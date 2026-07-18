@@ -1482,6 +1482,47 @@ class TestOriginVar:
         assert "synthetic" not in origin
         assert "button_answer" not in origin
 
+    async def test_voice_handoff_reservation_requires_trusted_commit(
+        self, tmp_path,
+    ):
+        """Only a complete server-installed reservation crosses to tools."""
+        import agent as agent_mod
+
+        captured: dict[str, Any] = {}
+
+        class CapturingClient(FakeClient):
+            async def receive_response(self):
+                captured["origin"] = agent_mod.origin_var.get(None)
+                async for m in super().receive_response():
+                    yield m
+
+        class CompleteReservation:
+            def reserve(self):
+                return None
+
+            def release(self):
+                return None
+
+            def commit(self, _job):
+                return None
+
+        a = _make_agent(tmp_path, role="concierge")
+        complete = CompleteReservation()
+        msg = _msg("voice", "scope-1", "hello")
+        msg.context.update({
+            "_voice_transport": "ws",
+            "_voice_handoff_reservation": complete,
+        })
+        with patch("sdk_client_pool._default_make_client", CapturingClient):
+            await a._process(msg)
+        assert captured["origin"]["_voice_handoff_reservation"] is complete
+
+        incomplete = SimpleNamespace(reserve=lambda: None, release=lambda: None)
+        msg.context["_voice_handoff_reservation"] = incomplete
+        with patch("sdk_client_pool._default_make_client", CapturingClient):
+            await a._process(msg)
+        assert "_voice_handoff_reservation" not in captured["origin"]
+
     async def test_origin_snapshot_copies_marker_keys_when_present(self, tmp_path):
         """synthetic/button_answer ride on msg.context (set by a LATER
         task's button-broker replay) and must be copied through verbatim."""

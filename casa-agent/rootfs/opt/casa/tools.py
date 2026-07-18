@@ -1283,8 +1283,59 @@ class _PermitHandoff:
 
 
 _BACKGROUND_ROUTE_CAPABILITIES = frozenset({
-    "background_jobs", "satellite_announce",
+    "background_jobs", "satellite_announce", "voice_handoff",
 })
+CONCIERGE_ROLE = "concierge"
+
+
+def requires_voice_handoff(origin: dict, caller_role: str) -> bool:
+    """Whether this trusted Concierge call must use WS handoff delivery."""
+    return (
+        caller_role == CONCIERGE_ROLE
+        and origin.get("channel") == "voice"
+        and origin.get("voice_transport") == "ws"
+        and bool(origin.get("_voice_handoff_reservation"))
+    )
+
+
+def validate_voice_handoff_static(
+    agent_name: str, origin: dict, requested_mode: str,
+) -> tuple[str, Any | None, dict | None]:
+    """Normalize an eligible Concierge voice delegation before any await.
+
+    The policy keys on the stable registered role, not an operator-editable
+    display name or model prompt.  It checks only static trusted provenance;
+    the existing asynchronous prelaunch pipeline still owns ACL, dependency,
+    and concurrency gates.
+    """
+    caller_role = str(origin.get("execution_role") or origin.get("role") or "")
+    if (
+        requested_mode != "sync"
+        or caller_role != CONCIERGE_ROLE
+        or origin.get("role") != CONCIERGE_ROLE
+        or origin.get("channel") != "voice"
+    ):
+        return requested_mode, None, None
+
+    caller_cfg = _agent_role_map.get(caller_role)
+    declared = {d.agent for d in (getattr(caller_cfg, "delegates", None) or [])}
+    # Preserve the established ACL error and ordering for an undeclared
+    # target; capability errors must not disclose target configuration.
+    if agent_name not in declared:
+        return requested_mode, None, None
+
+    reservation = origin.get("_voice_handoff_reservation")
+    if (
+        not requires_voice_handoff(origin, caller_role)
+        or not callable(getattr(reservation, "reserve", None))
+        or not callable(getattr(reservation, "release", None))
+        or not callable(getattr(reservation, "commit", None))
+        or not background_route_available(origin)
+    ):
+        return requested_mode, None, _background_delivery_unavailable_result()
+    return "async", reservation, None
+
+
 def background_route_available(origin: dict | None) -> bool:
     """Return whether the trusted turn origin can accept background audio."""
     if not isinstance(origin, dict):
@@ -1907,7 +1958,8 @@ async def _prelaunch(
     # sink's own errors are still swallowed (best-effort) and do NOT
     # release the permit — a launch still proceeds.
     try:
-        if channel == "voice":
+        if (channel == "voice"
+                and not requires_voice_handoff(origin, caller_role)):
             sink = (origin or {}).get("_progress_sink")
             if callable(sink):
                 try:
@@ -2146,6 +2198,7 @@ def _new_voice_job(
     origin: dict,
     task_text: str,
     context_text: str,
+    handoff_id: str | None = None,
 ) -> VoiceJob:
     """Build the durable ACCEPTED row from trusted turn provenance."""
     raw_user_id = origin.get("user_id")
@@ -2184,6 +2237,7 @@ def _new_voice_job(
             and origin["voice_job_control_id"].strip()
             else None
         ),
+        handoff_id=handoff_id,
     )
 
 
@@ -2403,6 +2457,7 @@ async def _start_voice_async_job(
     resolution: Any,
     permit: Any,
     handoff: _PermitHandoff,
+    handoff_reservation: Any | None = None,
     parent_job_id: str | None = None,
 ) -> dict:
     """Persist ACCEPTED, bind RUNNING task/permit ownership, return metadata."""
@@ -2412,6 +2467,7 @@ async def _start_voice_async_job(
     # READY row cannot consume one of the configured live backlog slots.
     await registry.expire_due()
     job_id = str(uuid.uuid4())
+    handoff_id = str(uuid.uuid4()) if handoff_reservation is not None else None
     job = _new_voice_job(
         job_id=job_id,
         parent_job_id=parent_job_id,
@@ -2420,12 +2476,14 @@ async def _start_voice_async_job(
         origin=origin,
         task_text=task_text,
         context_text=context_text,
+        handoff_id=handoff_id,
     )
     actor = _job_actor_from_origin(origin)
     if parent_job_id is not None and actor is None:
         raise JobAuthorizationError("voice continuation has no actor")
     created = False
     task: asyncio.Task | None = None
+    reservation_committed = False
     start_gate = asyncio.Event()
     try:
         try:
@@ -2443,6 +2501,8 @@ async def _start_voice_async_job(
                 )
             created = True
         except JobRouteCapacityError:
+            if handoff_reservation is not None:
+                handoff_reservation.release()
             return _result({
                 "status": "error",
                 "kind": "route_capacity_reached",
@@ -2481,9 +2541,29 @@ async def _start_voice_async_job(
                 _record_launch_safe(specialist_role)
             raise
         handoff.transferred = True
+        if handoff_reservation is not None:
+            pending_job = await registry.mark_handoff_pending(job_id, handoff_id)
+            handoff_reservation.commit(pending_job)
+            reservation_committed = True
         start_gate.set()
     except BaseException:
+        if handoff_reservation is not None and not reservation_committed:
+            handoff_reservation.release()
         if handoff.transferred:
+            if handoff_reservation is None:
+                raise
+            if task is not None and not task.done():
+                task.cancel()
+                await _await_task_teardown(task, _CEILING_TEARDOWN_BOUND_S)
+            if created:
+                if parent_job_id is None:
+                    await registry.cancel(job_id)
+                else:
+                    await registry.compensate_unbound_continuation(
+                        parent_job_id,
+                        job_id,
+                        actor=actor,
+                    )
             raise
         if task is not None and not task.done():
             task.cancel()
@@ -2540,6 +2620,26 @@ async def delegate_to_agent(args: dict) -> dict:
     # later turn has since rewritten in place.
     origin = _snapshot_origin()
 
+    # Concierge is the sole server-authorized voice handoff role.  Do this
+    # synchronously, before `_prelaunch` reaches a plugin/limiter await, so a
+    # live voice turn reserves foreground ownership before any work can race
+    # ahead.  Task 3 owns durable bind/commit and will consume this object.
+    mode, handoff_reservation, static_error = validate_voice_handoff_static(
+        agent_name, origin, mode,
+    )
+    if static_error is not None:
+        return static_error
+    if handoff_reservation is not None:
+        if handoff_reservation.reserve() is False:
+            return _result({
+                "status": "error",
+                "kind": "handoff_after_speech",
+                "message": (
+                    "A specialist handoff cannot start after this voice turn "
+                    "has begun speaking."
+                ),
+            })
+
     # A4: THE unified prelaunch pipeline — one call that runs EVERY
     # pre-launch gate (ACL, not-initialized, input-size bounds, depth, mode,
     # target resolution, resident-compat, requires-seam, concurrency,
@@ -2553,9 +2653,16 @@ async def delegate_to_agent(args: dict) -> dict:
     # (Task 6, spec §4.6) is the concurrency slot this delegation now owns —
     # the caller owns its lifetime from here: sync/async releases via the
     # task done-callback; interactive hands it to the engagement record.
-    cfg, resolution, permit, prelaunch_error = await _prelaunch(
-        agent_name, origin, mode, task_text, context_text)
+    try:
+        cfg, resolution, permit, prelaunch_error = await _prelaunch(
+            agent_name, origin, mode, task_text, context_text)
+    except BaseException:
+        if handoff_reservation is not None:
+            handoff_reservation.release()
+        raise
     if prelaunch_error is not None:
+        if handoff_reservation is not None:
+            handoff_reservation.release()
         return prelaunch_error
 
     # Task 6 (spec §4.6): lexical ownership guard. `owned` holds the permit
@@ -2740,7 +2847,19 @@ async def delegate_to_agent(args: dict) -> dict:
                     resolution=resolution,
                     permit=permit,
                     handoff=handoff,
+                    handoff_reservation=handoff_reservation,
                 )
+                if handoff_reservation is not None:
+                    try:
+                        launch_status = json.loads(
+                            result["content"][0]["text"],
+                        ).get("status")
+                    except (IndexError, KeyError, TypeError, json.JSONDecodeError):
+                        launch_status = None
+                    if launch_status == "error":
+                        # The real launch path releases before returning an
+                        # error; preserve that contract at this seam too.
+                        handoff_reservation.release()
             finally:
                 if handoff.transferred:
                     owned = None  # __TRANSFER_VOICE_JOB__

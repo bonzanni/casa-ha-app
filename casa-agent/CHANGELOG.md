@@ -1,5 +1,17 @@
 # Changelog
 
+## [0.90.0] - 2026-07-18
+
+Concierge specialist questions now acknowledge immediately and deliver their
+answer later, once the originating satellite is idle. Butler home-control turns
+remain direct and immediate.
+
+### Added
+
+- Coordinated protocol-2 voice handoff with the companion Home Assistant
+  integration, so Concierge can confirm a specialist request through Assist
+  before the specialist continues in the background.
+
 ## [0.89.0] - 2026-07-18
 
 Engagement conversations now read like proper chat: formatting renders, replies

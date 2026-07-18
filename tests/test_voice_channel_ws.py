@@ -14,7 +14,7 @@ from aiohttp import web, WSMsgType
 from aiohttp.test_utils import TestClient, TestServer
 
 from bus import BusMessage, MessageBus, MessageType
-from channels.voice.channel import VoiceChannel
+from channels.voice.channel import VoiceChannel, VoiceHandoffReservation
 from channels.voice.routes import VoiceWsConnection
 from error_kinds import VoiceToolLoopError
 
@@ -63,6 +63,121 @@ class _DeliverySpy:
 
     async def route_connected(self, _route):
         return None
+
+
+class _HandoffJob:
+    """Minimal durable job shape delivered by the Task-3 commit seam."""
+
+    id = "job-1"
+    handoff_id = "handoff-1"
+    specialist_display_name = "Finance"
+
+
+class _RecordingWs:
+    """Connection double that proves the write precedes request cancellation."""
+
+    voice_route_id = "route-1"
+    voice_route_capabilities = frozenset({
+        "background_jobs", "satellite_announce", "voice_handoff",
+    })
+    voice_job_control_id = "route-1"
+
+    def __init__(self) -> None:
+        self.frames: list[dict] = []
+        self.write_completed = asyncio.Event()
+
+    async def send_json(self, frame: dict) -> None:
+        self.frames.append(frame)
+        await asyncio.sleep(0)
+        self.write_completed.set()
+
+
+class _HandoffingBus:
+    """Models a Concierge handler committing after Task-3 durability."""
+
+    def __init__(self) -> None:
+        self.request_cancelled = asyncio.Event()
+        self.specialist_task: asyncio.Task | None = None
+
+    async def request(self, msg: BusMessage, timeout: float) -> None:
+        reservation = msg.context["_voice_handoff_reservation"]
+        assert reservation.reserve() is True
+        # A token arriving while the (normally async) prelaunch path is held
+        # must not win the foreground race.
+        await msg.context["_on_token"]("This must not be spoken.")
+        self.specialist_task = asyncio.create_task(asyncio.Event().wait())
+        reservation.commit(_HandoffJob())
+        try:
+            await asyncio.Event().wait()
+        except asyncio.CancelledError:
+            assert self.specialist_task is not None
+            assert not self.specialist_task.done()
+            assert self.request_cancelled is not None
+            self.request_cancelled.set()
+            raise
+
+
+class _FailingHandoffWs(_RecordingWs):
+    """A transport failure must use the ordinary error path, not succeed."""
+
+    async def send_json(self, frame: dict) -> None:
+        self.frames.append(frame)
+        if frame["type"] == "handoff":
+            raise ConnectionResetError("closing transport")
+        await asyncio.sleep(0)
+        self.write_completed.set()
+
+
+class _BlockingBlockWs(_RecordingWs):
+    """Stops a speech write after the channel has selected it."""
+
+    def __init__(self) -> None:
+        super().__init__()
+        self.block_started = asyncio.Event()
+        self.release_block = asyncio.Event()
+
+    async def send_json(self, frame: dict) -> None:
+        self.frames.append(frame)
+        if frame["type"] == "block":
+            self.block_started.set()
+            await self.release_block.wait()
+        self.write_completed.set()
+
+
+class _HandoffThenErrorBus(_HandoffingBus):
+    """A late foreground error must lose to the durable handoff."""
+
+    async def request(self, msg: BusMessage, timeout: float) -> None:
+        reservation = msg.context["_voice_handoff_reservation"]
+        assert reservation.reserve() is True
+        self.specialist_task = asyncio.create_task(asyncio.Event().wait())
+        reservation.commit(_HandoffJob())
+        await msg.context["_error_sink"]("sdk_error", "not after handoff")
+        try:
+            await asyncio.Event().wait()
+        except asyncio.CancelledError:
+            self.request_cancelled.set()
+            raise
+
+
+class _ReserveDuringSpeechBus:
+    def __init__(self, ws: _BlockingBlockWs) -> None:
+        self._ws = ws
+        self.reserved_during_write: bool | None = None
+
+    async def request(self, msg: BusMessage, timeout: float) -> BusMessage:
+        writing = asyncio.create_task(msg.context["_on_token"]("Spoken."))
+        await self._ws.block_started.wait()
+        reservation = msg.context["_voice_handoff_reservation"]
+        self.reserved_during_write = reservation.reserve()
+        if self.reserved_during_write:
+            reservation.commit(_HandoffJob())
+        self._ws.release_block.set()
+        await writing
+        return BusMessage(
+            type=MessageType.RESPONSE, source="concierge", target="voice",
+            content="Spoken.", channel="voice", context=msg.context,
+        )
 
 
 @pytest.fixture
@@ -155,6 +270,116 @@ async def unsigned_route_ws_app():
 
 @pytest.mark.asyncio
 class TestWSTurn:
+    async def test_handoff_suppresses_a_late_foreground_error(self):
+        bus = _HandoffThenErrorBus()
+        channel = VoiceChannel(
+            bus=bus, default_agent="concierge", webhook_secret="",
+            sse_path="/api/converse", ws_path="/api/converse/ws",
+            agent_configs={"concierge": _FakeCfg()}, memory=AsyncMock(),
+            idle_timeout=300,
+        )
+        ws = _RecordingWs()
+
+        await channel._run_ws_utterance(
+            ws, {"agent_role": "concierge", "text": "ask finance"},
+            "utterance-1", asyncio.get_running_loop().time() + 20,
+        )
+
+        assert [frame["type"] for frame in ws.frames] == ["handoff"]
+        bus.specialist_task.cancel()
+        await asyncio.gather(bus.specialist_task, return_exceptions=True)
+
+    async def test_speech_selection_rejects_handoff_during_block_write(self):
+        ws = _BlockingBlockWs()
+        bus = _ReserveDuringSpeechBus(ws)
+        channel = VoiceChannel(
+            bus=bus, default_agent="concierge", webhook_secret="",
+            sse_path="/api/converse", ws_path="/api/converse/ws",
+            agent_configs={"concierge": _FakeCfg()}, memory=AsyncMock(),
+            idle_timeout=300,
+        )
+
+        await channel._run_ws_utterance(
+            ws, {"agent_role": "concierge", "text": "speak"},
+            "utterance-1", asyncio.get_running_loop().time() + 20,
+        )
+
+        assert bus.reserved_during_write is False
+        assert "handoff" not in [frame["type"] for frame in ws.frames]
+
+    async def test_handoff_ends_only_the_foreground_request_after_its_frame(
+        self,
+    ):
+        """A durable job owns the background task, not the old utterance."""
+        bus = _HandoffingBus()
+        channel = VoiceChannel(
+            bus=bus, default_agent="concierge", webhook_secret="",
+            sse_path="/api/converse", ws_path="/api/converse/ws",
+            agent_configs={"concierge": _FakeCfg()}, memory=AsyncMock(),
+            idle_timeout=300,
+        )
+        ws = _RecordingWs()
+
+        await channel._run_ws_utterance(
+            ws,
+            {
+                "agent_role": "concierge", "text": "please ask finance",
+                "scope_id": "scope-1", "device_id": "kitchen",
+            },
+            "utterance-1",
+            asyncio.get_running_loop().time() + 20,
+        )
+
+        assert ws.frames == [{
+            "type": "handoff", "utterance_id": "utterance-1",
+            "handoff_id": "handoff-1", "text": "I will ask Finance.",
+        }]
+        assert ws.write_completed.is_set()
+        assert bus.request_cancelled.is_set()
+        assert bus.specialist_task is not None
+        assert not bus.specialist_task.done()
+        bus.specialist_task.cancel()
+        await asyncio.gather(bus.specialist_task, return_exceptions=True)
+
+    async def test_handoff_reservation_releases_streaming_and_rejects_late_reserve(
+        self,
+    ):
+        reservation = VoiceHandoffReservation()
+
+        assert reservation.reserve() is True
+        assert reservation.held is True
+        reservation.release()
+        assert reservation.held is False
+        reservation.mark_speech_sent()
+        assert reservation.reserve() is False
+
+    async def test_failed_handoff_write_does_not_fake_a_terminal_success(self):
+        bus = _HandoffingBus()
+        channel = VoiceChannel(
+            bus=bus, default_agent="concierge", webhook_secret="",
+            sse_path="/api/converse", ws_path="/api/converse/ws",
+            agent_configs={"concierge": _FakeCfg()}, memory=AsyncMock(),
+            idle_timeout=300,
+        )
+        ws = _FailingHandoffWs()
+
+        await channel._run_ws_utterance(
+            ws,
+            {
+                "agent_role": "concierge", "text": "please ask finance",
+                "scope_id": "scope-1", "device_id": "kitchen",
+            },
+            "utterance-1",
+            asyncio.get_running_loop().time() + 20,
+        )
+
+        assert [frame["type"] for frame in ws.frames] == ["handoff", "error"]
+        assert bus.request_cancelled.is_set()
+        assert bus.specialist_task is not None
+        assert not bus.specialist_task.done()
+        bus.specialist_task.cancel()
+        await asyncio.gather(bus.specialist_task, return_exceptions=True)
+
     async def test_stt_start_then_utterance(self, ws_app):
         client, _, memory, _ = ws_app
         async with client.ws_connect("/api/converse/ws") as ws:
@@ -272,7 +497,7 @@ class TestWSTurn:
             "/api/converse/ws", headers=headers,
         ) as ws:
             await ws.send_json({
-                "type": "job_claimed", "protocol": 1,
+                "type": "job_claimed", "protocol": 2,
                 "job_id": "job-1",
                 "delivery_attempt_id": "attempt-1",
             })
@@ -292,6 +517,30 @@ class TestWSTurn:
             with pytest.raises(asyncio.TimeoutError):
                 await asyncio.wait_for(ws.receive_json(), timeout=0.05)
             assert ws.closed is False
+
+    async def test_handoff_received_before_route_registration_is_ignored(
+        self, signed_ws_app,
+    ):
+        client, channel, delivery, headers = signed_ws_app
+        dispatch = AsyncMock()
+        channel._bus.handlers["butler"] = dispatch
+
+        async with client.ws_connect(
+            "/api/converse/ws", headers=headers,
+        ) as ws:
+            await ws.send_json({
+                "type": "handoff_received",
+                "protocol": 2,
+                "utterance_id": "u-1",
+                "handoff_id": "handoff-1",
+                "text": "I will look into that.",
+            })
+            with pytest.raises(asyncio.TimeoutError):
+                await asyncio.wait_for(ws.receive_json(), timeout=0.05)
+
+        assert channel.routes.get_connected("entry-1:concierge") is None
+        assert delivery.calls == []
+        dispatch.assert_not_awaited()
 
     async def test_non_object_json_frame_is_ignored_without_close(
         self, signed_ws_app,
@@ -313,16 +562,16 @@ class TestWSTurn:
             "/api/converse/ws", headers=headers,
         ) as ws:
             await ws.send_json({
-                "type": "voice_route_register", "protocol": 1,
+                "type": "voice_route_register", "protocol": 2,
                 "route_id": "entry-1", "agent_role": "concierge",
                 "capabilities": [
-                    "background_jobs", "satellite_announce",
+                    "background_jobs", "satellite_announce", "voice_handoff",
                 ],
             })
             assert await ws.receive_json() == {
-                "type": "voice_route_registered", "protocol": 1,
+                "type": "voice_route_registered", "protocol": 2,
                 "accepted_capabilities": [
-                    "background_jobs", "satellite_announce",
+                    "background_jobs", "satellite_announce", "voice_handoff",
                 ],
             }
             bound = channel.routes.get_connected("entry-1")
@@ -342,16 +591,16 @@ class TestWSTurn:
             "/api/converse/ws", headers=headers,
         ) as ws:
             await ws.send_json({
-                "type": "voice_route_register", "protocol": 1,
+                "type": "voice_route_register", "protocol": 2,
                 "route_id": "entry-1", "agent_role": "concierge",
                 "capabilities": [
-                    "background_jobs", "satellite_announce",
+                    "background_jobs", "satellite_announce", "voice_handoff",
                 ],
             })
             await ws.receive_json()
             assert channel.routes.get_connected("entry-1") is not None
             await ws.send_json({
-                "type": "job_claimed", "protocol": 1,
+                "type": "job_claimed", "protocol": 2,
                 "job_id": "job-1",
                 "delivery_attempt_id": "attempt-1",
             })
@@ -369,10 +618,10 @@ class TestWSTurn:
         client, channel = unsigned_route_ws_app
         async with client.ws_connect("/api/converse/ws") as ws:
             await ws.send_json({
-                "type": "voice_route_register", "protocol": 1,
+                "type": "voice_route_register", "protocol": 2,
                 "route_id": "entry-1", "agent_role": "butler",
                 "capabilities": [
-                    "background_jobs", "satellite_announce",
+                    "background_jobs", "satellite_announce", "voice_handoff",
                 ],
             })
             ack = await ws.receive_json()

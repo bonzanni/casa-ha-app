@@ -19,11 +19,13 @@ import agent as agent_mod
 import tools
 from bus import MessageBus
 from channels import ChannelManager
+from channels.voice.channel import VoiceChannel
 from channels.voice.routes import VoiceRouteRegistry, VoiceWsConnection
 from config import AgentConfig, CharacterConfig, DelegateEntry
 from job_registry import (
     DeliveryState,
     ExecutionState,
+    HandoffState,
     JobFailure,
     JobRegistry,
     VoiceJob,
@@ -64,7 +66,7 @@ def voice_origin(**overrides) -> dict:
         "voice_transport": "ws",
         "voice_route_id": "entry-1",
         "voice_route_capabilities": frozenset({
-            "background_jobs", "satellite_announce",
+            "background_jobs", "satellite_announce", "voice_handoff",
         }),
         "origin_device_id": "device-kitchen",
         "voice_job_control_id": "entry-1",
@@ -132,6 +134,22 @@ class _ControlledRunner:
 
     async def fail(self, exc: BaseException) -> None:
         await self.outputs.put(exc)
+
+
+class _Reservation:
+    def __init__(self) -> None:
+        self.reserved = 0
+        self.released = 0
+        self.committed: list[VoiceJob] = []
+
+    def reserve(self) -> None:
+        self.reserved += 1
+
+    def release(self) -> None:
+        self.released += 1
+
+    def commit(self, job: VoiceJob) -> None:
+        self.committed.append(job)
 
 
 class ToolEnv:
@@ -238,6 +256,107 @@ async def test_voice_async_accepts_and_returns_only_opaque_metadata(tool_env):
     assert job.origin_device_id == "device-kitchen"
     assert job.task == "Does this target?"
     assert tool_env.limiter.in_flight == 1
+
+
+@pytest.mark.asyncio
+async def test_handoff_commit_follows_durable_pending_latch(tool_env):
+    reservation = _Reservation()
+    origin = voice_origin(_voice_handoff_reservation=reservation)
+
+    payload = tool_payload(await tool_env.invoke_delegate(origin, mode="sync"))
+    job = tool_env.job_registry.get(payload["job_id"])
+
+    assert job.handoff_state is HandoffState.PENDING
+    assert job.handoff_id is not None
+    assert reservation.reserved == 1
+    assert reservation.released == 0
+    assert reservation.committed == [job]
+
+
+@pytest.mark.asyncio
+async def test_channel_handoff_commits_real_job_before_cancelling_outer_request(
+    tool_env, monkeypatch,
+):
+    """Channel, real tool persistence, and registry share one handoff seam."""
+    gate_entered = asyncio.Event()
+    release_gate = asyncio.Event()
+    outer_cancelled = asyncio.Event()
+    bus = MessageBus()
+
+    class _Ws:
+        voice_route_id = "entry-1"
+        voice_route_capabilities = frozenset({
+            "background_jobs", "satellite_announce", "voice_handoff",
+        })
+        voice_job_control_id = "entry-1"
+
+        def __init__(self) -> None:
+            self.frames: list[dict] = []
+
+        async def send_json(self, frame: dict) -> None:
+            self.frames.append(frame)
+
+    async def _prelaunch(_agent, origin, mode, *_args):
+        assert mode == "async"
+        assert origin["_voice_handoff_reservation"].held is True
+        gate_entered.set()
+        await release_gate.wait()
+        return _specialist_cfg("judge", "Judge"), None, None, None
+
+    async def _concierge(msg):
+        reservation = msg.context["_voice_handoff_reservation"]
+        origin = voice_origin(
+            _voice_handoff_reservation=reservation,
+            voice_deadline=msg.context["_voice_deadline"],
+        )
+        token = agent_mod.origin_var.set(origin)
+        try:
+            await tools.delegate_to_agent.handler({
+                "agent": "judge", "task": "durable task", "context": "",
+                "mode": "sync",
+            })
+            await asyncio.Event().wait()
+        except asyncio.CancelledError:
+            outer_cancelled.set()
+            raise
+        finally:
+            agent_mod.origin_var.reset(token)
+
+    monkeypatch.setattr(tools, "_prelaunch", _prelaunch)
+    monkeypatch.setattr(tools, "background_route_available", lambda _origin: True)
+    bus.register("concierge", _concierge)
+    loop = asyncio.create_task(bus.run_agent_loop("concierge"))
+    concierge_cfg = _caller_cfg()
+    concierge_cfg.channels = ["ha_voice"]
+    channel = VoiceChannel(
+        bus=bus, default_agent="concierge", webhook_secret="",
+        sse_path="/api/converse", ws_path="/api/converse/ws",
+        agent_configs={"concierge": concierge_cfg}, memory=None,
+        idle_timeout=300,
+    )
+    ws = _Ws()
+    turn = asyncio.create_task(channel._run_ws_utterance(
+        ws,
+        {"agent_role": "concierge", "text": "ask judge", "device_id": "kitchen"},
+        "utterance-1", asyncio.get_running_loop().time() + 20,
+    ))
+    await gate_entered.wait()
+    assert ws.frames == []
+    release_gate.set()
+    await turn
+
+    assert [frame["type"] for frame in ws.frames] == ["handoff"]
+    job = tool_env.job_registry.all()[0]
+    assert job.handoff_state is HandoffState.PENDING
+    assert job.handoff_id == ws.frames[0]["handoff_id"]
+    assert outer_cancelled.is_set()
+    specialist_task = tool_env.job_registry._tasks[job.id]
+    assert tool_env.job_registry.owns_task(job.id, specialist_task)
+    assert not specialist_task.done()
+    specialist_task.cancel()
+    await asyncio.gather(specialist_task, return_exceptions=True)
+    loop.cancel()
+    await asyncio.gather(loop, return_exceptions=True)
 
 
 @pytest.mark.asyncio
@@ -464,10 +583,12 @@ async def test_tool_uses_live_route_freshness_at_launch_and_completion(
     connection = VoiceWsConnection(_Socket())
     await routes.register(connection, {
         "type": "voice_route_register",
-        "protocol": 1,
+        "protocol": 2,
         "route_id": "entry-1",
         "agent_role": "concierge",
-        "capabilities": ["background_jobs", "satellite_announce"],
+        "capabilities": [
+            "background_jobs", "satellite_announce", "voice_handoff",
+        ],
     })
     await routes.disconnect(connection)
     monkeypatch.setattr(

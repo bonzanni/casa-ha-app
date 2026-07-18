@@ -2576,6 +2576,7 @@ async def main() -> None:
     voice_channel = None
     if voice_sse_enabled or voice_ws_enabled:
         from channels.voice import VoiceChannel
+        from channels.voice.channel import VoiceHandoffCoordinator
         from channels.voice.delivery import VoiceDeliveryCoordinator
         from channels.voice.routes import VoiceRouteRegistry
 
@@ -2585,8 +2586,10 @@ async def main() -> None:
             freshness_s=voice_delivery_config.route_freshness_s,
         )
         voice_delivery = VoiceDeliveryCoordinator(job_registry, voice_routes)
+        voice_handoff = VoiceHandoffCoordinator(job_registry)
         runtime.voice_route_registry = voice_routes
         runtime.voice_delivery_coordinator = voice_delivery
+        runtime.voice_handoff_coordinator = voice_handoff
 
         voice_channel = VoiceChannel(
             bus=bus,
@@ -2602,6 +2605,7 @@ async def main() -> None:
             rate_limiter=voice_rate_limiter,
             route_registry=voice_routes,
             delivery_coordinator=voice_delivery,
+            handoff_coordinator=voice_handoff,
         )
         channel_manager.register(voice_channel)
         logger.info(
