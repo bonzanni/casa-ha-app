@@ -193,6 +193,11 @@ class _FakeChannel:
         self.edits.append((message_id, text, clear_keyboard))
         return True
 
+    async def edit_topic_message_rich(self, topic_id, message_id, text, *,
+                                      clear_keyboard=False):
+        return await self.edit_topic_message(
+            topic_id, message_id, text, clear_keyboard=clear_keyboard)
+
 
 class _StatusDriver:
     """A driver stub for the ask handler that records status transitions and

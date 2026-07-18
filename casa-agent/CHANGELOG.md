@@ -1,5 +1,27 @@
 # Changelog
 
+## [0.89.0] - 2026-07-18
+
+Engagement conversations now read like proper chat: formatting renders, replies
+are spaced apart, questions always come as tappable buttons, and the agent can
+acknowledge you with a quick reaction.
+
+### Added
+
+- Agents in an engagement can react to your latest message with an emoji (👍
+  done, 👀 working) as a lightweight, non-blocking acknowledgement.
+
+### Changed
+
+- Engagement narration, questions, and their follow-up edits now render Markdown
+  (**bold**, `code`, code blocks) as real formatting instead of showing the raw
+  `**` and backtick characters.
+- Consecutive narration updates are separated by a blank line, so streamed
+  progress no longer runs together into text like "questions.Good".
+- When an agent asks a question with choices, it now reliably offers tappable
+  buttons — even mid-conversation and even when an underlying skill would
+  otherwise ask in prose.
+
 ## [0.88.0] - 2026-07-17
 
 Casa can now be discovered automatically by its companion Home Assistant

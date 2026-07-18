@@ -136,6 +136,16 @@ def _install_telegram_stubs() -> None:
     tg.MessageEntity = _FakeMessageEntity
     tg.InputFile = _FakeInputFile
 
+    # R5 (v0.89.0): reaction primitive for the `react` framework tool.
+    class _FakeReactionTypeEmoji:
+        def __init__(self, emoji):
+            self.emoji = emoji
+
+        def __repr__(self):
+            return f"_FakeReactionTypeEmoji({self.emoji!r})"
+
+    tg.ReactionTypeEmoji = _FakeReactionTypeEmoji
+
     tg_ext = types.ModuleType("telegram.ext")
     tg_ext.Application = MagicMock()
     tg_ext.ContextTypes = MagicMock()

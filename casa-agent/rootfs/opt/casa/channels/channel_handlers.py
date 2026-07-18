@@ -1332,12 +1332,16 @@ def _ask_keyboard_finish(
         # sequencer markup primitive (``edit_discrete``) that the toggle redraw
         # uses, so the two writers serialize on ONE lock — a stale toggle redraw
         # can never land after (and resurrect) a settled keyboard. The finish
-        # hook stays the sole TERMINAL writer. Single-select keeps today's direct
-        # ``edit_topic_message`` (``settle_edit`` is None).
+        # hook stays the sole TERMINAL writer. Single-select settles via the
+        # RICH edit primitive (R2b/c, v0.89.0): ``edit_topic_message_rich``
+        # re-renders the settled body's markdown (so a formatted ask does not
+        # revert to literal ``**`` on answer/expire/supersede) while retaining
+        # the explicit keyboard-clear (S1). An edit is a single edit with no
+        # cancellation gate, so its render→plain fallback is acceptable.
         if settle_edit is not None:
             do_edit = lambda: settle_edit(text)  # noqa: E731
         else:
-            do_edit = lambda: telegram_channel.edit_topic_message(  # noqa: E731
+            do_edit = lambda: telegram_channel.edit_topic_message_rich(  # noqa: E731
                 topic_id, message_id, text, clear_keyboard=True)
         confirmed = await confirmed_settle_edit(do_edit, sleep=sleep)
         if not confirmed:
@@ -1803,15 +1807,19 @@ def _make_ask(
                             driver, "sequencer_is_terminal", None)
                         if _seq_terminal is not None and _seq_terminal(eng_id):
                             return None
-                        # A6 (spec §D1, Sol r9-2): SINGLE-ATTEMPT PLAIN send — like
-                        # the button-ask body, ``send_to_topic`` performs exactly
-                        # ONE physical send. The rich ``send_response_to_topic``
-                        # could send twice (rich → BadRequest → plain fallback),
-                        # and a cancel landing during the awaited first attempt
-                        # would not be re-checked before the fallback posted the
-                        # abandoned anchor — the double-send this forecloses.
+                        # A6 (spec §D1, Sol r9-2) + R2b (v0.89.0): SINGLE-ATTEMPT
+                        # rich send — like the button-ask body, ``post_ask_body_rich``
+                        # performs exactly ONE physical send and FAILS CLOSED on an
+                        # entity BadRequest (no plain retry). The rich
+                        # ``send_response_to_topic`` could send twice (rich →
+                        # BadRequest → plain fallback), and a cancel landing during
+                        # the awaited first attempt would not be re-checked before
+                        # the fallback posted the abandoned anchor — the double-send
+                        # this forecloses. Plain bodies still send raw (render() →
+                        # entities=None ⇒ verbatim), so this remains one send either
+                        # way; markdown now renders as MessageEntity spans.
                         try:
-                            mid = await telegram_channel.send_to_topic(
+                            mid = await telegram_channel.post_ask_body_rich(
                                 rec.topic_id, display)
                         except Exception:  # noqa: BLE001
                             logger.warning("free-text anchor post failed (eng=%s)",
@@ -2496,11 +2504,14 @@ async def _withdraw_anchor(
     """§A3(c) compensation: best-effort confirmed WITHDRAW-edit of an orphan
     anchor (posted, but its ledger write failed) via the RAW wire edit primitive
     — NEVER ``edit_discrete`` (the initial-anchor poster runs under the sequencer
-    lock on the relay task; no reacquisition from poster context). An unconfirmed
-    edit leaves one stale plain-text line — the documented visual-orphan class."""
+    lock on the relay task; no reacquisition from poster context). R2c (v0.89.0):
+    routes through the RICH edit primitive for parity with every other ask/anchor
+    lifecycle edit (the withdrawn copy is plain, so render() ⇒ entities=None ⇒
+    verbatim — behaviour-preserving). An unconfirmed edit leaves one stale
+    plain-text line — the documented visual-orphan class."""
     try:
         confirmed = await confirmed_settle_edit(
-            lambda: telegram_channel.edit_topic_message(
+            lambda: telegram_channel.edit_topic_message_rich(
                 topic_id, mid, _ANCHOR_WITHDRAWN, clear_keyboard=True),
         )
         if not confirmed:

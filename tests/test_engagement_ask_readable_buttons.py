@@ -160,6 +160,7 @@ class TestPostOptionsKeyboardReadable:
         from channels import telegram as tg_mod
 
         ch = tg_mod.TelegramChannel.__new__(tg_mod.TelegramChannel)
+        ch._rich_text_enabled = False
         ch._engagement_registry = MagicMock()
         ch._engagement_registry.get = MagicMock(return_value=MagicMock(topic_id=42))
         ch.send_to_topic = AsyncMock(return_value=101)
@@ -248,6 +249,12 @@ class _FakeChannel:
     ) -> bool:
         self.edits.append({"text": text, "clear_keyboard": clear_keyboard})
         return True
+
+    async def edit_topic_message_rich(
+        self, topic_id, message_id, text, *, clear_keyboard=False,
+    ) -> bool:
+        return await self.edit_topic_message(
+            topic_id, message_id, text, clear_keyboard=clear_keyboard)
 
 
 class _FakeRequest:

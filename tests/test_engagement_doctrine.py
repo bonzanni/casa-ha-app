@@ -246,6 +246,23 @@ def test_sharpened_silent_yield_exact_counterexample(fixture_name, request):
     assert _SILENT_YIELD_COUNTEREXAMPLE in text
 
 
+@pytest.mark.parametrize("fixture_name", ["conduct_text", "template_text"])
+def test_r4_subskill_idiom_and_typed_reply_not_prose_forever(
+    fixture_name, request,
+):
+    """R4 (v0.89.0, buttons-always): a sub-skill's "ask conversationally" /
+    "one question per message" language is chat idiom, NOT channel mechanics —
+    in an engagement, enumerable questions ALWAYS route through `ask`/`options`
+    regardless of what a sub-skill (e.g. superpowers:brainstorming) says; and a
+    typed operator reply never switches the agent to prose-forever. Both the
+    durable doctrine file and the mirrored template must carry both halves."""
+    text = request.getfixturevalue(fixture_name)
+    # Half A — sub-skill idiom is not channel mechanics.
+    assert "chat idiom, not channel mechanics" in text
+    # Half B — a typed reply is not a permanent switch to prose.
+    assert "a typed operator reply never switches you to prose-forever" in text
+
+
 def test_conduct_silent_yield_counterexample_is_verbatim():
     """Belt-and-suspenders on the primary doctrine file: assert the exact
     counter-example sentence appears with its original capitalization/

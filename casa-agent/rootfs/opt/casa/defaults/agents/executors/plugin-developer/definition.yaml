@@ -14,6 +14,10 @@ tools:
   allowed:
     - mcp__casa-framework__query_engager
     - mcp__casa-framework__emit_completion
+    # R5 (v0.89.0): drop a lightweight, non-decisional emoji ack (👍/👀) on the
+    # operator's latest message. Registering the tool does not expose it — this
+    # grant does. See doctrine/engagement-conduct.md ("Reacting").
+    - mcp__casa-framework__react
     # v0.46.4: broad Bash — the builder must run/test what it writes across
     # open-ended toolchains (python/pytest/uv/npm/ruff/tsc/make/...). An
     # allowlist can't cover dev, so safety lives in the hook stack

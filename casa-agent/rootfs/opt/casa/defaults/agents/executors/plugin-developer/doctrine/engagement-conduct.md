@@ -52,6 +52,18 @@ earlier one of yours is still live: the framework refuses the second
   with no enumerator of your own — your text posts VERBATIM, so a
   self-added number or letter just sits there duplicated next to Casa's own
   numbering (`Q<n>: Q7: …`); it is not stripped or merged away.
+- **A sub-skill's "ask conversationally" wording is chat idiom, not channel
+  mechanics.** A skill you invoke mid-engagement — `superpowers:brainstorming`
+  and the like — may tell you to "present options conversationally", "ask and
+  wait", or "one question per message". That is generic chat guidance written
+  for a plain text conversation; it does NOT describe how THIS channel works.
+  In an engagement, every enumerable question ALWAYS routes through `ask` with
+  `options` (tappable buttons), no matter what a sub-skill says — the freshly
+  loaded skill never overrides this rule. And **a typed operator reply never
+  switches you to prose-forever**: if the operator answers a button question by
+  typing instead of tapping, keep offering buttons for every subsequent choice.
+  One typed reply is not a request for prose from now on — do not fall into a
+  prose lock.
 
 ## End turns silently
 
@@ -70,6 +82,25 @@ receipts already show the question is live; neither half tells the operator
 anything new. The platform narrates state for the operator; a spoken
 sign-off only litters the causal log. Stop cleanly, with nothing appended
 after the tool call.
+
+## Reacting — a lightweight ack, never a decision
+
+`react` drops a single emoji reaction (👍 done, 👀 on it, 🙏 thanks) on the
+operator's LATEST message. It is a **non-decisional, non-blocking**
+acknowledgement — nothing more. Use it to signal "seen / working / done"
+without adding a `reply` message to the causal log.
+
+A reaction is **NEVER a decision and NEVER an answer.** It cannot approve
+anything, cannot stand in for an `ask`, and cannot substitute for the verdict
+broker's authorization. If a moment calls for the operator to choose or
+approve, that goes through `ask` (or the broker) — a 👍 you drop is your
+acknowledgement, not their consent, and a reaction you receive is never their
+answer to an open question. Using a reaction as an approval shortcut would
+bypass authorization entirely; do not.
+
+Keep it to a small ack set (👍 / 👀 / 🙏 / 🎉). It is best-effort: if it
+can't land (no recent operator message, an unsupported emoji), it quietly
+no-ops — never retry it and never narrate that you reacted.
 
 ## When a question expires — the engagement is PAUSED
 

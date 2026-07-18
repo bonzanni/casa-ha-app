@@ -119,6 +119,14 @@ class _AskFakeChannel:
             self.edited_expired.append((topic_id, message_id, text))
         return True
 
+    # R2c: the single-select finish-hook settle routes through the rich edit
+    # primitive; the fake delegates (no wire render).
+    async def edit_topic_message_rich(
+        self, topic_id, message_id, text, *, clear_keyboard=False,
+    ) -> bool:
+        return await self.edit_topic_message(
+            topic_id, message_id, text, clear_keyboard=clear_keyboard)
+
 
 class _FakeRequest:
     """Minimal aiohttp.web.Request stand-in — the handler only calls
@@ -650,6 +658,7 @@ class TestPostOptionsKeyboard:
         from channels import telegram as tg_mod
 
         ch = tg_mod.TelegramChannel.__new__(tg_mod.TelegramChannel)
+        ch._rich_text_enabled = False
         ch._engagement_registry = MagicMock()
         ch._engagement_registry.get = MagicMock(
             return_value=MagicMock(topic_id=42),
@@ -687,6 +696,7 @@ class TestPostOptionsKeyboard:
         import uuid
 
         ch = tg_mod.TelegramChannel.__new__(tg_mod.TelegramChannel)
+        ch._rich_text_enabled = False
         ch._engagement_registry = MagicMock()
         ch._engagement_registry.get = MagicMock(
             return_value=MagicMock(topic_id=42),
@@ -707,6 +717,7 @@ class TestPostOptionsKeyboard:
         from channels import telegram as tg_mod
 
         ch = tg_mod.TelegramChannel.__new__(tg_mod.TelegramChannel)
+        ch._rich_text_enabled = False
         ch._engagement_registry = MagicMock()
         ch._engagement_registry.get = MagicMock(return_value=None)
         ch.send_to_topic = AsyncMock()
@@ -722,6 +733,7 @@ class TestPostOptionsKeyboard:
         from channels import telegram as tg_mod
 
         ch = tg_mod.TelegramChannel.__new__(tg_mod.TelegramChannel)
+        ch._rich_text_enabled = False
         ch._engagement_registry = MagicMock()
         ch._engagement_registry.get = MagicMock(
             return_value=MagicMock(topic_id=None),
@@ -746,6 +758,7 @@ class TestEditTopicMessage:
         from channels import telegram as tg_mod
 
         ch = tg_mod.TelegramChannel.__new__(tg_mod.TelegramChannel)
+        ch._rich_text_enabled = False
         ch.engagement_supergroup_id = 555
         ch._bot = MagicMock()
         ch._bot.edit_message_text = AsyncMock()
@@ -761,6 +774,7 @@ class TestEditTopicMessage:
         from telegram.error import BadRequest
 
         ch = tg_mod.TelegramChannel.__new__(tg_mod.TelegramChannel)
+        ch._rich_text_enabled = False
         ch.engagement_supergroup_id = 555
         bot = MagicMock()
         bot.edit_message_text = AsyncMock(
@@ -776,6 +790,7 @@ class TestEditTopicMessage:
         from telegram.error import BadRequest
 
         ch = tg_mod.TelegramChannel.__new__(tg_mod.TelegramChannel)
+        ch._rich_text_enabled = False
         ch.engagement_supergroup_id = 555
         bot = MagicMock()
         bot.edit_message_text = AsyncMock(
@@ -790,6 +805,7 @@ class TestEditTopicMessage:
         from channels import telegram as tg_mod
 
         ch = tg_mod.TelegramChannel.__new__(tg_mod.TelegramChannel)
+        ch._rich_text_enabled = False
         ch.engagement_supergroup_id = None
         ch._bot = MagicMock()
         ch._bot.edit_message_text = AsyncMock()
@@ -804,6 +820,7 @@ class TestDeleteTopicMessage:
         from channels import telegram as tg_mod
 
         ch = tg_mod.TelegramChannel.__new__(tg_mod.TelegramChannel)
+        ch._rich_text_enabled = False
         ch.engagement_supergroup_id = 555
         bot = MagicMock()
         bot.delete_message = AsyncMock(return_value=True)
@@ -817,6 +834,7 @@ class TestDeleteTopicMessage:
         from channels import telegram as tg_mod
 
         ch = tg_mod.TelegramChannel.__new__(tg_mod.TelegramChannel)
+        ch._rich_text_enabled = False
         ch.engagement_supergroup_id = 555
         bot = MagicMock()
         bot.delete_message = AsyncMock(side_effect=RuntimeError("gone"))
@@ -829,6 +847,7 @@ class TestDeleteTopicMessage:
         from channels import telegram as tg_mod
 
         ch = tg_mod.TelegramChannel.__new__(tg_mod.TelegramChannel)
+        ch._rich_text_enabled = False
         ch.engagement_supergroup_id = None
         ch._bot = MagicMock()
         ch._bot.delete_message = AsyncMock()

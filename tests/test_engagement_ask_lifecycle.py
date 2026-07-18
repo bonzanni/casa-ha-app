@@ -67,6 +67,17 @@ class _FakeChannel:
              "clear_keyboard": clear_keyboard})
         return True
 
+    # R2b/c: the ask/anchor post + lifecycle edits route through the rich
+    # primitives; the fake records identically (no wire render).
+    async def post_ask_body_rich(self, thread_id, text, **kwargs) -> int:
+        return await self.send_to_topic(thread_id, text, **kwargs)
+
+    async def edit_topic_message_rich(
+        self, topic_id, message_id, text, *, clear_keyboard=False,
+    ) -> bool:
+        return await self.edit_topic_message(
+            topic_id, message_id, text, clear_keyboard=clear_keyboard)
+
 
 class _FakeDriver:
     """Fake claude_code driver backed by a REAL ``OutputSequencer`` (§2).
@@ -662,6 +673,12 @@ class _FailEditChannel:
             {"message_id": message_id, "text": text,
              "clear_keyboard": clear_keyboard, "ok": ok})
         return ok
+
+    async def edit_topic_message_rich(
+        self, topic_id, message_id, text, *, clear_keyboard=False,
+    ) -> bool:
+        return await self.edit_topic_message(
+            topic_id, message_id, text, clear_keyboard=clear_keyboard)
 
 
 async def test_finish_hook_preserves_ledger_on_unconfirmed_edit():

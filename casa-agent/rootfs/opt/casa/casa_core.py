@@ -960,6 +960,35 @@ def _wire_engagement_permission_relay(
     return cc_hook_policies
 
 
+def _wire_engagement_buttons_reminder(
+    cc_hook_policies: dict,
+    *,
+    engagement_registry,
+) -> dict:
+    """Inject engagement_buttons_reminder into a built cc_hook_policies dict.
+
+    R4 (v0.89.0, buttons-always): a PreToolUse(Skill) salience backstop that
+    needs the live ``engagement_registry`` (to resolve an ACTIVE engagement
+    from the CC payload's cwd), so — like ``engagement_permission_relay`` — it
+    can't be built via the parameter-free HOOK_POLICIES factory pattern. The
+    matcher is ``Skill`` so only Skill loads reach the callback (the executor's
+    generated .claude/settings.json registers the same Skill matcher, and
+    ``build_policy_callbacks_from_hooks_yaml`` skips this policy — no factory —
+    so the HTTP resolver falls back to this wired default).
+
+    Mutates and returns ``cc_hook_policies`` for caller convenience.
+    """
+    from hooks import make_engagement_buttons_reminder
+
+    cc_hook_policies["engagement_buttons_reminder"] = (
+        r"Skill",
+        make_engagement_buttons_reminder(
+            engagement_registry=engagement_registry,
+        ),
+    )
+    return cc_hook_policies
+
+
 async def _drain_broker_before_channel_shutdown(channel_manager: Any) -> None:
     """Graceful-shutdown barrier (r4-B1/B3): resolve every live
     ``verdict_broker`` request as ``cancelled`` and let its keyboard-edit
@@ -2285,25 +2314,30 @@ async def main() -> None:
         thread_id: int, text: str, reply_to_message_id: int | None = None,
     ) -> int | None:
         if telegram_channel is not None:
+            # R2a (v0.89.0): route narration/notice topic sends through the RICH
+            # primitive so markdown renders as MessageEntity spans (plain text is
+            # sent verbatim — render() returns entities=None and falls back).
             if reply_to_message_id is not None:
                 # v0.79.0 (§3): reply-quote the operator's message (Sol-verified
                 # PTB 22.7 spelling).
                 from telegram import ReplyParameters
-                return await telegram_channel.send_to_topic(
+                return await telegram_channel.send_to_topic_rich(
                     thread_id, text,
                     reply_parameters=ReplyParameters(
                         message_id=reply_to_message_id,
                         allow_sending_without_reply=True,
                     ),
                 )
-            return await telegram_channel.send_to_topic(thread_id, text)
+            return await telegram_channel.send_to_topic_rich(thread_id, text)
         return None
 
     async def _edit_topic_message(
         thread_id: int, message_id: int, text: str, *, clear_keyboard: bool = False,
     ) -> bool:
         if telegram_channel is not None:
-            return await telegram_channel.edit_topic_message(
+            # R2a (v0.89.0): route narration edits through the RICH primitive so
+            # EVERY edit re-renders markdown (plain text edits verbatim).
+            return await telegram_channel.edit_topic_message_rich(
                 thread_id, message_id, text, clear_keyboard=clear_keyboard)
         return False
 
@@ -2705,6 +2739,11 @@ async def main() -> None:
         engagement_registry=engagement_registry,
         telegram_channel=telegram_channel,
     )
+    # R4 (v0.89.0): buttons-always PreToolUse(Skill) salience backstop.
+    _wire_engagement_buttons_reminder(
+        _cc_hook_policies,
+        engagement_registry=engagement_registry,
+    )
     # H3 (v0.53.0): per-executor hooks.yaml params for the HTTP hook path.
     _executor_cc_policies = _build_executor_cc_hook_policies(executor_registry)
     app.router.add_post(
@@ -2770,6 +2809,11 @@ async def main() -> None:
         _internal_hook_policies,
         engagement_registry=engagement_registry,
         telegram_channel=telegram_channel,
+    )
+    # R4 (v0.89.0): buttons-always PreToolUse(Skill) salience backstop.
+    _wire_engagement_buttons_reminder(
+        _internal_hook_policies,
+        engagement_registry=engagement_registry,
     )
     from tools import CASA_TOOLS as _CASA_TOOLS_FOR_INTERNAL
     _internal_tool_dispatch = {

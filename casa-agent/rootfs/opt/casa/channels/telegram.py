@@ -600,8 +600,70 @@ class TelegramChannel(Channel):
         # in_casa_driver._locks. Entries are not pruned — bounded growth,
         # cleared on add-on restart.
         self._engagement_handler_locks: dict[int, asyncio.Lock] = {}
+        # R5 (v0.89.0): NON-PERSISTENT current-inbound target for the `react`
+        # framework tool. Maps engagement_id -> (chat_id, topic_id, message_id)
+        # of the LATEST operator message seen in that engagement's topic.
+        # Deliberately in-memory (NOT a registry field): it must NOT survive a
+        # restart — after a restart there is no known "latest" message to react
+        # to, and the react tool's non-live gate makes an empty map fail soft.
+        # Recorded SYNCHRONOUSLY in handle_update from the trusted
+        # msg.message_id; MONOTONIC (never regresses to an older id).
+        self._current_inbound: dict[str, tuple[int, int, int]] = {}
         # Default routing: forward to the existing PTB handler.
         self._route_to_ellen = self._route_to_ellen_default
+
+    # ------------------------------------------------------------------
+    # R5 (v0.89.0): current-inbound target + emoji reaction (react tool)
+    # ------------------------------------------------------------------
+
+    def _record_inbound_target(
+        self, engagement_id: str, chat_id: int, topic_id: int,
+        message_id: int | None,
+    ) -> None:
+        """Record the LATEST operator message for an engagement (react target).
+
+        MONOTONIC: replaces the stored target ONLY when ``message_id`` is
+        strictly greater than the stored one. ``handle_update`` runs
+        concurrently per Bot-API update; the per-topic lock serialises routing
+        but NOT Telegram delivery order, so an unconditional write could let a
+        delayed older update clobber a newer target. Telegram message ids are
+        monotonically increasing per chat, so the greatest id is the newest.
+        """
+        if not engagement_id or message_id is None:
+            return
+        prev = self._current_inbound.get(engagement_id)
+        if prev is not None and message_id <= prev[2]:
+            return
+        self._current_inbound[engagement_id] = (chat_id, topic_id, message_id)
+
+    def get_current_inbound(
+        self, engagement_id: str,
+    ) -> tuple[int, int, int] | None:
+        """Return ``(chat_id, topic_id, message_id)`` for the engagement's
+        latest operator message, or ``None`` (restart / no inbound / cleared)."""
+        return self._current_inbound.get(engagement_id)
+
+    def clear_inbound(self, engagement_id: str) -> None:
+        """Best-effort drop of a finished engagement's target (map hygiene).
+        A missed clear is harmless: react's non-live gate rejects it anyway."""
+        self._current_inbound.pop(engagement_id, None)
+
+    async def set_reaction(
+        self, chat_id: int, message_id: int, emoji: str,
+    ) -> None:
+        """Set a single emoji reaction on a message (PTB set_message_reaction).
+
+        Raises when the channel isn't started (RuntimeError) and lets
+        TelegramError propagate — the ``react`` tool classifies both."""
+        from telegram import ReactionTypeEmoji
+        bot = self.bot
+        if bot is None:
+            raise RuntimeError("Telegram channel not started; cannot set reaction")
+        await bot.set_message_reaction(
+            chat_id=chat_id,
+            message_id=message_id,
+            reaction=[ReactionTypeEmoji(emoji=emoji)],
+        )
 
     # ------------------------------------------------------------------
     # Lifecycle
@@ -1258,6 +1320,17 @@ class TelegramChannel(Channel):
                 if rec is None or rec.status in ("completed", "cancelled", "error"):
                     await self.send_to_topic(thread_id, "No active engagement in this topic.")
                     return
+
+                # R5 (v0.89.0): record this operator message as the react
+                # target — SYNCHRONOUSLY, from the TRUSTED msg.message_id and
+                # the authoritative topic/chat identity, BEFORE the first await
+                # below. Monotonic (see _record_inbound_target): a delayed older
+                # update cannot clobber a newer target. Only ACTIVE records
+                # reach here (the status check above returned otherwise).
+                self._record_inbound_target(
+                    rec.id, chat_id, thread_id,
+                    getattr(msg, "message_id", None),
+                )
 
                 # v0.79.0 (§3, F2/F5): an inbound operator message is a causal
                 # event, visible on Telegram the instant it arrives. SEAL open
@@ -2071,14 +2144,18 @@ class TelegramChannel(Channel):
         shorts: "list | None" = None,
         multi: bool = False,
     ) -> int | None:
-        """Post a plain-text multiple-choice question with one tappable
+        """Post a rich-text multiple-choice question with one tappable
         button per option (W5 `ask`).
 
-        Mirrors ``post_perm_keyboard``'s engagement/topic resolution but
-        skips MarkdownV2 entirely — the question/options are operator- or
-        agent-authored free text (not a static template around an escaped
-        tool-call preview), so a plain send sidesteps parse-entity 400s
-        without needing an escaping pass.
+        Mirrors ``post_perm_keyboard``'s engagement/topic resolution but skips
+        MarkdownV2 entirely — the question/options are operator- or agent-authored
+        free text. R2b (v0.89.0): the body renders through ``post_ask_body_rich``
+        (a SINGLE-ATTEMPT rich send, fail-closed on an entity ``BadRequest``) so
+        markdown (``**bold**``, `` `code` ``) renders as ``MessageEntity`` spans
+        instead of leaking literal markers, WITHOUT the double-send that the
+        round-4 single-post cancellation gate forecloses. Plain bodies still send
+        raw (``render()`` returns ``entities=None`` ⇒ verbatim plain), so no
+        escaping pass is needed.
         """
         from telegram import InlineKeyboardButton, InlineKeyboardMarkup
 
@@ -2116,7 +2193,7 @@ class TelegramChannel(Channel):
 
         if multi:
             kbd = _build_multi_keyboard(request_id, options, captions, selected=())
-            return await self.send_to_topic(
+            return await self.post_ask_body_rich(
                 rec.topic_id, question, reply_markup=kbd)
 
         kbd = InlineKeyboardMarkup([
@@ -2127,7 +2204,8 @@ class TelegramChannel(Channel):
             for i in range(len(options))
         ])
 
-        return await self.send_to_topic(rec.topic_id, question, reply_markup=kbd)
+        return await self.post_ask_body_rich(
+            rec.topic_id, question, reply_markup=kbd)
 
     async def edit_topic_message(
         self, topic_id: int | None, message_id: int, text: str,
@@ -2184,6 +2262,90 @@ class TelegramChannel(Channel):
             )
             return False
 
+    async def edit_topic_message_rich(
+        self, topic_id: int | None, message_id: int, text: str,
+        *, clear_keyboard: bool = False,
+    ) -> bool:
+        """R2a (v0.89.0): rich-text edit of a posted NARRATION topic message.
+
+        Rich sibling of ``edit_topic_message``: ``render()`` the CURRENT full
+        string into ``MessageEntity`` spans and edit them in, so markdown
+        (``**bold**``, `` `code` ``, fenced-pre) renders instead of leaking
+        literal markers. Plain (no markup / over limits ⇒ ``entities is None``)
+        delegates to the plain ``edit_topic_message`` and edits the RAW text
+        verbatim. On an entity ``BadRequest`` the ORIGINAL text is edited in
+        plain once (fail-literal); a "not modified" ``BadRequest`` is tolerated
+        as success (JC4, matching ``edit_topic_message``). ``clear_keyboard``
+        drops the tappable buttons via an explicit empty ``InlineKeyboardMarkup``
+        (the S1 fix), exactly as ``edit_topic_message`` does.
+
+        RENDERS ON EVERY EDIT (not only at a terminal edit): a narration message
+        can be SEALED by a tool_use / discrete post / rollover before the turn's
+        ``result``, and a render-at-terminal rule would leave every earlier
+        sealed message permanently plain. ``render()`` recomputes from the whole
+        current string each call.
+
+        Accepted, documented residuals (NOT fixed — YAGNI): a throttled
+        INTERMEDIATE edit can catch a half-open span (``**bold`` before the
+        closing ``**`` has streamed in) and briefly show literal markers; it
+        self-heals on the next edit and is fully correct at every sealing edit.
+        A rollover split can bisect a span across two messages and each half
+        degrades to literal independently — degraded, never corrupt.
+        """
+        if not self._rich_text_enabled:
+            return await self.edit_topic_message(
+                topic_id, message_id, text, clear_keyboard=clear_keyboard)
+        display, entities = render(text)
+        if entities is None:
+            return await self.edit_topic_message(
+                topic_id, message_id, text, clear_keyboard=clear_keyboard)
+        if not self.engagement_supergroup_id:
+            return False
+        markup_kwargs: dict = {}
+        if clear_keyboard:
+            from telegram import InlineKeyboardMarkup
+            markup_kwargs["reply_markup"] = InlineKeyboardMarkup([])
+        try:
+            await self.bot.edit_message_text(
+                chat_id=self.engagement_supergroup_id,
+                message_id=message_id,
+                text=display,
+                entities=entities,
+                **markup_kwargs,
+            )
+            return True
+        except BadRequest as exc:
+            if "not modified" in str(exc).lower():
+                return True
+            logger.warning(
+                "edit_topic_message_rich fell back to plain "
+                "(topic=%s message_id=%s): %s", topic_id, message_id, exc)
+            try:
+                await self.bot.edit_message_text(
+                    chat_id=self.engagement_supergroup_id,
+                    message_id=message_id,
+                    text=text,  # ORIGINAL, verbatim
+                    **markup_kwargs,
+                )
+                return True
+            except BadRequest as exc2:
+                if "not modified" in str(exc2).lower():
+                    return True
+                logger.warning(
+                    "edit_topic_message_rich plain retry failed "
+                    "(topic=%s message_id=%s): %s", topic_id, message_id, exc2)
+                return False
+            except Exception as exc2:  # noqa: BLE001 — best-effort, never raise
+                logger.warning(
+                    "edit_topic_message_rich plain retry failed "
+                    "(topic=%s message_id=%s): %s", topic_id, message_id, exc2)
+                return False
+        except Exception as exc:  # noqa: BLE001 — best-effort, never raise
+            logger.warning(
+                "edit_topic_message_rich failed "
+                "(topic=%s message_id=%s): %s", topic_id, message_id, exc)
+            return False
+
     async def send_topic_message_markup(
         self, topic_id: int | None, text: str, markup: Any = None,
         *, reply_to: int | None = None,
@@ -2237,34 +2399,65 @@ class TelegramChannel(Channel):
         ``markup`` values resolve like ``send_topic_message_markup``'s (a real
         keyboard passes through; ``MARKUP_EMPTY``/``None`` ⇒ explicit empty
         keyboard to CLEAR). "Message is not modified" is tolerated as success
-        (the desired end-state already holds), matching ``edit_topic_message``."""
+        (the desired end-state already holds), matching ``edit_topic_message``.
+
+        R2c (v0.89.0): the two TEXT-present branches render markdown into
+        ``MessageEntity`` spans (the multi-select settle path
+        ``settle_ask_keyboard`` → ``edit_discrete`` → here re-sends the ask body,
+        which carries the raw ``**`` markers). ``render()`` decides: entities
+        present ⇒ edit them in (keeping the resolved ``reply_markup``); on an
+        entity ``BadRequest`` retry ONCE plain with the ORIGINAL raw text — an
+        EDIT is NOT the cancellation-gated POST, so this second edit introduces
+        no double-send race. ``entities is None`` (plain text / the marker
+        literals from the re-anchor/orphan edits) ⇒ edit the RAW text verbatim
+        (behaviour-preserving). The ``text is None`` markup-only branch never
+        renders. The F1 no-op cache in ``edit_discrete`` keys on the raw ``text``
+        ABOVE this wire, so rendering below it stays consistent."""
         from channels.output_sequencer import _ABSENT
         if not self.engagement_supergroup_id:
             return False
         markup_touched = markup is not _ABSENT
         if text is None and not markup_touched:
             return True  # nothing to change
+        markup_kwargs: dict = {}
+        if markup_touched:
+            markup_kwargs["reply_markup"] = self._resolve_wire_keyboard(
+                markup, clear=True)
         try:
             if text is None:
+                # Markup-only edit — render() is never invoked (no text).
                 await self.bot.edit_message_reply_markup(
                     chat_id=self.engagement_supergroup_id,
-                    message_id=message_id,
-                    reply_markup=self._resolve_wire_keyboard(markup, clear=True),
+                    message_id=message_id, **markup_kwargs,
                 )
-            elif markup_touched:
+                return True
+            display, entities = (
+                render(text) if self._rich_text_enabled else (text, None))
+            if entities is None:
                 await self.bot.edit_message_text(
                     chat_id=self.engagement_supergroup_id,
-                    message_id=message_id,
-                    text=text,
-                    reply_markup=self._resolve_wire_keyboard(markup, clear=True),
+                    message_id=message_id, text=text, **markup_kwargs,
                 )
-            else:
+                return True
+            try:
                 await self.bot.edit_message_text(
                     chat_id=self.engagement_supergroup_id,
-                    message_id=message_id,
-                    text=text,
+                    message_id=message_id, text=display, entities=entities,
+                    **markup_kwargs,
                 )
-            return True
+                return True
+            except BadRequest as exc:
+                if "not modified" in str(exc).lower():
+                    return True
+                logger.warning(
+                    "edit_topic_message_markup rich edit fell back to plain "
+                    "(topic=%s message_id=%s): %s", topic_id, message_id, exc)
+                await self.bot.edit_message_text(
+                    chat_id=self.engagement_supergroup_id,
+                    message_id=message_id, text=text,  # ORIGINAL, verbatim
+                    **markup_kwargs,
+                )
+                return True
         except BadRequest as exc:
             if "not modified" in str(exc).lower():
                 return True
@@ -2633,6 +2826,94 @@ class TelegramChannel(Channel):
         )
         return msg.message_id
 
+    async def send_to_topic_rich(
+        self, thread_id: int, text: str, **kwargs,
+    ) -> int:
+        """R2a (v0.89.0): post agent output into a topic WITH rich text.
+
+        The narration relay path (``OutputSequencer.open_narration`` →
+        ``casa_core._send_to_topic``) and the block-mode reply finalize
+        (``send_response_to_topic``) both route through here so markdown
+        (``**bold**``, `` `code` ``, fenced-pre) renders as ``MessageEntity``
+        spans instead of leaking literal markers. ``render()`` recomputes from
+        the COMPLETE current string on every call — see the matching per-edit
+        render in ``edit_topic_message_rich``.
+
+        Plain (no markup / over limits ⇒ ``entities is None``) → send the RAW
+        text verbatim through the plain ``send_to_topic`` (mirrors the
+        raw-when-no-entities precedent elsewhere in this module). On an entity
+        ``BadRequest`` the ORIGINAL text is resent plain once (fail-literal); a
+        duplicate is harmless for narration, which is not under the cancellation
+        gate. ``kwargs`` (e.g. ``reply_parameters``) forward to both paths.
+
+        Accepted, documented residuals (render-every-edit, NOT fixed — YAGNI):
+        a throttled INTERMEDIATE edit can catch a half-open span (``**bold``
+        before the closing ``**`` streams in) and briefly show literal markers;
+        it self-heals at the next edit. A rollover split can bisect a span
+        across messages and each half degrades to literal independently —
+        degraded, never corrupt.
+        """
+        if not self._rich_text_enabled:
+            return await self.send_to_topic(thread_id, text, **kwargs)
+        display, entities = render(text)
+        if entities is None:
+            return await self.send_to_topic(thread_id, text, **kwargs)
+        if not self.engagement_supergroup_id:
+            raise RuntimeError("engagement supergroup not configured")
+        try:
+            msg = await self.bot.send_message(
+                chat_id=self.engagement_supergroup_id, text=display,
+                message_thread_id=thread_id, entities=entities, **kwargs,
+            )
+        except BadRequest as exc:
+            logger.warning("topic narration rich-text fell back to plain: %s", exc)
+            msg = await self.bot.send_message(
+                chat_id=self.engagement_supergroup_id, text=text,
+                message_thread_id=thread_id, **kwargs,
+            )
+        return msg.message_id
+
+    async def post_ask_body_rich(
+        self, thread_id: int, text: str, **kwargs,
+    ) -> int:
+        """R2b (v0.89.0): SINGLE-ATTEMPT rich send for the ask/anchor POST path.
+
+        The round-4 single-post CANCELLATION invariant is BINDING: the ask
+        poster (``post_options_keyboard``) and the free-text-anchor poster
+        (``channel_handlers._post_anchor``) must make EXACTLY ONE physical Bot
+        API send attempt, so a cancel that latches immediately before the send
+        (re-read at the wire) can never be raced by a *second* send. This is
+        why this method must NOT be ``send_to_topic_rich`` / ``send_response_to_topic``
+        — their rich→``BadRequest``→plain fallback is that forbidden second send.
+
+        Behaviour (mirrors the raw-when-no-entities precedent of the other rich
+        primitives, but with NO fallback):
+        * killswitch off / ``entities is None`` (no markup, or markers stripped
+          e.g. >100 spans) → send the ORIGINAL RAW ``text`` plain in ONE attempt
+          (never the marker-stripped ``display``);
+        * entities present → send WITH entities in ONE attempt. An entity
+          ``BadRequest`` FAILS CLOSED — it PROPAGATES to the caller (which treats
+          a failed post as ``delivery_failed``); there is NO plain retry and NO
+          second send.
+
+        ``kwargs`` (e.g. ``reply_markup`` for the ask keyboard) forward on both
+        paths. Returns the posted ``message_id``.
+        """
+        if not self._rich_text_enabled:
+            return await self.send_to_topic(thread_id, text, **kwargs)
+        display, entities = render(text)
+        if entities is None:
+            return await self.send_to_topic(thread_id, text, **kwargs)
+        if not self.engagement_supergroup_id:
+            raise RuntimeError("engagement supergroup not configured")
+        # ONE physical send. On BadRequest this raises — fail-closed, never a
+        # second (plain) send (the double-send the cancellation gate forecloses).
+        msg = await self.bot.send_message(
+            chat_id=self.engagement_supergroup_id, text=display,
+            message_thread_id=thread_id, entities=entities, **kwargs,
+        )
+        return msg.message_id
+
     async def pin_topic_message(
         self, thread_id: int, message_id: int,
     ) -> bool:
@@ -2823,6 +3104,8 @@ class TelegramChannel(Channel):
                 "engagement %s (topic %s): %s",
                 rec.id[:8], rec.topic_id, exc,
             )
+        # R5 (v0.89.0): drop the react target for this terminal engagement.
+        self.clear_inbound(rec.id)
 
     # ------------------------------------------------------------------
     # Outbound: block mode
@@ -2964,26 +3247,9 @@ class TelegramChannel(Channel):
 
         Used by the Claude-Code reply handler and by TopicStreamHandle's
         single-message finalize. Plain (no markup) → send_to_topic verbatim; on
-        entity BadRequest resend the ORIGINAL text plain."""
-        if not self._rich_text_enabled:
-            return await self.send_to_topic(thread_id, text, **kwargs)
-        display, entities = render(text)
-        if entities is None:
-            return await self.send_to_topic(thread_id, text, **kwargs)
-        if not self.engagement_supergroup_id:
-            raise RuntimeError("engagement supergroup not configured")
-        try:
-            msg = await self.bot.send_message(
-                chat_id=self.engagement_supergroup_id, text=display,
-                message_thread_id=thread_id, entities=entities, **kwargs,
-            )
-        except BadRequest as exc:
-            logger.warning("topic rich-text fell back to plain: %s", exc)
-            msg = await self.bot.send_message(
-                chat_id=self.engagement_supergroup_id, text=text,
-                message_thread_id=thread_id, **kwargs,
-            )
-        return msg.message_id
+        entity BadRequest resend the ORIGINAL text plain. Shares the rich
+        send/fallback engine with narration via ``send_to_topic_rich``."""
+        return await self.send_to_topic_rich(thread_id, text, **kwargs)
 
     async def turn_finished(self, context: dict[str, Any]) -> None:
         """L7 (v0.52.0): teardown for turns that end WITHOUT delivery.

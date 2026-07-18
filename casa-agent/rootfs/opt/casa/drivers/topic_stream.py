@@ -47,7 +47,7 @@ import logging
 import os
 import time
 from dataclasses import dataclass, field
-from typing import Any, Awaitable, Callable
+from typing import Any, Awaitable, Callable, NamedTuple
 
 from atomic_io import atomic_write_json
 from channels.output_sequencer import (
@@ -55,6 +55,7 @@ from channels.output_sequencer import (
     ASK_TOOL,
     DISCARDED,
     FAILED,
+    HOLD_ELIGIBLE_TOOLS,
     SEALED,
     OutputSequencer,
     projection_hash,
@@ -165,6 +166,44 @@ def iter_content_blocks(frame: dict) -> list[tuple]:
                 "tool_use", block.get("name") or "", block.get("input") or {},
             ))
     return out
+
+
+class AssistantNarration(NamedTuple):
+    """The §R3 boundary signal read from ONE assistant frame."""
+
+    message_id: str
+    text: str
+
+
+def extract_narration(frame: dict) -> "AssistantNarration | None":
+    """The ONE typed reader of an assistant frame's ``(message.id, text)`` — the
+    §R3 narration-boundary signal.
+
+    Returns ``None`` for a non-assistant frame. ``text`` joins the frame's
+    non-empty text blocks — per the captured real-CLI contract there is AT MOST
+    ONE (the fixture-tripwire test enforces it), so the join is a no-op for the
+    single-block case and stays defensively correct otherwise. ``message_id`` is
+    ``""`` only for a malformed frame missing ``message.id`` — treated as an id
+    that never changes, so an id-less stream degrades to the pre-R3 separator-
+    free join. A DISTINCT ``message_id`` marks a NEW narration segment: the live
+    path, ``_replay_text`` and the held-anchor-buffer flush all read the boundary
+    through THIS extractor so the three advance narration state identically. The
+    boundary is the STRUCTURAL id change, never content inspection.
+    """
+    if not isinstance(frame, dict) or frame.get("type") != "assistant":
+        return None
+    message = frame.get("message") or {}
+    mid = message.get("id")
+    texts = [
+        block["text"]
+        for block in message.get("content") or []
+        if isinstance(block, dict) and block.get("type") == "text"
+        and isinstance(block.get("text"), str) and block["text"]
+    ]
+    return AssistantNarration(
+        message_id=mid if isinstance(mid, str) else "",
+        text="".join(texts),
+    )
 
 
 def is_mutating_tooluse(frame: dict) -> tuple[bool, str]:
@@ -510,6 +549,12 @@ class TopicStreamRelay:
         self.cursor = StreamCursor()
         # Per-turn in-memory state (never persisted — rebuilt on recovery).
         self._turn_text = ""
+        # §R3: message.id of the LAST text frame appended to narration (``None``
+        # at a turn boundary). A frame whose id differs begins a NEW assistant
+        # message → its text is prefixed with a ``\n\n`` separator. Advanced by
+        # ``_apply_msg_sep`` — the ONE boundary decision the live path, replay
+        # and the held-buffer flush all share, so they stay byte-parallel.
+        self._last_text_msg_id: str | None = None
         self._per_message_text = ""
         # W-R4 (Sol r1-3): length of the CURRENT narration message's text that
         # has actually reached the wire (a send/edit that landed). It tracks
@@ -566,7 +611,10 @@ class TopicStreamRelay:
         # or an answer before ``result``; it is DISCARDED at ``result`` if the
         # anchor is still open-and-unanswered. In-memory only, reset every turn
         # boundary (``_reset_turn_state``).
-        self._anchor_buffer: list[tuple[str, list[int], int]] = []
+        # §R3: each held frame carries its ``message.id`` (4th element) so the
+        # flush re-derives the SAME per-message separators the live/replay paths
+        # would, keeping the three consumers byte-parallel.
+        self._anchor_buffer: list[tuple[str, list[int], int, str]] = []
         # D5 Task C3 (Sol r4-3): cold-replay DISARM latch. Set at cold start
         # when the persisted ``hold_pending`` marker is set — the recovered
         # turn's held frames lie BEYOND ``current`` and would otherwise re-
@@ -669,7 +717,23 @@ class TopicStreamRelay:
 
     # -- replay-mode text reconstruction -----------------------------------
 
-    def _replay_text(self, text: str) -> None:
+    def _apply_msg_sep(self, message_id: str, text: str) -> str:
+        """§R3: prefix *text* with a ``\\n\\n`` separator iff *message_id* begins
+        a NEW assistant message (differs from the last-appended text frame's id
+        AND a segment was already appended this turn), then advance the recorded
+        id. THE single narration-boundary decision — a structural ``message.id``
+        change, never content inspection — shared by every narration-commit path
+        (live text-only, live mixed-frame, cold replay, held-buffer flush) so all
+        four advance ``_last_text_msg_id`` and the narration byte-stream
+        IDENTICALLY. Under the CLI contract each text frame has a distinct id, so
+        this fires before every segment after the first; the id-comparison is the
+        robust rule (a same-id continuation would correctly get no separator)."""
+        if self._last_text_msg_id is not None and message_id != self._last_text_msg_id:
+            text = "\n\n" + text
+        self._last_text_msg_id = message_id
+        return text
+
+    def _replay_text(self, text: str, message_id: str = "") -> None:
         """Rebuild ``per_message_text`` from a replayed text block — no sends.
 
         When the checkpoint recorded per-message narration boundaries
@@ -678,7 +742,14 @@ class TopicStreamRelay:
         its own text (the last message's slice becomes ``per_message_text``).
         Legacy checkpoints (field absent) fall back to _MSG_MAX-only splitting —
         their recovery is already covered by the conservative seal.
+
+        §R3: the replayed frame is prefixed with the SAME ``\\n\\n`` separator the
+        live path inserted at a ``message.id`` boundary, so the reconstructed
+        ``_turn_text`` (the only READ of ``_turn_text``) matches the live
+        narration byte-for-byte and the ``message_text_lens`` split lands
+        identically.
         """
+        text = self._apply_msg_sep(message_id, text)
         self._turn_text += text
         lens = self.cursor.message_text_lens
         if lens:
@@ -974,7 +1045,9 @@ class TopicStreamRelay:
             # new message; edit grew the current or rolled to a fresh one).
             self._sync_last_len()
 
-    async def _post_text(self, text: str, seg, off_after: int) -> None:
+    async def _post_text(
+        self, text: str, seg, off_after: int, message_id: str = "",
+    ) -> None:
         """Text-only streaming path: throttle + single frame-end checkpoint."""
         # wb2-3: once the engagement is TERMINAL (settle_all_open_questions closed
         # the anchor ledger; this relay stays alive until completion posting),
@@ -994,8 +1067,16 @@ class TopicStreamRelay:
         # prose (disarmed) on cold recovery instead of re-suppressing it.
         if self._suppressing_for is not None:
             self._arm_hold_marker()
-            self._anchor_buffer.append((text, list(seg), off_after))
+            self._anchor_buffer.append((text, list(seg), off_after, message_id))
             return
+        # ``_turn_text`` is a WRITE-ONLY replay scratch on the LIVE path (its only
+        # READ is in ``_replay_text``, which rebuilds its own copy on cold
+        # recovery), so the §R3 separator is applied where it is load-bearing —
+        # the posting ops below (``_per_message_text`` / ``message_text_lens``)
+        # and the replay reconstruction. Keeping this append RAW also avoids
+        # committing the boundary decision BEFORE the atomic hold-or-post branch
+        # (a HOLD must NOT advance ``_last_text_msg_id`` — its separator is
+        # deferred to the flush).
         self._turn_text += text
         if self._dropped:
             self._advance_dropped(seg, off_after)
@@ -1005,11 +1086,15 @@ class TopicStreamRelay:
         # posting LATE (out-of-band). Route the post through the sequencer's
         # ATOMIC read-decide-write so the seam re-read + narration post share the
         # ONE lock the late poster uses; a hold buffers + arms (no checkpoint).
+        # The §R3 separator is applied INSIDE the poster (POST) / deferred to the
+        # flush (HOLD), so the boundary decision follows the atomic outcome.
         if self._anchor_candidate is not None and self.open_anchor_state is not None:
-            if await self._atomic_post_or_hold(text, seg, off_after):
+            if await self._atomic_post_or_hold(text, seg, off_after, message_id):
                 return
         else:
-            ops = self._plan_ops(text)
+            # §R3: prefix the narration separator when this frame begins a NEW
+            # assistant message (the shared boundary decision).
+            ops = self._plan_ops(self._apply_msg_sep(message_id, text))
             if not ops:
                 self._checkpoint(seg, off_after)
                 return
@@ -1035,7 +1120,9 @@ class TopicStreamRelay:
         self.cursor.last_posted_len = self._posted_len
         self._save()
 
-    async def _append_narration(self, text: str, seg, off_after: int) -> None:
+    async def _append_narration(
+        self, text: str, seg, off_after: int, message_id: str = "",
+    ) -> None:
         """Append narration text WITHOUT throttle or checkpoint (used by the
         block-ordered mixed-frame path, which checkpoints once at frame end)."""
         # wb2-3: terminal ⇒ forbid narration writes (see ``_post_text``). The
@@ -1048,16 +1135,19 @@ class TopicStreamRelay:
         # Write-ahead the ``hold_pending`` marker before holding (C3).
         if self._suppressing_for is not None:
             self._arm_hold_marker()
-            self._anchor_buffer.append((text, list(seg), off_after))
+            self._anchor_buffer.append((text, list(seg), off_after, message_id))
             return
+        # ``_turn_text`` is write-only on the live path (see ``_post_text``); the
+        # §R3 separator is applied to the posting ops / poster below.
         self._turn_text += text
         if self._dropped:
             return
         # §D5 r4-2 atomic hold-or-post for a pending, not-yet-armed candidate.
         if self._anchor_candidate is not None and self.open_anchor_state is not None:
-            await self._atomic_post_or_hold(text, seg, off_after)
+            await self._atomic_post_or_hold(text, seg, off_after, message_id)
             return
-        ops = self._plan_ops(text)
+        # §R3: prefix the narration separator at a new-message boundary.
+        ops = self._plan_ops(self._apply_msg_sep(message_id, text))
         await self._execute_ops(ops)
 
     async def _match_discrete_block(self, name: str, tool_input: dict) -> None:
@@ -1112,7 +1202,7 @@ class TopicStreamRelay:
             self._anchor_candidate = (name, block_hash)
 
     def _log_oob_match(self, tool_name: str, block_hash: str, status: str) -> None:
-        """F-OOB instrumentation (spec D7): content-free INFO log at the
+        """F-OOB instrumentation (spec D7): content-free log at the
         discrete-post MATCH POINT (``_match_discrete_block``).
 
         Carries ONLY the pinned projection-hash PREFIX (8 hex — never the
@@ -1127,7 +1217,16 @@ class TopicStreamRelay:
         a ``slot_timeout`` block's eventual out-of-band post), the two log
         lines carry enough timing to reconstruct the observed F-OOB ~10s gap
         (Sol r1-8: likely the 2s slot hold + 10s intent timeout, not a hash
-        defect) — instrumentation only, NO behavioral change."""
+        defect) — instrumentation only, NO behavioral change.
+
+        R6a (round-5 minors): every tool_use block drives this — including
+        non-post tools (Read/Glob/ToolSearch/TaskCreate/...) that can NEVER
+        match a hold-eligible intent and always resolve to a guaranteed-
+        uninteresting ``no_match latency=-1.0``. Logging those at INFO buried
+        the real F-OOB ``oob_late_post``/``slot_timeout`` signal, so only the
+        HOLD-ELIGIBLE post tools (``ask``/``reply``/``emit_completion`` —
+        ``HOLD_ELIGIBLE_TOOLS``) log at INFO; every other block logs the same
+        line at DEBUG."""
         intent = self.sequencer.registry.peek(tool_name, block_hash)
         if intent is not None:
             intent_state = intent.state
@@ -1135,7 +1234,9 @@ class TopicStreamRelay:
         else:
             intent_state = "none"
             latency_ms = -1.0
-        logger.info(
+        level = logging.INFO if tool_name in HOLD_ELIGIBLE_TOOLS else logging.DEBUG
+        logger.log(
+            level,
             "oob_match hash=%s result=%s intent_state=%s latency_ms=%.1f "
             "tool=%s engagement=%s",
             block_hash[:8], status, intent_state, latency_ms, tool_name,
@@ -1204,7 +1305,9 @@ class TopicStreamRelay:
         if state is not None:
             self._suppressing_for = (state[0], state[1])
 
-    async def _atomic_post_or_hold(self, text: str, seg, off_after: int) -> bool:
+    async def _atomic_post_or_hold(
+        self, text: str, seg, off_after: int, message_id: str = "",
+    ) -> bool:
         """§D5 r4-2: route a not-yet-armed prose post through the sequencer's
         ATOMIC read-decide-write, so the seam re-read and the narration post
         share the ONE lock the late anchor poster uses. Returns ``True`` if the
@@ -1219,10 +1322,16 @@ class TopicStreamRelay:
         # wb1-3: pass the CANDIDATE-BOUND seam (``_effective_open_state``) so an
         # already-flushed/disarmed prior anchor cannot make this op hold — it
         # would otherwise buffer legitimate post-B prose off the still-open A.
+        # §R3: the separator is applied INSIDE the poster, which runs ONLY on a
+        # POST — a HOLD never invokes it, so ``_last_text_msg_id`` is not advanced
+        # for a held frame (its separator is deferred to the flush, which buffers
+        # the RAW text below).
         status = await self.sequencer.post_unless_anchor_open(
             text,
             self._effective_open_state,
-            poster=lambda t=text: self._execute_ops(self._plan_ops(t)),
+            poster=lambda t=text, m=message_id: self._execute_ops(
+                self._plan_ops(self._apply_msg_sep(m, t))
+            ),
         )
         if status != "held":
             return False
@@ -1239,7 +1348,7 @@ class TopicStreamRelay:
             self._suppressing_for = (0, 0)
         # Write-ahead the ``hold_pending`` marker before holding (C3).
         self._arm_hold_marker()
-        self._anchor_buffer.append((text, list(seg), off_after))
+        self._anchor_buffer.append((text, list(seg), off_after, message_id))
         return True
 
     async def _flush_anchor_buffer(self) -> bool:
@@ -1259,7 +1368,14 @@ class TopicStreamRelay:
         existing visible-delivery contract."""
         if not self._anchor_buffer:
             return True
-        buffered = "".join(text for (text, _seg, _off) in self._anchor_buffer)
+        # §R3: re-derive the per-message separators as the held frames enter
+        # narration — the SAME shared boundary decision the live/replay paths
+        # use, applied in buffer order (the first held frame's separator is
+        # relative to the last-posted segment before buffering began).
+        buffered = "".join(
+            self._apply_msg_sep(mid, text)
+            for (text, _seg, _off, mid) in self._anchor_buffer
+        )
         if not buffered:
             self._anchor_buffer = []
             return True
@@ -1305,14 +1421,16 @@ class TopicStreamRelay:
         self._anchor_candidate = None
 
     async def _handle_assistant_blocks(
-        self, blocks: list[tuple], seg, off_after: int,
+        self, blocks: list[tuple], seg, off_after: int, message_id: str = "",
     ) -> None:
         """Process a tool-bearing assistant frame block-by-block (§2(3)).
 
         Text blocks append to narration; each tool_use block fires the
         mutating-tool event (once, for the first mutating tool) and drives
         relay-mediated discrete matching AT ITS POSITION. Checkpoints ONCE at
-        frame end."""
+        frame end. §R3: every text block in this frame carries the frame's
+        ``message_id`` (per the CLI contract there is at most one), so the shared
+        separator decision fires at the frame's message boundary."""
         if self._dropped:
             self._advance_dropped(seg, off_after)
             return
@@ -1320,7 +1438,7 @@ class TopicStreamRelay:
         flushed_buffer = False
         for block in blocks:
             if block[0] == "text":
-                await self._append_narration(block[1], seg, off_after)
+                await self._append_narration(block[1], seg, off_after, message_id)
                 if self._dropped:
                     self._advance_dropped(seg, off_after)
                     return
@@ -1383,6 +1501,7 @@ class TopicStreamRelay:
 
     def _reset_turn_state(self) -> None:
         self._turn_text = ""
+        self._last_text_msg_id = None  # §R3: no prior segment in a fresh turn
         self._per_message_text = ""
         self._posted_len = 0
         self._replay_msg_count = 0
@@ -1711,10 +1830,12 @@ class TopicStreamRelay:
 
         if not self._live:
             # REPLAY: rebuild visible-text state ONLY; suppress all side effects.
-            if frame is not None and frame.get("type") == "assistant":
-                texts = extract_text_blocks(frame)
-                if texts:
-                    self._replay_text("".join(texts))
+            # §R3: re-derive from the SAME (message_id, text) extractor the live
+            # path uses, so the separator lands identically on reconstruction.
+            if frame is not None:
+                narr = extract_narration(frame)
+                if narr is not None and narr.text:
+                    self._replay_text(narr.text, narr.message_id)
             return
 
         if frame is None:
@@ -1792,18 +1913,22 @@ class TopicStreamRelay:
             return
 
         if ftype == "assistant":
+            # §R3: read the frame's (message_id, text) ONCE through the shared
+            # extractor and thread the id into every narration-commit path.
+            narr = extract_narration(frame)
             blocks = iter_content_blocks(frame)
             if any(b[0] == "tool_use" for b in blocks):
                 # Mixed / tool-bearing frame: process blocks IN ORDER so a
                 # relay-mediated discrete post lands at exactly its content-
                 # block position (§2(3)), interleaved with narration text.
-                await self._handle_assistant_blocks(blocks, seg, off_after)
+                await self._handle_assistant_blocks(
+                    blocks, seg, off_after, narr.message_id
+                )
                 return
             # Text-only frame (the common streaming case): unchanged fast path —
             # join, throttle, single checkpoint.
-            texts = [b[1] for b in blocks if b[0] == "text"]
-            if texts:
-                await self._post_text("".join(texts), seg, off_after)
+            if narr.text:
+                await self._post_text(narr.text, seg, off_after, narr.message_id)
                 return
             # No visible text (e.g. thinking-only) → invisible checkpoint.
             self._checkpoint(seg, off_after)

@@ -406,6 +406,84 @@ async def send_media(args: dict) -> dict:
 
 
 # ---------------------------------------------------------------------------
+# react — lightweight emoji ack on the LATEST operator message (R5, v0.89.0)
+#
+# Stateless, order-safe, active-record-gated. Reads the current-inbound target
+# recorded by TelegramChannel.handle_update (keyed by engagement_id) and sets
+# ONE emoji reaction on it. The correctness guarantee is the NON-LIVE
+# REJECTION: internal_handlers binds engagement_var to an ACTIVE record only,
+# so a terminated/missing engagement yields None here and a stale target can
+# never produce a reaction. NEVER falls back to eng.origin; NEVER raises (a
+# raise would abort the turn) — every failure is a soft result.
+# ---------------------------------------------------------------------------
+
+
+@tool(
+    "react",
+    "Drop a lightweight emoji reaction (e.g. 👍 done, 👀 on it) on the "
+    "operator's LATEST message in this engagement topic. A non-decisional, "
+    "non-blocking acknowledgement — NEVER an approval or an answer to an "
+    "`ask`; route every decision through the verdict broker / `ask` instead.",
+    {"type": "object",
+     "properties": {"emoji": {"type": "string"}},
+     "required": ["emoji"]},
+)
+async def react(args: dict) -> dict:
+    try:
+        emoji = args.get("emoji")
+        if not isinstance(emoji, str) or not emoji.strip():
+            return _result({"status": "error", "kind": "invalid_arguments",
+                            "message": "emoji must be a non-empty string"})
+
+        # Non-live rejection = the correctness guarantee. engagement_var is
+        # bound ONLY for an ACTIVE record (internal_handlers), so a terminated
+        # / missing engagement yields None → fail soft. NEVER use eng.origin.
+        eng = engagement_var.get(None)
+        if eng is None or getattr(eng, "status", None) != "active":
+            return _result({"status": "no_current_inbound",
+                            "message": "no active engagement to react in"})
+
+        # The current-inbound target lives on the TelegramChannel (the only
+        # channel with engagement topics). No target = restart / no inbound
+        # yet / cleared → soft no-op.
+        ch = _channel_manager.get("telegram") if _channel_manager is not None else None
+        if ch is None or not hasattr(ch, "get_current_inbound"):
+            return _result({"status": "no_current_inbound",
+                            "message": "no channel able to set reactions"})
+        target = ch.get_current_inbound(eng.id)
+        if target is None:
+            return _result({"status": "no_current_inbound",
+                            "message": "no current inbound message recorded"})
+        chat_id, _topic_id, message_id = target
+
+        from telegram.error import (
+            BadRequest, Forbidden, NetworkError, RetryAfter, TelegramError,
+            TimedOut,
+        )
+        try:
+            await ch.set_reaction(chat_id, message_id, emoji)
+        except (BadRequest, Forbidden) as exc:
+            return _result({"status": "error", "kind": "invalid_emoji",
+                            "message": f"telegram refused reaction: "
+                                       f"{type(exc).__name__}"})
+        except (TimedOut, NetworkError, RetryAfter, TelegramError) as exc:
+            return _result({"status": "error", "kind": "delivery_uncertain",
+                            "message": f"reaction delivery uncertain: "
+                                       f"{type(exc).__name__}; not retried"})
+        except RuntimeError:
+            return _result({"status": "no_current_inbound",
+                            "message": "channel not started"})
+        return _result({"status": "ok", "reaction": emoji,
+                        "message_id": message_id,
+                        "summary": f"reacted {emoji} on the latest operator "
+                                   "message"})
+    except Exception:  # noqa: BLE001 — never abort a turn; worst case is a result
+        logger.exception("react: unexpected failure")
+        return _result({"status": "error", "kind": "internal_error",
+                        "message": "unexpected failure"})
+
+
+# ---------------------------------------------------------------------------
 # ask_user — resident DM button questions (v0.76.0 W5b, A:§2)
 #
 # Two-turn, detached: REGISTER -> POST -> RETURN. The tool never awaits the
@@ -1083,6 +1161,10 @@ def build_engagement_resume_options(engagement, session_id: str) -> ClaudeAgentO
                 extra_casa_tools=(
                     "mcp__casa-framework__query_engager",
                     "mcp__casa-framework__emit_completion",
+                    # R5 (v0.89.0): a resumed engaged executor keeps `react`.
+                    # Scoped to executors (the specialist branch below does NOT
+                    # grant it) — matches the plugin-developer definition grant.
+                    "mcp__casa-framework__react",
                 ),
             )
     else:
@@ -4473,6 +4555,13 @@ async def _finalize_engagement(
                     "finalize engagement %s: close_topic failed: %s",
                     engagement.id[:8], exc,
                 )
+            # R5 (v0.89.0): drop the react target (map hygiene). Best-effort —
+            # a missed clear is harmless (react's non-live gate rejects it).
+            if hasattr(tch, "clear_inbound"):
+                try:
+                    tch.clear_inbound(engagement.id)
+                except Exception:  # noqa: BLE001
+                    pass
 
     # 3. Tear down driver client
     if driver is not None:
@@ -6712,6 +6801,7 @@ async def get_item_fields(args: dict) -> dict:
 CASA_TOOLS: tuple = (
     send_message,
     send_media,
+    react,
     ask_user,
     delegate_to_agent,
     voice_job_status,
