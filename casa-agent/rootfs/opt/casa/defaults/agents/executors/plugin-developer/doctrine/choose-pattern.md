@@ -10,19 +10,29 @@ typed outputs, predictable error shapes). Example: `face-rec` exposes
 tools (Bash, Read, Write, …) in a new domain. No subprocess needed. Faster
 to author, lower runtime cost.
 
-## MCPB vs casa.systemRequirements vs vendoring
+## Vendoring vs casa.systemRequirements (MCPB is NOT a Casa mechanism)
 
-**MCPB** — package your MCP server + its Python/Node runtime deps into a
-sealed bundle. Best for: pure-Python or pure-Node plugins. Use
-`mcp-server-dev:build-mcpb` skill.
+**Vendoring — the sanctioned pattern for Python MCP-server library deps.**
+Commit your deps (`pip install --target server/vendor -r
+server/requirements.txt`, pinned) and launch with `python3` +
+`PYTHONPATH=${CLAUDE_PLUGIN_ROOT}/server/vendor`. Full recipe:
+`casa-self-containment.md` §"Python MCP servers". Node servers: commit
+the built `server/dist/` and launch with baseline `node`.
 
 **casa.systemRequirements** — declare a third-party CLI your MCP server
 shells out to (`aws`, `kubectl`, `terraform`, `ffmpeg` (via tarball), …).
 Casa installs into `/config/tools/`. Use this for any
 non-baseline CLI. Three strategies available: `tarball`, `venv`, `npm`.
+This provisions *binaries on PATH* — it does NOT make libraries
+importable by your server.
 
-**Vendoring** — small pure-Python deps only. Avoid; MCPB is nearly always
-better.
+**MCPB — do NOT use for Casa plugins.** Casa reads `.mcp.json` from the
+committed tree and provisions nothing at install time: no `mcpb.json`,
+no requirements install, no bundle unpack, no venv creation. An MCPB
+bundle (or any `.venv` reference) yields a server that can never spawn
+in Casa (this exact failure shipped as gmail v0.2.0). The
+`mcp-server-dev:build-mcpb` skill is for distributing to Claude
+Desktop-style hosts — never for a Casa plugin.
 
 ## Apt / dpkg
 
