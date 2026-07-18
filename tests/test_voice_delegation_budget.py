@@ -78,6 +78,20 @@ def _init_tools_for_voice():
     return tm, reg
 
 
+class _Reservation:
+    """Duck-typed handoff reservation supplied by the trusted voice channel."""
+
+    def __init__(self) -> None:
+        self.reserve_calls = 0
+        self.release_calls = 0
+
+    def reserve(self) -> None:
+        self.reserve_calls += 1
+
+    def release(self) -> None:
+        self.release_calls += 1
+
+
 # ---------------------------------------------------------------------------
 # TestVoiceModes — async/interactive rejected outright on voice
 # ---------------------------------------------------------------------------
@@ -164,6 +178,8 @@ class TestVoiceModes:
         reg = MagicMock()
         reg.get.return_value = None
         reg.register_delegation = AsyncMock()
+        reg.complete_delegation = AsyncMock()
+        reg.job_registry.finish_voice_result = AsyncMock()
         reg.cancel_delegation = AsyncMock()
         # A resident target: channels non-empty. Declared by assistant.
         butler = _cfg("butler")
@@ -190,6 +206,249 @@ class TestVoiceModes:
 
         payload = json.loads(res["content"][0]["text"])
         assert payload["kind"] == "mode_unsupported_on_voice", payload
+
+
+@pytest.mark.asyncio
+class TestConciergeVoiceHandoffPolicy:
+    async def test_concierge_voice_sync_is_normalized_to_async_without_progress(
+        self, monkeypatch,
+    ):
+        """A trusted Concierge handoff bypasses the generic wait narration."""
+        import agent as agent_mod
+        import tools as tm
+
+        reg = MagicMock()
+        reg.get.return_value = None
+        tm.init_tools(
+            channel_manager=MagicMock(), bus=MagicMock(),
+            specialist_registry=reg, mcp_registry=MagicMock(),
+            trigger_registry=MagicMock(), engagement_registry=MagicMock(),
+            agent_role_map={
+                "concierge": _cfg("concierge", delegates=("finance",)),
+                "finance": _cfg("finance"),
+            },
+        )
+        reservation = _Reservation()
+        progress = AsyncMock()
+        started: dict = {}
+        prelaunch_modes: list[str] = []
+
+        async def _prelaunch(agent_name, origin, mode, *args):
+            prelaunch_modes.append(mode)
+            return _cfg("finance"), None, None, None
+
+        async def _start(**kwargs):
+            started.update(kwargs)
+            return tm._result({"status": "pending", "job_id": "job-1"})
+
+        monkeypatch.setattr(tm, "_prelaunch", _prelaunch)
+        monkeypatch.setattr(tm, "_start_voice_async_job", _start)
+        token = agent_mod.origin_var.set(_voice_origin(
+            role="concierge", execution_role="concierge",
+            voice_transport="ws", voice_route_id="entry-1",
+            origin_device_id="kitchen",
+            voice_route_capabilities=frozenset({
+                "background_jobs", "satellite_announce", "voice_handoff",
+            }),
+            _voice_handoff_reservation=reservation,
+            _progress_sink=progress,
+        ))
+        try:
+            result = await tm.delegate_to_agent.handler({
+                "agent": "finance", "task": "t", "context": "",
+                "mode": "sync",
+            })
+        finally:
+            agent_mod.origin_var.reset(token)
+
+        payload = json.loads(result["content"][0]["text"])
+        assert payload == {"status": "pending", "job_id": "job-1"}
+        assert prelaunch_modes == ["async"]
+        assert started["specialist_role"] == "finance"
+        assert reservation.reserve_calls == 1
+        progress.assert_not_awaited()
+
+    @pytest.mark.parametrize("overrides", [
+        {"voice_route_id": None},
+        {"voice_route_capabilities": frozenset({
+            "background_jobs", "satellite_announce",
+        })},
+    ])
+    async def test_concierge_voice_sync_fails_without_handoff_route(
+        self, overrides,
+    ):
+        import agent as agent_mod
+        import tools as tm
+
+        reg = MagicMock()
+        reg.get.return_value = None
+        tm.init_tools(
+            channel_manager=MagicMock(), bus=MagicMock(),
+            specialist_registry=reg, mcp_registry=MagicMock(),
+            trigger_registry=MagicMock(), engagement_registry=MagicMock(),
+            agent_role_map={
+                "concierge": _cfg("concierge", delegates=("finance",)),
+                "finance": _cfg("finance"),
+            },
+        )
+        reservation = _Reservation()
+        origin = _voice_origin(
+            role="concierge", execution_role="concierge",
+            voice_transport="ws", voice_route_id="entry-1",
+            origin_device_id="kitchen",
+            voice_route_capabilities=frozenset({
+                "background_jobs", "satellite_announce", "voice_handoff",
+            }),
+            _voice_handoff_reservation=reservation,
+        )
+        origin.update(overrides)
+        token = agent_mod.origin_var.set(origin)
+        try:
+            result = await tm.delegate_to_agent.handler({
+                "agent": "finance", "task": "t", "context": "",
+                "mode": "sync",
+            })
+        finally:
+            agent_mod.origin_var.reset(token)
+
+        payload = json.loads(result["content"][0]["text"])
+        assert payload["kind"] == "background_delivery_unavailable"
+        assert reservation.reserve_calls == 0
+        reg.register_delegation.assert_not_called()
+
+    async def test_handoff_reservation_releases_on_async_persistence_error(
+        self, monkeypatch,
+    ):
+        import agent as agent_mod
+        import tools as tm
+
+        reg = MagicMock()
+        reg.get.return_value = None
+        tm.init_tools(
+            channel_manager=MagicMock(), bus=MagicMock(),
+            specialist_registry=reg, mcp_registry=MagicMock(),
+            trigger_registry=MagicMock(), engagement_registry=MagicMock(),
+            agent_role_map={
+                "concierge": _cfg("concierge", delegates=("finance",)),
+                "finance": _cfg("finance"),
+            },
+        )
+        reservation = _Reservation()
+
+        async def _prelaunch(*args):
+            return _cfg("finance"), None, None, None
+
+        async def _start(**kwargs):
+            return tm._result({
+                "status": "error", "kind": "route_capacity_reached",
+            })
+
+        monkeypatch.setattr(tm, "_prelaunch", _prelaunch)
+        monkeypatch.setattr(tm, "_start_voice_async_job", _start)
+        token = agent_mod.origin_var.set(_voice_origin(
+            role="concierge", execution_role="concierge",
+            voice_transport="ws", voice_route_id="entry-1",
+            origin_device_id="kitchen",
+            voice_route_capabilities=frozenset({
+                "background_jobs", "satellite_announce", "voice_handoff",
+            }),
+            _voice_handoff_reservation=reservation,
+        ))
+        try:
+            result = await tm.delegate_to_agent.handler({
+                "agent": "finance", "task": "t", "context": "",
+                "mode": "sync",
+            })
+        finally:
+            agent_mod.origin_var.reset(token)
+
+        assert json.loads(result["content"][0]["text"])["kind"] == (
+            "route_capacity_reached"
+        )
+        assert reservation.reserve_calls == 1
+        assert reservation.release_calls == 1
+
+    @pytest.mark.parametrize("role,channel", [
+        ("butler", "voice"), ("tina", "voice"), ("concierge", "telegram"),
+    ])
+    async def test_only_concierge_voice_normalizes_sync(self, monkeypatch, role, channel):
+        import agent as agent_mod
+        import tools as tm
+
+        reg = MagicMock()
+        reg.get.return_value = None
+        reg.register_delegation = AsyncMock()
+        reg.complete_delegation = AsyncMock()
+        reg.job_registry.finish_voice_result = AsyncMock()
+        tm.init_tools(
+            channel_manager=MagicMock(), bus=MagicMock(),
+            specialist_registry=reg, mcp_registry=MagicMock(),
+            trigger_registry=MagicMock(), engagement_registry=MagicMock(),
+            agent_role_map={
+                role: _cfg(role, delegates=("finance",)), "finance": _cfg("finance"),
+            },
+        )
+
+        async def _run(*args, **kwargs):
+            return _voice_output(tm, "ok")
+
+        modes: list[str] = []
+
+        async def _prelaunch(agent_name, origin, mode, *args):
+            modes.append(mode)
+            return _cfg("finance"), None, None, None
+
+        async def _start(**kwargs):
+            raise AssertionError("non-Concierge voice calls must remain sync")
+
+        monkeypatch.setattr(tm, "_prelaunch", _prelaunch)
+        monkeypatch.setattr(tm, "_run_delegated_agent", _run)
+        monkeypatch.setattr(tm, "_start_voice_async_job", _start)
+        origin = _voice_origin(
+            role=role, execution_role=role, channel=channel,
+            voice_deadline=asyncio.get_running_loop().time() + 20.0,
+        )
+        token = agent_mod.origin_var.set(origin)
+        try:
+            result = await tm.delegate_to_agent.handler({
+                "agent": "finance", "task": "t", "context": "",
+                "mode": "sync",
+            })
+        finally:
+            agent_mod.origin_var.reset(token)
+
+        assert json.loads(result["content"][0]["text"])["status"] == "ok"
+        assert modes == ["sync"]
+
+    async def test_async_prelaunch_does_not_emit_generic_progress(self):
+        import tools as tm
+
+        tm, reg = _init_tools_for_voice()
+        tm.init_tools(
+            channel_manager=MagicMock(), bus=MagicMock(),
+            specialist_registry=reg, mcp_registry=MagicMock(),
+            trigger_registry=MagicMock(), engagement_registry=MagicMock(),
+            agent_role_map={
+                "concierge": _cfg("concierge", delegates=("finance",)),
+                "finance": _cfg("finance"),
+            },
+        )
+        progress = AsyncMock()
+        origin = _voice_origin(
+            role="concierge", execution_role="concierge",
+            voice_transport="ws", voice_route_id="entry-1",
+            origin_device_id="kitchen",
+            voice_route_capabilities=frozenset({
+                "background_jobs", "satellite_announce", "voice_handoff",
+            }),
+            _voice_handoff_reservation=_Reservation(),
+            _progress_sink=progress,
+        )
+
+        _, _, _, error = await tm._prelaunch("finance", origin, "async")
+
+        assert error is None
+        progress.assert_not_awaited()
 
 
 # ---------------------------------------------------------------------------
@@ -839,6 +1098,7 @@ class TestVoiceDeadlineOriginPropagation:
         async def _sink(text: str) -> None:
             return None
 
+        reservation = _Reservation()
         a = _make_agent(tmp_path, role="butler")
         msg = BusMessage(
             type=MessageType.CHANNEL_IN, source="voice", target="butler",
@@ -849,9 +1109,10 @@ class TestVoiceDeadlineOriginPropagation:
                 "_voice_transport": "ws",
                 "_voice_route_id": "entry-1",
                 "_voice_route_capabilities": frozenset({
-                    "background_jobs", "satellite_announce",
+                    "background_jobs", "satellite_announce", "voice_handoff",
                 }),
                 "_origin_device_id": "device-kitchen",
+                "_voice_handoff_reservation": reservation,
             },
         )
         with patch("sdk_client_pool._default_make_client", CapturingClient):
@@ -863,9 +1124,10 @@ class TestVoiceDeadlineOriginPropagation:
         assert origin["voice_transport"] == "ws"
         assert origin["voice_route_id"] == "entry-1"
         assert origin["voice_route_capabilities"] == frozenset({
-            "background_jobs", "satellite_announce",
+            "background_jobs", "satellite_announce", "voice_handoff",
         })
         assert origin["origin_device_id"] == "device-kitchen"
+        assert origin["_voice_handoff_reservation"] is reservation
 
     async def test_non_voice_channel_does_not_propagate_deadline(self, tmp_path):
         """Defensive: even if a non-voice message somehow carried these
