@@ -1,5 +1,17 @@
 # Changelog
 
+## [0.89.0] - 2026-07-18
+
+Concierge specialist questions now acknowledge immediately and deliver their
+answer later, once the originating satellite is idle. Butler home-control turns
+remain direct and immediate.
+
+### Added
+
+- Coordinated protocol-2 voice handoff with the companion Home Assistant
+  integration, so Concierge can confirm a specialist request through Assist
+  before the specialist continues in the background.
+
 ## [0.88.0] - 2026-07-17
 
 Casa can now be discovered automatically by its companion Home Assistant
