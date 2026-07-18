@@ -4046,13 +4046,21 @@ class ClaudeCodeDriver(DriverProtocol):
                     from drivers.summary_controller import (
                         activity_for_tool, extract_plan,
                     )
-                    await summary.submit_activity(activity_for_tool(name))
+                    activity = activity_for_tool(name)
                     plan = extract_plan(name, payload.get("input") or {})
                     if plan is not None:
-                        # §5 P1-B r4: forward the relay's ordering coordinate
-                        # ``(segment, offset, block_ordinal)`` VERBATIM so the
-                        # controller can reject a stale/duplicate plan frame.
-                        await summary.submit_plan(**plan, seq=payload.get("seq"))
+                        # §5 P1-B (r6 fix): apply the activity AND the plan under
+                        # ONE lock with ONE flush, so the tool_use that carries a
+                        # TodoWrite renders its checklist in the SAME flush (a
+                        # separate activity flush would otherwise consume the
+                        # throttle window and starve the plan render). ``seq`` is
+                        # the relay's monotonic per-turn tool-event counter,
+                        # forwarded VERBATIM so the controller rejects a
+                        # stale/duplicate plan frame.
+                        await summary.submit_activity_and_plan(
+                            activity, **plan, seq=payload.get("seq"))
+                    else:
+                        await summary.submit_activity(activity)
         elif kind == "result":
             self._epoch_pending[eng_id] = None
             self._turn_running[eng_id] = False

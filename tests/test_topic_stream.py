@@ -1176,15 +1176,61 @@ async def test_live_tool_use_emits_activity_event(tmp_path):
     )
     cursor = tmp_path / ".stream_cursor.json"
     await _make_relay(tmp_path, cursor, rec, events).run()
-    # P1-B r4: the tool_use event now carries an ordering ``seq`` coordinate
-    # ``(segment, offset, block_ordinal)`` stamped at this call site.
+    # §5 P1-B (r6 fix): the tool_use event carries a MONOTONIC per-turn
+    # tool-event counter as its ordering ``seq`` — a plain int, NOT a
+    # segment-derived coordinate. The turn's first tool_use is 1.
     tool_events = [p for k, p in events if k == "tool_use"]
     assert len(tool_events) == 1
     assert tool_events[0]["tool"] == "Bash"
     assert tool_events[0]["input"] == {"command": "ls"}
-    seq = tool_events[0]["seq"]
-    assert isinstance(seq, tuple) and len(seq) == 3
-    assert seq[2] == 0  # single block → block_ordinal 0
+    assert tool_events[0]["seq"] == 1
+
+
+async def test_tool_use_seq_is_monotonic_within_turn(tmp_path):
+    # Two tool_use blocks in ONE assistant frame, plus a third in a later frame
+    # of the SAME turn, get distinct STRICTLY-INCREASING counter seqs.
+    rec, events = Recorder(), []
+    two_block = {
+        "type": "assistant",
+        "message": {"content": [
+            {"type": "tool_use", "name": "TodoWrite", "input": {}},
+            {"type": "tool_use", "name": "Bash", "input": {}},
+        ]},
+    }
+    _write_current(
+        tmp_path,
+        [_spawn(1), _init(), two_block, _tool_in("Read", {}), _result()],
+    )
+    cursor = tmp_path / ".stream_cursor.json"
+    await _make_relay(tmp_path, cursor, rec, events).run()
+    seqs = [p["seq"] for k, p in events if k == "tool_use"]
+    assert seqs == [1, 2, 3]  # distinct + strictly increasing within the turn
+
+
+async def test_tool_use_seq_crosses_rotation_monotonically(tmp_path):
+    # §5 P1-B (r6 fix) rotation-crossing: a TodoWrite in segment A, a mid-turn
+    # log rotation, then a TodoWrite in segment B ⇒ B's seq is still GREATER
+    # than A's (a bare per-turn counter, not a segment-derived coordinate that a
+    # rotated inode could make sort lower and the controller reject forever).
+    rec, events = Recorder(), []
+    log_dir = str(tmp_path)
+    current = os.path.join(log_dir, "current")
+    cursor = tmp_path / ".stream_cursor.json"
+    # Segment A (inode X): open turn — init + first TodoWrite, no result yet.
+    _write_current(tmp_path, [_spawn(1), _init(), _tool("TodoWrite")])
+    relay = _make_relay(tmp_path, cursor, rec, events)
+    await relay.run()  # consumes segment A live, latches WARM (turn still open)
+    seqs_a = [p["seq"] for k, p in events if k == "tool_use"]
+    assert seqs_a == [1]
+    # Rotate: current(X) → @a.s archive; a NEW current(Y) holds the turn's tail.
+    os.rename(current, os.path.join(log_dir, "@a.s"))
+    _write_current(tmp_path, [_tool("TodoWrite"), _result()])
+    # WARM re-entry on the SAME relay (same process): the per-turn counter is NOT
+    # reset, so the post-rotation TodoWrite sorts strictly above the first.
+    await relay.run()
+    seqs = [p["seq"] for k, p in events if k == "tool_use"]
+    assert seqs == [1, 2]
+    assert seqs[1] > seqs[0]  # segment B accepted (monotonic across rotation)
 
 
 async def test_replayed_tool_use_is_suppressed(tmp_path):

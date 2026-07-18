@@ -30,6 +30,7 @@ from __future__ import annotations
 import asyncio
 import logging
 import time
+from collections import deque
 from contextlib import asynccontextmanager
 from typing import Awaitable, Callable
 
@@ -158,56 +159,116 @@ def _todo_label(todo: object) -> str | None:
     return sanitize_plan_subject(text) or None
 
 
+def _todo_item(idx: int, status: str, todo: object) -> dict:
+    """A rendered checklist entry ``{ordinal, status, label|None}`` (§5 P1-B)."""
+    return {"ordinal": idx + 1, "status": status, "label": _todo_label(todo)}
+
+
 def _extract_todo_plan(todos: list) -> dict:
-    """Full-scan / bounded-window TodoWrite extraction (§5 P1-B r4).
+    """SINGLE-PASS full-scan / bounded-window TodoWrite extraction (§5 P1-B r4;
+    r6 single-pass rewrite).
 
-    Scans the COMPLETE ``todos`` list ONCE (no cap — it is an in-memory list) to
-    compute ``total``, exact done/active/pending counts and the TRUE anchor
-    (first ``in_progress``, else first ``pending``, else the LAST item — the true
-    last, never a truncation point). RETAINS only bounded state: the counts, the
-    window entries ``[{ordinal, status, label|None}]`` for ``[anchor−1 …
-    anchor+6]`` clamped, and per-region ``hidden_before``/``hidden_after``
-    buckets (done/active/pending) attributed during the SAME scan (global counts
-    alone cannot attribute statuses to the two hidden regions, and multiple
-    ``in_progress`` items must sum correctly). Retained state is O(window)
-    regardless of plan size, so the active item is visible with its true ordinal
-    for ANY plan size.
+    Scans the COMPLETE ``todos`` list ONCE (no cap, no O(n) auxiliary list) to
+    compute ``total``, the exact ``done`` count and the TRUE anchor (first
+    ``in_progress``, else first ``pending``, else the LAST item — the true last,
+    never a truncation point), RETAINING only bounded state: the window entries
+    ``[{ordinal, status, label|None}]`` for ``[anchor−1 … anchor+6]`` clamped,
+    the per-region ``hidden_before``/``hidden_after`` status buckets, and a small
+    fixed lookback so the anchor's window can be reconstructed even when the
+    anchor is discovered late.
+
+    The two-level anchor priority (a later ``in_progress`` outranks an earlier
+    ``pending``) is handled with at-most-ONE promotion: a first ``pending`` opens
+    a provisional window; a later ``active`` PROMOTES to the final anchor and the
+    now-before entries are re-bucketed. ``prev`` (the immediately preceding item)
+    always supplies the promoted anchor's ``anchor−1`` slot. Retained state is
+    O(window) regardless of plan size.
     """
-    total = len(todos)
-    statuses = [_todo_status(t) for t in todos]
-    done = sum(1 for s in statuses if s == "done")
-
-    anchor: int | None = None
-    for i, s in enumerate(statuses):
-        if s == "active":
-            anchor = i
-            break
-    if anchor is None:
-        for i, s in enumerate(statuses):
-            if s == "pending":
-                anchor = i
-                break
-    if anchor is None and total:
-        anchor = total - 1  # all-completed → the TRUE last item
-
-    subject = ""
-    items: list[dict] = []
+    done = 0
     before = dict(_ZERO_BUCKETS)
     after = dict(_ZERO_BUCKETS)
-    if total:
-        start = max(0, anchor - _WINDOW_BEFORE)
-        end = min(total - 1, anchor + _WINDOW_AFTER)
-        for i, todo in enumerate(todos):
-            s = statuses[i]
-            if i < start:
-                before[s] += 1
-            elif i > end:
-                after[s] += 1
+    items: list[dict] = []
+    anchor: int | None = None
+    anchor_final = False          # True once the anchor is a first ``active``
+    # Lookback while still SEARCHING (no anchor yet): the last few items, so an
+    # anchor found late (incl. all-completed → last) still gets its window. Only
+    # ``_WINDOW_BEFORE + 1`` items can ever enter the window from behind.
+    hold: deque = deque(maxlen=_WINDOW_BEFORE + 1)
+    prev: tuple | None = None     # (idx, status, todo) of the previous item
+    total = 0
+
+    for i, todo in enumerate(todos):
+        total = i + 1
+        s = _todo_status(todo)
+        if s == "done":
+            done += 1
+
+        if anchor is None:
+            if s == "done":
+                # Not an anchor: retire the oldest held item to ``before``.
+                if len(hold) == hold.maxlen:
+                    o_idx, o_s, _o = hold[0]
+                    before[o_s] += 1
+                hold.append((i, s, todo))
             else:
-                label = _todo_label(todo)
-                items.append({"ordinal": i + 1, "status": s, "label": label})
-                if i == anchor:
-                    subject = label or ""
+                # First non-done item OPENS the window. ``active`` finalizes the
+                # anchor; ``pending`` is provisional (a later active promotes).
+                anchor = i
+                anchor_final = s == "active"
+                start = max(0, i - _WINDOW_BEFORE)
+                for h_idx, h_s, h_todo in hold:
+                    if h_idx < start:
+                        before[h_s] += 1
+                    else:
+                        items.append(_todo_item(h_idx, h_s, h_todo))
+                items.append(_todo_item(i, s, todo))
+        elif anchor_final:
+            if i <= anchor + _WINDOW_AFTER:
+                items.append(_todo_item(i, s, todo))
+            else:
+                after[s] += 1
+        elif s == "active":
+            # PROMOTE the provisional pending anchor to this first active. Fold
+            # every collected window entry and every after-bucket count into
+            # ``before`` (all sit strictly before the new anchor), then correct
+            # for ``prev`` (index i−1, counted once above) which becomes the new
+            # anchor's ``anchor−1`` window head.
+            for it in items:
+                before[it["status"]] += 1
+            for k in before:
+                before[k] += after[k]
+                after[k] = 0
+            p_idx, p_s, p_todo = prev  # type: ignore[misc]
+            before[p_s] -= 1
+            items = [_todo_item(p_idx, p_s, p_todo), _todo_item(i, s, todo)]
+            anchor = i
+            anchor_final = True
+        else:
+            # Provisional pending anchor still collecting its window.
+            if i <= anchor + _WINDOW_AFTER:
+                items.append(_todo_item(i, s, todo))
+            else:
+                after[s] += 1
+
+        prev = (i, s, todo)
+
+    if anchor is None and total:
+        # All completed → the TRUE last item is the anchor; the tail lookback
+        # holds exactly ``[anchor−1 … anchor]``.
+        anchor = total - 1
+        start = max(0, anchor - _WINDOW_BEFORE)
+        for h_idx, h_s, h_todo in hold:
+            if h_idx < start:
+                before[h_s] += 1
+            else:
+                items.append(_todo_item(h_idx, h_s, h_todo))
+
+    subject = ""
+    if anchor is not None:
+        for it in items:
+            if it["ordinal"] == anchor + 1:
+                subject = it["label"] or ""
+                break
     return {
         "done": done,
         "total": total,
@@ -550,6 +611,51 @@ class SummaryController:
             self._activity = activity
             await self._flush_locked(force=False)
 
+    def _merge_plan_locked(
+        self,
+        *,
+        done: int | None,
+        total: int | None,
+        subject: str | None,
+        items: list | tuple | None,
+        hidden_before: dict | None,
+        hidden_after: dict | None,
+        is_todo: bool,
+        seq: object | None,
+    ) -> bool:
+        """Merge a plan-progress fragment into the controller state (lock held,
+        no flush). Returns ``False`` when *seq* is stale (≤ the watermark) so the
+        caller can skip a redundant flush; ``True`` when the frame was applied.
+
+        ORDERING (r4): a stale/duplicate frame (``seq`` ≤ watermark) mutates
+        nothing. AUTHORITY (r3 latch): a TodoWrite fragment (``is_todo``) is the
+        authoritative display source — it overwrites the counts, subject,
+        checklist window and hidden buckets, and LATCHES the plan for the turn.
+        While latched, a Task* fragment (``is_todo`` False) NEVER mutates the
+        plan; unlatched, a Task* ``subject`` is the display fallback only.
+        """
+        if (
+            seq is not None
+            and self._plan_seq_watermark is not None
+            and seq <= self._plan_seq_watermark
+        ):
+            return False
+        if is_todo:
+            self._todo_plan_seen_this_turn = True
+            self._plan_done = done
+            self._plan_total = total
+            self._plan_subject = subject or ""
+            self._plan_items = tuple(items or ())
+            self._plan_hidden_before = hidden_before or dict(_ZERO_BUCKETS)
+            self._plan_hidden_after = hidden_after or dict(_ZERO_BUCKETS)
+        elif not self._todo_plan_seen_this_turn:
+            # Task* fallback — display-only, and only while unlatched.
+            if subject is not None:
+                self._plan_subject = subject
+        if seq is not None:
+            self._plan_seq_watermark = seq
+        return True
+
     async def submit_plan(
         self,
         *,
@@ -568,34 +674,47 @@ class SummaryController:
         frame is a stale/duplicate and is rejected outright (no mutation, no
         flush). An accepted frame advances the watermark.
 
-        AUTHORITY (r3 latch): a TodoWrite fragment (``is_todo``) is the
-        authoritative display source — it overwrites the counts, subject,
-        checklist window and hidden buckets, and LATCHES the plan for the turn.
-        While latched, a Task* fragment (``is_todo`` False) NEVER mutates the
-        plan; unlatched, a Task* ``subject`` is the display fallback only.
+        AUTHORITY (r3 latch): see :meth:`_merge_plan_locked`.
         """
         async with self._writing():
-            # Ordering: reject a stale/duplicate frame (≤ watermark).
-            if (
-                seq is not None
-                and self._plan_seq_watermark is not None
-                and seq <= self._plan_seq_watermark
+            if self._merge_plan_locked(
+                done=done, total=total, subject=subject, items=items,
+                hidden_before=hidden_before, hidden_after=hidden_after,
+                is_todo=is_todo, seq=seq,
             ):
-                return
-            if is_todo:
-                self._todo_plan_seen_this_turn = True
-                self._plan_done = done
-                self._plan_total = total
-                self._plan_subject = subject or ""
-                self._plan_items = tuple(items or ())
-                self._plan_hidden_before = hidden_before or dict(_ZERO_BUCKETS)
-                self._plan_hidden_after = hidden_after or dict(_ZERO_BUCKETS)
-            elif not self._todo_plan_seen_this_turn:
-                # Task* fallback — display-only, and only while unlatched.
-                if subject is not None:
-                    self._plan_subject = subject
-            if seq is not None:
-                self._plan_seq_watermark = seq
+                await self._flush_locked(force=False)
+
+    async def submit_activity_and_plan(
+        self,
+        activity: str,
+        *,
+        done: int | None = None,
+        total: int | None = None,
+        subject: str | None = None,
+        items: list | tuple | None = None,
+        hidden_before: dict | None = None,
+        hidden_after: dict | None = None,
+        is_todo: bool = False,
+        seq: object | None = None,
+    ) -> None:
+        """Apply an ACTIVITY update AND a plan-progress fragment atomically —
+        under ONE writer lock with ONE flush (§5 P1-B, r6 fix).
+
+        A tool_use block carries both signals; issuing ``submit_activity`` then
+        ``submit_plan`` as two calls let the activity flush consume the throttle
+        window, so the TodoWrite checklist render then waited for the next event
+        or tick. Coalescing them means the same tool_use that carries a TodoWrite
+        renders its checklist in the SAME flush. The activity ALWAYS applies (a
+        stale/duplicate plan ``seq`` still updates the activity line); the plan
+        merges only when not stale.
+        """
+        async with self._writing():
+            self._activity = activity
+            self._merge_plan_locked(
+                done=done, total=total, subject=subject, items=items,
+                hidden_before=hidden_before, hidden_after=hidden_after,
+                is_todo=is_todo, seq=seq,
+            )
             await self._flush_locked(force=False)
 
     # -- turn lifecycle (elapsed base + tick) -------------------------------

@@ -586,6 +586,17 @@ class TopicStreamRelay:
         self.cursor = StreamCursor()
         # Per-turn in-memory state (never persisted — rebuilt on recovery).
         self._turn_text = ""
+        # §5 P1-B (r6 fix): a relay-owned MONOTONIC per-turn tool-event counter.
+        # Incremented ONCE per tool_use block processed on the LIVE path and
+        # stamped as the plan-frame ordering ``seq`` (below). It is strictly
+        # increasing WITHIN a turn and — unlike the former ``(segment, offset,
+        # block_ordinal)`` coordinate — carries NO file identity, so a mid-turn
+        # log rotation can never make a newer TodoWrite sort lower than an
+        # earlier one (which the controller's ≤-watermark would then reject
+        # forever, freezing the checklist). Reset with the rest of the per-turn
+        # state in ``_reset_turn_state``; the controller's watermark resets on
+        # the same turn boundary.
+        self._tool_event_seq = 0
         # §R3: message.id of the LAST text frame appended to narration (``None``
         # at a turn boundary). A frame whose id differs begins a NEW assistant
         # message → its text is prefixed with a ``\n\n`` separator. Advanced by
@@ -1672,7 +1683,7 @@ class TopicStreamRelay:
             return
         fired_mutating = False
         flushed_buffer = False
-        for block_ordinal, block in enumerate(blocks):
+        for block in blocks:
             if block[0] == "text":
                 await self._append_narration(block[1], seg, off_after, message_id)
                 if self._dropped:
@@ -1705,19 +1716,24 @@ class TopicStreamRelay:
                 # only — replay never reaches _handle_assistant_blocks), so the
                 # controller derives post-recovery state from the lifecycle
                 # alone and never from stale, replayed tool frames.
-                # v0.91.0 (§5 P1-B r4): stamp a total-order ordering coordinate
-                # ``(segment, offset, block_ordinal)`` — the relay frame
-                # coordinate PLUS this tool_use block's index within the frame,
-                # so two TodoWrite blocks in ONE assistant frame get distinct,
-                # ordered sequences. The controller's plan watermark rejects a
-                # frame ≤ this. Passed verbatim through to ``submit_plan``.
+                # §5 P1-B (r6 fix): stamp a MONOTONIC per-turn tool-event counter
+                # as the ordering ``seq`` — incremented once per tool_use block
+                # processed, so two TodoWrite blocks in ONE assistant frame get
+                # distinct, strictly-increasing sequences AND a TodoWrite after a
+                # mid-turn log rotation still sorts ABOVE an earlier one (the old
+                # ``(segment, offset, block_ordinal)`` coordinate carried file
+                # identity, so a rotated segment could sort lower and the
+                # controller's ≤-watermark would reject the newer plan forever).
+                # The controller's plan watermark rejects a frame ≤ this; passed
+                # verbatim through to ``submit_plan``.
+                self._tool_event_seq += 1
                 await _maybe_await(
                     self.on_turn_event(
                         "tool_use",
                         {
                             "tool": name,
                             "input": tool_input,
-                            "seq": (tuple(seg), off_after, block_ordinal),
+                            "seq": self._tool_event_seq,
                         },
                     )
                 )
@@ -1749,6 +1765,11 @@ class TopicStreamRelay:
 
     def _reset_turn_state(self) -> None:
         self._turn_text = ""
+        # §5 P1-B (r6 fix): a fresh turn restarts the monotonic tool-event
+        # counter at 0. The controller's plan-ordering watermark resets on the
+        # SAME boundary (``note_turn_start``), so the new turn's first tool_use
+        # (counter 1) is always accepted.
+        self._tool_event_seq = 0
         self._last_text_msg_id = None  # §R3: no prior segment in a fresh turn
         # P2: a fresh turn has no pending separators and starts replay ordinal 0.
         self._seps_clear()

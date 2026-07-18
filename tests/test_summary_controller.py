@@ -286,6 +286,42 @@ class TestTodoWindowExtraction:
         assert plan["items"][-1] == {"ordinal": 5, "status": "done",
                                      "label": "c4"}
 
+    def test_pending_before_active_promotes_anchor(self):
+        # A pending precedes the first in_progress far apart: the single-pass
+        # extraction PROMOTES the provisional pending anchor to the active one,
+        # and the now-before entries are re-bucketed (r6 single-pass rewrite).
+        todos = (
+            [{"content": "p0", "status": "pending"}]
+            + [{"content": f"d{i}", "status": "completed"} for i in range(1, 10)]
+            + [{"content": "the active", "status": "in_progress"}]
+        )
+        plan = extract_plan("TodoWrite", {"todos": todos})
+        # Anchor = the in_progress at index 10 → window [9 .. 10] (clamped end).
+        assert plan["subject"] == "the active"
+        ords = [it["ordinal"] for it in plan["items"]]
+        assert ords == [10, 11]
+        active = [it for it in plan["items"] if it["status"] == "active"]
+        assert active == [{"ordinal": 11, "status": "active",
+                           "label": "the active"}]
+        # Before region: the pending (index 0) + dones 1..8 (index 9 is the
+        # window head). 8 done + 1 pending.
+        assert plan["hidden_before"] == {"done": 8, "active": 0, "pending": 1}
+        assert plan["hidden_after"] == {"done": 0, "active": 0, "pending": 0}
+
+    def test_pending_then_adjacent_active_keeps_both_in_window(self):
+        # [pending, active]: promotion keeps the pending as the anchor−1 head.
+        todos = [
+            {"content": "first", "status": "pending"},
+            {"content": "second", "status": "in_progress"},
+        ]
+        plan = extract_plan("TodoWrite", {"todos": todos})
+        assert plan["subject"] == "second"
+        assert plan["items"] == [
+            {"ordinal": 1, "status": "pending", "label": "first"},
+            {"ordinal": 2, "status": "active", "label": "second"},
+        ]
+        assert plan["hidden_before"] == {"done": 0, "active": 0, "pending": 0}
+
     def test_marker_only_label_becomes_none_but_still_counts(self):
         todos = [
             {"content": "***", "status": "completed"},   # sanitizes to empty
@@ -911,23 +947,19 @@ class TestTodoAuthorityLatch:
 
 class TestPlanOrderingWatermark:
     async def test_stale_relay_coordinate_rejected(self):
-        # Relay path: seq = (segment, offset, block_ordinal).
+        # Relay path (r6 fix): seq = monotonic per-turn tool-event counter.
         c = _make()
-        newer = ((7, 11), 400, 0)
-        older = ((7, 11), 120, 0)
-        await c.submit_plan(**_todo_frag(subject="new"), seq=newer)
-        await c.submit_plan(**_todo_frag(subject="stale"), seq=older)
+        await c.submit_plan(**_todo_frag(subject="new"), seq=4)
+        await c.submit_plan(**_todo_frag(subject="stale"), seq=2)
         assert c._plan_subject == "new"  # stale-after-new rejected
         c.shutdown()
 
     async def test_two_todowrite_blocks_one_frame_distinct_seq(self):
-        # Two TodoWrite blocks in ONE assistant frame share (segment, offset)
-        # but get distinct block ordinals; the SECOND wins.
+        # Two TodoWrite blocks in ONE assistant frame get distinct, strictly
+        # increasing counter seqs (r6 fix); the SECOND wins.
         c = _make()
-        seq0 = ((7, 11), 400, 0)
-        seq1 = ((7, 11), 400, 1)
-        await c.submit_plan(**_todo_frag(subject="first"), seq=seq0)
-        await c.submit_plan(**_todo_frag(subject="second"), seq=seq1)
+        await c.submit_plan(**_todo_frag(subject="first"), seq=1)
+        await c.submit_plan(**_todo_frag(subject="second"), seq=2)
         assert c._plan_subject == "second"
         c.shutdown()
 
@@ -971,7 +1003,7 @@ class TestChecklistEndToEnd:
             {"content": "OAuth setup", "status": "in_progress"},
             {"content": "wire callback", "status": "pending"},
         ]})
-        await c.submit_plan(**plan1, seq=((3, 9), 100, 0))
+        await c.submit_plan(**plan1, seq=1)
         assert "▶ 1. OAuth setup" in seq.edits[-1][1]
         # Frame 2 (past the throttle window): item 1 done, item 2 active.
         clock.t += 11.0
@@ -979,7 +1011,7 @@ class TestChecklistEndToEnd:
             {"content": "OAuth setup", "status": "completed"},
             {"content": "wire callback", "status": "in_progress"},
         ]})
-        await c.submit_plan(**plan2, seq=((3, 9), 260, 0))
+        await c.submit_plan(**plan2, seq=2)
         rendered = seq.edits[-1][1]
         assert "☑ 1. OAuth setup" in rendered
         assert "▶ 2. wire callback" in rendered
@@ -997,4 +1029,37 @@ class TestChecklistEndToEnd:
         rendered = seq.edits[-1][1]
         assert "▶ 1. OAuth" in rendered
         assert "*" not in rendered
+        c.shutdown()
+
+
+class TestActivityAndPlanSameFlush:
+    async def test_todowrite_renders_checklist_in_same_flush(self):
+        # r6 fix: a tool_use carrying a TodoWrite applies BOTH the activity and
+        # the plan under ONE lock with ONE flush — the checklist is visible in
+        # the SAME (first) edit, not deferred to a later event/tick. Earlier, a
+        # prior activity flush consumed the throttle window and starved it.
+        seq = FakeSequencer()
+        c = _make(seq, message_id=500)
+        plan = extract_plan("TodoWrite", {"todos": [
+            {"content": "OAuth setup", "status": "in_progress"},
+        ]})
+        await c.submit_activity_and_plan("planning", **plan, seq=1)
+        assert len(seq.edits) == 1  # ONE flush
+        rendered = seq.edits[-1][1]
+        assert "▶ 1. OAuth setup" in rendered  # checklist in the SAME flush
+        c.shutdown()
+
+    async def test_stale_plan_still_applies_activity(self):
+        # A stale plan seq is rejected, but the activity ALWAYS applies (the
+        # combined op never drops the activity update).
+        seq = FakeSequencer()
+        clock = Clock()
+        c = _make(seq, clock=clock, message_id=500)
+        await c.submit_plan(**_todo_frag(subject="latched"), seq=5)
+        first_subject = c._plan_subject
+        clock.t += 11.0  # clear the throttle so the next flush lands
+        await c.submit_activity_and_plan(
+            "running commands", **_todo_frag(subject="stale"), seq=2)
+        assert c._plan_subject == first_subject  # stale plan rejected
+        assert c._activity == "running commands"  # activity still applied
         c.shutdown()
