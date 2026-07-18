@@ -6,7 +6,12 @@ import asyncio
 
 import pytest
 
-from channels.voice.routes import VoiceRouteRegistry, VoiceWsConnection
+from channels.voice.routes import (
+    _CAPABILITIES,
+    _PROTOCOL,
+    VoiceRouteRegistry,
+    VoiceWsConnection,
+)
 from config import AgentConfig
 
 
@@ -36,10 +41,12 @@ def _cfg(role: str, channels: list[str]) -> AgentConfig:
 def _register_frame(**changes) -> dict:
     return {
         "type": "voice_route_register",
-        "protocol": 1,
+        "protocol": 2,
         "route_id": "entry-1",
         "agent_role": "concierge",
-        "capabilities": ["background_jobs", "satellite_announce"],
+        "capabilities": [
+            "background_jobs", "satellite_announce", "voice_handoff",
+        ],
         **changes,
     }
 
@@ -70,9 +77,9 @@ async def test_authenticated_registration_is_acknowledged_and_bound_to_socket():
 
     assert raw.sent == [{
         "type": "voice_route_registered",
-        "protocol": 1,
+        "protocol": 2,
         "accepted_capabilities": [
-            "background_jobs", "satellite_announce",
+            "background_jobs", "satellite_announce", "voice_handoff",
         ],
     }]
     assert routes.get_connected("entry-1") is bound
@@ -81,7 +88,7 @@ async def test_authenticated_registration_is_acknowledged_and_bound_to_socket():
     assert bound.role == "concierge"
     assert connection.voice_route_id == "entry-1"
     assert connection.voice_route_capabilities == frozenset({
-        "background_jobs", "satellite_announce",
+        "background_jobs", "satellite_announce", "voice_handoff",
     })
     assert bound.job_control_id == "entry-1"
     assert connection.voice_job_control_id == "entry-1"
@@ -135,8 +142,8 @@ async def test_unknown_protocol_and_capability_fail_closed_but_are_acknowledged(
     }]
 
 
-@pytest.mark.parametrize("protocol", [True, 1.0])
-async def test_protocol_requires_exact_json_integer_one(protocol):
+@pytest.mark.parametrize("protocol", [True, 1.0, 1])
+async def test_protocol_requires_exact_json_integer_two(protocol):
     raw = _RawSocket()
     connection = VoiceWsConnection(raw)
     routes = VoiceRouteRegistry(
@@ -168,6 +175,45 @@ async def test_any_unknown_capability_fails_the_whole_registration_closed():
     )) is None
     assert raw.sent[-1]["accepted_capabilities"] == []
     assert routes.get_connected("entry-1") is None
+
+
+async def test_missing_voice_handoff_capability_fails_registration_closed():
+    raw = _RawSocket()
+    connection = VoiceWsConnection(raw)
+    routes = VoiceRouteRegistry(
+        secret_present=True,
+        agent_configs={"concierge": _cfg("concierge", ["ha_voice"])},
+    )
+
+    assert await routes.register(connection, _register_frame(
+        capabilities=["background_jobs", "satellite_announce"],
+    )) is None
+
+    assert raw.sent[-1]["accepted_capabilities"] == []
+    assert routes.get_connected("entry-1") is None
+    assert connection.voice_route_id is None
+
+
+async def test_protocol_contract_requires_every_v2_handoff_capability():
+    raw = _RawSocket()
+    connection = VoiceWsConnection(raw)
+    registry = VoiceRouteRegistry(
+        secret_present=True,
+        agent_configs={"concierge": _cfg("concierge", ["ha_voice"])},
+    )
+
+    bound = await registry.register(
+        connection, _register_frame(route_id="entry-1:concierge"),
+    )
+
+    assert _PROTOCOL == 2
+    assert _CAPABILITIES == (
+        "background_jobs", "satellite_announce", "voice_handoff",
+    )
+    assert bound is not None
+    assert registry.get_connected("entry-1:concierge").capabilities == frozenset(
+        _CAPABILITIES,
+    )
 
 
 async def test_disconnect_clears_writer_but_retains_capability_for_60_seconds():

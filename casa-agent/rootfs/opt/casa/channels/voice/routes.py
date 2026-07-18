@@ -10,8 +10,8 @@ from typing import Any, Callable, Mapping
 from channel_authz import agent_allowed_on
 
 
-_PROTOCOL = 1
-_CAPABILITIES = ("background_jobs", "satellite_announce")
+_PROTOCOL = 2
+_CAPABILITIES = ("background_jobs", "satellite_announce", "voice_handoff")
 _BACKGROUND_CAPABILITIES = frozenset(_CAPABILITIES)
 
 
@@ -24,7 +24,7 @@ def _identifier(value: Any) -> str | None:
     return normalized
 
 
-def _is_protocol_one(value: Any) -> bool:
+def _is_supported_protocol(value: Any) -> bool:
     return type(value) is int and value == _PROTOCOL
 
 
@@ -88,7 +88,7 @@ class VoiceRouteRegistry:
         connection: VoiceWsConnection,
         frame: Mapping[str, Any],
     ) -> BoundVoiceRoute | None:
-        """Validate, acknowledge, and bind a protocol-1 registration."""
+        """Validate, acknowledge, and bind a protocol-2 registration."""
         self._clear_connection_binding(connection)
         protocol = frame.get("protocol")
         accepted: tuple[str, ...] = ()
@@ -108,10 +108,11 @@ class VoiceRouteRegistry:
             valid_requested = (
                 valid_requested
                 and requested_set <= _BACKGROUND_CAPABILITIES
+                and _BACKGROUND_CAPABILITIES <= requested_set
             )
 
         if (
-            _is_protocol_one(protocol)
+            _is_supported_protocol(protocol)
             and self._secret_present
             and route_id is not None
             and role is not None
@@ -120,11 +121,7 @@ class VoiceRouteRegistry:
             and valid_requested
         ):
             self._prune_expired_metadata()
-            accepted = tuple(
-                capability
-                for capability in _CAPABILITIES
-                if capability in requested_set
-            )
+            accepted = _CAPABILITIES
             capabilities = frozenset(accepted)
             now = self._clock()
             old = self._connected.get(route_id)

@@ -576,6 +576,11 @@ class VoiceChannel(Channel):
                         await self._delivery.handle(connection, frame)
                     continue
 
+                if t == "handoff_received":
+                    # A handoff receipt is Casa-to-integration protocol output.
+                    # Never let an unregistered client-side echo create work.
+                    continue
+
                 if t == "stt_start":
                     scope_id = _nonempty_identifier(frame.get("scope_id"))
                     agent_role = _nonempty_identifier(frame.get("agent_role"))
