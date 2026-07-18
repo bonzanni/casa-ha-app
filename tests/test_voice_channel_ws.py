@@ -272,7 +272,7 @@ class TestWSTurn:
             "/api/converse/ws", headers=headers,
         ) as ws:
             await ws.send_json({
-                "type": "job_claimed", "protocol": 1,
+                "type": "job_claimed", "protocol": 2,
                 "job_id": "job-1",
                 "delivery_attempt_id": "attempt-1",
             })
@@ -292,6 +292,30 @@ class TestWSTurn:
             with pytest.raises(asyncio.TimeoutError):
                 await asyncio.wait_for(ws.receive_json(), timeout=0.05)
             assert ws.closed is False
+
+    async def test_handoff_received_before_route_registration_is_ignored(
+        self, signed_ws_app,
+    ):
+        client, channel, delivery, headers = signed_ws_app
+        dispatch = AsyncMock()
+        channel._bus.handlers["butler"] = dispatch
+
+        async with client.ws_connect(
+            "/api/converse/ws", headers=headers,
+        ) as ws:
+            await ws.send_json({
+                "type": "handoff_received",
+                "protocol": 2,
+                "utterance_id": "u-1",
+                "handoff_id": "handoff-1",
+                "text": "I will look into that.",
+            })
+            with pytest.raises(asyncio.TimeoutError):
+                await asyncio.wait_for(ws.receive_json(), timeout=0.05)
+
+        assert channel.routes.get_connected("entry-1:concierge") is None
+        assert delivery.calls == []
+        dispatch.assert_not_awaited()
 
     async def test_non_object_json_frame_is_ignored_without_close(
         self, signed_ws_app,
@@ -313,16 +337,16 @@ class TestWSTurn:
             "/api/converse/ws", headers=headers,
         ) as ws:
             await ws.send_json({
-                "type": "voice_route_register", "protocol": 1,
+                "type": "voice_route_register", "protocol": 2,
                 "route_id": "entry-1", "agent_role": "concierge",
                 "capabilities": [
-                    "background_jobs", "satellite_announce",
+                    "background_jobs", "satellite_announce", "voice_handoff",
                 ],
             })
             assert await ws.receive_json() == {
-                "type": "voice_route_registered", "protocol": 1,
+                "type": "voice_route_registered", "protocol": 2,
                 "accepted_capabilities": [
-                    "background_jobs", "satellite_announce",
+                    "background_jobs", "satellite_announce", "voice_handoff",
                 ],
             }
             bound = channel.routes.get_connected("entry-1")
@@ -342,16 +366,16 @@ class TestWSTurn:
             "/api/converse/ws", headers=headers,
         ) as ws:
             await ws.send_json({
-                "type": "voice_route_register", "protocol": 1,
+                "type": "voice_route_register", "protocol": 2,
                 "route_id": "entry-1", "agent_role": "concierge",
                 "capabilities": [
-                    "background_jobs", "satellite_announce",
+                    "background_jobs", "satellite_announce", "voice_handoff",
                 ],
             })
             await ws.receive_json()
             assert channel.routes.get_connected("entry-1") is not None
             await ws.send_json({
-                "type": "job_claimed", "protocol": 1,
+                "type": "job_claimed", "protocol": 2,
                 "job_id": "job-1",
                 "delivery_attempt_id": "attempt-1",
             })
@@ -369,10 +393,10 @@ class TestWSTurn:
         client, channel = unsigned_route_ws_app
         async with client.ws_connect("/api/converse/ws") as ws:
             await ws.send_json({
-                "type": "voice_route_register", "protocol": 1,
+                "type": "voice_route_register", "protocol": 2,
                 "route_id": "entry-1", "agent_role": "butler",
                 "capabilities": [
-                    "background_jobs", "satellite_announce",
+                    "background_jobs", "satellite_announce", "voice_handoff",
                 ],
             })
             ack = await ws.receive_json()
