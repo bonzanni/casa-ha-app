@@ -600,8 +600,70 @@ class TelegramChannel(Channel):
         # in_casa_driver._locks. Entries are not pruned — bounded growth,
         # cleared on add-on restart.
         self._engagement_handler_locks: dict[int, asyncio.Lock] = {}
+        # R5 (v0.89.0): NON-PERSISTENT current-inbound target for the `react`
+        # framework tool. Maps engagement_id -> (chat_id, topic_id, message_id)
+        # of the LATEST operator message seen in that engagement's topic.
+        # Deliberately in-memory (NOT a registry field): it must NOT survive a
+        # restart — after a restart there is no known "latest" message to react
+        # to, and the react tool's non-live gate makes an empty map fail soft.
+        # Recorded SYNCHRONOUSLY in handle_update from the trusted
+        # msg.message_id; MONOTONIC (never regresses to an older id).
+        self._current_inbound: dict[str, tuple[int, int, int]] = {}
         # Default routing: forward to the existing PTB handler.
         self._route_to_ellen = self._route_to_ellen_default
+
+    # ------------------------------------------------------------------
+    # R5 (v0.89.0): current-inbound target + emoji reaction (react tool)
+    # ------------------------------------------------------------------
+
+    def _record_inbound_target(
+        self, engagement_id: str, chat_id: int, topic_id: int,
+        message_id: int | None,
+    ) -> None:
+        """Record the LATEST operator message for an engagement (react target).
+
+        MONOTONIC: replaces the stored target ONLY when ``message_id`` is
+        strictly greater than the stored one. ``handle_update`` runs
+        concurrently per Bot-API update; the per-topic lock serialises routing
+        but NOT Telegram delivery order, so an unconditional write could let a
+        delayed older update clobber a newer target. Telegram message ids are
+        monotonically increasing per chat, so the greatest id is the newest.
+        """
+        if not engagement_id or message_id is None:
+            return
+        prev = self._current_inbound.get(engagement_id)
+        if prev is not None and message_id <= prev[2]:
+            return
+        self._current_inbound[engagement_id] = (chat_id, topic_id, message_id)
+
+    def get_current_inbound(
+        self, engagement_id: str,
+    ) -> tuple[int, int, int] | None:
+        """Return ``(chat_id, topic_id, message_id)`` for the engagement's
+        latest operator message, or ``None`` (restart / no inbound / cleared)."""
+        return self._current_inbound.get(engagement_id)
+
+    def clear_inbound(self, engagement_id: str) -> None:
+        """Best-effort drop of a finished engagement's target (map hygiene).
+        A missed clear is harmless: react's non-live gate rejects it anyway."""
+        self._current_inbound.pop(engagement_id, None)
+
+    async def set_reaction(
+        self, chat_id: int, message_id: int, emoji: str,
+    ) -> None:
+        """Set a single emoji reaction on a message (PTB set_message_reaction).
+
+        Raises when the channel isn't started (RuntimeError) and lets
+        TelegramError propagate — the ``react`` tool classifies both."""
+        from telegram import ReactionTypeEmoji
+        bot = self.bot
+        if bot is None:
+            raise RuntimeError("Telegram channel not started; cannot set reaction")
+        await bot.set_message_reaction(
+            chat_id=chat_id,
+            message_id=message_id,
+            reaction=[ReactionTypeEmoji(emoji=emoji)],
+        )
 
     # ------------------------------------------------------------------
     # Lifecycle
@@ -1258,6 +1320,17 @@ class TelegramChannel(Channel):
                 if rec is None or rec.status in ("completed", "cancelled", "error"):
                     await self.send_to_topic(thread_id, "No active engagement in this topic.")
                     return
+
+                # R5 (v0.89.0): record this operator message as the react
+                # target — SYNCHRONOUSLY, from the TRUSTED msg.message_id and
+                # the authoritative topic/chat identity, BEFORE the first await
+                # below. Monotonic (see _record_inbound_target): a delayed older
+                # update cannot clobber a newer target. Only ACTIVE records
+                # reach here (the status check above returned otherwise).
+                self._record_inbound_target(
+                    rec.id, chat_id, thread_id,
+                    getattr(msg, "message_id", None),
+                )
 
                 # v0.79.0 (§3, F2/F5): an inbound operator message is a causal
                 # event, visible on Telegram the instant it arrives. SEAL open
@@ -3031,6 +3104,8 @@ class TelegramChannel(Channel):
                 "engagement %s (topic %s): %s",
                 rec.id[:8], rec.topic_id, exc,
             )
+        # R5 (v0.89.0): drop the react target for this terminal engagement.
+        self.clear_inbound(rec.id)
 
     # ------------------------------------------------------------------
     # Outbound: block mode
