@@ -2326,34 +2326,65 @@ class TelegramChannel(Channel):
         ``markup`` values resolve like ``send_topic_message_markup``'s (a real
         keyboard passes through; ``MARKUP_EMPTY``/``None`` ⇒ explicit empty
         keyboard to CLEAR). "Message is not modified" is tolerated as success
-        (the desired end-state already holds), matching ``edit_topic_message``."""
+        (the desired end-state already holds), matching ``edit_topic_message``.
+
+        R2c (v0.89.0): the two TEXT-present branches render markdown into
+        ``MessageEntity`` spans (the multi-select settle path
+        ``settle_ask_keyboard`` → ``edit_discrete`` → here re-sends the ask body,
+        which carries the raw ``**`` markers). ``render()`` decides: entities
+        present ⇒ edit them in (keeping the resolved ``reply_markup``); on an
+        entity ``BadRequest`` retry ONCE plain with the ORIGINAL raw text — an
+        EDIT is NOT the cancellation-gated POST, so this second edit introduces
+        no double-send race. ``entities is None`` (plain text / the marker
+        literals from the re-anchor/orphan edits) ⇒ edit the RAW text verbatim
+        (behaviour-preserving). The ``text is None`` markup-only branch never
+        renders. The F1 no-op cache in ``edit_discrete`` keys on the raw ``text``
+        ABOVE this wire, so rendering below it stays consistent."""
         from channels.output_sequencer import _ABSENT
         if not self.engagement_supergroup_id:
             return False
         markup_touched = markup is not _ABSENT
         if text is None and not markup_touched:
             return True  # nothing to change
+        markup_kwargs: dict = {}
+        if markup_touched:
+            markup_kwargs["reply_markup"] = self._resolve_wire_keyboard(
+                markup, clear=True)
         try:
             if text is None:
+                # Markup-only edit — render() is never invoked (no text).
                 await self.bot.edit_message_reply_markup(
                     chat_id=self.engagement_supergroup_id,
-                    message_id=message_id,
-                    reply_markup=self._resolve_wire_keyboard(markup, clear=True),
+                    message_id=message_id, **markup_kwargs,
                 )
-            elif markup_touched:
+                return True
+            display, entities = (
+                render(text) if self._rich_text_enabled else (text, None))
+            if entities is None:
                 await self.bot.edit_message_text(
                     chat_id=self.engagement_supergroup_id,
-                    message_id=message_id,
-                    text=text,
-                    reply_markup=self._resolve_wire_keyboard(markup, clear=True),
+                    message_id=message_id, text=text, **markup_kwargs,
                 )
-            else:
+                return True
+            try:
                 await self.bot.edit_message_text(
                     chat_id=self.engagement_supergroup_id,
-                    message_id=message_id,
-                    text=text,
+                    message_id=message_id, text=display, entities=entities,
+                    **markup_kwargs,
                 )
-            return True
+                return True
+            except BadRequest as exc:
+                if "not modified" in str(exc).lower():
+                    return True
+                logger.warning(
+                    "edit_topic_message_markup rich edit fell back to plain "
+                    "(topic=%s message_id=%s): %s", topic_id, message_id, exc)
+                await self.bot.edit_message_text(
+                    chat_id=self.engagement_supergroup_id,
+                    message_id=message_id, text=text,  # ORIGINAL, verbatim
+                    **markup_kwargs,
+                )
+                return True
         except BadRequest as exc:
             if "not modified" in str(exc).lower():
                 return True

@@ -257,3 +257,119 @@ async def test_single_select_settle_edit_renders_rich(real_env):
     # The settle STILL clears the keyboard (S1 fix retained through the rich path).
     assert isinstance(kw["reply_markup"], InlineKeyboardMarkup)
     assert list(kw["reply_markup"].inline_keyboard) == []
+
+
+# ===========================================================================
+# Part (c) · MULTI settle: edit_topic_message_markup renders the body rich
+# (settle_ask_keyboard → edit_discrete → edit_topic_message_markup)
+# ===========================================================================
+
+async def test_edit_markup_renders_entities_markup_touched():
+    """A multi settle (text + explicit-empty keyboard) renders markdown as
+    entities — the keyboard is still cleared."""
+    from channels.output_sequencer import MARKUP_EMPTY
+    ch, bot = _mk_channel_with_fake_bot()
+    ok = await ch.edit_topic_message_markup(
+        42, 999, "Deploy **prod**?\n✅ Options 1, 2", MARKUP_EMPTY)
+    assert ok is True
+    kw = bot.edit_message_text.await_args.kwargs
+    assert "**" not in kw["text"]
+    assert any(e.type == MessageEntity.BOLD for e in kw["entities"])
+    assert isinstance(kw["reply_markup"], InlineKeyboardMarkup)
+    assert list(kw["reply_markup"].inline_keyboard) == []
+
+
+async def test_edit_markup_renders_entities_text_only():
+    """A text-only edit (markup ABSENT — keyboard untouched) also renders rich,
+    and does NOT pass a reply_markup (PTB leaves the keyboard in place)."""
+    from channels.output_sequencer import _ABSENT
+    ch, bot = _mk_channel_with_fake_bot()
+    ok = await ch.edit_topic_message_markup(42, 999, "now `code`", _ABSENT)
+    assert ok is True
+    kw = bot.edit_message_text.await_args.kwargs
+    assert kw["text"] == "now code"
+    assert kw["entities"][0].type == MessageEntity.CODE
+    assert "reply_markup" not in kw
+
+
+async def test_edit_markup_marker_literal_sends_raw_no_entities():
+    """Regression: the re-anchor MOVED marker literal has no markdown metachars
+    ⇒ render() returns entities=None ⇒ the RAW text is edited verbatim
+    (identical output to the pre-R2c plain edit)."""
+    from channels.output_sequencer import MARKUP_EMPTY
+    ch, bot = _mk_channel_with_fake_bot()
+    marker = "⤵ MOVED Q3 — answer the current copy below"
+    await ch.edit_topic_message_markup(42, 999, marker, MARKUP_EMPTY)
+    kw = bot.edit_message_text.await_args.kwargs
+    assert kw["text"] == marker
+    assert "entities" not in kw
+
+
+async def test_edit_markup_markup_only_render_not_invoked():
+    """Regression: text=None ⇒ markup-only edit via edit_message_reply_markup;
+    render() is never invoked and edit_message_text is never called."""
+    from channels.output_sequencer import MARKUP_EMPTY
+    ch, bot = _mk_channel_with_fake_bot()
+    bot.edit_message_reply_markup = AsyncMock(return_value=True)
+    ok = await ch.edit_topic_message_markup(42, 999, None, MARKUP_EMPTY)
+    assert ok is True
+    assert bot.edit_message_reply_markup.await_count == 1
+    assert bot.edit_message_text.await_count == 0
+
+
+async def test_edit_markup_badrequest_falls_back_to_plain_once():
+    """An EDIT is not the cancellation-gated POST, so an entity BadRequest may
+    retry ONCE plain with the ORIGINAL raw text."""
+    from channels.output_sequencer import MARKUP_EMPTY
+    ch, bot = _mk_channel_with_fake_bot()
+    bot.edit_message_text.side_effect = [BadRequest("bad entity"), None]
+    ok = await ch.edit_topic_message_markup(42, 999, "Deploy **prod**?", MARKUP_EMPTY)
+    assert ok is True
+    assert bot.edit_message_text.await_count == 2
+    last = bot.edit_message_text.await_args_list[-1].kwargs
+    assert last["text"] == "Deploy **prod**?"  # ORIGINAL, verbatim
+    assert "entities" not in last
+
+
+async def test_edit_markup_not_modified_is_success():
+    from channels.output_sequencer import MARKUP_EMPTY
+    ch, bot = _mk_channel_with_fake_bot()
+    bot.edit_message_text.side_effect = BadRequest("Bad Request: message is not modified")
+    ok = await ch.edit_topic_message_markup(42, 999, "Deploy **prod**?", MARKUP_EMPTY)
+    assert ok is True
+    assert bot.edit_message_text.await_count == 1  # not-modified ⇒ no plain retry
+
+
+async def test_edit_markup_killswitch_off_is_plain():
+    from channels.output_sequencer import MARKUP_EMPTY
+    ch, bot = _mk_channel_with_fake_bot()
+    ch._rich_text_enabled = False
+    await ch.edit_topic_message_markup(42, 999, "Deploy **prod**?", MARKUP_EMPTY)
+    kw = bot.edit_message_text.await_args.kwargs
+    assert kw["text"] == "Deploy **prod**?"
+    assert "entities" not in kw
+
+
+async def test_multi_settle_via_edit_discrete_renders_rich():
+    """The REAL settle path: OutputSequencer.edit_discrete → the channel's
+    edit_topic_message_markup wire (mirroring casa_core's closure) renders the
+    settled body's markdown as entities — no literal ** on settle."""
+    from channels.output_sequencer import OutputSequencer, MARKUP_EMPTY
+    ch, bot = _mk_channel_with_fake_bot()
+
+    async def _send_markup(topic, text, markup, reply_to=None):
+        return await ch.send_topic_message_markup(topic, text, markup, reply_to=reply_to)
+
+    async def _edit_markup(topic, mid, text, markup):
+        return await ch.edit_topic_message_markup(topic, mid, text, markup)
+
+    seq = OutputSequencer(
+        engagement_id="e1", topic_id=42,
+        send_message=None, edit_message=None,
+        send_message_markup=_send_markup, edit_message_markup=_edit_markup)
+    ok = await seq.edit_discrete(
+        999, text="Deploy **prod**?\n✅ Options 1, 2", markup=MARKUP_EMPTY)
+    assert ok is True
+    kw = bot.edit_message_text.await_args.kwargs
+    assert "**" not in kw["text"]
+    assert any(e.type == MessageEntity.BOLD for e in kw["entities"])
