@@ -87,6 +87,10 @@ class VoiceHandoffReservation:
     def held(self) -> bool:
         return self._held
 
+    @property
+    def committed(self) -> bool:
+        return self._committed
+
     def bind_commit(self, callback: Callable[[VoiceJob], None]) -> None:
         """Install the channel-owned completion callback exactly once."""
         if self._commit_callback is not None:
@@ -916,13 +920,17 @@ class VoiceChannel(Channel):
                 delta = accumulated[len(last_text):]
                 last_text = accumulated
                 for block in splitter.feed(delta):
+                    # Select speech before starting the asynchronous write.
+                    # `reserve()` is synchronous, so this prevents a tool
+                    # call from claiming a handoff while this write is in
+                    # flight and later producing both terminal paths.
+                    speech_block_sent = True
+                    reservation.mark_speech_sent()
                     await ws.send_json({
                         "type": "block", "utterance_id": uid,
                         "text": adapter.render(block), "final": False,
                     })
                     _log_first_block()
-                    speech_block_sent = True
-                    reservation.mark_speech_sent()
 
         async def _progress_sink(text: str) -> None:
             # A4: see the SSE handler's _progress_sink for the full
@@ -940,11 +948,16 @@ class VoiceChannel(Channel):
 
         async def _error_sink(kind: str, spoken: str) -> None:
             nonlocal error_emitted
-            await ws.send_json({
-                "type": "error", "utterance_id": uid,
-                "kind": kind, "spoken": spoken,
-            })
-            error_emitted = True
+            async with write_lock:
+                # A Task-3 commit has already selected the terminal handoff.
+                # Never append an ordinary foreground error to that frame.
+                if handoff.done() or reservation.committed:
+                    return
+                await ws.send_json({
+                    "type": "error", "utterance_id": uid,
+                    "kind": kind, "spoken": spoken,
+                })
+                error_emitted = True
 
         external_context = sanitize_external_context(frame.get("context"))
         route_id, route_capabilities, job_control_id = (
