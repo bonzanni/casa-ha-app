@@ -585,7 +585,8 @@ class Agent:
             # duck-typed capability object, never a caller-supplied shape.
             reservation = msg.context.get("_voice_handoff_reservation")
             if (callable(getattr(reservation, "reserve", None))
-                    and callable(getattr(reservation, "release", None))):
+                    and callable(getattr(reservation, "release", None))
+                    and callable(getattr(reservation, "commit", None))):
                 origin_snapshot["_voice_handoff_reservation"] = reservation
         origin_token = origin_var.set(origin_snapshot)
         try:

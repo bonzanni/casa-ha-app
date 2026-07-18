@@ -1329,6 +1329,7 @@ def validate_voice_handoff_static(
         not requires_voice_handoff(origin, caller_role)
         or not callable(getattr(reservation, "reserve", None))
         or not callable(getattr(reservation, "release", None))
+        or not callable(getattr(reservation, "commit", None))
         or not background_route_available(origin)
     ):
         return requested_mode, None, _background_delivery_unavailable_result()
@@ -2197,6 +2198,7 @@ def _new_voice_job(
     origin: dict,
     task_text: str,
     context_text: str,
+    handoff_id: str | None = None,
 ) -> VoiceJob:
     """Build the durable ACCEPTED row from trusted turn provenance."""
     raw_user_id = origin.get("user_id")
@@ -2235,6 +2237,7 @@ def _new_voice_job(
             and origin["voice_job_control_id"].strip()
             else None
         ),
+        handoff_id=handoff_id,
     )
 
 
@@ -2454,6 +2457,7 @@ async def _start_voice_async_job(
     resolution: Any,
     permit: Any,
     handoff: _PermitHandoff,
+    handoff_reservation: Any | None = None,
     parent_job_id: str | None = None,
 ) -> dict:
     """Persist ACCEPTED, bind RUNNING task/permit ownership, return metadata."""
@@ -2463,6 +2467,7 @@ async def _start_voice_async_job(
     # READY row cannot consume one of the configured live backlog slots.
     await registry.expire_due()
     job_id = str(uuid.uuid4())
+    handoff_id = str(uuid.uuid4()) if handoff_reservation is not None else None
     job = _new_voice_job(
         job_id=job_id,
         parent_job_id=parent_job_id,
@@ -2471,12 +2476,14 @@ async def _start_voice_async_job(
         origin=origin,
         task_text=task_text,
         context_text=context_text,
+        handoff_id=handoff_id,
     )
     actor = _job_actor_from_origin(origin)
     if parent_job_id is not None and actor is None:
         raise JobAuthorizationError("voice continuation has no actor")
     created = False
     task: asyncio.Task | None = None
+    reservation_committed = False
     start_gate = asyncio.Event()
     try:
         try:
@@ -2494,6 +2501,8 @@ async def _start_voice_async_job(
                 )
             created = True
         except JobRouteCapacityError:
+            if handoff_reservation is not None:
+                handoff_reservation.release()
             return _result({
                 "status": "error",
                 "kind": "route_capacity_reached",
@@ -2532,9 +2541,29 @@ async def _start_voice_async_job(
                 _record_launch_safe(specialist_role)
             raise
         handoff.transferred = True
+        if handoff_reservation is not None:
+            pending_job = await registry.mark_handoff_pending(job_id, handoff_id)
+            handoff_reservation.commit(pending_job)
+            reservation_committed = True
         start_gate.set()
     except BaseException:
+        if handoff_reservation is not None and not reservation_committed:
+            handoff_reservation.release()
         if handoff.transferred:
+            if handoff_reservation is None:
+                raise
+            if task is not None and not task.done():
+                task.cancel()
+                await _await_task_teardown(task, _CEILING_TEARDOWN_BOUND_S)
+            if created:
+                if parent_job_id is None:
+                    await registry.cancel(job_id)
+                else:
+                    await registry.compensate_unbound_continuation(
+                        parent_job_id,
+                        job_id,
+                        actor=actor,
+                    )
             raise
         if task is not None and not task.done():
             task.cancel()
@@ -2810,16 +2839,11 @@ async def delegate_to_agent(args: dict) -> dict:
                     resolution=resolution,
                     permit=permit,
                     handoff=handoff,
+                    handoff_reservation=handoff_reservation,
                 )
-            except BaseException:
-                if handoff_reservation is not None:
-                    handoff_reservation.release()
-                raise
             finally:
                 if handoff.transferred:
                     owned = None  # __TRANSFER_VOICE_JOB__
-            if handoff_reservation is not None and result.get("is_error"):
-                handoff_reservation.release()
             return result
 
         delegation_id = str(uuid.uuid4())

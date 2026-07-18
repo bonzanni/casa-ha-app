@@ -36,9 +36,58 @@ from channels.voice.prosodic import ProsodicSplitter
 from channels.voice.routes import VoiceRouteRegistry, VoiceWsConnection
 from channels.voice.session import VoiceSessionPool
 from channels.voice.tts_adapter import TagDialectAdapter
+from job_registry import JobTransitionError, VoiceJob
 from semantic_memory import SemanticMemory
 
 logger = logging.getLogger(__name__)
+
+
+class VoiceHandoffCoordinator:
+    """Send and acknowledge durable handoffs on authenticated routes only."""
+
+    def __init__(self, registry: Any) -> None:
+        self._registry = registry
+
+    @staticmethod
+    def _frame(job: VoiceJob) -> dict[str, Any]:
+        """Build the intentionally metadata-only coordinator frame."""
+        return {
+            "type": "voice_handoff",
+            "protocol": 2,
+            "job_id": job.id,
+            "handoff_id": job.handoff_id,
+            "specialist_display_name": job.specialist_display_name,
+        }
+
+    async def route_connected(self, route: Any) -> None:
+        """Reoffer only this route's persisted pending acknowledgements."""
+        route_id = _nonempty_identifier(getattr(route, "route_id", None))
+        if route_id is None:
+            return
+        for job in self._registry.pending_handoffs_for_route(route_id):
+            await route.send_json(self._frame(job))
+
+    async def handle(self, route: Any, frame: Mapping[str, Any]) -> None:
+        """Accept a receipt only for the server-bound route that owns it."""
+        if (
+            frame.get("type") != "handoff_received"
+            or frame.get("protocol") != 2
+        ):
+            return
+        job_id = _nonempty_identifier(frame.get("job_id"))
+        handoff_id = _nonempty_identifier(frame.get("handoff_id"))
+        route_id = _nonempty_identifier(getattr(route, "route_id", None))
+        if job_id is None or handoff_id is None or route_id is None:
+            return
+        job = self._registry.get(job_id)
+        if job is None or job.origin_route_id != route_id:
+            return
+        try:
+            await self._registry.acknowledge_handoff(job_id, handoff_id)
+        except JobTransitionError:
+            # A duplicate receipt is idempotent in the registry; mismatched
+            # IDs and stale lifecycle rows are intentionally silent here.
+            return
 
 
 def _nonempty_identifier(value: Any) -> str | None:
@@ -159,6 +208,7 @@ class VoiceChannel(Channel):
         monotonic: Callable[[], float] = time.monotonic,
         route_registry: VoiceRouteRegistry | None = None,
         delivery_coordinator: Any | None = None,
+        handoff_coordinator: VoiceHandoffCoordinator | None = None,
     ) -> None:
         self._bus = bus
         self.default_agent = default_agent
@@ -179,6 +229,7 @@ class VoiceChannel(Channel):
             agent_configs=agent_configs,
         )
         self._delivery = delivery_coordinator
+        self._handoff = handoff_coordinator
 
     # --- Channel ABC --------------------------------------------------
 
@@ -569,6 +620,8 @@ class VoiceChannel(Channel):
                     bound = await self.routes.register(connection, frame)
                     if bound is not None and self._delivery is not None:
                         await self._delivery.route_connected(bound)
+                    if bound is not None and self._handoff is not None:
+                        await self._handoff.route_connected(bound)
                     continue
 
                 if isinstance(t, str) and t.startswith("job_"):
@@ -577,8 +630,19 @@ class VoiceChannel(Channel):
                     continue
 
                 if t == "handoff_received":
-                    # A handoff receipt is Casa-to-integration protocol output.
-                    # Never let an unregistered client-side echo create work.
+                    route_id = _nonempty_identifier(
+                        getattr(connection, "voice_route_id", None)
+                    )
+                    bound = (
+                        self.routes.get_connected(route_id)
+                        if route_id is not None else None
+                    )
+                    if (
+                        bound is not None
+                        and bound.connection is connection
+                        and self._handoff is not None
+                    ):
+                        await self._handoff.handle(bound, frame)
                     continue
 
                 if t == "stt_start":
