@@ -31,6 +31,7 @@ def test_reserved_context_keys_are_exactly_the_spec_set():
         "_voice_route_id", "_voice_route_capabilities",
         "_voice_job_control_id",
         "_origin_device_id", "_voice_transport",
+        "_voice_handoff_reservation",
     })
 
 
@@ -57,6 +58,7 @@ class TestSanitizeExternalContext:
             "_voice_job_control_id": "spoofed-control",
             "_origin_device_id": "spoofed-device",
             "_voice_transport": "ws",
+            "_voice_handoff_reservation": Mock(),
         }
         out = sanitize_external_context(ctx)
         assert out == {"chat_id": "1", "cid": "abc"}

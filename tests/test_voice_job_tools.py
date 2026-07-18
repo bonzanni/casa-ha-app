@@ -64,7 +64,7 @@ def voice_origin(**overrides) -> dict:
         "voice_transport": "ws",
         "voice_route_id": "entry-1",
         "voice_route_capabilities": frozenset({
-            "background_jobs", "satellite_announce",
+            "background_jobs", "satellite_announce", "voice_handoff",
         }),
         "origin_device_id": "device-kitchen",
         "voice_job_control_id": "entry-1",
@@ -464,10 +464,12 @@ async def test_tool_uses_live_route_freshness_at_launch_and_completion(
     connection = VoiceWsConnection(_Socket())
     await routes.register(connection, {
         "type": "voice_route_register",
-        "protocol": 1,
+        "protocol": 2,
         "route_id": "entry-1",
         "agent_role": "concierge",
-        "capabilities": ["background_jobs", "satellite_announce"],
+        "capabilities": [
+            "background_jobs", "satellite_announce", "voice_handoff",
+        ],
     })
     await routes.disconnect(connection)
     monkeypatch.setattr(
