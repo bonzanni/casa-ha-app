@@ -274,3 +274,57 @@ def test_conduct_silent_yield_counterexample_is_verbatim():
         "for the operator's answer before proceeding."
     )
     assert exact in raw
+
+
+# --- round 6 (P1-A / P3, Task 3) additions ----------------------------------
+#
+# P1-A: mirror the canonical plan into TodoWrite for operator visibility
+# (display authority, not execution authority; updates land BEFORE an
+# ask/terminal boundary; the checklist never replaces required `ask` buttons
+# or ask-then-stop). P3: when narration is otherwise permitted, narrate in
+# complete sentences and never end a segment with a dangling colon
+# announcing content that won't stream — with explicit precedence under
+# ask-then-stop / end-turns-silently / buttons-always.
+
+
+@pytest.mark.parametrize("fixture_name", ["conduct_text", "template_text"])
+class TestP1ATodoWriteMirrorPresent:
+    def test_mirror_todowrite_for_visibility(self, fixture_name, request):
+        text = request.getfixturevalue(fixture_name)
+        assert "todowrite" in text
+        assert "operator visibility" in text
+        assert "in_progress" in text
+        assert "completed" in text
+
+    def test_updates_before_ask_terminal_boundary(self, fixture_name, request):
+        text = request.getfixturevalue(fixture_name)
+        assert "before an ask/terminal boundary" in text
+
+    def test_display_authority_not_execution_authority(self, fixture_name, request):
+        text = request.getfixturevalue(fixture_name)
+        assert "display authority" in text
+        assert "execution authority" in text
+        assert "engineering record" in text
+
+    def test_checklist_never_replaces_ask_or_ask_then_stop(self, fixture_name, request):
+        text = request.getfixturevalue(fixture_name)
+        assert "never replaces" in text
+        assert "ask` buttons" in text or "ask buttons" in text
+        assert "ask-then-stop" in text
+
+
+@pytest.mark.parametrize("fixture_name", ["conduct_text", "template_text"])
+class TestP3NarrationCompleteSentencesPresent:
+    def test_complete_sentences_no_dangling_colon(self, fixture_name, request):
+        text = request.getfixturevalue(fixture_name)
+        assert "when narration is otherwise permitted" in text
+        assert "complete sentences" in text
+        assert "colon" in text
+        assert "will not stream" in text
+
+    def test_explicit_precedence_under_existing_rules(self, fixture_name, request):
+        text = request.getfixturevalue(fixture_name)
+        assert "ask-then-stop" in text
+        assert "end-turns-silently" in text
+        assert "buttons-always" in text
+        assert "no narration after an ask" in text
