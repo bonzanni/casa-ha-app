@@ -128,6 +128,58 @@ class _FailingHandoffWs(_RecordingWs):
         self.write_completed.set()
 
 
+class _BlockingBlockWs(_RecordingWs):
+    """Stops a speech write after the channel has selected it."""
+
+    def __init__(self) -> None:
+        super().__init__()
+        self.block_started = asyncio.Event()
+        self.release_block = asyncio.Event()
+
+    async def send_json(self, frame: dict) -> None:
+        self.frames.append(frame)
+        if frame["type"] == "block":
+            self.block_started.set()
+            await self.release_block.wait()
+        self.write_completed.set()
+
+
+class _HandoffThenErrorBus(_HandoffingBus):
+    """A late foreground error must lose to the durable handoff."""
+
+    async def request(self, msg: BusMessage, timeout: float) -> None:
+        reservation = msg.context["_voice_handoff_reservation"]
+        assert reservation.reserve() is True
+        self.specialist_task = asyncio.create_task(asyncio.Event().wait())
+        reservation.commit(_HandoffJob())
+        await msg.context["_error_sink"]("sdk_error", "not after handoff")
+        try:
+            await asyncio.Event().wait()
+        except asyncio.CancelledError:
+            self.request_cancelled.set()
+            raise
+
+
+class _ReserveDuringSpeechBus:
+    def __init__(self, ws: _BlockingBlockWs) -> None:
+        self._ws = ws
+        self.reserved_during_write: bool | None = None
+
+    async def request(self, msg: BusMessage, timeout: float) -> BusMessage:
+        writing = asyncio.create_task(msg.context["_on_token"]("Spoken."))
+        await self._ws.block_started.wait()
+        reservation = msg.context["_voice_handoff_reservation"]
+        self.reserved_during_write = reservation.reserve()
+        if self.reserved_during_write:
+            reservation.commit(_HandoffJob())
+        self._ws.release_block.set()
+        await writing
+        return BusMessage(
+            type=MessageType.RESPONSE, source="concierge", target="voice",
+            content="Spoken.", channel="voice", context=msg.context,
+        )
+
+
 @pytest.fixture
 async def ws_app():
     telemetry_clock = iter((20.0, 20.250))
@@ -218,6 +270,43 @@ async def unsigned_route_ws_app():
 
 @pytest.mark.asyncio
 class TestWSTurn:
+    async def test_handoff_suppresses_a_late_foreground_error(self):
+        bus = _HandoffThenErrorBus()
+        channel = VoiceChannel(
+            bus=bus, default_agent="concierge", webhook_secret="",
+            sse_path="/api/converse", ws_path="/api/converse/ws",
+            agent_configs={"concierge": _FakeCfg()}, memory=AsyncMock(),
+            idle_timeout=300,
+        )
+        ws = _RecordingWs()
+
+        await channel._run_ws_utterance(
+            ws, {"agent_role": "concierge", "text": "ask finance"},
+            "utterance-1", asyncio.get_running_loop().time() + 20,
+        )
+
+        assert [frame["type"] for frame in ws.frames] == ["handoff"]
+        bus.specialist_task.cancel()
+        await asyncio.gather(bus.specialist_task, return_exceptions=True)
+
+    async def test_speech_selection_rejects_handoff_during_block_write(self):
+        ws = _BlockingBlockWs()
+        bus = _ReserveDuringSpeechBus(ws)
+        channel = VoiceChannel(
+            bus=bus, default_agent="concierge", webhook_secret="",
+            sse_path="/api/converse", ws_path="/api/converse/ws",
+            agent_configs={"concierge": _FakeCfg()}, memory=AsyncMock(),
+            idle_timeout=300,
+        )
+
+        await channel._run_ws_utterance(
+            ws, {"agent_role": "concierge", "text": "speak"},
+            "utterance-1", asyncio.get_running_loop().time() + 20,
+        )
+
+        assert bus.reserved_during_write is False
+        assert "handoff" not in [frame["type"] for frame in ws.frames]
+
     async def test_handoff_ends_only_the_foreground_request_after_its_frame(
         self,
     ):
