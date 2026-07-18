@@ -123,9 +123,11 @@ Casa exposes two transports for Home Assistant voice / generic voice clients. Th
 - `/api/converse/ws` — persistent WebSocket. Conversation frames include
   inbound `stt_start`, `utterance`, `stage`, and `cancel`, with outbound
   `block`, `done`, and `error`. A Home Assistant integration may also register
-  an authenticated protocol-1 delivery route. Casa accepts background work
-  only after that exact socket has acknowledged both `background_jobs` and
-  `satellite_announce`; old or unacknowledged integrations stay synchronous.
+  an authenticated protocol-2 delivery route. Concierge specialist handoff
+  requires that exact socket to acknowledge the complete coordinated capability
+  set: `background_jobs`, `satellite_announce`, and `voice_handoff`. Missing
+  protocol 2 or any one capability fails closed before Casa creates a job;
+  there is no legacy handoff fallback.
 
 ### Voice-agent discovery
 
@@ -173,12 +175,15 @@ how high the option is set.
 
 ### Background specialist voice jobs
 
-A specialist-capable voice resident such as Gary can acknowledge a hand-off
-quickly, end the current voice turn, and keep its own resident context free of
-the result. The specialist runs in an isolated session. When it finishes, Casa
-passes only a policy-approved spoken summary to the Home Assistant companion
+Concierge (Gary) can acknowledge a specialist hand-off quickly, end the current
+voice turn, and keep its own resident context free of the result. Speak the
+specialist request, hear the acknowledgement, then continue speaking or cancel
+normally; Casa delivers the completed result when the originating satellite is
+idle. The specialist runs in an isolated session. When it finishes, Casa passes
+only a policy-approved spoken summary to the Home Assistant companion
 integration; full output, citations, and private detail are never injected back
-into Gary's SDK session.
+into Gary's SDK session. Butler (Tina) keeps its direct, immediate home-control
+behaviour and does not use this asynchronous specialist handoff.
 
 Home Assistant announces a queued summary immediately when the originating
 satellite is already idle. If it is listening, processing, or responding, the
@@ -195,11 +200,14 @@ results normally announce only that a result is ready; an explicit detail
 request is still identity/clearance checked and does not add result tokens to
 Gary's context.
 
-Background mode requires a currently or recently registered, HMAC-authenticated
-protocol-1 WebSocket route. SSE and older integrations continue to support
-synchronous turns but do not accept background work. Delivery is intentionally
-at least once: if audio succeeds but its acknowledgement is lost, a concise
-summary can repeat after restart rather than disappear.
+Background handoff requires a currently or recently registered,
+HMAC-authenticated protocol-2 WebSocket route with all three coordinated
+capabilities: `background_jobs`, `satellite_announce`, and `voice_handoff`.
+SSE supports synchronous turns but never handoff; an older or incomplete
+WebSocket registration is refused before job creation rather than falling back.
+Delivery is intentionally at least once: if audio succeeds but its
+acknowledgement is lost, a concise summary can repeat after restart rather than
+disappear.
 
 The HMAC signature over the empty HTTP upgrade request body authenticates the
 Home Assistant client only when the WebSocket is established. It does not

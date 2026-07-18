@@ -11,6 +11,7 @@ import agent as agent_mod
 import tools
 from bus import MessageBus, MessageType
 from channels import ChannelManager
+from channels.voice.channel import VoiceHandoffReservation
 from config import AgentConfig, CharacterConfig, DelegateEntry
 from job_registry import ExecutionState, JobRegistry
 from specialist_limits import SpecialistLimiter
@@ -22,6 +23,8 @@ pytestmark = [pytest.mark.unit, pytest.mark.asyncio]
 
 
 def _origin() -> dict:
+    reservation = VoiceHandoffReservation()
+    reservation.bind_commit(lambda _job: None)
     return {
         "role": "concierge",
         "execution_role": "concierge",
@@ -33,10 +36,11 @@ def _origin() -> dict:
         "voice_transport": "ws",
         "voice_route_id": "entry-1",
         "voice_route_capabilities": frozenset({
-            "background_jobs", "satellite_announce",
+            "background_jobs", "satellite_announce", "voice_handoff",
         }),
         "origin_device_id": "device-kitchen",
         "voice_job_control_id": "entry-1",
+        "_voice_handoff_reservation": reservation,
     }
 
 
