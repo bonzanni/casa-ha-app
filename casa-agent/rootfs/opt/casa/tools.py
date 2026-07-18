@@ -2534,8 +2534,13 @@ async def delegate_to_agent(args: dict) -> dict:
     # (Task 6, spec §4.6) is the concurrency slot this delegation now owns —
     # the caller owns its lifetime from here: sync/async releases via the
     # task done-callback; interactive hands it to the engagement record.
-    cfg, resolution, permit, prelaunch_error = await _prelaunch(
-        agent_name, origin, mode, task_text, context_text)
+    try:
+        cfg, resolution, permit, prelaunch_error = await _prelaunch(
+            agent_name, origin, mode, task_text, context_text)
+    except BaseException:
+        if handoff_reservation is not None:
+            handoff_reservation.release()
+        raise
     if prelaunch_error is not None:
         if handoff_reservation is not None:
             handoff_reservation.release()
