@@ -638,7 +638,10 @@ class TestEngagementButtonsReminderWired:
     ``_wire_engagement_buttons_reminder`` at the same two sites as the
     permission relay (public-8099 fallback + internal socket)."""
 
-    def test_policy_registered_under_skill_matcher(self):
+    async def test_policy_registered_under_skill_matcher(self):
+        # async to satisfy the module-level asyncio pytestmark (the assertion
+        # body is synchronous) — avoids the "marked asyncio but not async"
+        # PytestWarning while keeping output pristine.
         from unittest.mock import MagicMock
         from casa_core import _wire_engagement_buttons_reminder
 
