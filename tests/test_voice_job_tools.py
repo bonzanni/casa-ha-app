@@ -24,6 +24,7 @@ from config import AgentConfig, CharacterConfig, DelegateEntry
 from job_registry import (
     DeliveryState,
     ExecutionState,
+    HandoffState,
     JobFailure,
     JobRegistry,
     VoiceJob,
@@ -134,6 +135,22 @@ class _ControlledRunner:
         await self.outputs.put(exc)
 
 
+class _Reservation:
+    def __init__(self) -> None:
+        self.reserved = 0
+        self.released = 0
+        self.committed: list[VoiceJob] = []
+
+    def reserve(self) -> None:
+        self.reserved += 1
+
+    def release(self) -> None:
+        self.released += 1
+
+    def commit(self, job: VoiceJob) -> None:
+        self.committed.append(job)
+
+
 class ToolEnv:
     def __init__(
         self,
@@ -238,6 +255,21 @@ async def test_voice_async_accepts_and_returns_only_opaque_metadata(tool_env):
     assert job.origin_device_id == "device-kitchen"
     assert job.task == "Does this target?"
     assert tool_env.limiter.in_flight == 1
+
+
+@pytest.mark.asyncio
+async def test_handoff_commit_follows_durable_pending_latch(tool_env):
+    reservation = _Reservation()
+    origin = voice_origin(_voice_handoff_reservation=reservation)
+
+    payload = tool_payload(await tool_env.invoke_delegate(origin, mode="sync"))
+    job = tool_env.job_registry.get(payload["job_id"])
+
+    assert job.handoff_state is HandoffState.PENDING
+    assert job.handoff_id is not None
+    assert reservation.reserved == 1
+    assert reservation.released == 0
+    assert reservation.committed == [job]
 
 
 @pytest.mark.asyncio

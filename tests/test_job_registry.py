@@ -12,6 +12,7 @@ import pytest
 from job_registry import (
     DeliveryState,
     ExecutionState,
+    HandoffState,
     JobAuthorizationError,
     JobFailure,
     JobRegistry,
@@ -115,6 +116,58 @@ async def test_create_is_atomic_and_survives_reload(tmp_path):
     reloaded = JobRegistry(tmp_path / "jobs.json", tmp_path / "delegations.json")
     await reloaded.load()
     assert reloaded.get("job-1") == make_job()
+
+
+async def test_handoff_latch_round_trips_and_receipt_is_idempotent(tmp_path):
+    registry = await loaded_registry(tmp_path, make_job())
+
+    pending = await registry.mark_handoff_pending("job-1", "handoff-1")
+    assert pending.handoff_id == "handoff-1"
+    assert pending.handoff_state is HandoffState.PENDING
+
+    received = await registry.acknowledge_handoff("job-1", "handoff-1")
+    assert received.handoff_state is HandoffState.RECEIVED
+    assert await registry.acknowledge_handoff("job-1", "handoff-1") == received
+    with pytest.raises(JobTransitionError):
+        await registry.acknowledge_handoff("job-1", "other-handoff")
+
+    reloaded = JobRegistry(tmp_path / "jobs.json", tmp_path / "delegations.json")
+    await reloaded.load()
+    assert reloaded.get("job-1") == received
+
+
+async def test_legacy_snapshot_defaults_handoff_latch_to_none(tmp_path):
+    registry = await loaded_registry(tmp_path, make_job())
+    snapshot = json.loads((tmp_path / "jobs.json").read_text())
+    snapshot[0].pop("handoff_id", None)
+    snapshot[0].pop("handoff_state", None)
+    (tmp_path / "jobs.json").write_text(json.dumps(snapshot))
+
+    reloaded = JobRegistry(tmp_path / "jobs.json", tmp_path / "delegations.json")
+    await reloaded.load()
+    job = reloaded.get("job-1")
+    assert job.handoff_id is None
+    assert job.handoff_state is HandoffState.NONE
+
+
+async def test_pending_handoff_survives_orphan_recovery_but_cancelled_does_not(
+    tmp_path,
+):
+    registry = await loaded_registry(tmp_path, make_job())
+    await registry.mark_handoff_pending("job-1", "handoff-1")
+
+    await registry.recover_after_restart()
+    assert [job.id for job in registry.pending_handoffs_for_route("entry-1")] == [
+        "job-1",
+    ]
+    assert registry.get("job-1").execution_state is ExecutionState.ORPHANED
+
+    await registry.create(make_job(id="job-2"))
+    await registry.mark_handoff_pending("job-2", "handoff-2")
+    await registry.request_cancel("job-2", actor=actor_for_job())
+    assert [job.id for job in registry.pending_handoffs_for_route("entry-1")] == [
+        "job-1",
+    ]
 
 
 async def test_multiple_terminal_jobs_survive_reload_in_delivery_order(tmp_path):

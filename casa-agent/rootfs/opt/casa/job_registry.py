@@ -43,6 +43,14 @@ class DeliveryState(StrEnum):
     EXPIRED = "EXPIRED"
 
 
+class HandoffState(StrEnum):
+    """Durable acknowledgement latch for a voice specialist handoff."""
+
+    NONE = "NONE"
+    PENDING = "PENDING"
+    RECEIVED = "RECEIVED"
+
+
 @dataclass(frozen=True)
 class JobFailure:
     """Stable failure envelope safe to persist and deliver after restart."""
@@ -87,6 +95,10 @@ class VoiceJob:
     # None is the backward-compatible legacy row shape, which remains scoped
     # to ``scope_id`` exactly as before this field existed.
     job_control_id: str | None = None
+    # Separate from delivery state: this records that the integration has
+    # acknowledged the foreground-to-background handoff frame.
+    handoff_id: str | None = None
+    handoff_state: HandoffState = HandoffState.NONE
 
 
 @dataclass(frozen=True)
@@ -600,6 +612,74 @@ class JobRegistry:
                 candidate, after_publish=publish_runtime_ownership,
             )
             return event
+
+    async def mark_handoff_pending(
+        self, job_id: str, handoff_id: str,
+    ) -> VoiceJob:
+        """Durably arm a route-bound handoff before its frame is emitted."""
+        if not isinstance(handoff_id, str) or not handoff_id.strip():
+            raise ValueError("handoff id must not be empty")
+        async with self._lock:
+            current = self._require_job(job_id)
+            if not current.origin_route_id:
+                raise JobTransitionError(
+                    f"job {job_id!r} is not bound to a voice route"
+                )
+            if current.handoff_id not in {None, handoff_id}:
+                raise self._transition_error(
+                    current, "mark_handoff_pending", expected="matching handoff id",
+                )
+            if current.handoff_state is HandoffState.RECEIVED:
+                raise self._transition_error(
+                    current, "mark_handoff_pending", expected="handoff not received",
+                )
+            if current.handoff_state is HandoffState.PENDING:
+                return current
+            return await self._persist_job_locked(replace(
+                current,
+                handoff_id=handoff_id,
+                handoff_state=HandoffState.PENDING,
+            ))
+
+    async def acknowledge_handoff(
+        self, job_id: str, handoff_id: str,
+    ) -> VoiceJob:
+        """Compare-and-set a handoff acknowledgement without state regression."""
+        if not isinstance(handoff_id, str) or not handoff_id.strip():
+            raise ValueError("handoff id must not be empty")
+        async with self._lock:
+            current = self._require_job(job_id)
+            if current.handoff_id != handoff_id:
+                raise self._transition_error(
+                    current, "acknowledge_handoff", expected="matching handoff id",
+                )
+            if current.handoff_state is HandoffState.RECEIVED:
+                return current
+            if current.handoff_state is not HandoffState.PENDING:
+                raise self._transition_error(
+                    current, "acknowledge_handoff", expected="handoff=PENDING",
+                )
+            return await self._persist_job_locked(replace(
+                current, handoff_state=HandoffState.RECEIVED,
+            ))
+
+    def pending_handoffs_for_route(self, route_id: str) -> list[VoiceJob]:
+        """Return pending, still-deliverable handoffs for one bound route."""
+        if not isinstance(route_id, str) or not route_id.strip():
+            return []
+        return [
+            job for job in self.all()
+            if (
+                job.origin_route_id == route_id
+                and job.handoff_state is HandoffState.PENDING
+                and job.handoff_id is not None
+                and not job.cancel_pending
+                and job.execution_state is not ExecutionState.CANCELLED
+                and job.delivery_state not in {
+                    DeliveryState.CANCELLED, DeliveryState.EXPIRED,
+                }
+            )
+        ]
 
     async def finish(self, job_id: str, result: str) -> VoiceJob:
         """Persist a successful terminal execution and queue voice delivery."""
@@ -1197,6 +1277,8 @@ class JobRegistry:
                 job_control_id=JobRegistry._optional_str(
                     row.get("job_control_id")
                 ),
+                handoff_id=JobRegistry._optional_str(row.get("handoff_id")),
+                handoff_state=HandoffState(row.get("handoff_state", "NONE")),
             )
         except (KeyError, TypeError, ValueError) as exc:
             raise JobRegistryError(f"invalid job snapshot row: {exc}") from exc
@@ -1238,6 +1320,8 @@ class JobRegistry:
             "orphan_notification_pending": job.orphan_notification_pending,
             "prompted_delivery": job.prompted_delivery,
             "job_control_id": job.job_control_id,
+            "handoff_id": job.handoff_id,
+            "handoff_state": job.handoff_state.value,
         }
 
     async def _write_snapshot_locked(

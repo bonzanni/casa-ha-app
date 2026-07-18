@@ -11,12 +11,13 @@ import pytest
 from unittest.mock import AsyncMock
 
 from bus import BusMessage, MessageBus, MessageType
-from channels.voice.channel import VoiceChannel
+from channels.voice.channel import VoiceChannel, VoiceHandoffCoordinator
 from channels.voice.delivery import VoiceDeliveryCoordinator
 from channels.voice.routes import VoiceRouteRegistry, VoiceWsConnection
 from job_registry import (
     DeliveryState,
     ExecutionState,
+    HandoffState,
     JobRegistry,
     VoiceJob,
 )
@@ -152,6 +153,43 @@ def _frame(frame_type: str, offer: dict, **changes) -> dict:
     }
 
 
+async def test_handoff_reoffer_is_route_scoped_and_receipt_stops_replay(
+    tmp_path,
+):
+    registry = JobRegistry(tmp_path / "jobs.json", tmp_path / "delegations.json")
+    await registry.load()
+    await registry.create(_ready_job(
+        "job-1", sequence=1, device="kitchen",
+        execution_state=ExecutionState.RUNNING,
+        delivery_state=DeliveryState.NONE,
+        terminal_at=None,
+        result=None,
+    ))
+    await registry.mark_handoff_pending("job-1", "handoff-1")
+    coordinator = VoiceHandoffCoordinator(registry)
+    route = _Route()
+
+    await coordinator.route_connected(route)
+    assert route.sent == [{
+        "type": "voice_handoff", "protocol": 2,
+        "job_id": "job-1", "handoff_id": "handoff-1",
+        "specialist_display_name": "Judge",
+    }]
+
+    await coordinator.route_connected(route)
+    assert route.sent[-1] == route.sent[0]
+
+    await coordinator.handle(route, {
+        "type": "handoff_received", "protocol": 2,
+        "job_id": "job-1", "handoff_id": "handoff-1",
+        "task": "CLIENT_TEXT_MUST_NOT_BE_USED",
+    })
+    assert registry.get("job-1").handoff_state is HandoffState.RECEIVED
+
+    await coordinator.route_connected(route)
+    assert len(route.sent) == 2
+
+
 async def test_shared_writer_interleaves_utterances_and_delivery_protocol(
     tmp_path,
 ):
@@ -171,10 +209,12 @@ async def test_shared_writer_interleaves_utterances_and_delivery_protocol(
     )
     bound = await routes.register(connection, {
         "type": "voice_route_register",
-        "protocol": 1,
+        "protocol": 2,
         "route_id": "entry-1",
         "agent_role": "concierge",
-        "capabilities": ["background_jobs", "satellite_announce"],
+        "capabilities": [
+            "background_jobs", "satellite_announce", "voice_handoff",
+        ],
     })
     assert bound is not None
     coordinator = VoiceDeliveryCoordinator(jobs, routes)
@@ -420,10 +460,12 @@ async def test_recently_disconnected_route_accepts_then_waits_and_reoffers(
     first = VoiceWsConnection(first_raw)
     await routes.register(first, {
         "type": "voice_route_register",
-        "protocol": 1,
+        "protocol": 2,
         "route_id": "entry-1",
         "agent_role": "concierge",
-        "capabilities": ["background_jobs", "satellite_announce"],
+        "capabilities": [
+            "background_jobs", "satellite_announce", "voice_handoff",
+        ],
     })
     await routes.disconnect(first)
     now[0] = 159.0
@@ -462,10 +504,12 @@ async def test_recently_disconnected_route_accepts_then_waits_and_reoffers(
     second = VoiceWsConnection(second_raw)
     bound = await routes.register(second, {
         "type": "voice_route_register",
-        "protocol": 1,
+        "protocol": 2,
         "route_id": "entry-1",
         "agent_role": "concierge",
-        "capabilities": ["background_jobs", "satellite_announce"],
+        "capabilities": [
+            "background_jobs", "satellite_announce", "voice_handoff",
+        ],
     })
     await coordinator.route_connected(bound)
     assert [
