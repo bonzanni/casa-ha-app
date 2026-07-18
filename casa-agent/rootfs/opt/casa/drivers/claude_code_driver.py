@@ -4049,7 +4049,10 @@ class ClaudeCodeDriver(DriverProtocol):
                     await summary.submit_activity(activity_for_tool(name))
                     plan = extract_plan(name, payload.get("input") or {})
                     if plan is not None:
-                        await summary.submit_plan(**plan)
+                        # §5 P1-B r4: forward the relay's ordering coordinate
+                        # ``(segment, offset, block_ordinal)`` VERBATIM so the
+                        # controller can reject a stale/duplicate plan frame.
+                        await summary.submit_plan(**plan, seq=payload.get("seq"))
         elif kind == "result":
             self._epoch_pending[eng_id] = None
             self._turn_running[eng_id] = False

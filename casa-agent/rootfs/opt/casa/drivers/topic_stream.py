@@ -1672,7 +1672,7 @@ class TopicStreamRelay:
             return
         fired_mutating = False
         flushed_buffer = False
-        for block in blocks:
+        for block_ordinal, block in enumerate(blocks):
             if block[0] == "text":
                 await self._append_narration(block[1], seg, off_after, message_id)
                 if self._dropped:
@@ -1705,9 +1705,21 @@ class TopicStreamRelay:
                 # only — replay never reaches _handle_assistant_blocks), so the
                 # controller derives post-recovery state from the lifecycle
                 # alone and never from stale, replayed tool frames.
+                # v0.91.0 (§5 P1-B r4): stamp a total-order ordering coordinate
+                # ``(segment, offset, block_ordinal)`` — the relay frame
+                # coordinate PLUS this tool_use block's index within the frame,
+                # so two TodoWrite blocks in ONE assistant frame get distinct,
+                # ordered sequences. The controller's plan watermark rejects a
+                # frame ≤ this. Passed verbatim through to ``submit_plan``.
                 await _maybe_await(
                     self.on_turn_event(
-                        "tool_use", {"tool": name, "input": tool_input})
+                        "tool_use",
+                        {
+                            "tool": name,
+                            "input": tool_input,
+                            "seq": (tuple(seg), off_after, block_ordinal),
+                        },
+                    )
                 )
                 await self._match_discrete_block(name, tool_input)
 

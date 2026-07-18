@@ -1176,7 +1176,15 @@ async def test_live_tool_use_emits_activity_event(tmp_path):
     )
     cursor = tmp_path / ".stream_cursor.json"
     await _make_relay(tmp_path, cursor, rec, events).run()
-    assert ("tool_use", {"tool": "Bash", "input": {"command": "ls"}}) in events
+    # P1-B r4: the tool_use event now carries an ordering ``seq`` coordinate
+    # ``(segment, offset, block_ordinal)`` stamped at this call site.
+    tool_events = [p for k, p in events if k == "tool_use"]
+    assert len(tool_events) == 1
+    assert tool_events[0]["tool"] == "Bash"
+    assert tool_events[0]["input"] == {"command": "ls"}
+    seq = tool_events[0]["seq"]
+    assert isinstance(seq, tuple) and len(seq) == 3
+    assert seq[2] == 0  # single block → block_ordinal 0
 
 
 async def test_replayed_tool_use_is_suppressed(tmp_path):

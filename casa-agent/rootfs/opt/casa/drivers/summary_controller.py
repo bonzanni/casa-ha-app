@@ -69,6 +69,17 @@ _THROTTLE_S = 10.0        # §5: edits ≥10s apart EXCEPT status-class changes.
 _TICK_S = 60.0            # §5 B1: one edit-eligible elapsed tick per 60s.
 _PLAN_SUBJECT_CAP = 60    # §5 B2: 60-char cap on agent-authored plan subjects.
 
+# -- P1-B (v0.91.0): pinned-summary plan checklist --------------------------
+_MCP_SERVER_CAP = 32      # §5 P1-B: cap the mcp server substring AT SOURCE.
+_GOAL_LINE_CAP = 200      # §5 P1-B: goal line capped at render.
+_OPEN_QS_INLINE_MAX = 3   # §5 P1-B: collapse open-questions beyond 3 entries.
+_SUMMARY_HARD_CAP = 4096  # §5 P1-B: the unconditional final wire bound.
+_WINDOW_BEFORE = 1        # §5 P1-B: window is [anchor−1 … anchor+6].
+_WINDOW_AFTER = 6
+# Per-status checklist marks (done → ☑, active → ▶, pending → ☐).
+_ITEM_MARK: dict[str, str] = {"done": "☑", "active": "▶", "pending": "☐"}
+_ZERO_BUCKETS: dict[str, int] = {"done": 0, "active": 0, "pending": 0}
+
 
 # ---------------------------------------------------------------------------
 # Pure helpers (activity mapping, plan extraction, elapsed, rendering).
@@ -102,33 +113,121 @@ def activity_for_tool(tool_name: str) -> str:
     if name.startswith("mcp__"):
         parts = name.split("__")
         server = parts[1] if len(parts) > 1 and parts[1] else "mcp"
-        return f"using {server} tools"
+        # §5 P1-B: cap the (unbounded) server substring AT SOURCE so the status
+        # line can never blow the 4096 wire bound.
+        return f"using {server[:_MCP_SERVER_CAP]} tools"
     return "working"
 
 
 def sanitize_plan_subject(subject: object) -> str:
-    """Sanitize an agent-authored plan subject (§5 B2).
+    """Sanitize an agent-authored plan subject / checklist label (§5 B2, P1-B).
 
-    UNSAFE-TEXT (v0.78 predicate — control/bidi codepoints incl. newlines) is
-    rejected outright (returns ``""`` so the ``current:`` clause is omitted —
-    a subject with a newline would otherwise break the single-line summary
-    layout); otherwise the subject is capped at 60 characters.
+    FIXED pipeline order (§5 P1-B r3 — summary edits ride the v0.89.0 R2a rich
+    closure): (1) reject UNSAFE-TEXT (v0.78 predicate — control/bidi codepoints
+    incl. newlines) outright (returns ``""``); (2) strip the rich marker chars
+    (``*``, backticks) so a mid-marker cut can never unbalance the rich edit;
+    (3) THEN cap at 60 characters. An all-marker subject empties to ``""`` after
+    step (2). ``'*'*60+'OAuth'`` → ``OAuth`` (NOT capped to 60 stars).
     """
     if not isinstance(subject, str) or not subject:
         return ""
     if is_unsafe_text(subject):
         return ""
-    return subject[:_PLAN_SUBJECT_CAP]
+    stripped = subject.replace("*", "").replace("`", "")
+    return stripped[:_PLAN_SUBJECT_CAP]
+
+
+def _todo_status(todo: object) -> str:
+    """Normalize a todo's status to ``done``/``active``/``pending`` (§5 P1-B r4;
+    unknown or missing status normalizes to ``pending``)."""
+    status = todo.get("status") if isinstance(todo, dict) else None
+    if status == "completed":
+        return "done"
+    if status == "in_progress":
+        return "active"
+    return "pending"
+
+
+def _todo_label(todo: object) -> str | None:
+    """Sanitized checklist label for a todo, or ``None`` when sanitization
+    empties it (§5 P1-B: the ``content`` — the stable task title — falls back to
+    ``activeForm``; empties to ``None`` so the render shows ``—``)."""
+    if not isinstance(todo, dict):
+        return None
+    text = todo.get("content") or todo.get("activeForm") or ""
+    return sanitize_plan_subject(text) or None
+
+
+def _extract_todo_plan(todos: list) -> dict:
+    """Full-scan / bounded-window TodoWrite extraction (§5 P1-B r4).
+
+    Scans the COMPLETE ``todos`` list ONCE (no cap — it is an in-memory list) to
+    compute ``total``, exact done/active/pending counts and the TRUE anchor
+    (first ``in_progress``, else first ``pending``, else the LAST item — the true
+    last, never a truncation point). RETAINS only bounded state: the counts, the
+    window entries ``[{ordinal, status, label|None}]`` for ``[anchor−1 …
+    anchor+6]`` clamped, and per-region ``hidden_before``/``hidden_after``
+    buckets (done/active/pending) attributed during the SAME scan (global counts
+    alone cannot attribute statuses to the two hidden regions, and multiple
+    ``in_progress`` items must sum correctly). Retained state is O(window)
+    regardless of plan size, so the active item is visible with its true ordinal
+    for ANY plan size.
+    """
+    total = len(todos)
+    statuses = [_todo_status(t) for t in todos]
+    done = sum(1 for s in statuses if s == "done")
+
+    anchor: int | None = None
+    for i, s in enumerate(statuses):
+        if s == "active":
+            anchor = i
+            break
+    if anchor is None:
+        for i, s in enumerate(statuses):
+            if s == "pending":
+                anchor = i
+                break
+    if anchor is None and total:
+        anchor = total - 1  # all-completed → the TRUE last item
+
+    subject = ""
+    items: list[dict] = []
+    before = dict(_ZERO_BUCKETS)
+    after = dict(_ZERO_BUCKETS)
+    if total:
+        start = max(0, anchor - _WINDOW_BEFORE)
+        end = min(total - 1, anchor + _WINDOW_AFTER)
+        for i, todo in enumerate(todos):
+            s = statuses[i]
+            if i < start:
+                before[s] += 1
+            elif i > end:
+                after[s] += 1
+            else:
+                label = _todo_label(todo)
+                items.append({"ordinal": i + 1, "status": s, "label": label})
+                if i == anchor:
+                    subject = label or ""
+    return {
+        "done": done,
+        "total": total,
+        "subject": subject,
+        "items": items,
+        "hidden_before": before,
+        "hidden_after": after,
+        "is_todo": True,
+    }
 
 
 def extract_plan(tool_name: str, tool_input: dict) -> dict | None:
     """Derive a plan-progress DESIRED-STATE fragment from a Task*/TodoWrite
-    tool_use payload (§5 B2), or ``None`` when the tool carries no plan.
+    tool_use payload (§5 B2, P1-B), or ``None`` when the tool carries no plan.
 
-    ``TodoWrite`` → ``{done, total, subject}`` from its ``todos`` list (done =
-    completed count; subject = the in-progress item's text). ``Task*`` → a
-    ``{subject}`` fragment only (the sub-agent's description), leaving the
-    done/total counts unchanged. ``subject`` fragments are already sanitized.
+    ``TodoWrite`` → the full-scan/bounded-window fragment (``is_todo=True``):
+    ``{done, total, subject, items, hidden_before, hidden_after}`` — the
+    AUTHORITATIVE display source. ``Task*`` → a ``{subject}`` FALLBACK fragment
+    (``is_todo=False``) only; while a TodoWrite has latched the plan this turn,
+    the controller ignores Task* mutations. ``subject``/labels are sanitized.
     """
     name = tool_name or ""
     inp = tool_input if isinstance(tool_input, dict) else {}
@@ -136,24 +235,10 @@ def extract_plan(tool_name: str, tool_input: dict) -> dict | None:
         todos = inp.get("todos")
         if not isinstance(todos, list):
             return None
-        total = len(todos)
-        done = sum(
-            1 for t in todos
-            if isinstance(t, dict) and t.get("status") == "completed"
-        )
-        subject = ""
-        for t in todos:
-            if isinstance(t, dict) and t.get("status") == "in_progress":
-                subject = t.get("activeForm") or t.get("content") or ""
-                break
-        return {
-            "done": done,
-            "total": total,
-            "subject": sanitize_plan_subject(subject),
-        }
+        return _extract_todo_plan(todos)
     if name.startswith("Task"):
         subject = inp.get("description") or inp.get("prompt") or ""
-        return {"subject": sanitize_plan_subject(subject)}
+        return {"subject": sanitize_plan_subject(subject), "is_todo": False}
     return None
 
 
@@ -167,6 +252,33 @@ def format_elapsed(seconds: float) -> str:
     return f"{total // 3600}h {(total % 3600) // 60:02d}m"
 
 
+def _render_item_line(item: dict) -> str:
+    """One checklist line: ``<mark> <ordinal>. <label|—>`` (§5 P1-B r4)."""
+    mark = _ITEM_MARK.get(item.get("status"), "☐")
+    label = item.get("label")
+    return f"{mark} {item.get('ordinal')}. {label if label else '—'}"
+
+
+def _hidden_count_line(bucket: dict | None, word: str) -> str:
+    """A framing hidden-count line with the per-region status breakdown, or
+    ``""`` when the region is empty (§5 P1-B r4). The active bucket renders only
+    when nonzero: ``… N earlier — k done, p pending`` (or ``… N more — k done,
+    a active, p pending``)."""
+    if not bucket:
+        return ""
+    done = bucket.get("done", 0)
+    active = bucket.get("active", 0)
+    pending = bucket.get("pending", 0)
+    n = done + active + pending
+    if n <= 0:
+        return ""
+    parts = [f"{done} done"]
+    if active > 0:
+        parts.append(f"{active} active")
+    parts.append(f"{pending} pending")
+    return f"… {n} {word} — " + ", ".join(parts)
+
+
 def render_summary(
     *,
     goal_line: str,
@@ -174,6 +286,9 @@ def render_summary(
     plan_done: int | None = None,
     plan_total: int | None = None,
     plan_subject: str = "",
+    plan_items: tuple | list = (),
+    plan_hidden_before: dict | None = None,
+    plan_hidden_after: dict | None = None,
     activity: str | None = None,
     elapsed_str: str = "",
     open_qs: tuple[int, ...] = (),
@@ -200,7 +315,7 @@ def render_summary(
         Plan: 2/5 — current: OAuth setup
         Open questions: Q11
     """
-    lines: list[str] = []
+    lines: list[str | None] = []
     status_line = status
     if activity:
         status_line += f" — {activity}"
@@ -208,15 +323,59 @@ def render_summary(
             status_line += f" · {elapsed_str}"
     lines.append(status_line)
     if goal_line:
-        lines.append(goal_line)
+        # §5 P1-B: cap the (unbounded) goal line at render.
+        gl = goal_line
+        if len(gl) > _GOAL_LINE_CAP:
+            gl = gl[:_GOAL_LINE_CAP] + "…"
+        lines.append(gl)
+    # §5 P1-B r4: the plan block. Checklist presence keys on ``total > 0`` (never
+    # on labels — a marker-only plan still renders). When window entries are
+    # present they REPLACE the redundant ` — current:` clause (the ▶ anchor line
+    # carries the current item); a bare plan fragment keeps the legacy line.
+    item_line_idxs: list[int] = []
     if plan_total:
-        subj = f" — current: {plan_subject}" if plan_subject else ""
-        lines.append(f"Plan: {plan_done or 0}/{plan_total}{subj}")
+        if plan_items:
+            lines.append(f"Plan: {plan_done or 0}/{plan_total}")
+            hb = _hidden_count_line(plan_hidden_before, "earlier")
+            if hb:
+                lines.append(hb)
+            for item in plan_items:
+                item_line_idxs.append(len(lines))
+                lines.append(_render_item_line(item))
+            ha = _hidden_count_line(plan_hidden_after, "more")
+            if ha:
+                lines.append(ha)
+        else:
+            subj = f" — current: {plan_subject}" if plan_subject else ""
+            lines.append(f"Plan: {plan_done or 0}/{plan_total}{subj}")
     if open_qs:
-        lines.append(
-            "Open questions: " + ", ".join(f"Q{n}" for n in open_qs)
-        )
-    return "\n".join(lines)
+        # §5 P1-B: collapse an oversized open-questions set.
+        if len(open_qs) > _OPEN_QS_INLINE_MAX:
+            lines.append(f"⏳ {len(open_qs)} open questions")
+        else:
+            lines.append(
+                "Open questions: " + ", ".join(f"Q{n}" for n in open_qs)
+            )
+
+    def _join() -> str:
+        return "\n".join(ln for ln in lines if ln is not None)
+
+    text = _join()
+    # §5 P1-B r4 (checklist-preserving priority): the unbounded inputs are
+    # already bounded above (activity server-name at source, goal at 200,
+    # open-questions collapsed), so the checklist is the LAST content sacrificed
+    # — drop item lines only if STILL over, bottom-up, before the unconditional
+    # whole-payload truncation. All of this operates on the RAW text BEFORE the
+    # rich closure, so this ≤4096 bound is the wire bound.
+    if len(text) > _SUMMARY_HARD_CAP:
+        for idx in reversed(item_line_idxs):
+            lines[idx] = None
+            text = _join()
+            if len(text) <= _SUMMARY_HARD_CAP:
+                break
+    if len(text) > _SUMMARY_HARD_CAP:
+        text = text[:_SUMMARY_HARD_CAP]
+    return text
 
 
 # ---------------------------------------------------------------------------
@@ -268,6 +427,20 @@ class SummaryController:
         self._plan_done: int | None = None
         self._plan_total: int | None = None
         self._plan_subject = ""
+        # §5 P1-B: the bounded checklist window + per-region hidden buckets.
+        self._plan_items: tuple = ()
+        self._plan_hidden_before: dict = dict(_ZERO_BUCKETS)
+        self._plan_hidden_after: dict = dict(_ZERO_BUCKETS)
+        # §5 P1-B r3: Todo-plan authority latch — set on the first accepted
+        # TodoWrite fragment this turn, reset with the plan lifecycle at the turn
+        # boundary. While latched, Task* fragments never mutate the plan.
+        self._todo_plan_seen_this_turn = False
+        # §5 P1-B r4: plan-frame ordering watermark. ``submit_plan`` rejects a
+        # frame whose sequence is ≤ the watermark (a stale/duplicate frame);
+        # reset with the plan lifecycle at the turn boundary. Any orderable
+        # sequence works — the relay coordinate ``(segment, offset, ordinal)``
+        # OR the in-casa driver's per-turn integer counter.
+        self._plan_seq_watermark: object | None = None
         self._turn_running = False
         self._turn_base: float | None = None  # monotonic base for elapsed
         # Edit throttle + last-rendered (coalescing / no-op).
@@ -383,16 +556,46 @@ class SummaryController:
         done: int | None = None,
         total: int | None = None,
         subject: str | None = None,
+        items: list | tuple | None = None,
+        hidden_before: dict | None = None,
+        hidden_after: dict | None = None,
+        is_todo: bool = False,
+        seq: object | None = None,
     ) -> None:
-        """Merge a plan-progress fragment (§5 B2). ``None`` fields are left
-        unchanged (a Task* subject update keeps the last TodoWrite counts)."""
+        """Merge a plan-progress fragment (§5 B2, P1-B).
+
+        ORDERING (r4): if *seq* is supplied and is ≤ the ordering watermark, the
+        frame is a stale/duplicate and is rejected outright (no mutation, no
+        flush). An accepted frame advances the watermark.
+
+        AUTHORITY (r3 latch): a TodoWrite fragment (``is_todo``) is the
+        authoritative display source — it overwrites the counts, subject,
+        checklist window and hidden buckets, and LATCHES the plan for the turn.
+        While latched, a Task* fragment (``is_todo`` False) NEVER mutates the
+        plan; unlatched, a Task* ``subject`` is the display fallback only.
+        """
         async with self._writing():
-            if done is not None:
+            # Ordering: reject a stale/duplicate frame (≤ watermark).
+            if (
+                seq is not None
+                and self._plan_seq_watermark is not None
+                and seq <= self._plan_seq_watermark
+            ):
+                return
+            if is_todo:
+                self._todo_plan_seen_this_turn = True
                 self._plan_done = done
-            if total is not None:
                 self._plan_total = total
-            if subject is not None:
-                self._plan_subject = subject
+                self._plan_subject = subject or ""
+                self._plan_items = tuple(items or ())
+                self._plan_hidden_before = hidden_before or dict(_ZERO_BUCKETS)
+                self._plan_hidden_after = hidden_after or dict(_ZERO_BUCKETS)
+            elif not self._todo_plan_seen_this_turn:
+                # Task* fallback — display-only, and only while unlatched.
+                if subject is not None:
+                    self._plan_subject = subject
+            if seq is not None:
+                self._plan_seq_watermark = seq
             await self._flush_locked(force=False)
 
     # -- turn lifecycle (elapsed base + tick) -------------------------------
@@ -402,6 +605,15 @@ class SummaryController:
         async with self._writing():
             self._turn_running = True
             self._turn_base = self._now()
+            # §5 P1-B r3/r4: a fresh turn re-opens the plan authority window —
+            # reset the Todo-plan latch and the ordering watermark so the new
+            # turn's first accepted fragment re-establishes authority and no
+            # prior-turn sequence blocks it. (The plan COUNTS/items persist —
+            # the checklist stays visible until the next TodoWrite overwrites
+            # it — mirroring the existing plan_done/total lifecycle; no reset
+            # site is added.)
+            self._todo_plan_seen_this_turn = False
+            self._plan_seq_watermark = None
             self._reconcile_tick_locked()
 
     async def note_turn_end(self) -> None:
@@ -505,6 +717,9 @@ class SummaryController:
             plan_done=self._plan_done,
             plan_total=self._plan_total,
             plan_subject=self._plan_subject,
+            plan_items=self._plan_items,
+            plan_hidden_before=self._plan_hidden_before,
+            plan_hidden_after=self._plan_hidden_after,
             activity=activity,
             elapsed_str=elapsed_str,
             open_qs=open_qs,
