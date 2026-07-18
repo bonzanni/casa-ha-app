@@ -129,6 +129,13 @@ class TestActivityMapping:
     def test_coarse_mapping(self, tool, expected):
         assert activity_for_tool(tool) == expected
 
+    def test_mcp_server_name_capped_at_32(self):
+        # P1-B r4: the mcp server substring is capped at 32 chars AT SOURCE so
+        # the status line cannot blow the 4096 wire bound.
+        long = "s" * 100
+        out = activity_for_tool(f"mcp__{long}__do")
+        assert out == "using " + "s" * 32 + " tools"
+
 
 class TestPlanSanitization:
     def test_unsafe_text_rejected(self):
@@ -148,7 +155,18 @@ class TestPlanSanitization:
         assert sanitize_plan_subject(None) == ""
         assert sanitize_plan_subject("") == ""
 
+    def test_strips_markers_before_cap(self):
+        # P1-B r3 pipeline order: control/bidi → strip ``*``/backticks → 60-cap.
+        # ``'*'*60+'OAuth'`` must strip to ``OAuth`` (NOT be capped to 60 stars).
+        assert sanitize_plan_subject("*" * 60 + "OAuth") == "OAuth"
+        assert sanitize_plan_subject("`code`") == "code"
+        # Marker-only text empties.
+        assert sanitize_plan_subject("***") == ""
+
     def test_todowrite_counts_and_current(self):
+        # P1-B r4: TodoWrite now yields the full-scan/bounded-window fragment —
+        # counts, per-item window entries (label from ``content``), per-region
+        # hidden buckets and the ``is_todo`` authority flag.
         plan = extract_plan(
             "TodoWrite",
             {
@@ -160,21 +178,166 @@ class TestPlanSanitization:
                 ]
             },
         )
-        assert plan == {"done": 1, "total": 3, "subject": "doing b"}
+        assert plan == {
+            "done": 1,
+            "total": 3,
+            "subject": "b",
+            "items": [
+                {"ordinal": 1, "status": "done", "label": "a"},
+                {"ordinal": 2, "status": "active", "label": "b"},
+                {"ordinal": 3, "status": "pending", "label": "c"},
+            ],
+            "hidden_before": {"done": 0, "active": 0, "pending": 0},
+            "hidden_after": {"done": 0, "active": 0, "pending": 0},
+            "is_todo": True,
+        }
 
     def test_todowrite_sanitizes_current(self):
+        # An unsafe (newline) label empties → None (still counted); subject "".
         plan = extract_plan(
             "TodoWrite",
             {"todos": [{"content": "bad\nsubject", "status": "in_progress"}]},
         )
-        assert plan == {"done": 0, "total": 1, "subject": ""}
+        assert plan["done"] == 0
+        assert plan["total"] == 1
+        assert plan["subject"] == ""
+        assert plan["items"] == [
+            {"ordinal": 1, "status": "active", "label": None}
+        ]
+        assert plan["is_todo"] is True
 
     def test_task_subject_only(self):
+        # Task* is a display FALLBACK only (is_todo False) — no counts/items.
         plan = extract_plan("Task", {"description": "spin up a subagent"})
-        assert plan == {"subject": "spin up a subagent"}
+        assert plan == {"subject": "spin up a subagent", "is_todo": False}
 
     def test_non_plan_tool_returns_none(self):
         assert extract_plan("Bash", {"command": "ls"}) is None
+
+
+class TestTodoWindowExtraction:
+    """P1-B r4: full-scan / bounded-window TodoWrite extraction."""
+
+    def test_active_item_visible_with_true_ordinal_of_100(self):
+        # 100 todos: 0-78 completed, 79 in_progress, 80-99 pending. The active
+        # item at ordinal 80 (index 79) is visible with its TRUE ordinal, and
+        # retained state is O(window), not O(100).
+        todos = (
+            [{"content": f"t{i}", "status": "completed"} for i in range(79)]
+            + [{"content": "the active one", "status": "in_progress"}]
+            + [{"content": f"t{i}", "status": "pending"} for i in range(80, 100)]
+        )
+        plan = extract_plan("TodoWrite", {"todos": todos})
+        assert plan["total"] == 100
+        assert plan["done"] == 79
+        ords = [it["ordinal"] for it in plan["items"]]
+        # Window is [anchor-1 .. anchor+6] over index 79 → indices 78..85.
+        assert ords == [79, 80, 81, 82, 83, 84, 85, 86]
+        active = [it for it in plan["items"] if it["status"] == "active"]
+        assert active == [{"ordinal": 80, "status": "active",
+                           "label": "the active one"}]
+        # Hidden regions: 78 done before (indices 0..77), 14 pending after.
+        assert plan["hidden_before"] == {"done": 78, "active": 0, "pending": 0}
+        assert plan["hidden_after"] == {"done": 0, "active": 0, "pending": 14}
+        # Retained window is bounded regardless of plan size.
+        assert len(plan["items"]) == 8
+
+    def test_unknown_status_normalizes_to_pending(self):
+        todos = [
+            {"content": "a", "status": "completed"},
+            {"content": "b", "status": "weird"},
+            {"content": "c"},  # missing status
+        ]
+        plan = extract_plan("TodoWrite", {"todos": todos})
+        assert [it["status"] for it in plan["items"]] == [
+            "done", "pending", "pending",
+        ]
+        # Anchor = first pending (the normalized 'weird' item at index 1).
+        assert plan["subject"] == "b"
+
+    def test_multiple_in_progress_sum_in_hidden_buckets(self):
+        # Two in_progress far apart: the FIRST is the anchor; the second falls
+        # into the hidden-after 'active' bucket (per-region attribution).
+        todos = (
+            [{"content": "a0", "status": "in_progress"}]
+            + [{"content": f"p{i}", "status": "pending"} for i in range(20)]
+            + [{"content": "a21", "status": "in_progress"}]
+        )
+        plan = extract_plan("TodoWrite", {"todos": todos})
+        assert plan["items"][0] == {"ordinal": 1, "status": "active",
+                                    "label": "a0"}
+        assert plan["hidden_after"]["active"] == 1
+
+    def test_all_pending_anchor_is_first(self):
+        todos = [{"content": f"p{i}", "status": "pending"} for i in range(5)]
+        plan = extract_plan("TodoWrite", {"todos": todos})
+        # Anchor = first pending (index 0); window covers all 5.
+        assert plan["subject"] == "p0"
+        assert plan["items"][0] == {"ordinal": 1, "status": "pending",
+                                    "label": "p0"}
+        assert len(plan["items"]) == 5
+
+    def test_all_completed_anchor_is_last(self):
+        todos = [{"content": f"c{i}", "status": "completed"} for i in range(5)]
+        plan = extract_plan("TodoWrite", {"todos": todos})
+        assert plan["done"] == 5
+        # Anchor = the TRUE last item (index 4), not a truncation point.
+        assert plan["subject"] == "c4"
+        assert plan["items"][-1] == {"ordinal": 5, "status": "done",
+                                     "label": "c4"}
+
+    def test_pending_before_active_promotes_anchor(self):
+        # A pending precedes the first in_progress far apart: the single-pass
+        # extraction PROMOTES the provisional pending anchor to the active one,
+        # and the now-before entries are re-bucketed (r6 single-pass rewrite).
+        todos = (
+            [{"content": "p0", "status": "pending"}]
+            + [{"content": f"d{i}", "status": "completed"} for i in range(1, 10)]
+            + [{"content": "the active", "status": "in_progress"}]
+        )
+        plan = extract_plan("TodoWrite", {"todos": todos})
+        # Anchor = the in_progress at index 10 → window [9 .. 10] (clamped end).
+        assert plan["subject"] == "the active"
+        ords = [it["ordinal"] for it in plan["items"]]
+        assert ords == [10, 11]
+        active = [it for it in plan["items"] if it["status"] == "active"]
+        assert active == [{"ordinal": 11, "status": "active",
+                           "label": "the active"}]
+        # Before region: the pending (index 0) + dones 1..8 (index 9 is the
+        # window head). 8 done + 1 pending.
+        assert plan["hidden_before"] == {"done": 8, "active": 0, "pending": 1}
+        assert plan["hidden_after"] == {"done": 0, "active": 0, "pending": 0}
+
+    def test_pending_then_adjacent_active_keeps_both_in_window(self):
+        # [pending, active]: promotion keeps the pending as the anchor−1 head.
+        todos = [
+            {"content": "first", "status": "pending"},
+            {"content": "second", "status": "in_progress"},
+        ]
+        plan = extract_plan("TodoWrite", {"todos": todos})
+        assert plan["subject"] == "second"
+        assert plan["items"] == [
+            {"ordinal": 1, "status": "pending", "label": "first"},
+            {"ordinal": 2, "status": "active", "label": "second"},
+        ]
+        assert plan["hidden_before"] == {"done": 0, "active": 0, "pending": 0}
+
+    def test_marker_only_label_becomes_none_but_still_counts(self):
+        todos = [
+            {"content": "***", "status": "completed"},   # sanitizes to empty
+            {"content": "real", "status": "in_progress"},
+        ]
+        plan = extract_plan("TodoWrite", {"todos": todos})
+        assert plan["total"] == 2
+        assert plan["done"] == 1  # the marker-only DONE item still counts
+        assert plan["items"][0] == {"ordinal": 1, "status": "done",
+                                    "label": None}
+
+    def test_empty_todos_is_zero_total(self):
+        plan = extract_plan("TodoWrite", {"todos": []})
+        assert plan["total"] == 0
+        assert plan["items"] == []
+        assert plan["is_todo"] is True
 
 
 class TestElapsedFormat:
@@ -260,6 +423,133 @@ class TestLayoutExact:
         )
         assert out == "⚙️ working — reading files"
         assert "Now:" not in out
+
+
+class TestChecklistRender:
+    """P1-B r4: the pinned-summary plan checklist render."""
+
+    def _items(self, *specs):
+        return [
+            {"ordinal": o, "status": s, "label": lbl} for (o, s, lbl) in specs
+        ]
+
+    def test_marks_and_true_ordinals(self):
+        out = render_summary(
+            goal_line="Gmail plugin",
+            status=STATUS_WORKING,
+            plan_done=1,
+            plan_total=3,
+            plan_items=self._items(
+                (1, "done", "OAuth setup"),
+                (2, "active", "wire callback"),
+                (3, "pending", "write tests"),
+            ),
+        )
+        assert out == (
+            "⚙️ working\n"
+            "Gmail plugin\n"
+            "Plan: 1/3\n"
+            "☑ 1. OAuth setup\n"
+            "▶ 2. wire callback\n"
+            "☐ 3. write tests"
+        )
+        # The redundant ` — current:` clause is dropped when the checklist renders.
+        assert "current:" not in out
+
+    def test_none_label_renders_dash(self):
+        out = render_summary(
+            goal_line="",
+            status=STATUS_WORKING,
+            plan_done=0,
+            plan_total=2,
+            plan_items=self._items((1, "active", None), (2, "pending", "next")),
+        )
+        assert "▶ 1. —" in out
+        assert "☐ 2. next" in out
+
+    def test_presence_keyed_on_total_not_labels(self):
+        # A marker-only plan (all labels None) still renders — presence keys on
+        # total > 0, never on labels.
+        out = render_summary(
+            goal_line="g",
+            status=STATUS_WORKING,
+            plan_done=0,
+            plan_total=2,
+            plan_items=self._items((1, "active", None), (2, "pending", None)),
+        )
+        assert "Plan: 0/2" in out
+        assert "▶ 1. —" in out
+        assert "☐ 2. —" in out
+
+    def test_hidden_count_lines_with_breakdown(self):
+        out = render_summary(
+            goal_line="",
+            status=STATUS_WORKING,
+            plan_done=80,
+            plan_total=100,
+            plan_items=self._items(
+                (79, "done", "a"), (80, "active", "b"), (81, "pending", "c"),
+            ),
+            plan_hidden_before={"done": 78, "active": 0, "pending": 0},
+            plan_hidden_after={"done": 0, "active": 1, "pending": 18},
+        )
+        assert "… 78 earlier — 78 done, 0 pending" in out
+        # The active bucket renders when nonzero.
+        assert "… 19 more — 0 done, 1 active, 18 pending" in out
+
+    def test_small_plan_no_hidden_lines(self):
+        out = render_summary(
+            goal_line="",
+            status=STATUS_WORKING,
+            plan_done=1,
+            plan_total=2,
+            plan_items=self._items((1, "done", "a"), (2, "active", "b")),
+            plan_hidden_before={"done": 0, "active": 0, "pending": 0},
+            plan_hidden_after={"done": 0, "active": 0, "pending": 0},
+        )
+        assert "earlier" not in out
+        assert "more" not in out
+
+    def test_goal_line_capped_at_200(self):
+        out = render_summary(
+            goal_line="G" * 5000, status=STATUS_WORKING,
+        )
+        goal = out.splitlines()[1]
+        assert goal == "G" * 200 + "…"
+
+    def test_open_questions_collapse_beyond_three(self):
+        out = render_summary(
+            goal_line="", status=STATUS_WAITING_REPLY,
+            open_qs=(1, 2, 3, 4, 5),
+        )
+        assert "⏳ 5 open questions" in out
+        assert "Open questions:" not in out
+        # Three or fewer stay verbatim.
+        out3 = render_summary(
+            goal_line="", status=STATUS_WAITING_REPLY, open_qs=(1, 2, 3),
+        )
+        assert "Open questions: Q1, Q2, Q3" in out3
+
+    def test_goal_flood_does_not_evict_checklist(self):
+        out = render_summary(
+            goal_line="G" * 9000,
+            status=STATUS_WORKING,
+            plan_done=1,
+            plan_total=3,
+            plan_items=self._items(
+                (1, "done", "a"), (2, "active", "b"), (3, "pending", "c"),
+            ),
+        )
+        assert len(out) <= 4096
+        assert "▶ 2. b" in out  # checklist survives the goal flood
+
+    def test_unconditional_4096_truncation(self):
+        # An adversarially long activity is not capped at source here, so the
+        # final whole-payload truncation is the hard wire bound.
+        out = render_summary(
+            goal_line="g", status=STATUS_WORKING, activity="x" * 10000,
+        )
+        assert len(out) <= 4096
 
 
 # ---------------------------------------------------------------------------
@@ -596,3 +886,180 @@ async def test_terminal_copies():
     assert render_summary(goal_line="", status=STATUS_CANCELLED) == "🛑 cancelled"
     assert render_summary(goal_line="", status=STATUS_ERROR) == "⚠️ error"
     assert render_summary(goal_line="", status=STATUS_COMPLETED) == "✅ completed"
+
+
+# ---------------------------------------------------------------------------
+# P1-B: plan checklist — Todo authority latch, ordering watermark, end-to-end.
+# ---------------------------------------------------------------------------
+
+
+def _todo_frag(**over):
+    """A minimal accepted-TodoWrite fragment as produced by ``extract_plan``."""
+    frag = {
+        "done": 0,
+        "total": 2,
+        "subject": "a",
+        "items": [
+            {"ordinal": 1, "status": "active", "label": "a"},
+            {"ordinal": 2, "status": "pending", "label": "b"},
+        ],
+        "hidden_before": {"done": 0, "active": 0, "pending": 0},
+        "hidden_after": {"done": 0, "active": 0, "pending": 0},
+        "is_todo": True,
+    }
+    frag.update(over)
+    return frag
+
+
+class TestTodoAuthorityLatch:
+    async def test_todo_latch_blocks_task_subject_mutation(self):
+        c = _make()
+        await c.submit_plan(**_todo_frag(subject="from todo"))
+        # A later Task* (fallback) fragment must NOT mutate the latched plan.
+        await c.submit_plan(subject="from task", is_todo=False)
+        assert c._plan_subject == "from todo"
+        assert c._plan_total == 2
+        c.shutdown()
+
+    async def test_task_subject_used_only_while_unlatched(self):
+        c = _make()
+        # No TodoWrite yet → a Task* subject IS the display fallback.
+        await c.submit_plan(subject="task subj", is_todo=False)
+        assert c._plan_subject == "task subj"
+        c.shutdown()
+
+    async def test_latch_blocks_task_after_empty_todowrite(self):
+        c = _make()
+        await c.submit_plan(**_todo_frag())
+        # A later TodoWrite([]) keeps the latch (is_todo True), and a Task*
+        # afterward still cannot mutate.
+        await c.submit_plan(
+            done=0, total=0, subject="", items=[],
+            hidden_before={"done": 0, "active": 0, "pending": 0},
+            hidden_after={"done": 0, "active": 0, "pending": 0},
+            is_todo=True,
+        )
+        await c.submit_plan(subject="sneaky", is_todo=False)
+        assert c._plan_subject == ""
+        assert c._plan_total == 0
+        c.shutdown()
+
+
+class TestPlanOrderingWatermark:
+    async def test_stale_relay_coordinate_rejected(self):
+        # Relay path (r6 fix): seq = monotonic per-turn tool-event counter.
+        c = _make()
+        await c.submit_plan(**_todo_frag(subject="new"), seq=4)
+        await c.submit_plan(**_todo_frag(subject="stale"), seq=2)
+        assert c._plan_subject == "new"  # stale-after-new rejected
+        c.shutdown()
+
+    async def test_two_todowrite_blocks_one_frame_distinct_seq(self):
+        # Two TodoWrite blocks in ONE assistant frame get distinct, strictly
+        # increasing counter seqs (r6 fix); the SECOND wins.
+        c = _make()
+        await c.submit_plan(**_todo_frag(subject="first"), seq=1)
+        await c.submit_plan(**_todo_frag(subject="second"), seq=2)
+        assert c._plan_subject == "second"
+        c.shutdown()
+
+    async def test_stale_in_casa_counter_rejected(self):
+        # In-casa driver path: seq is a monotonic per-turn integer counter —
+        # SAME reject-≤ contract.
+        c = _make()
+        await c.submit_plan(**_todo_frag(subject="c5"), seq=5)
+        await c.submit_plan(**_todo_frag(subject="c3"), seq=3)
+        assert c._plan_subject == "c5"
+        c.shutdown()
+
+    async def test_watermark_resets_at_turn_boundary(self):
+        # The watermark resets with the plan lifecycle at the turn boundary, so
+        # a fresh turn's first frame (any seq) is accepted.
+        c = _make()
+        await c.submit_plan(**_todo_frag(subject="t1"), seq=99)
+        await c.note_turn_start()  # fresh turn → watermark + latch reset
+        await c.submit_plan(**_todo_frag(subject="t2"), seq=1)
+        assert c._plan_subject == "t2"
+        c.shutdown()
+
+    async def test_turn_boundary_resets_latch(self):
+        c = _make()
+        await c.submit_plan(**_todo_frag(subject="latched"), seq=1)
+        await c.note_turn_start()  # fresh turn → latch cleared
+        await c.submit_plan(subject="task now allowed", is_todo=False, seq=2)
+        assert c._plan_subject == "task now allowed"
+        c.shutdown()
+
+
+class TestChecklistEndToEnd:
+    async def test_todowrite_driven_checklist_across_two_frames(self):
+        # Two TodoWrite frames through the REAL controller + REAL renderer: the
+        # ☑/▶ marks and true ordinals reach the pinned summary edit.
+        seq = FakeSequencer()
+        clock = Clock()
+        c = _make(seq, clock=clock, message_id=500)
+        # Frame 1: item 1 active.
+        plan1 = extract_plan("TodoWrite", {"todos": [
+            {"content": "OAuth setup", "status": "in_progress"},
+            {"content": "wire callback", "status": "pending"},
+        ]})
+        await c.submit_plan(**plan1, seq=1)
+        assert "▶ 1. OAuth setup" in seq.edits[-1][1]
+        # Frame 2 (past the throttle window): item 1 done, item 2 active.
+        clock.t += 11.0
+        plan2 = extract_plan("TodoWrite", {"todos": [
+            {"content": "OAuth setup", "status": "completed"},
+            {"content": "wire callback", "status": "in_progress"},
+        ]})
+        await c.submit_plan(**plan2, seq=2)
+        rendered = seq.edits[-1][1]
+        assert "☑ 1. OAuth setup" in rendered
+        assert "▶ 2. wire callback" in rendered
+        c.shutdown()
+
+    async def test_hostile_markup_through_real_render(self):
+        # `'*'*60+'OAuth'` sanitizes to `OAuth` end-to-end; no stray markers in
+        # the rendered checklist label.
+        seq = FakeSequencer()
+        c = _make(seq, message_id=500)
+        plan = extract_plan("TodoWrite", {"todos": [
+            {"content": "*" * 60 + "OAuth", "status": "in_progress"},
+        ]})
+        await c.submit_plan(**plan, seq=1)
+        rendered = seq.edits[-1][1]
+        assert "▶ 1. OAuth" in rendered
+        assert "*" not in rendered
+        c.shutdown()
+
+
+class TestActivityAndPlanSameFlush:
+    async def test_todowrite_renders_checklist_in_same_flush(self):
+        # r6 fix: a tool_use carrying a TodoWrite applies BOTH the activity and
+        # the plan under ONE lock with ONE flush — the checklist is visible in
+        # the SAME (first) edit, not deferred to a later event/tick. Earlier, a
+        # prior activity flush consumed the throttle window and starved it.
+        seq = FakeSequencer()
+        c = _make(seq, message_id=500)
+        plan = extract_plan("TodoWrite", {"todos": [
+            {"content": "OAuth setup", "status": "in_progress"},
+        ]})
+        await c.submit_activity_and_plan("planning", **plan, seq=1)
+        assert len(seq.edits) == 1  # ONE flush
+        rendered = seq.edits[-1][1]
+        assert "▶ 1. OAuth setup" in rendered  # checklist in the SAME flush
+        c.shutdown()
+
+    async def test_stale_plan_still_applies_activity(self):
+        # A stale plan seq is rejected, but the activity ALWAYS applies (the
+        # combined op never drops the activity update).
+        seq = FakeSequencer()
+        clock = Clock()
+        c = _make(seq, clock=clock, message_id=500)
+        await c.submit_plan(**_todo_frag(subject="latched"), seq=5)
+        first_subject = c._plan_subject
+        clock.t += 11.0  # clear the throttle so the next flush lands
+        await c.submit_activity_and_plan(
+            "running commands", **_todo_frag(subject="stale"), seq=2)
+        assert c._plan_subject == first_subject  # stale plan rejected
+        assert c._activity == "running commands"  # activity still applied
+        c.shutdown()

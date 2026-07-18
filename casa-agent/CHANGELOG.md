@@ -1,5 +1,23 @@
 # Changelog
 
+## [0.91.0] - 2026-07-18
+
+Engagement topics now show a live task checklist, and streamed updates start
+cleanly.
+
+### Added
+
+- The pinned summary shows the agent's task list as a live checklist (☑ done,
+  ▶ current, ☐ pending) that checks off as work completes, with exact counts
+  for tasks outside the visible window.
+
+### Fixed
+
+- Streamed narration no longer starts a new message with stray blank lines
+  after the agent runs tools.
+- Progress narration reads as complete sentences instead of fragments ending
+  in a colon whose content never arrives.
+
 ## [0.90.0] - 2026-07-18
 
 Concierge specialist questions now acknowledge immediately and deliver their

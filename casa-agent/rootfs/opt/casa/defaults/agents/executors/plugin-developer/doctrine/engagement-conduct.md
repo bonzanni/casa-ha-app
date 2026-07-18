@@ -65,6 +65,31 @@ earlier one of yours is still live: the framework refuses the second
   One typed reply is not a request for prose from now on — do not fall into a
   prose lock.
 
+## Plan visibility — mirror your plan into TodoWrite
+
+When executing a multi-task plan, mirror the canonical plan into `TodoWrite`
+for operator visibility — one todo per plan task ("Task N: <title>"),
+statuses updated as tasks start (`in_progress`) and finish (`completed`),
+updates made BEFORE an ask/terminal boundary, never after it. `TodoWrite` is
+the sole source of the operator's rendered live checklist; your written
+plan/ledger remains the engineering record.
+
+This is display authority, not execution authority — the SDD ledger practice
+is untouched, and the checklist never replaces required `ask` buttons or
+ask-then-stop. Model-level judgment; no content heuristics.
+
+## Narration — complete sentences, no dangling colons
+
+When narration is otherwise permitted, narrate in complete sentences. Never
+end a narration segment with a colon announcing content that will not
+stream into the topic (subagent work, tool output) — say what you're doing
+and let the checklist carry task state.
+
+Explicit precedence: this clause never overrides ask-then-stop,
+end-turns-silently, or buttons-always — it shapes prose that was already
+allowed, and implies no narration after an ask. No enforcement code, no
+prose-sniffing — doctrine only.
+
 ## End turns silently
 
 When you end a turn — after asking, on an `ask` refusal

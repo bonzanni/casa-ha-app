@@ -64,6 +64,7 @@ from channels.output_sequencer import (
 logger = logging.getLogger(__name__)
 
 _MSG_MAX = 3900          # roll to a new topic message past this many chars
+_SEP = "\n\n"            # R3 narration-boundary separator (P2 provenance target)
 _DROP_THRESHOLD = 20     # consecutive Telegram failures before dropping the turn
 _BACKOFF_BASE = 1.0      # seconds
 _BACKOFF_MAX = 30.0      # seconds
@@ -259,6 +260,16 @@ class StreamCursor:
     # RECOVERY-SEALING option; an absent-tolerated additive field honors that
     # intent (no incompatibility, replay converges).
     message_text_lens: list[int] = field(default_factory=list)
+    # P2 (F-LEADSEP, r6): per-message narration separator-provenance flag,
+    # parallel to ``message_ids``. ``True`` iff the live path STRIPPED the
+    # injected ``\n\n`` boundary separator at this message's head (a sealed-open
+    # discarded it — the separator would otherwise render a leading blank line
+    # after a tool burst). Replay skips the sep for exactly these ordinals so
+    # the reconstructed narration is byte-identical to the live wire. NORMALIZED
+    # ON LOAD to ``[False] * len(message_ids)`` (absent/short legacy state pads
+    # with ``False`` — never wholesale-replaces valid flags); a save-time
+    # assertion holds it parallel to ``message_ids``. Additive, legacy=all-False.
+    sep_stripped: list[bool] = field(default_factory=list)
     last_posted_len: int = 0
     dropped_through: dict | None = None
     # D5 Task C3 (Sol r4-3): the ONE minimal persisted exception to the
@@ -271,9 +282,26 @@ class StreamCursor:
     # Absent-tolerated → ``False`` (older checkpoints predate the field).
     hold_pending: bool = False
 
+    def __post_init__(self) -> None:
+        # P2: NORMALIZE sep_stripped parallel to message_ids at EVERY
+        # construction (load AND direct) — pad a short/absent legacy list to
+        # ``[False] * len(message_ids)`` (never wholesale-replace valid flags),
+        # trim an over-long one, before ANY use. A legacy checkpoint (field
+        # absent) becomes all-False; a v0.91+ checkpoint round-trips unchanged.
+        self.sep_stripped = [bool(x) for x in self.sep_stripped]
+        if len(self.sep_stripped) < len(self.message_ids):
+            self.sep_stripped.extend(
+                [False] * (len(self.message_ids) - len(self.sep_stripped))
+            )
+        elif len(self.sep_stripped) > len(self.message_ids):
+            del self.sep_stripped[len(self.message_ids):]
+
     @classmethod
     def load(cls, path: str | os.PathLike[str]) -> "StreamCursor":
-        """Load the cursor; an absent/corrupt file yields an all-zero cursor."""
+        """Load the cursor; an absent/corrupt file yields an all-zero cursor.
+
+        ``sep_stripped`` is normalized parallel to ``message_ids`` in
+        ``__post_init__`` (legacy checkpoints predate the field → all-False)."""
         try:
             with open(path, "rb") as fh:
                 data = json.load(fh)
@@ -286,12 +314,20 @@ class StreamCursor:
             current=data.get("current") or _zero_coord(),
             message_ids=list(data.get("message_ids") or []),
             message_text_lens=list(data.get("message_text_lens") or []),
+            sep_stripped=list(data.get("sep_stripped") or []),
             last_posted_len=int(data.get("last_posted_len") or 0),
             dropped_through=data.get("dropped_through"),
             hold_pending=bool(data.get("hold_pending") or False),
         )
 
     def save(self, path: str | os.PathLike[str]) -> None:
+        # P2 save-time invariant: sep_stripped stays parallel to message_ids
+        # (the relay's cursor helper enforces this on every mutation — this is a
+        # belt-and-suspenders assertion that catches any missed site in tests).
+        assert len(self.sep_stripped) == len(self.message_ids), (
+            "sep_stripped/message_ids length skew: "
+            f"{len(self.sep_stripped)} != {len(self.message_ids)}"
+        )
         atomic_write_json(
             path,
             {
@@ -299,6 +335,7 @@ class StreamCursor:
                 "current": self.current,
                 "message_ids": self.message_ids,
                 "message_text_lens": self.message_text_lens,
+                "sep_stripped": self.sep_stripped,
                 "last_posted_len": self.last_posted_len,
                 "dropped_through": self.dropped_through,
                 "hold_pending": self.hold_pending,
@@ -549,12 +586,39 @@ class TopicStreamRelay:
         self.cursor = StreamCursor()
         # Per-turn in-memory state (never persisted — rebuilt on recovery).
         self._turn_text = ""
+        # §5 P1-B (r6 fix): a relay-owned MONOTONIC per-turn tool-event counter.
+        # Incremented ONCE per tool_use block processed on the LIVE path and
+        # stamped as the plan-frame ordering ``seq`` (below). It is strictly
+        # increasing WITHIN a turn and — unlike the former ``(segment, offset,
+        # block_ordinal)`` coordinate — carries NO file identity, so a mid-turn
+        # log rotation can never make a newer TodoWrite sort lower than an
+        # earlier one (which the controller's ≤-watermark would then reject
+        # forever, freezing the checklist). Reset with the rest of the per-turn
+        # state in ``_reset_turn_state``; the controller's watermark resets on
+        # the same turn boundary.
+        self._tool_event_seq = 0
         # §R3: message.id of the LAST text frame appended to narration (``None``
         # at a turn boundary). A frame whose id differs begins a NEW assistant
         # message → its text is prefixed with a ``\n\n`` separator. Advanced by
         # ``_apply_msg_sep`` — the ONE boundary decision the live path, replay
         # and the held-buffer flush all share, so they stay byte-parallel.
         self._last_text_msg_id: str | None = None
+        # P2 (F-LEADSEP, r6): ORDERED separator-provenance descriptors — absolute
+        # offsets (in ``_per_message_text`` coordinates) of every injected-and-
+        # not-yet-posted ``\n\n`` boundary separator. Appended ON THE LIVE COMMIT
+        # PATH ONLY (``_apply_msg_sep(record=True)``); replay never appends and
+        # this is asserted EMPTY at the replay→live transition. ONE helper owns
+        # every mutation (append/consume/rebase/clear) — no site touches it
+        # directly. Multiple pending injections coexist (throttled tails); the
+        # sealed-open re-plan strips iff the earliest descriptor sits at the
+        # tail's head. NO content matching anywhere — provenance only.
+        self._pending_seps: list[int] = []
+        # P2 replay ordinal invariant: ``j`` = number of COMPLETED recorded
+        # messages whose start-boundary the reconstruction has consumed. Used to
+        # decide, at each replayed ``message.id`` boundary, whether the separator
+        # was stripped live (``sep_stripped[j]``) and must be skipped so the
+        # reconstructed byte-stream matches the wire. Reset every turn boundary.
+        self._replay_j = 0
         self._per_message_text = ""
         # W-R4 (Sol r1-3): length of the CURRENT narration message's text that
         # has actually reached the wire (a send/edit that landed). It tracks
@@ -658,18 +722,68 @@ class TopicStreamRelay:
         self._save()
 
     def _sync_last_len(self) -> None:
-        """Keep ``message_text_lens`` parallel to ``message_ids`` with its last
-        entry == the current message's narration length (the additive replay-
-        boundary field). Prior entries are frozen at each message's final text
-        length, including a SEALED message the live path rolled off of."""
+        """Keep ``message_text_lens`` AND ``sep_stripped`` parallel to
+        ``message_ids`` with the lens' last entry == the current message's
+        narration length (the additive replay-boundary field). Prior entries are
+        frozen at each message's final text length, including a SEALED message
+        the live path rolled off of. P2: sep_stripped is PADDED with ``False``
+        for any id lacking a flag (never overwritten — the flag is authored once
+        at ``_open_message`` time), so this and the openers keep all three lists
+        parallel via ONE routine (Sol r3-MAJOR: clearing message_ids while
+        leaving flags would misalign the next turn)."""
         lens = self.cursor.message_text_lens
+        flags = self.cursor.sep_stripped
         ids = self.cursor.message_ids
         if len(lens) > len(ids):
             del lens[len(ids):]
+        if len(flags) > len(ids):
+            del flags[len(ids):]
         while len(lens) < len(ids):
             lens.append(0)
+        while len(flags) < len(ids):
+            flags.append(False)
         if ids:
             lens[-1] = len(self._per_message_text)
+
+    # -- P2 message-list + separator-provenance helpers ---------------------
+
+    def _open_message(self, mid, text: str, *, sep_stripped: bool) -> None:
+        """Open a NEW narration message ATOMICALLY (Sol r2-3): append its id +
+        its authored ``sep_stripped`` flag, adopt it as the current message
+        (``_per_message_text``/``_posted_len``), and sync the parallel lens.
+        The ONE opener the live commit paths + reconcile route through."""
+        self.cursor.message_ids.append(mid)
+        self.cursor.sep_stripped.append(bool(sep_stripped))
+        self._per_message_text = text
+        self._posted_len = len(text)
+        self._sync_last_len()
+
+    def _reset_message_lists(self) -> None:
+        """Clear message_ids/message_text_lens/sep_stripped TOGETHER (turn
+        close/reset/gap) so no turn boundary can leave the flags misaligned."""
+        self.cursor.message_ids = []
+        self.cursor.message_text_lens = []
+        self.cursor.sep_stripped = []
+
+    def _seps_append(self, offset: int) -> None:
+        self._pending_seps.append(offset)
+
+    def _seps_consume_below(self, posted_len: int) -> None:
+        """CONSUME descriptors whose bytes are now on the wire (offset <
+        posted_len) — coordinates otherwise unchanged (applied-edit path)."""
+        self._pending_seps = [s for s in self._pending_seps if s >= posted_len]
+
+    def _seps_rebase_to(self, new_start: int) -> None:
+        """Op-scoped rebasing (Terra r4-MINOR): a rollover send opens a new
+        message starting at source offset ``new_start`` — CONSUME descriptors in
+        the already-sealed prefix and subtract the new message's start from the
+        rest (no content inspection, exact parity in long throttled tails)."""
+        self._pending_seps = [
+            s - new_start for s in self._pending_seps if s >= new_start
+        ]
+
+    def _seps_clear(self) -> None:
+        self._pending_seps = []
 
     # -- coordinate ordering ------------------------------------------------
 
@@ -717,21 +831,57 @@ class TopicStreamRelay:
 
     # -- replay-mode text reconstruction -----------------------------------
 
-    def _apply_msg_sep(self, message_id: str, text: str) -> str:
+    def _apply_msg_sep(
+        self, message_id: str, text: str, *, record: bool = False,
+    ) -> str:
         """§R3: prefix *text* with a ``\\n\\n`` separator iff *message_id* begins
         a NEW assistant message (differs from the last-appended text frame's id
         AND a segment was already appended this turn), then advance the recorded
         id. THE single narration-boundary decision — a structural ``message.id``
-        change, never content inspection — shared by every narration-commit path
-        (live text-only, live mixed-frame, cold replay, held-buffer flush) so all
-        four advance ``_last_text_msg_id`` and the narration byte-stream
+        change, never content inspection — shared by every LIVE narration-commit
+        path so they advance ``_last_text_msg_id`` and the narration byte-stream
         IDENTICALLY. Under the CLI contract each text frame has a distinct id, so
-        this fires before every segment after the first; the id-comparison is the
-        robust rule (a same-id continuation would correctly get no separator)."""
+        this fires before every segment after the first.
+
+        P2 (F-LEADSEP, r6) — LIVE-COMMIT-ONLY provenance: when *record* is set
+        (every LIVE commit path) an injected separator appends a descriptor at
+        ``len(_per_message_text)`` — the exact offset the sep will occupy once
+        the ops apply. Replay NEVER records (``record`` defaults False): its
+        ``_apply_msg_sep`` reconstructs already-posted bytes and reads the
+        persisted ``sep_stripped`` flags instead, so a historical separator can
+        never masquerade as a live pending one (Sol/Terra r5-BLOCKER)."""
         if self._last_text_msg_id is not None and message_id != self._last_text_msg_id:
-            text = "\n\n" + text
+            if record:
+                self._seps_append(len(self._per_message_text))
+            text = _SEP + text
         self._last_text_msg_id = message_id
         return text
+
+    def _replay_sep_at_boundary(self) -> str:
+        """P2 replay skip-decision at a reconstructed ``message.id`` boundary.
+
+        Return ``""`` (skip) iff this boundary begins recorded message ordinal
+        ``j`` EXACTLY (the reconstructed position equals ``j``'s cumulative start
+        in ``message_text_lens``) AND ``sep_stripped[j]`` — else ``\\n\\n``. The
+        ordinal invariant (Sol/Terra r2-MAJOR): ``_replay_j`` counts completed
+        recorded messages consumed; each boundary is consumed ONCE; the flag
+        lookup is ``sep_stripped[j] if 0 <= j < len(sep_stripped) else False`` —
+        NEVER clamped or rebound (Sol r4/r5). Consecutive legacy zero-length lens
+        entries share a position and are consumed flag-False (never a skip)."""
+        lens = self.cursor.message_text_lens
+        flags = self.cursor.sep_stripped
+        pos = len(self._turn_text)
+        sep = _SEP  # default: a mid-message id change, not a recorded boundary
+        while self._replay_j + 1 <= len(lens):
+            cum = sum(lens[: self._replay_j + 1])
+            if cum > pos:
+                break
+            self._replay_j += 1
+            if cum == pos:
+                j = self._replay_j
+                stripped = flags[j] if 0 <= j < len(flags) else False
+                sep = "" if stripped else _SEP
+        return sep
 
     def _replay_text(self, text: str, message_id: str = "") -> None:
         """Rebuild ``per_message_text`` from a replayed text block — no sends.
@@ -743,13 +893,21 @@ class TopicStreamRelay:
         Legacy checkpoints (field absent) fall back to _MSG_MAX-only splitting —
         their recovery is already covered by the conservative seal.
 
-        §R3: the replayed frame is prefixed with the SAME ``\\n\\n`` separator the
-        live path inserted at a ``message.id`` boundary, so the reconstructed
+        §R3/P2: the replayed frame is prefixed with the SAME ``\\n\\n`` separator
+        the live path inserted at a ``message.id`` boundary — EXCEPT where the
+        live path STRIPPED it at a sealed-open (``sep_stripped[j]``), in which
+        case the boundary skip-decision omits it so the reconstructed
         ``_turn_text`` (the only READ of ``_turn_text``) matches the live
         narration byte-for-byte and the ``message_text_lens`` split lands
-        identically.
+        identically. Replay records NO separator descriptor (LIVE-COMMIT-ONLY).
         """
-        text = self._apply_msg_sep(message_id, text)
+        is_boundary = (
+            self._last_text_msg_id is not None
+            and message_id != self._last_text_msg_id
+        )
+        self._last_text_msg_id = message_id
+        if is_boundary:
+            text = self._replay_sep_at_boundary() + text
         self._turn_text += text
         lens = self.cursor.message_text_lens
         if lens:
@@ -803,6 +961,13 @@ class TopicStreamRelay:
         at-least-once risk).
         """
         self._reconciled = True
+        # P2 replay→live boundary invariant (Sol/Terra r5-BLOCKER): replay never
+        # records a separator descriptor, so the pending list is EMPTY here — a
+        # historical already-posted separator can never survive to strip authored
+        # bytes at a sealed continuation.
+        assert not self._pending_seps, (
+            "pending separator descriptors leaked into replay→live transition"
+        )
         if not (self.cursor.message_ids and self._per_message_text):
             return
         try:
@@ -843,17 +1008,22 @@ class TopicStreamRelay:
                         # sized to the delta, so replay mis-split the reconstructed
                         # text and the next reconcile re-posted a shifted overlap.)
                         lens = self.cursor.message_text_lens
+                        flags = self.cursor.sep_stripped
                         ids = self.cursor.message_ids
                         if len(lens) > len(ids):
                             del lens[len(ids):]
+                        if len(flags) > len(ids):
+                            del flags[len(ids):]
                         while len(lens) < len(ids):
                             lens.append(0)
+                        while len(flags) < len(ids):
+                            flags.append(False)
                         if ids:
                             lens[-1] = self.cursor.last_posted_len
-                        self.cursor.message_ids.append(mid)
-                        self.cursor.message_text_lens.append(len(pending))
-                        self._per_message_text = pending
-                        self._posted_len = len(pending)
+                        # P2: the delta message carries no INJECTED separator (a
+                        # raw wire-truth slice), so its flag is False; open it via
+                        # the shared atomic opener so all three lists stay parallel.
+                        self._open_message(mid, pending, sep_stripped=False)
                         self.cursor.last_posted_len = len(pending)
                     else:
                         # Dropped mid-reconcile: the tail never reached the wire,
@@ -893,6 +1063,9 @@ class TopicStreamRelay:
                 self.engagement_id, self._fail_count,
             )
         self._dropped = True
+        # P2: drop mode discards the unposted tail — clear pending separators so
+        # no stale descriptor survives into a later commit (Terra r2-MAJOR).
+        self._seps_clear()
 
     async def _apply_op(self, factory: Callable[[], Any]) -> tuple[bool, Any]:
         """Run one Telegram op, retrying with bounded backoff until it succeeds
@@ -985,13 +1158,28 @@ class TopicStreamRelay:
             pmt = piece
         return ops
 
-    async def _execute_ops(self, ops: list[tuple[str, str]]) -> None:
+    async def _execute_ops(
+        self, ops: list[tuple[str, str]], complete_target: str | None = None,
+    ) -> None:
         """Render *ops* (send/edit) through the sequencer. Sets ``self._dropped``
         on a drop; NEVER checkpoints (the caller owns cursor advancement).
 
-        An ``edit`` that returns SEALED opens a NEW narration message for the
-        pending increment — §2 rollover-on-interleave / conservative recovery
-        seal."""
+        P2: *complete_target* is the COMPLETE LOGICAL TARGET of this commit —
+        ``_per_message_text`` (before the append) + the sep-applied text — the
+        SAME coordinate system the pending separator descriptors live in. The
+        sealed re-plan reads the WHOLE tail from it and never from a single
+        sealed op's fragment (Sol r4-BLOCKER; makes the ``_MSG_MAX−1/−2``
+        rollover-boundary degeneracies unrepresentable). ``cum`` tracks each op's
+        source start in that target (derived so a full-message rollover, whose
+        already-posted prefix is NOT among the ops, still aligns) for op-scoped
+        descriptor rebasing. When *complete_target* is omitted (direct-call tests
+        that never touch descriptors) it defaults to the ops' concatenation."""
+        if complete_target is None:
+            complete_target = "".join(value for _kind, value in ops)
+        # Source start of the FIRST op: the part of the target the ops do NOT
+        # re-render (a full-message rollover's already-posted prefix) is exactly
+        # ``len(target) − Σ len(op values)``.
+        cum = len(complete_target) - sum(len(value) for _kind, value in ops)
         for kind, value in ops:
             if self._dropped:
                 return
@@ -1001,11 +1189,15 @@ class TopicStreamRelay:
                 )
                 if not applied:
                     return
-                self.cursor.message_ids.append(mid)
-                self._per_message_text = value
-                self._posted_len = len(value)
+                # A send opens a NEW message at source offset ``cum``: consume
+                # descriptors in the already-sealed prefix, rebase the rest
+                # relative to the new message's start (never strip — Terra
+                # r4-MINOR), then consume any that this fully-posted send just put
+                # on the wire.
+                self._seps_rebase_to(cum)
+                self._open_message(mid, value, sep_stripped=False)
+                self._seps_consume_below(self._posted_len)
             else:  # edit
-                prior = self._per_message_text
                 res = await self._apply_seq_edit(
                     self.cursor.message_ids[-1], value
                 )
@@ -1014,36 +1206,72 @@ class TopicStreamRelay:
                 if res == "discarded":
                     # wb3-2: the engagement terminalized mid-edit — stop cleanly,
                     # post nothing more below the terminal completion.
+                    self._seps_clear()
                     return
                 if res == "sealed":
-                    # F2/R4 NO-LOSS (Sol diff gate): slice from ``_posted_len``
-                    # — what actually reached the wire for THIS message — NOT
-                    # ``len(prior)``. ``prior`` (``_per_message_text``) can
-                    # include a throttled, never-posted suffix (a held ``CCC``);
-                    # slicing at ``len(prior)`` would drop it behind the seal
-                    # forever. The posted prefix is ``prior[:_posted_len]``;
-                    # everything past it (held suffix + this frame's new text)
-                    # rides into the fresh message exactly once.
-                    posted_prefix = prior[: self._posted_len]
-                    increment = (
-                        value[self._posted_len:]
-                        if value.startswith(posted_prefix) else value
-                    )
-                    applied, mid = await self._apply_op(
-                        lambda v=increment: self.sequencer.open_narration(v)
-                    )
-                    if not applied:
-                        return
-                    self.cursor.message_ids.append(mid)
-                    self._per_message_text = increment
-                    self._posted_len = len(increment)
-                else:  # applied
-                    self._per_message_text = value
-                    self._posted_len = len(value)
+                    # P2 FULL-TAIL RE-PLAN (Sol r4-BLOCKER): the message was
+                    # sealed (a discrete posted below it). DISCARD the remaining
+                    # old ops and re-plan the COMPLETE tail from ``_posted_len``,
+                    # stripping the leading injected separator iff its descriptor
+                    # sits exactly at the tail's head. Never resume the old loop.
+                    await self._replan_sealed(complete_target)
+                    return
+                # applied: the whole edit value reached the wire — its
+                # descriptors are now immutable; coordinates otherwise unchanged.
+                self._per_message_text = value
+                self._posted_len = len(value)
+                self._seps_consume_below(self._posted_len)
+                self._sync_last_len()
                 self._last_edit_ts = self._now()
-            # Record this op's per-message narration boundary (send appended a
-            # new message; edit grew the current or rolled to a fresh one).
-            self._sync_last_len()
+            cum += len(value)
+
+    async def _replan_sealed(self, complete_target: str) -> None:
+        """P2 sealed-open re-plan (r5). Post the COMPLETE logical tail past the
+        wire high-water as a fresh message chain — FIRST op always a ``send`` —
+        stripping the one leading injected separator iff the earliest pending
+        descriptor sits at the tail's head. The first opened message records
+        ``sep_stripped=True`` iff the strip fired; every rollover continuation
+        records ``False``. After the tail is posted ALL pending descriptors are
+        consumed (Terra r3-BLOCKER: no descriptor survives to remap against a
+        later ``_posted_len``)."""
+        tail = complete_target[self._posted_len:]
+        # Strip iff the earliest injected separator begins the tail (provenance,
+        # never content matching).
+        strip = bool(self._pending_seps) and self._pending_seps[0] == self._posted_len
+        if strip:
+            candidate = tail[len(_SEP):]
+            if candidate:
+                tail = candidate
+            else:
+                # Empty-after-strip defensive floor (Sol r2-2): NEVER strip to
+                # empty — its failure direction is the old cosmetic bug, never a
+                # parity break. (Unreachable given the non-empty-text guard.)
+                strip = False
+        if not tail:
+            self._seps_clear()
+            return
+        first = True
+        while tail:
+            piece, tail = tail[:_MSG_MAX], tail[_MSG_MAX:]
+            applied, mid = await self._apply_op(
+                lambda v=piece: self.sequencer.open_narration(v)
+            )
+            if not applied:
+                return
+            self._open_message(mid, piece, sep_stripped=(strip and first))
+            first = False
+        self._seps_clear()
+
+    async def _commit_narration(self, message_id: str, text: str) -> None:
+        """P2: the ONE shared LIVE narration append routine — apply the R3
+        separator (recording its provenance descriptor), then execute the planned
+        ops. Used by the mixed-frame path, the atomic hold-or-post poster, and
+        the per-tuple held-buffer flush so all commit identically."""
+        if not text:
+            return
+        sep_applied = self._apply_msg_sep(message_id, text, record=True)
+        complete_target = self._per_message_text + sep_applied
+        await self._execute_ops(self._plan_ops(sep_applied), complete_target)
 
     async def _post_text(
         self, text: str, seg, off_after: int, message_id: str = "",
@@ -1055,6 +1283,16 @@ class TopicStreamRelay:
         # completion (D5 discard doctrine). Drop the text and advance the cursor so
         # the frame is not re-read on the next poll.
         if self._is_terminal():
+            # P2: terminalize is a clearing site — no narration will post below
+            # the terminal completion, so drop any pending separator descriptors.
+            self._seps_clear()
+            self._checkpoint(seg, off_after)
+            return
+        # P2 empty-text guard (Sol r2-2): a text-less frame never reaches a
+        # commit — checkpoint and return, so a sealed increment is always
+        # ``sep + non-empty`` and post-strip text is never empty. No-behavior
+        # change (the caller already gates on ``narr.text``); belt-and-suspenders.
+        if not text:
             self._checkpoint(seg, off_after)
             return
         await self._maybe_arm_suppression()
@@ -1092,22 +1330,27 @@ class TopicStreamRelay:
             if await self._atomic_post_or_hold(text, seg, off_after, message_id):
                 return
         else:
-            # §R3: prefix the narration separator when this frame begins a NEW
-            # assistant message (the shared boundary decision).
-            ops = self._plan_ops(self._apply_msg_sep(message_id, text))
+            # §R3/P2: prefix the narration separator when this frame begins a NEW
+            # assistant message (the shared boundary decision), recording its
+            # provenance descriptor on this LIVE commit path.
+            sep_applied = self._apply_msg_sep(message_id, text, record=True)
+            complete_target = self._per_message_text + sep_applied
+            ops = self._plan_ops(sep_applied)
             if not ops:
                 self._checkpoint(seg, off_after)
                 return
 
             # Throttle only the rapid single-edit streaming case: skip the live
             # edit within the window (text is retained in memory and flushed by
-            # the next edit or at finalize), and do NOT advance the cursor.
+            # the next edit or at finalize), and do NOT advance the cursor. P2:
+            # coordinates are unchanged (same string grows at the tail), so the
+            # pending separator descriptor is RETAINED across the hold.
             if len(ops) == 1 and ops[0][0] == "edit":
                 if self._now() - self._last_edit_ts < self._edit_throttle:
                     self._per_message_text = ops[0][1]
                     return
 
-            await self._execute_ops(ops)
+            await self._execute_ops(ops, complete_target)
         if self._dropped:
             self._advance_dropped(seg, off_after)
             return
@@ -1129,6 +1372,10 @@ class TopicStreamRelay:
         # frame-end checkpoint in ``_handle_assistant_blocks`` advances the cursor.
         if self._is_terminal():
             return
+        # P2 empty-text guard (Sol r2-2): a text-less block never reaches a
+        # commit (mixed-frame commit site). No-behavior change.
+        if not text:
+            return
         await self._maybe_arm_suppression()
         # §D5: armed — BUFFER (see ``_post_text``). The frame-end checkpoint in
         # ``_handle_assistant_blocks`` is EXEMPTED while the buffer is non-empty.
@@ -1146,9 +1393,9 @@ class TopicStreamRelay:
         if self._anchor_candidate is not None and self.open_anchor_state is not None:
             await self._atomic_post_or_hold(text, seg, off_after, message_id)
             return
-        # §R3: prefix the narration separator at a new-message boundary.
-        ops = self._plan_ops(self._apply_msg_sep(message_id, text))
-        await self._execute_ops(ops)
+        # §R3/P2: commit through the ONE shared LIVE append routine (separator +
+        # provenance descriptor + planned ops).
+        await self._commit_narration(message_id, text)
 
     async def _match_discrete_block(self, name: str, tool_input: dict) -> None:
         """Drive relay-mediated discrete matching for ONE tool_use block (§2(3)).
@@ -1329,9 +1576,7 @@ class TopicStreamRelay:
         status = await self.sequencer.post_unless_anchor_open(
             text,
             self._effective_open_state,
-            poster=lambda t=text, m=message_id: self._execute_ops(
-                self._plan_ops(self._apply_msg_sep(m, t))
-            ),
+            poster=lambda t=text, m=message_id: self._commit_narration(m, t),
         )
         if status != "held":
             return False
@@ -1368,22 +1613,24 @@ class TopicStreamRelay:
         existing visible-delivery contract."""
         if not self._anchor_buffer:
             return True
-        # §R3: re-derive the per-message separators as the held frames enter
-        # narration — the SAME shared boundary decision the live/replay paths
-        # use, applied in buffer order (the first held frame's separator is
-        # relative to the last-posted segment before buffering began).
-        buffered = "".join(
-            self._apply_msg_sep(mid, text)
-            for (text, _seg, _off, mid) in self._anchor_buffer
-        )
-        if not buffered:
-            self._anchor_buffer = []
-            return True
-        await self._execute_ops(self._plan_ops(buffered))
-        if self._dropped:
-            # Delivery hit the wire-failure floor: RETAIN the buffer (its frame
-            # coords stay intact) so the held prose survives for a resurface.
-            return False
+        # P2 (Sol r2-1 / Terra r2-2): commit the buffered tuples SEQUENTIALLY
+        # through the ONE shared LIVE append routine — one ``_apply_msg_sep`` +
+        # commit PER TUPLE, so separator descriptors are generated and consumed
+        # per commit EXACTLY as live (never a batched comprehension: an offset
+        # keyed to the batch could delete authored text — Terra ``XY\n\nZ``).
+        delivered = 0
+        for (text, _seg, _off, mid) in list(self._anchor_buffer):
+            await self._commit_narration(mid, text)
+            if self._dropped:
+                # Partial-failure (Terra r3-MINOR): the delivered PREFIX is on the
+                # wire — remove ONLY those tuples, RETAIN the rest + the hold
+                # marker with the boundary behind them, and clear pending
+                # descriptors with the drop (per the clearing rules). Recovery is
+                # cold replay's job (§D5 resurface-never-lose).
+                del self._anchor_buffer[:delivered]
+                self._seps_clear()
+                return False
+            delivered += 1
         self._anchor_buffer = []
         return True
 
@@ -1469,9 +1716,26 @@ class TopicStreamRelay:
                 # only — replay never reaches _handle_assistant_blocks), so the
                 # controller derives post-recovery state from the lifecycle
                 # alone and never from stale, replayed tool frames.
+                # §5 P1-B (r6 fix): stamp a MONOTONIC per-turn tool-event counter
+                # as the ordering ``seq`` — incremented once per tool_use block
+                # processed, so two TodoWrite blocks in ONE assistant frame get
+                # distinct, strictly-increasing sequences AND a TodoWrite after a
+                # mid-turn log rotation still sorts ABOVE an earlier one (the old
+                # ``(segment, offset, block_ordinal)`` coordinate carried file
+                # identity, so a rotated segment could sort lower and the
+                # controller's ≤-watermark would reject the newer plan forever).
+                # The controller's plan watermark rejects a frame ≤ this; passed
+                # verbatim through to ``submit_plan``.
+                self._tool_event_seq += 1
                 await _maybe_await(
                     self.on_turn_event(
-                        "tool_use", {"tool": name, "input": tool_input})
+                        "tool_use",
+                        {
+                            "tool": name,
+                            "input": tool_input,
+                            "seq": self._tool_event_seq,
+                        },
+                    )
                 )
                 await self._match_discrete_block(name, tool_input)
 
@@ -1501,7 +1765,15 @@ class TopicStreamRelay:
 
     def _reset_turn_state(self) -> None:
         self._turn_text = ""
+        # §5 P1-B (r6 fix): a fresh turn restarts the monotonic tool-event
+        # counter at 0. The controller's plan-ordering watermark resets on the
+        # SAME boundary (``note_turn_start``), so the new turn's first tool_use
+        # (counter 1) is always accepted.
+        self._tool_event_seq = 0
         self._last_text_msg_id = None  # §R3: no prior segment in a fresh turn
+        # P2: a fresh turn has no pending separators and starts replay ordinal 0.
+        self._seps_clear()
+        self._replay_j = 0
         self._per_message_text = ""
         self._posted_len = 0
         self._replay_msg_count = 0
@@ -1575,7 +1847,10 @@ class TopicStreamRelay:
                     )
                     raise _FlushDeferred
             else:
+                # Held-buffer DISCARD (anchor still open, or terminal): the held
+                # prose never posts — clear the buffer AND any pending separators.
                 self._anchor_buffer = []
+                self._seps_clear()
         coord = {"segment": list(seg), "offset": off_after}
         # wb3-2: a TERMINAL engagement DISCARDS its closing edit entirely — the
         # completion has (or will) post, and a sealed-narration repost of the
@@ -1607,13 +1882,13 @@ class TopicStreamRelay:
                 # ``_posted_len``) posts EXACTLY that suffix, once. This is the
                 # NORMAL in-process finalize; the conservative crash-recovery
                 # seal in ``_reconcile`` is a SEPARATE branch that may duplicate.
-                pending = self._per_message_text[self._posted_len:]
-                if pending:
-                    applied, mid = await self._apply_op(
-                        lambda p=pending: self.sequencer.open_narration(p)
-                    )
-                    if applied:
-                        self.cursor.message_ids = [mid]
+                # P2: route through the SAME sealed-open re-plan as ``_execute_ops``
+                # so a throttled leading separator at the tail's head is STRIPPED
+                # (no leading blank line when the closing fragment opens a new
+                # message); the complete logical target is the full current
+                # message, so ``tail == pending`` and a no-descriptor tail behaves
+                # exactly as before (posts ``pending``, or nothing when empty).
+                await self._replan_sealed(self._per_message_text)
 
         if self._dropped:
             # The turn ended in drop mode: ``dropped_through`` reaches the
@@ -1621,8 +1896,8 @@ class TopicStreamRelay:
             self.cursor.dropped_through = dict(coord)
         self.cursor.current = coord
         self.cursor.turn_start = dict(coord)
-        self.cursor.message_ids = []
-        self.cursor.message_text_lens = []
+        # P2: clear all three message lists together (parallel-list lifecycle).
+        self._reset_message_lists()
         self.cursor.last_posted_len = 0
         # §D5 r3-2 (C3): ``result`` is a held-frames boundary — the buffer was
         # just FLUSHED (answer arrived) or DISCARDED (anchor still open), and a
@@ -1726,8 +2001,7 @@ class TopicStreamRelay:
                         self._save()
                     self._live = True
                     self._reconciled = True
-                    self.cursor.message_ids = []
-                    self.cursor.message_text_lens = []
+                    self._reset_message_lists()
                     self._reset_turn_state()
                     gap_seen = True
                     continue
@@ -1900,8 +2174,7 @@ class TopicStreamRelay:
         if ftype == "system" and frame.get("subtype") == "init":
             off_before = off_after - len(raw)
             self.cursor.turn_start = {"segment": list(seg), "offset": off_before}
-            self.cursor.message_ids = []
-            self.cursor.message_text_lens = []
+            self._reset_message_lists()
             self.cursor.last_posted_len = 0
             self._reset_turn_state()
             await _maybe_await(
