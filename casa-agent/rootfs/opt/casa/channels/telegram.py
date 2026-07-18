@@ -2071,14 +2071,18 @@ class TelegramChannel(Channel):
         shorts: "list | None" = None,
         multi: bool = False,
     ) -> int | None:
-        """Post a plain-text multiple-choice question with one tappable
+        """Post a rich-text multiple-choice question with one tappable
         button per option (W5 `ask`).
 
-        Mirrors ``post_perm_keyboard``'s engagement/topic resolution but
-        skips MarkdownV2 entirely — the question/options are operator- or
-        agent-authored free text (not a static template around an escaped
-        tool-call preview), so a plain send sidesteps parse-entity 400s
-        without needing an escaping pass.
+        Mirrors ``post_perm_keyboard``'s engagement/topic resolution but skips
+        MarkdownV2 entirely — the question/options are operator- or agent-authored
+        free text. R2b (v0.89.0): the body renders through ``post_ask_body_rich``
+        (a SINGLE-ATTEMPT rich send, fail-closed on an entity ``BadRequest``) so
+        markdown (``**bold**``, `` `code` ``) renders as ``MessageEntity`` spans
+        instead of leaking literal markers, WITHOUT the double-send that the
+        round-4 single-post cancellation gate forecloses. Plain bodies still send
+        raw (``render()`` returns ``entities=None`` ⇒ verbatim plain), so no
+        escaping pass is needed.
         """
         from telegram import InlineKeyboardButton, InlineKeyboardMarkup
 
@@ -2116,7 +2120,7 @@ class TelegramChannel(Channel):
 
         if multi:
             kbd = _build_multi_keyboard(request_id, options, captions, selected=())
-            return await self.send_to_topic(
+            return await self.post_ask_body_rich(
                 rec.topic_id, question, reply_markup=kbd)
 
         kbd = InlineKeyboardMarkup([
@@ -2127,7 +2131,8 @@ class TelegramChannel(Channel):
             for i in range(len(options))
         ])
 
-        return await self.send_to_topic(rec.topic_id, question, reply_markup=kbd)
+        return await self.post_ask_body_rich(
+            rec.topic_id, question, reply_markup=kbd)
 
     async def edit_topic_message(
         self, topic_id: int | None, message_id: int, text: str,
@@ -2762,6 +2767,47 @@ class TelegramChannel(Channel):
                 chat_id=self.engagement_supergroup_id, text=text,
                 message_thread_id=thread_id, **kwargs,
             )
+        return msg.message_id
+
+    async def post_ask_body_rich(
+        self, thread_id: int, text: str, **kwargs,
+    ) -> int:
+        """R2b (v0.89.0): SINGLE-ATTEMPT rich send for the ask/anchor POST path.
+
+        The round-4 single-post CANCELLATION invariant is BINDING: the ask
+        poster (``post_options_keyboard``) and the free-text-anchor poster
+        (``channel_handlers._post_anchor``) must make EXACTLY ONE physical Bot
+        API send attempt, so a cancel that latches immediately before the send
+        (re-read at the wire) can never be raced by a *second* send. This is
+        why this method must NOT be ``send_to_topic_rich`` / ``send_response_to_topic``
+        — their rich→``BadRequest``→plain fallback is that forbidden second send.
+
+        Behaviour (mirrors the raw-when-no-entities precedent of the other rich
+        primitives, but with NO fallback):
+        * killswitch off / ``entities is None`` (no markup, or markers stripped
+          e.g. >100 spans) → send the ORIGINAL RAW ``text`` plain in ONE attempt
+          (never the marker-stripped ``display``);
+        * entities present → send WITH entities in ONE attempt. An entity
+          ``BadRequest`` FAILS CLOSED — it PROPAGATES to the caller (which treats
+          a failed post as ``delivery_failed``); there is NO plain retry and NO
+          second send.
+
+        ``kwargs`` (e.g. ``reply_markup`` for the ask keyboard) forward on both
+        paths. Returns the posted ``message_id``.
+        """
+        if not self._rich_text_enabled:
+            return await self.send_to_topic(thread_id, text, **kwargs)
+        display, entities = render(text)
+        if entities is None:
+            return await self.send_to_topic(thread_id, text, **kwargs)
+        if not self.engagement_supergroup_id:
+            raise RuntimeError("engagement supergroup not configured")
+        # ONE physical send. On BadRequest this raises — fail-closed, never a
+        # second (plain) send (the double-send the cancellation gate forecloses).
+        msg = await self.bot.send_message(
+            chat_id=self.engagement_supergroup_id, text=display,
+            message_thread_id=thread_id, entities=entities, **kwargs,
+        )
         return msg.message_id
 
     async def pin_topic_message(

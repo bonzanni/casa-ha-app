@@ -61,6 +61,12 @@ class _Chan:
     async def edit_topic_message(self, *a, **k) -> bool:
         return True
 
+    async def post_ask_body_rich(self, thread_id, text, **kwargs) -> int | None:
+        return await self.send_to_topic(thread_id, text, **kwargs)
+
+    async def edit_topic_message_rich(self, *a, **k) -> bool:
+        return await self.edit_topic_message(*a, **k)
+
     async def narration_send(self, topic_id, text, reply_to=None) -> int:
         return self._id()
 

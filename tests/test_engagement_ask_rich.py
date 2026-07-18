@@ -1,0 +1,259 @@
+"""R2b+c (v0.89.0) — ask/anchor bodies + lifecycle edits render rich.
+
+The engagement ``ask`` (tappable option buttons) and free-text ``anchor``
+bodies, plus their lifecycle edits (settle/answer/expire/withdraw), used to be
+posted/edited as PLAIN text, so markdown (``**bold**``, `` `code` ``) leaked
+literal markers. This routes them through the rich renderer.
+
+The BINDING invariant (round-4 single-post cancellation gate): the ask poster
+(``post_options_keyboard``) and the free-text-anchor poster
+(``_post_anchor``) must make EXACTLY ONE physical Bot API send attempt. So the
+POST path uses ``post_ask_body_rich`` — a SINGLE-ATTEMPT rich send that FAILS
+CLOSED on an entity ``BadRequest`` (no plain retry, no second send) — NOT
+``send_to_topic_rich``/``send_response_to_topic`` (whose rich→plain fallback is
+a second send). Lifecycle EDITS are not cancellation-gated, so they route
+through ``edit_topic_message_rich`` (render → plain fallback is fine for edits).
+"""
+
+from __future__ import annotations
+
+import asyncio
+import json
+from unittest.mock import AsyncMock, MagicMock
+
+import pytest
+from telegram import InlineKeyboardMarkup, MessageEntity
+from telegram.error import BadRequest
+
+import agent as agent_mod
+import verdict_broker
+from verdict_broker import VerdictBroker
+
+from test_telegram_topic_stream import _mk_channel_with_fake_bot
+from test_engagement_ask_lifecycle import _FakeDriver, _FakeRequest, _body
+
+pytestmark = pytest.mark.asyncio
+
+
+# ===========================================================================
+# Part (b) · primitive: post_ask_body_rich — SINGLE-ATTEMPT rich send
+# ===========================================================================
+
+async def test_post_ask_body_rich_renders_entities():
+    ch, bot = _mk_channel_with_fake_bot()
+    mid = await ch.post_ask_body_rich(42, "**Deploy** now?")
+    assert bot.send_message.await_count == 1  # exactly ONE physical send
+    kw = bot.send_message.await_args.kwargs
+    assert kw["text"] == "Deploy now?"
+    assert kw["message_thread_id"] == 42
+    assert kw["entities"][0].type == MessageEntity.BOLD
+    assert mid == 12345
+
+
+async def test_post_ask_body_rich_plain_sends_raw_no_entities():
+    ch, bot = _mk_channel_with_fake_bot()
+    await ch.post_ask_body_rich(42, "just a question?")
+    assert bot.send_message.await_count == 1
+    kw = bot.send_message.await_args.kwargs
+    assert kw["text"] == "just a question?"
+    assert "entities" not in kw
+
+
+async def test_post_ask_body_rich_fails_closed_no_second_send():
+    """The load-bearing invariant: an entity BadRequest FAILS CLOSED — it
+    propagates and there is NO plain retry (that second send is exactly what
+    the round-4 cancellation gate forecloses)."""
+    ch, bot = _mk_channel_with_fake_bot()
+    bot.send_message.side_effect = BadRequest("bad entity")
+    with pytest.raises(BadRequest):
+        await ch.post_ask_body_rich(42, "**Deploy** now?")
+    assert bot.send_message.await_count == 1  # ONE attempt, no fallback
+
+
+async def test_post_ask_body_rich_101_spans_sends_raw_body_once():
+    """>100 spans ⇒ render() strips to entities=None ⇒ the ORIGINAL RAW body is
+    sent plain in exactly ONE attempt (never the marker-stripped display)."""
+    ch, bot = _mk_channel_with_fake_bot()
+    body = " ".join(f"**b{i}**" for i in range(101))  # 101 bold spans
+    await ch.post_ask_body_rich(42, body)
+    assert bot.send_message.await_count == 1
+    kw = bot.send_message.await_args.kwargs
+    assert kw["text"] == body  # RAW body, markers intact
+    assert "entities" not in kw
+
+
+async def test_post_ask_body_rich_forwards_reply_markup_on_both_paths():
+    kbd = InlineKeyboardMarkup([])
+    # entities path
+    ch, bot = _mk_channel_with_fake_bot()
+    await ch.post_ask_body_rich(42, "**bold**", reply_markup=kbd)
+    assert bot.send_message.await_args.kwargs["reply_markup"] is kbd
+    assert "entities" in bot.send_message.await_args.kwargs
+    # plain path
+    ch2, bot2 = _mk_channel_with_fake_bot()
+    await ch2.post_ask_body_rich(42, "plain", reply_markup=kbd)
+    assert bot2.send_message.await_args.kwargs["reply_markup"] is kbd
+    assert "entities" not in bot2.send_message.await_args.kwargs
+
+
+async def test_post_ask_body_rich_killswitch_off_is_plain():
+    ch, bot = _mk_channel_with_fake_bot()
+    ch._rich_text_enabled = False
+    await ch.post_ask_body_rich(42, "**bold**")
+    kw = bot.send_message.await_args.kwargs
+    assert kw["text"] == "**bold**"
+    assert "entities" not in kw
+
+
+# ===========================================================================
+# Part (b) · post_options_keyboard renders the button-ask body rich
+# ===========================================================================
+
+def _fake_registry_with_topic(topic_id: int = 42):
+    reg = MagicMock()
+    reg.get = MagicMock(return_value=MagicMock(topic_id=topic_id))
+    return reg
+
+
+async def test_post_options_keyboard_renders_entities():
+    ch, bot = _mk_channel_with_fake_bot()
+    ch._engagement_registry = _fake_registry_with_topic()
+    fresh = VerdictBroker()
+    with pytest.MonkeyPatch.context() as mp:
+        mp.setattr(verdict_broker, "BROKER", fresh)
+        mid = await ch.post_options_keyboard(
+            engagement_id="e1", request_id="r1",
+            question="Q1: **Deploy** now?\n\n1. Yes\n2. No",
+            options=["Yes", "No"],
+        )
+    assert bot.send_message.await_count == 1  # single physical send
+    kw = bot.send_message.await_args.kwargs
+    assert "**" not in kw["text"]  # markers rendered, not literal
+    assert any(e.type == MessageEntity.BOLD for e in kw["entities"])
+    assert isinstance(kw["reply_markup"], InlineKeyboardMarkup)
+    assert mid == 12345
+
+
+async def test_post_options_keyboard_plain_body_sends_raw():
+    ch, bot = _mk_channel_with_fake_bot()
+    ch._engagement_registry = _fake_registry_with_topic()
+    fresh = VerdictBroker()
+    with pytest.MonkeyPatch.context() as mp:
+        mp.setattr(verdict_broker, "BROKER", fresh)
+        await ch.post_options_keyboard(
+            engagement_id="e1", request_id="r1",
+            question="Q1: Deploy now?\n\n1. Yes\n2. No",
+            options=["Yes", "No"],
+        )
+    kw = bot.send_message.await_args.kwargs
+    assert kw["text"] == "Q1: Deploy now?\n\n1. Yes\n2. No"
+    assert "entities" not in kw
+    assert isinstance(kw["reply_markup"], InlineKeyboardMarkup)
+
+
+# ===========================================================================
+# Handler-level env: REAL cancellation gate + REAL registry, real channel
+# over a fake bot (counts PHYSICAL Bot API send attempts).
+# ===========================================================================
+
+@pytest.fixture
+async def real_env(tmp_path, monkeypatch):
+    from engagement_registry import EngagementRegistry
+    from channels.channel_handlers import _make_channel_handlers
+    from channels.telegram import TelegramChannel
+
+    fresh = VerdictBroker()
+    monkeypatch.setattr(verdict_broker, "BROKER", fresh)
+
+    reg = EngagementRegistry(
+        tombstone_path=str(tmp_path / "engagements.json"), bus=None)
+    rec = await reg.create(
+        "executor", "configurator", "claude_code", "t",
+        {"user_id": 555}, topic_id=42)
+
+    fake_bot = MagicMock()
+    fake_bot.send_message = AsyncMock(return_value=MagicMock(message_id=7777))
+    fake_bot.edit_message_text = AsyncMock(return_value=True)
+    fake_app = MagicMock()
+    fake_app.bot = fake_bot
+    ch = TelegramChannel(
+        bot_token="x:y", chat_id=100, default_agent="assistant",
+        engagement_supergroup_id=-1001)
+    ch._app = fake_app
+    ch._engagement_registry = reg
+
+    driver = _FakeDriver()
+    monkeypatch.setattr(agent_mod, "active_claude_code_driver", driver)
+    handlers = _make_channel_handlers(telegram_channel=ch, engagement_registry=reg)
+    return {
+        "reg": reg, "rec": rec, "ch": ch, "bot": fake_bot, "driver": driver,
+        "broker": fresh, "ask": handlers["/internal/channel/ask"],
+    }
+
+
+def _payload(**over):
+    base = {
+        "engagement_id": "PLACEHOLDER", "request_id": "rid-1",
+        "question": "Proceed?", "options": ["A", "B"], "timeout_s": 60,
+        "projection_hash": "hash-abc",
+    }
+    base.update(over)
+    return base
+
+
+# --- Part (b) · anchor single physical send -------------------------------
+
+async def test_anchor_rich_body_single_physical_send(real_env):
+    """A free-text anchor with markdown posts in EXACTLY ONE physical send,
+    carrying entities (markers rendered, not literal)."""
+    eid = real_env["rec"].id
+    resp = await real_env["ask"](_FakeRequest(_payload(
+        engagement_id=eid, request_id="ft1",
+        question="Pick the **prod** DB?", options=[])))
+    assert _body(resp)["ok"] is True
+    await asyncio.sleep(0.01)  # drive the simulated relay-deferred post
+    bot = real_env["bot"]
+    assert bot.send_message.await_count == 1  # ONE physical Bot API send
+    kw = bot.send_message.await_args.kwargs
+    assert kw["text"] == "Q1: Pick the prod DB?"  # markers rendered away
+    assert any(e.type == MessageEntity.BOLD for e in kw["entities"])
+
+
+async def test_anchor_rich_badrequest_fails_closed_single_send(real_env):
+    """The BINDING single-post invariant: an entity BadRequest on the anchor
+    post FAILS CLOSED — exactly ONE physical send attempt (no rich→plain
+    double-send), and the handler reports failure rather than posting twice."""
+    real_env["bot"].send_message.side_effect = BadRequest("bad entity")
+    eid = real_env["rec"].id
+    resp = await real_env["ask"](_FakeRequest(_payload(
+        engagement_id=eid, request_id="ft2",
+        question="Pick the **prod** DB?", options=[])))
+    await asyncio.sleep(0.01)
+    assert real_env["bot"].send_message.await_count == 1  # NO second send
+    assert _body(resp)["ok"] is False
+
+
+# --- Part (c) · single-select settle edit renders rich (the :1340 path) ----
+
+async def test_single_select_settle_edit_renders_rich(real_env):
+    """A settled single-select ask's finish-hook edit (channel_handlers:1340)
+    routes through the RICH edit primitive — no literal ``**`` after answer."""
+    eid = real_env["rec"].id
+    task = asyncio.ensure_future(real_env["ask"](_FakeRequest(_payload(
+        engagement_id=eid, request_id="s1",
+        question="Deploy **prod**?", options=["Yes", "No"]))))
+    await asyncio.sleep(0.02)
+    assert real_env["broker"].deliver(
+        namespace="engagement_ask", scope=eid, request_id="s1",
+        option_index=0, actor_id=555) == "delivered"
+    await asyncio.wait_for(task, timeout=1.0)
+    await real_env["broker"].drain_hooks()
+
+    bot = real_env["bot"]
+    assert bot.edit_message_text.await_count >= 1
+    kw = bot.edit_message_text.await_args.kwargs
+    assert "**" not in kw["text"]  # rendered, not literal
+    assert any(e.type == MessageEntity.BOLD for e in kw["entities"])
+    # The settle STILL clears the keyboard (S1 fix retained through the rich path).
+    assert isinstance(kw["reply_markup"], InlineKeyboardMarkup)
+    assert list(kw["reply_markup"].inline_keyboard) == []

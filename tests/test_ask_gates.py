@@ -104,6 +104,19 @@ class _Chan:
              "clear_keyboard": clear_keyboard})
         return True
 
+    # R2b/c: anchor post + lifecycle edits route through the rich primitives;
+    # the fake delegates so the recorded ledgers + injectable ``send_returns_none``
+    # / monkeypatched-raising ``send_to_topic`` still apply, and ``rich_topic_sends``
+    # stays 0 for an anchor (the rich two-send ``send_response_to_topic`` is never hit).
+    async def post_ask_body_rich(self, thread_id, text, **kwargs) -> int | None:
+        return await self.send_to_topic(thread_id, text, **kwargs)
+
+    async def edit_topic_message_rich(
+        self, topic_id, message_id, text, *, clear_keyboard=False,
+    ) -> bool:
+        return await self.edit_topic_message(
+            topic_id, message_id, text, clear_keyboard=clear_keyboard)
+
     # sequencer narration primitives (share the SAME counter)
     async def narration_send(self, topic_id, text, reply_to=None) -> int:
         m = self._id()

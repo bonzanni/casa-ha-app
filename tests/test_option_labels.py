@@ -155,6 +155,12 @@ class _FakeChannel:
         self.edits.append({"text": text, "clear_keyboard": clear_keyboard})
         return True
 
+    async def edit_topic_message_rich(
+        self, topic_id, message_id, text, *, clear_keyboard=False,
+    ) -> bool:
+        return await self.edit_topic_message(
+            topic_id, message_id, text, clear_keyboard=clear_keyboard)
+
 
 class _FakeRequest:
     def __init__(self, payload: dict) -> None:
