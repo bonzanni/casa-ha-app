@@ -40,7 +40,7 @@ from mcp_registry import McpServerRegistry
 from channel_trust import channel_trust_display, user_peer_for_channel
 from timekeeping import resolve_tz
 from hindsight_ids import bank_id
-from sensitivity import clearance_for_channel, readable_tiers
+from sensitivity import clearance_for_origin, readable_tiers
 from session_saver import freshness_window, retain_cold_session, save_session
 from semantic_memory import NoOpSemanticMemory, SemanticMemory
 from session_registry import (
@@ -200,17 +200,29 @@ def _memory_bank() -> str:
     return bank_id("casa")
 
 
+def _current_origin_clearance(channel: str) -> str:
+    """Read-clearance for the CURRENT turn, keyed off the unspoofable origin
+    marker in ``origin_var`` (Release A Layer 2) rather than the channel string,
+    so a webhook_trigger turn reads public and only an explicit ``invoke`` reads
+    private on the webhook channel. Falls through to channel clearance when no
+    origin marker is present (non-webhook surfaces unchanged)."""
+    origin = origin_var.get(None) or {}
+    return clearance_for_origin(
+        origin.get("_origin_route"), origin.get("_origin_clearance"), channel,
+    )
+
+
 def _recall_tier_tags(channel: str) -> list[str]:
-    """Tiers a turn on ``channel`` may recall = readable_tiers(clearance). The sole
-    read-side access gate (design §2.3)."""
-    return readable_tiers(clearance_for_channel(channel))
+    """Tiers a turn may recall = readable_tiers(clearance). The sole read-side
+    access gate (design §2.3), origin-keyed (Layer 2)."""
+    return readable_tiers(_current_origin_clearance(channel))
 
 
 def _overlay_allowed(channel: str) -> bool:
     """The bank-level mental-model overlay cannot be tier-filtered, so it is pushed
     ONLY at ``private`` clearance — a context that may already see everything
     (design §2.3). At any lower clearance it would leak across tiers."""
-    return clearance_for_channel(channel) == "private"
+    return _current_origin_clearance(channel) == "private"
 
 
 # Release A / Layer 1 — the two casa-framework tools an untrusted webhook turn
