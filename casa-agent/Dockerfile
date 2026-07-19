@@ -79,7 +79,7 @@ RUN /opt/casa/venv/bin/pip install --no-cache-dir -r /tmp/requirements.txt
 # on the broad `COPY rootfs /` below (re-copied identically later, harmless).
 COPY rootfs/etc/gitconfig /etc/gitconfig
 COPY rootfs/opt/casa/scripts/git-credential-casa.sh /opt/casa/scripts/git-credential-casa.sh
-COPY rootfs/opt/casa/plugin_registry.py rootfs/opt/casa/plugin_store.py rootfs/opt/casa/text_util.py /opt/casa/
+COPY rootfs/opt/casa/plugin_registry.py rootfs/opt/casa/plugin_store.py rootfs/opt/casa/plugin_triggers.py rootfs/opt/casa/text_util.py /opt/casa/
 COPY rootfs/opt/casa/scripts/build_plugin_bundle.py /opt/casa/scripts/build_plugin_bundle.py
 COPY rootfs/opt/casa/defaults/plugin-registry.json /opt/casa/defaults/plugin-registry.json
 RUN python3 /opt/casa/scripts/build_plugin_bundle.py \
