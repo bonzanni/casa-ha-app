@@ -1,5 +1,15 @@
 # Changelog
 
+## [0.98.2] - 2026-07-19
+
+### Fixed
+
+- Approving a plugin webhook trigger's consent now refreshes plugin health
+  immediately. Previously the trigger routed correctly on approval, but the
+  health report kept showing it as "pending consent" (and could re-nag) until
+  the next plugin change or restart. Found live while wiring the first
+  plugin-declared trigger.
+
 ## [0.98.1] - 2026-07-19
 
 ### Fixed

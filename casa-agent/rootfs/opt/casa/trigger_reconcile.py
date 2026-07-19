@@ -243,15 +243,36 @@ def _mint_secrets(desired: DesiredTriggers, secrets_dir: Path) -> None:
             if entry.get("plugin") not in failed_plugins}
 
 
+async def _regen_health_safe() -> None:
+    """Regenerate the plugin-health report (no operator notify) so a
+    just-acked trigger's stale ``trigger_pending_ack`` clears immediately
+    (v0.98.2 P2 follow-up) instead of lingering until the next plugin
+    mutation/boot. ``current_issues()`` recomputes fresh from the persisted
+    acks + resolver, so the routed trigger drops out of the report. Never
+    raises — a health-refresh failure must not break the reconcile."""
+    try:
+        import tools
+        await asyncio.to_thread(tools._regenerate_plugin_health, [])
+    except Exception:  # noqa: BLE001
+        logger.warning("post-consent plugin-health regen failed", exc_info=True)
+
+
 async def reconcile_plugin_triggers(
     *, trigger_registry: Any, role_configs: dict,
     channel_manager: Any = None, acks: Any = None,
     secrets_dir: "Path | None" = None, prompt: bool = True,
     resolver: "Callable[[str | None], Any] | None" = None,
     global_secret_ok: "Callable[[], bool] | None" = None,
+    regen_health: bool = False,
 ) -> list:
     """Compute + apply: swap the complete desired overlay into the registry,
-    mint eager secrets, fire consent prompts. Returns the trigger issues."""
+    mint eager secrets, fire consent prompts. Returns the trigger issues.
+
+    ``regen_health`` (set by the consent-approve reconcile) additionally
+    rewrites plugin-health after the swap so a freshly-acked trigger's stale
+    ``trigger_pending_ack`` clears at once. The mutation/boot/reload paths
+    leave it False — they regenerate health themselves — so there is no
+    double-regen."""
     acks = acks if acks is not None else _default_acks()
     # Resolved at CALL time from the module attribute (not a def-time default)
     # so there is one source of truth for the secrets location.
@@ -290,6 +311,10 @@ async def reconcile_plugin_triggers(
                 role_configs=role_configs, channel_manager=channel_manager,
                 acks=acks, secrets_dir=secrets_dir, resolver=resolver,
                 global_secret_ok=global_secret_ok)
+    if regen_health:
+        # After the lock: the overlay + persisted ack are already live, so the
+        # fresh health pass sees the routed (no-longer-pending) state.
+        await _regen_health_safe()
     return desired.issues
 
 
@@ -318,7 +343,7 @@ def _fire_consent_prompts(
             trigger_registry=trigger_registry, role_configs=role_configs,
             channel_manager=channel_manager, acks=acks,
             secrets_dir=secrets_dir, prompt=False, resolver=resolver,
-            global_secret_ok=global_secret_ok)
+            global_secret_ok=global_secret_ok, regen_health=True)
 
     for p in pending:
         try:
