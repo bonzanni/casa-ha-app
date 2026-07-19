@@ -6422,6 +6422,25 @@ def _invalidate_lifecycle(*, artifact_id: "str | None" = None,
     if artifact_id:
         GRANTS.purge_artifact(artifact_id)
         CHALLENGES.cancel_matching(artifact=artifact_id)
+        # Release B: an artifact change/removal drops its webhook-trigger
+        # consents (the ack identity is artifact-bound) and retires the
+        # per-trigger secrets — live + .next + rotation state — BEFORE any
+        # re-approval can mint replacements, so a new artifact never
+        # inherits the old one's credentials. cancel_matching above already
+        # killed any pending consent keyboard for the old artifact
+        # (TriggerConsentKey carries artifact_id). Never fatal: the grant
+        # purge invariants must hold even if the ack sweep fails.
+        try:
+            import trigger_acks
+            import trigger_reconcile
+            import webhook_auth
+            for rec in trigger_acks.ACKS.revoke_artifact(artifact_id):
+                webhook_auth.retire_secret(
+                    rec.get("effective") or "",
+                    secrets_dir=trigger_reconcile.SECRETS_DIR)
+        except Exception:  # noqa: BLE001
+            logger.warning("trigger-ack artifact revoke failed (%s)",
+                           artifact_id, exc_info=True)
     for target in roles or ():
         role = normalize_role(target)
         GRANTS.purge_role(role)

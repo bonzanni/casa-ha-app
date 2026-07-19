@@ -197,6 +197,28 @@ def read_secret(name: str, *, owner: str, secrets_dir: Path) -> bytes | None:
     return _read_final(name, owner, Path(secrets_dir))
 
 
+def retire_secret(name: str, *, secrets_dir: Path) -> None:
+    """Remove EVERY slot for ``name`` — the live secret, a staged ``.next``,
+    and the rotation state file (Release B artifact retirement).
+
+    Called when the owning plugin artifact changes or is removed, BEFORE any
+    re-approval can mint a replacement — a new artifact never inherits the
+    old one's credentials. Missing files/dir are fine; never raises.
+    """
+    if not name:
+        return
+    secrets_dir = Path(secrets_dir)
+    for fname in (name, _next_name(name), f"{name}.rot.json"):
+        try:
+            (secrets_dir / fname).unlink()
+        except OSError:
+            pass
+    try:
+        _fsync_dir(secrets_dir)
+    except OSError:
+        pass
+
+
 def ensure_secret(name: str, *, owner: str, secrets_dir: Path) -> bytes | None:
     """Return the live secret for ``name``, minting it for ``owner="casa"`` if
     absent. For ``owner="provider"`` this is read-only (Casa never mints a

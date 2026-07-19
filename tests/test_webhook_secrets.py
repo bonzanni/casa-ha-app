@@ -72,3 +72,35 @@ def test_orphan_tmp_files_swept(tmp_path: Path):
     os.utime(orphan, (old, old))
     ensure_secret("vm", owner="casa", secrets_dir=tmp_path)
     assert not orphan.exists()
+
+
+# ---------------------------------------------------------------------------
+# Release B — artifact retirement: retire_secret removes ALL slots
+# ---------------------------------------------------------------------------
+
+
+def test_retire_secret_removes_live_next_and_rotation_state(tmp_path):
+    from webhook_auth import retire_secret, rotation_begin
+
+    name = "plg-elevenlabs--voicemail"
+    ensure_secret(name, owner="casa", secrets_dir=tmp_path)
+    rotation_begin(name, owner="casa", secrets_dir=tmp_path)
+    assert (tmp_path / name).exists()
+    assert (tmp_path / f"{name}.next").exists()
+    assert (tmp_path / f"{name}.rot.json").exists()
+
+    retire_secret(name, secrets_dir=tmp_path)
+    assert not (tmp_path / name).exists()
+    assert not (tmp_path / f"{name}.next").exists()
+    assert not (tmp_path / f"{name}.rot.json").exists()
+    # and a later mint starts FRESH (no inheritance)
+    fresh = ensure_secret(name, owner="casa", secrets_dir=tmp_path)
+    assert fresh is not None
+
+
+def test_retire_secret_tolerates_missing_files_and_dir(tmp_path):
+    from webhook_auth import retire_secret
+
+    retire_secret("never-existed", secrets_dir=tmp_path)          # no raise
+    retire_secret("x", secrets_dir=tmp_path / "no-such-dir")      # no raise
+    retire_secret("", secrets_dir=tmp_path)                       # no raise

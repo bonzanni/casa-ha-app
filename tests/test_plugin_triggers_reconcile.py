@@ -624,3 +624,73 @@ async def test_boot_reconcile_failure_is_not_fatal(monkeypatch):
     monkeypatch.setattr(tr, "reconcile_plugin_triggers", _boom)
     await casa_core._boot_reconcile_plugin_triggers(
         trigger_registry=_registry(), role_configs={})  # must not raise
+
+
+# ---------------------------------------------------------------------------
+# lifecycle — artifact change revokes acks + retires secrets
+# ---------------------------------------------------------------------------
+
+
+def test_invalidate_lifecycle_revokes_artifact_acks_and_retires_secrets(
+    monkeypatch, tmp_path,
+):
+    """plugin_update/plugin_remove call _invalidate_lifecycle with the OLD
+    artifact_id: its trigger consents must drop (identity is artifact-bound)
+    and the per-trigger secrets must be retired BEFORE any re-approval — a
+    new artifact never inherits the old one's credentials."""
+    import tools as tools_mod
+    import trigger_acks as trigger_acks_mod
+    import webhook_auth
+
+    secrets_dir = tmp_path / "webhook_secrets"
+    acks = TriggerAckStore(path=tmp_path / "acks.json")
+    monkeypatch.setattr(trigger_acks_mod, "ACKS", acks)
+    monkeypatch.setattr(tr, "SECRETS_DIR", secrets_dir)
+    _ack(acks)
+    _ack(acks, plugin="other", artifact_id="art-9", declared="hook")
+    eff = "plg-elevenlabs--voicemail"
+    webhook_auth.ensure_secret(eff, owner="casa", secrets_dir=secrets_dir)
+    webhook_auth.ensure_secret("plg-other--hook", owner="casa",
+                               secrets_dir=secrets_dir)
+
+    tools_mod._invalidate_lifecycle(artifact_id="art-1")
+
+    assert not acks.is_acked(_ident_default())
+    assert not (secrets_dir / eff).exists()
+    # the unrelated plugin's ack + secret survive
+    assert (secrets_dir / "plg-other--hook").exists()
+    assert len(acks.revoke_plugin("other")) == 1
+
+
+def test_invalidate_lifecycle_roles_only_keeps_acks(monkeypatch, tmp_path):
+    """Unassign passes roles (no artifact_id): the identity-bound consent
+    survives — re-assigning the SAME artifact+target+auth restores the route
+    without a fresh prompt (the operator already approved that exact tuple)."""
+    import tools as tools_mod
+    import trigger_acks as trigger_acks_mod
+
+    acks = TriggerAckStore(path=tmp_path / "acks.json")
+    monkeypatch.setattr(trigger_acks_mod, "ACKS", acks)
+    _ack(acks)
+    tools_mod._invalidate_lifecycle(roles=["resident:assistant"])
+    assert acks.is_acked(_ident_default())
+
+
+def test_invalidate_lifecycle_survives_ack_store_failure(monkeypatch, tmp_path):
+    """The grant/challenge purge must still run when the trigger-ack sweep
+    blows up (never let Release B break the Release A invariants)."""
+    import tools as tools_mod
+    import trigger_acks as trigger_acks_mod
+
+    class _Boom:
+        def revoke_artifact(self, artifact_id):
+            raise RuntimeError("store exploded")
+
+    monkeypatch.setattr(trigger_acks_mod, "ACKS", _Boom())
+    tools_mod._invalidate_lifecycle(artifact_id="art-1")  # must not raise
+
+
+def _ident_default():
+    return ack_identity(plugin="elevenlabs", artifact_id="art-1",
+                        effective="plg-elevenlabs--voicemail",
+                        target="resident:assistant", auth=AUTH)
