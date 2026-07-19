@@ -694,3 +694,69 @@ def _ident_default():
     return ack_identity(plugin="elevenlabs", artifact_id="art-1",
                         effective="plg-elevenlabs--voicemail",
                         target="resident:assistant", auth=AUTH)
+
+
+# ---------------------------------------------------------------------------
+# the trigger_ack_revoke tool — synchronous unroute
+# ---------------------------------------------------------------------------
+
+
+def _wire_revoke_env(monkeypatch, tmp_path, *, acked=True):
+    """A live routed plugin + real registry overlay + patched runtime, so the
+    tool exercises the REAL reconcile path (only the resolver is faked)."""
+    import json as _json
+
+    import agent as agent_mod
+    import plugin_registry
+    import tools as tools_mod
+    import trigger_acks as trigger_acks_mod
+
+    registry = _registry()
+    acks = TriggerAckStore(path=tmp_path / "acks.json")
+    monkeypatch.setattr(trigger_acks_mod, "ACKS", acks)
+    if acked:
+        _ack(acks)
+    p = _plugin()
+    resolver = _resolver({None: [p], "resident:assistant": [p]})
+    monkeypatch.setattr(plugin_registry, "resolve_all", lambda: resolver(None))
+    monkeypatch.setattr(plugin_registry, "resolve_for",
+                        lambda t: resolver(t))
+    runtime = SimpleNamespace(
+        trigger_registry=registry,
+        role_configs=_role_configs(assistant=["webhook"]),
+        channel_manager=None)
+    monkeypatch.setattr(agent_mod, "active_runtime", runtime)
+    monkeypatch.setattr(tr, "SECRETS_DIR", tmp_path / "webhook_secrets")
+    monkeypatch.setattr(tools_mod, "_regenerate_plugin_health",
+                        lambda extra: None)
+    # route it via a real reconcile first
+    return tools_mod, registry, acks, _json
+
+
+async def test_trigger_ack_revoke_unroutes_synchronously(monkeypatch, tmp_path):
+    tools_mod, registry, acks, _json = _wire_revoke_env(monkeypatch, tmp_path)
+    await tr.reconcile_from_runtime(
+        __import__("agent").active_runtime, prompt=False)
+    eff = "plg-elevenlabs--voicemail"
+    assert registry.get_webhook_target(eff) == "assistant"
+
+    r = await tools_mod.trigger_ack_revoke.handler({"name": "elevenlabs"})
+    payload = _json.loads(r["content"][0]["text"])
+    assert payload["ok"] is True
+    assert payload["revoked"] == 1
+    assert payload["unrouted"] == [eff]
+    # the route is GONE the moment the tool returns (immediate 404)
+    assert registry.get_webhook_target(eff) is None
+    assert not acks.is_acked(_ident_default())
+
+
+async def test_trigger_ack_revoke_unknown_plugin_is_idempotent(
+    monkeypatch, tmp_path,
+):
+    tools_mod, registry, acks, _json = _wire_revoke_env(
+        monkeypatch, tmp_path, acked=False)
+    r = await tools_mod.trigger_ack_revoke.handler({"name": "ghost"})
+    payload = _json.loads(r["content"][0]["text"])
+    assert payload["ok"] is True
+    assert payload["revoked"] == 0
+    assert payload["unrouted"] == []

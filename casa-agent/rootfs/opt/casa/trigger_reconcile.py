@@ -228,13 +228,16 @@ def _mint_secrets(desired: DesiredTriggers, secrets_dir: Path) -> None:
 async def reconcile_plugin_triggers(
     *, trigger_registry: Any, role_configs: dict,
     channel_manager: Any = None, acks: Any = None,
-    secrets_dir: Path = SECRETS_DIR, prompt: bool = True,
+    secrets_dir: "Path | None" = None, prompt: bool = True,
     resolver: "Callable[[str | None], Any] | None" = None,
     global_secret_ok: "Callable[[], bool] | None" = None,
 ) -> list:
     """Compute + apply: swap the complete desired overlay into the registry,
     mint eager secrets, fire consent prompts. Returns the trigger issues."""
     acks = acks if acks is not None else _default_acks()
+    # Resolved at CALL time from the module attribute (not a def-time default)
+    # so there is one source of truth for the secrets location.
+    secrets_dir = SECRETS_DIR if secrets_dir is None else secrets_dir
 
     def _compute_and_mint() -> DesiredTriggers:
         desired = compute_desired(

@@ -6704,6 +6704,40 @@ async def plugin_remove(args: dict) -> dict:
 
 
 @tool(
+    "trigger_ack_revoke",
+    "Revoke the operator's webhook-trigger consent for a plugin and unroute "
+    "its /webhook/plg-<plugin>--… endpoints IMMEDIATELY (they 404 before "
+    "this returns). The per-trigger secret is kept, so a later re-approval "
+    "restores the route without re-provisioning the external service; the "
+    "consent DM re-prompts on the next plugin mutation or "
+    "casa_reload_triggers.",
+    {"type": "object", "properties": {"name": {"type": "string"}},
+     "required": ["name"]},
+)
+async def trigger_ack_revoke(args: dict) -> dict:
+    """Release B operator off-switch. Runs under _PLUGIN_TOOLS_LOCK like the
+    lifecycle mutations; the reconcile inside is the SYNCHRONOUS unroute —
+    the overlay swap completes before the tool returns, so an inbound
+    request can only race the 404, never a half-revoked route."""
+    async with _PLUGIN_TOOLS_LOCK:
+        import agent as agent_mod
+        import trigger_acks
+        import trigger_reconcile
+        name = args["name"]
+        removed = await asyncio.to_thread(
+            trigger_acks.ACKS.revoke_plugin, name)
+        runtime = getattr(agent_mod, "active_runtime", None)
+        await trigger_reconcile.reconcile_from_runtime(runtime, prompt=False)
+        # Refresh health (trigger_pending_ack reappears via the recomputable
+        # input) WITHOUT the operator DM — they just did this deliberately.
+        await asyncio.to_thread(_regenerate_plugin_health, [])
+        return _result({
+            "ok": True, "name": name, "revoked": len(removed),
+            "unrouted": sorted(r.get("effective") or "" for r in removed),
+        })
+
+
+@tool(
     "plugin_list",
     "List every registered plugin with its version, revision, targets, "
     "artifact presence, and seeded-default status.",
@@ -7189,6 +7223,7 @@ CASA_TOOLS: tuple = (
     plugin_assign,
     plugin_unassign,
     plugin_remove,
+    trigger_ack_revoke,            # Release B — plugin-trigger consent off-switch
     plugin_list,
     verify_plugin_state,
     verify_plugin_secrets,
