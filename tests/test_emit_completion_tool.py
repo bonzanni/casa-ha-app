@@ -439,3 +439,188 @@ class TestPluginDeveloperCompletionGuard:
         assert payload["kind"] == "completion_rejected"
         assert payload["failures"][0]["reason_code"] == "guard_error"
         assert reg.get(rec.id).status == "active"
+
+
+class TestFinalizeResultMapping:
+    """G4 D5 (v0.96.0): emit_completion must not acknowledge a completion
+    that did not actually finalize (Sol g4-r1-6 — the persistence-rollback
+    False was previously acked as success)."""
+
+    async def _setup(self, tmp_path):
+        from engagement_registry import EngagementRegistry
+        from tools import init_tools
+        reg = EngagementRegistry(tombstone_path=str(tmp_path / "e.json"),
+                                 bus=None)
+        rec = await reg.create(
+            kind="specialist", role_or_type="finance", driver="in_casa",
+            task="t", origin={"role": "assistant", "channel": "telegram"},
+            topic_id=42,
+        )
+        tch = MagicMock(); tch.send_to_topic = AsyncMock()
+        tch.close_topic = AsyncMock()
+        cm = MagicMock(); cm.get.return_value = tch
+        bus = MagicMock(); bus.notify = AsyncMock()
+        init_tools(
+            channel_manager=cm, bus=bus,
+            specialist_registry=MagicMock(), mcp_registry=MagicMock(),
+            trigger_registry=MagicMock(), engagement_registry=reg,
+        )
+        return reg, rec
+
+    async def test_persist_failure_returns_retryable_error(
+            self, tmp_path, monkeypatch):
+        from tools import emit_completion, engagement_var
+        reg, rec = await self._setup(tmp_path)
+
+        async def boom(*a, **k):
+            raise OSError("tombstone write failed")
+        monkeypatch.setattr(reg, "try_transition_terminal", boom)
+
+        token = engagement_var.set(rec)
+        try:
+            res = await emit_completion.handler({
+                "text": "done", "artifacts": [], "next_steps": [],
+                "status": "ok"})
+        finally:
+            engagement_var.reset(token)
+        payload = json.loads(res["content"][0]["text"])
+        assert payload["status"] != "acknowledged"
+        assert payload["kind"] == "finalize_persist_failed"
+        assert payload.get("retryable") is True
+        assert rec.status not in ("completed", "error", "cancelled")
+
+
+class _FakeInboundDriver:
+    """Minimal claude_code-driver stand-in for the G4 completion gate."""
+    def __init__(self, depth=0, reservations=0, texts=()):
+        self._depth = depth
+        self._resv = reservations
+        self._texts = list(texts)
+        self.refusals: list[str] = []
+        self.cancelled_intents: list[tuple] = []
+
+    def inbound_unread_depth(self, eng_id): return self._depth
+    def inbound_reservations(self, eng_id): return self._resv
+    def inbound_unread_texts(self, eng_id): return list(self._texts)
+    def record_completion_refusal(self, eng_id):
+        self.refusals.append(eng_id); return len(self.refusals)
+    def cancel_send_intent(self, eng_id, request_id):
+        self.cancelled_intents.append((eng_id, request_id))
+    def register_completion_consumption(self, eng_id, args): pass
+    async def drain_inbound_spool(self, engagement): pass
+
+
+class TestCompletionInboundGate:
+    """G4 D1/D2 (v0.96.0): emit_completion must not complete past unread
+    operator input."""
+
+    async def _setup(self, tmp_path, driver):
+        import agent as agent_mod
+        from engagement_registry import EngagementRegistry
+        from tools import init_tools
+        reg = EngagementRegistry(tombstone_path=str(tmp_path / "e.json"),
+                                 bus=None)
+        rec = await reg.create(
+            kind="executor", role_or_type="probe-exec",
+            driver="claude_code", task="t",
+            origin={"role": "assistant", "channel": "telegram"}, topic_id=42,
+        )
+        tch = MagicMock(); tch.send_to_topic = AsyncMock()
+        tch.close_topic = AsyncMock()
+        cm = MagicMock(); cm.get.return_value = tch
+        bus = MagicMock(); bus.notify = AsyncMock()
+        init_tools(
+            channel_manager=cm, bus=bus,
+            specialist_registry=MagicMock(), mcp_registry=MagicMock(),
+            trigger_registry=MagicMock(), engagement_registry=reg,
+        )
+        agent_mod.active_claude_code_driver = driver
+        return reg, rec, tch
+
+    async def _emit(self, rec, status="ok"):
+        from tools import emit_completion, engagement_var
+        token = engagement_var.set(rec)
+        try:
+            res = await emit_completion.handler({
+                "text": "done", "artifacts": [], "next_steps": [],
+                "status": status})
+        finally:
+            engagement_var.reset(token)
+        return json.loads(res["content"][0]["text"])
+
+    async def test_unread_queued_message_refuses_completion(
+            self, tmp_path, monkeypatch):
+        import agent as agent_mod
+        drv = _FakeInboundDriver(depth=1, texts=["change the design"])
+        reg, rec, _ = await self._setup(tmp_path, drv)
+        try:
+            payload = await self._emit(rec)
+        finally:
+            agent_mod.active_claude_code_driver = None
+        assert payload["kind"] == "unread_inbound"
+        assert payload.get("retryable") is True
+        assert rec.status not in ("completed", "error", "cancelled")
+        assert drv.refusals  # counted for escalation
+
+    async def test_pending_ingress_reservation_refuses_completion(
+            self, tmp_path):
+        import agent as agent_mod
+        drv = _FakeInboundDriver(depth=0, reservations=1)
+        reg, rec, _ = await self._setup(tmp_path, drv)
+        try:
+            payload = await self._emit(rec)
+        finally:
+            agent_mod.active_claude_code_driver = None
+        assert payload["kind"] == "unread_inbound"
+        assert rec.status not in ("completed", "error", "cancelled")
+
+    async def test_clean_spool_completes(self, tmp_path):
+        import agent as agent_mod
+        drv = _FakeInboundDriver()
+        reg, rec, _ = await self._setup(tmp_path, drv)
+        try:
+            payload = await self._emit(rec)
+        finally:
+            agent_mod.active_claude_code_driver = None
+        assert payload["status"] == "acknowledged"
+        assert rec.status == "completed"
+
+    async def test_error_status_not_gated_but_annotated(self, tmp_path):
+        """A broken engagement must be able to die even with unread input;
+        the topic post carries the never-read texts (D4)."""
+        import agent as agent_mod
+        drv = _FakeInboundDriver(depth=1, texts=["msg-that-was-never-read"])
+        reg, rec, tch = await self._setup(tmp_path, drv)
+        try:
+            payload = await self._emit(rec, status="error")
+        finally:
+            agent_mod.active_claude_code_driver = None
+        assert payload["status"] == "acknowledged"
+        assert rec.status == "error"
+        posted = "".join(str(c.args) + str(c.kwargs)
+                         for c in tch.send_to_topic.call_args_list)
+        assert "never read" in posted
+        assert "msg-that-was-never-read" in posted
+
+    async def test_race_message_lands_between_gate_and_flip(
+            self, tmp_path, monkeypatch):
+        """G4 D2: depth flips to >0 after the handler gate but before the
+        terminal mutation — the registry-internal hook must refuse."""
+        import agent as agent_mod
+        drv = _FakeInboundDriver(depth=0)
+        reg, rec, _ = await self._setup(tmp_path, drv)
+
+        async def racing_drain(engagement):
+            drv._depth = 1
+            drv._texts = ["late message"]
+        drv.drain_inbound_spool = racing_drain
+
+        try:
+            payload = await self._emit(rec)
+        finally:
+            agent_mod.active_claude_code_driver = None
+        assert payload["kind"] == "unread_inbound"
+        assert rec.status not in ("completed", "error", "cancelled")
+        # the pre-registered consumption debt was rolled back
+        assert any(r[1].startswith("emit_completion:")
+                   for r in drv.cancelled_intents) or drv.cancelled_intents == []

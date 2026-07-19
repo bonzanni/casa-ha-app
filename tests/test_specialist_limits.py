@@ -759,7 +759,7 @@ class TestInteractiveEngagementPermitRelease:
             rec, outcome="completed", text="done", artifacts=[],
             next_steps=[], driver=None,
         )
-        assert won is True
+        assert bool(won) is True   # FinalizeResult.FINALIZED (G4 D5)
 
         # Released — the scope is acquirable again.
         again = limiter.try_acquire(scope)

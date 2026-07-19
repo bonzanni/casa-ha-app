@@ -579,6 +579,9 @@ class TelegramChannel(Channel):
         # classification, handler cancellation, spool enqueue rejection). Wired by
         # casa_core, None-safe for tests.
         self._driver_reserve_answer = None
+        # G4 D2 (v0.96.0): inbound-ingress reservation seam (see casa_core).
+        self._driver_reserve_inbound = None
+        self._driver_release_inbound = None
         self._driver_rollback_answer_reservation = None
         # v0.79.0 (§3, F2): route a platform-origin topic notice (command
         # replies, resume errors) through the engagement's OUTPUT SEQUENCER so
@@ -1332,42 +1335,56 @@ class TelegramChannel(Channel):
                     getattr(msg, "message_id", None),
                 )
 
-                # v0.79.0 (§3, F2/F5): an inbound operator message is a causal
-                # event, visible on Telegram the instant it arrives. SEAL open
-                # narration + advance the topic high-water at TRUE handler entry
-                # — BEFORE command handling and BEFORE update_user_turn()'s
-                # await. This must precede any command reply (/silent, a rejected
-                # /cancel|/complete) AND any suspension, else a reply or mid-turn
-                # narration could append BELOW the operator's message.
-                if self._driver_advance_high_water is not None:
+                # G4 D2 (v0.96.0, Sol code-r2-1): SYNCHRONOUS ingress
+                # reservation at TRUE handler entry — before ANY suspension
+                # (including the high-water advance directly below). A
+                # completion racing any await in this handler must already
+                # observe the accepted message as unread. Released in the
+                # finally for every path that does not hand off delivery,
+                # and by _deliver_turn_bg once the spool enqueue resolves.
+                inbound_reserved = False
+                if self._driver_reserve_inbound is not None:
                     try:
-                        await self._driver_advance_high_water(
-                            rec, getattr(msg, "message_id", None))
-                    except Exception as exc:  # noqa: BLE001 — advisory sealing
-                        logger.debug(
-                            "advance_high_water failed for %s: %s",
-                            rec.id[:8], exc,
-                        )
-
-                # v0.83.0 (§A3, Sol r7-1): set the answered RESERVATION in the
-                # SAME synchronous section as the high-water advance — NO await
-                # between the advance above and this reserve — so a concurrent
-                # result-finalize that observed the answer's high-water also
-                # observes the reservation. ``reserve_answer`` is SYNCHRONOUS.
-                # The reservation counts the oldest unanswered anchor as ANSWERED
-                # (gates/summary/re-anchor) until the message either PROMOTES it
-                # (durable enqueue) or ROLLS it back (every non-delivery path
-                # below: command classification, resume failure, handler
-                # cancellation, spool enqueue rejection). ``handed_off`` transfers
-                # ownership to ``_deliver_turn_bg`` on the delivery path.
+                        inbound_reserved = bool(
+                            self._driver_reserve_inbound(rec))
+                    except Exception:  # noqa: BLE001
+                        logger.debug("reserve_inbound failed", exc_info=True)
                 answer_token = None
-                if self._driver_reserve_answer is not None:
-                    try:
-                        answer_token = self._driver_reserve_answer(rec)
-                    except Exception:  # noqa: BLE001 — reservation is advisory
-                        answer_token = None
                 handed_off = False
                 try:
+                    # v0.79.0 (§3, F2/F5): an inbound operator message is a causal
+                    # event, visible on Telegram the instant it arrives. SEAL open
+                    # narration + advance the topic high-water at TRUE handler entry
+                    # — BEFORE command handling and BEFORE update_user_turn()'s
+                    # await. This must precede any command reply (/silent, a rejected
+                    # /cancel|/complete) AND any suspension, else a reply or mid-turn
+                    # narration could append BELOW the operator's message.
+                    if self._driver_advance_high_water is not None:
+                        try:
+                            await self._driver_advance_high_water(
+                                rec, getattr(msg, "message_id", None))
+                        except Exception as exc:  # noqa: BLE001 — advisory sealing
+                            logger.debug(
+                                "advance_high_water failed for %s: %s",
+                                rec.id[:8], exc,
+                            )
+
+                    # v0.83.0 (§A3, Sol r7-1): set the answered RESERVATION in the
+                    # SAME synchronous section as the high-water advance — NO await
+                    # between the advance above and this reserve — so a concurrent
+                    # result-finalize that observed the answer's high-water also
+                    # observes the reservation. ``reserve_answer`` is SYNCHRONOUS.
+                    # The reservation counts the oldest unanswered anchor as ANSWERED
+                    # (gates/summary/re-anchor) until the message either PROMOTES it
+                    # (durable enqueue) or ROLLS it back (every non-delivery path
+                    # below: command classification, resume failure, handler
+                    # cancellation, spool enqueue rejection). ``handed_off`` transfers
+                    # ownership to ``_deliver_turn_bg`` on the delivery path.
+                    if self._driver_reserve_answer is not None:
+                        try:
+                            answer_token = self._driver_reserve_answer(rec)
+                        except Exception:  # noqa: BLE001 — reservation is advisory
+                            answer_token = None
                     if text.startswith("/"):
                         # M10 (v0.52.0): group command menus send "/cancel@botname"
                         # (Telegram appends @botusername to menu-selected commands
@@ -1518,7 +1535,8 @@ class TelegramChannel(Channel):
                             self._deliver_turn_bg(
                                 rec, text,
                                 tg_message_id=getattr(msg, "message_id", None),
-                                answer_token=answer_token))
+                                answer_token=answer_token,
+                                inbound_reserved=inbound_reserved))
                         self._turn_tasks.add(task)
                         task.add_done_callback(self._turn_tasks.discard)
                     return
@@ -1530,6 +1548,16 @@ class TelegramChannel(Channel):
                     # if promotion consumed it, or if a later message re-reserved.
                     if not handed_off:
                         await self._rollback_answer(rec, answer_token)
+                        # G4 D2: a path that never handed off the delivery
+                        # task must release the ingress reservation too —
+                        # a leak here would refuse completion forever.
+                        if inbound_reserved and (
+                                self._driver_release_inbound is not None):
+                            try:
+                                self._driver_release_inbound(rec)
+                            except Exception:  # noqa: BLE001
+                                logger.debug(
+                                    "release_inbound failed", exc_info=True)
 
         # 3) Other chats. When telegram_chat_id is configured it is an
         #    allowlist (DOCS.md: "Telegram chat ID to restrict messages
@@ -1571,6 +1599,7 @@ class TelegramChannel(Channel):
     async def _deliver_turn_bg(
         self, rec, text: str, *, tg_message_id: int | None = None,
         answer_token: str | None = None,
+        inbound_reserved: bool = False,
     ) -> None:
         """M9 (v0.52.0): run one engagement user-turn to completion.
 
@@ -1590,14 +1619,29 @@ class TelegramChannel(Channel):
         ``error``) or a raised/cancelled delivery CAS-rolls it back so the
         question stops being treated as answered.
         """
+        def _release_inbound():
+            # G4 D2: the reservation ends when the enqueue RESOLVED either
+            # way — an accepted enqueue transfers "unread" accounting to the
+            # spool (state=queued); a rejected/raised one is gone.
+            nonlocal inbound_reserved
+            if inbound_reserved and self._driver_release_inbound is not None:
+                inbound_reserved = False
+                try:
+                    self._driver_release_inbound(rec)
+                except Exception:  # noqa: BLE001
+                    logger.debug("release_inbound failed", exc_info=True)
+
         try:
             disposition = await self._driver_send_user_turn(
                 rec, text, tg_message_id=tg_message_id)
+            _release_inbound()
         except asyncio.CancelledError:
+            _release_inbound()
             # Cancelled before a durable enqueue could promote — roll back.
             await self._rollback_answer(rec, answer_token)
             raise
         except Exception as exc:  # noqa: BLE001
+            _release_inbound()
             # The enqueue raised (never durably spooled) — the reservation must
             # roll back so the answer-lifecycle isn't left falsely promoted.
             latest = (

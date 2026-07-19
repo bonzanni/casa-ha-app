@@ -2666,3 +2666,64 @@ def test_all_drivers_accept_tg_message_id_kwarg():
         sig = inspect.signature(cls.send_user_turn)
         assert "tg_message_id" in sig.parameters, (
             f"{cls.__name__}.send_user_turn must accept tg_message_id")
+
+
+# --- G4 (v0.96.0): completion-gate driver surface ---------------------------
+
+
+class TestCompletionGateDriverSurface:
+    def _driver(self):
+        import drivers.claude_code_driver as ccd
+        d = ccd.ClaudeCodeDriver.__new__(ccd.ClaudeCodeDriver)
+        d._inbound = {}
+        d._completion_refusals = {}
+        d._inbound_reservations = {}
+        return d
+
+    def test_reservation_counter_lifecycle(self):
+        d = self._driver()
+        assert d.inbound_reservations("e1") == 0
+        d.reserve_inbound("e1"); d.reserve_inbound("e1")
+        assert d.inbound_reservations("e1") == 2
+        d.release_inbound_reservation("e1")
+        assert d.inbound_reservations("e1") == 1
+        d.release_inbound_reservation("e1")
+        d.release_inbound_reservation("e1")   # floor at 0, no negative
+        assert d.inbound_reservations("e1") == 0
+        assert "e1" not in d._inbound_reservations   # no leak
+
+    def test_completion_refusal_counter(self):
+        d = self._driver()
+        assert d.record_completion_refusal("e1") == 1
+        assert d.record_completion_refusal("e1") == 2
+        assert d.record_completion_refusal("e2") == 1
+
+    def test_unread_texts_empty_without_spool(self):
+        d = self._driver()
+        assert d.inbound_unread_texts("nope") == []
+
+
+    def test_spool_unread_texts_population(self, tmp_path):
+        """G4 D4: texts mirror unread_depth's population — queued,
+        non-initial only (delivered/initial excluded)."""
+        import asyncio
+        import drivers.claude_code_driver as ccd
+
+        async def run():
+            spool = ccd._InboundSpool(
+                engagement_id="e" * 32,
+                spool_path=str(tmp_path / "spool.jsonl"),
+                write_fifo=AsyncMock(return_value=False),
+                send_notice=AsyncMock(),
+                is_turn_running=lambda: True,
+                current_epoch=lambda: 1,
+            )
+            await spool.enqueue("the initial prompt", is_initial=True)
+            await spool.enqueue("first operator message")
+            await spool.enqueue("second operator message")
+            texts = spool.unread_texts()
+            depth = spool.unread_depth()
+            assert len(texts) == depth
+            assert "the initial prompt" not in texts
+            assert any("first operator" in t for t in texts)
+        asyncio.run(run())

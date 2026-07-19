@@ -158,6 +158,13 @@ means: **end your turn now, silently.** The unread message is delivered to you
 the moment you end this turn — do not retry `ask`, do not keep working through
 it. Stop, let the message arrive, then decide.
 
+The same gate protects **completion**: `emit_completion` refuses with
+`unread_inbound` when an operator message is waiting unread (v0.96.0). The
+contract is identical — **end your turn now**; the message arrives at your
+next turn start; read it, THEN decide whether your completion still stands.
+Never re-emit in the same turn: the platform will force a turn boundary if
+you do, and your completion may be superseded by what the operator wrote.
+
 ## Redirect priority lane
 
 Two operator inputs pre-empt whatever you're doing:

@@ -357,7 +357,7 @@ class TestFinalizeEngagementBrokerCleanup:
             rec, outcome="completed", text="done", artifacts=[],
             next_steps=[], driver=driver,
         )
-        assert won is True
+        assert bool(won) is True   # FinalizeResult.FINALIZED (D5)
 
         assert "keyboard_edit" in order
         assert order.index("keyboard_edit") < order.index("send_to_topic")
@@ -414,7 +414,7 @@ class TestFinalizeEngagementBrokerCleanup:
             rec, outcome="completed", text="done", artifacts=[],
             next_steps=[], driver=None,
         )
-        assert won is True
+        assert bool(won) is True   # FinalizeResult.FINALIZED (D5)
         telegram.close_topic.assert_awaited_once()
 
 
@@ -503,3 +503,56 @@ async def test_finalize_preserves_plugin_artifacts_in_casa_meta(
     meta = load_casa_meta(str(ws))
     assert meta["status"] == "COMPLETED"
     assert meta["plugin_artifacts"] == artifacts       # NOT dropped
+
+
+# --- G4 D5 (v0.96.0): typed finalize result --------------------------------
+
+
+def test_finalize_result_enum_exists():
+    from tools import FinalizeResult
+    assert {r.name for r in FinalizeResult} >= {
+        "FINALIZED", "ALREADY_TERMINAL", "PRECONDITION_FAILED",
+        "PERSIST_FAILED"}
+    # Truthiness contract preserved for existing boolean callers: only a
+    # won finalize is truthy.
+    assert bool(FinalizeResult.FINALIZED) is True
+    assert bool(FinalizeResult.ALREADY_TERMINAL) is False
+    assert bool(FinalizeResult.PERSIST_FAILED) is False
+    assert bool(FinalizeResult.PRECONDITION_FAILED) is False
+
+
+def test_terminal_hook_abort_raises_and_leaves_live():
+    """G4 D2: the registry evaluates the terminal hook INSIDE the mutation
+    critical section; an abort leaves the record live."""
+    import asyncio
+    from engagement_registry import (
+        EngagementRegistry, TerminalPreconditionFailed)
+
+    async def run(tmp_path="/tmp"):
+        import tempfile
+        with tempfile.TemporaryDirectory() as td:
+            reg = EngagementRegistry(tombstone_path=td + "/e.json", bus=None)
+            rec = await reg.create(
+                kind="executor", role_or_type="plugin-developer",
+                driver="claude_code", task="t",
+                origin={"role": "assistant"}, topic_id=1)
+            calls = []
+            def hook():
+                calls.append(1)
+                return "unread_inbound depth=1"
+            try:
+                await reg.try_transition_terminal(
+                    rec.id, "completed", strict=True, terminal_hook=hook)
+            except TerminalPreconditionFailed as exc:
+                assert "unread_inbound" in str(exc)
+            else:
+                raise AssertionError("expected TerminalPreconditionFailed")
+            assert calls == [1]
+            assert rec.status not in ("completed", "cancelled", "error")
+            # hook returning None proceeds
+            won = await reg.try_transition_terminal(
+                rec.id, "completed", strict=True, terminal_hook=lambda: None)
+            assert won is True
+            assert rec.status == "completed"
+    asyncio.get_event_loop().run_until_complete(run()) if False else None
+    asyncio.run(run())

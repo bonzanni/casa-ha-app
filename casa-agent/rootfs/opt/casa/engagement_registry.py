@@ -224,6 +224,13 @@ class EngagementRecord:
 # ---------------------------------------------------------------------------
 
 
+class TerminalPreconditionFailed(Exception):
+    """G4 D2 (v0.96.0): raised by ``try_transition_terminal`` when the
+    caller-supplied ``terminal_hook`` vetoes the terminal flip (e.g. unread
+    operator inbound at completion time). The record is left LIVE and
+    unmodified."""
+
+
 class EngagementRegistry:
     """In-memory dict + ``/data/engagements.json`` tombstone.
 
@@ -563,6 +570,7 @@ class EngagementRegistry:
         error_message: str = "",
         stale_before: float | None = None,
         strict: bool = False,
+        terminal_hook=None,
     ) -> bool:
         """Atomically move a record to a terminal status. Returns True only
         for the first caller; False if missing or already terminal.
@@ -600,6 +608,15 @@ class EngagementRegistry:
             if stale_before is not None and rec.last_user_turn_ts >= stale_before:
                 # Revived since the reap snapshot — never cancel a live engagement.
                 return False
+            # G4 D2 (v0.96.0): caller-supplied SYNCHRONOUS terminal hook,
+            # evaluated inside this critical section with NO suspension
+            # between check and flip — the atomic completion precondition
+            # (unread-inbound gate) and/or the unread-text snapshot for the
+            # no-silent-loss annotation. A non-None return VETOES the flip.
+            if terminal_hook is not None:
+                abort_reason = terminal_hook()
+                if abort_reason is not None:
+                    raise TerminalPreconditionFailed(abort_reason)
             new_status = (
                 outcome if outcome in ("completed", "cancelled") else "error"
             )
