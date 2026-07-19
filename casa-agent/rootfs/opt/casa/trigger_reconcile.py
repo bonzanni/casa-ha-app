@@ -174,7 +174,8 @@ def compute_desired(
             ident = ack_identity(
                 plugin=rp.name, artifact_id=rp.artifact_id,
                 effective=t["effective"], target=target, auth=t["auth"])
-            if not acks.is_acked(ident):
+            ack_rec = acks.get(ident)
+            if ack_rec is None:
                 out.issues.append(PluginIssue(
                     name=rp.name, target=target, stage="triggers",
                     reason_code="trigger_pending_ack",
@@ -187,9 +188,11 @@ def compute_desired(
             entries[t["effective"]] = {
                 "plugin": rp.name, "role": role,
                 "clearance": t["clearance"], "auth": t["auth"],
-                # the consent identity this route was approved under — the
-                # mint binds the secret to it (non-inheritance at activation)
-                "identity": ident}
+                # the (consent identity, approval generation) this route was
+                # approved under — the mint binds the secret to the PAIR, so
+                # a re-approval after a revoke (new gen) rekeys even for an
+                # identical tuple (Sol shipB-r3)
+                "identity": f"{ident}#{ack_rec.get('gen', '')}"}
 
         # Per-plugin all-or-nothing: any gap unroutes the whole set.
         if not plugin_pending and not nonconsent_gap:

@@ -168,6 +168,40 @@ async def test_artifact_change_rekeys_secret_even_without_retirement(tmp_path):
     assert (tmp_path / "webhook_secrets" / eff).read_bytes() != old_secret
 
 
+async def test_reapproval_after_revoke_rekeys_even_if_retire_failed(
+    monkeypatch, tmp_path,
+):
+    """Sol shipB-r3: revoke promises 're-approval mints fresh'. Even when
+    EVERY retirement silently failed (the old — possibly compromised —
+    secret survives on disk), the re-approval's new generation forces a
+    rekey at activation."""
+    import webhook_auth
+
+    registry = _registry()
+    acks = TriggerAckStore(path=tmp_path / "acks.json")
+    _ack(acks)
+    p = _plugin()
+    args = dict(
+        plugins_by_target={None: [p], "resident:assistant": [p]},
+        role_configs=_role_configs(assistant=["webhook"]),
+        acks=acks, tmp_path=tmp_path)
+    await _reconcile(registry, **args)
+    eff = "plg-elevenlabs--voicemail"
+    old_secret = (tmp_path / "webhook_secrets" / eff).read_bytes()
+
+    # revoke, with retirement COMPLETELY broken (nothing is deleted)
+    monkeypatch.setattr(webhook_auth, "retire_secrets_with_prefix",
+                        lambda prefix, *, secrets_dir: [])
+    acks.revoke_plugin("elevenlabs")
+    assert (tmp_path / "webhook_secrets" / eff).read_bytes() == old_secret
+
+    # operator re-approves the IDENTICAL tuple → new approval generation
+    _ack(acks)
+    issues = await _reconcile(registry, **args)
+    assert issues == []
+    assert (tmp_path / "webhook_secrets" / eff).read_bytes() != old_secret
+
+
 async def test_unacked_plugin_stays_unrouted_with_pending_issue(tmp_path):
     registry = _registry()
     acks = TriggerAckStore(path=tmp_path / "acks.json")

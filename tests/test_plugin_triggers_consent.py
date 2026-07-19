@@ -212,6 +212,28 @@ def test_revoke_publishes_only_after_durable_write(tmp_path, monkeypatch):
     assert store.is_acked(ident)
 
 
+def test_record_mints_a_fresh_generation_after_revoke(tmp_path):
+    """Sol shipB-r3: every APPROVAL carries a unique generation — re-approval
+    after a revoke must produce a different (identity, gen) pair so the
+    secret mint necessarily rekeys, even when the identity is identical."""
+    store = TriggerAckStore(path=tmp_path / "acks.json")
+    ident = _record(store)
+    gen1 = store.get(ident)["gen"]
+    # idempotent re-record of a LIVE ack keeps the generation stable
+    _record(store)
+    assert store.get(ident)["gen"] == gen1
+    # revoke + re-approve rotates it
+    store.revoke_plugin("elevenlabs")
+    _record(store)
+    gen2 = store.get(ident)["gen"]
+    assert gen2 and gen2 != gen1
+
+
+def test_get_returns_none_for_unacked(tmp_path):
+    store = TriggerAckStore(path=tmp_path / "acks.json")
+    assert store.get(_identity()) is None
+
+
 def test_stored_records_carry_structured_metadata(tmp_path):
     path = tmp_path / "acks.json"
     store = TriggerAckStore(path=path)

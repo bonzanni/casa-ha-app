@@ -26,6 +26,7 @@ import json
 import logging
 import threading
 import time
+import uuid
 from pathlib import Path
 from typing import Any
 
@@ -68,8 +69,10 @@ class TriggerAckStore:
             fields = {k: rec.get(k)
                       for k in ("plugin", "artifact_id", "effective", "target")}
             auth = rec.get("auth")
+            gen = rec.get("gen")
             if (not all(isinstance(v, str) and v for v in fields.values())
-                    or not isinstance(auth, dict)):
+                    or not isinstance(auth, dict)
+                    or not (isinstance(gen, str) and gen)):
                 return {}
             try:
                 expected = ack_identity(auth=auth, **fields)
@@ -99,6 +102,14 @@ class TriggerAckStore:
         with self._lock:
             return identity in self._acks
 
+    def get(self, identity: str) -> "dict[str, Any] | None":
+        """The full ack record for *identity* (a copy), or ``None``. The
+        reconciler reads ``rec["gen"]`` — the per-approval generation — to
+        bind the minted secret to THIS approval, not just the identity."""
+        with self._lock:
+            rec = self._acks.get(identity)
+            return dict(rec) if rec is not None else None
+
     # -- mutations (each persists atomically before returning) ---------------
 
     def record(
@@ -115,6 +126,14 @@ class TriggerAckStore:
             "ts": int(time.time()),
         }
         with self._lock:
+            # Per-approval GENERATION (Sol shipB-r3): unique per approval so
+            # re-approval after a revoke (record gone) necessarily yields a
+            # new (identity, gen) pair — the secret mint binds to it and
+            # must rekey. Re-recording a LIVE ack (idempotent duplicate)
+            # keeps the generation, so the bound secret stays stable.
+            existing = self._acks.get(identity)
+            rec["gen"] = (existing["gen"] if existing and existing.get("gen")
+                          else uuid.uuid4().hex)
             candidate = dict(self._acks)
             candidate[identity] = rec
             self._persist_candidate_locked(candidate)
