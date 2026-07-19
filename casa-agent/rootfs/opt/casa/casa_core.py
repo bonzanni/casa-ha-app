@@ -1322,6 +1322,14 @@ def _make_webhook_handler(
             context={
                 "webhook_name": name,
                 "cid": request.get("cid") or new_cid(),
+                # Release A: server-set, unspoofable containment markers. A
+                # webhook_trigger turn is UNTRUSTED (third-party content) → the
+                # restricted runtime + public-floored recall clearance. Fresh
+                # UUID chat_id makes each dispatch a one-shot that can never
+                # resume another session.
+                "_origin_route": "webhook_trigger",
+                "_origin_clearance": trigger_registry.get_clearance(name),
+                "chat_id": str(uuid.uuid4()),
             },
         )
         await bus.send(msg)
@@ -1461,6 +1469,11 @@ def build_invoke_message(
         context["chat_id"] = str(uuid.uuid4())
     if not context.get("cid"):
         context["cid"] = new_cid()
+    # Release A: stamp the unspoofable origin route AFTER sanitization so a
+    # caller cannot forge it. /invoke is operator-signed (HMAC) → the trusted
+    # "invoke" route (private clearance, full runtime); distinct from the
+    # "webhook_trigger" route stamped by the /webhook/{name} dispatch.
+    context["_origin_route"] = "invoke"
     return BusMessage(
         type=MessageType.REQUEST,
         source="webhook",

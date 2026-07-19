@@ -544,7 +544,15 @@ class Agent:
         # answers) ride on msg.context when a LATER task (ask_user/button
         # broker) sets them; copy through only if actually present so a
         # normal turn's origin stays free of stray None-valued keys.
-        for _marker_key in ("synthetic", "button_answer"):
+        # Release A: ``_origin_route``/``_origin_clearance`` are stamped
+        # server-side at ingress (build_invoke_message / the /webhook/{name}
+        # dispatch) and are RESERVED (stripped from external context), so a
+        # copy here carries only the trustworthy server value into
+        # ``origin_var`` — where _build_options (restricted-runtime gate),
+        # the recall clearance gate, and delegation synthesis read it.
+        for _marker_key in (
+            "synthetic", "button_answer", "_origin_route", "_origin_clearance",
+        ):
             if _marker_key in msg.context:
                 origin_snapshot[_marker_key] = msg.context[_marker_key]
         # A4: voice turn budget + progress sink. Set by the SSE/WS handler

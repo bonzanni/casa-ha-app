@@ -61,6 +61,10 @@ class TriggerRegistry:
         # naturally evicts removed names.
         self._webhook_targets: dict[str, str] = {}
         self._webhook_names_by_role: dict[str, list[str]] = {}
+        # Release A: per-trigger memory read-clearance (spec A1/A4), stamped
+        # onto webhook_trigger turns so the recall gate reads at the declared
+        # tier (default/floor "public", never "private").
+        self._webhook_clearances: dict[str, str] = {}
 
     def register_agent(
         self,
@@ -202,6 +206,9 @@ class TriggerRegistry:
         self._webhook_paths_by_role.setdefault(role, []).append(trig.path)
         self._webhook_targets[trig.name] = role
         self._webhook_names_by_role.setdefault(role, []).append(trig.name)
+        self._webhook_clearances[trig.name] = (
+            getattr(trig, "clearance", "public") or "public"
+        )
 
     def get_webhook_target(self, name: str) -> str | None:
         """Return the role registered for a webhook trigger ``name``,
@@ -210,6 +217,13 @@ class TriggerRegistry:
         unknown names and dispatch knowns to the right role.
         """
         return self._webhook_targets.get(name)
+
+    def get_clearance(self, name: str) -> str:
+        """Return the declared memory read-clearance for webhook trigger
+        ``name`` (default ``"public"``). Stamped onto the dispatched turn's
+        ``_origin_clearance`` so the recall gate reads at the declared tier.
+        """
+        return self._webhook_clearances.get(name, "public")
 
     def reregister_for(
         self,
@@ -251,6 +265,7 @@ class TriggerRegistry:
             # belt-and-braces).
             if self._webhook_targets.get(name) == role:
                 self._webhook_targets.pop(name, None)
+                self._webhook_clearances.pop(name, None)
         self._webhook_names_by_role[role] = []
 
         self.register_agent(role, triggers, channels)

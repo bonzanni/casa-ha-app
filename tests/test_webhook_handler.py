@@ -24,10 +24,12 @@ def _make_bus():
     return bus
 
 
-def _make_registry(targets: dict[str, str]):
-    """Stand-in TriggerRegistry exposing only get_webhook_target."""
+def _make_registry(targets: dict[str, str], clearances: dict[str, str] | None = None):
+    """Stand-in TriggerRegistry exposing get_webhook_target + get_clearance."""
+    clearances = clearances or {}
     reg = MagicMock()
     reg.get_webhook_target = lambda name: targets.get(name)
+    reg.get_clearance = lambda name: clearances.get(name, "public")
     return reg
 
 
@@ -39,6 +41,7 @@ async def _build_app(
     *,
     secret: str = "",
     targets: dict[str, str] | None = None,
+    clearances: dict[str, str] | None = None,
     default_role: str = "assistant",
     bus=None,
 ):
@@ -52,7 +55,7 @@ async def _build_app(
     handler = _make_webhook_handler(
         webhook_rate_limiter=limiter,
         webhook_secret=secret,
-        trigger_registry=_make_registry(targets),
+        trigger_registry=_make_registry(targets, clearances),
         default_role=default_role,
         bus=bus,
     )
@@ -133,11 +136,18 @@ class TestWebhookAllowlist:
             })
             assert r.status == 200
             msg = bus.send.call_args.args[0]
-            # Precise contract: only Casa-owned keys are present.
-            assert set(msg.context.keys()) <= {"webhook_name", "cid"}
+            # Precise contract: only Casa-OWNED keys are present. Release A
+            # adds the server-set origin markers + one-shot chat_id; caller
+            # keys are still stripped.
+            assert set(msg.context.keys()) <= {
+                "webhook_name", "cid",
+                "_origin_route", "_origin_clearance", "chat_id",
+            }
             assert "execution_role" not in msg.context
             assert "smuggled" not in msg.context
             assert "synthetic" not in msg.context
+            # The caller cannot forge the origin route: it is server-stamped.
+            assert msg.context["_origin_route"] == "webhook_trigger"
 
     async def test_valid_hmac_unknown_name_returns_404(self):
         """Valid HMAC but unknown name still 404s (defense-in-depth):
@@ -157,3 +167,36 @@ class TestWebhookAllowlist:
             )
             assert r.status == 404
             bus.send.assert_not_called()
+
+
+class TestWebhookOriginStamping:
+    """Release A / Layer 3: the wildcard dispatch stamps the unspoofable
+    webhook_trigger origin markers + a fresh one-shot chat_id."""
+
+    async def test_dispatch_stamps_webhook_trigger_markers(self):
+        app, bus = await _build_app(
+            targets={"vm": "assistant"}, clearances={"vm": "family"})
+        async with TestClient(TestServer(app)) as client:
+            r = await client.post("/webhook/vm", json={"x": 1})
+            assert r.status == 200
+        msg = bus.send.call_args.args[0]
+        assert msg.context["_origin_route"] == "webhook_trigger"
+        assert msg.context["_origin_clearance"] == "family"
+        # fresh uuid chat_id (one-shot isolation)
+        chat_id = msg.context["chat_id"]
+        assert isinstance(chat_id, str) and len(chat_id) == 36
+
+    async def test_clearance_defaults_public(self):
+        app, bus = await _build_app(targets={"vm": "assistant"})
+        async with TestClient(TestServer(app)) as client:
+            await client.post("/webhook/vm", json={})
+        msg = bus.send.call_args.args[0]
+        assert msg.context["_origin_clearance"] == "public"
+
+    async def test_two_dispatches_get_distinct_chat_ids(self):
+        app, bus = await _build_app(targets={"vm": "assistant"})
+        async with TestClient(TestServer(app)) as client:
+            await client.post("/webhook/vm", json={})
+            await client.post("/webhook/vm", json={})
+        ids = {c.args[0].context["chat_id"] for c in bus.send.call_args_list}
+        assert len(ids) == 2

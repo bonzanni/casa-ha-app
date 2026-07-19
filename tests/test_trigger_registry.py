@@ -170,6 +170,27 @@ class TestWebhook:
         paths = [str(r.resource.canonical) for r in app.router.routes()]
         assert any("/webhook/gh" in p for p in paths)
 
+    async def test_get_clearance_returns_declared_and_defaults_public(self):
+        """Release A: per-trigger clearance is stored and readable; unknown
+        names default to public; reregister eviction clears it."""
+        from config import TriggerSpec
+        from trigger_registry import TriggerRegistry
+
+        sched = _make_scheduler()
+        app = web.Application()
+        bus = _make_bus()
+        reg = TriggerRegistry(scheduler=sched, app=app, bus=bus)
+        reg.register_agent(
+            "assistant",
+            [TriggerSpec(name="vm", type="webhook", path="/webhook/vm",
+                         clearance="family")],
+            channels=["webhook"],
+        )
+        assert reg.get_clearance("vm") == "family"
+        assert reg.get_clearance("never-registered") == "public"
+        reg.reregister_for("assistant", [], channels=["webhook"])
+        assert reg.get_clearance("vm") == "public"  # evicted → default
+
     async def test_duplicate_webhook_path_rejected(self):
         from trigger_registry import TriggerRegistry, TriggerError
 
