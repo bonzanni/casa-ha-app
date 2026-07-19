@@ -22,6 +22,7 @@ from __future__ import annotations
 
 import hashlib
 import hmac
+import json
 import os
 import re
 import secrets
@@ -209,3 +210,173 @@ def ensure_secret(name: str, *, owner: str, secrets_dir: Path) -> bytes | None:
     _publish(name, secrets.token_urlsafe(_CASA_TOKEN_NBYTES).encode("ascii"),
              secrets_dir)
     return _read_final(name, owner, secrets_dir)
+
+
+# ---------------------------------------------------------------------------
+# Secret rotation state machine (spec A2c) — persisted, crash-safe.
+#
+# Phases (state file ``<name>.rot.json``; absent = idle):
+#   awaiting_next : provider rotation begun, waiting for the provider `.next`
+#                   import (single-accept; live endpoint keeps working).
+#   staged        : `.next` present + valid; verifier dual-accepts live + next.
+#   promote       : persisted immediately before the live-replace rename, so a
+#                   crash mid-rename is recoverable.
+#
+# `.next` is published with the same no-clobber staging primitive as the live
+# secret; the state file is published with an atomic overwrite (os.replace).
+# ---------------------------------------------------------------------------
+
+
+def _state_path(name: str, secrets_dir: Path) -> Path:
+    return secrets_dir / f"{name}.rot.json"
+
+
+def _next_name(name: str) -> str:
+    return f"{name}.next"
+
+
+def _write_state(name: str, phase: str, owner: str, secrets_dir: Path) -> None:
+    payload = json.dumps(
+        {"phase": phase, "secret_owner": owner, "started_ts": int(time.time())}
+    ).encode("ascii")
+    tmp = secrets_dir / f".rot-{os.getpid()}-{secrets.token_hex(8)}"
+    fd = os.open(tmp, os.O_CREAT | os.O_EXCL | os.O_WRONLY | os.O_NOFOLLOW, 0o600)
+    try:
+        os.write(fd, payload)
+        os.fsync(fd)
+    finally:
+        os.close(fd)
+    os.replace(tmp, _state_path(name, secrets_dir))
+    dir_fd = os.open(secrets_dir, os.O_DIRECTORY | os.O_NOFOLLOW)
+    try:
+        os.fsync(dir_fd)
+    finally:
+        os.close(dir_fd)
+
+
+def _read_state(name: str, secrets_dir: Path) -> dict | None:
+    """Parsed rotation state, or ``None`` if absent/malformed (fail-closed:
+    a malformed state file is deleted)."""
+    path = _state_path(name, secrets_dir)
+    try:
+        raw = path.read_text()
+    except OSError:
+        return None
+    try:
+        st = json.loads(raw)
+        if not isinstance(st, dict) or st.get("phase") not in (
+            "awaiting_next", "staged", "promote"
+        ):
+            raise ValueError("bad phase")
+        return st
+    except (ValueError, TypeError):
+        try:
+            path.unlink()
+        except OSError:
+            pass
+        return None
+
+
+def _clear_state(name: str, secrets_dir: Path) -> None:
+    try:
+        _state_path(name, secrets_dir).unlink()
+    except OSError:
+        pass
+    dir_fd = os.open(secrets_dir, os.O_DIRECTORY | os.O_NOFOLLOW)
+    try:
+        os.fsync(dir_fd)
+    finally:
+        os.close(dir_fd)
+
+
+def _fsync_dir(secrets_dir: Path) -> None:
+    dir_fd = os.open(secrets_dir, os.O_DIRECTORY | os.O_NOFOLLOW)
+    try:
+        os.fsync(dir_fd)
+    finally:
+        os.close(dir_fd)
+
+
+def rotation_begin(name: str, *, owner: str, secrets_dir: Path) -> str:
+    """Begin a rotation. Returns the resolved phase.
+
+    ``casa``: mint (or reuse an existing) ``.next`` and go straight to
+    ``staged``. ``provider``: enter ``awaiting_next`` (the ``.next`` arrives
+    later via :func:`rotation_import_next`).
+    """
+    secrets_dir = Path(secrets_dir)
+    if owner == "casa":
+        # Reuse an existing `.next` (prior unfinished rotation), else mint.
+        if _read_final(_next_name(name), owner, secrets_dir) is None:
+            _publish(_next_name(name),
+                     secrets.token_urlsafe(_CASA_TOKEN_NBYTES).encode("ascii"),
+                     secrets_dir)
+        _write_state(name, "staged", owner, secrets_dir)
+        return "staged"
+    _write_state(name, "awaiting_next", owner, secrets_dir)
+    return "awaiting_next"
+
+
+def rotation_import_next(
+    name: str, value: bytes, *, owner: str, secrets_dir: Path,
+) -> str:
+    """Import a provider-minted ``.next`` secret (slot=next). Transitions
+    ``awaiting_next`` → ``staged``. Idempotent for an equal re-import; raises
+    ``ValueError('secret_conflict')`` for an unequal one (spec A2b/Sol r5-1)."""
+    secrets_dir = Path(secrets_dir)
+    if not _valid_value(owner, value):
+        raise ValueError("invalid_secret_value")
+    existing = _read_final(_next_name(name), owner, secrets_dir)
+    if existing is not None:
+        if not hmac.compare_digest(existing, value):
+            raise ValueError("secret_conflict")
+        _write_state(name, "staged", owner, secrets_dir)
+        return "staged"
+    _publish(_next_name(name), value, secrets_dir)
+    _write_state(name, "staged", owner, secrets_dir)
+    return "staged"
+
+
+def rotation_promote(name: str, *, secrets_dir: Path) -> str:
+    """Promote ``.next`` to the live secret and clear rotation state.
+
+    Persists ``promote`` before the rename so a crash mid-rename recovers.
+    """
+    secrets_dir = Path(secrets_dir)
+    st = _read_state(name, secrets_dir)
+    owner = (st or {}).get("secret_owner", "casa")
+    _write_state(name, "promote", owner, secrets_dir)
+    os.replace(secrets_dir / _next_name(name), secrets_dir / name)
+    _fsync_dir(secrets_dir)
+    _clear_state(name, secrets_dir)
+    return "idle"
+
+
+def rotation_recover(name: str, *, owner: str, secrets_dir: Path) -> str:
+    """Reconcile persisted rotation state at boot. Returns the resolved phase.
+
+    Every durable combination converges: ``awaiting_next`` keeps waiting;
+    ``staged`` stays only with a valid ``.next`` (else reverts to idle);
+    ``promote`` completes the rename if ``.next`` survives, else the live file
+    already won.
+    """
+    secrets_dir = Path(secrets_dir)
+    st = _read_state(name, secrets_dir)
+    if st is None:
+        return "idle"
+    phase = st["phase"]
+    st_owner = st.get("secret_owner", owner)
+    if phase == "awaiting_next":
+        return "awaiting_next"
+    if phase == "staged":
+        if _read_final(_next_name(name), st_owner, secrets_dir) is not None:
+            return "staged"
+        _clear_state(name, secrets_dir)
+        return "idle"
+    # promote
+    next_path = secrets_dir / _next_name(name)
+    if next_path.exists():
+        os.replace(next_path, secrets_dir / name)
+        _fsync_dir(secrets_dir)
+    _clear_state(name, secrets_dir)
+    return "idle"
