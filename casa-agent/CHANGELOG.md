@@ -1,5 +1,38 @@
 # Changelog
 
+## [0.98.0] - 2026-07-19
+
+Plugins can now declare webhook triggers — gated by a one-time consent tap.
+
+### Added
+
+- **Plugin-declared webhook triggers.** A plugin's manifest may carry
+  `casa.triggers`: webhook triggers targeting one resident each, served at
+  `POST /webhook/plg-<plugin>--<name>` by the existing authenticated wildcard
+  handler. Declarations are validated at publish time (bad ones refuse the
+  install), and the `plg-` name prefix is reserved so plugin and user trigger
+  names can never collide.
+- **Operator consent gate.** A plugin trigger routes only after you tap
+  Approve on a one-time DM ("Plugin X wants to open POST /webhook/… →
+  assistant"). Consent is bound to the exact plugin artifact, trigger name,
+  target, and auth policy — a plugin update re-prompts and rotates the
+  trigger's secret. Until everything lines up (install, assignment, the
+  resident's `webhook` channel, consent) the endpoint 404s and plugin health
+  shows why (`trigger_pending_ack`, `trigger_channel_missing`, …).
+- **`trigger_ack_revoke` tool.** The off-switch: revokes a plugin's trigger
+  consent and unroutes its endpoints immediately.
+- Per-trigger secrets for plugin triggers are minted eagerly at consent time
+  (readable at `/data/webhook_secrets/plg-…` for provider setup) and retired
+  when the plugin artifact changes or is removed — a new version never
+  inherits the old one's credentials.
+
+### Changed
+
+- Plugin lifecycle mutations and trigger/agent reloads now re-derive plugin
+  trigger routing as their last step (a resident losing its `webhook` channel
+  unroutes that plugin ingress), and plugin health recomputes trigger state
+  on every refresh.
+
 ## [0.97.0] - 2026-07-19
 
 Webhook triggers get per-trigger authentication, and webhook-origin turns run

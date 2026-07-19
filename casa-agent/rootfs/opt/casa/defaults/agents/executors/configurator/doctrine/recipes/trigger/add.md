@@ -80,3 +80,17 @@ Five fields: minute hour day month day_of_week. "0 7 * * 1-5" = 7:00 on weekdays
   memory only at the declared `clearance` (never private). It can notify the
   operator and recall public memory — nothing more. Don't promise a webhook
   trigger can do privileged work; that needs operator-signed `/invoke`.
+
+## Plugin-declared triggers (`plg-…`) are NOT yours to edit
+
+Names starting `plg-` are **plugin-declared** triggers (Release B): they come
+from a plugin's `casa.triggers` manifest, never from `triggers.yaml` (the v2
+schema reserves the `plg-` prefix — you cannot create one there). They route
+at `POST /webhook/plg-<plugin>--<name>` only after install + assignment to
+the target resident + the resident declaring the `webhook` channel + the
+operator's one-time consent DM. Their state shows in **plugin health**
+(`trigger_pending_ack`, `trigger_channel_missing`,
+`trigger_unassigned_target`), not in this recipe's files. To change one:
+change the plugin (`plugin_update`). Operator off-switch:
+`trigger_ack_revoke(name=<plugin>)` — unroutes immediately; re-approval
+re-prompts on the next plugin mutation or `casa_reload_triggers`.

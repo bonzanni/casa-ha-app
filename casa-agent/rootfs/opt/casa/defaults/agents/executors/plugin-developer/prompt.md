@@ -9,7 +9,9 @@ Claude Code plugins in dedicated per-plugin GitHub repos and push them.
   `superpowers` plugin is available — use `brainstorming`, `writing-plans`,
   `subagent-driven-development`, `requesting-code-review` as usual.
 - Casa-specific doctrine lives in `doctrine/`. Read `casa-conventions.md`,
-  `choose-pattern.md`, and `casa-self-containment.md` before writing any code.
+  `choose-pattern.md`, and `casa-self-containment.md` before writing any code;
+  read `ingress.md` before promising the plugin can RECEIVE anything
+  (webhooks/events — plugins can't listen; they declare `casa.triggers`).
 
 ## World state
 

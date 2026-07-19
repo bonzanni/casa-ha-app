@@ -116,6 +116,16 @@ memory. Operator-signed `/invoke` keeps full trust.
 > Webhook trigger `path` is removed in 0.97.0 — triggers are served at
 > `POST /webhook/<name>`.
 
+**Plugin-declared triggers (0.98.0).** A plugin may declare webhook triggers
+in its manifest (`casa.triggers`); they are served at
+`POST /webhook/plg-<plugin>--<name>` (the `plg-` prefix is reserved for
+plugins). Such a trigger routes only after the plugin is installed and
+assigned to the target resident, the resident declares the `webhook`
+channel, and you approve a one-time consent message in Telegram — until
+then the endpoint returns 404 and the reason shows in plugin health. A
+plugin update re-asks for consent and rotates the trigger's secret;
+`trigger_ack_revoke` switches a plugin's triggers off immediately.
+
 The target of `/invoke/{agent}` must declare the `webhook` capability in its `channels:` list to be invoke-reachable; a request for an agent that does not (for example the voice butler, which declares only `ha_voice`) returns `404 {"error": "unknown agent"}` — the same response as for an agent that does not exist, so the endpoint reveals nothing about which agents are configured. The default `assistant` (Ellen) declares `webhook` and stays reachable.
 
 ### Invoke example
