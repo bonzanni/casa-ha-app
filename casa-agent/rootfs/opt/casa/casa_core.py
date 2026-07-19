@@ -1429,6 +1429,14 @@ def _make_invoke_handler(
         if limited is not None:
             return limited
 
+        # Release A (spec A1): /invoke is fail-closed. With no global secret
+        # (webhook auth disabled) the route is effectively OFF — it must never
+        # accept an unauthenticated arbitrary-prompt request. Returns 403 rather
+        # than 401 to signal the route is disabled, not merely mis-signed.
+        if not webhook_secret:
+            return web.json_response(
+                {"error": "webhook auth disabled"}, status=403)
+
         body = await request.read()
         if not _verify(request, body):
             return web.json_response({"error": "invalid signature"}, status=401)
