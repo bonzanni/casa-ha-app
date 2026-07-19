@@ -215,6 +215,15 @@ async def send_message(args: dict) -> dict:
     message = args.get("message", "")
     channel = args.get("channel", "telegram")
 
+    # Release A / Layer 1 egress binding: an UNTRUSTED webhook turn
+    # (channel=="webhook" and not an explicit `invoke`) may notify only the
+    # operator's Telegram surface — the caller-selected channel is ignored so
+    # third-party content can't be relayed to arbitrary channels (confused
+    # deputy). Trusted /invoke and all non-webhook origins are unaffected.
+    _origin = _snapshot_origin()
+    if _origin.get("channel") == "webhook" and _origin.get("_origin_route") != "invoke":
+        channel = "telegram"
+
     if _channel_manager is None:
         return {"content": [{"type": "text", "text": "Error: tools not initialized"}]}
 
