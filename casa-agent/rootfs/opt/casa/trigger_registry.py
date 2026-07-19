@@ -66,6 +66,16 @@ class TriggerRegistry:
         # tolerance_secs/secret_owner. The wildcard handler reads it to verify
         # the request with the right scheme + secret.
         self._webhook_auth_policies: dict[str, dict] = {}
+        # Release B: plugin-declared webhook triggers form a SEPARATE overlay
+        # layer keyed by effective name (always ``plg-<plugin>--<declared>``).
+        # Resident trigger names can never start with ``plg-`` (schema
+        # reservation), so the two namespaces are DISJOINT — the overlay needs
+        # no owner map and cannot collide with or be evicted by resident
+        # (re)registration. The whole overlay is replaced atomically (one dict
+        # rebind) by the reconciler, so a request read sees the old-complete or
+        # new-complete overlay, never a partial one. Each value:
+        # ``{"role": str, "clearance": str, "auth": dict}``.
+        self._plugin_overlay: dict[str, dict] = {}
 
     def register_agent(
         self,
@@ -182,22 +192,50 @@ class TriggerRegistry:
         """Return the role registered for a webhook trigger ``name``,
         or ``None`` if no such trigger is currently registered. Consulted
         by the wildcard ``/webhook/{name}`` handler in casa_core to 404
-        unknown names and dispatch knowns to the right role.
+        unknown names and dispatch knowns to the right role. Resident
+        triggers win; plugin-overlay triggers (``plg-…``) are the fallback
+        (the namespaces are disjoint, so at most one ever matches).
         """
-        return self._webhook_targets.get(name)
+        role = self._webhook_targets.get(name)
+        if role is not None:
+            return role
+        entry = self._plugin_overlay.get(name)
+        return entry["role"] if entry is not None else None
 
     def get_clearance(self, name: str) -> str:
         """Return the declared memory read-clearance for webhook trigger
         ``name`` (default ``"public"``). Stamped onto the dispatched turn's
         ``_origin_clearance`` so the recall gate reads at the declared tier.
         """
-        return self._webhook_clearances.get(name, "public")
+        if name in self._webhook_clearances:
+            return self._webhook_clearances[name]
+        entry = self._plugin_overlay.get(name)
+        return entry["clearance"] if entry is not None else "public"
 
     def get_auth_policy(self, name: str) -> dict | None:
         """Return the per-trigger auth policy for webhook ``name`` (mode/header/
         tolerance_secs/secret_owner), or ``None`` if the name is unregistered.
         The wildcard handler verifies the request with this policy."""
-        return self._webhook_auth_policies.get(name)
+        policy = self._webhook_auth_policies.get(name)
+        if policy is not None:
+            return policy
+        entry = self._plugin_overlay.get(name)
+        return entry["auth"] if entry is not None else None
+
+    def replace_plugin_overlay(self, overlay: dict[str, dict]) -> None:
+        """Atomically replace the ENTIRE plugin-trigger overlay (Release B).
+
+        ``overlay`` maps effective name → ``{"role", "clearance", "auth"}``.
+        The reconciler builds the complete desired overlay (every resolved,
+        assigned, valid, acked plugin trigger) and swaps it here in one dict
+        rebind — so a removed/unresolved/revoked plugin's ingress is swept
+        (absent from the new map → 404) and readers never see a partial set.
+        """
+        self._plugin_overlay = dict(overlay)
+
+    def plugin_overlay_names(self) -> list[str]:
+        """Effective names currently live in the plugin overlay."""
+        return list(self._plugin_overlay)
 
     def reregister_for(
         self,
