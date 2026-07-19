@@ -233,6 +233,14 @@ class ClaudeAgentOptions:
     # v0.84.0 effective CLI pin: every Casa option builder selects the
     # boot-verified absolute executable. The mock accepts and ignores it.
     cli_path: str | None = None
+    # v0.97.0 (Release A) restricted webhook runtime: the untrusted-webhook
+    # option builder (build_restricted_webhook_options) sets these to lock the
+    # runtime down — tools=[] strips built-ins, strict_mcp_config excludes
+    # ambient .mcp.json, settings carries {"disableAllHooks": true}. The mock
+    # accepts and ignores them (offline builds assert them directly).
+    tools: Any = None
+    strict_mcp_config: bool = False
+    settings: str | None = None
 
 
 class ClaudeSDKClient:

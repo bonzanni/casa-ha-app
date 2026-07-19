@@ -44,3 +44,24 @@ def test_external_api_server_unaffected():
     ext_start = text.index("# --- External API server")
     external = text[ext_start:]
     assert "allow 172.30.32.2;" not in external
+
+
+def test_external_api_server_blocks_internal_mcp_and_hooks():
+    """v0.97.0 SECURITY: the public 18065 server must NOT proxy the
+    unauthenticated internal fallback endpoints /mcp/ and /hooks/ (they
+    dispatch CASA_TOOLS — recall_memory returns private memory, plugin_add
+    installs plugins). They must return 404 externally; loopback (in-container
+    workspace subprocesses on 127.0.0.1:8099) is unaffected."""
+    text = _SCRIPT.read_text()
+    ext_start = text.index("# --- External API server")
+    external = text[ext_start:]
+    # Both deny blocks must appear BEFORE the catch-all proxy location so they
+    # win (nginx longest-prefix match makes /mcp/ + /hooks/ beat /).
+    assert "location /mcp/ {" in external
+    assert "location /hooks/ {" in external
+    catchall = external.index("proxy_pass http://127.0.0.1:8099;")
+    assert external.index("location /mcp/ {") < catchall
+    assert external.index("location /hooks/ {") < catchall
+    # And they return 404, not proxy.
+    mcp_block = external[external.index("location /mcp/ {"):]
+    assert mcp_block[:mcp_block.index("}")].strip().endswith("return 404;")

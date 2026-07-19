@@ -10,17 +10,13 @@ NAME="casa-invoke-$$"
 trap "stop_container $NAME" EXIT
 
 log "Starting container $NAME"
-start_container "$NAME" >/dev/null
+start_authed_container "$NAME" >/dev/null
 wait_healthy "$NAME"
 
 log "C-3a: two /invoke calls with caller-supplied distinct chat_ids"
-curl -sf -X POST "http://localhost:${HOST_PORT}/invoke/assistant" \
-    -H 'Content-Type: application/json' \
-    -d '{"prompt":"hi A","context":{"chat_id":"user-A"}}' >/dev/null \
+signed_invoke "$HOST_PORT" assistant '{"prompt":"hi A","context":{"chat_id":"user-A"}}' >/dev/null \
     || fail "first /invoke failed"
-curl -sf -X POST "http://localhost:${HOST_PORT}/invoke/assistant" \
-    -H 'Content-Type: application/json' \
-    -d '{"prompt":"hi B","context":{"chat_id":"user-B"}}' >/dev/null \
+signed_invoke "$HOST_PORT" assistant '{"prompt":"hi B","context":{"chat_id":"user-B"}}' >/dev/null \
     || fail "second /invoke failed"
 
 # Give the session-registry write a beat to flush.
@@ -50,12 +46,8 @@ echo "$keys" | grep -q "$exp_default" \
 pass "C-3a distinct caller-supplied chat_ids"
 
 log "C-3b: two /invoke calls WITHOUT chat_id get unique UUIDs"
-curl -sf -X POST "http://localhost:${HOST_PORT}/invoke/assistant" \
-    -H 'Content-Type: application/json' \
-    -d '{"prompt":"hi X"}' >/dev/null
-curl -sf -X POST "http://localhost:${HOST_PORT}/invoke/assistant" \
-    -H 'Content-Type: application/json' \
-    -d '{"prompt":"hi Y"}' >/dev/null
+signed_invoke "$HOST_PORT" assistant '{"prompt":"hi X"}' >/dev/null
+signed_invoke "$HOST_PORT" assistant '{"prompt":"hi Y"}' >/dev/null
 
 sleep 1
 webhook_keys=$(docker exec "$NAME" sh -c \

@@ -42,6 +42,12 @@ RESERVED_CONTEXT_KEYS = frozenset({
     "_origin_device_id",
     "_voice_transport",
     "_voice_handoff_reservation",
+    # Release A: unspoofable, server-set origin markers. An external caller
+    # (webhook payload, /invoke body) must never set these — the ingress
+    # handler stamps them after sanitization so a webhook-origin turn cannot
+    # forge "invoke"/"private" clearance (spec A0/A4).
+    "_origin_route",
+    "_origin_clearance",
 })
 
 

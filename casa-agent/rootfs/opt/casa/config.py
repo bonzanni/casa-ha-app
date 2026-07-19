@@ -164,6 +164,13 @@ class TriggerSpec:
     path: str = ""
     channel: str = ""
     prompt: str = ""
+    # v2 (Release A): per-trigger webhook auth policy + memory read clearance.
+    # ``auth`` is None for non-webhook triggers; webhook triggers are normalized
+    # to a full policy dict by agent_loader (defaulting absent auth to hmac_body).
+    # ``clearance`` bounds what memory tiers a webhook-origin turn may recall
+    # (never "private"); ignored for non-webhook triggers.
+    auth: dict[str, Any] | None = None
+    clearance: str = "public"
 
 
 @dataclass

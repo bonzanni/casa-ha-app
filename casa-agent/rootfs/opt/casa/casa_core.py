@@ -11,6 +11,7 @@ import math
 import os
 import signal
 import sys
+import time
 import uuid
 from pathlib import Path
 from typing import Any, Mapping
@@ -1254,6 +1255,10 @@ async def _close_tina_ha_facade(
         logger.warning("ha_facade_close_failed")
 
 
+# Max webhook request body (spec A3). Larger requests are rejected before read.
+_WEBHOOK_BODY_MAX = 64 * 1024
+
+
 def _make_webhook_handler(
     *,
     webhook_rate_limiter: Any,
@@ -1261,45 +1266,77 @@ def _make_webhook_handler(
     trigger_registry: Any,
     default_role: str,
     bus: Any,
+    secrets_dir: str | Path = "/data/webhook_secrets",
 ):
     """Build the wildcard ``/webhook/{name}`` handler.
 
-    The handler:
+    Request pipeline (spec A3): rate limit → bounded body read (64 KiB) →
+    name lookup (unknown ⇒ 404) → PER-TRIGGER auth verify (fail ⇒ 401) →
+    dispatch a SCHEDULED bus message to the registered role.
 
-    * applies the global rate limit (shared bucket with /invoke/{agent}),
-    * verifies the HMAC-SHA256 signature when ``webhook_secret`` is set
-      (so unknown names cannot leak via 404 vs 401 timing),
-    * looks up ``name`` in ``trigger_registry.get_webhook_target(name)``
-      — returns 404 ``{"error": "unknown webhook"}`` for unknowns
-      (N-2, v0.36.0),
-    * dispatches a SCHEDULED bus message to the registered role, falling
-      back to ``default_role`` only when the registry returns the
-      sentinel ``"__assistant_default__"`` (kept for forward parity if
-      we want a public open dispatch later — currently unused).
+    Auth is per-trigger (spec A1): each webhook trigger declares an ``auth``
+    policy (``hmac_body`` uses the global ``webhook_secret``; ``static_header``/
+    ``timestamped_hmac`` use a per-trigger secret under ``secrets_dir``). An
+    empty/absent secret fails closed. 404 precedes auth (names are non-secret,
+    r3 design decision) so the policy can be selected by name.
 
     Extracted from ``main()`` so it is unit-testable; see
     ``tests/test_webhook_handler.py``.
     """
+    import webhook_auth
+    secrets_dir = Path(secrets_dir)
+    if webhook_secret:
+        import log_redact as _lr
+        _lr.register_secret(webhook_secret)
 
-    def _verify(request: web.Request, body: bytes) -> bool:
-        if not webhook_secret:
-            return True
-        sig = request.headers.get("X-Webhook-Signature", "")
-        expected = hmac.new(
-            webhook_secret.encode(), body, hashlib.sha256,
-        ).hexdigest()
-        return hmac.compare_digest(sig, expected)
+    import log_redact
+
+    def _secret_for(name: str, policy: dict) -> bytes:
+        mode = policy.get("mode", "hmac_body")
+        if mode == "hmac_body":
+            return webhook_secret.encode() if webhook_secret else b""
+        owner = policy.get("secret_owner", "casa")
+        # casa: mint-if-absent so the operator can read + provision it;
+        # provider: read-only (imported out of band).
+        got = webhook_auth.ensure_secret(name, owner=owner, secrets_dir=secrets_dir)
+        if got:
+            # Register for exact-value log redaction (spec A2) so a per-trigger
+            # secret can never surface in Casa's application logs.
+            try:
+                log_redact.register_secret(got.decode("utf-8", "replace"))
+            except Exception:  # noqa: BLE001 — redaction is best-effort
+                pass
+        return got or b""
+
+    def _verify(request: web.Request, body: bytes, name: str, policy: dict) -> bool:
+        return webhook_auth.verify(
+            policy.get("mode", "hmac_body"),
+            body=body,
+            headers=request.headers,
+            secret=_secret_for(name, policy),
+            header_name=policy.get("header", "X-Webhook-Signature"),
+            tolerance_secs=int(policy.get("tolerance_secs", 300)),
+            now=int(time.time()),
+        )
 
     async def webhook_handler(request: web.Request) -> web.Response:
         limited = rate_limit_response(webhook_rate_limiter, "global")
         if limited is not None:
             return limited
 
-        body = await request.read()
-        if not _verify(request, body):
-            return web.json_response(
-                {"error": "invalid signature"}, status=401,
-            )
+        # Bounded body read (spec A3): reject a declared oversize Content-Length
+        # early, AND stream-read with a hard cap so a chunked/Transfer-Encoding
+        # request cannot buffer past 64 KiB (Terra ship-review P1).
+        if request.content_length is not None and request.content_length > _WEBHOOK_BODY_MAX:
+            return web.json_response({"error": "payload too large"}, status=413)
+        chunks: list[bytes] = []
+        read = 0
+        async for chunk in request.content.iter_chunked(8192):
+            read += len(chunk)
+            if read > _WEBHOOK_BODY_MAX:
+                return web.json_response({"error": "payload too large"}, status=413)
+            chunks.append(chunk)
+        body = b"".join(chunks)
 
         name = request.match_info.get("name", "")
         target_role = trigger_registry.get_webhook_target(name)
@@ -1308,8 +1345,17 @@ def _make_webhook_handler(
                 {"error": "unknown webhook"}, status=404,
             )
 
+        policy = trigger_registry.get_auth_policy(name) or {"mode": "hmac_body"}
+        if not _verify(request, body, name, policy):
+            return web.json_response(
+                {"error": "invalid signature"}, status=401,
+            )
+
+        # Parse the ALREADY-READ body (the streaming cap above consumed
+        # request.content, so request.json() would re-read empty — Terra
+        # ship-review P2). Fall back to raw text for non-JSON payloads.
         try:
-            payload = await request.json()
+            payload = json.loads(body)
         except Exception:
             payload = body.decode("utf-8", errors="replace")
 
@@ -1322,6 +1368,14 @@ def _make_webhook_handler(
             context={
                 "webhook_name": name,
                 "cid": request.get("cid") or new_cid(),
+                # Release A: server-set, unspoofable containment markers. A
+                # webhook_trigger turn is UNTRUSTED (third-party content) → the
+                # restricted runtime + public-floored recall clearance. Fresh
+                # UUID chat_id makes each dispatch a one-shot that can never
+                # resume another session.
+                "_origin_route": "webhook_trigger",
+                "_origin_clearance": trigger_registry.get_clearance(name),
+                "chat_id": str(uuid.uuid4()),
             },
         )
         await bus.send(msg)
@@ -1397,6 +1451,14 @@ def _make_invoke_handler(
         if limited is not None:
             return limited
 
+        # Release A (spec A1): /invoke is fail-closed. With no global secret
+        # (webhook auth disabled) the route is effectively OFF — it must never
+        # accept an unauthenticated arbitrary-prompt request. Returns 403 rather
+        # than 401 to signal the route is disabled, not merely mis-signed.
+        if not webhook_secret:
+            return web.json_response(
+                {"error": "webhook auth disabled"}, status=403)
+
         body = await request.read()
         if not _verify(request, body):
             return web.json_response({"error": "invalid signature"}, status=401)
@@ -1461,6 +1523,11 @@ def build_invoke_message(
         context["chat_id"] = str(uuid.uuid4())
     if not context.get("cid"):
         context["cid"] = new_cid()
+    # Release A: stamp the unspoofable origin route AFTER sanitization so a
+    # caller cannot forge it. /invoke is operator-signed (HMAC) → the trusted
+    # "invoke" route (private clearance, full runtime); distinct from the
+    # "webhook_trigger" route stamped by the /webhook/{name} dispatch.
+    context["_origin_route"] = "invoke"
     return BusMessage(
         type=MessageType.REQUEST,
         source="webhook",

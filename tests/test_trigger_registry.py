@@ -155,7 +155,11 @@ class TestCron:
 
 
 class TestWebhook:
-    async def test_webhook_registers_aiohttp_route(self):
+    async def test_webhook_registers_no_per_path_route(self):
+        """Release A: webhook triggers are served ONLY by the authenticated
+        wildcard /webhook/{name} handler. Registration adds the name to the
+        allowlist but registers NO per-path aiohttp route (the old unauth'd
+        per-path route — and, for v2 path="", an open POST / — is removed)."""
         from trigger_registry import TriggerRegistry
 
         sched = _make_scheduler()
@@ -167,29 +171,14 @@ class TestWebhook:
             "assistant", [_trigger_webhook()], channels=["webhook"],
         )
 
-        paths = [str(r.resource.canonical) for r in app.router.routes()]
-        assert any("/webhook/gh" in p for p in paths)
+        # No per-path route was registered (serving is wildcard-only).
+        assert list(app.router.routes()) == []
+        # But the name IS in the dispatch allowlist.
+        assert reg.get_webhook_target("gh") == "assistant"
 
-    async def test_duplicate_webhook_path_rejected(self):
-        from trigger_registry import TriggerRegistry, TriggerError
-
-        sched = _make_scheduler()
-        app = web.Application()
-        bus = _make_bus()
-        reg = TriggerRegistry(scheduler=sched, app=app, bus=bus)
-
-        reg.register_agent("assistant", [_trigger_webhook()],
-                           channels=["webhook"])
-        with pytest.raises(TriggerError, match="/webhook/gh"):
-            reg.register_agent("butler", [_trigger_webhook()],
-                               channels=["webhook"])
-
-    async def test_registered_trigger_payload_context_never_enters_bus_message(self):
-        """r2-B6 (A:§1): the per-trigger registered handler embeds the
-        payload in message CONTENT and builds a Casa-OWNED context
-        (webhook_name/chat_id/cid) — it must NOT propagate a caller-supplied
-        payload["context"] dict into BusMessage.context."""
-        from aiohttp.test_utils import TestClient, TestServer
+    async def test_v2_empty_path_registers_no_root_route(self):
+        """A v2 webhook trigger (path="") must NOT register an open POST /."""
+        from config import TriggerSpec
         from trigger_registry import TriggerRegistry
 
         sched = _make_scheduler()
@@ -197,27 +186,40 @@ class TestWebhook:
         bus = _make_bus()
         reg = TriggerRegistry(scheduler=sched, app=app, bus=bus)
         reg.register_agent(
-            "assistant", [_trigger_webhook(name="gh", path="/webhook/gh")],
+            "assistant",
+            [TriggerSpec(name="a", type="webhook"),
+             TriggerSpec(name="b", type="webhook")],  # two empty-path v2 triggers
             channels=["webhook"],
         )
+        assert list(app.router.routes()) == []
+        assert reg.get_webhook_target("a") == "assistant"
+        assert reg.get_webhook_target("b") == "assistant"
 
-        async with TestClient(TestServer(app)) as client:
-            r = await client.post("/webhook/gh", json={
-                "x": 1,
-                "context": {
-                    "execution_role": "butler", "message_type": "channel_in",
-                    "source": "telegram", "synthetic": "button",
-                    "smuggled": "should-not-appear",
-                },
-            })
-            assert r.status == 200
+    async def test_get_clearance_returns_declared_and_defaults_public(self):
+        """Release A: per-trigger clearance is stored and readable; unknown
+        names default to public; reregister eviction clears it."""
+        from config import TriggerSpec
+        from trigger_registry import TriggerRegistry
 
-        bus.send.assert_awaited_once()
-        msg = bus.send.call_args.args[0]
-        assert set(msg.context.keys()) <= {"webhook_name", "chat_id", "cid"}
-        assert "execution_role" not in msg.context
-        assert "smuggled" not in msg.context
-        assert "synthetic" not in msg.context
+        sched = _make_scheduler()
+        app = web.Application()
+        bus = _make_bus()
+        reg = TriggerRegistry(scheduler=sched, app=app, bus=bus)
+        reg.register_agent(
+            "assistant",
+            [TriggerSpec(name="vm", type="webhook", path="/webhook/vm",
+                         clearance="family")],
+            channels=["webhook"],
+        )
+        assert reg.get_clearance("vm") == "family"
+        assert reg.get_clearance("never-registered") == "public"
+        reg.reregister_for("assistant", [], channels=["webhook"])
+        assert reg.get_clearance("vm") == "public"  # evicted → default
+
+    # NOTE (Release A): the per-path route is removed, so path is no longer a
+    # collision axis (duplicate-name rejection is covered by
+    # TestCrossRoleWebhookNameCollision below), and the per-path handler's
+    # context-safety test moved to test_webhook_handler (the wildcard handler).
 
 
 class TestCrossRoleWebhookNameCollision:

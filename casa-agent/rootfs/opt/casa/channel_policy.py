@@ -11,6 +11,15 @@ voice to writable at that speaker's clearance — change this one predicate."""
 from __future__ import annotations
 
 # Channels whose speaker is authenticated and may write the trusted bank.
+#
+# SECURITY INVARIANT (Release A / spec A4): "webhook" is deliberately absent, so
+# BOTH /invoke and webhook_trigger turns are recall-only for writes and
+# third-party webhook content can never reach the shared bank via save_session,
+# retain_cold_session, or retain_delegated. This is why the webhook-origin store
+# machinery (sticky contamination bit, atomic claim snapshot) is NOT needed.
+# Adding "webhook" here (granting invoke/webhook write-trust) REQUIRES first
+# adding an origin-aware store-deny keyed on _origin_route=="webhook_trigger" —
+# see the Task 8+9 restricted-runtime design (Sol+Terra r5).
 _WRITABLE_CHANNELS: frozenset[str] = frozenset({"telegram"})
 
 

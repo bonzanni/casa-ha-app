@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import json
 import logging
 import time
 from contextvars import ContextVar
@@ -39,7 +40,7 @@ from mcp_registry import McpServerRegistry
 from channel_trust import channel_trust_display, user_peer_for_channel
 from timekeeping import resolve_tz
 from hindsight_ids import bank_id
-from sensitivity import clearance_for_channel, readable_tiers
+from sensitivity import clearance_for_origin, readable_tiers
 from session_saver import freshness_window, retain_cold_session, save_session
 from semantic_memory import NoOpSemanticMemory, SemanticMemory
 from session_registry import (
@@ -199,17 +200,88 @@ def _memory_bank() -> str:
     return bank_id("casa")
 
 
+def _current_origin_clearance(channel: str) -> str:
+    """Read-clearance for the CURRENT turn, keyed off the unspoofable origin
+    marker in ``origin_var`` (Release A Layer 2) rather than the channel string,
+    so a webhook_trigger turn reads public and only an explicit ``invoke`` reads
+    private on the webhook channel. Falls through to channel clearance when no
+    origin marker is present (non-webhook surfaces unchanged)."""
+    origin = origin_var.get(None) or {}
+    return clearance_for_origin(
+        origin.get("_origin_route"), origin.get("_origin_clearance"), channel,
+    )
+
+
 def _recall_tier_tags(channel: str) -> list[str]:
-    """Tiers a turn on ``channel`` may recall = readable_tiers(clearance). The sole
-    read-side access gate (design §2.3)."""
-    return readable_tiers(clearance_for_channel(channel))
+    """Tiers a turn may recall = readable_tiers(clearance). The sole read-side
+    access gate (design §2.3), origin-keyed (Layer 2)."""
+    return readable_tiers(_current_origin_clearance(channel))
 
 
 def _overlay_allowed(channel: str) -> bool:
     """The bank-level mental-model overlay cannot be tier-filtered, so it is pushed
     ONLY at ``private`` clearance — a context that may already see everything
     (design §2.3). At any lower clearance it would leak across tiers."""
-    return clearance_for_channel(channel) == "private"
+    return _current_origin_clearance(channel) == "private"
+
+
+# Release A / Layer 1 — the two casa-framework tools an untrusted webhook turn
+# may use: public-clearance recall + operator-bound notify. Everything else
+# (Bash, filesystem, network, delegation, plugin/config mutation) is denied.
+_RESTRICTED_WEBHOOK_TOOLS = (
+    "mcp__casa-framework__recall_memory",
+    "mcp__casa-framework__send_message",
+)
+# Defense-in-depth: Agent/Task can bypass allowed_tools (they route to
+# sub-agents), so name them in disallowed_tools; Bash is belt-and-braces on top
+# of tools=[].
+_RESTRICTED_DISALLOWED_TOOLS = ("Bash", "Task", "Agent")
+
+
+def build_restricted_webhook_options(
+    *,
+    model: str,
+    role: str,
+    system_prompt: str,
+    max_turns: int,
+    agent_home: str,
+    resume_sid: str | None,
+) -> ClaudeAgentOptions:
+    """Build the LOCKED-DOWN options for an UNTRUSTED webhook turn (spec A4 /
+    Release A Layer 1 — the primary containment boundary; Sol+Terra design r5).
+
+    Third-party webhook content runs with NO plugins, NO external/managed hooks
+    (``settings={"disableAllHooks": true}``; ``setting_sources=[]``), NO built-in
+    tools (``tools=[]`` — ``allowed_tools`` alone is only auto-approval and would
+    leave Bash reachable), NO skills, strict MCP config (no ambient ``.mcp.json``),
+    ``permission_mode="dontAsk"``, and exactly two casa-framework tools. ``Agent``/
+    ``Task`` are additionally disallowed (they bypass ``allowed_tools``). This
+    closes the Bash→(unauthenticated)Hindsight, Bash→transcript-file, and
+    pre-tool-decision-hook bypasses that application-level memory gates cannot.
+    """
+    from tools import create_casa_tools
+    casa_server = create_casa_tools(frozenset(_RESTRICTED_WEBHOOK_TOOLS))
+    return ClaudeAgentOptions(
+        model=model,
+        cli_path=CLAUDE_CLI_PATH,
+        system_prompt=system_prompt,
+        allowed_tools=list(_RESTRICTED_WEBHOOK_TOOLS),
+        disallowed_tools=list(_RESTRICTED_DISALLOWED_TOOLS),
+        permission_mode="dontAsk",
+        max_turns=max_turns,
+        mcp_servers={"casa-framework": casa_server},
+        hooks={},
+        cwd=agent_home,
+        resume=resume_sid,
+        setting_sources=[],
+        skills=[],
+        tools=[],
+        strict_mcp_config=True,
+        plugins=[],
+        settings=json.dumps({"disableAllHooks": True}),
+        can_use_tool=make_fail_closed_can_use_tool(role),
+        include_partial_messages=False,
+    )
 
 
 class Agent:
@@ -490,13 +562,23 @@ class Agent:
             "Reply to the user via their original channel. Be concise.\n"
         )
 
+        # Release A Layer 3: the notification's context carries only cid/chat_id,
+        # so copy the trusted origin markers from the PERSISTED completion origin
+        # into the synthesized turn — otherwise a delegating /invoke would
+        # fail-close to public/restricted on resume. These keys are reserved
+        # (server-set), so the persisted origin value is the trustworthy one.
+        synth_context = dict(msg.context)
+        for _marker_key in ("_origin_route", "_origin_clearance"):
+            if _marker_key in origin:
+                synth_context[_marker_key] = origin[_marker_key]
+
         return BusMessage(
             type=MessageType.REQUEST,
             source=msg.source,
             target=msg.target,
             content=body,
             channel=msg.channel,
-            context=dict(msg.context),
+            context=synth_context,
         )
 
     # ------------------------------------------------------------------
@@ -544,7 +626,15 @@ class Agent:
         # answers) ride on msg.context when a LATER task (ask_user/button
         # broker) sets them; copy through only if actually present so a
         # normal turn's origin stays free of stray None-valued keys.
-        for _marker_key in ("synthetic", "button_answer"):
+        # Release A: ``_origin_route``/``_origin_clearance`` are stamped
+        # server-side at ingress (build_invoke_message / the /webhook/{name}
+        # dispatch) and are RESERVED (stripped from external context), so a
+        # copy here carries only the trustworthy server value into
+        # ``origin_var`` — where _build_options (restricted-runtime gate),
+        # the recall clearance gate, and delegation synthesis read it.
+        for _marker_key in (
+            "synthetic", "button_answer", "_origin_route", "_origin_clearance",
+        ):
             if _marker_key in msg.context:
                 origin_snapshot[_marker_key] = msg.context[_marker_key]
         # A4: voice turn budget + progress sink. Set by the SSE/WS handler
@@ -841,6 +931,25 @@ class Agent:
             self.config.cwd
             or f"/config/agent-home/{self.config.role}"
         )
+
+        # Release A / Layer 1 (PRIMARY containment): an UNTRUSTED webhook turn
+        # — channel=="webhook" and NOT an explicit server-stamped `invoke`
+        # (fail-closed: webhook_trigger OR any missing/unknown route) — builds a
+        # locked-down runtime and short-circuits the full options path (no
+        # plugins, no external hooks, no Bash/fs/net, two casa-framework tools).
+        # webhook_trigger turns are SCHEDULED → bypass the client pool → fresh
+        # options per turn, so this branch is pool-key-neutral.
+        _route = (origin_var.get(None) or {}).get("_origin_route")
+        if channel == "webhook" and _route != "invoke":
+            restricted = build_restricted_webhook_options(
+                model=self.config.model,
+                role=self.config.role,
+                system_prompt=self.config.system_prompt,
+                max_turns=self.config.tools.max_turns,
+                agent_home=agent_home,
+                resume_sid=resume_sid,
+            )
+            return sdk_logging.with_stderr_callback(restricted, engagement_id=None)
 
         # 2b. Memory context (spec §4.3) — channel-aware load on the
         # SemanticMemory seam: a cheap mental-model overlay at fresh-session

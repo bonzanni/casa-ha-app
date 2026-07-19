@@ -31,10 +31,38 @@ _REDACT_PATTERNS: list[tuple[re.Pattern[str], str]] = [
 ]
 
 
+# Exact secret values registered at load (Release A): per-trigger webhook
+# secrets are opaque and match no generic pattern, so callers register the
+# literal value and every occurrence is masked. Scope is Casa's application
+# logging handler only (a plugin process printing to its own stdout is out of
+# scope — see spec A2/B4).
+_MIN_REGISTERED_LEN = 8
+_REGISTERED_SECRETS: set[str] = set()
+_REDACTED = "«redacted»"
+
+
+def register_secret(value: str) -> None:
+    """Register an exact secret value for literal redaction in Casa logs.
+
+    Values shorter than 8 chars are ignored — too short to be a meaningful
+    secret and dangerous to blanket-replace.
+    """
+    if isinstance(value, str) and len(value) >= _MIN_REGISTERED_LEN:
+        _REGISTERED_SECRETS.add(value)
+
+
+def _reset_registered_secrets() -> None:
+    """Test hook: clear the registry."""
+    _REGISTERED_SECRETS.clear()
+
+
 def redact(text: str) -> str:
-    """Replace known secret patterns in *text* with masked versions."""
+    """Replace known secret patterns and registered exact values in *text*."""
     for pattern, replacement in _REDACT_PATTERNS:
         text = pattern.sub(replacement, text)
+    for value in _REGISTERED_SECRETS:
+        if value in text:
+            text = text.replace(value, _REDACTED)
     return text
 
 

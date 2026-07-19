@@ -10,17 +10,13 @@ NAME="casa-conc-$$"
 trap "stop_container $NAME" EXIT
 
 log "Starting container with MOCK_SDK_LATENCY_SEC=2"
-start_container "$NAME" -e MOCK_SDK_LATENCY_SEC=2 >/dev/null
+start_authed_container "$NAME" -e MOCK_SDK_LATENCY_SEC=2 >/dev/null
 wait_healthy "$NAME"
 
 log "D-1: firing two /invoke calls in parallel"
 start_ts=$(date +%s%3N)
-curl -sf -X POST "http://localhost:${HOST_PORT}/invoke/assistant" \
-    -H 'Content-Type: application/json' \
-    -d '{"prompt":"slow-A","context":{"chat_id":"A"}}' >/dev/null &
-curl -sf -X POST "http://localhost:${HOST_PORT}/invoke/assistant" \
-    -H 'Content-Type: application/json' \
-    -d '{"prompt":"slow-B","context":{"chat_id":"B"}}' >/dev/null &
+signed_invoke "$HOST_PORT" assistant '{"prompt":"slow-A","context":{"chat_id":"A"}}' >/dev/null &
+signed_invoke "$HOST_PORT" assistant '{"prompt":"slow-B","context":{"chat_id":"B"}}' >/dev/null &
 wait
 end_ts=$(date +%s%3N)
 elapsed=$(( end_ts - start_ts ))

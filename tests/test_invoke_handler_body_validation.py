@@ -4,11 +4,33 @@ bodies and must normalize an explicit "context": null instead of crashing.
 
 from __future__ import annotations
 
+import hashlib
+import hmac
+import json
+
 import pytest
 from aiohttp import web
 from aiohttp.test_utils import TestClient, TestServer
 
 pytestmark = pytest.mark.unit
+
+# Release A: /invoke is fail-closed — it requires a non-empty secret + a valid
+# signature, so these body-validation tests (which exercise POST-auth logic)
+# authenticate first.
+_SECRET = "invoke-secret"
+
+
+def _sign(body: bytes) -> str:
+    return hmac.new(_SECRET.encode(), body, hashlib.sha256).hexdigest()
+
+
+async def _post_signed(client, path, obj):
+    body = json.dumps(obj).encode()
+    return await client.post(
+        path, data=body,
+        headers={"Content-Type": "application/json",
+                 "X-Webhook-Signature": _sign(body)},
+    )
 
 
 class _StubResult:
@@ -39,7 +61,7 @@ def _make_app(bus):
     # webhook — so it stays invoke-reachable under the spec A3 gate.
     handler = _make_invoke_handler(
         webhook_rate_limiter=RateLimiter(capacity=0, window_s=60.0),  # 0 = disabled
-        webhook_secret="",  # HMAC off
+        webhook_secret=_SECRET,  # fail-closed: /invoke requires a secret
         bus=bus,
         assistant_role="assistant",
         role_configs={"assistant": _StubCfg(["telegram", "webhook"])},
@@ -54,9 +76,11 @@ async def test_non_dict_json_bodies_return_400_not_500():
     app = _make_app(_StubBus())
     async with TestClient(TestServer(app)) as client:
         for body in ("[1]", '"hi"', "42", "null"):
+            raw = body.encode()
             r = await client.post(
-                "/invoke/assistant", data=body,
-                headers={"Content-Type": "application/json"},
+                "/invoke/assistant", data=raw,
+                headers={"Content-Type": "application/json",
+                         "X-Webhook-Signature": _sign(raw)},
             )
             assert r.status == 400, f"body={body} gave {r.status}"
             assert (await r.json()) == {"error": "invalid JSON body"}
@@ -67,9 +91,9 @@ async def test_context_null_is_normalized_and_invocation_succeeds():
     bus = _StubBus()
     app = _make_app(bus)
     async with TestClient(TestServer(app)) as client:
-        r = await client.post(
-            "/invoke/assistant",
-            json={"prompt": "status", "context": None},
+        r = await _post_signed(
+            client, "/invoke/assistant",
+            {"prompt": "status", "context": None},
         )
         assert r.status == 200
         assert (await r.json()) == {"response": "ok"}
@@ -83,9 +107,9 @@ async def test_context_non_dict_string_is_normalized():
     bus = _StubBus()
     app = _make_app(bus)
     async with TestClient(TestServer(app)) as client:
-        r = await client.post(
-            "/invoke/assistant",
-            json={"prompt": "status", "context": "abc"},
+        r = await _post_signed(
+            client, "/invoke/assistant",
+            {"prompt": "status", "context": "abc"},
         )
         assert r.status == 200
         assert bus.last_msg.context.get("cid")
@@ -96,7 +120,7 @@ async def test_missing_prompt_still_returns_400():
     """Existing contract must survive the refactor."""
     app = _make_app(_StubBus())
     async with TestClient(TestServer(app)) as client:
-        r = await client.post("/invoke/assistant", json={})
+        r = await _post_signed(client, "/invoke/assistant", {})
         assert r.status == 400
         assert (await r.json()) == {"error": "missing 'prompt' field"}
 
@@ -110,9 +134,9 @@ async def test_caller_supplied_reserved_keys_are_stripped():
     bus = _StubBus()
     app = _make_app(bus)
     async with TestClient(TestServer(app)) as client:
-        r = await client.post(
-            "/invoke/assistant",
-            json={
+        r = await _post_signed(
+            client, "/invoke/assistant",
+            {
                 "prompt": "status",
                 "context": {
                     "chat_id": "caller-1",
@@ -134,3 +158,25 @@ async def test_caller_supplied_reserved_keys_are_stripped():
             "message_type", "source",
         ):
             assert key not in ctx, f"reserved key {key!r} leaked into BusMessage.context"
+
+
+@pytest.mark.asyncio
+async def test_invoke_fail_closed_403_when_no_secret():
+    """Release A (spec A1): /invoke with webhook auth disabled (empty secret)
+    returns 403 — the route is off, never an open arbitrary-prompt endpoint."""
+    from casa_core import _make_invoke_handler
+    from casa_core_middleware import cid_middleware
+    from rate_limit import RateLimiter
+    bus = _StubBus()
+    handler = _make_invoke_handler(
+        webhook_rate_limiter=RateLimiter(capacity=0, window_s=60.0),
+        webhook_secret="",  # auth disabled
+        bus=bus, assistant_role="assistant",
+        role_configs={"assistant": _StubCfg(["telegram", "webhook"])},
+    )
+    app = web.Application(middlewares=[cid_middleware])
+    app.router.add_post("/invoke/{agent}", handler)
+    async with TestClient(TestServer(app)) as client:
+        r = await client.post("/invoke/assistant", json={"prompt": "hi"})
+        assert r.status == 403
+        assert bus.last_msg is None

@@ -15,7 +15,7 @@ NAME="casa-sch-$$"
 trap "stop_container $NAME" EXIT
 
 log "Starting container with default triggers (heartbeat + morning-briefing)"
-start_container "$NAME" >/dev/null
+start_authed_container "$NAME" >/dev/null
 wait_healthy "$NAME"
 
 log "S-1: assert boot logs show 2 triggers registered for assistant"
@@ -23,9 +23,11 @@ assert_log_contains "$NAME" "Registered 2 trigger(s) for agent 'assistant'"
 pass "S-1 assistant has 2 triggers registered (heartbeat + morning-briefing)"
 
 log "S-2: invoking assistant to ask about schedule"
+_S2_BODY='{"prompt": "What cron tasks are on your schedule today?"}'
 RESP=$(curl -s -X POST "http://localhost:${HOST_PORT}/invoke/assistant" \
     -H "Content-Type: application/json" \
-    -d '{"prompt": "What cron tasks are on your schedule today?"}' || true)
+    -H "X-Webhook-Signature: $(sign_body "$_S2_BODY")" \
+    -d "$_S2_BODY" || true)
 
 log "Response: $RESP"
 

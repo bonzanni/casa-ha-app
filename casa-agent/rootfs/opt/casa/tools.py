@@ -215,6 +215,15 @@ async def send_message(args: dict) -> dict:
     message = args.get("message", "")
     channel = args.get("channel", "telegram")
 
+    # Release A / Layer 1 egress binding: an UNTRUSTED webhook turn
+    # (channel=="webhook" and not an explicit `invoke`) may notify only the
+    # operator's Telegram surface — the caller-selected channel is ignored so
+    # third-party content can't be relayed to arbitrary channels (confused
+    # deputy). Trusted /invoke and all non-webhook origins are unaffected.
+    _origin = _snapshot_origin()
+    if _origin.get("channel") == "webhook" and _origin.get("_origin_route") != "invoke":
+        channel = "telegram"
+
     if _channel_manager is None:
         return {"content": [{"type": "text", "text": "Error: tools not initialized"}]}
 
@@ -3526,9 +3535,15 @@ async def recall_memory(args: dict) -> dict:
     channel = origin.get("channel", "telegram")
     caller_cfg = _agent_role_map.get(role)
 
-    # Tier clearance — the same read-side gate the turn path uses (design §2.3).
-    from sensitivity import clearance_for_channel, readable_tiers
-    tags = readable_tiers(clearance_for_channel(channel))
+    # Tier clearance — the same read-side gate the turn path uses (design §2.3),
+    # re-keyed off the unspoofable origin marker (Release A Layer 2): a
+    # webhook_trigger turn reads at its declared clearance (public floor, never
+    # private); /invoke stays private; missing/unknown route on the webhook
+    # channel fails closed to public.
+    from sensitivity import clearance_for_origin, readable_tiers
+    tags = readable_tiers(clearance_for_origin(
+        origin.get("_origin_route"), origin.get("_origin_clearance"), channel,
+    ))
 
     budget = "low" if channel == "voice" else "mid"
     tokens = (

@@ -153,6 +153,28 @@ class TestMigration:
         assert reg._data == before
         assert list(reg._data) == [v2key]        # key unchanged, not re-hashed
 
+    async def test_migrate_purges_all_webhook_entries(self, tmp_path):
+        # Release A / Layer 4: webhook session entries (v1 AND already-v2) are
+        # PURGED at migration — their origin route (invoke vs webhook_trigger)
+        # is unknowable, so they must never be resumed or treated as trusted.
+        from session_registry import SessionRegistry, build_scoped_session_key
+        path = tmp_path / "sessions.json"; path.write_text("{}")
+        reg = SessionRegistry(str(path))
+        v2_webhook = build_scoped_session_key("webhook", "assistant", "some-uuid")
+        reg._data = {
+            "webhook-legacyuuid": {"agent": "assistant", "sdk_session_id": "a",
+                                   "last_active": "2026-07-14T00:00:00+00:00"},
+            v2_webhook: {"agent": "assistant", "sdk_session_id": "b",
+                         "last_active": "2026-07-14T00:00:00+00:00"},
+            "telegram-999": {"agent": "assistant", "sdk_session_id": "c",
+                             "last_active": "2026-07-14T00:00:00+00:00"},
+        }
+        result = reg.migrate_to_v2()
+        assert not any(k.startswith("webhook-") for k in reg.all_entries())
+        assert reg.get(build_scoped_session_key(
+            "telegram", "assistant", "999"))["sdk_session_id"] == "c"
+        assert result["dropped"] >= 2  # both webhook entries dropped
+
 
 class TestVoicePoolRoleKeyed:
     def test_two_roles_one_scope_distinct_sessions(self):
@@ -191,15 +213,15 @@ class TestWebhookOneshotScopeClassSurvivesV2:
         await sweeper._sweep_once()
         assert reg.get(key) is None, "v2 webhook one-shot must be evicted under the SHORT webhook TTL"
 
-    async def test_migrated_v1_webhook_oneshot_swept_under_webhook_ttl(self, tmp_path):
-        # IMPORTANT-1 (review): a v1 webhook-<uuid> one-shot aged between the
-        # webhook TTL (1d) and the general TTL (30d) must, AFTER migration to a
-        # v2 key (whose hash is no longer uuid-shaped), still be evicted under
-        # the SHORT webhook TTL — proving migrate_to_v2 stamps scope_class and
-        # the sweeper honours it. Without the stamp it would survive to 30 days
-        # and, being a one-shot, never re-register to acquire the short TTL.
+    async def test_migrated_v1_webhook_oneshot_is_purged(self, tmp_path):
+        # Release A / Layer 4 (SUPERSEDES the old webhook_oneshot-migration
+        # behavior): a pre-upgrade v1 webhook-<uuid> entry is DROPPED at
+        # migration rather than carried forward, because its origin route is
+        # unknowable. Purging is strictly safer than the previous short-TTL
+        # carry-forward (the session is gone, not merely short-lived). NEW
+        # webhook one-shots still get scope_class at register() time and the
+        # short webhook TTL — see test_v2_webhook_oneshot_still_gets_webhook_ttl.
         from session_registry import SessionRegistry, build_scoped_session_key
-        from session_sweeper import SessionSweeper
 
         reg = SessionRegistry(str(tmp_path / "sessions.json"))
         uuid_scope = "550e8400-e29b-41d4-a716-446655440000"
@@ -207,14 +229,7 @@ class TestWebhookOneshotScopeClassSurvivesV2:
         reg._data[f"webhook-{uuid_scope}"] = {
             "agent": "assistant", "sdk_session_id": "sid-1", "last_active": aged,
         }
-        assert reg.migrate_to_v2() == {"migrated": 1, "dropped": 0}
+        assert reg.migrate_to_v2() == {"migrated": 0, "dropped": 1}
         v2key = build_scoped_session_key("webhook", "assistant", uuid_scope)
-        assert reg.get(v2key)["scope_class"] == "webhook_oneshot"
-
-        sweeper = SessionSweeper(
-            registry=reg, session_ttl_days=30, webhook_session_ttl_days=1,
-        )
-        await sweeper._sweep_once()
-        assert reg.get(v2key) is None, (
-            "migrated v1 webhook one-shot must be evicted under the webhook TTL"
-        )
+        assert reg.get(v2key) is None
+        assert not any(k.startswith("webhook-") for k in reg.all_entries())

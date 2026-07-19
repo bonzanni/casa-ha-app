@@ -92,9 +92,29 @@ All endpoints are accessible through the ingress proxy.
 | `POST` | `/webhook/{name}` | Fire-and-forget named webhook |
 | `POST` | `/invoke/{agent}` | Synchronous agent invocation (returns response) |
 
-Webhook and invoke endpoints accept JSON bodies. When `webhook_auth_enabled` is
-enabled, include an `X-Webhook-Signature` header with the HMAC-SHA256 hex digest
-of the request body, using the configured override or generated secret.
+Webhook and invoke endpoints accept JSON bodies (capped at 64 KiB). Auth is
+**fail-closed**: `/invoke` is rejected with `403` when `webhook_auth_enabled` is
+off, and a webhook trigger whose secret is missing returns `401` rather than
+serving open.
+
+**Per-trigger webhook auth.** Each webhook trigger declares an `auth` mode:
+
+- `hmac_body` (default) — `X-Webhook-Signature` = HMAC-SHA256 hex of the body,
+  using the global secret.
+- `static_header` — a shared secret compared against a request header (default
+  `X-API-Key`), for services that can only send static headers. The per-trigger
+  secret lives at `/data/webhook_secrets/<trigger-name>`.
+- `timestamped_hmac` — a `t=<unix>,v0=<hex>` signature (default header
+  `ElevenLabs-Signature`) within a tolerance window.
+
+A turn started by a `/webhook/{name}` trigger is treated as **untrusted
+third-party content**: it runs in a restricted runtime (no shell, filesystem,
+network, plugins, or hooks — only public-clearance memory recall and an
+operator-bound notification), reads memory at a reduced clearance, and writes no
+memory. Operator-signed `/invoke` keeps full trust.
+
+> Webhook trigger `path` is removed in 0.97.0 — triggers are served at
+> `POST /webhook/<name>`.
 
 The target of `/invoke/{agent}` must declare the `webhook` capability in its `channels:` list to be invoke-reachable; a request for an agent that does not (for example the voice butler, which declares only `ha_voice`) returns `404 {"error": "unknown agent"}` — the same response as for an agent that does not exist, so the endpoint reveals nothing about which agents are configured. The default `assistant` (Ellen) declares `webhook` and stays reachable.
 

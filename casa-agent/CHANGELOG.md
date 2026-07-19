@@ -1,5 +1,38 @@
 # Changelog
 
+## [0.97.0] - 2026-07-19
+
+Webhook triggers get per-trigger authentication, and webhook-origin turns run
+contained.
+
+### Added
+
+- **Per-trigger webhook auth.** Each webhook trigger declares an `auth` block
+  with one of three modes: `hmac_body` (the existing global-secret HMAC),
+  `static_header` (a shared secret compared against a request header — for
+  services that can only send static headers), or `timestamped_hmac` (a
+  timestamped signature with a tolerance window). Per-trigger secrets live under
+  `/data/webhook_secrets/`. Triggers may also declare a memory read `clearance`.
+- **Webhook-origin containment.** A turn started by a `/webhook/{name}` trigger
+  is treated as untrusted third-party content: it runs in a restricted runtime
+  (no plugins, no external hooks, no shell/filesystem/network tools — only
+  public-clearance memory recall and an operator-bound notification), reads
+  memory at a reduced clearance (never private), writes no memory, and gets a
+  fresh one-shot session that cannot resume another. Operator-signed `/invoke`
+  keeps full trust.
+
+### Changed
+
+- **Breaking:** webhook trigger `path` is removed. Triggers are served at
+  `POST /webhook/<name>`. A v1 config with `path` still loads (with a migration
+  warning) but is served at `/webhook/<name>` only.
+- Webhook auth is now fail-closed: a webhook trigger whose secret is missing, and
+  `/invoke` when webhook auth is disabled, are rejected (401/403) rather than
+  served open.
+- Webhook request bodies are capped at 64 KiB (413 on oversize).
+- Pre-upgrade webhook sessions are purged at boot migration (their trust origin
+  is unknowable).
+
 ## [0.96.0] - 2026-07-19
 
 Engagements can no longer complete past an unread operator message.
