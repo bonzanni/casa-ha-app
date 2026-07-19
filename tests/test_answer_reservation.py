@@ -969,3 +969,86 @@ class TestHandlerDelivery:
         await _drain_turns(ch)
 
         assert drv._answer_reservations.get(rec.id) is None
+
+
+class TestInboundIngressReservation:
+    """G4 D2 (v0.96.0, Sol code-r1-2/r2-1 mandatory): the ingress
+    reservation is visible BEFORE the handler's FIRST await (the high-water
+    advance) and is released on every path — delivery, command
+    classification, and cancellation while suspended."""
+
+    async def _ctx(self, tmp_path, fake_telegram_bot):
+        ch, reg, rec, drv, n = await _handler_ctx(tmp_path, fake_telegram_bot)
+        ch._observer = MagicMock()
+        ch._driver_reserve_inbound = (
+            lambda r: (drv.reserve_inbound(r.id), True)[1])
+        ch._driver_release_inbound = (
+            lambda r: drv.release_inbound_reservation(r.id))
+        return ch, reg, rec, drv
+
+    async def test_reservation_visible_at_first_await(
+        self, tmp_path, fake_telegram_bot,
+    ):
+        ch, reg, rec, drv = await self._ctx(tmp_path, fake_telegram_bot)
+        seen: list[int] = []
+
+        async def spying_high_water(r, mid):
+            # THE first await of the handler — a completion racing this
+            # suspension must already see the reservation.
+            seen.append(drv.inbound_reservations(rec.id))
+        ch._driver_advance_high_water = spying_high_water
+
+        u = _mk_update(chat_id=-1001, text="please reconsider the design",
+                       thread_id=555, user_id=77)
+        await ch.handle_update(u)
+        await _drain_turns(ch)
+
+        assert seen and seen[0] >= 1
+        # enqueue resolved → released; unread accounting lives in the spool.
+        assert drv.inbound_reservations(rec.id) == 0
+
+    async def test_command_path_takes_then_releases(
+        self, tmp_path, fake_telegram_bot,
+    ):
+        """Non-vacuous (Sol code-r2-1): the reservation IS taken before the
+        command branch runs, and the finally releases it."""
+        ch, reg, rec, drv = await self._ctx(tmp_path, fake_telegram_bot)
+        seen: list[int] = []
+
+        async def spying_high_water(r, mid):
+            seen.append(drv.inbound_reservations(rec.id))
+        ch._driver_advance_high_water = spying_high_water
+
+        u = _mk_update(chat_id=-1001, text="/silent", thread_id=555,
+                       user_id=77)
+        await ch.handle_update(u)
+        await _drain_turns(ch)
+        assert seen and seen[0] >= 1        # reservation existed during the await
+        assert drv.inbound_reservations(rec.id) == 0   # and was released
+
+    async def test_cancellation_while_suspended_releases(
+        self, tmp_path, fake_telegram_bot,
+    ):
+        """Handler cancelled while blocked on the high-water await — the
+        finally must still release the reservation."""
+        import asyncio as _asyncio
+        ch, reg, rec, drv = await self._ctx(tmp_path, fake_telegram_bot)
+        gate = _asyncio.Event()
+        entered = _asyncio.Event()
+
+        async def blocking_high_water(r, mid):
+            entered.set()
+            await gate.wait()
+        ch._driver_advance_high_water = blocking_high_water
+
+        u = _mk_update(chat_id=-1001, text="hello there", thread_id=555,
+                       user_id=77)
+        task = _asyncio.create_task(ch.handle_update(u))
+        await entered.wait()
+        assert drv.inbound_reservations(rec.id) >= 1   # held while suspended
+        task.cancel()
+        try:
+            await task
+        except _asyncio.CancelledError:
+            pass
+        assert drv.inbound_reservations(rec.id) == 0   # released on cancel

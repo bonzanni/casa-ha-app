@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import enum
 import json
 import logging
 import math
@@ -59,7 +60,7 @@ import sdk_logging
 import specialist_limits
 from tokens import extract_usage
 from drivers.brief import normalize_brief, render_brief_task, validate_brief
-from engagement_registry import EngagementRecord, EngagementRegistry
+from engagement_registry import TerminalPreconditionFailed, EngagementRecord, EngagementRegistry
 from specialist_registry import (
     DelegationComplete,
     DelegationRecord,
@@ -4441,6 +4442,21 @@ async def _abort_engagement_topic(
 # ---------------------------------------------------------------------------
 
 
+class FinalizeResult(enum.Enum):
+    """G4 D5 (v0.96.0): typed outcome of ``_finalize_engagement``. Truthiness
+    preserves the historical bool contract for existing callers — only a WON
+    finalize is truthy (Sol g4-r1-6: an untyped falsy return conflated
+    "already terminal" with "persist rolled back, record still LIVE", and
+    emit_completion acked the latter as success)."""
+    FINALIZED = "finalized"
+    ALREADY_TERMINAL = "already_terminal"
+    PRECONDITION_FAILED = "precondition_failed"   # D2 (unread inbound) — v0.96.0
+    PERSIST_FAILED = "persist_failed"
+
+    def __bool__(self) -> bool:
+        return self is FinalizeResult.FINALIZED
+
+
 async def _finalize_engagement(
     engagement: EngagementRecord,
     *,
@@ -4451,7 +4467,8 @@ async def _finalize_engagement(
     driver: Any | None,
     stale_before: float | None = None,
     output_truncated: bool = False,     # Task 6 (spec §4.6)
-) -> bool:
+    inbound_gate: bool = False,         # G4 D1/D2 (v0.96.0): emit/completed only
+) -> "FinalizeResult":
     """End an engagement: update registry, close topic, NOTIFY Ellen,
     retain a tier-classified engagement summary on the shared ``casa`` bank.
 
@@ -4462,9 +4479,11 @@ async def _finalize_engagement(
     record's ``last_user_turn_ts`` is still older than this cutoff — a record
     revived by a user turn since the reap snapshot is left live.
 
-    Returns ``True`` iff this call won the terminal transition and ran the
-    finalize side-effects; ``False`` if the record was already terminal or
-    the ``stale_before`` guard lost (so the reap doesn't count it).
+    Returns a ``FinalizeResult``; only ``FINALIZED`` (truthy) means this
+    call won the terminal transition and ran the finalize side-effects.
+    ``ALREADY_TERMINAL`` covers already-terminal AND a lost ``stale_before``
+    guard; ``PERSIST_FAILED`` means the tombstone write rolled back and the
+    record is STILL LIVE (retryable).
     """
     now = time.time()
 
@@ -4491,6 +4510,35 @@ async def _finalize_engagement(
     #    rolls the record back (full-field) and re-raises rather than leaving a
     #    closed topic with no terminal record; treat that as "did not win" so
     #    the record stays live for a retry / boot replay instead of a torn close.
+    # G4 D2/D4 (v0.96.0): SYNCHRONOUS terminal hook, evaluated inside the
+    # registry's terminal critical section (no suspension between check and
+    # flip). Composes the completion inbound GATE (inbound_gate=True: veto on
+    # unread depth or a pending ingress reservation) with the no-silent-loss
+    # SNAPSHOT of queued-unseen texts (all callers — surfaced to the topic
+    # after the flip). Accessor failures fail OPEN with a warning: a driver
+    # bug must not wedge termination forever.
+    unread_snapshot: list[str] = []
+
+    def _terminal_hook():
+        if driver is None or not hasattr(driver, "inbound_unread_texts"):
+            return None
+        try:
+            texts = list(driver.inbound_unread_texts(engagement.id))
+            texts = [t for t in texts if isinstance(t, str)]
+            _hr = (driver.inbound_reservations(engagement.id)
+                   if hasattr(driver, "inbound_reservations") else 0)
+            resv = _hr if type(_hr) is int else 0
+        except Exception:  # noqa: BLE001 — fail open
+            logger.warning(
+                "finalize engagement %s: inbound accessors failed — "
+                "gate skipped", engagement.id[:8], exc_info=True)
+            return None
+        unread_snapshot[:] = list(texts)
+        if inbound_gate and (texts or resv):
+            return (f"unread_inbound depth={len(texts)} "
+                    f"reservations={resv}")
+        return None
+
     if _engagement_registry is not None:
         try:
             won = await _engagement_registry.try_transition_terminal(
@@ -4499,21 +4547,27 @@ async def _finalize_engagement(
                 error_kind="emit_completion_error", error_message=text,
                 stale_before=stale_before,
                 strict=True,
+                terminal_hook=_terminal_hook,
             )
+        except TerminalPreconditionFailed as exc:
+            logger.info(
+                "Engagement %s completion vetoed by inbound gate: %s",
+                engagement.id[:8], exc)
+            return FinalizeResult.PRECONDITION_FAILED
         except Exception as exc:  # noqa: BLE001 — strict persist failed + rolled back
             logger.warning(
                 "Engagement %s terminal transition failed to persist "
                 "(rolled back, left live): %s",
                 engagement.id[:8], exc,
             )
-            return False
+            return FinalizeResult.PERSIST_FAILED
         if not won:
             logger.info(
                 "Engagement %s not finalized — already terminal or revived "
                 "since snapshot (outcome=%s)",
                 engagement.id[:8], outcome,
             )
-            return False
+            return FinalizeResult.ALREADY_TERMINAL
 
     # Task 6 (spec §4.6): THIS call just won the terminal flip — release
     # the specialist concurrency permit (if any; executor engagements and
@@ -4619,6 +4673,30 @@ async def _finalize_engagement(
                     summary_text += (
                         "\n\n⚠️ This engagement took an action before you "
                         "responded — please review."
+                    )
+                # G4 D4 (v0.96.0): surface operator messages that were NEVER
+                # read (queued at terminalization — cancel/reap/error paths;
+                # a gated completion cannot reach here with unread input).
+                # TOPIC-ONLY (never in `text`, which flows to the bus
+                # notification and semantic memory) and BOUNDED to one
+                # message: excerpts + count, full texts stay in the durable
+                # spool file.
+                if unread_snapshot:
+                    _budget = 2800
+                    _parts = []
+                    for _t in unread_snapshot:
+                        _ex = _t if len(_t) <= 400 else _t[:400] + "…"
+                        if _budget - len(_ex) < 0:
+                            break
+                        _budget -= len(_ex)
+                        _parts.append(f"• {_ex}")
+                    _more = len(unread_snapshot) - len(_parts)
+                    summary_text += (
+                        f"\n\n⚠️ {len(unread_snapshot)} operator "
+                        "message(s) were never read by this engagement:\n"
+                        + "\n".join(_parts)
+                        + (f"\n…and {_more} more (kept in the engagement's "
+                           "inbound spool file)." if _more > 0 else "")
                     )
                 # v0.79.0 (§2 F1(c)): for a claude_code engagement, DRAIN the
                 # sequencer (settle pending narration + parked/armed intents)
@@ -4890,7 +4968,7 @@ async def _finalize_engagement(
             "Engagement %s finalized outcome=%s",
             engagement.id[:8], outcome,
         )
-    return True
+    return FinalizeResult.FINALIZED
 
 
 # ---------------------------------------------------------------------------
@@ -5185,6 +5263,51 @@ async def emit_completion(args: dict) -> dict:
         finally:
             _ENGAGEMENTS_PENDING_RELOAD.discard(engagement.id)
 
+    # G4 D1 (v0.96.0): completion inbound gate — the ask gate's contract
+    # (`unread_inbound` ⇒ end your turn) extended to completion. Gates ONLY
+    # successful outcomes; failed/error exits stay ungated (a broken
+    # engagement must be able to die) and rely on the D4 annotation.
+    # Placed BEFORE consumption-debt registration so a refusal leaves no
+    # sequencer debt (Sol g4-r1-7).
+    if (outcome == "completed" and driver is not None
+            and hasattr(driver, "inbound_unread_depth")):
+        try:
+            _d = driver.inbound_unread_depth(engagement.id)
+            _r = (driver.inbound_reservations(engagement.id)
+                  if hasattr(driver, "inbound_reservations") else 0)
+        except Exception:  # noqa: BLE001 — fail open, never wedge completion
+            _d = _r = 0
+        # STRICT int typing (fail open otherwise): a duck/mock driver whose
+        # accessors return non-ints must read as "no unread input", never as
+        # a fabricated depth (int(MagicMock()) == 1 bit us in the gate).
+        _depth = _d if type(_d) is int else 0
+        _resv = _r if type(_r) is int else 0
+        if _depth > 0 or _resv > 0:
+            try:
+                _rn = (driver.record_completion_refusal(engagement.id)
+                       if hasattr(driver, "record_completion_refusal") else 1)
+            except Exception:  # noqa: BLE001
+                _rn = 1
+            _n = _rn if type(_rn) is int else 1
+            # D3: from the 2nd consecutive refusal, force a turn boundary so
+            # the queued envelope actually pumps (delivery re-arms only at
+            # spawn) instead of livelocking on doctrine alone.
+            if _n >= 2 and hasattr(driver, "force_completion_turn_boundary"):
+                try:
+                    await driver.force_completion_turn_boundary(engagement)
+                except Exception:  # noqa: BLE001 — escalation is best-effort
+                    logger.warning(
+                        "completion-gate forced boundary failed for %s",
+                        engagement.id[:8], exc_info=True)
+            return _result({
+                "status": "error", "kind": "unread_inbound",
+                "retryable": True,
+                "message": (
+                    "an operator message is waiting unread — END YOUR TURN "
+                    "NOW; the message is delivered at your next turn start; "
+                    "read it, then call emit_completion again"),
+            })
+
     # v0.79.0 (§2 F1(c)): register the emit_completion CONSUMPTION DEBT (identity
     # hash over the raw args) so the relay silently consumes the emit_completion
     # tool_use block instead of emitting stray narration below the completion.
@@ -5195,7 +5318,7 @@ async def emit_completion(args: dict) -> dict:
         except Exception:  # noqa: BLE001 — defensive, never block completion
             logger.debug("register_completion_consumption failed", exc_info=True)
 
-    await _finalize_engagement(
+    fin = await _finalize_engagement(
         engagement,
         outcome=outcome,
         text=text,
@@ -5203,7 +5326,41 @@ async def emit_completion(args: dict) -> dict:
         next_steps=next_steps,
         driver=driver,
         output_truncated=output_truncated,  # Task 6 (spec §4.6)
+        inbound_gate=(outcome == "completed"),   # G4 D1/D2
     )
+    # G4 D2 (v0.96.0): the registry-internal gate vetoed the flip (a message
+    # landed between the handler gate above and the terminal critical
+    # section). Roll back the consumption debt registered above (Sol
+    # g4-r1-7) and refuse with the same retryable contract.
+    if fin is FinalizeResult.PRECONDITION_FAILED:
+        if driver is not None and hasattr(driver, "cancel_send_intent"):
+            try:
+                driver.cancel_send_intent(
+                    engagement.id, f"emit_completion:{engagement.id}")
+            except Exception:  # noqa: BLE001 — best-effort debt rollback
+                logger.debug("completion debt rollback failed", exc_info=True)
+        if (driver is not None
+                and hasattr(driver, "record_completion_refusal")):
+            try:
+                driver.record_completion_refusal(engagement.id)
+            except Exception:  # noqa: BLE001
+                pass
+        return _result({
+            "status": "error", "kind": "unread_inbound", "retryable": True,
+            "message": (
+                "an operator message arrived while completing — END YOUR "
+                "TURN NOW; read it at your next turn start, then call "
+                "emit_completion again"),
+        })
+    # G4 D5 (v0.96.0): a persist rollback leaves the record LIVE — surface a
+    # retryable error instead of acking a completion that did not happen.
+    if fin is FinalizeResult.PERSIST_FAILED:
+        return _result({
+            "status": "error", "kind": "finalize_persist_failed",
+            "retryable": True,
+            "message": ("completion could not be persisted; the engagement "
+                        "is still active — call emit_completion again"),
+        })
     # Drain on terminal paths (e.g., outcome=error or
     # already-terminal short-circuit above) — the engagement is gone.
     _ENGAGEMENTS_PENDING_RELOAD.discard(engagement.id)

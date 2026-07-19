@@ -2501,6 +2501,23 @@ async def main() -> None:
             return None
         telegram_channel._driver_reserve_answer = _driver_reserve_answer
 
+        # G4 D2 (v0.96.0): SYNCHRONOUS inbound-ingress reservation — taken at
+        # trusted handler entry (under the topic lock, before the background
+        # delivery task exists) and released after the spool enqueue resolves.
+        # Terminalization refuses while reservations > 0, closing the
+        # accepted-but-not-yet-spooled completion race.
+        def _driver_reserve_inbound(rec):
+            if rec.driver == "claude_code":
+                claude_code_driver.reserve_inbound(rec.id)
+                return True
+            return False
+        telegram_channel._driver_reserve_inbound = _driver_reserve_inbound
+
+        def _driver_release_inbound(rec):
+            if rec.driver == "claude_code":
+                claude_code_driver.release_inbound_reservation(rec.id)
+        telegram_channel._driver_release_inbound = _driver_release_inbound
+
         async def _driver_rollback_answer_reservation(
                 rec, token, *, suppress_reanchor=False):
             if rec.driver == "claude_code" and token is not None:

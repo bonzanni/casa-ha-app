@@ -1,5 +1,28 @@
 # Changelog
 
+## [0.96.0] - 2026-07-19
+
+Engagements can no longer complete past an unread operator message.
+
+### Added
+
+- `emit_completion` now refuses (`unread_inbound`, retryable) when an
+  operator message is waiting unread — the same contract as the existing
+  ask gate: end the turn, read the message, then decide whether the
+  completion still stands. The check is atomic with the terminal
+  transition, covers messages still in flight between Telegram acceptance
+  and the spool, and repeated refusals force a real turn boundary so the
+  pending message is actually delivered.
+- If an engagement still terminates with unread operator messages (error
+  exits, cancels, reaps), the closing topic post now says so and quotes
+  bounded excerpts, instead of dropping them silently.
+
+### Fixed
+
+- A completion whose terminal record failed to persist is no longer
+  acknowledged as successful — it now returns a retryable error while the
+  engagement stays live.
+
 ## [0.95.1] - 2026-07-19
 
 ### Fixed

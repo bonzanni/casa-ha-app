@@ -470,6 +470,13 @@ class _InboundSpool:
         change means an operator message arrived in the race window."""
         return self._generation
 
+    def unread_texts(self) -> list[str]:
+        """G4 D4 (v0.96.0): the TEXTS of queued operator envelopes the agent
+        has not seen (same population as ``unread_depth`` — queued,
+        non-initial, deliverable). ``delivered`` is excluded: it is not
+        proof of non-reading (Sol g4-r1-5)."""
+        return [e.text for e in self._lane_members() if not e.is_initial]
+
     def unread_depth(self) -> int:
         """Count of queued operator envelopes the agent has NOT yet seen
         (deliverable, not-yet-delivered, non-initial). ``depth > 0`` at ask
@@ -850,6 +857,9 @@ class ClaudeCodeDriver(DriverProtocol):
         # turn (reset at turn_start). From the 3rd the refusal copy escalates +
         # a WARN counter is logged (soft anti-livelock — no hard force-end).
         self._ask_refusals: dict[str, int] = {}
+        # G4 (v0.96.0): completion-gate state
+        self._completion_refusals: dict[str, int] = {}
+        self._inbound_reservations: dict[str, int] = {}
         # v0.83.0 (§A3, Sol r6-4 + r7-2): in-memory ANSWERED overlay. When
         # ``mark_question_answered``'s STRICT persist raises (the durable envelope
         # is already spooled, so the agent WILL get the answer — the question must
@@ -1156,6 +1166,8 @@ class ClaudeCodeDriver(DriverProtocol):
             t.cancel()
         self._last_turn_ts.pop(engagement.id, None)
         self._inbound.pop(engagement.id, None)
+        self._completion_refusals.pop(engagement.id, None)
+        self._inbound_reservations.pop(engagement.id, None)
         self._reply_texts.pop(engagement.id, None)
         self._epoch_pending.pop(engagement.id, None)
         self._turn_running.pop(engagement.id, None)
@@ -2515,6 +2527,63 @@ class ClaudeCodeDriver(DriverProtocol):
         race-close re-check. 0 when no spool exists (degraded / no driver)."""
         spool = self._inbound.get(engagement_id)
         return spool.generation() if spool is not None else 0
+
+    def inbound_unread_texts(self, engagement_id: str) -> list[str]:
+        """G4 D4: queued-unseen operator texts ([] when no spool)."""
+        spool = self._inbound.get(engagement_id)
+        return spool.unread_texts() if spool is not None else []
+
+    def reserve_inbound(self, engagement_id: str) -> None:
+        """G4 D2: SYNCHRONOUS ingress reservation — taken by the trusted
+        Telegram handler under the topic lock BEFORE the background
+        delivery task exists, so an accepted-but-not-yet-spooled message
+        counts as unread at completion time."""
+        self._inbound_reservations[engagement_id] = (
+            self._inbound_reservations.get(engagement_id, 0) + 1)
+
+    def release_inbound_reservation(self, engagement_id: str) -> None:
+        n = self._inbound_reservations.get(engagement_id, 0) - 1
+        if n <= 0:
+            self._inbound_reservations.pop(engagement_id, None)
+        else:
+            self._inbound_reservations[engagement_id] = n
+
+    def inbound_reservations(self, engagement_id: str) -> int:
+        return self._inbound_reservations.get(engagement_id, 0)
+
+    def record_completion_refusal(self, engagement_id: str) -> int:
+        """G4 D3: bump + return the count of consecutive unread_inbound
+        completion refusals. Reset at turn_start and teardown. From the
+        2nd, the caller escalates via the forced turn boundary so the
+        pending envelope actually pumps (Sol g4-r1-4)."""
+        n = self._completion_refusals.get(engagement_id, 0) + 1
+        self._completion_refusals[engagement_id] = n
+        if n >= 3:
+            logger.warning(
+                "engagement %s: %d consecutive completion refusals — "
+                "unread operator inbound persists across retries",
+                engagement_id[:8], n)
+        return n
+
+    async def force_completion_turn_boundary(self, engagement) -> None:
+        """G4 D3 (v0.96.0): escalation for repeated ``unread_inbound``
+        completion refusals — force a REAL turn boundary so the queued
+        operator envelope actually pumps at the respawn (delivery re-arms
+        only at ``on_spawn``; doctrine alone can livelock a completion-bent
+        model — Sol g4-r1-4). Reuses the operator-away verified group-kill;
+        s6 respawns the run script, which resumes the session and receives
+        the pending envelope."""
+        eng_id = engagement.id
+        ok = await self._force_turn_boundary(
+            engagement_id=eng_id,
+            workspace_dir=str(Path(self._engagements_root) / eng_id),
+            expected_epoch=None,
+            track_task=(lambda t, eid=eng_id:
+                        self._register_force_cleanup(eid, t)),
+        )
+        logger.info(
+            "engagement %s: completion-gate forced turn boundary (ok=%s)",
+            eng_id[:8], ok)
 
     def inbound_unread_depth(self, engagement_id: str) -> int:
         """§4 gate: number of unseen queued operator messages. ``> 0`` refuses
@@ -3970,6 +4039,9 @@ class ClaudeCodeDriver(DriverProtocol):
             self._turn_running[eng_id] = True
             # §4: a fresh turn resets the consecutive-ask-refusal escalation.
             self._ask_refusals[eng_id] = 0
+            # G4 D3: a fresh turn resets the completion-refusal escalation
+            # (unconditional — the counter must clear even spool-less).
+            self._completion_refusals.pop(eng_id, None)
             spool = self._inbound.get(eng_id)
             if spool is not None:
                 await spool.on_turn_start()
