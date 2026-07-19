@@ -6607,6 +6607,13 @@ def _tool_verify_plugin_state(
         path / ".mcp.json", path) if checksum_valid else [])
     if any(c["status"] == "missing" for c in command_status):
         reasons.append("mcp_command_missing")
+    # G6 corrected (2026-07-19): a server env self-declaring a CLI-reserved
+    # var (CLAUDE_PLUGIN_DATA/CLAUDE_PLUGIN_ROOT) shadows the CLI's native
+    # per-plugin value with a literal — blocking, same tier as mcp_invalid.
+    reserved_env = (plugin_store.reserved_env_violations(path / ".mcp.json")
+                    if checksum_valid else [])
+    if reserved_env:
+        reasons.append("mcp_reserved_env")
     granted = grants_for_resolved(rp) if checksum_valid else []
     # A:§3.7 (B7): eyeball-checkable declared protected tools. A malformed
     # field already surfaced as a blocking "protected_tools_invalid" reason
@@ -6826,6 +6833,7 @@ def _tool_verify_plugin_state(
         "tools": tools_status,
         "secrets": secrets_status,
         "mcp_commands": command_status,
+        "reserved_env": reserved_env,
         "granted_tools": granted,
         "protected_tools": sorted(protected_tools),
         "protected_tool_summaries": protected_tool_summaries,

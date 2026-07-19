@@ -4,10 +4,14 @@
 configurator adding it to the registry (`plugin_add`) and assigning it.**
 
 No Dockerfile forks. No "please install X manually." No out-of-band
-configuration. Everything a plugin needs — system tools, env vars,
-persistent state — is declared in the plugin's own manifest
-(`.claude-plugin/plugin.json`, incl. `casa.systemRequirements`) or its
-`.mcp.json::env`.
+configuration. Everything a plugin needs from the OUTSIDE — system tools
+and user-supplied env vars (secrets, endpoints, addresses) — is declared
+in the plugin's own manifest (`.claude-plugin/plugin.json`, incl.
+`casa.systemRequirements`) or its `.mcp.json::env`. CLI-reserved
+variables (`CLAUDE_PLUGIN_ROOT`, `CLAUDE_PLUGIN_DATA`) are the one
+exception: the CLI supplies them natively and they are NEVER declared
+(see below); persistent state lives in the CLI-provided
+`CLAUDE_PLUGIN_DATA` directory, not behind any declaration.
 
 ## What this forbids
 
@@ -20,6 +24,27 @@ persistent state — is declared in the plugin's own manifest
 - Env vars set "externally" — declare via `.mcp.json::env ${VAR}`.
 - Writes outside `${CLAUDE_PLUGIN_DATA}` and the MCP subprocess cwd.
 - `casa.systemRequirements: [{type: "apt", …}]` (hard-rejected).
+
+## `CLAUDE_PLUGIN_DATA` — CLI-provided, NEVER declare it
+
+`CLAUDE_PLUGIN_DATA` (like `CLAUDE_PLUGIN_ROOT`) is **reserved and injected
+by the Claude CLI itself**: every plugin MCP server automatically receives
+a private, per-plugin persistent directory in its environment. Just read
+`os.environ["CLAUDE_PLUGIN_DATA"]` at runtime — no namespacing needed, the
+path is already yours alone.
+
+**Never declare either variable under `.mcp.json::env`.** A declaration
+shadows the CLI's native value; the self-referential form
+(`"CLAUDE_PLUGIN_DATA": "${CLAUDE_PLUGIN_DATA}"`) delivers the
+LITERAL placeholder string to your server — which is how gmail v0.4.0
+ended up persisting its OAuth token into a directory literally named
+`${CLAUDE_PLUGIN_DATA}`. The pre-push guard and Casa's install verify both
+hard-reject the declaration (`mcp_reserved_env`).
+
+Persistence: for resident/specialist-assigned plugins the directory lives
+on Casa's persistent config volume (survives updates, included in Home
+Assistant backups). For executor engagements it is engagement-local —
+treat it as scratch there.
 
 ## Decision tree
 
@@ -83,6 +108,9 @@ The `self_containment_guard` hook scans your working tree when you run
 - `.mcp.json` `command`/`args` entries whose `${CLAUDE_PLUGIN_ROOT}/<path>`
   is **not tracked by git** (untracked or gitignored — e.g. a dev venv),
   escapes the plugin root via `..`, or is absolute after interpolation.
+- `.mcp.json::env` entries self-declaring a CLI-reserved variable
+  (`CLAUDE_PLUGIN_DATA`, `CLAUDE_PLUGIN_ROOT`) — see `mcp_reserved_env`
+  above.
 
 Matches block the push. Fix and retry. For a genuine false positive
 (only), re-run as `CASA_ALLOW_ANTI_PATTERN=1 git push ...` — the

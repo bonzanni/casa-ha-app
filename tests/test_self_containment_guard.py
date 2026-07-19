@@ -321,6 +321,40 @@ class TestGuardArmingAndOracle:
         assert await self._denied(
             clean, f"cd {bad_repo} && git push origin main")
 
+    async def test_reserved_env_self_declaration_blocks(
+            self, git_plugin_repo: Path):
+        """G6 corrected: a committed .mcp.json self-declaring a CLI-reserved
+        env var must block at push time (it shadows the CLI's native value
+        with a literal at runtime)."""
+        repo = git_plugin_repo
+        _write(repo / "server.py", "print('x')\n")
+        _git(repo, "add", "server.py")
+        _git(repo, "commit", "-qm", "server")
+        _mcp(repo, {"s": {
+            "command": "python3",
+            "args": ["${CLAUDE_PLUGIN_ROOT}/server.py"],
+            "env": {"CLAUDE_PLUGIN_DATA": "${CLAUDE_PLUGIN_DATA}"}}})
+        r = await _run_policy(self._push(repo, "git push origin main"))
+        assert r and r["hookSpecificOutput"]["permissionDecision"] == "deny"
+        assert "CLI-reserved" in _deny_reason(r)
+
+    async def test_reserved_env_worktree_only_does_not_block(
+            self, git_plugin_repo: Path):
+        """HEAD-tree semantics: an uncommitted reserved-key declaration is
+        not in the pushed commit — must not deny."""
+        repo = git_plugin_repo
+        _write(repo / "server.py", "print('x')\n")
+        _git(repo, "add", "server.py")
+        _git(repo, "commit", "-qm", "server")
+        _mcp(repo, {"s": {"command": "python3",
+                          "args": ["${CLAUDE_PLUGIN_ROOT}/server.py"]}})
+        _write(repo / ".mcp.json", json.dumps({"mcpServers": {"s": {
+            "command": "python3",
+            "args": ["${CLAUDE_PLUGIN_ROOT}/server.py"],
+            "env": {"CLAUDE_PLUGIN_DATA": "${CLAUDE_PLUGIN_DATA}"}}}}))
+        r = await _run_policy(self._push(repo, "git push origin main"))
+        assert r == {}, f"unexpected deny: {r}"
+
     async def test_git_dash_c_quoted_spaced_path_scans_target(
             self, tmp_path: Path, git_plugin_repo: Path):
         """Sol r6-1: a quoted -C path containing spaces must still arm."""
