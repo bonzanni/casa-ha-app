@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import json
 import logging
 import time
 from contextvars import ContextVar
@@ -210,6 +211,65 @@ def _overlay_allowed(channel: str) -> bool:
     ONLY at ``private`` clearance — a context that may already see everything
     (design §2.3). At any lower clearance it would leak across tiers."""
     return clearance_for_channel(channel) == "private"
+
+
+# Release A / Layer 1 — the two casa-framework tools an untrusted webhook turn
+# may use: public-clearance recall + operator-bound notify. Everything else
+# (Bash, filesystem, network, delegation, plugin/config mutation) is denied.
+_RESTRICTED_WEBHOOK_TOOLS = (
+    "mcp__casa-framework__recall_memory",
+    "mcp__casa-framework__send_message",
+)
+# Defense-in-depth: Agent/Task can bypass allowed_tools (they route to
+# sub-agents), so name them in disallowed_tools; Bash is belt-and-braces on top
+# of tools=[].
+_RESTRICTED_DISALLOWED_TOOLS = ("Bash", "Task", "Agent")
+
+
+def build_restricted_webhook_options(
+    *,
+    model: str,
+    role: str,
+    system_prompt: str,
+    max_turns: int,
+    agent_home: str,
+    resume_sid: str | None,
+) -> ClaudeAgentOptions:
+    """Build the LOCKED-DOWN options for an UNTRUSTED webhook turn (spec A4 /
+    Release A Layer 1 — the primary containment boundary; Sol+Terra design r5).
+
+    Third-party webhook content runs with NO plugins, NO external/managed hooks
+    (``settings={"disableAllHooks": true}``; ``setting_sources=[]``), NO built-in
+    tools (``tools=[]`` — ``allowed_tools`` alone is only auto-approval and would
+    leave Bash reachable), NO skills, strict MCP config (no ambient ``.mcp.json``),
+    ``permission_mode="dontAsk"``, and exactly two casa-framework tools. ``Agent``/
+    ``Task`` are additionally disallowed (they bypass ``allowed_tools``). This
+    closes the Bash→(unauthenticated)Hindsight, Bash→transcript-file, and
+    pre-tool-decision-hook bypasses that application-level memory gates cannot.
+    """
+    from tools import create_casa_tools
+    casa_server = create_casa_tools(frozenset(_RESTRICTED_WEBHOOK_TOOLS))
+    return ClaudeAgentOptions(
+        model=model,
+        cli_path=CLAUDE_CLI_PATH,
+        system_prompt=system_prompt,
+        allowed_tools=list(_RESTRICTED_WEBHOOK_TOOLS),
+        disallowed_tools=list(_RESTRICTED_DISALLOWED_TOOLS),
+        permission_mode="dontAsk",
+        max_turns=max_turns,
+        mcp_servers={"casa-framework": casa_server},
+        hooks={},
+        cwd=agent_home,
+        resume=resume_sid,
+        setting_sources=[],
+        skills=[],
+        tools=[],
+        strict_mcp_config=True,
+        plugins=[],
+        settings=json.dumps({"disableAllHooks": True}),
+        can_use_tool=make_fail_closed_can_use_tool(role),
+        include_partial_messages=False,
+    )
 
 
 class Agent:
@@ -849,6 +909,25 @@ class Agent:
             self.config.cwd
             or f"/config/agent-home/{self.config.role}"
         )
+
+        # Release A / Layer 1 (PRIMARY containment): an UNTRUSTED webhook turn
+        # — channel=="webhook" and NOT an explicit server-stamped `invoke`
+        # (fail-closed: webhook_trigger OR any missing/unknown route) — builds a
+        # locked-down runtime and short-circuits the full options path (no
+        # plugins, no external hooks, no Bash/fs/net, two casa-framework tools).
+        # webhook_trigger turns are SCHEDULED → bypass the client pool → fresh
+        # options per turn, so this branch is pool-key-neutral.
+        _route = (origin_var.get(None) or {}).get("_origin_route")
+        if channel == "webhook" and _route != "invoke":
+            restricted = build_restricted_webhook_options(
+                model=self.config.model,
+                role=self.config.role,
+                system_prompt=self.config.system_prompt,
+                max_turns=self.config.tools.max_turns,
+                agent_home=agent_home,
+                resume_sid=resume_sid,
+            )
+            return sdk_logging.with_stderr_callback(restricted, engagement_id=None)
 
         # 2b. Memory context (spec §4.3) — channel-aware load on the
         # SemanticMemory seam: a cheap mental-model overlay at fresh-session

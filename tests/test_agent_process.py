@@ -1983,3 +1983,43 @@ class TestSaveBeforeOverwrite:
 # ---------------------------------------------------------------------------
 # Structural contract: Agent.__init__ must not accept memory param
 # ---------------------------------------------------------------------------
+
+
+async def test_untrusted_webhook_trigger_gets_restricted_runtime(tmp_path):
+    """Release A Layer 1: a webhook_trigger turn builds the locked-down runtime."""
+    import json
+    from agent import origin_var
+    agent = _make_agent(tmp_path, role="assistant")
+    token = origin_var.set({"_origin_route": "webhook_trigger"})
+    try:
+        options = await agent._build_options(
+            channel="webhook", channel_key="webhook-assistant-uuid",
+            is_fresh=True, resume_sid=None, user_text="voicemail from a caller",
+        )
+    finally:
+        origin_var.reset(token)
+    assert options.tools == []
+    assert options.plugins == []
+    assert options.setting_sources == []
+    assert json.loads(options.settings) == {"disableAllHooks": True}
+    assert set(options.allowed_tools) == {
+        "mcp__casa-framework__recall_memory",
+        "mcp__casa-framework__send_message",
+    }
+
+
+async def test_webhook_missing_route_is_restricted_fail_closed(tmp_path):
+    """Fail-closed: a webhook turn with NO origin route (marker regression) is
+    still restricted — never the full runtime."""
+    from agent import origin_var
+    agent = _make_agent(tmp_path, role="assistant")
+    token = origin_var.set({})  # no _origin_route
+    try:
+        options = await agent._build_options(
+            channel="webhook", channel_key="webhook-assistant-x",
+            is_fresh=True, resume_sid=None, user_text="x",
+        )
+    finally:
+        origin_var.reset(token)
+    assert options.tools == []
+    assert options.setting_sources == []
