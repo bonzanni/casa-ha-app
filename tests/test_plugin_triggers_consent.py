@@ -152,6 +152,66 @@ def test_wrong_shape_store_fails_closed(tmp_path):
     assert not TriggerAckStore(path=path).is_acked(_identity())
 
 
+def test_tampered_identity_fails_whole_store_closed(tmp_path):
+    """Terra shipB-r1 P1-3a: a parseable store whose key does not equal the
+    RECOMPUTED identity of its own record must grant nothing — a truncated /
+    merged / hand-edited store can never manufacture consent."""
+    path = tmp_path / "acks.json"
+    store = TriggerAckStore(path=path)
+    good = _record(store)
+    on_disk = json.loads(path.read_text(encoding="utf-8"))
+    rec = next(iter(on_disk["acks"].values()))
+    on_disk["acks"]["0" * 64] = {**rec, "effective": "plg-evil--backdoor"}
+    path.write_text(json.dumps(on_disk), encoding="utf-8")
+    reloaded = TriggerAckStore(path=path)
+    assert not reloaded.is_acked("0" * 64)
+    assert not reloaded.is_acked(good)  # ANY bad entry ⇒ whole store closed
+
+
+def test_wrong_schema_version_fails_closed(tmp_path):
+    path = tmp_path / "acks.json"
+    store = TriggerAckStore(path=path)
+    ident = _record(store)
+    on_disk = json.loads(path.read_text(encoding="utf-8"))
+    on_disk["schema_version"] = 99
+    path.write_text(json.dumps(on_disk), encoding="utf-8")
+    assert not TriggerAckStore(path=path).is_acked(ident)
+
+
+def test_record_publishes_only_after_durable_write(tmp_path, monkeypatch):
+    """Terra shipB-r1 P1-3b: a failed persist must raise AND leave the
+    in-memory view unchanged — a reconcile racing the failure can never
+    route an ack that would vanish on reboot."""
+    import trigger_acks as mod
+
+    store = TriggerAckStore(path=tmp_path / "acks.json")
+
+    def _boom(path, text):
+        raise OSError("disk full")
+
+    import atomic_io
+    monkeypatch.setattr(atomic_io, "atomic_write_text", _boom)
+    with pytest.raises(OSError):
+        _record(store)
+    assert not store.is_acked(_identity())
+
+
+def test_revoke_publishes_only_after_durable_write(tmp_path, monkeypatch):
+    store = TriggerAckStore(path=tmp_path / "acks.json")
+    ident = _record(store)
+
+    def _boom(path, text):
+        raise OSError("disk full")
+
+    import atomic_io
+    monkeypatch.setattr(atomic_io, "atomic_write_text", _boom)
+    with pytest.raises(OSError):
+        store.revoke_plugin("elevenlabs")
+    # memory unchanged: the revoke did NOT half-apply (a crash would have
+    # silently resurrected it from disk otherwise)
+    assert store.is_acked(ident)
+
+
 def test_stored_records_carry_structured_metadata(tmp_path):
     path = tmp_path / "acks.json"
     store = TriggerAckStore(path=path)

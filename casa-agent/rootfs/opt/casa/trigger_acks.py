@@ -45,25 +45,51 @@ class TriggerAckStore:
     # -- load / persist ------------------------------------------------------
 
     def _load(self) -> dict[str, dict[str, Any]]:
+        """Whole-store fail-closed load (Terra shipB-r1 P1-3a): wrong schema,
+        any malformed record, or any key that does not equal the RECOMPUTED
+        identity of its own record ⇒ NO acks at all. A truncated / merged /
+        hand-edited store can never manufacture consent; the operator simply
+        re-consents."""
+        from plugin_triggers import ack_identity
+
         try:
             raw = json.loads(self.path.read_text(encoding="utf-8"))
         except (OSError, ValueError):
             return {}
-        acks = raw.get("acks") if isinstance(raw, dict) else None
+        if not isinstance(raw, dict) or raw.get("schema_version") != _SCHEMA_VERSION:
+            return {}
+        acks = raw.get("acks")
         if not isinstance(acks, dict):
             return {}
         out: dict[str, dict[str, Any]] = {}
         for ident, rec in acks.items():
-            if isinstance(ident, str) and isinstance(rec, dict):
-                out[ident] = rec
+            if not (isinstance(ident, str) and isinstance(rec, dict)):
+                return {}
+            fields = {k: rec.get(k)
+                      for k in ("plugin", "artifact_id", "effective", "target")}
+            auth = rec.get("auth")
+            if (not all(isinstance(v, str) and v for v in fields.values())
+                    or not isinstance(auth, dict)):
+                return {}
+            try:
+                expected = ack_identity(auth=auth, **fields)
+            except Exception:  # noqa: BLE001 — unhashable garbage ⇒ closed
+                return {}
+            if expected != ident:
+                return {}
+            out[ident] = rec
         return out
 
-    def _persist_locked(self) -> None:
+    def _persist_candidate_locked(self, candidate: dict[str, dict[str, Any]]) -> None:
+        """Durably write *candidate*; the caller publishes it to ``_acks``
+        ONLY afterwards (Terra shipB-r1 P1-3b) — a failed write raises with
+        the in-memory view unchanged, so a racing reconcile can never route
+        (or drop) state that would revert on reboot."""
         from atomic_io import atomic_write_text
         self.path.parent.mkdir(parents=True, exist_ok=True)
         atomic_write_text(
             self.path,
-            json.dumps({"schema_version": _SCHEMA_VERSION, "acks": self._acks},
+            json.dumps({"schema_version": _SCHEMA_VERSION, "acks": candidate},
                        indent=2, sort_keys=True) + "\n",
         )
 
@@ -89,8 +115,10 @@ class TriggerAckStore:
             "ts": int(time.time()),
         }
         with self._lock:
-            self._acks[identity] = rec
-            self._persist_locked()
+            candidate = dict(self._acks)
+            candidate[identity] = rec
+            self._persist_candidate_locked(candidate)
+            self._acks = candidate
 
     def revoke_plugin(self, plugin: str) -> list[dict[str, Any]]:
         """Drop every ack recorded for *plugin*; returns the removed records."""
@@ -104,9 +132,12 @@ class TriggerAckStore:
     def _revoke(self, predicate) -> list[dict[str, Any]]:
         with self._lock:
             matched = [i for i, rec in self._acks.items() if predicate(rec)]
-            removed = [self._acks.pop(i) for i in matched]
-            if removed:
-                self._persist_locked()
+            if not matched:
+                return []
+            candidate = dict(self._acks)
+            removed = [candidate.pop(i) for i in matched]
+            self._persist_candidate_locked(candidate)
+            self._acks = candidate
             return removed
 
 

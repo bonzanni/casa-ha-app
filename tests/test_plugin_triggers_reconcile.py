@@ -762,6 +762,98 @@ async def test_trigger_ack_revoke_unknown_plugin_is_idempotent(
     assert payload["unrouted"] == []
 
 
+async def test_mint_exception_fails_only_that_plugin(monkeypatch, tmp_path):
+    """Terra shipB-r1 P1-2 (isolation half): one plugin's secret-mint
+    blow-up drops THAT plugin with trigger_secret_missing; the other
+    plugin's routes still swap in."""
+    import webhook_auth
+
+    registry = _registry()
+    acks = TriggerAckStore(path=tmp_path / "acks.json")
+    _ack(acks)
+    _ack(acks, plugin="other", artifact_id="art-9", declared="hook")
+    good = _plugin()
+    other = _plugin(name="other", artifact_id="art-9",
+                    triggers=[_trigger(name="hook")])
+    real_ensure = webhook_auth.ensure_secret
+
+    def _selective(name, **kw):
+        if name.startswith("plg-other--"):
+            raise OSError("disk full")
+        return real_ensure(name, **kw)
+
+    monkeypatch.setattr(webhook_auth, "ensure_secret", _selective)
+    issues = await _reconcile(
+        registry,
+        plugins_by_target={None: [good, other],
+                           "resident:assistant": [good, other]},
+        role_configs=_role_configs(assistant=["webhook"]),
+        acks=acks, tmp_path=tmp_path)
+    assert [(i.name, i.reason_code) for i in issues] == [
+        ("other", "trigger_secret_missing")]
+    assert registry.get_webhook_target("plg-elevenlabs--voicemail") == "assistant"
+    assert registry.get_webhook_target("plg-other--hook") is None
+
+
+async def test_compute_failure_fails_closed_to_empty_overlay(
+    monkeypatch, tmp_path,
+):
+    """Terra shipB-r1 P1-2 (backstop half): a total compute failure must not
+    RETAIN the old overlay — swap empty (no plugin ingress) and propagate."""
+    registry = _registry()
+    registry.replace_plugin_overlay({
+        "plg-stale--route": {"plugin": "stale", "role": "assistant",
+                             "clearance": "public", "auth": AUTH}})
+    acks = TriggerAckStore(path=tmp_path / "acks.json")
+
+    def _boom_resolver(target):
+        raise RuntimeError("resolver exploded")
+
+    with pytest.raises(RuntimeError):
+        await _reconcile(
+            registry, plugins_by_target={},
+            role_configs=_role_configs(assistant=["webhook"]),
+            acks=acks, tmp_path=tmp_path, resolver=_boom_resolver)
+    assert registry.get_webhook_target("plg-stale--route") is None
+
+
+async def test_trigger_ack_revoke_cancels_pending_consent_keyboards(
+    monkeypatch, tmp_path,
+):
+    """Terra shipB-r1 P1-1: a live consent keyboard for the plugin must die
+    with the revoke — a stale Approve tap after trigger_ack_revoke can
+    never re-ack/re-route."""
+    import authz_grants
+    import verdict_broker
+
+    broker = verdict_broker.VerdictBroker()
+    monkeypatch.setattr(verdict_broker, "BROKER", broker)
+    coord = authz_grants.ChallengeCoordinator()
+    monkeypatch.setattr(authz_grants, "CHALLENGES", coord)
+    import tools as tools_mod
+    monkeypatch.setattr(tools_mod, "CHALLENGES", coord)
+
+    tools_mod, registry, acks, _json = _wire_revoke_env(
+        monkeypatch, tmp_path, acked=False)
+    telegram = _FakeTelegram()
+    runtime = __import__("agent").active_runtime
+    runtime.channel_manager = _FakeChannelManager(telegram)
+    # reconcile WITH prompting → a live pending consent keyboard
+    await tr.reconcile_from_runtime(runtime)
+    for _ in range(8):
+        await asyncio.sleep(0)
+    assert len(telegram.posts) == 1
+    assert len(coord._entries) == 1
+    ch = next(iter(coord._entries.values()))
+
+    await tools_mod.trigger_ack_revoke.handler({"name": "elevenlabs"})
+    # the broker record is cancelled: a late tap cannot claim it
+    claim = broker.claim(namespace="resident_ask", scope=ch.scope,
+                         request_id=ch.rid, option_index=0, actor_id=100)
+    assert isinstance(claim, str)  # rejected (stale/duplicate), never a win
+    assert not acks.is_acked(_ident_default())
+
+
 async def test_trigger_ack_revoke_unroutes_even_if_reconcile_fails(
     monkeypatch, tmp_path,
 ):

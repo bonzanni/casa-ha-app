@@ -762,7 +762,7 @@ class ChallengeCoordinator:
 
     def cancel_matching(
         self, *, role: str | None = None, artifact: str | None = None,
-        chat: int | None = None,
+        chat: int | None = None, plugin: str | None = None,
     ) -> int:
         """Cancel the broker records for every live challenge matching ANY of
         the provided filters (keyboard -> expired via the finish hook). Returns
@@ -778,6 +778,12 @@ class ChallengeCoordinator:
             if artifact is not None and getattr(k, "artifact_id", None) == artifact:
                 return True
             if chat is not None and getattr(k, "chat_id", None) == chat:
+                return True
+            # plugin filter (Terra shipB-r1 P1-1): trigger_ack_revoke kills a
+            # plugin's PENDING consent keyboards so a stale Approve tap can
+            # never undo the revoke. GrantKey has no `plugin` attr ⇒ never
+            # matched by this filter.
+            if plugin is not None and getattr(k, "plugin", None) == plugin:
                 return True
             return False
 

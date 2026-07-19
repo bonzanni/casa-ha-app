@@ -6724,6 +6724,10 @@ async def trigger_ack_revoke(args: dict) -> dict:
         import trigger_acks
         import trigger_reconcile
         name = args["name"]
+        # Terra shipB-r1 P1-1: kill any PENDING consent keyboard for this
+        # plugin FIRST (synchronous broker cancel — later taps read
+        # "expired"), so a stale Approve can never re-ack past the revoke.
+        CHALLENGES.cancel_matching(plugin=name)
         removed = await asyncio.to_thread(
             trigger_acks.ACKS.revoke_plugin, name)
         runtime = getattr(agent_mod, "active_runtime", None)

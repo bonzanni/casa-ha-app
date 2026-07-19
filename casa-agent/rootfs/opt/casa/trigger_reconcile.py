@@ -206,8 +206,15 @@ def _mint_secrets(desired: DesiredTriggers, secrets_dir: Path) -> None:
     for eff, entry in desired.overlay.items():
         if entry["auth"].get("mode") not in _PER_TRIGGER_SECRET_MODES:
             continue
-        got = webhook_auth.ensure_secret(eff, owner="casa",
-                                         secrets_dir=secrets_dir)
+        try:
+            got = webhook_auth.ensure_secret(eff, owner="casa",
+                                             secrets_dir=secrets_dir)
+        except Exception:  # noqa: BLE001 — Terra shipB-r1 P1-2: one plugin's
+            # mint blow-up (fs error) must fail-close THAT plugin, never
+            # abort the whole reconcile (which would retain every stale
+            # route, including a just-unassigned plugin's).
+            logger.exception("per-trigger secret mint failed (%s)", eff)
+            got = None
         if not got:
             failed_plugins.add(entry.get("plugin", ""))
             desired.issues.append(PluginIssue(
@@ -247,7 +254,17 @@ async def reconcile_plugin_triggers(
         return desired
 
     async with _RECONCILE_LOCK:
-        desired = await asyncio.to_thread(_compute_and_mint)
+        try:
+            desired = await asyncio.to_thread(_compute_and_mint)
+        except Exception:
+            # Terra shipB-r1 P1-2: a compute failure must not RETAIN the old
+            # overlay (a just-unassigned/revoked plugin's routes would stay
+            # live behind a swallowed warning). Fail closed to NO plugin
+            # ingress — resident triggers are untouched — then propagate so
+            # the caller logs/surfaces it; the next successful reconcile
+            # restores the valid set.
+            trigger_registry.replace_plugin_overlay({})
+            raise
         trigger_registry.replace_plugin_overlay(desired.overlay)
 
     if prompt and desired.pending:
