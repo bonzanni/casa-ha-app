@@ -20,11 +20,13 @@ Plugins can now declare webhook triggers — gated by a one-time consent tap.
   resident's `webhook` channel, consent) the endpoint 404s and plugin health
   shows why (`trigger_pending_ack`, `trigger_channel_missing`, …).
 - **`trigger_ack_revoke` tool.** The off-switch: revokes a plugin's trigger
-  consent and unroutes its endpoints immediately.
+  consent, unroutes its endpoints immediately, and retires its secrets —
+  a later re-approval always mints fresh ones.
 - Per-trigger secrets for plugin triggers are minted eagerly at consent time
-  (readable at `/data/webhook_secrets/plg-…` for provider setup) and retired
-  when the plugin artifact changes or is removed — a new version never
-  inherits the old one's credentials.
+  (readable at `/data/webhook_secrets/plg-…` for provider setup) and bound
+  to the exact approval they were minted under — a plugin update, a
+  revoke + re-approval, or any policy change always rekeys; a new version
+  never inherits the old one's credentials.
 
 ### Changed
 
