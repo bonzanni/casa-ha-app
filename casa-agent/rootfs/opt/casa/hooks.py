@@ -1025,6 +1025,17 @@ def _scan_mcp_launch_refs(cwd: Path) -> list[str]:
         for server, cfg in servers.items():
             args = cfg.get("args")
             env = cfg.get("env")
+            # G6 corrected: self-declaring a CLI-reserved env var shadows the
+            # CLI's native per-plugin value with a literal (the gmail-v0.4.0
+            # bug) — block at push time, same as verify's mcp_reserved_env.
+            from plugin_store import RESERVED_PLUGIN_ENV_KEYS
+            for key in (env.keys() if isinstance(env, dict) else ()):
+                if key in RESERVED_PLUGIN_ENV_KEYS:
+                    findings.append(
+                        f"{rel_mcp} [{server}]: env self-declares "
+                        f"CLI-reserved {key} — remove it; the CLI provides "
+                        "it natively (declaring it yields a literal "
+                        "placeholder at runtime)")
             refs = ([cfg.get("command")]
                     + list(args if isinstance(args, list) else [])
                     + [v for v in (env.values() if isinstance(env, dict)

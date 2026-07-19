@@ -1,5 +1,20 @@
 # Changelog
 
+## [0.95.0] - 2026-07-19
+
+Plugin state directories now work as documented.
+
+### Fixed
+
+- `CLAUDE_PLUGIN_DATA` is provided natively by the Claude CLI as a private,
+  persistent per-plugin directory — but a plugin that re-declared the
+  variable in its own `.mcp.json` shadowed it with a literal placeholder
+  string (the gmail plugin stored its OAuth token in a directory literally
+  named `${CLAUDE_PLUGIN_DATA}`). Casa's own plugin doctrine used to
+  instruct exactly that declaration. The doctrine is corrected, and the
+  self-declaration is now rejected at both plugin push time and install
+  verification (`mcp_reserved_env`).
+
 ## [0.94.0] - 2026-07-19
 
 Stray `**` and `##` markers no longer leak into Telegram messages.

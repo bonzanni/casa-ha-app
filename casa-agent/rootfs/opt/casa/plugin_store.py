@@ -265,6 +265,34 @@ _ENV_VAR_RE = re.compile(r"\$\{([A-Z_][A-Z0-9_]*)\}")
 _PLUGIN_ROOT_VAR = "${CLAUDE_PLUGIN_ROOT}"
 _PLUGIN_DATA_VAR = "${CLAUDE_PLUGIN_DATA}"
 
+# G6 corrected (2026-07-19, Sol v095 + CLI probe): these are CLI-RESERVED —
+# the Claude CLI natively injects a per-plugin value into every plugin MCP
+# server's environment. A plugin that SELF-DECLARES one of them in
+# ``.mcp.json::env`` shadows the native value; the self-referential form
+# (``"CLAUDE_PLUGIN_DATA": "${CLAUDE_PLUGIN_DATA}"``) delivers the LITERAL
+# placeholder string (the gmail-v0.4.0 token-in-a-literal-directory bug).
+RESERVED_PLUGIN_ENV_KEYS: frozenset[str] = frozenset({
+    "CLAUDE_PLUGIN_DATA",
+    "CLAUDE_PLUGIN_ROOT",
+})
+
+
+def reserved_env_violations(mcp_json_path: Path) -> list[str]:
+    """Servers whose ``env`` self-declares a CLI-reserved variable (any
+    value — the KEY alone shadows the CLI's native provision). One
+    human-readable string per violation; empty when clean or file absent."""
+    violations: list[str] = []
+    for name, cfg in mcp_servers_map(Path(mcp_json_path)).items():
+        env = cfg.get("env")
+        for key in (env.keys() if isinstance(env, dict) else ()):
+            if key in RESERVED_PLUGIN_ENV_KEYS:
+                violations.append(
+                    f"[{name}]: env self-declares CLI-reserved {key} — the "
+                    "CLI provides it natively; declaring it shadows the "
+                    "native value (self-reference yields the literal "
+                    "placeholder)")
+    return violations
+
 
 def mcp_command_verdicts(mcp_json_path: Path, plugin_root: Path | str,
                          *, _which=None) -> list[dict]:
