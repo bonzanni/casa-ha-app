@@ -239,13 +239,16 @@ class _StubBus:
         return _StubResult()
 
 
+_INVOKE_SECRET = "chan-authz-secret"
+
+
 def _make_invoke_app(bus, role_configs):
     from casa_core import _make_invoke_handler
     from rate_limit import RateLimiter
 
     handler = _make_invoke_handler(
         webhook_rate_limiter=RateLimiter(capacity=0, window_s=60.0),  # 0 = disabled
-        webhook_secret="",
+        webhook_secret=_INVOKE_SECRET,  # Release A: /invoke is fail-closed
         bus=bus,
         assistant_role="assistant",
         role_configs=role_configs,
@@ -255,6 +258,17 @@ def _make_invoke_app(bus, role_configs):
     return app
 
 
+async def _post_invoke(client, path, obj):
+    import hashlib
+    import hmac
+    body = json.dumps(obj).encode()
+    sig = hmac.new(_INVOKE_SECRET.encode(), body, hashlib.sha256).hexdigest()
+    return await client.post(
+        path, data=body,
+        headers={"Content-Type": "application/json", "X-Webhook-Signature": sig},
+    )
+
+
 @pytest.mark.asyncio
 class TestInvokeChannelAuthz:
     async def test_voice_only_resident_404s(self):
@@ -262,9 +276,7 @@ class TestInvokeChannelAuthz:
         role_configs = {"butler": _Cfg(["ha_voice"])}
         app = _make_invoke_app(bus, role_configs)
         async with TestClient(TestServer(app)) as client:
-            resp = await client.post(
-                "/invoke/butler", json={"prompt": "hi"},
-            )
+            resp = await _post_invoke(client, "/invoke/butler", {"prompt": "hi"})
             assert resp.status == 404
             assert (await resp.json()) == {"error": "unknown agent"}
             assert bus.dispatched is False
@@ -274,9 +286,7 @@ class TestInvokeChannelAuthz:
         role_configs = {"assistant": _Cfg(["telegram", "webhook"])}
         app = _make_invoke_app(bus, role_configs)
         async with TestClient(TestServer(app)) as client:
-            resp = await client.post(
-                "/invoke/assistant", json={"prompt": "hi"},
-            )
+            resp = await _post_invoke(client, "/invoke/assistant", {"prompt": "hi"})
             assert resp.status == 200
             assert (await resp.json()) == {"response": "ok"}
             assert bus.dispatched is True
