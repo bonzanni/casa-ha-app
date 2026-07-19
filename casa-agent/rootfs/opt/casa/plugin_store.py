@@ -550,6 +550,15 @@ def artifact_verdict(path: Path, *, name: str, repo: str, revision: str,
         manifest_protected_tools(manifest)
     except StoreError:
         return "protected_tools_invalid"
+    # Release B (Sol plan-review P1-10): an artifact PUBLISHED BEFORE this
+    # release could carry a malformed/unsupported casa.triggers block that the
+    # publish-time gate never saw. Re-check here so it is excluded from
+    # resolution (per-plugin degradation) rather than routing an invalid
+    # trigger — the same upgrade-path posture as protectedTools above.
+    try:
+        manifest_triggers(manifest, name)
+    except StoreError:
+        return "triggers_invalid"
     return None
 
 
@@ -789,6 +798,29 @@ def manifest_sysreqs(manifest: dict) -> list:
     return [r for r in reqs if isinstance(r, dict)] if isinstance(reqs, list) else []
 
 
+def manifest_triggers(manifest: dict, plugin_name: str) -> list:
+    """Guarded + STRICT ``casa.triggers`` extraction (Release B), beside
+    ``manifest_protected_tools``. Absent ``casa.triggers`` → ``[]``. Any
+    intrinsic-validation error (shape, naming, auth policy, non-resident
+    target, deferred ``provider`` secret_owner, counts/lengths) is a
+    plugin-author error: raises ``StoreError(reason_code="triggers_invalid")``.
+
+    Needs ``plugin_name`` because the routed effective name is
+    ``plg-<plugin>--<declared>`` (Sol plan-review P1-10). Each call site
+    decides the meaning of a raise — ``validate_manifest`` refuses the
+    install/update; ``artifact_verdict`` excludes the stored artifact from
+    resolution (per-plugin degradation). Returns the normalized trigger list.
+    """
+    import plugin_triggers
+    triggers, errors = plugin_triggers.parse_and_validate(plugin_name, manifest)
+    if errors:
+        raise StoreError(
+            "casa.triggers invalid: " + "; ".join(errors[:5]),
+            reason_code="triggers_invalid",
+            detail={"errors": errors})
+    return triggers
+
+
 def manifest_protected_tools(manifest: dict) -> list:
     """Guarded + STRICT casa.protectedTools extraction (A:§3.7, extended
     v0.78.0 W1), beside manifest_sysreqs. An ABSENT ``casa.protectedTools``
@@ -919,6 +951,9 @@ def validate_manifest(root: Path, expected_name: str) -> dict:
     # A:§3.7 (B7): a PRESENT-but-malformed casa.protectedTools refuses the
     # install/update outright (strict; raises protected_tools_invalid).
     manifest_protected_tools(manifest)
+    # Release B: a PRESENT-but-malformed casa.triggers refuses the
+    # install/update outright (strict; raises triggers_invalid).
+    manifest_triggers(manifest, expected_name)
     return manifest
 
 
