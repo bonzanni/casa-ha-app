@@ -6727,7 +6727,22 @@ async def trigger_ack_revoke(args: dict) -> dict:
         removed = await asyncio.to_thread(
             trigger_acks.ACKS.revoke_plugin, name)
         runtime = getattr(agent_mod, "active_runtime", None)
-        await trigger_reconcile.reconcile_from_runtime(runtime, prompt=False)
+        registry = getattr(runtime, "trigger_registry", None)
+        if registry is not None:
+            # Fail-closed DIRECT sweep first — the immediate-404 guarantee
+            # must not depend on resolver health. Effective names are
+            # injective (plg-<plugin>--…), so a prefix match is exact.
+            prefix = f"plg-{name}--"
+            registry.replace_plugin_overlay({
+                eff: entry
+                for eff, entry in registry.plugin_overlay_snapshot().items()
+                if not eff.startswith(prefix)})
+        try:
+            await trigger_reconcile.reconcile_from_runtime(
+                runtime, prompt=False)
+        except Exception:  # noqa: BLE001 — sweep above already unrouted
+            logger.warning("post-revoke trigger reconcile failed",
+                           exc_info=True)
         # Refresh health (trigger_pending_ack reappears via the recomputable
         # input) WITHOUT the operator DM — they just did this deliberately.
         await asyncio.to_thread(_regenerate_plugin_health, [])

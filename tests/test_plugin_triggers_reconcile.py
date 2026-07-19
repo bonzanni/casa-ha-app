@@ -760,3 +760,26 @@ async def test_trigger_ack_revoke_unknown_plugin_is_idempotent(
     assert payload["ok"] is True
     assert payload["revoked"] == 0
     assert payload["unrouted"] == []
+
+
+async def test_trigger_ack_revoke_unroutes_even_if_reconcile_fails(
+    monkeypatch, tmp_path,
+):
+    """The immediate-404 guarantee must not depend on resolver health: a
+    reconcile blow-up after the revoke still sweeps the plugin's overlay
+    entries (names are injective: plg-<plugin>--…) before the tool returns."""
+    tools_mod, registry, acks, _json = _wire_revoke_env(monkeypatch, tmp_path)
+    await tr.reconcile_from_runtime(
+        __import__("agent").active_runtime, prompt=False)
+    eff = "plg-elevenlabs--voicemail"
+    assert registry.get_webhook_target(eff) == "assistant"
+
+    async def _boom(runtime, prompt=True):
+        raise RuntimeError("resolver exploded")
+
+    monkeypatch.setattr(tr, "reconcile_from_runtime", _boom)
+    r = await tools_mod.trigger_ack_revoke.handler({"name": "elevenlabs"})
+    payload = _json.loads(r["content"][0]["text"])
+    assert payload["ok"] is True
+    assert registry.get_webhook_target(eff) is None
+    assert not acks.is_acked(_ident_default())

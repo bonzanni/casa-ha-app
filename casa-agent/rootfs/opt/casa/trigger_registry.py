@@ -237,6 +237,12 @@ class TriggerRegistry:
         """Effective names currently live in the plugin overlay."""
         return list(self._plugin_overlay)
 
+    def plugin_overlay_snapshot(self) -> dict[str, dict]:
+        """A shallow copy of the current overlay — for callers that must
+        derive a swept replacement WITHOUT a resolver pass (the revoke
+        tool's fail-closed direct sweep)."""
+        return dict(self._plugin_overlay)
+
     def reregister_for(
         self,
         role: str,
