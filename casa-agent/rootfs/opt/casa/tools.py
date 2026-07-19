@@ -6705,12 +6705,12 @@ async def plugin_remove(args: dict) -> dict:
 
 @tool(
     "trigger_ack_revoke",
-    "Revoke the operator's webhook-trigger consent for a plugin and unroute "
+    "Revoke the operator's webhook-trigger consent for a plugin, unroute "
     "its /webhook/plg-<plugin>--… endpoints IMMEDIATELY (they 404 before "
-    "this returns). The per-trigger secret is kept, so a later re-approval "
-    "restores the route without re-provisioning the external service; the "
-    "consent DM re-prompts on the next plugin mutation or "
-    "casa_reload_triggers.",
+    "this returns), and retire its per-trigger secrets. A later re-approval "
+    "mints fresh secrets, so the plugin's setup tool must re-provision the "
+    "external service; the consent DM re-prompts on the next plugin "
+    "mutation or casa_reload_triggers.",
     {"type": "object", "properties": {"name": {"type": "string"}},
      "required": ["name"]},
 )
@@ -6732,11 +6732,13 @@ async def trigger_ack_revoke(args: dict) -> dict:
             trigger_acks.ACKS.revoke_plugin, name)
         runtime = getattr(agent_mod, "active_runtime", None)
         registry = getattr(runtime, "trigger_registry", None)
+        # Effective names are injective (plg-<plugin>--…), so a prefix
+        # match is exact — used for BOTH the overlay sweep and the
+        # filesystem secret retirement below.
+        prefix = f"plg-{name}--"
         if registry is not None:
             # Fail-closed DIRECT sweep first — the immediate-404 guarantee
-            # must not depend on resolver health. Effective names are
-            # injective (plg-<plugin>--…), so a prefix match is exact.
-            prefix = f"plg-{name}--"
+            # must not depend on resolver health.
             registry.replace_plugin_overlay({
                 eff: entry
                 for eff, entry in registry.plugin_overlay_snapshot().items()
@@ -6747,12 +6749,22 @@ async def trigger_ack_revoke(args: dict) -> dict:
         except Exception:  # noqa: BLE001 — sweep above already unrouted
             logger.warning("post-revoke trigger reconcile failed",
                            exc_info=True)
+        # Sol shipB-r1 P1-4: retire the plugin's per-trigger secrets from
+        # the FILESYSTEM inventory (prefix glob — never from the ack
+        # records this tool just deleted). Keeping them would let the NEXT
+        # artifact inherit the old credential: a later plugin_update's
+        # revoke_artifact would find no records and retire nothing.
+        import webhook_auth
+        retired = await asyncio.to_thread(
+            webhook_auth.retire_secrets_with_prefix, prefix,
+            secrets_dir=trigger_reconcile.SECRETS_DIR)
         # Refresh health (trigger_pending_ack reappears via the recomputable
         # input) WITHOUT the operator DM — they just did this deliberately.
         await asyncio.to_thread(_regenerate_plugin_health, [])
         return _result({
             "ok": True, "name": name, "revoked": len(removed),
             "unrouted": sorted(r.get("effective") or "" for r in removed),
+            "secrets_retired": retired,
         })
 
 

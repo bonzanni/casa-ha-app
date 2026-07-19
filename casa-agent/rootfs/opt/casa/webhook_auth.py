@@ -219,6 +219,33 @@ def retire_secret(name: str, *, secrets_dir: Path) -> None:
         pass
 
 
+def retire_secrets_with_prefix(prefix: str, *, secrets_dir: Path) -> list[str]:
+    """Retire EVERY slot whose base name starts with *prefix* (Sol shipB-r1
+    P1-4: the revoke path must retire from the FILESYSTEM inventory, never
+    from ack records — a revoke that deleted the records would otherwise
+    leave the secret for the next artifact to inherit). Returns the retired
+    base names; never raises."""
+    if not prefix:
+        return []
+    secrets_dir = Path(secrets_dir)
+    try:
+        names = [p.name for p in secrets_dir.iterdir()]
+    except OSError:
+        return []
+    bases: set[str] = set()
+    for n in names:
+        base = n
+        if base.endswith(".rot.json"):
+            base = base[: -len(".rot.json")]
+        elif base.endswith(".next"):
+            base = base[: -len(".next")]
+        if base.startswith(prefix):
+            bases.add(base)
+    for base in sorted(bases):
+        retire_secret(base, secrets_dir=secrets_dir)
+    return sorted(bases)
+
+
 def ensure_secret(name: str, *, owner: str, secrets_dir: Path) -> bytes | None:
     """Return the live secret for ``name``, minting it for ``owner="casa"`` if
     absent. For ``owner="provider"`` this is read-only (Casa never mints a

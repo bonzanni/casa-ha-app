@@ -1297,8 +1297,16 @@ def _make_webhook_handler(
             return webhook_secret.encode() if webhook_secret else b""
         owner = policy.get("secret_owner", "casa")
         # casa: mint-if-absent so the operator can read + provision it;
-        # provider: read-only (imported out of band).
-        got = webhook_auth.ensure_secret(name, owner=owner, secrets_dir=secrets_dir)
+        # provider: read-only (imported out of band). Sol shipB-r1 P1-6: a
+        # filesystem failure here (unwritable/full secrets dir) must degrade
+        # to an EMPTY secret — which never authenticates (401) — not a 500.
+        try:
+            got = webhook_auth.ensure_secret(
+                name, owner=owner, secrets_dir=secrets_dir)
+        except Exception:  # noqa: BLE001 — fail closed, never fail open/500
+            logger.warning("webhook secret read/mint failed (%s)", name,
+                           exc_info=True)
+            return b""
         if got:
             # Register for exact-value log redaction (spec A2) so a per-trigger
             # secret can never surface in Casa's application logs.

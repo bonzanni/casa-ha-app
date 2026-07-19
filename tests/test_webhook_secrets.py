@@ -104,3 +104,30 @@ def test_retire_secret_tolerates_missing_files_and_dir(tmp_path):
     retire_secret("never-existed", secrets_dir=tmp_path)          # no raise
     retire_secret("x", secrets_dir=tmp_path / "no-such-dir")      # no raise
     retire_secret("", secrets_dir=tmp_path)                       # no raise
+
+
+def test_retire_secrets_with_prefix_sweeps_all_slots(tmp_path):
+    """Sol shipB-r1 P1-4: revoke retires from the FILESYSTEM inventory by
+    prefix — live + .next + .rot.json for every matching base, others kept."""
+    from webhook_auth import retire_secrets_with_prefix, rotation_begin
+
+    for base in ("plg-p--a", "plg-p--b", "plg-other--x", "resident-vm"):
+        ensure_secret(base, owner="casa", secrets_dir=tmp_path)
+    rotation_begin("plg-p--a", owner="casa", secrets_dir=tmp_path)
+
+    retired = retire_secrets_with_prefix("plg-p--", secrets_dir=tmp_path)
+    assert retired == ["plg-p--a", "plg-p--b"]
+    assert not (tmp_path / "plg-p--a").exists()
+    assert not (tmp_path / "plg-p--a.next").exists()
+    assert not (tmp_path / "plg-p--a.rot.json").exists()
+    assert not (tmp_path / "plg-p--b").exists()
+    assert (tmp_path / "plg-other--x").exists()
+    assert (tmp_path / "resident-vm").exists()
+
+
+def test_retire_secrets_with_prefix_tolerates_missing_dir(tmp_path):
+    from webhook_auth import retire_secrets_with_prefix
+
+    assert retire_secrets_with_prefix("plg-p--",
+                                      secrets_dir=tmp_path / "nope") == []
+    assert retire_secrets_with_prefix("", secrets_dir=tmp_path) == []

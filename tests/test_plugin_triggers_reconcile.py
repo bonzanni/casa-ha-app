@@ -740,14 +740,22 @@ async def test_trigger_ack_revoke_unroutes_synchronously(monkeypatch, tmp_path):
     eff = "plg-elevenlabs--voicemail"
     assert registry.get_webhook_target(eff) == "assistant"
 
+    # the eager mint routed a secret; revoke must RETIRE it (Sol shipB-r1
+    # P1-4: a kept secret would be inherited by the next artifact, since the
+    # ack records revoke_artifact would need are deleted right here)
+    secrets_dir = tmp_path / "webhook_secrets"
+    assert (secrets_dir / eff).exists()
+
     r = await tools_mod.trigger_ack_revoke.handler({"name": "elevenlabs"})
     payload = _json.loads(r["content"][0]["text"])
     assert payload["ok"] is True
     assert payload["revoked"] == 1
     assert payload["unrouted"] == [eff]
+    assert payload["secrets_retired"] == [eff]
     # the route is GONE the moment the tool returns (immediate 404)
     assert registry.get_webhook_target(eff) is None
     assert not acks.is_acked(_ident_default())
+    assert not (secrets_dir / eff).exists()
 
 
 async def test_trigger_ack_revoke_unknown_plugin_is_idempotent(

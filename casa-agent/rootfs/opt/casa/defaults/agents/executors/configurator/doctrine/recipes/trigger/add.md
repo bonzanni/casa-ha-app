@@ -92,5 +92,7 @@ operator's one-time consent DM. Their state shows in **plugin health**
 (`trigger_pending_ack`, `trigger_channel_missing`,
 `trigger_unassigned_target`), not in this recipe's files. To change one:
 change the plugin (`plugin_update`). Operator off-switch:
-`trigger_ack_revoke(name=<plugin>)` — unroutes immediately; re-approval
-re-prompts on the next plugin mutation or `casa_reload_triggers`.
+`trigger_ack_revoke(name=<plugin>)` — unroutes immediately AND retires the
+per-trigger secrets; re-approval (re-prompted on the next plugin mutation or
+`casa_reload_triggers`) mints fresh ones, so the plugin's setup tool must
+re-provision the external service.
