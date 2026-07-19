@@ -27,7 +27,7 @@ from telegram import InputFile, Update
 from telegram.constants import ChatAction
 from telegram.error import BadRequest, NetworkError, TelegramError, TimedOut
 
-from channels.tg_richtext import render
+from channels.tg_richtext import render, render_paged
 from telegram.ext import (
     Application,
     CallbackQueryHandler,
@@ -3183,7 +3183,13 @@ class TelegramChannel(Channel):
             )
 
     async def send_response(self, message: str, context: dict[str, Any]) -> None:
-        """Block-mode agent response with rich-text rendering (plain fallback)."""
+        """Block-mode agent response with rich-text rendering (plain fallback).
+
+        v2 (RC3): an oversized response paginates through ``render_paged()`` —
+        every page sends rendered (previously the whole message fell back to
+        plain raw chunks via ``send()``). Single page keeps the v0.70.0
+        contract exactly (raw-when-no-entities, BadRequest → raw resend);
+        multi-page fallbacks use each page's DISPLAY."""
         # Release the lease before the availability guard (reconnect-safe).
         target_chat = _resolve_chat_id(context, self.chat_id)
         self._release_typing(context, target_chat)
@@ -3193,11 +3199,20 @@ class TelegramChannel(Channel):
         if not self._rich_text_enabled:
             await self.send(message, context)
             return
-        display, entities = render(message)
-        if entities is None:
-            await self.send(message, context)
+        pages = render_paged(message)
+        if len(pages) == 1:
+            display, entities = pages[0]
+            if entities is None:
+                await self.send(message, context)
+                return
+            await self._send_one(target_chat, message, display, entities)
             return
-        await self._send_one(target_chat, message, display, entities)
+        for display, entities in pages:
+            if entities is None:
+                await self._app.bot.send_message(
+                    chat_id=target_chat, text=display)
+            else:
+                await self._send_one(target_chat, display, display, entities)
 
     async def finalize_response_stream(
         self, full_text: str, context: dict[str, Any], on_token: OnTokenCallback,
@@ -3222,23 +3237,44 @@ class TelegramChannel(Channel):
         if message_id is None:
             await self.send_response(full_text, context)
             return
-        display, entities = render(full_text)
-        if entities is None:
+        # v2 (RC3): an oversized SUCCESSFUL response no longer delegates to
+        # the plain finalize_stream (raw-marker chunks); page 1 rich-edits the
+        # streamed message, the rest send rendered. Single page keeps the
+        # v0.70.0 contract (no markup → plain finalize, BadRequest → raw edit).
+        pages = render_paged(full_text)
+        if len(pages) == 1 and pages[0][1] is None:
             await self.finalize_stream(full_text, context, on_token)
             return
+        display0, entities0 = pages[0]
+        fallback0 = full_text if len(pages) == 1 else display0
         try:
             try:
-                await self._app.bot.edit_message_text(
-                    chat_id=target_chat, message_id=message_id,
-                    text=display, entities=entities,
-                )
+                if entities0 is not None:
+                    await self._app.bot.edit_message_text(
+                        chat_id=target_chat, message_id=message_id,
+                        text=display0, entities=entities0,
+                    )
+                else:
+                    await self._app.bot.edit_message_text(
+                        chat_id=target_chat, message_id=message_id,
+                        text=fallback0,
+                    )
             except BadRequest:
                 await self._app.bot.edit_message_text(
-                    chat_id=target_chat, message_id=message_id, text=full_text,
+                    chat_id=target_chat, message_id=message_id, text=fallback0,
                 )
         except TelegramError as exc:
             if "not modified" not in str(exc).lower():
                 logger.warning("Final stream edit failed: %s", exc)
+        for display, entities in pages[1:]:
+            try:
+                if entities is None:
+                    await self._app.bot.send_message(
+                        chat_id=target_chat, text=display)
+                else:
+                    await self._send_one(target_chat, display, display, entities)
+            except TelegramError as exc:
+                logger.warning("Final stream overflow send failed: %s", exc)
 
     async def send_response_to_topic(
         self, thread_id: int, text: str, **kwargs,
@@ -3246,10 +3282,49 @@ class TelegramChannel(Channel):
         """Post an agent response into an engagement topic with rich text.
 
         Used by the Claude-Code reply handler and by TopicStreamHandle's
-        single-message finalize. Plain (no markup) → send_to_topic verbatim; on
-        entity BadRequest resend the ORIGINAL text plain. Shares the rich
-        send/fallback engine with narration via ``send_to_topic_rich``."""
-        return await self.send_to_topic_rich(thread_id, text, **kwargs)
+        finalize. v2 (2026-07-19, Sol+Terra D3): THIS is the paginating rich
+        helper — an oversized response becomes several rendered messages via
+        ``render_paged()`` (each ≤4096 UTF-16 units and ≤100 entities), so a
+        long reply never ships raw markdown (the RC3 leak) and never 400s on
+        length. ``send_to_topic_rich`` stays the sequencer's ONE-message
+        narration primitive and is only used here for the single-page case.
+
+        Single page keeps the v0.89.0 contract exactly (raw-when-no-entities,
+        BadRequest → raw resend). Multi-page: every page sends its DISPLAY
+        slice (markers already consumed — raw source offsets no longer
+        correspond), falling back to the same display plain on an entity
+        BadRequest; ``kwargs`` (e.g. ``reply_parameters``) attach to the FIRST
+        page only. Returns the LAST page's ``message_id`` (the bottom-most
+        message — the correct reply anchor for subsequent traffic)."""
+        if not self._rich_text_enabled:
+            return await self.send_to_topic(thread_id, text, **kwargs)
+        pages = render_paged(text)
+        if len(pages) == 1:
+            return await self.send_to_topic_rich(thread_id, text, **kwargs)
+        if not self.engagement_supergroup_id:
+            raise RuntimeError("engagement supergroup not configured")
+        last_mid: int | None = None
+        page_kwargs = kwargs
+        for display, entities in pages:
+            if entities is None:
+                last_mid = await self.send_to_topic(
+                    thread_id, display, **page_kwargs)
+            else:
+                try:
+                    msg = await self.bot.send_message(
+                        chat_id=self.engagement_supergroup_id, text=display,
+                        message_thread_id=thread_id, entities=entities,
+                        **page_kwargs,
+                    )
+                    last_mid = msg.message_id
+                except BadRequest as exc:
+                    logger.warning(
+                        "topic response page fell back to plain: %s", exc)
+                    last_mid = await self.send_to_topic(
+                        thread_id, display, **page_kwargs)
+            page_kwargs = {}
+        assert last_mid is not None  # pages is never empty
+        return last_mid
 
     async def turn_finished(self, context: dict[str, Any]) -> None:
         """L7 (v0.52.0): teardown for turns that end WITHOUT delivery.
@@ -3476,12 +3551,10 @@ class TopicStreamHandle:
             return
 
         if self._message_id is None:
-            # No prior emit: one fresh message. Rich-render when it fits a single
-            # Telegram message; otherwise fall back to the plain split-send.
-            if (
-                self._channel._rich_text_enabled
-                and len(full_text) <= _TG_MAX_LENGTH
-            ):
+            # No prior emit: fresh message(s). v2 (RC3): send_response_to_topic
+            # paginates internally, so any size delivers rendered — the plain
+            # split-send survives only for the rich-text killswitch.
+            if self._channel._rich_text_enabled:
                 try:
                     await self._channel.send_response_to_topic(
                         self._topic_id, full_text,
@@ -3501,54 +3574,81 @@ class TopicStreamHandle:
                     logger.warning("Stream finalize send failed: %s", exc)
             return
 
-        if len(full_text) <= _TG_MAX_LENGTH:
-            display, entities = (full_text, None)
-            if self._channel._rich_text_enabled:
-                display, entities = render(full_text)
+        if not self._channel._rich_text_enabled:
+            # Killswitch: pre-v2 plain behavior (edit, then plain overflow).
+            chunks = _split_message(full_text)
             try:
-                if entities is not None:
-                    try:
-                        await bot.edit_message_text(
-                            chat_id=self._channel.engagement_supergroup_id,
-                            message_id=self._message_id,
-                            text=display, entities=entities,
-                        )
-                    except BadRequest:
-                        await bot.edit_message_text(
-                            chat_id=self._channel.engagement_supergroup_id,
-                            message_id=self._message_id,
-                            text=full_text,
-                        )
-                else:
-                    await bot.edit_message_text(
-                        chat_id=self._channel.engagement_supergroup_id,
-                        message_id=self._message_id,
-                        text=full_text,
-                    )
+                await bot.edit_message_text(
+                    chat_id=self._channel.engagement_supergroup_id,
+                    message_id=self._message_id,
+                    text=chunks[0],
+                )
             except TelegramError as exc:
                 if "not modified" not in str(exc).lower():
                     logger.warning("Stream finalize edit failed: %s", exc)
+            for chunk in chunks[1:]:
+                try:
+                    await bot.send_message(
+                        chat_id=self._channel.engagement_supergroup_id,
+                        message_thread_id=self._topic_id,
+                        text=chunk,
+                    )
+                except TelegramError as exc:
+                    logger.warning(
+                        "Stream finalize overflow send failed: %s", exc,
+                    )
             return
 
-        chunks = _split_message(full_text)
+        # v2 (RC3): page 1 rich-edits the streamed message; the rest are rich
+        # sends. Entity BadRequest degrades to that page's DISPLAY plain (the
+        # single-page case keeps the v0.89.0 raw-fallback contract).
+        pages = render_paged(full_text)
+        display0, entities0 = pages[0]
+        fallback0 = full_text if len(pages) == 1 else display0
         try:
-            await bot.edit_message_text(
-                chat_id=self._channel.engagement_supergroup_id,
-                message_id=self._message_id,
-                text=chunks[0],
-            )
+            if entities0 is not None:
+                try:
+                    await bot.edit_message_text(
+                        chat_id=self._channel.engagement_supergroup_id,
+                        message_id=self._message_id,
+                        text=display0, entities=entities0,
+                    )
+                except BadRequest:
+                    await bot.edit_message_text(
+                        chat_id=self._channel.engagement_supergroup_id,
+                        message_id=self._message_id,
+                        text=fallback0,
+                    )
+            else:
+                await bot.edit_message_text(
+                    chat_id=self._channel.engagement_supergroup_id,
+                    message_id=self._message_id,
+                    text=fallback0,
+                )
         except TelegramError as exc:
             if "not modified" not in str(exc).lower():
-                logger.warning(
-                    "Stream finalize overflow edit failed: %s", exc,
-                )
-        for chunk in chunks[1:]:
+                logger.warning("Stream finalize edit failed: %s", exc)
+        for display, entities in pages[1:]:
             try:
-                await bot.send_message(
-                    chat_id=self._channel.engagement_supergroup_id,
-                    message_thread_id=self._topic_id,
-                    text=chunk,
-                )
+                if entities is not None:
+                    try:
+                        await bot.send_message(
+                            chat_id=self._channel.engagement_supergroup_id,
+                            message_thread_id=self._topic_id,
+                            text=display, entities=entities,
+                        )
+                    except BadRequest:
+                        await bot.send_message(
+                            chat_id=self._channel.engagement_supergroup_id,
+                            message_thread_id=self._topic_id,
+                            text=display,
+                        )
+                else:
+                    await bot.send_message(
+                        chat_id=self._channel.engagement_supergroup_id,
+                        message_thread_id=self._topic_id,
+                        text=display,
+                    )
             except TelegramError as exc:
                 logger.warning(
                     "Stream finalize overflow send failed: %s", exc,
