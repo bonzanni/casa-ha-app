@@ -17,6 +17,37 @@ build_image() {
     docker build -f test-local/Dockerfile.test -t "$IMAGE" . >/dev/null
 }
 
+# --- Release A: /invoke + /webhook are fail-closed (401/403 without a valid
+# signature). Tests that exercise those endpoints boot with an auth-ON options
+# override and sign each request. WEBHOOK_SECRET_E2E matches options.auth.json.
+WEBHOOK_SECRET_E2E="e2e-invoke-secret"
+_REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
+
+# start_authed_container <name> [extra docker args...]
+# Like start_container but mounts the auth-ON options over /data/options.json.
+start_authed_container() {
+    local name="$1"; shift
+    start_container "$name" \
+        -v "${_REPO_ROOT}/test-local/options.auth.json:/data/options.json:ro" \
+        "$@"
+}
+
+# sign_body <body> -> HMAC-SHA256 hex of the body under WEBHOOK_SECRET_E2E.
+sign_body() {
+    printf '%s' "$1" \
+        | openssl dgst -sha256 -hmac "$WEBHOOK_SECRET_E2E" -r \
+        | cut -d' ' -f1
+}
+
+# signed_invoke <host_port> <agent> <json-body> -> curl output; fails on non-2xx.
+signed_invoke() {
+    local port="$1" agent="$2" body="$3"
+    curl -sf -X POST "http://localhost:${port}/invoke/${agent}" \
+        -H 'Content-Type: application/json' \
+        -H "X-Webhook-Signature: $(sign_body "$body")" \
+        -d "$body"
+}
+
 # start_container <name> [extra docker args...]
 # Prints the container id on stdout.
 # Maps ${HOST_PORT}:8080 always; if EXT_PORT is set, also maps
