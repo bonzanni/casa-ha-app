@@ -64,3 +64,34 @@ class TestRedactAnthropicKeys:
         result = redact(text)
         assert secret_body not in result
         assert "sk-ant-oat01-" in result
+
+
+class TestExactValueRegistration:
+    """Release A (Task 6): per-trigger webhook secrets are opaque and match no
+    generic pattern, so they are registered for exact-value redaction."""
+
+    def setup_method(self):
+        from log_redact import _reset_registered_secrets
+        _reset_registered_secrets()
+
+    def teardown_method(self):
+        from log_redact import _reset_registered_secrets
+        _reset_registered_secrets()
+
+    def test_registered_value_is_redacted(self):
+        from log_redact import register_secret
+        register_secret("whsec_opaqueProviderValue123")
+        out = redact("delivering with secret whsec_opaqueProviderValue123 now")
+        assert "whsec_opaqueProviderValue123" not in out
+        assert "delivering with secret" in out
+
+    def test_unregistered_value_untouched(self):
+        out = redact("plain harmless text 12345")
+        assert "plain harmless text 12345" in out
+
+    def test_short_or_empty_values_not_registered(self):
+        from log_redact import register_secret
+        register_secret("")      # ignored — would blank everything
+        register_secret("abc")   # too short to be a meaningful secret
+        out = redact("abc and more")
+        assert "abc and more" in out
