@@ -127,6 +127,8 @@ async def test_prompt_posts_keyboard_with_binding_facts(monkeypatch, tmp_path):
     assert "/webhook/plg-elevenlabs--voicemail" in text
     assert "assistant" in text
     assert "static_header" in text
+    # the memory clearance is part of what the operator approves — disclose it
+    assert "clearance public" in text
 
 
 async def test_duplicate_prompt_is_deduped(monkeypatch, tmp_path):

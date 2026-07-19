@@ -182,7 +182,7 @@ def compute_desired(
                 plugin_pending.append({
                     "plugin": rp.name, "artifact_id": rp.artifact_id,
                     "effective": t["effective"], "target": target,
-                    "auth": t["auth"]})
+                    "auth": t["auth"], "clearance": t["clearance"]})
                 continue
             entries[t["effective"]] = {
                 "plugin": rp.name, "role": role,
