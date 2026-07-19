@@ -5987,8 +5987,15 @@ def _regenerate_plugin_health(extra_issues: list) -> None:
             if verify.get("ready") is not True and not rows:
                 for reason in (verify.get("reasons") or ["not_ready"]):
                     _add(name, None, reason)
+    # Release B: plugin-trigger issues are a RECOMPUTABLE input — derived
+    # fresh on EVERY regeneration (never passed as one-shot extras), so an
+    # unrelated health refresh can never erase trigger_pending_ack /
+    # trigger_channel_missing. current_issues() never raises.
+    import trigger_reconcile
+    trigger_issues = trigger_reconcile.current_issues()
     plugin_health.write_report(
-        issues=(list(res.issues) + list(extra_issues) + runtime_issues),
+        issues=(list(res.issues) + list(extra_issues) + runtime_issues
+                + list(trigger_issues)),
         warnings=list(res.warnings),
         path=_PLUGIN_HEALTH_PATH,
     )
@@ -6165,6 +6172,18 @@ async def _reload_and_verify_targets(name: str, targets: list,
                                    "%s: %s", role, exc)
     stale_absent = (_stale_absent_targets(targets, name, runtime)
                     if expect == "absent" else [])
+    # Release B: reconcile plugin-declared webhook triggers LAST — after the
+    # snapshot reload, agent reconstruction, and verify — so the overlay
+    # derives from the POST-mutation resolver state (every one of the 5
+    # lifecycle mutations funnels through this sequencer). Its issues land in
+    # the health regen below via trigger_reconcile.current_issues() (a
+    # recomputable input, never a one-shot extra). A reconcile failure keeps
+    # the old overlay (fail-safe for ingress) and never fails the mutation.
+    try:
+        import trigger_reconcile
+        await trigger_reconcile.reconcile_from_runtime(runtime)
+    except Exception:  # noqa: BLE001
+        logger.warning("plugin-trigger reconcile failed", exc_info=True)
     ok = (not snapshot_raced and not reload_errors
           and _postcondition_holds(verify, targets, expect=expect,
                                    name=name, runtime=runtime))

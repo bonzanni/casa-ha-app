@@ -1,0 +1,626 @@
+"""Release B — the plugin-trigger reconciler.
+
+The reconciler is the ONE writer of the TriggerRegistry plugin overlay: it
+builds the COMPLETE desired overlay (every resolved + assigned + valid +
+acked plugin trigger), eagerly mints casa-owned per-trigger secrets for the
+routed set, swaps the overlay atomically (stale plugin ingress is swept by
+absence), and fires consent prompts for triggers whose ONLY gap is the ack.
+Contextual failures surface as recomputable PluginIssues (stage="triggers").
+"""
+import asyncio
+from types import SimpleNamespace
+
+import pytest
+
+import trigger_reconcile as tr
+from trigger_acks import TriggerAckStore
+from trigger_registry import TriggerRegistry
+from plugin_triggers import ack_identity
+
+AUTH = {"mode": "static_header", "header": "X-API-Key",
+        "tolerance_secs": 300, "secret_owner": "casa"}
+
+
+def _manifest(triggers):
+    return {"name": "x", "casa": {"triggers": triggers}}
+
+
+def _trigger(**over):
+    t = {"name": "voicemail", "type": "webhook",
+         "target": "resident:assistant",
+         "auth": {"mode": "static_header", "header": "X-API-Key"}}
+    t.update(over)
+    return t
+
+
+def _plugin(name="elevenlabs", artifact_id="art-1", triggers=None):
+    return SimpleNamespace(
+        name=name, artifact_id=artifact_id, path=f"/store/{name}",
+        version="1.0.0",
+        manifest=_manifest([_trigger()] if triggers is None else triggers))
+
+
+def _resolver(plugins_by_target):
+    """target (or None) -> list of resolved plugins; registry always valid."""
+    def resolve(target):
+        return SimpleNamespace(
+            registry_valid=True,
+            plugins=list(plugins_by_target.get(target, [])))
+    return resolve
+
+
+def _invalid_resolver():
+    def resolve(target):
+        return SimpleNamespace(registry_valid=False, plugins=[])
+    return resolve
+
+
+def _role_configs(**roles):
+    """role -> channels list."""
+    out = {}
+    for role, channels in roles.items():
+        out[role] = SimpleNamespace(channels=list(channels))
+    return out
+
+
+class _FakeTelegram:
+    chat_id = "100"
+
+    def __init__(self):
+        self.posts = []
+
+    async def post_dm_keyboard(self, *, chat_id, request_id, text, options):
+        self.posts.append((chat_id, request_id, text, tuple(options)))
+        return 55
+
+    async def edit_dm_message(self, chat_id, message_id, text):
+        return True
+
+
+class _FakeChannelManager:
+    def __init__(self, telegram=None):
+        self._telegram = telegram
+
+    def get(self, name):
+        return self._telegram if name == "telegram" else None
+
+
+def _registry():
+    # Overlay operations never touch the scheduler/app/bus.
+    return TriggerRegistry(scheduler=None, app=None, bus=None)
+
+
+def _ack(acks, plugin="elevenlabs", artifact_id="art-1",
+         declared="voicemail", target="resident:assistant", auth=None):
+    auth = auth or AUTH
+    effective = f"plg-{plugin}--{declared}"
+    ident = ack_identity(plugin=plugin, artifact_id=artifact_id,
+                         effective=effective, target=target, auth=auth)
+    acks.record(identity=ident, plugin=plugin, artifact_id=artifact_id,
+                effective=effective, target=target, auth=auth)
+    return ident
+
+
+async def _reconcile(registry, *, plugins_by_target, role_configs, acks,
+                     tmp_path, channel_manager=None, prompt=True,
+                     global_secret_ok=True, resolver=None):
+    return await tr.reconcile_plugin_triggers(
+        trigger_registry=registry,
+        role_configs=role_configs,
+        channel_manager=channel_manager,
+        acks=acks,
+        secrets_dir=tmp_path / "webhook_secrets",
+        prompt=prompt,
+        resolver=resolver or _resolver(plugins_by_target),
+        global_secret_ok=lambda: global_secret_ok,
+    )
+
+
+# ---------------------------------------------------------------------------
+# routing
+# ---------------------------------------------------------------------------
+
+
+async def test_valid_acked_plugin_routes_and_mints_secret(tmp_path):
+    registry = _registry()
+    acks = TriggerAckStore(path=tmp_path / "acks.json")
+    _ack(acks)
+    p = _plugin()
+    issues = await _reconcile(
+        registry, plugins_by_target={None: [p], "resident:assistant": [p]},
+        role_configs=_role_configs(assistant=["telegram", "webhook"]),
+        acks=acks, tmp_path=tmp_path)
+    assert issues == []
+    eff = "plg-elevenlabs--voicemail"
+    assert registry.get_webhook_target(eff) == "assistant"
+    assert registry.get_clearance(eff) == "public"
+    assert registry.get_auth_policy(eff)["mode"] == "static_header"
+    # the secret was minted EAGERLY (before any request) so the plugin's
+    # setup tool can read it
+    assert (tmp_path / "webhook_secrets" / eff).exists()
+
+
+async def test_unacked_plugin_stays_unrouted_with_pending_issue(tmp_path):
+    registry = _registry()
+    acks = TriggerAckStore(path=tmp_path / "acks.json")
+    p = _plugin()
+    issues = await _reconcile(
+        registry, plugins_by_target={None: [p], "resident:assistant": [p]},
+        role_configs=_role_configs(assistant=["webhook"]),
+        acks=acks, tmp_path=tmp_path)
+    assert [i.reason_code for i in issues] == ["trigger_pending_ack"]
+    assert issues[0].name == "elevenlabs"
+    assert issues[0].stage == "triggers"
+    assert registry.get_webhook_target("plg-elevenlabs--voicemail") is None
+    # no eager secret for an unrouted trigger
+    assert not (tmp_path / "webhook_secrets" / "plg-elevenlabs--voicemail").exists()
+
+
+async def test_missing_webhook_channel_blocks(tmp_path):
+    registry = _registry()
+    acks = TriggerAckStore(path=tmp_path / "acks.json")
+    _ack(acks)
+    p = _plugin()
+    issues = await _reconcile(
+        registry, plugins_by_target={None: [p], "resident:assistant": [p]},
+        role_configs=_role_configs(assistant=["telegram"]),  # no webhook
+        acks=acks, tmp_path=tmp_path)
+    assert [i.reason_code for i in issues] == ["trigger_channel_missing"]
+    assert registry.get_webhook_target("plg-elevenlabs--voicemail") is None
+
+
+async def test_unknown_target_resident_blocks(tmp_path):
+    registry = _registry()
+    acks = TriggerAckStore(path=tmp_path / "acks.json")
+    p = _plugin(triggers=[_trigger(target="resident:ghost")])
+    issues = await _reconcile(
+        registry, plugins_by_target={None: [p]},
+        role_configs=_role_configs(assistant=["webhook"]),
+        acks=acks, tmp_path=tmp_path)
+    assert [i.reason_code for i in issues] == ["trigger_channel_missing"]
+
+
+async def test_unassigned_plugin_routes_nothing(tmp_path):
+    """Assignment authority: the plugin declares resident:assistant but its
+    registry entry is NOT assigned there (target-scoped resolution excludes
+    it) — it must not route."""
+    registry = _registry()
+    acks = TriggerAckStore(path=tmp_path / "acks.json")
+    _ack(acks)
+    p = _plugin()
+    issues = await _reconcile(
+        registry,
+        plugins_by_target={None: [p]},  # assigned nowhere resident-side
+        role_configs=_role_configs(assistant=["webhook"]),
+        acks=acks, tmp_path=tmp_path)
+    assert [i.reason_code for i in issues] == ["trigger_unassigned_target"]
+    assert registry.get_webhook_target("plg-elevenlabs--voicemail") is None
+
+
+async def test_stale_plugin_overlay_is_swept(tmp_path):
+    registry = _registry()
+    registry.replace_plugin_overlay({
+        "plg-gone--old": {"role": "assistant", "clearance": "public",
+                          "auth": AUTH}})
+    acks = TriggerAckStore(path=tmp_path / "acks.json")
+    issues = await _reconcile(
+        registry, plugins_by_target={None: []},
+        role_configs=_role_configs(assistant=["webhook"]),
+        acks=acks, tmp_path=tmp_path)
+    assert issues == []
+    assert registry.get_webhook_target("plg-gone--old") is None
+
+
+async def test_per_plugin_all_or_nothing(tmp_path):
+    """One bad trigger (channel missing) sinks the plugin's WHOLE set — the
+    acked+valid sibling must not route either."""
+    registry = _registry()
+    acks = TriggerAckStore(path=tmp_path / "acks.json")
+    _ack(acks)
+    p = _plugin(triggers=[
+        _trigger(),
+        _trigger(name="transcript", target="resident:ghost")])
+    issues = await _reconcile(
+        registry, plugins_by_target={None: [p], "resident:assistant": [p]},
+        role_configs=_role_configs(assistant=["webhook"]),
+        acks=acks, tmp_path=tmp_path)
+    assert [i.reason_code for i in issues] == ["trigger_channel_missing"]
+    assert registry.get_webhook_target("plg-elevenlabs--voicemail") is None
+
+
+async def test_other_plugins_unaffected_by_one_bad_plugin(tmp_path):
+    registry = _registry()
+    acks = TriggerAckStore(path=tmp_path / "acks.json")
+    _ack(acks)
+    good = _plugin()
+    bad = _plugin(name="badone", artifact_id="art-9",
+                  triggers=[_trigger(target="resident:ghost")])
+    issues = await _reconcile(
+        registry,
+        plugins_by_target={None: [good, bad], "resident:assistant": [good]},
+        role_configs=_role_configs(assistant=["webhook"]),
+        acks=acks, tmp_path=tmp_path)
+    assert [i.name for i in issues] == ["badone"]
+    assert registry.get_webhook_target("plg-elevenlabs--voicemail") == "assistant"
+
+
+async def test_intrinsic_invalid_manifest_is_trigger_invalid(tmp_path):
+    registry = _registry()
+    acks = TriggerAckStore(path=tmp_path / "acks.json")
+    p = _plugin(triggers=[_trigger(target="specialist:finance")])
+    issues = await _reconcile(
+        registry, plugins_by_target={None: [p], "resident:assistant": [p]},
+        role_configs=_role_configs(assistant=["webhook"]),
+        acks=acks, tmp_path=tmp_path)
+    assert [i.reason_code for i in issues] == ["trigger_invalid"]
+
+
+async def test_invalid_registry_fails_closed_to_empty_overlay(tmp_path):
+    registry = _registry()
+    registry.replace_plugin_overlay({
+        "plg-old--x": {"role": "assistant", "clearance": "public",
+                       "auth": AUTH}})
+    acks = TriggerAckStore(path=tmp_path / "acks.json")
+    issues = await _reconcile(
+        registry, plugins_by_target={},
+        role_configs=_role_configs(assistant=["webhook"]),
+        acks=acks, tmp_path=tmp_path, resolver=_invalid_resolver())
+    assert issues == []  # registry-invalid has its own (non-trigger) issues
+    assert registry.get_webhook_target("plg-old--x") is None
+
+
+async def test_hmac_body_requires_global_secret(tmp_path):
+    registry = _registry()
+    acks = TriggerAckStore(path=tmp_path / "acks.json")
+    auth = {"mode": "hmac_body", "header": "X-Webhook-Signature",
+            "tolerance_secs": 300, "secret_owner": "casa"}
+    p = _plugin(triggers=[_trigger(auth={"mode": "hmac_body"})])
+    _ack(acks, auth=auth)
+    issues = await _reconcile(
+        registry, plugins_by_target={None: [p], "resident:assistant": [p]},
+        role_configs=_role_configs(assistant=["webhook"]),
+        acks=acks, tmp_path=tmp_path, global_secret_ok=False)
+    assert [i.reason_code for i in issues] == ["trigger_secret_missing"]
+
+    issues = await _reconcile(
+        registry, plugins_by_target={None: [p], "resident:assistant": [p]},
+        role_configs=_role_configs(assistant=["webhook"]),
+        acks=acks, tmp_path=tmp_path, global_secret_ok=True)
+    assert issues == []
+    eff = "plg-elevenlabs--voicemail"
+    assert registry.get_webhook_target(eff) == "assistant"
+    # hmac_body uses the GLOBAL secret — no per-trigger file is minted
+    assert not (tmp_path / "webhook_secrets" / eff).exists()
+
+
+# ---------------------------------------------------------------------------
+# consent prompting
+# ---------------------------------------------------------------------------
+
+
+async def test_pending_consent_fires_one_prompt(monkeypatch, tmp_path):
+    import verdict_broker
+    monkeypatch.setattr(verdict_broker, "BROKER", verdict_broker.VerdictBroker())
+    import authz_grants
+    monkeypatch.setattr(authz_grants, "CHALLENGES",
+                        authz_grants.ChallengeCoordinator())
+    registry = _registry()
+    acks = TriggerAckStore(path=tmp_path / "acks.json")
+    telegram = _FakeTelegram()
+    p = _plugin()
+    issues = await _reconcile(
+        registry, plugins_by_target={None: [p], "resident:assistant": [p]},
+        role_configs=_role_configs(assistant=["webhook"]),
+        acks=acks, tmp_path=tmp_path,
+        channel_manager=_FakeChannelManager(telegram))
+    assert [i.reason_code for i in issues] == ["trigger_pending_ack"]
+    for _ in range(8):
+        await asyncio.sleep(0)
+    assert len(telegram.posts) == 1
+    assert "/webhook/plg-elevenlabs--voicemail" in telegram.posts[0][2]
+    # a second reconcile dedupes onto the live challenge (no second keyboard)
+    await _reconcile(
+        registry, plugins_by_target={None: [p], "resident:assistant": [p]},
+        role_configs=_role_configs(assistant=["webhook"]),
+        acks=acks, tmp_path=tmp_path,
+        channel_manager=_FakeChannelManager(telegram))
+    for _ in range(8):
+        await asyncio.sleep(0)
+    assert len(telegram.posts) == 1
+
+
+async def test_no_prompt_when_other_gaps_remain(monkeypatch, tmp_path):
+    """Consent is prompted only when the ack is the ONLY missing piece —
+    approving a trigger that still can't route is a broken promise."""
+    import verdict_broker
+    monkeypatch.setattr(verdict_broker, "BROKER", verdict_broker.VerdictBroker())
+    import authz_grants
+    monkeypatch.setattr(authz_grants, "CHALLENGES",
+                        authz_grants.ChallengeCoordinator())
+    registry = _registry()
+    acks = TriggerAckStore(path=tmp_path / "acks.json")
+    telegram = _FakeTelegram()
+    p = _plugin(triggers=[
+        _trigger(),  # consent missing
+        _trigger(name="transcript", target="resident:ghost")])  # channel gap
+    await _reconcile(
+        registry, plugins_by_target={None: [p], "resident:assistant": [p]},
+        role_configs=_role_configs(assistant=["webhook"]),
+        acks=acks, tmp_path=tmp_path,
+        channel_manager=_FakeChannelManager(telegram))
+    for _ in range(8):
+        await asyncio.sleep(0)
+    assert telegram.posts == []
+
+
+async def test_no_prompt_without_operator_channel(monkeypatch, tmp_path):
+    registry = _registry()
+    acks = TriggerAckStore(path=tmp_path / "acks.json")
+    p = _plugin()
+    issues = await _reconcile(
+        registry, plugins_by_target={None: [p], "resident:assistant": [p]},
+        role_configs=_role_configs(assistant=["webhook"]),
+        acks=acks, tmp_path=tmp_path,
+        channel_manager=_FakeChannelManager(None))
+    # pending_ack stands; nothing crashes; no keyboard anywhere
+    assert [i.reason_code for i in issues] == ["trigger_pending_ack"]
+
+
+async def test_prompt_false_skips_prompting(monkeypatch, tmp_path):
+    registry = _registry()
+    acks = TriggerAckStore(path=tmp_path / "acks.json")
+    telegram = _FakeTelegram()
+    p = _plugin()
+    await _reconcile(
+        registry, plugins_by_target={None: [p], "resident:assistant": [p]},
+        role_configs=_role_configs(assistant=["webhook"]),
+        acks=acks, tmp_path=tmp_path, prompt=False,
+        channel_manager=_FakeChannelManager(telegram))
+    for _ in range(8):
+        await asyncio.sleep(0)
+    assert telegram.posts == []
+
+
+# ---------------------------------------------------------------------------
+# health recomputability
+# ---------------------------------------------------------------------------
+
+
+async def test_current_issues_recomputes_from_active_runtime(
+    monkeypatch, tmp_path,
+):
+    import agent as agent_mod
+    registry = _registry()
+    acks = TriggerAckStore(path=tmp_path / "acks.json")
+    p = _plugin()
+    resolver = _resolver({None: [p], "resident:assistant": [p]})
+    runtime = SimpleNamespace(
+        trigger_registry=registry,
+        role_configs=_role_configs(assistant=["webhook"]),
+        channel_manager=None)
+    monkeypatch.setattr(agent_mod, "active_runtime", runtime)
+    monkeypatch.setattr(tr, "_default_resolver", lambda: resolver)
+    monkeypatch.setattr(tr, "_default_acks", lambda: acks)
+    issues = tr.current_issues()
+    assert [i.reason_code for i in issues] == ["trigger_pending_ack"]
+    # acking makes the SAME recomputation come back clean
+    _ack(acks)
+    monkeypatch.setattr(tr, "_default_global_secret_ok", lambda: (lambda: True))
+    assert tr.current_issues() == []
+
+
+async def test_current_issues_without_runtime_is_empty(monkeypatch):
+    import agent as agent_mod
+    monkeypatch.setattr(agent_mod, "active_runtime", None)
+    assert tr.current_issues() == []
+
+
+# ---------------------------------------------------------------------------
+# wiring — the runtime seam
+# ---------------------------------------------------------------------------
+
+
+async def test_mutation_sequencer_reconciles_after_verify_before_regen(
+    monkeypatch,
+):
+    """tools._reload_and_verify_targets (the choke point all 5 lifecycle
+    mutations funnel through) reconciles LAST — after snapshot reload +
+    verify — and BEFORE the health regen that folds the trigger issues."""
+    import agent as agent_mod
+    import plugin_registry
+    import tools as tools_mod
+
+    log: list = []
+    monkeypatch.setattr(plugin_registry, "reload_snapshot",
+                        lambda: log.append("snapshot"))
+    monkeypatch.setattr(plugin_registry, "snapshot_generation", lambda: 1)
+    monkeypatch.setattr(agent_mod, "active_runtime", None)
+    monkeypatch.setattr(tools_mod, "_tool_verify_plugin_state",
+                        lambda plugin_name: (log.append("verify"),
+                                             {"ready": True, "targets": []})[1])
+    monkeypatch.setattr(tools_mod, "_regenerate_plugin_health",
+                        lambda extra: log.append("regen"))
+
+    async def _fake_notify():
+        return None
+
+    monkeypatch.setattr(tools_mod, "_notify_plugin_health_if_possible",
+                        _fake_notify)
+
+    async def _spy(runtime, prompt=True):
+        log.append("reconcile")
+        return []
+
+    monkeypatch.setattr(tr, "reconcile_from_runtime", _spy)
+    result = await tools_mod._reload_and_verify_targets(
+        "p", [], expect="present")
+    assert log == ["snapshot", "verify", "reconcile", "regen"]
+    assert result["ok"] is True
+
+
+async def test_mutation_sequencer_survives_reconcile_failure(monkeypatch):
+    import agent as agent_mod
+    import plugin_registry
+    import tools as tools_mod
+
+    monkeypatch.setattr(plugin_registry, "reload_snapshot", lambda: None)
+    monkeypatch.setattr(plugin_registry, "snapshot_generation", lambda: 1)
+    monkeypatch.setattr(agent_mod, "active_runtime", None)
+    monkeypatch.setattr(tools_mod, "_tool_verify_plugin_state",
+                        lambda plugin_name: {"ready": True, "targets": []})
+    monkeypatch.setattr(tools_mod, "_regenerate_plugin_health",
+                        lambda extra: None)
+
+    async def _fake_notify():
+        return None
+
+    monkeypatch.setattr(tools_mod, "_notify_plugin_health_if_possible",
+                        _fake_notify)
+
+    async def _boom(runtime, prompt=True):
+        raise RuntimeError("reconcile blew up")
+
+    monkeypatch.setattr(tr, "reconcile_from_runtime", _boom)
+    result = await tools_mod._reload_and_verify_targets(
+        "p", [], expect="present")
+    assert result["ok"] is True  # ingress reconcile never fails the mutation
+
+
+async def test_regenerate_health_folds_recomputable_trigger_issues(
+    monkeypatch, tmp_path,
+):
+    import plugin_registry
+    import tools as tools_mod
+    from plugin_registry import PluginIssue
+
+    monkeypatch.setattr(tools_mod, "_PLUGIN_HEALTH_PATH",
+                        str(tmp_path / "health.json"))
+    monkeypatch.setattr(plugin_registry, "resolve_all",
+                        lambda: SimpleNamespace(issues=[], warnings=[]))
+    monkeypatch.setattr(plugin_registry, "load_registry",
+                        lambda: SimpleNamespace(valid=False, entries=[]))
+    trig = PluginIssue(name="elevenlabs", target="resident:assistant",
+                       stage="triggers", reason_code="trigger_pending_ack")
+    monkeypatch.setattr(tr, "current_issues", lambda: [trig])
+    # regen with NO extras (the erasure case pre-fix) still carries the issue
+    tools_mod._regenerate_plugin_health([])
+    import json as _json
+    report = _json.loads((tmp_path / "health.json").read_text())
+    assert [i["reason_code"] for i in report["issues"]] == [
+        "trigger_pending_ack"]
+    # and a SECOND unrelated regen recomputes it again (never erased)
+    tools_mod._regenerate_plugin_health([])
+    report = _json.loads((tmp_path / "health.json").read_text())
+    assert [i["reason_code"] for i in report["issues"]] == [
+        "trigger_pending_ack"]
+
+
+@pytest.mark.parametrize("scope", ["triggers", "agent", "agents", "full"])
+async def test_reload_dispatch_reconciles_trigger_scopes(monkeypatch, scope):
+    import reload as reload_mod
+
+    calls: list = []
+
+    async def _handler(runtime, role=None, include_env=False):
+        return ["did_thing"]
+
+    monkeypatch.setitem(reload_mod._HANDLERS, scope, _handler)
+
+    async def _spy(runtime, prompt=True):
+        calls.append(runtime)
+        return []
+
+    monkeypatch.setattr(tr, "reconcile_from_runtime", _spy)
+    runtime = SimpleNamespace()
+    result = await reload_mod.dispatch(scope, runtime=runtime, role="r")
+    assert result["status"] == "ok"
+    assert calls == [runtime]
+    assert "plugin_triggers_reconciled" in result["actions"]
+
+
+async def test_reload_dispatch_skips_non_trigger_scopes(monkeypatch):
+    import reload as reload_mod
+
+    calls: list = []
+
+    async def _handler(runtime, role=None):
+        return ["did_thing"]
+
+    monkeypatch.setitem(reload_mod._HANDLERS, "synthetic_scope", _handler)
+
+    async def _spy(runtime, prompt=True):
+        calls.append(runtime)
+        return []
+
+    monkeypatch.setattr(tr, "reconcile_from_runtime", _spy)
+    result = await reload_mod.dispatch("synthetic_scope",
+                                       runtime=SimpleNamespace())
+    assert result["status"] == "ok"
+    assert calls == []
+
+
+async def test_reload_dispatch_failed_handler_does_not_reconcile(monkeypatch):
+    import reload as reload_mod
+
+    calls: list = []
+
+    async def _handler(runtime, role=None):
+        raise reload_mod.ReloadError("synthetic", "boom")
+
+    monkeypatch.setitem(reload_mod._HANDLERS, "triggers", _handler)
+
+    async def _spy(runtime, prompt=True):
+        calls.append(runtime)
+        return []
+
+    monkeypatch.setattr(tr, "reconcile_from_runtime", _spy)
+    result = await reload_mod.dispatch("triggers", runtime=SimpleNamespace(),
+                                       role="r")
+    assert result["status"] == "error"
+    assert calls == []
+
+
+async def test_boot_reconcile_regens_health_only_on_issues(monkeypatch):
+    import casa_core
+    import tools as tools_mod
+    from plugin_registry import PluginIssue
+
+    regen: list = []
+    monkeypatch.setattr(tools_mod, "_regenerate_plugin_health",
+                        lambda extra: regen.append(extra))
+    recon_calls: list = []
+
+    async def _spy(**kw):
+        recon_calls.append(kw)
+        return [PluginIssue(name="p", target=None, stage="triggers",
+                            reason_code="trigger_pending_ack")]
+
+    monkeypatch.setattr(tr, "reconcile_plugin_triggers", _spy)
+    registry = _registry()
+    await casa_core._boot_reconcile_plugin_triggers(
+        trigger_registry=registry, role_configs={})
+    assert len(recon_calls) == 1
+    assert recon_calls[0]["prompt"] is False  # telegram is not polling yet
+    assert regen == [[]]
+
+    # clean reconcile: plugin_boot's fresh report already lacks trigger
+    # issues, so no extra regen churn
+    async def _clean(**kw):
+        return []
+
+    monkeypatch.setattr(tr, "reconcile_plugin_triggers", _clean)
+    regen.clear()
+    await casa_core._boot_reconcile_plugin_triggers(
+        trigger_registry=registry, role_configs={})
+    assert regen == []
+
+
+async def test_boot_reconcile_failure_is_not_fatal(monkeypatch):
+    import casa_core
+
+    async def _boom(**kw):
+        raise RuntimeError("boot reconcile blew up")
+
+    monkeypatch.setattr(tr, "reconcile_plugin_triggers", _boom)
+    await casa_core._boot_reconcile_plugin_triggers(
+        trigger_registry=_registry(), role_configs={})  # must not raise

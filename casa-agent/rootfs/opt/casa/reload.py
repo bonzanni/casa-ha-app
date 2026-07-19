@@ -116,6 +116,12 @@ def register_handler(scope: str, fn: HandlerFn) -> None:
     _HANDLERS[scope] = fn
 
 
+# Release B: reload scopes whose success can change what plugin triggers may
+# route (resident channels/triggers, the agent set, or everything) — dispatch
+# re-derives the plugin-trigger overlay after these succeed.
+_TRIGGER_RECONCILE_SCOPES = frozenset({"triggers", "agent", "agents", "full"})
+
+
 async def dispatch(
     scope: str,
     *,
@@ -150,6 +156,22 @@ async def dispatch(
                 actions = await handler(
                     runtime, role=role, include_env=include_env,
                 ) if scope == "full" else await handler(runtime, role=role)
+                # Release B: a reload that can change trigger routing inputs
+                # (a resident's channels/triggers, the agent set, or the whole
+                # runtime) must re-derive the plugin-trigger overlay — e.g. a
+                # resident LOSING its webhook channel must unroute the plugin
+                # triggers that targeted it. Failure is non-fatal: the reload
+                # itself succeeded; the stale overlay heals on the next
+                # reconcile (any plugin mutation / reload).
+                if scope in _TRIGGER_RECONCILE_SCOPES:
+                    try:
+                        import trigger_reconcile
+                        await trigger_reconcile.reconcile_from_runtime(runtime)
+                        actions = [*actions, "plugin_triggers_reconciled"]
+                    except Exception:  # noqa: BLE001
+                        logger.warning(
+                            "plugin-trigger reconcile after reload failed",
+                            exc_info=True)
                 ms = int(time.monotonic() * 1000 - started_ms)
                 logger.info(
                     "casa_reload scope=%s role=%s ms=%d ok=True actions=%s",
