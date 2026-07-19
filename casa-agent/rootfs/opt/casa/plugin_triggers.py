@@ -13,6 +13,8 @@ the set means the whole plugin's trigger declaration is rejected by callers.
 """
 from __future__ import annotations
 
+import hashlib
+import json
 import re
 from typing import Any
 
@@ -39,6 +41,32 @@ _AUTH_KEYS = {"mode", "header", "tolerance_secs", "secret_owner"}
 def effective_name(plugin: str, declared: str) -> str:
     """The routed webhook name for a plugin-declared trigger: ``plg-<plugin>--<declared>``."""
     return f"plg-{plugin}--{declared}"
+
+
+# The auth fields that participate in the consent identity — exactly the
+# normalized policy shape `_validate_auth` emits. Anything else in a caller-
+# supplied dict is ignored so an unnormalized copy hashes the same.
+_IDENTITY_AUTH_KEYS = ("mode", "header", "tolerance_secs", "secret_owner")
+
+
+def ack_identity(
+    *, plugin: str, artifact_id: str, effective: str, target: str,
+    auth: dict[str, Any],
+) -> str:
+    """The consent identity: sha256 over the exact tuple the operator approves.
+
+    Binds an ack to ``(plugin, artifact_id, effective, target,
+    normalized-auth-policy)`` — a plugin update (new artifact), a renamed or
+    retargeted trigger, or ANY auth-policy change (mode/header/tolerance/
+    owner) yields a different identity, so the old consent can never carry
+    over to a policy the operator did not see.
+    """
+    norm_auth = {k: auth.get(k) for k in _IDENTITY_AUTH_KEYS}
+    body = json.dumps(
+        [plugin, artifact_id, effective, target, norm_auth],
+        sort_keys=True, separators=(",", ":"), ensure_ascii=False,
+    )
+    return hashlib.sha256(body.encode("utf-8")).hexdigest()
 
 
 def _validate_auth(auth: Any, errs: list[str], where: str) -> dict[str, Any] | None:
