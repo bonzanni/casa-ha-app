@@ -1,5 +1,13 @@
 # Changelog
 
+## [0.98.1] - 2026-07-19
+
+### Fixed
+
+- The v0.98.0 image build failed: the plugin-bundle build stage's narrow
+  file set was missing the new `plugin_triggers.py` module that publish-time
+  trigger validation imports. No runtime behavior change.
+
 ## [0.98.0] - 2026-07-19
 
 Plugins can now declare webhook triggers — gated by a one-time consent tap.
