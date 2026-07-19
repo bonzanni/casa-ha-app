@@ -1,5 +1,36 @@
 # Changelog
 
+## [0.94.0] - 2026-07-19
+
+Stray `**` and `##` markers no longer leak into Telegram messages.
+
+### Fixed
+
+- Bold or italic text touching inline code (`**`file.py`**`, `**see
+  `cmd` now**`) now renders correctly instead of leaving literal `**`
+  interleaved with formatted text — the most common formatting leak in
+  engagement replies and DM answers. Telegram forbids bold overlapping
+  monospace, so the bold is applied around the code fragment.
+- Markdown headings (`## Section`) now render as bold lines instead of
+  showing literal `#` markers. Standard edge cases stay literal (no space
+  after the hashes, 7+ hashes, headings inside code blocks).
+- Replies longer than one Telegram message no longer fall back to raw
+  markdown: long responses are now split at paragraph/line boundaries and
+  every part renders formatted, within Telegram's length and entity
+  limits (code blocks split across messages stay monospace).
+
+### Added
+
+- Plain markdown tables (header + `|---|` separator row, no formatting
+  inside cells) now render monospaced so columns stay aligned. Tables with
+  bold/code in their cells keep the previous inline rendering.
+
+### Changed
+
+- Formatting is now resolved line-by-line: a bold span can no longer pair
+  across a newline, and a line with an unpaired backtick stays fully
+  literal (previously other formatting on that line could still apply).
+
 ## [0.93.0] - 2026-07-19
 
 Plugin names can no longer be guessed wrong at install time.
