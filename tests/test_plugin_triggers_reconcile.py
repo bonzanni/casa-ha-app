@@ -140,6 +140,34 @@ async def test_valid_acked_plugin_routes_and_mints_secret(tmp_path):
     assert (tmp_path / "webhook_secrets" / eff).exists()
 
 
+async def test_artifact_change_rekeys_secret_even_without_retirement(tmp_path):
+    """Terra shipB-r2: the credential can never cross an artifact boundary —
+    even when NOTHING retired the old secret, the new artifact's activation
+    mints a fresh one (identity-bound mint)."""
+    registry = _registry()
+    acks = TriggerAckStore(path=tmp_path / "acks.json")
+    _ack(acks)
+    p1 = _plugin()
+    await _reconcile(
+        registry, plugins_by_target={None: [p1], "resident:assistant": [p1]},
+        role_configs=_role_configs(assistant=["webhook"]),
+        acks=acks, tmp_path=tmp_path)
+    eff = "plg-elevenlabs--voicemail"
+    old_secret = (tmp_path / "webhook_secrets" / eff).read_bytes()
+
+    # artifact changes; the old secret file deliberately SURVIVES (no
+    # retirement ran); operator re-acks the new identity
+    _ack(acks, artifact_id="art-2")
+    p2 = _plugin(artifact_id="art-2")
+    issues = await _reconcile(
+        registry, plugins_by_target={None: [p2], "resident:assistant": [p2]},
+        role_configs=_role_configs(assistant=["webhook"]),
+        acks=acks, tmp_path=tmp_path)
+    assert issues == []
+    assert registry.get_webhook_target(eff) == "assistant"
+    assert (tmp_path / "webhook_secrets" / eff).read_bytes() != old_secret
+
+
 async def test_unacked_plugin_stays_unrouted_with_pending_issue(tmp_path):
     registry = _registry()
     acks = TriggerAckStore(path=tmp_path / "acks.json")

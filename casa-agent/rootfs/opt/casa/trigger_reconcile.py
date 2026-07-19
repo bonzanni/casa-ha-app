@@ -186,7 +186,10 @@ def compute_desired(
                 continue
             entries[t["effective"]] = {
                 "plugin": rp.name, "role": role,
-                "clearance": t["clearance"], "auth": t["auth"]}
+                "clearance": t["clearance"], "auth": t["auth"],
+                # the consent identity this route was approved under — the
+                # mint binds the secret to it (non-inheritance at activation)
+                "identity": ident}
 
         # Per-plugin all-or-nothing: any gap unroutes the whole set.
         if not plugin_pending and not nonconsent_gap:
@@ -207,8 +210,13 @@ def _mint_secrets(desired: DesiredTriggers, secrets_dir: Path) -> None:
         if entry["auth"].get("mode") not in _PER_TRIGGER_SECRET_MODES:
             continue
         try:
-            got = webhook_auth.ensure_secret(eff, owner="casa",
-                                             secrets_dir=secrets_dir)
+            # Identity-bound (Terra shipB-r2): a surviving secret minted
+            # under a DIFFERENT consent identity is rekeyed here — the old
+            # credential can never carry into a new approval even when an
+            # earlier retirement silently failed.
+            got = webhook_auth.ensure_secret_for_identity(
+                eff, identity=entry.get("identity", ""),
+                secrets_dir=secrets_dir)
         except Exception:  # noqa: BLE001 — Terra shipB-r1 P1-2: one plugin's
             # mint blow-up (fs error) must fail-close THAT plugin, never
             # abort the whole reconcile (which would retain every stale

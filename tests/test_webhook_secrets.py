@@ -131,3 +131,79 @@ def test_retire_secrets_with_prefix_tolerates_missing_dir(tmp_path):
     assert retire_secrets_with_prefix("plg-p--",
                                       secrets_dir=tmp_path / "nope") == []
     assert retire_secrets_with_prefix("", secrets_dir=tmp_path) == []
+
+
+# ---------------------------------------------------------------------------
+# Terra shipB-r2: identity-bound minting — non-inheritance enforced at
+# ACTIVATION, independent of whether an earlier retirement succeeded.
+# ---------------------------------------------------------------------------
+
+
+def test_identity_bound_mint_stable_for_same_identity(tmp_path):
+    from webhook_auth import ensure_secret_for_identity
+
+    a = ensure_secret_for_identity("plg-p--t", identity="i1",
+                                   secrets_dir=tmp_path)
+    b = ensure_secret_for_identity("plg-p--t", identity="i1",
+                                   secrets_dir=tmp_path)
+    assert a is not None and a == b
+
+
+def test_identity_change_rekeys_even_if_retire_was_skipped(tmp_path):
+    """The original P1-4 scenario: the old artifact's secret SURVIVED (a
+    failed/skipped retirement); the new identity's activation must never
+    reuse it."""
+    from webhook_auth import ensure_secret_for_identity
+
+    old = ensure_secret_for_identity("plg-p--t", identity="old-artifact",
+                                     secrets_dir=tmp_path)
+    new = ensure_secret_for_identity("plg-p--t", identity="new-artifact",
+                                     secrets_dir=tmp_path)
+    assert new is not None and new != old
+
+
+def test_unbound_existing_secret_is_rekeyed(tmp_path):
+    """A live secret with no .ident sidecar (pre-Release-B mint, crash, or a
+    handler lazy mint) has unknown provenance — rekey, never reuse."""
+    from webhook_auth import ensure_secret_for_identity
+
+    legacy = ensure_secret("plg-p--t", owner="casa", secrets_dir=tmp_path)
+    bound = ensure_secret_for_identity("plg-p--t", identity="i1",
+                                       secrets_dir=tmp_path)
+    assert bound is not None and bound != legacy
+
+
+def test_rekey_failure_fails_closed_to_none(tmp_path, monkeypatch):
+    """If the stale secret cannot actually be removed, activation returns
+    None (trigger stays unrouted with trigger_secret_missing) — NEVER the
+    surviving old credential."""
+    import webhook_auth
+    from webhook_auth import ensure_secret_for_identity
+
+    ensure_secret_for_identity("plg-p--t", identity="old",
+                               secrets_dir=tmp_path)
+    monkeypatch.setattr(webhook_auth, "retire_secret",
+                        lambda name, *, secrets_dir: None)  # retire no-ops
+    assert ensure_secret_for_identity("plg-p--t", identity="new",
+                                      secrets_dir=tmp_path) is None
+
+
+def test_retire_removes_identity_sidecar_too(tmp_path):
+    from webhook_auth import ensure_secret_for_identity, retire_secret
+
+    ensure_secret_for_identity("plg-p--t", identity="i1",
+                               secrets_dir=tmp_path)
+    assert (tmp_path / "plg-p--t.ident").exists()
+    retire_secret("plg-p--t", secrets_dir=tmp_path)
+    assert not (tmp_path / "plg-p--t.ident").exists()
+
+
+def test_prefix_retirement_covers_ident_sidecars(tmp_path):
+    from webhook_auth import (ensure_secret_for_identity,
+                              retire_secrets_with_prefix)
+
+    ensure_secret_for_identity("plg-p--t", identity="i1",
+                               secrets_dir=tmp_path)
+    retired = retire_secrets_with_prefix("plg-p--", secrets_dir=tmp_path)
+    assert retired == ["plg-p--t"]
+    assert not (tmp_path / "plg-p--t.ident").exists()
