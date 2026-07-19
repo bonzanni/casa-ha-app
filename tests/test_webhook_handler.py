@@ -274,6 +274,30 @@ class TestPerTriggerAuthModes:
             assert r.status == 401
             bus.send.assert_not_called()
 
+    async def test_secret_mint_failure_returns_401_not_500(
+        self, tmp_path, monkeypatch,
+    ):
+        """Sol shipB-r1 P1-6: an ensure_secret filesystem failure (unwritable
+        / full secrets dir) must degrade to an empty secret — 401 — never a
+        500 through the auth path."""
+        import webhook_auth
+
+        def _boom(name, **kw):
+            raise OSError("read-only filesystem")
+
+        monkeypatch.setattr(webhook_auth, "ensure_secret", _boom)
+        app, bus = await _build_app(
+            targets={"vm": "assistant"},
+            policies={"vm": {"mode": "static_header", "header": "X-API-Key",
+                             "tolerance_secs": 300, "secret_owner": "casa"}},
+            secrets_dir=str(tmp_path),
+        )
+        async with TestClient(TestServer(app)) as client:
+            r = await client.post("/webhook/vm", data=b"{}",
+                                  headers={"X-API-Key": "whatever"})
+            assert r.status == 401
+            bus.send.assert_not_called()
+
     async def test_oversize_body_rejected_413(self, tmp_path):
         app, bus = await _build_app(
             secret="s", targets={"vm": "assistant"}, secrets_dir=str(tmp_path))

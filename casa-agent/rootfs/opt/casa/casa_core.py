@@ -1297,8 +1297,16 @@ def _make_webhook_handler(
             return webhook_secret.encode() if webhook_secret else b""
         owner = policy.get("secret_owner", "casa")
         # casa: mint-if-absent so the operator can read + provision it;
-        # provider: read-only (imported out of band).
-        got = webhook_auth.ensure_secret(name, owner=owner, secrets_dir=secrets_dir)
+        # provider: read-only (imported out of band). Sol shipB-r1 P1-6: a
+        # filesystem failure here (unwritable/full secrets dir) must degrade
+        # to an EMPTY secret — which never authenticates (401) — not a 500.
+        try:
+            got = webhook_auth.ensure_secret(
+                name, owner=owner, secrets_dir=secrets_dir)
+        except Exception:  # noqa: BLE001 — fail closed, never fail open/500
+            logger.warning("webhook secret read/mint failed (%s)", name,
+                           exc_info=True)
+            return b""
         if got:
             # Register for exact-value log redaction (spec A2) so a per-trigger
             # secret can never surface in Casa's application logs.
@@ -1674,6 +1682,33 @@ async def notify_config_sync(
             json.dump(report, fh)
     except OSError as exc:
         logger.warning("config_sync notify: could not mark report notified: %s", exc)
+
+
+async def _boot_reconcile_plugin_triggers(
+    *, trigger_registry: Any, role_configs: dict,
+) -> None:
+    """Release B boot seam: derive + route the plugin-declared webhook
+    trigger overlay AFTER resident triggers register and BEFORE the site
+    serves (so /webhook/plg-… routes exist from the first request).
+
+    Prompting is deferred (``prompt=False`` — Telegram is not polling yet;
+    the operator-consent DM fires on the next lifecycle reconcile instead);
+    when the reconcile surfaces trigger issues, the health report — freshly
+    written WITHOUT them by the pre-service plugin_boot oneshot — is
+    regenerated so the post-boot health DM announces e.g.
+    ``trigger_pending_ack``. Never fatal: a reconcile failure boots with an
+    empty overlay (fail-closed for ingress), not a dead Casa.
+    """
+    try:
+        import trigger_reconcile
+        issues = await trigger_reconcile.reconcile_plugin_triggers(
+            trigger_registry=trigger_registry, role_configs=role_configs,
+            channel_manager=None, prompt=False)
+        if issues:
+            from tools import _regenerate_plugin_health
+            await asyncio.to_thread(_regenerate_plugin_health, [])
+    except Exception:  # noqa: BLE001
+        logger.warning("boot plugin-trigger reconcile failed", exc_info=True)
 
 
 async def notify_plugin_health(
@@ -2870,6 +2905,12 @@ async def main() -> None:
                 "Registered %d trigger(s) for agent '%s'",
                 len(cfg.triggers), role,
             )
+
+    # 13c. Release B: plugin-declared webhook triggers — reconcile the
+    # overlay after resident triggers register, before the server starts.
+    await _boot_reconcile_plugin_triggers(
+        trigger_registry=trigger_registry, role_configs=role_configs,
+    )
 
     runner = web.AppRunner(
         app,

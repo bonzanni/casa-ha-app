@@ -1,0 +1,182 @@
+"""Operator-consent DM prompts for plugin-declared webhook triggers
+(Release B).
+
+A plugin trigger routes ONLY after the operator taps Approve on a DM
+keyboard bound to the trigger's full consent identity
+(:func:`plugin_triggers.ack_identity` — plugin + artifact + effective name +
+target + normalized auth policy). This module supplies the trigger-consent
+flavor on the generic :class:`authz_grants.ChallengeCoordinator`:
+
+* Approve → record the ack in :mod:`trigger_acks` (the SYNCHRONOUS commit
+  step, mirroring the GrantKey mint) and fire a reconcile so the route goes
+  live — never an agent-continuation dispatch.
+* Deny / expiry → the trigger stays unrouted (``trigger_pending_ack``);
+  the next lifecycle reconcile may re-prompt.
+
+Taps ride the SAME validated Telegram DM callback path as authz grants
+(broker scope ``authz:{chat}``): the handler fail-closes on the meta's
+``chat_id``/``operator_id``, so an unauthorized or stale tap can never ack.
+"""
+from __future__ import annotations
+
+import logging
+from dataclasses import dataclass
+from typing import Any, Awaitable, Callable
+
+from plugin_triggers import ack_identity
+
+logger = logging.getLogger(__name__)
+
+# Consent TTL: longer than the 120 s authz-challenge TTL — a consent decision
+# follows an operator-driven plugin mutation but is not turn-scoped; give the
+# operator ten minutes before the keyboard expires (re-prompted on the next
+# reconcile-with-prompt, e.g. any plugin lifecycle mutation).
+TRIGGER_CONSENT_TTL_S = 600.0
+
+
+@dataclass(frozen=True)
+class TriggerConsentKey:
+    """Challenge-dedup key for one pending trigger consent.
+
+    Carries ``artifact_id`` so ``ChallengeCoordinator.cancel_matching(
+    artifact=old)`` — the plugin-lifecycle invalidation — cancels a pending
+    keyboard whose artifact just changed: an old keyboard can never ack the
+    replacement artifact (``identity`` binds the full approved tuple).
+    """
+
+    plugin: str
+    artifact_id: str
+    effective: str
+    target: str
+    identity: str
+
+
+def operator_identity(channel: Any) -> "tuple[int, int] | None":
+    """The validated operator ``(chat_id, operator_id)`` from the configured
+    Telegram DM channel, or ``None`` (fail-closed: no prompt, the trigger
+    stays ``pending_ack``).
+
+    The configured ``channel.chat_id`` is the operator's 1:1 DM chat. For a
+    private Telegram chat the chat id EQUALS the operator's user id (both
+    positive); group/supergroup ids are negative, so a misconfigured group
+    chat yields ``None`` — nobody's tap would validate rather than the wrong
+    someone's.
+    """
+    raw = getattr(channel, "chat_id", None)
+    try:
+        cid = int(str(raw).strip())
+    except (TypeError, ValueError):
+        return None
+    if cid <= 0:
+        return None
+    return cid, cid
+
+
+def render_trigger_consent_message(
+    *, plugin: str, effective: str, role: str, auth: dict,
+    clearance: str = "public",
+) -> str:
+    mode = auth.get("mode", "?")
+    header = auth.get("header", "?")
+    return (
+        "\U0001F510 Plugin ingress consent\n\n"
+        f"Plugin '{plugin}' wants to open POST /webhook/{effective} "
+        f"→ {role} (auth {mode}, header {header}; memory clearance "
+        f"{clearance}).\n\n"
+        "Approve to route it; Deny to leave it unrouted."
+    )
+
+
+def prompt_trigger_consent(
+    *, coordinator: Any, channel: Any, chat_id: int, operator_id: int,
+    plugin: str, artifact_id: str, effective: str, target: str,
+    auth: dict, acks: Any, clearance: str = "public",
+    reconcile_cb: "Callable[[], Awaitable[None]] | None" = None,
+) -> Any:
+    """Post (or dedupe onto) the consent keyboard for ONE plugin trigger.
+
+    Returns the coordinator's ``ChallengeHandle``. ``acks`` is the
+    :class:`trigger_acks.TriggerAckStore`; ``reconcile_cb`` re-runs the
+    trigger reconciler after an approve so the route goes live immediately.
+    """
+    identity = ack_identity(plugin=plugin, artifact_id=artifact_id,
+                            effective=effective, target=target, auth=auth)
+    key = TriggerConsentKey(plugin=plugin, artifact_id=artifact_id,
+                            effective=effective, target=target,
+                            identity=identity)
+    role = target.partition(":")[2] or target
+    text = render_trigger_consent_message(
+        plugin=plugin, effective=effective, role=role, auth=auth,
+        clearance=clearance)
+
+    def _on_commit_sync(idx: int, meta: dict) -> None:
+        # Telegram callback, IMMEDIATELY after a successful commit (no await
+        # between): idx 0 -> persist the ack atomically; idx 1 -> no-op. An
+        # exception here is swallowed+logged by the callback; ``acked`` stays
+        # absent and the finish hook edits the internal-error text — a
+        # consent that failed to persist must never activate a route.
+        if idx == 0:
+            acks.record(identity=identity, plugin=plugin,
+                        artifact_id=artifact_id, effective=effective,
+                        target=target, auth=auth)
+            meta["acked"] = True
+
+    def _finish_factory(message_id: int, req: Any) -> Callable[[dict], Any]:
+        async def _finish(outcome: dict) -> None:
+            o = outcome.get("outcome") if isinstance(outcome, dict) else None
+            if o != "answered":
+                await channel.edit_dm_message(
+                    chat_id, message_id,
+                    f"⌛ Expired — consent for POST /webhook/"
+                    f"{effective} was not answered; it stays unrouted",
+                )
+                return
+            if outcome.get("option_index") == 0:
+                if not req.meta.get("acked"):
+                    # Commit landed but the sync step never persisted the ack
+                    # (raised + swallowed) — surface the internal error and
+                    # NEVER activate a route the store can't back.
+                    await channel.edit_dm_message(
+                        chat_id, message_id,
+                        "internal error recording the trigger consent — "
+                        "re-run the plugin mutation to be prompted again",
+                    )
+                    return
+                # Edit the SUCCESS state FIRST, then reconcile, then overwrite
+                # ONLY on failure (ordered inside this one hook task) —
+                # mirrors the authz edit-first → dispatch → overwrite order.
+                await channel.edit_dm_message(
+                    chat_id, message_id,
+                    f"✅ Enabled — POST /webhook/{effective} now "
+                    f"routes to {role}",
+                )
+                if reconcile_cb is not None:
+                    try:
+                        await reconcile_cb()
+                    except Exception:  # noqa: BLE001 — surface, never raise
+                        logger.exception(
+                            "post-consent trigger reconcile failed "
+                            "(plugin=%s effective=%s)", plugin, effective)
+                        await channel.edit_dm_message(
+                            chat_id, message_id,
+                            f"⚠️ Approved, but activating "
+                            f"/webhook/{effective} failed — run "
+                            "plugin_verify",
+                        )
+            else:
+                await channel.edit_dm_message(
+                    chat_id, message_id,
+                    f"❌ Denied — POST /webhook/{effective} stays "
+                    "unrouted",
+                )
+
+        return _finish
+
+    return coordinator.register_challenge(
+        key, chat_id=chat_id, operator_id=operator_id, channel=channel,
+        challenge_text=text, options=["Approve", "Deny"],
+        on_commit_sync=_on_commit_sync, finish_factory=_finish_factory,
+        kind="trigger_consent",
+        meta_extra={"trigger_effective": effective, "trigger_plugin": plugin},
+        timeout_s=TRIGGER_CONSENT_TTL_S,
+    )

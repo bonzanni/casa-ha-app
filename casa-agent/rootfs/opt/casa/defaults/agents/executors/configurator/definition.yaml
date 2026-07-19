@@ -31,6 +31,8 @@ tools:
     - mcp__casa-framework__plugin_assign
     - mcp__casa-framework__plugin_unassign
     - mcp__casa-framework__plugin_remove
+    # Release B — plugin webhook-trigger consent off-switch (immediate 404).
+    - mcp__casa-framework__trigger_ack_revoke
     - mcp__casa-framework__plugin_list
     - mcp__casa-framework__verify_plugin_state
     - mcp__casa-framework__set_plugin_env_reference

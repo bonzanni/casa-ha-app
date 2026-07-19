@@ -77,3 +77,18 @@ def test_interval_trigger_still_validates():
     jsonschema.validate(_doc({
         "name": "hb", "type": "interval", "minutes": 5,
         "channel": "telegram", "prompt": "ping"}), SCHEMA)
+
+
+def test_user_trigger_name_cannot_use_reserved_plg_prefix():
+    # Release B: 'plg-' is reserved for plugin-declared triggers; a user
+    # trigger claiming it would collide in the shared webhook namespace.
+    with pytest.raises(jsonschema.ValidationError):
+        jsonschema.validate(_doc({"name": "plg-x", "type": "webhook",
+                                  "auth": {"mode": "static_header"}}), SCHEMA)
+
+
+def test_user_trigger_normal_name_still_ok():
+    jsonschema.validate(_doc({"name": "plgx", "type": "webhook",
+                              "auth": {"mode": "static_header"}}), SCHEMA)
+    jsonschema.validate(_doc({"name": "my-plg", "type": "webhook",
+                              "auth": {"mode": "static_header"}}), SCHEMA)

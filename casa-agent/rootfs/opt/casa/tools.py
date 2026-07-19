@@ -5987,8 +5987,15 @@ def _regenerate_plugin_health(extra_issues: list) -> None:
             if verify.get("ready") is not True and not rows:
                 for reason in (verify.get("reasons") or ["not_ready"]):
                     _add(name, None, reason)
+    # Release B: plugin-trigger issues are a RECOMPUTABLE input — derived
+    # fresh on EVERY regeneration (never passed as one-shot extras), so an
+    # unrelated health refresh can never erase trigger_pending_ack /
+    # trigger_channel_missing. current_issues() never raises.
+    import trigger_reconcile
+    trigger_issues = trigger_reconcile.current_issues()
     plugin_health.write_report(
-        issues=(list(res.issues) + list(extra_issues) + runtime_issues),
+        issues=(list(res.issues) + list(extra_issues) + runtime_issues
+                + list(trigger_issues)),
         warnings=list(res.warnings),
         path=_PLUGIN_HEALTH_PATH,
     )
@@ -6165,6 +6172,18 @@ async def _reload_and_verify_targets(name: str, targets: list,
                                    "%s: %s", role, exc)
     stale_absent = (_stale_absent_targets(targets, name, runtime)
                     if expect == "absent" else [])
+    # Release B: reconcile plugin-declared webhook triggers LAST — after the
+    # snapshot reload, agent reconstruction, and verify — so the overlay
+    # derives from the POST-mutation resolver state (every one of the 5
+    # lifecycle mutations funnels through this sequencer). Its issues land in
+    # the health regen below via trigger_reconcile.current_issues() (a
+    # recomputable input, never a one-shot extra). A reconcile failure keeps
+    # the old overlay (fail-safe for ingress) and never fails the mutation.
+    try:
+        import trigger_reconcile
+        await trigger_reconcile.reconcile_from_runtime(runtime)
+    except Exception:  # noqa: BLE001
+        logger.warning("plugin-trigger reconcile failed", exc_info=True)
     ok = (not snapshot_raced and not reload_errors
           and _postcondition_holds(verify, targets, expect=expect,
                                    name=name, runtime=runtime))
@@ -6403,6 +6422,25 @@ def _invalidate_lifecycle(*, artifact_id: "str | None" = None,
     if artifact_id:
         GRANTS.purge_artifact(artifact_id)
         CHALLENGES.cancel_matching(artifact=artifact_id)
+        # Release B: an artifact change/removal drops its webhook-trigger
+        # consents (the ack identity is artifact-bound) and retires the
+        # per-trigger secrets — live + .next + rotation state — BEFORE any
+        # re-approval can mint replacements, so a new artifact never
+        # inherits the old one's credentials. cancel_matching above already
+        # killed any pending consent keyboard for the old artifact
+        # (TriggerConsentKey carries artifact_id). Never fatal: the grant
+        # purge invariants must hold even if the ack sweep fails.
+        try:
+            import trigger_acks
+            import trigger_reconcile
+            import webhook_auth
+            for rec in trigger_acks.ACKS.revoke_artifact(artifact_id):
+                webhook_auth.retire_secret(
+                    rec.get("effective") or "",
+                    secrets_dir=trigger_reconcile.SECRETS_DIR)
+        except Exception:  # noqa: BLE001
+            logger.warning("trigger-ack artifact revoke failed (%s)",
+                           artifact_id, exc_info=True)
     for target in roles or ():
         role = normalize_role(target)
         GRANTS.purge_role(role)
@@ -6663,6 +6701,81 @@ async def plugin_remove(args: dict) -> dict:
             core["name"], core["targets"], expect="absent")
         core.update(seq)
         return _result(core)
+
+
+@tool(
+    "trigger_ack_revoke",
+    "Revoke the operator's webhook-trigger consent for a plugin, unroute "
+    "its /webhook/plg-<plugin>--… endpoints IMMEDIATELY (they 404 before "
+    "this returns), and retire its per-trigger secrets. A later re-approval "
+    "mints fresh secrets, so the plugin's setup tool must re-provision the "
+    "external service; the consent DM re-prompts on the next plugin "
+    "mutation or casa_reload_triggers.",
+    {"type": "object", "properties": {"name": {"type": "string"}},
+     "required": ["name"]},
+)
+async def trigger_ack_revoke(args: dict) -> dict:
+    """Release B operator off-switch. Runs under _PLUGIN_TOOLS_LOCK like the
+    lifecycle mutations; the reconcile inside is the SYNCHRONOUS unroute —
+    the overlay swap completes before the tool returns, so an inbound
+    request can only race the 404, never a half-revoked route."""
+    async with _PLUGIN_TOOLS_LOCK:
+        import agent as agent_mod
+        import trigger_acks
+        import trigger_reconcile
+        name = args["name"]
+        # Terra shipB-r1 P1-1: kill any PENDING consent keyboard for this
+        # plugin FIRST (synchronous broker cancel — later taps read
+        # "expired"), so a stale Approve can never re-ack past the revoke.
+        CHALLENGES.cancel_matching(plugin=name)
+        removed = await asyncio.to_thread(
+            trigger_acks.ACKS.revoke_plugin, name)
+        runtime = getattr(agent_mod, "active_runtime", None)
+        registry = getattr(runtime, "trigger_registry", None)
+        # Effective names are injective (plg-<plugin>--…), so a prefix
+        # match is exact — used for BOTH the overlay sweep and the
+        # filesystem secret retirement below.
+        prefix = f"plg-{name}--"
+        if registry is not None:
+            # Fail-closed DIRECT sweep first — the immediate-404 guarantee
+            # must not depend on resolver health. Match on the entry's OWN
+            # plugin attribution (Sol shipB-r2 P1-3), with the name prefix
+            # as belt-and-braces for any entry lacking it.
+            registry.replace_plugin_overlay({
+                eff: entry
+                for eff, entry in registry.plugin_overlay_snapshot().items()
+                if entry.get("plugin", "") != name
+                and not eff.startswith(prefix)})
+        try:
+            await trigger_reconcile.reconcile_from_runtime(
+                runtime, prompt=False)
+        except Exception:  # noqa: BLE001 — sweep above already unrouted
+            logger.warning("post-revoke trigger reconcile failed",
+                           exc_info=True)
+        # Sol shipB-r1 P1-4: retire the plugin's per-trigger secrets from
+        # the FILESYSTEM inventory (prefix glob — never from the ack
+        # records this tool just deleted). Keeping them would let the NEXT
+        # artifact inherit the old credential: a later plugin_update's
+        # revoke_artifact would find no records and retire nothing.
+        import webhook_auth
+        retired = await asyncio.to_thread(
+            webhook_auth.retire_secrets_with_prefix, prefix,
+            secrets_dir=trigger_reconcile.SECRETS_DIR)
+        # Sol shipB-r2 P1-1: cancel AGAIN after our reconcile. Prompts fire
+        # under _RECONCILE_LOCK, and our reconcile above serialized behind
+        # any in-flight one — so a keyboard posted by that in-flight
+        # reconcile is REGISTERED by now and this cancel provably kills it.
+        # (Reconciles triggered by LATER mutations legitimately re-prompt —
+        # that is the documented re-consent path, not a survival.)
+        CHALLENGES.cancel_matching(plugin=name)
+        # Refresh health (trigger_pending_ack reappears via the recomputable
+        # input) WITHOUT the operator DM — they just did this deliberately.
+        await asyncio.to_thread(_regenerate_plugin_health, [])
+        return _result({
+            "ok": True, "name": name, "revoked": len(removed),
+            "unrouted": sorted(r.get("effective") or "" for r in removed),
+            "secrets_retired": retired,
+        })
 
 
 @tool(
@@ -7151,6 +7264,7 @@ CASA_TOOLS: tuple = (
     plugin_assign,
     plugin_unassign,
     plugin_remove,
+    trigger_ack_revoke,            # Release B — plugin-trigger consent off-switch
     plugin_list,
     verify_plugin_state,
     verify_plugin_secrets,

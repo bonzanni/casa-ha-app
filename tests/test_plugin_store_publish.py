@@ -967,3 +967,53 @@ def test_artifact_verdict_rejects_symlinked_parent(tmp_path):
     assert artifact_verdict(linked_parent / ("a" * 64), name="p", repo="o/r",
                             revision="git:" + "a" * 40, subdir="",
                             artifact_id="a" * 64) == "artifact_invalid"
+
+
+def _tree_with_casa(tmp_path, name, casa):
+    root = tmp_path / "src"
+    (root / ".claude-plugin").mkdir(parents=True)
+    (root / ".claude-plugin" / "plugin.json").write_text(
+        json.dumps({"name": name, "version": "1.0.0", "casa": casa}),
+        encoding="utf-8")
+    (root / "skills").mkdir()
+    (root / "skills" / "s.md").write_text("s", encoding="utf-8")
+    return root
+
+
+class TestManifestTriggers:
+    """Release B: casa.triggers is validated at publish/install time."""
+
+    def test_validate_manifest_accepts_valid_triggers(self, tmp_path):
+        root = _tree_with_casa(tmp_path, "elevenlabs", {"triggers": [
+            {"name": "voicemail", "type": "webhook",
+             "target": "resident:assistant", "auth": {"mode": "static_header"}}]})
+        mf = validate_manifest(root, "elevenlabs")  # no raise
+        assert mf["name"] == "elevenlabs"
+
+    def test_validate_manifest_rejects_bad_target(self, tmp_path):
+        root = _tree_with_casa(tmp_path, "p", {"triggers": [
+            {"name": "x", "type": "webhook", "target": "specialist:finance",
+             "auth": {"mode": "static_header"}}]})
+        with pytest.raises(StoreError) as ei:
+            validate_manifest(root, "p")
+        assert ei.value.reason_code == "triggers_invalid"
+
+    def test_validate_manifest_rejects_provider_owner(self, tmp_path):
+        root = _tree_with_casa(tmp_path, "p", {"triggers": [
+            {"name": "x", "type": "webhook", "target": "resident:assistant",
+             "auth": {"mode": "timestamped_hmac", "secret_owner": "provider"}}]})
+        with pytest.raises(StoreError) as ei:
+            validate_manifest(root, "p")
+        assert ei.value.reason_code == "triggers_invalid"
+
+    def test_absent_triggers_ok(self, tmp_path):
+        root = _tree_with_casa(tmp_path, "p", {})
+        validate_manifest(root, "p")  # no raise
+
+    def test_manifest_triggers_helper_uses_plugin_name(self):
+        from plugin_store import manifest_triggers
+        manifest = {"casa": {"triggers": [
+            {"name": "vm", "type": "webhook", "target": "resident:assistant",
+             "auth": {"mode": "static_header"}}]}}
+        trigs = manifest_triggers(manifest, "el")
+        assert trigs[0]["effective"] == "plg-el--vm"

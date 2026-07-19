@@ -1,5 +1,13 @@
 # Choosing a plugin pattern
 
+## Receiving events (webhooks)
+
+Plugins can't listen — no ports, no routes, no resident processes. If the
+plugin must RECEIVE events (a provider webhook, a voicemail notification),
+declare `casa.triggers` in the manifest and ship a setup tool that points
+the provider at `POST /webhook/plg-<plugin>--<name>`. Full doctrine:
+`ingress.md`.
+
 ## MCP server vs skill-only
 
 **MCP server** — when you need a structured tool surface (typed inputs,

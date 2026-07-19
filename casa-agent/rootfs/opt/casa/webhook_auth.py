@@ -197,6 +197,60 @@ def read_secret(name: str, *, owner: str, secrets_dir: Path) -> bytes | None:
     return _read_final(name, owner, Path(secrets_dir))
 
 
+def retire_secret(name: str, *, secrets_dir: Path) -> None:
+    """Remove EVERY slot for ``name`` — the live secret, a staged ``.next``,
+    the rotation state file, and the ``.ident`` consent binding (Release B
+    artifact retirement).
+
+    Called when the owning plugin artifact changes or is removed, BEFORE any
+    re-approval can mint a replacement — a new artifact never inherits the
+    old one's credentials. Missing files/dir are fine; never raises.
+    Best-effort by design: non-inheritance does NOT depend on this
+    succeeding — :func:`ensure_secret_for_identity` rekeys at activation
+    whenever the surviving secret's identity binding doesn't match.
+    """
+    if not name:
+        return
+    secrets_dir = Path(secrets_dir)
+    for fname in (name, _next_name(name), f"{name}.rot.json",
+                  f"{name}.ident"):
+        try:
+            (secrets_dir / fname).unlink()
+        except OSError:
+            pass
+    try:
+        _fsync_dir(secrets_dir)
+    except OSError:
+        pass
+
+
+def retire_secrets_with_prefix(prefix: str, *, secrets_dir: Path) -> list[str]:
+    """Retire EVERY slot whose base name starts with *prefix* (Sol shipB-r1
+    P1-4: the revoke path must retire from the FILESYSTEM inventory, never
+    from ack records — a revoke that deleted the records would otherwise
+    leave the secret for the next artifact to inherit). Returns the retired
+    base names; never raises."""
+    if not prefix:
+        return []
+    secrets_dir = Path(secrets_dir)
+    try:
+        names = [p.name for p in secrets_dir.iterdir()]
+    except OSError:
+        return []
+    bases: set[str] = set()
+    for n in names:
+        base = n
+        for suffix in (".rot.json", ".next", ".ident"):
+            if base.endswith(suffix):
+                base = base[: -len(suffix)]
+                break
+        if base.startswith(prefix):
+            bases.add(base)
+    for base in sorted(bases):
+        retire_secret(base, secrets_dir=secrets_dir)
+    return sorted(bases)
+
+
 def ensure_secret(name: str, *, owner: str, secrets_dir: Path) -> bytes | None:
     """Return the live secret for ``name``, minting it for ``owner="casa"`` if
     absent. For ``owner="provider"`` this is read-only (Casa never mints a
@@ -213,6 +267,68 @@ def ensure_secret(name: str, *, owner: str, secrets_dir: Path) -> bytes | None:
     _publish(name, secrets.token_urlsafe(_CASA_TOKEN_NBYTES).encode("ascii"),
              secrets_dir)
     return _read_final(name, owner, secrets_dir)
+
+
+def _ident_path(name: str, secrets_dir: Path) -> Path:
+    return secrets_dir / f"{name}.ident"
+
+
+def _write_ident(name: str, identity: str, secrets_dir: Path) -> bool:
+    """Atomically persist the consent-identity binding; False on failure."""
+    try:
+        tmp = secrets_dir / f".ident-{os.getpid()}-{secrets.token_hex(8)}"
+        fd = os.open(tmp, os.O_CREAT | os.O_EXCL | os.O_WRONLY | os.O_NOFOLLOW,
+                     0o600)
+        try:
+            os.write(fd, identity.encode("ascii"))
+            os.fsync(fd)
+        finally:
+            os.close(fd)
+        os.replace(tmp, _ident_path(name, secrets_dir))
+        _fsync_dir(secrets_dir)
+        return True
+    except (OSError, UnicodeEncodeError):
+        return False
+
+
+def ensure_secret_for_identity(
+    name: str, *, identity: str, secrets_dir: Path,
+) -> bytes | None:
+    """The live casa-owned secret for ``name``, GUARANTEED minted under the
+    consent *identity* (Terra shipB-r2: non-inheritance is enforced at
+    ACTIVATION, not at retirement).
+
+    A surviving secret whose ``.ident`` sidecar matches *identity* is reused
+    (same approved tuple — continuity for the provisioned external service).
+    A secret bound to a DIFFERENT identity, or with no binding at all
+    (pre-binding mint, crash, lazy handler mint), is retired and re-minted —
+    so even a silently-failed earlier retirement can never leak the old
+    credential into a new approval. If the stale secret cannot actually be
+    removed, this returns ``None`` (the trigger stays unrouted with
+    ``trigger_secret_missing``) rather than the surviving old value.
+    """
+    secrets_dir = Path(secrets_dir)
+    existing = _read_final(name, "casa", secrets_dir)
+    if existing is not None:
+        try:
+            bound = _ident_path(name, secrets_dir).read_text(
+                encoding="ascii").strip()
+        except (OSError, UnicodeDecodeError):
+            bound = None
+        if bound == identity:
+            return existing
+        retire_secret(name, secrets_dir=secrets_dir)
+        if _read_final(name, "casa", secrets_dir) is not None:
+            return None  # stale credential survived — fail closed, no reuse
+    got = ensure_secret(name, owner="casa", secrets_dir=secrets_dir)
+    if got is None:
+        return None
+    if not _write_ident(name, identity, secrets_dir):
+        # An unbound secret would be rekeyed on every reconcile (safe but
+        # churn) — surface the problem instead: retire + unrouted.
+        retire_secret(name, secrets_dir=secrets_dir)
+        return None
+    return got
 
 
 # ---------------------------------------------------------------------------

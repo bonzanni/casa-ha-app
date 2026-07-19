@@ -33,7 +33,7 @@
         "additionalProperties": false,
         "required": ["name", "type"],
         "properties": {
-          "name":        {"type": "string", "minLength": 1, "pattern": "^[a-zA-Z0-9_-]+$"},
+          "name":        {"type": "string", "minLength": 1, "pattern": "^(?!plg-)[a-zA-Z0-9_-]+$"},
           "type":        {"type": "string", "enum": ["interval", "cron", "webhook"]},
           "minutes":     {"type": "integer", "minimum": 1},
           "schedule":    {"type": "string", "minLength": 1},
