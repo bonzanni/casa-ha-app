@@ -51,14 +51,11 @@ class TriggerRegistry:
         self._app = app
         self._bus = bus
         self._seen_job_ids: set[str] = set()
-        self._seen_webhook_paths: set[str] = set()
         self._specs_by_job_id: dict[str, TriggerSpec] = {}
-        self._webhook_paths_by_role: dict[str, list[str]] = {}
         # N-1 + N-2 (v0.36.0): per-boot allowlist of webhook trigger names
         # → role. The wildcard /webhook/{name} handler in casa_core consults
         # this to 404 unknown names and dispatch knowns to the registered
-        # role. Maintained alongside _webhook_paths_by_role so reregister_for
-        # naturally evicts removed names.
+        # role. reregister_for evicts removed names by role.
         self._webhook_targets: dict[str, str] = {}
         self._webhook_names_by_role: dict[str, list[str]] = {}
         # Release A: per-trigger memory read-clearance (spec A1/A4), stamped
@@ -97,11 +94,11 @@ class TriggerRegistry:
                     )
                 self._register_scheduled(role, trig)
             elif trig.type == "webhook":
-                if trig.path in self._seen_webhook_paths:
-                    raise TriggerError(
-                        f"agent {role!r} trigger {trig.name!r}: webhook "
-                        f"path {trig.path!r} already registered"
-                    )
+                # Release A: webhook triggers are served EXCLUSIVELY by the
+                # authenticated wildcard /webhook/{name} handler — the old
+                # per-path route is gone, so ``path`` is neither served nor a
+                # collision axis (v2 triggers carry path=""; a path check would
+                # false-collide). Uniqueness is by trigger NAME only.
                 owner = self._webhook_targets.get(trig.name)
                 if owner is not None and owner != role:
                     raise TriggerError(
@@ -109,7 +106,6 @@ class TriggerRegistry:
                         f"trigger name already registered by role {owner!r}"
                     )
                 self._register_webhook(role, trig)
-                self._seen_webhook_paths.add(trig.path)
             else:
                 raise TriggerError(
                     f"agent {role!r} trigger {trig.name!r}: unknown "
@@ -164,50 +160,14 @@ class TriggerRegistry:
         self._specs_by_job_id[job_id] = trig
 
     def _register_webhook(self, role: str, trig: TriggerSpec) -> None:
-        # N-1 + N-2 (v0.36.0): the wildcard /webhook/{name} handler in
-        # casa_core dispatches webhook traffic via the allowlist below;
-        # the per-trigger router.add_post is a best-effort registration
-        # for non-/webhook/<name> paths added at boot. Post-boot adds
-        # (in-process reload) hit a frozen aiohttp router and used to
-        # raise; now we swallow and rely on the wildcard handler so
-        # casa_reload(scope=triggers) succeeds for webhook triggers.
-        async def _handler(request: web.Request) -> web.Response:
-            logger.info(
-                "Webhook trigger fired: agent=%s name=%s path=%s",
-                role, trig.name, trig.path,
-            )
-            try:
-                payload = await request.json()
-            except Exception:
-                payload = {}
-
-            msg = BusMessage(
-                type=MessageType.SCHEDULED,
-                source="webhook",
-                target=role,
-                content=f"Webhook {trig.name!r} fired; payload: {payload}",
-                channel="webhook",
-                context={
-                    "webhook_name": trig.name,
-                    "chat_id": trig.name,
-                    "cid": request.get("cid") or new_cid(),
-                },
-            )
-            await self._bus.send(msg)
-            return web.json_response({"status": "accepted"})
-
-        try:
-            self._app.router.add_post(trig.path, _handler)
-        except RuntimeError as exc:
-            # aiohttp raises "Cannot register a resource into frozen
-            # router" once startup completes. Acceptable for in-process
-            # reload — wildcard handler still routes by name.
-            logger.debug(
-                "skip per-path webhook route for agent=%s name=%s path=%s "
-                "(router frozen, dispatch via wildcard /webhook/{name}): %s",
-                role, trig.name, trig.path, exc,
-            )
-        self._webhook_paths_by_role.setdefault(role, []).append(trig.path)
+        # Release A: webhook triggers are served ONLY by the authenticated
+        # wildcard /webhook/{name} handler in casa_core (per-trigger auth +
+        # body cap + origin stamping + fresh-uuid one-shot). The old
+        # per-path ``router.add_post(trig.path, …)`` route — which did NO
+        # auth, NO body cap, and pinned chat_id=trig.name — is REMOVED (it
+        # was an unauthenticated bypass; a v2 trigger's empty path even
+        # registered an open ``POST /``). This method now only maintains the
+        # name→role/clearance/auth allowlist the wildcard handler consults.
         self._webhook_targets[trig.name] = role
         self._webhook_names_by_role.setdefault(role, []).append(trig.name)
         self._webhook_clearances[trig.name] = (
@@ -263,12 +223,6 @@ class TriggerRegistry:
                 logger.warning("remove_job %s failed: %s", jid, exc)
             self._seen_job_ids.discard(jid)
             self._specs_by_job_id.pop(jid, None)
-
-        for path in self._webhook_paths_by_role.get(role, []):
-            self._seen_webhook_paths.discard(path)
-            # aiohttp has no supported public "remove route" API. Callers
-            # should avoid reusing webhook paths across re-registrations.
-        self._webhook_paths_by_role[role] = []
 
         # N-2 (v0.36.0): evict this role's webhook names from the
         # allowlist so a removed webhook trigger naturally 404s on the

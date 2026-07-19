@@ -1285,6 +1285,11 @@ def _make_webhook_handler(
     """
     import webhook_auth
     secrets_dir = Path(secrets_dir)
+    if webhook_secret:
+        import log_redact as _lr
+        _lr.register_secret(webhook_secret)
+
+    import log_redact
 
     def _secret_for(name: str, policy: dict) -> bytes:
         mode = policy.get("mode", "hmac_body")
@@ -1294,6 +1299,13 @@ def _make_webhook_handler(
         # casa: mint-if-absent so the operator can read + provision it;
         # provider: read-only (imported out of band).
         got = webhook_auth.ensure_secret(name, owner=owner, secrets_dir=secrets_dir)
+        if got:
+            # Register for exact-value log redaction (spec A2) so a per-trigger
+            # secret can never surface in Casa's application logs.
+            try:
+                log_redact.register_secret(got.decode("utf-8", "replace"))
+            except Exception:  # noqa: BLE001 — redaction is best-effort
+                pass
         return got or b""
 
     def _verify(request: web.Request, body: bytes, name: str, policy: dict) -> bool:
@@ -1312,12 +1324,19 @@ def _make_webhook_handler(
         if limited is not None:
             return limited
 
-        # Bounded body read (spec A3): reject oversize before buffering it all.
+        # Bounded body read (spec A3): reject a declared oversize Content-Length
+        # early, AND stream-read with a hard cap so a chunked/Transfer-Encoding
+        # request cannot buffer past 64 KiB (Terra ship-review P1).
         if request.content_length is not None and request.content_length > _WEBHOOK_BODY_MAX:
             return web.json_response({"error": "payload too large"}, status=413)
-        body = await request.read()
-        if len(body) > _WEBHOOK_BODY_MAX:
-            return web.json_response({"error": "payload too large"}, status=413)
+        chunks: list[bytes] = []
+        read = 0
+        async for chunk in request.content.iter_chunked(8192):
+            read += len(chunk)
+            if read > _WEBHOOK_BODY_MAX:
+                return web.json_response({"error": "payload too large"}, status=413)
+            chunks.append(chunk)
+        body = b"".join(chunks)
 
         name = request.match_info.get("name", "")
         target_role = trigger_registry.get_webhook_target(name)
