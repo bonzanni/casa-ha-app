@@ -777,3 +777,193 @@ def test_publish_rejects_cyclic_symlink(tmp_path):
                           revision="legacy-content:" + "c" * 64, subdir="",
                           src_root=src, store_root=store, staging_root=staging)
     assert ei.value.reason_code == "unsafe_archive"
+
+
+# --- G7 (v0.95.1, Sol-corrected): bytecode stays checksum-visible ----------
+
+
+def _mk_minimal_artifact(tmp_path):
+    import json as _json
+    from plugin_store import content_checksum, write_metadata
+    root = tmp_path / "artifact"
+    (root / ".claude-plugin").mkdir(parents=True)
+    (root / ".claude-plugin" / "plugin.json").write_text(
+        _json.dumps({"name": "p", "version": "1.0.0"}), encoding="utf-8")
+    (root / "server").mkdir()
+    (root / "server" / "server.py").write_text("print('x')\n", encoding="utf-8")
+    write_metadata(root, name="p", repo="o/r", ref="v1",
+                   revision="git:" + "a" * 40, subdir="",
+                   artifact_id="a" * 64, version="1.0.0",
+                   checksum=content_checksum(root))
+    return root
+
+
+def _poison(root):
+    pc = root / "server" / "__pycache__"
+    pc.mkdir()
+    (pc / "server.cpython-311.pyc").write_bytes(b"\x00fakebytecode")
+    (root / "server" / "stray.pyc").write_bytes(b"\x00loose")
+
+
+def _verdict(root):
+    from plugin_store import artifact_verdict
+    return artifact_verdict(root, name="p", repo="o/r",
+                            revision="git:" + "a" * 40, subdir="",
+                            artifact_id="a" * 64)
+
+
+def test_bytecode_in_artifact_still_corrupts(tmp_path):
+    """Checksums stay STRICT (a crafted header-valid .pyc shadows its .py at
+    import time) — bytecode inside an artifact IS drift."""
+    root = _mk_minimal_artifact(tmp_path)
+    _poison(root)
+    assert _verdict(root) == "corrupt_artifact"
+
+
+def test_heal_removes_bytecode_only_drift(tmp_path):
+    from plugin_store import heal_bytecode_poisoned_artifact
+    root = _mk_minimal_artifact(tmp_path)
+    _poison(root)
+    assert heal_bytecode_poisoned_artifact(root) is True
+    assert _verdict(root) is None
+    assert not (root / "server" / "__pycache__").exists()
+
+
+def test_heal_refuses_real_tampering(tmp_path):
+    """Bytecode present AND a source modified: healing must refuse — the
+    tree is tampered beyond the interpreter cache."""
+    from plugin_store import heal_bytecode_poisoned_artifact
+    root = _mk_minimal_artifact(tmp_path)
+    _poison(root)
+    (root / "server" / "server.py").chmod(0o644)
+    (root / "server" / "server.py").write_text("print('evil')\n",
+                                               encoding="utf-8")
+    assert heal_bytecode_poisoned_artifact(root) is False
+    assert _verdict(root) == "corrupt_artifact"
+
+
+def test_heal_noop_on_clean_artifact(tmp_path):
+    from plugin_store import heal_bytecode_poisoned_artifact
+    root = _mk_minimal_artifact(tmp_path)
+    assert heal_bytecode_poisoned_artifact(root) is False
+
+
+def test_strip_bytecode_derivatives(tmp_path):
+    from plugin_store import strip_bytecode_derivatives
+    root = _mk_minimal_artifact(tmp_path)
+    _poison(root)
+    assert strip_bytecode_derivatives(root) >= 2
+    assert not list(root.rglob("*.pyc"))
+
+
+def test_foreign_file_still_corrupts_artifact(tmp_path):
+    root = _mk_minimal_artifact(tmp_path)
+    (root / "evil.md").write_text("tampered", encoding="utf-8")
+    assert _verdict(root) == "corrupt_artifact"
+
+
+def test_freeze_strips_directory_write_bits(tmp_path):
+    import stat as _stat
+    from plugin_store import _freeze_artifact_files
+    root = _mk_minimal_artifact(tmp_path)
+    _freeze_artifact_files(root)
+    for d in (root, root / "server", root / ".claude-plugin"):
+        assert _stat.S_IMODE(d.stat().st_mode) & 0o222 == 0, d
+
+
+def test_boot_sweep_refreezes_legacy_artifacts(tmp_path):
+    """Sol v0951b-2: a clean pre-v0.95.1 artifact (writable dirs) must come
+    out of the ACTUAL boot sweep frozen even though nothing needed healing."""
+    import logging
+    import stat as _stat
+    from plugin_boot import heal_and_freeze_store
+    store = tmp_path / "store" / "p"
+    store.mkdir(parents=True)
+    root = _mk_minimal_artifact(tmp_path)
+    dest = store / ("a" * 64)
+    root.rename(dest)
+    heal_and_freeze_store(tmp_path / "store", logging.getLogger("t"))
+    assert _stat.S_IMODE(dest.stat().st_mode) & 0o222 == 0
+    assert _stat.S_IMODE((dest / "server").stat().st_mode) & 0o222 == 0
+
+
+def test_boot_sweep_skips_symlinked_artifact_root(tmp_path):
+    """Sol v0951c-1: a symlinked store entry must not heal/freeze the
+    EXTERNAL target tree."""
+    import logging
+    import stat as _stat
+    from plugin_boot import heal_and_freeze_store
+    outside = tmp_path / "outside"
+    (outside / "sub").mkdir(parents=True)
+    outside.chmod(0o777)
+    (outside / "sub").chmod(0o777)
+    store = tmp_path / "store" / "p"
+    store.mkdir(parents=True)
+    (store / ("b" * 64)).symlink_to(outside)
+    heal_and_freeze_store(tmp_path / "store", logging.getLogger("t"))
+    assert _stat.S_IMODE(outside.stat().st_mode) & 0o222 != 0
+    assert _stat.S_IMODE((outside / "sub").stat().st_mode) & 0o222 != 0
+
+
+def test_boot_sweep_skips_symlinked_name_dir(tmp_path):
+    """Sol v0951d-1: a symlinked PLUGIN-NAME (first-level) dir must not be
+    descended — glob-style traversal would freeze the external tree."""
+    import logging
+    import stat as _stat
+    from plugin_boot import heal_and_freeze_store
+    outside = tmp_path / "outside"
+    (outside / ("c" * 64)).mkdir(parents=True)
+    outside.chmod(0o777)
+    (outside / ("c" * 64)).chmod(0o777)
+    store = tmp_path / "store"
+    store.mkdir()
+    (store / "p").symlink_to(outside)
+    heal_and_freeze_store(store, logging.getLogger("t"))
+    assert _stat.S_IMODE(outside.stat().st_mode) & 0o222 != 0
+    assert _stat.S_IMODE((outside / ("c" * 64)).stat().st_mode) & 0o222 != 0
+
+
+def test_freeze_refuses_symlinked_root(tmp_path):
+    import stat as _stat
+    from plugin_store import _freeze_artifact_files
+    outside = tmp_path / "target"
+    outside.mkdir()
+    outside.chmod(0o777)
+    link = tmp_path / "link"
+    link.symlink_to(outside)
+    _freeze_artifact_files(link)
+    assert _stat.S_IMODE(outside.stat().st_mode) & 0o222 != 0
+
+
+def test_s6_exports_pycache_prefix():
+    from pathlib import Path as _P
+    text = (_P(__file__).resolve().parent.parent / "casa-agent" / "rootfs"
+            / "etc" / "s6-overlay" / "scripts"
+            / "setup-configs.sh").read_text(encoding="utf-8")
+    assert "/run/s6/container_environment/PYTHONPYCACHEPREFIX" in text
+
+
+def test_artifact_verdict_rejects_symlinked_path(tmp_path):
+    """Sol v0951e-1: a symlinked artifact (or name-level) path must never
+    validate — an external writable tree would be cached as immutable."""
+    root = _mk_minimal_artifact(tmp_path)
+    link = tmp_path / "link"
+    link.symlink_to(root)
+    from plugin_store import artifact_verdict
+    assert artifact_verdict(link, name="p", repo="o/r",
+                            revision="git:" + "a" * 40, subdir="",
+                            artifact_id="a" * 64) == "artifact_invalid"
+
+
+def test_artifact_verdict_rejects_symlinked_parent(tmp_path):
+    real_parent = tmp_path / "real-name-dir"
+    real_parent.mkdir()
+    root = _mk_minimal_artifact(tmp_path)
+    dest = real_parent / ("a" * 64)
+    root.rename(dest)
+    linked_parent = tmp_path / "linked-name-dir"
+    linked_parent.symlink_to(real_parent)
+    from plugin_store import artifact_verdict
+    assert artifact_verdict(linked_parent / ("a" * 64), name="p", repo="o/r",
+                            revision="git:" + "a" * 40, subdir="",
+                            artifact_id="a" * 64) == "artifact_invalid"

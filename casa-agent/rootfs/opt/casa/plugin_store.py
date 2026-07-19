@@ -95,6 +95,63 @@ def _entry_line(rel: str, etype: str, exec_bit: int, payload: str) -> bytes:
     return str(len(body)).encode("ascii") + b":" + body
 
 
+def _is_bytecode_derivative(rel_posix: str) -> bool:
+    """G7 (v0.95.1, Sol-corrected): checksums stay STRICT — a crafted,
+    header-valid ``.pyc`` shadows an unchanged checksummed ``.py`` at
+    import time (reproduced), so bytecode must remain checksum-VISIBLE.
+    This predicate powers prevention (publish-time strip) and the boot
+    heal sweep instead: interpreter caches are kept OUT of artifacts
+    (PYTHONPYCACHEPREFIX + frozen dirs), never checksum-excluded."""
+    parts = rel_posix.split("/")
+    return "__pycache__" in parts or rel_posix.endswith(".pyc")
+
+
+def strip_bytecode_derivatives(root: Path) -> int:
+    """Remove ``__pycache__``/``*.pyc`` from a tree (publish staging: a repo
+    or vendored dir may commit caches). Returns count removed."""
+    root = Path(root)
+    removed = 0
+    for p in sorted(root.rglob("*"), key=lambda q: len(q.parts),
+                    reverse=True):
+        rel = p.relative_to(root).as_posix()
+        if not _is_bytecode_derivative(rel):
+            continue
+        try:
+            if p.is_dir() and not p.is_symlink():
+                shutil.rmtree(p)
+            else:
+                p.unlink(missing_ok=True)
+            removed += 1
+        except OSError:
+            pass
+    return removed
+
+
+def heal_bytecode_poisoned_artifact(root: Path) -> bool:
+    """G7 boot heal: if an artifact's ONLY drift from its stored checksum is
+    interpreter bytecode (the pre-v0.95.1 self-poisoning), remove the
+    derivatives and return True. A tree that still mismatches after the
+    strip is genuinely tampered — leave it corrupt, restore nothing."""
+    meta = read_metadata(root)
+    if not meta:
+        return False
+    expected = meta.get("content_checksum", "")
+    if content_checksum(root) == expected:
+        return False                       # already clean — nothing to heal
+    if not any(_is_bytecode_derivative(p.relative_to(root).as_posix())
+               for p in Path(root).rglob("*")):
+        return False                       # no bytecode present — real drift
+    import tempfile
+    with tempfile.TemporaryDirectory(dir=str(Path(root).parent)) as td:
+        probe = Path(td) / "probe"
+        shutil.copytree(root, probe, symlinks=True)
+        strip_bytecode_derivatives(probe)
+        if content_checksum(probe) != expected:
+            return False                   # tampered beyond bytecode
+    strip_bytecode_derivatives(root)
+    return True
+
+
 def content_checksum(root: Path) -> str:
     root = Path(root)
     lines: list[bytes] = []
@@ -453,7 +510,14 @@ def artifact_verdict(path: Path, *, name: str, repo: str, revision: str,
                      subdir: str, artifact_id: str) -> str | None:
     """Deep validation against the EXPECTED identity (Sol R2-1).
     None = fully valid; 'artifact_invalid' = metadata/manifest/identity
-    problem; 'corrupt_artifact' = identity fine but content checksum fails."""
+    problem; 'corrupt_artifact' = identity fine but content checksum fails.
+
+    Sol v0951e-1: a SYMLINKED store path (either level) is rejected outright
+    — resolution would otherwise cache an external, still-writable tree as
+    an immutable artifact, defeating the frozen-store guarantees."""
+    p_ = Path(path)
+    if p_.is_symlink() or p_.parent.is_symlink():
+        return "artifact_invalid"
     meta = read_metadata(path)
     if not isinstance(meta, dict):
         return "artifact_invalid"
@@ -860,7 +924,15 @@ def validate_manifest(root: Path, expected_name: str) -> dict:
 
 def _stage_and_swap(*, name, repo, ref, revision, subdir, staged: Path,
                     store_root: Path) -> PublishResult:
-    """Shared tail: validate -> checksum -> metadata-in-staging -> rename."""
+    """Shared tail: strip caches -> validate -> checksum -> metadata-in-
+    staging -> rename."""
+    # G7 (v0.95.1): a repo/vendored tree may COMMIT bytecode caches — strip
+    # before checksum so the published artifact never contains .pyc (a
+    # header-valid .pyc shadows its checksummed .py at import time).
+    stripped = strip_bytecode_derivatives(staged)
+    if stripped:
+        logger.info("publish(%s): stripped %d committed bytecode cache "
+                    "entries from staging", name, stripped)
     _reject_escaping_symlinks(staged)            # Sol round-3 H7
     manifest = validate_manifest(staged, name)
     artifact_id = compute_artifact_id(repo=repo, revision=revision,
@@ -895,8 +967,11 @@ def _freeze_artifact_files(root: Path) -> None:
     """Sol #7: strip write bits from a published artifact's FILES so the cached
     deep-validation's immutability assumption holds against in-place tampering
     (e.g. `echo >> skill.md` after the snapshot cached this artifact as valid).
-    Directories are left writable so plugin_remove / a future gc can still
-    rmtree without restoring perms. Best-effort — never fails a publish; the
+    v0.95.1 (G7): DIRECTORIES are frozen too — a writable dir let a plugin's
+    Python server bytecode-cache into its own artifact (and is the foothold
+    for the crafted-.pyc shadow attack); the old "writable for plugin_remove"
+    rationale was stale (plugin_remove retains artifacts; root-context sweeps
+    ignore modes anyway). Best-effort — never fails a publish; the
     /config/plugins write guards (Sol #5) are the primary barrier.
 
     Sol round-3 H7: NEVER chmod through a symlink — `os.chmod(path)` follows
@@ -904,8 +979,14 @@ def _freeze_artifact_files(root: Path) -> None:
     EXTERNAL target's mode. Symlinks are skipped here (and escaping symlinks are
     rejected at publish/import time by `_reject_escaping_symlinks`)."""
     import stat
+    # Sol v0951c-1: NEVER operate through a symlinked root — os.walk would
+    # traverse and chmod the EXTERNAL target tree (reproduced: a root
+    # symlink to an 0777 dir froze the target).
+    if os.path.islink(root):
+        return
     try:
-        for dirpath, _dirs, files in os.walk(root):
+        # Bottom-up so freezing a parent dir never blocks freezing children.
+        for dirpath, dirs, files in os.walk(root, topdown=False):
             for fn in files:
                 p = os.path.join(dirpath, fn)
                 try:
@@ -914,6 +995,19 @@ def _freeze_artifact_files(root: Path) -> None:
                     os.chmod(p, stat.S_IMODE(os.lstat(p).st_mode) & ~0o222)
                 except OSError:
                     pass
+            for dn in dirs:
+                d = os.path.join(dirpath, dn)
+                try:
+                    if os.path.islink(d):
+                        continue
+                    os.chmod(d, stat.S_IMODE(os.lstat(d).st_mode) & ~0o222)
+                except OSError:
+                    pass
+        # Sol v0951b-1: the walk never visits ROOT itself.
+        try:
+            os.chmod(root, stat.S_IMODE(os.lstat(root).st_mode) & ~0o222)
+        except OSError:
+            pass
     except OSError:
         pass
 

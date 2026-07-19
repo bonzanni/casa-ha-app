@@ -21,6 +21,32 @@ from pathlib import Path
 BUNDLE_ROOT = Path("/opt/casa/plugin-bundle")
 
 
+def heal_and_freeze_store(store_root, log) -> None:
+    """G7 sweep (v0.95.1): heal bytecode-only drift (pre-fix Python plugins
+    bytecode-cached into their own frozen artifacts -> corrupt_artifact) and
+    re-freeze EVERY stored artifact (Sol v0951b-2: legacy artifacts carry
+    writable directories). Symlinked entries are skipped entirely (Sol
+    v0951c-1: a symlinked root would heal/freeze the EXTERNAL target).
+    Idempotent, best-effort."""
+    import plugin_store
+    from pathlib import Path
+    # Sol v0951d-1: iterate ONE level at a time — glob("*/*") happily
+    # descends THROUGH a symlinked plugin-name directory, so both levels
+    # must reject symlinks before any descent.
+    for namedir in sorted(Path(store_root).iterdir()):
+        if namedir.is_symlink() or not namedir.is_dir():
+            continue
+        for plugdir in sorted(namedir.iterdir()):
+            if plugdir.is_symlink() or not plugdir.is_dir():
+                continue
+            try:
+                if plugin_store.heal_bytecode_poisoned_artifact(plugdir):
+                    log.info("healed bytecode-poisoned artifact: %s", plugdir)
+            except Exception as exc:  # noqa: BLE001 — heal is best-effort
+                log.warning("heal sweep failed for %s: %s", plugdir, exc)
+            plugin_store._freeze_artifact_files(plugdir)
+
+
 def main() -> int:
     logging.basicConfig(level=logging.INFO,
                         format="[plugin-boot] %(levelname)s %(message)s")
@@ -32,6 +58,7 @@ def main() -> int:
         import plugin_store
 
         plugin_registry.STORE_ROOT.mkdir(parents=True, exist_ok=True)
+        heal_and_freeze_store(plugin_registry.STORE_ROOT, log)
         issues.extend(plugin_store.import_bundle(BUNDLE_ROOT))
 
         # Seed the default registry. A MISSING registry.json loads as a valid,
