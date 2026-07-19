@@ -563,6 +563,59 @@ async def test_add_tag_version_mismatch_aborts_before_sysreqs_and_save(
     assert st.raw["plugins"] == []            # registry byte-identical
 
 
+async def test_add_name_mismatch_from_publish_reports_manifest_name(
+        monkeypatch, tmp_path):
+    """Naming harmonization (2026-07-19, Sol v093-1): publish's
+    validate_manifest rejects a wrong caller-supplied name — the tool payload
+    must carry the canonical `manifest_name` so the configurator
+    self-corrects in ONE retry (repo `casa-plugin-gmail` ⇒ plugin `gmail`)."""
+    from plugin_store import StoreError
+    st = _State()
+    exc = StoreError("manifest name 'gmail' != 'casa-plugin-gmail'",
+                     reason_code="name_mismatch",
+                     detail={"manifest_name": "gmail"})
+    tools_mod = _wire(monkeypatch, tmp_path, st, publish_exc=exc)
+    core = tools_mod._plugin_add_sync(
+        name="casa-plugin-gmail", repo="o/casa-plugin-gmail", ref="v1.2.0",
+        targets=["resident:assistant"])
+    assert core["ok"] is False and core["kind"] == "name_mismatch"
+    assert core["manifest_name"] == "gmail"
+    assert "install_requirements" not in st.log and "save" not in st.log
+    assert st.raw["plugins"] == []            # registry byte-identical
+
+
+async def test_update_name_mismatch_from_publish_reports_manifest_name(
+        monkeypatch, tmp_path):
+    """Update-path analog: a new manifest that renames the plugin surfaces
+    `name_mismatch` + `manifest_name`. (Unlike add, retrying update with the
+    manifest name would be `not_registered` — a rename is an explicit
+    add/migration, per the recipe.)"""
+    from plugin_store import StoreError
+    st = _State()
+    st.raw["plugins"].append(_entry())
+    exc = StoreError("manifest name 'renamed' != 'probe'",
+                     reason_code="name_mismatch",
+                     detail={"manifest_name": "renamed"})
+    tools_mod = _wire(monkeypatch, tmp_path, st, publish_exc=exc)
+    core = tools_mod._plugin_update_sync(name="probe", new_ref="v1.2.0")
+    assert core["ok"] is False and core["kind"] == "name_mismatch"
+    assert core["manifest_name"] == "renamed"
+    assert "install_requirements" not in st.log and "save" not in st.log
+
+
+def test_validate_manifest_name_mismatch_carries_manifest_name(tmp_path):
+    """Store-level: the StoreError itself must carry the canonical name."""
+    import json as _json
+    from plugin_store import StoreError, validate_manifest
+    (tmp_path / ".claude-plugin").mkdir()
+    (tmp_path / ".claude-plugin" / "plugin.json").write_text(
+        _json.dumps({"name": "gmail", "version": "1.0.0"}), encoding="utf-8")
+    with pytest.raises(StoreError) as ei:
+        validate_manifest(tmp_path, "casa-plugin-gmail")
+    assert ei.value.reason_code == "name_mismatch"
+    assert ei.value.detail == {"manifest_name": "gmail"}
+
+
 async def test_add_invalid_expected_revision_rejected(monkeypatch, tmp_path):
     st = _State()
     tools_mod = _wire(monkeypatch, tmp_path, st, publish=_pr())

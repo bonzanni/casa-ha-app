@@ -6144,7 +6144,8 @@ def _plugin_add_sync(*, name: str, repo: str, ref: str, subdir: str = "",
     except plugin_store.ResolveUnavailable:
         return {"ok": False, "kind": "resolve_unavailable"}
     except plugin_store.StoreError as exc:
-        return {"ok": False, "kind": getattr(exc, "reason_code", "store_error")}
+        return {"ok": False, "kind": getattr(exc, "reason_code", "store_error"),
+                **getattr(exc, "detail", {})}
     err = _tag_version_guard(ref, result.manifest)             # BEFORE sysreqs
     if err is not None:
         return err
@@ -6195,7 +6196,8 @@ def _plugin_update_sync(*, name: str, new_ref: str,
     except plugin_store.ResolveUnavailable:
         return {"ok": False, "kind": "resolve_unavailable"}
     except plugin_store.StoreError as exc:
-        return {"ok": False, "kind": getattr(exc, "reason_code", "store_error")}
+        return {"ok": False, "kind": getattr(exc, "reason_code", "store_error"),
+                **getattr(exc, "detail", {})}
     err = _tag_version_guard(new_ref, result.manifest)         # BEFORE sysreqs
     if err is not None:
         return err

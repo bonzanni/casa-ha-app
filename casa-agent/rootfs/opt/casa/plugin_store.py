@@ -35,10 +35,15 @@ METADATA_FILENAME = ".casa-artifact.json"
 class StoreError(Exception):
     reason_code = "store_error"
 
-    def __init__(self, message: str, *, reason_code: str | None = None):
+    def __init__(self, message: str, *, reason_code: str | None = None,
+                 detail: dict | None = None):
         super().__init__(message)
         if reason_code is not None:
             self.reason_code = reason_code
+        # Machine-readable payload extras the tool layer surfaces verbatim —
+        # e.g. name_mismatch carries the canonical manifest_name so the
+        # configurator self-corrects in one retry (Sol v093-1).
+        self.detail: dict = dict(detail or {})
 
 
 class RefNotFound(StoreError):
@@ -804,7 +809,8 @@ def validate_manifest(root: Path, expected_name: str) -> dict:
     if manifest.get("name") != expected_name:
         raise StoreError(
             f"manifest name {manifest.get('name')!r} != {expected_name!r}",
-            reason_code="name_mismatch")
+            reason_code="name_mismatch",
+            detail={"manifest_name": manifest.get("name")})
     if not isinstance(manifest.get("version"), str) or not manifest["version"]:
         # Real-world plugins (e.g. every anthropics/claude-plugins-official
         # plugin) ship NO top-level version. Version is no longer identity-load-

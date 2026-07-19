@@ -75,6 +75,15 @@ from your pinned commit. That means:
 - `skills/<name>/SKILL.md` — skills pack. Single-line description triggers
   right. Keep it specific.
 - `agents/<name>.md` — optional subagents.
+- **Naming (harmonized 2026-07-19):** the `.claude-plugin/plugin.json`
+  `name` is the plugin's canonical identity everywhere downstream — the
+  registry entry, `verify_plugin_state`, plugin health, and the tool
+  namespace (`mcp__plugin_<name>_<server>__*`). Keeper repos are named
+  `casa-plugin-<name>` (repo `casa-plugin-gmail` ⇒ plugin `gmail`). Pick the
+  short name first, derive the repo from it, and **state the plugin name
+  explicitly in your completion handoff** — the configurator must never
+  have to guess it from the repo (`plugin_add` hard-rejects a mismatched
+  name).
 - `.mcp.json` — MCP server declaration. Use `${CLAUDE_PLUGIN_ROOT}/server.py`
   and similar relative anchors. Every referenced path must be **committed**
   — never a dev-only venv or build dir; a Python server with library deps
