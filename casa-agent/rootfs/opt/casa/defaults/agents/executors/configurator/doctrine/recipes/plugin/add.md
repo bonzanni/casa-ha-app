@@ -9,9 +9,20 @@ installs any system requirements, assigns it to targets, and reloads + verifies
 
 ## Ask the user
 
-1. **Plugin name?** Lowercase, hyphenated (e.g. `casa-probe-greet`) — must equal
-   the plugin's own `plugin.json` `name`.
-2. **Source repo?** `<owner>/<name>` (or a `https://github.com/<owner>/<name>`
+1. **Plugin name?** The plugin's own `.claude-plugin/plugin.json` `name` —
+   lowercase, hyphenated. **The repo name is NOT the plugin name:** keeper
+   repos follow `casa-plugin-<name>` (repo `casa-plugin-gmail` → plugin
+   `gmail`; repo `casa-plugin-lesina-invoice` → plugin `lesina-invoice`),
+   and a repo may host the plugin in a `subdir`. Never pass the repo
+   basename as `name`. Sources of truth, in order: the plugin-developer
+   completion handoff (it states the plugin name), or the repo's
+   `plugin.json`. `plugin_add` hard-rejects a wrong name with
+   `name_mismatch` + the canonical `manifest_name` — retry the ADD with
+   that exact name, don't guess again. (On `plugin_update` a
+   `name_mismatch` means the NEW manifest renamed the plugin — that is
+   never a retry: a rename is an explicit migration, `plugin_add` under
+   the new name + `plugin_remove` of the old, operator-confirmed.)
+2. **Source repo?** `<owner>/<repo>` (or a `https://github.com/<owner>/<repo>`
    URL). For a plugin-developer build, take it from that engagement's topic.
 3. **Pin (ref)?** The release tag (`vX.Y.Z`) for a plugin-developer build —
    take it, plus the `revision` sha, verbatim from that engagement's

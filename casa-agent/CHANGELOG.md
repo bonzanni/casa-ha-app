@@ -1,5 +1,20 @@
 # Changelog
 
+## [0.93.0] - 2026-07-19
+
+Plugin names can no longer be guessed wrong at install time.
+
+### Added
+
+- The `name_mismatch` rejection from `plugin_add`/`plugin_update` now
+  returns the plugin's canonical manifest name, so the installer
+  self-corrects an add in one retry instead of guessing — a repo named
+  `casa-plugin-gmail` hosts the plugin `gmail`, and confusing the two
+  previously produced an opaque error with no path forward.
+- Installer and plugin-developer doctrine now state the naming convention
+  explicitly: keeper repos are `casa-plugin-<name>`, the manifest `name` is
+  the canonical identity, and build handoffs must state the plugin name.
+
 ## [0.92.0] - 2026-07-18
 
 A broken plugin MCP server is now caught at install time with a precise
