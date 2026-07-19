@@ -190,6 +190,17 @@ class SessionRegistry:
         one-shot never re-registers to acquire it later (spec A2)."""
         migrated = dropped = 0
         for key in list(self._data):
+            # Release A / Layer 4: PURGE every webhook session entry — v1
+            # (``webhook-<scope>``) AND already-v2 (``webhook-v2-<hash>``) —
+            # BEFORE the v2 early-continue below. A pre-upgrade webhook session's
+            # origin route (operator-signed ``invoke`` vs untrusted
+            # ``webhook_trigger``) is unknowable, so it must never be resumed or
+            # treated as trusted; fresh dispatches start clean. (New webhook
+            # one-shots still acquire scope_class + the short TTL at register().)
+            if key.startswith("webhook-"):
+                self._data.pop(key)
+                dropped += 1
+                continue
             parts = key.split("-", 2)
             if len(parts) >= 2 and parts[1] == SESSION_KEY_SCHEMA_V2:
                 continue  # already v2
@@ -200,8 +211,6 @@ class SessionRegistry:
                 dropped += 1
                 continue
             scope = key[len(channel) + 1:]
-            if channel == "webhook" and _is_uuid_scope(scope):
-                entry["scope_class"] = "webhook_oneshot"
             self._data[build_scoped_session_key(channel, agent, scope)] = entry
             migrated += 1
         return {"migrated": migrated, "dropped": dropped}
