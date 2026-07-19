@@ -32,6 +32,8 @@ def test_reserved_context_keys_are_exactly_the_spec_set():
         "_voice_job_control_id",
         "_origin_device_id", "_voice_transport",
         "_voice_handoff_reservation",
+        # Release A: unspoofable server-set webhook-origin markers.
+        "_origin_route", "_origin_clearance",
     })
 
 

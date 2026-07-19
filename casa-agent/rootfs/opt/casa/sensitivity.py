@@ -62,6 +62,35 @@ def clearance_for_channel(channel: str) -> str:
     return CLEARANCE_BY_CHANNEL.get(channel, _DEFAULT_CLEARANCE)
 
 
+# Memory read-clearance a webhook trigger may declare (spec A1/A4). Never
+# "private" — a webhook-origin turn carries third-party content and must not
+# unlock the operator's most sensitive memories.
+_WEBHOOK_TRIGGER_TIERS = frozenset({"public", "friends", "family"})
+
+
+def clearance_for_origin(
+    origin_route: str | None,
+    origin_clearance: str | None,
+    channel: str,
+) -> str:
+    """Read-clearance keyed off the unspoofable, server-set origin marker
+    rather than the channel string (spec A0/A4).
+
+    ``webhook_trigger`` turns read at their declared ``origin_clearance``
+    (default-deny: a missing/malformed/``private`` value ⇒ ``public``).
+    ``invoke`` turns are operator-signed and read at ``private`` (the
+    documented authenticated exception). Any other origin falls through to
+    today's channel-keyed clearance so existing surfaces are unchanged.
+    """
+    if origin_route == "webhook_trigger":
+        if origin_clearance in _WEBHOOK_TRIGGER_TIERS:
+            return origin_clearance
+        return "public"
+    if origin_route == "invoke":
+        return "private"
+    return clearance_for_channel(channel)
+
+
 # ---------------------------------------------------------------------------
 # LLM output parsing (design §2.4)
 # ---------------------------------------------------------------------------
