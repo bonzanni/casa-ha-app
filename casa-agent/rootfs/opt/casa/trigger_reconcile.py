@@ -274,13 +274,19 @@ async def reconcile_plugin_triggers(
             trigger_registry.replace_plugin_overlay({})
             raise
         trigger_registry.replace_plugin_overlay(desired.overlay)
-
-    if prompt and desired.pending:
-        _fire_consent_prompts(
-            desired.pending, trigger_registry=trigger_registry,
-            role_configs=role_configs, channel_manager=channel_manager,
-            acks=acks, secrets_dir=secrets_dir, resolver=resolver,
-            global_secret_ok=global_secret_ok)
+        # Prompts fire INSIDE the lock (Sol shipB-r2 P1-1): keyboard
+        # registration is then ordered BEFORE any later reconcile can
+        # acquire the lock — so trigger_ack_revoke's final
+        # cancel_matching(plugin=…), which runs after ITS reconcile,
+        # provably catches every keyboard an in-flight reconcile posted.
+        # register_challenge is synchronous (the Telegram post happens on
+        # an owned background driver), so this adds no IO under the lock.
+        if prompt and desired.pending:
+            _fire_consent_prompts(
+                desired.pending, trigger_registry=trigger_registry,
+                role_configs=role_configs, channel_manager=channel_manager,
+                acks=acks, secrets_dir=secrets_dir, resolver=resolver,
+                global_secret_ok=global_secret_ok)
     return desired.issues
 
 

@@ -6738,11 +6738,14 @@ async def trigger_ack_revoke(args: dict) -> dict:
         prefix = f"plg-{name}--"
         if registry is not None:
             # Fail-closed DIRECT sweep first — the immediate-404 guarantee
-            # must not depend on resolver health.
+            # must not depend on resolver health. Match on the entry's OWN
+            # plugin attribution (Sol shipB-r2 P1-3), with the name prefix
+            # as belt-and-braces for any entry lacking it.
             registry.replace_plugin_overlay({
                 eff: entry
                 for eff, entry in registry.plugin_overlay_snapshot().items()
-                if not eff.startswith(prefix)})
+                if entry.get("plugin", "") != name
+                and not eff.startswith(prefix)})
         try:
             await trigger_reconcile.reconcile_from_runtime(
                 runtime, prompt=False)
@@ -6758,6 +6761,13 @@ async def trigger_ack_revoke(args: dict) -> dict:
         retired = await asyncio.to_thread(
             webhook_auth.retire_secrets_with_prefix, prefix,
             secrets_dir=trigger_reconcile.SECRETS_DIR)
+        # Sol shipB-r2 P1-1: cancel AGAIN after our reconcile. Prompts fire
+        # under _RECONCILE_LOCK, and our reconcile above serialized behind
+        # any in-flight one — so a keyboard posted by that in-flight
+        # reconcile is REGISTERED by now and this cancel provably kills it.
+        # (Reconciles triggered by LATER mutations legitimately re-prompt —
+        # that is the documented re-consent path, not a survival.)
+        CHALLENGES.cancel_matching(plugin=name)
         # Refresh health (trigger_pending_ack reappears via the recomputable
         # input) WITHOUT the operator DM — they just did this deliberately.
         await asyncio.to_thread(_regenerate_plugin_health, [])

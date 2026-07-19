@@ -155,3 +155,35 @@ def test_duplicate_declared_names_rejected():
 def test_non_webhook_type_rejected():
     _, errs = parse_and_validate("p", _m([_wh(type="interval")]))
     assert errs
+
+
+# ---------------------------------------------------------------------------
+# Sol shipB-r2 P1-3: injectivity requires banning the ambiguous dash edges —
+# plugin "a-" + declared "x" and plugin "a" + declared "-x" would BOTH yield
+# "plg-a---x" (colliding routes; a's revoke prefix would sweep a-'s secrets).
+# ---------------------------------------------------------------------------
+
+
+def test_plugin_name_trailing_dash_rejected():
+    _, errs = parse_and_validate("a-", _m([
+        {"name": "x", "type": "webhook", "target": "resident:assistant",
+         "auth": {"mode": "static_header"}}]))
+    assert any("end with '-'" in e for e in errs)
+
+
+def test_declared_name_leading_dash_rejected():
+    _, errs = parse_and_validate("a", _m([
+        {"name": "-x", "type": "webhook", "target": "resident:assistant",
+         "auth": {"mode": "static_header"}}]))
+    assert any("start with '-'" in e for e in errs)
+
+
+def test_dash_edge_collision_pair_is_fully_rejected():
+    """Neither producer of the ambiguous effective name survives."""
+    t1, e1 = parse_and_validate("a-", _m([
+        {"name": "x", "type": "webhook", "target": "resident:assistant",
+         "auth": {"mode": "static_header"}}]))
+    t2, e2 = parse_and_validate("a", _m([
+        {"name": "-x", "type": "webhook", "target": "resident:assistant",
+         "auth": {"mode": "static_header"}}]))
+    assert e1 and e2

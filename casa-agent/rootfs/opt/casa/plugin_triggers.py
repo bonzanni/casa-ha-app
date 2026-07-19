@@ -121,8 +121,17 @@ def parse_and_validate(
         return [], ["casa.triggers must be a list"]
 
     # Plugin name itself must be injective-safe (feeds the effective name).
+    # Sol shipB-r2 P1-3: a trailing '-' on the plugin (or a leading '-' on a
+    # declared name, below) makes the '--' separator ambiguous — plugin "a-"
+    # + name "x" and plugin "a" + name "-x" would both route
+    # "plg-a---x", and plugin a's revoke prefix "plg-a--" would sweep
+    # plugin a-'s secrets. With both edges banned, the FIRST '--' in an
+    # effective name is always exactly the separator (unique decomposition).
     if "--" in plugin:
         errs.append(f"plugin name {plugin!r} may not contain '--'")
+    if plugin.endswith("-"):
+        errs.append(f"plugin name {plugin!r} may not end with '-' "
+                    "(ambiguous trigger-name separator)")
 
     if len(raw) > _MAX_TRIGGERS:
         errs.append(f"too many triggers ({len(raw)} > {_MAX_TRIGGERS})")
@@ -146,6 +155,9 @@ def parse_and_validate(
             name = None
         elif "--" in name:
             errs.append(f"{where}: name {name!r} may not contain '--'")
+        elif name.startswith("-"):
+            errs.append(f"{where}: name {name!r} may not start with '-' "
+                        "(ambiguous plugin-name separator)")
         elif name.startswith("plg-"):
             errs.append(f"{where}: name may not start with the reserved 'plg-' prefix")
         else:

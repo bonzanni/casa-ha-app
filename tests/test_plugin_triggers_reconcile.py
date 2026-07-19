@@ -890,6 +890,73 @@ async def test_trigger_ack_revoke_cancels_pending_consent_keyboards(
     assert not acks.is_acked(_ident_default())
 
 
+async def test_revoke_kills_keyboard_posted_by_inflight_reconcile(
+    monkeypatch, tmp_path,
+):
+    """Sol shipB-r2 P1-1: a reconcile already in flight (blocked in compute)
+    when the revoke starts posts its consent keyboard AFTER the revoke's
+    first cancel — the revoke's FINAL cancel (after its own reconcile, which
+    serializes behind the in-flight one; prompts fire under the lock) must
+    kill it, so no keyboard survives the revoke call."""
+    import threading
+
+    import authz_grants
+    import verdict_broker
+
+    broker = verdict_broker.VerdictBroker()
+    monkeypatch.setattr(verdict_broker, "BROKER", broker)
+    coord = authz_grants.ChallengeCoordinator()
+    monkeypatch.setattr(authz_grants, "CHALLENGES", coord)
+    import tools as tools_mod
+    monkeypatch.setattr(tools_mod, "CHALLENGES", coord)
+
+    tools_mod, registry, acks, _json = _wire_revoke_env(
+        monkeypatch, tmp_path, acked=False)
+    telegram = _FakeTelegram()
+    runtime = __import__("agent").active_runtime
+    runtime.channel_manager = _FakeChannelManager(telegram)
+
+    # make the FIRST resolve block until released (the in-flight reconcile
+    # sits inside compute, holding _RECONCILE_LOCK, while the revoke runs)
+    import plugin_registry
+    gate = threading.Event()
+    blocked_once = threading.Event()
+    real_resolve_all = plugin_registry.resolve_all
+
+    def _blocking_resolve_all():
+        if not blocked_once.is_set():
+            blocked_once.set()
+            gate.wait(timeout=5)
+        return real_resolve_all()
+
+    monkeypatch.setattr(plugin_registry, "resolve_all", _blocking_resolve_all)
+
+    inflight = asyncio.create_task(tr.reconcile_from_runtime(runtime))
+    for _ in range(20):
+        await asyncio.sleep(0.01)
+        if blocked_once.is_set():
+            break
+    assert blocked_once.is_set()
+
+    revoke = asyncio.create_task(
+        tools_mod.trigger_ack_revoke.handler({"name": "elevenlabs"}))
+    await asyncio.sleep(0.05)  # revoke: first cancel done, waiting on lock
+    gate.set()                 # in-flight completes: swap + POST keyboard
+    await revoke
+    await inflight
+    for _ in range(8):
+        await asyncio.sleep(0)
+
+    # the in-flight reconcile DID post a keyboard…
+    assert len(telegram.posts) == 1
+    # …but its broker record is dead: a late Approve tap cannot claim it
+    _chat, rid, _text, _opts = telegram.posts[0]
+    claim = broker.claim(namespace="resident_ask", scope="authz:100",
+                         request_id=rid, option_index=0, actor_id=100)
+    assert isinstance(claim, str)
+    assert not acks.is_acked(_ident_default())
+
+
 async def test_trigger_ack_revoke_unroutes_even_if_reconcile_fails(
     monkeypatch, tmp_path,
 ):
