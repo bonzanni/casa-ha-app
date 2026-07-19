@@ -11,6 +11,7 @@ import math
 import os
 import signal
 import sys
+import time
 import uuid
 from pathlib import Path
 from typing import Any, Mapping
@@ -1254,6 +1255,10 @@ async def _close_tina_ha_facade(
         logger.warning("ha_facade_close_failed")
 
 
+# Max webhook request body (spec A3). Larger requests are rejected before read.
+_WEBHOOK_BODY_MAX = 64 * 1024
+
+
 def _make_webhook_handler(
     *,
     webhook_rate_limiter: Any,
@@ -1261,51 +1266,70 @@ def _make_webhook_handler(
     trigger_registry: Any,
     default_role: str,
     bus: Any,
+    secrets_dir: str | Path = "/data/webhook_secrets",
 ):
     """Build the wildcard ``/webhook/{name}`` handler.
 
-    The handler:
+    Request pipeline (spec A3): rate limit → bounded body read (64 KiB) →
+    name lookup (unknown ⇒ 404) → PER-TRIGGER auth verify (fail ⇒ 401) →
+    dispatch a SCHEDULED bus message to the registered role.
 
-    * applies the global rate limit (shared bucket with /invoke/{agent}),
-    * verifies the HMAC-SHA256 signature when ``webhook_secret`` is set
-      (so unknown names cannot leak via 404 vs 401 timing),
-    * looks up ``name`` in ``trigger_registry.get_webhook_target(name)``
-      — returns 404 ``{"error": "unknown webhook"}`` for unknowns
-      (N-2, v0.36.0),
-    * dispatches a SCHEDULED bus message to the registered role, falling
-      back to ``default_role`` only when the registry returns the
-      sentinel ``"__assistant_default__"`` (kept for forward parity if
-      we want a public open dispatch later — currently unused).
+    Auth is per-trigger (spec A1): each webhook trigger declares an ``auth``
+    policy (``hmac_body`` uses the global ``webhook_secret``; ``static_header``/
+    ``timestamped_hmac`` use a per-trigger secret under ``secrets_dir``). An
+    empty/absent secret fails closed. 404 precedes auth (names are non-secret,
+    r3 design decision) so the policy can be selected by name.
 
     Extracted from ``main()`` so it is unit-testable; see
     ``tests/test_webhook_handler.py``.
     """
+    import webhook_auth
+    secrets_dir = Path(secrets_dir)
 
-    def _verify(request: web.Request, body: bytes) -> bool:
-        if not webhook_secret:
-            return True
-        sig = request.headers.get("X-Webhook-Signature", "")
-        expected = hmac.new(
-            webhook_secret.encode(), body, hashlib.sha256,
-        ).hexdigest()
-        return hmac.compare_digest(sig, expected)
+    def _secret_for(name: str, policy: dict) -> bytes:
+        mode = policy.get("mode", "hmac_body")
+        if mode == "hmac_body":
+            return webhook_secret.encode() if webhook_secret else b""
+        owner = policy.get("secret_owner", "casa")
+        # casa: mint-if-absent so the operator can read + provision it;
+        # provider: read-only (imported out of band).
+        got = webhook_auth.ensure_secret(name, owner=owner, secrets_dir=secrets_dir)
+        return got or b""
+
+    def _verify(request: web.Request, body: bytes, name: str, policy: dict) -> bool:
+        return webhook_auth.verify(
+            policy.get("mode", "hmac_body"),
+            body=body,
+            headers=request.headers,
+            secret=_secret_for(name, policy),
+            header_name=policy.get("header", "X-Webhook-Signature"),
+            tolerance_secs=int(policy.get("tolerance_secs", 300)),
+            now=int(time.time()),
+        )
 
     async def webhook_handler(request: web.Request) -> web.Response:
         limited = rate_limit_response(webhook_rate_limiter, "global")
         if limited is not None:
             return limited
 
+        # Bounded body read (spec A3): reject oversize before buffering it all.
+        if request.content_length is not None and request.content_length > _WEBHOOK_BODY_MAX:
+            return web.json_response({"error": "payload too large"}, status=413)
         body = await request.read()
-        if not _verify(request, body):
-            return web.json_response(
-                {"error": "invalid signature"}, status=401,
-            )
+        if len(body) > _WEBHOOK_BODY_MAX:
+            return web.json_response({"error": "payload too large"}, status=413)
 
         name = request.match_info.get("name", "")
         target_role = trigger_registry.get_webhook_target(name)
         if target_role is None:
             return web.json_response(
                 {"error": "unknown webhook"}, status=404,
+            )
+
+        policy = trigger_registry.get_auth_policy(name) or {"mode": "hmac_body"}
+        if not _verify(request, body, name, policy):
+            return web.json_response(
+                {"error": "invalid signature"}, status=401,
             )
 
         try:

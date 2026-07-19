@@ -65,6 +65,10 @@ class TriggerRegistry:
         # onto webhook_trigger turns so the recall gate reads at the declared
         # tier (default/floor "public", never "private").
         self._webhook_clearances: dict[str, str] = {}
+        # Release A: per-trigger auth policy (spec A1) — mode/header/
+        # tolerance_secs/secret_owner. The wildcard handler reads it to verify
+        # the request with the right scheme + secret.
+        self._webhook_auth_policies: dict[str, dict] = {}
 
     def register_agent(
         self,
@@ -209,6 +213,10 @@ class TriggerRegistry:
         self._webhook_clearances[trig.name] = (
             getattr(trig, "clearance", "public") or "public"
         )
+        self._webhook_auth_policies[trig.name] = getattr(trig, "auth", None) or {
+            "mode": "hmac_body", "header": "X-Webhook-Signature",
+            "tolerance_secs": 300, "secret_owner": "casa",
+        }
 
     def get_webhook_target(self, name: str) -> str | None:
         """Return the role registered for a webhook trigger ``name``,
@@ -224,6 +232,12 @@ class TriggerRegistry:
         ``_origin_clearance`` so the recall gate reads at the declared tier.
         """
         return self._webhook_clearances.get(name, "public")
+
+    def get_auth_policy(self, name: str) -> dict | None:
+        """Return the per-trigger auth policy for webhook ``name`` (mode/header/
+        tolerance_secs/secret_owner), or ``None`` if the name is unregistered.
+        The wildcard handler verifies the request with this policy."""
+        return self._webhook_auth_policies.get(name)
 
     def reregister_for(
         self,
@@ -266,6 +280,7 @@ class TriggerRegistry:
             if self._webhook_targets.get(name) == role:
                 self._webhook_targets.pop(name, None)
                 self._webhook_clearances.pop(name, None)
+                self._webhook_auth_policies.pop(name, None)
         self._webhook_names_by_role[role] = []
 
         self.register_agent(role, triggers, channels)
