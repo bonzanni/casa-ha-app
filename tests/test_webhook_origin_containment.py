@@ -34,8 +34,17 @@ def test_invoke_stays_private():
     assert clearance_for_origin("invoke", None, "webhook") == "private"
 
 
-def test_unknown_origin_falls_through_to_channel():
-    # No origin marker ⇒ today's channel-keyed behavior is preserved.
+def test_unknown_origin_falls_through_to_channel_for_non_webhook():
+    # No origin marker on a NON-webhook channel ⇒ today's channel-keyed behavior.
     assert clearance_for_origin(None, None, "telegram") == "private"
     assert clearance_for_origin(None, None, "voice") == "friends"
     assert clearance_for_origin(None, None, "unknown-future") == "public"
+
+
+def test_webhook_channel_fail_closed_without_invoke():
+    # Fail-closed (Sol r4): private on the webhook channel is granted ONLY for an
+    # explicit `invoke` route. A missing/unknown route must NOT inherit the
+    # channel's historical private clearance — it reads public.
+    assert clearance_for_origin(None, None, "webhook") == "public"
+    assert clearance_for_origin("bogus-route", None, "webhook") == "public"
+    assert clearance_for_origin("invoke", None, "webhook") == "private"

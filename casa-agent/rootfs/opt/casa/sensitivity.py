@@ -82,12 +82,18 @@ def clearance_for_origin(
     documented authenticated exception). Any other origin falls through to
     today's channel-keyed clearance so existing surfaces are unchanged.
     """
+    if origin_route == "invoke":
+        return "private"
     if origin_route == "webhook_trigger":
         if origin_clearance in _WEBHOOK_TRIGGER_TIERS:
             return origin_clearance
         return "public"
-    if origin_route == "invoke":
-        return "private"
+    # No trusted origin marker. Fail closed on the webhook channel (Sol r4):
+    # private there is granted ONLY for an explicit server-stamped ``invoke`` —
+    # a missing/unknown route must not inherit webhook's historical private
+    # clearance. Non-webhook channels keep today's channel-keyed behavior.
+    if channel == "webhook":
+        return "public"
     return clearance_for_channel(channel)
 
 
