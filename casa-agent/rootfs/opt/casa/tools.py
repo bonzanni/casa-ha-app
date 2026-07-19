@@ -3526,9 +3526,15 @@ async def recall_memory(args: dict) -> dict:
     channel = origin.get("channel", "telegram")
     caller_cfg = _agent_role_map.get(role)
 
-    # Tier clearance — the same read-side gate the turn path uses (design §2.3).
-    from sensitivity import clearance_for_channel, readable_tiers
-    tags = readable_tiers(clearance_for_channel(channel))
+    # Tier clearance — the same read-side gate the turn path uses (design §2.3),
+    # re-keyed off the unspoofable origin marker (Release A Layer 2): a
+    # webhook_trigger turn reads at its declared clearance (public floor, never
+    # private); /invoke stays private; missing/unknown route on the webhook
+    # channel fails closed to public.
+    from sensitivity import clearance_for_origin, readable_tiers
+    tags = readable_tiers(clearance_for_origin(
+        origin.get("_origin_route"), origin.get("_origin_clearance"), channel,
+    ))
 
     budget = "low" if channel == "voice" else "mid"
     tokens = (
