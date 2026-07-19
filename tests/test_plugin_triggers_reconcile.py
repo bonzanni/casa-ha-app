@@ -168,6 +168,119 @@ async def test_artifact_change_rekeys_secret_even_without_retirement(tmp_path):
     assert (tmp_path / "webhook_secrets" / eff).read_bytes() != old_secret
 
 
+async def test_regen_health_flag_regenerates_report(monkeypatch, tmp_path):
+    """P2 follow-up (v0.98.2): the consent-approve reconcile must regenerate
+    plugin-health so a just-acked trigger's stale trigger_pending_ack clears
+    at once instead of lingering until the next mutation."""
+    import tools as tools_mod
+    calls: list = []
+    monkeypatch.setattr(tools_mod, "_regenerate_plugin_health",
+                        lambda extra: calls.append(extra))
+    registry = _registry()
+    acks = TriggerAckStore(path=tmp_path / "acks.json")
+    _ack(acks)
+    p = _plugin()
+    await tr.reconcile_plugin_triggers(
+        trigger_registry=registry,
+        role_configs=_role_configs(assistant=["webhook"]),
+        acks=acks, secrets_dir=tmp_path / "webhook_secrets", prompt=False,
+        resolver=_resolver({None: [p], "resident:assistant": [p]}),
+        global_secret_ok=lambda: True, regen_health=True)
+    assert calls == [[]]
+
+
+async def test_default_reconcile_does_not_regen_health(monkeypatch, tmp_path):
+    """The mutation/boot paths regen health separately — the default reconcile
+    must NOT double-regen."""
+    import tools as tools_mod
+    calls: list = []
+    monkeypatch.setattr(tools_mod, "_regenerate_plugin_health",
+                        lambda extra: calls.append(extra))
+    registry = _registry()
+    acks = TriggerAckStore(path=tmp_path / "acks.json")
+    _ack(acks)
+    p = _plugin()
+    await _reconcile(
+        registry, plugins_by_target={None: [p], "resident:assistant": [p]},
+        role_configs=_role_configs(assistant=["webhook"]),
+        acks=acks, tmp_path=tmp_path)
+    assert calls == []
+
+
+async def test_regen_health_failure_never_breaks_reconcile(monkeypatch, tmp_path):
+    import tools as tools_mod
+
+    def _boom(extra):
+        raise RuntimeError("health regen blew up")
+
+    monkeypatch.setattr(tools_mod, "_regenerate_plugin_health", _boom)
+    registry = _registry()
+    acks = TriggerAckStore(path=tmp_path / "acks.json")
+    _ack(acks)
+    p = _plugin()
+    issues = await tr.reconcile_plugin_triggers(
+        trigger_registry=registry,
+        role_configs=_role_configs(assistant=["webhook"]),
+        acks=acks, secrets_dir=tmp_path / "webhook_secrets", prompt=False,
+        resolver=_resolver({None: [p], "resident:assistant": [p]}),
+        global_secret_ok=lambda: True, regen_health=True)
+    assert issues == []  # reconcile still succeeded; the trigger routed
+    assert registry.get_webhook_target("plg-elevenlabs--voicemail") == "assistant"
+
+
+async def test_consent_approve_regenerates_health(monkeypatch, tmp_path):
+    """Integration: an operator Approve on the consent keyboard clears the
+    stale trigger_pending_ack by regenerating the health report — the exact
+    prod symptom this fix targets."""
+    import authz_grants
+    import tools as tools_mod
+    import verdict_broker
+
+    broker = verdict_broker.VerdictBroker()
+    monkeypatch.setattr(verdict_broker, "BROKER", broker)
+    coord = authz_grants.ChallengeCoordinator()
+    monkeypatch.setattr(authz_grants, "CHALLENGES", coord)
+    regen: list = []
+    monkeypatch.setattr(tools_mod, "_regenerate_plugin_health",
+                        lambda extra: regen.append(extra))
+
+    registry = _registry()
+    acks = TriggerAckStore(path=tmp_path / "acks.json")
+    telegram = _FakeTelegram()
+    p = _plugin()
+    # reconcile WITH prompting -> a live pending consent keyboard (unacked)
+    await _reconcile(
+        registry, plugins_by_target={None: [p], "resident:assistant": [p]},
+        role_configs=_role_configs(assistant=["webhook"]),
+        acks=acks, tmp_path=tmp_path,
+        channel_manager=_FakeChannelManager(telegram))
+    for _ in range(8):
+        await asyncio.sleep(0)
+    assert len(telegram.posts) == 1
+    assert regen == []  # nothing regenerated yet — still pending
+
+    # operator taps Approve (claim -> commit -> sync ack step) then settle
+    key = next(iter(coord._entries))
+    ch = coord._entries[key]
+    claim = broker.claim(namespace="resident_ask", scope=ch.scope,
+                         request_id=ch.rid, option_index=0, actor_id=100)
+    assert not isinstance(claim, str)
+    assert broker.commit(claim) is True
+    step = ch.req.meta.get("on_commit_sync")
+    if step is not None:
+        step(0)
+    # the finish hook runs as a broker-driven task and its reconcile uses
+    # asyncio.to_thread — poll with real sleeps until it settles.
+    for _ in range(100):
+        if regen:
+            break
+        await asyncio.sleep(0.02)
+
+    assert acks.is_acked(_ident_default())
+    assert registry.get_webhook_target("plg-elevenlabs--voicemail") == "assistant"
+    assert regen == [[]]  # health regenerated exactly once on approve
+
+
 async def test_reapproval_after_revoke_rekeys_even_if_retire_failed(
     monkeypatch, tmp_path,
 ):
