@@ -1351,8 +1351,11 @@ def _make_webhook_handler(
                 {"error": "invalid signature"}, status=401,
             )
 
+        # Parse the ALREADY-READ body (the streaming cap above consumed
+        # request.content, so request.json() would re-read empty — Terra
+        # ship-review P2). Fall back to raw text for non-JSON payloads.
         try:
-            payload = await request.json()
+            payload = json.loads(body)
         except Exception:
             payload = body.decode("utf-8", errors="replace")
 

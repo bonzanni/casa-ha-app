@@ -283,3 +283,25 @@ class TestPerTriggerAuthModes:
                                   headers={"X-Webhook-Signature": "x"})
             assert r.status == 413
             bus.send.assert_not_called()
+
+
+class TestWebhookPayloadParsing:
+    """Release A: the handler parses the already-read body as JSON (the
+    streaming body-cap consumed request.content, so request.json() re-reads
+    empty — Terra ship-review P2)."""
+
+    _SECRET = "s3cret"
+
+    async def test_json_payload_is_parsed_not_raw_text(self):
+        app, bus = await _build_app(secret=self._SECRET, targets={"vm": "assistant"})
+        body = json.dumps({"caller_name": "Alice", "urgency": "high"}).encode()
+        async with TestClient(TestServer(app)) as client:
+            r = await client.post(
+                "/webhook/vm", data=body,
+                headers={"X-Webhook-Signature": _hmac(self._SECRET, body)},
+            )
+            assert r.status == 200
+        content = bus.send.call_args.args[0].content
+        # The parsed dict (not the raw JSON string) is embedded in the prompt.
+        assert "'caller_name': 'Alice'" in content or '"caller_name": "Alice"' in content
+        assert "Alice" in content and "high" in content

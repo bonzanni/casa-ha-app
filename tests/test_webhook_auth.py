@@ -114,3 +114,24 @@ def test_unknown_mode_fails():
         "nonsense", body=b"", headers={},
         secret=SEC, header_name="X", tolerance_secs=0, now=0,
     )
+
+
+def test_timestamped_hmac_huge_timestamp_returns_false_not_raise():
+    # A 5000-digit timestamp must be rejected (no int() blowup → no 500).
+    hdr = "t=" + "9" * 5000 + ",v0=" + "a" * 64
+    assert not verify(
+        "timestamped_hmac", body=b"{}",
+        headers={"ElevenLabs-Signature": hdr},
+        secret=SEC, header_name="ElevenLabs-Signature",
+        tolerance_secs=300, now=1000,
+    )
+
+
+def test_timestamped_hmac_oversize_hex_rejected():
+    hdr = f"t=1000,v0={'a' * 5000}"
+    assert not verify(
+        "timestamped_hmac", body=b"{}",
+        headers={"ElevenLabs-Signature": hdr},
+        secret=SEC, header_name="ElevenLabs-Signature",
+        tolerance_secs=300, now=1000,
+    )

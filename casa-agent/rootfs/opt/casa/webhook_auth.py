@@ -40,8 +40,11 @@ _PROVIDER_MAX = 4096
 _TMP_SWEEP_SECS = 60
 
 # Strict single-instance parse: exactly ``t=<digits>,v0=<lowercase-hex>`` with
-# no leading/trailing/interior whitespace and no extra fields.
-_TS_RE = re.compile(r"^t=(\d+),v0=([0-9a-f]+)$")
+# no leading/trailing/interior whitespace and no extra fields. Both fields are
+# LENGTH-BOUNDED so an attacker cannot force a huge ``int()`` (a 5000-digit
+# timestamp would otherwise raise before auth → 500): a unix timestamp is ~10
+# digits, and a SHA-256 hex digest is 64 chars.
+_TS_RE = re.compile(r"^t=(\d{1,19}),v0=([0-9a-f]{1,128})$")
 
 
 def _ct_eq(a: bytes, b: bytes) -> bool:
