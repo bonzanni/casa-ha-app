@@ -22,8 +22,21 @@ from __future__ import annotations
 
 import hashlib
 import hmac
+import os
 import re
+import secrets
+import stat
+import time
+from pathlib import Path
 from typing import Mapping
+
+# Casa-minted secrets: 32 urlsafe bytes → exactly 43 base64url chars.
+_CASA_TOKEN_NBYTES = 32
+_CASA_TOKEN_LEN = 43
+# Provider (opaque) secret bounds (spec A2, Sol r4-4).
+_PROVIDER_MAX = 4096
+# Orphan staging-file sweep window.
+_TMP_SWEEP_SECS = 60
 
 # Strict single-instance parse: exactly ``t=<digits>,v0=<lowercase-hex>`` with
 # no leading/trailing/interior whitespace and no extra fields.
@@ -95,3 +108,104 @@ def verify(
         return _ct_eq(m.group(2).encode("ascii"), expected.encode("ascii"))
 
     return False
+
+
+# ---------------------------------------------------------------------------
+# Per-trigger secret storage (spec A2) — crash-safe staging, ownership-aware
+# validation. All reads/writes are fail-closed: an invalid or unreadable slot
+# yields ``None`` and the caller omits the trigger (never an open pass-through).
+# ---------------------------------------------------------------------------
+
+
+def _valid_value(owner: str, raw: bytes) -> bool:
+    """Owner-appropriate validation of a stored secret's bytes."""
+    if owner == "casa":
+        return len(raw) == _CASA_TOKEN_LEN and raw.isascii()
+    # provider: opaque, non-empty, bounded, printable ASCII.
+    if not raw or len(raw) > _PROVIDER_MAX:
+        return False
+    return all(0x20 <= b < 0x7F for b in raw)
+
+
+def _sweep_orphans(secrets_dir: Path) -> None:
+    now = time.time()
+    for p in secrets_dir.glob(".tmp-*"):
+        try:
+            if now - p.stat().st_mtime > _TMP_SWEEP_SECS:
+                p.unlink()
+        except OSError:
+            pass
+
+
+def _read_final(name: str, owner: str, secrets_dir: Path) -> bytes | None:
+    """Read and owner-validate the live secret; ``None`` on any anomaly.
+
+    ``O_NOFOLLOW`` rejects a symlinked final name; ``fstat`` rejects a
+    non-regular file.
+    """
+    path = secrets_dir / name
+    try:
+        fd = os.open(path, os.O_RDONLY | os.O_NOFOLLOW)
+    except OSError:
+        return None
+    try:
+        st = os.fstat(fd)
+        if not stat.S_ISREG(st.st_mode):
+            return None
+        raw = os.read(fd, _PROVIDER_MAX + 1)
+    finally:
+        os.close(fd)
+    return raw if _valid_value(owner, raw) else None
+
+
+def _publish(name: str, value: bytes, secrets_dir: Path) -> None:
+    """Atomically publish ``value`` at ``name`` via staging + linkat.
+
+    The final name never holds a partial file: a private staging file is
+    written and fsynced, then hard-linked into place (``EEXIST`` if a
+    concurrent winner already published — never clobbered).
+    """
+    secrets_dir.mkdir(mode=0o700, parents=True, exist_ok=True)
+    staging = secrets_dir / f".tmp-{os.getpid()}-{secrets.token_hex(8)}"
+    fd = os.open(staging, os.O_CREAT | os.O_EXCL | os.O_WRONLY | os.O_NOFOLLOW, 0o600)
+    try:
+        os.write(fd, value)
+        os.fsync(fd)
+    finally:
+        os.close(fd)
+    dir_fd = os.open(secrets_dir, os.O_DIRECTORY | os.O_NOFOLLOW)
+    try:
+        try:
+            os.link(staging, secrets_dir / name)
+        except FileExistsError:
+            pass  # a concurrent winner published first — keep theirs
+        os.fsync(dir_fd)
+    finally:
+        os.close(dir_fd)
+        try:
+            staging.unlink()
+        except OSError:
+            pass
+
+
+def read_secret(name: str, *, owner: str, secrets_dir: Path) -> bytes | None:
+    """Read the live secret for ``name`` (fail-closed)."""
+    return _read_final(name, owner, Path(secrets_dir))
+
+
+def ensure_secret(name: str, *, owner: str, secrets_dir: Path) -> bytes | None:
+    """Return the live secret for ``name``, minting it for ``owner="casa"`` if
+    absent. For ``owner="provider"`` this is read-only (Casa never mints a
+    provider secret) — returns ``None`` until imported.
+    """
+    secrets_dir = Path(secrets_dir)
+    if secrets_dir.exists():
+        _sweep_orphans(secrets_dir)
+    existing = _read_final(name, owner, secrets_dir)
+    if existing is not None:
+        return existing
+    if owner != "casa":
+        return None
+    _publish(name, secrets.token_urlsafe(_CASA_TOKEN_NBYTES).encode("ascii"),
+             secrets_dir)
+    return _read_final(name, owner, secrets_dir)
