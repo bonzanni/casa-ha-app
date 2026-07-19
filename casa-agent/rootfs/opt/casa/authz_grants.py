@@ -427,7 +427,7 @@ class _Challenge:
     challenge registered under the same key by a retry.
     """
 
-    key: GrantKey
+    key: Any            # GrantKey | trigger_consent.TriggerConsentKey
     scope: str
     rid: str
     req: Any                       # verdict_broker.PendingRequest
@@ -478,15 +478,121 @@ class ChallengeHandle:
 
 class ChallengeCoordinator:
     """Atomic challenge registration + async-settled setup driver + two-latch
-    cleanup + the single-owner authz finish hook (A:§3.4)."""
+    cleanup (A:§3.4).
+
+    Release B refactor: the registration/driver/latch machinery is GENERIC
+    (:meth:`register_challenge`) — what Approve *does* is supplied by the
+    caller (a sync commit step + a finish-hook factory), not hardwired.
+    :meth:`get_or_create` is the authz-grant flavor (GrantKey mint + agent
+    continuation dispatch, byte-for-byte the pre-refactor behavior);
+    ``trigger_consent.prompt_trigger_consent`` is the plugin-trigger flavor
+    (consent-ack record + reconcile, no continuation).
+    """
 
     def __init__(self) -> None:
-        self._entries: dict[GrantKey, _Challenge] = {}
+        # Keys are hashable challenge identities: ``GrantKey`` for authz
+        # grants, ``trigger_consent.TriggerConsentKey`` for trigger consents.
+        self._entries: dict[Any, _Challenge] = {}
         # Strong refs to the owned setup drivers so they are never GC'd
         # mid-flight; ``drain`` awaits exactly this set at shutdown.
         self._drivers: set[asyncio.Task] = set()
 
-    # -- registration (SYNCHRONOUS, loop-confined, single owner) ------------
+    # -- generic registration (SYNCHRONOUS, loop-confined, single owner) -----
+
+    def register_challenge(
+        self, key: Any, *, chat_id: int, operator_id: int, channel: Any,
+        challenge_text: str, options: "list[str] | None" = None,
+        on_commit_sync: "Callable[[int, dict], None] | None" = None,
+        finish_factory: "Callable[[int, Any], Callable[[dict], Any]] | None" = None,
+        kind: str = "authz", meta_extra: "dict | None" = None,
+        timeout_s: "float | None" = None,
+    ) -> ChallengeHandle:
+        """Register ONE operator challenge keyboard for *key* (dedup by key).
+
+        *on_commit_sync(option_index, meta)* runs in the Telegram callback
+        IMMEDIATELY after a successful commit (no await between) — the
+        caller's atomic record step (GrantKey mint / consent-ack write); it
+        mutates the broker-owned *meta* to signal the finish hook.
+        *finish_factory(message_id, req)* returns the settlement hook — the
+        single serialized owner of ALL post-commit async work.
+
+        Size validation runs BEFORE any insert: oversized ⇒ refused handle,
+        NO entry, NO keyboard, NO registration. The broker scope stays
+        ``authz:{chat_id}`` for every kind — the Telegram DM callback resolves
+        taps under that scope and fail-closes on the meta's chat/operator.
+        """
+        existing = self._entries.get(key)
+        if existing is not None:
+            return ChallengeHandle(created=False, _challenge=existing)
+
+        if len(challenge_text) > _CHALLENGE_MAX_CHARS:
+            return ChallengeHandle(created=True, refused="args_too_large")
+
+        options = list(options or ["Approve", "Deny"])
+        broker = _broker()
+        rid = uuid.uuid4().hex
+        scope = f"authz:{chat_id}"
+        # register() shallow-copies this dict; the complete meta (minus the
+        # self-referential on_commit_sync) is supplied up front.
+        meta = {
+            "kind": kind,
+            "chat_id": chat_id,
+            "operator_id": operator_id,
+            "options": options,
+            "_scope": scope,
+        }
+        meta.update(meta_extra or {})
+        req, _created = broker.register(
+            namespace="resident_ask", scope=scope, request_id=rid,
+            timeout_s=(_CHALLENGE_TTL_S if timeout_s is None else timeout_s),
+            detached=True, supersede=False, meta=meta,
+        )
+
+        # The sync step MUST mutate the BROKER-OWNED req.meta (register()
+        # shallow-copied our dict), so it is attached AFTER register with the
+        # broker's own dict captured — mutating the caller's original would be
+        # invisible to the finish hook (which reads e.g. req.meta["minted"]).
+        if on_commit_sync is not None:
+            def _step(idx: int, _meta: dict = req.meta,
+                      _cb: Callable[[int, dict], None] = on_commit_sync) -> None:
+                _cb(idx, _meta)
+
+            req.meta["on_commit_sync"] = _step
+
+        ch = _Challenge(key=key, scope=scope, rid=rid, req=req, broker=broker)
+        # Request latch: fires on EVERY terminal resolution of the future
+        # (answered / no_answer / cancelled / delivery_failed).
+        req._future.add_done_callback(
+            lambda _f, _c=ch: self._settle_request(_c)
+        )
+        self._entries[key] = ch
+
+        async def _post() -> Any:
+            return await channel.post_dm_keyboard(
+                chat_id=chat_id, request_id=rid, text=challenge_text,
+                options=options,
+            )
+
+        def _finish_factory(message_id: int, _req: Any = req) -> Callable[[dict], Any]:
+            if finish_factory is None:
+                async def _noop(_outcome: dict) -> None:
+                    return None
+                return _noop
+            return finish_factory(message_id, _req)
+
+        # Spawn the owned SETUP DRIVER (strong-ref'd): it does ONLY the
+        # posting / setup settlement (single registration owner — register
+        # already happened synchronously above).
+        driver = asyncio.get_running_loop().create_task(
+            self._drive(ch, _post, _finish_factory)
+        )
+        ch.driver = driver
+        self._drivers.add(driver)
+        driver.add_done_callback(self._drivers.discard)
+
+        return ChallengeHandle(created=True, _challenge=ch)
+
+    # -- the authz-grant flavor ----------------------------------------------
 
     def get_or_create(
         self, key: GrantKey, *, chat_id: int, operator_id: int,
@@ -508,77 +614,37 @@ class ChallengeCoordinator:
             canonical_json=canonical_json, summary=summary,
             display_name=display_name,
         )
-        if len(challenge_text) > _CHALLENGE_MAX_CHARS:
-            return ChallengeHandle(created=True, refused="args_too_large")
 
-        broker = _broker()
-        rid = uuid.uuid4().hex
-        scope = f"authz:{chat_id}"
-        # register() shallow-copies this dict; the complete meta (minus the
-        # self-referential on_commit_sync) is supplied up front.
-        req, _created = broker.register(
-            namespace="resident_ask", scope=scope, request_id=rid,
-            timeout_s=_CHALLENGE_TTL_S, detached=True, supersede=False,
-            meta={
-                "kind": "authz",
-                "chat_id": chat_id,
-                "operator_id": operator_id,
-                "target_role": target_role,
-                "grant_key": key,
-                "canonical_args_json": canonical_json,
-                "enforcement_role": enforcement_role,
-                "options": ["Approve", "Deny"],
-                "_scope": scope,
-            },
-        )
-
-        # The sync step MUST mutate the BROKER-OWNED req.meta (register()
-        # shallow-copied our dict), so it is attached AFTER register with the
-        # broker's own dict captured — mutating the caller's original would be
-        # invisible to the finish hook (which reads req.meta["minted"]).
-        def _on_commit_sync(idx: int, _meta: dict = req.meta, _key: GrantKey = key) -> None:
+        def _on_commit_sync(idx: int, meta: dict, _key: GrantKey = key) -> None:
             # Runs in the Telegram callback IMMEDIATELY after a successful
             # commit (no await between): idx 0 -> mint + record; idx 1 -> no-op.
             if idx == 0:
                 GRANTS.mint(_key)
-                _meta["minted"] = True
+                meta["minted"] = True
 
-        req.meta["on_commit_sync"] = _on_commit_sync
-
-        ch = _Challenge(key=key, scope=scope, rid=rid, req=req, broker=broker)
-        # Request latch: fires on EVERY terminal resolution of the future
-        # (answered / no_answer / cancelled / delivery_failed).
-        req._future.add_done_callback(
-            lambda _f, _c=ch: self._settle_request(_c)
-        )
-        self._entries[key] = ch
-
-        async def _post() -> Any:
-            return await channel.post_dm_keyboard(
-                chat_id=chat_id, request_id=rid, text=challenge_text,
-                options=["Approve", "Deny"],
-            )
-
-        def _finish_factory(message_id: int) -> Callable[[dict], Any]:
+        def _finish_factory(message_id: int, req: Any) -> Callable[[dict], Any]:
+            # rid comes from the req itself (never an entry lookup — a retry
+            # re-registered under the same key must not lend its rid here).
             return self._make_finish_hook(
                 channel=channel, chat_id=chat_id, operator_id=operator_id,
                 target_role=target_role, enforcement_role=enforcement_role,
                 tool_name=tool_name, canonical_json=canonical_json,
-                rid=rid, message_id=message_id, req=req,
+                rid=req.request_id, message_id=message_id, req=req,
                 display_name=display_name,
             )
 
-        # Spawn the owned SETUP DRIVER (strong-ref'd): it does ONLY the
-        # posting / setup settlement (single registration owner — register
-        # already happened synchronously above).
-        driver = asyncio.get_running_loop().create_task(
-            self._drive(ch, _post, _finish_factory)
+        return self.register_challenge(
+            key, chat_id=chat_id, operator_id=operator_id, channel=channel,
+            challenge_text=challenge_text,
+            on_commit_sync=_on_commit_sync, finish_factory=_finish_factory,
+            kind="authz",
+            meta_extra={
+                "target_role": target_role,
+                "grant_key": key,
+                "canonical_args_json": canonical_json,
+                "enforcement_role": enforcement_role,
+            },
         )
-        ch.driver = driver
-        self._drivers.add(driver)
-        driver.add_done_callback(self._drivers.discard)
-
-        return ChallengeHandle(created=True, _challenge=ch)
 
     # -- owned setup driver -------------------------------------------------
 
@@ -702,12 +768,16 @@ class ChallengeCoordinator:
         the provided filters (keyboard -> expired via the finish hook). Returns
         the number of records actually cancelled."""
 
-        def _matches(k: GrantKey) -> bool:
-            if role is not None and k.enforcement_role == role:
+        def _matches(k: Any) -> bool:
+            # getattr-based so BOTH key types match on the fields they carry:
+            # GrantKey has all three; TriggerConsentKey carries artifact_id
+            # only (a lifecycle artifact invalidation must kill its pending
+            # consent keyboard; role/chat filters never match it).
+            if role is not None and getattr(k, "enforcement_role", None) == role:
                 return True
-            if artifact is not None and k.artifact_id == artifact:
+            if artifact is not None and getattr(k, "artifact_id", None) == artifact:
                 return True
-            if chat is not None and k.chat_id == chat:
+            if chat is not None and getattr(k, "chat_id", None) == chat:
                 return True
             return False
 
