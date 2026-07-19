@@ -1,11 +1,31 @@
 {
   "$schema": "https://json-schema.org/draft/2020-12/schema",
   "$id": "casa:triggers.v1",
+  "$comment": "Accepts schema_version 1 (legacy; webhook requires path) and 2 (per-trigger auth + clearance; path forbidden). Filename kept for loader-path stability.",
   "type": "object",
   "additionalProperties": false,
   "required": ["schema_version", "triggers"],
+  "$defs": {
+    "auth": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["mode"],
+      "properties": {
+        "mode": {"type": "string", "enum": ["hmac_body", "static_header", "timestamped_hmac"]},
+        "header": {"type": "string", "pattern": "^[!#$%&'*+._`|~0-9A-Za-z-]+$"},
+        "tolerance_secs": {"type": "integer", "minimum": 60, "maximum": 3600},
+        "secret_owner": {"type": "string", "enum": ["casa", "provider"]}
+      },
+      "allOf": [
+        {
+          "if": {"required": ["secret_owner"], "properties": {"secret_owner": {"const": "provider"}}},
+          "then": {"properties": {"mode": {"const": "timestamped_hmac"}}}
+        }
+      ]
+    }
+  },
   "properties": {
-    "schema_version": {"const": 1},
+    "schema_version": {"enum": [1, 2]},
     "triggers": {
       "type": "array",
       "items": {
@@ -20,7 +40,9 @@
           "path":        {"type": "string", "pattern": "^/.+"},
           "channel":     {"type": "string"},
           "prompt":      {"type": "string", "minLength": 1},
-          "prompt_file": {"type": "string", "minLength": 1, "pattern": "\\.md$"}
+          "prompt_file": {"type": "string", "minLength": 1, "pattern": "\\.md$"},
+          "clearance":   {"type": "string", "enum": ["public", "friends", "family"]},
+          "auth":        {"$ref": "#/$defs/auth"}
         },
         "allOf": [
           {
@@ -42,13 +64,47 @@
                 {"required": ["prompt_file"], "not": {"required": ["prompt"]}}
               ]
             }
-          },
-          {
-            "if": {"properties": {"type": {"const": "webhook"}}},
-            "then": {"required": ["path"]}
           }
         ]
       }
     }
-  }
+  },
+  "allOf": [
+    {
+      "$comment": "v1 legacy: webhook triggers require path (unchanged behavior).",
+      "if": {"properties": {"schema_version": {"const": 1}}},
+      "then": {
+        "properties": {
+          "triggers": {
+            "items": {
+              "allOf": [
+                {
+                  "if": {"properties": {"type": {"const": "webhook"}}},
+                  "then": {"required": ["path"]}
+                }
+              ]
+            }
+          }
+        }
+      }
+    },
+    {
+      "$comment": "v2: webhook triggers forbid path (served at /webhook/<name>).",
+      "if": {"properties": {"schema_version": {"const": 2}}},
+      "then": {
+        "properties": {
+          "triggers": {
+            "items": {
+              "allOf": [
+                {
+                  "if": {"properties": {"type": {"const": "webhook"}}},
+                  "then": {"not": {"required": ["path"]}}
+                }
+              ]
+            }
+          }
+        }
+      }
+    }
+  ]
 }
