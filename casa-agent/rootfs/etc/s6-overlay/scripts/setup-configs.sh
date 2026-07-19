@@ -374,6 +374,16 @@ fi
 # Drop any legacy profile.d leftover from earlier drafts. Safe on fresh install.
 rm -f /etc/profile.d/casa-tools.sh
 
+# --- G7 (v0.95.1): keep interpreter bytecode OUT of plugin artifacts -------
+# A Python plugin MCP server used to bytecode-cache into its own frozen,
+# checksummed store artifact (-> corrupt_artifact on the next health regen;
+# and a writable cache inside an artifact is the foothold for a crafted-.pyc
+# shadow attack). Redirect ALL python bytecode caches to a disposable
+# location for every s6-supervised service and their children (the CC CLI
+# and plugin MCP servers inherit this).
+mkdir -p /tmp/casa-pycache
+printf "%s" /tmp/casa-pycache > /run/s6/container_environment/PYTHONPYCACHEPREFIX
+
 # --- Plan 4b: system-requirements reconciliation (§4.3.4) -----------------
 # Reconciler runs the declared install strategy for every plugin tool that is
 # missing after upgrade (persistent volume survives, but failures / user-wipes

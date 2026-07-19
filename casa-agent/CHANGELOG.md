@@ -1,5 +1,18 @@
 # Changelog
 
+## [0.95.1] - 2026-07-19
+
+### Fixed
+
+- Python-based plugins no longer corrupt their own installed artifact:
+  the interpreter's bytecode cache is redirected outside plugin artifacts,
+  artifacts are now fully frozen (directories included), any bytecode
+  committed to a plugin repo is stripped at publish, and artifacts already
+  poisoned by the old behavior are healed at boot when their only drift is
+  bytecode. Integrity checksums remain strict — bytecode inside an
+  artifact still reads as tampering, because a crafted cache file could
+  otherwise silently replace checksummed code at import time.
+
 ## [0.95.0] - 2026-07-19
 
 Plugin state directories now work as documented.
