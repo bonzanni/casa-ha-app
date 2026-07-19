@@ -203,3 +203,37 @@ class TestNonDelegationNotificationPassthrough:
         prompt = _FakeClient.captured_prompts[0]
         assert "[System notification: your delegation to" not in prompt
         assert "a plain string, not a DelegationComplete" in prompt
+
+
+class TestSynthesisPreservesOriginMarkers:
+    """Release A Layer 3: completion synthesis must carry the origin markers
+    from DelegationComplete.origin into the synthesized turn's context, so a
+    delegating /invoke keeps private clearance instead of fail-closing."""
+
+    def _synth(self, agent, origin):
+        complete = DelegationComplete(
+            delegation_id="d-mk", agent="finance", status="ok", text="done",
+            origin={"role": "assistant", "channel": "webhook", "chat_id": "x",
+                    "cid": "c", "user_text": "q", **origin},
+        )
+        msg = BusMessage(
+            type=MessageType.NOTIFICATION, source="finance", target="assistant",
+            content=complete, channel="webhook",
+            context={"cid": "c", "chat_id": "x"},
+        )
+        return agent._synthesize_delegation_turn(msg)
+
+    async def test_invoke_route_preserved(self, tmp_path):
+        out = self._synth(_make_agent(tmp_path), {"_origin_route": "invoke"})
+        assert out.context["_origin_route"] == "invoke"
+
+    async def test_webhook_trigger_clearance_preserved(self, tmp_path):
+        out = self._synth(_make_agent(tmp_path), {
+            "_origin_route": "webhook_trigger", "_origin_clearance": "family"})
+        assert out.context["_origin_route"] == "webhook_trigger"
+        assert out.context["_origin_clearance"] == "family"
+
+    async def test_no_markers_no_stray_keys(self, tmp_path):
+        out = self._synth(_make_agent(tmp_path), {})
+        assert "_origin_route" not in out.context
+        assert "_origin_clearance" not in out.context

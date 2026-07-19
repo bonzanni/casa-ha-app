@@ -562,13 +562,23 @@ class Agent:
             "Reply to the user via their original channel. Be concise.\n"
         )
 
+        # Release A Layer 3: the notification's context carries only cid/chat_id,
+        # so copy the trusted origin markers from the PERSISTED completion origin
+        # into the synthesized turn — otherwise a delegating /invoke would
+        # fail-close to public/restricted on resume. These keys are reserved
+        # (server-set), so the persisted origin value is the trustworthy one.
+        synth_context = dict(msg.context)
+        for _marker_key in ("_origin_route", "_origin_clearance"):
+            if _marker_key in origin:
+                synth_context[_marker_key] = origin[_marker_key]
+
         return BusMessage(
             type=MessageType.REQUEST,
             source=msg.source,
             target=msg.target,
             content=body,
             channel=msg.channel,
-            context=dict(msg.context),
+            context=synth_context,
         )
 
     # ------------------------------------------------------------------
