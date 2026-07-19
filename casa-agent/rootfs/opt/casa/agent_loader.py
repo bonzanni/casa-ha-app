@@ -8,6 +8,7 @@ verbatim.
 from __future__ import annotations
 
 import json
+import logging
 import os
 from typing import Any
 
@@ -635,6 +636,37 @@ def _build_executor_memory(block: dict[str, Any]) -> "ExecutorMemoryConfig":
     )
 
 
+logger = logging.getLogger(__name__)
+
+# Default signature header per auth mode (spec A1).
+_DEFAULT_AUTH_HEADER = {
+    "hmac_body": "X-Webhook-Signature",
+    "static_header": "X-API-Key",
+    "timestamped_hmac": "ElevenLabs-Signature",
+}
+
+
+def _normalize_webhook_auth(trig: dict[str, Any], trig_name: str) -> dict[str, Any]:
+    """Return a fully-defaulted auth policy for a webhook trigger.
+
+    An absent ``auth`` block synthesizes ``hmac_body`` — this also covers v1
+    webhook triggers (which have no ``auth`` key), so they inherit the global-
+    secret HMAC and the fail-closed registration rule uniformly (spec A1).
+    """
+    auth = dict(trig.get("auth") or {})
+    mode = auth.get("mode", "hmac_body")
+    auth["mode"] = mode
+    auth.setdefault("header", _DEFAULT_AUTH_HEADER.get(mode, "X-Webhook-Signature"))
+    auth.setdefault("tolerance_secs", 300)
+    auth.setdefault("secret_owner", "casa")
+    if trig.get("path"):
+        logger.warning(
+            "webhook trigger %r: 'path' is deprecated and ignored; served at "
+            "/webhook/%s", trig_name, trig.get("name", trig_name),
+        )
+    return auth
+
+
 def _build_triggers(
     data: dict[str, Any], *, agent_dir: str,
 ) -> list[TriggerSpec]:
@@ -648,6 +680,7 @@ def _build_triggers(
             )
         else:
             prompt_text = ""  # webhook triggers have no prompt
+        is_webhook = t.get("type") == "webhook"
         specs.append(TriggerSpec(
             name=t["name"],
             type=t["type"],
@@ -656,6 +689,8 @@ def _build_triggers(
             path=t.get("path", "") or "",
             channel=t.get("channel", "") or "",
             prompt=prompt_text,
+            auth=_normalize_webhook_auth(t, trig_name) if is_webhook else None,
+            clearance=t.get("clearance", "public") if is_webhook else "public",
         ))
     return specs
 
