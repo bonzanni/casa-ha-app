@@ -122,6 +122,18 @@ async def test_unexpected_backend_error_is_unavailable_not_ok(monkeypatch):
     assert payload["status"] == "unavailable"
 
 
+async def test_sem_none_returns_unavailable_not_ok(monkeypatch):
+    """No backend wired = memory cannot be checked — never a fake zero-hit."""
+    monkeypatch.setattr(agent_mod, "active_semantic_memory", None, raising=False)
+    token = agent_mod.origin_var.set({"role": "assistant", "channel": "telegram"})
+    try:
+        out = await tools.recall_memory.handler({"query": "q"})
+    finally:
+        agent_mod.origin_var.reset(token)
+    payload = json.loads(out["content"][0]["text"])
+    assert payload["status"] == "unavailable"
+
+
 async def test_zero_hit_recall_stays_ok_with_empty_memory(monkeypatch):
     """A genuine zero-hit search keeps the {status: ok, memory: ""} shape."""
     class _Empty:

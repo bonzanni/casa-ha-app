@@ -154,11 +154,19 @@ class HindsightSemanticMemory(SemanticMemory):
         results = resp.get("results") if isinstance(resp, dict) else None
         if not isinstance(results, list):
             raise _unavailable("malformed_envelope")
+        try:
+            digest = render_recall(resp)
+        except Exception as exc:  # noqa: BLE001 — non-dict/odd items must not leak raw
+            raise _unavailable("malformed_envelope") from exc
+        if results and not digest:
+            # Hits exist but none rendered ([{}], empty text, …): that is NOT
+            # a genuine zero-hit — the memories cannot be read.
+            raise _unavailable("malformed_envelope")
         logger.info(
             "memory_recall bank=%s tags=%s outcome=%s hits=%d latency_ms=%d",
             bank, tags, "hits" if results else "empty", len(results), _latency_ms(),
         )
-        return render_recall(resp)
+        return digest
 
     async def profile(self, bank: str) -> str:
         _validate_bank_id(bank)

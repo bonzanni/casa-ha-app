@@ -266,6 +266,36 @@ async def test_empty_reply_no_retain(monkeypatch):
 
 
 # ---------------------------------------------------------------------------
+# Test 5b: Recall unavailable → explicit status note, never a fake digest
+# ---------------------------------------------------------------------------
+
+
+async def test_recall_unavailable_injects_status_note(monkeypatch):
+    """When memory could not be checked, the specialist is told so explicitly
+    — a silent cold turn would let it claim Casa lacks information."""
+    import agent as agent_mod
+    from semantic_memory import RecallUnavailable
+
+    class _DownSem(_FakeSem):
+        async def recall(self, *a, **k):
+            raise RecallUnavailable("http_504")
+
+    cfg = _specialist_cfg(role="finance", token_budget=4000)
+    monkeypatch.setattr(agent_mod, "active_semantic_memory", _DownSem(), raising=False)
+    _set_origin(monkeypatch, channel="telegram")
+    _FakeSDKClient.reset(response="ok")
+
+    with patch.object(tools, "ClaudeSDKClient", _FakeSDKClient):
+        output = await tools._run_delegated_agent(cfg, task_text="hi", context_text="")
+
+    assert output.text == "ok"                      # turn still completes
+    prompt = _FakeSDKClient.captured_prompt
+    assert '<memory_context agent="finance" status="unavailable">' in prompt
+    assert "could not be checked" in prompt
+    # No fabricated digest content beyond the status note.
+
+
+# ---------------------------------------------------------------------------
 # Test 6: Legacy helpers are gone
 # ---------------------------------------------------------------------------
 

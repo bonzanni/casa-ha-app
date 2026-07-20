@@ -59,7 +59,12 @@ async def delegated_recall(
         logger.warning("delegated recall unavailable (channel=%s)", origin_channel)
         raise
     except Exception as exc:  # noqa: BLE001 — typed for callers, never a raw crash
-        logger.warning("delegated recall failed (channel=%s)", origin_channel, exc_info=True)
+        # Exception TYPE only — repr/traceback could embed the query text,
+        # which must never be logged.
+        logger.warning(
+            "delegated recall failed (channel=%s): %s",
+            origin_channel, type(exc).__name__,
+        )
         raise RecallUnavailable("backend_error") from exc
 
 

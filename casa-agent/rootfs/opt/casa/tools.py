@@ -1496,9 +1496,18 @@ async def _run_delegated_agent(
                     max_tokens=cfg.memory.token_budget,
                 )
             except RecallUnavailable:
-                # Delegated turn proceeds cold; inject nothing rather than an
-                # empty block the specialist could read as "no memories exist".
+                # Delegated turn proceeds cold, but the specialist is TOLD the
+                # check failed — a silent cold turn reads as "no memories
+                # exist" and the specialist would claim absence to the user.
                 digest = ""
+                memory_block = (
+                    f'<memory_context agent="{cfg.role}" status="unavailable">\n'
+                    "Long-term memory could not be checked for this task "
+                    "(backend unavailable). Do not conclude Casa lacks "
+                    "information on any topic — if asked, say memory could "
+                    "not be checked.\n"
+                    "</memory_context>\n\n"
+                )
             if digest:
                 memory_block = (
                     f'<memory_context agent="{cfg.role}">\n'
@@ -3534,7 +3543,15 @@ async def recall_memory(args: dict) -> dict:
                         "message": "Error: query is required"})
     sem = getattr(agent_mod, "active_semantic_memory", None)
     if sem is None:
-        return _result({"status": "ok", "memory": ""})  # not wired / cold
+        # No backend wired: memory CANNOT be checked — never a fake zero-hit.
+        return _result({
+            "status": "unavailable",
+            "message": (
+                "Long-term memory could not be checked (no memory backend). "
+                "Do NOT say the information doesn't exist — say memory "
+                "couldn't be checked."
+            ),
+        })
 
     origin = _snapshot_origin()
     role = origin.get("role", "assistant")
@@ -5467,8 +5484,10 @@ async def _synthesize_answer(
 @tool(
     "query_engager",
     "Ask the engaging agent a question. Returns synthesized answer from the "
-    "engager's clearance-filtered memory, or status=unknown. Callable only from "
-    "inside an active engagement.",
+    "engager's clearance-filtered memory; status=unknown means the memory was "
+    "searched and holds nothing relevant; status=unavailable means memory "
+    "could not be checked (do not conclude the information doesn't exist). "
+    "Callable only from inside an active engagement.",
     {"question": str, "max_tokens": int},
 )
 async def query_engager(args: dict) -> dict:
@@ -5485,7 +5504,10 @@ async def query_engager(args: dict) -> dict:
     sem = getattr(agent_mod, "active_semantic_memory", None)
     context = ""
     memory_unavailable = False
-    if sem is not None:
+    if sem is None:
+        # No backend wired: the engager's memory cannot be checked.
+        memory_unavailable = True
+    else:
         try:
             context = await delegated_recall(
                 sem, query=question,
@@ -5515,7 +5537,13 @@ async def query_engager(args: dict) -> dict:
             pass
 
     if memory_unavailable:
-        return _result({"status": "unavailable", "text": ""})
+        return _result({
+            "status": "unavailable", "text": "",
+            "message": (
+                "The engager's memory could not be checked (backend "
+                "unavailable). Do not conclude the information doesn't exist."
+            ),
+        })
     if not context:
         return _result({"status": "unknown", "text": ""})
     answer = await _synthesize_answer(question, context, max_tokens)

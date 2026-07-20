@@ -242,6 +242,35 @@ def test_breaker_failed_probe_reopens_for_full_cooldown():
     assert b.allow()
 
 
+def test_breaker_half_open_allows_exactly_one_probe():
+    """Concurrent turns after cooldown must not all probe at once — the
+    half-open state admits ONE probe until it records success or failure."""
+    now = [0.0]
+    b = _RecallBreaker(threshold=3, cooldown_s=60.0, clock=lambda: now[0])
+    for _ in range(3):
+        b.record_failure()
+    now[0] += 61
+    assert b.allow()            # first turn reserves the probe
+    assert not b.allow()        # concurrent turn: probe already in flight
+    assert not b.allow()
+    b.record_success()
+    assert b.allow()            # closed again — everyone may recall
+
+
+def test_breaker_stale_probe_reservation_expires():
+    """A probe whose turn died without recording (e.g. cancelled) must not
+    wedge the breaker: the reservation expires after a cooldown."""
+    now = [0.0]
+    b = _RecallBreaker(threshold=3, cooldown_s=60.0, clock=lambda: now[0])
+    for _ in range(3):
+        b.record_failure()
+    now[0] += 61
+    assert b.allow()            # probe reserved, never recorded
+    assert not b.allow()
+    now[0] += 61                # reservation stale
+    assert b.allow()            # a fresh probe may proceed
+
+
 def test_breaker_successful_probe_closes():
     now = [0.0]
     b = _RecallBreaker(threshold=3, cooldown_s=60.0, clock=lambda: now[0])

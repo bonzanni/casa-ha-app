@@ -2,7 +2,8 @@
 """Long-term semantic-memory seam (memory re-architecture spec §5).
 
 A small interface shaped to a best-in-class backend (Hindsight), with a
-NoOp degraded impl (empty strings → the agent runs cold on its SDK thread).
+NoOp degraded impl (recall unavailable, silent writes → the agent runs cold
+on its SDK thread).
 Reads return rendered markdown digests for the system prompt; ``retain``
 is fire-and-forget (None). Short-term/recency is NOT here — that is owned
 by the SDK session.
@@ -95,8 +96,14 @@ class SemanticMemory(ABC):
 
 
 class NoOpSemanticMemory(SemanticMemory):
-    """Degraded backend: retain is silent, reads return ''. The agent then
-    runs on its SDK thread alone (cold long-term)."""
+    """Degraded backend: retain is silent, profile returns ''. The agent then
+    runs on its SDK thread alone (cold long-term).
+
+    ``recall`` raises :class:`RecallUnavailable` (v0.99.0): a NoOp cannot
+    CHECK memory, and returning '' would fabricate a genuine-looking zero-hit
+    search — agents would then claim "nothing found" where no search ever
+    ran. The overlay (``profile``) stays a silent '' because nothing claims
+    absence from a missing overlay."""
 
     async def retain(
         self, bank: str, items: list[dict[str, Any]], *, async_: bool = True,
@@ -108,7 +115,7 @@ class NoOpSemanticMemory(SemanticMemory):
         types: tuple[str, ...] = ("world", "experience", "observation"),
         tags_match: str = "any", budget: str = "mid",
     ) -> str:
-        return ""
+        raise RecallUnavailable("not_configured")
 
     async def profile(self, bank: str) -> str:
         return ""

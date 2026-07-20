@@ -31,9 +31,20 @@ async def test_noop_retain_is_silent() -> None:
     assert await mem.retain("casa-assistant", [{"content": "x"}]) is None
 
 
-async def test_noop_reads_return_empty_string() -> None:
+async def test_noop_recall_raises_unavailable() -> None:
+    """A NoOp backend cannot CHECK memory, so its recall is UNAVAILABLE —
+    returning '' would fabricate a genuine-looking zero-hit search and let
+    agents claim "nothing found" where no search ever ran."""
     mem = NoOpSemanticMemory()
-    assert await mem.recall("casa-assistant", "q", tags=["house"], max_tokens=512) == ""
+    with pytest.raises(RecallUnavailable) as ei:
+        await mem.recall("casa-assistant", "q", tags=["house"], max_tokens=512)
+    assert ei.value.reason == "not_configured"
+
+
+async def test_noop_profile_returns_empty_string() -> None:
+    # The overlay is optional enrichment (nothing claims absence from it),
+    # so the NoOp profile stays a silent ''.
+    mem = NoOpSemanticMemory()
     assert await mem.profile("casa-assistant") == ""
 
 

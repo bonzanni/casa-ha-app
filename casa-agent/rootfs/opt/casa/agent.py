@@ -229,22 +229,39 @@ class _RecallBreaker:
         self._clock = clock
         self._failures = 0
         self._opened_at: float | None = None
+        self._probe_started_at: float | None = None  # half-open probe in flight
 
     @property
     def open(self) -> bool:
         return self._opened_at is not None
 
     def allow(self) -> bool:
-        """True when a recall attempt may proceed (closed, or half-open probe)."""
+        """True when a recall attempt may proceed (closed, or THE half-open
+        probe). In half-open state exactly one probe is admitted at a time —
+        concurrent turns arriving after cooldown must not all hit the backend
+        at once. Calling this in half-open state RESERVES the probe; the
+        reservation is released by record_success/record_failure, and expires
+        after a cooldown so a turn that died without recording (cancelled
+        mid-probe) cannot wedge the breaker open forever. All calls run on
+        the one event loop, so no lock is needed."""
         if self._opened_at is None:
             return True
-        return self._clock() - self._opened_at >= self._cooldown_s
+        now = self._clock()
+        if now - self._opened_at < self._cooldown_s:
+            return False
+        if (self._probe_started_at is not None
+                and now - self._probe_started_at < self._cooldown_s):
+            return False
+        self._probe_started_at = now
+        return True
 
     def record_success(self) -> None:
         self._failures = 0
         self._opened_at = None
+        self._probe_started_at = None
 
     def record_failure(self) -> None:
+        self._probe_started_at = None
         self._failures += 1
         if self._failures >= self._threshold:
             self._opened_at = self._clock()  # re-stamps on a failed half-open probe
@@ -1054,15 +1071,16 @@ class Agent:
                     int((time.monotonic() - _recall_t0) * 1000),
                     self._recall_breaker.open,
                 )
-            except Exception:  # noqa: BLE001
+            except Exception as exc:  # noqa: BLE001
                 self._recall_breaker.record_failure()
+                # Exception TYPE only — repr/traceback could embed the query
+                # text, which must never be logged.
                 logger.warning(
-                    "auto_recall role=%s outcome=unavailable reason=unexpected "
+                    "auto_recall role=%s outcome=unavailable reason=unexpected:%s "
                     "latency_ms=%d breaker_open=%s",
-                    self.config.role,
+                    self.config.role, type(exc).__name__,
                     int((time.monotonic() - _recall_t0) * 1000),
                     self._recall_breaker.open,
-                    exc_info=True,
                 )
         parts: list[str] = []
         if overlay_digest:

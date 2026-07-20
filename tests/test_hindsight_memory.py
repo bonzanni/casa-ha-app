@@ -319,6 +319,22 @@ async def test_recall_wellformed_empty_is_zero_hits() -> None:
     assert await mem.recall("casa", "q", tags=["public"], max_tokens=100) == ""
 
 
+@pytest.mark.parametrize("results", [
+    [{}],                       # item with no text
+    [{"text": ""}],             # item with empty text
+    ["not a dict"],             # non-dict item (render would raise)
+    [{"text": None}],           # null text
+])
+async def test_recall_unrenderable_results_are_unavailable_not_zero_hits(results) -> None:
+    """Non-empty results that render to nothing are NOT a genuine zero-hit —
+    hits exist but cannot be read, so the recall is UNAVAILABLE."""
+    mem = HindsightSemanticMemory(base_url="http://hs:8888")
+    mem._request = AsyncMock(return_value={"results": results})
+    with pytest.raises(RecallUnavailable) as ei:
+        await mem.recall("casa", "q", tags=["public"], max_tokens=100)
+    assert ei.value.reason == "malformed_envelope"
+
+
 async def test_recall_logs_unavailable_with_latency_not_query(caplog) -> None:
     mem = HindsightSemanticMemory(base_url="http://hs:8888")
     mem._session = _SeqSession([_SeqResp(raise_for_status_exc=_http_err(504))])

@@ -140,3 +140,5 @@ async def test_unavailable_recall_returns_unavailable_not_unknown(tmp_path, monk
 
     payload = json.loads(res["content"][0]["text"])
     assert payload["status"] == "unavailable"
+    assert "could not be checked" in payload["message"]
+    assert "unavailable" in query_engager.description   # tool advertises the third status
