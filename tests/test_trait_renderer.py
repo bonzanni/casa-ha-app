@@ -49,3 +49,14 @@ def test_every_non_neutral_phrase_mapping(axis: str, level: int) -> None:
 
 def test_estimator_normalizes_nfc_and_line_endings() -> None:
     assert estimate_tokens_v1("é\r\nabcd") == estimate_tokens_v1("é\nabcd")
+
+
+def test_estimator_case_goldens() -> None:
+    # Consumes every fixture estimator case so none is dead data. Case 0 uses a
+    # DECOMPOSED "e" + U+0301 (combining acute) plus a CRLF: under the specified
+    # NFC+LF normalization it composes/collapses to 6 scalars -> 6//4 == 1. An
+    # estimator that skipped NFC would count 8 -> 2 and fail here, so this golden
+    # actively guards the normalization step.
+    data = json.loads(FIXTURE.read_text(encoding="utf-8"))
+    for case in data["estimator_cases"]:
+        assert estimate_tokens_v1(case["input"]) == case["expected"], case["input"]
