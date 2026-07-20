@@ -112,26 +112,29 @@ def run_contract(
         f"/v1/default/banks/{bank}/memories",
         retain_body,
     )
-    time.sleep(8)
+    time.sleep(12)
 
+    # Recall once per sensitivity tier. Tag filtering deterministically surfaces
+    # every retained item under its own tier, independent of semantic ranking or
+    # budget truncation, so `observed` reliably contains all contract cases.
     recall_envelopes = []
     observed = {}
-    for budget in ("low", "mid"):
+    for tier in ("public", "friends", "family", "private"):
         _, envelope = _request(
             base_url,
             "POST",
             f"/v1/default/banks/{bank}/memories/recall",
             {
                 "query": fixture["query"],
-                "tags": ["public", "friends", "family", "private"],
+                "tags": [tier],
                 "tags_match": "any",
-                "max_tokens": 2048,
+                "max_tokens": 8192,
                 "types": ["world", "experience", "observation"],
-                "budget": budget,
+                "budget": "high",
             },
             timeout=90,
         )
-        recall_envelopes.append({"budget": budget, "response": envelope})
+        recall_envelopes.append({"tier": tier, "response": envelope})
         for result in envelope.get("results", []):
             for tag in result.get("tags", []):
                 if isinstance(tag, str) and tag.startswith("contract-id-"):
@@ -174,17 +177,23 @@ def run_contract(
                 "query": fixture["query"],
                 "tags": check["tags"],
                 "tags_match": "any",
-                "max_tokens": 2048,
+                "max_tokens": 8192,
                 "types": ["world", "experience", "observation"],
-                "budget": "low",
+                "budget": "high",
             },
             timeout=90,
         )
+        # One document yields several extracted facts that all inherit its tags,
+        # so a tier can return the same contract id more than once. The contract
+        # is about which ids appear under a tier (set semantics), matching the
+        # deduplicated expected_ids, so collapse duplicates here.
         actual_ids = sorted(
-            tag
-            for result in envelope.get("results", [])
-            for tag in result.get("tags", [])
-            if isinstance(tag, str) and tag.startswith("contract-id-")
+            {
+                tag
+                for result in envelope.get("results", [])
+                for tag in result.get("tags", [])
+                if isinstance(tag, str) and tag.startswith("contract-id-")
+            }
         )
         tier_checks.append(
             {

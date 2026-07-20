@@ -1,8 +1,8 @@
 {
-  "query": "phase a provenance contract sentinel",
+  "query": "contract sentinel",
   "retain_items": [
     {
-      "content": "phase a provenance contract sentinel user",
+      "content": "Contract sentinel one: Nicola prefers his espresso brewed at ninety-three degrees each weekday morning.",
       "tags": [
         "public",
         "contract-id-user",
@@ -11,16 +11,16 @@
       "document_id": "phase-a-contract-user"
     },
     {
-      "content": "phase a provenance contract sentinel resident",
+      "content": "Contract sentinel two: the butler Tina moved the Tuesday grocery delivery to before noon.",
       "tags": [
         "friends",
         "contract-id-resident",
-        "casa-source-v1.eyJiaW5kaW5nX2RpZ2VzdCI6InNoYTI1NjoxMTExMTExMTExMTExMTExMTExMTExMTExMTExMTExMTExMTExMTExMTExMTExMTExMTExMTExMTExMTExIiwiZGlzcGxheV9uYW1lIjoiUGhhc2UgQSBUaW5hIGZpeHR1cmUiLCJwZXJzb25hX2lkIjoidGVzdC5pbnZhbGlkL3BoYXNlLWEtdGluYS1maXh0dXJlIiwicGVyc29uYV92ZXJzaW9uIjoiMC4wLjAiLCJyb2xlX2lkIjoicmVzaWRlbnQ6YnV0bGVyIiwic3BlYWtlcl9raW5kIjoicmVzaWRlbnQiLCJ1c2VyX2lkIjpudWxsLCJ1c2VyX3BlZXIiOm51bGx9"
+        "casa-source-v1.eyJiaW5kaW5nX2RpZ2VzdCI6InNoYTI1NjoxMTExMTExMTExMTExMTExMTExMTExMTExMTExMTExMTExMTExMTExMTExMTExMTExMTExMTExMTExMTExMTExIiwiZGlzcGxheV9uYW1lIjoiUGhhc2UgQSBUaW5hIGZpeHR1cmUiLCJwZXJzb25hX2lkIjoidGVzdC5pbnZhbGlkL3BoYXNlLWEtdGluYS1maXh0dXJlIiwicGVyc29uYV92ZXJzaW9uIjoiMC4wLjAiLCJyb2xlX2lkIjoicmVzaWRlbnQ6YnV0bGVyIiwic3BlYWtlcl9raW5kIjoicmVzaWRlbnQiLCJ1c2VyX2lkIjpudWxsLCJ1c2VyX3BlZXIiOm51bGx9"
       ],
       "document_id": "phase-a-contract-resident"
     },
     {
-      "content": "phase a provenance contract sentinel diagnostic",
+      "content": "Contract sentinel three: the greenhouse thermostat tripped at four twelve and vented the east wing.",
       "tags": [
         "family",
         "contract-id-diagnostic",
@@ -34,7 +34,7 @@
       "document_id": "document-sentinel-b0f77a"
     },
     {
-      "content": "phase a provenance contract sentinel max-user-unicode",
+      "content": "Contract sentinel four: Aunt Beatrice mailed a postcard from Lisbon about the number twenty-eight tram.",
       "tags": [
         "private",
         "contract-id-max-user",
@@ -43,7 +43,7 @@
       "document_id": "phase-a-contract-max-user-unicode"
     },
     {
-      "content": "phase a provenance contract sentinel max-agent-unicode",
+      "content": "Contract sentinel five: the solar inverter firmware upgrade is set for the second Sunday of March.",
       "tags": [
         "family",
         "contract-id-max-agent",
@@ -79,11 +79,11 @@
       "diagnostic": false,
       "maximum_length": false,
       "sensitivity": "friends",
-      "canonical_payload_bytes": 288,
-      "encoded_tag_bytes": 399,
-      "provenance_tag": "casa-source-v1.eyJiaW5kaW5nX2RpZ2VzdCI6InNoYTI1NjoxMTExMTExMTExMTExMTExMTExMTExMTExMTExMTExMTExMTExMTExMTExMTExMTExMTExMTExMTExMTExIiwiZGlzcGxheV9uYW1lIjoiUGhhc2UgQSBUaW5hIGZpeHR1cmUiLCJwZXJzb25hX2lkIjoidGVzdC5pbnZhbGlkL3BoYXNlLWEtdGluYS1maXh0dXJlIiwicGVyc29uYV92ZXJzaW9uIjoiMC4wLjAiLCJyb2xlX2lkIjoicmVzaWRlbnQ6YnV0bGVyIiwic3BlYWtlcl9raW5kIjoicmVzaWRlbnQiLCJ1c2VyX2lkIjpudWxsLCJ1c2VyX3BlZXIiOm51bGx9",
+      "canonical_payload_bytes": 291,
+      "encoded_tag_bytes": 403,
+      "provenance_tag": "casa-source-v1.eyJiaW5kaW5nX2RpZ2VzdCI6InNoYTI1NjoxMTExMTExMTExMTExMTExMTExMTExMTExMTExMTExMTExMTExMTExMTExMTExMTExMTExMTExMTExMTExMTExIiwiZGlzcGxheV9uYW1lIjoiUGhhc2UgQSBUaW5hIGZpeHR1cmUiLCJwZXJzb25hX2lkIjoidGVzdC5pbnZhbGlkL3BoYXNlLWEtdGluYS1maXh0dXJlIiwicGVyc29uYV92ZXJzaW9uIjoiMC4wLjAiLCJyb2xlX2lkIjoicmVzaWRlbnQ6YnV0bGVyIiwic3BlYWtlcl9raW5kIjoicmVzaWRlbnQiLCJ1c2VyX2lkIjpudWxsLCJ1c2VyX3BlZXIiOm51bGx9",
       "provenance": {
-        "binding_digest": "sha256:1111111111111111111111111111111111111111111111111111111111111",
+        "binding_digest": "sha256:1111111111111111111111111111111111111111111111111111111111111111",
         "display_name": "Phase A Tina fixture",
         "persona_id": "test.invalid/phase-a-tina-fixture",
         "persona_version": "0.0.0",
