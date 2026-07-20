@@ -316,7 +316,8 @@ def test_legacy_helpers_removed():
 
 
 async def test_sem_none_no_crash(monkeypatch):
-    """active_semantic_memory unset (boot-degraded) → specialist runs, no memory injection, no crash."""
+    """active_semantic_memory unset (boot-degraded) → specialist runs, gets the
+    unavailability note (memory can't be checked ≠ no memories), no crash."""
     import agent as agent_mod
     monkeypatch.setattr(agent_mod, "active_semantic_memory", None, raising=False)
     cfg = _specialist_cfg(role="finance", token_budget=4000)
@@ -327,4 +328,6 @@ async def test_sem_none_no_crash(monkeypatch):
         output = await tools._run_delegated_agent(cfg, task_text="hi", context_text="")
 
     assert output.text == "ok"
-    assert "<memory_context" not in _FakeSDKClient.captured_prompt
+    prompt = _FakeSDKClient.captured_prompt
+    assert '<memory_context agent="finance" status="unavailable">' in prompt
+    assert "could not be checked" in prompt

@@ -1487,8 +1487,20 @@ async def _run_delegated_agent(
     # read-clearance (design §3, plan 3). Opt-in via cfg.memory.token_budget > 0.
     memory_block = ""
     if cfg.memory.token_budget > 0:
+        unavailable_note = (
+            f'<memory_context agent="{cfg.role}" status="unavailable">\n'
+            "Long-term memory could not be checked for this task "
+            "(backend unavailable). Do not conclude Casa lacks "
+            "information on any topic — if asked, say memory could "
+            "not be checked.\n"
+            "</memory_context>\n\n"
+        )
         sem = getattr(agent_mod, "active_semantic_memory", None)
-        if sem is not None:
+        if sem is None:
+            # No backend wired: same unavailability as a failed check — a
+            # silent cold turn reads as "no memories exist".
+            memory_block = unavailable_note
+        else:
             try:
                 digest = await delegated_recall(
                     sem, query=task_text,
@@ -1500,14 +1512,7 @@ async def _run_delegated_agent(
                 # check failed — a silent cold turn reads as "no memories
                 # exist" and the specialist would claim absence to the user.
                 digest = ""
-                memory_block = (
-                    f'<memory_context agent="{cfg.role}" status="unavailable">\n'
-                    "Long-term memory could not be checked for this task "
-                    "(backend unavailable). Do not conclude Casa lacks "
-                    "information on any topic — if asked, say memory could "
-                    "not be checked.\n"
-                    "</memory_context>\n\n"
-                )
+                memory_block = unavailable_note
             if digest:
                 memory_block = (
                     f'<memory_context agent="{cfg.role}">\n'
@@ -3584,8 +3589,13 @@ async def recall_memory(args: dict) -> dict:
         # status=ok with an empty digest — the model would then (per doctrine)
         # tell the user Casa has no such information, which is false. Any
         # failure here (typed RecallUnavailable or unexpected) means memory
-        # could not be checked.
-        reason = getattr(exc, "reason", type(exc).__name__)
+        # could not be checked. Only RecallUnavailable's slug reasons are
+        # trusted in logs; anything else logs its TYPE (an arbitrary .reason
+        # attribute could carry content).
+        reason = (
+            exc.reason if isinstance(exc, RecallUnavailable)
+            else type(exc).__name__
+        )
         logger.warning(
             "recall_memory outcome=unavailable role=%r reason=%s", role, reason,
         )
@@ -5483,11 +5493,12 @@ async def _synthesize_answer(
 
 @tool(
     "query_engager",
-    "Ask the engaging agent a question. Returns synthesized answer from the "
-    "engager's clearance-filtered memory; status=unknown means the memory was "
-    "searched and holds nothing relevant; status=unavailable means memory "
-    "could not be checked (do not conclude the information doesn't exist). "
-    "Callable only from inside an active engagement.",
+    "Ask the engaging agent a question. status=ok returns the answer "
+    "synthesized from the engager's clearance-filtered memory; status=unknown "
+    "means the memory was searched and holds nothing relevant; "
+    "status=unavailable means memory could not be checked (do not conclude "
+    "the information doesn't exist). Callable only from inside an active "
+    "engagement.",
     {"question": str, "max_tokens": int},
 )
 async def query_engager(args: dict) -> dict:
