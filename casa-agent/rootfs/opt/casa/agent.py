@@ -42,7 +42,7 @@ from timekeeping import resolve_tz
 from hindsight_ids import bank_id
 from sensitivity import clearance_for_origin, readable_tiers
 from session_saver import freshness_window, retain_cold_session, save_session
-from semantic_memory import NoOpSemanticMemory, SemanticMemory
+from semantic_memory import NoOpSemanticMemory, RecallUnavailable, SemanticMemory
 from session_registry import (
     SessionRegistry,
     _is_uuid_scope,
@@ -200,6 +200,73 @@ def _memory_bank() -> str:
     return bank_id("casa")
 
 
+# Auto-recall (pre-turn) bound: prompt construction must never sit on the full
+# HTTP client timeout (20s) waiting for an overloaded reranker — past this
+# deadline the recall is cancelled and the turn runs cold (v0.99.0).
+_AUTO_RECALL_TIMEOUT_S = 5.0
+_RECALL_BREAKER_THRESHOLD = 3      # consecutive failures before opening
+_RECALL_BREAKER_COOLDOWN_S = 60.0  # open duration before a half-open probe
+
+
+class _RecallBreaker:
+    """Circuit breaker for the automatic pre-turn recall (v0.99.0).
+
+    After ``threshold`` CONSECUTIVE failures the breaker opens and auto-recall
+    runs cold (skipped entirely) instead of adding a doomed multi-second call —
+    and load — to every turn of an already-overloaded backend. After
+    ``cooldown_s`` the next turn's recall is allowed through as the recovery
+    probe: success closes the breaker, failure re-opens it for a full cooldown.
+    The recall_memory pull tool is intentionally NOT gated — an explicit pull
+    can still try (and surface status=unavailable to the model)."""
+
+    def __init__(
+        self, *, threshold: int = _RECALL_BREAKER_THRESHOLD,
+        cooldown_s: float = _RECALL_BREAKER_COOLDOWN_S,
+        clock: Callable[[], float] = time.monotonic,
+    ) -> None:
+        self._threshold = threshold
+        self._cooldown_s = cooldown_s
+        self._clock = clock
+        self._failures = 0
+        self._opened_at: float | None = None
+        self._probe_started_at: float | None = None  # half-open probe in flight
+
+    @property
+    def open(self) -> bool:
+        return self._opened_at is not None
+
+    def allow(self) -> bool:
+        """True when a recall attempt may proceed (closed, or THE half-open
+        probe). In half-open state exactly one probe is admitted at a time —
+        concurrent turns arriving after cooldown must not all hit the backend
+        at once. Calling this in half-open state RESERVES the probe; the
+        reservation is released by record_success/record_failure, and expires
+        after a cooldown so a turn that died without recording (cancelled
+        mid-probe) cannot wedge the breaker open forever. All calls run on
+        the one event loop, so no lock is needed."""
+        if self._opened_at is None:
+            return True
+        now = self._clock()
+        if now - self._opened_at < self._cooldown_s:
+            return False
+        if (self._probe_started_at is not None
+                and now - self._probe_started_at < self._cooldown_s):
+            return False
+        self._probe_started_at = now
+        return True
+
+    def record_success(self) -> None:
+        self._failures = 0
+        self._opened_at = None
+        self._probe_started_at = None
+
+    def record_failure(self) -> None:
+        self._probe_started_at = None
+        self._failures += 1
+        if self._failures >= self._threshold:
+            self._opened_at = self._clock()  # re-stamps on a failed half-open probe
+
+
 def _current_origin_clearance(channel: str) -> str:
     """Read-clearance for the CURRENT turn, keyed off the unspoofable origin
     marker in ``origin_var`` (Release A Layer 2) rather than the channel string,
@@ -307,6 +374,10 @@ class Agent:
         # Per-instance so assistant (4000) and butler (800) budgets stay
         # isolated even when the same channel serves both roles.
         self._budget_tracker = BudgetTracker()
+        # Auto-recall circuit breaker (v0.99.0): per-instance — the backend is
+        # shared, but auto-recall fires only on this agent's fresh text turns,
+        # so per-instance state converges on backend health within one turn each.
+        self._recall_breaker = _RecallBreaker()
         # Unified plugin architecture (§3.3/§3.9): per-instance ONE-shot
         # snapshot of the registry resolution for this agent's tier:role
         # (resolution + {name: artifact_id} binding + resolver generation),
@@ -966,16 +1037,50 @@ class Agent:
                     "profile overlay failed for role=%s", self.config.role,
                     exc_info=True,
                 )
-        if load_plan.auto_recall:
+        if load_plan.auto_recall and not self._recall_breaker.allow():
+            # Breaker open: run cold rather than hammer an unavailable backend
+            # on every turn. No memory block; the model is never told an empty
+            # recall happened (doctrine: "unavailable" ≠ "no memories").
+            logger.info(
+                "auto_recall role=%s outcome=skipped reason=breaker_open",
+                self.config.role,
+            )
+        elif load_plan.auto_recall:
+            _recall_t0 = time.monotonic()
             try:
-                facts = await self._semantic_memory.recall(
-                    bank, user_text, tags=_recall_tier_tags(channel),
-                    max_tokens=self.config.memory.token_budget,
-                    budget="mid",  # auto_recall is always non-voice (see _plan_load); voice uses the recall_memory pull tool at budget=low
+                # Bounded deadline: never the full HTTP timeout. No synchronous
+                # retry on failure — a 504 means the reranker is overloaded and
+                # retrying makes it worse (the seam itself only retries
+                # connection-level drops, never HTTP errors).
+                facts = await asyncio.wait_for(
+                    self._semantic_memory.recall(
+                        bank, user_text, tags=_recall_tier_tags(channel),
+                        max_tokens=self.config.memory.token_budget,
+                        budget="mid",  # auto_recall is always non-voice (see _plan_load); voice uses the recall_memory pull tool at budget=low
+                    ),
+                    timeout=_AUTO_RECALL_TIMEOUT_S,
                 )
-            except Exception:  # noqa: BLE001
+                self._recall_breaker.record_success()
+            except (RecallUnavailable, asyncio.TimeoutError) as exc:
+                self._recall_breaker.record_failure()
                 logger.warning(
-                    "recall failed for role=%s", self.config.role, exc_info=True,
+                    "auto_recall role=%s outcome=unavailable reason=%s "
+                    "latency_ms=%d breaker_open=%s",
+                    self.config.role,
+                    getattr(exc, "reason", "deadline"),
+                    int((time.monotonic() - _recall_t0) * 1000),
+                    self._recall_breaker.open,
+                )
+            except Exception as exc:  # noqa: BLE001
+                self._recall_breaker.record_failure()
+                # Exception TYPE only — repr/traceback could embed the query
+                # text, which must never be logged.
+                logger.warning(
+                    "auto_recall role=%s outcome=unavailable reason=unexpected:%s "
+                    "latency_ms=%d breaker_open=%s",
+                    self.config.role, type(exc).__name__,
+                    int((time.monotonic() - _recall_t0) * 1000),
+                    self._recall_breaker.open,
                 )
         parts: list[str] = []
         if overlay_digest:

@@ -9,7 +9,7 @@ from unittest.mock import AsyncMock
 import pytest
 
 from hindsight_memory import HindsightSemanticMemory
-from semantic_memory import SemanticMemory
+from semantic_memory import RecallUnavailable, SemanticMemory
 
 pytestmark = [pytest.mark.unit]
 
@@ -234,6 +234,136 @@ async def test_request_does_not_retry_http_error() -> None:
     with pytest.raises(aiohttp.ClientResponseError):
         await mem._request("POST", "/p", {"q": "x"})
     assert mem._session.calls == 1, "HTTP errors must not be retried"
+
+
+# --- Three-outcome recall contract (v0.99.0) -------------------------------
+# A recall has exactly three outcomes: hits, zero hits, UNAVAILABLE. Only a
+# well-formed 2xx envelope with an actual (possibly empty) `results` list may
+# mean zero hits; timeouts, 5xx/429, transport failures and malformed
+# envelopes raise RecallUnavailable instead of collapsing to ''.
+
+
+def _http_err(status: int):
+    import aiohttp
+    return aiohttp.ClientResponseError(request_info=None, history=(), status=status)
+
+
+async def test_recall_504_raises_unavailable() -> None:
+    mem = HindsightSemanticMemory(base_url="http://hs:8888")
+    mem._session = _SeqSession([_SeqResp(raise_for_status_exc=_http_err(504))])
+    with pytest.raises(RecallUnavailable) as ei:
+        await mem.recall("casa", "q", tags=["public"], max_tokens=100)
+    assert ei.value.reason == "http_504"
+
+
+async def test_recall_429_raises_unavailable() -> None:
+    mem = HindsightSemanticMemory(base_url="http://hs:8888")
+    mem._session = _SeqSession([_SeqResp(raise_for_status_exc=_http_err(429))])
+    with pytest.raises(RecallUnavailable) as ei:
+        await mem.recall("casa", "q", tags=["public"], max_tokens=100)
+    assert ei.value.reason == "http_429"
+
+
+async def test_recall_does_not_retry_5xx() -> None:
+    """A 504 means the reranker is overloaded — a synchronous retry makes it
+    worse. Exactly one request, then UNAVAILABLE."""
+    mem = HindsightSemanticMemory(base_url="http://hs:8888")
+    mem._session = _SeqSession([
+        _SeqResp(raise_for_status_exc=_http_err(504)),
+        _SeqResp(body={"results": []}),
+    ])
+    with pytest.raises(RecallUnavailable):
+        await mem.recall("casa", "q", tags=["public"], max_tokens=100)
+    assert mem._session.calls == 1
+
+
+async def test_recall_timeout_raises_unavailable() -> None:
+    import asyncio
+    mem = HindsightSemanticMemory(base_url="http://hs:8888")
+    mem._session = _SeqSession([_SeqResp(exc=asyncio.TimeoutError())])
+    with pytest.raises(RecallUnavailable) as ei:
+        await mem.recall("casa", "q", tags=["public"], max_tokens=100)
+    assert ei.value.reason == "timeout"
+
+
+async def test_recall_connection_error_raises_unavailable() -> None:
+    """Transport failure surviving the single reconnect retry → UNAVAILABLE."""
+    import aiohttp
+    mem = HindsightSemanticMemory(base_url="http://hs:8888")
+    mem._session = _SeqSession([
+        _SeqResp(exc=aiohttp.ServerDisconnectedError()),
+        _SeqResp(exc=aiohttp.ServerDisconnectedError()),
+    ])
+    with pytest.raises(RecallUnavailable):
+        await mem.recall("casa", "q", tags=["public"], max_tokens=100)
+
+
+@pytest.mark.parametrize("body", [
+    {},                       # missing results key
+    {"results": "nope"},      # wrong-shaped results
+    {"memories": []},         # wrong envelope key
+    "not a dict",             # non-dict body
+])
+async def test_recall_malformed_envelope_raises_unavailable(body) -> None:
+    mem = HindsightSemanticMemory(base_url="http://hs:8888")
+    mem._request = AsyncMock(return_value=body)
+    with pytest.raises(RecallUnavailable) as ei:
+        await mem.recall("casa", "q", tags=["public"], max_tokens=100)
+    assert ei.value.reason == "malformed_envelope"
+
+
+async def test_recall_wellformed_empty_is_zero_hits() -> None:
+    """{"results": []} on a 2xx is the ONLY shape that means zero hits."""
+    mem = HindsightSemanticMemory(base_url="http://hs:8888")
+    mem._request = AsyncMock(return_value={"results": []})
+    assert await mem.recall("casa", "q", tags=["public"], max_tokens=100) == ""
+
+
+@pytest.mark.parametrize("results", [
+    [{}],                       # item with no text
+    [{"text": ""}],             # item with empty text
+    ["not a dict"],             # non-dict item (render would raise)
+    [{"text": None}],           # null text
+])
+async def test_recall_unrenderable_results_are_unavailable_not_zero_hits(results) -> None:
+    """Non-empty results that render to nothing are NOT a genuine zero-hit —
+    hits exist but cannot be read, so the recall is UNAVAILABLE."""
+    mem = HindsightSemanticMemory(base_url="http://hs:8888")
+    mem._request = AsyncMock(return_value={"results": results})
+    with pytest.raises(RecallUnavailable) as ei:
+        await mem.recall("casa", "q", tags=["public"], max_tokens=100)
+    assert ei.value.reason == "malformed_envelope"
+
+
+async def test_recall_logs_unavailable_with_latency_not_query(caplog) -> None:
+    mem = HindsightSemanticMemory(base_url="http://hs:8888")
+    mem._session = _SeqSession([_SeqResp(raise_for_status_exc=_http_err(504))])
+    with caplog.at_level(logging.INFO, logger="hindsight_memory"):
+        with pytest.raises(RecallUnavailable):
+            await mem.recall(
+                "casa", "what is my secret salary", tags=["private"],
+                max_tokens=100,
+            )
+    line = "".join(r.getMessage() for r in caplog.records)
+    assert "outcome=unavailable" in line
+    assert "reason=http_504" in line
+    assert "latency_ms=" in line
+    assert "salary" not in line   # query text must NOT be logged
+
+
+async def test_recall_logs_success_outcomes_with_latency(caplog) -> None:
+    mem = HindsightSemanticMemory(base_url="http://hs:8888")
+    mem._request = AsyncMock(return_value={"results": [
+        {"text": "one", "type": "world", "tags": ["public"]},
+    ]})
+    with caplog.at_level(logging.INFO, logger="hindsight_memory"):
+        await mem.recall("casa", "q", tags=["public"], max_tokens=100)
+    mem._request = AsyncMock(return_value={"results": []})
+    with caplog.at_level(logging.INFO, logger="hindsight_memory"):
+        await mem.recall("casa", "q", tags=["public"], max_tokens=100)
+    lines = [r.getMessage() for r in caplog.records if "memory_recall" in r.getMessage()]
+    assert any("outcome=hits" in ln and "latency_ms=" in ln for ln in lines)
+    assert any("outcome=empty" in ln and "latency_ms=" in ln for ln in lines)
 
 
 async def test_session_uses_force_close_connector() -> None:

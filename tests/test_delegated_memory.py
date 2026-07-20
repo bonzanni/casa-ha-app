@@ -53,13 +53,39 @@ async def test_delegated_recall_defaults_to_mid_budget():
     assert sem.recall_calls[0]["budget"] == "mid"
 
 
-async def test_delegated_recall_swallows_errors():
+async def test_delegated_recall_propagates_unavailable():
+    """Three-outcome contract: backend unavailability is NOT collapsed to ''
+    (which callers could not tell from a genuine zero-hit recall)."""
+    from semantic_memory import RecallUnavailable
+
+    class _Down:
+        async def recall(self, *a, **k): raise RecallUnavailable("http_504")
+    with pytest.raises(RecallUnavailable):
+        await delegated_memory.delegated_recall(
+            _Down(), query="q", origin_channel="telegram", max_tokens=10,
+        )
+
+
+async def test_delegated_recall_wraps_unexpected_errors_as_unavailable():
+    """Any unexpected backend error still surfaces as UNAVAILABLE (typed),
+    never as a raw exception and never as a fake zero-hit ''."""
+    from semantic_memory import RecallUnavailable
+
     class _Boom:
         async def recall(self, *a, **k): raise RuntimeError("x")
+    with pytest.raises(RecallUnavailable):
+        await delegated_memory.delegated_recall(
+            _Boom(), query="q", origin_channel="telegram", max_tokens=10,
+        )
+
+
+async def test_delegated_recall_empty_query_is_zero_hits_no_call():
+    sem = _Sem()
     out = await delegated_memory.delegated_recall(
-        _Boom(), query="q", origin_channel="telegram", max_tokens=10,
+        sem, query="   ", origin_channel="telegram", max_tokens=10,
     )
-    assert out == ""   # leak-safe / never crashes the delegated turn
+    assert out == ""
+    assert sem.recall_calls == []
 
 
 async def test_retain_delegated_classifies_each_item(monkeypatch):

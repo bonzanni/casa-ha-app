@@ -37,6 +37,7 @@ from plugin_grants import (
 )
 from authz_grants import CHALLENGES, GRANTS, normalize_role
 from delegated_memory import delegated_recall, retain_delegated
+from semantic_memory import RecallUnavailable
 
 from claude_agent_sdk import (
     AssistantMessage,
@@ -1486,13 +1487,32 @@ async def _run_delegated_agent(
     # read-clearance (design §3, plan 3). Opt-in via cfg.memory.token_budget > 0.
     memory_block = ""
     if cfg.memory.token_budget > 0:
+        unavailable_note = (
+            f'<memory_context agent="{cfg.role}" status="unavailable">\n'
+            "Long-term memory could not be checked for this task "
+            "(backend unavailable). Do not conclude Casa lacks "
+            "information on any topic — if asked, say memory could "
+            "not be checked.\n"
+            "</memory_context>\n\n"
+        )
         sem = getattr(agent_mod, "active_semantic_memory", None)
-        if sem is not None:
-            digest = await delegated_recall(
-                sem, query=task_text,
-                origin_channel=str(parent.get("channel", "")),
-                max_tokens=cfg.memory.token_budget,
-            )
+        if sem is None:
+            # No backend wired: same unavailability as a failed check — a
+            # silent cold turn reads as "no memories exist".
+            memory_block = unavailable_note
+        else:
+            try:
+                digest = await delegated_recall(
+                    sem, query=task_text,
+                    origin_channel=str(parent.get("channel", "")),
+                    max_tokens=cfg.memory.token_budget,
+                )
+            except RecallUnavailable:
+                # Delegated turn proceeds cold, but the specialist is TOLD the
+                # check failed — a silent cold turn reads as "no memories
+                # exist" and the specialist would claim absence to the user.
+                digest = ""
+                memory_block = unavailable_note
             if digest:
                 memory_block = (
                     f'<memory_context agent="{cfg.role}">\n'
@@ -3528,7 +3548,15 @@ async def recall_memory(args: dict) -> dict:
                         "message": "Error: query is required"})
     sem = getattr(agent_mod, "active_semantic_memory", None)
     if sem is None:
-        return _result({"status": "ok", "memory": ""})  # not wired / cold
+        # No backend wired: memory CANNOT be checked — never a fake zero-hit.
+        return _result({
+            "status": "unavailable",
+            "message": (
+                "Long-term memory could not be checked (no memory backend). "
+                "Do NOT say the information doesn't exist — say memory "
+                "couldn't be checked."
+            ),
+        })
 
     origin = _snapshot_origin()
     role = origin.get("role", "assistant")
@@ -3557,8 +3585,28 @@ async def recall_memory(args: dict) -> dict:
             tags=tags, max_tokens=tokens, budget=budget,
         )
     except Exception as exc:  # noqa: BLE001
-        logger.warning("recall_memory failed for role=%r: %s", role, exc)
-        digest = ""
+        # Three-outcome contract (v0.99.0): a failed recall must NOT report
+        # status=ok with an empty digest — the model would then (per doctrine)
+        # tell the user Casa has no such information, which is false. Any
+        # failure here (typed RecallUnavailable or unexpected) means memory
+        # could not be checked. Only RecallUnavailable's slug reasons are
+        # trusted in logs; anything else logs its TYPE (an arbitrary .reason
+        # attribute could carry content).
+        reason = (
+            exc.reason if isinstance(exc, RecallUnavailable)
+            else type(exc).__name__
+        )
+        logger.warning(
+            "recall_memory outcome=unavailable role=%r reason=%s", role, reason,
+        )
+        return _result({
+            "status": "unavailable",
+            "message": (
+                "Long-term memory could not be checked (backend unavailable). "
+                "Tell the user memory couldn't be checked right now — do NOT "
+                "say the information doesn't exist or that you don't have it."
+            ),
+        })
     return _result({"status": "ok", "memory": digest})
 
 
@@ -3903,15 +3951,18 @@ async def _fetch_executor_archive(
     """Read prior-engagement "lessons" as a SEMANTIC recall against the shared
     ``casa`` bank, keyed on the current ``task`` and filtered to the originating
     engagement's read-clearance (design §3, plan 3). Returns the digest under a
-    recognizable header, or "" when memory is unavailable / the recall is empty.
-    Best-effort: ``delegated_recall`` swallows its own errors."""
+    recognizable header, or "" when the recall is empty or memory could not
+    be checked (RecallUnavailable → run cold; never a fabricated header)."""
     import agent as agent_mod
     sem = getattr(agent_mod, "active_semantic_memory", None)
     if sem is None:
         return ""
-    digest = await delegated_recall(
-        sem, query=task, origin_channel=origin_channel, max_tokens=token_budget,
-    )
+    try:
+        digest = await delegated_recall(
+            sem, query=task, origin_channel=origin_channel, max_tokens=token_budget,
+        )
+    except RecallUnavailable:
+        return ""
     return f"## Prior engagements (lessons learned)\n{digest}" if digest else ""
 
 
@@ -5442,9 +5493,12 @@ async def _synthesize_answer(
 
 @tool(
     "query_engager",
-    "Ask the engaging agent a question. Returns synthesized answer from the "
-    "engager's clearance-filtered memory, or status=unknown. Callable only from "
-    "inside an active engagement.",
+    "Ask the engaging agent a question. status=ok returns the answer "
+    "synthesized from the engager's clearance-filtered memory; status=unknown "
+    "means the memory was searched and holds nothing relevant; "
+    "status=unavailable means memory could not be checked (do not conclude "
+    "the information doesn't exist). Callable only from inside an active "
+    "engagement.",
     {"question": str, "max_tokens": int},
 )
 async def query_engager(args: dict) -> dict:
@@ -5460,12 +5514,21 @@ async def query_engager(args: dict) -> dict:
     import agent as agent_mod
     sem = getattr(agent_mod, "active_semantic_memory", None)
     context = ""
-    if sem is not None:
-        context = await delegated_recall(
-            sem, query=question,
-            origin_channel=str(engagement.origin.get("channel", "")),
-            max_tokens=2000,
-        )
+    memory_unavailable = False
+    if sem is None:
+        # No backend wired: the engager's memory cannot be checked.
+        memory_unavailable = True
+    else:
+        try:
+            context = await delegated_recall(
+                sem, query=question,
+                origin_channel=str(engagement.origin.get("channel", "")),
+                max_tokens=2000,
+            )
+        except RecallUnavailable:
+            # Distinct from status=unknown (a genuine zero-hit): the engager's
+            # memory could not be checked at all.
+            memory_unavailable = True
 
     # Publish bus event so observer can see the query
     if _bus is not None:
@@ -5484,6 +5547,14 @@ async def query_engager(args: dict) -> dict:
         except Exception:
             pass
 
+    if memory_unavailable:
+        return _result({
+            "status": "unavailable", "text": "",
+            "message": (
+                "The engager's memory could not be checked (backend "
+                "unavailable). Do not conclude the information doesn't exist."
+            ),
+        })
     if not context:
         return _result({"status": "unknown", "text": ""})
     answer = await _synthesize_answer(question, context, max_tokens)

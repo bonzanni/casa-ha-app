@@ -1,5 +1,35 @@
 # Changelog
 
+## [0.99.0] - 2026-07-20
+
+Memory failures are no longer mistaken for "no memories found".
+
+### Fixed
+
+- **Agents no longer deny knowledge they have when the memory backend
+  fails.** Previously every recall failure (timeout, 5xx, transport error)
+  was silently reported as an empty search result, so an agent would
+  confidently tell you Casa has no such information — while the memory
+  backend was merely down or slow (measured at a 75–80% failure rate under
+  load on 2026-07-20). Recall now has three distinct outcomes: found,
+  genuinely nothing found, and *memory unavailable*. Agents are instructed
+  to say memory could not be checked — never that the information doesn't
+  exist — unless a search actually ran and came back empty.
+
+### Changed
+
+- The `recall_memory` tool returns `status: unavailable` (instead of a
+  misleading `status: ok` with an empty result) when memory can't be
+  checked; the same distinction flows through delegated agents, executor
+  engagements, and `query_engager`.
+- The automatic pre-turn recall runs under a short 5s deadline instead of
+  stalling prompt construction for the full 20s HTTP timeout, never retries
+  an overloaded backend, and a circuit breaker stops recall attempts after
+  3 consecutive failures (recovering via a single probe once per minute).
+- Recall outcomes are logged distinguishably with latency (query text and
+  recalled content are never logged), so backend failure rates are now
+  measurable from the logs.
+
 ## [0.98.2] - 2026-07-19
 
 ### Fixed

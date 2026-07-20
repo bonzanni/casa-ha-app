@@ -8,13 +8,20 @@ unauthenticated on the internal network (spec §8.4).
 """
 from __future__ import annotations
 
+import asyncio
 import logging
+import time
 from typing import Any
 
 import aiohttp
 
 from hindsight_ids import bank_id as _validate_bank_id  # fail-fast on bad ids
-from semantic_memory import SemanticMemory, render_mental_models, render_recall
+from semantic_memory import (
+    RecallUnavailable,
+    SemanticMemory,
+    render_mental_models,
+    render_recall,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -104,23 +111,62 @@ class HindsightSemanticMemory(SemanticMemory):
         types: tuple[str, ...] = _DEFAULT_TYPES,
         tags_match: str = "any", budget: str = "mid",
     ) -> str:
+        """Three-outcome contract (v0.99.0): hits, zero hits, or
+        RecallUnavailable. Only a well-formed 2xx envelope carrying an actual
+        ``results`` list may mean zero hits; every failure (timeout, 5xx/429,
+        transport drop, malformed envelope) raises so callers can tell
+        "memory could not be checked" from "searched and found nothing".
+        No synchronous retry on HTTP errors — a 504 means the reranker is
+        overloaded and retrying makes it worse (_request already restricts
+        its single retry to connection-level drops)."""
         _validate_bank_id(bank)
-        resp = await self._request(
-            "POST", f"/v1/default/banks/{bank}/memories/recall",
-            {
-                "query": query, "tags": tags, "tags_match": tags_match,
-                "max_tokens": max_tokens, "types": list(types), "budget": budget,
-            },
-        )
-        # E1 (observability): recalls were silent, so an empty recall was
-        # indistinguishable from a recall never happening. Log the hit count
-        # and the clearance tags used (never the query text — may be sensitive).
-        hits = resp.get("results") or resp.get("memories") or []
+        t0 = time.monotonic()
+
+        def _latency_ms() -> int:
+            return int((time.monotonic() - t0) * 1000)
+
+        def _unavailable(reason: str) -> RecallUnavailable:
+            # E1 (observability): one distinguishable line per outcome, with
+            # latency; never the query text (may be sensitive).
+            logger.warning(
+                "memory_recall bank=%s tags=%s outcome=unavailable reason=%s latency_ms=%d",
+                bank, tags, reason, _latency_ms(),
+            )
+            return RecallUnavailable(reason)
+
+        try:
+            resp = await self._request(
+                "POST", f"/v1/default/banks/{bank}/memories/recall",
+                {
+                    "query": query, "tags": tags, "tags_match": tags_match,
+                    "max_tokens": max_tokens, "types": list(types), "budget": budget,
+                },
+            )
+        except asyncio.TimeoutError as exc:
+            raise _unavailable("timeout") from exc
+        except aiohttp.ClientResponseError as exc:
+            raise _unavailable(f"http_{exc.status}") from exc
+        except (aiohttp.ClientError, ValueError) as exc:
+            # ClientError: connection drops surviving the single reconnect
+            # retry; ValueError: undecodable JSON body on a 2xx.
+            raise _unavailable("transport") from exc
+
+        results = resp.get("results") if isinstance(resp, dict) else None
+        if not isinstance(results, list):
+            raise _unavailable("malformed_envelope")
+        try:
+            digest = render_recall(resp)
+        except Exception as exc:  # noqa: BLE001 — non-dict/odd items must not leak raw
+            raise _unavailable("malformed_envelope") from exc
+        if results and not digest:
+            # Hits exist but none rendered ([{}], empty text, …): that is NOT
+            # a genuine zero-hit — the memories cannot be read.
+            raise _unavailable("malformed_envelope")
         logger.info(
-            "memory_recall bank=%s tags=%s hits=%d",
-            bank, tags, len(hits) if isinstance(hits, list) else 0,
+            "memory_recall bank=%s tags=%s outcome=%s hits=%d latency_ms=%d",
+            bank, tags, "hits" if results else "empty", len(results), _latency_ms(),
         )
-        return render_recall(resp)
+        return digest
 
     async def profile(self, bank: str) -> str:
         _validate_bank_id(bank)

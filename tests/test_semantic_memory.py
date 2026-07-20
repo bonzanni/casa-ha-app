@@ -4,7 +4,13 @@ from __future__ import annotations
 
 import pytest
 
-from semantic_memory import NoOpSemanticMemory, SemanticMemory, render_mental_models, render_recall
+from semantic_memory import (
+    NoOpSemanticMemory,
+    RecallUnavailable,
+    SemanticMemory,
+    render_mental_models,
+    render_recall,
+)
 
 pytestmark = [pytest.mark.unit]
 
@@ -25,10 +31,30 @@ async def test_noop_retain_is_silent() -> None:
     assert await mem.retain("casa-assistant", [{"content": "x"}]) is None
 
 
-async def test_noop_reads_return_empty_string() -> None:
+async def test_noop_recall_raises_unavailable() -> None:
+    """A NoOp backend cannot CHECK memory, so its recall is UNAVAILABLE —
+    returning '' would fabricate a genuine-looking zero-hit search and let
+    agents claim "nothing found" where no search ever ran."""
     mem = NoOpSemanticMemory()
-    assert await mem.recall("casa-assistant", "q", tags=["house"], max_tokens=512) == ""
+    with pytest.raises(RecallUnavailable) as ei:
+        await mem.recall("casa-assistant", "q", tags=["house"], max_tokens=512)
+    assert ei.value.reason == "not_configured"
+
+
+async def test_noop_profile_returns_empty_string() -> None:
+    # The overlay is optional enrichment (nothing claims absence from it),
+    # so the NoOp profile stays a silent ''.
+    mem = NoOpSemanticMemory()
     assert await mem.profile("casa-assistant") == ""
+
+
+def test_recall_unavailable_is_a_typed_exception() -> None:
+    """Three-outcome contract: UNAVAILABLE is a typed exception on the seam,
+    never collapsed into the zero-hit '' return."""
+    exc = RecallUnavailable("timeout")
+    assert isinstance(exc, Exception)
+    assert exc.reason == "timeout"
+    assert "timeout" in str(exc)
 
 
 def test_render_mental_models_empty() -> None:

@@ -2,7 +2,8 @@
 """Long-term semantic-memory seam (memory re-architecture spec §5).
 
 A small interface shaped to a best-in-class backend (Hindsight), with a
-NoOp degraded impl (empty strings → the agent runs cold on its SDK thread).
+NoOp degraded impl (recall unavailable, silent writes → the agent runs cold
+on its SDK thread).
 Reads return rendered markdown digests for the system prompt; ``retain``
 is fire-and-forget (None). Short-term/recency is NOT here — that is owned
 by the SDK session.
@@ -11,6 +12,26 @@ from __future__ import annotations
 
 from abc import ABC, abstractmethod
 from typing import Any
+
+
+class RecallUnavailable(RuntimeError):
+    """Semantic recall could NOT be performed — timeout, 5xx/429, transport
+    failure, or a malformed response envelope.
+
+    Three-outcome contract (v0.99.0): a recall is either (1) hits, (2) a
+    genuine zero-hit '' from a well-formed 2xx response, or (3) this
+    exception. Backends and bridges must never collapse a failure into '',
+    which callers cannot tell from "searched and found nothing" — that is
+    how agents end up truthfully-looking denying knowledge they have.
+
+    ``reason`` is a stable slug (``timeout``, ``http_504``, ``transport``,
+    ``malformed_envelope``, ``backend_error``) safe to log; it never carries
+    query text or recalled content.
+    """
+
+    def __init__(self, reason: str) -> None:
+        self.reason = reason
+        super().__init__(f"recall unavailable: {reason}")
 
 
 def render_mental_models(response: dict[str, Any]) -> str:
@@ -75,8 +96,14 @@ class SemanticMemory(ABC):
 
 
 class NoOpSemanticMemory(SemanticMemory):
-    """Degraded backend: retain is silent, reads return ''. The agent then
-    runs on its SDK thread alone (cold long-term)."""
+    """Degraded backend: retain is silent, profile returns ''. The agent then
+    runs on its SDK thread alone (cold long-term).
+
+    ``recall`` raises :class:`RecallUnavailable` (v0.99.0): a NoOp cannot
+    CHECK memory, and returning '' would fabricate a genuine-looking zero-hit
+    search — agents would then claim "nothing found" where no search ever
+    ran. The overlay (``profile``) stays a silent '' because nothing claims
+    absence from a missing overlay."""
 
     async def retain(
         self, bank: str, items: list[dict[str, Any]], *, async_: bool = True,
@@ -88,7 +115,7 @@ class NoOpSemanticMemory(SemanticMemory):
         types: tuple[str, ...] = ("world", "experience", "observation"),
         tags_match: str = "any", budget: str = "mid",
     ) -> str:
-        return ""
+        raise RecallUnavailable("not_configured")
 
     async def profile(self, bank: str) -> str:
         return ""

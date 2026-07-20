@@ -93,6 +93,29 @@ async def test_sem_none_returns_empty_string(monkeypatch):
 
 
 # ---------------------------------------------------------------------------
+# 3b. Backend unavailable → empty string, no crash (delegated turn runs cold)
+# ---------------------------------------------------------------------------
+
+async def test_unavailable_recall_returns_empty_no_crash(monkeypatch):
+    """RecallUnavailable from the seam must not crash the engagement spawn —
+    the archive block is simply omitted (never a fabricated header)."""
+    from semantic_memory import RecallUnavailable
+
+    class _Down:
+        async def recall(self, *a, **k): raise RecallUnavailable("timeout")
+
+    monkeypatch.setattr(agent_mod, "active_semantic_memory", _Down(), raising=False)
+
+    result = await _fetch_executor_archive(
+        task="build the invoice",
+        origin_channel="telegram",
+        token_budget=3000,
+    )
+
+    assert result == ""
+
+
+# ---------------------------------------------------------------------------
 # 4. Voice clearance → reduced tag set
 # ---------------------------------------------------------------------------
 
