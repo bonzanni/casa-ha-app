@@ -111,3 +111,32 @@ async def test_empty_recall_returns_unknown(tmp_path, monkeypatch):
 
     payload = json.loads(res["content"][0]["text"])
     assert payload["status"] == "unknown"
+
+
+async def test_unavailable_recall_returns_unavailable_not_unknown(tmp_path, monkeypatch):
+    """Three-outcome contract: engager memory that could NOT be checked is
+    'unavailable', distinct from a genuine zero-hit 'unknown'."""
+    from engagement_registry import EngagementRegistry
+    from semantic_memory import RecallUnavailable
+    from tools import query_engager, engagement_var
+
+    class _Down(_Sem):
+        async def recall(self, *a, **k): raise RecallUnavailable("http_504")
+
+    reg = EngagementRegistry(tombstone_path=str(tmp_path / "e.json"), bus=None)
+    rec = await reg.create(
+        kind="specialist", role_or_type="finance", driver="in_casa",
+        task="t", origin={"role": "assistant", "channel": "telegram",
+                          "chat_id": "c1"},
+        topic_id=42,
+    )
+    await _setup(reg, _Down(), monkeypatch)
+
+    token = engagement_var.set(rec)
+    try:
+        res = await query_engager.handler({"question": "x", "max_tokens": 500})
+    finally:
+        engagement_var.reset(token)
+
+    payload = json.loads(res["content"][0]["text"])
+    assert payload["status"] == "unavailable"

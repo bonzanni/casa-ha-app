@@ -4,7 +4,13 @@ from __future__ import annotations
 
 import pytest
 
-from semantic_memory import NoOpSemanticMemory, SemanticMemory, render_mental_models, render_recall
+from semantic_memory import (
+    NoOpSemanticMemory,
+    RecallUnavailable,
+    SemanticMemory,
+    render_mental_models,
+    render_recall,
+)
 
 pytestmark = [pytest.mark.unit]
 
@@ -29,6 +35,15 @@ async def test_noop_reads_return_empty_string() -> None:
     mem = NoOpSemanticMemory()
     assert await mem.recall("casa-assistant", "q", tags=["house"], max_tokens=512) == ""
     assert await mem.profile("casa-assistant") == ""
+
+
+def test_recall_unavailable_is_a_typed_exception() -> None:
+    """Three-outcome contract: UNAVAILABLE is a typed exception on the seam,
+    never collapsed into the zero-hit '' return."""
+    exc = RecallUnavailable("timeout")
+    assert isinstance(exc, Exception)
+    assert exc.reason == "timeout"
+    assert "timeout" in str(exc)
 
 
 def test_render_mental_models_empty() -> None:

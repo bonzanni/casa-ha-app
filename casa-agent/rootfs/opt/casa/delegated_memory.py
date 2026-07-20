@@ -22,6 +22,7 @@ from typing import Any
 
 from channel_policy import writes_to_bank
 from hindsight_ids import bank_id
+from semantic_memory import RecallUnavailable
 from sensitivity import clearance_for_channel, readable_tiers
 from tier_classifier import classify_tier
 
@@ -33,7 +34,12 @@ async def delegated_recall(
     budget: str = "mid",
 ) -> str:
     """Recall the shared bank at the ORIGINATING context's read-clearance.
-    Best-effort: any error → '' (the delegated turn proceeds with no memory).
+
+    Three-outcome contract (v0.99.0): returns the digest ('' = a GENUINE
+    zero-hit search) or raises :class:`RecallUnavailable` when memory could
+    not be checked — the two must never be conflated, or the delegated agent
+    denies knowledge Casa actually has. Call sites decide how to degrade
+    (typically: proceed with no memory block, without claiming absence).
 
     ``budget`` defaults to ``mid``. The v0.68.1 ``low`` default (D-3) was a
     stop-gap for a hindsight-side rerank-latency bug that crossed the 20s
@@ -48,9 +54,13 @@ async def delegated_recall(
         return await semantic_memory.recall(
             bank_id("casa"), query, tags=tags, max_tokens=max_tokens, budget=budget,
         )
-    except Exception:  # noqa: BLE001 — delegated read must never crash the turn
+    except RecallUnavailable:
+        # Backend already logged outcome/reason/latency.
+        logger.warning("delegated recall unavailable (channel=%s)", origin_channel)
+        raise
+    except Exception as exc:  # noqa: BLE001 — typed for callers, never a raw crash
         logger.warning("delegated recall failed (channel=%s)", origin_channel, exc_info=True)
-        return ""
+        raise RecallUnavailable("backend_error") from exc
 
 
 async def retain_delegated(

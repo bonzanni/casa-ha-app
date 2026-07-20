@@ -37,6 +37,7 @@ from plugin_grants import (
 )
 from authz_grants import CHALLENGES, GRANTS, normalize_role
 from delegated_memory import delegated_recall, retain_delegated
+from semantic_memory import RecallUnavailable
 
 from claude_agent_sdk import (
     AssistantMessage,
@@ -1488,11 +1489,16 @@ async def _run_delegated_agent(
     if cfg.memory.token_budget > 0:
         sem = getattr(agent_mod, "active_semantic_memory", None)
         if sem is not None:
-            digest = await delegated_recall(
-                sem, query=task_text,
-                origin_channel=str(parent.get("channel", "")),
-                max_tokens=cfg.memory.token_budget,
-            )
+            try:
+                digest = await delegated_recall(
+                    sem, query=task_text,
+                    origin_channel=str(parent.get("channel", "")),
+                    max_tokens=cfg.memory.token_budget,
+                )
+            except RecallUnavailable:
+                # Delegated turn proceeds cold; inject nothing rather than an
+                # empty block the specialist could read as "no memories exist".
+                digest = ""
             if digest:
                 memory_block = (
                     f'<memory_context agent="{cfg.role}">\n'
@@ -3557,8 +3563,23 @@ async def recall_memory(args: dict) -> dict:
             tags=tags, max_tokens=tokens, budget=budget,
         )
     except Exception as exc:  # noqa: BLE001
-        logger.warning("recall_memory failed for role=%r: %s", role, exc)
-        digest = ""
+        # Three-outcome contract (v0.99.0): a failed recall must NOT report
+        # status=ok with an empty digest — the model would then (per doctrine)
+        # tell the user Casa has no such information, which is false. Any
+        # failure here (typed RecallUnavailable or unexpected) means memory
+        # could not be checked.
+        reason = getattr(exc, "reason", type(exc).__name__)
+        logger.warning(
+            "recall_memory outcome=unavailable role=%r reason=%s", role, reason,
+        )
+        return _result({
+            "status": "unavailable",
+            "message": (
+                "Long-term memory could not be checked (backend unavailable). "
+                "Tell the user memory couldn't be checked right now — do NOT "
+                "say the information doesn't exist or that you don't have it."
+            ),
+        })
     return _result({"status": "ok", "memory": digest})
 
 
@@ -3903,15 +3924,18 @@ async def _fetch_executor_archive(
     """Read prior-engagement "lessons" as a SEMANTIC recall against the shared
     ``casa`` bank, keyed on the current ``task`` and filtered to the originating
     engagement's read-clearance (design §3, plan 3). Returns the digest under a
-    recognizable header, or "" when memory is unavailable / the recall is empty.
-    Best-effort: ``delegated_recall`` swallows its own errors."""
+    recognizable header, or "" when the recall is empty or memory could not
+    be checked (RecallUnavailable → run cold; never a fabricated header)."""
     import agent as agent_mod
     sem = getattr(agent_mod, "active_semantic_memory", None)
     if sem is None:
         return ""
-    digest = await delegated_recall(
-        sem, query=task, origin_channel=origin_channel, max_tokens=token_budget,
-    )
+    try:
+        digest = await delegated_recall(
+            sem, query=task, origin_channel=origin_channel, max_tokens=token_budget,
+        )
+    except RecallUnavailable:
+        return ""
     return f"## Prior engagements (lessons learned)\n{digest}" if digest else ""
 
 
@@ -5460,12 +5484,18 @@ async def query_engager(args: dict) -> dict:
     import agent as agent_mod
     sem = getattr(agent_mod, "active_semantic_memory", None)
     context = ""
+    memory_unavailable = False
     if sem is not None:
-        context = await delegated_recall(
-            sem, query=question,
-            origin_channel=str(engagement.origin.get("channel", "")),
-            max_tokens=2000,
-        )
+        try:
+            context = await delegated_recall(
+                sem, query=question,
+                origin_channel=str(engagement.origin.get("channel", "")),
+                max_tokens=2000,
+            )
+        except RecallUnavailable:
+            # Distinct from status=unknown (a genuine zero-hit): the engager's
+            # memory could not be checked at all.
+            memory_unavailable = True
 
     # Publish bus event so observer can see the query
     if _bus is not None:
@@ -5484,6 +5514,8 @@ async def query_engager(args: dict) -> dict:
         except Exception:
             pass
 
+    if memory_unavailable:
+        return _result({"status": "unavailable", "text": ""})
     if not context:
         return _result({"status": "unknown", "text": ""})
     answer = await _synthesize_answer(question, context, max_tokens)

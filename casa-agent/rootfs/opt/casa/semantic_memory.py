@@ -13,6 +13,26 @@ from abc import ABC, abstractmethod
 from typing import Any
 
 
+class RecallUnavailable(RuntimeError):
+    """Semantic recall could NOT be performed — timeout, 5xx/429, transport
+    failure, or a malformed response envelope.
+
+    Three-outcome contract (v0.99.0): a recall is either (1) hits, (2) a
+    genuine zero-hit '' from a well-formed 2xx response, or (3) this
+    exception. Backends and bridges must never collapse a failure into '',
+    which callers cannot tell from "searched and found nothing" — that is
+    how agents end up truthfully-looking denying knowledge they have.
+
+    ``reason`` is a stable slug (``timeout``, ``http_504``, ``transport``,
+    ``malformed_envelope``, ``backend_error``) safe to log; it never carries
+    query text or recalled content.
+    """
+
+    def __init__(self, reason: str) -> None:
+        self.reason = reason
+        super().__init__(f"recall unavailable: {reason}")
+
+
 def render_mental_models(response: dict[str, Any]) -> str:
     """Render a mental-model list response into a digest. Tolerant of the
     list key name (``mental_models``/``models``/``items``)."""

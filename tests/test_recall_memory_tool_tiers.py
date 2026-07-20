@@ -1,4 +1,6 @@
 """recall_memory tool recalls the shared bank, filtered by channel clearance."""
+import json
+
 import pytest
 
 import agent as agent_mod
@@ -85,6 +87,55 @@ async def test_invoke_recall_sees_all_tiers(monkeypatch):
     finally:
         agent_mod.origin_var.reset(token)
     assert sem.calls[0]["tags"] == ["family", "friends", "private", "public"]
+
+
+async def test_backend_unavailable_returns_unavailable_status(monkeypatch):
+    """Three-outcome contract: a failed recall must NOT report status=ok —
+    the agent would then falsely tell the user Casa has no such memory."""
+    from semantic_memory import RecallUnavailable
+
+    class _Down:
+        async def recall(self, *a, **k): raise RecallUnavailable("http_504")
+
+    monkeypatch.setattr(agent_mod, "active_semantic_memory", _Down(), raising=False)
+    token = agent_mod.origin_var.set({"role": "assistant", "channel": "telegram"})
+    try:
+        out = await tools.recall_memory.handler({"query": "thermostat"})
+    finally:
+        agent_mod.origin_var.reset(token)
+    payload = json.loads(out["content"][0]["text"])
+    assert payload["status"] == "unavailable"
+    assert "memory" not in payload   # never a fake empty digest
+
+
+async def test_unexpected_backend_error_is_unavailable_not_ok(monkeypatch):
+    class _Boom:
+        async def recall(self, *a, **k): raise RuntimeError("x")
+
+    monkeypatch.setattr(agent_mod, "active_semantic_memory", _Boom(), raising=False)
+    token = agent_mod.origin_var.set({"role": "assistant", "channel": "telegram"})
+    try:
+        out = await tools.recall_memory.handler({"query": "q"})
+    finally:
+        agent_mod.origin_var.reset(token)
+    payload = json.loads(out["content"][0]["text"])
+    assert payload["status"] == "unavailable"
+
+
+async def test_zero_hit_recall_stays_ok_with_empty_memory(monkeypatch):
+    """A genuine zero-hit search keeps the {status: ok, memory: ""} shape."""
+    class _Empty:
+        async def recall(self, *a, **k): return ""
+
+    monkeypatch.setattr(agent_mod, "active_semantic_memory", _Empty(), raising=False)
+    token = agent_mod.origin_var.set({"role": "assistant", "channel": "telegram"})
+    try:
+        out = await tools.recall_memory.handler({"query": "q"})
+    finally:
+        agent_mod.origin_var.reset(token)
+    payload = json.loads(out["content"][0]["text"])
+    assert payload["status"] == "ok"
+    assert payload["memory"] == ""
 
 
 async def test_webhook_missing_route_recall_fail_closed_public(monkeypatch):

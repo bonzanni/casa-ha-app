@@ -562,7 +562,12 @@ async def test_memory_failure_does_not_break_response(tmp_path, caplog):
         with caplog.at_level(logging.WARNING):
             out = await agent._process(_msg("telegram", "123", "hi"))
     assert out == "pong"
-    assert any("recall failed" in r.message.lower() for r in caplog.records)
+    # v0.99.0 three-outcome contract: the failure logs as a distinguishable
+    # "unavailable" outcome (not the old undifferentiated "recall failed").
+    assert any(
+        "auto_recall" in r.message and "outcome=unavailable" in r.message
+        for r in caplog.records
+    )
     prompt = FakeClient.captured_options.system_prompt
     assert "<memory_context>" not in prompt
     assert "<channel_context>" in prompt
