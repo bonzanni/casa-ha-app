@@ -32,3 +32,8 @@ mcp>=1.28.1,<2
 # `casa-source-v1.` reserved Hindsight tag must encode a byte-stable
 # canonical JSON payload so encode/decode round trips are deterministic.
 rfc8785==0.1.4
+# Personality Phase A (Task 3): ACCEPTED-CommonMark validation for the
+# strict persona-pack loader's persona.md parsing (markdown_sections.py) —
+# rejects unsupported Markdown tokens/raw HTML and does byte-preserving
+# source-slice section extraction.
+markdown-it-py==4.0.0

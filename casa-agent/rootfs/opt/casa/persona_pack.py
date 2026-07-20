@@ -1,0 +1,171 @@
+from __future__ import annotations
+
+import json
+import os
+import stat
+from dataclasses import dataclass
+from pathlib import Path
+from types import MappingProxyType
+from typing import Mapping
+
+import jsonschema
+import yaml
+
+from canonical_bytes import canonical_json_bytes, canonical_text, checksum_bytes
+from markdown_sections import sections
+
+_REQUIRED = {"persona.yaml", "persona.md"}
+_OPTIONAL = {"examples.yaml"}
+_FORBIDDEN_MARKERS = (
+    "${", "{{", "}}", "{%", "%}", "{#", "#}", "!include",
+    "<platform_frame>", "</platform_frame>", "<role_identity>",
+    "</role_identity>", "<persona>", "</persona>", "<role_doctrine>",
+    "</role_doctrine>", "<safety_kernel>", "</safety_kernel>", "<html",
+)
+_AXES = {
+    "warmth", "formality", "candor", "attunement",
+    "curiosity", "levity", "social_energy", "optimism",
+}
+
+
+class PersonaPackError(ValueError):
+    pass
+
+
+@dataclass(frozen=True, slots=True)
+class PersonaManifest:
+    files: tuple[Mapping[str, object], ...]
+    checksum: str
+
+
+@dataclass(frozen=True, slots=True)
+class PersonaPack:
+    persona_id: str
+    version: str
+    trait_schema_version: int
+    identity: Mapping[str, object]
+    relationship_posture: str
+    archetype: str
+    traits: Mapping[str, int]
+    quirks: tuple[Mapping[str, str], ...]
+    markdown: str
+    examples: tuple[Mapping[str, str], ...]
+    manifest: PersonaManifest
+    checksum: str
+
+
+def _admit_files(pack_dir: Path) -> tuple[Path, ...]:
+    entries = sorted(pack_dir.iterdir(), key=lambda path: path.name)
+    names = {entry.name for entry in entries}
+    if not _REQUIRED <= names or names - _REQUIRED - _OPTIONAL:
+        raise PersonaPackError("persona pack file set is invalid")
+    admitted = []
+    for path in entries:
+        info = path.lstat()
+        if path.name.startswith(".") or not stat.S_ISREG(info.st_mode):
+            raise PersonaPackError(f"invalid persona file: {path.name}")
+        if info.st_nlink != 1:
+            raise PersonaPackError(f"hard-linked persona file: {path.name}")
+        if info.st_mode & 0o111:
+            raise PersonaPackError(f"executable persona file: {path.name}")
+        admitted.append(path)
+    return tuple(admitted)
+
+
+def _reject_markers(text: str) -> None:
+    lowered = text.lower()
+    if any(marker.lower() in lowered for marker in _FORBIDDEN_MARKERS):
+        raise PersonaPackError("template, include, HTML, or delimiter detected")
+
+
+def _validate_schema(payload: object, schema_path: Path) -> None:
+    # jsonschema.validate raises jsonschema.exceptions.ValidationError on
+    # its own — the loader's contract is that every rejection surfaces as
+    # PersonaPackError, so wrap it here rather than leaking the jsonschema
+    # exception type to callers.
+    try:
+        jsonschema.validate(payload, json.loads(schema_path.read_text()))
+    except jsonschema.exceptions.ValidationError as exc:
+        raise PersonaPackError(f"schema validation failed: {exc.message}") from exc
+
+
+def load_persona_pack(pack_dir: Path, manifest_path: Path) -> PersonaPack:
+    files = _admit_files(pack_dir)
+    canonical_files = {}
+    manifest_rows = []
+    for path in files:
+        text = canonical_text(path.read_text(encoding="utf-8"))
+        _reject_markers(text)
+        canonical_files[path.name] = text
+        manifest_rows.append({
+            "path": path.name,
+            "type": "file",
+            "executable": False,
+            "checksum": checksum_bytes(text.encode("utf-8")),
+        })
+
+    persona = yaml.safe_load(canonical_files["persona.yaml"])
+    schema_path = (
+        Path(__file__).parent / "defaults/schema/persona.v1.json"
+    )
+    _validate_schema(persona, schema_path)
+    if set(persona["traits"]) != _AXES:
+        raise PersonaPackError("traits must contain exactly the eight v1 axes")
+
+    try:
+        parsed_sections = sections(canonical_files["persona.md"])
+    except ValueError as exc:
+        raise PersonaPackError(f"persona.md failed Markdown validation: {exc}") from exc
+    core_bodies = [body for level, name, body in parsed_sections
+                   if level == 1 and name == "Core"]
+    if len(core_bodies) != 1:
+        raise PersonaPackError("exactly one # Core section is required")
+    core_length = len(core_bodies[0].strip())
+    if not 300 <= core_length <= 500:
+        raise PersonaPackError("Core body must contain 300–500 characters")
+    if not any(level == 2 and name == "Negative space"
+               for level, name, _ in parsed_sections):
+        raise PersonaPackError("## Negative space is required")
+
+    examples = ()
+    if "examples.yaml" in canonical_files:
+        raw_examples = yaml.safe_load(canonical_files["examples.yaml"])
+        example_schema = (
+            Path(__file__).parent / "defaults/schema/persona-examples.v1.json"
+        )
+        _validate_schema(raw_examples, example_schema)
+        examples = tuple(
+            MappingProxyType(dict(value))
+            for value in raw_examples.get("examples", [])
+        )
+
+    manifest_payload = {
+        "api_version": "casa.persona.manifest/v1",
+        "files": manifest_rows,
+    }
+    manifest_checksum = checksum_bytes(canonical_json_bytes(manifest_payload))
+    manifest_payload["checksum"] = manifest_checksum
+    try:
+        expected_manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError) as exc:
+        raise PersonaPackError(f"persona manifest could not be read: {exc}") from exc
+    if expected_manifest != manifest_payload:
+        raise PersonaPackError("persona manifest does not match admitted files")
+
+    return PersonaPack(
+        persona_id=persona["id"],
+        version=persona["version"],
+        trait_schema_version=persona["trait_schema_version"],
+        identity=MappingProxyType(dict(persona["identity"])),
+        relationship_posture=persona["relationship_posture"],
+        archetype=persona["archetype"],
+        traits=MappingProxyType(dict(persona["traits"])),
+        quirks=tuple(MappingProxyType(dict(q)) for q in persona.get("quirks", [])),
+        markdown=canonical_files["persona.md"],
+        examples=examples,
+        manifest=PersonaManifest(
+            files=tuple(MappingProxyType(dict(row)) for row in manifest_rows),
+            checksum=manifest_checksum,
+        ),
+        checksum=manifest_checksum,
+    )

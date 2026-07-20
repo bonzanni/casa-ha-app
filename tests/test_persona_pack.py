@@ -1,0 +1,665 @@
+"""Strict persona-pack loader coverage.
+
+`persona_pack.load_persona_pack` reads an authored persona pack
+(persona.yaml + persona.md + optional examples.yaml) plus a loader-owned
+manifest.json envelope, validates it hard against the v1 schemas and the
+Core/quirks/trait invariants, and produces an immutable `PersonaPack`. It
+must reject anything outside the exact admitted file set (hidden files,
+undeclared files, subdirectories, executable files, symlinks, hard links,
+devices, FIFOs), any role-owned/forbidden YAML key, any template/include/
+HTML/Casa-structural-delimiter marker in persona prose, and any manifest
+that does not exactly match the admitted, checksummed file set.
+
+`markdown_sections` underlies the persona.md parsing: it does ACCEPTED-
+CommonMark validation (rejecting unsupported tokens and raw HTML) and
+BYTE-PRESERVING source-slice extraction (extracted section bodies must be
+exact substrings of the canonical source, never re-rendered, so checksums
+stay stable).
+"""
+
+from __future__ import annotations
+
+import json
+import os
+import stat
+from pathlib import Path
+
+import pytest
+import yaml
+
+from canonical_bytes import canonical_json_bytes, canonical_text, checksum_bytes
+from markdown_sections import (
+    MarkdownSectionError,
+    select_markdown_sections,
+    sections,
+    validate_markdown,
+)
+from persona_pack import PersonaPackError, load_persona_pack
+
+
+# ---------------------------------------------------------------------------
+# Shared fixtures / helpers
+# ---------------------------------------------------------------------------
+
+
+def valid_yaml() -> dict:
+    return {
+        "api_version": "casa.persona/v1",
+        "id": "example.personas/test",
+        "version": "1.0.0",
+        "trait_schema_version": 1,
+        "identity": {
+            "display_name": "Test",
+            "pronouns": {
+                "subject": "they",
+                "object": "them",
+                "possessive_adjective": "their",
+                "possessive_pronoun": "theirs",
+                "reflexive": "themselves",
+            },
+        },
+        "relationship_posture": "professional",
+        "archetype": "household-assistant",
+        "traits": {
+            "warmth": 3, "formality": 3, "candor": 3, "attunement": 3,
+            "curiosity": 3, "levity": 3, "social_energy": 3, "optimism": 3,
+        },
+        "quirks": [],
+    }
+
+
+def core() -> str:
+    body = (
+        "Test is a calm and attentive household presence who responds with "
+        "measured social ease. They notice practical details, distinguish "
+        "evidence from assumption, and maintain a consistent interpersonal "
+        "manner without claiming memories or authority that the role and "
+        "available evidence do not support. Their identity remains stable "
+        "across text and voice while operational behaviour remains role-owned."
+    )
+    return f"# Core\n\n{body}\n\n## Negative space\n\nNo fake intimacy or authority.\n"
+
+
+def core_with_fill_length(n: int) -> str:
+    """`## Negative space` is a level-2 heading nested under `# Core`, so
+    `markdown_sections.sections()` (next-heading-of-same-or-shallower-level
+    boundary) folds the Negative-space heading + body into the Core
+    section's own extracted body — it never terminates it. `n` is the
+    length of the literal filler text, not the measured Core-section
+    length; see `core_with_measured_core_length` for the latter."""
+    body = "A" * n
+    return f"# Core\n\n{body}\n\n## Negative space\n\nNo fake intimacy or authority.\n"
+
+
+def _measured_core_length(fill_len: int) -> int:
+    canonical = canonical_text(core_with_fill_length(fill_len))
+    core_bodies = [body for level, name, body in sections(canonical)
+                   if level == 1 and name == "Core"]
+    return len(core_bodies[0].strip())
+
+
+def core_with_measured_core_length(target: int) -> str:
+    """Build a document whose *measured* Core-section length (exactly what
+    `persona_pack.load_persona_pack` checks against the 300-500 bound) is
+    `target` — found by binary search over the fill length against the real
+    `markdown_sections.sections()` (measured length is monotonic non-
+    decreasing in fill length) rather than assuming a fixed linear offset,
+    so this stays correct even given small-fill edge effects (an empty
+    filler body collapses adjacent blank lines differently) and if the
+    fixed Negative-space wording ever changes."""
+    lo, hi = 0, target
+    while lo < hi:
+        mid = (lo + hi) // 2
+        if _measured_core_length(mid) < target:
+            lo = mid + 1
+        else:
+            hi = mid
+    assert _measured_core_length(lo) == target, (
+        f"no fill length produces an exact measured Core length of {target}"
+    )
+    return core_with_fill_length(lo)
+
+
+def write_pack(path: Path) -> Path:
+    pack = path / "pack"
+    pack.mkdir()
+    (pack / "persona.yaml").write_text(
+        yaml.safe_dump(valid_yaml(), sort_keys=False),
+        encoding="utf-8",
+    )
+    (pack / "persona.md").write_text(core(), encoding="utf-8")
+    return pack
+
+
+def build_manifest(pack: Path) -> dict:
+    """Replicate the loader's manifest-construction algorithm using only
+    the already-shipped `canonical_bytes` primitives (Task 1/2), so tests
+    can hand `load_persona_pack` a manifest.json that matches whatever the
+    loader will independently recompute from the pack's admitted files."""
+    rows = []
+    for name in sorted(os.listdir(pack)):
+        path = pack / name
+        text = canonical_text(path.read_text(encoding="utf-8"))
+        rows.append({
+            "path": name,
+            "type": "file",
+            "executable": False,
+            "checksum": checksum_bytes(text.encode("utf-8")),
+        })
+    payload = {"api_version": "casa.persona.manifest/v1", "files": rows}
+    payload["checksum"] = checksum_bytes(canonical_json_bytes(payload))
+    return payload
+
+
+def write_manifest(pack: Path, manifest_path: Path) -> dict:
+    payload = build_manifest(pack)
+    manifest_path.write_text(json.dumps(payload), encoding="utf-8")
+    return payload
+
+
+def write_valid_manifest(pack: Path, manifest_path: Path) -> None:
+    write_manifest(pack, manifest_path)
+
+
+# ---------------------------------------------------------------------------
+# Step 1 (brief, verbatim): forbidden/invalid YAML, templates/HTML/
+# structural delimiters, hidden files.
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.parametrize(
+    "mutation",
+    [
+        lambda data: data.update({"tools": {}}),
+        lambda data: data.update({"model": "haiku"}),
+        lambda data: data.update({"channels": ["voice"]}),
+        lambda data: data["traits"].pop("warmth"),
+        lambda data: data["traits"].update({"warmth": 6}),
+    ],
+)
+def test_forbidden_or_invalid_yaml_fails(tmp_path: Path, mutation) -> None:
+    pack = write_pack(tmp_path)
+    data = valid_yaml()
+    mutation(data)
+    (pack / "persona.yaml").write_text(
+        yaml.safe_dump(data, sort_keys=False), encoding="utf-8"
+    )
+    with pytest.raises(PersonaPackError):
+        load_persona_pack(pack, tmp_path / "manifest.json")
+
+
+@pytest.mark.parametrize("text", ["${SECRET}", "{{ value }}", "{% include x %}",
+                                  "<platform_frame>", "<b>html</b>", "!include x"])
+def test_templates_html_and_structural_delimiters_fail(
+    tmp_path: Path, text: str,
+) -> None:
+    pack = write_pack(tmp_path)
+    (pack / "persona.md").write_text(core() + text + "\n", encoding="utf-8")
+    with pytest.raises(PersonaPackError):
+        load_persona_pack(pack, tmp_path / "manifest.json")
+
+
+def test_hidden_executable_symlink_hardlink_and_subdirectory_fail(
+    tmp_path: Path,
+) -> None:
+    pack = write_pack(tmp_path)
+    (pack / ".hidden").write_text("x", encoding="utf-8")
+    with pytest.raises(PersonaPackError):
+        load_persona_pack(pack, tmp_path / "manifest.json")
+
+
+# ---------------------------------------------------------------------------
+# Additional pack-boundary rejection coverage (mandated by the "reject
+# hidden files, undeclared files, subdirectories, executable files,
+# symlinks, hard links, devices, FIFOs" constraint) — each isolates ONE
+# admission-boundary category so a regression in `_admit_files` is
+# attributable.
+# ---------------------------------------------------------------------------
+
+
+def test_undeclared_extra_file_fails(tmp_path: Path) -> None:
+    pack = write_pack(tmp_path)
+    (pack / "readme.txt").write_text("not part of the pack", encoding="utf-8")
+    with pytest.raises(PersonaPackError):
+        load_persona_pack(pack, tmp_path / "manifest.json")
+
+
+def test_missing_required_file_fails(tmp_path: Path) -> None:
+    pack = write_pack(tmp_path)
+    (pack / "persona.md").unlink()
+    with pytest.raises(PersonaPackError):
+        load_persona_pack(pack, tmp_path / "manifest.json")
+
+
+def test_executable_persona_file_fails(tmp_path: Path) -> None:
+    pack = write_pack(tmp_path)
+    path = pack / "persona.yaml"
+    path.chmod(path.stat().st_mode | stat.S_IXUSR)
+    with pytest.raises(PersonaPackError):
+        load_persona_pack(pack, tmp_path / "manifest.json")
+
+
+def test_symlinked_persona_file_fails(tmp_path: Path) -> None:
+    pack = write_pack(tmp_path)
+    real = tmp_path / "outside_examples.yaml"
+    real.write_text("api_version: casa.persona.examples/v1\nexamples: []\n", encoding="utf-8")
+    (pack / "examples.yaml").symlink_to(real)
+    with pytest.raises(PersonaPackError):
+        load_persona_pack(pack, tmp_path / "manifest.json")
+
+
+def test_hardlinked_persona_file_fails(tmp_path: Path) -> None:
+    # The hard link must occupy one of the DECLARED filenames (here
+    # persona.md) so this exercises `_admit_files`'s `st_nlink != 1` guard
+    # specifically, rather than the earlier undeclared-file-set check that
+    # an extra/undeclared hard-linked name would trip instead.
+    pack = write_pack(tmp_path)
+    external = tmp_path / "external_persona.md"
+    external.write_text(core(), encoding="utf-8")
+    (pack / "persona.md").unlink()
+    os.link(external, pack / "persona.md")
+    with pytest.raises(PersonaPackError):
+        load_persona_pack(pack, tmp_path / "manifest.json")
+
+
+def test_subdirectory_in_pack_fails(tmp_path: Path) -> None:
+    # The directory must occupy a DECLARED filename (here the optional
+    # examples.yaml) so this exercises `_admit_files`'s `S_ISREG` guard
+    # specifically, rather than the earlier undeclared-file-set check that
+    # an extra/undeclared subdirectory name would trip instead.
+    pack = write_pack(tmp_path)
+    (pack / "examples.yaml").mkdir()
+    with pytest.raises(PersonaPackError):
+        load_persona_pack(pack, tmp_path / "manifest.json")
+
+
+def test_fifo_in_pack_fails(tmp_path: Path) -> None:
+    pack = write_pack(tmp_path)
+    fifo_path = pack / "examples.yaml"
+    os.mkfifo(fifo_path)
+    try:
+        with pytest.raises(PersonaPackError):
+            load_persona_pack(pack, tmp_path / "manifest.json")
+    finally:
+        fifo_path.unlink()
+
+
+# Device-file rejection (mknod for a character/block device) requires root
+# in this environment and cannot be exercised without it; `_admit_files`
+# rejects non-regular files via `stat.S_ISREG`, which covers devices by the
+# same code path already exercised by the FIFO/symlink/subdirectory cases
+# above. See task-3-report.md for this environment limitation.
+
+
+# ---------------------------------------------------------------------------
+# Manifest verification
+# ---------------------------------------------------------------------------
+
+
+def test_valid_pack_with_matching_manifest_loads(tmp_path: Path) -> None:
+    pack = write_pack(tmp_path)
+    manifest_path = tmp_path / "manifest.json"
+    write_valid_manifest(pack, manifest_path)
+    result = load_persona_pack(pack, manifest_path)
+    assert result.persona_id == "example.personas/test"
+    assert result.version == "1.0.0"
+    assert result.trait_schema_version == 1
+    assert result.traits["warmth"] == 3
+    assert result.checksum.startswith("sha256:")
+    assert result.manifest.checksum == result.checksum
+
+
+def test_manifest_mismatch_fails(tmp_path: Path) -> None:
+    pack = write_pack(tmp_path)
+    manifest_path = tmp_path / "manifest.json"
+    payload = build_manifest(pack)
+    payload["files"][0]["checksum"] = "sha256:" + "0" * 64
+    manifest_path.write_text(json.dumps(payload), encoding="utf-8")
+    with pytest.raises(PersonaPackError):
+        load_persona_pack(pack, manifest_path)
+
+
+def test_missing_manifest_file_fails(tmp_path: Path) -> None:
+    pack = write_pack(tmp_path)
+    with pytest.raises((PersonaPackError, OSError)):
+        load_persona_pack(pack, tmp_path / "does-not-exist.json")
+
+
+def test_manifest_stale_after_pack_content_changes(tmp_path: Path) -> None:
+    pack = write_pack(tmp_path)
+    manifest_path = tmp_path / "manifest.json"
+    write_valid_manifest(pack, manifest_path)
+    (pack / "persona.md").write_text(core() + "\nExtra unreviewed sentence.\n", encoding="utf-8")
+    with pytest.raises(PersonaPackError):
+        load_persona_pack(pack, manifest_path)
+
+
+# ---------------------------------------------------------------------------
+# Core length boundaries: 300-500 Unicode characters required (299/501 fail,
+# 300/500 pass).
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.parametrize("length", [299, 501])
+def test_core_body_length_outside_boundaries_fails(tmp_path: Path, length: int) -> None:
+    pack = write_pack(tmp_path)
+    (pack / "persona.md").write_text(core_with_measured_core_length(length), encoding="utf-8")
+    manifest_path = tmp_path / "manifest.json"
+    write_valid_manifest(pack, manifest_path)
+    with pytest.raises(PersonaPackError):
+        load_persona_pack(pack, manifest_path)
+
+
+@pytest.mark.parametrize("length", [300, 500])
+def test_core_body_length_at_boundaries_passes(tmp_path: Path, length: int) -> None:
+    pack = write_pack(tmp_path)
+    (pack / "persona.md").write_text(core_with_measured_core_length(length), encoding="utf-8")
+    manifest_path = tmp_path / "manifest.json"
+    write_valid_manifest(pack, manifest_path)
+    result = load_persona_pack(pack, manifest_path)
+    assert result.persona_id == "example.personas/test"
+
+
+def test_missing_core_section_fails(tmp_path: Path) -> None:
+    pack = write_pack(tmp_path)
+    (pack / "persona.md").write_text(
+        "# Not Core\n\nSomething else entirely that is not the required "
+        "section heading at all.\n\n## Negative space\n\nNone.\n",
+        encoding="utf-8",
+    )
+    manifest_path = tmp_path / "manifest.json"
+    write_valid_manifest(pack, manifest_path)
+    with pytest.raises(PersonaPackError):
+        load_persona_pack(pack, manifest_path)
+
+
+def test_duplicate_core_section_fails(tmp_path: Path) -> None:
+    pack = write_pack(tmp_path)
+    doc = core() + "\n" + core_with_fill_length(320)
+    (pack / "persona.md").write_text(doc, encoding="utf-8")
+    manifest_path = tmp_path / "manifest.json"
+    write_valid_manifest(pack, manifest_path)
+    with pytest.raises(PersonaPackError):
+        load_persona_pack(pack, manifest_path)
+
+
+def test_missing_negative_space_section_fails(tmp_path: Path) -> None:
+    pack = write_pack(tmp_path)
+    body = "A" * 320
+    (pack / "persona.md").write_text(f"# Core\n\n{body}\n", encoding="utf-8")
+    manifest_path = tmp_path / "manifest.json"
+    write_valid_manifest(pack, manifest_path)
+    with pytest.raises(PersonaPackError):
+        load_persona_pack(pack, manifest_path)
+
+
+# ---------------------------------------------------------------------------
+# Quirks: at most three entries, author order preserved, context/tendency
+# capped at 240 chars each.
+# ---------------------------------------------------------------------------
+
+
+def _quirk(i: int) -> dict:
+    return {
+        "frequency": "occasional",
+        "context": f"context-{i}",
+        "tendency": f"tendency-{i}",
+    }
+
+
+@pytest.mark.parametrize("count", [0, 3])
+def test_quirks_count_within_limit_passes(tmp_path: Path, count: int) -> None:
+    pack = write_pack(tmp_path)
+    data = valid_yaml()
+    data["quirks"] = [_quirk(i) for i in range(count)]
+    (pack / "persona.yaml").write_text(yaml.safe_dump(data, sort_keys=False), encoding="utf-8")
+    manifest_path = tmp_path / "manifest.json"
+    write_valid_manifest(pack, manifest_path)
+    result = load_persona_pack(pack, manifest_path)
+    assert [q["context"] for q in result.quirks] == [f"context-{i}" for i in range(count)]
+
+
+def test_quirks_count_over_limit_fails(tmp_path: Path) -> None:
+    pack = write_pack(tmp_path)
+    data = valid_yaml()
+    data["quirks"] = [_quirk(i) for i in range(4)]
+    (pack / "persona.yaml").write_text(yaml.safe_dump(data, sort_keys=False), encoding="utf-8")
+    with pytest.raises(PersonaPackError):
+        load_persona_pack(pack, tmp_path / "manifest.json")
+
+
+@pytest.mark.parametrize("field", ["context", "tendency"])
+def test_quirk_field_over_240_chars_fails(tmp_path: Path, field: str) -> None:
+    pack = write_pack(tmp_path)
+    data = valid_yaml()
+    quirk = _quirk(0)
+    quirk[field] = "x" * 241
+    data["quirks"] = [quirk]
+    (pack / "persona.yaml").write_text(yaml.safe_dump(data, sort_keys=False), encoding="utf-8")
+    with pytest.raises(PersonaPackError):
+        load_persona_pack(pack, tmp_path / "manifest.json")
+
+
+def test_quirks_preserve_author_order(tmp_path: Path) -> None:
+    pack = write_pack(tmp_path)
+    data = valid_yaml()
+    data["quirks"] = [_quirk(2), _quirk(0), _quirk(1)]
+    (pack / "persona.yaml").write_text(yaml.safe_dump(data, sort_keys=False), encoding="utf-8")
+    manifest_path = tmp_path / "manifest.json"
+    write_valid_manifest(pack, manifest_path)
+    result = load_persona_pack(pack, manifest_path)
+    assert [q["context"] for q in result.quirks] == ["context-2", "context-0", "context-1"]
+
+
+# ---------------------------------------------------------------------------
+# Every forbidden/role-owned top-level YAML key.
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.parametrize(
+    "key,value",
+    [
+        ("tools", {}),
+        ("model", "haiku"),
+        ("channels", ["voice"]),
+        ("system_prompt", "override"),
+        ("mcp_servers", []),
+        ("hooks", {}),
+        ("permissions", {}),
+    ],
+)
+def test_every_role_owned_key_is_forbidden(tmp_path: Path, key: str, value: object) -> None:
+    pack = write_pack(tmp_path)
+    data = valid_yaml()
+    data[key] = value
+    (pack / "persona.yaml").write_text(yaml.safe_dump(data, sort_keys=False), encoding="utf-8")
+    with pytest.raises(PersonaPackError):
+        load_persona_pack(pack, tmp_path / "manifest.json")
+
+
+# ---------------------------------------------------------------------------
+# Trait schema: exactly the eight v1 axes, integers 1-5.
+# ---------------------------------------------------------------------------
+
+
+def test_trait_missing_axis_fails(tmp_path: Path) -> None:
+    pack = write_pack(tmp_path)
+    data = valid_yaml()
+    del data["traits"]["curiosity"]
+    (pack / "persona.yaml").write_text(yaml.safe_dump(data, sort_keys=False), encoding="utf-8")
+    with pytest.raises(PersonaPackError):
+        load_persona_pack(pack, tmp_path / "manifest.json")
+
+
+def test_trait_extra_axis_fails(tmp_path: Path) -> None:
+    pack = write_pack(tmp_path)
+    data = valid_yaml()
+    data["traits"]["extra_axis"] = 3
+    (pack / "persona.yaml").write_text(yaml.safe_dump(data, sort_keys=False), encoding="utf-8")
+    with pytest.raises(PersonaPackError):
+        load_persona_pack(pack, tmp_path / "manifest.json")
+
+
+@pytest.mark.parametrize("value", [0, 6, 3.5])
+def test_trait_value_out_of_range_or_non_integer_fails(tmp_path: Path, value) -> None:
+    pack = write_pack(tmp_path)
+    data = valid_yaml()
+    data["traits"]["warmth"] = value
+    (pack / "persona.yaml").write_text(yaml.safe_dump(data, sort_keys=False), encoding="utf-8")
+    with pytest.raises(PersonaPackError):
+        load_persona_pack(pack, tmp_path / "manifest.json")
+
+
+# ---------------------------------------------------------------------------
+# Pronoun field length.
+# ---------------------------------------------------------------------------
+
+
+def test_invalid_pronoun_length_fails(tmp_path: Path) -> None:
+    pack = write_pack(tmp_path)
+    data = valid_yaml()
+    data["identity"]["pronouns"]["subject"] = "x" * 41
+    (pack / "persona.yaml").write_text(yaml.safe_dump(data, sort_keys=False), encoding="utf-8")
+    with pytest.raises(PersonaPackError):
+        load_persona_pack(pack, tmp_path / "manifest.json")
+
+
+def test_empty_pronoun_field_fails(tmp_path: Path) -> None:
+    pack = write_pack(tmp_path)
+    data = valid_yaml()
+    data["identity"]["pronouns"]["object"] = ""
+    (pack / "persona.yaml").write_text(yaml.safe_dump(data, sort_keys=False), encoding="utf-8")
+    with pytest.raises(PersonaPackError):
+        load_persona_pack(pack, tmp_path / "manifest.json")
+
+
+# ---------------------------------------------------------------------------
+# examples.yaml (optional file, schema-validated when present).
+# ---------------------------------------------------------------------------
+
+
+def test_valid_examples_file_loads(tmp_path: Path) -> None:
+    pack = write_pack(tmp_path)
+    examples_payload = {
+        "api_version": "casa.persona.examples/v1",
+        "examples": [
+            {"surface": "text", "user": "hi", "good": "Hello.", "bad": "yo"},
+        ],
+    }
+    (pack / "examples.yaml").write_text(
+        yaml.safe_dump(examples_payload, sort_keys=False), encoding="utf-8"
+    )
+    manifest_path = tmp_path / "manifest.json"
+    write_valid_manifest(pack, manifest_path)
+    result = load_persona_pack(pack, manifest_path)
+    assert len(result.examples) == 1
+    assert result.examples[0]["good"] == "Hello."
+
+
+def test_examples_file_wrong_api_version_fails(tmp_path: Path) -> None:
+    pack = write_pack(tmp_path)
+    examples_payload = {
+        "api_version": "casa.persona.examples/v0",
+        "examples": [],
+    }
+    (pack / "examples.yaml").write_text(
+        yaml.safe_dump(examples_payload, sort_keys=False), encoding="utf-8"
+    )
+    with pytest.raises(PersonaPackError):
+        load_persona_pack(pack, tmp_path / "manifest.json")
+
+
+# ===========================================================================
+# markdown_sections — ACCEPTED-CommonMark validation + byte-preserving
+# source-slice extraction, tested directly.
+# ===========================================================================
+
+
+@pytest.mark.parametrize(
+    "html_fragment",
+    [
+        "<b>html</b>",
+        "<b>unterminated",
+        "<!--comment-->",
+        "<!DOCTYPE html>",
+        "<?probe?>",
+        "<script>x</script>",
+        "<div>\nblock\n</div>\n",
+    ],
+)
+def test_raw_html_fails_in_all_forms(html_fragment: str) -> None:
+    source = core() + html_fragment + "\n"
+    with pytest.raises(MarkdownSectionError):
+        validate_markdown(source)
+
+
+@pytest.mark.parametrize("text", ["2 < 3", "`<b>`"])
+def test_non_html_angle_brackets_and_backticked_code_remain_valid(text: str) -> None:
+    source = core() + text + "\n"
+    assert validate_markdown(source)
+
+
+@pytest.mark.parametrize(
+    "unsupported_fragment",
+    [
+        "> a blockquote\n",
+        "1. an ordered list item\n",
+        "---\n",
+        "![alt](img.png)\n",
+        "[a link](http://example.com)\n",
+    ],
+)
+def test_unsupported_markdown_tokens_fail(unsupported_fragment: str) -> None:
+    # A blank line before the fragment is required so "---" is parsed as a
+    # thematic break (hr) rather than a setext-heading underline for the
+    # immediately preceding paragraph (CommonMark setext rule).
+    source = core() + "\n" + unsupported_fragment
+    with pytest.raises(MarkdownSectionError):
+        validate_markdown(source)
+
+
+def test_source_slice_extraction_is_byte_preserving() -> None:
+    source = core()
+    canonical = canonical_text(source)
+    parsed = sections(canonical)
+    core_bodies = [body for level, name, body in parsed if level == 1 and name == "Core"]
+    assert len(core_bodies) == 1
+    # The extracted body must be an exact substring of the canonical
+    # source — never a re-render — so its checksum stays stable.
+    assert core_bodies[0].strip("\n") in canonical
+    negative_space_bodies = [
+        body for level, name, body in parsed if level == 2 and name == "Negative space"
+    ]
+    assert len(negative_space_bodies) == 1
+    assert negative_space_bodies[0].strip("\n") in canonical
+
+
+def _sibling_sections_source() -> str:
+    # Sibling level-1 headings (unlike `## Negative space` under `# Core`,
+    # which is a nested subsection swallowed into Core's own body) isolate
+    # `select_markdown_sections`'s subset-selection behaviour from the
+    # heading-nesting behaviour covered by `test_source_slice_...` above.
+    return (
+        "# First\n\nFirst section body text.\n\n"
+        "# Second\n\nSecond section body text.\n\n"
+        "# Third\n\nThird section body text.\n"
+    )
+
+
+def test_select_markdown_sections_returns_named_bodies_in_source_order() -> None:
+    canonical = canonical_text(_sibling_sections_source())
+    result = select_markdown_sections(canonical, ("Third", "First"))
+    assert "First section body text." in result
+    assert "Third section body text." in result
+    first_pos = result.index("First section body text.")
+    third_pos = result.index("Third section body text.")
+    # Selection follows SOURCE order, not the order names were requested in.
+    assert first_pos < third_pos
+
+
+def test_select_markdown_sections_omits_unselected_sections() -> None:
+    canonical = canonical_text(_sibling_sections_source())
+    result = select_markdown_sections(canonical, ("First",))
+    assert "First section body text." in result
+    assert "Second section body text." not in result
+    assert "Third section body text." not in result
