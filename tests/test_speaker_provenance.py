@@ -1,0 +1,593 @@
+"""Strict codec tests for the immutable speaker-provenance contract.
+
+Covers the reserved `casa-source-v1.` tag codec (canonical RFC 8785 JSON,
+base64url unpadded), the frozen `SpeakerProvenance`/`RetainedTurn` snapshot
+types, and the `UserProvenance.from_origin` factory contract: an anonymous
+voice speaker never acquires a name, and an authenticated transport
+identity is the ONLY name source (no caller-supplied display name can be
+injected through the factory).
+"""
+
+from __future__ import annotations
+
+import base64
+import inspect
+from dataclasses import FrozenInstanceError
+
+import pytest
+
+from speaker_provenance import (
+    MAX_CANONICAL_PROVENANCE_BYTES,
+    MAX_ENCODED_PROVENANCE_TAG_BYTES,
+    RESERVED_SOURCE_PREFIX,
+    UserProvenance,
+    _FIELD_LIMITS,
+    decode_provenance_from_tags,
+    decode_provenance_tag,
+    encode_provenance_tag,
+    validate_speaker_provenance,
+)
+from canonical_bytes import canonical_json_bytes
+from personality_types import (
+    AuthenticatedUser,
+    RetainedTurn,
+    SpeakerProvenance,
+    TrustedOrigin,
+)
+
+
+def resident() -> SpeakerProvenance:
+    return SpeakerProvenance(
+        speaker_kind="resident",
+        role_id="resident:butler",
+        persona_id="casa.personas/tina",
+        persona_version="1.0.0",
+        display_name="Tina",
+        binding_digest="sha256:" + "5" * 64,
+        user_peer=None,
+        user_id=None,
+    )
+
+
+def specialist() -> SpeakerProvenance:
+    return SpeakerProvenance(
+        speaker_kind="specialist",
+        role_id="specialist:gary",
+        persona_id="casa.personas/gary",
+        persona_version="2.3.1",
+        display_name="Gary",
+        binding_digest="sha256:" + "a" * 64,
+        user_peer=None,
+        user_id=None,
+    )
+
+
+def executor() -> SpeakerProvenance:
+    return SpeakerProvenance(
+        speaker_kind="executor",
+        role_id="executor:home",
+    )
+
+
+def user() -> SpeakerProvenance:
+    return SpeakerProvenance(speaker_kind="user", user_peer="telegram_123")
+
+
+def system() -> SpeakerProvenance:
+    return SpeakerProvenance(speaker_kind="system")
+
+
+# ---------------------------------------------------------------------------
+# Step 1 skeleton (verbatim from the brief)
+# ---------------------------------------------------------------------------
+
+
+def test_reserved_tag_round_trip_is_canonical_and_unpadded() -> None:
+    tag = encode_provenance_tag(resident())
+    assert tag.startswith(RESERVED_SOURCE_PREFIX)
+    assert "=" not in tag
+    assert decode_provenance_tag(tag) == resident()
+
+
+@pytest.mark.parametrize(
+    "tags",
+    [
+        (),
+        ("casa-source-v1.bad!",),
+        (encode_provenance_tag(resident()), encode_provenance_tag(resident())),
+        (encode_provenance_tag(resident()), "casa-source-v2.invalid"),
+    ],
+)
+def test_missing_malformed_duplicate_or_conflicting_tags_are_unknown(tags) -> None:
+    provenance, reason = decode_provenance_from_tags(tags)
+    assert provenance is None
+    assert reason != "ok"
+
+
+def test_snapshot_is_frozen() -> None:
+    value = resident()
+    with pytest.raises(FrozenInstanceError):
+        value.display_name = "Changed"
+
+
+# ---------------------------------------------------------------------------
+# Additional codec coverage: all speaker kinds round-trip, ASCII, tag shape
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.parametrize(
+    "value",
+    [resident(), specialist(), executor(), user(), system()],
+    ids=["resident", "specialist", "executor", "user", "system"],
+)
+def test_all_speaker_kinds_round_trip(value: SpeakerProvenance) -> None:
+    tag = encode_provenance_tag(value)
+    assert tag.isascii()
+    assert tag.startswith(RESERVED_SOURCE_PREFIX)
+    assert "=" not in tag
+    assert decode_provenance_tag(tag) == value
+
+
+def test_retained_turn_is_frozen_and_holds_provenance() -> None:
+    turn = RetainedTurn(text="hello", provenance=resident())
+    assert turn.provenance == resident()
+    with pytest.raises(FrozenInstanceError):
+        turn.text = "changed"
+
+
+# ---------------------------------------------------------------------------
+# Maximum-length and worst-case 4-byte Unicode round trips
+# ---------------------------------------------------------------------------
+
+_POO = "\U0001f4a9"  # U+1F4A9, worst-case 4-byte UTF-8 scalar
+
+
+def _fill(scalar_limit: int, byte_limit: int, unicode_char: str | None = None) -> str:
+    """Build the longest string that still satisfies both a scalar-count and
+    a UTF-8-byte-count ceiling for the given char set."""
+    if unicode_char is None:
+        return "a" * scalar_limit
+    char_bytes = len(unicode_char.encode("utf-8"))
+    max_by_scalar = scalar_limit
+    max_by_bytes = byte_limit // char_bytes
+    count = min(max_by_scalar, max_by_bytes)
+    return unicode_char * count
+
+
+def test_max_length_user_round_trip() -> None:
+    scalar, byte = _FIELD_LIMITS["user_peer"]
+    scalar_id, byte_id = _FIELD_LIMITS["user_id"]
+    value = SpeakerProvenance(
+        speaker_kind="user",
+        user_peer=_fill(scalar, byte),
+        user_id=_fill(scalar_id, byte_id),
+    )
+    validate_speaker_provenance(value)
+    tag = encode_provenance_tag(value)
+    assert decode_provenance_tag(tag) == value
+
+
+def test_max_length_agent_round_trip() -> None:
+    scalar_role, byte_role = _FIELD_LIMITS["role_id"]
+    scalar_persona, byte_persona = _FIELD_LIMITS["persona_id"]
+    scalar_ver, byte_ver = _FIELD_LIMITS["persona_version"]
+    scalar_name, byte_name = _FIELD_LIMITS["display_name"]
+    # role_id/persona_id/persona_version must still match their regexes, so
+    # build max-length values that are also structurally valid rather than
+    # pure filler.
+    role_id = "resident:" + "b" * (scalar_role - len("resident:"))
+    persona_id = "a/" + "b" * (scalar_persona - 2)
+    persona_version = "0.0." + "9" * (scalar_ver - 4)
+    display_name = _fill(scalar_name, byte_name)
+    value = SpeakerProvenance(
+        speaker_kind="resident",
+        role_id=role_id,
+        persona_id=persona_id,
+        persona_version=persona_version,
+        display_name=display_name,
+        binding_digest="sha256:" + "5" * 64,
+    )
+    validate_speaker_provenance(value)
+    tag = encode_provenance_tag(value)
+    assert decode_provenance_tag(tag) == value
+
+
+def test_worst_case_four_byte_unicode_user_round_trip() -> None:
+    scalar, byte = _FIELD_LIMITS["user_peer"]
+    value = SpeakerProvenance(
+        speaker_kind="user",
+        user_peer=_fill(scalar, byte, _POO),
+    )
+    validate_speaker_provenance(value)
+    tag = encode_provenance_tag(value)
+    assert decode_provenance_tag(tag) == value
+
+
+def test_worst_case_four_byte_unicode_agent_display_name_round_trip() -> None:
+    scalar_name, byte_name = _FIELD_LIMITS["display_name"]
+    display_name = _fill(scalar_name, byte_name, _POO)
+    value = SpeakerProvenance(
+        speaker_kind="resident",
+        role_id="resident:butler",
+        persona_id="casa.personas/tina",
+        persona_version="1.0.0",
+        display_name=display_name,
+        binding_digest="sha256:" + "5" * 64,
+    )
+    validate_speaker_provenance(value)
+    tag = encode_provenance_tag(value)
+    assert decode_provenance_tag(tag) == value
+
+
+# ---------------------------------------------------------------------------
+# One-byte-over-limit field failures for every _FIELD_LIMITS field
+# ---------------------------------------------------------------------------
+
+
+def test_role_id_one_byte_over_scalar_limit_fails() -> None:
+    scalar, _ = _FIELD_LIMITS["role_id"]
+    role_id = "resident:" + "b" * (scalar - len("resident:") + 1)
+    value = SpeakerProvenance(
+        speaker_kind="resident",
+        role_id=role_id,
+        persona_id="casa.personas/tina",
+        persona_version="1.0.0",
+        binding_digest="sha256:" + "5" * 64,
+    )
+    with pytest.raises(ValueError):
+        validate_speaker_provenance(value)
+
+
+def test_persona_id_one_byte_over_scalar_limit_fails() -> None:
+    scalar, _ = _FIELD_LIMITS["persona_id"]
+    persona_id = "a/" + "b" * (scalar - 2 + 1)
+    value = SpeakerProvenance(
+        speaker_kind="resident",
+        role_id="resident:butler",
+        persona_id=persona_id,
+        persona_version="1.0.0",
+        binding_digest="sha256:" + "5" * 64,
+    )
+    with pytest.raises(ValueError):
+        validate_speaker_provenance(value)
+
+
+def test_persona_version_one_byte_over_scalar_limit_fails() -> None:
+    scalar, _ = _FIELD_LIMITS["persona_version"]
+    persona_version = "0.0." + "9" * (scalar - 4 + 1)
+    value = SpeakerProvenance(
+        speaker_kind="resident",
+        role_id="resident:butler",
+        persona_id="casa.personas/tina",
+        persona_version=persona_version,
+        binding_digest="sha256:" + "5" * 64,
+    )
+    with pytest.raises(ValueError):
+        validate_speaker_provenance(value)
+
+
+def test_display_name_one_byte_over_scalar_limit_fails() -> None:
+    scalar, _ = _FIELD_LIMITS["display_name"]
+    value = SpeakerProvenance(
+        speaker_kind="resident",
+        role_id="resident:butler",
+        persona_id="casa.personas/tina",
+        persona_version="1.0.0",
+        display_name="a" * (scalar + 1),
+        binding_digest="sha256:" + "5" * 64,
+    )
+    with pytest.raises(ValueError):
+        validate_speaker_provenance(value)
+
+
+# display_name has no distinguishable "byte-limit-only" failure: its
+# byte/scalar ratio is exactly 320/80 = 4, the maximum possible UTF-8 bytes
+# per scalar. Any string within the 80-scalar cap therefore has at most
+# 80*4=320 bytes, so it is structurally impossible to exceed the byte
+# ceiling while staying under the scalar ceiling for this field — the two
+# checks are coincident at the boundary. The scalar test above (which uses
+# 4-byte filler in the worst-case-Unicode round trip, and ASCII filler here)
+# already exercises this field's one-over failure fully.
+
+
+def test_user_peer_one_byte_over_scalar_limit_fails() -> None:
+    scalar, _ = _FIELD_LIMITS["user_peer"]
+    value = SpeakerProvenance(speaker_kind="user", user_peer="a" * (scalar + 1))
+    with pytest.raises(ValueError):
+        validate_speaker_provenance(value)
+
+
+def test_user_id_one_byte_over_scalar_limit_fails() -> None:
+    scalar, _ = _FIELD_LIMITS["user_id"]
+    value = SpeakerProvenance(
+        speaker_kind="user",
+        user_peer="telegram_123",
+        user_id="a" * (scalar + 1),
+    )
+    with pytest.raises(ValueError):
+        validate_speaker_provenance(value)
+
+
+def test_user_peer_one_byte_over_byte_limit_but_under_scalar_limit_fails() -> None:
+    """user_peer's ratio (512/256 = 2 bytes/scalar) is looser than its max
+    4-byte-per-char width, so a byte-limit-only violation — one byte over
+    512 while the scalar count stays under 256 — IS constructible using a
+    4-byte filler char, unlike display_name above."""
+    scalar_limit, byte_limit = _FIELD_LIMITS["user_peer"]
+    count = (byte_limit // 4) + 1  # 4-byte char => bytes = count * 4
+    assert count <= scalar_limit, "must stay under the scalar cap"
+    user_peer = _POO * count
+    assert len(user_peer) < scalar_limit
+    assert len(user_peer.encode("utf-8")) > byte_limit
+    value = SpeakerProvenance(speaker_kind="user", user_peer=user_peer)
+    with pytest.raises(ValueError):
+        validate_speaker_provenance(value)
+
+
+def test_user_id_one_byte_over_byte_limit_but_under_scalar_limit_fails() -> None:
+    scalar_limit, byte_limit = _FIELD_LIMITS["user_id"]
+    count = (byte_limit // 4) + 1
+    assert count <= scalar_limit, "must stay under the scalar cap"
+    user_id = _POO * count
+    assert len(user_id) < scalar_limit
+    assert len(user_id.encode("utf-8")) > byte_limit
+    value = SpeakerProvenance(speaker_kind="user", user_peer="telegram_123", user_id=user_id)
+    with pytest.raises(ValueError):
+        validate_speaker_provenance(value)
+
+
+# ---------------------------------------------------------------------------
+# Exact boundary tests: 2048-byte canonical payload, 2746-byte final tag
+# ---------------------------------------------------------------------------
+
+
+# NOTE on how these tests are constructed: the per-field `_FIELD_LIMITS`
+# ceilings cap the maximum canonical JSON payload reachable by ANY value
+# that also passes `validate_speaker_provenance` well below 2048 bytes (the
+# richest case, a "user" record with both `user_peer` and `user_id` maxed
+# out using 2-byte UTF-8 filler, tops out at roughly 1.1 KB). That means
+# `encode_provenance_tag`'s own 2048-byte size check can never actually
+# fire for a legitimately field-validated `SpeakerProvenance` today — it is
+# pure defense-in-depth headroom (protects against a future field addition
+# or a validator bug), not a reachable path. The exact 2048/2746 byte
+# ceilings ARE independently exercisable, though: `decode_provenance_tag`
+# checks encoded/decoded SIZE strictly before it calls
+# `provenance_from_mapping` (which is what applies the tighter per-field
+# limits). So these tests build a raw, schema-shaped dict directly (not
+# going through `SpeakerProvenance`/`validate_speaker_provenance`), base64
+# it by hand into a tag, and confirm the SIZE ceiling in
+# `decode_provenance_tag` accepts exactly-2048/2746-byte input and rejects
+# one byte more — independent of what the (separate, tighter) per-field
+# check does afterward.
+
+
+def _wire_bytes_for_user_peer(user_peer: str) -> bytes:
+    return canonical_json_bytes(
+        {
+            "speaker_kind": "user",
+            "role_id": None,
+            "persona_id": None,
+            "persona_version": None,
+            "display_name": None,
+            "binding_digest": None,
+            "user_peer": user_peer,
+            "user_id": None,
+        }
+    )
+
+
+def _max_user_peer_for_payload_ceiling(overshoot: int = 0) -> str:
+    """The `user_peer` value (ASCII, so 1 char == 1 byte) whose canonical
+    JSON payload lands at exactly MAX_CANONICAL_PROVENANCE_BYTES + overshoot.
+    Deliberately exceeds the real `_FIELD_LIMITS["user_peer"]` ceiling — this
+    builds a raw dict for the SIZE-ceiling tests below, never a validated
+    `SpeakerProvenance`."""
+    base_len = len(_wire_bytes_for_user_peer("p"))
+    pad_needed = MAX_CANONICAL_PROVENANCE_BYTES - base_len + overshoot
+    return "p" + "a" * pad_needed
+
+
+def _tag_from_raw_wire(wire: bytes) -> str:
+    payload = base64.urlsafe_b64encode(wire).decode("ascii").rstrip("=")
+    return RESERVED_SOURCE_PREFIX + payload
+
+
+def test_exact_2048_byte_canonical_payload_passes_size_ceiling() -> None:
+    """A raw payload of exactly 2048 canonical bytes must clear
+    `decode_provenance_tag`'s size ceiling: it is rejected afterwards for
+    exceeding the (tighter, independent) `user_peer` field limit — proving
+    the rejection is NOT the size ceiling, i.e. the size ceiling itself
+    passed a value at its exact boundary."""
+    user_peer = _max_user_peer_for_payload_ceiling()
+    wire = _wire_bytes_for_user_peer(user_peer)
+    assert len(wire) == MAX_CANONICAL_PROVENANCE_BYTES
+    tag = _tag_from_raw_wire(wire)
+    with pytest.raises(ValueError, match="length limit") as excinfo:
+        decode_provenance_tag(tag)
+    assert "2048 bytes" not in str(excinfo.value)
+    assert "2746 bytes" not in str(excinfo.value)
+
+
+def test_canonical_payload_one_byte_over_2048_rejected_by_size_ceiling() -> None:
+    """One byte past the ceiling must be rejected by a SIZE check (either
+    the outer tag-length check or the payload-length pre-check — both fire
+    before content validation ever runs), never by field-level content
+    validation."""
+    user_peer = _max_user_peer_for_payload_ceiling(overshoot=1)
+    wire = _wire_bytes_for_user_peer(user_peer)
+    assert len(wire) == MAX_CANONICAL_PROVENANCE_BYTES + 1
+    tag = _tag_from_raw_wire(wire)
+    with pytest.raises(ValueError, match=r"2048 bytes|2746 bytes") as excinfo:
+        decode_provenance_tag(tag)
+    assert "length limit" not in str(excinfo.value)
+
+
+def test_exact_2746_byte_final_tag_passes_length_precheck() -> None:
+    """The tag produced from an exactly-2048-byte payload must land at
+    exactly MAX_ENCODED_PROVENANCE_TAG_BYTES: 15-byte ASCII prefix +
+    unpadded base64url of 2048 bytes (ceil(2048*4/3) = 2731 chars) = 2746.
+    `decode_provenance_tag` must accept that exact length and reject it only
+    for the (independent, tighter) per-field content ceiling."""
+    assert len(RESERVED_SOURCE_PREFIX.encode("ascii")) == 15
+    user_peer = _max_user_peer_for_payload_ceiling()
+    wire = _wire_bytes_for_user_peer(user_peer)
+    tag = _tag_from_raw_wire(wire)
+    assert len(tag.encode("ascii")) == MAX_ENCODED_PROVENANCE_TAG_BYTES
+    with pytest.raises(ValueError, match="length limit") as excinfo:
+        decode_provenance_tag(tag)
+    assert "2746 bytes" not in str(excinfo.value)
+
+
+def test_tag_one_byte_over_2746_rejected_before_decoding() -> None:
+    """A tag exactly one byte past MAX_ENCODED_PROVENANCE_TAG_BYTES must be
+    rejected by the length pre-check, before any base64/JSON decoding is
+    attempted (garbage payload content that would blow up a real decoder,
+    proving decode never got that far)."""
+    overlong_payload = "a" * (MAX_ENCODED_PROVENANCE_TAG_BYTES - len(RESERVED_SOURCE_PREFIX) + 1)
+    tag = RESERVED_SOURCE_PREFIX + overlong_payload
+    assert len(tag.encode("ascii")) == MAX_ENCODED_PROVENANCE_TAG_BYTES + 1
+    with pytest.raises(ValueError, match="2746 bytes"):
+        decode_provenance_tag(tag)
+
+
+# ---------------------------------------------------------------------------
+# Oversized encoded-INPUT rejection before base64/JSON decoding
+# ---------------------------------------------------------------------------
+
+
+def test_oversized_encoded_tag_input_rejected_before_decoding() -> None:
+    # Construct a tag string far larger than MAX_ENCODED_PROVENANCE_TAG_BYTES
+    # whose payload segment is deliberately NOT valid base64url and NOT valid
+    # JSON once decoded — if the length pre-check didn't run first, this
+    # would raise from inside base64/json decoding instead of the length
+    # guard, and the exercise below verifies decode never gets that far by
+    # using a payload guaranteed to blow up if fed to a real decoder.
+    huge_payload = "%" * (MAX_ENCODED_PROVENANCE_TAG_BYTES * 3)
+    tag = RESERVED_SOURCE_PREFIX + huge_payload
+    with pytest.raises(ValueError, match="2746 bytes"):
+        decode_provenance_tag(tag)
+
+
+def test_oversized_but_validly_shaped_encoded_input_rejected_before_decoding() -> None:
+    # Even a well-formed unpadded-base64url alphabet payload that merely
+    # exceeds the tag byte ceiling must be rejected by the length pre-check.
+    overlong_payload = "a" * (MAX_ENCODED_PROVENANCE_TAG_BYTES * 2)
+    tag = RESERVED_SOURCE_PREFIX + overlong_payload
+    with pytest.raises(ValueError, match="2746 bytes"):
+        decode_provenance_tag(tag)
+
+
+# ---------------------------------------------------------------------------
+# UserProvenance.from_origin factory contract
+# ---------------------------------------------------------------------------
+
+
+def test_anonymous_voice_never_acquires_a_name() -> None:
+    value = UserProvenance.from_origin(
+        surface="voice",
+        server_origin=TrustedOrigin(
+            route="voice", is_authenticated=False, clearance="friends"
+        ),
+        authenticated_user=None,
+        user_peer="voice_speaker",
+    )
+    assert value.user_peer == "voice_speaker"
+    assert value.user_id is None
+    assert value.display_name is None
+
+
+def test_authenticated_transport_identity_is_the_only_name_source() -> None:
+    value = UserProvenance.from_origin(
+        surface="telegram",
+        server_origin=TrustedOrigin(
+            route="telegram", is_authenticated=True, clearance="private"
+        ),
+        authenticated_user=AuthenticatedUser(
+            stable_id="3899230", configured_display_name="Nicola"
+        ),
+        user_peer="telegram_3899230",
+    )
+    assert value.user_id == "3899230"
+    assert value.display_name == "Nicola"
+
+
+def test_from_origin_signature_has_no_claimed_name_parameter() -> None:
+    """The factory must not accept a display_name / user_name argument —
+    an authenticated transport identity is the only name source."""
+    params = set(inspect.signature(UserProvenance.from_origin).parameters)
+    for forbidden in ("display_name", "user_name", "user_display_name", "name"):
+        assert forbidden not in params
+
+
+def test_claimed_display_name_cannot_be_injected_via_kwargs() -> None:
+    """A caller cannot smuggle a claimed name in through an unexpected
+    keyword argument — the factory must reject it outright rather than
+    silently accepting and threading it through."""
+    with pytest.raises(TypeError):
+        UserProvenance.from_origin(
+            surface="telegram",
+            server_origin=TrustedOrigin(
+                route="telegram", is_authenticated=True, clearance="private"
+            ),
+            authenticated_user=AuthenticatedUser(
+                stable_id="3899230", configured_display_name="Nicola"
+            ),
+            user_peer="telegram_3899230",
+            user_display_name="Attacker-Controlled Name",
+        )
+
+
+def test_claimed_name_in_external_mapping_is_not_threaded_through() -> None:
+    """Simulates an inbound payload where an attacker sets a claimed name
+    field (as if from message text or a webhook body). Only fields the
+    factory's real signature accepts may be passed; the claimed-name key
+    must be dropped, not silently accepted, and the resulting provenance
+    must reflect ONLY the authenticated transport identity."""
+    inbound_payload = {
+        "surface": "telegram",
+        "server_origin": TrustedOrigin(
+            route="telegram", is_authenticated=True, clearance="private"
+        ),
+        "authenticated_user": AuthenticatedUser(
+            stable_id="3899230", configured_display_name="Nicola"
+        ),
+        "user_peer": "telegram_3899230",
+        "user_display_name": "Attacker-Controlled Name",
+        "user_name": "Also Attacker-Controlled",
+    }
+    accepted_params = set(inspect.signature(UserProvenance.from_origin).parameters)
+    safe_kwargs = {k: v for k, v in inbound_payload.items() if k in accepted_params}
+    assert "user_display_name" not in safe_kwargs
+    assert "user_name" not in safe_kwargs
+    value = UserProvenance.from_origin(**safe_kwargs)
+    assert value.display_name == "Nicola"
+    assert value.user_id == "3899230"
+
+
+def test_unauthenticated_non_voice_surface_gets_no_identity() -> None:
+    value = UserProvenance.from_origin(
+        surface="telegram",
+        server_origin=TrustedOrigin(
+            route="telegram", is_authenticated=False, clearance="public"
+        ),
+        authenticated_user=AuthenticatedUser(
+            stable_id="3899230", configured_display_name="Nicola"
+        ),
+        user_peer="telegram_anon",
+    )
+    # server_origin says NOT authenticated, so even a present
+    # authenticated_user object must not be trusted.
+    assert value.user_id is None
+    assert value.display_name is None
+
+
+def test_from_origin_route_mismatch_rejected() -> None:
+    with pytest.raises(ValueError):
+        UserProvenance.from_origin(
+            surface="telegram",
+            server_origin=TrustedOrigin(
+                route="voice", is_authenticated=True, clearance="private"
+            ),
+            authenticated_user=None,
+            user_peer="telegram_123",
+        )
