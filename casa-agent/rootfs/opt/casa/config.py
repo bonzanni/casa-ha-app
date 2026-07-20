@@ -11,7 +11,10 @@ import logging
 import os
 import re
 from dataclasses import dataclass, field
-from typing import Any
+from typing import TYPE_CHECKING, Any
+
+if TYPE_CHECKING:
+    from role_artifact import RoleArtifactSource
 
 logger = logging.getLogger(__name__)
 
@@ -218,6 +221,13 @@ class AgentConfig:
     hooks: HooksConfig = field(default_factory=HooksConfig)
     system_prompt: str = ""
     requires: RequiresConfig = field(default_factory=RequiresConfig)
+    # Personality Phase A, Task 5: the image-owned canonical role artifact
+    # (defaults/roles/<kind>/<slot>/{role.yaml,doctrine.md}) this agent was
+    # loaded against. Additive/optional — None for any AgentConfig built
+    # outside agent_loader.load_agent_from_dir (the ~30+ test fixtures that
+    # construct AgentConfig(...) directly keep working unchanged). Task 6
+    # consumes this exact source for model resolution and the role checksum.
+    role_artifact: RoleArtifactSource | None = None
 
 
 @dataclass
@@ -261,3 +271,7 @@ class ExecutorDefinition:
     plugins_dir: str = ""   # absolute path to per-executor plugins/ dir; "" = none
     # --- M4 addition (engagement memory) ---
     memory: ExecutorMemoryConfig = field(default_factory=ExecutorMemoryConfig)
+    # --- Personality Phase A, Task 5 addition ---
+    # The image-owned canonical role artifact at defaults/roles/executor/<type>/.
+    # Executors have no persona and no binding (see role.yaml persona: forbidden).
+    role_artifact: RoleArtifactSource | None = None

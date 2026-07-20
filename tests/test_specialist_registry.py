@@ -55,6 +55,28 @@ def _seed_specialist_dir(
     return d
 
 
+def _use_synthetic_roles_dir(monkeypatch, tmp_path, *slots: str) -> None:
+    """Personality Phase A, Task 5: SpecialistRegistry.load() -> agent_loader
+    .load_all_specialists() -> load_agent_from_dir() now requires a canonical
+    role artifact under defaults/roles/specialist/<slot>/ for every
+    specialist it loads (cross-validated on kind/slot). The real shipped
+    image only carries 'finance'; tests here deliberately use synthetic
+    specialist names to probe registry mechanics (token budgets, summary
+    logging, disabled-role sorting) unrelated to role-artifact content.
+    SpecialistRegistry has no roles_dir override (out of Task 5's scope —
+    it isn't in the brief's file list), so redirect agent_loader's module-
+    level DEFAULT_ROLES_DIR for the duration of the test instead."""
+    try:
+        from tests.test_agent_loader import _seed_role_artifact
+    except ImportError:
+        from test_agent_loader import _seed_role_artifact
+
+    roles_dir = tmp_path / "roles"
+    for slot in slots:
+        _seed_role_artifact(roles_dir, "specialist", slot)
+    monkeypatch.setattr("agent_loader.DEFAULT_ROLES_DIR", str(roles_dir))
+
+
 # ---------------------------------------------------------------------------
 # TestLoader
 # ---------------------------------------------------------------------------
@@ -127,7 +149,7 @@ class TestValidation:
         failures = reg.load_failures()
         assert any(name == "bogus" for name, _ in failures)
 
-    async def test_accepts_non_zero_token_budget(self, tmp_path, caplog):
+    async def test_accepts_non_zero_token_budget(self, tmp_path, caplog, monkeypatch):
         """M4b: specialists may opt into Honcho memory by setting
         memory.token_budget > 0. The validator must accept this."""
         import logging
@@ -136,6 +158,7 @@ class TestValidation:
         specialists = tmp_path / "specialists"
         specialists.mkdir()
         _seed_specialist_dir(specialists, "rich", token_budget=1000)
+        _use_synthetic_roles_dir(monkeypatch, tmp_path, "rich")
         reg = SpecialistRegistry(str(specialists),
                                  tombstone_path=str(tmp_path / "del.json"))
         with caplog.at_level(logging.ERROR):
@@ -432,7 +455,7 @@ class TestDelegationCompleteShape:
 
 class TestSummaryLog:
     async def test_summary_line_present_with_mixed_enabled_disabled(
-        self, tmp_path, caplog,
+        self, tmp_path, caplog, monkeypatch,
     ):
         import logging
         from specialist_registry import SpecialistRegistry
@@ -441,6 +464,7 @@ class TestSummaryLog:
         specialists.mkdir()
         _seed_specialist_dir(specialists, "foo", enabled=True)
         _seed_specialist_dir(specialists, "bar", enabled=False)
+        _use_synthetic_roles_dir(monkeypatch, tmp_path, "foo", "bar")
 
         reg = SpecialistRegistry(str(specialists),
                                  tombstone_path=str(tmp_path / "del.json"))
@@ -530,7 +554,9 @@ class TestDisabledAccessors:
         assert reg.is_disabled("finance") is False
         assert reg.get("finance") is not None
 
-    async def test_disabled_roles_returns_sorted_defensive_copy(self, tmp_path):
+    async def test_disabled_roles_returns_sorted_defensive_copy(
+        self, tmp_path, monkeypatch,
+    ):
         from specialist_registry import SpecialistRegistry
 
         specialists = tmp_path / "specialists"
@@ -538,6 +564,7 @@ class TestDisabledAccessors:
         _seed_specialist_dir(specialists, "zeta", enabled=False)
         _seed_specialist_dir(specialists, "alpha", enabled=False)
         _seed_specialist_dir(specialists, "beta", enabled=False)
+        _use_synthetic_roles_dir(monkeypatch, tmp_path, "zeta", "alpha", "beta")
         reg = SpecialistRegistry(str(specialists),
                                  tombstone_path=str(tmp_path / "del.json"))
         reg.load()

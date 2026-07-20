@@ -377,6 +377,10 @@ class TestDoctrineDirOptOut:
         whole executor dir) but yield defn.doctrine_dir == ''."""
         import os
         from agent_loader import load_all_executors
+        try:
+            from tests.test_load_all_executors import _seed_executor_role_artifact
+        except ImportError:
+            from test_load_all_executors import _seed_executor_role_artifact
         _write_minimal_executor(str(tmp_path), "noduct", body_override=textwrap.dedent("""\
             schema_version: 1
             type: noduct
@@ -390,14 +394,22 @@ class TestDoctrineDirOptOut:
               permission_mode: acceptEdits
         """))
         os.rmdir(os.path.join(tmp_path, "executors", "noduct", "doctrine"))
-        loaded, failed = load_all_executors(str(tmp_path))
+        roles_dir = os.path.join(str(tmp_path), "roles")
+        _seed_executor_role_artifact(roles_dir, "noduct")
+        loaded, failed = load_all_executors(str(tmp_path), roles_dir=roles_dir)
         assert failed == []
         assert loaded["noduct"].doctrine_dir == ""
 
     def test_default_doctrine_dir_resolves_to_abs_path(self, tmp_path):
         import os
         from agent_loader import load_all_executors
+        try:
+            from tests.test_load_all_executors import _seed_executor_role_artifact
+        except ImportError:
+            from test_load_all_executors import _seed_executor_role_artifact
         _write_minimal_executor(str(tmp_path), "withduct")
-        loaded, _failed = load_all_executors(str(tmp_path))
+        roles_dir = os.path.join(str(tmp_path), "roles")
+        _seed_executor_role_artifact(roles_dir, "withduct")
+        loaded, _failed = load_all_executors(str(tmp_path), roles_dir=roles_dir)
         assert loaded["withduct"].doctrine_dir == os.path.join(
             str(tmp_path), "executors", "withduct", "doctrine")

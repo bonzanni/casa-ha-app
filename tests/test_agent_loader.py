@@ -83,6 +83,55 @@ def _seed_specialist(base: Path, role: str = "finance") -> Path:
     return d
 
 
+def _seed_role_artifact(roles_dir: Path, kind: str, slot: str) -> Path:
+    """Write a minimal schema-valid canonical role artifact for (kind,
+    slot) under a test-owned roles_dir (Personality Phase A, Task 5).
+    load_agent_from_dir now requires one at defaults/roles/<kind>/<slot>/
+    for every resident/specialist it loads, cross-validated on kind+slot.
+    The real shipped image only carries assistant/butler (resident) and
+    finance (specialist); tests that deliberately construct synthetic or
+    cross-tier role combinations (e.g. a 'finance' RESIDENT, used only to
+    probe the duplicate-role-across-tiers invariant) need their own
+    fixture roles_dir instead of colliding with the real defaults/roles/
+    tree, hence this test-only stand-in."""
+    d = roles_dir / kind / slot
+    _w(d / "role.yaml", f"""\
+        api_version: casa.role/v1
+        id: {kind}:{slot}
+        kind: {kind}
+        slot: {slot}
+        mission: Test fixture role.
+        enabled: true
+        model: {{source: fixed, value: sonnet}}
+        tools:
+          allowed: []
+          disallowed: []
+          permission_mode: acceptEdits
+          max_turns: 10
+          skills: all
+          voice_guard: none
+        mcp_servers: []
+        channels: []
+        memory: {{token_budget: 0, read_strategy: per_turn}}
+        session: {{strategy: ephemeral, idle_timeout_seconds: 0}}
+        disclosure: {{policy: standard, overrides: {{}}}}
+        delegates: []
+        executors: []
+        triggers: []
+        hooks: {{pre_tool_use: []}}
+        tts: {{tag_dialect: none, error_phrases: {{}}}}
+        response:
+          text: {{register: plain}}
+          voice: {{register: plain}}
+          restricted_webhook: {{register: plain}}
+        persona: {{policy: forbidden}}
+        requires: {{plugins: [], tools: []}}
+        doctrine_file: doctrine.md
+    """)
+    _w(d / "doctrine.md", "# Core doctrine\n\nTest fixture doctrine body.\n")
+    return d
+
+
 def _policies_file(base: Path) -> Path:
     p = base / "disclosure.yaml"
     _w(p, """\
@@ -124,6 +173,14 @@ class TestHappyPath:
         assert "### Voice" in cfg.system_prompt
         assert "### Response shape" in cfg.system_prompt
         assert "### Disclosure" in cfg.system_prompt
+        # Personality Phase A, Task 5: the canonical role artifact is
+        # loaded against the REAL shipped defaults/roles/resident/assistant/
+        # (no roles_dir override — default production tree).
+        assert cfg.role_artifact is not None
+        assert cfg.role_artifact.role["id"] == "resident:assistant"
+        assert cfg.role_artifact.role["kind"] == "resident"
+        assert cfg.role_artifact.role["slot"] == "assistant"
+        assert cfg.role_artifact.doctrine.startswith("# Core doctrine\n")
 
     def test_loads_specialist_directory(self, tmp_path):
         from agent_loader import load_agent_from_dir
@@ -138,7 +195,131 @@ class TestHappyPath:
         # Disclosure, no Delegation section in the prompt.
         assert cfg.system_prompt.startswith("You are Alex.")
         assert "### Disclosure" not in cfg.system_prompt
+        # Real shipped defaults/roles/specialist/finance/ (default roles_dir).
+        assert cfg.role_artifact is not None
+        assert cfg.role_artifact.role["id"] == "specialist:finance"
+        assert cfg.role_artifact.role["kind"] == "specialist"
         assert "### Delegation" not in cfg.system_prompt
+
+
+# ---------------------------------------------------------------------------
+# TestRoleArtifactIntegration — Personality Phase A, Task 5
+# ---------------------------------------------------------------------------
+
+
+class TestRoleArtifactIntegration:
+    """load_agent_from_dir loads the image-owned canonical role artifact
+    from defaults/roles/<tier>/<role_from_path>/ (or a test-injected
+    roles_dir) and cross-validates that its declared kind/slot match the
+    directory it was loaded for — a mismatch or missing artifact fails
+    closed with LoadError, mirroring every other strict-load invariant in
+    this module."""
+
+    def test_missing_role_artifact_raises(self, tmp_path):
+        from agent_loader import LoadError, load_agent_from_dir
+        from policies import load_policies
+
+        agent_dir = _seed_resident(tmp_path / "agents", "assistant")
+        policies = load_policies(str(_policies_file(tmp_path / "policies")))
+        empty_roles_dir = tmp_path / "empty_roles"
+        empty_roles_dir.mkdir()
+
+        with pytest.raises(LoadError, match="role artifact"):
+            load_agent_from_dir(
+                str(agent_dir), policies=policies, roles_dir=str(empty_roles_dir),
+            )
+
+    def test_mismatched_slot_raises(self, tmp_path):
+        """A role artifact whose declared slot doesn't match the agent
+        directory name is rejected even though it loads cleanly on its
+        own terms."""
+        from agent_loader import LoadError, load_agent_from_dir
+        from policies import load_policies
+
+        agent_dir = _seed_resident(tmp_path / "agents", "assistant")
+        policies = load_policies(str(_policies_file(tmp_path / "policies")))
+        roles_dir = tmp_path / "roles"
+        # Seed a role artifact for slot 'assistant' but move it under a
+        # directory named 'assistant' while it internally declares a
+        # DIFFERENT slot — reuse _seed_role_artifact for 'other', then
+        # relocate it to where load_agent_from_dir will actually look.
+        _seed_role_artifact(roles_dir, "resident", "other")
+        (roles_dir / "resident" / "other").rename(roles_dir / "resident" / "assistant")
+
+        with pytest.raises(LoadError, match="slot"):
+            load_agent_from_dir(
+                str(agent_dir), policies=policies, roles_dir=str(roles_dir),
+            )
+
+    def test_mismatched_kind_raises(self, tmp_path):
+        """A role artifact found at the CORRECT path (specialist/finance,
+        matching the directory's inferred tier and slot) but whose OWN
+        declared 'kind' field disagrees is rejected — the loader trusts
+        the artifact's own declared kind, not just its location."""
+        from agent_loader import LoadError, load_agent_from_dir
+
+        agent_dir = _seed_specialist(tmp_path / "specialists", "finance")
+        roles_dir = tmp_path / "roles"
+        d = roles_dir / "specialist" / "finance"
+        _w(d / "role.yaml", """\
+            api_version: casa.role/v1
+            id: resident:finance
+            kind: resident
+            slot: finance
+            mission: Wrong-kind fixture.
+            enabled: true
+            model: {source: fixed, value: sonnet}
+            tools:
+              allowed: []
+              disallowed: []
+              permission_mode: acceptEdits
+              max_turns: 10
+              skills: all
+              voice_guard: none
+            mcp_servers: []
+            channels: [telegram]
+            memory: {token_budget: 0, read_strategy: per_turn}
+            session: {strategy: ephemeral, idle_timeout_seconds: 0}
+            disclosure: {policy: standard, overrides: {}}
+            delegates: []
+            executors: []
+            triggers: []
+            hooks: {pre_tool_use: []}
+            tts: {tag_dialect: none, error_phrases: {}}
+            response:
+              text: {register: plain}
+              voice: {register: plain}
+              restricted_webhook: {register: plain}
+            persona: {policy: required, compatibility: ["x@>=1.0.0 <2.0.0"]}
+            requires: {plugins: [], tools: []}
+            doctrine_file: doctrine.md
+        """)
+        _w(d / "doctrine.md", "# Core doctrine\n\nBody.\n")
+
+        with pytest.raises(LoadError, match="kind"):
+            load_agent_from_dir(
+                str(agent_dir), policies=None, roles_dir=str(roles_dir),
+            )
+
+    def test_schema_invalid_role_artifact_raises(self, tmp_path):
+        """A schema-invalid role.yaml under the resolved role_dir fails
+        the load too — load_agent_from_dir wraps role_artifact.py's raw
+        jsonschema.ValidationError into the module's own LoadError
+        contract, consistent with every other schema-bearing file here."""
+        from agent_loader import LoadError, load_agent_from_dir
+        from policies import load_policies
+
+        agent_dir = _seed_resident(tmp_path / "agents", "assistant")
+        policies = load_policies(str(_policies_file(tmp_path / "policies")))
+        roles_dir = tmp_path / "roles"
+        d = roles_dir / "resident" / "assistant"
+        _w(d / "role.yaml", "api_version: casa.role/v1\n")  # missing everything else
+        _w(d / "doctrine.md", "# Core doctrine\n\nBody.\n")
+
+        with pytest.raises(LoadError, match="role artifact"):
+            load_agent_from_dir(
+                str(agent_dir), policies=policies, roles_dir=str(roles_dir),
+            )
 
 
 def test_runtime_loads_context_surface_policy(tmp_path):
@@ -971,16 +1152,27 @@ class TestValidateConfigRepoBootParity:
         spec = _seed_specialist(repo / "agents" / "specialists", "finance")
         self._enable_specialist(spec, "finance")              # enabled specialist finance
         self._policies(repo)
+        # The real shipped image only carries a SPECIALIST 'finance' role
+        # artifact — this test deliberately probes the cross-tier
+        # collision, so it needs its own fixture roles_dir carrying BOTH
+        # a resident and a specialist 'finance' artifact.
+        roles_dir = tmp_path / "roles"
+        _seed_role_artifact(roles_dir, "resident", "finance")
+        _seed_role_artifact(roles_dir, "specialist", "finance")
 
         # Prove boot fatals exactly as casa_core.main would at line ~1280:
         # residents + enabled specialists both carry role 'finance'.
         policy_lib = load_policies(str(repo / "policies" / "disclosure.yaml"))
-        residents = load_all_agents(str(repo / "agents"), policies=policy_lib)
-        spec_found, _ = load_all_specialists(str(repo / "agents" / "specialists"))
+        residents = load_all_agents(
+            str(repo / "agents"), policies=policy_lib, roles_dir=str(roles_dir),
+        )
+        spec_found, _ = load_all_specialists(
+            str(repo / "agents" / "specialists"), roles_dir=str(roles_dir),
+        )
         with pytest.raises(ValueError):
             _build_role_registry(residents=residents, specialists=spec_found)
 
-        errors = validate_config_repo(str(repo))
+        errors = validate_config_repo(str(repo), roles_dir=str(roles_dir))
         assert any(
             "duplicate role" in e and "finance" in e for e in errors
         ), errors
@@ -1003,8 +1195,16 @@ class TestValidateConfigRepoBootParity:
         # Seeded specialist defaults to enabled: false — dropped at boot.
         _seed_specialist(repo / "agents" / "specialists", "finance")
         self._policies(repo)
+        # roles_dir override replaces the default tree entirely, so it
+        # must carry every artifact this repo's agents load against —
+        # including the REAL 'assistant' resident, not just the synthetic
+        # cross-tier 'finance' fixtures this test is actually probing.
+        roles_dir = tmp_path / "roles"
+        _seed_role_artifact(roles_dir, "resident", "assistant")
+        _seed_role_artifact(roles_dir, "resident", "finance")
+        _seed_role_artifact(roles_dir, "specialist", "finance")
 
-        errors = validate_config_repo(str(repo))
+        errors = validate_config_repo(str(repo), roles_dir=str(roles_dir))
         assert errors == [], errors
 
     def test_no_primary_assistant_butler_only_refused(self, tmp_path):

@@ -10,6 +10,7 @@ from __future__ import annotations
 import json
 import logging
 import os
+from pathlib import Path
 from typing import Any
 
 import yaml
@@ -35,8 +36,15 @@ from config import (
     _substitute_env,
 )
 from policies import PolicyLibrary, render_disclosure_section
+from role_artifact import RoleArtifactSource, load_role_artifact
 
 SCHEMA_DIR = os.path.join(os.path.dirname(__file__), "defaults", "schema")
+
+# Personality Phase A, Task 5: the only image-owned canonical role layout,
+# defaults/roles/<kind>/<slot>/{role.yaml,doctrine.md}. ``roles_dir`` kwargs
+# threaded through the loader functions below default to this and let tests
+# inject a synthetic tree instead of patching the filesystem.
+DEFAULT_ROLES_DIR = os.path.join(os.path.dirname(__file__), "defaults", "roles")
 
 # --- Tier file-set rules ---------------------------------------------------
 
@@ -154,7 +162,9 @@ _SCHEMA_BY_POLICY_FILE: dict[str, tuple[str, str]] = {
 }
 
 
-def validate_config_repo(config_dir: str) -> list[str]:
+def validate_config_repo(
+    config_dir: str, *, roles_dir: str | None = None,
+) -> list[str]:
     """E-G v0.31.0 pre-commit gate. Walk schema-bearing YAML in
     *config_dir/agents/* and *config_dir/policies/* and return a list of
     error messages — one per file that fails schema validation. Empty
@@ -165,6 +175,9 @@ def validate_config_repo(config_dir: str) -> list[str]:
     The check uses the same ``_validate`` codepath as boot-time loading,
     so a passing pre-commit gate guarantees a green boot validation for
     every file the configurator can edit.
+
+    ``roles_dir`` — see ``load_agent_from_dir``; propagated to the
+    boot-parity replay below (both the resident and specialist loads).
 
     **Agents/ walk.** Recursive; ``.git/`` skipped. Basename lookup in
     ``_SCHEMA_BY_FILENAME``. The original E-G repro path is the
@@ -279,7 +292,9 @@ def validate_config_repo(config_dir: str) -> list[str]:
             # "no assistant" onto it.
             resident_dir_names.add(entry)
             try:
-                cfg = load_agent_from_dir(path, policies=policy_lib)
+                cfg = load_agent_from_dir(
+                    path, policies=policy_lib, roles_dir=roles_dir,
+                )
             except Exception as exc:
                 # Broad by design (mandate: 'a validation error must be
                 # reported, never itself crash the gate'). load_agent_from_dir
@@ -354,7 +369,9 @@ def validate_config_repo(config_dir: str) -> list[str]:
         specialist_configs: dict[str, AgentConfig] = {}
         specialists_dir = os.path.join(agents_root, "specialists")
         try:
-            spec_found, _spec_failed = load_all_specialists(specialists_dir)
+            spec_found, _spec_failed = load_all_specialists(
+                specialists_dir, roles_dir=roles_dir,
+            )
         except LoadError:
             # A collection-level specialist error (non-directory under
             # specialists/) is boot-non-fatal: SpecialistRegistry.load catches
@@ -416,6 +433,86 @@ def _read_yaml(path: str) -> dict[str, Any]:
 def _infer_tier(runtime_data: dict[str, Any]) -> str:
     channels = runtime_data.get("channels") or []
     return "resident" if channels else "specialist"
+
+
+# --- Canonical role artifact loading (Personality Phase A, Task 5) --------
+#
+# The image-owned canonical layout is defaults/roles/<kind>/<slot>/. This is
+# a SEPARATE tree from the per-agent-directory operational files above
+# (character.yaml, runtime.yaml, prompts/system.md, ...) — those remain
+# legacy operational inputs through Phase A and are never read as
+# role-artifact inputs. Task 6 removes the transitional tier-inference
+# above and consumes RoleArtifactSource for model resolution and the role
+# checksum; Task 5 only wires the loader seam and cross-validates that the
+# artifact found on disk actually matches the directory it was loaded for.
+
+
+def _load_role_artifact_for(
+    tier: str, role_from_path: str, roles_dir: str | None,
+) -> RoleArtifactSource:
+    """Load and cross-validate the canonical role artifact for one resident
+    or specialist agent directory (``tier`` is ``resident``/``specialist``
+    here; executors use ``_load_executor_role_artifact`` below)."""
+    base = roles_dir or DEFAULT_ROLES_DIR
+    role_dir = Path(base) / tier / role_from_path
+    try:
+        artifact = load_role_artifact(role_dir)
+    except (OSError, ValueError, yaml.YAMLError,
+            jsonschema.exceptions.ValidationError) as exc:
+        raise LoadError(
+            f"agent {role_from_path!r} ({tier}): role artifact load failed "
+            f"at {role_dir}: {exc}"
+        ) from exc
+    found_kind = artifact.role.get("kind")
+    if found_kind != tier:
+        raise LoadError(
+            f"agent {role_from_path!r}: role artifact kind {found_kind!r} "
+            f"at {role_dir} does not match directory tier {tier!r}"
+        )
+    found_slot = artifact.role.get("slot")
+    if found_slot != role_from_path:
+        raise LoadError(
+            f"agent {role_from_path!r}: role artifact slot {found_slot!r} "
+            f"at {role_dir} does not match directory name {role_from_path!r}"
+        )
+    return artifact
+
+
+def _load_executor_role_artifact(
+    entry: str, roles_dir: str | None,
+) -> RoleArtifactSource:
+    """Load and cross-validate the canonical role artifact for one executor
+    type directory. Executors are checked more strictly (id, kind, AND
+    slot) since ``load_all_executors`` has no separate directory-name
+    cross-check elsewhere in its per-entry loop the way residents/
+    specialists get from ``character.yaml``'s role field."""
+    base = roles_dir or DEFAULT_ROLES_DIR
+    role_dir = Path(base) / "executor" / entry
+    try:
+        artifact = load_role_artifact(role_dir)
+    except (OSError, ValueError, yaml.YAMLError,
+            jsonschema.exceptions.ValidationError) as exc:
+        raise LoadError(
+            f"executor {entry!r}: role artifact load failed at {role_dir}: {exc}"
+        ) from exc
+    role = artifact.role
+    if role.get("kind") != "executor":
+        raise LoadError(
+            f"executor {entry!r}: role artifact kind {role.get('kind')!r} "
+            f"at {role_dir} must be 'executor'"
+        )
+    if role.get("slot") != entry:
+        raise LoadError(
+            f"executor {entry!r}: role artifact slot {role.get('slot')!r} "
+            f"at {role_dir} does not match executor type {entry!r}"
+        )
+    expected_id = f"executor:{entry}"
+    if role.get("id") != expected_id:
+        raise LoadError(
+            f"executor {entry!r}: role artifact id {role.get('id')!r} at "
+            f"{role_dir} does not match expected {expected_id!r}"
+        )
+    return artifact
 
 
 def _check_file_set(agent_dir: str, tier: str, role: str) -> None:
@@ -783,12 +880,18 @@ def _compose_prompt(
 
 def load_agent_from_dir(
     agent_dir: str, *, policies: PolicyLibrary | None,
+    roles_dir: str | None = None,
 ) -> AgentConfig:
     """Load one agent directory. Strict: every error raises LoadError.
 
     ``policies`` may be None for specialist loads (specialists have no
     disclosure.yaml). It must be non-None for residents or the composer
     raises at Disclosure-render time.
+
+    ``roles_dir`` overrides the image-owned ``defaults/roles/`` root used
+    to load and cross-validate the canonical role artifact (Personality
+    Phase A, Task 5). Defaults to the real shipped tree; tests inject a
+    synthetic ``roles_dir`` instead of patching the filesystem.
     """
     if not os.path.isdir(agent_dir):
         raise LoadError(f"not a directory: {agent_dir}")
@@ -831,6 +934,9 @@ def load_agent_from_dir(
     rs_data = _read_yaml(rs_path)
     _validate(rs_data, "response_shape", rs_path)
     cfg.response_shape = _build_response_shape(rs_data)
+
+    # Canonical role artifact (image-owned defaults/roles/<kind>/<slot>/).
+    cfg.role_artifact = _load_role_artifact_for(tier, role_from_path, roles_dir)
 
     # runtime.yaml — already read + validated; build fields.
     _build_runtime_fields(cfg, runtime_data)
@@ -892,6 +998,7 @@ def load_agent_from_dir(
 
 def load_all_agents(
     agents_dir: str, *, policies: PolicyLibrary | None,
+    roles_dir: str | None = None,
 ) -> dict[str, AgentConfig]:
     """Walk *agents_dir* for resident directories.
 
@@ -899,6 +1006,8 @@ def load_all_agents(
     Plan 2 Tier 3), and any dotdir. Each subdirectory's name becomes
     the agent role. Raises ``LoadError`` on the first malformed agent —
     strict-mode from day one.
+
+    ``roles_dir`` — see ``load_agent_from_dir``; propagated unchanged.
     """
     found: dict[str, AgentConfig] = {}
     if not os.path.isdir(agents_dir):
@@ -912,13 +1021,13 @@ def load_all_agents(
                 f"unexpected non-directory at agents/{entry} — each agent "
                 f"is a directory; flat YAML files are no longer supported"
             )
-        cfg = load_agent_from_dir(path, policies=policies)
+        cfg = load_agent_from_dir(path, policies=policies, roles_dir=roles_dir)
         found[cfg.role] = cfg
     return found
 
 
 def load_all_specialists(
-    specialists_dir: str,
+    specialists_dir: str, *, roles_dir: str | None = None,
 ) -> tuple[dict[str, AgentConfig], list[tuple[str, str]]]:
     """Walk *specialists_dir* for specialist directories.
 
@@ -955,7 +1064,7 @@ def load_all_specialists(
                 f"supported"
             )
         try:
-            cfg = load_agent_from_dir(path, policies=None)
+            cfg = load_agent_from_dir(path, policies=None, roles_dir=roles_dir)
         except LoadError as exc:
             failed.append((entry, str(exc)))
             continue
@@ -964,7 +1073,7 @@ def load_all_specialists(
 
 
 def load_all_executors(
-    base_dir: str,
+    base_dir: str, *, roles_dir: str | None = None,
 ) -> tuple[dict[str, "ExecutorDefinition"], list[tuple[str, str]]]:
     """Scan ``<base_dir>/executors/*/`` and return ``(loaded, failed)``.
 
@@ -981,6 +1090,15 @@ def load_all_executors(
     A collection-level error (e.g. ``executors_root`` missing) still
     short-circuits with an empty ``(out, failed)`` per the existing
     early-return contract.
+
+    Personality Phase A, Task 5: each executor type also gets its
+    canonical role artifact loaded from ``<roles_dir or DEFAULT_ROLES_DIR>/
+    executor/<type>/`` and cross-validated (id, kind, and slot must match
+    the executor type). A missing or mismatched artifact is a per-executor
+    failure like any other, isolated the same way. The existing
+    ``definition.yaml``, prompt, hooks, observer, and doctrine directory
+    remain operational inputs during Phase A — they are not checksum
+    inputs. Executors have no persona and no binding.
     """
     from config import ExecutorDefinition, resolve_model
 
@@ -1040,6 +1158,8 @@ def load_all_executors(
                     f"{prompt_name!r} not found"
                 )
 
+            role_artifact = _load_executor_role_artifact(entry, roles_dir)
+
             memory_block = defn.get("memory") or {}
             d = ExecutorDefinition(
                 type=defn["type"],
@@ -1056,6 +1176,7 @@ def load_all_executors(
                 hooks_path=hooks_abs,
                 observer_policy_path=observer_abs,
                 doctrine_dir=doctrine_abs,
+                role_artifact=role_artifact,
                 # Plan 4a additions
                 extra_dirs=list(defn.get("extra_dirs", [])),
                 mirror_chat_to_topic=bool(defn.get("mirror_chat_to_topic", True)),

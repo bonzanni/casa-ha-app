@@ -108,6 +108,10 @@ def test_load_all_executors_parses_memory_block(tmp_path):
 
 def test_load_all_executors_defaults_memory_when_block_absent(tmp_path):
     from agent_loader import load_all_executors
+    try:
+        from tests.test_load_all_executors import _seed_executor_role_artifact
+    except ImportError:
+        from test_load_all_executors import _seed_executor_role_artifact
 
     base = tmp_path
     exec_dir = base / "executors" / "smoke"
@@ -121,7 +125,9 @@ def test_load_all_executors_defaults_memory_when_block_absent(tmp_path):
         encoding="utf-8",
     )
     (exec_dir / "prompt.md").write_text("hello {task}", encoding="utf-8")
+    roles_dir = str(base / "roles")
+    _seed_executor_role_artifact(roles_dir, "smoke")
 
-    out, _failed = load_all_executors(str(base))
+    out, _failed = load_all_executors(str(base), roles_dir=roles_dir)
     assert out["smoke"].memory.enabled is False
     assert out["smoke"].memory.token_budget == 2000

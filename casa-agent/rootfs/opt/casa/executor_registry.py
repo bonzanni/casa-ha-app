@@ -28,6 +28,19 @@ class ExecutorRegistry:
         self._disabled_defs: dict[str, ExecutorDefinition] = {}
 
     def load(self) -> None:
+        """Load every executor type under ``<self._dir>``.
+
+        Personality Phase A, Task 5: ``load_all_executors`` now also loads
+        and cross-validates each type's canonical role artifact
+        (``defaults/roles/executor/<type>/{role.yaml,doctrine.md}``) and
+        attaches it as ``ExecutorDefinition.role_artifact``, reachable
+        through ``get()``/``definition_any()`` like every other field. A
+        missing or id/kind/slot-mismatched artifact is a per-executor
+        failure isolated the same way a schema violation is — it does not
+        prevent sibling executors from loading. Task 6 consumes
+        ``role_artifact`` for model resolution and the role checksum;
+        executors get no persona and no binding.
+        """
         from agent_loader import LoadError, load_all_executors
 
         self._defs.clear()
