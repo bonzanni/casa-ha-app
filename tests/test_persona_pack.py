@@ -199,6 +199,20 @@ def test_templates_html_and_structural_delimiters_fail(
         load_persona_pack(pack, tmp_path / "manifest.json")
 
 
+def test_template_marker_in_persona_yaml_fails(tmp_path: Path) -> None:
+    # Mirrors test_templates_html_and_structural_delimiters_fail above, but
+    # for persona.yaml rather than persona.md — confirms `_reject_markers`
+    # is applied to every admitted file's raw text, not just persona.md.
+    pack = write_pack(tmp_path)
+    data = valid_yaml()
+    data["identity"]["display_name"] = "Test ${SECRET}"
+    (pack / "persona.yaml").write_text(
+        yaml.safe_dump(data, sort_keys=False), encoding="utf-8"
+    )
+    with pytest.raises(PersonaPackError):
+        load_persona_pack(pack, tmp_path / "manifest.json")
+
+
 def test_hidden_executable_symlink_hardlink_and_subdirectory_fail(
     tmp_path: Path,
 ) -> None:
@@ -323,6 +337,18 @@ def test_missing_manifest_file_fails(tmp_path: Path) -> None:
     pack = write_pack(tmp_path)
     with pytest.raises((PersonaPackError, OSError)):
         load_persona_pack(pack, tmp_path / "does-not-exist.json")
+
+
+def test_malformed_manifest_json_fails(tmp_path: Path) -> None:
+    # Otherwise-valid pack, but manifest.json is syntactically invalid JSON —
+    # exercises the json.JSONDecodeError branch of the loader's
+    # `except (OSError, json.JSONDecodeError)` guard, distinct from the
+    # missing-file/OSError path covered above.
+    pack = write_pack(tmp_path)
+    manifest_path = tmp_path / "manifest.json"
+    manifest_path.write_text("{not valid json", encoding="utf-8")
+    with pytest.raises(PersonaPackError):
+        load_persona_pack(pack, manifest_path)
 
 
 def test_manifest_stale_after_pack_content_changes(tmp_path: Path) -> None:
@@ -618,20 +644,61 @@ def test_unsupported_markdown_tokens_fail(unsupported_fragment: str) -> None:
         validate_markdown(source)
 
 
+def _heading_body_start(canonical: str, level: int, name: str) -> int:
+    """The byte offset where `sections()` begins a section's extracted
+    body: right after the heading line, past the blank-line separator."""
+    heading_line = f"{'#' * level} {name}"
+    idx = canonical.index(heading_line) + len(heading_line)
+    while canonical[idx] == "\n":
+        idx += 1
+    return idx
+
+
 def test_source_slice_extraction_is_byte_preserving() -> None:
-    source = core()
+    # A crafted document with distinctive inline markdown (*emphasis*,
+    # inline `code`) in each section body. Mere substring containment
+    # (`body in canonical`) would also pass for a body lifted from the
+    # WRONG offset (e.g. swapped between sections, or re-rendered from an
+    # AST) as long as matching text existed anywhere in the source — so
+    # this instead anchors each body to ITS OWN heading's exact source
+    # offset. Re-rendering emphasis/code from a parsed AST would also not
+    # reproduce these literal `*`/backtick source bytes verbatim.
+    source = (
+        "# Core\n\n"
+        "Core body with *emphasis* and inline `code` markers right here.\n\n"
+        "## Negative space\n\n"
+        "Negative space body with *other emphasis* and `other code`.\n"
+    )
     canonical = canonical_text(source)
     parsed = sections(canonical)
+
     core_bodies = [body for level, name, body in parsed if level == 1 and name == "Core"]
     assert len(core_bodies) == 1
-    # The extracted body must be an exact substring of the canonical
-    # source — never a re-render — so its checksum stays stable.
-    assert core_bodies[0].strip("\n") in canonical
+    core_body = core_bodies[0]
+    core_body_no_trailing_nl = core_body[:-1] if core_body.endswith("\n") else core_body
+    core_start = _heading_body_start(canonical, 1, "Core")
+    # Exact-offset check: the extracted body must equal the source slice
+    # immediately adjacent to its OWN heading, byte-for-byte.
+    assert (
+        canonical[core_start:core_start + len(core_body_no_trailing_nl)]
+        == core_body_no_trailing_nl
+    )
+    assert "*emphasis*" in core_body
+    assert "`code`" in core_body
+
     negative_space_bodies = [
         body for level, name, body in parsed if level == 2 and name == "Negative space"
     ]
     assert len(negative_space_bodies) == 1
-    assert negative_space_bodies[0].strip("\n") in canonical
+    ns_body = negative_space_bodies[0]
+    ns_body_no_trailing_nl = ns_body[:-1] if ns_body.endswith("\n") else ns_body
+    ns_start = _heading_body_start(canonical, 2, "Negative space")
+    assert (
+        canonical[ns_start:ns_start + len(ns_body_no_trailing_nl)]
+        == ns_body_no_trailing_nl
+    )
+    assert "*other emphasis*" in ns_body
+    assert "`other code`" in ns_body
 
 
 def _sibling_sections_source() -> str:
