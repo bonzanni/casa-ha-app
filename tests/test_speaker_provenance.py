@@ -12,9 +12,13 @@ from __future__ import annotations
 
 import base64
 import inspect
+import json
 from dataclasses import FrozenInstanceError
+from pathlib import Path
 
+import jsonschema
 import pytest
+import rfc8785
 
 from speaker_provenance import (
     MAX_CANONICAL_PROVENANCE_BYTES,
@@ -25,6 +29,7 @@ from speaker_provenance import (
     decode_provenance_from_tags,
     decode_provenance_tag,
     encode_provenance_tag,
+    provenance_mapping,
     validate_speaker_provenance,
 )
 from canonical_bytes import canonical_json_bytes
@@ -34,6 +39,41 @@ from personality_types import (
     SpeakerProvenance,
     TrustedOrigin,
 )
+
+_SCHEMA_PATH = (
+    Path(__file__).resolve().parent.parent
+    / "casa-agent" / "rootfs" / "opt" / "casa" / "defaults" / "schema"
+    / "speaker-provenance.v1.json"
+)
+
+
+def _raw_mapping(**overrides: object) -> dict[str, object]:
+    """A schema-shaped v1 payload dict with every field defaulted to None,
+    overridden by kwargs. Used to build malformed canonical tags directly
+    (bypassing `encode_provenance_tag`, which validates)."""
+    base: dict[str, object] = {
+        "speaker_kind": "user",
+        "role_id": None,
+        "persona_id": None,
+        "persona_version": None,
+        "display_name": None,
+        "binding_digest": None,
+        "user_peer": None,
+        "user_id": None,
+    }
+    base.update(overrides)
+    return base
+
+
+def _tag_from_wire(wire: bytes) -> str:
+    payload = base64.urlsafe_b64encode(wire).decode("ascii").rstrip("=")
+    return RESERVED_SOURCE_PREFIX + payload
+
+
+def _tag_from_raw_mapping(raw: dict[str, object]) -> str:
+    """Build a canonical (RFC 8785), correctly-base64'd tag directly from a
+    raw dict via `rfc8785.dumps` — never through `encode_provenance_tag`."""
+    return _tag_from_wire(rfc8785.dumps(raw))
 
 
 def resident() -> SpeakerProvenance:
@@ -591,3 +631,112 @@ def test_from_origin_route_mismatch_rejected() -> None:
             authenticated_user=None,
             user_peer="telegram_123",
         )
+
+
+# ---------------------------------------------------------------------------
+# CRITICAL: type-confused fields in an otherwise canonical, correctly-
+# base64'd tag must be rejected as malformed, never raise TypeError/
+# AttributeError out of validate_speaker_provenance.
+# ---------------------------------------------------------------------------
+
+
+def test_type_confused_display_name_on_user_is_malformed_not_a_crash() -> None:
+    tag = _tag_from_raw_mapping(
+        _raw_mapping(speaker_kind="user", user_peer="telegram_123", display_name=123)
+    )
+    provenance, reason = decode_provenance_from_tags((tag,))
+    assert provenance is None
+    assert reason != "ok"
+    with pytest.raises(ValueError):
+        decode_provenance_tag(tag)
+
+
+def test_type_confused_role_id_on_resident_is_malformed_not_a_crash() -> None:
+    tag = _tag_from_raw_mapping(
+        _raw_mapping(
+            speaker_kind="resident",
+            role_id=123,
+            persona_id="casa.personas/tina",
+            persona_version="1.0.0",
+            binding_digest="sha256:" + "5" * 64,
+        )
+    )
+    provenance, reason = decode_provenance_from_tags((tag,))
+    assert provenance is None
+    assert reason != "ok"
+    with pytest.raises(ValueError):
+        decode_provenance_tag(tag)
+
+
+# ---------------------------------------------------------------------------
+# decode_provenance_tag rejection categories (brief-mandated)
+# ---------------------------------------------------------------------------
+
+
+def test_non_ascii_tag_rejected() -> None:
+    tag = RESERVED_SOURCE_PREFIX + "é"
+    with pytest.raises(ValueError):
+        decode_provenance_tag(tag)
+
+
+def test_padded_base64_tag_rejected() -> None:
+    valid_tag = encode_provenance_tag(user())
+    padded_tag = valid_tag + "="
+    with pytest.raises(ValueError, match="unpadded base64url"):
+        decode_provenance_tag(padded_tag)
+
+
+def test_valid_but_non_canonical_json_payload_rejected() -> None:
+    """Valid base64 of valid JSON that decodes to a schema-shaped dict, but
+    whose wire bytes are NOT RFC 8785 canonical (here: standard json.dumps
+    key order + whitespace, rather than rfc8785's sorted/compact form)."""
+    raw = _raw_mapping(speaker_kind="user", user_peer="telegram_123")
+    non_canonical_wire = json.dumps(raw).encode("utf-8")
+    assert non_canonical_wire != canonical_json_bytes(raw)
+    tag = _tag_from_wire(non_canonical_wire)
+    with pytest.raises(ValueError, match="not canonical RFC 8785 JSON"):
+        decode_provenance_tag(tag)
+
+
+def test_sole_unsupported_version_tag_rejected() -> None:
+    """A single reserved-namespace tag with an unsupported version prefix
+    must be rejected by both entry points. (Not paired with a v1 tag here —
+    that would short-circuit to the "multiple" path without ever calling
+    the decoder.)"""
+    tag = "casa-source-v2.x"
+    provenance, reason = decode_provenance_from_tags((tag,))
+    assert provenance is None
+    assert reason != "ok"
+    with pytest.raises(ValueError, match="unsupported provenance tag"):
+        decode_provenance_tag(tag)
+
+
+# ---------------------------------------------------------------------------
+# JSON Schema drift guard: the schema and the Python validator must agree.
+# ---------------------------------------------------------------------------
+
+
+def test_schema_accepts_a_valid_provenance_mapping() -> None:
+    schema = json.loads(_SCHEMA_PATH.read_text())
+    jsonschema.validate(instance=provenance_mapping(resident()), schema=schema)
+
+
+def test_schema_and_python_validator_agree_on_invalid_mappings() -> None:
+    schema = json.loads(_SCHEMA_PATH.read_text())
+
+    # A resident missing binding_digest: both the schema and the Python
+    # validator must reject it.
+    resident_missing_digest = provenance_mapping(resident())
+    resident_missing_digest["binding_digest"] = None
+    with pytest.raises(jsonschema.ValidationError):
+        jsonschema.validate(instance=resident_missing_digest, schema=schema)
+    with pytest.raises(ValueError):
+        validate_speaker_provenance(SpeakerProvenance(**resident_missing_digest))
+
+    # A user carrying a non-null role_id: both must reject it.
+    user_with_role_id = provenance_mapping(user())
+    user_with_role_id["role_id"] = "resident:butler"
+    with pytest.raises(jsonschema.ValidationError):
+        jsonschema.validate(instance=user_with_role_id, schema=schema)
+    with pytest.raises(ValueError):
+        validate_speaker_provenance(SpeakerProvenance(**user_with_role_id))

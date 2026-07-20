@@ -5,7 +5,7 @@ import json
 import re
 import unicodedata
 from dataclasses import asdict
-from typing import Iterable, Literal, Mapping
+from typing import Iterable, Literal
 
 from canonical_bytes import canonical_json_bytes
 from personality_types import (
@@ -89,6 +89,11 @@ def _validate_string_bound(name: str, value: str | None) -> None:
 
 
 def validate_speaker_provenance(value: SpeakerProvenance) -> None:
+    for field_name in ("speaker_kind", "role_id", "persona_id", "persona_version",
+                       "display_name", "binding_digest", "user_peer", "user_id"):
+        field_value = getattr(value, field_name)
+        if field_value is not None and not isinstance(field_value, str):
+            raise ValueError(f"{field_name} must be a string or null")
     kind = value.speaker_kind
     if kind in {"resident", "specialist"}:
         if not value.role_id or not value.role_id.startswith(kind + ":"):
