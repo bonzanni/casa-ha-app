@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import base64
 import json
+import re
 import time
 import urllib.request
 from pathlib import Path
@@ -31,6 +32,16 @@ def decode_contract_tag(tag: str) -> dict[str, object]:
         "speaker_kind", "role_id", "persona_id", "persona_version",
         "display_name", "binding_digest", "user_peer", "user_id",
     }
+    # Guard the checksum well-formedness the fixture goldens must obey: a
+    # non-null binding_digest is exactly "sha256:" + 64 lowercase hex chars.
+    # This runs on every decoded fixture tag and every live-recalled tag, so a
+    # malformed digest (e.g. the 61-hex slip caught during the entry gate)
+    # fails deterministically instead of only under a manual pass.
+    digest = parsed.get("binding_digest")
+    assert digest is None or (
+        isinstance(digest, str)
+        and re.fullmatch(r"sha256:[0-9a-f]{64}", digest) is not None
+    ), "binding_digest must be null or 'sha256:' + 64 lowercase hex chars"
     return parsed
 
 
