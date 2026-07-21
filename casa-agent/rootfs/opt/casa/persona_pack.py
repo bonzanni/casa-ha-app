@@ -10,7 +10,7 @@ from typing import Mapping
 import jsonschema
 import yaml
 
-from authored_markers import contains_forbidden_marker
+from authored_markers import contains_forbidden_marker, reject_markers_in_parsed
 from canonical_bytes import (
     assert_json_safe,
     canonical_json_bytes,
@@ -104,18 +104,25 @@ def load_persona_pack(pack_dir: Path, manifest_path: Path) -> PersonaPack:
         })
 
     persona = yaml.safe_load(canonical_files["persona.yaml"])
-    # R1 (foundation review r2), defense in depth: persona.yaml is already
-    # raw-text marker-scanned above via _reject_markers, so an injection
-    # marker can't hide here the way it could in role.yaml's schema-open
-    # fields. This still guarantees freeze-soundness (deep_freeze below)
-    # and rejects any non-JSON type (set/bytes/datetime/cyclic) a YAML
-    # tag/alias could otherwise smuggle through yaml.safe_load.
+    # R1 (foundation review r2): guarantees freeze-soundness (deep_freeze
+    # below) and rejects any non-JSON type (set/bytes/datetime/cyclic) a
+    # YAML tag/alias could otherwise smuggle through yaml.safe_load.
     try:
         assert_json_safe(persona)
     except ValueError as exc:
         raise PersonaPackError(
             f"persona.yaml contains non-JSON-native content: {exc}"
         ) from exc
+    # F-A (foundation review r3): persona.yaml is already raw-text
+    # marker-scanned above via _reject_markers (kept as defense in depth),
+    # but a YAML string escape (e.g. "\x24\x7bOVERRIDE\x7d") has no
+    # literal marker bytes in the raw source — yaml.safe_load DECODES it
+    # into the live marker. Scan the PARSED string leaves too, which sees
+    # the value only after decoding and so cannot be bypassed this way.
+    try:
+        reject_markers_in_parsed(persona)
+    except ValueError as exc:
+        raise PersonaPackError(str(exc)) from exc
     schema_path = (
         Path(__file__).parent / "defaults/schema/persona.v1.json"
     )
@@ -147,6 +154,14 @@ def load_persona_pack(pack_dir: Path, manifest_path: Path) -> PersonaPack:
             raise PersonaPackError(
                 f"examples.yaml contains non-JSON-native content: {exc}"
             ) from exc
+        # F-A (foundation review r3): same parsed-leaf marker scan as
+        # persona.yaml above — examples.yaml's raw text is already
+        # marker-scanned via _reject_markers, but a YAML string escape is
+        # only visible after yaml.safe_load decodes it.
+        try:
+            reject_markers_in_parsed(raw_examples)
+        except ValueError as exc:
+            raise PersonaPackError(str(exc)) from exc
         example_schema = (
             Path(__file__).parent / "defaults/schema/persona-examples.v1.json"
         )

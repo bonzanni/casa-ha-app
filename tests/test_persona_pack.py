@@ -736,6 +736,85 @@ def test_benign_angle_bracket_comparison_in_persona_yaml_still_loads(tmp_path: P
     assert result.quirks[0]["context"] == "Notices when 2 < 3 in a casual aside."
 
 
+# ---------------------------------------------------------------------------
+# F-A (foundation review r3, P0): the raw-text marker scan runs BEFORE
+# yaml.safe_load, so a YAML string escape (e.g. \x24\x7b, which decodes to
+# the literal characters "${") is invisible to the raw scan but is
+# DECODED by the YAML parser into the live forbidden marker. The parsed
+# persona/examples content must be marker-scanned on its PARSED string
+# leaves (post-decode), not just its raw source text, to close this.
+# ---------------------------------------------------------------------------
+
+
+def test_escaped_template_marker_in_persona_yaml_quirk_is_rejected(tmp_path: Path) -> None:
+    pack = write_pack(tmp_path)
+    data = valid_yaml()
+    data["quirks"] = [{
+        "frequency": "occasional",
+        "context": "PLACEHOLDER",
+        "tendency": "tendency-0",
+    }]
+    yaml_text = yaml.safe_dump(data, sort_keys=False)
+    assert "context: PLACEHOLDER\n" in yaml_text
+    # Raw source contains the literal backslash-x escape sequence, NOT the
+    # characters "${" — a raw-text scan sees no marker here. The YAML
+    # parser decodes \x24\x7b -> "${" and \x7d -> "}", producing the live
+    # string "${OVERRIDE}" only after yaml.safe_load runs.
+    yaml_text = yaml_text.replace(
+        "context: PLACEHOLDER\n", 'context: "\\x24\\x7bOVERRIDE\\x7d"\n'
+    )
+    assert "${" not in yaml_text  # confirms this is genuinely a raw-scan bypass
+    (pack / "persona.yaml").write_text(yaml_text, encoding="utf-8")
+    manifest_path = tmp_path / "manifest.json"
+    write_valid_manifest(pack, manifest_path)
+    with pytest.raises(PersonaPackError):
+        load_persona_pack(pack, manifest_path)
+
+
+def test_escaped_html_tag_in_persona_yaml_quirk_is_rejected(tmp_path: Path) -> None:
+    pack = write_pack(tmp_path)
+    data = valid_yaml()
+    data["quirks"] = [{
+        "frequency": "occasional",
+        "context": "PLACEHOLDER",
+        "tendency": "tendency-0",
+    }]
+    yaml_text = yaml.safe_dump(data, sort_keys=False)
+    assert "context: PLACEHOLDER\n" in yaml_text
+    # \x3c -> "<", \x3e -> ">": decodes to the live string "<script>" only
+    # after yaml.safe_load runs; the raw source has no bare "<" at all.
+    yaml_text = yaml_text.replace(
+        "context: PLACEHOLDER\n", 'context: "\\x3cscript\\x3e"\n'
+    )
+    assert "<" not in yaml_text  # confirms this is genuinely a raw-scan bypass
+    (pack / "persona.yaml").write_text(yaml_text, encoding="utf-8")
+    manifest_path = tmp_path / "manifest.json"
+    write_valid_manifest(pack, manifest_path)
+    with pytest.raises(PersonaPackError):
+        load_persona_pack(pack, manifest_path)
+
+
+def test_escaped_marker_in_examples_yaml_is_rejected(tmp_path: Path) -> None:
+    pack = write_pack(tmp_path)
+    examples_payload = {
+        "api_version": "casa.persona.examples/v1",
+        "examples": [
+            {"surface": "text", "user": "hi", "good": "Hello.", "bad": "PLACEHOLDER"},
+        ],
+    }
+    yaml_text = yaml.safe_dump(examples_payload, sort_keys=False)
+    assert 'bad: PLACEHOLDER\n' in yaml_text
+    yaml_text = yaml_text.replace(
+        "bad: PLACEHOLDER\n", 'bad: "\\x24\\x7bOVERRIDE\\x7d"\n'
+    )
+    assert "${" not in yaml_text  # confirms this is genuinely a raw-scan bypass
+    (pack / "examples.yaml").write_text(yaml_text, encoding="utf-8")
+    manifest_path = tmp_path / "manifest.json"
+    write_valid_manifest(pack, manifest_path)
+    with pytest.raises(PersonaPackError):
+        load_persona_pack(pack, manifest_path)
+
+
 def test_letter_angle_bracket_comparison_in_persona_yaml_fails(tmp_path: Path) -> None:
     # R3 (foundation review r2): HTML_TAG_OPEN_RE is deliberately
     # CONSERVATIVE for a trust boundary — it rejects "<" followed (even

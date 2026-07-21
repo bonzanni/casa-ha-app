@@ -9,7 +9,7 @@ from typing import Mapping
 import jsonschema
 import yaml
 
-from authored_markers import contains_forbidden_marker
+from authored_markers import contains_forbidden_marker, reject_markers_in_parsed
 from canonical_bytes import assert_json_safe, canonical_text, deep_freeze
 from markdown_sections import validate_markdown
 
@@ -37,35 +37,21 @@ def _reject_markers(text: str) -> None:
         raise ValueError("template, include, HTML, or delimiter detected")
 
 
-def _iter_string_leaves(value: object):
-    if isinstance(value, str):
-        yield value
-    elif isinstance(value, dict):
-        for key, item in value.items():
-            yield from _iter_string_leaves(key)
-            yield from _iter_string_leaves(item)
-    elif isinstance(value, (list, tuple)):
-        for item in value:
-            yield from _iter_string_leaves(item)
-
-
-def _reject_markers_in_role_values(raw: object) -> None:
-    """Marker-check role.yaml's authored STRING VALUES rather than its raw
-    source text. role.v1.json intentionally leaves some fields open
-    (``disclosure.overrides``, ``tts.error_phrases`` values) as free-form
-    strings — that authored-content surface is exactly what this check must
-    cover. Raw-text scanning is deliberately NOT used here (unlike
-    doctrine.md/persona content) because role.yaml's own flow-style YAML
-    syntax legitimately produces adjacent closing braces (e.g.
-    ``disclosure: {policy: standard, overrides: {}}``), which collides
-    byte-for-byte with the forbidden ``}}`` template-close marker in every
-    shipped role artifact. Scanning only the parsed string leaves catches
-    every real injection surface (any string value the schema allows)
-    without that false positive, since YAML's own structural punctuation
-    never appears inside a parsed string value."""
-    for text in _iter_string_leaves(raw):
-        if contains_forbidden_marker(text):
-            raise ValueError("template, include, HTML, or delimiter detected")
+# role.yaml's marker check runs on PARSED string leaves (dict keys AND
+# values, via authored_markers.reject_markers_in_parsed), not raw source
+# text. role.v1.json intentionally leaves some fields open
+# (``disclosure.overrides``, ``tts.error_phrases`` values) as free-form
+# strings — that authored-content surface is exactly what this check must
+# cover. Raw-text scanning is deliberately NOT used here (unlike
+# doctrine.md/persona content) because role.yaml's own flow-style YAML
+# syntax legitimately produces adjacent closing braces (e.g.
+# ``disclosure: {policy: standard, overrides: {}}``), which collides
+# byte-for-byte with the forbidden ``}}`` template-close marker in every
+# shipped role artifact. Scanning only the parsed string leaves catches
+# every real injection surface (any string value the schema allows)
+# without that false positive, and — per foundation review r3, F-A — is
+# also immune to a marker hidden behind a YAML string escape, since it
+# only ever sees the DECODED value.
 
 
 def _admit_files(role_dir: Path) -> dict[str, Path]:
@@ -111,7 +97,7 @@ def load_role_artifact(role_dir: Path) -> RoleArtifactSource:
     # below, so none of them can crash on a cycle or be bypassed by a
     # marker hidden inside a non-dict/list/str container.
     assert_json_safe(raw)
-    _reject_markers_in_role_values(raw)
+    reject_markers_in_parsed(raw)
     schema_path = Path(__file__).parent / "defaults/schema/role.v1.json"
     jsonschema.validate(raw, json.loads(schema_path.read_text(encoding="utf-8")))
 
