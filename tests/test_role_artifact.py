@@ -181,8 +181,12 @@ class TestHappyPath:
 
 class TestFileSetRejection:
     def test_missing_directory_raises(self, tmp_path):
+        # J3 (foundation review r6): the loader's error boundary is now
+        # TOTAL — a missing role directory is the simplest OSError trigger
+        # for _admit_files' iterdir and must fold into ValueError, never
+        # escape as a raw FileNotFoundError/OSError.
         missing = tmp_path / "does_not_exist"
-        with pytest.raises(OSError):
+        with pytest.raises(ValueError):
             load_role_artifact(missing)
 
     def test_missing_role_yaml_raises(self, tmp_path):

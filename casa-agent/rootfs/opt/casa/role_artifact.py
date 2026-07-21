@@ -62,7 +62,14 @@ def _admit_files(role_dir: Path) -> dict[str, Path]:
     artifact directory can't substitute a symlink, hard link, or
     executable file for either expected entry, and rejects any hidden or
     unexpected entry outright rather than silently ignoring it."""
-    entries = sorted(role_dir.iterdir(), key=lambda path: path.name)
+    # J3 (foundation review r6): directory listing can raise a raw OSError
+    # (missing dir, permission error, an admission/read race) — scoped to
+    # the iteration only, so a genuine downstream logic bug still surfaces
+    # on its own terms.
+    try:
+        entries = sorted(role_dir.iterdir(), key=lambda path: path.name)
+    except OSError as exc:
+        raise ValueError(f"role directory unreadable: {exc}") from exc
     names = {entry.name for entry in entries}
     if names != set(_EXPECTED_FILES):
         raise ValueError(
@@ -70,7 +77,10 @@ def _admit_files(role_dir: Path) -> dict[str, Path]:
         )
     admitted: dict[str, Path] = {}
     for path in entries:
-        info = path.lstat()
+        try:
+            info = path.lstat()
+        except OSError as exc:
+            raise ValueError(f"role directory unreadable: {exc}") from exc
         if path.name.startswith(".") or not stat.S_ISREG(info.st_mode):
             raise ValueError(f"invalid role artifact file: {path.name}")
         if info.st_nlink != 1:
@@ -97,6 +107,11 @@ def load_role_artifact(role_dir: Path) -> RoleArtifactSource:
     # leak the raw codec error text.
     try:
         role_text = canonical_text(role_path.read_text(encoding="utf-8"))
+    except OSError as exc:
+        # J3 (foundation review r6): the read itself (not just the admitted
+        # lstat above) can still race and raise a raw OSError (e.g. the
+        # file vanishing between admission and read).
+        raise ValueError("role.yaml unreadable") from exc
     except UnicodeDecodeError as exc:
         raise ValueError("role.yaml has invalid encoding (not UTF-8)") from exc
     try:
@@ -150,6 +165,10 @@ def load_role_artifact(role_dir: Path) -> RoleArtifactSource:
     # boundary wrap as role.yaml above.
     try:
         doctrine = canonical_text(doctrine_path.read_text(encoding="utf-8"))
+    except OSError as exc:
+        # J3 (foundation review r6): same admission/read-race OSError
+        # boundary as role.yaml above.
+        raise ValueError("doctrine.md unreadable") from exc
     except UnicodeDecodeError as exc:
         raise ValueError("doctrine.md has invalid encoding (not UTF-8)") from exc
     if not doctrine.strip():

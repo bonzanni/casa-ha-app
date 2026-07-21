@@ -508,6 +508,16 @@ def test_invalid_utf8_byte_in_manifest_fails_with_persona_pack_error(
         load_persona_pack(pack, manifest_path)
 
 
+def test_missing_pack_directory_fails(tmp_path: Path) -> None:
+    # J3 (foundation review r6): a nonexistent pack directory is the
+    # simplest OSError trigger for _admit_files' iterdir — must fold into
+    # PersonaPackError, not escape as a raw FileNotFoundError/OSError.
+    missing = tmp_path / "does_not_exist"
+    manifest_path = tmp_path / "manifest.json"
+    with pytest.raises(PersonaPackError):
+        load_persona_pack(missing, manifest_path)
+
+
 def test_manifest_deeply_nested_json_raises_persona_pack_error_not_recursion_error(
     tmp_path: Path,
 ) -> None:

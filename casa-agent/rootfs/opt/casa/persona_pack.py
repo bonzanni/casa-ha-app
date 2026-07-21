@@ -74,13 +74,23 @@ class PersonaPack:
 
 
 def _admit_files(pack_dir: Path) -> tuple[Path, ...]:
-    entries = sorted(pack_dir.iterdir(), key=lambda path: path.name)
+    # J3 (foundation review r6): directory listing can raise a raw OSError
+    # (missing dir, permission error, an admission/read race) — scoped to
+    # the iteration only, so a genuine downstream logic bug still surfaces
+    # on its own terms.
+    try:
+        entries = sorted(pack_dir.iterdir(), key=lambda path: path.name)
+    except OSError as exc:
+        raise PersonaPackError(f"persona directory unreadable: {exc}") from exc
     names = {entry.name for entry in entries}
     if not _REQUIRED <= names or names - _REQUIRED - _OPTIONAL:
         raise PersonaPackError("persona pack file set is invalid")
     admitted = []
     for path in entries:
-        info = path.lstat()
+        try:
+            info = path.lstat()
+        except OSError as exc:
+            raise PersonaPackError(f"persona directory unreadable: {exc}") from exc
         if path.name.startswith(".") or not stat.S_ISREG(info.st_mode):
             raise PersonaPackError(f"invalid persona file: {path.name}")
         if info.st_nlink != 1:
@@ -122,6 +132,11 @@ def load_persona_pack(pack_dir: Path, manifest_path: Path) -> PersonaPack:
         # validation (_reject_markers etc.) still raises on its own terms.
         try:
             text = canonical_text(path.read_text(encoding="utf-8"))
+        except OSError as exc:
+            # J3 (foundation review r6): the read itself (not just the
+            # admitted lstat above) can still race and raise a raw OSError
+            # (e.g. the file vanishing between admission and read).
+            raise PersonaPackError(f"persona file unreadable: {path.name}") from exc
         except UnicodeDecodeError as exc:
             raise PersonaPackError(
                 f"persona file is not valid UTF-8: {path.name}"
