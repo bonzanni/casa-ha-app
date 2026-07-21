@@ -93,6 +93,17 @@ _CANONICAL_INT_MAX = 2**53 - 1
 _JSON_SCALARS = (str, bool, int, float, type(None))
 
 
+def _require_utf8_encodable(text: str, *, what: str = "string") -> None:
+    # H1 (foundation review r5): shared by both the dict-key check and the
+    # str-leaf check below, so a lone surrogate is rejected identically
+    # whether it appears as a mapping KEY or a string VALUE — DRY, and
+    # closes the gap where only values were checked.
+    try:
+        text.encode("utf-8")
+    except UnicodeEncodeError as exc:
+        raise ValueError(f"{what} not UTF-8 encodable") from exc
+
+
 def assert_json_safe(value, *, _depth=0, _seen=None, max_depth=64):
     """Recursively assert *value* is a finite tree of JSON-native types only.
     Rejects non-JSON types (set, bytes, datetime, ...), cycles, and excessive
@@ -119,6 +130,13 @@ def assert_json_safe(value, *, _depth=0, _seen=None, max_depth=64):
         for k, v in value.items():
             if not isinstance(k, str):
                 raise ValueError("non-string key in parsed data")
+            # H1 (foundation review r5): a dict key that IS a str still
+            # needs the same UTF-8-encodability check applied to string
+            # values below — a lone-surrogate key (e.g. from a YAML
+            # "\Uxxxxxxxx" escape landing in surrogate range) previously
+            # passed this gate unrejected, then made canonical_json_bytes
+            # raise UnicodeEncodeError far downstream.
+            _require_utf8_encodable(k, what="dict key")
             assert_json_safe(v, _depth=_depth + 1, _seen=_seen, max_depth=max_depth)
         _seen.discard(id(value))
         return
@@ -162,7 +180,4 @@ def assert_json_safe(value, *, _depth=0, _seen=None, max_depth=64):
     # raises far downstream. Reject it at the same gate as every other
     # non-canonical-safe value.
     if isinstance(value, str):
-        try:
-            value.encode("utf-8")
-        except UnicodeEncodeError as exc:
-            raise ValueError("string not UTF-8 encodable") from exc
+        _require_utf8_encodable(value)

@@ -293,6 +293,27 @@ def test_assert_json_safe_rejects_lone_surrogate_string() -> None:
         assert_json_safe("\uD800")
 
 
+# ---------------------------------------------------------------------------
+# H1 (foundation review r5): assert_json_safe's own dict-key loop checked
+# `isinstance(k, str)` but never applied the UTF-8-encodability check above
+# to the KEY itself — only to string VALUES. A lone-surrogate dict key (a
+# YAML "\Uxxxxxxxx" escape landing in surrogate range, same as the string
+# case above, but as a mapping key rather than a value) passed this gate
+# unrejected, then made canonical_json_bytes raise UnicodeEncodeError far
+# downstream, same class of bug as the value case this function already
+# guards against.
+# ---------------------------------------------------------------------------
+
+
+def test_assert_json_safe_rejects_lone_surrogate_dict_key() -> None:
+    with pytest.raises(ValueError, match="not UTF-8 encodable"):
+        assert_json_safe({"\uD800": 1})
+
+
+def test_assert_json_safe_accepts_normal_string_dict_key() -> None:
+    assert assert_json_safe({"café": 1}) is None  # does not raise
+
+
 @pytest.mark.parametrize("value", ["café", "日本語", "", "plain ascii"])
 def test_assert_json_safe_accepts_ordinary_unicode_strings(value: str) -> None:
     assert assert_json_safe(value) is None  # does not raise
@@ -324,6 +345,7 @@ def test_assert_json_safe_still_accepts_bool_regardless_of_int_range_check() -> 
         "café",
         "日本語",
         {"a": [1, 2.5, "three", True, False, None, 2**53 - 1]},
+        {"café": 1},
     ],
 )
 def test_values_passing_assert_json_safe_are_canonicalizable(value) -> None:

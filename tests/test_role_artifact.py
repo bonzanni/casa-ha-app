@@ -561,6 +561,23 @@ class TestJsonNativeInvariant:
         with pytest.raises(ValueError, match="not UTF-8 encodable"):
             load_role_artifact(d)
 
+    def test_yaml_lone_surrogate_dict_key_in_schema_open_field_is_rejected(
+        self, tmp_path
+    ):
+        # H1 (foundation review r5): assert_json_safe checked
+        # `isinstance(k, str)` for dict keys but never applied the same
+        # UTF-8-encodability check it applies to string values, so a
+        # lone-surrogate KEY (not just a lone-surrogate value, already
+        # covered above) passed the gate unrejected and made
+        # canonical_json_bytes raise far downstream.
+        role_yaml_text = _role_yaml_with_delegates(
+            'delegates:\n- "\\U0000D800": value\n'
+        )
+        d = write_role_dir(tmp_path, role_yaml_text=role_yaml_text)
+
+        with pytest.raises(ValueError, match="not UTF-8 encodable"):
+            load_role_artifact(d)
+
     def test_loaded_artifact_has_no_set_or_bytes_reachable(self, tmp_path):
         """Positive-side confirmation: a valid (JSON-native-only) role
         artifact loads fine, i.e. assert_json_safe does not reject
