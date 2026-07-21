@@ -323,6 +323,55 @@ def test_valid_pack_with_matching_manifest_loads(tmp_path: Path) -> None:
     assert result.manifest.checksum == result.checksum
 
 
+# ---------------------------------------------------------------------------
+# FIX 5 (foundation review, P1): artifacts must be DEEPLY frozen, not just
+# top-level MappingProxyType — nested dicts/lists inside identity, quirks,
+# examples, and manifest rows must also reject mutation.
+# ---------------------------------------------------------------------------
+
+
+def test_identity_pronouns_are_deeply_frozen(tmp_path: Path) -> None:
+    pack = write_pack(tmp_path)
+    manifest_path = tmp_path / "manifest.json"
+    write_valid_manifest(pack, manifest_path)
+    result = load_persona_pack(pack, manifest_path)
+
+    with pytest.raises(TypeError):
+        result.identity["pronouns"]["subject"] = "x"
+
+
+def test_quirk_mapping_rejects_mutation(tmp_path: Path) -> None:
+    pack = write_pack(tmp_path)
+    data = valid_yaml()
+    data["quirks"] = [_quirk(0)]
+    (pack / "persona.yaml").write_text(yaml.safe_dump(data, sort_keys=False), encoding="utf-8")
+    manifest_path = tmp_path / "manifest.json"
+    write_valid_manifest(pack, manifest_path)
+    result = load_persona_pack(pack, manifest_path)
+
+    with pytest.raises(TypeError):
+        result.quirks[0]["context"] = "mutated"
+
+
+def test_examples_mapping_rejects_mutation(tmp_path: Path) -> None:
+    pack = write_pack(tmp_path)
+    examples_payload = {
+        "api_version": "casa.persona.examples/v1",
+        "examples": [
+            {"surface": "text", "user": "hi", "good": "Hello.", "bad": "yo"},
+        ],
+    }
+    (pack / "examples.yaml").write_text(
+        yaml.safe_dump(examples_payload, sort_keys=False), encoding="utf-8"
+    )
+    manifest_path = tmp_path / "manifest.json"
+    write_valid_manifest(pack, manifest_path)
+    result = load_persona_pack(pack, manifest_path)
+
+    with pytest.raises(TypeError):
+        result.examples[0]["good"] = "mutated"
+
+
 def test_manifest_mismatch_fails(tmp_path: Path) -> None:
     pack = write_pack(tmp_path)
     manifest_path = tmp_path / "manifest.json"

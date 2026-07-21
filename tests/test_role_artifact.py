@@ -145,6 +145,16 @@ class TestHappyPath:
         with pytest.raises(TypeError):
             artifact.role["kind"] = "specialist"  # type: ignore[index]
 
+    def test_role_mapping_is_deeply_frozen(self, tmp_path):
+        """FIX 5 (foundation review, P1): nested dicts inside the top-level
+        role mapping must also be immutable, not just the top level."""
+        d = write_role_dir(tmp_path, role=valid_role())
+        artifact = load_role_artifact(d)
+
+        assert isinstance(artifact.role["model"], MappingProxyType)
+        with pytest.raises(TypeError):
+            artifact.role["model"]["source"] = "mutated"  # type: ignore[index]
+
     def test_dataclass_is_frozen(self, tmp_path):
         d = write_role_dir(tmp_path, role=valid_role())
         artifact = load_role_artifact(d)

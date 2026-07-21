@@ -5,13 +5,17 @@ import os
 import stat
 from dataclasses import dataclass
 from pathlib import Path
-from types import MappingProxyType
 from typing import Mapping
 
 import jsonschema
 import yaml
 
-from canonical_bytes import canonical_json_bytes, canonical_text, checksum_bytes
+from canonical_bytes import (
+    canonical_json_bytes,
+    canonical_text,
+    checksum_bytes,
+    deep_freeze,
+)
 from markdown_sections import sections
 
 _REQUIRED = {"persona.yaml", "persona.md"}
@@ -135,7 +139,7 @@ def load_persona_pack(pack_dir: Path, manifest_path: Path) -> PersonaPack:
         )
         _validate_schema(raw_examples, example_schema)
         examples = tuple(
-            MappingProxyType(dict(value))
+            deep_freeze(value)
             for value in raw_examples.get("examples", [])
         )
 
@@ -156,15 +160,15 @@ def load_persona_pack(pack_dir: Path, manifest_path: Path) -> PersonaPack:
         persona_id=persona["id"],
         version=persona["version"],
         trait_schema_version=persona["trait_schema_version"],
-        identity=MappingProxyType(dict(persona["identity"])),
+        identity=deep_freeze(persona["identity"]),
         relationship_posture=persona["relationship_posture"],
         archetype=persona["archetype"],
-        traits=MappingProxyType(dict(persona["traits"])),
-        quirks=tuple(MappingProxyType(dict(q)) for q in persona.get("quirks", [])),
+        traits=deep_freeze(persona["traits"]),
+        quirks=tuple(deep_freeze(q) for q in persona.get("quirks", [])),
         markdown=canonical_files["persona.md"],
         examples=examples,
         manifest=PersonaManifest(
-            files=tuple(MappingProxyType(dict(row)) for row in manifest_rows),
+            files=tuple(deep_freeze(row) for row in manifest_rows),
             checksum=manifest_checksum,
         ),
         checksum=manifest_checksum,

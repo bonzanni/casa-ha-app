@@ -4,14 +4,13 @@ import json
 import stat
 from dataclasses import dataclass
 from pathlib import Path
-from types import MappingProxyType
 from typing import Mapping
 
 import jsonschema
 import yaml
 
 from authored_markers import contains_forbidden_marker
-from canonical_bytes import canonical_text
+from canonical_bytes import canonical_text, deep_freeze
 from markdown_sections import validate_markdown
 
 # Byte-size caps checked BEFORE read_text, so a hostile artifact can't force
@@ -120,6 +119,6 @@ def load_role_artifact(role_dir: Path) -> RoleArtifactSource:
     if raw["doctrine_file"] != doctrine_path.name:
         raise ValueError("doctrine_file must resolve to doctrine.md")
     return RoleArtifactSource(
-        role=MappingProxyType(dict(raw)), doctrine=doctrine,
+        role=deep_freeze(raw), doctrine=doctrine,
         role_path=role_path, doctrine_path=doctrine_path,
     )
