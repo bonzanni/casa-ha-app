@@ -460,3 +460,11 @@ def live_collision_slugs() -> frozenset[str]:
     if _active_index is None:
         return _IMAGE_ROLE_SLOTS
     return _active_index.all_collision_slugs()
+
+
+def get_installed_instance(slug: str) -> "SpecialistInstance | None":
+    """Task 14: thin module-level wrapper over the process-wide
+    ``_active_index``, so admin/inspection code (``personality_admin_handlers``)
+    can look up a specialist's lifecycle state without threading the index
+    through every call site — same seam as ``live_installed_specialist_slugs``."""
+    return _active_index.get_instance(slug) if _active_index is not None else None

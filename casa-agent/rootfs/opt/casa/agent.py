@@ -1101,12 +1101,25 @@ class Agent:
             # Per-turn telemetry (spec 5.2 §5.2). Microsecond cost — string
             # format + one logger.info — and runs after streaming has
             # already flushed via on_token, so it is not on the voice
-            # critical path.
+            # critical path. Task 14: also carries binding provenance (when
+            # this role is persona-bound) so a `turn_tokens` line can be tied
+            # back to the exact role/binding/dependency set via `casactl
+            # explain`/`persona diff` — omitted (None/empty) for roles with
+            # no binding, which keeps the line byte-identical to pre-Task-14.
+            _binding = self.config.binding
             logger.info(
                 format_turn_summary(
                     self.config.role,
                     msg.channel or "-",
                     usage,
+                    role_checksum=self.config.role_checksum or None,
+                    binding_digest=self.config.binding_digest or None,
+                    dependency_digests=(
+                        _binding.dependency_digests if _binding is not None else ()
+                    ),
+                    effective_config_digest=(
+                        _binding.effective_config_digest if _binding is not None else None
+                    ),
                 ),
             )
 

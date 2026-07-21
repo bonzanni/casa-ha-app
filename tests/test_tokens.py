@@ -274,3 +274,71 @@ class TestFormatTurnSummary:
             "turn_tokens role=assistant channel=telegram "
             "input=0 output=0 cache_read=0 cache_write=0"
         )
+
+
+class TestFormatTurnSummaryProvenanceExtension:
+    """Task 14: four keyword-only, all-optional provenance fields (spec:
+    tie a `turn_tokens` line to the exact role/binding/dependency set via
+    `casactl explain`/`persona diff`). Every field is omitted by default so
+    the base line stays byte-identical to pre-Task-14 (see the
+    TestFormatTurnSummary class above, unmodified and still passing)."""
+
+    _USAGE = {
+        "input_tokens": 1, "output_tokens": 2,
+        "cache_read_input_tokens": 3, "cache_creation_input_tokens": 4,
+    }
+
+    def test_omitted_kwargs_render_byte_identical_base_line(self):
+        line = format_turn_summary("assistant", "telegram", self._USAGE)
+        assert line == (
+            "turn_tokens role=assistant channel=telegram "
+            "input=1 output=2 cache_read=3 cache_write=4"
+        )
+        assert "role_checksum" not in line
+        assert "binding_digest" not in line
+        assert "dependency_digests" not in line
+        assert "effective_config_digest" not in line
+
+    def test_role_checksum_appends_field(self):
+        line = format_turn_summary(
+            "concierge", "telegram", self._USAGE, role_checksum="rc-abc",
+        )
+        assert line.endswith("role_checksum=rc-abc")
+
+    def test_binding_digest_appends_field(self):
+        line = format_turn_summary(
+            "concierge", "telegram", self._USAGE, binding_digest="bd-xyz",
+        )
+        assert "binding_digest=bd-xyz" in line
+
+    def test_dependency_digests_joined_with_commas(self):
+        line = format_turn_summary(
+            "concierge", "telegram", self._USAGE,
+            dependency_digests=("dep-1", "dep-2", "dep-3"),
+        )
+        assert "dependency_digests=dep-1,dep-2,dep-3" in line
+
+    def test_empty_dependency_digests_omitted(self):
+        line = format_turn_summary(
+            "concierge", "telegram", self._USAGE, dependency_digests=(),
+        )
+        assert "dependency_digests" not in line
+
+    def test_effective_config_digest_appends_field(self):
+        line = format_turn_summary(
+            "concierge", "telegram", self._USAGE, effective_config_digest="ecd-1",
+        )
+        assert "effective_config_digest=ecd-1" in line
+
+    def test_all_four_provenance_fields_together(self):
+        line = format_turn_summary(
+            "concierge", "telegram", self._USAGE,
+            role_checksum="rc-abc", binding_digest="bd-xyz",
+            dependency_digests=("dep-1",), effective_config_digest="ecd-1",
+        )
+        assert line == (
+            "turn_tokens role=concierge channel=telegram "
+            "input=1 output=2 cache_read=3 cache_write=4 "
+            "role_checksum=rc-abc binding_digest=bd-xyz "
+            "dependency_digests=dep-1 effective_config_digest=ecd-1"
+        )

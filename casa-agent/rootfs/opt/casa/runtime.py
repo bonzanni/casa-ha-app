@@ -29,6 +29,7 @@ if TYPE_CHECKING:
     from policies import PolicyLibrary
     from prompt_compiler import CompiledPromptBundle
     from role_slot import RoleSlot
+    from explanation_store import ExplanationStore
     from semantic_memory import SemanticMemory
     from session_registry import SessionRegistry
     from specialist_registry import SpecialistRegistry
@@ -103,3 +104,12 @@ class CasaRuntime:
     persona_packs: "Mapping[str, PersonaPack]" = field(default_factory=dict)
     bindings: "Mapping[str, BindingRecord]" = field(default_factory=dict)
     compiled_prompt_bundles: "Mapping[str, CompiledPromptBundle]" = field(default_factory=dict)
+
+    # Personality Phase A, Task 14: lean per-correlation-id explanation store
+    # (inspect/explain telemetry). Constructed once at boot
+    # (ExplanationStore(Path("/data/explanations"))) and preserved verbatim
+    # across reload.py's mutate-in-place candidate-registry swap (reload.py
+    # never reconstructs CasaRuntime). Defaulted (None) so every existing
+    # narrow CasaRuntime(...) test constructor keeps compiling unchanged —
+    # MUST stay the final field (dataclass-ordering rule).
+    explanation_store: "ExplanationStore | None" = None

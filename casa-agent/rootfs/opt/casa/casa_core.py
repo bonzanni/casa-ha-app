@@ -136,6 +136,16 @@ async def start_internal_unix_runner(
         build_admin_reload_handler(runtime=runtime),
     )
 
+    # Task 14 (personality Phase A): lean inspection/explain admin routes —
+    # POST /admin/personality/{inspect,render,diff}, /admin/specialist/status,
+    # /admin/explain. Unix-socket-only: registered on internal_app alone,
+    # NEVER on the public 8099 app (see casa_core.py's `app` router further
+    # down). Skipped when runtime is None (some test/fallback boot paths).
+    if runtime is not None:
+        from personality_admin_handlers import register_personality_admin_routes
+
+        register_personality_admin_routes(internal_app, runtime=runtime)
+
     # E-12 (v0.37.0): /internal/channel/* family — POSTed by per-engagement
     # casa-engagement-channel MCP servers proxying outbound traffic to Telegram.
     # Only registered if a TelegramChannel instance is available (production
@@ -2209,6 +2219,11 @@ async def main() -> None:
     )
     # Task C.2: build the CasaRuntime container.
     from runtime import CasaRuntime
+    # Task 14: constructed exactly once at boot, preserved verbatim across
+    # every reload (reload.py mutates runtime.role_configs/agents in place
+    # and never reconstructs CasaRuntime).
+    from explanation_store import ExplanationStore
+    explanation_store = ExplanationStore(Path(DATA_DIR) / "explanations")
     runtime = CasaRuntime(
         agents={},                            # populated below at line ~984
         role_configs=role_configs,
@@ -2234,6 +2249,7 @@ async def main() -> None:
         persona_packs=_persona_packs,
         bindings=_bindings,
         compiled_prompt_bundles=_compiled_prompt_bundles,
+        explanation_store=explanation_store,
     )
     # Task 6 (spec §4.6): specialist concurrency cap + per-role cost
     # telemetry. `specialist_max_concurrency` bounds delegations in flight
