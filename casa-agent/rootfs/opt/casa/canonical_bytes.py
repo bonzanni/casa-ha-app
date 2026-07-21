@@ -16,8 +16,30 @@ def canonical_text(text: str) -> str:
     return "\n".join(lines).rstrip("\n") + "\n"
 
 
+def to_plain_json(value: object) -> object:
+    """Recursively convert ``deep_freeze``'s output (or any Mapping/sequence
+    tree) back into plain JSON-native containers: Mapping -> dict, list/tuple ->
+    list, scalars unchanged. This is the inverse of ``deep_freeze`` for
+    serialization and structural comparison.
+
+    Both ``rfc8785.dumps`` and ``json.dumps`` gate their object/array branches on
+    ``isinstance(obj, dict)`` / ``isinstance(obj, list)`` — a ``MappingProxyType``
+    or ``tuple`` (exactly what ``deep_freeze`` produces) is rejected. Any frozen
+    role/persona artifact content must therefore pass through here before it is
+    canonicalized, ``json.dumps``-serialized, or structurally compared (a frozen
+    ``tuple`` never ``==`` a plain ``list``)."""
+    if isinstance(value, Mapping):
+        return {key: to_plain_json(item) for key, item in value.items()}
+    if isinstance(value, (list, tuple)):
+        return [to_plain_json(item) for item in value]
+    return value
+
+
 def canonical_json_bytes(value: object) -> bytes:
-    return rfc8785.dumps(value)
+    # Normalize frozen containers (MappingProxyType/tuple from deep_freeze) back
+    # to plain dict/list first — rfc8785 rejects them outright — so canonicalizing
+    # a deep-frozen role/persona artifact (for checksums and digests) Just Works.
+    return rfc8785.dumps(to_plain_json(value))
 
 
 def checksum_bytes(value: bytes) -> str:

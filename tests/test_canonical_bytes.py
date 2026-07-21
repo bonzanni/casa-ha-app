@@ -14,11 +14,50 @@ import pytest
 
 from canonical_bytes import (
     assert_json_safe,
+    canonical_json_bytes,
     canonical_text,
     checksum_bytes,
     checksum_json,
     deep_freeze,
+    to_plain_json,
 )
+
+
+# ---------------------------------------------------------------------------
+# to_plain_json / canonical_json_bytes frozen-tolerance
+# (deep_freeze and the canonicalizer are sibling primitives and must compose:
+#  a deep-frozen role/persona artifact must be checksummable without error)
+# ---------------------------------------------------------------------------
+
+
+def test_canonical_json_bytes_accepts_deep_frozen_input() -> None:
+    plain = {"model": {"allowed": ["opus", "sonnet"], "default": "opus"},
+             "tools": {"allowed": []}}
+    frozen = deep_freeze(plain)
+    # deep_freeze yields MappingProxyType/tuple nested; rfc8785 would reject
+    # those directly. canonical_json_bytes must normalize and produce the SAME
+    # bytes as for the equivalent plain structure.
+    assert canonical_json_bytes(frozen) == canonical_json_bytes(plain)
+
+
+def test_checksum_json_is_identical_for_frozen_and_plain() -> None:
+    plain = {"b": [1, 2, 3], "a": {"x": True, "y": None}}
+    assert checksum_json(deep_freeze(plain)) == checksum_json(plain)
+
+
+def test_to_plain_json_unfreezes_recursively() -> None:
+    frozen = deep_freeze({"a": {"b": [1, {"c": 2}]}})
+    plain = to_plain_json(frozen)
+    assert isinstance(plain, dict)
+    assert isinstance(plain["a"], dict)
+    assert isinstance(plain["a"]["b"], list)
+    assert isinstance(plain["a"]["b"][1], dict)
+    assert plain == {"a": {"b": [1, {"c": 2}]}}
+
+
+def test_to_plain_json_is_identity_on_plain_scalars_and_containers() -> None:
+    value = {"s": "x", "i": 1, "f": 1.5, "b": True, "n": None, "l": [1, 2]}
+    assert to_plain_json(value) == value
 
 
 # ---------------------------------------------------------------------------
