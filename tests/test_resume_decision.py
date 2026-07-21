@@ -9,7 +9,7 @@ from datetime import datetime, timezone
 
 import pytest
 
-from agent import _resume_decision
+from agent import _resume_decision, agent_home_for_role_id
 
 pytestmark = [pytest.mark.unit]
 
@@ -130,3 +130,33 @@ def test_legacy_short_role_entry_cannot_resume_under_canonical_role_id() -> None
     )
     assert decision.action == "new"
     assert decision.reason == "role_mismatch"
+
+
+# I1 (final review, Task 9): agent_home_for_role_id must return EXACTLY the
+# path agent_home.py's provision_agent_home() creates (bare
+# ``<home_root>/<slot>`` for every kind — residents AND specialists; today's
+# provisioning never nests under ``{kind}s/``), since the reaper/reset/
+# cold-retain path derives its transcript directory from this function.
+
+
+def test_agent_home_for_role_id_resident_is_bare_slug() -> None:
+    assert agent_home_for_role_id("resident:butler") == "/config/agent-home/butler"
+
+
+def test_agent_home_for_role_id_specialist_is_bare_slug_not_nested() -> None:
+    # Matches provision_agent_home's ``home_root / role`` (agent_home.py) —
+    # NOT the ``specialists/<slot>`` nesting no provisioning code creates.
+    assert agent_home_for_role_id("specialist:finance") == "/config/agent-home/finance"
+
+
+def test_agent_home_for_role_id_executor_is_bare_slug_not_nested() -> None:
+    assert (
+        agent_home_for_role_id("executor:configurator")
+        == "/config/agent-home/configurator"
+    )
+
+
+@pytest.mark.parametrize("bad_role_id", ["butler", "bogus:", ":slot", ""])
+def test_agent_home_for_role_id_rejects_malformed_id(bad_role_id: str) -> None:
+    with pytest.raises(ValueError):
+        agent_home_for_role_id(bad_role_id)

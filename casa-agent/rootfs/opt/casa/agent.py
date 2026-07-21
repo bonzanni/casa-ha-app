@@ -190,17 +190,27 @@ def snapshot_session_entry(entry: dict | None) -> SessionEntrySnapshot | None:
 
 def agent_home_for_role_id(role_id: str) -> str:
     """Map a canonical ``kind:slot`` role id to its on-disk agent home — the
-    transcript cwd ``get_session_messages``/``delete_session`` read. Residents
-    live at ``/config/agent-home/<slot>`` (matching ``Agent._process``'s
-    short-slug ``agent_home``); specialists/executors nest under
-    ``/config/agent-home/<kind>s/<slot>``. Raises ``ValueError`` on a
-    non-canonical (short, pre-Task-9) role string."""
+    transcript cwd ``get_session_messages``/``delete_session`` read.
+
+    Bare ``/config/agent-home/<slot>`` for EVERY kind (resident, specialist,
+    executor) — this MUST stay byte-for-byte consistent with the actual
+    provisioning in ``agent_home.py``'s ``provision_agent_home`` (``agent_dir
+    = home_root / role``, a bare slug — no ``{kind}s/`` nesting) and with
+    ``Agent._process``'s own ``agent_home = f"/config/agent-home/{self.config.role}"``
+    derivation. Global slug uniqueness (enforced elsewhere) means bare slugs
+    never collide across kinds, so the bare form is safe for all of them
+    (executors get no provisioned home directory at all today, but any
+    session-entry lookup for one must still resolve to the same bare path
+    a resident/specialist would use). If a future plan changes the on-disk
+    layout (e.g. nesting specialists under ``specialists/<slot>``), BOTH this
+    function AND ``agent_home.py``'s provisioning must change together.
+
+    Raises ``ValueError`` on a non-canonical (short, pre-Task-9) role
+    string."""
     kind, separator, slot = role_id.partition(":")
     if separator != ":" or kind not in {"resident", "specialist", "executor"} or not slot:
         raise ValueError(f"invalid canonical role id {role_id!r}")
-    if kind == "resident":
-        return f"/config/agent-home/{slot}"
-    return f"/config/agent-home/{kind}s/{slot}"
+    return f"/config/agent-home/{slot}"
 
 
 def speaker_provenance_for_role(cfg: AgentConfig) -> SpeakerProvenance:
