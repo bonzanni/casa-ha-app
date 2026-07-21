@@ -89,11 +89,19 @@ class FreshnessReaper:
                     else:
                         continue  # a save is genuinely in-flight → let it finish
                 # Task 10: decode the entry into an immutable snapshot. A legacy
-                # pre-Task-9 entry or one with corrupt provenance yields None —
-                # never retain with invented authorship; drop the stale pointer.
+                # pre-Task-9 entry or one with corrupt/absent provenance yields
+                # either None (unusable entry) or a snapshot whose provenance
+                # fields are None (save_session refuses to retain those — "never
+                # retain with invented authorship" — and would otherwise be
+                # retried every sweep forever). Drop the stale pointer in both
+                # cases rather than handing it to a save that can't succeed.
                 from agent import snapshot_session_entry
                 snapshot = snapshot_session_entry(entry)
-                if snapshot is None:
+                if (
+                    snapshot is None
+                    or snapshot.speaker_provenance is None
+                    or snapshot.user_provenance is None
+                ):
                     await self._reg.remove(key)
                     continue
                 if not writes_to_bank(channel):
