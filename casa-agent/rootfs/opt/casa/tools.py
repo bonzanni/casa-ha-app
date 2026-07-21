@@ -7302,6 +7302,136 @@ async def get_item_fields(args: dict) -> dict:
     ))
 
 
+# --- Personality Phase A, Task 8: resident persona swap / reset -------------
+#
+# Both tools STAGE a desired instance tuple (InstanceDir.stage_desired) rather
+# than committing directly — the actual `active := desired` commit happens at
+# the NEXT BOOT's reconcile_resident_binding (agent_loader), which re-validates
+# against the then-current role checksum before committing. This keeps exactly
+# one commit code path (boot-time reconciliation), so a personality-identity
+# change is always restart-to-swap. `active_runtime` is the established
+# module-level accessor (mirrors active_semantic_memory), set by casa_core as
+# `agent.active_runtime = runtime`.
+
+_PERSONA_ROOTS = (Path("/config/personas"), Path("/opt/casa/defaults/personas"))
+
+
+def _resolve_local_persona(ref: str):
+    """Load an ALREADY LOCALLY PRESENT persona pack by exact ref (this plan does
+    not fetch a bare persona from a remote repo). Persona bytes are installed
+    under /config/personas/<ns>/<slug>/<version>/ (or the image defaults) by the
+    same out-of-band means as any other locally-staged content; this only loads
+    and validates what is already there."""
+    from persona_pack import load_persona_pack
+
+    persona_id, _, version = ref.partition("@")
+    for root in _PERSONA_ROOTS:
+        pack_dir = root / persona_id / version / "pack"
+        manifest_path = root / persona_id / version / "manifest.json"
+        if pack_dir.is_dir() and manifest_path.is_file():
+            return load_persona_pack(pack_dir, manifest_path)
+    raise ValueError(f"persona {ref!r} is not present under any configured persona root")
+
+
+def _stage_and_report(role_id: str, slot: str, binding) -> dict:
+    from personality_binding import InstanceDir, InstanceTuple
+
+    instance_dir = InstanceDir(Path("/config/bindings") / f"resident-{slot}")
+    active = instance_dir.active()
+    root = binding.override_source or binding.image_default_root or ""
+    instance_dir.stage_desired(InstanceTuple(
+        root=root, binding=binding, config_snapshot={}, config_digest=binding.effective_config_digest,
+    ))
+    return {
+        "ok": True, "role": role_id, "persona": f"{binding.persona_id}@{binding.persona_version}",
+        "activation": "restart_required",
+        "prior_persona": (f"{active.binding.persona_id}@{active.binding.persona_version}" if active else None),
+    }
+
+
+def _resolve_resident_role(role_id: str):
+    """Resolve a fixed resident slot's live RoleSlot from the Task 8
+    ``active_runtime.role_slots`` registry, or a structured-error result."""
+    from role_slot import FIXED_RESIDENT_SLOTS
+
+    slot = role_id.split(":", 1)[1] if ":" in role_id else ""
+    if slot not in FIXED_RESIDENT_SLOTS:
+        return None, slot, _result({"ok": False, "kind": "invalid_role"})
+    import agent as agent_mod
+    runtime = getattr(agent_mod, "active_runtime", None)
+    if runtime is None:
+        return None, slot, _result({"ok": False, "kind": "runtime_unavailable"})
+    role = runtime.role_slots.get(role_id)
+    if role is None:
+        return None, slot, _result({"ok": False, "kind": "role_not_loaded"})
+    return role, slot, None
+
+
+@tool(
+    "resident_persona_swap",
+    "Stage an OVERRIDE persona binding for a fixed resident slot (assistant/"
+    "butler/concierge) from an already locally-present persona pack. Validates "
+    "role/persona compatibility BEFORE staging anything. Takes effect only after "
+    "casa_restart_supervised (personality-identity changes are restart-to-swap, "
+    "never hot-reloaded).",
+    {"type": "object", "properties": {
+        "role": {"enum": ["resident:assistant", "resident:butler", "resident:concierge"]},
+        "persona_ref": {"type": "string"},
+    }, "required": ["role", "persona_ref"]},
+)
+async def resident_persona_swap(args: dict) -> dict:
+    from personality_binding import check_persona_requirements, materialize_override_binding
+
+    role_id = args["role"]
+    role, slot, err = _resolve_resident_role(role_id)
+    if err is not None:
+        return err
+    try:
+        persona = _resolve_local_persona(args["persona_ref"])
+        check_persona_requirements(role.normalized, persona)  # rejects BEFORE any staging
+    except ValueError as exc:
+        return _result({"ok": False, "kind": "incompatible_or_missing_persona", "detail": str(exc)})
+    binding = materialize_override_binding(
+        role=role, persona=persona, override_source=f"operator:{args['persona_ref']}",
+    )
+    return _result(_stage_and_report(role_id, slot, binding))
+
+
+@tool(
+    "resident_persona_reset",
+    "Stage a reset for a fixed resident slot's binding back to the CURRENT "
+    "in-image default persona, undoing any override (spec §2.3/§4.4's "
+    "always-available reset). Takes effect only after casa_restart_supervised.",
+    {"type": "object", "properties": {
+        "role": {"enum": ["resident:assistant", "resident:butler", "resident:concierge"]},
+    }, "required": ["role"]},
+)
+async def resident_persona_reset(args: dict) -> dict:
+    from personality_binding import (
+        IMAGE_DEFAULT_PERSONA_BY_SLOT,
+        check_persona_requirements,
+        materialize_image_default_binding,
+    )
+
+    role_id = args["role"]
+    role, slot, err = _resolve_resident_role(role_id)
+    if err is not None:
+        return err
+    default_ref = IMAGE_DEFAULT_PERSONA_BY_SLOT[slot]
+    # Run the SAME resolve-then-validate-before-staging sequence as
+    # resident_persona_swap — a missing/uninstalled default persona blob or a
+    # compatibility failure is returned as a structured error, never an
+    # unhandled ValueError out of the handler, and nothing is staged before
+    # validation passes.
+    try:
+        persona = _resolve_local_persona(default_ref)
+        check_persona_requirements(role.normalized, persona)  # rejects BEFORE any staging
+    except ValueError as exc:
+        return _result({"ok": False, "kind": "incompatible_or_missing_persona", "detail": str(exc)})
+    binding = materialize_image_default_binding(role=role, persona=persona, image_default_root=default_ref)
+    return _result(_stage_and_report(role_id, slot, binding))
+
+
 # Module-level tool registry — iterated by create_casa_tools() for the SDK
 # path and by the MCP HTTP bridge (mcp_bridge._build_tool_dispatch) for
 # real `claude` CLI engagements. Adding a tool here exposes it on both
@@ -7342,6 +7472,9 @@ CASA_TOOLS: tuple = (
     set_plugin_env_reference,
     list_vault_items,
     get_item_fields,
+    # Personality Phase A, Task 8 — configurator-only resident persona control.
+    resident_persona_swap,
+    resident_persona_reset,
 )
 
 

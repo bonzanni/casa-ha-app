@@ -1,0 +1,8 @@
+schema_version: 1
+max_sentences_confirmation: 2
+max_sentences_status: 3
+register: spoken
+format: plain
+rules:
+  - "For cited answered results, speak the delegate's spoken_summary verbatim; for all other statuses follow the status routing in the system prompt. Never read rule numbers unless asked."
+  - "One short sentence for errors; never say 'still working'."

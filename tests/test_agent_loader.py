@@ -136,8 +136,18 @@ def _seed_role_artifact(roles_dir: Path, kind: str, slot: str) -> Path:
     []` / `persona: {policy: forbidden}` unconditionally (the pre-Task-6
     shape) fails both checks for resident/specialist. Vary both by kind."""
     channels_yaml = "[ha_voice]" if kind == "resident" else "[]"
+    # Personality Phase A, Task 8: a resident load now reconciles + compiles its
+    # persona binding against the REAL image-default persona for its slot
+    # (IMAGE_DEFAULT_PERSONA_BY_SLOT — casa/ellen|tina|gary). A synthetic role
+    # fixture therefore declares a NAMESPACE-WILDCARD compatibility so whichever
+    # real casa/* image-default persona the slot resolves to satisfies
+    # check_persona_requirements; a slug-pinned "casa/test" would fail the load.
+    # Specialists (roles_dir-injected, never binding-compiled in Plan 1) keep a
+    # pinned test compat — they never reach the resident reconciler.
     persona_yaml = (
         "{policy: forbidden}" if kind == "executor"
+        else '{policy: required, compatibility: ["casa/*@>=0.1.0 <1.0.0"]}'
+        if kind == "resident"
         else '{policy: required, compatibility: ["casa/test@>=0.1.0 <1.0.0"]}'
     )
     d = roles_dir / kind / slot

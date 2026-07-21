@@ -925,9 +925,21 @@ def _compose_prompt(
 # --- Public API ------------------------------------------------------------
 
 
+def _resident_bindings_root(bindings_dir: str | None) -> Path:
+    """Personality Phase A, Task 8: the per-resident instance-tuple root
+    (``<root>/resident-<slot>/``). Explicit ``bindings_dir`` wins; else the
+    ``CASA_BINDINGS_DIR`` env override (mirrors ``CASA_CONFIG_DIR`` in
+    config_sync.py); else the shipped ``/config/bindings`` container path.
+    Tests point this at a tmp dir so a resident load never writes under the
+    real ``/config`` tree."""
+    return Path(
+        bindings_dir or os.environ.get("CASA_BINDINGS_DIR", "/config/bindings")
+    )
+
+
 def load_agent_from_dir(
     agent_dir: str, *, policies: PolicyLibrary | None,
-    roles_dir: str | None = None,
+    roles_dir: str | None = None, bindings_dir: str | None = None,
 ) -> AgentConfig:
     """Load one agent directory. Strict: every error raises LoadError.
 
@@ -939,6 +951,9 @@ def load_agent_from_dir(
     to load and cross-validate the canonical role artifact (Personality
     Phase A, Task 5). Defaults to the real shipped tree; tests inject a
     synthetic ``roles_dir`` instead of patching the filesystem.
+
+    ``bindings_dir`` overrides the resident instance-tuple root (Task 8)
+    used by boot-time binding reconciliation; see ``_resident_bindings_root``.
     """
     if not os.path.isdir(agent_dir):
         raise LoadError(f"not a directory: {agent_dir}")
@@ -1049,12 +1064,100 @@ def load_agent_from_dir(
     # Compose the system prompt.
     cfg.system_prompt = _compose_prompt(cfg, policies)
 
+    # Personality Phase A, Task 8: activate the resident's persona binding and
+    # compile its immutable per-surface prompt bundle. Runs LAST so every legacy
+    # validation/compose error keeps its ordering; residents are the only kind
+    # that carries a persona/binding/compiled bundle (specialists join in Plan 2,
+    # executors never). A resident fails to load ONLY when reconciliation itself
+    # raises (no active tuple exists AND the fresh attempt failed).
+    if cfg.kind == "resident":
+        _activate_resident_binding(cfg, role_from_path, bindings_dir)
+
     return cfg
+
+
+def _activate_resident_binding(
+    cfg: AgentConfig, role_from_path: str, bindings_dir: str | None,
+) -> None:
+    """Reconcile + compile the resident binding onto *cfg* (Task 8, Step 8)."""
+    from persona_pack import load_persona_pack
+    from personality_binding import (
+        IMAGE_DEFAULT_PERSONA_BY_SLOT,
+        InstanceDir,
+        reconcile_resident_binding,
+    )
+    from personality_types import SpeakerProvenance
+    from prompt_compiler import compile_prompt_bundle
+
+    # Image-owned personas ship under defaults/personas/ (module-relative, so
+    # this resolves identically in the container and under tests). Operator
+    # overrides live under <CASA_CONFIG_DIR>/personas/.
+    personas_root = Path(SCHEMA_DIR).parent / "personas"
+    override_root = Path(os.environ.get("CASA_CONFIG_DIR", "/config")) / "personas"
+
+    def _pack(root: Path, ref: str) -> "PersonaPack | None":
+        persona_id, _, version = ref.partition("@")
+        pack_dir = root / persona_id / version / "pack"
+        manifest_path = root / persona_id / version / "manifest.json"
+        if pack_dir.is_dir() and manifest_path.is_file():
+            return load_persona_pack(pack_dir, manifest_path)
+        return None
+
+    def _load_default(ref: str):
+        pack = _pack(personas_root, ref)
+        if pack is None:
+            raise ValueError(f"image-default persona {ref!r} is not present under {personas_root}")
+        return pack
+
+    def _load_override(ref: str):
+        for root in (override_root, personas_root):
+            pack = _pack(root, ref)
+            if pack is not None:
+                return pack
+        raise ValueError(
+            f"override persona {ref!r} is unavailable — run resident_persona_reset to recover"
+        )
+
+    instance_dir = InstanceDir(
+        _resident_bindings_root(bindings_dir) / f"resident-{cfg.role_slot.slot}"
+    )
+    try:
+        active_tuple = reconcile_resident_binding(
+            role=cfg.role_slot, image_default_persona_loader=_load_default,
+            override_persona_loader=_load_override, instance_dir=instance_dir,
+        )
+    except ValueError as exc:
+        raise LoadError(
+            f"agent {role_from_path!r}: resident binding reconciliation failed: {exc}"
+        ) from exc
+
+    if active_tuple.binding.mode == "image-default":
+        bound_persona = _load_default(IMAGE_DEFAULT_PERSONA_BY_SLOT[cfg.role_slot.slot])
+    else:
+        bound_persona = _load_override(
+            f"{active_tuple.binding.persona_id}@{active_tuple.binding.persona_version}"
+        )
+    platform_frame = (Path(SCHEMA_DIR).parent / "personality" / "platform-frame.md").read_text(encoding="utf-8")
+    safety_kernel = (Path(SCHEMA_DIR).parent / "personality" / "safety-kernel.md").read_text(encoding="utf-8")
+    bundle = compile_prompt_bundle(
+        role=cfg.role_slot, persona=bound_persona, binding=active_tuple.binding,
+        platform_frame=platform_frame, safety_kernel=safety_kernel,
+    )
+    cfg.persona_pack = bound_persona
+    cfg.binding = active_tuple.binding
+    cfg.compiled_prompt_bundle = bundle
+    cfg.binding_digest = active_tuple.binding.binding_digest
+    cfg.speaker_provenance = SpeakerProvenance(
+        speaker_kind="resident", role_id=cfg.role_slot.role_id,
+        persona_id=bound_persona.persona_id, persona_version=bound_persona.version,
+        display_name=bound_persona.identity["display_name"],
+        binding_digest=active_tuple.binding.binding_digest,
+    )
 
 
 def load_all_agents(
     agents_dir: str, *, policies: PolicyLibrary | None,
-    roles_dir: str | None = None,
+    roles_dir: str | None = None, bindings_dir: str | None = None,
 ) -> dict[str, AgentConfig]:
     """Walk *agents_dir* for resident directories.
 
@@ -1063,7 +1166,8 @@ def load_all_agents(
     the agent role. Raises ``LoadError`` on the first malformed agent —
     strict-mode from day one.
 
-    ``roles_dir`` — see ``load_agent_from_dir``; propagated unchanged.
+    ``roles_dir``/``bindings_dir`` — see ``load_agent_from_dir``; propagated
+    unchanged.
     """
     found: dict[str, AgentConfig] = {}
     if not os.path.isdir(agents_dir):
@@ -1077,7 +1181,9 @@ def load_all_agents(
                 f"unexpected non-directory at agents/{entry} — each agent "
                 f"is a directory; flat YAML files are no longer supported"
             )
-        cfg = load_agent_from_dir(path, policies=policies, roles_dir=roles_dir)
+        cfg = load_agent_from_dir(
+            path, policies=policies, roles_dir=roles_dir, bindings_dir=bindings_dir,
+        )
         found[cfg.role] = cfg
 
     # Personality Phase A, Task 6, Step 9: fail closed on drift from the

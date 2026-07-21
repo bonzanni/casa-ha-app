@@ -316,6 +316,19 @@ async def engagement_fixture(tmp_path):
 # another file. Clear both maps around every test (production-inert — nothing
 # imports this fixture; it only resets in-memory test state).
 @pytest.fixture(autouse=True)
+def _isolate_resident_bindings(tmp_path, monkeypatch):
+    """Personality Phase A, Task 8: point the resident instance-tuple root
+    (``CASA_BINDINGS_DIR``, consumed by agent_loader's boot-time binding
+    reconciliation) at a per-test tmp dir. Without this, any test that loads a
+    resident agent would try to write its active/desired binding tuple under the
+    real ``/config/bindings`` tree (unwritable in CI, cross-test-polluting
+    locally). Production leaves the env var unset and uses ``/config/bindings``.
+    Harmless for tests that never load a resident — it only sets an env var."""
+    monkeypatch.setenv("CASA_BINDINGS_DIR", str(tmp_path / "casa-bindings"))
+    yield
+
+
+@pytest.fixture(autouse=True)
 def _reset_ask_validation_gates():
     try:
         from channels import channel_handlers as _ch

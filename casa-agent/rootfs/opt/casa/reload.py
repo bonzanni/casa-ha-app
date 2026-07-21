@@ -530,6 +530,33 @@ async def reload_agent(runtime: Any, *, role: str | None = None) -> list[str]:
 
     actions = ["load_config"]
 
+    # Personality Phase A, Task 8, Step 9: refuse a hot-swap across a
+    # personality-identity change. A resident whose role_checksum OR
+    # binding_digest moved (a role.yaml/doctrine edit, or a staged persona
+    # swap/reset) is restart-to-swap, never hot-reloaded — the compiled prompt
+    # bundle and session epoch are bound to that identity. Runs BEFORE
+    # _construct_agent, so a rejected reload wastes no work and leaves every
+    # live registry/agent untouched (read-only on this path). getattr defaults
+    # keep this inert for non-resident tiers and narrow test stand-ins whose
+    # cfgs carry neither field.
+    if tier == "resident":
+        live_cfg = runtime.role_configs.get(role)
+        identity_changed = (
+            live_cfg is not None
+            and (getattr(new_cfg, "role_checksum", None) != getattr(live_cfg, "role_checksum", None)
+                 or getattr(new_cfg, "binding_digest", None) != getattr(live_cfg, "binding_digest", None))
+        )
+        if identity_changed:
+            logger.warning(
+                "reload_agent(%s): personality identity changed (role_checksum or "
+                "binding_digest differs) — refusing hot-swap, restart required", role,
+            )
+            raise ReloadError(
+                "restart_required",
+                f"role={role} personality identity changed; restart via "
+                f"casa_restart_supervised to activate",
+            )
+
     # v0.74.1 (Sol B1, live proxy-drive finding): a DISABLED specialist must
     # not be constructed or (re)registered. Reload used to install it into
     # runtime.agents + register its bus handler, leaving it reachable via

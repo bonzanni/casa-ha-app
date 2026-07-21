@@ -1011,11 +1011,26 @@ class Agent:
         # webhook_trigger turns are SCHEDULED → bypass the client pool → fresh
         # options per turn, so this branch is pool-key-neutral.
         _route = (origin_var.get(None) or {}).get("_origin_route")
+        # Personality Phase A, Task 8: a resident config carries a compiled
+        # per-surface prompt bundle; specialists/executors keep None and stay on
+        # the legacy self.config.system_prompt path untouched.
+        _bundle = (
+            self.config.compiled_prompt_bundle
+            if self.config.kind == "resident" else None
+        )
         if channel == "webhook" and _route != "invoke":
+            # An untrusted webhook origin ALWAYS takes the restricted_webhook
+            # projection (persona-stripped) for a resident — never route through
+            # projection_for here, which would fall back to the text surface for
+            # a missing/unknown route and leak the persona to an untrusted origin.
+            restricted_prompt = (
+                _bundle.restricted_webhook.system_prompt
+                if _bundle is not None else self.config.system_prompt
+            )
             restricted = build_restricted_webhook_options(
                 model=self.config.model,
                 role=self.config.role,
-                system_prompt=self.config.system_prompt,
+                system_prompt=restricted_prompt,
                 max_turns=self.config.tools.max_turns,
                 agent_home=agent_home,
                 resume_sid=resume_sid,
@@ -1096,8 +1111,19 @@ class Agent:
                 self.config.memory.token_budget,
             )
 
-        # 3. System prompt = composed-prompt + runtime-injected blocks.
-        system_parts = [self.config.system_prompt]
+        # 3. System prompt = composed-prompt + runtime-injected blocks. For a
+        # resident, the base is the immutable compiled projection selected for
+        # this surface (text/voice); specialists/executors keep the legacy
+        # composed self.config.system_prompt (Plan 1 does not touch their
+        # prompt composition).
+        if _bundle is not None:
+            from prompt_compiler import projection_for
+            base_system_prompt = projection_for(
+                _bundle, channel=channel, origin_route=_route,
+            ).system_prompt
+        else:
+            base_system_prompt = self.config.system_prompt
+        system_parts = [base_system_prompt]
         if memory_blocks:
             system_parts.append("\n" + memory_blocks)
         system_parts.append(

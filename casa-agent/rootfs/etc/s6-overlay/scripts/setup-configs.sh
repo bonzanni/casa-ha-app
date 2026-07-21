@@ -16,6 +16,9 @@ mkdir -p "$CONFIG_DIR/agents" \
          "$CONFIG_DIR/agents/executors" \
          "$CONFIG_DIR/policies" \
          "$CONFIG_DIR/bindings" \
+         "$CONFIG_DIR/bindings/resident-assistant" \
+         "$CONFIG_DIR/bindings/resident-butler" \
+         "$CONFIG_DIR/bindings/resident-concierge" \
          "$CONFIG_DIR/schema" \
          "$DATA_DIR/sdk-sessions" \
          "$DATA_DIR/casa-s6-services" \

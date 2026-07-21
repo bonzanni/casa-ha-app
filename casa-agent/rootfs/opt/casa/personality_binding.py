@@ -3,9 +3,11 @@ from __future__ import annotations
 
 import json
 import os
+import re
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Literal, Mapping
+from types import MappingProxyType
+from typing import Callable, Literal, Mapping
 
 import jsonschema
 import yaml
@@ -287,3 +289,145 @@ class InstanceDir:
         payload["_error_reason"] = reason
         error_path.write_text(yaml.safe_dump(payload, sort_keys=False), encoding="utf-8")
         desired_path.unlink()
+
+
+# --- Resident persona defaults + boot-time reconciliation (Task 8) ----------
+
+# The ONLY code path that chooses a fixed resident slot's default persona ref.
+# Keyed by role_slot.FIXED_RESIDENT_SLOTS; each value is an exact
+# "<namespace>/<slug>@<version>" ref resolvable under defaults/personas/.
+IMAGE_DEFAULT_PERSONA_BY_SLOT: Mapping[str, str] = MappingProxyType({
+    "assistant": "casa/ellen@0.1.0",
+    "butler": "casa/tina@0.1.0",
+    "concierge": "casa/gary@0.1.0",
+})
+
+# A persona_requirements entry is either an exact "ns/slug@X.Y.Z" pin (matched
+# by string equality) or a "ns/slug@>=X.Y.Z <A.B.C" range; a "ns/*@..." pattern
+# matches any slug in that namespace.
+_RANGE_RE = re.compile(
+    r"^(?P<ns_slug>[a-z0-9](?:[a-z0-9.-]*[a-z0-9])?/[a-z0-9*][a-z0-9-]*)@"
+    r">=(?P<low>\d+\.\d+\.\d+)\s*<(?P<high>\d+\.\d+\.\d+)$"
+)
+
+
+def _semver_tuple(value: str) -> tuple[int, int, int]:
+    major, minor, patch = value.split(".")
+    return int(major), int(minor), int(patch)
+
+
+def check_persona_requirements(role: Mapping[str, object], persona: PersonaPack) -> None:
+    """Validate persona.compatibility (the role's optional persona_requirements
+    constraint, spec §2.3): each entry is either an exact 'ns/slug@X.Y.Z' pin or a
+    'ns/slug@>=X.Y.Z <A.B.C' range; 'ns/*@...' matches any slug in that namespace.
+    A role with persona.policy == 'forbidden' has no compatibility list to check."""
+    persona_block = role.get("persona", {}) or {}
+    if persona_block.get("policy") == "forbidden":
+        return
+    entries = persona_block.get("compatibility") or ()
+    ref = f"{persona.persona_id}@{persona.version}"
+    for entry in entries:
+        if entry == ref:
+            return
+        match = _RANGE_RE.match(entry)
+        if not match:
+            continue
+        namespace, _, slug_pattern = match.group("ns_slug").partition("/")
+        persona_namespace, _, persona_slug = persona.persona_id.partition("/")
+        if namespace != persona_namespace or (slug_pattern != "*" and slug_pattern != persona_slug):
+            continue
+        low, high = _semver_tuple(match.group("low")), _semver_tuple(match.group("high"))
+        if low <= _semver_tuple(persona.version) < high:
+            return
+    raise ValueError(
+        f"persona {ref} does not satisfy role {role.get('id')}'s persona_requirements {list(entries)}"
+    )
+
+
+def reconcile_resident_binding(
+    *, role: RoleSlot, image_default_persona_loader: Callable[[str], PersonaPack],
+    override_persona_loader: Callable[[str], PersonaPack], instance_dir: InstanceDir,
+) -> InstanceTuple:
+    """Boot-time reconciliation of a resident's binding (spec §4.1, §4.2, §4.4).
+
+    Reads an already-staged ``desired.yaml`` FIRST — the artifact
+    ``resident_persona_swap``/``resident_persona_reset`` write BEFORE a restart —
+    and, when present, THAT staged candidate's persona selection is what gets
+    validated/compiled/committed (spec §4.2 step 4: "restart the affected agent;
+    on success active := desired"). Without this, a swap/reset staged before the
+    restart would be silently discarded and the resident would boot back onto its
+    old binding.
+
+    Either way — staged swap/reset, or the passive image-default-tracking path
+    when nothing is staged — the candidate binding is ALWAYS recomputed against
+    the role CURRENTLY loading (never a stale stored role_checksum), so an image
+    upgrade to role.yaml landing in the same restart as a pending swap still gets
+    the current role_checksum (spec §4.4).
+
+    1. Determine the candidate's persona SELECTION (mode + persona ref):
+       - a staged ``desired.yaml``, if present, wins;
+       - otherwise an override-bound ACTIVE tuple keeps its exact pinned persona;
+       - otherwise (image-default binding, or no active tuple at all — fresh
+         install) resolve the CURRENT ``IMAGE_DEFAULT_PERSONA_BY_SLOT[role.slot]``.
+    2. Materialize the candidate binding against the CURRENT role.
+    3. If the candidate's binding_digest equals the active tuple's, this is a
+       no-op — return the active tuple unchanged, discarding any now-redundant
+       staged file.
+    4. Otherwise (re-)stage the candidate as desired, validate persona↔role
+       compatibility, and on success commit ``active := desired`` via
+       ``InstanceDir.commit_desired_to_active()``. On failure (persona blob
+       missing/incompatible, disk error), discard the desired candidate with a
+       diagnostic and return the RETAINED PRIOR active tuple — boot proceeds on
+       the last-known-good binding, never crash-looping.
+    5. Only when there is NO active tuple at all (fresh install) AND step 4 fails
+       does this hard-fail loudly — raise ValueError so the caller turns it into
+       an actionable LoadError.
+
+    The persona resolve/materialize calls run INSIDE the same guarded block as
+    validate/stage/commit, so every failure mode is caught by the SAME handler
+    and ``active`` is preserved whenever an active tuple exists.
+    """
+    active = instance_dir.active()
+    staged = instance_dir.desired()
+
+    source_binding = staged.binding if staged is not None else (
+        active.binding if active is not None and active.binding.mode == "override" else None
+    )
+    try:
+        if source_binding is not None and source_binding.mode == "override":
+            persona_ref = f"{source_binding.persona_id}@{source_binding.persona_version}"
+            persona = override_persona_loader(persona_ref)
+            candidate_binding = materialize_override_binding(
+                role=role, persona=persona, override_source=source_binding.override_source,
+            )
+            root = candidate_binding.override_source
+        else:
+            default_ref = IMAGE_DEFAULT_PERSONA_BY_SLOT[role.slot]
+            persona = image_default_persona_loader(default_ref)
+            candidate_binding = materialize_image_default_binding(
+                role=role, persona=persona, image_default_root=default_ref,
+            )
+            root = candidate_binding.image_default_root
+
+        if active is not None and active.binding.binding_digest == candidate_binding.binding_digest:
+            if staged is not None:
+                instance_dir.discard_desired(reason="no-op: candidate matches the already-active binding")
+            return active
+
+        candidate_tuple = InstanceTuple(
+            root=root, binding=candidate_binding, config_snapshot={},
+            config_digest=candidate_binding.effective_config_digest,
+        )
+        check_persona_requirements(role.normalized, persona)
+        instance_dir.stage_desired(candidate_tuple)
+        return instance_dir.commit_desired_to_active()
+    except (ValueError, OSError) as exc:
+        # discard_desired() is a no-op when nothing was ever staged (e.g. the
+        # persona loader itself raised before stage_desired ran).
+        instance_dir.discard_desired(reason=str(exc))
+        if active is None:
+            raise ValueError(
+                f"resident {role.role_id}: no prior active binding exists and the "
+                f"fresh reconciliation failed: {exc}"
+            ) from exc
+        return active
