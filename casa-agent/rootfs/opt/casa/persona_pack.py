@@ -276,8 +276,13 @@ def load_persona_pack(pack_dir: Path, manifest_path: Path) -> PersonaPack:
         # here alongside OSError/json.JSONDecodeError, so an invalid UTF-8
         # byte in manifest.json escaped this boundary as a raw
         # UnicodeDecodeError instead of PersonaPackError.
+        # r6 close-out: catch bare ValueError too — json.loads raises a
+        # plain ValueError (not JSONDecodeError) for an integer literal
+        # over CPython's int-string-digit limit, which is reachable under
+        # the size cap. ValueError subsumes json.JSONDecodeError and
+        # UnicodeDecodeError, making the manifest parse boundary total.
         expected_manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
-    except (OSError, json.JSONDecodeError, UnicodeDecodeError, RecursionError) as exc:
+    except (OSError, ValueError, RecursionError) as exc:
         raise PersonaPackError(f"persona manifest could not be read: {exc}") from exc
     if expected_manifest != manifest_payload:
         raise PersonaPackError("persona manifest does not match admitted files")

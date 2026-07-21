@@ -536,6 +536,21 @@ def test_manifest_deeply_nested_json_raises_persona_pack_error_not_recursion_err
         load_persona_pack(pack, manifest_path)
 
 
+def test_manifest_oversized_integer_literal_raises_persona_pack_error(
+    tmp_path: Path,
+) -> None:
+    # r6 close-out: a manifest.json holding an integer literal longer than
+    # CPython's int-string-digit limit (default 4300) is well under
+    # MAX_MANIFEST_BYTES, yet json.loads raises a plain ValueError (NOT a
+    # json.JSONDecodeError) while converting it. The manifest parse boundary
+    # must fold that into PersonaPackError like every other rejection.
+    pack = write_pack(tmp_path)
+    manifest_path = tmp_path / "manifest.json"
+    manifest_path.write_text("5" * 5000, encoding="utf-8")
+    with pytest.raises(PersonaPackError):
+        load_persona_pack(pack, manifest_path)
+
+
 def test_oversized_manifest_file_fails(tmp_path: Path) -> None:
     # J1 (foundation review r6): a size cap on manifest.json, checked via
     # stat() BEFORE read/parse, so an oversized fetched manifest can't force
