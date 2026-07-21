@@ -419,6 +419,94 @@ class TestDelegationLifecycle:
 
 
 # ---------------------------------------------------------------------------
+# Task 12: register_delegation's typed creating/executing speaker provenance
+# ---------------------------------------------------------------------------
+
+
+class TestRegisterDelegationSpeakerProvenance:
+    async def test_sources_creating_from_origin_and_executing_from_configs(
+        self, tmp_path,
+    ):
+        """creating_speaker comes from record.origin["speaker_provenance"]
+        (Task 10 Step 7's origin_var wiring); executing_speaker comes from
+        the specialist's own AgentConfig.speaker_provenance, already held in
+        self._configs (populated by load()) — record carries neither."""
+        from config import AgentConfig
+        from personality_types import SpeakerProvenance
+        from specialist_registry import DelegationRecord, SpecialistRegistry
+
+        try:
+            from tests.role_artifact_stub import STUB_ROLE_ARTIFACT
+        except ImportError:
+            from role_artifact_stub import STUB_ROLE_ARTIFACT
+
+        reg = SpecialistRegistry(str(tmp_path / "specialists"),
+                                  tombstone_path=str(tmp_path / "del.json"))
+        reg.load()  # empty dir — no specialists on disk
+        finance_provenance = SpeakerProvenance(
+            speaker_kind="specialist", role_id="specialist:finance",
+            persona_id="casa/finance", persona_version="0.1.0",
+            display_name="Finance", binding_digest="sha256:" + "e" * 64,
+        )
+        reg._configs["finance"] = AgentConfig(
+            role_artifact=STUB_ROLE_ARTIFACT, role="finance",
+            speaker_provenance=finance_provenance,
+        )
+
+        caller = SpeakerProvenance(
+            speaker_kind="resident", role_id="resident:assistant",
+            persona_id="casa/ellen", persona_version="0.1.0",
+            display_name="Ellen", binding_digest="sha256:" + "1" * 64,
+        )
+        record = DelegationRecord(
+            id="d1", agent="finance", started_at=0.0,
+            origin={"role": "assistant", "channel": "telegram",
+                    "speaker_provenance": caller},
+        )
+        await reg.register_delegation(record)
+        job = reg.job_registry.get("d1")
+        assert job.creating_speaker == caller
+        assert job.executing_speaker == finance_provenance
+        assert job.executing_speaker.speaker_kind in {"specialist", "system"}
+        assert job.executing_speaker.speaker_kind != "executor"
+
+    async def test_falls_back_to_system_never_none(self, tmp_path):
+        """No speaker_provenance on origin (legacy/test caller), and the
+        specialist isn't in _configs at all — both fall back to an explicit
+        system identity, never None, never a fabricated persona."""
+        from specialist_registry import DelegationRecord, SpecialistRegistry
+
+        reg = SpecialistRegistry(str(tmp_path / "specialists"),
+                                  tombstone_path=str(tmp_path / "del.json"))
+        reg.load()
+        record = DelegationRecord(
+            id="d2", agent="unknown-specialist", started_at=0.0, origin={},
+        )
+        await reg.register_delegation(record)
+        job = reg.job_registry.get("d2")
+        assert job.creating_speaker.speaker_kind == "system"
+        assert job.executing_speaker.speaker_kind == "system"
+
+    async def test_non_provenance_origin_value_also_falls_back_to_system(
+        self, tmp_path,
+    ):
+        """A non-SpeakerProvenance value under the reserved key (a stale/
+        malformed legacy caller) must not be trusted as-is."""
+        from specialist_registry import DelegationRecord, SpecialistRegistry
+
+        reg = SpecialistRegistry(str(tmp_path / "specialists"),
+                                  tombstone_path=str(tmp_path / "del.json"))
+        reg.load()
+        record = DelegationRecord(
+            id="d3", agent="finance", started_at=0.0,
+            origin={"speaker_provenance": {"speaker_kind": "resident"}},
+        )
+        await reg.register_delegation(record)
+        job = reg.job_registry.get("d3")
+        assert job.creating_speaker.speaker_kind == "system"
+
+
+# ---------------------------------------------------------------------------
 # TestDelegationComplete dataclass shape
 # ---------------------------------------------------------------------------
 

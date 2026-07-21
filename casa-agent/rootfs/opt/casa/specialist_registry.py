@@ -25,6 +25,7 @@ from job_registry import (
     JobRegistry,
     VoiceJob,
 )
+from personality_types import SpeakerProvenance
 
 logger = logging.getLogger(__name__)
 
@@ -233,9 +234,28 @@ class SpecialistRegistry:
     async def register_delegation(self, record: DelegationRecord) -> None:
         await self._job_registry.load()
         origin = dict(record.origin)
+        # Task 12: creating_speaker is the DELEGATING caller's own identity,
+        # carried on origin["speaker_provenance"] by Task 10 Step 7's
+        # origin_var wiring; executing_speaker is the target specialist's own
+        # binding, read off the config this registry already loaded. `record`
+        # carries no AgentConfig of any kind — both values MUST come from one
+        # of these two already-accessible places, never a new parameter.
+        creating_speaker = origin.get("speaker_provenance")
+        if not isinstance(creating_speaker, SpeakerProvenance):
+            creating_speaker = SpeakerProvenance(speaker_kind="system")
+        specialist_cfg = self._configs.get(record.agent)
+        if specialist_cfg is not None and specialist_cfg.speaker_provenance is not None:
+            executing_speaker = specialist_cfg.speaker_provenance
+        else:
+            # No activated binding yet (Plan 1's scope) — the honest
+            # unattributed identity, never "executor:<slug>" (a specialist
+            # is not an executor — wrong kind).
+            executing_speaker = SpeakerProvenance(speaker_kind="system")
         await self._job_registry.create(VoiceJob(
             id=record.id,
             parent_job_id=None,
+            creating_speaker=creating_speaker,
+            executing_speaker=executing_speaker,
             creating_role=str(origin.get("role") or "assistant"),
             specialist_role=record.agent,
             specialist_display_name=record.agent,

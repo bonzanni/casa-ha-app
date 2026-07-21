@@ -21,9 +21,12 @@ from job_registry import (
     JobRegistry,
     VoiceJob,
 )
+from personality_types import SpeakerProvenance
 
 
 pytestmark = [pytest.mark.asyncio, pytest.mark.unit]
+
+SYSTEM_SPEAKER = SpeakerProvenance(speaker_kind="system")
 
 
 def _result(**changes) -> str:
@@ -45,6 +48,7 @@ def _ready_job(job_id: str, *, sequence: int, device: str, route="entry-1", **ch
     base = VoiceJob(
         id=job_id,
         parent_job_id=None,
+        creating_speaker=SYSTEM_SPEAKER, executing_speaker=SYSTEM_SPEAKER,
         creating_role="concierge",
         specialist_role="judge",
         specialist_display_name="Judge",

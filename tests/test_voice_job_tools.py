@@ -30,6 +30,7 @@ from job_registry import (
     JobRegistry,
     VoiceJob,
 )
+from personality_types import SpeakerProvenance
 from specialist_limits import SpecialistLimiter
 from specialist_registry import SpecialistRegistry
 
@@ -185,6 +186,8 @@ class ToolEnv:
         base = VoiceJob(
             id=job_id,
             parent_job_id=None,
+            creating_speaker=SpeakerProvenance(speaker_kind="system"),
+            executing_speaker=SpeakerProvenance(speaker_kind="system"),
             creating_role="concierge",
             specialist_role="judge",
             specialist_display_name="Judge",
@@ -261,6 +264,44 @@ async def test_voice_async_accepts_and_returns_only_opaque_metadata(tool_env):
     assert job.origin_device_id == "device-kitchen"
     assert job.task == "Does this target?"
     assert tool_env.limiter.in_flight == 1
+
+
+@pytest.mark.asyncio
+async def test_async_job_falls_back_to_system_speakers_when_unbound(tool_env):
+    """Neither the caller's origin nor the target specialist's config carry
+    an activated speaker_provenance (Plan 1's baseline) — both snapshots
+    must be the explicit unattributed system identity, never fabricated
+    from the bare creating_role/specialist_role strings."""
+    payload = tool_payload(await tool_env.invoke_delegate())
+    job = tool_env.job_registry.get(payload["job_id"])
+    assert job.creating_speaker == SpeakerProvenance(speaker_kind="system")
+    assert job.executing_speaker == SpeakerProvenance(speaker_kind="system")
+
+
+@pytest.mark.asyncio
+async def test_async_job_persists_creating_and_executing_speaker_snapshots(
+    tool_env,
+):
+    """A real caller identity on origin["speaker_provenance"] (Task 10 Step
+    7's origin_var wiring) becomes creating_speaker; the target specialist's
+    own AgentConfig.speaker_provenance becomes executing_speaker."""
+    caller_provenance = SpeakerProvenance(
+        speaker_kind="resident", role_id="resident:concierge",
+        persona_id="casa/gary", persona_version="0.1.0",
+        display_name="Gary", binding_digest="sha256:" + "a" * 64,
+    )
+    judge_provenance = SpeakerProvenance(
+        speaker_kind="specialist", role_id="specialist:judge",
+        persona_id="casa/judge", persona_version="0.1.0",
+        display_name="Judge", binding_digest="sha256:" + "b" * 64,
+    )
+    tools._agent_role_map["judge"].speaker_provenance = judge_provenance
+
+    origin = voice_origin(speaker_provenance=caller_provenance)
+    payload = tool_payload(await tool_env.invoke_delegate(origin))
+    job = tool_env.job_registry.get(payload["job_id"])
+    assert job.creating_speaker == caller_provenance
+    assert job.executing_speaker == judge_provenance
 
 
 @pytest.mark.asyncio
@@ -896,6 +937,55 @@ async def test_continue_job_copies_private_backend_context_without_returning_it(
 
 
 @pytest.mark.asyncio
+async def test_continuation_via_resume_copies_creator_and_recaptures_executor(
+    tool_env,
+):
+    """The awaiting_input=True resume path (_start_voice_async_job with
+    parent_job_id set) must copy the ORIGINAL job's creator verbatim — never
+    whoever is invoking continue_voice_job now — while executing_speaker
+    picks up the specialist's CURRENT binding."""
+    original_caller = SpeakerProvenance(
+        speaker_kind="resident", role_id="resident:concierge",
+        persona_id="casa/gary", persona_version="0.1.0",
+        display_name="Gary", binding_digest="sha256:" + "c" * 64,
+    )
+    updated_judge = SpeakerProvenance(
+        speaker_kind="specialist", role_id="specialist:judge",
+        persona_id="casa/judge", persona_version="0.2.0",
+        display_name="Judge", binding_digest="sha256:" + "d" * 64,
+    )
+    parent = await tool_env.add_job(
+        "job-parent",
+        creating_speaker=original_caller,
+        executing_speaker=SpeakerProvenance(speaker_kind="system"),
+        execution_state=ExecutionState.SUCCEEDED,
+        delivery_state=DeliveryState.READY,
+        terminal_at=time.time(),
+        expires_at=time.time() + 900,
+        result=json.dumps(_structured_result(
+            status="needs_clarification",
+            spoken_summary="Which card do you mean?",
+            clarification="Which card do you mean?",
+        )),
+        awaiting_input=True,
+        continuable_until=time.time() + 900,
+    )
+    # The specialist's binding has since activated — and the continuing
+    # turn's own identity must be ignored for creating_speaker regardless.
+    tools._agent_role_map["judge"].speaker_provenance = updated_judge
+
+    payload = tool_payload(await _call(
+        tools.continue_voice_job,
+        voice_origin(speaker_provenance=SpeakerProvenance(speaker_kind="system")),
+        {"input": "I mean Black Lotus", "job_id": "job-parent"},
+    ))
+    child = tool_env.job_registry.get(payload["job_id"])
+    assert child.parent_job_id == parent.id
+    assert child.creating_speaker == original_caller
+    assert child.executing_speaker == updated_judge
+
+
+@pytest.mark.asyncio
 @pytest.mark.parametrize("sensitivity", ["household", "private"])
 async def test_explicit_detail_request_creates_prompted_delivery_child(
     tool_env, sensitivity,
@@ -940,6 +1030,49 @@ async def test_explicit_detail_request_creates_prompted_delivery_child(
     assert tool_env.job_registry.get(parent.id).origin_device_id == "device-kitchen"
     assert tool_env.runner.calls == []
     assert tool_env.limiter.in_flight == 0
+
+
+@pytest.mark.asyncio
+async def test_prompted_delivery_continuation_copies_creator_and_recaptures_executor(
+    tool_env,
+):
+    """The prompted-delivery branch (_new_voice_job + create_prompted_delivery,
+    parent.awaiting_input is False) must ALSO copy the ORIGINAL job's creator
+    verbatim and pick up the specialist's CURRENT binding for the executor —
+    same Task 12 continuation contract as the resume branch."""
+    original_caller = SpeakerProvenance(
+        speaker_kind="resident", role_id="resident:concierge",
+        persona_id="casa/gary", persona_version="0.1.0",
+        display_name="Gary", binding_digest="sha256:" + "e" * 64,
+    )
+    updated_judge = SpeakerProvenance(
+        speaker_kind="specialist", role_id="specialist:judge",
+        persona_id="casa/judge", persona_version="0.2.0",
+        display_name="Judge", binding_digest="sha256:" + "f" * 64,
+    )
+    parent = await tool_env.add_job(
+        "job-parent",
+        creating_speaker=original_caller,
+        executing_speaker=SpeakerProvenance(speaker_kind="system"),
+        execution_state=ExecutionState.SUCCEEDED,
+        delivery_state=DeliveryState.DELIVERED,
+        terminal_at=time.time(),
+        expires_at=time.time() + 900,
+        result=json.dumps(_structured_result()),
+        awaiting_input=False,
+        continuable_until=None,
+    )
+    tools._agent_role_map["judge"].speaker_provenance = updated_judge
+
+    payload = tool_payload(await _call(
+        tools.continue_voice_job,
+        voice_origin(speaker_provenance=SpeakerProvenance(speaker_kind="system")),
+        {"input": "Please tell me the details", "job_id": "job-parent"},
+    ))
+    child = tool_env.job_registry.get(payload["job_id"])
+    assert child.parent_job_id == parent.id
+    assert child.creating_speaker == original_caller
+    assert child.executing_speaker == updated_judge
 
 
 @pytest.mark.asyncio

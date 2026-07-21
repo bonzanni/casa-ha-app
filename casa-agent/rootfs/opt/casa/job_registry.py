@@ -18,6 +18,8 @@ from enum import StrEnum
 from typing import Any, Awaitable, Callable, Mapping
 
 from atomic_io import atomic_write_json
+from personality_types import SpeakerProvenance
+from speaker_provenance import provenance_from_mapping, provenance_mapping
 
 
 logger = logging.getLogger(__name__)
@@ -65,6 +67,14 @@ class VoiceJob:
 
     id: str
     parent_job_id: str | None
+    # Task 12: the caller's and executor's typed identity snapshots, taken at
+    # construction and kept immutable for this job's lifetime — the source
+    # of truth for who created/is running this job. The bare-string fields
+    # below (creating_role/specialist_role/specialist_display_name) remain
+    # for backward-compatible display views; they are NEVER derived FROM
+    # these speaker snapshots, only alongside them.
+    creating_speaker: SpeakerProvenance
+    executing_speaker: SpeakerProvenance
     creating_role: str
     specialist_role: str
     specialist_display_name: str
@@ -1179,6 +1189,12 @@ class JobRegistry:
             job = VoiceJob(
                 id=job_id,
                 parent_job_id=None,
+                # This tombstone predates typed speaker provenance entirely
+                # (the pre-durable-job delegations.json format) — an honest
+                # unattributed system snapshot for both, never a persona
+                # fabricated from the bare role/agent strings below.
+                creating_speaker=SpeakerProvenance(speaker_kind="system"),
+                executing_speaker=SpeakerProvenance(speaker_kind="system"),
                 creating_role=str(origin.get("role") or "assistant"),
                 specialist_role=agent,
                 specialist_display_name=agent,
@@ -1244,6 +1260,8 @@ class JobRegistry:
             return VoiceJob(
                 id=str(row["id"]),
                 parent_job_id=JobRegistry._optional_str(row.get("parent_job_id")),
+                creating_speaker=JobRegistry._decode_speaker(row, "creating_speaker"),
+                executing_speaker=JobRegistry._decode_speaker(row, "executing_speaker"),
                 creating_role=str(row["creating_role"]),
                 specialist_role=str(row["specialist_role"]),
                 specialist_display_name=str(row["specialist_display_name"]),
@@ -1284,10 +1302,25 @@ class JobRegistry:
             raise JobRegistryError(f"invalid job snapshot row: {exc}") from exc
 
     @staticmethod
+    def _decode_speaker(row: dict, key: str) -> SpeakerProvenance:
+        """Decode one typed speaker snapshot from a persisted job row.
+
+        The key is absent only for a genuinely pre-Task-12 legacy record —
+        that decodes to an explicit unattributed system identity, NEVER a
+        persona fabricated from the row's bare creating_role/specialist_role
+        strings."""
+        value = row.get(key)
+        if value is None:
+            return SpeakerProvenance(speaker_kind="system")
+        return provenance_from_mapping(value)
+
+    @staticmethod
     def _encode_job(job: VoiceJob) -> dict[str, Any]:
         return {
             "id": job.id,
             "parent_job_id": job.parent_job_id,
+            "creating_speaker": provenance_mapping(job.creating_speaker),
+            "executing_speaker": provenance_mapping(job.executing_speaker),
             "creating_role": job.creating_role,
             "specialist_role": job.specialist_role,
             "specialist_display_name": job.specialist_display_name,

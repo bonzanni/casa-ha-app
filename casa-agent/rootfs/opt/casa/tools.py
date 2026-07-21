@@ -2253,12 +2253,39 @@ def _new_voice_job(
     task_text: str,
     context_text: str,
     handoff_id: str | None = None,
+    creating_speaker: SpeakerProvenance | None = None,
 ) -> VoiceJob:
-    """Build the durable ACCEPTED row from trusted turn provenance."""
+    """Build the durable ACCEPTED row from trusted turn provenance.
+
+    Task 12: ``creating_speaker`` defaults to the CURRENT turn's caller
+    identity off ``origin["speaker_provenance"]`` (Task 10 Step 7's
+    origin_var wiring), falling back to the explicit unattributed "system"
+    identity — the same policy Task 10 Step 7b uses. An explicit override is
+    passed by the continuation call site, which must copy the ORIGINAL job's
+    creator rather than whoever is invoking ``continue_voice_job`` now.
+    ``executing_speaker`` is always the target ``cfg``'s own identity via the
+    one fallback policy (``agent_mod.speaker_provenance_for_role``): real
+    persona if bound, a stable executor identity for an executor, else the
+    honest "system" identity for an unbound Plan-1 specialist — never
+    mislabeled "executor:<slug>".
+    """
+    import agent as agent_mod
+    from personality_types import SpeakerProvenance
+
     raw_user_id = origin.get("user_id")
+    if creating_speaker is None:
+        creating_speaker = origin.get("speaker_provenance")
+    if not isinstance(creating_speaker, SpeakerProvenance):
+        creating_speaker = SpeakerProvenance(speaker_kind="system")
+    executing_speaker = (
+        agent_mod.speaker_provenance_for_role(cfg)
+        if cfg is not None else SpeakerProvenance(speaker_kind="system")
+    )
     return VoiceJob(
         id=job_id,
         parent_job_id=parent_job_id,
+        creating_speaker=creating_speaker,
+        executing_speaker=executing_speaker,
         creating_role=str(
             origin.get("execution_role") or origin.get("role") or "assistant"
         ),
@@ -2513,8 +2540,15 @@ async def _start_voice_async_job(
     handoff: _PermitHandoff,
     handoff_reservation: Any | None = None,
     parent_job_id: str | None = None,
+    creating_speaker: SpeakerProvenance | None = None,
 ) -> dict:
-    """Persist ACCEPTED, bind RUNNING task/permit ownership, return metadata."""
+    """Persist ACCEPTED, bind RUNNING task/permit ownership, return metadata.
+
+    Task 12: ``creating_speaker`` is the continuation caller's override — the
+    ORIGINAL parent job's creator — passed by the ``continue_voice_job``
+    resume branch (``parent_job_id`` is not None there). A fresh delegation
+    (``parent_job_id`` is None) leaves it unset so ``_new_voice_job`` derives
+    it from the current turn's own origin."""
     registry = _specialist_registry.job_registry
     await registry.load()
     # Apply result TTL before the atomic route-capacity check so an expired
@@ -2531,6 +2565,7 @@ async def _start_voice_async_job(
         task_text=task_text,
         context_text=context_text,
         handoff_id=handoff_id,
+        creating_speaker=creating_speaker,
     )
     actor = _job_actor_from_origin(origin)
     if parent_job_id is not None and actor is None:
@@ -3469,6 +3504,11 @@ async def continue_voice_job(args: dict) -> dict:
             origin=origin,
             task_text=continuation_input,
             context_text="",
+            # Task 12: the continuation keeps the ORIGINAL job's creator —
+            # never whoever is invoking continue_voice_job now — while
+            # executing_speaker (derived above from the current cfg) picks
+            # up the specialist's CURRENT binding.
+            creating_speaker=parent.creating_speaker,
         )
         try:
             prompted = await registry.create_prompted_delivery(
@@ -3533,6 +3573,9 @@ async def continue_voice_job(args: dict) -> dict:
                     permit=permit,
                     handoff=handoff,
                     parent_job_id=parent.id,
+                    # Task 12: copy the ORIGINAL job's creator verbatim —
+                    # never whoever is invoking continue_voice_job now.
+                    creating_speaker=parent.creating_speaker,
                 )
             finally:
                 if handoff.transferred:

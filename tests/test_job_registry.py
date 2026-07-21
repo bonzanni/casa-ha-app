@@ -19,14 +19,18 @@ from job_registry import (
     JobTransitionError,
     VoiceJob,
 )
+from personality_types import SpeakerProvenance
 
 
 pytestmark = [pytest.mark.asyncio, pytest.mark.unit]
+
+SYSTEM_SPEAKER = SpeakerProvenance(speaker_kind="system")
 
 
 def make_job(**changes):
     base = VoiceJob(
         id="job-1", parent_job_id=None,
+        creating_speaker=SYSTEM_SPEAKER, executing_speaker=SYSTEM_SPEAKER,
         creating_role="concierge", specialist_role="mtg-judge",
         specialist_display_name="Judge",
         creator_peer="voice_speaker", creator_user_id=None,
@@ -1258,3 +1262,100 @@ async def test_restart_retains_delivery_attempt_for_one_full_lease(
     now[0] = 116.0
     await registry.expire_leases()
     assert registry.get("job-1").delivery_state is DeliveryState.READY
+
+
+# ---------------------------------------------------------------------------
+# Task 12: typed creating/executing speaker provenance
+# ---------------------------------------------------------------------------
+
+CALLER_SPEAKER = SpeakerProvenance(
+    speaker_kind="resident", role_id="resident:concierge",
+    persona_id="casa/gary", persona_version="0.1.0",
+    display_name="Gary", binding_digest="sha256:" + "a" * 64,
+)
+EXECUTOR_SPEAKER = SpeakerProvenance(
+    speaker_kind="specialist", role_id="specialist:mtg-judge",
+    persona_id="casa/judge", persona_version="0.1.0",
+    display_name="Judge", binding_digest="sha256:" + "b" * 64,
+)
+
+
+async def test_voice_job_round_trip_preserves_both_speaker_snapshots(tmp_path):
+    registry = JobRegistry(tmp_path / "jobs.json", tmp_path / "delegations.json")
+    await registry.load()
+    job = make_job(
+        creating_speaker=CALLER_SPEAKER, executing_speaker=EXECUTOR_SPEAKER,
+    )
+    await registry.create(job)
+
+    reloaded = JobRegistry(tmp_path / "jobs.json", tmp_path / "delegations.json")
+    await reloaded.load()
+    restored = reloaded.get("job-1")
+    assert restored.creating_speaker == CALLER_SPEAKER
+    assert restored.executing_speaker == EXECUTOR_SPEAKER
+    assert restored == job
+
+
+async def test_continuation_child_keeps_its_own_speaker_snapshots(tmp_path):
+    """job_registry.create_continuation is pure data plumbing — it must
+    persist whatever creating_speaker/executing_speaker the caller (tools.py)
+    already computed for the child, not derive or overwrite them: the parent
+    keeps its own creator, while a re-bound specialist's current executing
+    identity travels forward onto the child unchanged."""
+    registry = await loaded_registry(
+        tmp_path,
+        make_job(
+            creating_speaker=CALLER_SPEAKER,
+            executing_speaker=SpeakerProvenance(speaker_kind="system"),
+            execution_state=ExecutionState.SUCCEEDED,
+            delivery_state=DeliveryState.READY,
+            awaiting_input=True,
+            continuable_until=200.0,
+            terminal_at=101.0,
+            result="It targets.",
+            delivery_sequence=1,
+        ),
+    )
+    current_executor = SpeakerProvenance(
+        speaker_kind="specialist", role_id="specialist:mtg-judge",
+        persona_id="casa/judge", persona_version="0.2.0",
+        display_name="Judge", binding_digest="sha256:" + "c" * 64,
+    )
+    child = make_job(
+        id="job-2", parent_job_id="job-1",
+        creating_speaker=CALLER_SPEAKER, executing_speaker=current_executor,
+        execution_state=ExecutionState.ACCEPTED, delivery_state=DeliveryState.NONE,
+        result=None, failure=None, awaiting_input=False, continuable_until=None,
+    )
+    stored = await registry.create_continuation(
+        "job-1", child, actor=actor_for_job(),
+    )
+    assert stored.creating_speaker == CALLER_SPEAKER
+    assert stored.executing_speaker == current_executor
+
+    reloaded = JobRegistry(tmp_path / "jobs.json", tmp_path / "delegations.json")
+    await reloaded.load()
+    assert reloaded.get("job-2").creating_speaker == CALLER_SPEAKER
+    assert reloaded.get("job-2").executing_speaker == current_executor
+
+
+async def test_pre_task_12_legacy_record_decodes_to_a_system_speaker(tmp_path):
+    """A record persisted before this task shipped has neither key present —
+    it must decode to an explicit system-kind snapshot, never a fabricated
+    persona derived from the bare creating_role/specialist_role strings."""
+    registry = await loaded_registry(tmp_path, make_job(
+        creating_speaker=CALLER_SPEAKER, executing_speaker=EXECUTOR_SPEAKER,
+    ))
+    snapshot = json.loads((tmp_path / "jobs.json").read_text())
+    snapshot[0].pop("creating_speaker", None)
+    snapshot[0].pop("executing_speaker", None)
+    (tmp_path / "jobs.json").write_text(json.dumps(snapshot))
+
+    reloaded = JobRegistry(tmp_path / "jobs.json", tmp_path / "delegations.json")
+    await reloaded.load()
+    job = reloaded.get("job-1")
+    assert job.creating_speaker == SpeakerProvenance(speaker_kind="system")
+    assert job.executing_speaker == SpeakerProvenance(speaker_kind="system")
+    # Never derived from the still-present legacy display strings.
+    assert job.creating_role == "concierge"
+    assert job.specialist_role == "mtg-judge"
