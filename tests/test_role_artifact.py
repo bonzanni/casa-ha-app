@@ -498,6 +498,20 @@ class TestJsonNativeInvariant:
         with pytest.raises(ValueError, match="non-JSON-native type"):
             load_role_artifact(d)
 
+    def test_yaml_nan_in_schema_open_field_is_rejected(self, tmp_path):
+        # F-D (foundation review r3, P1): yaml.safe_load parses `.nan` to a
+        # live `float('nan')`, which assert_json_safe (pre-fix) accepted
+        # as an ordinary float even though it is not a valid JSON number
+        # and canonical_json_bytes (RFC 8785) later raises FloatDomainError
+        # for it — assert_json_safe should already reject it.
+        role_yaml_text = _role_yaml_with_delegates(
+            "delegates:\n- opaque: .nan\n"
+        )
+        d = write_role_dir(tmp_path, role_yaml_text=role_yaml_text)
+
+        with pytest.raises(ValueError, match="non-finite float"):
+            load_role_artifact(d)
+
     def test_loaded_artifact_has_no_set_or_bytes_reachable(self, tmp_path):
         """Positive-side confirmation: a valid (JSON-native-only) role
         artifact loads fine, i.e. assert_json_safe does not reject

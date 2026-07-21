@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import hashlib
+import math
 import unicodedata
 from types import MappingProxyType
 from typing import Mapping
@@ -126,3 +127,13 @@ def assert_json_safe(value, *, _depth=0, _seen=None, max_depth=64):
     # too (only dict/list/scalars are JSON-native from a fresh parse).
     if not isinstance(value, _JSON_SCALARS):
         raise ValueError(f"non-JSON-native type in parsed data: {type(value).__name__}")
+    # F-D (foundation review r3, P1): NaN/Infinity are not valid JSON
+    # numbers at all, yet every `float` was accepted here regardless —
+    # `yaml.safe_load` happily parses `.nan`/`.inf`/`-.inf`, and the
+    # project's own canonical_json_bytes (RFC 8785) later raises
+    # FloatDomainError for them. Reject non-finite floats at the same
+    # gate as every other non-JSON-native value, before that later,
+    # harder-to-attribute failure. `bool` is an `int` subclass, never a
+    # `float`, so this check cannot misfire on booleans.
+    if isinstance(value, float) and not math.isfinite(value):
+        raise ValueError("non-finite float in parsed data")

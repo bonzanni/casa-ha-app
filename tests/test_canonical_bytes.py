@@ -197,6 +197,34 @@ def test_assert_json_safe_rejects_a_tuple() -> None:
 
 
 # ---------------------------------------------------------------------------
+# F-D (foundation review r3, P1): assert_json_safe accepted every `float`,
+# so `.nan`/`.inf`/`-.inf` passed the "JSON-native" gate even though the
+# project's own canonical_json_bytes (RFC 8785) later raises
+# FloatDomainError for them — the invariant this function's own docstring
+# claims ("a finite tree of JSON-native types") was violated for floats
+# specifically. NaN/Infinity are not valid JSON numbers at all.
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.parametrize("value", [float("nan"), float("inf"), float("-inf")])
+def test_assert_json_safe_rejects_non_finite_floats(value: float) -> None:
+    with pytest.raises(ValueError, match="non-finite float"):
+        assert_json_safe(value)
+
+
+@pytest.mark.parametrize("value", [float("nan"), float("inf"), float("-inf")])
+def test_assert_json_safe_rejects_non_finite_float_nested_in_a_dict(value: float) -> None:
+    with pytest.raises(ValueError, match="non-finite float"):
+        assert_json_safe({"a": [1, value]})
+
+
+def test_assert_json_safe_still_accepts_an_ordinary_finite_float() -> None:
+    assert assert_json_safe(3.5) is None  # does not raise
+    assert assert_json_safe(0.0) is None
+    assert assert_json_safe(-0.0) is None
+
+
+# ---------------------------------------------------------------------------
 # deep_freeze cycle/depth hardening (R1, foundation review r2)
 #
 # deep_freeze is a shared primitive independent of any caller's own
