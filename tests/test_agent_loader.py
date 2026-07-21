@@ -301,6 +301,32 @@ class TestRoleArtifactIntegration:
                 str(agent_dir), policies=None, roles_dir=str(roles_dir),
             )
 
+    def test_mismatched_id_raises(self, tmp_path):
+        """FIX 4 (foundation review, P1): a role artifact whose declared
+        kind and slot BOTH match the directory (so the earlier kind/slot
+        cross-checks pass) but whose 'id' field disagrees with
+        f"{kind}:{slot}" must still be rejected — mirroring the id check
+        the executor path already does (_load_executor_role_artifact)."""
+        from agent_loader import LoadError, load_agent_from_dir
+        from policies import load_policies
+
+        agent_dir = _seed_resident(tmp_path / "agents", "assistant")
+        policies = load_policies(str(_policies_file(tmp_path / "policies")))
+        roles_dir = tmp_path / "roles"
+        _seed_role_artifact(roles_dir, "resident", "assistant")
+        role_yaml = roles_dir / "resident" / "assistant" / "role.yaml"
+        text = role_yaml.read_text(encoding="utf-8")
+        assert "id: resident:assistant" in text
+        role_yaml.write_text(
+            text.replace("id: resident:assistant", "id: resident:butler"),
+            encoding="utf-8",
+        )
+
+        with pytest.raises(LoadError, match="id"):
+            load_agent_from_dir(
+                str(agent_dir), policies=policies, roles_dir=str(roles_dir),
+            )
+
     def test_schema_invalid_role_artifact_raises(self, tmp_path):
         """A schema-invalid role.yaml under the resolved role_dir fails
         the load too — load_agent_from_dir wraps role_artifact.py's raw

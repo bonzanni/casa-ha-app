@@ -475,6 +475,13 @@ def _load_role_artifact_for(
             f"agent {role_from_path!r}: role artifact slot {found_slot!r} "
             f"at {role_dir} does not match directory name {role_from_path!r}"
         )
+    expected_id = f"{tier}:{role_from_path}"
+    if artifact.role.get("id") != expected_id:
+        raise LoadError(
+            f"agent {role_from_path!r}: role artifact id "
+            f"{artifact.role.get('id')!r} at {role_dir} does not match "
+            f"expected {expected_id!r}"
+        )
     return artifact
 
 
