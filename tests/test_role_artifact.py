@@ -529,6 +529,38 @@ class TestJsonNativeInvariant:
         with pytest.raises(ValueError, match="non-finite float"):
             load_role_artifact(d)
 
+    def test_yaml_int_outside_canonical_safe_range_in_schema_open_field_is_rejected(
+        self, tmp_path
+    ):
+        # G3 (foundation review r4, P1): assert_json_safe's contract is
+        # "everything passing this can be RFC-8785-canonicalized without
+        # error" — an integer outside the JCS safe-integer range (here
+        # 2**53) passed the pre-fix gate + schema, yet later made
+        # canonical_json_bytes raise IntegerDomainError far from this
+        # loader. assert_json_safe must reject it at the same gate as
+        # every other non-canonical-safe value.
+        role_yaml_text = _role_yaml_with_delegates(
+            "delegates:\n- opaque: 9007199254740992\n"
+        )
+        d = write_role_dir(tmp_path, role_yaml_text=role_yaml_text)
+
+        with pytest.raises(ValueError, match="integer outside canonical-safe range"):
+            load_role_artifact(d)
+
+    def test_yaml_lone_surrogate_string_in_schema_open_field_is_rejected(
+        self, tmp_path
+    ):
+        # G3 (foundation review r4, P1): a string containing a lone
+        # surrogate (not UTF-8 encodable) passed the pre-fix gate + schema,
+        # yet later made canonical_json_bytes raise CanonicalizationError.
+        role_yaml_text = _role_yaml_with_delegates(
+            'delegates:\n- opaque: "\\U0000D800"\n'
+        )
+        d = write_role_dir(tmp_path, role_yaml_text=role_yaml_text)
+
+        with pytest.raises(ValueError, match="not UTF-8 encodable"):
+            load_role_artifact(d)
+
     def test_loaded_artifact_has_no_set_or_bytes_reachable(self, tmp_path):
         """Positive-side confirmation: a valid (JSON-native-only) role
         artifact loads fine, i.e. assert_json_safe does not reject

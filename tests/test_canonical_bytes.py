@@ -262,3 +262,74 @@ def test_deep_freeze_excessive_depth_raises_value_error() -> None:
         value = [value]
     with pytest.raises(ValueError, match="nesting exceeds limit"):
         deep_freeze(value)
+
+
+# ---------------------------------------------------------------------------
+# G3 (foundation review r4, P1): assert_json_safe's contract is "everything
+# passing this can be RFC-8785-canonicalized without error." Two gaps let a
+# value pass the gate (and a schema) yet make canonical_json_bytes raise:
+# an int outside RFC 8785's JCS safe-integer range (IntegerDomainError), and
+# a str with a lone surrogate (not UTF-8 encodable -> CanonicalizationError).
+# ---------------------------------------------------------------------------
+
+
+def test_assert_json_safe_rejects_int_above_safe_range() -> None:
+    with pytest.raises(ValueError, match="integer outside canonical-safe range"):
+        assert_json_safe(2**53)
+
+
+def test_assert_json_safe_rejects_int_below_safe_range() -> None:
+    with pytest.raises(ValueError, match="integer outside canonical-safe range"):
+        assert_json_safe(-(2**53))
+
+
+@pytest.mark.parametrize("value", [2**53 - 1, -(2**53 - 1), 0, 1, -1])
+def test_assert_json_safe_accepts_int_at_or_within_safe_range(value: int) -> None:
+    assert assert_json_safe(value) is None  # does not raise
+
+
+def test_assert_json_safe_rejects_lone_surrogate_string() -> None:
+    with pytest.raises(ValueError, match="not UTF-8 encodable"):
+        assert_json_safe("\uD800")
+
+
+@pytest.mark.parametrize("value", ["café", "日本語", "", "plain ascii"])
+def test_assert_json_safe_accepts_ordinary_unicode_strings(value: str) -> None:
+    assert assert_json_safe(value) is None  # does not raise
+
+
+def test_assert_json_safe_rejects_out_of_range_int_nested_in_a_dict() -> None:
+    with pytest.raises(ValueError, match="integer outside canonical-safe range"):
+        assert_json_safe({"a": [1, 2**53]})
+
+
+def test_assert_json_safe_rejects_lone_surrogate_nested_in_a_list() -> None:
+    with pytest.raises(ValueError, match="not UTF-8 encodable"):
+        assert_json_safe(["ok", "\uD800"])
+
+
+def test_assert_json_safe_still_accepts_bool_regardless_of_int_range_check() -> None:
+    # bool is an int subclass but must never be treated as an out-of-range
+    # integer (True == 1, False == 0, both trivially within range anyway,
+    # but this pins that the int-range check never misfires on bool).
+    assert assert_json_safe(True) is None
+    assert assert_json_safe(False) is None
+
+
+@pytest.mark.parametrize(
+    "value",
+    [
+        2**53 - 1,
+        -(2**53 - 1),
+        "café",
+        "日本語",
+        {"a": [1, 2.5, "three", True, False, None, 2**53 - 1]},
+    ],
+)
+def test_values_passing_assert_json_safe_are_canonicalizable(value) -> None:
+    # Cross-check the completed invariant: anything that passes
+    # assert_json_safe must NOT raise when actually canonicalized.
+    from canonical_bytes import canonical_json_bytes
+
+    assert assert_json_safe(value) is None
+    canonical_json_bytes(value)  # must not raise
