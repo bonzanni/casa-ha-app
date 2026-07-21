@@ -803,6 +803,17 @@ class Agent:
             "message_type": msg.type.value,
             "source": msg.source,
             "execution_role": self.config.role,
+            # Provenance foundation (Task 9/10): the real identity of the agent
+            # whose turn this is — a live SpeakerProvenance dataclass (or None
+            # for a config not yet bound to a persona: an executor, or a Plan-1
+            # specialist before Plan 2's N1 wires its binding). This is what lets
+            # a delegated turn attribute its CALLER correctly instead of having
+            # no provenance to read at all. Stored as a LIVE object (never a
+            # mapping) because origin_var is an in-process ContextVar — exactly
+            # like the _voice_handoff_reservation object carried below. It is
+            # NEVER persisted: engagement tombstones strip it (see
+            # engagement_registry._persistable_origin).
+            "speaker_provenance": self.config.speaker_provenance,
         }
         # Reserved provenance markers (synthetic turn replay, button
         # answers) ride on msg.context when a LATER task (ask_user/button
@@ -1644,22 +1655,14 @@ class Agent:
         register()). Tracked so it isn't GC'd; failures are swallowed in
         retain_cold_session and never reach the turn.
 
-        Task 9: takes the immutable ``SessionEntrySnapshot`` the resume gate
-        produced (``decision.old``) — the same object every call site passes.
-        ``retain_cold_session`` keeps its current ``sid``/``role``/``user_peer``
-        signature (Task 10 reduces it to consume the snapshot directly); the
-        snapshot's fields are unpacked here at the call boundary. A legacy
-        entry has no ``user_provenance`` — its user peer degrades to ``""``,
-        which never invents authorship."""
+        Task 9/10: takes the immutable ``SessionEntrySnapshot`` the resume gate
+        produced (``decision.old``) and passes it straight through to the reduced
+        ``retain_cold_session``, which reads the speaker/user provenance off the
+        snapshot itself. A legacy/corrupt snapshot with no usable provenance
+        retains nothing (never invents authorship)."""
         task = asyncio.create_task(
             retain_cold_session(
-                sid=old.sdk_session_id, role=self.config.role, directory=directory,
-                user_peer=(
-                    old.user_provenance.user_peer
-                    if old.user_provenance and old.user_provenance.user_peer
-                    else ""
-                ),
-                channel=channel,
+                old, directory=directory, channel=channel,
                 semantic_memory=self._semantic_memory,
             ),
             name=f"cold-retain-{old.sdk_session_id}",

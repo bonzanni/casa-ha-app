@@ -119,6 +119,47 @@ class TestRegistryCreate:
         assert rec.topic_id is None
         assert reg.by_topic_id(0) is None
 
+    async def test_create_strips_non_persistable_origin_from_tombstone(self, tmp_path):
+        """Task 10: origin snapshots may carry LIVE, non-JSON objects (a
+        SpeakerProvenance dataclass, the voice handoff reservation) for
+        in-process reads only. Persisting them would crash json.dumps — the
+        tombstone must strip them, while the in-memory record keeps them live."""
+        from engagement_registry import EngagementRegistry
+        from personality_types import SpeakerProvenance
+
+        prov = SpeakerProvenance(
+            speaker_kind="resident", role_id="resident:butler", persona_id="casa/tina",
+            persona_version="0.1.0", display_name="Tina", binding_digest="sha256:" + "a" * 64,
+        )
+
+        class _LiveReservation:
+            def reserve(self): ...
+            def release(self): ...
+            def commit(self): ...
+
+        reg = EngagementRegistry(tombstone_path=str(tmp_path / "e.json"), bus=None)
+        # create() writes the tombstone synchronously — a live-object origin must
+        # not raise here.
+        rec = await reg.create(
+            kind="specialist", role_or_type="finance", driver="in_casa", task="t",
+            origin={
+                "role": "resident:butler", "channel": "telegram",
+                "speaker_provenance": prov,
+                "_voice_handoff_reservation": _LiveReservation(),
+                "voice_route_capabilities": frozenset({"cap"}),
+            },
+            topic_id=None,
+        )
+        # In-memory record keeps the live objects for in-process use.
+        assert rec.origin["speaker_provenance"] is prov
+        # Persisted tombstone dropped them and is valid JSON.
+        persisted = json.loads((tmp_path / "e.json").read_text())
+        row = next(r for r in persisted if r["id"] == rec.id)
+        assert "speaker_provenance" not in row["origin"]
+        assert "_voice_handoff_reservation" not in row["origin"]
+        assert "voice_route_capabilities" not in row["origin"]
+        assert row["origin"]["channel"] == "telegram"
+
 
 class TestRegistryStateTransitions:
     async def test_mark_completed_persists_terminal_tombstone(self, tmp_path):

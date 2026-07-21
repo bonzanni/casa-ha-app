@@ -27,25 +27,55 @@ async def fake_classify(c):
     return "friends"
 
 
+def _snapshot(*, with_provenance: bool):
+    """Build a SessionEntrySnapshot the reduced retain_cold_session consumes."""
+    from agent import snapshot_session_entry
+    from speaker_provenance import provenance_mapping
+    from session_reg_helpers import STUB_SPEAKER_PROV, STUB_USER_PROV
+    entry = {"agent": "resident:assistant", "sdk_session_id": "s1"}
+    if with_provenance:
+        entry["speaker_provenance"] = provenance_mapping(STUB_SPEAKER_PROV)
+        entry["user_provenance"] = provenance_mapping(STUB_USER_PROV)
+    return snapshot_session_entry(entry)
+
+
 async def test_retain_cold_session_telegram(monkeypatch):
     monkeypatch.setattr(session_saver, "classify_tier", fake_classify)
     monkeypatch.setattr(session_saver, "get_session_messages",
                         lambda sid, directory: [_Msg("user", "hi")])
     sem = _Sem()
     await session_saver.retain_cold_session(
-        sid="s1", role="assistant", directory="/tmp",
-        user_peer="nicola", channel="telegram", semantic_memory=sem,
+        _snapshot(with_provenance=True), directory="/tmp",
+        channel="telegram", semantic_memory=sem,
     )
-    assert sem.retained == [("casa", [["friends"]])]
+    # One retain to the shared bank; the single user turn is tier-tagged "friends".
+    assert len(sem.retained) == 1
+    bank, tagsets = sem.retained[0]
+    assert bank == "casa"
+    assert tagsets[0][0] == "friends"                       # tier tag first
+    assert any(t.startswith("casa-source-") for t in tagsets[0])  # + provenance tag
 
 
 async def test_retain_cold_session_voice_noop():
     sem = _Sem()
     await session_saver.retain_cold_session(
-        sid="s1", role="butler", directory="/tmp",
-        user_peer="voice_speaker", channel="voice", semantic_memory=sem,
+        _snapshot(with_provenance=False), directory="/tmp",
+        channel="voice", semantic_memory=sem,
     )
     assert sem.retained == []  # recall-only channel never retains
+
+
+async def test_retain_cold_session_no_provenance_noop(monkeypatch):
+    """A legacy/corrupt snapshot with no usable provenance retains NOTHING —
+    memory is never written with invented authorship."""
+    monkeypatch.setattr(session_saver, "get_session_messages",
+                        lambda sid, directory: [_Msg("user", "hi")])
+    sem = _Sem()
+    await session_saver.retain_cold_session(
+        _snapshot(with_provenance=False), directory="/tmp",
+        channel="telegram", semantic_memory=sem,
+    )
+    assert sem.retained == []
 
 
 def test_gap_branch_does_not_await_save_session():

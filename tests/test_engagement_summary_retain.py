@@ -98,8 +98,16 @@ async def test_telegram_summary_retained_and_postback_fires(tmp_path, monkeypatc
     assert payload["engagement_id"] == rec.id
     assert payload["task"] == "pay rent"
     assert payload["status"] == "completed"
-    assert item["tags"] == ["private"]
-    assert item["document_id"] == f"engagement:{rec.id}:summary:0"
+    # Task 10: exactly one tier tag + one reserved provenance tag; the summary is
+    # attributed to the honest unattributed "system" identity (no origin author
+    # present in the fixture) and content-addressed under the m-a- agent id space.
+    from hindsight_ids import agent_document_id
+    from personality_types import SpeakerProvenance
+    assert item["tags"][0] == "private"
+    assert sum(1 for t in item["tags"] if t.startswith("casa-source-")) == 1
+    assert item["document_id"] == agent_document_id(
+        SpeakerProvenance(speaker_kind="system"), item["content"],
+    )
 
     # Post-back NOTIFICATION still fired.
     bus.notify.assert_awaited_once()
@@ -178,15 +186,16 @@ async def test_executor_kind_retains_distinct_doc_prefix(tmp_path, monkeypatch):
     await asyncio.gather(*list(tools_mod._specialist_bg_tasks), return_exceptions=True)
 
     # Two retains: the engagement summary + the per-executor-type summary,
-    # under DISTINCT document_ids so they do not clobber each other.
+    # under DISTINCT content-addressed document_ids so they do not clobber
+    # each other (the two payloads differ, so their agent ids differ).
     assert len(sem.retain_calls) == 2
     doc_ids = [c["items"][0]["document_id"] for c in sem.retain_calls]
-    assert any(d.endswith(":summary:0") for d in doc_ids)
-    assert any(d.endswith(":executor_summary:0") for d in doc_ids)
+    assert all(d.startswith("m-a-") for d in doc_ids)
+    assert len(set(doc_ids)) == 2
 
     exec_call = next(
         c for c in sem.retain_calls
-        if c["items"][0]["document_id"].endswith(":executor_summary:0")
+        if json.loads(c["items"][0]["content"]).get("kind") == "executor_engagement_summary"
     )
     exec_payload = json.loads(exec_call["items"][0]["content"])
     assert exec_payload["kind"] == "executor_engagement_summary"

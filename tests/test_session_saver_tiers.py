@@ -3,9 +3,13 @@
 import pytest
 
 import session_saver
-from hindsight_ids import content_document_id
+from hindsight_ids import agent_document_id, content_document_id
+from session_reg_helpers import STUB_SPEAKER_PROV, STUB_USER_PROV
 
 pytestmark = [pytest.mark.unit]
+
+# STUB_USER_PROV.user_peer is "tester"; STUB_SPEAKER_PROV is a resident.
+_USER_PEER = STUB_USER_PROV.user_peer
 
 
 class _Msg:
@@ -21,13 +25,13 @@ async def test_transcript_items_tagged_per_item(monkeypatch):
 
     msgs = [_Msg("user", "my salary is 5000"), _Msg("assistant", "bin day is Tuesday")]
     items = await session_saver.transcript_to_items(
-        msgs, sdk_session_id="s1", user_peer="nicola",
+        msgs, speaker_provenance=STUB_SPEAKER_PROV, user_provenance=STUB_USER_PROV,
     )
-    assert [i["tags"] for i in items] == [["private"], ["public"]]
-    # F1: document_id is content-derived (cross-session idempotent), not sid:idx.
+    assert [i["tags"][0] for i in items] == ["private", "public"]
+    # Task 10: content-derived document_id, keyed by KIND (user_peer vs persona).
     assert [i["document_id"] for i in items] == [
-        content_document_id("nicola", "my salary is 5000"),
-        content_document_id("assistant", "bin day is Tuesday"),
+        content_document_id(_USER_PEER, "my salary is 5000"),
+        agent_document_id(STUB_SPEAKER_PROV, "bin day is Tuesday"),
     ]
 
 
@@ -49,7 +53,7 @@ async def test_transcript_dedupes_repeated_line_within_batch(monkeypatch):
         _Msg("assistant", "ok"),                                # dup
     ]
     items = await session_saver.transcript_to_items(
-        msgs, sdk_session_id="s1", user_peer="nicola",
+        msgs, speaker_provenance=STUB_SPEAKER_PROV, user_provenance=STUB_USER_PROV,
     )
     assert [i["content"] for i in items] == [
         "harden probe TG-DISPATCH-001 reply ok", "ok",
@@ -66,14 +70,16 @@ async def test_transcript_same_content_stable_id_across_sessions(monkeypatch):
     monkeypatch.setattr(session_saver, "classify_tier", fake_classify)
 
     msg = [_Msg("user", "the bins go out on Tuesday")]
-    a = await session_saver.transcript_to_items(msg, sdk_session_id="sid-A", user_peer="nicola")
-    b = await session_saver.transcript_to_items(msg, sdk_session_id="sid-B", user_peer="nicola")
+    a = await session_saver.transcript_to_items(
+        msg, speaker_provenance=STUB_SPEAKER_PROV, user_provenance=STUB_USER_PROV)
+    b = await session_saver.transcript_to_items(
+        msg, speaker_provenance=STUB_SPEAKER_PROV, user_provenance=STUB_USER_PROV)
     assert a[0]["document_id"] == b[0]["document_id"]
 
-    # A different speaker with the same words is a distinct document.
+    # A different speaker KIND (agent) with the same words is a distinct document.
     other = await session_saver.transcript_to_items(
         [_Msg("assistant", "the bins go out on Tuesday")],
-        sdk_session_id="sid-A", user_peer="nicola",
+        speaker_provenance=STUB_SPEAKER_PROV, user_provenance=STUB_USER_PROV,
     )
     assert other[0]["document_id"] != a[0]["document_id"]
 
@@ -92,8 +98,7 @@ async def test_save_session_skips_voice():
         async def finish_save(self, k, sid=None): pass
 
     ok = await session_saver.save_session(
-        "voice-abc", _Reg(), _Sem(), role="butler",
-        directory="/tmp", user_peer="voice_speaker", channel="voice",
+        "voice-abc", _Reg(), _Sem(), directory="/tmp", channel="voice",
     )
     assert ok is False
     assert retained == []  # voice persists nothing (recall-only)
@@ -114,19 +119,26 @@ async def test_save_session_retains_telegram_to_shared_bank(monkeypatch):
             retained["bank"] = bank
             retained["tags"] = [i["tags"] for i in items]
 
+    from speaker_provenance import provenance_mapping
+
     class _Reg:
         async def try_begin_save(self, k): return True
-        def get(self, k): return {"sdk_session_id": "s1"}
+        def get(self, k):
+            # Task 10: save_session reads speaker/user provenance from the entry.
+            return {
+                "agent": "resident:assistant", "sdk_session_id": "s1",
+                "speaker_provenance": provenance_mapping(STUB_SPEAKER_PROV),
+                "user_provenance": provenance_mapping(STUB_USER_PROV),
+            }
         async def finish_save(self, k, sid=None): pass
         async def clear_save_claim(self, k, sid=None): pass
 
     ok = await session_saver.save_session(
-        "telegram-1", _Reg(), _Sem(), role="assistant",
-        directory="/tmp", user_peer="nicola", channel="telegram",
+        "telegram-1", _Reg(), _Sem(), directory="/tmp", channel="telegram",
     )
     assert ok is True
     assert retained["bank"] == "casa"
-    assert retained["tags"] == [["friends"]]
+    assert [t[0] for t in retained["tags"]] == ["friends"]   # tier tag first
 
 
 async def test_transcript_classification_is_concurrent(monkeypatch):
@@ -147,13 +159,13 @@ async def test_transcript_classification_is_concurrent(monkeypatch):
     monkeypatch.setattr(session_saver, "classify_tier", fake_classify)
     msgs = [_Msg("user", f"fact {i}") for i in range(8)]
     items = await session_saver.transcript_to_items(
-        msgs, sdk_session_id="s1", user_peer="nicola",
+        msgs, speaker_provenance=STUB_SPEAKER_PROV, user_provenance=STUB_USER_PROV,
     )
     assert len(items) == 8
     # Serial gives peak == 1; bounded-parallel gives peak in [2, 4].
     assert peak >= 2, f"classification ran serially (peak in-flight = {peak})"
     assert peak <= session_saver._CLASSIFY_CONCURRENCY, "semaphore bound exceeded"
-    # F1: content-derived ids, one per distinct fact, order preserved.
+    # Content-derived ids, one per distinct fact, order preserved.
     assert [i["document_id"] for i in items] == [
-        content_document_id("nicola", f"fact {i}") for i in range(8)
+        content_document_id(_USER_PEER, f"fact {i}") for i in range(8)
     ]

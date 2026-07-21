@@ -3,8 +3,21 @@
 import pytest
 
 import delegated_memory
+from personality_types import RetainedTurn, SpeakerProvenance
 
 pytestmark = [pytest.mark.unit]
+
+
+def _user(peer: str = "nicola") -> SpeakerProvenance:
+    return SpeakerProvenance(speaker_kind="user", user_peer=peer)
+
+
+def _resident(slot: str = "finance") -> SpeakerProvenance:
+    return SpeakerProvenance(
+        speaker_kind="resident", role_id=f"resident:{slot}", persona_id=f"casa/{slot}",
+        persona_version="0.1.0", display_name=slot.capitalize(),
+        binding_digest="sha256:" + "a" * 64,
+    )
 
 
 class _Sem:
@@ -93,20 +106,34 @@ async def test_retain_delegated_classifies_each_item(monkeypatch):
     monkeypatch.setattr(delegated_memory, "classify_tier", fake_classify)
     sem = _Sem()
     await delegated_memory.retain_delegated(
-        sem, origin_channel="telegram", doc_prefix="delegation:cid1:finance",
-        turns=[("user", "what is my salary"), ("assistant", "your salary is 5000")],
+        sem, origin_channel="telegram",
+        turns=[
+            RetainedTurn("what is my salary", _user()),
+            RetainedTurn("your salary is 5000", _resident()),
+        ],
     )
     items = sem.retain_calls[0]["items"]
     assert sem.retain_calls[0]["bank"] == "casa"
-    assert [i["tags"] for i in items] == [["private"], ["private"]]
-    assert [i["document_id"] for i in items] == ["delegation:cid1:finance:0", "delegation:cid1:finance:1"]
+    # Task 10: each item carries exactly one tier tag + one reserved provenance tag.
+    assert [i["tags"][0] for i in items] == ["private", "private"]
+    assert all(
+        sum(1 for t in i["tags"] if t.startswith("casa-source-")) == 1 for i in items
+    )
+    # Content-addressed ids: user turn keyed on user_peer, agent turn on persona
+    # identity — distinct, and each namespaced by kind.
+    doc_ids = [i["document_id"] for i in items]
+    assert doc_ids[0].startswith("m-") and not doc_ids[0].startswith("m-a-")
+    assert doc_ids[1].startswith("m-a-")
+    assert len(set(doc_ids)) == 2
+    # Provenance survives into metadata for reconstruction.
+    assert "casa_source_v1" in items[0]["metadata"]
 
 
 async def test_retain_delegated_voice_writes_nothing():
     sem = _Sem()
     await delegated_memory.retain_delegated(
-        sem, origin_channel="voice", doc_prefix="delegation:cid2:house",
-        turns=[("assistant", "anything")],
+        sem, origin_channel="voice",
+        turns=[RetainedTurn("anything", _resident("house"))],
     )
     assert sem.retain_calls == []   # voice = recall-only (write-trust)
 
@@ -116,9 +143,32 @@ async def test_retain_delegated_skips_blank_turns(monkeypatch):
     monkeypatch.setattr(delegated_memory, "classify_tier", fake_classify)
     sem = _Sem()
     await delegated_memory.retain_delegated(
-        sem, origin_channel="telegram", doc_prefix="d:1",
-        turns=[("user", "   "), ("assistant", "real")],
+        sem, origin_channel="telegram",
+        turns=[RetainedTurn("   ", _user()), RetainedTurn("real", _resident())],
     )
     items = sem.retain_calls[0]["items"]
-    assert [i["content"] for i in items] == ["real"]
-    assert [i["document_id"] for i in items] == ["d:1:1"]   # index preserved from the original turn list
+    assert [i["content"] for i in items] == ["real"]   # blank turn dropped
+
+
+async def test_run_delegated_agent_reads_the_callers_real_provenance_off_origin_var() -> None:
+    """Regression: before this fix, origin_var never carried speaker_provenance at
+    all, so a delegated turn's caller_provenance was always None — this proves
+    _run_delegated_agent's parent.get("speaker_provenance") sees the real value
+    Agent._process now sets."""
+    import agent as agent_mod
+
+    caller = SpeakerProvenance(
+        speaker_kind="resident", role_id="resident:butler", persona_id="casa/tina",
+        persona_version="0.1.0", display_name="Tina", binding_digest="sha256:" + "1" * 64,
+    )
+    token = agent_mod.origin_var.set({
+        "role": "butler", "channel": "telegram", "execution_role": "butler",
+        "speaker_provenance": caller,
+    })
+    try:
+        import tools
+
+        snapshot = tools._snapshot_origin()
+        assert snapshot["speaker_provenance"] == caller
+    finally:
+        agent_mod.origin_var.reset(token)

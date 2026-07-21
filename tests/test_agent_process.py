@@ -1889,14 +1889,12 @@ class TestSaveBeforeOverwrite:
 
         retain_calls: list[dict] = []
 
-        async def _fake_retain_cold(
-            *, sid, role, directory, user_peer, channel, semantic_memory,
-        ):
+        async def _fake_retain_cold(old, *, directory, channel, semantic_memory):
             retain_calls.append({
-                "sid": sid,
-                "role": role,
+                "sid": old.sdk_session_id,
+                "role": old.agent,
                 "directory": directory,
-                "user_peer": user_peer,
+                "user_peer": old.user_provenance.user_peer if old.user_provenance else None,
                 "channel": channel,
             })
 
@@ -1946,7 +1944,8 @@ class TestSaveBeforeOverwrite:
         )
         call = retain_calls[0]
         assert call["sid"] == "old-stale-sid", call
-        assert call["role"] == "assistant", call
+        # Task 9/10: the snapshot carries the canonical role_id as ``agent``.
+        assert call["role"] == "resident:assistant", call
         assert call["directory"].endswith("agent-home/assistant"), call
         assert call["user_peer"] == "nicola", call
         assert call["channel"] == "telegram", call
@@ -1960,7 +1959,7 @@ class TestSaveBeforeOverwrite:
         save_calls: list[dict] = []
 
         async def _fake_save(channel_key, session_registry, semantic_memory,
-                             *, role, directory, user_peer, channel):
+                             *, directory, channel):
             save_calls.append({"channel_key": channel_key})
 
         monkeypatch.setattr(agent_mod, "save_session", _fake_save)

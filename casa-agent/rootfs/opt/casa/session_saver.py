@@ -8,13 +8,17 @@ import asyncio
 import logging
 import os
 from datetime import timedelta
-from typing import Any
+from typing import TYPE_CHECKING, Any
 
 from channel_policy import writes_to_bank
-from channel_trust import user_peer_for_channel
 from claude_agent_sdk import get_session_messages
-from hindsight_ids import bank_id, content_document_id
+from hindsight_ids import bank_id
+from memory_provenance import build_retain_items
+from personality_types import RetainedTurn, SpeakerProvenance
 from tier_classifier import classify_tier
+
+if TYPE_CHECKING:
+    from agent import SessionEntrySnapshot
 
 logger = logging.getLogger(__name__)
 
@@ -58,92 +62,69 @@ def _message_text(message: Any) -> str:
 
 
 async def transcript_to_items(
-    messages: list, *, sdk_session_id: str, user_peer: str,
+    messages: list, *, speaker_provenance: SpeakerProvenance,
+    user_provenance: SpeakerProvenance,
 ) -> list[dict[str, Any]]:
-    """Turn an SDK transcript into Hindsight retain items (design §4.2; tier model
-    §2.4). One item per DISTINCT text-bearing turn, each classified at its TRUE
-    sensitivity tier (default-private on uncertainty) and tagged ``[tier]`` —
-    Hindsight tags are document-granular, so per-item is the finest partition
-    available.
+    """Turn an SDK transcript into provenance-bearing Hindsight retain items
+    (design §4.2; tier model §2.4; personality Task 10). Each user turn is
+    attributed to ``user_provenance`` (the trusted per-turn ingress identity) and
+    each assistant turn to ``speaker_provenance`` (the resident's real persona
+    identity), then funneled through :func:`build_retain_items` so every item
+    carries its speaker provenance tag + canonical metadata alongside its tier.
 
-    F1 (2026-07-09 bug review): a repetitive conversation used to emit one item
-    per occurrence of a repeated line AND re-retain the same content under a new
-    ``document_id`` every time the SDK session rotated — one session produced ~40
-    near-duplicate memories, ~50 across four sids. Two dedup layers fix that:
-
-    * **Within-batch:** collapse identical ``(speaker, text)`` turns so a line
-      repeated N times in one transcript yields ONE item (first occurrence wins,
-      order preserved). ``sdk_session_id`` is now unused for the id but kept in
-      the signature for caller stability and future provenance needs.
-    * **Cross-session:** ``document_id`` is content-derived
-      (:func:`content_document_id`), so the same ``(speaker, text)`` retained
-      from any later session upserts to the SAME Hindsight document instead of
-      duplicating."""
-    # Phase 1 — collect DISTINCT text-bearing turns (first occurrence wins,
-    # original order preserved). Dedup key is (speaker, text): the same words
-    # from user vs assistant stay distinct.
-    seen: set[tuple[str, str]] = set()
-    pending: list[tuple[str, str]] = []  # (text, speaker)
+    F1 (2026-07-09 bug review): dedup is now owned by ``build_retain_items`` — a
+    line repeated N times collapses within-batch, and the content-addressed
+    ``document_id`` (user_peer- or persona-identity-keyed) makes the same turn
+    retained from any later session upsert to the SAME document instead of
+    duplicating. ``classify_tier`` is passed by name so tests that monkeypatch
+    ``session_saver.classify_tier`` still take effect."""
+    turns: list[RetainedTurn] = []
     for m in messages:
         text = _message_text(getattr(m, "message", None))
         if not text:
             continue
-        speaker = user_peer if getattr(m, "type", "") == "user" else "assistant"
-        key = (speaker, text)
-        if key in seen:
-            continue
-        seen.add(key)
-        pending.append((text, speaker))
-    if not pending:
+        if getattr(m, "type", "") == "user":
+            turns.append(RetainedTurn(text, user_provenance))
+        else:
+            turns.append(RetainedTurn(text, speaker_provenance))
+    if not turns:
         return []
-    # Phase 2 — classify concurrently, bounded by a semaphore. classify_tier is
-    # looked up at call time (module-global) so tests that monkeypatch
-    # session_saver.classify_tier still take effect; it never raises (catches
-    # all and returns DEFAULT_TIER), so plain gather is safe.
-    sem = asyncio.Semaphore(_CLASSIFY_CONCURRENCY)
-
-    async def _classify(text: str) -> str:
-        async with sem:
-            return await classify_tier(text)
-
-    tiers = await asyncio.gather(*(_classify(t) for t, _ in pending))
-    return [
-        {
-            "content": text,
-            "tags": [tier],
-            "metadata": {"speaker": speaker},
-            "document_id": content_document_id(speaker, text),
-        }
-        for (text, speaker), tier in zip(pending, tiers)
-    ]
+    return await build_retain_items(
+        turns, classify=classify_tier, classify_concurrency=_CLASSIFY_CONCURRENCY,
+    )
 
 
 async def save_session(
-    channel_key: str, registry, semantic_memory, *, role: str, directory: str,
-    user_peer: str, channel: str,
+    channel_key: str, registry, semantic_memory, *, directory: str, channel: str,
 ) -> bool:
     """Idempotently retain an ended session to long-term memory (design §4.2; tier
-    model §2.4). Channels that fail write-trust (voice — recall-only) persist
-    nothing. Atomically claims the entry; on success retains the per-item
-    tier-tagged transcript to the shared ``casa`` bank and removes the entry."""
+    model §2.4; personality Task 10). Channels that fail write-trust (voice —
+    recall-only) persist nothing. Atomically claims the entry; the persisted
+    speaker/user identities come from the entry's own provenance snapshot (never
+    a caller-passed role/user_peer), so a legacy or corrupt entry with no usable
+    provenance releases the claim rather than retaining with invented authorship.
+    On success retains the per-item tier+provenance-tagged transcript to the
+    shared ``casa`` bank and removes the entry."""
+    from agent import snapshot_session_entry
+
     if not writes_to_bank(channel):
         return False  # recall-only channel (e.g. voice): never persists facts
     if not await registry.try_begin_save(channel_key):
         return False  # missing or already being saved (reaper/next-turn race)
-    entry = registry.get(channel_key)
-    if entry is None:
-        logger.error("save_session: entry for %s vanished after claim — releasing", channel_key)
+    snapshot = snapshot_session_entry(registry.get(channel_key))
+    if snapshot is None or snapshot.speaker_provenance is None or snapshot.user_provenance is None:
+        logger.debug(
+            "save_session: %s has no usable provenance snapshot — releasing claim",
+            channel_key,
+        )
         await registry.clear_save_claim(channel_key)
         return False
-    sid = entry.get("sdk_session_id")
-    if not sid:
-        logger.debug("save_session: %s has no sid — releasing claim", channel_key)
-        await registry.clear_save_claim(channel_key)
-        return False
+    sid = snapshot.sdk_session_id
     try:
         messages = await asyncio.to_thread(get_session_messages, sid, directory)
         items = await transcript_to_items(
-            messages, sdk_session_id=sid, user_peer=user_peer,
+            messages, speaker_provenance=snapshot.speaker_provenance,
+            user_provenance=snapshot.user_provenance,
         )
         if items:
             await semantic_memory.retain(bank_id("casa"), items, async_=True)
@@ -158,8 +139,7 @@ async def save_session(
 
 
 async def retain_cold_session(
-    *, sid: str, role: str, directory: str, user_peer: str, channel: str,
-    semantic_memory,
+    old: "SessionEntrySnapshot", *, directory: str, channel: str, semantic_memory,
 ) -> None:
     """Retain a specific cold SDK session's transcript to the shared ``casa`` bank,
     OFF the turn's critical path and DECOUPLED from the session registry (no
@@ -167,22 +147,28 @@ async def retain_cold_session(
     registry entry for this channel is about to be overwritten by the new session —
     so a registry-claiming save (save_session) would race register(); this does not
     touch the registry at all. Channels failing write-trust (voice) retain nothing.
-    document_id=sid:idx keeps the retain idempotent."""
-    # role is accepted for caller-symmetry with save_session (which also takes role)
-    # and reserved for future per-role filtering; it is not used in the body today.
+
+    Personality Task 10: consumes the immutable ``SessionEntrySnapshot`` directly.
+    A legacy/corrupt snapshot with no usable speaker/user provenance retains
+    NOTHING — memory is never written with invented authorship. The
+    content-addressed ``document_id`` keeps re-retain idempotent."""
     if not writes_to_bank(channel):
         return
-    if not sid:  # defensive: the gap call site already guards, but this is a public API
-        return
+    if old.speaker_provenance is None or old.user_provenance is None:
+        return  # legacy/corrupt snapshot: never retain with invented authorship
     try:
-        messages = await asyncio.to_thread(get_session_messages, sid, directory)
+        messages = await asyncio.to_thread(get_session_messages, old.sdk_session_id, directory)
         items = await transcript_to_items(
-            messages, sdk_session_id=sid, user_peer=user_peer,
+            messages, speaker_provenance=old.speaker_provenance,
+            user_provenance=old.user_provenance,
         )
         if items:
             await semantic_memory.retain(bank_id("casa"), items, async_=True)
     except Exception:  # noqa: BLE001 — background; never surface to the turn
-        logger.warning("background cold-session retain failed for sid=%s", sid, exc_info=True)
+        logger.warning(
+            "background cold-session retain failed for sid=%s", old.sdk_session_id,
+            exc_info=True,
+        )
 
 
 async def reset_channel(
@@ -213,12 +199,13 @@ async def reset_channel(
         directory = agent_home_for_role_id(role)
     except ValueError:
         directory = f"/config/agent-home/{role}"
-    user_peer = user_peer_for_channel(channel)
+    # Task 10: the reduced save_session reads speaker/user provenance from the
+    # entry snapshot itself — no role=/user_peer= to pass here.
     # save_session is idempotent and removes the entry on a successful retain;
     # remove() afterwards guarantees the pointer is cleared even when the save
     # was a no-op (nothing to retain).
     await save_session(
         channel_key, registry, semantic_memory,
-        role=role, directory=directory, user_peer=user_peer, channel=channel,
+        directory=directory, channel=channel,
     )
     await registry.remove(channel_key)

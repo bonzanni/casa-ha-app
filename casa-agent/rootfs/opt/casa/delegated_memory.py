@@ -18,10 +18,12 @@ turn / engagement that spawned them — its channel is on ``origin_var`` /
 from __future__ import annotations
 
 import logging
-from typing import Any
+from typing import Any, Sequence
 
 from channel_policy import writes_to_bank
 from hindsight_ids import bank_id
+from memory_provenance import build_retain_items
+from personality_types import RetainedTurn
 from semantic_memory import RecallUnavailable
 from sensitivity import clearance_for_channel, readable_tiers
 from tier_classifier import classify_tier
@@ -69,31 +71,26 @@ async def delegated_recall(
 
 
 async def retain_delegated(
-    semantic_memory: Any, *, origin_channel: str, doc_prefix: str,
-    turns: list[tuple[str, str]],
+    semantic_memory: Any, *, origin_channel: str, turns: Sequence[RetainedTurn],
 ) -> None:
-    """Explicitly retain delegated ``turns`` (``(speaker, text)``) to the shared
-    bank, each classified at its TRUE tier — IFF the originating channel is
-    write-trusted (voice → recall-only → nothing). ``document_id`` =
-    ``f"{doc_prefix}:{idx}"`` (idx from the original list) keeps re-retain
-    idempotent. Best-effort; never raises."""
+    """Explicitly retain delegated ``turns`` to the shared bank, each classified at
+    its TRUE tier AND attributed to its real :class:`SpeakerProvenance` — IFF the
+    originating channel is write-trusted (voice → recall-only → nothing).
+
+    Personality Task 10: dropped ``doc_prefix`` — :func:`build_retain_items`
+    content-addresses each turn (user_peer- or persona-identity-keyed), so
+    re-retain idempotency no longer needs a caller-scoped prefix, and the same
+    fact retained across delegations collapses to one document. ``classify_tier``
+    is passed by name so tests that monkeypatch ``delegated_memory.classify_tier``
+    still take effect. Best-effort; never raises."""
     if not writes_to_bank(origin_channel):
         return
-    items: list[dict[str, Any]] = []
-    for idx, (speaker, text) in enumerate(turns):
-        body = (text or "").strip()
-        if not body:
-            continue
-        tier = await classify_tier(body)
-        items.append({
-            "content": body,
-            "tags": [tier],
-            "metadata": {"speaker": speaker},
-            "document_id": f"{doc_prefix}:{idx}",
-        })
+    items = await build_retain_items(turns, classify=classify_tier)
     if not items:
         return
     try:
         await semantic_memory.retain(bank_id("casa"), items, async_=True)
     except Exception:  # noqa: BLE001 — best-effort background write
-        logger.warning("delegated retain failed (prefix=%s)", doc_prefix, exc_info=True)
+        logger.warning(
+            "delegated retain failed (origin_channel=%s)", origin_channel, exc_info=True,
+        )

@@ -1448,6 +1448,25 @@ async def _run_delegated_agent(
     # turn (async delegations especially), and a pooled client's origin_var
     # holder can be rewritten by the NEXT turn while this one is in flight.
     parent = _snapshot_origin()
+    from personality_types import RetainedTurn, SpeakerProvenance
+
+    # Task 10: the caller's REAL identity, read back off the origin snapshot
+    # Agent._process now stamps. Absent (a legacy/test ingress that predates this
+    # wiring, or the caller is itself an executor/unbound specialist) → the
+    # explicit unattributed "system" identity (every field null is a VALID
+    # provenance, speaker_provenance.py's system branch). NEVER fabricate a
+    # persona for the caller.
+    caller_provenance = parent.get("speaker_provenance")
+    if not isinstance(caller_provenance, SpeakerProvenance):
+        caller_provenance = SpeakerProvenance(speaker_kind="system")
+    # The EXECUTING agent's own identity, via the SAME cfg.kind-based fallback
+    # policy SessionRegistry.register's callers use (Task 9): a resident (or a
+    # bound specialist, once Plan 2 lands) keeps its real persona; an executor
+    # gets a stable executor identity; an unbound Plan-1 specialist gets the
+    # honest "system" identity — never mislabeled "executor:<slug>". One policy,
+    # not two; resolves itself when Plan 2 populates cfg.speaker_provenance.
+    executing_provenance = agent_mod.speaker_provenance_for_role(cfg)
+
     child_origin = {
         **parent,
         "delegation_depth": int(parent.get("delegation_depth", 0)) + 1,
@@ -1455,6 +1474,10 @@ async def _run_delegated_agent(
         # distinct from parent["role"] (the caller) — turn_provenance()
         # compares the two to classify this turn as "delegated".
         "execution_role": cfg.role,
+        # Mirrors execution_role: child_origin carries the EXECUTING agent's own
+        # provenance forward, not the caller's — so a NESTED delegation's
+        # "parent" sees the immediately-enclosing agent's identity.
+        "speaker_provenance": executing_provenance,
     }
 
     # Resolve caller display name; fall back to role.
@@ -1588,11 +1611,12 @@ async def _run_delegated_agent(
     if cfg.memory.token_budget > 0 and text:
         sem = getattr(agent_mod, "active_semantic_memory", None)
         if sem is not None:
-            cid = str(parent.get("cid", "-"))
             bg = asyncio.create_task(retain_delegated(
                 sem, origin_channel=str(parent.get("channel", "")),
-                doc_prefix=f"delegation:{cid}:{cfg.role}",
-                turns=[("user", task_text), ("assistant", text)],
+                turns=[
+                    RetainedTurn(task_text, caller_provenance),
+                    RetainedTurn(text, executing_provenance),
+                ],
             ))
             _specialist_bg_tasks.add(bg)
             bg.add_done_callback(_specialist_bg_tasks.discard)
@@ -4890,6 +4914,14 @@ async def _finalize_engagement(
     # promptly; the deferred-reload path below drains them first (H-1).
     retain_tasks: list[asyncio.Task] = []
     import agent as agent_mod
+    from personality_types import RetainedTurn, SpeakerProvenance
+    # Task 10: the structured summary is a platform record authored on behalf of
+    # the finalized engagement. Attribute it to the identity on the current
+    # origin snapshot when one is present; otherwise the honest, unattributed
+    # "system" identity — NEVER a fabricated persona.
+    _summary_prov = _snapshot_origin().get("speaker_provenance")
+    if not isinstance(_summary_prov, SpeakerProvenance):
+        _summary_prov = SpeakerProvenance(speaker_kind="system")
     sem = getattr(agent_mod, "active_semantic_memory", None)
     if sem is not None:
         summary = json.dumps({
@@ -4907,8 +4939,7 @@ async def _finalize_engagement(
         })
         bg = asyncio.create_task(retain_delegated(
             sem, origin_channel=str(engagement.origin.get("channel", "")),
-            doc_prefix=f"engagement:{engagement.id}:summary",
-            turns=[("assistant", summary)],
+            turns=[RetainedTurn(summary, _summary_prov)],
         ))
         _specialist_bg_tasks.add(bg)
         bg.add_done_callback(_specialist_bg_tasks.discard)
@@ -4949,8 +4980,9 @@ async def _finalize_engagement(
             )
 
     # Per-executor-type structured summary (only kind=executor), retained
-    # tier-tagged on the shared bank with a DISTINCT doc_prefix so it does not
-    # clobber the engagement_summary item above.
+    # tier-tagged on the shared bank. Its content differs from the engagement
+    # summary above, so its content-addressed document_id (Task 10) is distinct
+    # and the two never clobber each other.
     # `sem` is the active_semantic_memory resolved in step 5 above.
     if engagement.kind == "executor" and sem is not None:
         type_summary = json.dumps({
@@ -4968,8 +5000,7 @@ async def _finalize_engagement(
         })
         bg = asyncio.create_task(retain_delegated(
             sem, origin_channel=str(engagement.origin.get("channel", "")),
-            doc_prefix=f"engagement:{engagement.id}:executor_summary",
-            turns=[("assistant", type_summary)],
+            turns=[RetainedTurn(type_summary, _summary_prov)],
         ))
         _specialist_bg_tasks.add(bg)
         bg.add_done_callback(_specialist_bg_tasks.discard)

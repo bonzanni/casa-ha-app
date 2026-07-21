@@ -216,11 +216,16 @@ async def test_write_retain_telegram(monkeypatch):
     assert rc["bank"] == "casa"
     items = rc["items"]
     assert len(items) == 2  # user turn + assistant turn
-    assert items[0]["document_id"] == "delegation:cid42:finance:0"
-    assert items[1]["document_id"] == "delegation:cid42:finance:1"
+    # Task 10: content-addressed ids (the retired doc_prefix:idx scheme is gone).
+    # This fixture's origin carries no caller speaker_provenance and the cfg has
+    # no bound identity, so both parties fall back to the honest unattributed
+    # "system" identity → both ids live in the m-a- agent id space, distinct by
+    # their differing text.
+    assert all(i["document_id"].startswith("m-a-") for i in items)
+    assert items[0]["document_id"] != items[1]["document_id"]
     # classify stub: "cashflow" in user text → private; assistant text no → friends
-    assert items[0]["tags"] == ["private"]
-    assert items[1]["tags"] == ["friends"]
+    assert [i["tags"][0] for i in items] == ["private", "friends"]
+    assert all(sum(1 for t in i["tags"] if t.startswith("casa-source-")) == 1 for i in items)
 
 
 # ---------------------------------------------------------------------------
