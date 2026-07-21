@@ -815,6 +815,40 @@ def test_escaped_marker_in_examples_yaml_is_rejected(tmp_path: Path) -> None:
         load_persona_pack(pack, manifest_path)
 
 
+# ---------------------------------------------------------------------------
+# F-B (foundation review r3, P0): yaml.safe_load's own PARSER recurses on a
+# deeply-nested flow scalar well under any of the loader's size caps, so an
+# uncaught RecursionError crashed the loader before assert_json_safe (which
+# only runs AFTER parsing succeeds) ever got a chance to bound the depth.
+# ---------------------------------------------------------------------------
+
+
+def test_deeply_nested_flow_sequence_in_persona_yaml_raises_not_recursion_error(
+    tmp_path: Path,
+) -> None:
+    pack = write_pack(tmp_path)
+    (pack / "persona.yaml").write_text(
+        "[" * 2000 + "0" + "]" * 2000, encoding="utf-8"
+    )
+    manifest_path = tmp_path / "manifest.json"
+    write_valid_manifest(pack, manifest_path)
+    with pytest.raises(PersonaPackError):
+        load_persona_pack(pack, manifest_path)
+
+
+def test_deeply_nested_flow_sequence_in_examples_yaml_raises_not_recursion_error(
+    tmp_path: Path,
+) -> None:
+    pack = write_pack(tmp_path)
+    (pack / "examples.yaml").write_text(
+        "[" * 2000 + "0" + "]" * 2000, encoding="utf-8"
+    )
+    manifest_path = tmp_path / "manifest.json"
+    write_valid_manifest(pack, manifest_path)
+    with pytest.raises(PersonaPackError):
+        load_persona_pack(pack, manifest_path)
+
+
 def test_letter_angle_bracket_comparison_in_persona_yaml_fails(tmp_path: Path) -> None:
     # R3 (foundation review r2): HTML_TAG_OPEN_RE is deliberately
     # CONSERVATIVE for a trust boundary — it rejects "<" followed (even

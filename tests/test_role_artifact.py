@@ -308,10 +308,28 @@ class TestSchemaValidation:
             load_role_artifact(d)
 
     def test_malformed_yaml_raises(self, tmp_path):
+        # F-B (foundation review r3): the loader now catches yaml.YAMLError
+        # itself and re-raises ValueError (rather than leaking the yaml
+        # exception type), so malformed YAML crashes are folded into the
+        # same generic ValueError as every other parse-step rejection.
         d = write_role_dir(
             tmp_path, role_yaml_text="api_version: [unterminated\n",
         )
-        with pytest.raises(yaml.YAMLError):
+        with pytest.raises(ValueError):
+            load_role_artifact(d)
+
+    def test_deeply_nested_flow_sequence_raises_value_error_not_recursion_error(
+        self, tmp_path
+    ):
+        # F-B (foundation review r3, P0): yaml.safe_load's own PARSER
+        # recurses on a deeply-nested flow scalar, well under the 64KB
+        # role.yaml size cap, so an uncaught RecursionError crashed the
+        # loader before assert_json_safe (which runs AFTER parsing) ever
+        # got a chance to bound the depth.
+        d = write_role_dir(
+            tmp_path, role_yaml_text="[" * 2000 + "0" + "]" * 2000,
+        )
+        with pytest.raises(ValueError):
             load_role_artifact(d)
 
 

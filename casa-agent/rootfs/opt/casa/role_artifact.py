@@ -89,7 +89,17 @@ def load_role_artifact(role_dir: Path) -> RoleArtifactSource:
     doctrine_path = admitted["doctrine.md"]
 
     role_text = canonical_text(role_path.read_text(encoding="utf-8"))
-    raw = yaml.safe_load(role_text)
+    try:
+        raw = yaml.safe_load(role_text)
+    except (yaml.YAMLError, RecursionError) as exc:
+        # F-B (foundation review r3, P0): a hostile deeply-nested flow
+        # scalar (e.g. "[" * 2000 + "0" + "]" * 2000), well under
+        # MAX_ROLE_YAML_BYTES, makes yaml's own PARSER recurse — this
+        # happens INSIDE yaml.safe_load, before assert_json_safe below
+        # (which only bounds depth in the ALREADY-PARSED tree) ever runs.
+        # Fold both a genuine YAML syntax error and a parser RecursionError
+        # into the same generic, fail-closed ValueError.
+        raise ValueError("role.yaml contains invalid or unparseable YAML") from exc
     # R1 (foundation review r2): yaml.safe_load can yield non-JSON-native
     # types (set/bytes/datetime/cyclic) via YAML tags/aliases that
     # role.v1.json's schema-open fields admit. Assert the parsed tree is

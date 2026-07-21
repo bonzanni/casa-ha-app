@@ -103,7 +103,19 @@ def load_persona_pack(pack_dir: Path, manifest_path: Path) -> PersonaPack:
             "checksum": checksum_bytes(text.encode("utf-8")),
         })
 
-    persona = yaml.safe_load(canonical_files["persona.yaml"])
+    try:
+        persona = yaml.safe_load(canonical_files["persona.yaml"])
+    except (yaml.YAMLError, RecursionError) as exc:
+        # F-B (foundation review r3, P0): a hostile deeply-nested flow
+        # scalar makes yaml's own PARSER recurse, well under any size cap
+        # here — this happens INSIDE yaml.safe_load, before
+        # assert_json_safe below (which only bounds depth in the
+        # ALREADY-PARSED tree) ever runs. Fold both a genuine YAML syntax
+        # error and a parser RecursionError into the same generic,
+        # fail-closed PersonaPackError.
+        raise PersonaPackError(
+            "persona.yaml contains invalid or unparseable YAML"
+        ) from exc
     # R1 (foundation review r2): guarantees freeze-soundness (deep_freeze
     # below) and rejects any non-JSON type (set/bytes/datetime/cyclic) a
     # YAML tag/alias could otherwise smuggle through yaml.safe_load.
@@ -147,7 +159,14 @@ def load_persona_pack(pack_dir: Path, manifest_path: Path) -> PersonaPack:
 
     examples = ()
     if "examples.yaml" in canonical_files:
-        raw_examples = yaml.safe_load(canonical_files["examples.yaml"])
+        try:
+            raw_examples = yaml.safe_load(canonical_files["examples.yaml"])
+        except (yaml.YAMLError, RecursionError) as exc:
+            # F-B (foundation review r3, P0): same parser-recursion hazard
+            # as persona.yaml above.
+            raise PersonaPackError(
+                "examples.yaml contains invalid or unparseable YAML"
+            ) from exc
         try:
             assert_json_safe(raw_examples)
         except ValueError as exc:
