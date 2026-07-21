@@ -30,6 +30,8 @@ from job_registry import (
 )
 from personality_binding import InstanceDir
 from personality_types import SpeakerProvenance
+# Forward re-export for future Plan 2 / Task 14 callers (module-level-accessor
+# precedent this file already follows, e.g. _active_index below).
 from specialist_lifecycle import InstanceState, SpecialistInstance, check_slug_uniqueness  # noqa: F401
 
 logger = logging.getLogger(__name__)

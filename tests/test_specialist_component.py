@@ -86,11 +86,18 @@ _DOCTRINE = textwrap.dedent("""\
 def _build_component_dir(
     tmp_path: Path, *, slug: str = "mtg", kind: str = "specialist",
     dependencies: list[dict[str, str]] | None = None,
+    role_slug: str | None = None,
 ) -> tuple[Path, Path]:
+    # role_slug lets a caller desync the role artifact's own slot/id from the
+    # manifest's component_id (which stays a valid "casa/<slug>") — needed to
+    # exercise an invalid ROLE slug without also tripping the unrelated
+    # manifest-schema component_id pattern.
     component_dir = tmp_path / "component"
     role_dir = component_dir / "role"
     role_dir.mkdir(parents=True)
-    (role_dir / "role.yaml").write_text(_role_yaml(kind=kind, slug=slug), encoding="utf-8")
+    (role_dir / "role.yaml").write_text(
+        _role_yaml(kind=kind, slug=role_slug if role_slug is not None else slug), encoding="utf-8",
+    )
     (role_dir / "doctrine.md").write_text(_DOCTRINE, encoding="utf-8")
     config_schema = {"required": ["api_base"], "secret_names": []}
     (component_dir / "config-schema.json").write_text(
@@ -171,6 +178,25 @@ def test_load_specialist_component_rejects_non_specialist_role_kind(tmp_path: Pa
     component_dir, manifest_path = _build_component_dir(tmp_path, slug="mtg", kind="executor")
 
     with pytest.raises(ValueError, match="kind: specialist"):
+        load_specialist_component(component_dir, manifest_path)
+
+
+def test_load_specialist_component_rejects_invalid_role_slug(tmp_path: Path) -> None:
+    # End-to-end regression guard for the invariant that a specialist
+    # component whose role declares an invalid slug can never load — even
+    # though specialist_component.py's own _SLUG_RE.fullmatch(slug) check
+    # (specialist_component.py:58) is redundant with role.v1.json's
+    # identical `slot` pattern, enforced upstream by load_role_artifact's
+    # jsonschema.validate. Confirmed by direct observation: the raised error
+    # is a ValueError from role_artifact.load_role_artifact wrapping
+    # jsonschema's ValidationError ("role schema validation failed: ...
+    # does not match '^[a-z0-9][a-z0-9-]*$'") — this fires BEFORE
+    # specialist_component.py's own redundant slug check ever runs.
+    component_dir, manifest_path = _build_component_dir(
+        tmp_path, slug="mtg", kind="specialist", role_slug="Bad_Slug",
+    )
+
+    with pytest.raises(ValueError, match="does not match"):
         load_specialist_component(component_dir, manifest_path)
 
 
