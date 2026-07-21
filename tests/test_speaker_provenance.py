@@ -759,6 +759,37 @@ def test_nesting_depth_over_limit_is_rejected_by_depth_guard() -> None:
 
 
 # ---------------------------------------------------------------------------
+# FIX 2 (foundation review, P1): base64url decoding must be canonical —
+# non-alphabet characters spliced into an otherwise-valid payload (silently
+# ignored by base64.urlsafe_b64decode, so they decode to the SAME bytes)
+# must be rejected rather than accepted as an alternate spelling of a valid
+# tag.
+# ---------------------------------------------------------------------------
+
+
+def test_non_canonical_base64_spelling_is_rejected() -> None:
+    valid_tag = encode_provenance_tag(user())
+    payload = valid_tag[len(RESERVED_SOURCE_PREFIX):]
+    assert len(payload) % 4 != 1  # inserting 4 chars preserves this
+    mid = len(payload) // 2
+    spliced_payload = payload[:mid] + "!!!!" + payload[mid:]
+    spliced_tag = RESERVED_SOURCE_PREFIX + spliced_payload
+
+    # Sanity: the splice really does decode to the same bytes (confirms the
+    # vulnerability this test guards against, independent of our fix).
+    padding = "=" * (-len(spliced_payload) % 4)
+    assert base64.urlsafe_b64decode(spliced_payload + padding) == base64.urlsafe_b64decode(
+        payload + "=" * (-len(payload) % 4)
+    )
+
+    provenance, reason = decode_provenance_from_tags((spliced_tag,))
+    assert provenance is None
+    assert reason == "malformed"
+    with pytest.raises(ValueError):
+        decode_provenance_tag(spliced_tag)
+
+
+# ---------------------------------------------------------------------------
 # JSON Schema drift guard: the schema and the Python validator must agree.
 # ---------------------------------------------------------------------------
 

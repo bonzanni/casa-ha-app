@@ -210,6 +210,13 @@ def decode_provenance_tag(tag: str) -> SpeakerProvenance:
         wire = base64.urlsafe_b64decode(payload + "=" * (-len(payload) % 4))
         if len(wire) > MAX_CANONICAL_PROVENANCE_BYTES:
             raise ValueError("canonical provenance payload exceeds 2048 bytes")
+        # FIX 2: base64.urlsafe_b64decode (validate=False) silently drops
+        # any character outside the base64url alphabet, so a payload with
+        # junk spliced in can decode to the SAME bytes as the canonical
+        # spelling encode_provenance_tag would have produced. Require the
+        # payload to be that one canonical spelling.
+        if base64.urlsafe_b64encode(wire).decode("ascii").rstrip("=") != payload:
+            raise ValueError("invalid provenance payload")
         # FIX 1: bound nesting depth before trusting the parser — a cheap
         # hostile payload (deeply nested arrays) can otherwise blow the
         # interpreter's recursion limit inside json.loads.
