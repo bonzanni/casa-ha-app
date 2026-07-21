@@ -719,6 +719,9 @@ def test_img_tag_in_examples_yaml_fails(tmp_path: Path) -> None:
 
 
 def test_benign_angle_bracket_comparison_in_persona_yaml_still_loads(tmp_path: Path) -> None:
+    # NUMERIC right-hand side: HTML_TAG_OPEN_RE requires a LETTER after the
+    # (optionally whitespace-separated) '<', so "2 < 3" never matches it —
+    # this is the one prose form of "<" that is guaranteed to load.
     pack = write_pack(tmp_path)
     data = valid_yaml()
     data["quirks"] = [{
@@ -731,6 +734,28 @@ def test_benign_angle_bracket_comparison_in_persona_yaml_still_loads(tmp_path: P
     write_valid_manifest(pack, manifest_path)
     result = load_persona_pack(pack, manifest_path)
     assert result.quirks[0]["context"] == "Notices when 2 < 3 in a casual aside."
+
+
+def test_letter_angle_bracket_comparison_in_persona_yaml_fails(tmp_path: Path) -> None:
+    # R3 (foundation review r2): HTML_TAG_OPEN_RE is deliberately
+    # CONSERVATIVE for a trust boundary — it rejects "<" followed (even
+    # across whitespace) by a LETTER, so "a < b" is rejected, unlike the
+    # numeric "2 < 3" case above. This pins that contrast explicitly so
+    # the module's documented behavior and this test never drift apart
+    # again (a prior version of this comment/test only proved the numeric
+    # case, leaving the letter case's rejection undocumented).
+    pack = write_pack(tmp_path)
+    data = valid_yaml()
+    data["quirks"] = [{
+        "frequency": "occasional",
+        "context": "Notices when a < b in a casual aside.",
+        "tendency": "tendency-0",
+    }]
+    (pack / "persona.yaml").write_text(yaml.safe_dump(data, sort_keys=False), encoding="utf-8")
+    manifest_path = tmp_path / "manifest.json"
+    write_valid_manifest(pack, manifest_path)
+    with pytest.raises(PersonaPackError, match="template, include, HTML, or delimiter"):
+        load_persona_pack(pack, manifest_path)
 
 
 # ===========================================================================
