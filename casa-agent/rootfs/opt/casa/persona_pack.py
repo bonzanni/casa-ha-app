@@ -32,6 +32,10 @@ _OPTIONAL = {"examples.yaml"}
 MAX_PERSONA_YAML_BYTES = 65536
 MAX_PERSONA_MD_BYTES = 262144
 MAX_EXAMPLES_BYTES = 65536
+# J1 (foundation review r6): checked via stat() BEFORE read/parse, so a
+# fetched manifest.json can't force an unbounded read/parse allocation —
+# mirrors the pack-file size caps above.
+MAX_MANIFEST_BYTES = 65536
 _FILE_SIZE_CAPS: dict[str, int] = {
     "persona.yaml": MAX_PERSONA_YAML_BYTES,
     "persona.md": MAX_PERSONA_MD_BYTES,
@@ -238,13 +242,27 @@ def load_persona_pack(pack_dir: Path, manifest_path: Path) -> PersonaPack:
     }
     manifest_checksum = checksum_bytes(canonical_json_bytes(manifest_payload))
     manifest_payload["checksum"] = manifest_checksum
+    # J1 (foundation review r6, P0): a manifest.json well under any prior
+    # cap could still be a hostile deeply-nested JSON document (e.g.
+    # "[" * N + "0" + "]" * N) — json.loads's own parser recurses on it,
+    # raising a raw RecursionError that escaped this boundary entirely.
+    # Cap the file size (checked via stat(), before any read) the same way
+    # the admitted pack files are capped, and fold RecursionError into the
+    # same generic PersonaPackError as every other manifest-read/parse
+    # rejection below.
+    try:
+        manifest_size = manifest_path.stat().st_size
+    except OSError as exc:
+        raise PersonaPackError(f"persona manifest could not be read: {exc}") from exc
+    if manifest_size > MAX_MANIFEST_BYTES:
+        raise PersonaPackError("persona manifest file too large")
     try:
         # H2 (foundation review r5): UnicodeDecodeError was not caught
         # here alongside OSError/json.JSONDecodeError, so an invalid UTF-8
         # byte in manifest.json escaped this boundary as a raw
         # UnicodeDecodeError instead of PersonaPackError.
         expected_manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
-    except (OSError, json.JSONDecodeError, UnicodeDecodeError) as exc:
+    except (OSError, json.JSONDecodeError, UnicodeDecodeError, RecursionError) as exc:
         raise PersonaPackError(f"persona manifest could not be read: {exc}") from exc
     if expected_manifest != manifest_payload:
         raise PersonaPackError("persona manifest does not match admitted files")

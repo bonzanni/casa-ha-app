@@ -460,8 +460,11 @@ def test_manifest_mismatch_fails(tmp_path: Path) -> None:
 
 
 def test_missing_manifest_file_fails(tmp_path: Path) -> None:
+    # J3 (foundation review r6): the loader's error boundary is now TOTAL —
+    # a missing manifest file must raise ONLY PersonaPackError, never a raw
+    # OSError/FileNotFoundError escaping the boundary.
     pack = write_pack(tmp_path)
-    with pytest.raises((PersonaPackError, OSError)):
+    with pytest.raises(PersonaPackError):
         load_persona_pack(pack, tmp_path / "does-not-exist.json")
 
 
@@ -502,6 +505,40 @@ def test_invalid_utf8_byte_in_manifest_fails_with_persona_pack_error(
     manifest_path = tmp_path / "manifest.json"
     manifest_path.write_bytes(b'{"api_version": "casa.persona.manifest/v1", \xff}')
     with pytest.raises(PersonaPackError):
+        load_persona_pack(pack, manifest_path)
+
+
+def test_manifest_deeply_nested_json_raises_persona_pack_error_not_recursion_error(
+    tmp_path: Path,
+) -> None:
+    # J1 (foundation review r6, P0): a manifest.json containing a deeply
+    # nested JSON array is valid JSON well under MAX_MANIFEST_BYTES, but
+    # json.loads's own parser recurses on it — the loader must fold that
+    # into PersonaPackError rather than let a raw RecursionError escape.
+    # Depth 20000 (~40KB, still under the 65536-byte manifest cap) reliably
+    # triggers CPython's json decoder RecursionError on this build; a
+    # shallower depth (e.g. 2000) does not.
+    pack = write_pack(tmp_path)
+    manifest_path = tmp_path / "manifest.json"
+    depth = 20000
+    manifest_path.write_text("[" * depth + "0" + "]" * depth, encoding="utf-8")
+    with pytest.raises(PersonaPackError):
+        load_persona_pack(pack, manifest_path)
+
+
+def test_oversized_manifest_file_fails(tmp_path: Path) -> None:
+    # J1 (foundation review r6): a size cap on manifest.json, checked via
+    # stat() BEFORE read/parse, so an oversized fetched manifest can't force
+    # an unbounded read/parse allocation.
+    pack = write_pack(tmp_path)
+    manifest_path = tmp_path / "manifest.json"
+    payload = {
+        "api_version": "casa.persona.manifest/v1",
+        "files": [],
+        "pad": "a" * 70_000,
+    }
+    manifest_path.write_text(json.dumps(payload), encoding="utf-8")
+    with pytest.raises(PersonaPackError, match="too large"):
         load_persona_pack(pack, manifest_path)
 
 
