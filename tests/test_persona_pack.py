@@ -306,6 +306,60 @@ def test_fifo_in_pack_fails(tmp_path: Path) -> None:
 
 
 # ---------------------------------------------------------------------------
+# G1 (foundation review r4, P0): role_artifact.py caps role.yaml/doctrine.md
+# by st_size BEFORE read_text; persona_pack.py's _admit_files had no such
+# cap, so a huge persona.yaml/persona.md/examples.yaml would be read fully
+# into memory (and then normalized/scanned/checksummed) before schema
+# rejection ever ran — an OOM vector for an untrusted pack. Mirrors
+# test_role_artifact.py's TestAdversarialTrustGate oversized-file tests.
+# ---------------------------------------------------------------------------
+
+
+def test_oversized_persona_yaml_fails(tmp_path: Path) -> None:
+    from persona_pack import MAX_PERSONA_YAML_BYTES
+
+    pack = write_pack(tmp_path)
+    data = valid_yaml()
+    data["identity"]["display_name"] = "A" * MAX_PERSONA_YAML_BYTES
+    (pack / "persona.yaml").write_text(
+        yaml.safe_dump(data, sort_keys=False), encoding="utf-8"
+    )
+    assert (pack / "persona.yaml").stat().st_size > MAX_PERSONA_YAML_BYTES
+    with pytest.raises(PersonaPackError):
+        load_persona_pack(pack, tmp_path / "manifest.json")
+
+
+def test_oversized_persona_md_fails(tmp_path: Path) -> None:
+    from persona_pack import MAX_PERSONA_MD_BYTES
+
+    pack = write_pack(tmp_path)
+    (pack / "persona.md").write_text(
+        core() + "A" * MAX_PERSONA_MD_BYTES, encoding="utf-8"
+    )
+    assert (pack / "persona.md").stat().st_size > MAX_PERSONA_MD_BYTES
+    with pytest.raises(PersonaPackError):
+        load_persona_pack(pack, tmp_path / "manifest.json")
+
+
+def test_oversized_examples_yaml_fails(tmp_path: Path) -> None:
+    from persona_pack import MAX_EXAMPLES_BYTES
+
+    pack = write_pack(tmp_path)
+    examples_payload = {
+        "api_version": "casa.persona.examples/v1",
+        "examples": [
+            {"surface": "text", "user": "hi", "good": "A" * MAX_EXAMPLES_BYTES, "bad": "x"},
+        ],
+    }
+    (pack / "examples.yaml").write_text(
+        yaml.safe_dump(examples_payload, sort_keys=False), encoding="utf-8"
+    )
+    assert (pack / "examples.yaml").stat().st_size > MAX_EXAMPLES_BYTES
+    with pytest.raises(PersonaPackError):
+        load_persona_pack(pack, tmp_path / "manifest.json")
+
+
+# ---------------------------------------------------------------------------
 # Manifest verification
 # ---------------------------------------------------------------------------
 

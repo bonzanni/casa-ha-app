@@ -23,6 +23,20 @@ from yaml_safety import load_yaml_no_aliases
 
 _REQUIRED = {"persona.yaml", "persona.md"}
 _OPTIONAL = {"examples.yaml"}
+
+# Byte-size caps checked BEFORE read_text, so a hostile pack can't force an
+# unbounded allocation — mirrors role_artifact.py's MAX_ROLE_YAML_BYTES /
+# MAX_DOCTRINE_BYTES pattern (foundation review r4, G1). persona.yaml and
+# examples.yaml are small structured files; persona.md is free-form prose
+# but still bounded generously, at the same scale as doctrine.md.
+MAX_PERSONA_YAML_BYTES = 65536
+MAX_PERSONA_MD_BYTES = 262144
+MAX_EXAMPLES_BYTES = 65536
+_FILE_SIZE_CAPS: dict[str, int] = {
+    "persona.yaml": MAX_PERSONA_YAML_BYTES,
+    "persona.md": MAX_PERSONA_MD_BYTES,
+    "examples.yaml": MAX_EXAMPLES_BYTES,
+}
 _AXES = {
     "warmth", "formality", "candor", "attunement",
     "curiosity", "levity", "social_energy", "optimism",
@@ -69,6 +83,8 @@ def _admit_files(pack_dir: Path) -> tuple[Path, ...]:
             raise PersonaPackError(f"hard-linked persona file: {path.name}")
         if info.st_mode & 0o111:
             raise PersonaPackError(f"executable persona file: {path.name}")
+        if info.st_size > _FILE_SIZE_CAPS[path.name]:
+            raise PersonaPackError(f"persona file too large: {path.name}")
         admitted.append(path)
     return tuple(admitted)
 
