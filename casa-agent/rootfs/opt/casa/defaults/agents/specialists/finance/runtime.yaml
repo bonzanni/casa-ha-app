@@ -1,5 +1,6 @@
 schema_version: 1
-model: sonnet
+kind: specialist
+model: {source: fixed, value: sonnet}
 enabled: false
 tools:
   allowed: [Read, Skill, mcp__casa-framework__get_schedule, mcp__casa-framework__send_media, mcp__casa-framework__ask_user]

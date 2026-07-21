@@ -191,8 +191,12 @@ export CASA_IMAGE_VERSION="$(bashio::addon.version 2>/dev/null || echo unknown)"
 # validator saw the literal "${...}" and reported a bogus "Unknown model
 # shortname" in config-sync-report.json. Export them here for env-parity with
 # boot so the validation is faithful (a genuinely bad model still fails).
-export PRIMARY_AGENT_MODEL="$(bashio::config 'primary_agent_model')"
-export VOICE_AGENT_MODEL="$(bashio::config 'voice_agent_model')"
+_casa_primary_model="$(bashio::config 'primary_agent_model')"
+_casa_voice_model="$(bashio::config 'voice_agent_model')"
+[ -n "$_casa_primary_model" ] && [ "$_casa_primary_model" != "null" ] || _casa_primary_model=opus
+[ -n "$_casa_voice_model" ] && [ "$_casa_voice_model" != "null" ] || _casa_voice_model=haiku
+export PRIMARY_AGENT_MODEL="$_casa_primary_model"
+export VOICE_AGENT_MODEL="$_casa_voice_model"
 python3 /opt/casa/config_sync.py || bashio::log.warning "config_sync exited non-zero (non-fatal)"
 
 # Initialize session registry if missing
