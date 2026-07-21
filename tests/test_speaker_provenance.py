@@ -712,6 +712,53 @@ def test_sole_unsupported_version_tag_rejected() -> None:
 
 
 # ---------------------------------------------------------------------------
+# FIX 1 (foundation review, P0): a deeply-nested-array payload must never
+# escape decode_provenance_tag/decode_provenance_from_tags as a raw
+# RecursionError — it must fail closed as the same malformed-provenance
+# ValueError, both via an explicit depth bound checked BEFORE json.loads
+# and (defense in depth) a broadened except clause.
+# ---------------------------------------------------------------------------
+
+
+def _nested_array_wire(depth: int) -> bytes:
+    return b"[" * depth + b"0" + b"]" * depth
+
+
+def test_hostile_deeply_nested_payload_is_malformed_not_a_crash() -> None:
+    wire = _nested_array_wire(1000)
+    assert len(wire) < MAX_CANONICAL_PROVENANCE_BYTES
+    tag = _tag_from_wire(wire)
+
+    provenance, reason = decode_provenance_from_tags((tag,))
+    assert provenance is None
+    assert reason == "malformed"
+
+    with pytest.raises(ValueError) as exc_info:
+        decode_provenance_tag(tag)
+    assert not isinstance(exc_info.value, RecursionError)
+
+
+def test_nesting_depth_at_limit_is_not_rejected_by_depth_guard() -> None:
+    """Depth exactly at the bound must clear the depth guard — json.loads
+    then runs and the payload is rejected for a DIFFERENT reason (it's an
+    array, not a provenance object), proving the depth check itself did
+    not trip."""
+    from speaker_provenance import MAX_PROVENANCE_JSON_DEPTH
+
+    tag = _tag_from_wire(_nested_array_wire(MAX_PROVENANCE_JSON_DEPTH))
+    with pytest.raises(ValueError, match="provenance must be an object"):
+        decode_provenance_tag(tag)
+
+
+def test_nesting_depth_over_limit_is_rejected_by_depth_guard() -> None:
+    from speaker_provenance import MAX_PROVENANCE_JSON_DEPTH
+
+    tag = _tag_from_wire(_nested_array_wire(MAX_PROVENANCE_JSON_DEPTH + 1))
+    with pytest.raises(ValueError, match="invalid provenance payload"):
+        decode_provenance_tag(tag)
+
+
+# ---------------------------------------------------------------------------
 # JSON Schema drift guard: the schema and the Python validator must agree.
 # ---------------------------------------------------------------------------
 

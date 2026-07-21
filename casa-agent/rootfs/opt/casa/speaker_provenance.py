@@ -24,6 +24,13 @@ _CHECKSUM_RE = re.compile(r"^sha256:[0-9a-f]{64}$")
 _SEMVER_RE = re.compile(r"^(0|[1-9]\d*)\.(0|[1-9]\d*)\.(0|[1-9]\d*)$")
 MAX_CANONICAL_PROVENANCE_BYTES = 2048
 MAX_ENCODED_PROVENANCE_TAG_BYTES = 2746
+# Provenance JSON is a flat mapping of scalar fields — 32 levels of
+# array/object nesting is already generous. Enforced as an explicit
+# byte-level scan BEFORE json.loads so a hostile-but-cheap payload (e.g.
+# ~1000 nested arrays) is rejected as malformed rather than relying on the
+# interpreter's own recursion limit, which raises RecursionError — not a
+# ValueError, so it would otherwise escape this module's error contract.
+MAX_PROVENANCE_JSON_DEPTH = 32
 _FIELD_LIMITS = {
     "role_id": (128, 128),
     "persona_id": (192, 192),
@@ -160,6 +167,33 @@ def encode_provenance_tag(value: SpeakerProvenance) -> str:
     return tag
 
 
+def _reject_excessive_json_nesting(wire: bytes, limit: int) -> None:
+    """Reject *wire* if its bracket/brace nesting depth exceeds *limit*,
+    scanning raw bytes so this never itself recurses. String contents are
+    skipped (tracking quote/escape state) so a bracket character inside a
+    JSON string value is not mistaken for structural nesting."""
+    depth = 0
+    in_string = False
+    escaped = False
+    for byte in wire:
+        if in_string:
+            if escaped:
+                escaped = False
+            elif byte == 0x5C:  # backslash
+                escaped = True
+            elif byte == 0x22:  # double quote
+                in_string = False
+            continue
+        if byte == 0x22:  # double quote
+            in_string = True
+        elif byte in (0x7B, 0x5B):  # '{' or '['
+            depth += 1
+            if depth > limit:
+                raise ValueError("invalid provenance payload")
+        elif byte in (0x7D, 0x5D):  # '}' or ']'
+            depth -= 1
+
+
 def decode_provenance_tag(tag: str) -> SpeakerProvenance:
     if not isinstance(tag, str) or not tag.isascii():
         raise ValueError("provenance tag must be ASCII")
@@ -176,8 +210,12 @@ def decode_provenance_tag(tag: str) -> SpeakerProvenance:
         wire = base64.urlsafe_b64decode(payload + "=" * (-len(payload) % 4))
         if len(wire) > MAX_CANONICAL_PROVENANCE_BYTES:
             raise ValueError("canonical provenance payload exceeds 2048 bytes")
+        # FIX 1: bound nesting depth before trusting the parser — a cheap
+        # hostile payload (deeply nested arrays) can otherwise blow the
+        # interpreter's recursion limit inside json.loads.
+        _reject_excessive_json_nesting(wire, MAX_PROVENANCE_JSON_DEPTH)
         raw = json.loads(wire)
-    except (ValueError, UnicodeDecodeError) as exc:
+    except (ValueError, UnicodeDecodeError, RecursionError) as exc:
         raise ValueError("invalid provenance payload") from exc
     if wire != canonical_json_bytes(raw):
         raise ValueError("provenance payload is not canonical RFC 8785 JSON")
