@@ -2033,8 +2033,18 @@ async def main() -> None:
         resident ever sets a non-empty ``config.cwd``, its transcript lands
         there instead and the reaper/save would look in the wrong dir; keep
         ``config.cwd`` empty for residents. (Formula also duplicated in
-        session_sweeper/session_saver/agent.py — consolidate in a cleanup.)"""
-        return f"/config/agent-home/{role}"
+        session_sweeper/session_saver/agent.py — consolidate in a cleanup.)
+
+        Task 9: the reaper/sweeper read the stored ``agent`` field, which now
+        holds the canonical role_id (``resident:butler``). Route it through
+        ``agent_home_for_role_id`` (which returns the SAME bare-slug path
+        agent.py writes transcripts to); a legacy short-role entry falls back
+        to the bare-slug formula."""
+        from agent import agent_home_for_role_id
+        try:
+            return agent_home_for_role_id(role)
+        except ValueError:
+            return f"/config/agent-home/{role}"
 
     # 3. Message bus
     bus = MessageBus()

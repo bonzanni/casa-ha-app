@@ -11,13 +11,20 @@ from unittest.mock import AsyncMock, patch
 import pytest
 
 import retry as retry_mod
-from agent import Agent
+from agent import Agent, ResumeDecision
 from bus import BusMessage, MessageType
 from channels import ChannelManager
 from config import AgentConfig, CharacterConfig, MemoryConfig, ToolsConfig
 from mcp_registry import McpServerRegistry
 from semantic_memory import SemanticMemory
 from session_registry import SessionRegistry, build_scoped_session_key
+from session_reg_helpers import (
+    RESIDENT_DIGEST,
+    STUB_SPEAKER_PROV,
+    STUB_USER_PROV,
+    resident_prov,
+    resident_role_id,
+)
 
 from claude_agent_sdk import (
     AssistantMessage as _SDKAssistantMessage,
@@ -233,7 +240,7 @@ def _make_agent(
     role: str = "assistant",
     semantic_memory: SemanticMemory | None = None,
 ) -> Agent:
-    cfg = AgentConfig(role_artifact=STUB_ROLE_ARTIFACT, 
+    cfg = AgentConfig(role_artifact=STUB_ROLE_ARTIFACT,
         role=role,
         model="claude-sonnet-4-6",
         system_prompt="You are helpful.",
@@ -243,6 +250,12 @@ def _make_agent(
             token_budget=1000,
             read_strategy="per_turn",
         ),
+        # Task 9: a real resident identity triple so session registration and
+        # the resume gate operate on canonical {role_id, binding_digest}.
+        role_id=resident_role_id(role),
+        kind="resident",
+        binding_digest=RESIDENT_DIGEST,
+        speaker_provenance=resident_prov(role),
     )
     return Agent(
         config=cfg,
@@ -546,7 +559,7 @@ async def test_system_prompt_memory_context_only_when_nonempty(tmp_path):
     # live pool decision hook instead to force a fresh session (assertions
     # unchanged; §4.3 recall fires only on is_fresh).
     with patch("sdk_client_pool._default_make_client", FakeClient), \
-         patch.object(agent2._pool, "_decide", return_value=("new", False)):
+         patch.object(agent2._pool, "_decide", return_value=ResumeDecision("new", None, False, None, "missing")):
         await agent2._process(_msg("telegram", "123", "hi"))
     prompt2 = FakeClient.captured_options.system_prompt
     assert "<memory_context>" in prompt2
@@ -1113,7 +1126,7 @@ class TestTokenBudgetMonitoring:
         # captured ``decide`` by reference at construction, so patching the
         # module-level ``agent._resume_decision`` would not reach it.
         with patch("sdk_client_pool._default_make_client", FakeClient), \
-             patch.object(agent._pool, "_decide", return_value=("new", False)):
+             patch.object(agent._pool, "_decide", return_value=ResumeDecision("new", None, False, None, "missing")):
             for _ in range(5):
                 await agent._process(_msg("telegram", "123", "hi"))
 
@@ -1214,7 +1227,7 @@ def _make_agent_with_registry(
     """Like _make_agent, but takes a pre-constructed SessionRegistry so
     tests can pre-populate entries.
     """
-    cfg = AgentConfig(role_artifact=STUB_ROLE_ARTIFACT, 
+    cfg = AgentConfig(role_artifact=STUB_ROLE_ARTIFACT,
         role=role,
         model="claude-sonnet-4-6",
         system_prompt="You are helpful.",
@@ -1224,6 +1237,11 @@ def _make_agent_with_registry(
             token_budget=1000,
             read_strategy="per_turn",
         ),
+        # Task 9: real resident identity triple (see _make_agent).
+        role_id=resident_role_id(role),
+        kind="resident",
+        binding_digest=RESIDENT_DIGEST,
+        speaker_provenance=resident_prov(role),
     )
     return Agent(
         config=cfg,
@@ -1251,7 +1269,10 @@ class TestResumeResilience:
         reg = SessionRegistry(str(tmp_path / "sessions.json"))
         await reg.register(
             build_scoped_session_key("voice", "butler", "probe-scope"),
-            "butler", "stale-sid-abc",
+            resident_role_id("butler"), "stale-sid-abc",
+            binding_digest=RESIDENT_DIGEST,
+            speaker_provenance=resident_prov("butler"),
+            user_provenance=STUB_USER_PROV,
         )
 
         agent = _make_agent_with_registry(reg, role="butler")
@@ -1284,7 +1305,10 @@ class TestResumeResilience:
         reg = SessionRegistry(str(tmp_path / "sessions.json"))
         await reg.register(
             build_scoped_session_key("telegram", "butler", "202"),
-            "butler", "STALE-SID-1",
+            resident_role_id("butler"), "STALE-SID-1",
+            binding_digest=RESIDENT_DIGEST,
+            speaker_provenance=resident_prov("butler"),
+            user_provenance=STUB_USER_PROV,
         )
 
         agent = _make_agent_with_registry(reg, role="butler")
@@ -1328,7 +1352,10 @@ class TestResumeResilience:
         reg = SessionRegistry(str(tmp_path / "sessions.json"))
         await reg.register(
             build_scoped_session_key("voice", "butler", "probe-scope"),
-            "butler", "stale-sid-abc",
+            resident_role_id("butler"), "stale-sid-abc",
+            binding_digest=RESIDENT_DIGEST,
+            speaker_provenance=resident_prov("butler"),
+            user_provenance=STUB_USER_PROV,
         )
 
         agent = _make_agent_with_registry(reg, role="butler")
@@ -1376,7 +1403,10 @@ class TestResumeResilience:
         reg = SessionRegistry(str(tmp_path / "sessions.json"))
         await reg.register(
             build_scoped_session_key("voice", "butler", "probe-scope"),
-            "butler", "stale-sid-xyz",
+            resident_role_id("butler"), "stale-sid-xyz",
+            binding_digest=RESIDENT_DIGEST,
+            speaker_provenance=resident_prov("butler"),
+            user_provenance=STUB_USER_PROV,
         )
 
         agent = _make_agent_with_registry(reg, role="butler")
@@ -1404,7 +1434,12 @@ class TestResumeResilience:
 
         reg = SessionRegistry(str(tmp_path / "sessions.json"))
         expected_channel_key = build_scoped_session_key("voice", "butler", "probe-scope")
-        await reg.register(expected_channel_key, "butler", "stale-sid-xyz")
+        await reg.register(
+            expected_channel_key, resident_role_id("butler"), "stale-sid-xyz",
+            binding_digest=RESIDENT_DIGEST,
+            speaker_provenance=resident_prov("butler"),
+            user_provenance=STUB_USER_PROV,
+        )
 
         agent = _make_agent_with_registry(reg, role="butler")
 
@@ -1875,15 +1910,21 @@ class TestSaveBeforeOverwrite:
         FakeClient.reset()
 
         reg = SessionRegistry(str(tmp_path / "sessions.json"))
-        # Inject a stale entry: sdk_session_id present, last_active > 12 h ago.
+        # Inject a stale entry under the canonical resident identity (Task 9):
+        # sdk_session_id present, last_active > 12 h ago → expired, retain_old.
+        # Seeded via register() so it carries a real stored user_provenance.
+        from personality_types import SpeakerProvenance
         stale_ts = (
             datetime.now(timezone.utc) - timedelta(hours=13)
         ).isoformat()
-        reg._data[build_scoped_session_key("telegram", "assistant", "123")] = {
-            "agent": "assistant",
-            "sdk_session_id": "old-stale-sid",
-            "last_active": stale_ts,
-        }
+        cold_key = build_scoped_session_key("telegram", "assistant", "123")
+        await reg.register(
+            cold_key, resident_role_id("assistant"), "old-stale-sid",
+            binding_digest=RESIDENT_DIGEST,
+            speaker_provenance=resident_prov("assistant"),
+            user_provenance=SpeakerProvenance(speaker_kind="user", user_peer="nicola"),
+        )
+        reg._data[cold_key]["last_active"] = stale_ts
 
         agent = _make_agent_with_registry(reg, role="assistant")
 
@@ -1931,9 +1972,10 @@ class TestSaveBeforeOverwrite:
             datetime.now(timezone.utc) - timedelta(minutes=5)
         ).isoformat()
         reg._data[build_scoped_session_key("telegram", "assistant", "456")] = {
-            "agent": "assistant",
+            "agent": resident_role_id("assistant"),
             "sdk_session_id": "fresh-live-sid",
             "last_active": fresh_ts,
+            "binding_digest": RESIDENT_DIGEST,
         }
 
         agent = _make_agent_with_registry(reg, role="assistant")
@@ -1967,9 +2009,10 @@ class TestSaveBeforeOverwrite:
             datetime.now(timezone.utc) - timedelta(minutes=5)
         ).isoformat()
         reg._data[build_scoped_session_key("telegram", "assistant", "789")] = {
-            "agent": "assistant",
+            "agent": resident_role_id("assistant"),
             "sdk_session_id": "live-sid-resume",
             "last_active": fresh_ts,
+            "binding_digest": RESIDENT_DIGEST,
         }
 
         fake = FakeSemanticMemory(overlay="should-not-appear", facts="should-not-appear")

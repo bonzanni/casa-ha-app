@@ -10,7 +10,7 @@ from contextvars import ContextVar
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from types import MappingProxyType
-from typing import Any, Awaitable, Callable, Mapping
+from typing import Any, Awaitable, Callable, Literal, Mapping
 
 from claude_agent_sdk import (
     AssistantMessage,
@@ -37,10 +37,12 @@ from hooks import resolve_hooks
 from log_cid import cid_var
 import sdk_logging
 from mcp_registry import McpServerRegistry
-from channel_trust import channel_trust_display, user_peer_for_channel
+from channel_trust import channel_trust_display
 from timekeeping import resolve_tz
 from hindsight_ids import bank_id
 from sensitivity import clearance_for_origin, readable_tiers
+from personality_types import SpeakerProvenance
+from speaker_provenance import UserProvenance, provenance_from_mapping
 from session_saver import freshness_window, retain_cold_session, save_session
 from semantic_memory import NoOpSemanticMemory, RecallUnavailable, SemanticMemory
 from session_registry import (
@@ -131,32 +133,131 @@ def _render_executors_block(executors) -> str:
     return "\n".join(lines)
 
 
-def _resume_decision(
-    channel: str, entry: dict | None, now: datetime, *, role: str | None = None,
-) -> tuple[str, bool]:
-    """Spec §3.3/§4.2: resume iff an entry exists and is within its channel
-    freshness window; otherwise start new — and if a stale entry with a live
-    sdk_session_id exists, signal save-before-overwrite (next-turn-after-gap).
-    Returns (decision, save_old): decision in {"resume","new"}; save_old True
-    only when starting new over a stale-but-present session.
+@dataclass(frozen=True, slots=True)
+class SessionEntrySnapshot:
+    """An immutable copy of a persisted session entry, decoded once under the
+    entry lock so no later mutation of the source dict can bleed into a
+    resume/retain decision (Task 9). ``binding_digest``/``speaker_provenance``/
+    ``user_provenance`` are absent (``None``) on legacy pre-Task-9 entries."""
+    agent: str
+    sdk_session_id: str
+    last_active: str | None
+    scope_class: str | None
+    binding_digest: str | None
+    speaker_provenance: SpeakerProvenance | None
+    user_provenance: SpeakerProvenance | None
 
-    A2: ``role``, when given, is a STRICT resume gate — an entry recorded
-    under a different (or absent) agent is never resumed, even if it's
-    otherwise fresh. Two residents sharing one channel_key's device/scope
-    must never hijack each other's SDK session. An agent-less entry seen
-    alongside a role is defense-in-depth (migrate_to_v2 already drops those)."""
-    if not entry or not entry.get("sdk_session_id"):
-        return ("new", False)
-    if role is not None and entry.get("agent") != role:
-        return ("new", False)
-    la = entry.get("last_active")
+
+@dataclass(frozen=True, slots=True)
+class ResumeDecision:
+    """The structured outcome of the resume gate (replaces the former
+    ``(decision, save_old)`` tuple). ``retain_old``/``old`` drive
+    save-before-overwrite of a superseded cold session."""
+    action: Literal["resume", "new"]
+    resume_sid: str | None
+    retain_old: bool
+    old: SessionEntrySnapshot | None
+    reason: Literal[
+        "missing", "role_mismatch", "binding_mismatch",
+        "fresh", "expired", "invalid_entry",
+    ]
+
+
+def _decode_provenance(raw: object) -> SpeakerProvenance | None:
+    if raw is None:
+        return None
     try:
-        last = datetime.fromisoformat(la) if isinstance(la, str) else None
+        return provenance_from_mapping(raw)
+    except ValueError:
+        return None  # a corrupt stored snapshot is treated as absent, never fabricated
+
+
+def snapshot_session_entry(entry: dict | None) -> SessionEntrySnapshot | None:
+    """Decode a persisted entry into an immutable snapshot, or ``None`` when
+    there is nothing resumable (no entry / no sid / no agent)."""
+    if not entry or not entry.get("sdk_session_id") or not entry.get("agent"):
+        return None
+    return SessionEntrySnapshot(
+        agent=str(entry["agent"]),
+        sdk_session_id=str(entry["sdk_session_id"]),
+        last_active=entry.get("last_active"),
+        scope_class=entry.get("scope_class"),
+        binding_digest=entry.get("binding_digest"),
+        speaker_provenance=_decode_provenance(entry.get("speaker_provenance")),
+        user_provenance=_decode_provenance(entry.get("user_provenance")),
+    )
+
+
+def agent_home_for_role_id(role_id: str) -> str:
+    """Map a canonical ``kind:slot`` role id to its on-disk agent home — the
+    transcript cwd ``get_session_messages``/``delete_session`` read. Residents
+    live at ``/config/agent-home/<slot>`` (matching ``Agent._process``'s
+    short-slug ``agent_home``); specialists/executors nest under
+    ``/config/agent-home/<kind>s/<slot>``. Raises ``ValueError`` on a
+    non-canonical (short, pre-Task-9) role string."""
+    kind, separator, slot = role_id.partition(":")
+    if separator != ":" or kind not in {"resident", "specialist", "executor"} or not slot:
+        raise ValueError(f"invalid canonical role id {role_id!r}")
+    if kind == "resident":
+        return f"/config/agent-home/{slot}"
+    return f"/config/agent-home/{kind}s/{slot}"
+
+
+def speaker_provenance_for_role(cfg: AgentConfig) -> SpeakerProvenance:
+    """Task 9 (finding 3): the ONE fallback policy for a config's own executing
+    identity when ``cfg.speaker_provenance`` is unset — used at every
+    ``SessionRegistry.register`` call site so a nullable ``cfg.speaker_provenance``
+    never reaches ``register``'s non-null ``validate_speaker_provenance`` gate.
+
+    - A resident (Task 8 always activates this) keeps its real persona identity.
+    - ``cfg.kind == "executor"`` (never persona/binding-bearing per the taxonomy)
+      gets a stable, honestly-labeled executor identity.
+    - Anything else with NO activated binding yet (an unbound Plan-1 specialist,
+      or an identity-less unit-test config) gets the explicit unattributed
+      ``system`` identity — a VALID provenance (every field null) that is honest
+      about "unattributed" rather than fabricating a persona. Resolves itself the
+      moment Plan 2 populates ``cfg.speaker_provenance`` for specialists."""
+    if cfg.speaker_provenance is not None:
+        return cfg.speaker_provenance
+    if cfg.kind == "executor" and cfg.role_id:
+        return SpeakerProvenance(speaker_kind="executor", role_id=cfg.role_id)
+    return SpeakerProvenance(speaker_kind="system")
+
+
+def _resume_decision(
+    channel: str, entry: dict | None, now: datetime, *,
+    role_id: str, binding_digest: str,
+) -> ResumeDecision:
+    """Spec §3.3/§4.2 + personality Task 9: resume iff a stored entry exists,
+    matches this config's ``{role_id, binding_digest}`` identity, AND is within
+    its channel freshness window. A role or binding mismatch — or a stale but
+    present session — signals save-before-overwrite via ``retain_old``/``old``.
+
+    The role gate is checked BEFORE the digest gate so a legacy short-role
+    entry (``"butler"``) is reported as ``role_mismatch`` against a canonical
+    ``"resident:butler"`` lookup and never resumed. For a specialist/executor
+    with no binding populated, both stored and looked-up ``binding_digest`` are
+    ``""`` — the digest gate degrades to a no-op and resume falls back to
+    role-id-only gating, byte-for-byte matching the prior behavior."""
+    old = snapshot_session_entry(entry)
+    if old is None:
+        return ResumeDecision("new", None, False, None, "missing")
+    if old.agent != role_id:
+        return ResumeDecision("new", None, True, old, "role_mismatch")
+    if (old.binding_digest or "") != (binding_digest or ""):
+        return ResumeDecision("new", None, True, old, "binding_mismatch")
+    try:
+        last = (
+            datetime.fromisoformat(old.last_active)
+            if isinstance(old.last_active, str) else None
+        )
     except ValueError:
         last = None
-    if last is not None and (now - last) <= freshness_window(channel):
-        return ("resume", False)
-    return ("new", True)
+    if last is None:
+        return ResumeDecision("new", None, True, old, "invalid_entry")
+    if (now - last) <= freshness_window(channel):
+        return ResumeDecision("resume", old.sdk_session_id, False, old, "fresh")
+    return ResumeDecision("new", None, True, old, "expired")
 
 
 @dataclass(frozen=True)
@@ -416,7 +517,8 @@ class Agent:
             # impossible post-A2 collision-safety, but defense-in-depth) never
             # resumes.
             decide=lambda ch, entry, now: _resume_decision(
-                ch, entry, now, role=self.config.role,
+                ch, entry, now,
+                role_id=self.config.role_id, binding_digest=self.config.binding_digest,
             ),
             origin_ctxvar=origin_var, cid_ctxvar=cid_var,
             engagement_ctxvar=_engagement_var,
@@ -666,7 +768,6 @@ class Agent:
             self.config.role,
             msg.context.get("chat_id"),
         )
-        user_peer = user_peer_for_channel(msg.channel)
         user_text = str(msg.content)
 
         # The origin snapshot is set into ``origin_var`` for this task (so the
@@ -759,6 +860,25 @@ class Agent:
                 or f"/config/agent-home/{self.config.role}"
             )
 
+            # Task 9: build this turn's persisted user identity ONCE, from the
+            # server-created typed ingress field (never free-text
+            # origin/context), so the pooled ``_publish``, the bypass path, and
+            # the final ``register()`` all persist the SAME identity. A turn
+            # with no trusted ingress (scheduled heartbeat, webhook trigger,
+            # delegation-completion synthesis, internal/test turn) has no human
+            # author — it is recorded with the honest unattributed ``system``
+            # identity, never a fabricated user.
+            trusted = msg.trusted_user_origin
+            if trusted is not None:
+                user_provenance = UserProvenance.from_origin(
+                    surface=trusted.surface,
+                    server_origin=trusted.server_origin,
+                    authenticated_user=trusted.authenticated_user,
+                    user_peer=trusted.user_peer,
+                )
+            else:
+                user_provenance = SpeakerProvenance(speaker_kind="system")
+
             # <current_time> rides on the per-turn query text (NOT the cached
             # system prompt) so the agent still knows the wall-clock time to
             # second precision without busting prompt caching (M27). user_text
@@ -829,11 +949,14 @@ class Agent:
                     nonlocal session_published
                     await self._session_registry.register(
                         channel_key=channel_key,
-                        agent=self.config.role,
+                        agent=self.config.role_id,
                         sdk_session_id=sid,
                         scope_class=(
                             "webhook_oneshot" if is_webhook_oneshot else None
                         ),
+                        binding_digest=self.config.binding_digest,
+                        speaker_provenance=speaker_provenance_for_role(self.config),
+                        user_provenance=user_provenance,
                     )
                     session_published = True
 
@@ -841,8 +964,9 @@ class Agent:
                     channel_key=channel_key, channel=msg.channel,
                     prompt=prompt_text, origin=origin_snapshot,
                     cid=cid_var.get(), build_options=_build,
-                    on_stale_old=lambda old_sid: self._spawn_cold_retain(
-                        old_sid, agent_home, user_peer, msg.channel,
+                    binding_digest=self.config.binding_digest,
+                    on_stale_old=lambda old: self._spawn_cold_retain(
+                        old, directory=agent_home, channel=msg.channel,
                     ),
                     on_message=on_message,
                     on_success=_publish,
@@ -871,27 +995,27 @@ class Agent:
                     else None
                 )
                 existing = self._session_registry.get(channel_key)
-                decision, save_old = _resume_decision(
+                decision = _resume_decision(
                     msg.channel, existing, datetime.now(timezone.utc),
-                    role=self.config.role,
+                    role_id=self.config.role_id,
+                    binding_digest=self.config.binding_digest,
                 )
                 resume_sid = (
-                    existing.get("sdk_session_id")
-                    if decision == "resume" and existing else None
+                    decision.resume_sid if decision.action == "resume" else None
                 )
                 last_resume["sid"] = resume_sid
-                if decision == "resume":
+                if decision.action == "resume":
                     await self._session_registry.touch(channel_key)
-                elif save_old and (existing or {}).get("sdk_session_id"):
+                elif decision.retain_old and decision.old is not None:
                     # next-turn-after-gap: register() below overwrites this
-                    # channel's pointer, so retain the OLD sid in the BACKGROUND
-                    # (claim-free / registry-decoupled — cannot race register();
-                    # per-item classification runs off the hot path, tier §2.4).
+                    # channel's pointer, so retain the OLD immutable snapshot in
+                    # the BACKGROUND (claim-free / registry-decoupled — cannot
+                    # race register(); per-item classification runs off the hot
+                    # path, tier §2.4).
                     self._spawn_cold_retain(
-                        existing["sdk_session_id"], agent_home, user_peer,
-                        msg.channel,
+                        decision.old, directory=agent_home, channel=msg.channel,
                     )
-                # else ("new", False): no prior entry → nothing to save
+                # else ("new", retain_old=False): no prior entry → nothing to save
                 options = await self._build_options(
                     channel=msg.channel, channel_key=channel_key,
                     is_fresh=resume_sid is None, resume_sid=resume_sid,
@@ -979,9 +1103,12 @@ class Agent:
             if sdk_session_id and not session_published:
                 await self._session_registry.register(
                     channel_key=channel_key,
-                    agent=self.config.role,
+                    agent=self.config.role_id,
                     sdk_session_id=sdk_session_id,
                     scope_class="webhook_oneshot" if is_webhook_oneshot else None,
+                    binding_digest=self.config.binding_digest,
+                    speaker_provenance=speaker_provenance_for_role(self.config),
+                    user_provenance=user_provenance,
                 )
 
             return response_text or None
@@ -1501,18 +1628,31 @@ class Agent:
             return resolution
 
     def _spawn_cold_retain(
-        self, sid: str, directory: str, user_peer: str, channel: str,
+        self, old: SessionEntrySnapshot, *, directory: str, channel: str,
     ) -> None:
         """Retain a cold prior session in the background (claim-free; cannot race
         register()). Tracked so it isn't GC'd; failures are swallowed in
-        retain_cold_session and never reach the turn."""
+        retain_cold_session and never reach the turn.
+
+        Task 9: takes the immutable ``SessionEntrySnapshot`` the resume gate
+        produced (``decision.old``) — the same object every call site passes.
+        ``retain_cold_session`` keeps its current ``sid``/``role``/``user_peer``
+        signature (Task 10 reduces it to consume the snapshot directly); the
+        snapshot's fields are unpacked here at the call boundary. A legacy
+        entry has no ``user_provenance`` — its user peer degrades to ``""``,
+        which never invents authorship."""
         task = asyncio.create_task(
             retain_cold_session(
-                sid=sid, role=self.config.role, directory=directory,
-                user_peer=user_peer, channel=channel,
+                sid=old.sdk_session_id, role=self.config.role, directory=directory,
+                user_peer=(
+                    old.user_provenance.user_peer
+                    if old.user_provenance and old.user_provenance.user_peer
+                    else ""
+                ),
+                channel=channel,
                 semantic_memory=self._semantic_memory,
             ),
-            name=f"cold-retain-{sid}",
+            name=f"cold-retain-{old.sdk_session_id}",
         )
         self._bg_tasks.add(task)
         task.add_done_callback(self._bg_tasks.discard)

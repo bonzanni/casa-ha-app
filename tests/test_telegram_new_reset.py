@@ -16,6 +16,7 @@ import pytest
 from bus import BusMessage, MessageBus
 from channels.telegram import TelegramChannel
 from session_registry import build_scoped_session_key
+from session_reg_helpers import STUB_BINDING_DIGEST, STUB_SPEAKER_PROV, STUB_USER_PROV
 
 pytestmark = [pytest.mark.unit, pytest.mark.asyncio]
 
@@ -91,7 +92,7 @@ class TestTelegramNewReset:
         from session_registry import SessionRegistry
 
         reg = SessionRegistry(str(tmp_path / "s.json"))
-        await reg.register(_KEY_42, "assistant", "sid-1")
+        await reg.register(_KEY_42, "assistant", "sid-1", binding_digest=STUB_BINDING_DIGEST, speaker_provenance=STUB_SPEAKER_PROV, user_provenance=STUB_USER_PROV)
         sem = AsyncMock()
         msgs = [
             type("M", (), {"type": "user", "message": {"content": "remember X"}})()
@@ -109,7 +110,7 @@ class TestTelegramNewReset:
         from session_registry import SessionRegistry
 
         reg = SessionRegistry(str(tmp_path / "s.json"))
-        await reg.register(_KEY_42, "assistant", "sid-1")
+        await reg.register(_KEY_42, "assistant", "sid-1", binding_digest=STUB_BINDING_DIGEST, speaker_provenance=STUB_SPEAKER_PROV, user_provenance=STUB_USER_PROV)
         sem = AsyncMock()
         msgs = [
             type("M", (), {"type": "user", "message": {"content": "hi"}})()
@@ -129,7 +130,7 @@ class TestTelegramNewReset:
         from session_registry import SessionRegistry
 
         reg = SessionRegistry(str(tmp_path / "s.json"))
-        await reg.register(_KEY_42, "assistant", "sid-1")
+        await reg.register(_KEY_42, "assistant", "sid-1", binding_digest=STUB_BINDING_DIGEST, speaker_provenance=STUB_SPEAKER_PROV, user_provenance=STUB_USER_PROV)
         sem = AsyncMock()
         msgs = [
             type("M", (), {"type": "user", "message": {"content": "hi"}})()
@@ -146,7 +147,7 @@ class TestTelegramNewReset:
         from session_registry import SessionRegistry
 
         reg = SessionRegistry(str(tmp_path / "s.json"))
-        await reg.register(_KEY_42, "assistant", "sid-1")
+        await reg.register(_KEY_42, "assistant", "sid-1", binding_digest=STUB_BINDING_DIGEST, speaker_provenance=STUB_SPEAKER_PROV, user_provenance=STUB_USER_PROV)
         sem = AsyncMock()
         msgs = [
             type("M", (), {"type": "user", "message": {"content": "important data"}})()

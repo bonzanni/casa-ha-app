@@ -27,6 +27,7 @@ from config import AgentConfig, CharacterConfig, MemoryConfig, ToolsConfig
 from mcp_registry import McpServerRegistry
 from semantic_memory import SemanticMemory
 from session_registry import SessionRegistry, build_scoped_session_key
+from session_reg_helpers import RESIDENT_DIGEST, resident_prov, resident_role_id
 
 try:
     from tests.role_artifact_stub import STUB_ROLE_ARTIFACT
@@ -137,13 +138,17 @@ def scripted_factory(monkeypatch):
 
 @pytest.fixture
 async def agent_fixture(tmp_path, scripted_factory):
-    cfg = AgentConfig(role_artifact=STUB_ROLE_ARTIFACT, 
+    cfg = AgentConfig(role_artifact=STUB_ROLE_ARTIFACT,
         role="assistant",
         model="claude-sonnet-4-6",
         system_prompt="You are helpful.",
         character=CharacterConfig(name="Test"),
         tools=ToolsConfig(allowed=["Read"], permission_mode="acceptEdits"),
         memory=MemoryConfig(token_budget=1000, read_strategy="per_turn"),
+        role_id=resident_role_id("assistant"),
+        kind="resident",
+        binding_digest=RESIDENT_DIGEST,
+        speaker_provenance=resident_prov("assistant"),
     )
     agent = Agent(
         config=cfg,
@@ -511,7 +516,7 @@ async def test_facade_schema_refresh_reconnects_only_butler_with_new_config(
 
     def make_agent(role):
         return Agent(
-            config=AgentConfig(role_artifact=STUB_ROLE_ARTIFACT, 
+            config=AgentConfig(role_artifact=STUB_ROLE_ARTIFACT,
                 role=role,
                 model="claude-sonnet-4-6",
                 system_prompt="You are helpful.",
@@ -524,6 +529,10 @@ async def test_facade_schema_refresh_reconnects_only_butler_with_new_config(
                 memory=MemoryConfig(
                     token_budget=1000, read_strategy="per_turn",
                 ),
+                role_id=resident_role_id(role),
+                kind="resident",
+                binding_digest=RESIDENT_DIGEST,
+                speaker_provenance=resident_prov(role),
             ),
             session_registry=sessions,
             mcp_registry=registry,

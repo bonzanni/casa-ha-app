@@ -10,6 +10,7 @@ import pytest
 import session_saver
 from hindsight_ids import content_document_id
 from session_saver import freshness_window, reset_channel, save_session, transcript_to_items
+from session_reg_helpers import STUB_BINDING_DIGEST, STUB_SPEAKER_PROV, STUB_USER_PROV
 
 pytestmark = [pytest.mark.unit]
 
@@ -75,7 +76,7 @@ async def test_save_session_retains_and_finishes(tmp_path, monkeypatch):
 
     from session_registry import SessionRegistry
     reg = SessionRegistry(str(tmp_path / "s.json"))
-    await reg.register("telegram-r1", "assistant", "sid-9")
+    await reg.register("telegram-r1", "assistant", "sid-9", binding_digest=STUB_BINDING_DIGEST, speaker_provenance=STUB_SPEAKER_PROV, user_provenance=STUB_USER_PROV)
     sem = AsyncMock()  # SemanticMemory
     msgs = [type("M", (), {"type": "user", "message": {"role": "user", "content": "hi"}})()]
     with patch("session_saver.get_session_messages", return_value=msgs):
@@ -100,7 +101,7 @@ async def test_save_session_releases_claim_on_failure(tmp_path, monkeypatch):
 
     from session_registry import SessionRegistry
     reg = SessionRegistry(str(tmp_path / "s.json"))
-    await reg.register("telegram-r1", "assistant", "sid-9")
+    await reg.register("telegram-r1", "assistant", "sid-9", binding_digest=STUB_BINDING_DIGEST, speaker_provenance=STUB_SPEAKER_PROV, user_provenance=STUB_USER_PROV)
     sem = AsyncMock()
     sem.retain.side_effect = RuntimeError("hindsight down")
     msgs = [type("M", (), {"type": "user", "message": {"content": "hi"}})()]
@@ -117,7 +118,7 @@ async def test_save_session_releases_claim_on_failure(tmp_path, monkeypatch):
 async def test_save_session_skips_when_already_claimed(tmp_path):
     from session_registry import SessionRegistry
     reg = SessionRegistry(str(tmp_path / "s.json"))
-    await reg.register("telegram-r1", "assistant", "sid-9")
+    await reg.register("telegram-r1", "assistant", "sid-9", binding_digest=STUB_BINDING_DIGEST, speaker_provenance=STUB_SPEAKER_PROV, user_provenance=STUB_USER_PROV)
     await reg.try_begin_save("telegram-r1")       # someone else claimed it
     sem = AsyncMock()
     ok = await save_session(
@@ -131,7 +132,7 @@ async def test_save_session_skips_when_already_claimed(tmp_path):
 async def test_save_session_empty_transcript_still_finishes(tmp_path):
     from session_registry import SessionRegistry
     reg = SessionRegistry(str(tmp_path / "s.json"))
-    await reg.register("telegram-r1", "assistant", "sid-9")
+    await reg.register("telegram-r1", "assistant", "sid-9", binding_digest=STUB_BINDING_DIGEST, speaker_provenance=STUB_SPEAKER_PROV, user_provenance=STUB_USER_PROV)
     sem = AsyncMock()
     # tool-only message → transcript_to_items returns [] → no retain, but still finishes
     msgs = [type("M", (), {"type": "assistant",
@@ -166,7 +167,7 @@ async def test_save_session_voice_skips_entirely(tmp_path):
     """Voice channel → writes_to_bank returns False → skip before any claim."""
     from session_registry import SessionRegistry
     reg = SessionRegistry(str(tmp_path / "s.json"))
-    await reg.register("voice-r1", "assistant", "sid-9")
+    await reg.register("voice-r1", "assistant", "sid-9", binding_digest=STUB_BINDING_DIGEST, speaker_provenance=STUB_SPEAKER_PROV, user_provenance=STUB_USER_PROV)
     sem = AsyncMock()
     ok = await save_session(
         "voice-r1", reg, sem, role="assistant", directory="/d",
@@ -185,7 +186,7 @@ async def test_reset_channel_saves_then_clears(tmp_path, monkeypatch):
 
     from session_registry import SessionRegistry
     reg = SessionRegistry(str(tmp_path / "s.json"))
-    await reg.register("telegram-42", "assistant", "sid-9")
+    await reg.register("telegram-42", "assistant", "sid-9", binding_digest=STUB_BINDING_DIGEST, speaker_provenance=STUB_SPEAKER_PROV, user_provenance=STUB_USER_PROV)
     sem = AsyncMock()
     msgs = [type("M", (), {"type": "user", "message": {"content": "remember X"}})()]
     with patch("session_saver.get_session_messages", return_value=msgs):

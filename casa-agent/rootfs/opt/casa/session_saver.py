@@ -193,15 +193,26 @@ async def reset_channel(
     directory are derived from the registry entry (the caller — e.g. the Telegram
     channel — does not need to know them). If there is no entry there is nothing
     to save; just return (the caller still acks)."""
+    # Imported lazily: agent imports session_saver at module load, so a
+    # top-level import here would cycle.
+    from agent import agent_home_for_role_id, snapshot_session_entry
+
     # AR-4 (pooling spec): close any warm SDK client for this key FIRST —
     # disconnect sends stdin EOF, which is what makes the CLI flush the
     # transcript .jsonl this save is about to read (SDK #625).
     await registry.notify_reset(channel_key)
     entry = registry.get(channel_key)
-    if entry is None:
+    snapshot = snapshot_session_entry(entry)
+    if snapshot is None:
         return
-    role = entry.get("agent", "assistant")
-    directory = f"/config/agent-home/{role}"
+    role = snapshot.agent
+    # Task 9: entries now store the canonical role_id; derive the transcript
+    # cwd from it. A legacy short-role entry (pre-Task-9) falls back to the
+    # bare-slug formula so its transcript is still found.
+    try:
+        directory = agent_home_for_role_id(role)
+    except ValueError:
+        directory = f"/config/agent-home/{role}"
     user_peer = user_peer_for_channel(channel)
     # save_session is idempotent and removes the entry on a successful retain;
     # remove() afterwards guarantees the pointer is cleared even when the save

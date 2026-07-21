@@ -58,3 +58,18 @@ class AuthenticatedUser:
     """Identity asserted by the authenticated transport, not by message text."""
     stable_id: str
     configured_display_name: str | None
+
+
+@dataclass(frozen=True, slots=True)
+class TrustedUserOriginInput:
+    """Personality Task 9: the server-created, per-turn ingress identity a
+    channel stamps onto its ``BusMessage`` AFTER external-context sanitization.
+    It is the ONLY source ``Agent._process`` reads to build the persisted
+    ``user_provenance`` — never free-text ``origin``/``context``. A turn that
+    carries no ``TrustedUserOriginInput`` (scheduled heartbeat, webhook
+    trigger, delegation-completion synthesis, internal/test turn) has no human
+    author and is recorded with the honest unattributed ``system`` identity."""
+    surface: Literal["telegram", "voice", "invoke", "webhook"]
+    server_origin: TrustedOrigin
+    authenticated_user: AuthenticatedUser | None
+    user_peer: str

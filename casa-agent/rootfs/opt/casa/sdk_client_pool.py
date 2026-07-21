@@ -60,13 +60,19 @@ class ManagedSdkClient:
 
     def __init__(self, options, *, origin_ctxvar, cid_ctxvar,
                  engagement_ctxvar, make_client=None,
-                 monotonic=time.monotonic) -> None:
+                 monotonic=time.monotonic, binding_digest: str = "") -> None:
         self.options = options
         self._origin_ctxvar = origin_ctxvar
         self._cid_ctxvar = cid_ctxvar
         self._engagement_ctxvar = engagement_ctxvar
         self._make_client = make_client or _default_make_client
         self._monotonic = monotonic
+        # Task 9: the identity this warm conversation was built for. A warm
+        # client is only reusable when the incoming turn's binding_digest
+        # matches (defense-in-depth on top of the registry-level resume gate).
+        # Never mutated to a new identity in place — an identity change forces
+        # a fresh ManagedSdkClient.
+        self.binding_digest = binding_digest
         self.origin_holder: dict = {}
         self.cid_box = _CidBox()
         self.lock = asyncio.Lock()
@@ -285,6 +291,7 @@ class SdkClientPool:
                    on_message,
                    on_success: Callable[[str], Awaitable[None]] | None = None,
                    on_decision: Callable[[str | None, bool], None] | None = None,
+                   binding_digest: str = "",
                    ) -> PoolTurnResult:
         """Run one serialized turn and publish its returned session id.
 
@@ -312,12 +319,11 @@ class SdkClientPool:
                     continue
                 # --- decision UNDER the entry lock (AR-3) ---
                 reg_entry = self._registry.get(channel_key)
-                decision, save_old = self._decide(
+                decision = self._decide(
                     channel, reg_entry, self._wall_now(),
                 )
                 resume_sid = (
-                    reg_entry.get("sdk_session_id")
-                    if decision == "resume" and reg_entry else None
+                    decision.resume_sid if decision.action == "resume" else None
                 )
                 is_fresh = resume_sid is None
                 # Finding 2 (final-review): record the decision even when the
@@ -328,19 +334,24 @@ class SdkClientPool:
                 # fallback which sid was in play.
                 if on_decision is not None:
                     on_decision(resume_sid, is_fresh)
+                # Task 9: a warm client is reusable only when the incoming
+                # turn's binding_digest matches the identity it was built for —
+                # defense-in-depth on top of the registry-level resume gate.
                 reusable = (
                     entry.state == "warm"
                     and not is_fresh
                     and entry.sid == resume_sid
+                    and entry.binding_digest == binding_digest
                 )
                 if not reusable:
-                    old_sid = entry.sid
                     if entry.state == "warm":
                         await entry.aclose()          # flush BEFORE retain (AR-4)
-                    if save_old:
-                        stale = (reg_entry or {}).get("sdk_session_id") or old_sid
-                        if stale:
-                            on_stale_old(stale)
+                    # Task 9: hand the resume gate's own immutable snapshot to
+                    # the retain callback (sourced from the registry read under
+                    # the entry lock, AR-3) — never a sid reconstructed from the
+                    # pool's own possibly-stale ``entry.sid``.
+                    if decision.retain_old and decision.old is not None:
+                        on_stale_old(decision.old)
                     options = await build_options(is_fresh, resume_sid)
                     fresh_client = ManagedSdkClient(
                         options,
@@ -349,6 +360,7 @@ class SdkClientPool:
                         engagement_ctxvar=self._engagement_ctxvar,
                         make_client=self._make_client or _default_make_client,
                         monotonic=self._monotonic,
+                        binding_digest=binding_digest,
                     )
                     fresh_client.lock = entry.lock    # keep the held lock
                     fresh_client.sid = resume_sid
@@ -365,7 +377,7 @@ class SdkClientPool:
                     async with self._pool_lock:
                         self._entries[channel_key] = fresh_client
                     entry = fresh_client
-                if decision == "resume":
+                if decision.action == "resume":
                     await self._registry.touch(channel_key)
                 publishing = False
                 try:

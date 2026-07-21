@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import copy
 import hashlib
 import json
 import logging
@@ -13,6 +14,8 @@ from datetime import datetime, timezone
 from typing import Any
 
 from atomic_io import atomic_write_json
+from personality_types import SpeakerProvenance
+from speaker_provenance import provenance_mapping, validate_speaker_provenance
 
 logger = logging.getLogger(__name__)
 
@@ -151,6 +154,10 @@ class SessionRegistry:
         agent: str,
         sdk_session_id: str,
         scope_class: str | None = None,
+        *,
+        binding_digest: str,
+        speaker_provenance: SpeakerProvenance,
+        user_provenance: SpeakerProvenance,
     ) -> None:
         """Register (or overwrite) a session entry and persist.
 
@@ -161,14 +168,37 @@ class SessionRegistry:
         A2) — currently only ``"webhook_oneshot"`` — onto the entry so
         :mod:`session_sweeper` can read it back at sweep time instead of
         re-deriving it from the (now-hashed, never-uuid-shaped) v2 key.
+
+        Personality Task 9: ``binding_digest``/``speaker_provenance``/
+        ``user_provenance`` are REQUIRED keyword-only additive fields —
+        every session-resume path now gates on
+        ``{stable_agent_id, role_checksum, binding_digest}``, and an entry
+        with an unset provenance could not later be distinguished from a
+        legitimate system/anonymous turn (the bug this closes). Both
+        provenances are validated (fail-fast on a malformed identity) and
+        stored as their canonical v1 mappings. Merged onto a deep copy of any
+        prior entry so a concurrent in-flight ``SpeakerProvenance``/dict can
+        never mutate the persisted snapshot.
         """
+        validate_speaker_provenance(speaker_provenance)
+        validate_speaker_provenance(user_provenance)
         async with self._lock:
-            entry: dict[str, Any] = {
+            entry: dict[str, Any] = copy.deepcopy(
+                self._data.get(channel_key) or {},
+            )
+            entry.update({
                 "agent": agent,
                 "sdk_session_id": sdk_session_id,
                 "last_active": datetime.now(timezone.utc).isoformat(),
-            }
-            if scope_class is not None:
+                "binding_digest": binding_digest,
+                "speaker_provenance": provenance_mapping(speaker_provenance),
+                "user_provenance": provenance_mapping(user_provenance),
+            })
+            # A fresh registration supersedes any in-flight save claim.
+            entry.pop("consolidated_at", None)
+            if scope_class is None:
+                entry.pop("scope_class", None)
+            else:
                 entry["scope_class"] = scope_class
             self._data[channel_key] = entry
             await self._save_locked()
