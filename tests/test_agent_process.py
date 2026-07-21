@@ -129,9 +129,10 @@ class FakeSemanticMemory(SemanticMemory):
     <memory_context>). Calls are recorded so tests can assert the channel-aware
     load contract (overlay at fresh-session start; recall text-only)."""
 
-    def __init__(self, overlay: str = "", facts: str = "") -> None:
+    def __init__(self, overlay: str = "", facts: str = "", provenance=None) -> None:
         self._overlay = overlay
         self._facts = facts
+        self._provenance = provenance
         self.profile_calls: list[str] = []
         self.recall_calls: list[dict] = []
         self.retain_calls: list[tuple] = []
@@ -149,6 +150,25 @@ class FakeSemanticMemory(SemanticMemory):
             "max_tokens": max_tokens, "budget": budget,
         })
         return self._facts
+
+    async def recall_items(
+        self, bank, query, *, tags, max_tokens, clearance,
+        types=("world", "experience", "observation"),
+        tags_match="any", budget="mid",
+    ):
+        self.recall_calls.append({
+            "bank": bank, "query": query, "tags": tags,
+            "max_tokens": max_tokens, "budget": budget, "clearance": clearance,
+        })
+        if not self._facts:
+            return ()
+        from personality_types import RecallHit
+        return (RecallHit(
+            text=self._facts, memory_type="world", sensitivity="friends",
+            application_tags=(), provenance=self._provenance, backend_id="b1",
+            document_id=None, chunk_id=None, source_fact_ids=None, metadata=None,
+            context=None, score=None,
+        ),)
 
     async def profile(self, bank):
         self.profile_calls.append(bank)
@@ -567,11 +587,38 @@ async def test_system_prompt_memory_context_only_when_nonempty(tmp_path):
     assert "[nicola] hi" in prompt2
 
 
+async def test_auto_recall_injects_attributed_memory_context(tmp_path):
+    """Task 11 (Step 9): the pre-turn auto-recall now injects an ATTRIBUTED
+    <memory_context> — each hit rendered with its recorded source — instead of
+    a bare digest string. A telegram turn reads at private clearance, so the
+    resident source (role + persona) is spoken; raw provenance/tier tags never
+    escape into the prompt."""
+    from personality_types import SpeakerProvenance
+
+    prov = SpeakerProvenance(
+        speaker_kind="resident", role_id="resident:butler",
+        persona_id="casa.personas/tina", persona_version="1.0.0",
+        display_name="Tina", binding_digest="sha256:" + "5" * 64,
+    )
+    sem = FakeSemanticMemory(facts="the thermostat is set to 20C", provenance=prov)
+    agent = _make_agent(tmp_path, role="assistant", semantic_memory=sem)
+    with patch("sdk_client_pool._default_make_client", FakeClient), \
+         patch.object(agent._pool, "_decide",
+                      return_value=ResumeDecision("new", None, False, None, "missing")):
+        await agent._process(_msg("telegram", "123", "hi"))
+    prompt = FakeClient.captured_options.system_prompt
+    assert "<memory_context>" in prompt
+    assert "Tina previously said: the thermostat is set to 20C" in prompt
+    assert "[source: resident:butler" in prompt
+    assert "casa-source-" not in prompt   # reserved tag never escapes
+    assert "sha256:" not in prompt        # binding digest never escapes
+
+
 async def test_memory_failure_does_not_break_response(tmp_path, caplog):
     import logging
 
     class BrokenSemanticMemory(FakeSemanticMemory):
-        async def recall(self, *a, **kw):
+        async def recall_items(self, *a, **kw):
             raise RuntimeError("hindsight down")
 
     sem = BrokenSemanticMemory()
@@ -1074,6 +1121,8 @@ class TestTokenBudgetMonitoring:
         """The recorder should see one call per turn with the digest
         size estimated from the assembled memory_blocks (spec §4.3:
         the recall facts wrapped in <memory_context>)."""
+        from personality_types import RecallHit, SpeakerProvenance
+        from recall_renderer import render_recall
         from tokens import estimate_tokens
         FakeClient.reset()
         FakeClient.usage = {
@@ -1082,7 +1131,10 @@ class TestTokenBudgetMonitoring:
             "cache_read_input_tokens": 0,
             "cache_creation_input_tokens": 0,
         }
-        facts = "x" * 8000
+        # Task 11: the recorded block is now the ATTRIBUTED render of the recall
+        # hits (bounded by token_budget), not the raw facts string. Keep the
+        # fact small enough to render fully so the expected size is exact.
+        facts = "x" * 100
         # Overlay empty so the recorded block is exactly the recall context.
         sem = FakeSemanticMemory(overlay="", facts=facts)
         agent = _make_agent(tmp_path, role="assistant", semantic_memory=sem)
@@ -1097,8 +1149,18 @@ class TestTokenBudgetMonitoring:
         with patch("sdk_client_pool._default_make_client", FakeClient):
             await agent._process(_msg("telegram", "123", "hi"))
 
+        digest = render_recall(
+            (RecallHit(
+                text=facts, memory_type="world", sensitivity="friends",
+                application_tags=(), provenance=None, backend_id="b1",
+                document_id=None, chunk_id=None, source_fact_ids=None,
+                metadata=None, context=None, score=None,
+            ),),
+            current_speaker=SpeakerProvenance(speaker_kind="system"),
+            surface="text", clearance="private", token_budget=1000,
+        )
         expected = estimate_tokens(
-            f"<memory_context>\n{facts}\n</memory_context>"
+            f"<memory_context>\n{digest}\n</memory_context>"
         )
         expected_channel_key = build_scoped_session_key("telegram", "assistant", "123")
         assert observed == [(f"{expected_channel_key}-assistant", expected, 1000)]
@@ -1115,10 +1177,13 @@ class TestTokenBudgetMonitoring:
             "cache_read_input_tokens": 0, "cache_creation_input_tokens": 0,
         }
         # 5000-token estimate vs 1000 budget → overrun.
-        # §4.3: recall (and thus the oversized memory_blocks) only fires on a
-        # FRESH session, so force every turn fresh — the budget streak is keyed
-        # on channel_key+role, which is stable across these five fresh turns.
-        sem = FakeSemanticMemory(facts="x" * 20000)
+        # §4.3: the oversized memory_block only fires on a FRESH session, so
+        # force every turn fresh — the budget streak is keyed on
+        # channel_key+role, stable across these five fresh turns. Task 11: the
+        # RECALL digest is now bounded by token_budget, so the oversized block
+        # is driven through the (un-capped) mental-model overlay instead — the
+        # budget-overrun machinery under test is identical either way.
+        sem = FakeSemanticMemory(overlay="x" * 20000, facts="")
         agent = _make_agent(tmp_path, role="assistant", semantic_memory=sem)
 
         caplog.set_level(_logging.WARNING, logger="tokens")

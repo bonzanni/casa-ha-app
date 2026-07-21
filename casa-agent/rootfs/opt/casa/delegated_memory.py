@@ -23,7 +23,9 @@ from typing import Any, Sequence
 from channel_policy import writes_to_bank
 from hindsight_ids import bank_id
 from memory_provenance import build_retain_items
-from personality_types import RetainedTurn
+from personality_types import RetainedTurn, SpeakerProvenance
+from recall_health import RecallPath, default_telemetry, observed_recall
+from recall_renderer import Surface, render_recall
 from semantic_memory import RecallUnavailable
 from sensitivity import clearance_for_channel, readable_tiers
 from tier_classifier import classify_tier
@@ -33,15 +35,24 @@ logger = logging.getLogger(__name__)
 
 async def delegated_recall(
     semantic_memory: Any, *, query: str, origin_channel: str, max_tokens: int,
-    budget: str = "mid",
+    budget: str = "mid", surface: Surface = "text",
+    path: RecallPath = "delegated", current_speaker: SpeakerProvenance | None = None,
 ) -> str:
-    """Recall the shared bank at the ORIGINATING context's read-clearance.
+    """Recall the shared bank at the ORIGINATING context's read-clearance,
+    returning an ATTRIBUTED digest (personality Task 11).
 
     Three-outcome contract (v0.99.0): returns the digest ('' = a GENUINE
     zero-hit search) or raises :class:`RecallUnavailable` when memory could
     not be checked — the two must never be conflated, or the delegated agent
     denies knowledge Casa actually has. Call sites decide how to degrade
     (typically: proceed with no memory block, without claiming absence).
+
+    Task 11: swaps the flat ``recall()`` string for typed ``recall_items()``
+    routed through the NEW ``recall_health.observed_recall`` breaker/telemetry
+    (``path`` distinguishes the delegated / query_engager / executor_archive
+    callers), then renders each hit with its recorded attribution. The exact
+    unavailable-vs-zero-hit discipline is UNCHANGED — only success-path
+    rendering differs.
 
     ``budget`` defaults to ``mid``. The v0.68.1 ``low`` default (D-3) was a
     stop-gap for a hindsight-side rerank-latency bug that crossed the 20s
@@ -51,13 +62,23 @@ async def delegated_recall(
     Explicit ``budget=`` (e.g. voice → ``low``) still overrides."""
     if not (query or "").strip():
         return ""
-    tags = readable_tiers(clearance_for_channel(origin_channel))
+    clearance = clearance_for_channel(origin_channel)
+    tags = readable_tiers(clearance)
+    if current_speaker is None:
+        current_speaker = SpeakerProvenance(speaker_kind="system")
     try:
-        return await semantic_memory.recall(
-            bank_id("casa"), query, tags=tags, max_tokens=max_tokens, budget=budget,
+        hits = await observed_recall(
+            path=path, telemetry=default_telemetry(),
+            operation=lambda: semantic_memory.recall_items(
+                bank_id("casa"), query, tags=tags, max_tokens=max_tokens,
+                clearance=clearance, budget=budget,
+            ),
         )
     except RecallUnavailable:
-        # Backend already logged outcome/reason/latency.
+        # Backend already logged outcome/reason/latency (recorded by
+        # observed_recall). RecallProtocolError (a RecallUnavailable subclass)
+        # is caught here too — a malformed/untrustworthy envelope is UNAVAILABLE,
+        # never a fake zero-hit.
         logger.warning("delegated recall unavailable (channel=%s)", origin_channel)
         raise
     except Exception as exc:  # noqa: BLE001 — typed for callers, never a raw crash
@@ -68,6 +89,10 @@ async def delegated_recall(
             origin_channel, type(exc).__name__,
         )
         raise RecallUnavailable("backend_error") from exc
+    return render_recall(
+        hits, current_speaker=current_speaker, surface=surface,
+        clearance=clearance, token_budget=max_tokens,
+    )
 
 
 async def retain_delegated(

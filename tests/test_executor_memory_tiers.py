@@ -15,22 +15,34 @@ from tools import _fetch_executor_archive
 pytestmark = [pytest.mark.unit]
 
 
+def _hit(text):
+    from personality_types import RecallHit
+    return RecallHit(
+        text=text, memory_type="world", sensitivity="friends",
+        application_tags=(), provenance=None, backend_id="b1", document_id=None,
+        chunk_id=None, source_fact_ids=None, metadata=None, context=None, score=None,
+    )
+
+
 class _Sem:
     """Minimal fake that records recall calls and returns a canned digest."""
 
-    def __init__(self, recall_ret: str = "- prior lesson"):
+    def __init__(self, recall_ret: str = "prior lesson"):
         self.recall_calls: list[dict] = []
         self._recall_ret = recall_ret
 
-    async def recall(self, bank, query, *, tags, max_tokens, budget="mid", **kw):
+    async def recall_items(self, bank, query, *, tags, max_tokens, clearance,
+                           types=("world", "experience", "observation"),
+                           tags_match="any", budget="mid"):
         self.recall_calls.append({
             "bank": bank,
             "query": query,
             "tags": sorted(tags),
             "max_tokens": max_tokens,
             "budget": budget,
+            "clearance": clearance,
         })
-        return self._recall_ret
+        return (_hit(self._recall_ret),) if self._recall_ret else ()
 
 
 # ---------------------------------------------------------------------------
@@ -39,7 +51,7 @@ class _Sem:
 
 async def test_semantic_recall_telegram_clearance(monkeypatch):
     """telegram origin → private clearance → all four tiers readable."""
-    fake = _Sem("- prior lesson")
+    fake = _Sem("prior lesson")
     monkeypatch.setattr(agent_mod, "active_semantic_memory", fake, raising=False)
 
     result = await _fetch_executor_archive(
@@ -53,8 +65,10 @@ async def test_semantic_recall_telegram_clearance(monkeypatch):
     assert c["bank"] == "casa"
     assert c["query"] == "build the invoice"
     assert c["tags"] == ["family", "friends", "private", "public"]
+    assert c["clearance"] == "private"
     assert c["max_tokens"] == 3000
-    assert result == "## Prior engagements (lessons learned)\n- prior lesson"
+    assert result.startswith("## Prior engagements (lessons learned)\n")
+    assert "prior lesson" in result
 
 
 # ---------------------------------------------------------------------------
@@ -102,7 +116,7 @@ async def test_unavailable_recall_returns_empty_no_crash(monkeypatch):
     from semantic_memory import RecallUnavailable
 
     class _Down:
-        async def recall(self, *a, **k): raise RecallUnavailable("timeout")
+        async def recall_items(self, *a, **k): raise RecallUnavailable("timeout")
 
     monkeypatch.setattr(agent_mod, "active_semantic_memory", _Down(), raising=False)
 

@@ -242,6 +242,10 @@ class _GaryMemory:
     async def recall(self, *args, **kwargs):
         return ""
 
+    async def recall_items(self, *args, **kwargs):
+        # Task 11: typed recall — a genuine zero-hit is the empty tuple.
+        return ()
+
     async def profile(self, *args, **kwargs):
         return ""
 

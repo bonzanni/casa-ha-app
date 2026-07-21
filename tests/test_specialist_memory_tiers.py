@@ -27,21 +27,33 @@ pytestmark = [pytest.mark.unit]
 # ---------------------------------------------------------------------------
 
 
+def _hit(text):
+    from personality_types import RecallHit
+    return RecallHit(
+        text=text, memory_type="world", sensitivity="friends",
+        application_tags=(), provenance=None, backend_id="b1", document_id=None,
+        chunk_id=None, source_fact_ids=None, metadata=None, context=None, score=None,
+    )
+
+
 class _FakeSem:
     def __init__(self, recall_ret: str = ""):
         self.recall_calls: list[dict] = []
         self.retain_calls: list[dict] = []
         self._recall_ret = recall_ret
 
-    async def recall(self, bank, query, *, tags, max_tokens, budget="mid", **kw):
+    async def recall_items(self, bank, query, *, tags, max_tokens, clearance,
+                           types=("world", "experience", "observation"),
+                           tags_match="any", budget="mid"):
         self.recall_calls.append({
             "bank": bank,
             "query": query,
             "tags": sorted(tags),
             "max_tokens": max_tokens,
             "budget": budget,
+            "clearance": clearance,
         })
-        return self._recall_ret
+        return (_hit(self._recall_ret),) if self._recall_ret else ()
 
     async def retain(self, bank, items, *, async_=True):
         self.retain_calls.append({"bank": bank, "items": items})
@@ -287,7 +299,7 @@ async def test_recall_unavailable_injects_status_note(monkeypatch):
     from semantic_memory import RecallUnavailable
 
     class _DownSem(_FakeSem):
-        async def recall(self, *a, **k):
+        async def recall_items(self, *a, **k):
             raise RecallUnavailable("http_504")
 
     cfg = _specialist_cfg(role="finance", token_budget=4000)

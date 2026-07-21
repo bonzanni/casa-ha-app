@@ -66,6 +66,18 @@ class _CaptureSem(SemanticMemory):
         self.recall_calls.append({"tags": list(tags)})
         return "some fact"
 
+    async def recall_items(self, bank, query, *, tags, max_tokens, clearance,
+                           types=("world", "experience", "observation"),
+                           tags_match="any", budget="mid"):
+        self.recall_calls.append({"tags": list(tags), "clearance": clearance})
+        from personality_types import RecallHit
+        return (RecallHit(
+            text="some fact", memory_type="world", sensitivity="friends",
+            application_tags=(), provenance=None, backend_id="b1", document_id=None,
+            chunk_id=None, source_fact_ids=None, metadata=None, context=None,
+            score=None,
+        ),)
+
     async def profile(self, bank):
         return ""
 

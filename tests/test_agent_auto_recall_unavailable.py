@@ -62,6 +62,11 @@ class _FailingSem(SemanticMemory):
     async def recall(self, bank, query, *, tags, max_tokens,
                      types=("world", "experience", "observation"),
                      tags_match="any", budget="mid"):
+        raise RecallUnavailable("http_504")
+
+    async def recall_items(self, bank, query, *, tags, max_tokens, clearance,
+                           types=("world", "experience", "observation"),
+                           tags_match="any", budget="mid"):
         self.recall_attempts += 1
         raise RecallUnavailable("http_504")
 
@@ -72,12 +77,12 @@ class _FailingSem(SemanticMemory):
 class _SlowSem(_FailingSem):
     """Recall hangs far past the bounded deadline (cancelled by wait_for)."""
 
-    async def recall(self, bank, query, *, tags, max_tokens,
-                     types=("world", "experience", "observation"),
-                     tags_match="any", budget="mid"):
+    async def recall_items(self, bank, query, *, tags, max_tokens, clearance,
+                           types=("world", "experience", "observation"),
+                           tags_match="any", budget="mid"):
         self.recall_attempts += 1
         await asyncio.sleep(30)
-        return "- too late"
+        return ()
 
 
 class _CaptureClient:
@@ -191,10 +196,16 @@ async def test_breaker_recovers_after_successful_probe(tmp_path):
         assert agent._recall_breaker.open
 
         # Heal the backend and force the cooldown to have elapsed.
-        async def _healthy(bank, query, *, tags, max_tokens, **kw):
+        async def _healthy(bank, query, *, tags, max_tokens, clearance, **kw):
+            from personality_types import RecallHit
             sem.recall_attempts += 1
-            return "- a fact"
-        sem.recall = _healthy  # type: ignore[method-assign]
+            return (RecallHit(
+                text="a fact", memory_type="world", sensitivity="friends",
+                application_tags=(), provenance=None, backend_id="b1",
+                document_id=None, chunk_id=None, source_fact_ids=None,
+                metadata=None, context=None, score=None,
+            ),)
+        sem.recall_items = _healthy  # type: ignore[method-assign]
         agent._recall_breaker._opened_at -= (agent._recall_breaker._cooldown_s + 1)
 
         before = sem.recall_attempts

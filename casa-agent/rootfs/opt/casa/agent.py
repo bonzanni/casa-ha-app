@@ -42,6 +42,7 @@ from timekeeping import resolve_tz
 from hindsight_ids import bank_id
 from sensitivity import clearance_for_origin, readable_tiers
 from personality_types import SpeakerProvenance
+from recall_renderer import render_recall
 from speaker_provenance import UserProvenance, provenance_from_mapping
 from session_saver import freshness_window, retain_cold_session, save_session
 from semantic_memory import NoOpSemanticMemory, RecallUnavailable, SemanticMemory
@@ -1210,20 +1211,33 @@ class Agent:
             )
         elif load_plan.auto_recall:
             _recall_t0 = time.monotonic()
+            _recall_clearance = _current_origin_clearance(channel)
             try:
                 # Bounded deadline: never the full HTTP timeout. No synchronous
                 # retry on failure — a 504 means the reranker is overloaded and
                 # retrying makes it worse (the seam itself only retries
                 # connection-level drops, never HTTP errors).
-                facts = await asyncio.wait_for(
-                    self._semantic_memory.recall(
+                #
+                # Task 11: the awaited method is now the typed, attributed
+                # recall_items; the OWN _RecallBreaker/wait_for/record_* logic
+                # around it is UNCHANGED (this site is NOT wrapped in the new
+                # recall_health breaker). On success the hits are rendered with
+                # their recorded attribution before assignment to ``facts``.
+                _hits = await asyncio.wait_for(
+                    self._semantic_memory.recall_items(
                         bank, user_text, tags=_recall_tier_tags(channel),
                         max_tokens=self.config.memory.token_budget,
+                        clearance=_recall_clearance,
                         budget="mid",  # auto_recall is always non-voice (see _plan_load); voice uses the recall_memory pull tool at budget=low
                     ),
                     timeout=_AUTO_RECALL_TIMEOUT_S,
                 )
                 self._recall_breaker.record_success()
+                facts = render_recall(
+                    _hits, current_speaker=speaker_provenance_for_role(self.config),
+                    surface="text", clearance=_recall_clearance,
+                    token_budget=self.config.memory.token_budget,
+                )
             except (RecallUnavailable, asyncio.TimeoutError) as exc:
                 self._recall_breaker.record_failure()
                 logger.warning(

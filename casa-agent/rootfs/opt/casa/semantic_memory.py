@@ -13,6 +13,8 @@ from __future__ import annotations
 from abc import ABC, abstractmethod
 from typing import Any
 
+from personality_types import RecallHit, SensitivityTier
+
 
 class RecallUnavailable(RuntimeError):
     """Semantic recall could NOT be performed — timeout, 5xx/429, transport
@@ -32,6 +34,25 @@ class RecallUnavailable(RuntimeError):
     def __init__(self, reason: str) -> None:
         self.reason = reason
         super().__init__(f"recall unavailable: {reason}")
+
+
+class RecallProtocolError(RecallUnavailable):
+    """The recall backend answered with a 2xx envelope that could not be
+    trusted as a structured result (personality Task 11).
+
+    A subclass of :class:`RecallUnavailable` so every existing
+    ``except RecallUnavailable`` still catches it and the three-outcome
+    discipline is preserved: a malformed envelope, a hit that fails the
+    per-field wire contract, or an all-hits-dropped-by-clearance response is
+    NEVER reported as a genuine zero-hit — it means memory could not be read.
+
+    ``reason`` is fixed to ``"protocol_error"``; ``detail`` is a bounded,
+    enum-like tag (e.g. ``"results_missing_or_wrong_shape"``) that NEVER
+    carries response content or query text."""
+
+    def __init__(self, detail: str) -> None:
+        super().__init__("protocol_error")
+        self.detail = detail
 
 
 def render_mental_models(response: dict[str, Any]) -> str:
@@ -83,6 +104,25 @@ class SemanticMemory(ABC):
         ``types`` MUST keep ``world`` or raw facts are dropped (spec §8.9)."""
 
     @abstractmethod
+    async def recall_items(
+        self, bank: str, query: str, *, tags: list[str], max_tokens: int,
+        clearance: SensitivityTier,
+        types: tuple[str, ...] = ("world", "experience", "observation"),
+        tags_match: str = "any", budget: str = "mid",
+    ) -> tuple[RecallHit, ...]:
+        """Typed, attributed recall (personality Task 11): decode each hit's
+        sensitivity tier + speaker provenance and return trustworthy,
+        readable :class:`RecallHit`s at or below ``clearance``.
+
+        ADDITIVE — ``recall`` above is untouched and remains available. Same
+        three-outcome contract: an empty tuple is returned ONLY for a
+        well-formed 2xx response whose ``results`` is an actual empty list;
+        a malformed envelope or a response whose hits are all dropped by the
+        clearance/wire contract raises :class:`RecallProtocolError`; every
+        transport/HTTP failure raises :class:`RecallUnavailable`."""
+        raise NotImplementedError
+
+    @abstractmethod
     async def profile(self, bank: str) -> str:
         """Return the bank's mental-model overlay digest (cheap GET, no LLM)."""
 
@@ -115,6 +155,14 @@ class NoOpSemanticMemory(SemanticMemory):
         types: tuple[str, ...] = ("world", "experience", "observation"),
         tags_match: str = "any", budget: str = "mid",
     ) -> str:
+        raise RecallUnavailable("not_configured")
+
+    async def recall_items(
+        self, bank: str, query: str, *, tags: list[str], max_tokens: int,
+        clearance: SensitivityTier,
+        types: tuple[str, ...] = ("world", "experience", "observation"),
+        tags_match: str = "any", budget: str = "mid",
+    ) -> tuple[RecallHit, ...]:
         raise RecallUnavailable("not_configured")
 
     async def profile(self, bank: str) -> str:

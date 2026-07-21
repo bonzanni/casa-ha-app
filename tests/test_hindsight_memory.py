@@ -375,3 +375,156 @@ async def test_session_uses_force_close_connector() -> None:
         assert session.connector.force_close is True
     finally:
         await session.close()
+
+
+# --- Personality Task 11: recall_items (typed, attributed, three-outcome) ---
+
+
+@pytest.fixture
+def memory() -> HindsightSemanticMemory:
+    return HindsightSemanticMemory(base_url="http://hs:8888")
+
+
+def _valid_payload() -> str:
+    """The base64 payload of a valid resident provenance tag (sans namespace)."""
+    from personality_types import SpeakerProvenance
+    from speaker_provenance import RESERVED_SOURCE_PREFIX, encode_provenance_tag
+
+    tag = encode_provenance_tag(SpeakerProvenance(
+        speaker_kind="resident", role_id="resident:butler",
+        persona_id="casa.personas/tina", persona_version="1.0.0",
+        display_name="Tina", binding_digest="sha256:" + "5" * 64,
+    ))
+    return tag[len(RESERVED_SOURCE_PREFIX):]
+
+
+async def test_recall_items_maps_hindsight_result_to_typed_hit(memory) -> None:
+    memory._request = AsyncMock(return_value={
+        "results": [{
+            "id": "backend-1", "text": " Fact ", "type": "world",
+            "tags": ["friends", "casa-source-v1." + _valid_payload()],
+            "document_id": None, "chunk_id": "chunk-1", "source_fact_ids": ["fact-1"],
+            "metadata": {}, "context": "context", "score": 0.75,
+        }],
+    })
+    hits = await memory.recall_items(
+        "casa", "query", tags=["friends"], max_tokens=100, clearance="friends",
+    )
+    assert hits[0].text == "Fact"
+    assert hits[0].sensitivity == "friends"
+    assert hits[0].backend_id == "backend-1"
+    assert hits[0].provenance is not None
+    assert hits[0].provenance.display_name == "Tina"
+    assert hits[0].chunk_id == "chunk-1"
+    assert hits[0].source_fact_ids == ("fact-1",)
+    assert hits[0].context == "context"
+    assert hits[0].score == 0.75
+    # Step 8: reserved + tier tags never survive into application_tags.
+    assert "casa-source-v1." + _valid_payload() not in hits[0].application_tags
+    for token in ("public", "friends", "family", "private"):
+        assert token not in hits[0].application_tags
+
+
+async def test_recall_items_posts_the_same_wire_shape_as_recall(memory) -> None:
+    memory._request = AsyncMock(return_value={"results": []})
+    await memory.recall_items(
+        "casa-assistant", "thermostat?", tags=["house"], max_tokens=512,
+        clearance="private", budget="low",
+    )
+    method, path, payload = memory._request.await_args.args
+    assert method == "POST"
+    assert path == "/v1/default/banks/casa-assistant/memories/recall"
+    assert payload["query"] == "thermostat?"
+    assert payload["tags"] == ["house"]
+    assert payload["tags_match"] == "any"
+    assert payload["max_tokens"] == 512
+    assert payload["budget"] == "low"
+    assert "world" in payload["types"]
+
+
+async def test_zero_wire_hits_is_the_only_empty_tuple_case(memory) -> None:
+    memory._request = AsyncMock(return_value={"results": []})
+    hits = await memory.recall_items(
+        "casa", "query", tags=["friends"], max_tokens=100, clearance="friends",
+    )
+    assert hits == ()
+
+
+async def test_all_hits_dropped_by_clearance_is_protocol_error_not_empty(memory) -> None:
+    from semantic_memory import RecallProtocolError
+
+    memory._request = AsyncMock(return_value={
+        "results": [{"id": "b1", "text": "secret", "type": "world", "tags": ["private"]}],
+    })
+    with pytest.raises(RecallProtocolError):
+        await memory.recall_items(
+            "casa", "query", tags=["friends"], max_tokens=100, clearance="friends",
+        )
+
+
+async def test_recall_items_protocol_error_is_a_recall_unavailable(memory) -> None:
+    """RecallProtocolError subclasses RecallUnavailable so every existing
+    `except RecallUnavailable` still catches it."""
+    from semantic_memory import RecallProtocolError
+
+    assert issubclass(RecallProtocolError, RecallUnavailable)
+    memory._request = AsyncMock(return_value={"nope": []})
+    with pytest.raises(RecallUnavailable):
+        await memory.recall_items(
+            "casa", "q", tags=["public"], max_tokens=10, clearance="public",
+        )
+
+
+@pytest.mark.parametrize("body", [
+    {},                       # missing results key
+    {"results": "nope"},      # wrong-shaped results
+    "not a dict",             # non-dict body
+])
+async def test_recall_items_malformed_envelope_is_protocol_error(memory, body) -> None:
+    from semantic_memory import RecallProtocolError
+
+    memory._request = AsyncMock(return_value=body)
+    with pytest.raises(RecallProtocolError):
+        await memory.recall_items(
+            "casa", "q", tags=["public"], max_tokens=10, clearance="public",
+        )
+
+
+async def test_recall_items_maps_failures_exactly_like_recall(memory) -> None:
+    import asyncio
+
+    import aiohttp
+
+    memory._request = AsyncMock(side_effect=asyncio.TimeoutError())
+    with pytest.raises(RecallUnavailable) as ei:
+        await memory.recall_items("casa", "q", tags=["public"], max_tokens=10, clearance="public")
+    assert ei.value.reason == "timeout"
+
+    memory._request = AsyncMock(side_effect=_http_err(504))
+    with pytest.raises(RecallUnavailable) as ei:
+        await memory.recall_items("casa", "q", tags=["public"], max_tokens=10, clearance="public")
+    assert ei.value.reason == "http_504"
+
+    memory._request = AsyncMock(side_effect=_http_err(429))
+    with pytest.raises(RecallUnavailable) as ei:
+        await memory.recall_items("casa", "q", tags=["public"], max_tokens=10, clearance="public")
+    assert ei.value.reason == "http_429"
+
+    memory._request = AsyncMock(side_effect=aiohttp.ClientError())
+    with pytest.raises(RecallUnavailable) as ei:
+        await memory.recall_items("casa", "q", tags=["public"], max_tokens=10, clearance="public")
+    assert ei.value.reason == "transport"
+
+    memory._request = AsyncMock(side_effect=ValueError("bad json"))
+    with pytest.raises(RecallUnavailable) as ei:
+        await memory.recall_items("casa", "q", tags=["public"], max_tokens=10, clearance="public")
+    assert ei.value.reason == "transport"
+
+
+async def test_recall_items_validates_bank_id(memory) -> None:
+    memory._request = AsyncMock()
+    with pytest.raises(ValueError):
+        await memory.recall_items(
+            "casa/finance", "q", tags=["public"], max_tokens=10, clearance="public",
+        )
+    memory._request.assert_not_awaited()

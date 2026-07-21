@@ -3556,6 +3556,17 @@ async def continue_voice_job(args: dict) -> dict:
 # ---------------------------------------------------------------------------
 
 
+def _recall_surface(channel: str, origin: dict) -> str:
+    """Attribution surface for a recall render (Task 11): voice speaks aloud;
+    an untrusted webhook_trigger turn is ``restricted_webhook`` (never names a
+    person, regardless of clearance); everything else is ``text``."""
+    if channel == "voice":
+        return "voice"
+    if origin.get("_origin_route") == "webhook_trigger":
+        return "restricted_webhook"
+    return "text"
+
+
 @tool(
     "recall_memory",
     "Search your long-term memory for facts relevant to a query.",
@@ -3592,30 +3603,45 @@ async def recall_memory(args: dict) -> dict:
     # webhook_trigger turn reads at its declared clearance (public floor, never
     # private); /invoke stays private; missing/unknown route on the webhook
     # channel fails closed to public.
+    from personality_types import SpeakerProvenance
     from sensitivity import clearance_for_origin, readable_tiers
-    tags = readable_tiers(clearance_for_origin(
+    clearance = clearance_for_origin(
         origin.get("_origin_route"), origin.get("_origin_clearance"), channel,
-    ))
+    )
+    tags = readable_tiers(clearance)
 
     budget = "low" if channel == "voice" else "mid"
     tokens = (
         getattr(getattr(caller_cfg, "memory", None), "token_budget", 2000)
         if caller_cfg else 2000
     )
+    # Attribution surface + the recalling agent's own identity (Task 11). The
+    # render itself is driven by each hit's recorded provenance; current_speaker
+    # is honest metadata only.
+    surface = _recall_surface(channel, origin)
+    current_speaker = (
+        getattr(caller_cfg, "speaker_provenance", None)
+        or SpeakerProvenance(speaker_kind="system")
+    )
     from hindsight_ids import bank_id
+    from recall_health import default_telemetry, observed_recall
+    from recall_renderer import render_recall
     try:
-        digest = await sem.recall(
-            bank_id("casa"), query,
-            tags=tags, max_tokens=tokens, budget=budget,
+        hits = await observed_recall(
+            path="direct_tool", telemetry=default_telemetry(),
+            operation=lambda: sem.recall_items(
+                bank_id("casa"), query, tags=tags, max_tokens=tokens,
+                clearance=clearance, budget=budget,
+            ),
         )
     except Exception as exc:  # noqa: BLE001
         # Three-outcome contract (v0.99.0): a failed recall must NOT report
         # status=ok with an empty digest — the model would then (per doctrine)
         # tell the user Casa has no such information, which is false. Any
-        # failure here (typed RecallUnavailable or unexpected) means memory
-        # could not be checked. Only RecallUnavailable's slug reasons are
-        # trusted in logs; anything else logs its TYPE (an arbitrary .reason
-        # attribute could carry content).
+        # failure here (typed RecallUnavailable — incl. RecallProtocolError — or
+        # unexpected) means memory could not be checked. Only RecallUnavailable's
+        # slug reasons are trusted in logs; anything else logs its TYPE (an
+        # arbitrary .reason attribute could carry content).
         reason = (
             exc.reason if isinstance(exc, RecallUnavailable)
             else type(exc).__name__
@@ -3631,6 +3657,10 @@ async def recall_memory(args: dict) -> dict:
                 "say the information doesn't exist or that you don't have it."
             ),
         })
+    digest = render_recall(
+        hits, current_speaker=current_speaker, surface=surface,
+        clearance=clearance, token_budget=tokens,
+    )
     return _result({"status": "ok", "memory": digest})
 
 
@@ -3984,6 +4014,7 @@ async def _fetch_executor_archive(
     try:
         digest = await delegated_recall(
             sem, query=task, origin_channel=origin_channel, max_tokens=token_budget,
+            path="executor_archive",
         )
     except RecallUnavailable:
         return ""
@@ -5554,7 +5585,7 @@ async def query_engager(args: dict) -> dict:
             context = await delegated_recall(
                 sem, query=question,
                 origin_channel=str(engagement.origin.get("channel", "")),
-                max_tokens=2000,
+                max_tokens=2000, path="query_engager",
             )
         except RecallUnavailable:
             # Distinct from status=unknown (a genuine zero-hit): the engager's

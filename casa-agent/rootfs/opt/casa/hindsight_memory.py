@@ -16,16 +16,41 @@ from typing import Any
 import aiohttp
 
 from hindsight_ids import bank_id as _validate_bank_id  # fail-fast on bad ids
+from personality_types import RecallHit
 from semantic_memory import (
+    RecallProtocolError,
     RecallUnavailable,
     SemanticMemory,
     render_mental_models,
     render_recall,
 )
+from speaker_provenance import RESERVED_SOURCE_NAMESPACE, decode_provenance_from_tags
 
 logger = logging.getLogger(__name__)
 
 _DEFAULT_TYPES = ("world", "experience", "observation")
+
+# Access ladder (design §2): a hit is readable iff its tier rank is <= the
+# reader's clearance rank. Mirrors sensitivity.TIERS, kept local so the decode
+# has no import cycle risk against the tools/agent graph.
+_TIER_RANK = {"public": 0, "friends": 1, "family": 2, "private": 3}
+
+
+def _decode_sensitivity(wire_tags: tuple[str, ...], *, clearance: str) -> str | None:
+    """Return the hit's sensitivity tier, or None if it is unreadable.
+
+    A trustworthy hit carries EXACTLY ONE tier token; zero or multiple tier
+    tokens is ambiguous → drop (None). A tier above ``clearance`` is not
+    readable by this context → drop (None). The single-occurrence rule is a
+    provenance-integrity gate, not a leak-safe default: a dropped hit never
+    surfaces, so it can never leak."""
+    occurrences = [tag for tag in wire_tags if tag in _TIER_RANK]
+    if len(occurrences) != 1:
+        return None
+    tier = occurrences[0]
+    if _TIER_RANK[tier] > _TIER_RANK.get(clearance, -1):
+        return None
+    return tier
 
 
 class HindsightSemanticMemory(SemanticMemory):
@@ -167,6 +192,107 @@ class HindsightSemanticMemory(SemanticMemory):
             bank, tags, "hits" if results else "empty", len(results), _latency_ms(),
         )
         return digest
+
+    async def recall_items(
+        self, bank: str, query: str, *, tags: list[str], max_tokens: int,
+        clearance: str,
+        types: tuple[str, ...] = _DEFAULT_TYPES,
+        tags_match: str = "any", budget: str = "mid",
+    ) -> tuple[RecallHit, ...]:
+        """Typed, attributed recall (personality Task 11). ADDITIVE — leaves
+        :meth:`recall` and its reason strings untouched. The failure mapping
+        below is byte-for-byte the SAME as :meth:`recall`
+        (asyncio.TimeoutError→timeout; aiohttp.ClientResponseError→http_{status};
+        (aiohttp.ClientError, ValueError)→transport). Three-outcome contract:
+        an empty tuple is returned ONLY for a well-formed 2xx ``results: []``;
+        a malformed envelope, a per-hit wire-contract violation, or an
+        all-hits-dropped-by-clearance response raises RecallProtocolError (a
+        RecallUnavailable subclass)."""
+        _validate_bank_id(bank)
+        t0 = time.monotonic()
+
+        def _latency_ms() -> int:
+            return int((time.monotonic() - t0) * 1000)
+
+        def _unavailable(reason: str) -> RecallUnavailable:
+            logger.warning(
+                "memory_recall_items bank=%s tags=%s outcome=unavailable "
+                "reason=%s latency_ms=%d",
+                bank, tags, reason, _latency_ms(),
+            )
+            return RecallUnavailable(reason)
+
+        try:
+            raw = await self._request(
+                "POST", f"/v1/default/banks/{bank}/memories/recall",
+                {
+                    "query": query, "tags": tags, "tags_match": tags_match,
+                    "max_tokens": max_tokens, "types": list(types), "budget": budget,
+                },
+            )
+        except asyncio.TimeoutError as exc:
+            raise _unavailable("timeout") from exc
+        except aiohttp.ClientResponseError as exc:
+            raise _unavailable(f"http_{exc.status}") from exc
+        except (aiohttp.ClientError, ValueError) as exc:
+            raise _unavailable("transport") from exc
+
+        if (not isinstance(raw, dict) or "results" not in raw
+                or not isinstance(raw["results"], list)):
+            raise RecallProtocolError("results_missing_or_wrong_shape")
+        if not raw["results"]:
+            logger.info(
+                "memory_recall_items bank=%s tags=%s outcome=empty hits=0 latency_ms=%d",
+                bank, tags, _latency_ms(),
+            )
+            return ()  # the sole successful-zero condition
+
+        hits: list[RecallHit] = []
+        for result in raw["results"]:
+            if not isinstance(result, dict):
+                raise RecallProtocolError("result_not_object")
+            text = result.get("text")
+            raw_tags = result.get("tags")
+            if not isinstance(text, str) or not text.strip():
+                raise RecallProtocolError("result_text_invalid")
+            if not isinstance(raw_tags, list) or not all(isinstance(t, str) for t in raw_tags):
+                raise RecallProtocolError("result_tags_invalid")
+            wire_tags = tuple(raw_tags)
+            sensitivity = _decode_sensitivity(wire_tags, clearance=clearance)
+            if sensitivity is None:
+                continue
+            provenance, _reason = decode_provenance_from_tags(wire_tags)
+            application_tags = tuple(
+                t for t in wire_tags
+                if t not in _TIER_RANK and not t.startswith(RESERVED_SOURCE_NAMESPACE)
+            )
+            source_fact_ids = (
+                tuple(result["source_fact_ids"])
+                if isinstance(result.get("source_fact_ids"), list) else None
+            )
+            score = (
+                float(result["score"])
+                if type(result.get("score")) in {int, float} else None
+            )
+            hits.append(RecallHit(
+                text=text.strip(), memory_type=result.get("type") or "unknown",
+                sensitivity=sensitivity, application_tags=application_tags,
+                provenance=provenance, backend_id=result.get("id") or None,
+                document_id=result.get("document_id") or None,
+                chunk_id=result.get("chunk_id") or None,
+                source_fact_ids=source_fact_ids,
+                metadata=RecallHit.freeze_metadata(result.get("metadata")),
+                context=result.get("context") or None, score=score,
+            ))
+        if not hits:
+            # Every hit was dropped (clearance or ambiguous provenance): NOT a
+            # genuine zero-hit — hits exist but none is trustworthy/readable.
+            raise RecallProtocolError("no_trustworthy_readable_hit")
+        logger.info(
+            "memory_recall_items bank=%s tags=%s outcome=hits hits=%d latency_ms=%d",
+            bank, tags, len(hits), _latency_ms(),
+        )
+        return tuple(hits)
 
     async def profile(self, bank: str) -> str:
         _validate_bank_id(bank)
