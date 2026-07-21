@@ -124,6 +124,60 @@ def test_an_invalid_staged_swap_is_rejected_and_active_keeps_running(tmp_path) -
     assert instance_dir.desired() is None
 
 
+def test_tool_stage_and_loader_reconcile_share_the_same_bindings_root(tmp_path, monkeypatch) -> None:
+    """Round-trip regression for the bindings-root divergence bug: the
+    resident_persona_swap/reset tools STAGE a desired tuple via
+    ``tools._stage_and_report``; only the NEXT boot's
+    ``reconcile_resident_binding`` (called from agent_loader's
+    ``load_agent_from_dir``) actually promotes it. Both sides MUST resolve the
+    same on-disk directory for a given slot + ``CASA_BINDINGS_DIR``, or a
+    staged swap is silently never activated. Before the fix,
+    ``tools._stage_and_report`` hardcoded ``/config/bindings`` while
+    ``agent_loader._resident_bindings_root`` honored ``CASA_BINDINGS_DIR`` —
+    so this test staged under the real (unwritable, in a test sandbox)
+    ``/config/bindings`` and reconcile — reading the tmp dir this test points
+    ``CASA_BINDINGS_DIR`` at — never saw the override."""
+    import agent_loader
+    import tools
+    from personality_binding import InstanceDir
+
+    monkeypatch.setenv("CASA_BINDINGS_DIR", str(tmp_path / "bindings-root"))
+
+    role = _role()
+    default = _persona("casa/tina", "0.1.0")
+    override = _persona("casa/gary", "0.2.0")
+
+    # Establish the boot-time active binding through the LOADER's own root
+    # resolver (mirrors load_agent_from_dir's _activate_resident_binding).
+    loader_instance_dir = InstanceDir(
+        agent_loader._resident_bindings_root(None) / f"resident-{role.slot}"
+    )
+    first = reconcile_resident_binding(
+        role=role, image_default_persona_loader=_loaders({"casa/tina@0.1.0": default}),
+        override_persona_loader=_loaders({}), instance_dir=loader_instance_dir,
+    )
+    assert first.binding.mode == "image-default"
+
+    # Stage an override via the TOOL's own helper — exactly what
+    # resident_persona_swap calls after resolving/validating the persona.
+    override_binding = materialize_override_binding(
+        role=role, persona=override, override_source="operator:casa/gary@0.2.0",
+    )
+    tools._stage_and_report(role.role_id, role.slot, override_binding)
+
+    # The next boot's reconcile, reading through the LOADER's seam, must see
+    # and promote the tool-staged override.
+    second = reconcile_resident_binding(
+        role=role, image_default_persona_loader=_loaders({"casa/tina@0.1.0": default}),
+        override_persona_loader=_loaders({"casa/gary@0.2.0": override}),
+        instance_dir=loader_instance_dir,
+    )
+    assert second.binding.mode == "override"
+    assert second.binding.persona_id == "casa/gary"
+    assert loader_instance_dir.active().binding.mode == "override"
+    assert loader_instance_dir.active().binding.persona_id == "casa/gary"
+
+
 def test_a_staged_candidate_identical_to_active_is_a_no_op_and_clears_the_stale_file(tmp_path) -> None:
     """resident_persona_reset staging a return-to-default when already on the
     default must not error or churn — and must not leave a stale desired.yaml."""

@@ -1131,12 +1131,28 @@ def _activate_resident_binding(
             f"agent {role_from_path!r}: resident binding reconciliation failed: {exc}"
         ) from exc
 
-    if active_tuple.binding.mode == "image-default":
-        bound_persona = _load_default(IMAGE_DEFAULT_PERSONA_BY_SLOT[cfg.role_slot.slot])
-    else:
-        bound_persona = _load_override(
-            f"{active_tuple.binding.persona_id}@{active_tuple.binding.persona_version}"
-        )
+    # Fix 2 (Personality Phase A review): reconcile_resident_binding can
+    # return a RETAINED last-known-good tuple WITHOUT itself raising (e.g.
+    # nothing staged, and the persona blob backing the current active
+    # override has since vanished from disk — reconcile's internal load
+    # attempt fails, is caught internally, and the retained active is handed
+    # back unchanged since an active tuple exists). The (re)load below then
+    # loads that SAME persona a second time; it must translate a missing/
+    # invalid blob to LoadError exactly like the reconcile call above, not
+    # escape as a raw ValueError.
+    try:
+        if active_tuple.binding.mode == "image-default":
+            bound_persona = _load_default(IMAGE_DEFAULT_PERSONA_BY_SLOT[cfg.role_slot.slot])
+        else:
+            bound_persona = _load_override(
+                f"{active_tuple.binding.persona_id}@{active_tuple.binding.persona_version}"
+            )
+    except ValueError as exc:
+        raise LoadError(
+            f"agent {role_from_path!r}: bound persona "
+            f"{active_tuple.binding.persona_id}@{active_tuple.binding.persona_version} "
+            f"failed to reload after reconciliation: {exc}"
+        ) from exc
     platform_frame = (Path(SCHEMA_DIR).parent / "personality" / "platform-frame.md").read_text(encoding="utf-8")
     safety_kernel = (Path(SCHEMA_DIR).parent / "personality" / "safety-kernel.md").read_text(encoding="utf-8")
     bundle = compile_prompt_bundle(

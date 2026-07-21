@@ -7336,7 +7336,16 @@ def _resolve_local_persona(ref: str):
 def _stage_and_report(role_id: str, slot: str, binding) -> dict:
     from personality_binding import InstanceDir, InstanceTuple
 
-    instance_dir = InstanceDir(Path("/config/bindings") / f"resident-{slot}")
+    # Resolve the bindings root through the SAME seam agent_loader's boot-time
+    # reconcile uses (agent_loader._resident_bindings_root — honors an explicit
+    # arg, then CASA_BINDINGS_DIR, then /config/bindings). This tool and the
+    # next boot's reconcile_resident_binding() MUST agree on the on-disk
+    # directory for a given slot, or a staged swap/reset is silently never
+    # picked up (see tests/test_reconcile_resident_binding.py's round-trip
+    # regression test).
+    import agent_loader
+
+    instance_dir = InstanceDir(agent_loader._resident_bindings_root(None) / f"resident-{slot}")
     active = instance_dir.active()
     root = binding.override_source or binding.image_default_root or ""
     instance_dir.stage_desired(InstanceTuple(

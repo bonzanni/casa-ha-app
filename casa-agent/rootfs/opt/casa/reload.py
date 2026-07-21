@@ -551,6 +551,11 @@ async def reload_agent(runtime: Any, *, role: str | None = None) -> list[str]:
                 "reload_agent(%s): personality identity changed (role_checksum or "
                 "binding_digest differs) — refusing hot-swap, restart required", role,
             )
+            # Note: the load_agent_from_dir() call above may have already committed a
+            # staged desired->active binding to DISK via reconcile before this guard
+            # fires — harmless, since that's idempotent with the mandatory restart's
+            # own boot-time reconcile and this guard leaves the live in-memory
+            # agent/registries untouched either way.
             raise ReloadError(
                 "restart_required",
                 f"role={role} personality identity changed; restart via "

@@ -178,6 +178,56 @@ def test_real_concierge_role_stages_a_reset_to_its_own_default(tmp_path) -> None
     assert instance_dir.desired() is None
 
 
+def test_missing_override_persona_blob_at_reload_raises_load_error(tmp_path) -> None:
+    """Fix 2 regression: reconcile_resident_binding can return a RETAINED
+    last-known-good OVERRIDE tuple without itself raising -- e.g. when nothing
+    is staged and the persona blob backing the current active override has
+    since vanished from disk, reconcile's own persona-load attempt fails,
+    is caught internally, and (since an active tuple exists) the retained
+    active is returned unchanged. agent_loader._activate_resident_binding then
+    reloads that SAME now-missing persona a second time, outside reconcile's
+    try/except ValueError -> LoadError translation. Before the fix that second
+    load escaped as a raw ValueError; it must be a LoadError instead."""
+    from persona_pack import PersonaManifest, PersonaPack
+    from personality_binding import InstanceDir, InstanceTuple, materialize_override_binding
+    from agent_loader import LoadError, load_agent_from_dir
+    from policies import load_policies
+
+    cfg = _load("concierge")
+    role = cfg.role_slot
+
+    ghost = PersonaPack(
+        persona_id="casa/gary", version="9.9.9", trait_schema_version=1,
+        identity={"display_name": "Ghost Gary", "pronouns": {
+            "subject": "they", "object": "them", "possessive_adjective": "their",
+            "possessive_pronoun": "theirs", "reflexive": "themself"}},
+        relationship_posture="established", archetype="concierge",
+        traits={"warmth": 3, "formality": 2, "candor": 4, "attunement": 4,
+                "curiosity": 3, "levity": 2, "social_energy": 3, "optimism": 3},
+        quirks=(), markdown="# Core\n\nGhost.\n",
+        examples=(), manifest=PersonaManifest(files=(), checksum="sha256:" + "9" * 64),
+        checksum="sha256:" + "8" * 64,
+    )
+    binding = materialize_override_binding(
+        role=role, persona=ghost, override_source="operator:casa/gary@9.9.9",
+    )
+    bindings_root = tmp_path / "bindings-root"
+    instance_dir = InstanceDir(bindings_root / "resident-concierge")
+    instance_dir.stage_desired(InstanceTuple(
+        root="operator:casa/gary@9.9.9", binding=binding,
+        config_snapshot={}, config_digest=binding.effective_config_digest,
+    ))
+    instance_dir.commit_desired_to_active()
+    assert instance_dir.active().binding.persona_version == "9.9.9"  # blob never installed
+
+    policies = load_policies(_POLICIES)
+    with pytest.raises(LoadError):
+        load_agent_from_dir(
+            f"{_AGENTS}/concierge", policies=policies,
+            bindings_dir=str(bindings_root),
+        )
+
+
 @pytest.mark.asyncio
 async def test_persona_swap_tool_structured_errors(monkeypatch) -> None:
     """The persona-swap tool returns structured errors before any staging:
