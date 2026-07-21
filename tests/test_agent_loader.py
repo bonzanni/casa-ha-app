@@ -20,6 +20,37 @@ def _w(path: Path, text: str) -> None:
     path.write_text(textwrap.dedent(text), encoding="utf-8")
 
 
+# Personality Phase A, Task 6: runtime.yaml's `model` is now a structured
+# block (matching role.v1.json's oneOf fixed/ha_option shape), and
+# agent_loader._build_runtime_fields cross-checks it BYTE-FOR-BYTE
+# (canonical_json_bytes) against the resolved role artifact's own `model`
+# block — a mismatch is a boot-parity LoadError. `_seed_resident`'s default
+# model per role therefore MUST mirror the REAL shipped
+# defaults/roles/resident/<role>/role.yaml for "assistant"/"butler" (the only
+# two real, roles_dir-default-resolvable resident slots these fixtures use),
+# and falls back to the same `{source: fixed, value: sonnet}` shape
+# `_seed_role_artifact` below writes for every other (synthetic/cross-tier)
+# role name, since those always pair with a custom roles_dir built via
+# `_seed_role_artifact`.
+_REAL_RESIDENT_MODEL_YAML = {
+    "assistant": (
+        "model: {source: ha_option, option: primary_agent_model, "
+        "default: opus, allowed: [opus, sonnet, haiku]}\n"
+    ),
+    "butler": (
+        "model: {source: ha_option, option: voice_agent_model, "
+        "default: haiku, allowed: [opus, sonnet, haiku]}\n"
+    ),
+    # concierge's real shipped role.yaml uses the identical ha_option shape
+    # as butler (both voice_agent_model-resolved residents).
+    "concierge": (
+        "model: {source: ha_option, option: voice_agent_model, "
+        "default: haiku, allowed: [opus, sonnet, haiku]}\n"
+    ),
+}
+_FIXED_SONNET_MODEL_YAML = "model: {source: fixed, value: sonnet}\n"
+
+
 def _seed_resident(base: Path, role: str = "assistant") -> Path:
     """Write a minimal valid resident directory. Returns the agent dir path."""
     d = base / role
@@ -47,9 +78,11 @@ def _seed_resident(base: Path, role: str = "assistant") -> Path:
         schema_version: 1
         policy: standard
     """)
-    _w(d / "runtime.yaml", """\
+    model_yaml = _REAL_RESIDENT_MODEL_YAML.get(role, _FIXED_SONNET_MODEL_YAML)
+    _w(d / "runtime.yaml", f"""\
         schema_version: 1
-        model: sonnet
+        kind: resident
+        {model_yaml.rstrip()}
         tools:
           allowed: [Read, Write]
         channels: [telegram]
@@ -73,7 +106,8 @@ def _seed_specialist(base: Path, role: str = "finance") -> Path:
     _w(d / "response_shape.yaml", "schema_version: 1\n")
     _w(d / "runtime.yaml", """\
         schema_version: 1
-        model: sonnet
+        kind: specialist
+        model: {source: fixed, value: sonnet}
         enabled: false
         memory:
           token_budget: 0
@@ -88,12 +122,24 @@ def _seed_role_artifact(roles_dir: Path, kind: str, slot: str) -> Path:
     slot) under a test-owned roles_dir (Personality Phase A, Task 5).
     load_agent_from_dir now requires one at defaults/roles/<kind>/<slot>/
     for every resident/specialist it loads, cross-validated on kind+slot.
-    The real shipped image only carries assistant/butler (resident) and
-    finance (specialist); tests that deliberately construct synthetic or
-    cross-tier role combinations (e.g. a 'finance' RESIDENT, used only to
-    probe the duplicate-role-across-tiers invariant) need their own
-    fixture roles_dir instead of colliding with the real defaults/roles/
-    tree, hence this test-only stand-in."""
+    The real shipped image only carries assistant/butler/concierge
+    (resident) and finance (specialist); tests that deliberately construct
+    synthetic or cross-tier role combinations (e.g. a 'finance' RESIDENT,
+    used only to probe the duplicate-role-across-tiers invariant) need
+    their own fixture roles_dir instead of colliding with the real
+    defaults/roles/ tree, hence this test-only stand-in.
+
+    Personality Phase A, Task 6: role_slot.validate_role_shape (now run by
+    materialize_role during every load) requires a non-empty `channels` for
+    resident kind and a binding-capable persona policy
+    (required/optional-but-bound) for every non-executor kind — `channels:
+    []` / `persona: {policy: forbidden}` unconditionally (the pre-Task-6
+    shape) fails both checks for resident/specialist. Vary both by kind."""
+    channels_yaml = "[ha_voice]" if kind == "resident" else "[]"
+    persona_yaml = (
+        "{policy: forbidden}" if kind == "executor"
+        else '{policy: required, compatibility: ["casa/test@>=0.1.0 <1.0.0"]}'
+    )
     d = roles_dir / kind / slot
     _w(d / "role.yaml", f"""\
         api_version: casa.role/v1
@@ -111,7 +157,7 @@ def _seed_role_artifact(roles_dir: Path, kind: str, slot: str) -> Path:
           skills: all
           voice_guard: none
         mcp_servers: []
-        channels: []
+        channels: {channels_yaml}
         memory: {{token_budget: 0, read_strategy: per_turn}}
         session: {{strategy: ephemeral, idle_timeout_seconds: 0}}
         disclosure: {{policy: standard, overrides: {{}}}}
@@ -124,7 +170,7 @@ def _seed_role_artifact(roles_dir: Path, kind: str, slot: str) -> Path:
           text: {{register: plain}}
           voice: {{register: plain}}
           restricted_webhook: {{register: plain}}
-        persona: {{policy: forbidden}}
+        persona: {persona_yaml}
         requires: {{plugins: [], tools: []}}
         doctrine_file: doctrine.md
     """)
@@ -166,7 +212,14 @@ class TestHappyPath:
 
         assert cfg.role == "assistant"
         assert cfg.character.name == "Ellen"
-        assert cfg.model == "claude-sonnet-4-6"
+        # Personality Phase A, Task 6: cfg.model is resolved through the
+        # canonical role artifact now, not runtime.yaml's bare string — the
+        # REAL shipped resident/assistant/role.yaml uses
+        # ha_option/primary_agent_model (default "opus"), and no env var is
+        # set in this test, so the resolved model is opus, not the old
+        # literal "sonnet".
+        assert cfg.model == "claude-opus-4-6"
+        assert cfg.resolved_model == "opus"
         assert "telegram" in cfg.channels
         # Composed prompt surfaces each section.
         assert cfg.system_prompt.startswith("You are Ellen.")
@@ -355,7 +408,8 @@ def test_runtime_loads_context_surface_policy(tmp_path):
     agent_dir = _seed_resident(tmp_path / "agents", "butler")
     _w(agent_dir / "runtime.yaml", """\
         schema_version: 1
-        model: sonnet
+        kind: resident
+        model: {source: ha_option, option: voice_agent_model, default: haiku, allowed: [opus, sonnet, haiku]}
         tools:
           allowed: [mcp__casa-framework__get_schedule]
           skills: none
@@ -627,29 +681,43 @@ class TestComposition:
 
 class TestLoadAllAgents:
     def test_finds_two_residents_skips_specialists_subdir(self, tmp_path):
+        """Personality Phase A, Task 6: load_all_agents now fails closed
+        unless the loaded resident set is EXACTLY the fixed three slots
+        (role_slot.FIXED_RESIDENT_SLOTS) — seed all three (against the REAL
+        production defaults/roles/resident/ tree, no roles_dir override) so
+        this test can still isolate its actual point: the specialists/
+        subdirectory is skipped, not folded into the resident set."""
         from agent_loader import load_all_agents
         from policies import load_policies
 
         agents_root = tmp_path / "agents"
         _seed_resident(agents_root, "assistant")
         _seed_resident(agents_root, "butler")
+        _seed_resident(agents_root, "concierge")
         _seed_specialist(agents_root / "specialists", "finance")
         policies = load_policies(str(_policies_file(tmp_path / "policies")))
 
         found = load_all_agents(str(agents_root), policies=policies)
-        assert set(found.keys()) == {"assistant", "butler"}
+        assert set(found.keys()) == {"assistant", "butler", "concierge"}
 
     def test_skips_dotdirs(self, tmp_path):
+        """Personality Phase A, Task 6: the fixed three-slot resident-set
+        enforcement means this test must seed all three to reach
+        load_all_agents' return at all — its actual point (a dotdir sitting
+        under agents/ must not be walked as an agent) is isolated by
+        asserting no fourth/dot-named key sneaks into the result."""
         from agent_loader import load_all_agents
         from policies import load_policies
 
         agents_root = tmp_path / "agents"
         _seed_resident(agents_root, "assistant")
+        _seed_resident(agents_root, "butler")
+        _seed_resident(agents_root, "concierge")
         (agents_root / ".git").mkdir()   # git repo root sits here
 
         policies = load_policies(str(_policies_file(tmp_path / "policies")))
         found = load_all_agents(str(agents_root), policies=policies)
-        assert set(found.keys()) == {"assistant"}
+        assert set(found.keys()) == {"assistant", "butler", "concierge"}
 
     def test_missing_dir_returns_empty(self, tmp_path):
         from agent_loader import load_all_agents
@@ -786,7 +854,8 @@ def test_runtime_yaml_loads_cross_peer_token_budget(tmp_path):
     explicit_dir = _seed_resident(tmp_path / "agents_explicit", "assistant")
     _w(explicit_dir / "runtime.yaml", """\
         schema_version: 1
-        model: sonnet
+        kind: resident
+        model: {source: ha_option, option: primary_agent_model, default: opus, allowed: [opus, sonnet, haiku]}
         tools:
           allowed: [Read, Write]
         memory:
@@ -1013,6 +1082,16 @@ class TestValidateConfigRepoBootParity:
         """)
 
     def test_copied_resident_with_stale_role_refused(self, tmp_path):
+        """Personality Phase A, Task 6: role-artifact loading now happens
+        BEFORE the character.yaml role-match check inside
+        load_agent_from_dir (Step 8's constructor-order fix), so a copied
+        directory with no corresponding role artifact would fail EARLIER on
+        a missing role artifact rather than exercising the check this test
+        actually targets. Seed a synthetic roles_dir carrying a 'helper'
+        resident role artifact too (alongside 'assistant', since a custom
+        roles_dir replaces the default tree entirely), so the role-artifact
+        load succeeds and the intended character.yaml/directory-name
+        mismatch is what raises."""
         import shutil
         from agent_loader import validate_config_repo, load_agent_from_dir, LoadError
 
@@ -1022,10 +1101,29 @@ class TestValidateConfigRepoBootParity:
         # Copy the whole dir but leave character.yaml role: assistant.
         shutil.copytree(src, repo / "agents" / "helper")
 
-        with pytest.raises(LoadError):  # boot fatals on this dir
-            load_agent_from_dir(str(repo / "agents" / "helper"), policies=None)
+        roles_dir = tmp_path / "roles"
+        _seed_role_artifact(roles_dir, "resident", "assistant")
+        _seed_role_artifact(roles_dir, "resident", "helper")
+        # _seed_role_artifact's fixture model is always {source: fixed,
+        # value: sonnet} — match both copied runtime.yaml files to it (they
+        # otherwise default to the REAL production ha_option shape, which
+        # would mismatch this synthetic roles_dir's role.yaml).
+        for d in (repo / "agents" / "assistant", repo / "agents" / "helper"):
+            _w(d / "runtime.yaml", """\
+                schema_version: 1
+                kind: resident
+                model: {source: fixed, value: sonnet}
+                tools:
+                  allowed: [Read, Write]
+                channels: [telegram]
+            """)
 
-        errors = validate_config_repo(str(repo))
+        with pytest.raises(LoadError):  # boot fatals on this dir
+            load_agent_from_dir(
+                str(repo / "agents" / "helper"), policies=None, roles_dir=str(roles_dir),
+            )
+
+        errors = validate_config_repo(str(repo), roles_dir=str(roles_dir))
         assert any("must match directory name" in e for e in errors), errors
 
     def test_stray_unknown_file_in_resident_refused(self, tmp_path):
@@ -1144,7 +1242,8 @@ class TestValidateConfigRepoBootParity:
         enabled: false, which would be dropped and never collide)."""
         _w(spec_dir / "runtime.yaml", f"""\
             schema_version: 1
-            model: sonnet
+            kind: specialist
+            model: {{source: fixed, value: sonnet}}
             enabled: true
             memory:
               token_budget: 0
@@ -1162,9 +1261,17 @@ class TestValidateConfigRepoBootParity:
                                   specialists=specialist_registry.all_configs())
         which RAISES ValueError 'duplicate role(s) across residents and
         specialists' when a role exists in both tiers. config_sync does not
-        heal it. The default image ships agents/specialists/finance/, so a
-        configurator that creates a finance resident trips this. The gate
-        must refuse the collision by replaying that registry build."""
+        heal it. The gate must refuse the collision by replaying that
+        registry build.
+
+        Personality Phase A, Task 6: load_all_agents now fails closed unless
+        the loaded resident set is EXACTLY the fixed three slots
+        (assistant/butler/concierge) — a resident named 'finance' (the
+        original repro's collision slot, prior to Task 6) can no longer
+        exist at all, so this collision can only still manifest on ONE OF
+        THE FIXED SLOTS. Collide on 'butler' instead: residents
+        assistant+butler+concierge (satisfying the fixed-slot invariant)
+        plus an ENABLED specialist ALSO named 'butler'."""
         from agent_loader import (
             validate_config_repo,
             load_all_agents,
@@ -1174,20 +1281,39 @@ class TestValidateConfigRepoBootParity:
         from casa_core import _build_role_registry
 
         repo = tmp_path / "cfg"
-        _seed_resident(repo / "agents", "finance")            # resident finance
-        spec = _seed_specialist(repo / "agents" / "specialists", "finance")
-        self._enable_specialist(spec, "finance")              # enabled specialist finance
+        _seed_resident(repo / "agents", "assistant")
+        _seed_resident(repo / "agents", "butler")             # resident butler
+        _seed_resident(repo / "agents", "concierge")
+        spec = _seed_specialist(repo / "agents" / "specialists", "butler")
+        self._enable_specialist(spec, "butler")               # enabled specialist butler
         self._policies(repo)
-        # The real shipped image only carries a SPECIALIST 'finance' role
+        # The real shipped image carries no SPECIALIST 'butler' role
         # artifact — this test deliberately probes the cross-tier
-        # collision, so it needs its own fixture roles_dir carrying BOTH
-        # a resident and a specialist 'finance' artifact.
+        # collision, so it needs its own fixture roles_dir carrying every
+        # artifact this repo's agents load against: the three REAL
+        # residents plus a synthetic specialist 'butler'.
         roles_dir = tmp_path / "roles"
-        _seed_role_artifact(roles_dir, "resident", "finance")
-        _seed_role_artifact(roles_dir, "specialist", "finance")
+        _seed_role_artifact(roles_dir, "resident", "assistant")
+        _seed_role_artifact(roles_dir, "resident", "butler")
+        _seed_role_artifact(roles_dir, "resident", "concierge")
+        _seed_role_artifact(roles_dir, "specialist", "butler")
+        # _seed_role_artifact's fixture model is always {source: fixed,
+        # value: sonnet} — this synthetic roles_dir replaces the default
+        # tree, so the three resident runtime.yaml files (which
+        # _seed_resident defaulted to the REAL production ha_option shape)
+        # must be rewritten to match it.
+        for slot in ("assistant", "butler", "concierge"):
+            _w(repo / "agents" / slot / "runtime.yaml", """\
+                schema_version: 1
+                kind: resident
+                model: {source: fixed, value: sonnet}
+                tools:
+                  allowed: [Read, Write]
+                channels: [telegram]
+            """)
 
         # Prove boot fatals exactly as casa_core.main would at line ~1280:
-        # residents + enabled specialists both carry role 'finance'.
+        # residents + enabled specialists both carry role 'butler'.
         policy_lib = load_policies(str(repo / "policies" / "disclosure.yaml"))
         residents = load_all_agents(
             str(repo / "agents"), policies=policy_lib, roles_dir=str(roles_dir),
@@ -1200,7 +1326,7 @@ class TestValidateConfigRepoBootParity:
 
         errors = validate_config_repo(str(repo), roles_dir=str(roles_dir))
         assert any(
-            "duplicate role" in e and "finance" in e for e in errors
+            "duplicate role" in e and "butler" in e for e in errors
         ), errors
 
     def test_disabled_specialist_role_collision_passes(self, tmp_path):
@@ -1210,25 +1336,46 @@ class TestValidateConfigRepoBootParity:
         _build_role_registry never sees the overlap. The gate must mirror
         that enablement filter and NOT over-refuse the (bootable) repo.
 
-        The repo carries a primary assistant resident too, so the
-        no-primary-assistant invariant (below) does not fire — this test
-        isolates the collision path, not the missing-assistant path."""
+        Personality Phase A, Task 6: role_slot.validate_role_shape itself
+        (not just load_all_agents' Step 9 check) now rejects ANY resident
+        slot outside the fixed three (assistant/butler/concierge) — a
+        resident named 'finance' can no longer exist at all. Collide on
+        'butler' instead, mirroring the sibling
+        test_resident_specialist_role_collision_refused above. The repo
+        carries all three fixed residents, so the no-primary-assistant
+        invariant (below) does not fire — this test isolates the collision
+        path, not the missing-assistant path."""
         from agent_loader import validate_config_repo
 
         repo = tmp_path / "cfg"
         _seed_resident(repo / "agents", "assistant")          # primary assistant
-        _seed_resident(repo / "agents", "finance")            # resident finance
+        _seed_resident(repo / "agents", "butler")             # resident butler
+        _seed_resident(repo / "agents", "concierge")
         # Seeded specialist defaults to enabled: false — dropped at boot.
-        _seed_specialist(repo / "agents" / "specialists", "finance")
+        _seed_specialist(repo / "agents" / "specialists", "butler")
         self._policies(repo)
         # roles_dir override replaces the default tree entirely, so it
         # must carry every artifact this repo's agents load against —
-        # including the REAL 'assistant' resident, not just the synthetic
-        # cross-tier 'finance' fixtures this test is actually probing.
+        # the three REAL residents plus the synthetic specialist 'butler'
+        # this test is actually probing.
         roles_dir = tmp_path / "roles"
         _seed_role_artifact(roles_dir, "resident", "assistant")
-        _seed_role_artifact(roles_dir, "resident", "finance")
-        _seed_role_artifact(roles_dir, "specialist", "finance")
+        _seed_role_artifact(roles_dir, "resident", "butler")
+        _seed_role_artifact(roles_dir, "resident", "concierge")
+        _seed_role_artifact(roles_dir, "specialist", "butler")
+        # _seed_role_artifact's fixture model is always {source: fixed,
+        # value: sonnet} — rewrite the three resident runtime.yaml files
+        # (which _seed_resident defaulted to the REAL production ha_option
+        # shape) to match this synthetic roles_dir.
+        for slot in ("assistant", "butler", "concierge"):
+            _w(repo / "agents" / slot / "runtime.yaml", """\
+                schema_version: 1
+                kind: resident
+                model: {source: fixed, value: sonnet}
+                tools:
+                  allowed: [Read, Write]
+                channels: [telegram]
+            """)
 
         errors = validate_config_repo(str(repo), roles_dir=str(roles_dir))
         assert errors == [], errors
@@ -1239,20 +1386,30 @@ class TestValidateConfigRepoBootParity:
         per-agent load, yet crash-loops boot. casa_core.main (line ~1306)
         RAISES RuntimeError 'No agent with role \\'assistant\\' found ... Casa
         cannot start without a primary assistant' because role_configs holds no
-        'assistant'. The gate must refuse it."""
-        from agent_loader import validate_config_repo, load_all_agents
+        'assistant'. The gate must refuse it.
+
+        Personality Phase A, Task 6: load_all_agents' own Step 9 fixed-slot
+        invariant now ALSO independently refuses this tree — even earlier,
+        and for a different (LoadError, not the downstream RuntimeError)
+        reason, since the loaded resident set ({'butler'}) isn't the
+        complete fixed three. validate_config_repo's boot-parity replay is a
+        SEPARATE loop (not load_all_agents) and still isolates + reports the
+        primary-assistant gap on its own terms, so that assertion is
+        unchanged; only the direct load_all_agents call's expectation
+        changes from 'succeeds with no assistant key' to 'raises LoadError'."""
+        from agent_loader import validate_config_repo, load_all_agents, LoadError
         from policies import load_policies
 
         repo = tmp_path / "cfg"
         _seed_resident(repo / "agents", "butler")   # enabled, non-assistant
         self._policies(repo)
 
-        # Prove boot reaches an assistant-less role_configs: load_all_agents
-        # succeeds (butler is valid) but yields no 'assistant' key, which
-        # casa_core.main then FATALs on.
+        # Prove boot fatals on this incomplete resident set: load_all_agents
+        # now raises LoadError before ever returning role_configs (Step 9),
+        # independent of casa_core.main's downstream primary-assistant check.
         policy_lib = load_policies(str(repo / "policies" / "disclosure.yaml"))
-        residents = load_all_agents(str(repo / "agents"), policies=policy_lib)
-        assert "assistant" not in residents
+        with pytest.raises(LoadError, match="fixed slots"):
+            load_all_agents(str(repo / "agents"), policies=policy_lib)
 
         errors = validate_config_repo(str(repo))
         assert any("primary assistant" in e for e in errors), errors
@@ -1287,37 +1444,93 @@ class TestValidateConfigRepoBootParity:
         assert any("primary assistant" in e for e in errors), errors
 
     def test_resident_unknown_model_reported_not_crashed(self, tmp_path):
-        """M5 defensive contract: a resident runtime.yaml naming an unknown
-        model shortname is 100% schema-valid (``model`` is a free string), but
-        boot's ``resolve_model`` RAISES ValueError inside load_agent_from_dir
-        — a NON-LoadError. The per-resident replay must REPORT it as a
+        """M5 defensive contract: a resident whose model resolution is
+        internally inconsistent is 100% schema-valid at both the
+        runtime.yaml AND role.yaml layers, but boot's
+        ``role_slot.resolve_role_model`` (inside ``materialize_role``, called
+        from ``_build_runtime_fields``) RAISES ``RoleValidationError`` (a
+        ``ValueError`` subclass) inside ``load_agent_from_dir`` — a
+        NON-``LoadError``. The per-resident replay must REPORT it as a
         validation error, never let it escape and crash the gate itself (the
         mandate: 'a validation error must be reported, never itself crash the
-        gate')."""
+        gate').
+
+        Personality Phase A, Task 6: runtime.yaml's ``model`` is no longer a
+        free string (a bare 'bogusmodel' now fails runtime.v1.json SCHEMA
+        validation instead — a ``LoadError``, not the ``ValueError`` this
+        test's contract targets). The equivalent defensive scenario under the
+        new structured shape is a role.yaml whose ha_option ``allowed`` list
+        excludes the model that actually resolves (env unset -> role_slot's
+        own default 'opus' for primary_agent_model) — schema-valid on its
+        own terms (every enum value is individually legal), but
+        ``resolve_role_model`` rejects it at the resolution step."""
         from agent_loader import validate_config_repo, load_all_agents
         from policies import load_policies
 
         repo = tmp_path / "cfg"
         d = _seed_resident(repo / "agents", "assistant")
         self._policies(repo)
-        _w(d / "runtime.yaml", """\
+        broken_model_yaml = (
+            "{source: ha_option, option: primary_agent_model, "
+            "default: opus, allowed: [sonnet, haiku]}"  # "opus" excluded
+        )
+        _w(d / "runtime.yaml", f"""\
             schema_version: 1
-            model: bogusmodel
+            kind: resident
+            model: {broken_model_yaml}
             tools:
               allowed: [Read, Write]
             channels: [telegram]
         """)
+        roles_dir = tmp_path / "roles"
+        _seed_role_artifact(roles_dir, "resident", "assistant")
+        _w(roles_dir / "resident" / "assistant" / "role.yaml", f"""\
+            api_version: casa.role/v1
+            id: resident:assistant
+            kind: resident
+            slot: assistant
+            mission: Test fixture role with an inconsistent model policy.
+            enabled: true
+            model: {broken_model_yaml}
+            tools:
+              allowed: []
+              disallowed: []
+              permission_mode: acceptEdits
+              max_turns: 10
+              skills: all
+              voice_guard: none
+            mcp_servers: []
+            channels: [telegram]
+            memory: {{token_budget: 0, read_strategy: per_turn}}
+            session: {{strategy: ephemeral, idle_timeout_seconds: 0}}
+            disclosure: {{policy: standard, overrides: {{}}}}
+            delegates: []
+            executors: []
+            triggers: []
+            hooks: {{pre_tool_use: []}}
+            tts: {{tag_dialect: none, error_phrases: {{}}}}
+            response:
+              text: {{register: plain}}
+              voice: {{register: plain}}
+              restricted_webhook: {{register: plain}}
+            persona: {{policy: required, compatibility: ["casa/test@>=0.1.0 <1.0.0"]}}
+            requires: {{plugins: [], tools: []}}
+            doctrine_file: doctrine.md
+        """)
 
         # Prove boot fatals with a NON-LoadError exactly as casa_core.main
-        # would: load_all_agents raises ValueError, not LoadError.
+        # would: load_all_agents raises RoleValidationError (a ValueError),
+        # not LoadError.
         policy_lib = load_policies(str(repo / "policies" / "disclosure.yaml"))
         with pytest.raises(ValueError):
-            load_all_agents(str(repo / "agents"), policies=policy_lib)
+            load_all_agents(
+                str(repo / "agents"), policies=policy_lib, roles_dir=str(roles_dir),
+            )
 
         # The gate must RETURN an error, not raise.
-        errors = validate_config_repo(str(repo))
+        errors = validate_config_repo(str(repo), roles_dir=str(roles_dir))
         assert any(
-            "bogusmodel" in e or "model shortname" in e for e in errors
+            "not in the role's allowed list" in e for e in errors
         ), errors
 
     def test_resident_unknown_policy_reported_not_crashed(self, tmp_path):

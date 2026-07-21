@@ -73,7 +73,8 @@ def _seed_resident_with_disclosure(base: Path, role: str = "assistant") -> Path:
     _w(d / "disclosure.yaml", "schema_version: 1\npolicy: standard\n")
     _w(d / "runtime.yaml", """\
         schema_version: 1
-        model: sonnet
+        kind: resident
+        model: {source: ha_option, option: primary_agent_model, default: opus, allowed: [opus, sonnet, haiku]}
         tools:
           allowed: [Read, Write]
         channels: [telegram]
@@ -252,7 +253,8 @@ class TestCasaReloadTriggersResident:
         _w(spec_dir / "response_shape.yaml", "schema_version: 1\n")
         _w(spec_dir / "runtime.yaml", """\
             schema_version: 1
-            model: sonnet
+            kind: specialist
+            model: {source: fixed, value: sonnet}
             enabled: false
             memory:
               token_budget: 0

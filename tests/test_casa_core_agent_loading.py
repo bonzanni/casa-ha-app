@@ -18,6 +18,28 @@ def _w(path: Path, text: str) -> None:
     path.write_text(textwrap.dedent(text), encoding="utf-8")
 
 
+# Personality Phase A, Task 6: runtime.yaml's `model` is a structured block
+# that must byte-for-byte match the resolved role artifact's own `model`
+# block (agent_loader._build_runtime_fields's boot-parity check) — these
+# fixtures resolve against the REAL production defaults/roles/resident/ tree
+# (no roles_dir override), so each role's model must mirror its real shipped
+# role.yaml exactly.
+_REAL_RESIDENT_MODEL_YAML = {
+    "assistant": (
+        "model: {source: ha_option, option: primary_agent_model, "
+        "default: opus, allowed: [opus, sonnet, haiku]}"
+    ),
+    "butler": (
+        "model: {source: ha_option, option: voice_agent_model, "
+        "default: haiku, allowed: [opus, sonnet, haiku]}"
+    ),
+    "concierge": (
+        "model: {source: ha_option, option: voice_agent_model, "
+        "default: haiku, allowed: [opus, sonnet, haiku]}"
+    ),
+}
+
+
 def _seed_resident(base: Path, role: str) -> Path:
     d = base / role
     _w(d / "character.yaml", f"""\
@@ -33,9 +55,11 @@ def _seed_resident(base: Path, role: str) -> Path:
     _w(d / "voice.yaml", "schema_version: 1\n")
     _w(d / "response_shape.yaml", "schema_version: 1\n")
     _w(d / "disclosure.yaml", "schema_version: 1\npolicy: standard\n")
-    _w(d / "runtime.yaml", """\
+    model_yaml = _REAL_RESIDENT_MODEL_YAML[role]
+    _w(d / "runtime.yaml", f"""\
         schema_version: 1
-        model: sonnet
+        kind: resident
+        {model_yaml}
         tools:
           allowed: [Read]
         channels: [telegram]
@@ -61,10 +85,15 @@ def _seed_policies(base: Path) -> Path:
 
 
 def _seed_minimal_tree(base: Path) -> tuple[Path, Path]:
+    """Personality Phase A, Task 6: load_all_agents now fails closed unless
+    the loaded resident set is EXACTLY the fixed three slots
+    (role_slot.FIXED_RESIDENT_SLOTS) — seed all three, matching the real
+    shipped defaults/roles/resident/ tree."""
     agents_root = base / "agents"
     agents_root.mkdir()
     _seed_resident(agents_root, "assistant")
     _seed_resident(agents_root, "butler")
+    _seed_resident(agents_root, "concierge")
     policies_dir = base / "policies"
     policies_dir.mkdir()
     _seed_policies(policies_dir)
@@ -79,7 +108,7 @@ class TestLoadsWithShippedFixtures:
         agents_root, policy_path = _seed_minimal_tree(tmp_path)
         policy_lib = load_policies(str(policy_path))
         found = load_all_agents(str(agents_root), policies=policy_lib)
-        assert set(found.keys()) == {"assistant", "butler"}
+        assert set(found.keys()) == {"assistant", "butler", "concierge"}
 
     def test_executors_subdir_skipped(self, tmp_path):
         from agent_loader import load_all_agents
@@ -103,7 +132,8 @@ class TestLoadsWithShippedFixtures:
         _w(exec_dir / "response_shape.yaml", "schema_version: 1\n")
         _w(exec_dir / "runtime.yaml", """\
             schema_version: 1
-            model: sonnet
+            kind: specialist
+            model: {source: fixed, value: sonnet}
             enabled: false
             memory:
               token_budget: 0
@@ -114,7 +144,7 @@ class TestLoadsWithShippedFixtures:
         policy_lib = load_policies(str(policy_path))
         found = load_all_agents(str(agents_root), policies=policy_lib)
         assert "finance" not in found
-        assert set(found.keys()) == {"assistant", "butler"}
+        assert set(found.keys()) == {"assistant", "butler", "concierge"}
 
     def test_missing_directory_returns_empty(self, tmp_path):
         from agent_loader import load_all_agents

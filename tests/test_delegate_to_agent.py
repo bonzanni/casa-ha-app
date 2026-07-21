@@ -54,7 +54,8 @@ def _seed_specialist_dir(
     (d / "response_shape.yaml").write_text("schema_version: 1\n", encoding="utf-8")
     (d / "runtime.yaml").write_text(textwrap.dedent(f"""\
         schema_version: 1
-        model: sonnet
+        kind: specialist
+        model: {{source: fixed, value: sonnet}}
         enabled: {str(enabled).lower()}
         tools:
           allowed: [Read]

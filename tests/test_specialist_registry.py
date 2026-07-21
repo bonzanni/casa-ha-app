@@ -42,7 +42,8 @@ def _seed_specialist_dir(
     channels_part = channels if channels is not None else []
     (d / "runtime.yaml").write_text(textwrap.dedent(f"""\
         schema_version: 1
-        model: sonnet
+        kind: specialist
+        model: {{source: fixed, value: sonnet}}
         enabled: {str(enabled).lower()}
         tools:
           allowed: [Read]
