@@ -17,6 +17,7 @@ from role_slot import (  # noqa: F401 — re-exported for existing callers (Task
     RoleSlot,
     compute_effective_config_digest,
 )
+from trait_renderer import RENDERER_VERSION
 
 _SCHEMA_DIR = Path(__file__).parent / "defaults" / "schema"
 
@@ -27,8 +28,6 @@ _SCHEMA_DIR = Path(__file__).parent / "defaults" / "schema"
 # also violate this plan's "defined EXACTLY ONCE" rule (see Self-Review). Any test
 # or caller that does `from personality_binding import EMPTY_CONFIG_DIGEST` keeps
 # working unchanged — only the module that OWNS the value moved.
-
-_MODES = ("image-default", "component-default", "override")
 
 
 @dataclass(frozen=True, slots=True)
@@ -75,14 +74,14 @@ def _build(
         stable_agent_id=role.role_id, role_checksum=role.checksum,
         persona_id=persona.persona_id, persona_version=persona.version,
         persona_checksum=persona.checksum,
-        compiler_schema_version=__import__("trait_renderer").RENDERER_VERSION,
+        compiler_schema_version=RENDERER_VERSION,
         dependency_digests=dependency_digests, effective_config_digest=effective_config_digest,
     )
     return BindingRecord(
         stable_agent_id=role.role_id, role_checksum=role.checksum, mode=mode,
         persona_id=persona.persona_id, persona_version=persona.version,
         persona_checksum=persona.checksum,
-        compiler_schema_version=__import__("trait_renderer").RENDERER_VERSION,
+        compiler_schema_version=RENDERER_VERSION,
         dependency_digests=tuple(sorted(dependency_digests)),
         effective_config_digest=effective_config_digest, binding_digest=digest,
         image_default_root=image_default_root, component_root=component_root,
@@ -124,7 +123,20 @@ def _raw_from_binding(record: BindingRecord) -> dict[str, object]:
 def verify_binding_record(raw: dict) -> BindingRecord:
     """The ONE shared verification path: recompute the digest from every OTHER
     field and reject a mismatch. Both load_binding and InstanceDir's tuple loader
-    call this — a binding's on-disk integrity is checked in exactly one place."""
+    call this — a binding's on-disk integrity is checked in exactly one place.
+
+    Also schema-validates ``raw`` against binding.v1.json before field access.
+    This is what turns a tampered/malformed nested binding (e.g. inside an
+    instance tuple, where the outer schema only checks ``binding`` is an
+    object) into a typed ``ValueError`` instead of a bare ``KeyError`` —
+    instance-tuple.v1.json does not itself enforce the nested binding's
+    required fields or patterns, so this is the only place that does for the
+    nested case."""
+    schema = json.loads((_SCHEMA_DIR / "binding.v1.json").read_text(encoding="utf-8"))
+    try:
+        jsonschema.validate(raw, schema)
+    except jsonschema.ValidationError as exc:
+        raise ValueError(str(exc)) from exc
     record = BindingRecord(
         stable_agent_id=raw["stable_agent_id"], role_checksum=raw["role_checksum"],
         mode=raw["mode"], persona_id=raw["persona_id"], persona_version=raw["persona_version"],
@@ -245,6 +257,15 @@ class InstanceDir:
             raise ValueError(f"{self._dir}: no desired tuple staged to commit")
         active_path = self._path("active.yaml")
         prior_path = self._path("active.prior.yaml")
+        current_active = load_instance_tuple(active_path)
+        if current_active is not None and current_active.binding.binding_digest == candidate.binding.binding_digest:
+            # Crash-retry / no-op recommit (§4.1): a previous run already wrote
+            # `candidate` to active.yaml but died before unlinking desired.yaml.
+            # active.yaml already IS the candidate, so do NOT rotate prior again
+            # — that would overwrite the true pre-commit rollback target with a
+            # duplicate of the new active. Just finish the interrupted step.
+            desired_path.unlink(missing_ok=True)
+            return candidate
         if active_path.exists():
             os.replace(self._copy_to_temp(active_path), prior_path)
         atomic_write_instance_tuple(active_path, candidate)  # write new active LAST-safe
@@ -254,6 +275,7 @@ class InstanceDir:
     def _copy_to_temp(self, path: Path) -> Path:
         temp = path.with_suffix(path.suffix + ".rollback-tmp")
         temp.write_bytes(path.read_bytes())
+        os.chmod(temp, 0o600)
         return temp
 
     def discard_desired(self, *, reason: str) -> None:

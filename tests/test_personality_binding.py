@@ -1,6 +1,7 @@
 from pathlib import Path
 
 import pytest
+import yaml
 
 from personality_binding import (
     EMPTY_CONFIG_DIGEST,
@@ -119,6 +120,54 @@ def test_commit_moves_desired_to_active_and_retains_prior(tmp_path: Path) -> Non
     assert prior_path.exists()
     from personality_binding import load_instance_tuple
     assert load_instance_tuple(prior_path) == first  # rollback target retained
+    assert (prior_path.stat().st_mode & 0o777) == 0o600  # defect #2: same lockdown as siblings
+
+
+def test_commit_is_crash_retry_idempotent_and_preserves_true_prior(tmp_path: Path) -> None:
+    """Regression for defect #1: a crash AFTER active.yaml is rewritten to the
+    new candidate but BEFORE desired.yaml is unlinked must be a safe no-op
+    retry — it must NOT re-rotate the (now-identical) active into prior and
+    clobber the true rollback target."""
+    from personality_binding import load_instance_tuple
+
+    d = InstanceDir(tmp_path / "resident-butler")
+    first = _tuple(_binding(persona_version="0.1.0"))
+    d.stage_desired(first)
+    d.commit_desired_to_active()
+
+    second = _tuple(_binding(persona_version="0.2.0"))
+    d.stage_desired(second)
+    d.commit_desired_to_active()
+
+    prior_path = tmp_path / "resident-butler" / "active.prior.yaml"
+    assert load_instance_tuple(prior_path) == first
+
+    # Simulate the interrupted-retry crash window: desired.yaml still holds
+    # the very tuple that is already active (i.e. the commit ran to
+    # completion on active.yaml but the process died before the final
+    # desired.yaml unlink, and now it retries).
+    d.stage_desired(second)
+    d.commit_desired_to_active()
+
+    assert load_instance_tuple(prior_path) == first  # true prior MUST survive the retry
+    assert d.active() == second
+    assert d.desired() is None
+
+
+def test_tampered_nested_binding_missing_field_raises_value_error(tmp_path: Path) -> None:
+    """Regression for defect #3: a tampered instance tuple whose nested
+    binding drops a required field must raise a path-prefixed ValueError,
+    not a bare KeyError."""
+    d = InstanceDir(tmp_path / "resident-butler")
+    d.stage_desired(_tuple(_binding()))
+    d.commit_desired_to_active()
+    active_path = tmp_path / "resident-butler" / "active.yaml"
+    raw = yaml.safe_load(active_path.read_text(encoding="utf-8"))
+    del raw["binding"]["persona_checksum"]
+    active_path.write_text(yaml.safe_dump(raw, sort_keys=False), encoding="utf-8")
+
+    with pytest.raises(ValueError, match=str(active_path)):
+        d.active()
 
 
 def test_discard_desired_leaves_active_untouched(tmp_path: Path) -> None:
