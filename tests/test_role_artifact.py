@@ -254,47 +254,52 @@ class TestDoctrineRejection:
 
 class TestSchemaValidation:
     def test_missing_required_field_raises(self, tmp_path):
+        # J2 (foundation review r6): jsonschema.exceptions.ValidationError
+        # inherits from Exception, NOT ValueError — the loader must wrap it
+        # so callers only ever see the ValueError family, mirroring
+        # persona_pack.py's _validate_schema.
         role = valid_role()
         del role["mission"]
         d = write_role_dir(tmp_path, role=role)
 
-        with pytest.raises(jsonschema.exceptions.ValidationError):
+        with pytest.raises(ValueError) as exc_info:
             load_role_artifact(d)
+        assert not isinstance(exc_info.value, jsonschema.exceptions.ValidationError)
 
     def test_unknown_top_level_field_raises(self, tmp_path):
         role = valid_role()
         role["bogus_field"] = "surprise"
         d = write_role_dir(tmp_path, role=role)
 
-        with pytest.raises(jsonschema.exceptions.ValidationError):
+        with pytest.raises(ValueError):
             load_role_artifact(d)
 
     def test_invalid_kind_enum_raises(self, tmp_path):
         role = valid_role(kind="butler")  # not resident/specialist/executor
         d = write_role_dir(tmp_path, role=role)
 
-        with pytest.raises(jsonschema.exceptions.ValidationError):
+        with pytest.raises(ValueError):
             load_role_artifact(d)
 
     def test_invalid_id_pattern_raises(self, tmp_path):
         role = valid_role(id="Resident:TestRole")  # pattern requires lowercase
         d = write_role_dir(tmp_path, role=role)
 
-        with pytest.raises(jsonschema.exceptions.ValidationError):
+        with pytest.raises(ValueError):
             load_role_artifact(d)
 
     def test_wrong_doctrine_file_const_raises(self, tmp_path):
         role = valid_role(doctrine_file="doctrine.txt")  # schema pins the const
         d = write_role_dir(tmp_path, role=role)
 
-        with pytest.raises(jsonschema.exceptions.ValidationError):
+        with pytest.raises(ValueError):
             load_role_artifact(d)
 
     def test_persona_required_without_compatibility_raises(self, tmp_path):
         role = valid_role(persona={"policy": "required"})  # missing compatibility
         d = write_role_dir(tmp_path, role=role)
 
-        with pytest.raises(jsonschema.exceptions.ValidationError):
+        with pytest.raises(ValueError):
             load_role_artifact(d)
 
     def test_ha_option_model_missing_allowed_raises(self, tmp_path):
@@ -304,7 +309,7 @@ class TestSchemaValidation:
         })  # missing "allowed"
         d = write_role_dir(tmp_path, role=role)
 
-        with pytest.raises(jsonschema.exceptions.ValidationError):
+        with pytest.raises(ValueError):
             load_role_artifact(d)
 
     def test_malformed_yaml_raises(self, tmp_path):

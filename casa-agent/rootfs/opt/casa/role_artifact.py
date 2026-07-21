@@ -134,7 +134,17 @@ def load_role_artifact(role_dir: Path) -> RoleArtifactSource:
     assert_json_safe(raw)
     reject_markers_in_parsed(raw)
     schema_path = Path(__file__).parent / "defaults/schema/role.v1.json"
-    jsonschema.validate(raw, json.loads(schema_path.read_text(encoding="utf-8")))
+    schema = json.loads(schema_path.read_text(encoding="utf-8"))
+    # J2 (foundation review r6): jsonschema.validate raises
+    # jsonschema.exceptions.ValidationError on its own, which inherits from
+    # Exception, NOT ValueError — this loader's contract is that every
+    # rejection surfaces as a ValueError, so wrap it here rather than
+    # leaking the jsonschema exception type to callers. Mirrors
+    # persona_pack.py's _validate_schema.
+    try:
+        jsonschema.validate(raw, schema)
+    except jsonschema.exceptions.ValidationError as exc:
+        raise ValueError(f"role schema validation failed: {exc.message}") from exc
 
     # H2 (foundation review r5, role-side consistency): same read/decode
     # boundary wrap as role.yaml above.
