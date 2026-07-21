@@ -15,6 +15,7 @@ mkdir -p "$CONFIG_DIR/agents" \
          "$CONFIG_DIR/agents/specialists" \
          "$CONFIG_DIR/agents/executors" \
          "$CONFIG_DIR/policies" \
+         "$CONFIG_DIR/bindings" \
          "$CONFIG_DIR/schema" \
          "$DATA_DIR/sdk-sessions" \
          "$DATA_DIR/casa-s6-services" \
@@ -146,6 +147,8 @@ elif [ ! -d "$CONFIG_DIR/.git" ]; then
 !agents/**
 !policies/
 !policies/**
+!bindings/
+!bindings/**
 !schema/
 !schema/**
 # Unified plugin architecture (v0.71.0): the registry is config — the single

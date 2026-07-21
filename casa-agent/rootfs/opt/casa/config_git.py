@@ -26,6 +26,8 @@ _GITIGNORE_CONTENT = """\
 !agents/**
 !policies/
 !policies/**
+!bindings/
+!bindings/**
 !schema/
 !schema/**
 # Unified plugin architecture (v0.71.0): the registry is config — the single
