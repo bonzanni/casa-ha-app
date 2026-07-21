@@ -89,7 +89,16 @@ def load_role_artifact(role_dir: Path) -> RoleArtifactSource:
     role_path = admitted["role.yaml"]
     doctrine_path = admitted["doctrine.md"]
 
-    role_text = canonical_text(role_path.read_text(encoding="utf-8"))
+    # H2 (foundation review r5, role-side consistency): a raw
+    # UnicodeDecodeError already stays in the ValueError family (it
+    # subclasses ValueError), so this loader's "raises ValueError" contract
+    # technically held even before this wrap — but fold it into the same
+    # clean, generic message as the parse-step rejections below rather than
+    # leak the raw codec error text.
+    try:
+        role_text = canonical_text(role_path.read_text(encoding="utf-8"))
+    except UnicodeDecodeError as exc:
+        raise ValueError("role.yaml has invalid encoding (not UTF-8)") from exc
     try:
         # F-C (foundation review r3, P0 DoS): load_yaml_no_aliases forbids
         # YAML aliases outright (yaml_safety._NoAliasSafeLoader) — a
@@ -127,7 +136,12 @@ def load_role_artifact(role_dir: Path) -> RoleArtifactSource:
     schema_path = Path(__file__).parent / "defaults/schema/role.v1.json"
     jsonschema.validate(raw, json.loads(schema_path.read_text(encoding="utf-8")))
 
-    doctrine = canonical_text(doctrine_path.read_text(encoding="utf-8"))
+    # H2 (foundation review r5, role-side consistency): same read/decode
+    # boundary wrap as role.yaml above.
+    try:
+        doctrine = canonical_text(doctrine_path.read_text(encoding="utf-8"))
+    except UnicodeDecodeError as exc:
+        raise ValueError("doctrine.md has invalid encoding (not UTF-8)") from exc
     if not doctrine.strip():
         raise ValueError("role doctrine is empty")
     _reject_markers(doctrine)

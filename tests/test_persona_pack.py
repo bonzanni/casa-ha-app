@@ -477,6 +477,34 @@ def test_malformed_manifest_json_fails(tmp_path: Path) -> None:
         load_persona_pack(pack, manifest_path)
 
 
+def test_invalid_utf8_byte_in_persona_yaml_fails_with_persona_pack_error(
+    tmp_path: Path,
+) -> None:
+    # H2 (foundation review r5): persona_pack.py read/decoded admitted
+    # files OUTSIDE any exception boundary, so an invalid UTF-8 byte in an
+    # admitted file raised a raw UnicodeDecodeError instead of folding into
+    # the loader's PersonaPackError contract (every other rejection path
+    # here raises PersonaPackError).
+    pack = write_pack(tmp_path)
+    (pack / "persona.yaml").write_bytes(b"not: \xffvalid utf8\n")
+    with pytest.raises(PersonaPackError):
+        load_persona_pack(pack, tmp_path / "manifest.json")
+
+
+def test_invalid_utf8_byte_in_manifest_fails_with_persona_pack_error(
+    tmp_path: Path,
+) -> None:
+    # H2 (foundation review r5): same boundary gap for the manifest read —
+    # its except clause already caught OSError/json.JSONDecodeError but not
+    # UnicodeDecodeError, so an invalid UTF-8 byte in manifest.json escaped
+    # as a raw UnicodeDecodeError instead of PersonaPackError.
+    pack = write_pack(tmp_path)
+    manifest_path = tmp_path / "manifest.json"
+    manifest_path.write_bytes(b'{"api_version": "casa.persona.manifest/v1", \xff}')
+    with pytest.raises(PersonaPackError):
+        load_persona_pack(pack, manifest_path)
+
+
 def test_manifest_stale_after_pack_content_changes(tmp_path: Path) -> None:
     pack = write_pack(tmp_path)
     manifest_path = tmp_path / "manifest.json"

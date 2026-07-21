@@ -110,7 +110,18 @@ def load_persona_pack(pack_dir: Path, manifest_path: Path) -> PersonaPack:
     canonical_files = {}
     manifest_rows = []
     for path in files:
-        text = canonical_text(path.read_text(encoding="utf-8"))
+        # H2 (foundation review r5): the read/decode itself sat OUTSIDE any
+        # exception boundary, so an admitted file containing an invalid
+        # UTF-8 byte raised a raw UnicodeDecodeError instead of folding
+        # into this loader's PersonaPackError contract like every other
+        # rejection path here. Scoped to the read/decode only — later
+        # validation (_reject_markers etc.) still raises on its own terms.
+        try:
+            text = canonical_text(path.read_text(encoding="utf-8"))
+        except UnicodeDecodeError as exc:
+            raise PersonaPackError(
+                f"persona file is not valid UTF-8: {path.name}"
+            ) from exc
         _reject_markers(text)
         canonical_files[path.name] = text
         manifest_rows.append({
@@ -228,8 +239,12 @@ def load_persona_pack(pack_dir: Path, manifest_path: Path) -> PersonaPack:
     manifest_checksum = checksum_bytes(canonical_json_bytes(manifest_payload))
     manifest_payload["checksum"] = manifest_checksum
     try:
+        # H2 (foundation review r5): UnicodeDecodeError was not caught
+        # here alongside OSError/json.JSONDecodeError, so an invalid UTF-8
+        # byte in manifest.json escaped this boundary as a raw
+        # UnicodeDecodeError instead of PersonaPackError.
         expected_manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
-    except (OSError, json.JSONDecodeError) as exc:
+    except (OSError, json.JSONDecodeError, UnicodeDecodeError) as exc:
         raise PersonaPackError(f"persona manifest could not be read: {exc}") from exc
     if expected_manifest != manifest_payload:
         raise PersonaPackError("persona manifest does not match admitted files")

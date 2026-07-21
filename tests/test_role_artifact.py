@@ -349,6 +349,32 @@ class TestSchemaValidation:
             load_role_artifact(d)
         assert "chr() arg" not in str(exc_info.value)
 
+    def test_invalid_utf8_byte_in_role_yaml_raises_clean_value_error(
+        self, tmp_path
+    ):
+        # H2 (foundation review r5, role-side consistency): the role.yaml
+        # read/decode sat outside any exception boundary. A raw
+        # UnicodeDecodeError already stays in the ValueError family (it
+        # subclasses ValueError), so the loader's contract technically
+        # held even before this fix — but wrap it for a clean, uniform
+        # message rather than leaking the raw codec error text.
+        d = write_role_dir(tmp_path)
+        (d / "role.yaml").write_bytes(b"api_version: \xffcasa.role/v1\n")
+        with pytest.raises(ValueError) as exc_info:
+            load_role_artifact(d)
+        assert "codec can't decode" not in str(exc_info.value)
+
+    def test_invalid_utf8_byte_in_doctrine_raises_clean_value_error(
+        self, tmp_path
+    ):
+        # H2 (foundation review r5, role-side consistency): same boundary
+        # gap for doctrine.md's read/decode.
+        d = write_role_dir(tmp_path)
+        (d / "doctrine.md").write_bytes(b"# Core doctrine\n\n\xffBody.\n")
+        with pytest.raises(ValueError) as exc_info:
+            load_role_artifact(d)
+        assert "codec can't decode" not in str(exc_info.value)
+
 
 # ---------------------------------------------------------------------------
 # Canonicalization of role.yaml text before parsing
