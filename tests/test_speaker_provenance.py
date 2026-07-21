@@ -11,6 +11,7 @@ injected through the factory).
 from __future__ import annotations
 
 import base64
+import codecs
 import inspect
 import json
 from dataclasses import FrozenInstanceError
@@ -756,6 +757,105 @@ def test_nesting_depth_over_limit_is_rejected_by_depth_guard() -> None:
     tag = _tag_from_wire(_nested_array_wire(MAX_PROVENANCE_JSON_DEPTH + 1))
     with pytest.raises(ValueError, match="invalid provenance payload"):
         decode_provenance_tag(tag)
+
+
+# ---------------------------------------------------------------------------
+# R2 (foundation review r2): _reject_excessive_json_nesting byte-scans
+# `wire` assuming UTF-8 (one structural byte per character), but
+# json.loads(bytes) auto-detects UTF-16/UTF-32 per RFC 4627. A UTF-16LE
+# wire encodes every ASCII character as two bytes (low byte + 0x00 high
+# byte). Terra's reproducer: a JSON string containing an escaped quote
+# (`\"`), immediately followed by real deep array nesting. In UTF-16LE,
+# the escaped-quote sequence's own 0x00 high bytes desync the scanner's
+# in_string tracking (it mistakes the escaped quote's low byte for an
+# unescaped string terminator, and the real closing quote's low byte for
+# a NEW string open) — so the scanner ends up believing the following
+# ~480 levels of genuine array nesting sit inside a string, and never
+# counts them at all. Fixed by requiring `wire` be valid UTF-8 BEFORE the
+# depth scan runs.
+# ---------------------------------------------------------------------------
+
+
+def _utf16le_bom_wire_with_desyncing_escaped_quote(nesting_depth: int) -> bytes:
+    """A UTF-16LE-BOM-encoded JSON wire: a top-level array whose first
+    element is the (JSON-escaped) string `"` and whose second element is
+    *nesting_depth* levels of real nested arrays. Byte-scanning this
+    assuming UTF-8 (the pre-fix behavior) desyncs on the escaped-quote
+    bytes and never counts the following real nesting at all."""
+    quoted_quote = json.dumps('"')  # -> the 4-character text: "\""
+    logical_text = "[" + quoted_quote + "," + "[" * nesting_depth + "0" + "]" * nesting_depth + "]"
+    json.loads(logical_text)  # sanity: this really is valid, deeply nested JSON
+    return codecs.BOM_UTF16_LE + logical_text.encode("utf-16-le")
+
+
+def test_old_byte_level_depth_scan_would_have_missed_the_utf16_nesting() -> None:
+    """Characterizes the vulnerability itself (independent of the fix):
+    replaying the pre-fix byte-scan algorithm against this wire proves it
+    never sees depth exceed 1, even though the wire's real (UTF-16-
+    decoded) nesting is far beyond MAX_PROVENANCE_JSON_DEPTH."""
+    from speaker_provenance import MAX_PROVENANCE_JSON_DEPTH
+
+    wire = _utf16le_bom_wire_with_desyncing_escaped_quote(480)
+
+    depth = 0
+    max_seen = 0
+    in_string = False
+    escaped = False
+    for byte in wire:
+        if in_string:
+            if escaped:
+                escaped = False
+            elif byte == 0x5C:
+                escaped = True
+            elif byte == 0x22:
+                in_string = False
+            continue
+        if byte == 0x22:
+            in_string = True
+        elif byte in (0x7B, 0x5B):
+            depth += 1
+            max_seen = max(max_seen, depth)
+        elif byte in (0x7D, 0x5D):
+            depth -= 1
+    assert max_seen < MAX_PROVENANCE_JSON_DEPTH
+
+
+def test_utf16_wire_is_rejected_before_reaching_json_loads(monkeypatch) -> None:
+    wire = _utf16le_bom_wire_with_desyncing_escaped_quote(480)
+    tag = _tag_from_wire(wire)
+
+    called = False
+    real_loads = json.loads
+
+    def _spy_loads(*args, **kwargs):
+        nonlocal called
+        called = True
+        return real_loads(*args, **kwargs)
+
+    monkeypatch.setattr("speaker_provenance.json.loads", _spy_loads)
+
+    provenance, reason = decode_provenance_from_tags((tag,))
+    assert provenance is None
+    assert reason == "malformed"
+    with pytest.raises(ValueError, match="invalid provenance payload"):
+        decode_provenance_tag(tag)
+    assert not called, (
+        "UTF-16 wire reached json.loads instead of being rejected by the "
+        "UTF-8 pre-check ahead of the depth scan"
+    )
+
+
+def test_non_utf8_wire_without_deep_nesting_is_still_rejected() -> None:
+    """A plain non-UTF-8 wire (no nesting-desync trick at all) must also
+    be rejected — the UTF-8 requirement is unconditional, not just a
+    patch for the specific desync reproducer above."""
+    wire = codecs.BOM_UTF16_LE + json.dumps({"speaker_kind": "user"}).encode(
+        "utf-16-le"
+    )
+    tag = _tag_from_wire(wire)
+    provenance, reason = decode_provenance_from_tags((tag,))
+    assert provenance is None
+    assert reason == "malformed"
 
 
 # ---------------------------------------------------------------------------

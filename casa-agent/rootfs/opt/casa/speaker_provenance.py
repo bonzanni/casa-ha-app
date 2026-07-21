@@ -217,6 +217,18 @@ def decode_provenance_tag(tag: str) -> SpeakerProvenance:
         # payload to be that one canonical spelling.
         if base64.urlsafe_b64encode(wire).decode("ascii").rstrip("=") != payload:
             raise ValueError("invalid provenance payload")
+        # FIX 3 (foundation review r2): _reject_excessive_json_nesting below
+        # scans `wire` byte-by-byte assuming UTF-8 (one structural byte per
+        # character), but json.loads(bytes) auto-detects UTF-16/UTF-32 per
+        # RFC 4627. A UTF-16-encoded wire's 2-byte-per-character encoding
+        # can desync the scanner's in_string tracking (e.g. an
+        # escaped-quote sequence), letting real nested-array bytes it
+        # should have counted slip past uncounted. Require wire be valid
+        # UTF-8 BEFORE the depth scan runs — the canonical RFC 8785 re-check
+        # further below already requires UTF-8 canonical JSON, so a
+        # non-UTF-8 wire is always invalid anyway; this just moves that
+        # guarantee ahead of the depth scan (and ahead of json.loads).
+        wire.decode("utf-8")
         # FIX 1: bound nesting depth before trusting the parser — a cheap
         # hostile payload (deeply nested arrays) can otherwise blow the
         # interpreter's recursion limit inside json.loads.
