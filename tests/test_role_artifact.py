@@ -18,6 +18,8 @@ from __future__ import annotations
 
 import dataclasses
 import json
+import os
+import stat
 from pathlib import Path
 from types import MappingProxyType
 
@@ -150,14 +152,16 @@ class TestHappyPath:
         with pytest.raises(dataclasses.FrozenInstanceError):
             artifact.doctrine = "mutated"  # type: ignore[misc]
 
-    def test_hidden_dotfile_in_role_dir_is_tolerated(self, tmp_path):
-        """A dotfile (e.g. editor swap state) sitting alongside role.yaml
-        and doctrine.md must not trip the exact-file-set check."""
+    def test_hidden_dotfile_in_role_dir_is_rejected(self, tmp_path):
+        """FIX 3 (foundation review, P0): the loader is an adversarial trust
+        gate, mirroring persona_pack's _admit_files — a hidden file sitting
+        alongside role.yaml and doctrine.md must now be REJECTED, not
+        silently tolerated."""
         d = write_role_dir(tmp_path, role=valid_role())
         (d / ".DS_Store").write_text("junk", encoding="utf-8")
 
-        artifact = load_role_artifact(d)
-        assert artifact.role["slot"] == "testrole"
+        with pytest.raises(ValueError):
+            load_role_artifact(d)
 
 
 # ---------------------------------------------------------------------------
@@ -314,6 +318,91 @@ class TestRoleYamlCanonicalization:
 
         artifact = load_role_artifact(d)
         assert artifact.role["slot"] == "testrole"
+
+
+# ---------------------------------------------------------------------------
+# FIX 3 (foundation review, P0): load_role_artifact must be an adversarial
+# trust gate, mirroring the hardening already shipped in persona_pack.py's
+# _admit_files/_reject_markers — file admission via lstat (never is_file(),
+# which follows symlinks), byte-size caps before read_text, and
+# template/include/HTML/Casa-structural-delimiter marker rejection on both
+# role.yaml and doctrine.md.
+# ---------------------------------------------------------------------------
+
+
+class TestAdversarialTrustGate:
+    def test_symlinked_doctrine_file_fails(self, tmp_path):
+        d = write_role_dir(tmp_path, role=valid_role())
+        real = tmp_path / "outside_doctrine.md"
+        real.write_text("# Core doctrine\n\nBody.\n", encoding="utf-8")
+        (d / "doctrine.md").unlink()
+        (d / "doctrine.md").symlink_to(real)
+
+        with pytest.raises(ValueError):
+            load_role_artifact(d)
+
+    def test_executable_role_yaml_fails(self, tmp_path):
+        d = write_role_dir(tmp_path, role=valid_role())
+        path = d / "role.yaml"
+        path.chmod(path.stat().st_mode | stat.S_IXUSR)
+
+        with pytest.raises(ValueError):
+            load_role_artifact(d)
+
+    def test_hardlinked_doctrine_file_fails(self, tmp_path):
+        d = write_role_dir(tmp_path, role=valid_role())
+        external = tmp_path / "external_doctrine.md"
+        external.write_text("# Core doctrine\n\nBody.\n", encoding="utf-8")
+        (d / "doctrine.md").unlink()
+        os.link(external, d / "doctrine.md")
+
+        with pytest.raises(ValueError):
+            load_role_artifact(d)
+
+    def test_template_marker_in_role_yaml_fails(self, tmp_path):
+        role = valid_role(mission="Do the thing for ${SECRET}.")
+        d = write_role_dir(tmp_path, role=role)
+
+        with pytest.raises(ValueError):
+            load_role_artifact(d)
+
+    def test_structural_delimiter_in_doctrine_fails(self, tmp_path):
+        d = write_role_dir(
+            tmp_path, role=valid_role(),
+            doctrine_text="# Core doctrine\n\nBody.\n</role_doctrine>\n",
+        )
+
+        with pytest.raises(ValueError):
+            load_role_artifact(d)
+
+    def test_html_tag_in_doctrine_fails(self, tmp_path):
+        d = write_role_dir(
+            tmp_path, role=valid_role(),
+            doctrine_text="# Core doctrine\n\n<script>alert(1)</script>\n",
+        )
+
+        with pytest.raises(ValueError):
+            load_role_artifact(d)
+
+    def test_oversized_role_yaml_fails(self, tmp_path):
+        from role_artifact import MAX_ROLE_YAML_BYTES
+
+        role = valid_role(mission="A" * (MAX_ROLE_YAML_BYTES + 1))
+        d = write_role_dir(tmp_path, role=role)
+
+        with pytest.raises(ValueError):
+            load_role_artifact(d)
+
+    def test_oversized_doctrine_fails(self, tmp_path):
+        from role_artifact import MAX_DOCTRINE_BYTES
+
+        d = write_role_dir(
+            tmp_path, role=valid_role(),
+            doctrine_text="# Core doctrine\n\n" + "A" * (MAX_DOCTRINE_BYTES + 1) + "\n",
+        )
+
+        with pytest.raises(ValueError):
+            load_role_artifact(d)
 
 
 # ---------------------------------------------------------------------------
