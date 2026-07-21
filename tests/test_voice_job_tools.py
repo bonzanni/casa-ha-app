@@ -33,12 +33,17 @@ from job_registry import (
 from specialist_limits import SpecialistLimiter
 from specialist_registry import SpecialistRegistry
 
+try:
+    from tests.role_artifact_stub import STUB_ROLE_ARTIFACT
+except ImportError:
+    from role_artifact_stub import STUB_ROLE_ARTIFACT
+
 
 pytestmark = pytest.mark.unit
 
 
 def _caller_cfg() -> AgentConfig:
-    cfg = AgentConfig(role="concierge")
+    cfg = AgentConfig(role_artifact=STUB_ROLE_ARTIFACT, role="concierge")
     cfg.delegates = [
         DelegateEntry(agent="judge", purpose="rules", when="rules question"),
         DelegateEntry(agent="health", purpose="health", when="health question"),
@@ -47,7 +52,7 @@ def _caller_cfg() -> AgentConfig:
 
 
 def _specialist_cfg(role: str, display_name: str) -> AgentConfig:
-    return AgentConfig(
+    return AgentConfig(role_artifact=STUB_ROLE_ARTIFACT, 
         role=role,
         character=CharacterConfig(name=display_name),
         model="claude-sonnet-4-6",

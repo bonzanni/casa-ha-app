@@ -31,6 +31,11 @@ from claude_agent_sdk import (
 from error_kinds import VoiceToolLoopError
 from voice_turn_guard import VoiceTurnGuard
 
+try:
+    from tests.role_artifact_stub import STUB_ROLE_ARTIFACT
+except ImportError:
+    from role_artifact_stub import STUB_ROLE_ARTIFACT
+
 pytestmark = [pytest.mark.asyncio, pytest.mark.unit]
 
 
@@ -228,7 +233,7 @@ def _make_agent(
     role: str = "assistant",
     semantic_memory: SemanticMemory | None = None,
 ) -> Agent:
-    cfg = AgentConfig(
+    cfg = AgentConfig(role_artifact=STUB_ROLE_ARTIFACT, 
         role=role,
         model="claude-sonnet-4-6",
         system_prompt="You are helpful.",
@@ -1209,7 +1214,7 @@ def _make_agent_with_registry(
     """Like _make_agent, but takes a pre-constructed SessionRegistry so
     tests can pre-populate entries.
     """
-    cfg = AgentConfig(
+    cfg = AgentConfig(role_artifact=STUB_ROLE_ARTIFACT, 
         role=role,
         model="claude-sonnet-4-6",
         system_prompt="You are helpful.",

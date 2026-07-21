@@ -41,6 +41,11 @@ from config import AgentConfig, CharacterConfig, MemoryConfig, ToolsConfig
 from mcp_registry import McpServerRegistry
 from session_registry import SessionRegistry
 
+try:
+    from tests.role_artifact_stub import STUB_ROLE_ARTIFACT
+except ImportError:
+    from role_artifact_stub import STUB_ROLE_ARTIFACT
+
 
 # ---------------------------------------------------------------------------
 # SDK-message helpers (SDK-shape-tolerant, mirror test_agent_pooling.py /
@@ -205,7 +210,7 @@ def patch_retry_sleep():
 
 
 def _make_agent(tmp_path, role: str = "butler") -> Agent:
-    cfg = AgentConfig(
+    cfg = AgentConfig(role_artifact=STUB_ROLE_ARTIFACT, 
         role=role,
         model="claude-sonnet-4-6",
         system_prompt="You are helpful.",

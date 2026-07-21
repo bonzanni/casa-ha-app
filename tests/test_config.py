@@ -1,8 +1,15 @@
 """Tests for config.py -- model mapping and dataclasses."""
 
+import dataclasses
+
 import pytest
 
 from config import resolve_model
+
+try:
+    from tests.role_artifact_stub import STUB_ROLE_ARTIFACT
+except ImportError:
+    from role_artifact_stub import STUB_ROLE_ARTIFACT
 
 
 # ------------------------------------------------------------------
@@ -128,7 +135,7 @@ class TestAgentConfigNewFields:
             AgentConfig, CharacterConfig, VoiceConfig,
             ResponseShapeConfig, HooksConfig,
         )
-        cfg = AgentConfig()
+        cfg = AgentConfig(role_artifact=STUB_ROLE_ARTIFACT)
         assert isinstance(cfg.character, CharacterConfig)
         assert isinstance(cfg.voice, VoiceConfig)
         assert isinstance(cfg.response_shape, ResponseShapeConfig)
@@ -139,10 +146,31 @@ class TestAgentConfigNewFields:
         assert cfg.system_prompt == ""
 
 
+class TestAgentConfigRoleArtifactRequired:
+    """Personality Phase A, Task 6, Step 7: role_artifact is now a required
+    kw_only constructor field with no default on both AgentConfig and
+    ExecutorDefinition — fixes defect #5 (a role-artifact-less agent could
+    silently boot with stale legacy runtime.yaml model resolution)."""
+
+    def test_agent_config_role_artifact_is_required(self) -> None:
+        from config import AgentConfig
+        field_ = next(f for f in dataclasses.fields(AgentConfig) if f.name == "role_artifact")
+        assert field_.default is dataclasses.MISSING
+        assert field_.default_factory is dataclasses.MISSING  # type: ignore[comparison-overlap]
+        assert field_.kw_only is True
+
+    def test_executor_definition_role_artifact_is_required(self) -> None:
+        from config import ExecutorDefinition
+        field_ = next(f for f in dataclasses.fields(ExecutorDefinition) if f.name == "role_artifact")
+        assert field_.default is dataclasses.MISSING
+        assert field_.kw_only is True
+
+
 class TestExecutorDefinition:
     def test_minimal_fields(self):
         from config import ExecutorDefinition
         d = ExecutorDefinition(
+            role_artifact=STUB_ROLE_ARTIFACT,
             type="configurator",
             description="Configure Casa.",
             model="claude-sonnet-4-6",
@@ -157,6 +185,7 @@ class TestExecutorDefinition:
     def test_full_fields(self):
         from config import ExecutorDefinition
         d = ExecutorDefinition(
+            role_artifact=STUB_ROLE_ARTIFACT,
             type="configurator",
             description="Configure Casa.",
             model="claude-sonnet-4-6",

@@ -21,6 +21,11 @@ import pytest
 from config import AgentConfig, DelegateEntry, RequiresConfig
 from plugin_registry import ResolutionResult, ResolvedPlugin
 
+try:
+    from tests.role_artifact_stub import STUB_ROLE_ARTIFACT
+except ImportError:
+    from role_artifact_stub import STUB_ROLE_ARTIFACT
+
 pytestmark = [pytest.mark.unit]
 
 REPO_ROOT = Path(__file__).resolve().parent.parent
@@ -31,7 +36,7 @@ SPECIALISTS_DIR = (
 
 def _cfg(role: str, delegates: tuple[str, ...] = (),
          requires: RequiresConfig | None = None) -> AgentConfig:
-    cfg = AgentConfig(role=role)
+    cfg = AgentConfig(role_artifact=STUB_ROLE_ARTIFACT, role=role)
     cfg.delegates = [DelegateEntry(agent=d, purpose="p", when="w") for d in delegates]
     if requires is not None:
         cfg.requires = requires

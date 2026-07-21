@@ -9,6 +9,11 @@ import pytest
 
 from agent_loader import LoadError, _read_yaml, _validate
 
+try:
+    from tests.role_artifact_stub import STUB_ROLE_ARTIFACT
+except ImportError:
+    from role_artifact_stub import STUB_ROLE_ARTIFACT
+
 pytestmark = pytest.mark.asyncio
 
 
@@ -73,7 +78,7 @@ def test_executor_entry_dataclass_fields():
 
 def test_agent_config_has_executors_field():
     from config import AgentConfig
-    cfg = AgentConfig()
+    cfg = AgentConfig(role_artifact=STUB_ROLE_ARTIFACT, )
     assert cfg.executors == []
 
 

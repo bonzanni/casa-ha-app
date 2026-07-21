@@ -18,6 +18,11 @@ from casa_core_middleware import cid_middleware
 from channels.voice.channel import VoiceChannel
 from error_kinds import VoiceToolLoopError
 
+try:
+    from tests.role_artifact_stub import STUB_ROLE_ARTIFACT
+except ImportError:
+    from role_artifact_stub import STUB_ROLE_ARTIFACT
+
 pytestmark = pytest.mark.unit
 
 
@@ -142,7 +147,7 @@ async def agent_error_voice_app(tmp_path):
 
     bus = MessageBus()
 
-    cfg = AgentConfig(
+    cfg = AgentConfig(role_artifact=STUB_ROLE_ARTIFACT, 
         role="butler",
         model="claude-haiku-4-5",
         system_prompt="Butler.",

@@ -37,6 +37,11 @@ from claude_agent_sdk import (
     TextBlock as _TB,
 )
 
+try:
+    from tests.role_artifact_stub import STUB_ROLE_ARTIFACT
+except ImportError:
+    from role_artifact_stub import STUB_ROLE_ARTIFACT
+
 pytestmark = [pytest.mark.asyncio, pytest.mark.unit]
 
 AGENTS = Path(__file__).resolve().parents[1] / "casa-agent" / "rootfs" / "opt" / "casa" / "defaults" / "agents"
@@ -96,7 +101,7 @@ class _CaptureClient:
 
 
 def _agent(tmp_path, role: str, *, seed_resumed: str | None = None) -> tuple[Agent, _CaptureSem]:
-    cfg = AgentConfig(
+    cfg = AgentConfig(role_artifact=STUB_ROLE_ARTIFACT, 
         role=role,
         model="claude-sonnet-4-6",
         system_prompt=f"You are {role}.",

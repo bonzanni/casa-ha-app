@@ -37,11 +37,16 @@ from config import (
 from specialist_limits import SpecialistLimiter
 from specialist_registry import DelegationComplete, SpecialistRegistry
 
+try:
+    from tests.role_artifact_stub import STUB_ROLE_ARTIFACT
+except ImportError:
+    from role_artifact_stub import STUB_ROLE_ARTIFACT
+
 pytestmark = [pytest.mark.asyncio, pytest.mark.unit]
 
 
 def _specialist_cfg(role: str = "finance") -> AgentConfig:
-    return AgentConfig(
+    return AgentConfig(role_artifact=STUB_ROLE_ARTIFACT, 
         role=role,
         model="claude-sonnet-4-6",
         system_prompt="You are " + role,
@@ -54,7 +59,7 @@ def _specialist_cfg(role: str = "finance") -> AgentConfig:
 
 
 def _caller_cfg(role: str = "assistant") -> AgentConfig:
-    cfg = AgentConfig(role=role)
+    cfg = AgentConfig(role_artifact=STUB_ROLE_ARTIFACT, role=role)
     cfg.delegates = [DelegateEntry(agent="finance", purpose="p", when="w")]
     return cfg
 

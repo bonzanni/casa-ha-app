@@ -8,6 +8,11 @@ from unittest.mock import AsyncMock, MagicMock
 
 import pytest
 
+try:
+    from tests.role_artifact_stub import STUB_ROLE_ARTIFACT
+except ImportError:
+    from role_artifact_stub import STUB_ROLE_ARTIFACT
+
 pytestmark = [pytest.mark.asyncio, pytest.mark.unit]
 
 
@@ -41,7 +46,7 @@ def _mock_executor_def(**overrides):
         "doctrine_dir": "",   # v0.74.2: non-empty + missing now fails closed
     }
     defaults.update(overrides)
-    return ExecutorDefinition(**defaults)
+    return ExecutorDefinition(role_artifact=STUB_ROLE_ARTIFACT, **defaults)
 
 
 async def _setup(

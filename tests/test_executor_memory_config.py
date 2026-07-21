@@ -10,6 +10,11 @@ import pytest
 
 from config import ExecutorDefinition, ExecutorMemoryConfig
 
+try:
+    from tests.role_artifact_stub import STUB_ROLE_ARTIFACT
+except ImportError:
+    from role_artifact_stub import STUB_ROLE_ARTIFACT
+
 
 _SCHEMA_PATH = os.path.join(
     os.path.dirname(__file__), "..", "casa-agent", "rootfs", "opt", "casa",
@@ -39,7 +44,7 @@ def test_default_memory_config_disabled():
 
 
 def test_executor_definition_default_memory_field():
-    defn = ExecutorDefinition(
+    defn = ExecutorDefinition(role_artifact=STUB_ROLE_ARTIFACT, 
         type="x", description="x" * 20, model="sonnet", driver="in_casa",
     )
     assert isinstance(defn.memory, ExecutorMemoryConfig)

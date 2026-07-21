@@ -5,11 +5,16 @@ from unittest.mock import AsyncMock, MagicMock
 import pytest
 from config import AgentConfig, CharacterConfig, DelegateEntry, ToolsConfig
 
+try:
+    from tests.role_artifact_stub import STUB_ROLE_ARTIFACT
+except ImportError:
+    from role_artifact_stub import STUB_ROLE_ARTIFACT
+
 pytestmark = [pytest.mark.asyncio, pytest.mark.unit]
 
 
 def _cfg(role, delegates=()):
-    cfg = AgentConfig(role=role)
+    cfg = AgentConfig(role_artifact=STUB_ROLE_ARTIFACT, role=role)
     cfg.character = CharacterConfig(name=role.title(), archetype=role, card="", prompt=f"You are {role}.")
     cfg.enabled = True; cfg.model = "haiku"
     cfg.tools = ToolsConfig(allowed=["Read"], disallowed=[], permission_mode="acceptEdits", max_turns=5)

@@ -26,6 +26,11 @@ from specialist_registry import (
     SpecialistRegistry,
 )
 
+try:
+    from tests.role_artifact_stub import STUB_ROLE_ARTIFACT
+except ImportError:
+    from role_artifact_stub import STUB_ROLE_ARTIFACT
+
 pytestmark = pytest.mark.asyncio
 
 
@@ -67,7 +72,7 @@ def _seed_specialist_dir(
 
 
 def _specialist_cfg(role: str = "finance", enabled: bool = True) -> AgentConfig:
-    return AgentConfig(
+    return AgentConfig(role_artifact=STUB_ROLE_ARTIFACT, 
         role=role,
         model="claude-sonnet-4-6",
         system_prompt="You are " + role,
@@ -187,7 +192,7 @@ def _caller_cfg(role: str = "assistant", delegates: tuple[str, ...] = ("finance"
     doesn't declare, so every fixture that drives `delegate_to_agent`
     must seed the caller into `agent_role_map` with the target declared.
     """
-    cfg = AgentConfig(role=role)
+    cfg = AgentConfig(role_artifact=STUB_ROLE_ARTIFACT, role=role)
     cfg.delegates = [DelegateEntry(agent=d, purpose="p", when="w") for d in delegates]
     return cfg
 

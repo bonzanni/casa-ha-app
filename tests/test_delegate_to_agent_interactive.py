@@ -12,6 +12,11 @@ from config import (
     ToolsConfig,
 )
 
+try:
+    from tests.role_artifact_stub import STUB_ROLE_ARTIFACT
+except ImportError:
+    from role_artifact_stub import STUB_ROLE_ARTIFACT
+
 pytestmark = [pytest.mark.asyncio, pytest.mark.unit]
 
 
@@ -21,13 +26,13 @@ def _make_assistant_cfg():
     Mirrors the assistant's real `delegates.yaml`, which declares finance —
     see `casa-agent/rootfs/opt/casa/defaults/agents/assistant/delegates.yaml`.
     """
-    cfg = AgentConfig(role="assistant")
+    cfg = AgentConfig(role_artifact=STUB_ROLE_ARTIFACT, role="assistant")
     cfg.delegates = [DelegateEntry(agent="finance", purpose="p", when="w")]
     return cfg
 
 
 def _make_alex_cfg():
-    cfg = AgentConfig(role="finance")
+    cfg = AgentConfig(role_artifact=STUB_ROLE_ARTIFACT, role="finance")
     cfg.character = CharacterConfig(name="Alex", archetype="finance",
                                      card="", prompt="You are Alex.")
     cfg.enabled = True

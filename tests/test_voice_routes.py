@@ -14,6 +14,11 @@ from channels.voice.routes import (
 )
 from config import AgentConfig
 
+try:
+    from tests.role_artifact_stub import STUB_ROLE_ARTIFACT
+except ImportError:
+    from role_artifact_stub import STUB_ROLE_ARTIFACT
+
 
 pytestmark = [pytest.mark.asyncio, pytest.mark.unit]
 
@@ -35,7 +40,7 @@ class _RawSocket:
 
 
 def _cfg(role: str, channels: list[str]) -> AgentConfig:
-    return AgentConfig(role=role, channels=channels)
+    return AgentConfig(role_artifact=STUB_ROLE_ARTIFACT, role=role, channels=channels)
 
 
 def _register_frame(**changes) -> dict:
