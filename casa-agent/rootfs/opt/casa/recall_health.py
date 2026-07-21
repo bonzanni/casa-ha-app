@@ -17,6 +17,7 @@ drive recovery without patching ``asyncio.sleep``.
 from __future__ import annotations
 
 import time
+from collections import deque
 from dataclasses import dataclass
 from typing import Awaitable, Callable, Literal
 
@@ -25,6 +26,13 @@ from semantic_memory import RecallUnavailable
 
 RECALL_BREAKER_FAILURE_THRESHOLD = 3
 RECALL_BREAKER_RECOVERY_SECONDS = 30.0
+
+# Process-wide telemetry sink cap. This is a continuously-running daemon —
+# an unbounded list here would leak forever (one event per recall). Bounded
+# to a few thousand: enough for a useful recent-history snapshot, small
+# enough to never matter memory-wise (see the pytest-OOM scar tissue in
+# CLAUDE.md re: unbounded process-wide state).
+RECALL_TELEMETRY_MAX_EVENTS = 4096
 
 RecallPath = Literal["delegated", "direct_tool", "query_engager", "executor_archive"]
 
@@ -42,7 +50,7 @@ class RecallTelemetry:
     """Append-only in-memory sink of recall outcomes (no gating behaviour)."""
 
     def __init__(self) -> None:
-        self._events: list[RecallTelemetryEvent] = []
+        self._events: deque[RecallTelemetryEvent] = deque(maxlen=RECALL_TELEMETRY_MAX_EVENTS)
 
     def record(self, event: RecallTelemetryEvent) -> None:
         self._events.append(event)

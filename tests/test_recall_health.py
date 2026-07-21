@@ -141,6 +141,23 @@ def test_breaker_half_open_failure_reopens() -> None:
     assert br.try_acquire() is False
 
 
+def test_telemetry_buffer_is_capped_and_retains_most_recent() -> None:
+    from recall_health import RECALL_TELEMETRY_MAX_EVENTS, RecallTelemetry, RecallTelemetryEvent
+
+    tel = RecallTelemetry()
+    total = RECALL_TELEMETRY_MAX_EVENTS + 100
+    for i in range(total):
+        tel.record(RecallTelemetryEvent(
+            "direct_tool", "hits", "ok", 0, i,
+        ))
+    events = tel.snapshot()
+    assert len(events) == RECALL_TELEMETRY_MAX_EVENTS
+    # The oldest 100 (hit_count 0..99) were evicted; the retained window is
+    # the most-recent RECALL_TELEMETRY_MAX_EVENTS, i.e. hit_count 100..total-1.
+    assert events[0].hit_count == 100
+    assert events[-1].hit_count == total - 1
+
+
 def test_breaker_success_resets_failure_count() -> None:
     from recall_health import RecallCircuitBreaker
 
