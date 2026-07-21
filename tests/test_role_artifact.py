@@ -332,6 +332,23 @@ class TestSchemaValidation:
         with pytest.raises(ValueError):
             load_role_artifact(d)
 
+    def test_invalid_unicode_escape_raises_value_error_not_raw_chr_error(
+        self, tmp_path
+    ):
+        # G2 (foundation review r4, P1): PyYAML raises a plain ValueError
+        # (e.g. "chr() arg not in range(0x110000)") for an invalid Unicode
+        # escape like "\U00110000" — this is neither yaml.YAMLError nor
+        # RecursionError, so it escaped the loader's parse-error boundary
+        # and leaked the raw parser-internal message instead of folding
+        # into the same generic, fail-closed ValueError as every other
+        # parse-step rejection above.
+        d = write_role_dir(
+            tmp_path, role_yaml_text='x: "\\U00110000"\n',
+        )
+        with pytest.raises(ValueError) as exc_info:
+            load_role_artifact(d)
+        assert "chr() arg" not in str(exc_info.value)
+
 
 # ---------------------------------------------------------------------------
 # Canonicalization of role.yaml text before parsing

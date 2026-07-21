@@ -904,6 +904,40 @@ def test_deeply_nested_flow_sequence_in_examples_yaml_raises_not_recursion_error
 
 
 # ---------------------------------------------------------------------------
+# G2 (foundation review r4, P1): PyYAML raises a plain ValueError (e.g.
+# "chr() arg not in range(0x110000)") for an invalid Unicode escape like
+# "\U00110000" — neither yaml.YAMLError nor RecursionError, so it escaped
+# the loader's `except (yaml.YAMLError, RecursionError)` parse boundary and
+# leaked the raw parser-internal message as a bare ValueError instead of a
+# PersonaPackError.
+# ---------------------------------------------------------------------------
+
+
+def test_invalid_unicode_escape_in_persona_yaml_raises_persona_pack_error(
+    tmp_path: Path,
+) -> None:
+    pack = write_pack(tmp_path)
+    (pack / "persona.yaml").write_text('x: "\\U00110000"\n', encoding="utf-8")
+    manifest_path = tmp_path / "manifest.json"
+    write_valid_manifest(pack, manifest_path)
+    with pytest.raises(PersonaPackError) as exc_info:
+        load_persona_pack(pack, manifest_path)
+    assert "chr() arg" not in str(exc_info.value)
+
+
+def test_invalid_unicode_escape_in_examples_yaml_raises_persona_pack_error(
+    tmp_path: Path,
+) -> None:
+    pack = write_pack(tmp_path)
+    (pack / "examples.yaml").write_text('x: "\\U00110000"\n', encoding="utf-8")
+    manifest_path = tmp_path / "manifest.json"
+    write_valid_manifest(pack, manifest_path)
+    with pytest.raises(PersonaPackError) as exc_info:
+        load_persona_pack(pack, manifest_path)
+    assert "chr() arg" not in str(exc_info.value)
+
+
+# ---------------------------------------------------------------------------
 # F-C (foundation review r3, P0 DoS): YAML aliases let a tiny, shallow
 # authored document expand into an exponentially large DAG once walked
 # (assert_json_safe, deep_freeze) — forbid aliases outright at parse time.

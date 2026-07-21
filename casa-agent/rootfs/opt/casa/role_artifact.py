@@ -99,7 +99,7 @@ def load_role_artifact(role_dir: Path) -> RoleArtifactSource:
         # below into a CPU + memory DoS. Anchors with no alias are inert
         # and remain permitted.
         raw = load_yaml_no_aliases(role_text)
-    except (yaml.YAMLError, RecursionError) as exc:
+    except (yaml.YAMLError, RecursionError, ValueError, UnicodeError) as exc:
         # F-B (foundation review r3, P0): a hostile deeply-nested flow
         # scalar (e.g. "[" * 2000 + "0" + "]" * 2000), well under
         # MAX_ROLE_YAML_BYTES, makes yaml's own PARSER recurse — this
@@ -107,7 +107,14 @@ def load_role_artifact(role_dir: Path) -> RoleArtifactSource:
         # (which only bounds depth in the ALREADY-PARSED tree) ever runs.
         # Fold both a genuine YAML syntax error, a forbidden-alias
         # rejection, and a parser RecursionError into the same generic,
-        # fail-closed ValueError.
+        # fail-closed ValueError. G2 (foundation review r4, P1): PyYAML's
+        # own scanner also raises a plain ValueError (e.g. "chr() arg not
+        # in range(0x110000)") for an invalid Unicode escape such as
+        # "\U00110000" — neither yaml.YAMLError nor RecursionError, so it
+        # previously escaped this boundary and leaked the raw
+        # parser-internal message. Catch ValueError/UnicodeError here too
+        # (scoped to this parse call only) so ANY parse failure folds into
+        # the same generic, clean error.
         raise ValueError("role.yaml contains invalid or unparseable YAML") from exc
     # R1 (foundation review r2): yaml.safe_load can yield non-JSON-native
     # types (set/bytes/datetime/cyclic) via YAML tags/aliases that

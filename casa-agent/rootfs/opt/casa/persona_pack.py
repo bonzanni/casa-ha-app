@@ -126,7 +126,7 @@ def load_persona_pack(pack_dir: Path, manifest_path: Path) -> PersonaPack:
         # for the DAG-amplification-DoS rationale. Anchors with no alias
         # remain permitted.
         persona = load_yaml_no_aliases(canonical_files["persona.yaml"])
-    except (yaml.YAMLError, RecursionError) as exc:
+    except (yaml.YAMLError, RecursionError, ValueError, UnicodeError) as exc:
         # F-B (foundation review r3, P0): a hostile deeply-nested flow
         # scalar makes yaml's own PARSER recurse, well under any size cap
         # here — this happens INSIDE the parse call, before
@@ -134,6 +134,13 @@ def load_persona_pack(pack_dir: Path, manifest_path: Path) -> PersonaPack:
         # ALREADY-PARSED tree) ever runs. Fold a genuine YAML syntax
         # error, a forbidden-alias rejection, and a parser RecursionError
         # into the same generic, fail-closed PersonaPackError.
+        # G2 (foundation review r4, P1): PyYAML's own scanner also raises
+        # a plain ValueError (e.g. "chr() arg not in range(0x110000)") for
+        # an invalid Unicode escape such as "\U00110000" — neither
+        # yaml.YAMLError nor RecursionError, so it previously escaped this
+        # boundary and leaked the raw parser-internal message. Catch
+        # ValueError/UnicodeError here too (scoped to this parse call
+        # only) so ANY parse failure folds into the same generic error.
         raise PersonaPackError(
             "persona.yaml contains invalid or unparseable YAML"
         ) from exc
@@ -184,9 +191,10 @@ def load_persona_pack(pack_dir: Path, manifest_path: Path) -> PersonaPack:
             # F-C (foundation review r3, P0 DoS): same alias-forbidding
             # parse as persona.yaml above.
             raw_examples = load_yaml_no_aliases(canonical_files["examples.yaml"])
-        except (yaml.YAMLError, RecursionError) as exc:
+        except (yaml.YAMLError, RecursionError, ValueError, UnicodeError) as exc:
             # F-B (foundation review r3, P0): same parser-recursion hazard
-            # as persona.yaml above.
+            # as persona.yaml above. G2 (foundation review r4, P1): same
+            # bare-ValueError-from-invalid-Unicode-escape hazard too.
             raise PersonaPackError(
                 "examples.yaml contains invalid or unparseable YAML"
             ) from exc
