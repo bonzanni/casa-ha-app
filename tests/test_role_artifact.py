@@ -44,6 +44,7 @@ _REAL_ROLES_DIR = Path(__file__).resolve().parent.parent / (
 _REAL_ROLE_DIRS = [
     ("resident", "assistant"),
     ("resident", "butler"),
+    ("resident", "concierge"),
     ("specialist", "finance"),
     ("executor", "configurator"),
     ("executor", "plugin-developer"),

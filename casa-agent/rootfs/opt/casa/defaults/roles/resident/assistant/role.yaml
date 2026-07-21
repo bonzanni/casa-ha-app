@@ -32,8 +32,6 @@ response:
   restricted_webhook: {register: plain, max_status_sentences: 2}
 persona:
   policy: required
-  compatibility:
-    - casa.bootstrap/ellen@0.1.0
-    - casa.personas/*@>=1.0.0 <2.0.0
+  compatibility: ["casa/ellen@>=0.1.0 <1.0.0"]
 requires: {plugins: [], tools: []}
 doctrine_file: doctrine.md
