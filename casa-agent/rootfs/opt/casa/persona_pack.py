@@ -19,6 +19,7 @@ from canonical_bytes import (
     deep_freeze,
 )
 from markdown_sections import sections
+from yaml_safety import load_yaml_no_aliases
 
 _REQUIRED = {"persona.yaml", "persona.md"}
 _OPTIONAL = {"examples.yaml"}
@@ -104,15 +105,19 @@ def load_persona_pack(pack_dir: Path, manifest_path: Path) -> PersonaPack:
         })
 
     try:
-        persona = yaml.safe_load(canonical_files["persona.yaml"])
+        # F-C (foundation review r3, P0 DoS): load_yaml_no_aliases forbids
+        # YAML aliases outright — see role_artifact.py's matching comment
+        # for the DAG-amplification-DoS rationale. Anchors with no alias
+        # remain permitted.
+        persona = load_yaml_no_aliases(canonical_files["persona.yaml"])
     except (yaml.YAMLError, RecursionError) as exc:
         # F-B (foundation review r3, P0): a hostile deeply-nested flow
         # scalar makes yaml's own PARSER recurse, well under any size cap
-        # here — this happens INSIDE yaml.safe_load, before
+        # here — this happens INSIDE the parse call, before
         # assert_json_safe below (which only bounds depth in the
-        # ALREADY-PARSED tree) ever runs. Fold both a genuine YAML syntax
-        # error and a parser RecursionError into the same generic,
-        # fail-closed PersonaPackError.
+        # ALREADY-PARSED tree) ever runs. Fold a genuine YAML syntax
+        # error, a forbidden-alias rejection, and a parser RecursionError
+        # into the same generic, fail-closed PersonaPackError.
         raise PersonaPackError(
             "persona.yaml contains invalid or unparseable YAML"
         ) from exc
@@ -160,7 +165,9 @@ def load_persona_pack(pack_dir: Path, manifest_path: Path) -> PersonaPack:
     examples = ()
     if "examples.yaml" in canonical_files:
         try:
-            raw_examples = yaml.safe_load(canonical_files["examples.yaml"])
+            # F-C (foundation review r3, P0 DoS): same alias-forbidding
+            # parse as persona.yaml above.
+            raw_examples = load_yaml_no_aliases(canonical_files["examples.yaml"])
         except (yaml.YAMLError, RecursionError) as exc:
             # F-B (foundation review r3, P0): same parser-recursion hazard
             # as persona.yaml above.

@@ -462,12 +462,19 @@ class TestJsonNativeInvariant:
     def test_self_referential_anchor_raises_value_error_not_recursion_error(
         self, tmp_path
     ):
+        # F-C (foundation review r3): a self-referential anchor is
+        # necessarily an ALIAS (`*loop`), so as of F-C this is now
+        # rejected at the PARSE step itself (the loader forbids aliases
+        # outright) — it never reaches assert_json_safe's cycle guard any
+        # more. Still asserts the fail-closed contract (ValueError, not an
+        # uncaught RecursionError); assert_json_safe's own cycle guard is
+        # covered directly (independent of YAML) in test_canonical_bytes.py.
         role_yaml_text = _role_yaml_with_delegates(
             "delegates:\n- opaque: &loop [*loop]\n"
         )
         d = write_role_dir(tmp_path, role_yaml_text=role_yaml_text)
 
-        with pytest.raises(ValueError, match="cyclic"):
+        with pytest.raises(ValueError):
             load_role_artifact(d)
 
     def test_yaml_set_tag_hiding_a_marker_is_rejected(self, tmp_path):
@@ -514,6 +521,54 @@ class TestJsonNativeInvariant:
 # ---------------------------------------------------------------------------
 # Real shipped canonical role artifacts (integration)
 # ---------------------------------------------------------------------------
+
+
+# ---------------------------------------------------------------------------
+# F-C (foundation review r3, P0 DoS): YAML aliases let a tiny, shallow
+# authored document expand into an exponentially large DAG once walked
+# (assert_json_safe, deep_freeze) — forbid aliases outright at parse time.
+# Anchors with no alias are harmless (no reuse) and must still load.
+# ---------------------------------------------------------------------------
+
+
+class TestNoAliasesPermitted:
+    def test_simple_yaml_alias_reference_is_rejected(self, tmp_path):
+        role_yaml_text = _role_yaml_with_delegates(
+            "delegates:\n- opaque: &a0 [x, x]\n  other: *a0\n"
+        )
+        d = write_role_dir(tmp_path, role_yaml_text=role_yaml_text)
+
+        with pytest.raises(ValueError):
+            load_role_artifact(d)
+
+    def test_alias_dag_amplification_bomb_is_rejected(self, tmp_path):
+        # Brief's fragment (3 levels is already enough to prove the
+        # loader rejects it at parse time, well before any amplified walk).
+        role_yaml_text = _role_yaml_with_delegates(
+            "delegates:\n"
+            "- opaque:\n"
+            "  - &a0 [x, x]\n"
+            "  - &a1 [*a0, *a0]\n"
+            "  - &a2 [*a1, *a1]\n"
+        )
+        d = write_role_dir(tmp_path, role_yaml_text=role_yaml_text)
+
+        with pytest.raises(ValueError):
+            load_role_artifact(d)
+
+    def test_anchor_with_no_alias_is_harmless_and_still_loads(self, tmp_path):
+        # An anchor alone (never referenced by an alias) has no reuse
+        # effect — only ALIASES are forbidden, not anchors, so this must
+        # still load.
+        role_yaml_text = _role_yaml_with_delegates(
+            "delegates:\n- opaque: &a0 [x, x]\n"
+        )
+        d = write_role_dir(tmp_path, role_yaml_text=role_yaml_text)
+
+        artifact = load_role_artifact(d)
+        # deep_freeze converts lists to tuples, so compare against the
+        # frozen shape rather than plain lists.
+        assert artifact.role["delegates"][0]["opaque"] == ("x", "x")
 
 
 @pytest.mark.parametrize("kind,slot", _REAL_ROLE_DIRS)

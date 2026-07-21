@@ -849,6 +849,65 @@ def test_deeply_nested_flow_sequence_in_examples_yaml_raises_not_recursion_error
         load_persona_pack(pack, manifest_path)
 
 
+# ---------------------------------------------------------------------------
+# F-C (foundation review r3, P0 DoS): YAML aliases let a tiny, shallow
+# authored document expand into an exponentially large DAG once walked
+# (assert_json_safe, deep_freeze) — forbid aliases outright at parse time.
+# Both persona.v1.json and persona-examples.v1.json are fully closed
+# schemas (additionalProperties: false throughout, no schema-open array/
+# object field) — unlike role.v1.json's `delegates` (see
+# test_role_artifact.py's TestNoAliasesPermitted, which covers the
+# DAG-amplification bomb shape directly) — so here the alias is a plain
+# SCALAR reuse: schema-valid whether or not aliases are permitted, which is
+# exactly what makes this a genuine pre-fix "loads successfully" case
+# rather than one that would fail for an unrelated (schema) reason either
+# way. Anchors with no alias are harmless and must still load (see the
+# existing test_real_shipped_persona_pack_loads no-regression coverage).
+# ---------------------------------------------------------------------------
+
+
+def test_simple_yaml_alias_reference_in_persona_yaml_quirk_is_rejected(
+    tmp_path: Path,
+) -> None:
+    pack = write_pack(tmp_path)
+    data = valid_yaml()
+    data["quirks"] = [{
+        "frequency": "occasional",
+        "context": "shared text",
+        "tendency": "shared text",
+    }]
+    yaml_text = yaml.safe_dump(data, sort_keys=False)
+    assert "context: shared text\n" in yaml_text
+    assert "tendency: shared text\n" in yaml_text
+    yaml_text = yaml_text.replace("context: shared text\n", "context: &c0 shared text\n")
+    yaml_text = yaml_text.replace("tendency: shared text\n", "tendency: *c0\n")
+    (pack / "persona.yaml").write_text(yaml_text, encoding="utf-8")
+    manifest_path = tmp_path / "manifest.json"
+    write_valid_manifest(pack, manifest_path)
+    with pytest.raises(PersonaPackError):
+        load_persona_pack(pack, manifest_path)
+
+
+def test_simple_yaml_alias_reference_in_examples_yaml_is_rejected(tmp_path: Path) -> None:
+    pack = write_pack(tmp_path)
+    examples_payload = {
+        "api_version": "casa.persona.examples/v1",
+        "examples": [
+            {"surface": "text", "user": "hi", "good": "shared text", "bad": "shared text"},
+        ],
+    }
+    yaml_text = yaml.safe_dump(examples_payload, sort_keys=False)
+    assert "good: shared text\n" in yaml_text
+    assert "bad: shared text\n" in yaml_text
+    yaml_text = yaml_text.replace("good: shared text\n", "good: &g0 shared text\n")
+    yaml_text = yaml_text.replace("bad: shared text\n", "bad: *g0\n")
+    (pack / "examples.yaml").write_text(yaml_text, encoding="utf-8")
+    manifest_path = tmp_path / "manifest.json"
+    write_valid_manifest(pack, manifest_path)
+    with pytest.raises(PersonaPackError):
+        load_persona_pack(pack, manifest_path)
+
+
 def test_letter_angle_bracket_comparison_in_persona_yaml_fails(tmp_path: Path) -> None:
     # R3 (foundation review r2): HTML_TAG_OPEN_RE is deliberately
     # CONSERVATIVE for a trust boundary — it rejects "<" followed (even

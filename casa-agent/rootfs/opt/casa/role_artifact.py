@@ -12,6 +12,7 @@ import yaml
 from authored_markers import contains_forbidden_marker, reject_markers_in_parsed
 from canonical_bytes import assert_json_safe, canonical_text, deep_freeze
 from markdown_sections import validate_markdown
+from yaml_safety import load_yaml_no_aliases
 
 # Byte-size caps checked BEFORE read_text, so a hostile artifact can't force
 # an unbounded allocation. role.yaml is a small structured config file;
@@ -90,15 +91,23 @@ def load_role_artifact(role_dir: Path) -> RoleArtifactSource:
 
     role_text = canonical_text(role_path.read_text(encoding="utf-8"))
     try:
-        raw = yaml.safe_load(role_text)
+        # F-C (foundation review r3, P0 DoS): load_yaml_no_aliases forbids
+        # YAML aliases outright (yaml_safety._NoAliasSafeLoader) — a
+        # fetched role.yaml could otherwise use aliases to build an
+        # exponentially-expanding DAG (tiny on disk, shallow, yet ~2^30
+        # leaves once walked) that turns assert_json_safe/deep_freeze
+        # below into a CPU + memory DoS. Anchors with no alias are inert
+        # and remain permitted.
+        raw = load_yaml_no_aliases(role_text)
     except (yaml.YAMLError, RecursionError) as exc:
         # F-B (foundation review r3, P0): a hostile deeply-nested flow
         # scalar (e.g. "[" * 2000 + "0" + "]" * 2000), well under
         # MAX_ROLE_YAML_BYTES, makes yaml's own PARSER recurse — this
-        # happens INSIDE yaml.safe_load, before assert_json_safe below
+        # happens INSIDE the parse call, before assert_json_safe below
         # (which only bounds depth in the ALREADY-PARSED tree) ever runs.
-        # Fold both a genuine YAML syntax error and a parser RecursionError
-        # into the same generic, fail-closed ValueError.
+        # Fold both a genuine YAML syntax error, a forbidden-alias
+        # rejection, and a parser RecursionError into the same generic,
+        # fail-closed ValueError.
         raise ValueError("role.yaml contains invalid or unparseable YAML") from exc
     # R1 (foundation review r2): yaml.safe_load can yield non-JSON-native
     # types (set/bytes/datetime/cyclic) via YAML tags/aliases that
