@@ -19,6 +19,7 @@ mkdir -p "$CONFIG_DIR/agents" \
          "$CONFIG_DIR/bindings/resident-assistant" \
          "$CONFIG_DIR/bindings/resident-butler" \
          "$CONFIG_DIR/bindings/resident-concierge" \
+         "$CONFIG_DIR/specialists" \
          "$CONFIG_DIR/schema" \
          "$DATA_DIR/sdk-sessions" \
          "$DATA_DIR/casa-s6-services" \
@@ -162,6 +163,17 @@ elif [ ! -d "$CONFIG_DIR/.git" ]; then
 !plugins/registry.json
 plugins/store/
 plugins/.staging/
+# Installed-specialist data model (Task 13): registry.json is config — same
+# audit-trail rationale as plugins/registry.json above. ONLY the per-slug
+# active/desired/prior tuples and the top-level registry are tracked; the
+# content-addressed component store and staging are binaries, never tracked.
+!specialists/
+!specialists/registry.json
+!specialists/*/active.yaml
+!specialists/*/desired.yaml
+!specialists/*/active.prior.yaml
+specialists/store/
+specialists/.staging/
 !.gitignore
 EOF
     git add -A 2>/dev/null || true

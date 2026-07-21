@@ -697,3 +697,31 @@ class TestSpecialistBootCapabilities:
         with caplog.at_level(logging.INFO):
             reg.load()
         assert not any("agent_capabilities" in r.getMessage() for r in caplog.records)
+
+
+class TestInstalledSpecialistIndexCollisionSet:
+    """Task 13: the slug-collision authority is EVERY image role's bare slot,
+    across ALL THREE kinds (resident, executor, AND specialist) — a prior
+    draft's hard-coded resident+executor-only set silently omitted the
+    bundled specialist:finance, which this regression-gates permanently."""
+
+    async def test_all_collision_slugs_includes_the_bundled_specialist_finance(self) -> None:
+        from specialist_registry import InstalledSpecialistIndex
+
+        index = InstalledSpecialistIndex(specialists_dir="/nonexistent")
+        index.load()  # zero installed specialists — this still asserts the IMAGE role set
+        collisions = index.all_collision_slugs()
+        assert "finance" in collisions  # specialist:finance — the bug this fixes
+        assert {"assistant", "butler", "concierge", "configurator", "plugin-developer", "finance"} <= collisions
+
+    async def test_discover_image_role_slots_scans_every_kind_directory(self, tmp_path) -> None:
+        """Unit-level proof the discovery walks resident/executor/specialist alike —
+        not a hand-picked per-kind constant."""
+        from specialist_registry import _discover_image_role_slots
+
+        for kind, slot in (("resident", "assistant"), ("executor", "configurator"),
+                            ("specialist", "finance")):
+            role_dir = tmp_path / kind / slot
+            role_dir.mkdir(parents=True)
+            (role_dir / "role.yaml").write_text(f"slot: {slot}\n", encoding="utf-8")
+        assert _discover_image_role_slots(str(tmp_path)) == {"assistant", "configurator", "finance"}

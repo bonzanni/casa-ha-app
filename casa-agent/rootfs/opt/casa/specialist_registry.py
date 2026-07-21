@@ -16,7 +16,10 @@ from __future__ import annotations
 import logging
 import os
 from dataclasses import dataclass, field
+from pathlib import Path
 from typing import Any
+
+import yaml
 
 from config import AgentConfig
 from job_registry import (
@@ -25,7 +28,9 @@ from job_registry import (
     JobRegistry,
     VoiceJob,
 )
+from personality_binding import InstanceDir
 from personality_types import SpeakerProvenance
+from specialist_lifecycle import InstanceState, SpecialistInstance, check_slug_uniqueness  # noqa: F401
 
 logger = logging.getLogger(__name__)
 
@@ -342,3 +347,114 @@ class SpecialistRegistry:
             "user_id": job.creator_user_id,
             "user_text": job.task,
         }
+
+
+# ---------------------------------------------------------------------------
+# Installed-specialist data model (Task 13) — a SEPARATE concern layered onto
+# the legacy SpecialistRegistry above (bundled /config/agents/specialists/
+# per-agent-directory tier-2 loading + in-flight delegation tracking). The
+# NEW tree this introduces, /config/specialists/<slug>/{active,desired}.yaml,
+# is a DIFFERENT directory from SpecialistRegistry._dir's legacy tree — do
+# not conflate them. This is DATA MODEL ONLY (spec Plan 1): no fetch/
+# consent/CAS-persist/compile runtime — that is Plan 2's N1.
+# ---------------------------------------------------------------------------
+
+
+def _discover_image_role_slots(roles_dir: str | None = None) -> frozenset[str]:
+    """Spec §2.4: the slug-collision authority is EVERY image role's bare slot,
+    across ALL THREE kinds (resident, executor, AND specialist) — never a
+    hand-maintained per-kind constant (the bug this replaces: a resident+executor
+    -only hard-coded set silently omitted the bundled specialist:finance, so an
+    install with slug 'finance' would have collided undetected). Scans
+    defaults/roles/<kind>/<slug>/role.yaml for every kind directory PRESENT under
+    roles_dir — no kind is special-cased, so a future fourth kind, a renamed
+    executor, or a newly-bundled transitional specialist needs no matching edit
+    here. Lazy-imports agent_loader.DEFAULT_ROLES_DIR (mirrors this module's
+    existing local-import convention for agent_loader, see load() above) to avoid
+    a module-level circular import."""
+    from agent_loader import DEFAULT_ROLES_DIR
+
+    base = Path(roles_dir or DEFAULT_ROLES_DIR)
+    slots: set[str] = set()
+    for kind_dir in sorted(p for p in base.iterdir() if p.is_dir()):
+        for role_dir in sorted(p for p in kind_dir.iterdir() if p.is_dir()):
+            role_yaml = role_dir / "role.yaml"
+            if not role_yaml.is_file():
+                continue
+            data = yaml.safe_load(role_yaml.read_text(encoding="utf-8"))
+            slots.add(str(data["slot"]))
+    return frozenset(slots)
+
+
+# Computed once at import — the image's OWN role tree is static content, never
+# mutated at runtime (an INSTALLED specialist lives in a separate tree,
+# /config/specialists/, layered on top by InstalledSpecialistIndex below).
+_IMAGE_ROLE_SLOTS = _discover_image_role_slots()
+
+
+class InstalledSpecialistIndex:
+    """Tracks 0..N INSTALLED specialist components under /config/specialists/<slug>/ —
+    a DIFFERENT tree from SpecialistRegistry._dir's legacy bundled
+    /config/agents/specialists/<role>/ (finance today). Populated at boot by
+    scanning for active.yaml/desired.yaml pairs; Plan 2's N1 is what actually
+    WRITES a new one via InstanceDir.stage_desired/commit_desired_to_active."""
+
+    def __init__(self, specialists_dir: str = "/config/specialists") -> None:
+        self._dir = Path(specialists_dir)
+        self._instances: dict[str, SpecialistInstance] = {}
+
+    def installed_slugs(self) -> frozenset[str]:
+        return frozenset(self._instances)
+
+    def all_collision_slugs(self) -> frozenset[str]:
+        return _IMAGE_ROLE_SLOTS | self.installed_slugs()
+
+    def get_instance(self, slug: str) -> SpecialistInstance | None:
+        return self._instances.get(slug)
+
+    def load(self) -> None:
+        """A slug directory with only a desired.yaml (no active.yaml) is a
+        brand-new specialist still in pending-configuration with NO running
+        active tuple (spec §4.1) — this Plan defines that state; Plan 2's N1
+        is what produces one."""
+        self._instances.clear()
+        if not self._dir.is_dir():
+            return
+        for entry in sorted(self._dir.iterdir()):
+            if not entry.is_dir() or entry.name in {"store", ".staging"}:
+                continue
+            slug = entry.name
+            instance_dir = InstanceDir(entry)
+            active, desired = instance_dir.active(), instance_dir.desired()
+            if active is None and desired is None:
+                continue
+            state: InstanceState = (
+                "active" if active is not None else "pending-configuration" if desired is not None else "error"
+            )
+            self._instances[slug] = SpecialistInstance(
+                slug=slug, stable_agent_id=f"specialist:{slug}", state=state,
+                active=active, desired=desired, last_activation_error=None,
+            )
+
+
+# Module-level accessor over the ONE process-wide index casa_core.py constructs at
+# boot — mirrors the established module-level pattern (e.g. tools.active_semantic_memory,
+# tools.py:3549) other registries in this codebase already use for tool-module access
+# without threading a runtime object through every call. Plan 2's N1 and Task 14's
+# admin handlers read through this seam.
+_active_index: "InstalledSpecialistIndex | None" = None
+
+
+def set_active_installed_index(index: "InstalledSpecialistIndex") -> None:
+    global _active_index
+    _active_index = index
+
+
+def live_installed_specialist_slugs() -> frozenset[str]:
+    return _active_index.installed_slugs() if _active_index is not None else frozenset()
+
+
+def live_collision_slugs() -> frozenset[str]:
+    if _active_index is None:
+        return _IMAGE_ROLE_SLOTS
+    return _active_index.all_collision_slugs()

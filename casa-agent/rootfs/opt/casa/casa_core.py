@@ -2107,7 +2107,8 @@ async def main() -> None:
 
     # 7. Framework tools
     from tools import create_casa_tools, init_tools
-    from specialist_registry import SpecialistRegistry
+    import specialist_registry as specialist_registry_module
+    from specialist_registry import InstalledSpecialistIndex, SpecialistRegistry
     from job_registry import JobRegistry
 
     # One durable owner for both delegated execution and voice-delivery state.
@@ -2126,6 +2127,19 @@ async def main() -> None:
         job_registry=job_registry,
     )
     specialist_registry.load()
+
+    # Task 13: the NEW installed-specialist data model — a SEPARATE tree
+    # (/config/specialists/<slug>/) and a SEPARATE object from the legacy
+    # SpecialistRegistry above (bundled /config/agents/specialists/). Wired
+    # here, before any channel/bus loop starts, so the module-level accessor
+    # (specialist_registry.live_collision_slugs/live_installed_specialist_slugs)
+    # is populated for the rest of boot — same ordering guarantee Task 8
+    # established for the four compiled-personality registries.
+    installed_specialist_index = InstalledSpecialistIndex(
+        os.path.join(CONFIG_DIR, "specialists"),
+    )
+    installed_specialist_index.load()
+    specialist_registry_module.set_active_installed_index(installed_specialist_index)
 
     from engagement_registry import EngagementRegistry
     engagement_registry = EngagementRegistry(
