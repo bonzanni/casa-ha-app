@@ -10,6 +10,7 @@ from typing import Mapping
 import jsonschema
 import yaml
 
+from authored_markers import contains_forbidden_marker
 from canonical_bytes import (
     canonical_json_bytes,
     canonical_text,
@@ -20,12 +21,6 @@ from markdown_sections import sections
 
 _REQUIRED = {"persona.yaml", "persona.md"}
 _OPTIONAL = {"examples.yaml"}
-_FORBIDDEN_MARKERS = (
-    "${", "{{", "}}", "{%", "%}", "{#", "#}", "!include",
-    "<platform_frame>", "</platform_frame>", "<role_identity>",
-    "</role_identity>", "<persona>", "</persona>", "<role_doctrine>",
-    "</role_doctrine>", "<safety_kernel>", "</safety_kernel>", "<html",
-)
 _AXES = {
     "warmth", "formality", "candor", "attunement",
     "curiosity", "levity", "social_energy", "optimism",
@@ -77,8 +72,7 @@ def _admit_files(pack_dir: Path) -> tuple[Path, ...]:
 
 
 def _reject_markers(text: str) -> None:
-    lowered = text.lower()
-    if any(marker.lower() in lowered for marker in _FORBIDDEN_MARKERS):
+    if contains_forbidden_marker(text):
         raise PersonaPackError("template, include, HTML, or delimiter detected")
 
 

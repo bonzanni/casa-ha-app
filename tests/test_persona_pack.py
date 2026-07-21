@@ -644,6 +644,72 @@ def test_examples_file_wrong_api_version_fails(tmp_path: Path) -> None:
         load_persona_pack(pack, tmp_path / "manifest.json")
 
 
+# ---------------------------------------------------------------------------
+# FIX 6 (foundation review, P1): general HTML rejection outside persona.md.
+# persona.md is caught by Markdown validation, but persona.yaml/
+# examples.yaml only went through `_reject_markers`, which (pre-fix) only
+# blocked the literal substring "<html" — `<script>`, `<img>`, etc. slipped
+# through in those two files.
+# ---------------------------------------------------------------------------
+
+
+def test_script_tag_in_persona_yaml_quirk_fails(tmp_path: Path) -> None:
+    # A valid manifest is written FIRST so that — pre-fix, when the marker
+    # check does not yet catch this — the load would otherwise SUCCEED
+    # rather than fail for an unrelated reason (an absent manifest.json
+    # also raises PersonaPackError, which would make this test a false
+    # positive that passes regardless of whether the HTML is rejected).
+    pack = write_pack(tmp_path)
+    data = valid_yaml()
+    data["quirks"] = [{
+        "frequency": "occasional",
+        "context": "<script>alert(1)</script>",
+        "tendency": "tendency-0",
+    }]
+    (pack / "persona.yaml").write_text(yaml.safe_dump(data, sort_keys=False), encoding="utf-8")
+    manifest_path = tmp_path / "manifest.json"
+    write_valid_manifest(pack, manifest_path)
+    with pytest.raises(PersonaPackError, match="template, include, HTML, or delimiter"):
+        load_persona_pack(pack, manifest_path)
+
+
+def test_img_tag_in_examples_yaml_fails(tmp_path: Path) -> None:
+    # See comment in test_script_tag_in_persona_yaml_quirk_fails above for
+    # why the manifest must match the ACTUAL (malicious) file content —
+    # written from the state that already contains the injected tag, so
+    # the manifest check itself can never be what raises here — only the
+    # marker/HTML rejection can (asserted via the specific message).
+    pack = write_pack(tmp_path)
+    examples_payload = {
+        "api_version": "casa.persona.examples/v1",
+        "examples": [
+            {"surface": "text", "user": "hi", "good": "Hello.", "bad": "<img src=x>"},
+        ],
+    }
+    (pack / "examples.yaml").write_text(
+        yaml.safe_dump(examples_payload, sort_keys=False), encoding="utf-8"
+    )
+    manifest_path = tmp_path / "manifest.json"
+    write_valid_manifest(pack, manifest_path)
+    with pytest.raises(PersonaPackError, match="template, include, HTML, or delimiter"):
+        load_persona_pack(pack, manifest_path)
+
+
+def test_benign_angle_bracket_comparison_in_persona_yaml_still_loads(tmp_path: Path) -> None:
+    pack = write_pack(tmp_path)
+    data = valid_yaml()
+    data["quirks"] = [{
+        "frequency": "occasional",
+        "context": "Notices when 2 < 3 in a casual aside.",
+        "tendency": "tendency-0",
+    }]
+    (pack / "persona.yaml").write_text(yaml.safe_dump(data, sort_keys=False), encoding="utf-8")
+    manifest_path = tmp_path / "manifest.json"
+    write_valid_manifest(pack, manifest_path)
+    result = load_persona_pack(pack, manifest_path)
+    assert result.quirks[0]["context"] == "Notices when 2 < 3 in a casual aside."
+
+
 # ===========================================================================
 # markdown_sections — ACCEPTED-CommonMark validation + byte-preserving
 # source-slice extraction, tested directly.
