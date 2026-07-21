@@ -10,7 +10,7 @@ import jsonschema
 import yaml
 
 from authored_markers import contains_forbidden_marker
-from canonical_bytes import canonical_text, deep_freeze
+from canonical_bytes import assert_json_safe, canonical_text, deep_freeze
 from markdown_sections import validate_markdown
 
 # Byte-size caps checked BEFORE read_text, so a hostile artifact can't force
@@ -104,6 +104,13 @@ def load_role_artifact(role_dir: Path) -> RoleArtifactSource:
 
     role_text = canonical_text(role_path.read_text(encoding="utf-8"))
     raw = yaml.safe_load(role_text)
+    # R1 (foundation review r2): yaml.safe_load can yield non-JSON-native
+    # types (set/bytes/datetime/cyclic) via YAML tags/aliases that
+    # role.v1.json's schema-open fields admit. Assert the parsed tree is
+    # JSON-native BEFORE the marker walk / schema validation / deep_freeze
+    # below, so none of them can crash on a cycle or be bypassed by a
+    # marker hidden inside a non-dict/list/str container.
+    assert_json_safe(raw)
     _reject_markers_in_role_values(raw)
     schema_path = Path(__file__).parent / "defaults/schema/role.v1.json"
     jsonschema.validate(raw, json.loads(schema_path.read_text(encoding="utf-8")))

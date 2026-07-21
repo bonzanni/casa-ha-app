@@ -324,6 +324,29 @@ def test_valid_pack_with_matching_manifest_loads(tmp_path: Path) -> None:
 
 
 # ---------------------------------------------------------------------------
+# R1 (foundation review r2): the 5 shipped canonical persona packs must
+# still load after assert_json_safe is wired in as defense in depth —
+# their content is ordinary JSON-shaped YAML, so this is a pure
+# no-regression check.
+# ---------------------------------------------------------------------------
+
+_REAL_PERSONAS_DIR = Path(__file__).resolve().parent.parent / (
+    "casa-agent/rootfs/opt/casa/defaults/personas"
+)
+_REAL_PERSONA_SLUGS = ["alex", "judge", "ellen", "gary", "tina"]
+
+
+@pytest.mark.parametrize("slug", _REAL_PERSONA_SLUGS)
+def test_real_shipped_persona_pack_loads(slug: str) -> None:
+    version_dir = _REAL_PERSONAS_DIR / "casa" / slug / "0.1.0"
+    result = load_persona_pack(
+        version_dir / "pack", version_dir / "manifest.json"
+    )
+    assert result.persona_id == f"casa/{slug}"
+    assert result.version == "0.1.0"
+
+
+# ---------------------------------------------------------------------------
 # FIX 5 (foundation review, P1): artifacts must be DEEPLY frozen, not just
 # top-level MappingProxyType — nested dicts/lists inside identity, quirks,
 # examples, and manifest rows must also reject mutation.

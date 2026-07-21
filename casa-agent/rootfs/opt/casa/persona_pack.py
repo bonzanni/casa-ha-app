@@ -12,6 +12,7 @@ import yaml
 
 from authored_markers import contains_forbidden_marker
 from canonical_bytes import (
+    assert_json_safe,
     canonical_json_bytes,
     canonical_text,
     checksum_bytes,
@@ -103,6 +104,18 @@ def load_persona_pack(pack_dir: Path, manifest_path: Path) -> PersonaPack:
         })
 
     persona = yaml.safe_load(canonical_files["persona.yaml"])
+    # R1 (foundation review r2), defense in depth: persona.yaml is already
+    # raw-text marker-scanned above via _reject_markers, so an injection
+    # marker can't hide here the way it could in role.yaml's schema-open
+    # fields. This still guarantees freeze-soundness (deep_freeze below)
+    # and rejects any non-JSON type (set/bytes/datetime/cyclic) a YAML
+    # tag/alias could otherwise smuggle through yaml.safe_load.
+    try:
+        assert_json_safe(persona)
+    except ValueError as exc:
+        raise PersonaPackError(
+            f"persona.yaml contains non-JSON-native content: {exc}"
+        ) from exc
     schema_path = (
         Path(__file__).parent / "defaults/schema/persona.v1.json"
     )
@@ -128,6 +141,12 @@ def load_persona_pack(pack_dir: Path, manifest_path: Path) -> PersonaPack:
     examples = ()
     if "examples.yaml" in canonical_files:
         raw_examples = yaml.safe_load(canonical_files["examples.yaml"])
+        try:
+            assert_json_safe(raw_examples)
+        except ValueError as exc:
+            raise PersonaPackError(
+                f"examples.yaml contains non-JSON-native content: {exc}"
+            ) from exc
         example_schema = (
             Path(__file__).parent / "defaults/schema/persona-examples.v1.json"
         )

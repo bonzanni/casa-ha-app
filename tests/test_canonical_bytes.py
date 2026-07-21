@@ -8,8 +8,17 @@ from __future__ import annotations
 import hashlib
 import re
 import unicodedata
+from types import MappingProxyType
 
-from canonical_bytes import canonical_text, checksum_bytes, checksum_json
+import pytest
+
+from canonical_bytes import (
+    assert_json_safe,
+    canonical_text,
+    checksum_bytes,
+    checksum_json,
+    deep_freeze,
+)
 
 
 # ---------------------------------------------------------------------------
@@ -115,3 +124,113 @@ def test_checksum_json_matches_checksum_bytes_of_canonical_json() -> None:
 
     value = {"b": 2, "a": 1}
     assert checksum_json(value) == checksum_bytes(canonical_json_bytes(value))
+
+
+# ---------------------------------------------------------------------------
+# assert_json_safe (R1, foundation review r2)
+#
+# yaml.safe_load can still yield non-JSON-native Python types for YAML
+# tags/aliases (`!!set` -> set, `!!binary` -> bytes) and self-referential
+# anchors (cyclic dict/list). assert_json_safe is the invariant that must
+# run right after parsing, before any recursive walk (marker scan,
+# deep_freeze) that would otherwise crash on a cycle or silently miss
+# content hidden in a non-dict/list/scalar container.
+# ---------------------------------------------------------------------------
+
+
+def test_assert_json_safe_accepts_a_normal_nested_json_dict() -> None:
+    value = {
+        "a": 1,
+        "b": [1, 2.5, "three", True, False, None],
+        "c": {"nested": {"deeper": ["x", "y"]}},
+    }
+    assert assert_json_safe(value) is None  # does not raise
+
+
+def test_assert_json_safe_rejects_a_set() -> None:
+    with pytest.raises(ValueError, match="non-JSON-native type"):
+        assert_json_safe({"a": {"b"}})
+
+
+def test_assert_json_safe_rejects_bytes() -> None:
+    with pytest.raises(ValueError, match="non-JSON-native type"):
+        assert_json_safe({"a": b"binary"})
+
+
+def test_assert_json_safe_rejects_a_cyclic_dict() -> None:
+    cyclic: dict = {}
+    cyclic["self"] = cyclic
+    with pytest.raises(ValueError, match="cyclic"):
+        assert_json_safe(cyclic)
+
+
+def test_assert_json_safe_rejects_a_cyclic_list() -> None:
+    cyclic: list = []
+    cyclic.append(cyclic)
+    with pytest.raises(ValueError, match="cyclic"):
+        assert_json_safe(cyclic)
+
+
+def test_assert_json_safe_rejects_depth_over_max_depth() -> None:
+    value: object = "leaf"
+    for _ in range(70):
+        value = [value]
+    with pytest.raises(ValueError, match="nesting exceeds limit"):
+        assert_json_safe(value)
+
+
+def test_assert_json_safe_accepts_depth_at_max_depth() -> None:
+    value: object = "leaf"
+    for _ in range(64):
+        value = [value]
+    assert assert_json_safe(value) is None  # does not raise
+
+
+def test_assert_json_safe_rejects_non_string_dict_key() -> None:
+    with pytest.raises(ValueError, match="non-string key"):
+        assert_json_safe({1: "a"})
+
+
+def test_assert_json_safe_rejects_a_tuple() -> None:
+    with pytest.raises(ValueError, match="non-JSON-native type"):
+        assert_json_safe(("a", "b"))
+
+
+# ---------------------------------------------------------------------------
+# deep_freeze cycle/depth hardening (R1, foundation review r2)
+#
+# deep_freeze is a shared primitive independent of any caller's own
+# guards, so it must fail closed (ValueError) rather than crash
+# (RecursionError) on a pathological input on its own.
+# ---------------------------------------------------------------------------
+
+
+def test_deep_freeze_still_freezes_ordinary_nested_content() -> None:
+    value = {"a": [1, {"b": 2}], "c": (3, 4)}
+    frozen = deep_freeze(value)
+    assert isinstance(frozen, MappingProxyType)
+    assert isinstance(frozen["a"], tuple)
+    assert isinstance(frozen["a"][1], MappingProxyType)
+    assert frozen["c"] == (3, 4)
+
+
+def test_deep_freeze_cyclic_dict_raises_value_error_not_recursion_error() -> None:
+    cyclic: dict = {}
+    cyclic["self"] = cyclic
+    with pytest.raises(ValueError, match="cyclic"):
+        deep_freeze(cyclic)
+
+
+def test_deep_freeze_cyclic_list_raises_value_error_not_recursion_error() -> None:
+    cyclic: list = []
+    cyclic.append(cyclic)
+    with pytest.raises(ValueError, match="cyclic"):
+        deep_freeze(cyclic)
+
+
+def test_deep_freeze_excessive_depth_raises_value_error() -> None:
+    value: object = "leaf"
+    for _ in range(1000):
+        value = [value]
+    with pytest.raises(ValueError, match="nesting exceeds limit"):
+        deep_freeze(value)

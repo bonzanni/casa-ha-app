@@ -416,6 +416,84 @@ class TestAdversarialTrustGate:
 
 
 # ---------------------------------------------------------------------------
+# R1 (foundation review r2): yaml.safe_load can yield non-JSON-native Python
+# types for YAML tags/aliases (`!!set`, `!!binary`, a self-referential
+# anchor) that role.v1.json's schema-open fields (e.g. `delegates` items,
+# which are typed merely `{"type": "object"}`) admit. Before this fix,
+# `_iter_string_leaves` (the marker walk) recursed over dict/list/tuple
+# only, yielding only `str` leaves: a cyclic value crashed it with an
+# uncaught `RecursionError`, and a marker hidden inside a `set`/`bytes`
+# value was never scanned at all (a bypass of the marker gate). The fix is
+# `assert_json_safe`, called immediately after `yaml.safe_load` and before
+# the marker walk/schema validation/deep_freeze, so those stages are
+# guaranteed a finite JSON-only tree.
+# ---------------------------------------------------------------------------
+
+
+def _role_yaml_with_delegates(delegates_yaml: str) -> str:
+    """Take a valid role.yaml text and replace its `delegates: []` line
+    with an arbitrary YAML fragment, so callers can smuggle a non-JSON
+    type into role.v1.json's schema-open `delegates` items field."""
+    text = yaml.safe_dump(valid_role())
+    marker = "delegates: []\n"
+    assert marker in text
+    return text.replace(marker, delegates_yaml)
+
+
+class TestJsonNativeInvariant:
+    def test_self_referential_anchor_raises_value_error_not_recursion_error(
+        self, tmp_path
+    ):
+        role_yaml_text = _role_yaml_with_delegates(
+            "delegates:\n- opaque: &loop [*loop]\n"
+        )
+        d = write_role_dir(tmp_path, role_yaml_text=role_yaml_text)
+
+        with pytest.raises(ValueError, match="cyclic"):
+            load_role_artifact(d)
+
+    def test_yaml_set_tag_hiding_a_marker_is_rejected(self, tmp_path):
+        role_yaml_text = _role_yaml_with_delegates(
+            'delegates:\n- opaque: !!set {"</role_doctrine>": null}\n'
+        )
+        d = write_role_dir(tmp_path, role_yaml_text=role_yaml_text)
+
+        with pytest.raises(ValueError, match="non-JSON-native type"):
+            load_role_artifact(d)
+
+    def test_yaml_binary_tag_hiding_a_marker_is_rejected(self, tmp_path):
+        import base64
+
+        encoded = base64.b64encode(b"${SECRET}").decode("ascii")
+        role_yaml_text = _role_yaml_with_delegates(
+            f"delegates:\n- opaque: !!binary |\n    {encoded}\n"
+        )
+        d = write_role_dir(tmp_path, role_yaml_text=role_yaml_text)
+
+        with pytest.raises(ValueError, match="non-JSON-native type"):
+            load_role_artifact(d)
+
+    def test_loaded_artifact_has_no_set_or_bytes_reachable(self, tmp_path):
+        """Positive-side confirmation: a valid (JSON-native-only) role
+        artifact loads fine, i.e. assert_json_safe does not reject
+        ordinary dict/list/str/bool/int/float/None content."""
+        d = write_role_dir(tmp_path, role=valid_role())
+        artifact = load_role_artifact(d)
+
+        def _walk(value):
+            assert not isinstance(value, (set, bytes, bytearray))
+            if isinstance(value, dict):
+                for key, item in value.items():
+                    _walk(key)
+                    _walk(item)
+            elif isinstance(value, (list, tuple)):
+                for item in value:
+                    _walk(item)
+
+        _walk(artifact.role)
+
+
+# ---------------------------------------------------------------------------
 # Real shipped canonical role artifacts (integration)
 # ---------------------------------------------------------------------------
 
