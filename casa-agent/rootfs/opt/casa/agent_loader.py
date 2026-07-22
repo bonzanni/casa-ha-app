@@ -54,6 +54,16 @@ SCHEMA_DIR = os.path.join(os.path.dirname(__file__), "defaults", "schema")
 # inject a synthetic tree instead of patching the filesystem.
 DEFAULT_ROLES_DIR = os.path.join(os.path.dirname(__file__), "defaults", "roles")
 
+# Round-6 P0-2 (Sol): executor permission modes ranked by permissiveness.
+# The image-owned role artifact's tools.permission_mode is the CEILING a
+# definition.yaml may not exceed (shipped: configurator=acceptEdits,
+# plugin-developer=auto). "bypassPermissions" is deliberately ABSENT — it
+# would reduce allowed_tools to mere auto-approval and is NEVER honored for
+# executors, whatever the role says; see load_all_executors for the clamp.
+_EXECUTOR_PERMISSION_MODE_RANK: dict[str, int] = {
+    "plan": 0, "default": 1, "acceptEdits": 2, "dontAsk": 3, "auto": 4,
+}
+
 # --- Tier file-set rules ---------------------------------------------------
 
 # NOTE: `plugins.yaml` is legacy, ignored since v0.71.0 (unified plugin
@@ -1466,6 +1476,43 @@ def load_all_executors(
                     entry, dropped_beyond_ceiling, entry,
                 )
 
+            # Round-6 P0-2 (Sol): permission_mode is a definition-editable
+            # capability field — a self-edit to "bypassPermissions" would
+            # turn the clamped allowlist into mere auto-approval and
+            # resurrect everything the allowlist excludes. The role
+            # artifact's required tools.permission_mode (role.v1.json — a
+            # free string; shipped: configurator=acceptEdits,
+            # plugin-developer=auto) is the CEILING: the definition may
+            # declare an equally- or less-permissive mode, never a more
+            # permissive one, and "bypassPermissions" is NEVER honored for
+            # an executor regardless of the role (it has no rank).
+            # Downgrades log the same tamper-signal style as the tool clamp
+            # above. (defaults/schema/executor.v1.json — what _validate()
+            # checks definition.yaml against — deliberately keeps its wider
+            # enum: a tampered value must DEGRADE to a safe mode here, not
+            # brick the executor at schema validation.)
+            declared_mode = tools.get("permission_mode", "acceptEdits")
+            role_mode = (
+                (role_artifact.role.get("tools") or {}).get("permission_mode"))
+            mode_ceiling = _EXECUTOR_PERMISSION_MODE_RANK.get(
+                role_mode, _EXECUTOR_PERMISSION_MODE_RANK["acceptEdits"])
+            if (declared_mode not in _EXECUTOR_PERMISSION_MODE_RANK
+                    or _EXECUTOR_PERMISSION_MODE_RANK[declared_mode]
+                    > mode_ceiling):
+                effective_mode = (
+                    role_mode
+                    if role_mode in _EXECUTOR_PERMISSION_MODE_RANK
+                    else "acceptEdits")
+                logger.error(
+                    "executor %r: definition.yaml permission_mode %r exceeds "
+                    "what executors may run at (role ceiling %r; "
+                    "bypassPermissions is never honored); downgraded to %r "
+                    "— treat as a tamper signal",
+                    entry, declared_mode, role_mode, effective_mode,
+                )
+            else:
+                effective_mode = declared_mode
+
             memory_block = defn.get("memory") or {}
             d = ExecutorDefinition(
                 type=defn["type"],
@@ -1475,7 +1522,7 @@ def load_all_executors(
                 enabled=defn.get("enabled", True),
                 tools_allowed=effective_allowed,
                 tools_disallowed=list(tools.get("disallowed", [])),
-                permission_mode=tools.get("permission_mode", "acceptEdits"),
+                permission_mode=effective_mode,
                 mcp_server_names=list(defn.get("mcp_server_names", [])),
                 idle_reminder_days=int(defn.get("idle_reminder_days", 7)),
                 prompt_template_path=prompt_abs,

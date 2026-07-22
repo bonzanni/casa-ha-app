@@ -124,3 +124,43 @@ async def test_resume_options_missing_config_fails_closed(monkeypatch):
     eng = SimpleNamespace(kind="specialist", role_or_type="ghost")
     with pytest.raises(Exception):
         tools_mod.build_engagement_resume_options(eng, "sess-1")
+
+
+async def test_resume_options_executor_disallows_subagent_spawn_and_bash(monkeypatch):
+    """Round-6 P0-1 (Sol): Q-1 — Agent/Task bypass allowed_tools and only
+    disallowed_tools is CLI-enforced. A resumed executor built from a
+    definition with disallowed: [] must still hard-deny Agent/Task, plus
+    Bash when the clamped allowlist does not carry it (P0-2 belt)."""
+    defn = SimpleNamespace(
+        hooks_path=None, mcp_server_names=["casa-framework"],
+        tools_allowed=["Read"], model="claude-sonnet-4-6",
+        permission_mode="acceptEdits", max_turns=None,
+        tools_disallowed=[], driver="in_casa",
+    )
+    tools_mod = _wire(
+        monkeypatch, executor_defn=defn,
+        mcp_registry=_role_aware_mcp_registry(),
+    )
+    eng = SimpleNamespace(kind="executor", role_or_type="configurator")
+    opts = tools_mod.build_engagement_resume_options(eng, "sess-q1")
+    assert {"Agent", "Task", "Bash"} <= set(opts.disallowed_tools)
+
+
+async def test_resume_options_executor_keeps_legitimate_bash(monkeypatch):
+    """plugin-developer-shaped resume: Bash in the (clamped) allowlist ->
+    Agent/Task still denied, Bash not."""
+    defn = SimpleNamespace(
+        hooks_path=None, mcp_server_names=["casa-framework"],
+        tools_allowed=["Read", "Bash"], model="claude-sonnet-4-6",
+        permission_mode="acceptEdits", max_turns=None,
+        tools_disallowed=[], driver="in_casa",
+    )
+    tools_mod = _wire(
+        monkeypatch, executor_defn=defn,
+        mcp_registry=_role_aware_mcp_registry(),
+    )
+    eng = SimpleNamespace(kind="executor", role_or_type="plugin-developer")
+    opts = tools_mod.build_engagement_resume_options(eng, "sess-q1b")
+    assert {"Agent", "Task"} <= set(opts.disallowed_tools)
+    assert "Bash" not in opts.disallowed_tools
+    assert "Bash" in opts.allowed_tools

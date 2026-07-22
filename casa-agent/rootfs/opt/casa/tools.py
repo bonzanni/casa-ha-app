@@ -1138,6 +1138,22 @@ def _build_executor_options(
     else:
         mcp_servers = {}
 
+    # Round-6 P0-1 (Sol): Q-1 (v0.69.8, above) — Agent/Task BYPASS
+    # allowed_tools and the fail-closed can_use_tool callback; only
+    # disallowed_tools is CLI-enforced. Executors shipped disallowed: [],
+    # so a configurator could spawn a sub-agent carrying the broad default
+    # toolset (Bash included) around every guard. Merge the same
+    # sub-agent-spawn denial the specialist builder gets, CODE-SIDE,
+    # regardless of definition.yaml contents. The resume path inherits this
+    # (build_engagement_resume_options -> this builder).
+    disallowed_tools = _with_subagent_spawn_disallowed(defn.tools_disallowed)
+    # Round-6 P0-2 belt+suspenders (Sol): an executor whose CLAMPED
+    # allowlist does not carry Bash gets it hard-denied too — the Bash
+    # denial then holds independent of allowlist/permission_mode machinery
+    # entirely. Harmless for plugin-developer (Bash legitimately allowed).
+    if "Bash" not in allowed_tools and "Bash" not in disallowed_tools:
+        disallowed_tools.append("Bash")
+
     # Executors (in_casa driver — Configurator, future Tier-3) operate on
     # the addon-config root rather than an agent-home, because their
     # mutation surface spans /config/ (agents/, marketplace/,
@@ -1147,7 +1163,7 @@ def _build_executor_options(
         cli_path=CLAUDE_CLI_PATH,
         system_prompt="",
         allowed_tools=allowed_tools,
-        disallowed_tools=list(defn.tools_disallowed),
+        disallowed_tools=disallowed_tools,
         permission_mode=defn.permission_mode or "acceptEdits",
         max_turns=200,
         mcp_servers=mcp_servers if mcp_servers else {},

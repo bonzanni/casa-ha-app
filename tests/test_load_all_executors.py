@@ -32,7 +32,8 @@ def _write_exec(base, name, defn_yaml=None, prompt="Hi."):
     return d
 
 
-def _seed_executor_role_artifact(roles_dir, type_name, allowed=()):
+def _seed_executor_role_artifact(roles_dir, type_name, allowed=(),
+                                 permission_mode="acceptEdits"):
     """Write a minimal schema-valid canonical role artifact for an
     executor type under a test-owned roles_dir (Personality Phase A,
     Task 5 — load_all_executors now requires one, cross-validated on
@@ -55,7 +56,7 @@ def _seed_executor_role_artifact(roles_dir, type_name, allowed=()):
             tools:
               allowed: {list(allowed)}
               disallowed: []
-              permission_mode: acceptEdits
+              permission_mode: {permission_mode}
               max_turns: 10
               skills: all
               voice_guard: none
@@ -436,6 +437,163 @@ class TestRoleCeilingClamp:
                 (agents_base / "executors" / t / "definition.yaml")
                 .read_text(encoding="utf-8"))["tools"]["allowed"]
             assert out[t].tools_allowed == list(declared), t
+        # Round-6 P0-2: shipped modes are within their role ceilings
+        # (plugin-developer legitimately ships "auto" — declared in BOTH
+        # its definition.yaml and its image-owned role.yaml).
+        assert out["configurator"].permission_mode == "acceptEdits"
+        assert out["plugin-developer"].permission_mode == "auto"
         assert not any(
             "beyond its role ceiling" in r.getMessage()
+            or "permission_mode" in r.getMessage()
             for r in caplog.records)
+
+
+class TestPermissionModeClamp:
+    """Round-6 P0-2 (Sol): permission_mode is a definition-editable
+    capability field — self-editing it to bypassPermissions would turn the
+    clamped allowlist into mere auto-approval. Executors only ever run at
+    default/acceptEdits; the role artifact's permission_mode is the ceiling
+    when it names one of those. Downgrades log the tamper signal."""
+
+    def _write_myx_mode(self, base, mode):
+        _write_exec(str(base), "myx", defn_yaml=textwrap.dedent(f"""\
+            schema_version: 1
+            type: myx
+            description: A reasonably long description that meets minLength 20.
+            model: sonnet
+            driver: in_casa
+            enabled: true
+            tools:
+              allowed: [Read]
+              permission_mode: {mode}
+            mcp_server_names: [casa-framework]
+        """))
+
+    def test_bypasspermissions_is_downgraded_and_logged(self, tmp_path, caplog):
+        import logging
+        from agent_loader import load_all_executors
+        base = tmp_path / "executors"
+        self._write_myx_mode(base, "bypassPermissions")
+        roles_dir = tmp_path / "roles"
+        _seed_executor_role_artifact(str(roles_dir), "myx", allowed=["Read"])
+        with caplog.at_level(logging.ERROR):
+            out, failed = load_all_executors(
+                str(tmp_path), roles_dir=str(roles_dir))
+        assert failed == []
+        assert out["myx"].permission_mode == "acceptEdits"
+        assert any(
+            "permission_mode" in r.getMessage() and "tamper" in r.getMessage()
+            for r in caplog.records)
+
+    def test_role_default_ceiling_clamps_acceptedits(self, tmp_path, caplog):
+        """Role declares 'default' -> definition's acceptEdits exceeds the
+        ceiling and clamps down to 'default'."""
+        import logging
+        from agent_loader import load_all_executors
+        base = tmp_path / "executors"
+        self._write_myx_mode(base, "acceptEdits")
+        roles_dir = tmp_path / "roles"
+        _seed_executor_role_artifact(
+            str(roles_dir), "myx", allowed=["Read"], permission_mode="default")
+        with caplog.at_level(logging.ERROR):
+            out, failed = load_all_executors(
+                str(tmp_path), roles_dir=str(roles_dir))
+        assert failed == []
+        assert out["myx"].permission_mode == "default"
+        assert any("permission_mode" in r.getMessage() for r in caplog.records)
+
+    def test_mode_exceeding_role_ceiling_is_clamped(self, tmp_path, caplog):
+        """Configurator-shaped self-escalation: role ceiling acceptEdits,
+        definition self-edited to the more permissive 'auto' -> clamped
+        back to the role's mode."""
+        import logging
+        from agent_loader import load_all_executors
+        base = tmp_path / "executors"
+        self._write_myx_mode(base, "auto")
+        roles_dir = tmp_path / "roles"
+        _seed_executor_role_artifact(str(roles_dir), "myx", allowed=["Read"])
+        with caplog.at_level(logging.ERROR):
+            out, failed = load_all_executors(
+                str(tmp_path), roles_dir=str(roles_dir))
+        assert failed == []
+        assert out["myx"].permission_mode == "acceptEdits"
+        assert any("permission_mode" in r.getMessage() for r in caplog.records)
+
+    def test_acceptedits_within_ceiling_is_untouched(self, tmp_path, caplog):
+        import logging
+        from agent_loader import load_all_executors
+        base = tmp_path / "executors"
+        self._write_myx_mode(base, "acceptEdits")
+        roles_dir = tmp_path / "roles"
+        _seed_executor_role_artifact(str(roles_dir), "myx", allowed=["Read"])
+        with caplog.at_level(logging.ERROR):
+            out, failed = load_all_executors(
+                str(tmp_path), roles_dir=str(roles_dir))
+        assert failed == []
+        assert out["myx"].permission_mode == "acceptEdits"
+        assert not any(
+            "permission_mode" in r.getMessage() for r in caplog.records)
+
+
+class TestExecutorDisallowedMerge:
+    """Round-6 P0-1 (Sol): Q-1 — Agent/Task bypass allowed_tools and are
+    only stopped by explicit disallowed_tools; executors shipped
+    disallowed: []. The in_casa builder now merges {Agent, Task} (the Q-1
+    _SUBAGENT_SPAWN_TOOLS set) code-side, plus Bash whenever the clamped
+    allowlist does not carry it (P0-2 belt+suspenders)."""
+
+    def _load_myx(self, tmp_path, allowed_line, role_allowed):
+        from agent_loader import load_all_executors
+        base = tmp_path / "executors"
+        _write_exec(str(base), "myx", defn_yaml=textwrap.dedent(f"""\
+            schema_version: 1
+            type: myx
+            description: A reasonably long description that meets minLength 20.
+            model: sonnet
+            driver: in_casa
+            enabled: true
+            tools:
+              allowed: {allowed_line}
+              disallowed: []
+              permission_mode: acceptEdits
+            mcp_server_names: [casa-framework]
+        """))
+        roles_dir = tmp_path / "roles"
+        _seed_executor_role_artifact(
+            str(roles_dir), "myx", allowed=role_allowed)
+        out, failed = load_all_executors(
+            str(tmp_path), roles_dir=str(roles_dir))
+        assert failed == []
+        return out["myx"]
+
+    def test_built_options_disallow_agent_task_and_bash(self, tmp_path):
+        """Configurator-shaped executor (no Bash in the allowlist), explicit
+        disallowed: [] -> built options still hard-deny Agent/Task/Bash."""
+        import tools as tools_mod
+        defn = self._load_myx(tmp_path, "[Read]", ["Read"])
+        opts = tools_mod._build_executor_options(
+            defn, executor_type="myx", plugin_paths=[])
+        assert {"Agent", "Task", "Bash"} <= set(opts.disallowed_tools)
+
+    def test_bash_not_denied_when_legitimately_allowed(self, tmp_path):
+        """plugin-developer-shaped executor (Bash within the role ceiling):
+        Agent/Task still denied, Bash NOT (it is a legitimate grant)."""
+        import tools as tools_mod
+        defn = self._load_myx(tmp_path, "[Read, Bash]", ["Read", "Bash"])
+        opts = tools_mod._build_executor_options(
+            defn, executor_type="myx", plugin_paths=[])
+        assert {"Agent", "Task"} <= set(opts.disallowed_tools)
+        assert "Bash" not in opts.disallowed_tools
+        assert "Bash" in opts.allowed_tools
+
+    def test_cc_permissions_deny_parity(self, tmp_path):
+        """claude_code-driver parity: _build_cc_permissions emits the same
+        code-mandatory deny set into settings.json permissions."""
+        from drivers.workspace import _build_cc_permissions
+        defn = self._load_myx(tmp_path, "[Read]", ["Read"])
+        perms = _build_cc_permissions(defn)
+        assert {"Agent", "Task", "Bash"} <= set(perms["deny"])
+        defn_bash = self._load_myx(tmp_path / "b", "[Read, Bash]", ["Read", "Bash"])
+        perms_bash = _build_cc_permissions(defn_bash)
+        assert {"Agent", "Task"} <= set(perms_bash["deny"])
+        assert "Bash" not in perms_bash["deny"]
