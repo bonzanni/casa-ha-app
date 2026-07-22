@@ -251,13 +251,18 @@ class SpecialistRegistry:
         if not isinstance(creating_speaker, SpeakerProvenance):
             creating_speaker = SpeakerProvenance(speaker_kind="system")
         specialist_cfg = self._configs.get(record.agent)
-        if specialist_cfg is not None and specialist_cfg.speaker_provenance is not None:
-            executing_speaker = specialist_cfg.speaker_provenance
-        else:
-            # No activated binding yet (Plan 1's scope) — the honest
-            # unattributed identity, never "executor:<slug>" (a specialist
-            # is not an executor — wrong kind).
-            executing_speaker = SpeakerProvenance(speaker_kind="system")
+        # Task 14 (whole-branch review): reuse the ONE canonical executing-speaker
+        # fallback (agent.speaker_provenance_for_role) instead of re-implementing
+        # it. For a bound specialist it returns cfg.speaker_provenance; for an
+        # unbound one it returns the honest unattributed `system` identity, never
+        # "executor:<slug>" (a specialist's kind is never "executor"). Lazy import
+        # mirrors tools.py's reuse of the same helper (no circular import).
+        import agent as agent_mod
+        executing_speaker = (
+            agent_mod.speaker_provenance_for_role(specialist_cfg)
+            if specialist_cfg is not None
+            else SpeakerProvenance(speaker_kind="system")
+        )
         await self._job_registry.create(VoiceJob(
             id=record.id,
             parent_job_id=None,

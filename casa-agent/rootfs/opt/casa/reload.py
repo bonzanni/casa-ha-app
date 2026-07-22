@@ -486,6 +486,28 @@ async def _teardown_role(runtime: Any, role: str) -> None:
         )
 
 
+def _resident_identity_changed(new_cfg: Any, live_cfg: Any) -> bool:
+    """True iff a resident's personality identity moved between the live config
+    and a freshly-loaded one — i.e. its ``role_checksum`` OR ``binding_digest``
+    differs (a role.yaml/doctrine edit, or a staged persona swap/reset that
+    ``load_agent_from_dir``'s reconcile committed desired->active).
+
+    Personality Phase A, Task 8/Task 14: this is the ONE canonical restart-to-swap
+    predicate, shared by every reload path that could otherwise hot-swap a live
+    resident (reload_agent, the policies cascade, the bulk agents sweep). A
+    ``None`` ``live_cfg`` (a fresh add, or a non-resident with no live entry) is
+    NOT a change -> False. ``getattr`` defaults keep it inert for non-resident
+    tiers and narrow test stand-ins whose cfgs carry neither field."""
+    if live_cfg is None:
+        return False
+    return (
+        getattr(new_cfg, "role_checksum", None)
+        != getattr(live_cfg, "role_checksum", None)
+        or getattr(new_cfg, "binding_digest", None)
+        != getattr(live_cfg, "binding_digest", None)
+    )
+
+
 async def reload_agent(runtime: Any, *, role: str | None = None) -> list[str]:
     """Atomic-swap reload of a single role's Agent + AgentConfig.
 
@@ -539,28 +561,23 @@ async def reload_agent(runtime: Any, *, role: str | None = None) -> list[str]:
     # live registry/agent untouched (read-only on this path). getattr defaults
     # keep this inert for non-resident tiers and narrow test stand-ins whose
     # cfgs carry neither field.
-    if tier == "resident":
-        live_cfg = runtime.role_configs.get(role)
-        identity_changed = (
-            live_cfg is not None
-            and (getattr(new_cfg, "role_checksum", None) != getattr(live_cfg, "role_checksum", None)
-                 or getattr(new_cfg, "binding_digest", None) != getattr(live_cfg, "binding_digest", None))
+    if tier == "resident" and _resident_identity_changed(
+        new_cfg, runtime.role_configs.get(role),
+    ):
+        logger.warning(
+            "reload_agent(%s): personality identity changed (role_checksum or "
+            "binding_digest differs) — refusing hot-swap, restart required", role,
         )
-        if identity_changed:
-            logger.warning(
-                "reload_agent(%s): personality identity changed (role_checksum or "
-                "binding_digest differs) — refusing hot-swap, restart required", role,
-            )
-            # Note: the load_agent_from_dir() call above may have already committed a
-            # staged desired->active binding to DISK via reconcile before this guard
-            # fires — harmless, since that's idempotent with the mandatory restart's
-            # own boot-time reconcile and this guard leaves the live in-memory
-            # agent/registries untouched either way.
-            raise ReloadError(
-                "restart_required",
-                f"role={role} personality identity changed; restart via "
-                f"casa_restart_supervised to activate",
-            )
+        # Note: the load_agent_from_dir() call above may have already committed a
+        # staged desired->active binding to DISK via reconcile before this guard
+        # fires — harmless, since that's idempotent with the mandatory restart's
+        # own boot-time reconcile and this guard leaves the live in-memory
+        # agent/registries untouched either way.
+        raise ReloadError(
+            "restart_required",
+            f"role={role} personality identity changed; restart via "
+            f"casa_restart_supervised to activate",
+        )
 
     # v0.74.1 (Sol B1, live proxy-drive finding): a DISABLED specialist must
     # not be constructed or (re)registered. Reload used to install it into
@@ -700,6 +717,28 @@ async def _reload_role_after_policies(runtime: Any, role: str) -> None:
         agent_loader.load_agent_from_dir,
         agent_dir, policies=runtime.policy_lib,
     )
+
+    # Personality Phase A, Task 14 (whole-branch review): restart-to-swap must
+    # hold on the POLICY cascade too. A resident whose role_checksum OR
+    # binding_digest moved (a doctrine edit, or a staged persona swap/reset that
+    # the load above committed desired->active on disk) is restart-to-swap —
+    # never hot-reloaded. Unlike reload_agent's single-role path we do NOT raise
+    # (that would abort the whole cascade for every OTHER role); we SKIP just
+    # this role, leaving its LIVE agent + cfg + registries untouched, so its
+    # deferred policy change lands only on the mandatory supervised restart. The
+    # on-disk desired->active commit is harmless — idempotent with that
+    # restart's own boot-time reconcile. Every identity-UNCHANGED role still
+    # reloads below to pick up the new policy_lib.
+    if tier == "resident" and _resident_identity_changed(
+        new_cfg, runtime.role_configs.get(role),
+    ):
+        logger.warning(
+            "policies cascade: role=%s personality identity changed "
+            "(role_checksum or binding_digest differs) — skipping hot-swap; the "
+            "policy change activates on a supervised restart", role,
+        )
+        return
+
     new_agent = await asyncio.to_thread(
         _construct_agent, cfg=new_cfg, runtime=runtime,
     )
@@ -877,6 +916,23 @@ async def reload_agents(runtime: Any, *, role: str | None = None) -> list[str]:
                 os.path.join(agents_dir, r),
                 policies=policy_lib,
             )
+            # Personality Phase A, Task 14 (whole-branch review): enforce
+            # restart-to-swap on the bulk sweep with the ONE canonical
+            # predicate. This loop only adds genuinely-new residents (r is not
+            # in role_configs), so ``live_cfg`` is None and the predicate is
+            # False — a fresh add's first activation is legitimate. An identity
+            # change on an ALREADY-LIVE resident is never reconstructed here (a
+            # known resident is not in this add set) and stays restart-to-swap;
+            # sharing the predicate guarantees a live resident can never be
+            # hot-swapped onto a new binding via scope=agents even if this path
+            # is later broadened to refresh existing residents.
+            if _resident_identity_changed(new_cfg, runtime.role_configs.get(r)):
+                logger.warning(
+                    "reload_agents: role=%s personality identity changed "
+                    "(role_checksum or binding_digest differs) — leaving the "
+                    "live agent in place; restart required to activate", r,
+                )
+                continue
             await asyncio.to_thread(
                 agent_home.provision_agent_home,
                 role=r,

@@ -2018,3 +2018,196 @@ class TestReloadUpdatesDisplayName:
             tool_name="invoice_reset", enforcement_role="assistant",
             canonical_json="{}", display_name=deps2.display_name)
         assert "Ellen-2 (assistant)" in text
+
+
+class TestRestartToSwapGuardCascades:
+    """Personality Phase A review (whole-branch): a resident whose personality
+    identity (role_checksum OR binding_digest) moved is restart-to-swap — the
+    policy cascade (scope=policies) and the bulk sweep (scope=agents) must NOT
+    hot-swap it onto the new binding. The single-role reload_agent path already
+    guards this by raising restart_required; the cascades instead SKIP the one
+    role and keep the loop going for every other role."""
+
+    @staticmethod
+    def _resident(role, *, checksum, digest, marker):
+        from types import SimpleNamespace
+        return SimpleNamespace(
+            role=role, role_checksum=checksum, binding_digest=digest,
+            marker=marker, character=SimpleNamespace(name=role, card=""),
+            triggers=[], channels=[],
+        )
+
+    async def test_reload_policies_defers_identity_changed_resident(
+            self, tmp_path, monkeypatch, caplog):
+        """A STAGED persona swap (binding_digest moved) on ``gary`` must NOT be
+        hot-swapped by scope=policies; ``tina`` (identity unchanged) still
+        reloads to pick up the new policy_lib."""
+        import logging
+        from reload import dispatch, register_handler, reload_policies
+        register_handler("policies", reload_policies)
+
+        agents_dir = tmp_path / "agents"
+        (agents_dir / "gary").mkdir(parents=True)
+        (agents_dir / "tina").mkdir()
+
+        # On-disk (post-reconcile) cfgs: gary's binding_digest moved OLD->NEW
+        # (a staged swap the load committed on disk); tina's is unchanged.
+        disk = {
+            "gary": self._resident("gary", checksum="RC_G",
+                                    digest="NEW", marker="reloaded"),
+            "tina": self._resident("tina", checksum="RC_T",
+                                    digest="T_OLD", marker="reloaded"),
+        }
+        monkeypatch.setattr(
+            "agent_loader.load_agent_from_dir",
+            lambda d, **kw: disk["gary"] if "gary" in d else disk["tina"])
+        monkeypatch.setattr("policies.load_policies",
+                            lambda *a, **kw: MagicMock())
+
+        import reload as reload_mod
+
+        def fake_construct(*, cfg, runtime):
+            a = MagicMock()
+            a.handle_message = MagicMock()
+            a._built_for = cfg
+            return a
+        monkeypatch.setattr(reload_mod, "_construct_agent", fake_construct)
+
+        runtime = _make_runtime()
+        runtime.config_dir = str(tmp_path)
+        runtime.agents_dir = str(agents_dir)
+        runtime.role_configs = {
+            "gary": self._resident("gary", checksum="RC_G",
+                                   digest="OLD", marker="live"),
+            "tina": self._resident("tina", checksum="RC_T",
+                                   digest="T_OLD", marker="live"),
+        }
+        old_gary = MagicMock()
+        old_gary.aclose = AsyncMock()
+        old_tina = MagicMock()
+        old_tina.aclose = AsyncMock()
+        runtime.agents = {"gary": old_gary, "tina": old_tina}
+        runtime.specialist_registry.all_configs = lambda: {}
+
+        with caplog.at_level(logging.WARNING, logger="reload"):
+            result = await dispatch("policies", runtime=runtime)
+        assert result["status"] == "ok"
+
+        # gary: identity changed -> NOT hot-swapped. Live cfg + agent untouched.
+        assert runtime.role_configs["gary"].marker == "live"
+        assert runtime.role_configs["gary"].binding_digest == "OLD"
+        assert runtime.agents["gary"] is old_gary
+        # tina: unchanged identity -> reloaded normally for the new policy_lib.
+        assert runtime.role_configs["tina"].marker == "reloaded"
+        assert runtime.agents["tina"] is not old_tina
+        assert runtime.agents["tina"]._built_for is disk["tina"]
+        # A restart-required warning surfaced for gary.
+        assert "gary" in caplog.text
+        assert "restart" in caplog.text.lower()
+
+    async def test_reload_policies_non_identity_change_still_reloads(
+            self, tmp_path, monkeypatch):
+        """The guard must NOT block a legitimate policy-only propagation: same
+        role_checksum + binding_digest -> the resident still reloads."""
+        from reload import dispatch, register_handler, reload_policies
+        register_handler("policies", reload_policies)
+
+        agents_dir = tmp_path / "agents"
+        (agents_dir / "gary").mkdir(parents=True)
+
+        reloaded_cfg = self._resident("gary", checksum="RC_G",
+                                      digest="SAME", marker="reloaded")
+        monkeypatch.setattr("agent_loader.load_agent_from_dir",
+                            lambda d, **kw: reloaded_cfg)
+        monkeypatch.setattr("policies.load_policies",
+                            lambda *a, **kw: MagicMock())
+
+        import reload as reload_mod
+
+        def fake_construct(*, cfg, runtime):
+            a = MagicMock()
+            a.handle_message = MagicMock()
+            a._built_for = cfg
+            return a
+        monkeypatch.setattr(reload_mod, "_construct_agent", fake_construct)
+
+        runtime = _make_runtime()
+        runtime.config_dir = str(tmp_path)
+        runtime.agents_dir = str(agents_dir)
+        runtime.role_configs = {
+            "gary": self._resident("gary", checksum="RC_G",
+                                   digest="SAME", marker="live"),
+        }
+        old_gary = MagicMock()
+        old_gary.aclose = AsyncMock()
+        runtime.agents = {"gary": old_gary}
+        runtime.specialist_registry.all_configs = lambda: {}
+
+        result = await dispatch("policies", runtime=runtime)
+        assert result["status"] == "ok"
+        # Identity unchanged -> the policy-only reload propagated normally.
+        assert runtime.role_configs["gary"].marker == "reloaded"
+        assert runtime.agents["gary"]._built_for is reloaded_cfg
+
+    async def test_reload_agents_defers_identity_changed_resident(
+            self, tmp_path, monkeypatch, caplog):
+        """scope=agents must never activate a staged personality-identity change
+        on a live resident: the live agent + cfg stay on the OLD binding, and the
+        sweep still processes the other roles."""
+        import logging
+        from reload import dispatch, register_handler, reload_agents
+        register_handler("agents", reload_agents)
+
+        agents_dir = tmp_path / "agents"
+        agents_dir.mkdir()
+        (agents_dir / "gary").mkdir()
+        (agents_dir / "newcomer").mkdir()   # genuinely-new resident -> add
+
+        # gary is live; its on-disk load reflects a staged swap (binding moved).
+        # newcomer is a brand-new resident (no live identity) -> must still add.
+        newcomer_cfg = self._resident("newcomer", checksum="RC_N",
+                                      digest="N", marker="new")
+        gary_disk = self._resident("gary", checksum="RC_G",
+                                   digest="NEW", marker="reloaded")
+
+        def fake_load(d, **kw):
+            if "newcomer" in d:
+                return newcomer_cfg
+            return gary_disk
+        monkeypatch.setattr("agent_loader.load_agent_from_dir", fake_load)
+        monkeypatch.setattr("policies.load_policies", lambda *a, **kw: MagicMock())
+        monkeypatch.setattr("agent_home.provision_agent_home",
+                            lambda *, role, home_root, defaults_root: None)
+
+        import reload as reload_mod
+
+        def fake_construct(*, cfg, runtime):
+            a = MagicMock()
+            a.handle_message = MagicMock()
+            a._built_for = cfg
+            return a
+        monkeypatch.setattr(reload_mod, "_construct_agent", fake_construct)
+
+        runtime = _make_runtime()
+        runtime.config_dir = str(tmp_path)
+        runtime.agents_dir = str(agents_dir)
+        runtime.role_configs = {
+            "gary": self._resident("gary", checksum="RC_G",
+                                   digest="OLD", marker="live"),
+        }
+        old_gary = MagicMock()
+        old_gary.aclose = AsyncMock()
+        runtime.agents = {"gary": old_gary}
+        runtime.specialist_registry.all_configs = lambda: {}
+
+        with caplog.at_level(logging.WARNING, logger="reload"):
+            result = await dispatch("agents", runtime=runtime)
+        assert result["status"] == "ok"
+
+        # gary: staged identity change -> NOT hot-swapped.
+        assert runtime.role_configs["gary"].marker == "live"
+        assert runtime.role_configs["gary"].binding_digest == "OLD"
+        assert runtime.agents["gary"] is old_gary
+        # newcomer: no live identity -> added normally (loop continued).
+        assert "newcomer" in runtime.role_configs
+        assert runtime.agents["newcomer"]._built_for is newcomer_cfg
