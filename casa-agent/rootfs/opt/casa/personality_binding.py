@@ -4,6 +4,7 @@ from __future__ import annotations
 import json
 import os
 import re
+import threading
 from dataclasses import dataclass
 from pathlib import Path
 from types import MappingProxyType
@@ -22,6 +23,23 @@ from role_slot import (  # noqa: F401 — re-exported for existing callers (Task
 from trait_renderer import RENDERER_VERSION
 
 _SCHEMA_DIR = Path(__file__).parent / "defaults" / "schema"
+
+# THE PERSONALITY-INSTANCE MUTATION LOCK (whole-branch review round 6, F1).
+# Defined HERE — its true home — because it guards the InstanceDir state whose
+# type (`InstanceDir`, below) and read/write primitives live in this module. It
+# covers BOTH instance trees: the resident tree (/config/bindings/resident-<slot>/,
+# written by `reconcile_resident_binding` below + `tools._stage_and_report` +
+# `persona_install.apply_persona_override`'s resident branch) AND the specialist
+# tree (/config/specialists/<slug>/, written by `specialist_install.py` +
+# `specialist_materialize.py`). `specialist_materialize` re-exports this same object
+# as `specialist_materialize.MATERIALIZE_LOCK`, so every historical reference keeps
+# working; the FULL writer catalog + deadlock/loop-safety analysis lives in
+# `specialist_materialize.py`'s header comment. Invariant: NO InstanceDir write
+# (stage_desired / commit_desired_to_active / discard_desired) in EITHER tree ever
+# happens outside this lock. LOOP-SAFETY: a non-reentrant `threading.Lock`, NEVER
+# acquired synchronously on the asyncio event loop — every acquirer runs in a
+# worker thread (or single-threaded boot init offloaded via `asyncio.to_thread`).
+MATERIALIZE_LOCK = threading.Lock()
 
 # NOTE: EMPTY_CONFIG_DIGEST / compute_effective_config_digest are defined in
 # role_slot.py (Task 6), imported and re-exported here — NOT redefined. Task 6's
@@ -441,48 +459,64 @@ def reconcile_resident_binding(
     The persona resolve/materialize calls run INSIDE the same guarded block as
     validate/stage/commit, so every failure mode is caught by the SAME handler
     and ``active`` is preserved whenever an active tuple exists.
+
+    Whole-branch review round 6, F1: the ENTIRE read-decide-write body runs under
+    ``MATERIALIZE_LOCK`` — this call stages/commits/discards the resident
+    InstanceDir on the boot and reload load paths, concurrently with the now-locked
+    persona-swap tools (``tools._stage_and_report`` /
+    ``persona_install.apply_persona_override``). Without the lock a reconcile could
+    overwrite or discard a freshly staged swap (or vice versa). The active/desired
+    reads are pulled INSIDE the lock so the read-modify-write is atomic against any
+    other lock holder — no TOCTOU. The persona-pack loads here are bounded LOCAL
+    disk reads on the rare boot/reload path, so holding the lock across them (a
+    correctness-first choice over the usual "read-only work outside the lock"
+    optimization) costs nothing measurable. Loop-safety: every caller reaches this
+    off the event loop — reload via ``asyncio.to_thread(load_agent_from_dir)``, boot
+    via ``asyncio.to_thread(load_all_agents)`` (casa_core), config_sync as a
+    standalone process, and ``tools.validate_config_repo`` via ``asyncio.to_thread``.
     """
-    active = instance_dir.active()
-    staged = instance_dir.desired()
+    with MATERIALIZE_LOCK:
+        active = instance_dir.active()
+        staged = instance_dir.desired()
 
-    source_binding = staged.binding if staged is not None else (
-        active.binding if active is not None and active.binding.mode == "override" else None
-    )
-    try:
-        if source_binding is not None and source_binding.mode == "override":
-            persona_ref = f"{source_binding.persona_id}@{source_binding.persona_version}"
-            persona = override_persona_loader(persona_ref)
-            candidate_binding = materialize_override_binding(
-                role=role, persona=persona, override_source=source_binding.override_source,
-            )
-            root = candidate_binding.override_source
-        else:
-            default_ref = IMAGE_DEFAULT_PERSONA_BY_SLOT[role.slot]
-            persona = image_default_persona_loader(default_ref)
-            candidate_binding = materialize_image_default_binding(
-                role=role, persona=persona, image_default_root=default_ref,
-            )
-            root = candidate_binding.image_default_root
-
-        if active is not None and active.binding.binding_digest == candidate_binding.binding_digest:
-            if staged is not None:
-                instance_dir.discard_desired(reason="no-op: candidate matches the already-active binding")
-            return active
-
-        candidate_tuple = InstanceTuple(
-            root=root, binding=candidate_binding, config_snapshot={},
-            config_digest=candidate_binding.effective_config_digest,
+        source_binding = staged.binding if staged is not None else (
+            active.binding if active is not None and active.binding.mode == "override" else None
         )
-        check_persona_requirements(role.normalized, persona)
-        instance_dir.stage_desired(candidate_tuple)
-        return instance_dir.commit_desired_to_active()
-    except (ValueError, OSError) as exc:
-        # discard_desired() is a no-op when nothing was ever staged (e.g. the
-        # persona loader itself raised before stage_desired ran).
-        instance_dir.discard_desired(reason=str(exc))
-        if active is None:
-            raise ValueError(
-                f"resident {role.role_id}: no prior active binding exists and the "
-                f"fresh reconciliation failed: {exc}"
-            ) from exc
-        return active
+        try:
+            if source_binding is not None and source_binding.mode == "override":
+                persona_ref = f"{source_binding.persona_id}@{source_binding.persona_version}"
+                persona = override_persona_loader(persona_ref)
+                candidate_binding = materialize_override_binding(
+                    role=role, persona=persona, override_source=source_binding.override_source,
+                )
+                root = candidate_binding.override_source
+            else:
+                default_ref = IMAGE_DEFAULT_PERSONA_BY_SLOT[role.slot]
+                persona = image_default_persona_loader(default_ref)
+                candidate_binding = materialize_image_default_binding(
+                    role=role, persona=persona, image_default_root=default_ref,
+                )
+                root = candidate_binding.image_default_root
+
+            if active is not None and active.binding.binding_digest == candidate_binding.binding_digest:
+                if staged is not None:
+                    instance_dir.discard_desired(reason="no-op: candidate matches the already-active binding")
+                return active
+
+            candidate_tuple = InstanceTuple(
+                root=root, binding=candidate_binding, config_snapshot={},
+                config_digest=candidate_binding.effective_config_digest,
+            )
+            check_persona_requirements(role.normalized, persona)
+            instance_dir.stage_desired(candidate_tuple)
+            return instance_dir.commit_desired_to_active()
+        except (ValueError, OSError) as exc:
+            # discard_desired() is a no-op when nothing was ever staged (e.g. the
+            # persona loader itself raised before stage_desired ran).
+            instance_dir.discard_desired(reason=str(exc))
+            if active is None:
+                raise ValueError(
+                    f"resident {role.role_id}: no prior active binding exists and the "
+                    f"fresh reconciliation failed: {exc}"
+                ) from exc
+            return active

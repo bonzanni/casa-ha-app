@@ -2153,11 +2153,21 @@ async def main() -> None:
     installed_specialist_index.load()
     specialist_registry_module.set_active_installed_index(installed_specialist_index)
 
+    # Round 6, F3: current_specialist_roles_dir acquires MATERIALIZE_LOCK (a
+    # threading.Lock) for its in-lock index reload + op-file self-heal + overlay
+    # rebuild. Boot is one-time single-threaded init, but to keep the
+    # no-sync-lock-on-the-event-loop invariant ABSOLUTE (no boot exception), run
+    # it in a worker thread — the index reload + in-lock publish (publish=True,
+    # round 6 F2) + reconcile all move off the loop in one hop. publish=True lets
+    # the in-lock body republish the SAME object set_active_installed_index
+    # already tracks above (idempotent; authoritative publish is now in-lock).
     from specialist_materialize import current_specialist_roles_dir
-    roles_overlay = current_specialist_roles_dir(
+    roles_overlay = await asyncio.to_thread(
+        current_specialist_roles_dir,
         installed_index=installed_specialist_index,
         specialists_dir=Path(os.path.join(CONFIG_DIR, "specialists")),
         agents_specialists_dir=Path(os.path.join(CONFIG_DIR, "agents", "specialists")),
+        publish=True,
     )
 
     specialist_registry = SpecialistRegistry(
@@ -2200,7 +2210,17 @@ async def main() -> None:
     policy_lib = load_policies(
         os.path.join(CONFIG_DIR, "policies", "disclosure.yaml"),
     )
-    role_configs = load_all_agents(agents_dir, policies=policy_lib)
+    # Round 6, F1 (loop-safety consistency): load_all_agents reconciles every
+    # resident's binding via personality_binding.reconcile_resident_binding, which
+    # now acquires MATERIALIZE_LOCK (a threading.Lock) around its stage/commit/
+    # discard. Run the boot scan in a worker thread so that acquisition never
+    # happens on the event loop — matching the F3 treatment of
+    # current_specialist_roles_dir above and the reload paths (which already reach
+    # load_agent_from_dir via asyncio.to_thread). Pure sync function; returns the
+    # same role_configs dict.
+    role_configs = await asyncio.to_thread(
+        load_all_agents, agents_dir, policies=policy_lib,
+    )
 
     # Personality Phase A, Task 8: derive the read-only persona/binding
     # registries from the loaded resident configs. Residents are the only

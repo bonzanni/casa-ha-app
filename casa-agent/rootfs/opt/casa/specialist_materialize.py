@@ -12,7 +12,6 @@ import logging
 import os
 import re
 import shutil
-import threading
 from pathlib import Path
 from typing import TYPE_CHECKING
 
@@ -45,20 +44,35 @@ _DEFAULT_OVERLAY_ROOT = Path("/config/specialists/.roles-overlay")
 # rmtree+rebuild, the per-slug op-file self-heal) ever happens outside this
 # lock. The specialist writers live in specialist_install.py; the resident +
 # cross-tier persona-override writers are persona_install.apply_persona_override
-# (both branches) and tools._stage_and_report (round 5, F2). Every such writer
-# either takes the lock itself or asserts it is held (the `_locked` helpers
-# below). Read-only gates — network fetch, git resolve, CAS staging/verify,
-# prompt compile, persona/role loads — all run OUTSIDE the lock (they complete
-# before the writer's `with MATERIALIZE_LOCK:` opens).
+# (both branches), tools._stage_and_report (round 5, F2), and
+# personality_binding.reconcile_resident_binding (round 6, F1 — the boot/reload
+# reconcile of a resident's own binding). Every such writer either takes the lock
+# itself or asserts it is held (the `_locked` helpers below). Read-only gates —
+# network fetch, git resolve, CAS staging/verify, prompt compile, persona/role
+# loads — run OUTSIDE the lock wherever cheaply separable (they complete before
+# the writer's `with MATERIALIZE_LOCK:` opens); reconcile_resident_binding is the
+# one exception, holding the lock across its bounded local-disk persona loads for
+# a TOCTOU-free read-modify-write (see its docstring).
 #
-# LOOP-SAFETY (round 5): this is a threading.Lock, and it MUST NEVER be acquired
+# ROUND 6 (F1): the lock OBJECT is now DEFINED in personality_binding.py — its true
+# home, since it guards that module's InstanceDir state — and RE-EXPORTED here as
+# `specialist_materialize.MATERIALIZE_LOCK` (see the `from personality_binding
+# import MATERIALIZE_LOCK` below). Every historical `specialist_materialize.
+# MATERIALIZE_LOCK` reference and bare `MATERIALIZE_LOCK` use in this module binds
+# the identical single object.
+#
+# LOOP-SAFETY (round 5+6): this is a threading.Lock, and it MUST NEVER be acquired
 # synchronously on the asyncio event loop — a concurrent holder would stall all
 # async processing. Every acquirer runs in a worker thread: specialist_install.py
 # writers are reached via tools.py `asyncio.to_thread`; apply_persona_override is
 # offloaded by tools.persona_apply's `asyncio.to_thread`; tools._stage_and_report
-# offloads its own in-lock section; current_specialist_roles_dir is reached from
-# reload.py via `asyncio.to_thread` (and from casa_core boot, before the loop
-# starts). No path acquires it on the loop thread.
+# offloads its own in-lock section; reconcile_resident_binding is reached from
+# reload via `asyncio.to_thread(load_agent_from_dir)`, from casa_core boot via
+# `asyncio.to_thread(load_all_agents)`, from config_sync as a standalone process,
+# and from `tools.validate_config_repo` via `asyncio.to_thread`;
+# current_specialist_roles_dir is reached from reload.py via `asyncio.to_thread`
+# and from casa_core boot via `asyncio.to_thread` (round 6, F3). No path acquires
+# it on the loop thread.
 #
 # Round 4, F3 (deadlock analysis): the lock is NOT reentrant, so there is
 # exactly ONE acquisition on any path. `current_specialist_roles_dir` acquires
@@ -74,7 +88,12 @@ _DEFAULT_OVERLAY_ROOT = Path("/config/specialists/.roles-overlay")
 # overlay function — so no path re-acquires and no second lock is taken while
 # holding it: zero deadlock / lock-ordering surface. See
 # `_reconcile_specialist_operational_files_locked` for the race it closes.
-MATERIALIZE_LOCK = threading.Lock()
+# Re-exported from its true home (round 6, F1). Same object; all references above
+# and below — plus `specialist_materialize.MATERIALIZE_LOCK` in other modules —
+# resolve to it. Top-level import is cycle-free: personality_binding never imports
+# specialist_materialize at module load (only a lazy in-function import of
+# InstanceDir), so this one-way edge introduces no import cycle.
+from personality_binding import MATERIALIZE_LOCK  # noqa: E402
 
 # F5 (fail-closed self-heal): a small marker dotfile written INTO each content
 # directory recording the (binding_digest, component_root) the op-files were
@@ -487,6 +506,7 @@ def current_specialist_roles_dir(
     *,
     specialists_dir: Path = Path("/config/specialists"),
     agents_specialists_dir: Path = Path("/config/agents/specialists"),
+    publish: bool = False,
 ) -> str:
     """The ONE function every specialist load/reload call site uses to get
     `roles_dir` (Round-2, finding #1). Freshly loads an `InstalledSpecialistIndex`
@@ -557,15 +577,26 @@ def current_specialist_roles_dir(
     # RESURRECT a just-removed one, and the op-file self-heal loop (which
     # iterates `installed_slugs()`) would skip a newly-installed slug entirely.
     # RE-LOAD the index IN-LOCK, before either reconcile, so both see exactly
-    # the state committed under this same lock. reload/casa_core publish the
-    # SAME `index` object they pass here via set_active_installed_index, and
-    # InstalledSpecialistIndex.load() swaps its instance map atomically, so this
-    # in-lock reload ALSO refreshes the process-wide global by reference —
-    # admin/inspection reads (live_installed_specialist_slugs / get_installed_
-    # instance) never lag the overlay this call built. (A None-caller `index` is
-    # never the global; reloading it in-lock is a harmless cheap double-scan.)
+    # the state committed under this same lock.
+    #
+    # Round 6, F2 (index-publication coherence): production callers pass
+    # `publish=True` and let THIS in-lock body publish the freshly-loaded index
+    # via `set_active_installed_index`. Doing the publish IN-LOCK, right after
+    # `index.load()`, makes it LAST-WINS-CONSISTENT: when two reload workers each
+    # build + publish a DIFFERENT index object, the process-wide global ends up
+    # pointing at whichever object the LAST lock-holder loaded — the SAME object
+    # whose overlay it just built — never the other worker's stale object. (The
+    # earlier by-reference-refresh scheme published pre-lock in each worker, so
+    # the global could be left pinned to worker A's object while worker B built
+    # the overlay last.) `InstalledSpecialistIndex.load()` swaps its instance map
+    # atomically, so a concurrent event-loop reader never observes a torn map.
+    # Test/ad-hoc callers leave `publish=False` (the default) so they never
+    # mutate the process-wide global.
     with MATERIALIZE_LOCK:
         index.load()
+        if publish:
+            from specialist_registry import set_active_installed_index
+            set_active_installed_index(index)
         _reconcile_specialist_operational_files_locked(
             installed_index=index, specialists_dir=specialists_dir,
             agents_specialists_dir=agents_specialists_dir,

@@ -123,3 +123,89 @@ def test_save_restore_keeps_the_next_test_clean():
 
     current_dir = getattr(specialist_registry_mod._active_index, "_dir", None)
     assert current_dir != Path("/nonexistent-marker-for-test")
+
+
+# ---------------------------------------------------------------------------
+# Whole-branch review round 6, F2 — index-publication coherence.
+# `current_specialist_roles_dir(publish=True)` publishes the freshly-loaded index
+# IN-LOCK (last-wins), not pre-lock in each reload worker. These pin: (a) last-wins
+# semantics, (b) a coherent global under concurrent publishers, (c) publish=False
+# (the default — test/ad-hoc callers) never mutating the global.
+# ---------------------------------------------------------------------------
+
+
+def test_publish_true_is_last_wins_across_sequential_resolves(tmp_path):
+    import specialist_registry as specialist_registry_mod
+    from specialist_materialize import current_specialist_roles_dir
+
+    specialists_dir, agents_specialists_dir = _install_specialist(tmp_path, slug="gizmo")
+
+    # Two DISTINCT index objects over the SAME on-disk tree — as two concurrent
+    # reload workers would each build. The LAST publish (obj_b) must win.
+    obj_a = specialist_registry_mod.InstalledSpecialistIndex(str(specialists_dir))
+    obj_b = specialist_registry_mod.InstalledSpecialistIndex(str(specialists_dir))
+
+    current_specialist_roles_dir(
+        installed_index=obj_a, specialists_dir=specialists_dir,
+        agents_specialists_dir=agents_specialists_dir, publish=True,
+    )
+    assert specialist_registry_mod._active_index is obj_a
+
+    current_specialist_roles_dir(
+        installed_index=obj_b, specialists_dir=specialists_dir,
+        agents_specialists_dir=agents_specialists_dir, publish=True,
+    )
+    # Last lock-holder's freshly-loaded object is the published global — identity
+    # AND content coherence (its in-lock load() populated the slug).
+    assert specialist_registry_mod._active_index is obj_b
+    assert "gizmo" in specialist_registry_mod.live_installed_specialist_slugs()
+
+
+def test_two_concurrent_publish_resolves_leave_a_coherent_global(tmp_path):
+    import threading
+
+    import specialist_registry as specialist_registry_mod
+    from specialist_materialize import current_specialist_roles_dir
+
+    specialists_dir, agents_specialists_dir = _install_specialist(tmp_path, slug="gizmo")
+
+    obj_a = specialist_registry_mod.InstalledSpecialistIndex(str(specialists_dir))
+    obj_b = specialist_registry_mod.InstalledSpecialistIndex(str(specialists_dir))
+    barrier = threading.Barrier(2)
+
+    def _resolve(obj):
+        barrier.wait()
+        current_specialist_roles_dir(
+            installed_index=obj, specialists_dir=specialists_dir,
+            agents_specialists_dir=agents_specialists_dir, publish=True,
+        )
+
+    threads = [threading.Thread(target=_resolve, args=(o,)) for o in (obj_a, obj_b)]
+    for t in threads:
+        t.start()
+    for t in threads:
+        t.join(timeout=10.0)
+
+    # The in-lock publish serializes: the global is EXACTLY one of the two passed
+    # objects — never a torn/third state — and it is fully loaded (content).
+    assert specialist_registry_mod._active_index in (obj_a, obj_b)
+    assert "gizmo" in specialist_registry_mod.live_installed_specialist_slugs()
+    assert specialist_registry_mod.get_installed_instance("gizmo") is not None
+
+
+def test_publish_false_default_never_mutates_the_global(tmp_path):
+    import specialist_registry as specialist_registry_mod
+    from specialist_materialize import current_specialist_roles_dir
+
+    specialists_dir, agents_specialists_dir = _install_specialist(tmp_path, slug="gizmo")
+
+    sentinel = specialist_registry_mod.InstalledSpecialistIndex(str(tmp_path / "sentinel-boot"))
+    specialist_registry_mod.set_active_installed_index(sentinel)
+
+    # Default publish=False — the ad-hoc/test caller must NOT touch the global.
+    current_specialist_roles_dir(
+        installed_index=specialist_registry_mod.InstalledSpecialistIndex(str(specialists_dir)),
+        specialists_dir=specialists_dir,
+        agents_specialists_dir=agents_specialists_dir,
+    )
+    assert specialist_registry_mod._active_index is sentinel

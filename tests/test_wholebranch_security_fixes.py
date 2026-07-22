@@ -1164,3 +1164,33 @@ def test_roles_dir_in_lock_reload_omits_a_slug_uninstalled_after_the_snapshot(
     # RESURRECTED it from retained CAS bytes. Post-fix the in-lock reload drops it.
     assert not (overlay / "research").exists()
     assert (overlay / "mtg" / "role.yaml").is_file()
+
+
+# ---------------------------------------------------------------------------
+# Whole-branch review round 6, F3 — loop-safety of the boot lock acquisitions.
+# casa_core boot must reach BOTH lock-acquiring calls off the event loop:
+#   - current_specialist_roles_dir (acquires MATERIALIZE_LOCK directly), and
+#   - load_all_agents (acquires it via reconcile_resident_binding, round 6 F1)
+# must each run inside `await asyncio.to_thread(...)`, never synchronously on the
+# loop. A source-level assertion is the cheap seam the enumeration relies on.
+# ---------------------------------------------------------------------------
+
+
+def test_casa_core_boot_offloads_both_lock_acquiring_calls_to_a_worker_thread():
+    import re as _re
+
+    import specialist_materialize
+
+    src = (Path(specialist_materialize.__file__).with_name("casa_core.py")).read_text(encoding="utf-8")
+
+    # current_specialist_roles_dir must be the target of an await asyncio.to_thread(...)
+    assert _re.search(
+        r"await\s+asyncio\.to_thread\(\s*current_specialist_roles_dir\b", src
+    ), "boot must call current_specialist_roles_dir via asyncio.to_thread"
+    # load_all_agents likewise (its reconcile_resident_binding takes the lock).
+    assert _re.search(
+        r"await\s+asyncio\.to_thread\(\s*load_all_agents\b", src
+    ), "boot must call load_all_agents via asyncio.to_thread"
+    # And neither may be invoked bare (synchronously) on the loop.
+    assert not _re.search(r"^\s*roles_overlay\s*=\s*current_specialist_roles_dir\(", src, _re.M)
+    assert not _re.search(r"^\s*role_configs\s*=\s*load_all_agents\(", src, _re.M)

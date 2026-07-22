@@ -253,10 +253,12 @@ async def _specialist_roles_dir(runtime: Any) -> str:
     ``current_specialist_roles_dir`` to load a fresh index INTERNALLY and
     discarded it — the process-wide ``_active_index`` stayed pinned at
     boot-time state forever. Building the index HERE (mirroring
-    casa_core.py's own boot sequence exactly) and publishing it before
-    handing it to ``current_specialist_roles_dir`` (as ``installed_index=``,
-    so it is reused rather than loaded twice) makes every boot/reload path
-    refresh the global.
+    casa_core.py's own boot sequence exactly) and handing it to
+    ``current_specialist_roles_dir`` (as ``installed_index=``, so it is reused
+    rather than loaded twice) with ``publish=True`` makes every boot/reload path
+    refresh the global — the publish now happens IN-LOCK inside that helper
+    (round 6, F2), last-wins-consistent across concurrent reload workers, rather
+    than pre-lock here.
 
     F3 (round 3): ``current_specialist_roles_dir`` now acquires
     ``specialist_materialize.MATERIALIZE_LOCK`` and does bounded file I/O
@@ -271,27 +273,27 @@ async def _specialist_roles_dir(runtime: Any) -> str:
     == 'specialist' else None`` keeps the resolve lazy for non-specialist
     tiers)."""
     import specialist_materialize
-    from specialist_registry import InstalledSpecialistIndex, set_active_installed_index
+    from specialist_registry import InstalledSpecialistIndex
 
     def _resolve() -> str:
         specialists_dir = Path(runtime.config_dir) / "specialists"
         index = InstalledSpecialistIndex(str(specialists_dir))
         index.load()
-        set_active_installed_index(index)
-        # Round-5 F3 (disclosed double-load): this pre-lock load+publish gives
-        # admin/inspection reads a valid (if momentarily one-reconcile-stale)
-        # index the instant it is published. `current_specialist_roles_dir` then
-        # RE-LOADS this SAME object IN-LOCK before it rebuilds the overlay, so
-        # the published global and the overlay both reflect the state committed
-        # under MATERIALIZE_LOCK — an install/uninstall racing between this
-        # off-lock load and the lock can no longer leave the overlay omitting a
-        # new slug or resurrecting a removed one. The second (in-lock) scan is a
-        # cheap disk re-read; the pre-lock load stays so the object is never
-        # published un-loaded.
+        # Round 6, F2 (index-publication coherence): publish the index INSIDE
+        # `current_specialist_roles_dir` (pass `publish=True`), NOT here pre-lock.
+        # Publishing under MATERIALIZE_LOCK — right after the in-lock re-load, on
+        # the SAME object whose overlay is then rebuilt — is last-wins-consistent
+        # across two concurrent reload workers: the process-wide global can no
+        # longer be left pinned to worker A's stale object while worker B built
+        # the overlay last. (Was: a pre-lock `set_active_installed_index(index)`
+        # here in each worker, which raced.) The in-lock re-load of this same
+        # object also keeps the published global and the overlay reflecting the
+        # exact state committed under the lock.
         return specialist_materialize.current_specialist_roles_dir(
             installed_index=index,
             specialists_dir=specialists_dir,
             agents_specialists_dir=Path(runtime.agents_dir) / "specialists",
+            publish=True,
         )
 
     return await asyncio.to_thread(_resolve)

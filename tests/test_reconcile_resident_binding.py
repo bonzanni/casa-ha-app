@@ -10,9 +10,11 @@ leaves the last-known-good active binding running instead of crash-looping.
 from __future__ import annotations
 
 import asyncio
+import threading
 
 from personality_binding import (
     IMAGE_DEFAULT_PERSONA_BY_SLOT,
+    MATERIALIZE_LOCK,
     InstanceDir,
     InstanceTuple,
     materialize_override_binding,
@@ -205,3 +207,122 @@ def test_a_staged_candidate_identical_to_active_is_a_no_op_and_clears_the_stale_
     )
     assert second == first
     assert instance_dir.desired() is None  # the no-op staged file is cleared, not left behind
+
+
+# ---------------------------------------------------------------------------
+# Whole-branch review round 6, F1 — reconcile_resident_binding must stage/commit
+# under MATERIALIZE_LOCK. It runs on the boot AND reload load paths, concurrently
+# with the now-locked persona-swap tools; off-lock it could overwrite/discard a
+# freshly staged swap. These pin the lock coverage (wave-4/5 pattern: patch the
+# InstanceDir write primitives to record MATERIALIZE_LOCK.locked()) plus the
+# swap-vs-reconcile serialization (reconcile blocks on any other lock holder).
+# ---------------------------------------------------------------------------
+
+
+def test_reconcile_resident_binding_stages_and_commits_under_the_materialize_lock(tmp_path) -> None:
+    """Every InstanceDir write reconcile performs — stage_desired,
+    commit_desired_to_active, and the discard_desired on both the no-op and
+    error paths — must observe MATERIALIZE_LOCK held. RED before the fix (the
+    whole body ran off-lock)."""
+    role = _role()
+    default = _persona("casa/tina", "0.1.0")
+    override = _persona("casa/gary", "0.2.0")
+    instance_dir = InstanceDir(tmp_path / "resident-butler")
+
+    seen: dict[str, list[bool]] = {"stage": [], "commit": [], "discard": []}
+    real_stage = InstanceDir.stage_desired
+    real_commit = InstanceDir.commit_desired_to_active
+    real_discard = InstanceDir.discard_desired
+
+    def spy_stage(self, tuple_):
+        seen["stage"].append(MATERIALIZE_LOCK.locked())
+        return real_stage(self, tuple_)
+
+    def spy_commit(self):
+        seen["commit"].append(MATERIALIZE_LOCK.locked())
+        return real_commit(self)
+
+    def spy_discard(self, *, reason):
+        seen["discard"].append(MATERIALIZE_LOCK.locked())
+        return real_discard(self, reason=reason)
+
+    def _clear():
+        for v in seen.values():
+            v.clear()
+
+    override_binding = materialize_override_binding(
+        role=role, persona=override, override_source="operator:casa/gary@0.2.0",
+    )
+    ghost_binding = materialize_override_binding(
+        role=role, persona=_persona("casa/ghost", "0.9.0"),
+        override_source="operator:casa/ghost@0.9.0",
+    )
+
+    import unittest.mock as mock
+    with mock.patch.object(InstanceDir, "stage_desired", spy_stage), \
+         mock.patch.object(InstanceDir, "commit_desired_to_active", spy_commit), \
+         mock.patch.object(InstanceDir, "discard_desired", spy_discard):
+        # (1) Fresh install: reconcile stages + commits the image default.
+        _clear()
+        reconcile_resident_binding(
+            role=role, image_default_persona_loader=_loaders({"casa/tina@0.1.0": default}),
+            override_persona_loader=_loaders({}), instance_dir=instance_dir,
+        )
+        assert seen["stage"] and all(seen["stage"]), ("fresh-stage", seen["stage"])
+        assert seen["commit"] and all(seen["commit"]), ("fresh-commit", seen["commit"])
+
+        # (2) A staged override → reconcile stages + commits it. (The direct
+        # stage here is setup, so clear the record BEFORE reconcile runs.)
+        instance_dir.stage_desired(InstanceTuple(
+            root="operator:casa/gary@0.2.0", binding=override_binding,
+            config_snapshot={}, config_digest=override_binding.effective_config_digest,
+        ))
+        _clear()
+        reconcile_resident_binding(
+            role=role, image_default_persona_loader=_loaders({"casa/tina@0.1.0": default}),
+            override_persona_loader=_loaders({"casa/gary@0.2.0": override}), instance_dir=instance_dir,
+        )
+        assert seen["stage"] and all(seen["stage"]), ("override-stage", seen["stage"])
+        assert seen["commit"] and all(seen["commit"]), ("override-commit", seen["commit"])
+
+        # (3) Error path: a staged candidate whose persona is unresolvable →
+        # reconcile discards it under the lock.
+        instance_dir.stage_desired(InstanceTuple(
+            root="operator:casa/ghost@0.9.0", binding=ghost_binding,
+            config_snapshot={}, config_digest=ghost_binding.effective_config_digest,
+        ))
+        _clear()
+        reconcile_resident_binding(
+            role=role, image_default_persona_loader=_loaders({"casa/tina@0.1.0": default}),
+            override_persona_loader=_loaders({}), instance_dir=instance_dir,
+        )
+        assert seen["discard"] and all(seen["discard"]), ("error-discard", seen["discard"])
+
+
+def test_reconcile_resident_binding_serializes_against_a_concurrent_lock_holder(tmp_path) -> None:
+    """Swap-vs-reconcile serialization: while ANOTHER holder (a persona-swap
+    tool) owns MATERIALIZE_LOCK, reconcile must BLOCK — it cannot race the swap's
+    stage/commit. Hold the lock, run reconcile in a worker thread, prove it does
+    not finish until the lock is released."""
+    role = _role()
+    default = _persona("casa/tina", "0.1.0")
+    instance_dir = InstanceDir(tmp_path / "resident-butler")
+
+    done = threading.Event()
+
+    def _run():
+        reconcile_resident_binding(
+            role=role, image_default_persona_loader=_loaders({"casa/tina@0.1.0": default}),
+            override_persona_loader=_loaders({}), instance_dir=instance_dir,
+        )
+        done.set()
+
+    with MATERIALIZE_LOCK:
+        worker = threading.Thread(target=_run)
+        worker.start()
+        # Reconcile cannot proceed while we hold the lock.
+        assert not done.wait(timeout=0.5), "reconcile ran without acquiring MATERIALIZE_LOCK"
+    # Lock released — reconcile now completes.
+    assert done.wait(timeout=5.0), "reconcile did not finish after the lock was released"
+    worker.join(timeout=5.0)
+    assert instance_dir.active() is not None
