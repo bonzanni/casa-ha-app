@@ -8,6 +8,8 @@ from typing import Mapping
 
 import rfc8785
 
+from authored_markers import contains_forbidden_marker
+
 
 def canonical_text(text: str) -> str:
     normalized = unicodedata.normalize("NFC", text)
@@ -203,3 +205,18 @@ def assert_json_safe(value, *, _depth=0, _seen=None, max_depth=64):
     # non-canonical-safe value.
     if isinstance(value, str):
         _require_utf8_encodable(value)
+
+
+def reject_forbidden_markers(text: str) -> None:
+    """Reject templating/include/HTML/compiler-delimiter markers in untrusted
+    prose (spec §2.2, §2.5b). Thin delegate over ``authored_markers.
+    contains_forbidden_marker`` — that module is the single owner of the
+    forbidden-marker set (``TEMPLATE_MARKERS``/``STRUCTURAL_MARKERS``/
+    ``FORBIDDEN_MARKERS``) and the conservative HTML-tag-open regex;
+    ``persona_pack.py`` wraps this (folding the message into
+    ``PersonaPackError``), and ``specialist_install.py`` (Task N1a) applies
+    it to fetched role/doctrine bytes, which ``role_artifact.
+    load_role_artifact`` does not raw-text-scan (that loader trusts
+    image-owned content; installed components are adversarial input)."""
+    if contains_forbidden_marker(text):
+        raise ValueError("template, include, HTML, or delimiter detected")

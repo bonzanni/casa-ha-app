@@ -10,13 +10,14 @@ from typing import Mapping
 import jsonschema
 import yaml
 
-from authored_markers import contains_forbidden_marker, reject_markers_in_parsed
+from authored_markers import reject_markers_in_parsed
 from canonical_bytes import (
     assert_json_safe,
     canonical_json_bytes,
     canonical_text,
     checksum_bytes,
     deep_freeze,
+    reject_forbidden_markers,
 )
 from markdown_sections import sections
 from yaml_safety import load_yaml_no_aliases
@@ -104,8 +105,10 @@ def _admit_files(pack_dir: Path) -> tuple[Path, ...]:
 
 
 def _reject_markers(text: str) -> None:
-    if contains_forbidden_marker(text):
-        raise PersonaPackError("template, include, HTML, or delimiter detected")
+    try:
+        reject_forbidden_markers(text)
+    except ValueError as exc:
+        raise PersonaPackError(str(exc)) from exc
 
 
 def _validate_schema(payload: object, schema_path: Path) -> None:
