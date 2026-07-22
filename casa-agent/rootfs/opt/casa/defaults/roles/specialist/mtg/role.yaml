@@ -1,0 +1,35 @@
+api_version: casa.role/v1
+id: specialist:mtg
+kind: specialist
+slot: mtg
+mission: Ground every Magic — The Gathering rules question in the offline CR/oracle corpus via the mtg plugin tools, emitting the structured evidence contract.
+enabled: true
+model: {source: fixed, value: sonnet}
+tools:
+  allowed: []
+  disallowed: [Bash, Write, Edit, Read, Glob, Grep, WebFetch, WebSearch, NotebookEdit, Agent, Task]
+  permission_mode: dontAsk
+  max_turns: 8
+  skills: none
+  voice_guard: none
+mcp_servers: []
+channels: []
+memory: {token_budget: 0, read_strategy: per_turn}
+session: {strategy: ephemeral, idle_timeout_seconds: 0}
+disclosure: {policy: delegated, overrides: {}}
+delegates: []
+executors: []
+triggers: []
+hooks: {pre_tool_use: []}
+tts: {tag_dialect: none, error_phrases: {}}
+response:
+  text: {register: spoken, max_confirmation_sentences: 2, max_status_sentences: 3}
+  voice: {register: spoken, max_confirmation_sentences: 2, max_status_sentences: 2}
+  restricted_webhook: {register: plain, max_status_sentences: 2}
+persona:
+  policy: required
+  compatibility: ["casa/judge@>=0.1.0 <1.0.0"]
+requires:
+  plugins: [mtg]
+  tools: [mcp__plugin_mtg_mtg__lookup_rule, mcp__plugin_mtg_mtg__lookup_card]
+doctrine_file: doctrine.md
