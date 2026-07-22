@@ -1,0 +1,51 @@
+api_version: casa.role/v1
+id: specialist:mtg-test
+kind: specialist
+slot: mtg-test
+mission: 'Answer Magic: the Gathering rules questions.'
+enabled: true
+model:
+  source: fixed
+  value: sonnet
+tools:
+  allowed: []
+  disallowed:
+  - Bash
+  permission_mode: dontAsk
+  max_turns: 8
+  skills: none
+  voice_guard: none
+mcp_servers: []
+channels: []
+memory:
+  token_budget: 0
+  read_strategy: per_turn
+session:
+  strategy: ephemeral
+  idle_timeout_seconds: 0
+disclosure:
+  policy: delegated
+  overrides: {}
+delegates: []
+executors: []
+triggers: []
+hooks:
+  pre_tool_use: []
+tts:
+  tag_dialect: none
+  error_phrases: {}
+response:
+  text:
+    register: precise
+  voice:
+    register: spoken
+  restricted_webhook:
+    register: plain
+persona:
+  policy: required
+  compatibility:
+  - casa/judge@>=0.1.0 <1.0.0
+requires:
+  plugins: []
+  tools: []
+doctrine_file: doctrine.md
