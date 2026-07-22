@@ -531,7 +531,7 @@ def test_commit_survives_a_materialize_failure_and_self_heals_on_next_reconcile(
             out = {}
             for slug in self.installed_slugs():
                 instance_ = self.get_instance(slug)
-                tuple_ = instance_.active if instance_ is not None else None
+                tuple_ = (instance_.active or instance_.desired) if instance_ is not None else None
                 if tuple_ is None:
                     continue
                 try:
