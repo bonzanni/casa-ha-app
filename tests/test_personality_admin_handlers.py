@@ -104,6 +104,23 @@ def test_explanation_no_persona_prose_in_default_output(store, record) -> None:
     assert "SENSITIVE MEMORY TEXT" not in encoded
 
 
+def test_explanation_default_strips_memory_tiers(store, record) -> None:
+    """GH #202: the sensitivity-tier tokens are metadata gated behind the SAME
+    show_sensitive confirmation as the prompt/memory prose."""
+    store.record(record)
+    result = store.get(record.correlation_id, show_sensitive=False)
+    assert "memory_tiers" not in result
+    # Attribution labels are already clearance-gated identity strings, not tier
+    # tokens — they stay visible in the default output.
+    assert result["memory_attributions"] == list(record.memory_attributions)
+
+
+def test_explanation_show_sensitive_returns_memory_tiers(store, record) -> None:
+    store.record(record)
+    result = store.get(record.correlation_id, show_sensitive=True)
+    assert result["memory_tiers"] == list(record.memory_tiers)
+
+
 def test_record_rejects_reserved_provenance_tag(store, record) -> None:
     import dataclasses
 
@@ -440,6 +457,41 @@ async def test_explain_show_sensitive_with_confirmed_returns_full(tmp_path, reco
         assert resp.status == 200
         body = await resp.json()
         assert body["system_prompt"] == record.system_prompt
+
+
+async def test_explain_default_omits_memory_tiers(tmp_path, record) -> None:
+    """GH #202 at the route: the default (unconfirmed) explain response must not
+    carry the memory sensitivity-tier tokens, while attribution labels remain."""
+    store = ExplanationStore(tmp_path / "explanations")
+    store.record(record)
+    runtime = _FakeRuntime(explanation_store=store)
+    app = _make_app(runtime)
+    async with TestClient(TestServer(app)) as client:
+        resp = await client.post(
+            "/admin/explain", json={"correlation_id": record.correlation_id},
+        )
+        assert resp.status == 200
+        body = await resp.json()
+        assert "memory_tiers" not in body
+        assert body["memory_attributions"] == list(record.memory_attributions)
+
+
+async def test_explain_show_sensitive_returns_memory_tiers(tmp_path, record) -> None:
+    store = ExplanationStore(tmp_path / "explanations")
+    store.record(record)
+    runtime = _FakeRuntime(explanation_store=store)
+    app = _make_app(runtime)
+    async with TestClient(TestServer(app)) as client:
+        resp = await client.post(
+            "/admin/explain",
+            json={
+                "correlation_id": record.correlation_id,
+                "show_sensitive": True, "confirmed": True,
+            },
+        )
+        assert resp.status == 200
+        body = await resp.json()
+        assert body["memory_tiers"] == list(record.memory_tiers)
 
 
 async def test_explain_unknown_correlation_id_404(tmp_path) -> None:

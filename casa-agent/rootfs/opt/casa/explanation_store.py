@@ -13,9 +13,12 @@ Privacy is enforced at the STORE boundary, not by the caller:
   provenance tag (spec: reserved tags are Hindsight-internal and must
   never leak into an operator-facing surface).
 * :meth:`ExplanationStore.get` strips ``system_prompt``/``memory_text``
-  by default; only ``show_sensitive=True`` (gated by the admin route's
-  ``confirmed=true`` requirement, and by ``casactl``'s interactive
-  ``SHOW`` confirmation) returns them.
+  AND the ``memory_tiers`` sensitivity-tier metadata (GH #202) by default;
+  only ``show_sensitive=True`` (gated by the admin route's ``confirmed=true``
+  requirement, and by ``casactl``'s interactive ``SHOW`` confirmation)
+  returns them. ``memory_attributions`` stay visible by default — they are
+  already clearance/surface-gated identity labels (never tier tokens, never
+  reserved ``casa-source-`` tags).
 
 Storage is atomic (temp file + chmod 0600 + ``os.replace``), TTL-pruned
 (24h), and capped at 1000 records — this is a debugging aid, not durable
@@ -35,6 +38,11 @@ EXPLANATION_TTL_SECONDS = 86400
 EXPLANATION_MAX_RECORDS = 1000
 _CID = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$")
 _SENSITIVE = {"system_prompt", "memory_text"}
+# GH #202: the memory sensitivity-tier tokens are metadata that reveals which
+# clearance tiers a turn's recall touched — gated behind the SAME explicit
+# show_sensitive confirmation as the prompt/memory prose (attribution labels,
+# which are already clearance-gated, stay visible).
+_SENSITIVE_TIER_META = {"memory_tiers"}
 
 
 @dataclass(frozen=True, slots=True)
@@ -107,7 +115,7 @@ class ExplanationStore:
             raise KeyError(correlation_id)
         value = json.loads(path.read_text(encoding="utf-8"))
         if not show_sensitive:
-            for key in _SENSITIVE:
+            for key in (*_SENSITIVE, *_SENSITIVE_TIER_META):
                 value.pop(key, None)
         return value
 
