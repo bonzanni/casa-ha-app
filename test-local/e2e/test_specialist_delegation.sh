@@ -22,6 +22,12 @@ _tmpbase() {
     fi
 }
 TMPBASE="$(_tmpbase)"
+# The Windows-derived base is only reachable from Git Bash; under WSL the
+# /c/... form does not exist (and CI has no powershell.exe at all). Fall
+# back to /tmp whenever the computed base is not actually usable.
+if ! mkdir -p "$TMPBASE" 2>/dev/null || [ ! -w "$TMPBASE" ]; then
+    TMPBASE=/tmp
+fi
 
 cleanup_all() {
     docker ps -q --filter "name=casa-deleg-.*-$$" | xargs -r docker stop >/dev/null 2>&1 || true
@@ -31,38 +37,45 @@ trap cleanup_all EXIT
 build_image
 
 # ============================================================
-# D-1: bundled-disabled contract (default env, no fixtures)
+# D-1: zero-specialists baseline (v0.100.0 cutover contract)
 # ============================================================
-log "D-1: bundled-disabled contract"
+# The image ships NO bundled specialists — every specialist is installed
+# from its component repository (see test_specialist_install_from_repo.sh
+# for the install path). A fresh boot must come up healthy with an empty
+# specialist set and must NOT seed any specialist directory into /config.
+log "D-1: zero-specialists baseline"
 
 NAME="casa-deleg-d1-$$"
 start_container "$NAME" >/dev/null
 wait_healthy "$NAME"
 
-# finance/ dir seeded to user config via the seed_agent_dir helper.
-# MSYS_NO_PATHCONV=1 prevents Git Bash from rewriting the container-side
-# path to a Windows one.
-MSYS_NO_PATHCONV=1 docker exec "$NAME" test -f /config/agents/specialists/finance/runtime.yaml \
-    || fail "D-1: finance/ was not seeded to /config"
+# No specialist dir seeded to user config (the old bundled-finance seeding
+# is gone with the cutover). MSYS_NO_PATHCONV=1 prevents Git Bash from
+# rewriting the container-side path to a Windows one.
+MSYS_NO_PATHCONV=1 docker exec "$NAME" test ! -e /config/agents/specialists/finance \
+    && MSYS_NO_PATHCONV=1 docker exec "$NAME" test -d /config/agents/specialists \
+    || fail "D-1: expected an empty /config/agents/specialists (no bundled finance)"
 
-# Per-specialist disabled log line present (post-cut shape — no file=...).
-assert_log_contains "$NAME" "Specialist 'finance' bundled but disabled"
-
-# Summary line: enabled=[] disabled=['finance'].
+# Summary line: nothing enabled, disabled, or failed.
 # Use assert_log_contains (polls up to 15s, grep -qF) — covers both the
 # ERE \[\] portability gap and the docker-logs stdout lag on CI.
-assert_log_contains "$NAME" "Specialists: enabled=[] disabled=['finance']"
+assert_log_contains "$NAME" "Specialists: enabled=[] disabled=[] failed=[]"
 
 # n8n not registered (no N8N_URL).
 assert_log_not_contains "$NAME" "Registered n8n-workflows MCP server"
 
 stop_container "$NAME"
-pass "D-1 bundled-disabled contract"
+pass "D-1 zero-specialists baseline"
 
 # ============================================================
-# D-2: flip-to-enabled contract (user-edited YAML via fixture mount)
+# D-2: orphan legacy specialist dir fails per-slug, boot survives
 # ============================================================
-log "D-2: flip-to-enabled contract"
+# A pre-cutover /config carrying a legacy 4-file specialist dir (exactly
+# what a production box upgraded from a bundled-finance release has, until
+# the specialist is reinstalled from its repository) must NOT crash-loop
+# boot: the slug fails to load with a per-slug error, siblings and
+# residents continue, and the user's directory is left byte-identical.
+log "D-2: orphan legacy specialist dir"
 
 NAME="casa-deleg-d2-$$"
 TMP_D2="${TMPBASE}/casa-deleg-d2-$$"
@@ -83,23 +96,17 @@ MSYS_NO_PATHCONV=1 docker run -d --rm --name "$NAME" \
     "$IMAGE" >/dev/null
 wait_healthy "$NAME"
 
-# 'loaded' line (specialist registered for delegation dispatch). Using
-# assert_log_contains for its built-in 15s poll — docker logs stdout
-# lag on CI caused D-2 to flake even after healthz was green (seen in
-# run 24767143034 on 2026-04-22).
-assert_log_contains "$NAME" "Specialist 'finance' loaded (model="
+# Per-slug failure surfaced loudly (no role artifact for an uninstalled
+# specialist), without poisoning the boot.
+assert_log_contains "$NAME" "Specialist 'finance' failed to load:"
 
-# Summary line reflects enabled finance.
-assert_log_contains "$NAME" "Specialists: enabled=['finance'] disabled=[]"
-
-# No n8n registration (fixture has no N8N_URL).
-assert_log_not_contains "$NAME" "Registered n8n-workflows MCP server"
+# Summary line reflects the failed slug — nothing enabled or disabled.
+assert_log_contains "$NAME" "Specialists: enabled=[] disabled=[] failed=['finance']"
 
 stop_container "$NAME"
 
-# Post-boot: the fixture's user-editable directory must still be content-
-# identical to its pre-boot state (no migration overrode the user's
-# enabled: true). Hash folds every file's sha256 into one.
+# Post-boot: the user's directory must still be content-identical to its
+# pre-boot state (no migration rewrote or pruned the orphan dir).
 FIXTURE_HASH_AFTER=$(_dir_hash "$TMP_D2/agents/specialists/finance")
 [ "$FIXTURE_HASH_BEFORE" = "$FIXTURE_HASH_AFTER" ] \
     || fail "D-2: fixture finance/ dir was modified by boot (hash drift)"
@@ -109,74 +116,4 @@ docker run --rm -v "${TMP_D2}:/target" --entrypoint sh "$IMAGE" \
     -c 'rm -rf /target/workspace /target/data' >/dev/null 2>&1 || true
 rm -rf "$TMP_D2" 2>/dev/null || true
 
-pass "D-2 flip-to-enabled contract"
-
-# ============================================================
-# D-3: second-specialist discovery (config-not-code regression)
-# ============================================================
-log "D-3: second-specialist discovery"
-
-NAME="casa-deleg-d3-$$"
-TMP_D3_DIR="${TMPBASE}/casa-deleg-d3-$$"
-HEALTH_DIR="$TMP_D3_DIR/health"
-mkdir -p "$HEALTH_DIR"
-
-# Minimal Tier 2 directory — enabled: false, empty channels, ephemeral
-# session, zero token budget. Written inline; not committed as a fixture
-# because the whole point is that *any* new specialist dir in defaults/
-# gets picked up by the seed_agent_dir glob.
-cat > "$HEALTH_DIR/character.yaml" <<'YAML'
-schema_version: 1
-name: Doc
-role: health
-archetype: health-specialist
-card: |
-  D-3 test fixture — do not ship.
-prompt: |
-  Test-only health specialist stub.
-YAML
-printf 'schema_version: 1\n' > "$HEALTH_DIR/voice.yaml"
-printf 'schema_version: 1\n' > "$HEALTH_DIR/response_shape.yaml"
-cat > "$HEALTH_DIR/runtime.yaml" <<'YAML'
-schema_version: 1
-enabled: false
-model: sonnet
-tools:
-  allowed: [Read]
-  disallowed: [Bash, Write, Edit]
-  permission_mode: acceptEdits
-  max_turns: 5
-mcp_server_names:
-  - casa-framework
-memory:
-  token_budget: 0
-session:
-  strategy: ephemeral
-  idle_timeout: 0
-YAML
-
-# Bind-mount the directory into the image's defaults specialists dir. Docker
-# supports directory bind-mounts; setup-configs.sh's seed_agent_dir picks
-# it up on first boot.
-MSYS_NO_PATHCONV=1 docker run -d --rm --name "$NAME" \
-    -p "${HOST_PORT}:8080" \
-    -v "${HEALTH_DIR}:/opt/casa/defaults/agents/specialists/health:ro" \
-    "$IMAGE" >/dev/null
-wait_healthy "$NAME"
-
-# Both dirs seeded to user config (the seed_agent_dir ran for each).
-MSYS_NO_PATHCONV=1 docker exec "$NAME" test -f /config/agents/specialists/finance/runtime.yaml \
-    || fail "D-3: finance/ was not seeded"
-MSYS_NO_PATHCONV=1 docker exec "$NAME" test -f /config/agents/specialists/health/runtime.yaml \
-    || fail "D-3: health/ was not seeded"
-
-# Per-specialist disabled log line for health (post-cut shape — no file=...).
-assert_log_contains "$NAME" "Specialist 'health' bundled but disabled"
-
-# Summary line has both finance and health in disabled set (sorted alphabetically).
-assert_log_contains "$NAME" "Specialists: enabled=[] disabled=['finance', 'health']"
-
-stop_container "$NAME"
-rm -rf "$TMP_D3_DIR" 2>/dev/null || true
-
-pass "D-3 second-specialist discovery"
+pass "D-2 orphan legacy specialist dir"

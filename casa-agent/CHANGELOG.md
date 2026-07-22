@@ -1,5 +1,16 @@
 # Changelog
 
+## [0.100.2] - 2026-07-22
+
+### Fixed
+
+- No functional changes. Reconciled the container e2e delegation suite to
+  the v0.100.0 zero-bundled-specialists contract: a fresh boot now asserts
+  an empty specialist set, and a leftover pre-0.100 specialist directory in
+  user config is verified to fail loudly per-slug without breaking boot
+  (the state an upgraded installation is in until the specialist is
+  reinstalled from its repository).
+
 ## [0.100.1] - 2026-07-22
 
 ### Fixed
