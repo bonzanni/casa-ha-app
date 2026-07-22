@@ -6887,6 +6887,91 @@ async def specialist_install_commit(args: dict) -> dict:
                      "activation_committed": instance.state == "active"})
 
 
+@tool(
+    "specialist_upgrade",
+    "Transactionally upgrade an installed specialist to a new version — the current install keeps "
+    "running until the new version validates+compiles successfully. Supply component_id/version/"
+    "root_digest/staged_dir exactly as returned by specialist_install_inspect(mode='upgrade', "
+    "target_slug=<slug>).",
+    {"type": "object", "properties": {
+        "slug": {"type": "string"}, "component_id": {"type": "string"},
+        "version": {"type": "string"}, "root_digest": {"type": "string"},
+        "staged_dir": {"type": "string"},
+        "config": {"type": "object", "additionalProperties": {"type": "string"}},
+        "secret_names_provided": {"type": "array", "items": {"type": "string"}}},
+     "required": ["slug", "component_id", "version", "root_digest", "staged_dir"]},
+)
+async def specialist_upgrade(args: dict) -> dict:
+    from specialist_component import load_specialist_component
+    from specialist_install import (
+        InspectionResult, SpecialistInstallError, compute_install_root_digest,
+        resolve_dependency_closure, upgrade_specialist,
+    )
+    from specialist_install_consent import SpecialistInstallAckStore
+
+    staged_dir = Path(args["staged_dir"])
+    component = load_specialist_component(staged_dir, staged_dir / "manifest.json")
+    # Same fresh re-validation as specialist_install_commit — upgrade must
+    # not trust a caller-supplied digest either.
+    deps = resolve_dependency_closure(component, staged_dir)
+    unavailable = [d for d in deps if not d.available]
+    if unavailable:
+        detail = "; ".join(f"{d.kind}:{d.identifier}: {d.detail}" for d in unavailable)
+        return _result({"ok": False, "kind": "dependency_unavailable", "detail": detail})
+    root_digest = compute_install_root_digest(
+        component, deps, manifest_bytes=(staged_dir / "manifest.json").read_bytes())
+    if root_digest != args["root_digest"]:
+        return _result({"ok": False, "kind": "checksum_changed",
+                         "detail": "staged component no longer matches the approved inspection"})
+    inspection = InspectionResult(
+        component_id=component.component_id, version=component.version, slug=component.slug,
+        component_checksum=component.checksum, root_digest=root_digest,
+        mission=str(component.role.role.get("mission", "")),
+        default_persona_ref=component.default_persona_ref,
+        default_persona_checksum=component.default_persona_checksum,
+        required_config_names=(), required_secret_names=(), dependencies=deps, staged_dir=staged_dir,
+    )
+    try:
+        instance = await asyncio.to_thread(
+            upgrade_specialist, slug=args["slug"], inspection=inspection,
+            config=args.get("config") or {},
+            secret_names_provided=frozenset(args.get("secret_names_provided") or []),
+            acks=SpecialistInstallAckStore(),
+        )
+    except SpecialistInstallError as exc:
+        return _result({"ok": False, "kind": exc.kind, "detail": exc.detail})
+    return _result({"ok": True, "slug": instance.slug, "state": instance.state})
+
+
+@tool(
+    "specialist_rollback",
+    "Restore an installed specialist's retained prior version (the state before its most recent "
+    "upgrade). Fails if no prior version was retained.",
+    {"type": "object", "properties": {"slug": {"type": "string"}}, "required": ["slug"]},
+)
+async def specialist_rollback(args: dict) -> dict:
+    from specialist_install import SpecialistInstallError, rollback_specialist
+
+    try:
+        instance = await asyncio.to_thread(rollback_specialist, slug=args["slug"])
+    except SpecialistInstallError as exc:
+        return _result({"ok": False, "kind": exc.kind, "detail": exc.detail})
+    return _result({"ok": True, "slug": instance.slug, "state": instance.state})
+
+
+@tool(
+    "specialist_uninstall",
+    "Remove an installed specialist entirely (its binding, config, and legacy operational files). "
+    "Does not affect a hand-authored (non-installed) specialist of the same name.",
+    {"type": "object", "properties": {"slug": {"type": "string"}}, "required": ["slug"]},
+)
+async def specialist_uninstall(args: dict) -> dict:
+    from specialist_install import uninstall_specialist
+
+    await asyncio.to_thread(uninstall_specialist, slug=args["slug"])
+    return _result({"ok": True, "slug": args["slug"]})
+
+
 def _find_entry(data, name: str) -> dict | None:
     return next((e for e in data.raw.get("plugins", [])
                  if isinstance(e, dict) and e.get("name") == name), None)
@@ -7765,6 +7850,11 @@ CASA_TOOLS: tuple = (
     # install-from-repo tools.
     specialist_install_inspect,
     specialist_install_commit,
+    # Personality Phase A, Plan 2 Task N1c — configurator-only specialist
+    # upgrade/rollback/uninstall tools.
+    specialist_upgrade,
+    specialist_rollback,
+    specialist_uninstall,
 )
 
 

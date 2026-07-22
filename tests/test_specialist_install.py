@@ -578,3 +578,191 @@ def test_commit_with_missing_required_config_yields_pending_configuration(tmp_pa
     assert instance.active is None
     assert instance.desired is not None
     assert not (tmp_path / "agents-specialists" / "mtg").exists()  # not materialized while pending
+
+
+# ---------------------------------------------------------------------------
+# upgrade_specialist / rollback_specialist / uninstall_specialist (Task N1c)
+# ---------------------------------------------------------------------------
+
+
+def _installed_mtg(tmp_path: Path) -> tuple[Path, Path, "specialist_install.InspectionResult"]:
+    """Shared setup: a committed, active mtg install at version 0.1.0."""
+    from specialist_component import load_specialist_component
+    from specialist_install import InspectionResult, commit_specialist_install, resolve_dependency_closure
+    from specialist_install_consent import SpecialistInstallAckStore, install_consent_identity
+
+    staged = _write_component(tmp_path / "staged-v1", slug="mtg")
+    component = load_specialist_component(staged, staged / "manifest.json")
+    deps = resolve_dependency_closure(component, staged)
+    from specialist_install import compute_install_root_digest
+    root_digest = compute_install_root_digest(
+        component, deps, manifest_bytes=(staged / "manifest.json").read_bytes())
+    inspection = InspectionResult(
+        component_id=component.component_id, version=component.version, slug=component.slug,
+        component_checksum=component.checksum, root_digest=root_digest, mission="x",
+        default_persona_ref=component.default_persona_ref,
+        default_persona_checksum=component.default_persona_checksum,
+        required_config_names=(), required_secret_names=(), dependencies=deps, staged_dir=staged,
+    )
+    acks = SpecialistInstallAckStore(path=tmp_path / "acks.json")
+    identity = install_consent_identity(
+        component_id=inspection.component_id, version=inspection.version,
+        component_checksum=inspection.root_digest, slug=inspection.slug)
+    acks.record(identity=identity, component_id=inspection.component_id, version=inspection.version,
+                component_checksum=inspection.root_digest, slug=inspection.slug)
+    specialists_dir, agents_specialists_dir = tmp_path / "specialists", tmp_path / "agents-specialists"
+    commit_specialist_install(
+        inspection=inspection, config={}, secret_names_provided=frozenset(), acks=acks,
+        specialists_dir=specialists_dir, agents_specialists_dir=agents_specialists_dir,
+    )
+    return specialists_dir, agents_specialists_dir, inspection
+
+
+def _v2_inspection(tmp_path: Path) -> "specialist_install.InspectionResult":
+    from specialist_component import load_specialist_component
+    from specialist_install import InspectionResult, resolve_dependency_closure
+
+    staged = _write_component(tmp_path / "staged-v2", slug="mtg")
+    manifest_path = staged / "manifest.json"
+    manifest = json.loads(manifest_path.read_text())
+    manifest["version"] = "0.2.0"
+    files = {
+        "role/role.yaml": (staged / "role" / "role.yaml").read_bytes(),
+        "role/doctrine.md": (staged / "role" / "doctrine.md").read_bytes(),
+        "config-schema.json": (staged / "config-schema.json").read_bytes(),
+    }
+    manifest["checksum"] = compute_component_checksum(files)
+    manifest_path.write_text(json.dumps(manifest), encoding="utf-8")
+    component = load_specialist_component(staged, manifest_path)
+    deps = resolve_dependency_closure(component, staged)
+    from specialist_install import compute_install_root_digest
+    root_digest = compute_install_root_digest(
+        component, deps, manifest_bytes=manifest_path.read_bytes())
+    return InspectionResult(
+        component_id=component.component_id, version=component.version, slug=component.slug,
+        component_checksum=component.checksum, root_digest=root_digest, mission="x",
+        default_persona_ref=component.default_persona_ref,
+        default_persona_checksum=component.default_persona_checksum,
+        required_config_names=(), required_secret_names=(), dependencies=deps, staged_dir=staged,
+    )
+
+
+def test_upgrade_commits_a_new_active_tuple_and_retains_the_prior_as_rollback_target(
+    tmp_path: Path,
+) -> None:
+    from specialist_install import upgrade_specialist
+    from specialist_install_consent import SpecialistInstallAckStore, install_consent_identity
+
+    specialists_dir, agents_specialists_dir, v1 = _installed_mtg(tmp_path)
+    v2 = _v2_inspection(tmp_path)
+    acks = SpecialistInstallAckStore(path=tmp_path / "acks.json")
+    identity = install_consent_identity(component_id=v2.component_id, version=v2.version,
+                                         component_checksum=v2.root_digest, slug=v2.slug)
+    acks.record(identity=identity, component_id=v2.component_id, version=v2.version,
+                component_checksum=v2.root_digest, slug=v2.slug)
+
+    instance = upgrade_specialist(
+        slug="mtg", inspection=v2, config={}, secret_names_provided=frozenset(), acks=acks,
+        specialists_dir=specialists_dir, agents_specialists_dir=agents_specialists_dir,
+    )
+    assert instance.state == "active"
+    assert instance.active.binding.persona_checksum  # sanity: compiled successfully
+    assert (specialists_dir / "mtg" / "active.prior.yaml").exists()
+
+
+def test_upgrade_with_missing_new_required_config_leaves_the_active_tuple_running(
+    tmp_path: Path,
+) -> None:
+    from specialist_install import upgrade_specialist
+    from specialist_install_consent import SpecialistInstallAckStore, install_consent_identity
+
+    specialists_dir, agents_specialists_dir, v1 = _installed_mtg(tmp_path)
+    v2 = _v2_inspection(tmp_path)
+    manifest_path = v2.staged_dir / "manifest.json"
+    manifest = json.loads(manifest_path.read_text())
+    (v2.staged_dir / "config-schema.json").write_text(
+        json.dumps({"required": ["new_secret_flag"], "secret_names": ["new_secret_flag"]}),
+        encoding="utf-8")
+    files = {
+        "role/role.yaml": (v2.staged_dir / "role" / "role.yaml").read_bytes(),
+        "role/doctrine.md": (v2.staged_dir / "role" / "doctrine.md").read_bytes(),
+        "config-schema.json": (v2.staged_dir / "config-schema.json").read_bytes(),
+    }
+    manifest["checksum"] = compute_component_checksum(files)
+    manifest_path.write_text(json.dumps(manifest), encoding="utf-8")
+    from specialist_install import (
+        InspectionResult, compute_install_root_digest, resolve_dependency_closure,
+    )
+    component = load_specialist_component(v2.staged_dir, manifest_path)
+    v2_deps = resolve_dependency_closure(component, v2.staged_dir)
+    v2_root_digest = compute_install_root_digest(
+        component, v2_deps, manifest_bytes=manifest_path.read_bytes())
+    v2 = InspectionResult(
+        component_id=component.component_id, version=component.version, slug=component.slug,
+        component_checksum=component.checksum, root_digest=v2_root_digest, mission="x",
+        default_persona_ref=component.default_persona_ref,
+        default_persona_checksum=component.default_persona_checksum,
+        required_config_names=(), required_secret_names=("new_secret_flag",),
+        dependencies=v2_deps, staged_dir=v2.staged_dir,
+    )
+    acks = SpecialistInstallAckStore(path=tmp_path / "acks.json")
+    identity = install_consent_identity(component_id=v2.component_id, version=v2.version,
+                                         component_checksum=v2.root_digest, slug=v2.slug)
+    acks.record(identity=identity, component_id=v2.component_id, version=v2.version,
+                component_checksum=v2.root_digest, slug=v2.slug)
+
+    instance = upgrade_specialist(
+        slug="mtg", inspection=v2, config={}, secret_names_provided=frozenset(), acks=acks,
+        specialists_dir=specialists_dir, agents_specialists_dir=agents_specialists_dir,
+    )
+    assert instance.state == "pending-configuration"
+    assert instance.active is not None  # the OLD (v1) active tuple keeps running
+    assert instance.active.root != instance.desired.root  # desired is the staged v2 candidate
+
+
+def test_rollback_restores_the_prior_tuple(tmp_path: Path) -> None:
+    from specialist_install import parse_component_root, rollback_specialist, upgrade_specialist
+    from specialist_install_consent import SpecialistInstallAckStore, install_consent_identity
+
+    specialists_dir, agents_specialists_dir, v1 = _installed_mtg(tmp_path)
+    v2 = _v2_inspection(tmp_path)
+    acks = SpecialistInstallAckStore(path=tmp_path / "acks.json")
+    identity = install_consent_identity(component_id=v2.component_id, version=v2.version,
+                                         component_checksum=v2.root_digest, slug=v2.slug)
+    acks.record(identity=identity, component_id=v2.component_id, version=v2.version,
+                component_checksum=v2.root_digest, slug=v2.slug)
+    upgrade_specialist(slug="mtg", inspection=v2, config={}, secret_names_provided=frozenset(),
+                        acks=acks, specialists_dir=specialists_dir,
+                        agents_specialists_dir=agents_specialists_dir)
+
+    rolled_back = rollback_specialist(
+        slug="mtg", specialists_dir=specialists_dir, agents_specialists_dir=agents_specialists_dir)
+    assert rolled_back.active.binding.component_root is not None
+    _, _, checksum = parse_component_root(rolled_back.active.root)
+    assert checksum == v1.root_digest  # back to the pre-upgrade version
+
+
+def test_rollback_with_no_prior_tuple_raises(tmp_path: Path) -> None:
+    from specialist_install import rollback_specialist
+
+    specialists_dir, agents_specialists_dir, _v1 = _installed_mtg(tmp_path)
+    with pytest.raises(SpecialistInstallError) as raised:
+        rollback_specialist(slug="mtg", specialists_dir=specialists_dir,
+                             agents_specialists_dir=agents_specialists_dir)
+    assert raised.value.kind == "no_prior_tuple"
+
+
+def test_uninstall_removes_the_instance_dir_and_operational_files(tmp_path: Path) -> None:
+    from specialist_install import uninstall_specialist
+
+    specialists_dir, agents_specialists_dir, _v1 = _installed_mtg(tmp_path)
+    op_dir = agents_specialists_dir / "mtg"
+    assert op_dir.is_symlink()  # sanity: the fixture installed via the real pipeline
+    content_dir = agents_specialists_dir / os.readlink(op_dir)
+
+    uninstall_specialist(slug="mtg", specialists_dir=specialists_dir,
+                          agents_specialists_dir=agents_specialists_dir)
+    assert not (specialists_dir / "mtg").exists()
+    assert not os.path.lexists(op_dir)  # Round-4 fix (finding #1): symlink itself is gone, not
+                                          # just dangling (shutil.rmtree silently no-ops on a symlink)
+    assert not content_dir.exists()  # and its versioned content directory with it

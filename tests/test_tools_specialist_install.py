@@ -112,3 +112,82 @@ async def test_specialist_install_inspect_surfaces_a_structured_failure(monkeypa
     payload = _payload(result)
     assert payload["ok"] is False
     assert payload["kind"] == "fetch_failed"
+
+
+# ---------------------------------------------------------------------------
+# specialist_upgrade / specialist_rollback / specialist_uninstall (Task N1c)
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_specialist_upgrade_rejects_a_changed_root_digest(monkeypatch, tmp_path) -> None:
+    """Mirrors test_specialist_install_commit_rejects_a_changed_root_digest —
+    the same fresh re-validation gate the brief mandates for the upgrade
+    tool: a caller-supplied root_digest that no longer matches the reloaded
+    staged bytes must refuse BEFORE upgrade_specialist is ever called."""
+    from test_specialist_install import _write_component
+    from specialist_component import load_specialist_component
+    import specialist_install
+    from tools import specialist_upgrade
+
+    staged = _write_component(tmp_path / "staged", slug="mtg")
+    component = load_specialist_component(staged, staged / "manifest.json")
+
+    def _must_not_be_called(*args, **kwargs):
+        raise AssertionError("upgrade_specialist must never be called on a root_digest mismatch")
+
+    # The tool's local `from specialist_install import upgrade_specialist`
+    # re-reads the module attribute at call time — patch it here.
+    monkeypatch.setattr(specialist_install, "upgrade_specialist", _must_not_be_called)
+
+    result = await specialist_upgrade.handler({
+        "slug": component.slug, "component_id": component.component_id,
+        "version": component.version, "staged_dir": str(staged),
+        "root_digest": "sha256:" + "f" * 64,  # deliberately wrong
+    })
+
+    payload = _payload(result)
+    assert payload["ok"] is False
+    assert payload["kind"] == "checksum_changed"
+
+
+@pytest.mark.asyncio
+async def test_specialist_rollback_tool_passes_through_no_prior_tuple(monkeypatch) -> None:
+    import specialist_install
+    from specialist_install import SpecialistInstallError
+    from tools import specialist_rollback
+
+    def _boom(*, slug):
+        raise SpecialistInstallError("no_prior_tuple", f"{slug!r} has no retained prior tuple")
+
+    # The tool's local `from specialist_install import rollback_specialist`
+    # re-reads the module attribute at call time — patch it here.
+    monkeypatch.setattr(specialist_install, "rollback_specialist", _boom)
+
+    result = await specialist_rollback.handler({"slug": "mtg"})
+
+    payload = _payload(result)
+    assert payload["ok"] is False
+    assert payload["kind"] == "no_prior_tuple"
+
+
+@pytest.mark.asyncio
+async def test_specialist_uninstall_tool_calls_uninstall_specialist_and_reports_ok(monkeypatch) -> None:
+    import specialist_install
+    from tools import specialist_uninstall
+
+    calls: list[dict] = []
+
+    def _fake_uninstall(*, slug):
+        calls.append({"slug": slug})
+
+    # The tool's local `from specialist_install import uninstall_specialist`
+    # re-reads the module attribute at call time — patch it here.
+    monkeypatch.setattr(specialist_install, "uninstall_specialist", _fake_uninstall)
+
+    result = await specialist_uninstall.handler({"slug": "mtg"})
+
+    payload = _payload(result)
+    assert payload["ok"] is True
+    assert payload["slug"] == "mtg"
+    assert calls == [{"slug": "mtg"}]

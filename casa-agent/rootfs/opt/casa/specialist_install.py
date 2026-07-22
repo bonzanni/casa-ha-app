@@ -637,3 +637,294 @@ def activate_binding_for_config(cfg, *, specialists_root: Path = Path("/config/s
         display_name=bound_persona.identity["display_name"],
         binding_digest=active_tuple.binding.binding_digest,
     )
+
+
+def upgrade_specialist(
+    *, slug: str, inspection: "InspectionResult", config: "Mapping[str, str]",
+    secret_names_provided: frozenset[str], acks: "SpecialistInstallAckStore",
+    specialists_dir: Path = Path("/config/specialists"),
+    agents_specialists_dir: Path = Path("/config/agents/specialists"),
+) -> "SpecialistInstance":
+    """Spec §2.4/§4.1's transactional reinstall/upgrade: stage the new
+    version as desired, validate+compile it fully BEFORE touching active,
+    commit atomically on success. On ANY failure BEFORE that commit the
+    active tuple is left completely untouched — this function never calls
+    anything that mutates active.yaml except InstanceDir.commit_desired_to_active
+    itself, and that is reached only after every validation gate below has
+    already passed.
+
+    Commit-first ordering (matches commit_specialist_install): once every
+    validation gate passes and commit_desired_to_active() runs, that IS the
+    success boundary the docstring's "never touches active until success"
+    refers to — materializing the operational files afterward is a
+    best-effort follow-up, not a second gate (see commit_specialist_install's
+    docstring for the full rationale: the tuple is the single authoritative
+    record; the operational files are a self-healing derived cache
+    current_specialist_roles_dir rebuilds on every boot/reload)."""
+    from personality_binding import (
+        InstanceDir, InstanceTuple, check_persona_requirements, compute_effective_config_digest,
+        materialize_component_default_binding, materialize_override_binding,
+    )
+    from persona_pack import load_persona_pack
+    from prompt_compiler import compile_prompt_bundle
+    from role_slot import materialize_role
+    from role_artifact import load_role_artifact
+    from specialist_lifecycle import SpecialistInstance, satisfy_config
+    from specialist_install_consent import install_consent_identity
+    import specialist_materialize
+
+    identity = install_consent_identity(
+        component_id=inspection.component_id, version=inspection.version,
+        component_checksum=inspection.root_digest, slug=inspection.slug)
+    if not acks.is_acked(identity):
+        raise SpecialistInstallError("consent_missing", "no recorded operator approval for the upgrade")
+
+    instance_dir = InstanceDir(specialists_dir / slug)
+    active_before = instance_dir.active()
+    if active_before is None:
+        raise SpecialistInstallError("no_active_tuple", f"{slug!r} has no active install to upgrade")
+
+    # Same CAS-before-verify TEMP-staging + reload + recompute + compare +
+    # os.replace pattern as commit_specialist_install (see that function's
+    # comments for the full rationale) — a digest mismatch here must never
+    # leave a wrong-digest-named CAS directory behind.
+    cas_dir = cas_store_dir(inspection.root_digest, store_root=specialists_dir / "store")
+    if not cas_dir.exists():
+        staging_root = specialists_dir / "store" / ".staging"
+        staging_root.mkdir(parents=True, exist_ok=True, mode=0o700)
+        cas_staging_dir = staging_root / uuid.uuid4().hex
+        shutil.copytree(inspection.staged_dir, cas_staging_dir, dirs_exist_ok=False, symlinks=True)
+        for path in cas_staging_dir.rglob("*"):
+            if path.is_file():
+                path.chmod(0o400)
+        try:
+            staged_component = load_specialist_component(
+                cas_staging_dir, cas_staging_dir / "manifest.json")
+            staged_deps = resolve_dependency_closure(staged_component, cas_staging_dir)
+            staged_unavailable = [d for d in staged_deps if not d.available]
+            if staged_unavailable:
+                detail = "; ".join(
+                    f"{d.kind}:{d.identifier}: {d.detail}" for d in staged_unavailable)
+                raise SpecialistInstallError("dependency_unavailable", detail)
+            staged_root_digest = compute_install_root_digest(
+                staged_component, staged_deps,
+                manifest_bytes=(cas_staging_dir / "manifest.json").read_bytes())
+            if staged_root_digest != inspection.root_digest:
+                raise SpecialistInstallError(
+                    "checksum_changed",
+                    "staged component no longer matches the approved inspection")
+        except Exception:
+            shutil.rmtree(cas_staging_dir, ignore_errors=True)
+            raise
+        os.replace(cas_staging_dir, cas_dir)
+    component = load_specialist_component(cas_dir, cas_dir / "manifest.json")
+    # The MCP tool boundary passes `slug` and `inspection` as INDEPENDENT
+    # arguments — specialist_upgrade builds `inspection` from the freshly-
+    # loaded staged component but takes `args["slug"]` separately, so
+    # nothing previously stopped a caller (compromised or mistaken tool-call
+    # sequence, or a test/direct caller that hand-builds InspectionResult)
+    # from upgrading slug X using component Y's bytes. Assert agreement at
+    # the lifecycle-function level — the layer every caller, sanctioned or
+    # not, must pass through.
+    if component.slug != slug:
+        raise SpecialistInstallError(
+            "slug_mismatch",
+            f"component slug {component.slug!r} does not match the requested upgrade slug {slug!r}")
+    fresh_deps = resolve_dependency_closure(component, cas_dir)
+    fresh_unavailable = [d for d in fresh_deps if not d.available]
+    if fresh_unavailable:
+        detail = "; ".join(f"{d.kind}:{d.identifier}: {d.detail}" for d in fresh_unavailable)
+        raise SpecialistInstallError("dependency_unavailable", detail)
+    fresh_root_digest = compute_install_root_digest(
+        component, fresh_deps, manifest_bytes=(cas_dir / "manifest.json").read_bytes())
+    if fresh_root_digest != inspection.root_digest:
+        raise SpecialistInstallError(
+            "checksum_changed", "CAS-persisted component no longer matches the approved inspection")
+    role = materialize_role(source=load_role_artifact(cas_dir / "role"), options={})
+    # An existing OVERRIDE binding must survive an upgrade — the component's
+    # own bundled default persona is only used when the active binding was
+    # already component-default (or this is a first activation). Reverting
+    # silently on every upgrade would discard an operator's explicit
+    # persona choice.
+    if active_before.binding.mode == "override":
+        personas_root = Path("/config/personas")
+        persona = load_persona_pack(
+            personas_root / active_before.binding.persona_id / active_before.binding.persona_version / "pack",
+            personas_root / active_before.binding.persona_id / active_before.binding.persona_version / "manifest.json",
+        )
+    else:
+        persona = load_persona_pack(cas_dir / "persona" / "pack", cas_dir / "persona" / "manifest.json")
+
+    # Re-validate the OPERATOR'S EXISTING non-secret config against the NEW
+    # schema, fail-closed, into the DESIRED snapshot only (spec §4.1) — the
+    # active config_snapshot is never read or touched here. Keys the NEW
+    # schema no longer declares are DROPPED, not carried forward forever —
+    # "re-validate ... fail-closed" means the schema is authoritative on
+    # every upgrade, not just at fresh install.
+    known_keys = set(component.config_schema.get("required", [])) | set(
+        component.config_schema.get("secret_names", []))
+    stale_config = {**dict(active_before.config_snapshot), **dict(config)}
+    dropped_keys = sorted(k for k in stale_config if k not in known_keys)
+    merged_config = {k: v for k, v in stale_config.items() if k in known_keys}
+    satisfied, missing = satisfy_config(
+        schema=component.config_schema, provided_non_secret=merged_config,
+        provided_secret_names=secret_names_provided,
+    )
+    root = component_root_string(component_id=component.component_id, version=component.version,
+                                  component_checksum=fresh_root_digest)
+    dependency_digests = tuple(sorted(d.digest for d in fresh_deps))
+
+    def _build_upgrade_binding(*, effective_config_digest: str):
+        # Reuse the SAME override-vs-default branch the "satisfied" path
+        # below needs, so a pending-configuration placeholder ALSO
+        # preserves an active override rather than silently dropping it if
+        # the operator has to supply missing config later.
+        if active_before.binding.mode == "override":
+            return materialize_override_binding(
+                role=role, persona=persona, override_source=active_before.binding.override_source,
+                dependency_digests=dependency_digests, effective_config_digest=effective_config_digest)
+        return materialize_component_default_binding(
+            role=role, persona=persona, component_root=root,
+            dependency_digests=dependency_digests, effective_config_digest=effective_config_digest)
+
+    if not satisfied:
+        placeholder = _build_upgrade_binding(
+            effective_config_digest=active_before.binding.effective_config_digest)
+        instance_dir.stage_desired(InstanceTuple(
+            root=root, binding=placeholder, config_snapshot=merged_config,
+            config_digest=placeholder.effective_config_digest))
+        note = f"missing required config/secret: {missing}"
+        if dropped_keys:
+            note += f"; dropped_config_keys={dropped_keys}"
+        return SpecialistInstance(
+            slug=slug, stable_agent_id=f"specialist:{slug}", state="pending-configuration",
+            active=active_before, desired=instance_dir.desired(),
+            last_activation_error=note)
+
+    try:
+        check_persona_requirements(role.normalized, persona)
+        effective_config_digest = compute_effective_config_digest(merged_config)
+        binding = _build_upgrade_binding(effective_config_digest=effective_config_digest)
+        compile_prompt_bundle(
+            role=role, persona=persona, binding=binding,
+            platform_frame=(Path(__file__).parent / "defaults" / "personality"
+                             / "platform-frame.md").read_text(encoding="utf-8"),
+            safety_kernel=(Path(__file__).parent / "defaults" / "personality"
+                           / "safety-kernel.md").read_text(encoding="utf-8"))
+    except ValueError as exc:
+        instance_dir.stage_desired(InstanceTuple(
+            root=root, binding=active_before.binding, config_snapshot=merged_config,
+            config_digest=active_before.binding.effective_config_digest))
+        instance_dir.discard_desired(reason=str(exc))
+        return SpecialistInstance(
+            slug=slug, stable_agent_id=f"specialist:{slug}", state="error",
+            active=active_before, desired=None, last_activation_error=str(exc))
+
+    instance_dir.stage_desired(InstanceTuple(
+        root=root, binding=binding, config_snapshot=merged_config, config_digest=effective_config_digest))
+    # Commit FIRST (every gate above — persona/role compatibility,
+    # compile_prompt_bundle — already passed, so this is the authoritative
+    # record), THEN materialize as a best-effort follow-up that self-heals
+    # via current_specialist_roles_dir if it fails. See
+    # commit_specialist_install's docstring for the full rationale.
+    committed = instance_dir.commit_desired_to_active()  # new binding digest -> new session epoch
+    note = f"dropped_config_keys={dropped_keys}" if dropped_keys else None
+    try:
+        specialist_materialize.materialize_specialist_operational_files(
+            agents_specialists_dir=agents_specialists_dir, slug=slug, role=role, persona=persona)
+    except Exception as exc:  # noqa: BLE001
+        logger.warning(
+            "specialist upgrade %r: operational-file materialize failed post-commit "
+            "(%s); will self-heal on next reconcile", slug, exc, exc_info=True)
+        heal_note = f"operational files pending reconcile: {exc}"
+        note = f"{note}; {heal_note}" if note else heal_note
+    return SpecialistInstance(
+        slug=slug, stable_agent_id=f"specialist:{slug}", state="active", active=committed,
+        desired=None, last_activation_error=note)
+
+
+def rollback_specialist(
+    *, slug: str, specialists_dir: Path = Path("/config/specialists"),
+    agents_specialists_dir: Path = Path("/config/agents/specialists"),
+) -> "SpecialistInstance":
+    """Restore the RETAINED active.prior.yaml as the new active tuple (spec
+    §2.4's rollback target — the prior binding's blobs stay pinned exactly
+    because a retained tuple still references them, see Task N1d's
+    cas_pin_roots). Rollback IS an upgrade to the prior tuple — reuse
+    InstanceDir's own stage/commit, never a bespoke restore path."""
+    from personality_binding import InstanceDir, load_instance_tuple
+    from role_slot import materialize_role
+    from role_artifact import load_role_artifact
+    from persona_pack import load_persona_pack
+    from specialist_lifecycle import SpecialistInstance
+    import specialist_materialize
+
+    instance_dir = InstanceDir(specialists_dir / slug)
+    prior_path = specialists_dir / slug / "active.prior.yaml"
+    prior = load_instance_tuple(prior_path)
+    if prior is None:
+        raise SpecialistInstallError("no_prior_tuple", f"{slug!r} has no retained prior tuple")
+
+    # `prior.root` is ALWAYS the component root (the override fix never
+    # touches `root`), independent of prior.binding.mode.
+    _, _, checksum = parse_component_root(prior.root)
+    cas_dir = cas_store_dir(checksum, store_root=specialists_dir / "store")
+    role = materialize_role(source=load_role_artifact(cas_dir / "role"), options={})
+    if prior.binding.mode == "override":
+        personas_root = Path("/config/personas")
+        persona = load_persona_pack(
+            personas_root / prior.binding.persona_id / prior.binding.persona_version / "pack",
+            personas_root / prior.binding.persona_id / prior.binding.persona_version / "manifest.json",
+        )
+    else:
+        persona = load_persona_pack(cas_dir / "persona" / "pack", cas_dir / "persona" / "manifest.json")
+
+    instance_dir.stage_desired(prior)
+    # Commit FIRST, same reordering as commit_specialist_install/
+    # upgrade_specialist — `prior` is a previously-active, already-validated
+    # tuple (it was active.yaml once before), so committing it back is
+    # itself the authoritative act; materialize is a best-effort follow-up
+    # that self-heals via current_specialist_roles_dir if it fails.
+    committed = instance_dir.commit_desired_to_active()
+    last_activation_error: str | None = None
+    try:
+        specialist_materialize.materialize_specialist_operational_files(
+            agents_specialists_dir=agents_specialists_dir, slug=slug, role=role, persona=persona)
+    except Exception as exc:  # noqa: BLE001
+        logger.warning(
+            "specialist rollback %r: operational-file materialize failed post-commit "
+            "(%s); will self-heal on next reconcile", slug, exc, exc_info=True)
+        last_activation_error = f"operational files pending reconcile: {exc}"
+
+    return SpecialistInstance(
+        slug=slug, stable_agent_id=f"specialist:{slug}", state="active", active=committed,
+        desired=None, last_activation_error=last_activation_error)
+
+
+def uninstall_specialist(
+    *, slug: str, specialists_dir: Path = Path("/config/specialists"),
+    agents_specialists_dir: Path = Path("/config/agents/specialists"),
+) -> None:
+    """Removes the instance and its legacy operational directory. Does NOT
+    delete CAS blobs (Task N1d's GC-root policy: a blob stays pinned while
+    ANY tuple of ANY installed specialist references it — deletion here
+    would need a full cross-specialist reference scan, which is exactly what
+    Task N1d's `cas_pin_roots` builds; the GC SWEEP itself stays deferred
+    per this plan's Global Constraints).
+
+    `agents_specialists_dir / slug` is a SYMLINK to a versioned content
+    directory (materialize_specialist_operational_files) once the specialist
+    has ever materialized, not a real directory. `shutil.rmtree` deliberately
+    REFUSES to operate on a symlink (raises OSError; with ignore_errors=True
+    it silently does nothing at all) — calling it directly on a symlinked
+    slug_dir would leave BOTH the symlink and its target behind, a silent
+    uninstall no-op. Unlink the symlink itself, then remove the versioned
+    content directory it pointed at."""
+    op_dir = agents_specialists_dir / slug
+    if op_dir.is_symlink():
+        content_dir = agents_specialists_dir / os.readlink(op_dir)
+        op_dir.unlink(missing_ok=True)
+        shutil.rmtree(content_dir, ignore_errors=True)
+    else:
+        shutil.rmtree(op_dir, ignore_errors=True)  # legacy real-dir layout, never migrated
+    shutil.rmtree(specialists_dir / slug, ignore_errors=True)
