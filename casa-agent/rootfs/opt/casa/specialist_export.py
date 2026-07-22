@@ -91,6 +91,17 @@ def export_mtg_component(
     reuse of tools._plugin_assign_sync rather than a duplicated lookup)."""
     from persona_pack import load_persona_pack
     from plugin_store import content_checksum
+    from specialist_install import is_safe_corpus_identifier
+
+    # F4 (write side): the corpus identifier is joined into every
+    # `corpus/<identifier>/...` bundle key below and, on the read side, into
+    # `component_dir / "corpus" / identifier`. Validate it against the SAME
+    # single-segment containment rule the reader
+    # (`resolve_dependency_closure`) enforces, so the two sides can never
+    # disagree and a bundle can never carry an escaping corpus path.
+    corpus_identifier = "mtg-rules-corpus"
+    if not is_safe_corpus_identifier(corpus_identifier):
+        raise ValueError(f"unsafe corpus identifier {corpus_identifier!r}")
 
     role_dir = defaults_root / "roles" / "specialist" / "mtg"
     role_files = {
@@ -113,7 +124,7 @@ def export_mtg_component(
         default_persona_checksum=pack.checksum,
         dependencies=[
             {"kind": "persona", "identifier": persona_ref, "digest": pack.checksum},
-            {"kind": "corpus/data", "identifier": "mtg-rules-corpus", "digest": corpus_digest},
+            {"kind": "corpus/data", "identifier": corpus_identifier, "digest": corpus_digest},
             {"kind": "plugin/implementation", "identifier": "mtg",
              "digest": mtg_plugin_content_checksum},
         ],
@@ -126,7 +137,7 @@ def export_mtg_component(
     for path in sorted(corpus_source.rglob("*")):
         if path.is_file():
             rel = path.relative_to(corpus_source)
-            files[f"corpus/mtg-rules-corpus/{rel.as_posix()}"] = path.read_bytes()
+            files[f"corpus/{corpus_identifier}/{rel.as_posix()}"] = path.read_bytes()
     return ExportBundle(component_id="casa/mtg", version="0.1.0", slug="mtg", files=files)
 
 

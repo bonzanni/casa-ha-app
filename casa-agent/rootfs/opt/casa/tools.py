@@ -7082,13 +7082,21 @@ async def persona_install_commit(args: dict) -> dict:
         "persona_version": {"type": "string"}}, "required": ["target_role_id", "persona_id", "persona_version"]},
 )
 async def persona_apply(args: dict) -> dict:
-    from persona_install import apply_persona_override
+    from persona_install import apply_persona_override, validate_persona_path_segments
     from persona_pack import PersonaPackError, load_persona_pack
     from role_slot import materialize_role
     from role_artifact import load_role_artifact
-    from specialist_install import SpecialistInstallError
+    from specialist_install import SpecialistInstallError, validate_specialist_slug
 
     kind, _, slot = args["target_role_id"].partition(":")
+    # F1: persona_id/persona_version index `/config/personas/<id>/<version>/`
+    # and `slot` indexes both the image-roles tree and the InstanceDir tree —
+    # validate every caller-supplied path segment before any join.
+    try:
+        validate_persona_path_segments(args["persona_id"], args["persona_version"])
+        validate_specialist_slug(slot)
+    except SpecialistInstallError as exc:
+        return _result({"ok": False, "kind": exc.kind, "detail": exc.detail})
     personas_root = Path("/config/personas") / args["persona_id"] / args["persona_version"]
     try:
         persona = load_persona_pack(personas_root / "pack", personas_root / "manifest.json")

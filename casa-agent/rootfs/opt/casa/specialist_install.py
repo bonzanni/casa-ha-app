@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import logging
 import os
+import re
 import shutil
 import uuid
 from dataclasses import dataclass
@@ -9,7 +10,7 @@ from pathlib import Path
 from typing import TYPE_CHECKING, Literal, Mapping
 
 from canonical_bytes import reject_forbidden_markers, to_plain_json
-from specialist_component import SpecialistComponent, load_specialist_component
+from specialist_component import SpecialistComponent, is_valid_slug, load_specialist_component
 from specialist_lifecycle import check_slug_uniqueness
 
 if TYPE_CHECKING:
@@ -25,6 +26,42 @@ class SpecialistInstallError(Exception):
         self.kind = kind
         self.detail = message
         super().__init__(message)
+
+
+# Whole-branch review F1 (slug traversal) / F4 (corpus identifier containment):
+# every lifecycle function that turns a CALLER-SUPPLIED slug or a
+# schema-unconstrained dependency identifier into a `Path` join must first
+# validate it against a canonical, single-segment shape — a value like
+# `../../..`, `/data`, or `a/b` must NEVER index shutil.rmtree/copytree or a
+# CAS/corpus lookup. These validators are the ONE authority every entry point
+# routes through (fail-closed, typed refusal).
+_CORPUS_IDENT_RE = re.compile(r"^[a-z0-9][a-z0-9._-]*$")
+
+
+def validate_specialist_slug(slug: object) -> str:
+    """F1: fail-closed slug gate at the lifecycle-function boundary — the layer
+    every caller (MCP tool, test, direct) must pass through. Reuses the
+    component loader's canonical slug regex (``specialist_component.
+    is_valid_slug`` / role.v1.json ``slot``). Raises a typed
+    ``invalid_slug`` error; never lets a traversal/absolute/separator slug
+    reach a ``Path`` join."""
+    if not is_valid_slug(slug):
+        raise SpecialistInstallError("invalid_slug", f"invalid specialist slug {slug!r}")
+    return slug  # type: ignore[return-value]
+
+
+def is_safe_corpus_identifier(identifier: object) -> bool:
+    """F4: a corpus dependency's ``identifier`` is schema-unconstrained
+    (specialist-component.v1.json only requires ``minLength: 1``) yet it is
+    joined as ``component_dir / "corpus" / identifier``. Require a
+    conservative single-segment name (no separators, no ``..``, not absolute)
+    so a hostile manifest can never make the join stat/hash bytes outside the
+    component directory."""
+    return (
+        isinstance(identifier, str)
+        and _CORPUS_IDENT_RE.fullmatch(identifier) is not None
+        and ".." not in identifier
+    )
 
 
 @dataclass(frozen=True, slots=True)
@@ -142,12 +179,48 @@ def resolve_dependency_closure(
                     kind=dep.kind, identifier=dep.identifier, digest=dep.digest,
                     available=False, detail=f"bundled persona invalid: {exc}"))
                 continue
-            available = pack.checksum == dep.digest
+            # Whole-branch review F3 (persona identity binding): a matching
+            # checksum alone proves the bundled bytes are INTERNALLY
+            # consistent, NOT that they are the persona the operator
+            # approved. Require, in addition to the checksum, that the
+            # bundled pack's own identity (`persona_id@version`) IS the
+            # declared dependency identifier AND that it matches the
+            # manifest's `default_persona` ref+checksum — otherwise a
+            # component could ship persona Y under a dependency line naming
+            # persona X and slip the substitution past consent. Any mismatch
+            # flows into `dependency_unavailable` at both inspect and the
+            # commit-time re-verification.
+            pack_ref = f"{pack.persona_id}@{pack.version}"
+            checksum_ok = pack.checksum == dep.digest
+            identity_ok = pack_ref == dep.identifier
+            default_ok = (
+                component.default_persona_ref == dep.identifier
+                and component.default_persona_checksum == dep.digest
+            )
+            available = checksum_ok and identity_ok and default_ok
+            if available:
+                detail = ""
+            elif not identity_ok:
+                detail = (f"bundled persona is {pack_ref!r}, not the declared "
+                          f"dependency {dep.identifier!r}")
+            elif not checksum_ok:
+                detail = "bundled persona checksum does not match manifest"
+            else:
+                detail = (
+                    "bundled persona does not match the component's declared default_persona "
+                    f"({component.default_persona_ref}#{component.default_persona_checksum})")
             out.append(DependencyResolution(
                 kind=dep.kind, identifier=dep.identifier, digest=dep.digest,
-                available=available,
-                detail="" if available else "bundled persona checksum does not match manifest"))
+                available=available, detail=detail))
         elif dep.kind == "corpus/data":
+            # F4: reject a hostile/unsafe corpus identifier BEFORE it ever
+            # indexes a filesystem join (`component_dir / "corpus" /
+            # identifier`) — nothing outside component_dir is stat'd/hashed.
+            if not is_safe_corpus_identifier(dep.identifier):
+                out.append(DependencyResolution(
+                    kind=dep.kind, identifier=dep.identifier, digest=dep.digest,
+                    available=False, detail="unsafe corpus identifier"))
+                continue
             corpus_dir = component_dir / "corpus" / dep.identifier
             if not corpus_dir.is_dir():
                 out.append(DependencyResolution(
@@ -279,6 +352,10 @@ def inspect_specialist_repo(
 
     if mode == "upgrade" and not target_slug:
         raise SpecialistInstallError("target_slug_required", "mode='upgrade' requires target_slug")
+    if target_slug is not None:
+        # F1: a caller-supplied target_slug is joined as `specialists_dir /
+        # target_slug` below (InstanceDir.active()) — validate before any join.
+        validate_specialist_slug(target_slug)
 
     staging_root.mkdir(parents=True, exist_ok=True, mode=0o700)
     component_dir = staging_root / uuid.uuid4().hex
@@ -389,6 +466,30 @@ def cas_store_dir(
     return store_root / component_checksum.removeprefix("sha256:")
 
 
+def _publish_cas_staging(cas_staging_dir: Path, cas_dir: Path) -> None:
+    """Atomically publish a verified staging directory into its final
+    content-addressed `cas_dir` via `os.replace`.
+
+    Md (concurrent-install CAS race): commit/upgrade check `cas_dir.exists()`
+    and, if absent, stage + verify + publish. Two installs of the SAME digest
+    racing can both pass the exists() check; the loser's `os.replace` then
+    lands on a now-populated `cas_dir` and raises `OSError` (ENOTEMPTY —
+    POSIX rename refuses a non-empty directory target). CAS content is
+    immutable/content-addressed, so the winner's bytes are byte-identical to
+    ours: discard our staging copy and return, letting the shared
+    re-load-and-verify path downstream run against the winner's `cas_dir`.
+    Any OTHER failure (or an OSError where `cas_dir` did NOT appear) cleans up
+    staging and re-raises — never silently swallowed."""
+    try:
+        os.replace(cas_staging_dir, cas_dir)
+    except OSError:
+        if cas_dir.exists():
+            shutil.rmtree(cas_staging_dir, ignore_errors=True)
+            return
+        shutil.rmtree(cas_staging_dir, ignore_errors=True)
+        raise
+
+
 def commit_specialist_install(
     *, inspection: "InspectionResult", config: "Mapping[str, str]",
     secret_names_provided: frozenset[str], acks: "SpecialistInstallAckStore",
@@ -436,7 +537,7 @@ def commit_specialist_install(
 
     identity = install_consent_identity(
         component_id=inspection.component_id, version=inspection.version,
-        component_checksum=inspection.root_digest, slug=inspection.slug,
+        root_digest=inspection.root_digest, slug=inspection.slug,
     )
     if not acks.is_acked(identity):
         raise SpecialistInstallError(
@@ -493,7 +594,7 @@ def commit_specialist_install(
         # location. `os.replace` is a single directory rename on the same
         # filesystem (/config always is) — no partially-written or
         # wrong-digest CAS state is ever observable at `cas_dir`.
-        os.replace(cas_staging_dir, cas_dir)
+        _publish_cas_staging(cas_staging_dir, cas_dir)
 
     # Re-load from the now-final (or, for a digest an earlier install
     # already verified and published, pre-existing) CAS directory.
@@ -551,7 +652,15 @@ def commit_specialist_install(
             last_activation_error=f"missing required config/secret: {missing}",
         )
 
-    check_persona_requirements(role.normalized, persona)  # raises ValueError if incompatible
+    # Mc: check_persona_requirements raises a BARE ValueError on
+    # incompatibility. commit_specialist_install has no local ValueError
+    # handler, so it would escape as an unstructured MCP error rather than
+    # the tool's typed {ok, kind} contract (specialist_install_commit catches
+    # only SpecialistInstallError). Wrap it typed.
+    try:
+        check_persona_requirements(role.normalized, persona)
+    except ValueError as exc:
+        raise SpecialistInstallError("persona_incompatible", str(exc)) from exc
     effective_config_digest = compute_effective_config_digest(dict(config))
     binding = materialize_component_default_binding(
         role=role, persona=persona, component_root=root,
@@ -586,6 +695,7 @@ def commit_specialist_install(
     try:
         specialist_materialize.materialize_specialist_operational_files(
             agents_specialists_dir=agents_specialists_dir, slug=inspection.slug, role=role, persona=persona,
+            binding_digest=committed.binding.binding_digest, component_root=committed.root,
         )
     except Exception as exc:  # noqa: BLE001
         logger.warning(
@@ -620,6 +730,11 @@ def activate_binding_for_config(cfg, *, specialists_root: Path = Path("/config/s
     from prompt_compiler import compile_prompt_bundle
     from personality_types import SpeakerProvenance
 
+    # F1 (confirm): cfg.role_slot.slot is already loader-validated
+    # (role_artifact enforces role.v1.json's slot pattern), but this function
+    # joins it as `specialists_root / slot` — re-assert the canonical shape so
+    # the containment guarantee holds regardless of how cfg was constructed.
+    validate_specialist_slug(cfg.role_slot.slot)
     instance_dir = InstanceDir(specialists_root / cfg.role_slot.slot)
     active_tuple = instance_dir.active()
     if active_tuple is None:
@@ -694,9 +809,14 @@ def upgrade_specialist(
     from specialist_install_consent import install_consent_identity
     import specialist_materialize
 
+    # F1: `slug` is a caller-supplied argument independent of `inspection`;
+    # it indexes `specialists_dir / slug` (and downstream Path joins) below.
+    # Validate at the top before any filesystem operation.
+    validate_specialist_slug(slug)
+
     identity = install_consent_identity(
         component_id=inspection.component_id, version=inspection.version,
-        component_checksum=inspection.root_digest, slug=inspection.slug)
+        root_digest=inspection.root_digest, slug=inspection.slug)
     if not acks.is_acked(identity):
         raise SpecialistInstallError("consent_missing", "no recorded operator approval for the upgrade")
 
@@ -737,7 +857,7 @@ def upgrade_specialist(
         except Exception:
             shutil.rmtree(cas_staging_dir, ignore_errors=True)
             raise
-        os.replace(cas_staging_dir, cas_dir)
+        _publish_cas_staging(cas_staging_dir, cas_dir)
     component = load_specialist_component(cas_dir, cas_dir / "manifest.json")
     # The MCP tool boundary passes `slug` and `inspection` as INDEPENDENT
     # arguments — specialist_upgrade builds `inspection` from the freshly-
@@ -822,8 +942,17 @@ def upgrade_specialist(
             active=active_before, desired=instance_dir.desired(),
             last_activation_error=note)
 
+    # Mc: a persona↔role incompatibility is a hard, typed refusal — raise
+    # SpecialistInstallError("persona_incompatible") BEFORE any desired tuple
+    # is staged (active stays untouched, matching upgrade's transactional
+    # contract) so the tool surfaces {ok:false, kind:persona_incompatible}
+    # rather than the generic error-state below (which stays reserved for a
+    # compile/ceiling ValueError, a genuinely different failure class).
     try:
         check_persona_requirements(role.normalized, persona)
+    except ValueError as exc:
+        raise SpecialistInstallError("persona_incompatible", str(exc)) from exc
+    try:
         effective_config_digest = compute_effective_config_digest(merged_config)
         binding = _build_upgrade_binding(effective_config_digest=effective_config_digest)
         compile_prompt_bundle(
@@ -852,7 +981,8 @@ def upgrade_specialist(
     note = f"dropped_config_keys={dropped_keys}" if dropped_keys else None
     try:
         specialist_materialize.materialize_specialist_operational_files(
-            agents_specialists_dir=agents_specialists_dir, slug=slug, role=role, persona=persona)
+            agents_specialists_dir=agents_specialists_dir, slug=slug, role=role, persona=persona,
+            binding_digest=committed.binding.binding_digest, component_root=committed.root)
     except Exception as exc:  # noqa: BLE001
         logger.warning(
             "specialist upgrade %r: operational-file materialize failed post-commit "
@@ -874,11 +1004,15 @@ def rollback_specialist(
     cas_pin_roots). Rollback IS an upgrade to the prior tuple — reuse
     InstanceDir's own stage/commit, never a bespoke restore path."""
     from personality_binding import InstanceDir, load_instance_tuple
+    from prompt_compiler import compile_prompt_bundle
     from role_slot import materialize_role
     from role_artifact import load_role_artifact
     from persona_pack import load_persona_pack
     from specialist_lifecycle import SpecialistInstance
     import specialist_materialize
+
+    # F1: `slug` is caller-supplied and indexes `specialists_dir / slug`.
+    validate_specialist_slug(slug)
 
     instance_dir = InstanceDir(specialists_dir / slug)
     prior_path = specialists_dir / slug / "active.prior.yaml"
@@ -900,6 +1034,31 @@ def rollback_specialist(
     else:
         persona = load_persona_pack(cas_dir / "persona" / "pack", cas_dir / "persona" / "manifest.json")
 
+    # Whole-branch review F6 (rollback verification gate): the prior tuple was
+    # valid when it was active, but the world may have changed since —
+    # a pinned plugin dependency can have been uninstalled/re-published out
+    # from under it. Re-run the SAME pre-activation gates upgrade uses (full
+    # dependency-closure availability against the prior's CAS bytes + a
+    # compile of role/persona/prior-binding) BEFORE staging/committing, so a
+    # rollback into a now-broken tuple is refused with a typed error and the
+    # current active tuple keeps running untouched.
+    prior_component = load_specialist_component(cas_dir, cas_dir / "manifest.json")
+    prior_deps = resolve_dependency_closure(prior_component, cas_dir)
+    unavailable = [d for d in prior_deps if not d.available]
+    if unavailable:
+        detail = "; ".join(f"{d.kind}:{d.identifier}: {d.detail}" for d in unavailable)
+        raise SpecialistInstallError("dependency_unavailable", detail)
+    try:
+        compile_prompt_bundle(
+            role=role, persona=persona, binding=prior.binding,
+            platform_frame=(Path(__file__).parent / "defaults" / "personality"
+                             / "platform-frame.md").read_text(encoding="utf-8"),
+            safety_kernel=(Path(__file__).parent / "defaults" / "personality"
+                           / "safety-kernel.md").read_text(encoding="utf-8"),
+        )
+    except ValueError as exc:
+        raise SpecialistInstallError("compile_failed", str(exc)) from exc
+
     instance_dir.stage_desired(prior)
     # Commit FIRST, same reordering as commit_specialist_install/
     # upgrade_specialist — `prior` is a previously-active, already-validated
@@ -910,7 +1069,8 @@ def rollback_specialist(
     last_activation_error: str | None = None
     try:
         specialist_materialize.materialize_specialist_operational_files(
-            agents_specialists_dir=agents_specialists_dir, slug=slug, role=role, persona=persona)
+            agents_specialists_dir=agents_specialists_dir, slug=slug, role=role, persona=persona,
+            binding_digest=committed.binding.binding_digest, component_root=committed.root)
     except Exception as exc:  # noqa: BLE001
         logger.warning(
             "specialist rollback %r: operational-file materialize failed post-commit "
@@ -940,12 +1100,29 @@ def uninstall_specialist(
     it silently does nothing at all) — calling it directly on a symlinked
     slug_dir would leave BOTH the symlink and its target behind, a silent
     uninstall no-op. Unlink the symlink itself, then remove the versioned
-    content directory it pointed at."""
+    content directory it pointed at.
+
+    F1: `slug` is caller-supplied and indexes both `agents_specialists_dir /
+    slug` and `specialists_dir / slug` — validate before either join.
+    F2: `os.readlink` on the materialize symlink used to be turned into an
+    `shutil.rmtree` target directly. A PRE-EXISTING malicious or accidental
+    symlink whose target is absolute (`finance -> /data`) or escapes the
+    directory would make that rmtree delete out-of-tree content.
+    `resolve_material_content_dir` fails closed on any non-contained target —
+    then we unlink ONLY the symlink and never rmtree its target."""
+    from specialist_materialize import resolve_material_content_dir
+
+    validate_specialist_slug(slug)
     op_dir = agents_specialists_dir / slug
     if op_dir.is_symlink():
-        content_dir = agents_specialists_dir / os.readlink(op_dir)
+        content_dir = resolve_material_content_dir(op_dir, agents_specialists_dir)
         op_dir.unlink(missing_ok=True)
-        shutil.rmtree(content_dir, ignore_errors=True)
+        if content_dir is not None:
+            shutil.rmtree(content_dir, ignore_errors=True)
+        else:
+            logger.warning(
+                "uninstall %r: operational symlink target failed containment; removed the "
+                "symlink only, left its (out-of-tree) target untouched", slug)
     else:
         shutil.rmtree(op_dir, ignore_errors=True)  # legacy real-dir layout, never migrated
     shutil.rmtree(specialists_dir / slug, ignore_errors=True)

@@ -443,7 +443,7 @@ def test_commit_persists_cas_writes_active_tuple_and_materializes_operational_fi
     acks = SpecialistInstallAckStore(path=tmp_path / "acks.json")
     identity = install_consent_identity(
         component_id=inspection.component_id, version=inspection.version,
-        component_checksum=inspection.root_digest, slug=inspection.slug)
+        root_digest=inspection.root_digest, slug=inspection.slug)
     acks.record(identity=identity, component_id=inspection.component_id, version=inspection.version,
                 component_checksum=inspection.root_digest, slug=inspection.slug)
 
@@ -486,7 +486,7 @@ def test_commit_survives_a_materialize_failure_and_self_heals_on_next_reconcile(
     acks = SpecialistInstallAckStore(path=tmp_path / "acks.json")
     identity = install_consent_identity(
         component_id=inspection.component_id, version=inspection.version,
-        component_checksum=inspection.root_digest, slug=inspection.slug)
+        root_digest=inspection.root_digest, slug=inspection.slug)
     acks.record(identity=identity, component_id=inspection.component_id, version=inspection.version,
                 component_checksum=inspection.root_digest, slug=inspection.slug)
 
@@ -565,7 +565,7 @@ def test_commit_with_missing_required_config_yields_pending_configuration(tmp_pa
     acks = SpecialistInstallAckStore(path=tmp_path / "acks.json")
     identity = install_consent_identity(
         component_id=inspection.component_id, version=inspection.version,
-        component_checksum=inspection.root_digest, slug=inspection.slug)
+        root_digest=inspection.root_digest, slug=inspection.slug)
     acks.record(identity=identity, component_id=inspection.component_id, version=inspection.version,
                 component_checksum=inspection.root_digest, slug=inspection.slug)
 
@@ -607,7 +607,7 @@ def _installed_mtg(tmp_path: Path) -> tuple[Path, Path, "specialist_install.Insp
     acks = SpecialistInstallAckStore(path=tmp_path / "acks.json")
     identity = install_consent_identity(
         component_id=inspection.component_id, version=inspection.version,
-        component_checksum=inspection.root_digest, slug=inspection.slug)
+        root_digest=inspection.root_digest, slug=inspection.slug)
     acks.record(identity=identity, component_id=inspection.component_id, version=inspection.version,
                 component_checksum=inspection.root_digest, slug=inspection.slug)
     specialists_dir, agents_specialists_dir = tmp_path / "specialists", tmp_path / "agents-specialists"
@@ -657,7 +657,7 @@ def test_upgrade_commits_a_new_active_tuple_and_retains_the_prior_as_rollback_ta
     v2 = _v2_inspection(tmp_path)
     acks = SpecialistInstallAckStore(path=tmp_path / "acks.json")
     identity = install_consent_identity(component_id=v2.component_id, version=v2.version,
-                                         component_checksum=v2.root_digest, slug=v2.slug)
+                                         root_digest=v2.root_digest, slug=v2.slug)
     acks.record(identity=identity, component_id=v2.component_id, version=v2.version,
                 component_checksum=v2.root_digest, slug=v2.slug)
 
@@ -707,7 +707,7 @@ def test_upgrade_with_missing_new_required_config_leaves_the_active_tuple_runnin
     )
     acks = SpecialistInstallAckStore(path=tmp_path / "acks.json")
     identity = install_consent_identity(component_id=v2.component_id, version=v2.version,
-                                         component_checksum=v2.root_digest, slug=v2.slug)
+                                         root_digest=v2.root_digest, slug=v2.slug)
     acks.record(identity=identity, component_id=v2.component_id, version=v2.version,
                 component_checksum=v2.root_digest, slug=v2.slug)
 
@@ -728,7 +728,7 @@ def test_rollback_restores_the_prior_tuple(tmp_path: Path) -> None:
     v2 = _v2_inspection(tmp_path)
     acks = SpecialistInstallAckStore(path=tmp_path / "acks.json")
     identity = install_consent_identity(component_id=v2.component_id, version=v2.version,
-                                         component_checksum=v2.root_digest, slug=v2.slug)
+                                         root_digest=v2.root_digest, slug=v2.slug)
     acks.record(identity=identity, component_id=v2.component_id, version=v2.version,
                 component_checksum=v2.root_digest, slug=v2.slug)
     upgrade_specialist(slug="mtg", inspection=v2, config={}, secret_names_provided=frozenset(),
@@ -781,7 +781,7 @@ def test_cas_pin_roots_includes_active_desired_and_prior_checksums(tmp_path: Pat
     v2 = _v2_inspection(tmp_path)
     acks = SpecialistInstallAckStore(path=tmp_path / "acks.json")
     identity = install_consent_identity(component_id=v2.component_id, version=v2.version,
-                                         component_checksum=v2.root_digest, slug=v2.slug)
+                                         root_digest=v2.root_digest, slug=v2.slug)
     acks.record(identity=identity, component_id=v2.component_id, version=v2.version,
                 component_checksum=v2.root_digest, slug=v2.slug)
     upgrade_specialist(slug="mtg", inspection=v2, config={}, secret_names_provided=frozenset(),

@@ -5,6 +5,7 @@ override binding, reusing Plan 1 Task 8's swap machinery exactly."""
 from __future__ import annotations
 
 import json
+import re
 import threading
 import time
 import uuid
@@ -14,6 +15,28 @@ from typing import TYPE_CHECKING, Any
 
 from canonical_bytes import checksum_json
 from specialist_install import SpecialistInstallError, resolve_and_fetch
+
+# Whole-branch review F1: `commit_persona_install` and `persona_apply` join a
+# persona_id + version into filesystem paths
+# (`/config/personas/<persona_id>/<version>/...`). Validate both against the
+# SAME patterns specialist-component.v1.json's `default_persona.ref` enforces
+# — a `persona_id` is exactly `namespace/name` (a single embedded slash, both
+# segments safe) and `version` is semver — so `..`, an absolute segment, or an
+# extra path separator can never index a persona directory.
+_PERSONA_ID_RE = re.compile(r"^[a-z0-9](?:[a-z0-9.-]*[a-z0-9])?/[a-z0-9][a-z0-9-]*$")
+_PERSONA_VERSION_RE = re.compile(r"^(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)$")
+
+
+def validate_persona_path_segments(persona_id: object, version: object) -> None:
+    """F1: fail-closed gate for the persona_id/version path segments joined
+    into `/config/personas/<persona_id>/<version>/`. Raises a typed
+    ``invalid_persona_ref`` SpecialistInstallError; never lets a
+    traversal/absolute/extra-separator value reach a ``Path`` join."""
+    if not (isinstance(persona_id, str) and _PERSONA_ID_RE.fullmatch(persona_id)):
+        raise SpecialistInstallError("invalid_persona_ref", f"invalid persona_id {persona_id!r}")
+    if not (isinstance(version, str) and _PERSONA_VERSION_RE.fullmatch(version)):
+        raise SpecialistInstallError(
+            "invalid_persona_ref", f"invalid persona version {version!r}")
 
 if TYPE_CHECKING:
     from persona_pack import PersonaPack
@@ -26,6 +49,7 @@ __all__ = [
     "PersonaInstallAckStore",
     "commit_persona_install",
     "apply_persona_override",
+    "validate_persona_path_segments",
 ]
 
 
@@ -138,6 +162,8 @@ def commit_persona_install(
         raise SpecialistInstallError(
             "consent_missing", "no recorded operator approval for this persona install")
 
+    # F1: validate the path segments BEFORE joining them into `dest`.
+    validate_persona_path_segments(inspection.persona_id, inspection.version)
     dest = personas_root / inspection.persona_id / inspection.version
     if (dest / "manifest.json").is_file():
         # Fix-round-1 (finding CRITICAL): `dest` is keyed by persona_id +
@@ -256,6 +282,12 @@ def apply_persona_override(
 
     # Specialist path — root MUST stay the component root; config/dependency
     # state carries forward from whatever is currently active.
+    # F1 (confirm): role.slot is loader-validated (role_artifact enforces
+    # role.v1.json's slot pattern), but the caller-built `instance_dir_root`
+    # is derived from that slot upstream — re-assert the canonical slug shape
+    # so a hostile target can never index the specialist InstanceDir tree.
+    from specialist_install import validate_specialist_slug
+    validate_specialist_slug(role.slot)
     active_before = instance_dir.active()
     if active_before is None:
         raise SpecialistInstallError(

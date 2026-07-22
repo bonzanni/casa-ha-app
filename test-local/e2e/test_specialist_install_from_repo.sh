@@ -138,7 +138,7 @@ assert res.component_id == "casa-test/mtg-test", res.component_id
 acks = SpecialistInstallAckStore()
 identity = install_consent_identity(
     component_id=res.component_id, version=res.version,
-    component_checksum=res.root_digest, slug=res.slug)
+    root_digest=res.root_digest, slug=res.slug)
 acks.record(identity=identity, component_id=res.component_id, version=res.version,
             component_checksum=res.root_digest, slug=res.slug)
 

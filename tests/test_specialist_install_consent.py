@@ -27,24 +27,24 @@ def _inspection(**overrides) -> InspectionResult:
 
 def test_identity_is_stable_for_the_same_inputs() -> None:
     a = install_consent_identity(component_id="casa-test/mtg", version="0.1.0",
-                                  component_checksum="sha256:" + "1" * 64, slug="mtg")
+                                  root_digest="sha256:" + "1" * 64, slug="mtg")
     b = install_consent_identity(component_id="casa-test/mtg", version="0.1.0",
-                                  component_checksum="sha256:" + "1" * 64, slug="mtg")
+                                  root_digest="sha256:" + "1" * 64, slug="mtg")
     assert a == b
 
 
 def test_identity_changes_when_component_checksum_changes() -> None:
     a = install_consent_identity(component_id="casa-test/mtg", version="0.1.0",
-                                  component_checksum="sha256:" + "1" * 64, slug="mtg")
+                                  root_digest="sha256:" + "1" * 64, slug="mtg")
     b = install_consent_identity(component_id="casa-test/mtg", version="0.1.0",
-                                  component_checksum="sha256:" + "9" * 64, slug="mtg")
+                                  root_digest="sha256:" + "9" * 64, slug="mtg")
     assert a != b
 
 
 def test_ack_store_is_unacked_until_recorded(tmp_path: Path) -> None:
     store = SpecialistInstallAckStore(path=tmp_path / "acks.json")
     identity = install_consent_identity(component_id="casa-test/mtg", version="0.1.0",
-                                         component_checksum="sha256:" + "1" * 64, slug="mtg")
+                                         root_digest="sha256:" + "1" * 64, slug="mtg")
     assert store.is_acked(identity) is False
     store.record(identity=identity, component_id="casa-test/mtg", version="0.1.0",
                  component_checksum="sha256:" + "1" * 64, slug="mtg")
@@ -54,7 +54,7 @@ def test_ack_store_is_unacked_until_recorded(tmp_path: Path) -> None:
 def test_ack_store_persists_across_instances(tmp_path: Path) -> None:
     path = tmp_path / "acks.json"
     identity = install_consent_identity(component_id="casa-test/mtg", version="0.1.0",
-                                         component_checksum="sha256:" + "1" * 64, slug="mtg")
+                                         root_digest="sha256:" + "1" * 64, slug="mtg")
     SpecialistInstallAckStore(path=path).record(
         identity=identity, component_id="casa-test/mtg", version="0.1.0",
         component_checksum="sha256:" + "1" * 64, slug="mtg")
@@ -67,7 +67,7 @@ def test_ack_store_fails_closed_on_a_hand_edited_key(tmp_path: Path) -> None:
 
     path = tmp_path / "acks.json"
     identity = install_consent_identity(component_id="casa-test/mtg", version="0.1.0",
-                                         component_checksum="sha256:" + "1" * 64, slug="mtg")
+                                         root_digest="sha256:" + "1" * 64, slug="mtg")
     SpecialistInstallAckStore(path=path).record(
         identity=identity, component_id="casa-test/mtg", version="0.1.0",
         component_checksum="sha256:" + "1" * 64, slug="mtg")
@@ -82,7 +82,7 @@ def test_ack_store_fails_closed_on_a_hand_edited_key(tmp_path: Path) -> None:
 def test_revoke_removes_an_ack(tmp_path: Path) -> None:
     store = SpecialistInstallAckStore(path=tmp_path / "acks.json")
     identity = install_consent_identity(component_id="casa-test/mtg", version="0.1.0",
-                                         component_checksum="sha256:" + "1" * 64, slug="mtg")
+                                         root_digest="sha256:" + "1" * 64, slug="mtg")
     store.record(identity=identity, component_id="casa-test/mtg", version="0.1.0",
                  component_checksum="sha256:" + "1" * 64, slug="mtg")
     assert store.revoke(identity) is True

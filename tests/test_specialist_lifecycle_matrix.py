@@ -66,7 +66,7 @@ def _approved_inspection(
     acks = SpecialistInstallAckStore(path=tmp_path / f"acks-{slug}{version_suffix}.json")
     identity = install_consent_identity(
         component_id=inspection.component_id, version=inspection.version,
-        component_checksum=inspection.root_digest, slug=inspection.slug)
+        root_digest=inspection.root_digest, slug=inspection.slug)
     acks.record(identity=identity, component_id=inspection.component_id, version=inspection.version,
                 component_checksum=inspection.root_digest, slug=inspection.slug)
     return inspection, acks
@@ -115,7 +115,7 @@ def test_fresh_install_missing_config_is_pending_configuration_with_no_active_tu
     acks = SpecialistInstallAckStore(path=tmp_path / "acks.json")
     identity = install_consent_identity(
         component_id=inspection.component_id, version=inspection.version,
-        component_checksum=inspection.root_digest, slug=inspection.slug)
+        root_digest=inspection.root_digest, slug=inspection.slug)
     acks.record(identity=identity, component_id=inspection.component_id, version=inspection.version,
                 component_checksum=inspection.root_digest, slug=inspection.slug)
 
@@ -241,7 +241,7 @@ def test_uninstall_then_reinstall_at_the_same_digest_is_allowed(tmp_path: Path) 
     second_acks = SpecialistInstallAckStore(path=tmp_path / "acks-reinstall.json")
     identity = install_consent_identity(
         component_id=inspection.component_id, version=inspection.version,
-        component_checksum=inspection.root_digest, slug=inspection.slug)
+        root_digest=inspection.root_digest, slug=inspection.slug)
     second_acks.record(identity=identity, component_id=inspection.component_id,
                         version=inspection.version, component_checksum=inspection.root_digest,
                         slug=inspection.slug)

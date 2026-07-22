@@ -22,7 +22,7 @@ _ACKS_PATH = Path("/data/specialist_install_acks.json")
 _SCHEMA_VERSION = 1
 
 
-def install_consent_identity(*, component_id: str, version: str, component_checksum: str,
+def install_consent_identity(*, component_id: str, version: str, root_digest: str,
                               slug: str) -> str:
     """The ONE identity-derivation function for a specialist-install consent
     decision (mirrors plugin_triggers.ack_identity). Binds the approval to
@@ -30,17 +30,23 @@ def install_consent_identity(*, component_id: str, version: str, component_check
     four fields yields a different identity, so a stale approval can never
     ack a different artifact.
 
-    Round-2 (finding #2): the parameter is still named `component_checksum`
-    for call-site compatibility, but EVERY production caller now passes
-    `inspection.root_digest` (compute_install_root_digest's full-closure
-    digest — role+doctrine+config-schema+manifest+persona+dependencies), not
-    `inspection.component_checksum` (the narrow 3-file digest, which is
-    still a separate field on InspectionResult for CAS-neutral display/
-    logging only). Binding consent to the narrow digest let a persona/
-    corpus/plugin substitution slip past an operator's approval unnoticed."""
+    The bound digest is `inspection.root_digest` — compute_install_root_digest's
+    full-closure digest (role+doctrine+config-schema+manifest+persona+
+    dependencies), NOT `inspection.component_checksum` (the narrow 3-file
+    digest, which is still a separate field on InspectionResult for
+    CAS-neutral display/logging only). Binding consent to the narrow digest
+    would let a persona/corpus/plugin substitution slip past an operator's
+    approval unnoticed.
+
+    Minor Ma (whole-branch review): the PARAMETER is now honestly named
+    `root_digest` to match what every caller actually passes. The persisted
+    ack-store JSON field and the identity-hash INPUT KEY both stay
+    `"component_checksum"` for backward compatibility — an existing ack file's
+    recomputed identity must remain byte-stable — so the value is mapped onto
+    that historical key here rather than renamed through the hash."""
     return checksum_json({
         "component_id": component_id, "version": version,
-        "component_checksum": component_checksum, "slug": slug,
+        "component_checksum": root_digest, "slug": slug,
     })
 
 
@@ -80,7 +86,12 @@ class SpecialistInstallAckStore:
                                                 "component_checksum", "slug")}
             if not all(isinstance(v, str) and v for v in fields.values()):
                 return {}
-            if install_consent_identity(**fields) != ident:
+            # Ma: the persisted field stays "component_checksum" (backward
+            # compat); map it onto the honestly-named `root_digest` parameter.
+            if install_consent_identity(
+                component_id=fields["component_id"], version=fields["version"],
+                root_digest=fields["component_checksum"], slug=fields["slug"],
+            ) != ident:
                 return {}
             out[ident] = rec
         return out
@@ -158,7 +169,7 @@ def prompt_specialist_install_consent(
 ) -> Any:
     identity = install_consent_identity(
         component_id=inspection.component_id, version=inspection.version,
-        component_checksum=inspection.root_digest, slug=inspection.slug,
+        root_digest=inspection.root_digest, slug=inspection.slug,
     )
     key = SpecialistInstallConsentKey(
         component_id=inspection.component_id, slug=inspection.slug, identity=identity)

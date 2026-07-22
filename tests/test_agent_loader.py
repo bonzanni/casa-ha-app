@@ -1657,7 +1657,7 @@ class TestSpecialistBindingActivation:
         acks = SpecialistInstallAckStore(path=tmp_path / "acks.json")
         identity = install_consent_identity(
             component_id=inspection.component_id, version=inspection.version,
-            component_checksum=inspection.root_digest, slug=inspection.slug)
+            root_digest=inspection.root_digest, slug=inspection.slug)
         acks.record(identity=identity, component_id=inspection.component_id, version=inspection.version,
                     component_checksum=inspection.root_digest, slug=inspection.slug)
 
