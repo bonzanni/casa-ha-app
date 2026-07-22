@@ -20,6 +20,8 @@ mkdir -p "$CONFIG_DIR/agents" \
          "$CONFIG_DIR/bindings/resident-butler" \
          "$CONFIG_DIR/bindings/resident-concierge" \
          "$CONFIG_DIR/specialists" \
+         "$CONFIG_DIR/specialists/.staging" \
+         "$CONFIG_DIR/specialists/.roles-overlay" \
          "$CONFIG_DIR/schema" \
          "$DATA_DIR/sdk-sessions" \
          "$DATA_DIR/casa-s6-services" \

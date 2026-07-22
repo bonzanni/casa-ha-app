@@ -6729,6 +6729,164 @@ async def plugin_update(args: dict) -> dict:
         return _result(core)
 
 
+@tool(
+    "specialist_install_inspect",
+    "Fetch a specialist component repo for inspection (non-persistent staging, no CAS write). "
+    "Returns the component's mission, default persona, required config/secret names, and "
+    "dependency-closure availability, or a structured error. On success this ALSO posts the "
+    "operator's DM Approve/Deny consent keyboard — specialist_install_commit will refuse until "
+    "that tap lands. Pass mode='upgrade' + target_slug=<slug> when re-inspecting the SAME repo "
+    "for an already-installed specialist (otherwise the collision check refuses it).",
+    {"type": "object", "properties": {
+        "repo": {"type": "string"}, "ref": {"type": "string"},
+        "subdir": {"type": "string"}, "expected_revision": {"type": "string"},
+        "mode": {"type": "string", "enum": ["install", "upgrade"]},
+        "target_slug": {"type": "string"}},
+     "required": ["repo", "ref"]},
+)
+async def specialist_install_inspect(args: dict) -> dict:
+    from specialist_install import SpecialistInstallError, inspect_specialist_repo
+
+    try:
+        result = await asyncio.to_thread(
+            inspect_specialist_repo, args["repo"], args["ref"], subdir=args.get("subdir", ""),
+            expected_revision=args.get("expected_revision"),
+            mode=args.get("mode", "install"), target_slug=args.get("target_slug"),
+        )
+    except SpecialistInstallError as exc:
+        return _result({"ok": False, "kind": exc.kind, "detail": exc.detail})
+
+    # Round-2 fix (finding #3): CREATE the structural approval challenge here
+    # — the prior draft returned inspection data and left
+    # prompt_specialist_install_consent uncalled anywhere in production, so
+    # the DM keyboard the recipe tells the LLM to "wait for" never posted.
+    # Mirrors the REAL production pattern trigger_reconcile._fire_consent_
+    # prompts (trigger_reconcile.py) already uses for plugin-trigger
+    # consent: the module-level ChallengeCoordinator singleton (CHALLENGES,
+    # already imported at module scope from authz_grants — no separate
+    # import needed here), the configured Telegram DM channel, and the
+    # validated operator identity.
+    from specialist_install_consent import SpecialistInstallAckStore, prompt_specialist_install_consent
+    import trigger_consent
+
+    channel = _channel_manager.get("telegram") if _channel_manager is not None else None
+    op = trigger_consent.operator_identity(channel) if channel is not None else None
+    if channel is not None and op is not None:
+        chat_id, operator_id = op
+        acks = SpecialistInstallAckStore()
+
+        async def _reconcile_cb() -> None:
+            # Intentionally a no-op: commit happens via a LATER, explicit
+            # specialist_install_commit call (the recipe polls for
+            # consent_missing rather than this callback auto-committing) —
+            # this callback exists only to satisfy prompt_specialist_install_
+            # consent's signature; recording the ack (which it does
+            # synchronously, before this callback ever runs) is the only
+            # side effect that matters here.
+            return
+
+        try:
+            # Round-3 fix (finding #3): register_challenge (authz_grants.py)
+            # calls `asyncio.get_running_loop().create_task(...)` SYNCHRONOUSLY
+            # — it requires the CALLING thread to already be inside a running
+            # event loop. `asyncio.to_thread` hands this call to a worker
+            # thread with NO running loop of its own, so `register_challenge`
+            # would raise `RuntimeError: no running event loop` there — a
+            # RuntimeError this `except Exception` swallows, so the DM
+            # keyboard silently never posts and the recipe's "wait for
+            # consent" step never resolves. Call directly on the event loop
+            # instead, exactly the way the real production pattern
+            # (`trigger_reconcile._fire_consent_prompts`, calling
+            # `trigger_consent.prompt_trigger_consent`) already does: a plain
+            # synchronous call, with NO `asyncio.to_thread` wrapper, from
+            # inside this coroutine (which IS running on the event loop).
+            prompt_specialist_install_consent(
+                coordinator=CHALLENGES,
+                channel=channel, chat_id=chat_id, operator_id=operator_id, inspection=result,
+                acks=acks, reconcile_cb=_reconcile_cb,
+            )
+        except Exception:  # noqa: BLE001 — inspection result still returned; recipe reports "waiting"
+            logger.exception("specialist install consent prompt failed to post")
+
+    return _result({
+        "ok": True, "component_id": result.component_id, "version": result.version,
+        "slug": result.slug, "component_checksum": result.component_checksum,
+        "root_digest": result.root_digest,
+        "mission": result.mission, "default_persona_ref": result.default_persona_ref,
+        "required_config_names": list(result.required_config_names),
+        "required_secret_names": list(result.required_secret_names),
+        "dependencies": [{"kind": d.kind, "identifier": d.identifier, "available": d.available}
+                          for d in result.dependencies],
+        "staged_dir": str(result.staged_dir),
+    })
+
+
+@tool(
+    "specialist_install_commit",
+    "Persist an INSPECTED specialist component to CAS, compile, and activate it — REFUSES unless "
+    "the operator has approved the install via the DM consent keyboard "
+    "(prompt_specialist_install_consent). Supply the component_id/version/root_digest/slug "
+    "exactly as returned by specialist_install_inspect.",
+    {"type": "object", "properties": {
+        "component_id": {"type": "string"}, "version": {"type": "string"},
+        "root_digest": {"type": "string"}, "slug": {"type": "string"},
+        "staged_dir": {"type": "string"},
+        "config": {"type": "object", "additionalProperties": {"type": "string"}},
+        "secret_names_provided": {"type": "array", "items": {"type": "string"}}},
+     "required": ["component_id", "version", "root_digest", "slug", "staged_dir"]},
+)
+async def specialist_install_commit(args: dict) -> dict:
+    from specialist_install import (
+        InspectionResult, SpecialistInstallError, commit_specialist_install,
+        compute_install_root_digest, resolve_dependency_closure,
+    )
+    from specialist_install_consent import SpecialistInstallAckStore
+    from specialist_component import load_specialist_component
+
+    staged_dir = Path(args["staged_dir"])
+    try:
+        component = load_specialist_component(staged_dir, staged_dir / "manifest.json")
+    except (ValueError, OSError) as exc:
+        return _result({"ok": False, "kind": "staged_dir_invalid", "detail": str(exc)})
+    if component.slug != args["slug"]:
+        return _result({"ok": False, "kind": "checksum_changed",
+                         "detail": "staged component no longer matches the approved inspection"})
+    # Round-2 fix (finding #2/#3): re-run the FULL dependency closure and
+    # recompute the root digest from the RELOADED staged bytes — never trust
+    # the caller-supplied root_digest/component_checksum args directly. An
+    # unavailable/changed dependency, or a root digest that no longer
+    # matches what the operator approved, is rejected HERE, before anything
+    # is persisted or activated.
+    deps = resolve_dependency_closure(component, staged_dir)
+    unavailable = [d for d in deps if not d.available]
+    if unavailable:
+        detail = "; ".join(f"{d.kind}:{d.identifier}: {d.detail}" for d in unavailable)
+        return _result({"ok": False, "kind": "dependency_unavailable", "detail": detail})
+    root_digest = compute_install_root_digest(
+        component, deps, manifest_bytes=(staged_dir / "manifest.json").read_bytes())
+    if root_digest != args["root_digest"]:
+        return _result({"ok": False, "kind": "checksum_changed",
+                         "detail": "staged component no longer matches the approved inspection"})
+    inspection = InspectionResult(
+        component_id=component.component_id, version=component.version, slug=component.slug,
+        component_checksum=component.checksum, root_digest=root_digest,
+        mission=str(component.role.role.get("mission", "")),
+        default_persona_ref=component.default_persona_ref,
+        default_persona_checksum=component.default_persona_checksum,
+        required_config_names=(), required_secret_names=(), dependencies=deps, staged_dir=staged_dir,
+    )
+    try:
+        instance = await asyncio.to_thread(
+            commit_specialist_install, inspection=inspection, config=args.get("config") or {},
+            secret_names_provided=frozenset(args.get("secret_names_provided") or []),
+            acks=SpecialistInstallAckStore(),
+        )
+    except SpecialistInstallError as exc:
+        return _result({"ok": False, "kind": exc.kind, "detail": exc.detail})
+    return _result({"ok": True, "slug": instance.slug, "state": instance.state,
+                     "activation_committed": instance.state == "active"})
+
+
 def _find_entry(data, name: str) -> dict | None:
     return next((e for e in data.raw.get("plugins", [])
                  if isinstance(e, dict) and e.get("name") == name), None)
@@ -7603,6 +7761,10 @@ CASA_TOOLS: tuple = (
     # Personality Phase A, Task 8 — configurator-only resident persona control.
     resident_persona_swap,
     resident_persona_reset,
+    # Personality Phase A, Plan 2 Task N1b — configurator-only specialist
+    # install-from-repo tools.
+    specialist_install_inspect,
+    specialist_install_commit,
 )
 
 
