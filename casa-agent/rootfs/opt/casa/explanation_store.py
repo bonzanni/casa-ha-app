@@ -29,7 +29,9 @@ from __future__ import annotations
 import json
 import os
 import re
+import threading
 import time
+import uuid
 from dataclasses import asdict, dataclass
 from pathlib import Path
 from typing import Callable
@@ -75,11 +77,23 @@ class ExplanationStore:
     control TTL/prune behavior deterministically without patching the
     module-global ``time.time`` or any ``asyncio.sleep`` (memory-cage
     rule — see CLAUDE.md).
+
+    F5 (whole-branch review, round 2): :meth:`record`/:meth:`get`/:meth:`prune`
+    now run on WORKER THREADS concurrently (``agent.py`` offloads the per-turn
+    write via ``asyncio.to_thread``). Two guards make that safe: (1) an
+    instance-level ``threading.Lock`` serializes every file operation, so a
+    prune racing a record can never unlink a half-published file or read a
+    partially-written one; (2) each write stages through a PER-WRITE UNIQUE
+    temp filename (``<cid>.<uuid>.tmp``), so two concurrent ``record()`` calls
+    for the SAME correlation id never collide on one shared temp path — each
+    still finishes with the atomic ``os.replace`` publish (last writer wins,
+    both readable-or-latest, never a torn file).
     """
 
     def __init__(self, root: Path = Path("/data/explanations"), *, now: Callable[[], float] = time.time) -> None:
         self._root = root
         self._now = now
+        self._lock = threading.Lock()
 
     def _path(self, correlation_id: str) -> Path:
         if not isinstance(correlation_id, str) or not _CID.fullmatch(correlation_id):
@@ -92,34 +106,47 @@ class ExplanationStore:
         if "casa-source-" in encoded:
             raise ValueError("reserved provenance tags cannot enter explanations")
         path = self._path(record.correlation_id)
-        self._root.mkdir(parents=True, exist_ok=True, mode=0o700)
-        temporary = path.with_suffix(".json.tmp")
-        temporary.write_text(encoded + "\n", encoding="utf-8")
-        os.chmod(temporary, 0o600)
-        os.replace(temporary, path)
-        # TTL/prune read the file's mtime as the record's age. Force it to
-        # the injectable `now` (not whatever the real OS clock says) so a
-        # test-supplied `now` callable drives TTL/prune deterministically —
-        # os.utime accepts any epoch float, real or test-fictional.
-        now = self._now()
-        os.utime(path, (now, now))
-        self.prune()
+        with self._lock:
+            self._root.mkdir(parents=True, exist_ok=True, mode=0o700)
+            # F5: a per-write unique temp name (never the shared
+            # `<cid>.json.tmp`) so concurrent writes for the same cid don't
+            # clobber each other's staging file mid-flight. `.tmp`-suffixed, so
+            # prune's `*.json` glob never sees it.
+            temporary = path.with_name(f"{path.stem}.{uuid.uuid4().hex}.tmp")
+            temporary.write_text(encoded + "\n", encoding="utf-8")
+            os.chmod(temporary, 0o600)
+            os.replace(temporary, path)
+            # TTL/prune read the file's mtime as the record's age. Force it to
+            # the injectable `now` (not whatever the real OS clock says) so a
+            # test-supplied `now` callable drives TTL/prune deterministically —
+            # os.utime accepts any epoch float, real or test-fictional.
+            now = self._now()
+            os.utime(path, (now, now))
+            self._prune_locked()
 
     def get(self, correlation_id: str, *, show_sensitive: bool = False) -> dict[str, object]:
         path = self._path(correlation_id)
-        try:
-            mtime = path.stat().st_mtime
-        except OSError as exc:
-            raise KeyError(correlation_id) from exc
-        if self._now() - mtime > EXPLANATION_TTL_SECONDS:
-            raise KeyError(correlation_id)
-        value = json.loads(path.read_text(encoding="utf-8"))
+        with self._lock:
+            try:
+                mtime = path.stat().st_mtime
+            except OSError as exc:
+                raise KeyError(correlation_id) from exc
+            if self._now() - mtime > EXPLANATION_TTL_SECONDS:
+                raise KeyError(correlation_id)
+            value = json.loads(path.read_text(encoding="utf-8"))
         if not show_sensitive:
             for key in (*_SENSITIVE, *_SENSITIVE_TIER_META):
                 value.pop(key, None)
         return value
 
     def prune(self) -> None:
+        with self._lock:
+            self._prune_locked()
+
+    def _prune_locked(self) -> None:
+        """Prune body; the caller MUST already hold ``self._lock`` (``record``
+        calls this while holding the lock, so a non-reentrant Lock stays
+        deadlock-free — never re-acquire here)."""
         if not self._root.is_dir():
             return
         files = sorted(self._root.glob("*.json"), key=lambda p: p.stat().st_mtime, reverse=True)
