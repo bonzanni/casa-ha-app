@@ -14,6 +14,7 @@ TTY + typed ``SHOW`` gate lives in ``casactl`` itself, one layer up.
 """
 from __future__ import annotations
 
+import asyncio
 from pathlib import Path
 
 from aiohttp import web
@@ -116,9 +117,17 @@ def register_personality_admin_routes(
         if not isinstance(cid, str) or not cid:
             return web.json_response({"error": "not_found"}, status=404)
         try:
-            return web.json_response(runtime.explanation_store.get(cid, show_sensitive=show_sensitive))
+            # F3 (round 3): ExplanationStore.get acquires the store's
+            # threading.Lock and does file I/O — offload to a worker thread so a
+            # concurrent per-turn store write (also to_thread'd) can never stall
+            # the event loop. The other admin routes read only in-memory runtime
+            # dicts / the lock-free installed-index snapshot, so none of them
+            # need this offload — only the store acquires a lock.
+            payload = await asyncio.to_thread(
+                runtime.explanation_store.get, cid, show_sensitive=show_sensitive)
         except (KeyError, ValueError):
             return web.json_response({"error": "not_found"}, status=404)
+        return web.json_response(payload)
 
     app.router.add_post("/admin/personality/inspect", _inspect)
     app.router.add_post("/admin/personality/render", _render)

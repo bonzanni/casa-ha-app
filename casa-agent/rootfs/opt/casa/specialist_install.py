@@ -720,10 +720,6 @@ def commit_specialist_install(
                        / "safety-kernel.md").read_text(encoding="utf-8"),
     )
 
-    instance_dir.stage_desired(InstanceTuple(
-        root=root, binding=binding, config_snapshot=dict(config),
-        config_digest=effective_config_digest,
-    ))
     # Round-4 fix (finding #2): commit FIRST — the tuple is the single
     # authoritative record (see this function's docstring) — then
     # materialize the operational files as a best-effort derived-cache
@@ -738,8 +734,17 @@ def commit_specialist_install(
     # (new binding paired with old capabilities). The lock spans ONLY this
     # tuple-commit+materialize; every compile/fetch gate above already ran
     # outside it. See specialist_materialize.MATERIALIZE_LOCK's deadlock note.
+    # F1 (round 3): stage_desired MUST be inside the lock too — two concurrent
+    # mutations on the same slug could otherwise interleave (A stages, B stages
+    # over desired.yaml, A commits B's tuple while materializing A's op-files),
+    # publishing an active tuple whose op-files/marker belong to a different
+    # mutation. Staging+commit+materialize+marker is now one atomic locked unit.
     last_activation_error: str | None = None
     with specialist_materialize.MATERIALIZE_LOCK:
+        instance_dir.stage_desired(InstanceTuple(
+            root=root, binding=binding, config_snapshot=dict(config),
+            config_digest=effective_config_digest,
+        ))
         committed = instance_dir.commit_desired_to_active()
         try:
             specialist_materialize.materialize_specialist_operational_files(
@@ -1019,8 +1024,6 @@ def upgrade_specialist(
             slug=slug, stable_agent_id=f"specialist:{slug}", state="error",
             active=active_before, desired=None, last_activation_error=str(exc))
 
-    instance_dir.stage_desired(InstanceTuple(
-        root=root, binding=binding, config_snapshot=merged_config, config_digest=effective_config_digest))
     # Commit FIRST (every gate above — persona/role compatibility,
     # compile_prompt_bundle — already passed, so this is the authoritative
     # record), THEN materialize as a best-effort follow-up that self-heals
@@ -1028,8 +1031,13 @@ def upgrade_specialist(
     # commit_specialist_install's docstring for the full rationale.
     # F3 (round 2): commit+materialize under MATERIALIZE_LOCK — see
     # commit_specialist_install's F3 note and the lock's deadlock analysis.
+    # F1 (round 3): stage_desired is inside the lock so stage+commit+materialize
+    # is one atomic unit against a concurrent same-slug mutation — see
+    # commit_specialist_install's F1 note.
     note = f"dropped_config_keys={dropped_keys}" if dropped_keys else None
     with specialist_materialize.MATERIALIZE_LOCK:
+        instance_dir.stage_desired(InstanceTuple(
+            root=root, binding=binding, config_snapshot=merged_config, config_digest=effective_config_digest))
         committed = instance_dir.commit_desired_to_active()  # new binding digest -> new session epoch
         try:
             specialist_materialize.materialize_specialist_operational_files(
@@ -1111,7 +1119,6 @@ def rollback_specialist(
     except ValueError as exc:
         raise SpecialistInstallError("compile_failed", str(exc)) from exc
 
-    instance_dir.stage_desired(prior)
     # Commit FIRST, same reordering as commit_specialist_install/
     # upgrade_specialist — `prior` is a previously-active, already-validated
     # tuple (it was active.yaml once before), so committing it back is
@@ -1119,8 +1126,12 @@ def rollback_specialist(
     # that self-heals via current_specialist_roles_dir if it fails.
     # F3 (round 2): commit+materialize under MATERIALIZE_LOCK — see
     # commit_specialist_install's F3 note and the lock's deadlock analysis.
+    # F1 (round 3): stage_desired (of the already-loaded `prior` tuple) is
+    # inside the lock so stage+commit+materialize is one atomic unit against a
+    # concurrent same-slug mutation — see commit_specialist_install's F1 note.
     last_activation_error: str | None = None
     with specialist_materialize.MATERIALIZE_LOCK:
+        instance_dir.stage_desired(prior)
         committed = instance_dir.commit_desired_to_active()
         try:
             specialist_materialize.materialize_specialist_operational_files(
@@ -1165,22 +1176,36 @@ def uninstall_specialist(
     directory would make that rmtree delete out-of-tree content.
     `resolve_material_content_dir` fails closed on any non-contained target —
     then we unlink ONLY the symlink and never rmtree its target."""
+    import specialist_materialize
     from specialist_materialize import resolve_material_content_dir
 
     validate_specialist_slug(slug)
-    op_dir = agents_specialists_dir / slug
-    if op_dir.is_symlink():
-        content_dir = resolve_material_content_dir(op_dir, agents_specialists_dir)
-        op_dir.unlink(missing_ok=True)
-        if content_dir is not None:
-            shutil.rmtree(content_dir, ignore_errors=True)
+    # F2 (round 3): hold MATERIALIZE_LOCK across the WHOLE removal — op symlink/
+    # content AND the InstanceDir tree. Without it a self-heal reconcile that
+    # already passed its in-lock active-tuple re-read could rematerialize this
+    # slug's op-dir from retained CAS bytes AFTER uninstall removed it,
+    # resurrecting the removed specialist until the next reconcile. Serializing
+    # under the same lock makes the two orderings both safe: reconcile-then-
+    # uninstall completes the rematerialize, then uninstall removes it; uninstall-
+    # then-reconcile removes active.yaml FIRST, so the reconcile's in-lock
+    # `InstanceDir(...).active()` re-read (specialist_materialize
+    # _reconcile_specialist_operational_files) yields None and the slug is
+    # skipped — no resurrection either way. Removing specialists/<slug> (which
+    # holds active.yaml) inside the lock is what makes that re-read authoritative.
+    with specialist_materialize.MATERIALIZE_LOCK:
+        op_dir = agents_specialists_dir / slug
+        if op_dir.is_symlink():
+            content_dir = resolve_material_content_dir(op_dir, agents_specialists_dir)
+            op_dir.unlink(missing_ok=True)
+            if content_dir is not None:
+                shutil.rmtree(content_dir, ignore_errors=True)
+            else:
+                logger.warning(
+                    "uninstall %r: operational symlink target failed containment; removed the "
+                    "symlink only, left its (out-of-tree) target untouched", slug)
         else:
-            logger.warning(
-                "uninstall %r: operational symlink target failed containment; removed the "
-                "symlink only, left its (out-of-tree) target untouched", slug)
-    else:
-        shutil.rmtree(op_dir, ignore_errors=True)  # legacy real-dir layout, never migrated
-    shutil.rmtree(specialists_dir / slug, ignore_errors=True)
+            shutil.rmtree(op_dir, ignore_errors=True)  # legacy real-dir layout, never migrated
+        shutil.rmtree(specialists_dir / slug, ignore_errors=True)
 
 
 # ---------------------------------------------------------------------------

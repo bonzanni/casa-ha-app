@@ -20,6 +20,7 @@ file that drives a REAL, non-mock refresh of that global via a genuine
 reload path) so it can never leak into other test files."""
 from __future__ import annotations
 
+import asyncio
 from pathlib import Path
 from types import SimpleNamespace
 
@@ -94,7 +95,9 @@ def test_specialist_tier_reload_refreshes_the_process_wide_installed_index(tmp_p
         agents_dir=str(agents_specialists_dir.parent),
     )
     # Every specialist-tier reload call site funnels through this ONE helper.
-    _specialist_roles_dir(runtime)
+    # Round-3 F3: the helper is now async (its lock+I/O runs in a worker thread
+    # via asyncio.to_thread) so a concurrent install can't stall the event loop.
+    asyncio.run(_specialist_roles_dir(runtime))
 
     assert "gizmo" in specialist_registry_mod.live_installed_specialist_slugs()
     assert specialist_registry_mod.get_installed_instance("gizmo") is not None

@@ -462,3 +462,135 @@ def test_commit_survives_concurrent_cas_publish_race(
     # race is absorbed and the install re-verifies the winner's bytes.
     assert raced["done"] is True
     assert instance.state == "active"
+
+
+# --------------------------------------------------------------------------
+# Round-3 F1 — stage_desired must be INSIDE MATERIALIZE_LOCK so that
+# stage+commit+materialize is one atomic unit against a concurrent same-slug
+# mutation. Deterministic proof: patch InstanceDir.stage_desired to record
+# whether the lock is held at the moment it runs on the ACTIVATING path, and
+# assert it was held (pre-fix it ran before the `with MATERIALIZE_LOCK:`).
+# --------------------------------------------------------------------------
+
+
+def _record_stage_lockstate(monkeypatch: pytest.MonkeyPatch) -> list[bool]:
+    """Patches InstanceDir.stage_desired to record MATERIALIZE_LOCK.locked()
+    on every call while still performing the real staging, and returns the
+    recording list."""
+    import specialist_materialize
+    from personality_binding import InstanceDir
+
+    seen: list[bool] = []
+    real_stage = InstanceDir.stage_desired
+
+    def _wrapped(self, tup, *a, **k):
+        seen.append(specialist_materialize.MATERIALIZE_LOCK.locked())
+        return real_stage(self, tup, *a, **k)
+
+    monkeypatch.setattr(InstanceDir, "stage_desired", _wrapped)
+    return seen
+
+
+def test_commit_stages_desired_inside_the_materialize_lock(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    seen = _record_stage_lockstate(monkeypatch)
+    inspection, acks = _approved_inspection(tmp_path, slug="mtg")
+    specialists_dir = tmp_path / "specialists"
+    agents_dir = tmp_path / "agents"
+
+    instance = commit_specialist_install(
+        inspection=inspection, config={}, secret_names_provided=frozenset(), acks=acks,
+        specialists_dir=specialists_dir, agents_specialists_dir=agents_dir)
+
+    assert instance.state == "active"
+    # The activating path stages exactly once, and it ran with the lock HELD.
+    assert seen == [True]
+
+
+def test_upgrade_stages_desired_inside_the_materialize_lock(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    v1, acks1 = _approved_inspection(tmp_path, slug="mtg", version_suffix="-v1")
+    specialists_dir = tmp_path / "specialists"
+    agents_dir = tmp_path / "agents"
+    commit_specialist_install(
+        inspection=v1, config={}, secret_names_provided=frozenset(), acks=acks1,
+        specialists_dir=specialists_dir, agents_specialists_dir=agents_dir)
+
+    seen = _record_stage_lockstate(monkeypatch)
+    v2, acks2 = _approved_inspection(
+        tmp_path, slug="mtg", version_suffix="-v2", version_override="0.2.0")
+    instance = upgrade_specialist(
+        slug="mtg", inspection=v2, config={}, secret_names_provided=frozenset(), acks=acks2,
+        specialists_dir=specialists_dir, agents_specialists_dir=agents_dir)
+
+    assert instance.state == "active"
+    assert seen == [True]
+
+
+def test_rollback_stages_desired_inside_the_materialize_lock(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    v1, acks1 = _approved_inspection(tmp_path, slug="mtg", version_suffix="-v1")
+    specialists_dir = tmp_path / "specialists"
+    agents_dir = tmp_path / "agents"
+    commit_specialist_install(
+        inspection=v1, config={}, secret_names_provided=frozenset(), acks=acks1,
+        specialists_dir=specialists_dir, agents_specialists_dir=agents_dir)
+    v2, acks2 = _approved_inspection(
+        tmp_path, slug="mtg", version_suffix="-v2", version_override="0.2.0")
+    upgrade_specialist(
+        slug="mtg", inspection=v2, config={}, secret_names_provided=frozenset(), acks=acks2,
+        specialists_dir=specialists_dir, agents_specialists_dir=agents_dir)
+
+    seen = _record_stage_lockstate(monkeypatch)
+    instance = rollback_specialist(
+        slug="mtg", specialists_dir=specialists_dir, agents_specialists_dir=agents_dir)
+
+    assert instance.state == "active"
+    assert seen == [True]
+
+
+# --------------------------------------------------------------------------
+# Round-3 F2 — uninstall removes the op-dir AND active.yaml under
+# MATERIALIZE_LOCK, so a self-heal reconcile pass over a STALE index snapshot
+# that still lists the slug re-reads active()==None inside the lock and skips
+# it — the op dir stays absent (no resurrection from retained CAS bytes).
+# --------------------------------------------------------------------------
+
+
+def test_uninstall_under_lock_prevents_reconcile_resurrection(
+    tmp_path: Path,
+) -> None:
+    import specialist_materialize
+    from specialist_registry import InstalledSpecialistIndex
+
+    specialists_dir, agents_dir = _install_active(tmp_path, slug="mtg")
+    assert (agents_dir / "mtg").is_symlink()
+
+    # Snapshot the index while "mtg" is still installed — mirrors
+    # current_specialist_roles_dir loading the index once before its reconcile
+    # loop runs. This snapshot still lists "mtg".
+    stale_index = InstalledSpecialistIndex(specialists_dir=str(specialists_dir))
+    stale_index.load()
+    assert "mtg" in set(stale_index.installed_slugs())
+
+    # Uninstall removes the op symlink/content AND specialists/mtg (active.yaml)
+    # under MATERIALIZE_LOCK.
+    uninstall_specialist(
+        slug="mtg", specialists_dir=specialists_dir, agents_specialists_dir=agents_dir)
+    assert not (agents_dir / "mtg").exists()
+    assert not (specialists_dir / "mtg").exists()
+
+    # A reconcile pass over the STALE snapshot (still lists "mtg"): its in-lock
+    # active()-re-read yields None because active.yaml is gone, so the slug is
+    # skipped and never rematerialized. RED-relevant: without removing
+    # active.yaml under the same lock, the stale snapshot's retained CAS bytes
+    # would resurrect the op dir here.
+    specialist_materialize._reconcile_specialist_operational_files(
+        installed_index=stale_index, specialists_dir=specialists_dir,
+        agents_specialists_dir=agents_dir)
+
+    assert not (agents_dir / "mtg").exists()
+    assert not (agents_dir / "mtg").is_symlink()

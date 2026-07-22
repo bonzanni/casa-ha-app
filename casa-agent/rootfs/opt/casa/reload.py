@@ -219,7 +219,7 @@ import os
 from pathlib import Path
 
 
-def _specialist_roles_dir(runtime: Any) -> str:
+async def _specialist_roles_dir(runtime: Any) -> str:
     """Task N1b Step 25b (Round-2, finding #1 — the P0 this whole plan exists
     to close): the ONE place every specialist-tier reload call site in this
     module gets its ``roles_dir``. Reconciles the roles overlay (+
@@ -256,20 +256,35 @@ def _specialist_roles_dir(runtime: Any) -> str:
     casa_core.py's own boot sequence exactly) and publishing it before
     handing it to ``current_specialist_roles_dir`` (as ``installed_index=``,
     so it is reused rather than loaded twice) makes every boot/reload path
-    refresh the global."""
+    refresh the global.
+
+    F3 (round 3): ``current_specialist_roles_dir`` now acquires
+    ``specialist_materialize.MATERIALIZE_LOCK`` and does bounded file I/O
+    (index load + per-slug op-file self-heal + roles-overlay rebuild). A
+    concurrent install/materialize holding that lock would otherwise stall
+    ALL asyncio processing, because every specialist-tier reload call site used
+    to invoke this helper SYNCHRONOUSLY on the event-loop thread. This whole
+    resolve now runs in a worker thread via ``asyncio.to_thread`` — one hop,
+    the index build + publish + reconcile move off the loop together — so the
+    lock is only ever contended between worker threads, never against the
+    loop. Callers ``await`` it (``await _specialist_roles_dir(runtime) if tier
+    == 'specialist' else None`` keeps the resolve lazy for non-specialist
+    tiers)."""
     import specialist_materialize
     from specialist_registry import InstalledSpecialistIndex, set_active_installed_index
 
-    specialists_dir = Path(runtime.config_dir) / "specialists"
-    index = InstalledSpecialistIndex(str(specialists_dir))
-    index.load()
-    set_active_installed_index(index)
+    def _resolve() -> str:
+        specialists_dir = Path(runtime.config_dir) / "specialists"
+        index = InstalledSpecialistIndex(str(specialists_dir))
+        index.load()
+        set_active_installed_index(index)
+        return specialist_materialize.current_specialist_roles_dir(
+            installed_index=index,
+            specialists_dir=specialists_dir,
+            agents_specialists_dir=Path(runtime.agents_dir) / "specialists",
+        )
 
-    return specialist_materialize.current_specialist_roles_dir(
-        installed_index=index,
-        specialists_dir=specialists_dir,
-        agents_specialists_dir=Path(runtime.agents_dir) / "specialists",
-    )
+    return await asyncio.to_thread(_resolve)
 
 
 async def reload_triggers(runtime: Any, *, role: str | None = None) -> list[str]:
@@ -319,7 +334,7 @@ async def reload_triggers(runtime: Any, *, role: str | None = None) -> list[str]
     # a component-only specialist (no image fallback) on its very first
     # `casa_reload(scope="triggers", role=<slug>)` after install.
     import agent_loader
-    roles_dir = _specialist_roles_dir(runtime) if tier == "specialist" else None
+    roles_dir = await _specialist_roles_dir(runtime) if tier == "specialist" else None
     try:
         cfg = await asyncio.to_thread(
             agent_loader.load_agent_from_dir,
@@ -663,7 +678,7 @@ async def reload_agent(runtime: Any, *, role: str | None = None) -> list[str]:
     import agent_loader
     # Task N1b Step 25b: an installed specialist's role artifact lives ONLY
     # under the reconciled roles overlay, never agent_loader.DEFAULT_ROLES_DIR.
-    roles_dir = _specialist_roles_dir(runtime) if tier == "specialist" else None
+    roles_dir = await _specialist_roles_dir(runtime) if tier == "specialist" else None
     try:
         new_cfg = await asyncio.to_thread(
             agent_loader.load_agent_from_dir, agent_dir, policies=policy_lib,
@@ -836,7 +851,7 @@ async def _reload_role_after_policies(runtime: Any, role: str) -> None:
 
     import agent_loader
     # Task N1b Step 25b: same roles_dir threading as reload_agent above.
-    roles_dir = _specialist_roles_dir(runtime) if tier == "specialist" else None
+    roles_dir = await _specialist_roles_dir(runtime) if tier == "specialist" else None
     new_cfg = await asyncio.to_thread(
         agent_loader.load_agent_from_dir,
         agent_dir, policies=runtime.policy_lib, roles_dir=roles_dir,
@@ -1115,9 +1130,10 @@ async def reload_agents(runtime: Any, *, role: str | None = None) -> list[str]:
     known_specialists_before = set(
         runtime.specialist_registry.all_configs().keys())
     try:
+        roles_dir = await _specialist_roles_dir(runtime)
         await asyncio.to_thread(
             runtime.specialist_registry.load,
-            roles_dir=_specialist_roles_dir(runtime),
+            roles_dir=roles_dir,
         )
     except Exception as exc:  # noqa: BLE001
         logger.warning("specialist_registry.load failed: %s", exc)
