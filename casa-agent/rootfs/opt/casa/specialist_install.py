@@ -576,3 +576,64 @@ def commit_specialist_install(
         slug=inspection.slug, stable_agent_id=f"specialist:{inspection.slug}",
         state="active", active=committed, desired=None, last_activation_error=last_activation_error,
     )
+
+
+def activate_binding_for_config(cfg, *, specialists_root: Path = Path("/config/specialists")) -> None:
+    """Mutates *cfg* in place with the compiled binding for its installed
+    component, if one has an ACTIVE tuple (spec §4.1: a pending-configuration
+    or legacy-bundled specialist has none, and this is a no-op — cfg keeps
+    compiled_prompt_bundle=None, and tools.py's system_prompt seam falls back
+    to the legacy cfg.system_prompt path). This is the seam Plan 1 Task 9's
+    speaker_provenance_for_role docstring names — 'once Plan 2's N1 populates
+    cfg.speaker_provenance for specialists — no further code change needed
+    there.'
+
+    Testability note (Task N1b Step 19): rather than inlining this the way
+    agent_loader.py's resident block does (which hard-codes
+    Path("/config/bindings")), this is a standalone function parameterized
+    by ``specialists_root`` — agent_loader.py's specialist branch calls it
+    with the real, hard-coded production root; unit tests call it directly
+    with a tmp_path root, no monkeypatching needed."""
+    from personality_binding import InstanceDir
+    from persona_pack import load_persona_pack
+    from prompt_compiler import compile_prompt_bundle
+    from personality_types import SpeakerProvenance
+
+    instance_dir = InstanceDir(specialists_root / cfg.role_slot.slot)
+    active_tuple = instance_dir.active()
+    if active_tuple is None:
+        return
+    # `root` is ALWAYS the component root regardless of binding.mode (Round-2
+    # fix, finding #4) — apply_persona_override never rewrites it for a
+    # specialist target, so this parse is unconditionally safe.
+    _, _, checksum = parse_component_root(active_tuple.root)
+    cas_dir = cas_store_dir(checksum, store_root=specialists_root / "store")
+    if active_tuple.binding.mode == "override":
+        # The persona to COMPILE with is the override's, not the component's
+        # bundled default — role/doctrine still come from cas_dir above.
+        personas_root = Path("/config/personas")
+        bound_persona = load_persona_pack(
+            personas_root / active_tuple.binding.persona_id / active_tuple.binding.persona_version / "pack",
+            personas_root / active_tuple.binding.persona_id / active_tuple.binding.persona_version / "manifest.json",
+        )
+    else:
+        bound_persona = load_persona_pack(
+            cas_dir / "persona" / "pack", cas_dir / "persona" / "manifest.json")
+    defaults_root = Path(__file__).parent / "defaults"
+    bundle = compile_prompt_bundle(
+        role=cfg.role_slot, persona=bound_persona, binding=active_tuple.binding,
+        platform_frame=(defaults_root / "personality" / "platform-frame.md").read_text(
+            encoding="utf-8"),
+        safety_kernel=(defaults_root / "personality" / "safety-kernel.md").read_text(
+            encoding="utf-8"),
+    )
+    cfg.persona_pack = bound_persona
+    cfg.binding = active_tuple.binding
+    cfg.compiled_prompt_bundle = bundle
+    cfg.binding_digest = active_tuple.binding.binding_digest
+    cfg.speaker_provenance = SpeakerProvenance(
+        speaker_kind="specialist", role_id=cfg.role_slot.role_id,
+        persona_id=bound_persona.persona_id, persona_version=bound_persona.version,
+        display_name=bound_persona.identity["display_name"],
+        binding_digest=active_tuple.binding.binding_digest,
+    )

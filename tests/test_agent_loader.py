@@ -1570,3 +1570,87 @@ class TestValidateConfigRepoBootParity:
         assert any(
             "nonexistent" in e or "unknown policy" in e for e in errors
         ), errors
+
+
+class TestSpecialistBindingActivation:
+    """Task N1b, Steps 19-21: agent_loader's specialist counterpart to the
+    Task 8 resident binding-activation block."""
+
+    def test_specialist_with_an_active_installed_binding_gets_a_compiled_bundle(
+        self, tmp_path,
+    ) -> None:
+        from test_specialist_install import _write_component
+        from specialist_component import load_specialist_component
+        from specialist_install import (
+            InspectionResult, activate_binding_for_config, commit_specialist_install,
+            resolve_dependency_closure,
+        )
+        from specialist_install_consent import SpecialistInstallAckStore, install_consent_identity
+        from role_slot import materialize_role
+        from role_artifact import load_role_artifact
+
+        staged = _write_component(tmp_path / "staged-component", slug="mtg")
+        component = load_specialist_component(staged, staged / "manifest.json")
+        deps = resolve_dependency_closure(component, staged)
+        from specialist_install import compute_install_root_digest
+        root_digest = compute_install_root_digest(
+            component, deps, manifest_bytes=(staged / "manifest.json").read_bytes())
+        inspection = InspectionResult(
+            component_id=component.component_id, version=component.version, slug=component.slug,
+            component_checksum=component.checksum, root_digest=root_digest,
+            mission=str(component.role.role["mission"]),
+            default_persona_ref=component.default_persona_ref,
+            default_persona_checksum=component.default_persona_checksum,
+            required_config_names=(), required_secret_names=(), dependencies=deps, staged_dir=staged,
+        )
+        acks = SpecialistInstallAckStore(path=tmp_path / "acks.json")
+        identity = install_consent_identity(
+            component_id=inspection.component_id, version=inspection.version,
+            component_checksum=inspection.root_digest, slug=inspection.slug)
+        acks.record(identity=identity, component_id=inspection.component_id, version=inspection.version,
+                    component_checksum=inspection.root_digest, slug=inspection.slug)
+
+        specialists_dir = tmp_path / "specialists"
+        agents_specialists_dir = tmp_path / "agents-specialists"
+        commit_specialist_install(
+            inspection=inspection, config={}, secret_names_provided=frozenset(), acks=acks,
+            specialists_dir=specialists_dir, agents_specialists_dir=agents_specialists_dir,
+        )
+
+        role = materialize_role(source=load_role_artifact(staged / "role"), options={})
+
+        class _Cfg:
+            pass
+
+        cfg = _Cfg()
+        cfg.role_slot = role
+        cfg.persona_pack = None
+        cfg.binding = None
+        cfg.compiled_prompt_bundle = None
+        cfg.binding_digest = None
+        cfg.speaker_provenance = None
+
+        activate_binding_for_config(cfg, specialists_root=specialists_dir)
+
+        assert cfg.compiled_prompt_bundle is not None
+        assert cfg.speaker_provenance is not None
+        assert cfg.speaker_provenance.speaker_kind == "specialist"
+        assert cfg.binding is not None and cfg.binding.mode == "component-default"
+
+    def test_specialist_with_no_active_binding_leaves_cfg_bundle_none(self, tmp_path) -> None:
+        from specialist_install import activate_binding_for_config
+        from role_slot import RoleSlot, ResolvedModel
+
+        class _Cfg:
+            pass
+
+        cfg = _Cfg()
+        cfg.role_slot = RoleSlot(
+            role_id="specialist:finance", kind="specialist", slot="finance", mission="x",
+            resolved_model=ResolvedModel(source="fixed", effective="sonnet",
+                                          sdk_model="claude-sonnet-4-6", option=None),
+            normalized={}, doctrine="Doctrine.\n", checksum="sha256:" + "1" * 64,
+        )
+        cfg.compiled_prompt_bundle = None
+        activate_binding_for_config(cfg, specialists_root=tmp_path / "specialists")  # no InstanceDir written
+        assert cfg.compiled_prompt_bundle is None  # legacy fallback path stays intact

@@ -109,7 +109,7 @@ class SpecialistRegistry:
 
     # -- Loading / validation -------------------------------------------------
 
-    def load(self) -> None:
+    def load(self, *, roles_dir: str | None = None) -> None:
         """Scan ``self._dir`` for specialist directories and register valid ones.
 
         O-2b (v0.37.9): per-specialist failures are tracked in
@@ -117,6 +117,13 @@ class SpecialistRegistry:
         so :mod:`reload` can surface them to ``casactl`` callers. One
         malformed specialist does not poison its siblings — see
         :func:`agent_loader.load_all_specialists`.
+
+        Plan 2, Task N1b: ``roles_dir``, when given, overrides the image-only
+        default so an installed specialist's role artifact (which cannot
+        live under ``defaults/roles/``) is found. Production always passes
+        the reconciled overlay root (``casa_core.py``); tests and every
+        other pre-existing caller omit it and get the unchanged image-only
+        behavior.
         """
         from agent_loader import LoadError, load_all_specialists
 
@@ -124,7 +131,7 @@ class SpecialistRegistry:
         self._disabled_names.clear()
         self._load_failures = []
         try:
-            found, failed = load_all_specialists(self._dir)
+            found, failed = load_all_specialists(self._dir, roles_dir=roles_dir)
         except LoadError as exc:
             # Collection-level error (e.g. non-directory under specialists/).
             logger.error("Specialist load failed at collection level: %s", exc)

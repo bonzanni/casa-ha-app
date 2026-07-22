@@ -1072,6 +1072,36 @@ def load_agent_from_dir(
     # raises (no active tuple exists AND the fresh attempt failed).
     if cfg.kind == "resident":
         _activate_resident_binding(cfg, role_from_path, bindings_dir)
+    elif cfg.kind == "specialist":
+        # Personality Phase A, Task N1b Step 19: the specialist counterpart
+        # to the resident block above — activates the INSTALLED component's
+        # binding (Plan 2's /config/specialists/<slug>/ InstanceDir tree,
+        # not /config/bindings/) so an installed specialist gets the same
+        # compiled_prompt_bundle/speaker_provenance seam residents get. A
+        # specialist with no active tuple (pending-configuration, or the
+        # legacy bundled `finance` before Task N2's cutover) is a no-op —
+        # activate_binding_for_config leaves cfg.compiled_prompt_bundle=None
+        # and tools.py's system-prompt seam falls back to the legacy
+        # cfg.system_prompt path.
+        #
+        # Wrapped into LoadError (unlike the resident block, which only
+        # wraps its two sub-calls): load_all_specialists' per-directory loop
+        # (agent_loader.py, load_all_specialists) isolates siblings by
+        # catching ONLY LoadError — a raw ValueError/OSError escaping here
+        # would poison every OTHER specialist's load in the same scan, not
+        # just this one, so every recoverable failure this call can raise
+        # (InstanceDir/parse_component_root/persona-pack loading/
+        # compile_prompt_bundle validation all raise ValueError or a
+        # ValueError subclass; a missing platform-frame/safety-kernel file
+        # raises OSError) is folded into LoadError here.
+        from specialist_install import activate_binding_for_config
+
+        try:
+            activate_binding_for_config(cfg)  # production root: the function's own default
+        except (ValueError, OSError) as exc:
+            raise LoadError(
+                f"agent {role_from_path!r}: specialist binding activation failed: {exc}"
+            ) from exc
 
     return cfg
 
