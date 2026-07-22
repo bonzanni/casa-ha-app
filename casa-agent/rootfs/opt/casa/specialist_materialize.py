@@ -196,14 +196,83 @@ def materialize_specialist_operational_files(
     shutil.rmtree(backup_dir, ignore_errors=True)
 
 
+def _map_session(session: dict) -> dict:
+    """role.yaml's session sub-schema (``defaults/schema/role.v1.json``
+    ``session``) requires ``{strategy, idle_timeout_seconds}``. The
+    OPERATIONAL ``runtime.v1.json`` ``session`` sub-schema allows only
+    ``{strategy, idle_timeout}`` with ``additionalProperties: false`` — a
+    straight pass-through of the role shape is a schema violation (field
+    NAME, not just value). Map the field name; never pass the role-shape
+    key through verbatim."""
+    out: dict = {}
+    if "strategy" in session:
+        out["strategy"] = session["strategy"]
+    if "idle_timeout_seconds" in session:
+        out["idle_timeout"] = session["idle_timeout_seconds"]
+    elif "idle_timeout" in session:
+        out["idle_timeout"] = session["idle_timeout"]
+    return out
+
+
+def _map_tts(tts: dict) -> tuple[dict, dict]:
+    """role.yaml's tts sub-schema requires ``{tag_dialect, error_phrases}``.
+    The operational ``runtime.v1.json`` ``tts`` sub-schema allows ONLY
+    ``tag_dialect`` (``additionalProperties: false``) — there is no home
+    for ``error_phrases`` inside ``tts`` at the operational layer. The
+    loader's actual consumer of voice-error strings is the SIBLING
+    top-level ``runtime.yaml`` key ``voice_errors`` (``runtime.v1.json``
+    ``voice_errors``; consumed by ``agent_loader._build_runtime_fields`` ->
+    ``cfg.voice_errors``), so ``error_phrases`` moves there instead of
+    being dropped. Returns ``(tts_out, voice_errors_out)``."""
+    tts_out = {"tag_dialect": tts.get("tag_dialect", "square_brackets")}
+    voice_errors_out = dict(tts.get("error_phrases") or {})
+    return tts_out, voice_errors_out
+
+
+def _map_response_register(role_register: str) -> str:
+    """role.yaml's ``response.text.register`` (``role.v1.json``
+    ``responseProjection.register``) is a free descriptive string
+    (``minLength: 1`` only, e.g. ``precise``). The operational
+    ``response_shape.v1.json`` ``register`` is a coarse channel-modality
+    enum (``["spoken", "written"]``) — role.yaml's ``response.text`` block
+    is, by construction, the TEXT/written-channel projection (as opposed
+    to its sibling ``response.voice`` block), so any descriptive value
+    other than the schema's own ``spoken`` literal maps to ``written``,
+    never passed through unmapped."""
+    return "spoken" if role_register == "spoken" else "written"
+
+
+def _character_card(persona: "PersonaPack", role: "RoleSlot", display_name: str) -> str:
+    """Honest, non-stub ``character.yaml`` ``card`` (``character.v1.json``
+    requires ``minLength: 1`` — never a placeholder). Derived from the
+    persona's display name plus the role's own mission statement (
+    ``role.v1.json`` ``mission``, always non-empty)."""
+    return f"{display_name} — the {role.slot} specialist. {role.mission}".strip()
+
+
+def _character_prompt(role: "RoleSlot") -> str:
+    """Honest, non-stub ``character.yaml`` ``prompt`` (``character.v1.json``
+    requires ``minLength: 1``). The role's doctrine (``role.doctrine``,
+    guaranteed non-empty by ``role_artifact.load_role_artifact``) is the
+    closest legacy-semantic equivalent to a system prompt available at
+    materialize time — note the ACTUALLY-served prompt for an active
+    specialist is the compiled bundle via the tools.py seam of a later
+    slice; this field is only the legacy fallback path and must never be
+    placeholder junk."""
+    return role.doctrine
+
+
 def _write_specialist_operational_files(
     slug_dir: Path, *, slug: str, role: "RoleSlot", persona: "PersonaPack",
 ) -> None:
     normalized = role.normalized
+    display_name = persona.identity.get("display_name", slug)
 
     character = {
-        "schema_version": 1, "name": persona.identity.get("display_name", slug),
-        "role": slug, "archetype": "specialist", "card": "", "prompt": "",
+        "schema_version": 1, "name": display_name,
+        "role": slug, "archetype": "specialist",
+        "card": _character_card(persona, role, display_name),
+        "prompt": _character_prompt(role),
     }
     (slug_dir / "character.yaml").write_text(
         yaml.safe_dump(character, sort_keys=False), encoding="utf-8")
@@ -216,19 +285,20 @@ def _write_specialist_operational_files(
         "max_sentences_confirmation": response.get("text", {}).get(
             "max_confirmation_sentences", 2),
         "max_sentences_status": response.get("text", {}).get("max_status_sentences", 3),
-        "register": response.get("text", {}).get("register", "written"),
+        "register": _map_response_register(response.get("text", {}).get("register", "written")),
         "format": "plain", "rules": [],
     }
     (slug_dir / "response_shape.yaml").write_text(
         yaml.safe_dump(response_shape, sort_keys=False), encoding="utf-8")
 
+    tts, voice_errors = _map_tts(dict(normalized.get("tts", {})))
     runtime = {
         "schema_version": 1, "kind": "specialist", "model": dict(normalized.get("model", {})),
         "enabled": True, "tools": dict(normalized.get("tools", {})),
         "mcp_server_names": list(normalized.get("mcp_servers", [])),
         "memory": dict(normalized.get("memory", {})), "channels": [],
-        "session": dict(normalized.get("session", {})), "tts": dict(normalized.get("tts", {})),
-        "voice_errors": {}, "cwd": "", "requires": dict(normalized.get("requires", {})),
+        "session": _map_session(dict(normalized.get("session", {}))), "tts": tts,
+        "voice_errors": voice_errors, "cwd": "", "requires": dict(normalized.get("requires", {})),
     }
     (slug_dir / "runtime.yaml").write_text(
         yaml.safe_dump(runtime, sort_keys=False), encoding="utf-8")

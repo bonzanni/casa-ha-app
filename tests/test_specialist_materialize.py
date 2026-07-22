@@ -238,3 +238,66 @@ def test_materialize_operational_files_migrates_a_legacy_real_directory_slug_dir
     assert character["name"] == "Finance"  # legacy content replaced, not merged
     # No stray `.finance.prior-*` backup left behind on success.
     assert not any(p.name.startswith(".finance.prior-") for p in agents_specialists_dir.iterdir())
+
+
+def test_materialized_finance_specialist_round_trips_through_the_real_loader(
+    tmp_path: Path,
+) -> None:
+    """N1b slice A regression (task-review Critical): the operational files
+    ``_write_specialist_operational_files`` writes must be schema-valid for
+    the REAL ``agent_loader.load_agent_from_dir`` — the module's entire
+    purpose — not merely internally consistent with the writer's own
+    assumptions. Exercises the full pipeline against the REAL bundled
+    finance role artifact (``defaults/roles/specialist/finance``) plus a
+    real-shaped persona, materializes operational files, builds a real
+    roles-overlay via ``reconcile_specialist_roles_overlay``, and then
+    calls the REAL loader. Must FAIL on the pre-fix writer: role.yaml's
+    ``session.idle_timeout_seconds`` / ``tts.error_phrases`` violate
+    ``runtime.v1.json``'s ``additionalProperties: false`` sub-schemas, and
+    the hardcoded ``card: ""`` / ``prompt: ""`` violate
+    ``character.v1.json``'s ``minLength: 1``."""
+    import agent_loader
+    import role_artifact
+    import role_slot
+    from persona_pack import PersonaManifest, PersonaPack
+
+    code_root = Path(agent_loader.__file__).resolve().parent
+    finance_role_dir = code_root / "defaults" / "roles" / "specialist" / "finance"
+    source = role_artifact.load_role_artifact(finance_role_dir)
+    role = role_slot.materialize_role(source=source, options={})
+
+    persona = PersonaPack(
+        persona_id="casa/alex", version="0.1.0", trait_schema_version=1,
+        identity={"display_name": "Alex", "pronouns": {
+            "subject": "they", "object": "them", "possessive_adjective": "their",
+            "possessive_pronoun": "theirs", "reflexive": "themself"}},
+        relationship_posture="established", archetype="advisor",
+        traits={"warmth": 2, "formality": 4, "candor": 5, "attunement": 3,
+                 "curiosity": 3, "levity": 1, "social_energy": 2, "optimism": 3},
+        quirks=(),
+        markdown="# Core\n\nHandles household finances precisely.\n\n"
+                 "## Negative space\n\nNever guesses at numbers.\n",
+        examples=(), manifest=PersonaManifest(files=(), checksum="sha256:" + "3" * 64),
+        checksum="sha256:" + "2" * 64,
+    )
+
+    agents_specialists_dir = tmp_path / "agents-specialists"
+    materialize_specialist_operational_files(
+        agents_specialists_dir=agents_specialists_dir, slug="finance",
+        role=role, persona=persona,
+    )
+    slug_dir = agents_specialists_dir / "finance"
+
+    overlay_root = tmp_path / "overlay"
+    reconcile_specialist_roles_overlay(
+        installed_index=_FakeInstalledIndex({}), overlay_root=overlay_root,
+        image_roles_dir=str(code_root / "defaults" / "roles"),
+    )
+
+    cfg = agent_loader.load_agent_from_dir(
+        str(slug_dir), policies=None, roles_dir=str(overlay_root),
+    )
+
+    assert cfg.role == "finance"
+    assert cfg.kind == "specialist"
+    assert cfg.role_artifact.role["id"] == "specialist:finance"
