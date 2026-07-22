@@ -275,6 +275,29 @@ def resolve_dependency_closure(
             out.append(DependencyResolution(
                 kind=dep.kind, identifier=dep.identifier, digest=dep.digest,
                 available=False, detail=f"unknown dependency kind {dep.kind!r}"))
+
+    # Whole-branch review F2 (round 2, persona dependency row required
+    # STRUCTURALLY): the per-dependency persona LEG above only fires when a
+    # persona row is PRESENT. A manifest with `dependencies: []` (or with no
+    # kind=="persona" row) would otherwise activate its bundled default persona
+    # with NO identity/checksum binding at all — the exact substitution the
+    # persona-identity check (F3, Plan-1) exists to prevent, bypassed by simple
+    # absence. The component-layout contract requires EXACTLY ONE kind=="persona"
+    # dependency whose identifier/digest match the manifest's `default_persona`
+    # 1:1. The COUNT invariant (exactly one) is the part the per-row loop cannot
+    # see — for a single persona row, the loop already fails-closed on any
+    # identity/checksum/default_persona mismatch (its `available` requires
+    # identity_ok and default_ok), so appending here ONLY for count != 1 avoids
+    # a duplicate resolution while still refusing absence (0 rows) and ambiguity
+    # (2+ rows). Enforced in the single closure `inspect_specialist_repo` and
+    # `commit_specialist_install` both route through, so it flows into
+    # `dependency_unavailable` at BOTH inspect and commit.
+    persona_deps = [d for d in component.dependencies if d.kind == "persona"]
+    if len(persona_deps) != 1:
+        out.append(DependencyResolution(
+            kind="persona", identifier=component.default_persona_ref,
+            digest=component.default_persona_checksum, available=False,
+            detail="persona dependency row missing/mismatched"))
     return tuple(out)
 
 
@@ -535,6 +558,16 @@ def commit_specialist_install(
     from specialist_install_consent import install_consent_identity
     import specialist_materialize
 
+    # F1 (round 2, inspection.slug traversal): `inspection.slug` is joined as
+    # `specialists_dir / inspection.slug` (InstanceDir) and threaded as the
+    # materialize slug below. A hand-built InspectionResult (or a compromised
+    # tool layer) with a matching ack could otherwise drive a Path join with a
+    # traversal slug. Validate at the lifecycle-function boundary every caller
+    # routes through — before consent, before any filesystem write — and
+    # re-assert after the post-publish CAS reload that the component's OWN slug
+    # agrees (mirroring upgrade_specialist's slug_mismatch treatment).
+    validate_specialist_slug(inspection.slug)
+
     identity = install_consent_identity(
         component_id=inspection.component_id, version=inspection.version,
         root_digest=inspection.root_digest, slug=inspection.slug,
@@ -599,6 +632,15 @@ def commit_specialist_install(
     # Re-load from the now-final (or, for a digest an earlier install
     # already verified and published, pre-existing) CAS directory.
     component = load_specialist_component(cas_dir, cas_dir / "manifest.json")
+    # F1 (round 2): the CAS component's OWN declared slug is authoritative —
+    # assert it agrees with the approved inspection slug (a mismatch means the
+    # inspection was hand-built/tampered to bind slug X's approval to component
+    # Y's bytes). Mirrors upgrade_specialist's slug_mismatch guard.
+    if component.slug != inspection.slug:
+        raise SpecialistInstallError(
+            "slug_mismatch",
+            f"CAS component slug {component.slug!r} does not match the approved "
+            f"inspection slug {inspection.slug!r}")
     role = materialize_role(source=load_role_artifact(cas_dir / "role"), options={})
     persona = load_persona_pack(cas_dir / "persona" / "pack", cas_dir / "persona" / "manifest.json")
 
@@ -690,18 +732,25 @@ def commit_specialist_install(
     # `specialist_materialize.current_specialist_roles_dir` re-materializes
     # every ACTIVE slug's operational files from its tuple on every
     # subsequent boot/reload call, so this slug self-heals automatically.
-    committed = instance_dir.commit_desired_to_active()
+    # F3 (round 2): hold MATERIALIZE_LOCK across commit+materialize so the
+    # self-heal reconcile loop (also under this lock) can never snapshot the
+    # OLD active tuple and then materialize its op-files over this NEW binding's
+    # (new binding paired with old capabilities). The lock spans ONLY this
+    # tuple-commit+materialize; every compile/fetch gate above already ran
+    # outside it. See specialist_materialize.MATERIALIZE_LOCK's deadlock note.
     last_activation_error: str | None = None
-    try:
-        specialist_materialize.materialize_specialist_operational_files(
-            agents_specialists_dir=agents_specialists_dir, slug=inspection.slug, role=role, persona=persona,
-            binding_digest=committed.binding.binding_digest, component_root=committed.root,
-        )
-    except Exception as exc:  # noqa: BLE001
-        logger.warning(
-            "specialist install %r: operational-file materialize failed post-commit "
-            "(%s); will self-heal on next reconcile", inspection.slug, exc, exc_info=True)
-        last_activation_error = f"operational files pending reconcile: {exc}"
+    with specialist_materialize.MATERIALIZE_LOCK:
+        committed = instance_dir.commit_desired_to_active()
+        try:
+            specialist_materialize.materialize_specialist_operational_files(
+                agents_specialists_dir=agents_specialists_dir, slug=inspection.slug, role=role, persona=persona,
+                binding_digest=committed.binding.binding_digest, component_root=committed.root,
+            )
+        except Exception as exc:  # noqa: BLE001
+            logger.warning(
+                "specialist install %r: operational-file materialize failed post-commit "
+                "(%s); will self-heal on next reconcile", inspection.slug, exc, exc_info=True)
+            last_activation_error = f"operational files pending reconcile: {exc}"
 
     return SpecialistInstance(
         slug=inspection.slug, stable_agent_id=f"specialist:{inspection.slug}",
@@ -977,18 +1026,21 @@ def upgrade_specialist(
     # record), THEN materialize as a best-effort follow-up that self-heals
     # via current_specialist_roles_dir if it fails. See
     # commit_specialist_install's docstring for the full rationale.
-    committed = instance_dir.commit_desired_to_active()  # new binding digest -> new session epoch
+    # F3 (round 2): commit+materialize under MATERIALIZE_LOCK — see
+    # commit_specialist_install's F3 note and the lock's deadlock analysis.
     note = f"dropped_config_keys={dropped_keys}" if dropped_keys else None
-    try:
-        specialist_materialize.materialize_specialist_operational_files(
-            agents_specialists_dir=agents_specialists_dir, slug=slug, role=role, persona=persona,
-            binding_digest=committed.binding.binding_digest, component_root=committed.root)
-    except Exception as exc:  # noqa: BLE001
-        logger.warning(
-            "specialist upgrade %r: operational-file materialize failed post-commit "
-            "(%s); will self-heal on next reconcile", slug, exc, exc_info=True)
-        heal_note = f"operational files pending reconcile: {exc}"
-        note = f"{note}; {heal_note}" if note else heal_note
+    with specialist_materialize.MATERIALIZE_LOCK:
+        committed = instance_dir.commit_desired_to_active()  # new binding digest -> new session epoch
+        try:
+            specialist_materialize.materialize_specialist_operational_files(
+                agents_specialists_dir=agents_specialists_dir, slug=slug, role=role, persona=persona,
+                binding_digest=committed.binding.binding_digest, component_root=committed.root)
+        except Exception as exc:  # noqa: BLE001
+            logger.warning(
+                "specialist upgrade %r: operational-file materialize failed post-commit "
+                "(%s); will self-heal on next reconcile", slug, exc, exc_info=True)
+            heal_note = f"operational files pending reconcile: {exc}"
+            note = f"{note}; {heal_note}" if note else heal_note
     return SpecialistInstance(
         slug=slug, stable_agent_id=f"specialist:{slug}", state="active", active=committed,
         desired=None, last_activation_error=note)
@@ -1065,17 +1117,20 @@ def rollback_specialist(
     # tuple (it was active.yaml once before), so committing it back is
     # itself the authoritative act; materialize is a best-effort follow-up
     # that self-heals via current_specialist_roles_dir if it fails.
-    committed = instance_dir.commit_desired_to_active()
+    # F3 (round 2): commit+materialize under MATERIALIZE_LOCK — see
+    # commit_specialist_install's F3 note and the lock's deadlock analysis.
     last_activation_error: str | None = None
-    try:
-        specialist_materialize.materialize_specialist_operational_files(
-            agents_specialists_dir=agents_specialists_dir, slug=slug, role=role, persona=persona,
-            binding_digest=committed.binding.binding_digest, component_root=committed.root)
-    except Exception as exc:  # noqa: BLE001
-        logger.warning(
-            "specialist rollback %r: operational-file materialize failed post-commit "
-            "(%s); will self-heal on next reconcile", slug, exc, exc_info=True)
-        last_activation_error = f"operational files pending reconcile: {exc}"
+    with specialist_materialize.MATERIALIZE_LOCK:
+        committed = instance_dir.commit_desired_to_active()
+        try:
+            specialist_materialize.materialize_specialist_operational_files(
+                agents_specialists_dir=agents_specialists_dir, slug=slug, role=role, persona=persona,
+                binding_digest=committed.binding.binding_digest, component_root=committed.root)
+        except Exception as exc:  # noqa: BLE001
+            logger.warning(
+                "specialist rollback %r: operational-file materialize failed post-commit "
+                "(%s); will self-heal on next reconcile", slug, exc, exc_info=True)
+            last_activation_error = f"operational files pending reconcile: {exc}"
 
     return SpecialistInstance(
         slug=slug, stable_agent_id=f"specialist:{slug}", state="active", active=committed,

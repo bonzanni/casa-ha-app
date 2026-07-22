@@ -12,6 +12,7 @@ import logging
 import os
 import re
 import shutil
+import threading
 from pathlib import Path
 from typing import TYPE_CHECKING
 
@@ -26,33 +27,59 @@ if TYPE_CHECKING:
 
 _DEFAULT_OVERLAY_ROOT = Path("/config/specialists/.roles-overlay")
 
-# Whole-branch review F2 (symlink-target containment): a materialize op-dir
-# symlink always points at a RELATIVE, single-segment content directory named
-# `.{slug}.material-<32-hex>`. `os.readlink` on such a symlink is turned into
-# an `shutil.rmtree`/GC target by the uninstall and re-materialize paths — a
-# PRE-EXISTING malicious/accidental symlink whose target is absolute
-# (`finance -> /data`) or escapes the directory must NEVER become a deletion
-# target. This regex is the shape gate; `resolve_material_content_dir` adds a
-# strict path-containment check on top.
-_MATERIAL_LINK_RE = re.compile(r"^\.[a-z0-9][a-z0-9-]*\.material-[0-9a-f]{32}$")
+# Whole-branch review F3 (round 2): serializes the tuple-commit+materialize
+# sequence (commit_specialist_install/upgrade_specialist/rollback_specialist)
+# against the self-heal reconcile loop's per-slug re-read+materialize. A single
+# process-wide lock — contention is negligible (installs are rare operator
+# actions; the self-heal loop does only bounded local file IO) — so a per-slug
+# lock table would add machinery for no measurable benefit. It is held ONLY
+# across (a) a commit function's commit_desired_to_active()+materialize and
+# (b) one self-heal slug's in-lock re-read+materialize; NEVER across any
+# network fetch, git resolve, or prompt compile (those all complete before the
+# lock is taken). It is never acquired recursively and no second lock is ever
+# taken while holding it, so it introduces no deadlock or lock-ordering
+# surface. See `_reconcile_specialist_operational_files` for the race it
+# closes.
+MATERIALIZE_LOCK = threading.Lock()
 
 # F5 (fail-closed self-heal): a small marker dotfile written INTO each content
 # directory recording the (binding_digest, component_root) the op-files were
 # materialized from. The self-heal loop reads it to decide whether an
-# already-on-disk op-dir is provably CURRENT for the active tuple; a dotfile is
+# already-on-disk op-dir is current-by-marker (origin-provenance, not content
+# integrity — see _check_file_set backstop) for the active tuple; a dotfile is
 # skipped by agent_loader._check_file_set, so it never trips the loader's
 # unknown-file gate.
+#
+# F6 (round 2, ADJUDICATED ACCEPT — scope of the guarantee): the marker proves
+# WHICH tuple these op-files were materialized from (origin provenance), NOT
+# that the bytes on disk still match what materialize wrote. A file that is
+# corrupted-but-marker-intact (in-place tampering) is deliberately out of this
+# marker's scope — that threat is covered elsewhere: MISSING files trip
+# agent_loader's _check_file_set (a loud, per-slug LoadError backstop at load
+# time), and aggressive removal of a marker-current op-dir on a merely
+# transient re-materialize failure is exactly the over-removal the F5 design
+# avoids (a benign retry, not a capability-drift, when the marker still matches).
 _BINDING_MARKER_NAME = ".binding-digest"
 
 
 def resolve_material_content_dir(link_path: Path, agents_specialists_dir: Path) -> "Path | None":
     """Return the content directory a materialize symlink at *link_path*
     points at — ONLY if its target is a SAFE relative single-segment
-    `.{slug}.material-<hex>` name that resolves strictly inside
+    `.{slug}.material-<32-hex>` name that resolves strictly inside
     *agents_specialists_dir*. Returns None on any containment violation
     (absolute target, separators, `..`, wrong shape, or an escaping resolved
     path); the caller must then unlink ONLY the symlink and NEVER rmtree its
-    target (F2)."""
+    target (F2).
+
+    Whole-branch review F4 (round 2, cross-slug GC containment): the op-dir
+    symlink lives AT ``agents_specialists_dir / <slug>``, so ``link_path.name``
+    IS the slug this link may legitimately materialize. The target must be
+    THIS slug's own ``.{slug}.material-<32-hex>`` — NOT any other slug's
+    content directory. Without this per-slug binding, an uninstall or
+    re-materialize of slug A whose symlink was cross-pointed at slug B's
+    ``.{B}.material-...`` dir would GC B's LIVE content. Parameterizing the
+    shape gate by the expected slug fails such a cross-pointed link closed
+    (returns None -> caller unlinks the symlink only, never rmtree's B's dir)."""
     try:
         target = os.readlink(link_path)
     except OSError:
@@ -61,7 +88,9 @@ def resolve_material_content_dir(link_path: Path, agents_specialists_dir: Path) 
             or (os.altsep and os.altsep in target)
             or target in ("", ".", "..")):
         return None
-    if _MATERIAL_LINK_RE.fullmatch(target) is None:
+    # F4: require the target to be THIS slug's content dir, never a foreign one.
+    expected_slug = link_path.name
+    if re.fullmatch(rf"\.{re.escape(expected_slug)}\.material-[0-9a-f]{{32}}", target) is None:
         return None
     content_dir = agents_specialists_dir / target
     try:
@@ -472,73 +501,93 @@ def _reconcile_specialist_operational_files(
     from role_slot import materialize_role
     from role_artifact import load_role_artifact
     from persona_pack import load_persona_pack
+    from personality_binding import InstanceDir
     from specialist_install import parse_component_root, cas_store_dir
 
     for slug in sorted(installed_index.installed_slugs()):
         instance = installed_index.get_instance(slug)
         if instance is None or instance.active is None:
             continue  # pending-configuration/error: never materialize, never loadable
-        active = instance.active
-        try:
-            _, _, checksum = parse_component_root(active.root)
-            cas_dir = cas_store_dir(checksum, store_root=specialists_dir / "store")
-            if active.binding.mode == "override":
-                # N1d-coupled path (kept verbatim from the brief's draft,
-                # disclosed in the N1b slice-B report): this branch is
-                # unreachable until Plan 2's N1d builds a way to install an
-                # 'override'-mode binding for a specialist — today,
-                # commit_specialist_install only ever produces
-                # 'component-default' bindings. personas_root is fixed at
-                # /config/personas, the persona-install tree N1d will add.
-                personas_root = Path("/config/personas")
-                persona = load_persona_pack(
-                    personas_root / active.binding.persona_id
-                    / active.binding.persona_version / "pack",
-                    personas_root / active.binding.persona_id
-                    / active.binding.persona_version / "manifest.json",
+        # F3 (reconcile-vs-commit race): `installed_index` was snapshotted by
+        # the caller; a concurrent upgrade/commit/rollback (also under
+        # MATERIALIZE_LOCK) may have committed a NEWER active tuple since. Hold
+        # MATERIALIZE_LOCK across this slug's re-read+materialize, and RE-READ
+        # the active tuple FROM DISK inside the lock immediately before
+        # materializing — so we can never write a stale snapshot's op-files
+        # over the freshly-committed binding's (new binding paired with old
+        # capabilities until the next reconcile). The lock is released between
+        # slugs so a concurrent commit interleaves cleanly; it is never held
+        # across the persona/role loads themselves acquiring any other lock.
+        with MATERIALIZE_LOCK:
+            active = InstanceDir(specialists_dir / slug).active()
+            if active is None:
+                continue  # uninstalled out from under the snapshot; nothing to heal
+            try:
+                _, _, checksum = parse_component_root(active.root)
+                cas_dir = cas_store_dir(checksum, store_root=specialists_dir / "store")
+                if active.binding.mode == "override":
+                    # N1d-coupled path (kept verbatim from the brief's draft,
+                    # disclosed in the N1b slice-B report): this branch is
+                    # unreachable until Plan 2's N1d builds a way to install an
+                    # 'override'-mode binding for a specialist — today,
+                    # commit_specialist_install only ever produces
+                    # 'component-default' bindings. personas_root is fixed at
+                    # /config/personas, the persona-install tree N1d will add.
+                    personas_root = Path("/config/personas")
+                    persona = load_persona_pack(
+                        personas_root / active.binding.persona_id
+                        / active.binding.persona_version / "pack",
+                        personas_root / active.binding.persona_id
+                        / active.binding.persona_version / "manifest.json",
+                    )
+                else:
+                    persona = load_persona_pack(
+                        cas_dir / "persona" / "pack", cas_dir / "persona" / "manifest.json")
+                role = materialize_role(source=load_role_artifact(cas_dir / "role"), options={})
+                materialize_specialist_operational_files(
+                    agents_specialists_dir=agents_specialists_dir, slug=slug, role=role, persona=persona,
+                    binding_digest=active.binding.binding_digest, component_root=active.root)
+            except Exception:  # noqa: BLE001 — one slug's failure must never block its siblings/the caller
+                # F5 (fail-closed self-heal). A re-materialize failure could
+                # leave an ACTIVELY-committed slug paired with STALE
+                # operational files (e.g. runtime.yaml's tools allowlist from a
+                # superseded tuple) — an approved capability change that
+                # silently never took effect. The marker records ORIGIN
+                # provenance (which tuple these op-files were built from), NOT
+                # content integrity — see the F6 note in `_write_binding_marker`.
+                # Fail closed: if the on-disk op-dir is NOT current-by-marker
+                # for the active tuple (marker absent or mismatched), drop the
+                # slug's op symlink so it becomes loudly UNLOADABLE
+                # (agent_loader can no longer find its directory) rather than
+                # run with stale capabilities. If the marker MATCHES the active
+                # tuple, the files are current-by-origin and a warning
+                # suffices; a corrupted-but-marker-intact file (in-place
+                # tampering, outside the threat model) is instead caught loudly
+                # by agent_loader._check_file_set at load time.
+                slug_dir = agents_specialists_dir / slug
+                marker = _read_binding_marker(slug_dir) if slug_dir.exists() else None
+                is_current = (
+                    marker is not None
+                    and marker.get("binding_digest") == active.binding.binding_digest
+                    and marker.get("root") == active.root
                 )
-            else:
-                persona = load_persona_pack(
-                    cas_dir / "persona" / "pack", cas_dir / "persona" / "manifest.json")
-            role = materialize_role(source=load_role_artifact(cas_dir / "role"), options={})
-            materialize_specialist_operational_files(
-                agents_specialists_dir=agents_specialists_dir, slug=slug, role=role, persona=persona,
-                binding_digest=active.binding.binding_digest, component_root=active.root)
-        except Exception:  # noqa: BLE001 — one slug's failure must never block its siblings/the caller
-            # F5 (fail-closed self-heal). A re-materialize failure could leave
-            # an ACTIVELY-committed slug paired with STALE operational files
-            # (e.g. runtime.yaml's tools allowlist from a superseded tuple) —
-            # an approved capability change that silently never took effect.
-            # Fail closed: if the on-disk op-dir is NOT provably current for
-            # the active tuple (marker absent or mismatched), drop the slug's
-            # op symlink so it becomes loudly UNLOADABLE (agent_loader can no
-            # longer find its directory) rather than run with stale
-            # capabilities. If the marker MATCHES the active tuple, the failure
-            # is benign (already current) and a warning suffices.
-            slug_dir = agents_specialists_dir / slug
-            marker = _read_binding_marker(slug_dir) if slug_dir.exists() else None
-            is_current = (
-                marker is not None
-                and marker.get("binding_digest") == active.binding.binding_digest
-                and marker.get("root") == active.root
-            )
-            if is_current:
-                logger.warning(
-                    "specialist %r: operational-file re-materialize failed but the on-disk "
-                    "marker is current for the active tuple; keeping existing files "
-                    "(will retry next call)", slug, exc_info=True)
-            else:
-                logger.error(
-                    "specialist %r: operational-file re-materialize failed AND on-disk files are "
-                    "stale/missing for the active tuple (marker mismatch) — removing the op "
-                    "symlink so the slug drops out of the registry rather than run with stale "
-                    "capabilities", slug, exc_info=True)
-                try:
-                    if slug_dir.is_symlink():
-                        slug_dir.unlink()  # F2: unlink the symlink only, never its target
-                    elif slug_dir.exists():
-                        shutil.rmtree(slug_dir, ignore_errors=True)  # legacy real-dir layout
-                except OSError:
+                if is_current:
+                    logger.warning(
+                        "specialist %r: operational-file re-materialize failed but the on-disk "
+                        "marker is current for the active tuple; keeping existing files "
+                        "(will retry next call)", slug, exc_info=True)
+                else:
                     logger.error(
-                        "specialist %r: failed to remove stale operational directory",
-                        slug, exc_info=True)
+                        "specialist %r: operational-file re-materialize failed AND on-disk files are "
+                        "stale/missing for the active tuple (marker mismatch) — removing the op "
+                        "symlink so the slug drops out of the registry rather than run with stale "
+                        "capabilities", slug, exc_info=True)
+                    try:
+                        if slug_dir.is_symlink():
+                            slug_dir.unlink()  # F2: unlink the symlink only, never its target
+                        elif slug_dir.exists():
+                            shutil.rmtree(slug_dir, ignore_errors=True)  # legacy real-dir layout
+                    except OSError:
+                        logger.error(
+                            "specialist %r: failed to remove stale operational directory",
+                            slug, exc_info=True)

@@ -376,3 +376,65 @@ Do not expose financial records or persona identity.
     # role.yaml's descriptive `register: precise` (text/written projection)
     # maps to the coarse operational enum value `written`, never passed through.
     assert cfg.response_shape.register == "written"
+
+
+# ---------------------------------------------------------------------------
+# Whole-branch review ROUND 2 — F4: resolve_material_content_dir must bind the
+# symlink target to THE SLUG'S OWN content dir, never a foreign slug's, so a
+# cross-pointed link can't GC another slug's live content.
+# ---------------------------------------------------------------------------
+
+
+def test_resolve_material_content_dir_accepts_this_slugs_own_target(tmp_path: Path) -> None:
+    from specialist_materialize import resolve_material_content_dir
+
+    agents_dir = tmp_path / "agents-specialists"
+    content = agents_dir / (".finance.material-" + "a" * 32)
+    content.mkdir(parents=True)
+    link = agents_dir / "finance"
+    os.symlink(content.name, link)
+
+    resolved = resolve_material_content_dir(link, agents_dir)
+    assert resolved is not None
+    assert resolved.resolve() == content.resolve()
+
+
+def test_resolve_material_content_dir_refuses_a_cross_slug_target(tmp_path: Path) -> None:
+    """slug A's link pointing at slug B's `.{B}.material-...` dir must fail
+    closed (None) — otherwise uninstall/rematerialize of A would GC B's dir."""
+    from specialist_materialize import resolve_material_content_dir
+
+    agents_dir = tmp_path / "agents-specialists"
+    b_content = agents_dir / (".finance.material-" + "b" * 32)  # slug B's live content
+    b_content.mkdir(parents=True)
+    a_link = agents_dir / "legal"  # slug A's op symlink...
+    os.symlink(b_content.name, a_link)  # ...cross-pointed at B's content dir
+
+    assert resolve_material_content_dir(a_link, agents_dir) is None
+    assert b_content.is_dir()  # untouched by the resolve
+
+
+def test_uninstall_with_cross_pointed_symlink_leaves_the_other_slugs_dir_intact(
+    tmp_path: Path,
+) -> None:
+    """End-to-end F4: uninstalling slug A whose symlink was cross-pointed at
+    slug B's content dir unlinks only A's symlink and leaves B's dir alive."""
+    import shutil as _shutil
+
+    from specialist_install import uninstall_specialist
+
+    agents_dir = tmp_path / "agents-specialists"
+    specialists_dir = tmp_path / "specialists"
+    b_content = agents_dir / (".finance.material-" + "c" * 32)
+    b_content.mkdir(parents=True)
+    (b_content / "runtime.yaml").write_text("schema_version: 1\n", encoding="utf-8")
+    a_link = agents_dir / "legal"
+    os.symlink(b_content.name, a_link)
+
+    uninstall_specialist(
+        slug="legal", specialists_dir=specialists_dir, agents_specialists_dir=agents_dir)
+
+    assert not os.path.lexists(a_link)  # A's cross-pointed symlink removed
+    assert b_content.is_dir()  # B's live content survives
+    assert (b_content / "runtime.yaml").is_file()
+    _shutil.rmtree(agents_dir, ignore_errors=True)

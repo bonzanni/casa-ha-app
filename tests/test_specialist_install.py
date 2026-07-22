@@ -924,3 +924,210 @@ def test_persona_pin_roots_includes_an_override_bound_specialist(tmp_path: Path)
 
     pinned = persona_pin_roots(bindings_dir=tmp_path / "bindings", specialists_dir=specialists_dir)
     assert "casa/judge@0.3.0" in pinned
+
+
+# ---------------------------------------------------------------------------
+# Whole-branch review ROUND 2 — F1 (inspection.slug traversal),
+# F2 (persona dependency row required structurally).
+# ---------------------------------------------------------------------------
+
+
+def _canary_paths(tmp_path: Path) -> list[Path]:
+    """Locations a traversal slug (`../evil`) joined onto `specialists_dir` /
+    `agents_specialists_dir` would escape to — asserting these stay absent is
+    the F1 canary that nothing was written outside the two roots."""
+    return [
+        tmp_path / "evil",  # ../evil from tmp_path/specialists
+        tmp_path.parent / "evil",
+    ]
+
+
+def test_commit_refuses_a_traversal_inspection_slug_and_writes_nothing_outside_roots(
+    tmp_path: Path,
+) -> None:
+    """F1: a hand-built InspectionResult whose `slug` is a traversal string —
+    WITH a matching recorded consent ack — must be refused with a typed error
+    at the lifecycle-function boundary, before any Path join escapes the roots."""
+    from specialist_install import InspectionResult, compute_install_root_digest
+
+    root = _write_component(tmp_path / "component", slug="mtg")
+    component = load_specialist_component(root, root / "manifest.json")
+    deps = resolve_dependency_closure(component, root)
+    root_digest = compute_install_root_digest(
+        component, deps, manifest_bytes=(root / "manifest.json").read_bytes())
+    evil_slug = "../evil"
+    inspection = InspectionResult(
+        component_id=component.component_id, version=component.version, slug=evil_slug,
+        component_checksum=component.checksum, root_digest=root_digest, mission="x",
+        default_persona_ref=component.default_persona_ref,
+        default_persona_checksum=component.default_persona_checksum,
+        required_config_names=(), required_secret_names=(), dependencies=deps, staged_dir=root,
+    )
+    acks = SpecialistInstallAckStore(path=tmp_path / "acks.json")
+    identity = install_consent_identity(
+        component_id=inspection.component_id, version=inspection.version,
+        root_digest=inspection.root_digest, slug=inspection.slug)
+    acks.record(identity=identity, component_id=inspection.component_id, version=inspection.version,
+                component_checksum=inspection.root_digest, slug=inspection.slug)
+
+    specialists_dir = tmp_path / "specialists"
+    agents_specialists_dir = tmp_path / "agents-specialists"
+    with pytest.raises(SpecialistInstallError) as raised:
+        commit_specialist_install(
+            inspection=inspection, config={}, secret_names_provided=frozenset(), acks=acks,
+            specialists_dir=specialists_dir, agents_specialists_dir=agents_specialists_dir,
+        )
+    assert raised.value.kind == "invalid_slug"
+    for canary in _canary_paths(tmp_path):
+        assert not canary.exists(), canary
+
+
+def test_commit_refuses_when_cas_component_slug_disagrees_with_inspection_slug(
+    tmp_path: Path,
+) -> None:
+    """F1 (second half): a VALID-but-WRONG inspection.slug (passes the slug
+    regex, differs from the component's own declared slug) is caught by the
+    post-publish CAS reload assert — binding slug X's approval to component Y's
+    bytes is refused with slug_mismatch, and slug X's instance dir is never
+    created."""
+    from specialist_install import InspectionResult, compute_install_root_digest
+
+    root = _write_component(tmp_path / "component", slug="mtg")
+    component = load_specialist_component(root, root / "manifest.json")
+    deps = resolve_dependency_closure(component, root)
+    root_digest = compute_install_root_digest(
+        component, deps, manifest_bytes=(root / "manifest.json").read_bytes())
+    wrong_slug = "notmtg"  # valid single-segment slug, but != component.slug ("mtg")
+    inspection = InspectionResult(
+        component_id=component.component_id, version=component.version, slug=wrong_slug,
+        component_checksum=component.checksum, root_digest=root_digest, mission="x",
+        default_persona_ref=component.default_persona_ref,
+        default_persona_checksum=component.default_persona_checksum,
+        required_config_names=(), required_secret_names=(), dependencies=deps, staged_dir=root,
+    )
+    acks = SpecialistInstallAckStore(path=tmp_path / "acks.json")
+    identity = install_consent_identity(
+        component_id=inspection.component_id, version=inspection.version,
+        root_digest=inspection.root_digest, slug=inspection.slug)
+    acks.record(identity=identity, component_id=inspection.component_id, version=inspection.version,
+                component_checksum=inspection.root_digest, slug=inspection.slug)
+
+    specialists_dir = tmp_path / "specialists"
+    with pytest.raises(SpecialistInstallError) as raised:
+        commit_specialist_install(
+            inspection=inspection, config={}, secret_names_provided=frozenset(), acks=acks,
+            specialists_dir=specialists_dir, agents_specialists_dir=tmp_path / "agents-specialists",
+        )
+    assert raised.value.kind == "slug_mismatch"
+    assert not (specialists_dir / wrong_slug).exists()  # no instance dir for the wrong slug
+
+
+def test_resolve_dependency_closure_refuses_empty_dependencies_no_persona_row(
+    tmp_path: Path,
+) -> None:
+    """F2: a component with `dependencies: []` (no persona row) still declares
+    a default_persona — resolve_dependency_closure must flag the missing
+    persona binding as unavailable rather than silently activating the bundled
+    default with no identity/checksum attestation."""
+    root = _write_component(tmp_path / "component", slug="mtg", dependencies=[])
+    component = load_specialist_component(root, root / "manifest.json")
+    resolutions = resolve_dependency_closure(component, root)
+    persona_rows = [r for r in resolutions if r.kind == "persona"]
+    assert len(persona_rows) == 1
+    assert persona_rows[0].available is False
+    assert "persona dependency row missing/mismatched" == persona_rows[0].detail
+
+
+def test_inspect_refuses_a_component_with_no_persona_dependency_row(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """F2 (inspect leg): the missing-persona-row failure flows into
+    dependency_unavailable at inspection time."""
+    component_root = _write_component(tmp_path / "component", slug="mtg", dependencies=[])
+    monkeypatch.setattr(specialist_install, "resolve_and_fetch", _stub_resolve_and_fetch(component_root))
+    index = InstalledSpecialistIndex(specialists_dir=str(tmp_path / "specialists"))
+    index.load()
+    with pytest.raises(SpecialistInstallError) as raised:
+        specialist_install.inspect_specialist_repo(
+            "org/repo", "main", staging_root=tmp_path / "staging", installed_index=index)
+    assert raised.value.kind == "dependency_unavailable"
+    assert "persona dependency row missing/mismatched" in raised.value.detail
+
+
+def test_commit_refuses_a_component_with_no_persona_dependency_row(tmp_path: Path) -> None:
+    """F2 (commit leg): even bypassing inspect with a hand-built InspectionResult
+    and a matching ack, the CAS-staging re-verification refuses the unbound
+    default persona."""
+    from specialist_install import InspectionResult, compute_install_root_digest
+
+    root = _write_component(tmp_path / "component", slug="mtg", dependencies=[])
+    component = load_specialist_component(root, root / "manifest.json")
+    deps = resolve_dependency_closure(component, root)  # already contains the failing persona row
+    # Recompute the digest as commit will: from the on-disk manifest bytes.
+    root_digest = compute_install_root_digest(
+        component, deps, manifest_bytes=(root / "manifest.json").read_bytes())
+    inspection = InspectionResult(
+        component_id=component.component_id, version=component.version, slug="mtg",
+        component_checksum=component.checksum, root_digest=root_digest, mission="x",
+        default_persona_ref=component.default_persona_ref,
+        default_persona_checksum=component.default_persona_checksum,
+        required_config_names=(), required_secret_names=(), dependencies=deps, staged_dir=root,
+    )
+    acks = SpecialistInstallAckStore(path=tmp_path / "acks.json")
+    identity = install_consent_identity(
+        component_id=inspection.component_id, version=inspection.version,
+        root_digest=inspection.root_digest, slug=inspection.slug)
+    acks.record(identity=identity, component_id=inspection.component_id, version=inspection.version,
+                component_checksum=inspection.root_digest, slug=inspection.slug)
+    with pytest.raises(SpecialistInstallError) as raised:
+        commit_specialist_install(
+            inspection=inspection, config={}, secret_names_provided=frozenset(), acks=acks,
+            specialists_dir=tmp_path / "specialists",
+            agents_specialists_dir=tmp_path / "agents-specialists",
+        )
+    assert raised.value.kind == "dependency_unavailable"
+
+
+def test_selfheal_reads_the_active_tuple_inside_the_lock_not_the_stale_snapshot(
+    tmp_path: Path,
+) -> None:
+    """F3: `_reconcile_specialist_operational_files` must RE-READ the active
+    tuple from disk inside MATERIALIZE_LOCK, so a tuple committed AFTER the
+    installed_index was snapshotted (simulating a concurrent upgrade/commit)
+    wins — its binding_digest is what lands in the materialized op-dir marker,
+    never the stale snapshot's."""
+    import specialist_materialize
+    from personality_binding import InstanceDir
+
+    specialists_dir, agents_specialists_dir, _v1 = _installed_mtg(tmp_path)
+
+    # Snapshot the index while tuple A is active (mirrors current_specialist_
+    # roles_dir loading the index once before the reconcile loop runs).
+    index = InstalledSpecialistIndex(specialists_dir=str(specialists_dir))
+    index.load()
+    tuple_a = InstanceDir(specialists_dir / "mtg").active()
+    assert tuple_a is not None
+
+    # Commit a DIFFERENT tuple B to active.yaml AFTER the snapshot — same
+    # component root (so CAS resolves) but a distinct binding via a different
+    # effective_config_digest, hence a different binding_digest.
+    binding_b = _specialist_binding(
+        "mtg", component_root=tuple_a.root, effective_config_digest="sha256:" + "7" * 64)
+    assert binding_b.binding_digest != tuple_a.binding.binding_digest
+    tuple_b = InstanceTuple(
+        root=tuple_a.root, binding=binding_b, config_snapshot={},
+        config_digest=binding_b.effective_config_digest)
+    instance_dir = InstanceDir(specialists_dir / "mtg")
+    instance_dir.stage_desired(tuple_b)
+    instance_dir.commit_desired_to_active()
+    assert InstanceDir(specialists_dir / "mtg").active().binding.binding_digest == binding_b.binding_digest
+
+    # Reconcile using the STALE index (still holds tuple A). The in-lock
+    # re-read must pick up tuple B from disk.
+    specialist_materialize._reconcile_specialist_operational_files(
+        installed_index=index, specialists_dir=specialists_dir,
+        agents_specialists_dir=agents_specialists_dir)
+
+    marker = specialist_materialize._read_binding_marker(agents_specialists_dir / "mtg")
+    assert marker is not None
+    assert marker["binding_digest"] == binding_b.binding_digest  # B won, not the stale A
