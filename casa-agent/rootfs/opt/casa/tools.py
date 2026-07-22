@@ -6809,7 +6809,12 @@ async def plugin_update(args: dict) -> dict:
     "Returns the component's mission, default persona, required config/secret names, and "
     "dependency-closure availability, or a structured error. On success this ALSO posts the "
     "operator's DM Approve/Deny consent keyboard — specialist_install_commit will refuse until "
-    "that tap lands. Pass mode='upgrade' + target_slug=<slug> when re-inspecting the SAME repo "
+    "that tap lands — UNLESS the consent ledger already holds an approval for this exact "
+    "component identity (pre-authorized installs skip the keyboard). If the keyboard cannot "
+    "actually be posted, this returns ok:false (consent_channel_unavailable / "
+    "consent_prompt_refused / consent_prompt_failed / consent_delivery_failed / "
+    "consent_prompt_inactive / consent_post_unsettled) instead of stranding the flow at "
+    "consent_missing. Pass mode='upgrade' + target_slug=<slug> when re-inspecting the SAME repo "
     "for an already-installed specialist (otherwise the collision check refuses it).",
     {"type": "object", "properties": {
         "repo": {"type": "string"}, "ref": {"type": "string"},
@@ -6840,49 +6845,26 @@ async def specialist_install_inspect(args: dict) -> dict:
     # already imported at module scope from authz_grants — no separate
     # import needed here), the configured Telegram DM channel, and the
     # validated operator identity.
-    from specialist_install_consent import SpecialistInstallAckStore, prompt_specialist_install_consent
+    #
+    # Round-5b (Sol P1): this used to return ok:true even when the keyboard
+    # could never post (no channel / no operator identity / registration
+    # refused / async delivery failed) — the flow then stranded forever at
+    # commit's consent_missing with zero diagnosis. Now: (1) if the ack
+    # ledger ALREADY holds a consent for this EXACT identity — the same
+    # install_consent_identity(component_id, version, root_digest, slug)
+    # binding specialist_install_commit re-validates against re-staged
+    # bytes — no keyboard is required or attempted (preserves the
+    # pre-authorized/synthetic-ack path and the Telegram-less container
+    # e2e); (2) otherwise the post is VERIFIED via the coordinator's
+    # settled-post machinery (ChallengeHandle.settled_post, authz_grants) and
+    # every failure is a STRUCTURED ok:false the recipe reports verbatim.
+    from specialist_install_consent import (
+        SpecialistInstallAckStore, install_consent_identity,
+        prompt_specialist_install_consent,
+    )
     import trigger_consent
 
-    channel = _channel_manager.get("telegram") if _channel_manager is not None else None
-    op = trigger_consent.operator_identity(channel) if channel is not None else None
-    if channel is not None and op is not None:
-        chat_id, operator_id = op
-        acks = SpecialistInstallAckStore()
-
-        async def _reconcile_cb() -> None:
-            # Intentionally a no-op: commit happens via a LATER, explicit
-            # specialist_install_commit call (the recipe polls for
-            # consent_missing rather than this callback auto-committing) —
-            # this callback exists only to satisfy prompt_specialist_install_
-            # consent's signature; recording the ack (which it does
-            # synchronously, before this callback ever runs) is the only
-            # side effect that matters here.
-            return
-
-        try:
-            # Round-3 fix (finding #3): register_challenge (authz_grants.py)
-            # calls `asyncio.get_running_loop().create_task(...)` SYNCHRONOUSLY
-            # — it requires the CALLING thread to already be inside a running
-            # event loop. `asyncio.to_thread` hands this call to a worker
-            # thread with NO running loop of its own, so `register_challenge`
-            # would raise `RuntimeError: no running event loop` there — a
-            # RuntimeError this `except Exception` swallows, so the DM
-            # keyboard silently never posts and the recipe's "wait for
-            # consent" step never resolves. Call directly on the event loop
-            # instead, exactly the way the real production pattern
-            # (`trigger_reconcile._fire_consent_prompts`, calling
-            # `trigger_consent.prompt_trigger_consent`) already does: a plain
-            # synchronous call, with NO `asyncio.to_thread` wrapper, from
-            # inside this coroutine (which IS running on the event loop).
-            prompt_specialist_install_consent(
-                coordinator=CHALLENGES,
-                channel=channel, chat_id=chat_id, operator_id=operator_id, inspection=result,
-                acks=acks, reconcile_cb=_reconcile_cb,
-            )
-        except Exception:  # noqa: BLE001 — inspection result still returned; recipe reports "waiting"
-            logger.exception("specialist install consent prompt failed to post")
-
-    return _result({
+    ok_payload = {
         "ok": True, "component_id": result.component_id, "version": result.version,
         "slug": result.slug, "component_checksum": result.component_checksum,
         "root_digest": result.root_digest,
@@ -6892,7 +6874,107 @@ async def specialist_install_inspect(args: dict) -> dict:
         "dependencies": [{"kind": d.kind, "identifier": d.identifier, "available": d.available}
                           for d in result.dependencies],
         "staged_dir": str(result.staged_dir),
-    })
+    }
+
+    acks = SpecialistInstallAckStore()
+    identity = install_consent_identity(
+        component_id=result.component_id, version=result.version,
+        root_digest=result.root_digest, slug=result.slug,
+    )
+    if acks.is_acked(identity):
+        # Spec §E: consent = "pre_authorized" | "keyboard_posted" on ok:true.
+        ok_payload["consent"] = "pre_authorized"
+        return _result(ok_payload)
+
+    channel = _channel_manager.get("telegram") if _channel_manager is not None else None
+    op = trigger_consent.operator_identity(channel) if channel is not None else None
+    if channel is None or op is None:
+        return _result({
+            "ok": False, "kind": "consent_channel_unavailable",
+            "detail": (
+                ("no telegram channel is configured" if channel is None else
+                 "no valid operator DM identity (chat_id unset, non-numeric, "
+                 "or a group chat)")
+                + " — the install-consent keyboard cannot be posted and no "
+                "pre-recorded consent ack exists for this component; fix the "
+                "operator DM channel (or pre-record a consent ack) and re-run "
+                "specialist_install_inspect"),
+        })
+    chat_id, operator_id = op
+
+    async def _reconcile_cb() -> None:
+        # Intentionally a no-op: commit happens via a LATER, explicit
+        # specialist_install_commit call (the recipe polls for
+        # consent_missing rather than this callback auto-committing) —
+        # this callback exists only to satisfy prompt_specialist_install_
+        # consent's signature; recording the ack (which it does
+        # synchronously, before this callback ever runs) is the only
+        # side effect that matters here.
+        return
+
+    try:
+        # Round-3 fix (finding #3): register_challenge (authz_grants.py)
+        # calls `asyncio.get_running_loop().create_task(...)` SYNCHRONOUSLY
+        # — it requires the CALLING thread to already be inside a running
+        # event loop, so it is called directly from this coroutine (never
+        # via asyncio.to_thread), exactly like the production pattern
+        # trigger_reconcile._fire_consent_prompts.
+        handle = prompt_specialist_install_consent(
+            coordinator=CHALLENGES,
+            channel=channel, chat_id=chat_id, operator_id=operator_id, inspection=result,
+            acks=acks, reconcile_cb=_reconcile_cb,
+        )
+    except Exception as exc:  # noqa: BLE001 — round-5b: structured, never a silent ok:true
+        logger.exception("specialist install consent prompt failed to post")
+        return _result({"ok": False, "kind": "consent_prompt_failed",
+                         "detail": f"{type(exc).__name__}: {exc}"})
+    failure = await _settle_install_consent_post(handle)
+    if failure is not None:
+        return _result(failure)
+    ok_payload["consent"] = "keyboard_posted"
+    return _result(ok_payload)
+
+
+# Round-5b: bound on awaiting the consent keyboard's settled post. The
+# coordinator's setup driver only posts (the operator tap resolves later,
+# elsewhere), so this normally settles in one Telegram round-trip; the bound
+# exists so a wedged channel yields a structured failure, not a hung tool.
+_INSTALL_CONSENT_POST_TIMEOUT_S = 30.0
+
+
+async def _settle_install_consent_post(handle) -> "dict | None":
+    """Verify an install-consent keyboard actually posted (round-5b, shared
+    by specialist_install_inspect / persona_install_inspect).
+
+    Returns ``None`` when the keyboard is live ("posted"), else the
+    structured ok:false payload for the precise failure: registration
+    refused (oversized challenge), Telegram delivery failure, a request that
+    settled terminally before/while posting, or a post that never settled
+    within the bound. ``settled_post`` shields the coordinator-owned driver,
+    so the timeout here never cancels the post itself."""
+    refused = getattr(handle, "refused", None)
+    if refused is not None:
+        return {"ok": False, "kind": "consent_prompt_refused",
+                "detail": f"consent challenge registration refused: {refused}"}
+    try:
+        settled = await asyncio.wait_for(
+            handle.settled_post(), timeout=_INSTALL_CONSENT_POST_TIMEOUT_S)
+    except asyncio.TimeoutError:
+        return {"ok": False, "kind": "consent_post_unsettled",
+                "detail": (f"consent keyboard post did not settle within "
+                           f"{_INSTALL_CONSENT_POST_TIMEOUT_S:.0f}s — check the "
+                           "Telegram channel, then re-run the inspect tool")}
+    if settled == "posted":
+        return None
+    if settled == "delivery_failed":
+        return {"ok": False, "kind": "consent_delivery_failed",
+                "detail": ("Telegram delivery of the consent keyboard failed — "
+                           "check the operator DM channel, then re-run the "
+                           "inspect tool")}
+    return {"ok": False, "kind": "consent_prompt_inactive",
+            "detail": ("the consent request settled terminally before the "
+                       "keyboard could post (TTL expiry or reset) — re-run "
+                       "the inspect tool to be prompted again")}
 
 
 @tool(
@@ -7050,13 +7132,20 @@ async def specialist_uninstall(args: dict) -> dict:
     "persona_install_inspect",
     "Fetch a persona-only repository for inspection (non-persistent staging). Returns the persona "
     "id/version/checksum/display name, or a structured error. On success this ALSO posts the "
-    "operator's DM Approve/Deny consent keyboard.",
+    "operator's DM Approve/Deny consent keyboard — unless the consent ledger already holds an "
+    "approval for this exact persona identity (pre-authorized installs skip the keyboard). If "
+    "the keyboard cannot actually be posted, this returns ok:false (consent_channel_unavailable "
+    "/ consent_prompt_refused / consent_prompt_failed / consent_delivery_failed / "
+    "consent_prompt_inactive / consent_post_unsettled) instead of stranding the flow at "
+    "consent_missing.",
     {"type": "object", "properties": {
         "repo": {"type": "string"}, "ref": {"type": "string"}, "subdir": {"type": "string"},
         "expected_revision": {"type": "string"}}, "required": ["repo", "ref"]},
 )
 async def persona_install_inspect(args: dict) -> dict:
-    from persona_install import PersonaInstallAckStore, inspect_persona_repo
+    from persona_install import (
+        PersonaInstallAckStore, inspect_persona_repo, persona_install_consent_identity,
+    )
     from persona_install_consent import prompt_persona_install_consent
     from specialist_install import SpecialistInstallError
 
@@ -7071,40 +7160,64 @@ async def persona_install_inspect(args: dict) -> dict:
     # CREATE the challenge here rather than leaving it uncalled (Round-2
     # fix, finding #3, the bare-persona sibling of that same gap). CHALLENGES
     # is the same module-level singleton already imported at the top of this
-    # file (`from authz_grants import CHALLENGES, ...`).
+    # file (`from authz_grants import CHALLENGES, ...`). Round-5b (Sol P1):
+    # same ledger-precedence + verified-post contract as
+    # specialist_install_inspect — the identity checked here
+    # (persona_install_consent_identity(persona_id, version, checksum)) is
+    # exactly what persona_install.commit_persona_install re-validates.
     import trigger_consent
+
+    ok_payload = {"ok": True, "persona_id": result.persona_id, "version": result.version,
+                  "checksum": result.checksum, "display_name": result.display_name,
+                  "staged_dir": str(result.staged_dir)}
+
+    acks = PersonaInstallAckStore()
+    identity = persona_install_consent_identity(
+        persona_id=result.persona_id, version=result.version, checksum=result.checksum)
+    if acks.is_acked(identity):
+        # Spec §E: consent = "pre_authorized" | "keyboard_posted" on ok:true.
+        ok_payload["consent"] = "pre_authorized"
+        return _result(ok_payload)
 
     channel = _channel_manager.get("telegram") if _channel_manager is not None else None
     op = trigger_consent.operator_identity(channel) if channel is not None else None
-    if channel is not None and op is not None:
-        chat_id, operator_id = op
-        acks = PersonaInstallAckStore()
+    if channel is None or op is None:
+        return _result({
+            "ok": False, "kind": "consent_channel_unavailable",
+            "detail": (
+                ("no telegram channel is configured" if channel is None else
+                 "no valid operator DM identity (chat_id unset, non-numeric, "
+                 "or a group chat)")
+                + " — the install-consent keyboard cannot be posted and no "
+                "pre-recorded consent ack exists for this persona; fix the "
+                "operator DM channel (or pre-record a consent ack) and re-run "
+                "persona_install_inspect"),
+        })
+    chat_id, operator_id = op
 
-        async def _reconcile_cb() -> None:
-            return  # commit happens via a later, explicit persona_install_commit call
+    async def _reconcile_cb() -> None:
+        return  # commit happens via a later, explicit persona_install_commit call
 
-        try:
-            # Round-3 fix (finding #3): same event-loop requirement as
-            # `specialist_install_inspect` above — `register_challenge`
-            # (authz_grants.py:586) calls `asyncio.get_running_loop().
-            # create_task(...)` synchronously, so it must run ON the event
-            # loop, not inside an `asyncio.to_thread` worker thread (which
-            # has no running loop and would raise, silently swallowed by
-            # this `except`). Call directly, mirroring
-            # `trigger_reconcile._fire_consent_prompts`'s synchronous call to
-            # `trigger_consent.prompt_trigger_consent`
-            # (trigger_reconcile.py:350-353).
-            prompt_persona_install_consent(
-                coordinator=CHALLENGES,
-                channel=channel, chat_id=chat_id, operator_id=operator_id, inspection=result,
-                acks=acks, reconcile_cb=_reconcile_cb,
-            )
-        except Exception:  # noqa: BLE001
-            logger.exception("persona install consent prompt failed to post")
-
-    return _result({"ok": True, "persona_id": result.persona_id, "version": result.version,
-                     "checksum": result.checksum, "display_name": result.display_name,
-                     "staged_dir": str(result.staged_dir)})
+    try:
+        # Round-3 fix (finding #3): same event-loop requirement as
+        # `specialist_install_inspect` above — `register_challenge`
+        # (authz_grants.py) calls `asyncio.get_running_loop().create_task(...)`
+        # synchronously, so it must run ON the event loop (never via
+        # asyncio.to_thread), mirroring trigger_reconcile._fire_consent_prompts.
+        handle = prompt_persona_install_consent(
+            coordinator=CHALLENGES,
+            channel=channel, chat_id=chat_id, operator_id=operator_id, inspection=result,
+            acks=acks, reconcile_cb=_reconcile_cb,
+        )
+    except Exception as exc:  # noqa: BLE001 — round-5b: structured, never a silent ok:true
+        logger.exception("persona install consent prompt failed to post")
+        return _result({"ok": False, "kind": "consent_prompt_failed",
+                         "detail": f"{type(exc).__name__}: {exc}"})
+    failure = await _settle_install_consent_post(handle)
+    if failure is not None:
+        return _result(failure)
+    ok_payload["consent"] = "keyboard_posted"
+    return _result(ok_payload)
 
 
 @tool(

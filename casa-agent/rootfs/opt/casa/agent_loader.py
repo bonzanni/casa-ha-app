@@ -1434,6 +1434,38 @@ def load_all_executors(
                 role=executor_role_slot, effective_config_digest=EMPTY_CONFIG_DIGEST,
             )
 
+            # Round-5 (Terra P0): the canonical role artifact is the
+            # immutable capability CEILING. definition.yaml is legitimately
+            # editable in operation (executor/enable|disable|edit-definition
+            # recipes), so a compromised/mistaken session could re-add a tool
+            # (e.g. Bash) that the image-owned role artifact
+            # (defaults/roles/executor/<type>/role.yaml — not operator-
+            # writable, covered by role_checksum) deliberately does not
+            # grant: capability self-escalation through the operational
+            # file. Clamp the effective allowlist to the INTERSECTION —
+            # definition.yaml may only narrow the role's grant, never exceed
+            # it. A role artifact without a tools.allowed list yields an
+            # EMPTY ceiling (fail-closed). Dropped entries are a tamper
+            # signal — logged loudly, never silent. (tools.disallowed is
+            # deliberately NOT clamped: it can only remove capability, so
+            # definition editing cannot escalate through it.)
+            declared_allowed = list(tools.get("allowed", []))
+            role_ceiling = set(
+                (role_artifact.role.get("tools") or {}).get("allowed") or [])
+            effective_allowed = [
+                t for t in declared_allowed if t in role_ceiling]
+            dropped_beyond_ceiling = [
+                t for t in declared_allowed if t not in role_ceiling]
+            if dropped_beyond_ceiling:
+                logger.error(
+                    "executor %r: definition.yaml grants tools beyond its "
+                    "role ceiling; dropped: %s (role.yaml under "
+                    "defaults/roles/executor/%s/ is the immutable "
+                    "capability ceiling — definition.yaml may only narrow "
+                    "it; treat an unexpected drop as a tamper signal)",
+                    entry, dropped_beyond_ceiling, entry,
+                )
+
             memory_block = defn.get("memory") or {}
             d = ExecutorDefinition(
                 type=defn["type"],
@@ -1441,7 +1473,7 @@ def load_all_executors(
                 model=resolve_model(defn["model"]),
                 driver=defn["driver"],
                 enabled=defn.get("enabled", True),
-                tools_allowed=list(tools.get("allowed", [])),
+                tools_allowed=effective_allowed,
                 tools_disallowed=list(tools.get("disallowed", [])),
                 permission_mode=tools.get("permission_mode", "acceptEdits"),
                 mcp_server_names=list(defn.get("mcp_server_names", [])),

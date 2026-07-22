@@ -32,14 +32,15 @@ def _write_exec(base, name, defn_yaml=None, prompt="Hi."):
     return d
 
 
-def _seed_executor_role_artifact(roles_dir, type_name):
+def _seed_executor_role_artifact(roles_dir, type_name, allowed=()):
     """Write a minimal schema-valid canonical role artifact for an
     executor type under a test-owned roles_dir (Personality Phase A,
     Task 5 — load_all_executors now requires one, cross-validated on
     id/kind/slot, per defaults/roles/executor/<type>/). Real shipped
     types ("configurator", "plugin-developer") already have real
     artifacts under the production defaults/roles/ tree and don't need
-    this; synthetic test-only types (e.g. "myx") do."""
+    this; synthetic test-only types (e.g. "myx") do. ``allowed`` seeds
+    the role's tools.allowed — the capability CEILING (round-5)."""
     d = os.path.join(roles_dir, "executor", type_name)
     os.makedirs(d, exist_ok=True)
     with open(os.path.join(d, "role.yaml"), "w") as fh:
@@ -52,7 +53,7 @@ def _seed_executor_role_artifact(roles_dir, type_name):
             enabled: true
             model: {{source: fixed, value: sonnet}}
             tools:
-              allowed: []
+              allowed: {list(allowed)}
               disallowed: []
               permission_mode: acceptEdits
               max_turns: 10
@@ -333,3 +334,108 @@ class TestExecutorRoleArtifact:
         assert len(failed) == 1
         assert failed[0][0] == "ccc"
         assert "role artifact" in failed[0][1]
+
+
+class TestRoleCeilingClamp:
+    """Round-5 (Terra P0): defaults/roles/executor/<type>/role.yaml is the
+    IMMUTABLE capability ceiling (image-owned, covered by role_checksum);
+    definition.yaml is operationally editable (executor recipes), so its
+    tools.allowed is clamped to the intersection with the role's — it may
+    only narrow, never exceed. Regression: a configurator session re-adding
+    Bash to its own definition.yaml must not get Bash back next session."""
+
+    def _write_myx(self, base, allowed_line):
+        _write_exec(str(base), "myx", defn_yaml=textwrap.dedent(f"""\
+            schema_version: 1
+            type: myx
+            description: A reasonably long description that meets minLength 20.
+            model: sonnet
+            driver: in_casa
+            enabled: true
+            tools:
+              allowed: {allowed_line}
+              permission_mode: acceptEdits
+            mcp_server_names: [casa-framework]
+        """))
+
+    def test_self_escalation_clamped_and_logged(self, tmp_path, caplog):
+        """(a) definition re-adds Bash; role ceiling lacks it -> dropped,
+        loudly logged (tamper signal), executor still loads."""
+        import logging
+        from agent_loader import load_all_executors
+        base = tmp_path / "executors"
+        self._write_myx(base, "[Read, Bash]")
+        roles_dir = tmp_path / "roles"
+        _seed_executor_role_artifact(str(roles_dir), "myx", allowed=["Read"])
+        with caplog.at_level(logging.ERROR):
+            out, failed = load_all_executors(
+                str(tmp_path), roles_dir=str(roles_dir))
+        assert failed == []
+        assert out["myx"].tools_allowed == ["Read"]
+        assert any(
+            "beyond its role ceiling" in r.getMessage()
+            and "Bash" in r.getMessage()
+            for r in caplog.records
+        ), "the drop must be logged loudly — it is a tamper signal"
+
+    def test_built_options_do_not_contain_escalated_tool(self, tmp_path):
+        """(a, end-to-end) the clamped list is what reaches
+        ClaudeAgentOptions.allowed_tools via tools._build_executor_options
+        (the in_casa builder; the claude_code path consumes the same
+        defn.tools_allowed via drivers.workspace._build_cc_permissions)."""
+        import tools as tools_mod
+        from agent_loader import load_all_executors
+        base = tmp_path / "executors"
+        self._write_myx(base, "[Read, Bash]")
+        roles_dir = tmp_path / "roles"
+        _seed_executor_role_artifact(str(roles_dir), "myx", allowed=["Read"])
+        out, failed = load_all_executors(
+            str(tmp_path), roles_dir=str(roles_dir))
+        assert failed == []
+        opts = tools_mod._build_executor_options(
+            out["myx"], executor_type="myx", plugin_paths=[])
+        assert "Bash" not in opts.allowed_tools
+        assert "Read" in opts.allowed_tools
+
+    def test_definition_narrower_than_role_is_respected(self, tmp_path, caplog):
+        """(b) narrowing is the definition's prerogative — no clamp, no log."""
+        import logging
+        from agent_loader import load_all_executors
+        base = tmp_path / "executors"
+        self._write_myx(base, "[Read]")
+        roles_dir = tmp_path / "roles"
+        _seed_executor_role_artifact(
+            str(roles_dir), "myx", allowed=["Read", "Write", "Bash"])
+        with caplog.at_level(logging.ERROR):
+            out, failed = load_all_executors(
+                str(tmp_path), roles_dir=str(roles_dir))
+        assert failed == []
+        assert out["myx"].tools_allowed == ["Read"]
+        assert not any(
+            "beyond its role ceiling" in r.getMessage()
+            for r in caplog.records)
+
+    def test_shipped_files_clamp_is_noop(self, caplog):
+        """(d) shipped parity: the real definition.yaml and role.yaml lists
+        are equal for both executors, so the clamp changes nothing and logs
+        no drop."""
+        import logging
+        from pathlib import Path
+        import yaml
+        from agent_loader import load_all_executors
+
+        agents_base = (
+            Path(__file__).resolve().parents[1]
+            / "casa-agent" / "rootfs" / "opt" / "casa" / "defaults" / "agents"
+        )
+        with caplog.at_level(logging.ERROR):
+            out, failed = load_all_executors(str(agents_base))
+        assert failed == []
+        for t in ("configurator", "plugin-developer"):
+            declared = yaml.safe_load(
+                (agents_base / "executors" / t / "definition.yaml")
+                .read_text(encoding="utf-8"))["tools"]["allowed"]
+            assert out[t].tools_allowed == list(declared), t
+        assert not any(
+            "beyond its role ceiling" in r.getMessage()
+            for r in caplog.records)

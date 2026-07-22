@@ -1,6 +1,58 @@
 # Changelog
 
-## [0.100.2] - 2026-07-22
+## [0.101.0] - 2026-07-23
+
+Install-from-repo, first try. A fresh-install verification run exposed why a
+specialist install through chat could go wrong; this release fixes the whole
+chain, from the tool the configurator sees to the doctrine it reads.
+
+### Fixed
+
+- **The configurator now actually has the install tools.** The specialist and
+  persona pipeline tools were declared on the configurator's role but never in
+  the runtime allowlist it is loaded with — so a chat-driven "install this
+  specialist from its repository" could never take the consented pipeline path.
+  The runtime list now carries all ten tools, and a test keeps the two lists
+  identical forever.
+- `plugin_add`/`plugin_assign` no longer report failure for the documented
+  plugin-before-specialist install order: a target specialist that is not
+  installed yet is reported as `pending_targets` (with a self-clearing
+  `target_pending` health warning), not a reload error.
+- Boot health reports no longer flag installed specialists with false schema
+  errors: config-sync's per-file validation skips the pipeline-managed
+  specialist directories (the digest-verified specialist loader is their
+  authority).
+- Six configurator recipes staged commit/reload/completion in the wrong order;
+  all now follow the canonical commit → reload → complete sequence, enforced by
+  a mechanical test over every recipe.
+- Specialist and persona install inspections no longer report success when the
+  operator consent prompt could not actually be delivered: the tools now verify
+  the consent keyboard posted (or that consent was already granted for exactly
+  this content) and return a precise, per-cause failure otherwise — instead of
+  leaving the install waiting forever for a tap that was never requested.
+
+### Changed
+
+- **The configurator no longer has a shell.** It never needed one: files are
+  edited with typed file tools, searches use the search tools, and component
+  state is managed by the install pipeline. Removing shell access closes a
+  whole class of policy-bypass shapes that command inspection cannot.
+- **Managed component state is write-protected in depth.** A new, always-on
+  guard denies hand-edits of specialist, plugin, persona, and binding state
+  (and of hook-policy files) for executor agents, with denial messages that
+  point to the correct typed tool and recipe. The guard is enforced in code on
+  both executor drivers — configuration files can add policies but never remove
+  this one.
+- The configurator's system prompt now carries a recipe index with a
+  mandatory-recipe rule, and five stale recipes that described the pre-0.101
+  hand-authored world (create/update/delete specialist, create/delete resident)
+  are retired stubs that redirect to the supported flows.
+
+### Security
+
+- Executor capability lists are clamped to the image-shipped role ceiling at
+  load time, and executors without a matching image role refuse to load — an
+  executor's editable configuration can narrow its tools but never extend them.
 
 ### Fixed
 
