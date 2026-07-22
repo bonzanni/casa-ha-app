@@ -2211,3 +2211,128 @@ class TestRestartToSwapGuardCascades:
         # newcomer: no live identity -> added normally (loop continued).
         assert "newcomer" in runtime.role_configs
         assert runtime.agents["newcomer"]._built_for is newcomer_cfg
+
+    async def test_reload_triggers_two_step_laundering_is_blocked(
+            self, tmp_path, monkeypatch, caplog):
+        """Task 14: the trigger-reload MUST NOT launder a staged identity change
+        into a later hot-swap. Step 1: scope=triggers on a resident whose on-disk
+        binding_digest moved reregisters triggers (the path's purpose) but must
+        PRESERVE the OLD cfg as the comparison baseline in role_configs. Step 2:
+        a subsequent scope=agent then still fires restart_required, because the
+        baseline was not poisoned NEW-vs-NEW."""
+        import logging
+        from types import SimpleNamespace
+        from reload import (dispatch, register_handler, reload_agent,
+                            reload_triggers)
+        register_handler("triggers", reload_triggers)
+        register_handler("agent", reload_agent)
+
+        agents_dir = tmp_path / "agents"
+        (agents_dir / "gary").mkdir(parents=True)
+
+        # On-disk (post-reconcile) cfg: gary's binding_digest moved OLD->NEW (a
+        # staged swap load_agent_from_dir committed desired->active on disk), and
+        # it carries a NEW trigger the reregister path must still install.
+        disk_cfg = SimpleNamespace(
+            role="gary", role_checksum="RC_G", binding_digest="NEW",
+            marker="reloaded",
+            character=SimpleNamespace(name="gary", card=""),
+            triggers=[SimpleNamespace(name="probe-new")],
+            channels=["telegram"],
+        )
+        monkeypatch.setattr("agent_loader.load_agent_from_dir",
+                            lambda d, **kw: disk_cfg)
+        monkeypatch.setattr("policies.load_policies",
+                            lambda *a, **kw: MagicMock())
+
+        import reload as reload_mod
+
+        def fake_construct(*, cfg, runtime):  # must never be reached for gary
+            a = MagicMock()
+            a.handle_message = MagicMock()
+            a._built_for = cfg
+            return a
+        monkeypatch.setattr(reload_mod, "_construct_agent", fake_construct)
+
+        live_cfg = SimpleNamespace(
+            role="gary", role_checksum="RC_G", binding_digest="OLD",
+            marker="live",
+            character=SimpleNamespace(name="gary", card=""),
+            triggers=[SimpleNamespace(name="boot-trigger")],
+            channels=["telegram"],
+        )
+        runtime = _make_runtime()
+        runtime.config_dir = str(tmp_path)
+        runtime.agents_dir = str(agents_dir)
+        runtime.role_configs = {"gary": live_cfg}
+        old_gary = MagicMock()
+        old_gary.aclose = AsyncMock()
+        runtime.agents = {"gary": old_gary}
+        runtime.trigger_registry.reregister_for = MagicMock()
+        runtime.specialist_registry.all_configs = lambda: {}
+
+        # --- Step 1: trigger reload with a STAGED identity change on disk ---
+        with caplog.at_level(logging.WARNING, logger="reload"):
+            r1 = await dispatch("triggers", runtime=runtime, role="gary")
+        assert r1["status"] == "ok"
+        # The path's purpose still works: NEW triggers were reregistered.
+        runtime.trigger_registry.reregister_for.assert_called_once_with(
+            "gary", [disk_cfg.triggers[0]], ["telegram"],
+        )
+        # BASELINE PRESERVED: role_configs still carries the OLD identity — the
+        # cache overwrite was refused because identity changed.
+        assert runtime.role_configs["gary"] is live_cfg
+        assert runtime.role_configs["gary"].binding_digest == "OLD"
+        assert "gary" in caplog.text
+        assert "restart" in caplog.text.lower()
+
+        # --- Step 2 (laundering proof): scope=agent still refuses hot-swap ---
+        r2 = await dispatch("agent", runtime=runtime, role="gary")
+        assert r2["status"] == "error"
+        assert r2["kind"] == "restart_required"
+        # The live agent was never swapped.
+        assert runtime.agents["gary"] is old_gary
+
+    async def test_reload_triggers_non_identity_change_still_refreshes(
+            self, tmp_path, monkeypatch):
+        """The guard must NOT break the legitimate Q-1 cache refresh: when the
+        resident's identity is UNCHANGED (same checksum + digest), scope=triggers
+        still overwrites role_configs[role] with the freshly-loaded cfg so the
+        back-compat consumer sees the post-reload trigger list."""
+        from types import SimpleNamespace
+        from reload import dispatch, register_handler, reload_triggers
+        register_handler("triggers", reload_triggers)
+
+        agents_dir = tmp_path / "agents"
+        (agents_dir / "gary").mkdir(parents=True)
+
+        new_cfg = SimpleNamespace(
+            role="gary", role_checksum="RC_G", binding_digest="SAME",
+            marker="reloaded",
+            triggers=[SimpleNamespace(name="boot-trigger"),
+                      SimpleNamespace(name="probe-q1")],
+            channels=["telegram"],
+        )
+        monkeypatch.setattr("agent_loader.load_agent_from_dir",
+                            lambda d, **kw: new_cfg)
+        monkeypatch.setattr("policies.load_policies",
+                            lambda *a, **kw: MagicMock())
+
+        runtime = _make_runtime()
+        runtime.config_dir = str(tmp_path)
+        runtime.agents_dir = str(agents_dir)
+        runtime.role_configs = {
+            "gary": SimpleNamespace(
+                role="gary", role_checksum="RC_G", binding_digest="SAME",
+                marker="live",
+                triggers=[SimpleNamespace(name="boot-trigger")],
+                channels=["telegram"]),
+        }
+        runtime.trigger_registry.reregister_for = MagicMock()
+
+        result = await dispatch("triggers", runtime=runtime, role="gary")
+        assert result["status"] == "ok"
+        # Identity unchanged -> the Q-1 cache refresh happened normally.
+        assert runtime.role_configs["gary"] is new_cfg
+        names = [t.name for t in runtime.role_configs["gary"].triggers]
+        assert names == ["boot-trigger", "probe-q1"]

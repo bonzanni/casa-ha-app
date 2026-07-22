@@ -280,7 +280,34 @@ async def reload_triggers(runtime: Any, *, role: str | None = None) -> list[str]
     # post-reload state, not the boot-time list. Mirrors the resident
     # vs specialist branching of reload_agent at lines 339-348.
     if role in runtime.role_configs:
-        runtime.role_configs[role] = cfg
+        # Personality Phase A, Task 14 (restart-to-swap invariant): the
+        # load_agent_from_dir above may have committed a STAGED persona swap
+        # desired->active on disk, yielding a NEW binding_digest on cfg while
+        # the LIVE agent still runs the OLD binding. Overwriting the cache
+        # unconditionally would poison the shared restart-to-swap baseline
+        # (runtime.role_configs is the comparison baseline for _resident_
+        # identity_changed): a SUBSEQUENT reload_agent / policy cascade would
+        # then compare NEW-vs-NEW, see no change, and HOT-SWAP the identity —
+        # two-step laundering of a change that MUST activate only via a
+        # supervised restart. So when the freshly-loaded cfg's personality
+        # identity moved, we keep the OLD cfg as the baseline and refuse the
+        # cache write. Trigger reregistration above already ran (triggers are
+        # not identity-bearing; refreshing them is this path's whole purpose).
+        # Documented side effect: the Q-1 back-compat consumer
+        # (tools.casa_reload_triggers reading role_configs[role].triggers)
+        # sees the boot-time trigger list until the restart the swap already
+        # requires — it self-heals on that restart's boot-time reconcile.
+        if _resident_identity_changed(cfg, runtime.role_configs.get(role)):
+            logger.warning(
+                "reload_triggers(%s): personality identity changed on disk "
+                "(role_checksum or binding_digest differs) — preserving the "
+                "OLD config as the restart-to-swap baseline; the identity "
+                "change activates on a supervised restart. Triggers were "
+                "reregistered; the back-compat trigger list stays boot-time "
+                "until that restart.", role,
+            )
+        else:
+            runtime.role_configs[role] = cfg
     else:
         try:
             await asyncio.to_thread(runtime.specialist_registry.load)
