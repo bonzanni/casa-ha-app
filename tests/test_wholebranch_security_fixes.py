@@ -594,3 +594,341 @@ def test_uninstall_under_lock_prevents_reconcile_resurrection(
 
     assert not (agents_dir / "mtg").exists()
     assert not (agents_dir / "mtg").is_symlink()
+
+
+# ==========================================================================
+# Round 4 — close the class: EVERY InstanceDir write under MATERIALIZE_LOCK,
+# in-lock re-validation of pre-lock reads, and the roles-overlay rebuild
+# serialized.
+# ==========================================================================
+
+
+def _approved_inspection_requiring_config(
+    tmp_path: Path, *, slug: str = "mtg", version_suffix: str = "",
+    version_override: str | None = None,
+):
+    """Like `_approved_inspection`, but the component's config-schema REQUIRES
+    an `api_key` secret — so a commit/upgrade that supplies none fails closed
+    into pending-configuration (exercising the placeholder stage path)."""
+    from specialist_component import compute_component_checksum, load_specialist_component
+    from specialist_install import InspectionResult, compute_install_root_digest
+    from specialist_install_consent import SpecialistInstallAckStore, install_consent_identity
+
+    root = _write_component(tmp_path / f"component-cfg-{slug}{version_suffix}", slug=slug)
+    (root / "config-schema.json").write_text(
+        json.dumps({"required": ["api_key"], "secret_names": ["api_key"]}), encoding="utf-8")
+    manifest_path = root / "manifest.json"
+    manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+    files = {
+        "role/role.yaml": (root / "role" / "role.yaml").read_bytes(),
+        "role/doctrine.md": (root / "role" / "doctrine.md").read_bytes(),
+        "config-schema.json": (root / "config-schema.json").read_bytes(),
+    }
+    manifest["checksum"] = compute_component_checksum(files)
+    if version_override is not None:
+        manifest["version"] = version_override
+    manifest_path.write_text(json.dumps(manifest), encoding="utf-8")
+    component = load_specialist_component(root, manifest_path)
+    deps = resolve_dependency_closure(component, root)
+    root_digest = compute_install_root_digest(
+        component, deps, manifest_bytes=manifest_path.read_bytes())
+    inspection = InspectionResult(
+        component_id=component.component_id, version=component.version, slug=component.slug,
+        component_checksum=component.checksum, root_digest=root_digest, mission="x",
+        default_persona_ref=component.default_persona_ref,
+        default_persona_checksum=component.default_persona_checksum,
+        required_config_names=(), required_secret_names=("api_key",),
+        dependencies=deps, staged_dir=root)
+    acks = SpecialistInstallAckStore(path=tmp_path / f"acks-cfg-{slug}{version_suffix}.json")
+    identity = install_consent_identity(
+        component_id=inspection.component_id, version=inspection.version,
+        root_digest=inspection.root_digest, slug=inspection.slug)
+    acks.record(identity=identity, component_id=inspection.component_id, version=inspection.version,
+                component_checksum=inspection.root_digest, slug=inspection.slug)
+    return inspection, acks
+
+
+def _record_stage_and_discard_lockstate(monkeypatch: pytest.MonkeyPatch) -> dict:
+    """Patch InstanceDir.stage_desired AND discard_desired to record
+    MATERIALIZE_LOCK.locked() on every call while still performing the real
+    write. Returns {"stage": [...], "discard": [...]}."""
+    import specialist_materialize
+    from personality_binding import InstanceDir
+
+    seen = {"stage": [], "discard": []}
+    real_stage = InstanceDir.stage_desired
+    real_discard = InstanceDir.discard_desired
+
+    def _stage(self, tup, *a, **k):
+        seen["stage"].append(specialist_materialize.MATERIALIZE_LOCK.locked())
+        return real_stage(self, tup, *a, **k)
+
+    def _discard(self, *a, **k):
+        seen["discard"].append(specialist_materialize.MATERIALIZE_LOCK.locked())
+        return real_discard(self, *a, **k)
+
+    monkeypatch.setattr(InstanceDir, "stage_desired", _stage)
+    monkeypatch.setattr(InstanceDir, "discard_desired", _discard)
+    return seen
+
+
+# -- F1: pending-config placeholder + upgrade error path stage under the lock --
+
+
+def test_commit_pending_config_stages_desired_inside_the_lock(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    seen = _record_stage_and_discard_lockstate(monkeypatch)
+    inspection, acks = _approved_inspection_requiring_config(tmp_path, slug="mtg")
+    instance = commit_specialist_install(
+        inspection=inspection, config={}, secret_names_provided=frozenset(), acks=acks,
+        specialists_dir=tmp_path / "specialists", agents_specialists_dir=tmp_path / "agents")
+    assert instance.state == "pending-configuration"
+    # RED pre-fix: the placeholder stage_desired ran OUTSIDE MATERIALIZE_LOCK.
+    assert seen["stage"] == [True]
+
+
+def test_upgrade_pending_config_stages_desired_inside_the_lock(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    v1, acks1 = _approved_inspection(tmp_path, slug="mtg", version_suffix="-v1")
+    specialists_dir = tmp_path / "specialists"
+    agents_dir = tmp_path / "agents"
+    commit_specialist_install(
+        inspection=v1, config={}, secret_names_provided=frozenset(), acks=acks1,
+        specialists_dir=specialists_dir, agents_specialists_dir=agents_dir)
+
+    seen = _record_stage_and_discard_lockstate(monkeypatch)
+    v2, acks2 = _approved_inspection_requiring_config(
+        tmp_path, slug="mtg", version_suffix="-v2", version_override="0.2.0")
+    instance = upgrade_specialist(
+        slug="mtg", inspection=v2, config={}, secret_names_provided=frozenset(), acks=acks2,
+        specialists_dir=specialists_dir, agents_specialists_dir=agents_dir)
+    assert instance.state == "pending-configuration"
+    # RED pre-fix: the upgrade placeholder stage_desired ran OUTSIDE the lock.
+    assert seen["stage"] == [True]
+
+
+def test_upgrade_error_path_stages_and_discards_inside_the_lock(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    import prompt_compiler
+
+    v1, acks1 = _approved_inspection(tmp_path, slug="mtg", version_suffix="-v1")
+    specialists_dir = tmp_path / "specialists"
+    agents_dir = tmp_path / "agents"
+    commit_specialist_install(
+        inspection=v1, config={}, secret_names_provided=frozenset(), acks=acks1,
+        specialists_dir=specialists_dir, agents_specialists_dir=agents_dir)
+    v2, acks2 = _approved_inspection(
+        tmp_path, slug="mtg", version_suffix="-v2", version_override="0.2.0")
+
+    # Force the pre-activation compile to fail so upgrade takes the ERROR path
+    # (stage the active binding as desired, then discard it into
+    # desired.error.yaml). Patch the SOURCE module attribute (upgrade imports
+    # it locally as `from prompt_compiler import compile_prompt_bundle`).
+    def _boom(*a, **k):
+        raise ValueError("ceiling exceeded")
+
+    monkeypatch.setattr(prompt_compiler, "compile_prompt_bundle", _boom)
+
+    seen = _record_stage_and_discard_lockstate(monkeypatch)
+    instance = upgrade_specialist(
+        slug="mtg", inspection=v2, config={}, secret_names_provided=frozenset(), acks=acks2,
+        specialists_dir=specialists_dir, agents_specialists_dir=agents_dir)
+    assert instance.state == "error"
+    # RED pre-fix: BOTH the error-path stage_desired and discard_desired ran
+    # OUTSIDE MATERIALIZE_LOCK.
+    assert seen["stage"] == [True]
+    assert seen["discard"] == [True]
+
+
+# -- F2: uninstall/install racing between the pre-lock read and the in-lock
+#        stage -> typed concurrent_mutation refusal, no recreated dir. --------
+
+
+def test_upgrade_refuses_when_uninstall_races_before_the_lock(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    import prompt_compiler
+    from personality_binding import InstanceDir
+
+    v1, acks1 = _approved_inspection(tmp_path, slug="mtg", version_suffix="-v1")
+    specialists_dir = tmp_path / "specialists"
+    agents_dir = tmp_path / "agents"
+    commit_specialist_install(
+        inspection=v1, config={}, secret_names_provided=frozenset(), acks=acks1,
+        specialists_dir=specialists_dir, agents_specialists_dir=agents_dir)
+    v2, acks2 = _approved_inspection(
+        tmp_path, slug="mtg", version_suffix="-v2", version_override="0.2.0")
+
+    # Hook the pre-activation compile (runs AFTER active_before was read, BEFORE
+    # the in-lock re-check) to run a full uninstall — the concurrent mutation
+    # that removes active.yaml out from under the upgrade.
+    real_compile = prompt_compiler.compile_prompt_bundle
+    fired = {"done": False}
+
+    def _compile_then_uninstall(*a, **k):
+        result = real_compile(*a, **k)
+        if not fired["done"]:
+            fired["done"] = True
+            uninstall_specialist(
+                slug="mtg", specialists_dir=specialists_dir, agents_specialists_dir=agents_dir)
+        return result
+
+    monkeypatch.setattr(prompt_compiler, "compile_prompt_bundle", _compile_then_uninstall)
+
+    with pytest.raises(SpecialistInstallError) as exc:
+        upgrade_specialist(
+            slug="mtg", inspection=v2, config={}, secret_names_provided=frozenset(), acks=acks2,
+            specialists_dir=specialists_dir, agents_specialists_dir=agents_dir)
+    assert exc.value.kind == "concurrent_mutation"
+    assert fired["done"] is True
+    # RED pre-fix: with no in-lock re-check, upgrade staged+committed after the
+    # uninstall, RESURRECTING the removed slug. Post-fix nothing is recreated.
+    assert InstanceDir(specialists_dir / "mtg").active() is None
+    assert not (specialists_dir / "mtg" / "desired.yaml").exists()
+    assert not (agents_dir / "mtg").exists()
+
+
+def test_rollback_refuses_when_uninstall_races_before_the_lock(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    import prompt_compiler
+    from personality_binding import InstanceDir
+
+    v1, acks1 = _approved_inspection(tmp_path, slug="mtg", version_suffix="-v1")
+    specialists_dir = tmp_path / "specialists"
+    agents_dir = tmp_path / "agents"
+    commit_specialist_install(
+        inspection=v1, config={}, secret_names_provided=frozenset(), acks=acks1,
+        specialists_dir=specialists_dir, agents_specialists_dir=agents_dir)
+    v2, acks2 = _approved_inspection(
+        tmp_path, slug="mtg", version_suffix="-v2", version_override="0.2.0")
+    upgrade_specialist(
+        slug="mtg", inspection=v2, config={}, secret_names_provided=frozenset(), acks=acks2,
+        specialists_dir=specialists_dir, agents_specialists_dir=agents_dir)
+
+    # rollback re-runs a compile as its verification gate (before the lock) —
+    # hook it to uninstall the slug first.
+    real_compile = prompt_compiler.compile_prompt_bundle
+    fired = {"done": False}
+
+    def _compile_then_uninstall(*a, **k):
+        result = real_compile(*a, **k)
+        if not fired["done"]:
+            fired["done"] = True
+            uninstall_specialist(
+                slug="mtg", specialists_dir=specialists_dir, agents_specialists_dir=agents_dir)
+        return result
+
+    monkeypatch.setattr(prompt_compiler, "compile_prompt_bundle", _compile_then_uninstall)
+
+    with pytest.raises(SpecialistInstallError) as exc:
+        rollback_specialist(
+            slug="mtg", specialists_dir=specialists_dir, agents_specialists_dir=agents_dir)
+    assert exc.value.kind == "concurrent_mutation"
+    assert fired["done"] is True
+    # RED pre-fix: rollback staged the prior tuple after the uninstall,
+    # resurrecting the removed slug.
+    assert InstanceDir(specialists_dir / "mtg").active() is None
+    assert not (specialists_dir / "mtg" / "desired.yaml").exists()
+    assert not (agents_dir / "mtg").exists()
+
+
+def test_commit_refuses_when_a_concurrent_install_activates_first(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    import prompt_compiler
+    from personality_binding import InstanceDir
+
+    specialists_dir = tmp_path / "specialists"
+    agents_dir = tmp_path / "agents"
+    # Two independent approved inspections for the SAME slug but DIFFERENT
+    # versions (distinct root digests) — the concurrent-install collision the
+    # inspect-time uniqueness check cannot catch once two installs both cleared
+    # it and race into commit.
+    loser, loser_acks = _approved_inspection(tmp_path, slug="mtg", version_suffix="-a")
+    winner, winner_acks = _approved_inspection(
+        tmp_path, slug="mtg", version_suffix="-b", version_override="0.2.0")
+
+    real_compile = prompt_compiler.compile_prompt_bundle
+    fired = {"done": False}
+
+    def _compile_then_win(*a, **k):
+        result = real_compile(*a, **k)
+        if not fired["done"]:
+            fired["done"] = True  # guard: the nested commit's own compile must not re-fire
+            commit_specialist_install(
+                inspection=winner, config={}, secret_names_provided=frozenset(), acks=winner_acks,
+                specialists_dir=specialists_dir, agents_specialists_dir=agents_dir)
+        return result
+
+    monkeypatch.setattr(prompt_compiler, "compile_prompt_bundle", _compile_then_win)
+
+    with pytest.raises(SpecialistInstallError) as exc:
+        commit_specialist_install(
+            inspection=loser, config={}, secret_names_provided=frozenset(), acks=loser_acks,
+            specialists_dir=specialists_dir, agents_specialists_dir=agents_dir)
+    assert exc.value.kind == "concurrent_mutation"
+    assert fired["done"] is True
+    # RED pre-fix: the loser staged+committed over the winner, rotating the
+    # winner's active into prior (silent double-activate). Post-fix the winner's
+    # active is preserved untouched.
+    active = InstanceDir(specialists_dir / "mtg").active()
+    assert active is not None
+    _, version, _ = parse_component_root(active.root)
+    assert version == "0.2.0"  # the winner's version, not the loser's 0.1.0
+
+
+# -- F3: concurrent current_specialist_roles_dir threads must serialize the
+#        destructive roles-overlay rmtree+rebuild — no exception, overlay
+#        complete. -------------------------------------------------------------
+
+
+def test_concurrent_current_specialist_roles_dir_threads_build_complete_overlay(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    import time
+    import specialist_materialize
+    from concurrent.futures import ThreadPoolExecutor
+
+    specialists_dir, agents_dir = _install_active(tmp_path, slug="mtg")
+    _install_active(tmp_path, slug="research")  # same dirs — a multi-slug overlay
+    _install_active(tmp_path, slug="finance")
+    expected_slugs = {"mtg", "research", "finance"}
+
+    # Widen the copy window so a concurrent thread's rmtree of the shared
+    # specialist-overlay dir reliably lands BETWEEN a copy's dest.mkdir and its
+    # file writes — deterministically reproducing the pre-fix race (the
+    # write_bytes then hits a vanished parent -> FileNotFoundError surfaced as a
+    # future exception). Post-fix the whole rebuild is serialized under
+    # MATERIALIZE_LOCK, so the sleep only slows things down and never collides.
+    def _slow_copy(src: Path, dest: Path) -> None:
+        dest.mkdir(parents=True, exist_ok=True, mode=0o700)
+        time.sleep(0.02)
+        for name in ("role.yaml", "doctrine.md"):
+            source_file = src / name
+            if not source_file.is_file():
+                raise ValueError(f"{src}: missing required role-artifact file {name!r}")
+            (dest / name).write_bytes(source_file.read_bytes())
+
+    monkeypatch.setattr(specialist_materialize, "_copy_role_dir", _slow_copy)
+
+    for _ in range(4):
+        with ThreadPoolExecutor(max_workers=4) as ex:
+            futures = [
+                ex.submit(
+                    specialist_materialize.current_specialist_roles_dir,
+                    specialists_dir=specialists_dir,
+                    agents_specialists_dir=agents_dir,
+                )
+                for _ in range(4)
+            ]
+            overlay_roots = [f.result() for f in futures]  # RED pre-fix: raises here
+
+        for overlay_root in overlay_roots:
+            overlay = Path(overlay_root) / "specialist"
+            for slug in expected_slugs:
+                assert (overlay / slug / "role.yaml").is_file()
+                assert (overlay / slug / "doctrine.md").is_file()

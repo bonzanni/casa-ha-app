@@ -64,6 +64,64 @@ def is_safe_corpus_identifier(identifier: object) -> bool:
     )
 
 
+# Whole-branch review round 4, F1/F2 — in-lock concurrent-mutation guards.
+# EVERY InstanceDir write (stage_desired/commit_desired_to_active/
+# discard_desired) in this module now happens under
+# specialist_materialize.MATERIALIZE_LOCK (round 3 covered only the activating
+# stage+commit; round 4 extends it to the pending-configuration placeholder and
+# the upgrade error path). But holding the lock is not enough on its own: a
+# pre-lock read (upgrade/rollback's `active_before`, or a fresh install's "the
+# slug is not yet active" premise) can go STALE while the caller blocks on the
+# lock, because a concurrent uninstall/install/upgrade for the SAME slug may
+# have run to completion first. These two helpers RE-VALIDATE that premise
+# INSIDE the lock, immediately before the first InstanceDir write, and fail
+# closed with a typed `concurrent_mutation` refusal — leaving every on-disk
+# tuple untouched — rather than resurrect a removed slug's InstanceDir or
+# double-activate over a concurrent winner. Both MUST be called with
+# MATERIALIZE_LOCK held.
+
+
+def _require_active_unchanged(instance_dir, active_before, *, slug: str) -> None:
+    """F2: upgrade/rollback captured `active_before` BEFORE taking the lock. A
+    concurrent uninstall (which removes specialists/<slug>, active.yaml
+    included) or a concurrent upgrade/rollback (which commits a different
+    active) may have won while we blocked on the lock. Require the active tuple
+    to still EXIST and carry the SAME `root` identity it had at `active_before`;
+    a vanished or root-changed active means a concurrent mutation won —
+    refuse, so we never stage/commit over it (or recreate a just-removed
+    InstanceDir). Comparing `root` (component_id@version#checksum) is the right
+    identity axis: it is the field that genuinely differs across install
+    versions even when binding_digest collides (see
+    InstanceDir.commit_desired_to_active's Task-N1c note)."""
+    current = instance_dir.active()
+    if current is None or current.root != active_before.root:
+        raise SpecialistInstallError(
+            "concurrent_mutation",
+            f"{slug!r}: the active install changed under a concurrent mutation "
+            f"(uninstall/upgrade/rollback) while acquiring the lock; refusing to "
+            f"overwrite it — retry the operation")
+
+
+def _refuse_if_active_present(instance_dir, *, slug: str) -> None:
+    """F2: a fresh `commit_specialist_install` (both the activating and the
+    pending-configuration placeholder paths) presumes the slug is NOT yet
+    active — inspect's `check_slug_uniqueness` rejected an already-installed
+    slug, and a reinstall-after-uninstall legitimately sees no active tuple
+    (uninstall removed it). But two concurrent fresh installs of the SAME slug
+    can both clear inspect and then race here; the first commits active, and
+    without this guard the second would stage its desired and
+    `commit_desired_to_active` would rotate the winner's active into prior and
+    write ours over it — a silent double-activate demoting the winner. Re-read
+    under the lock and refuse if an active tuple already exists (fail closed),
+    rather than clobber a concurrent winner."""
+    if instance_dir.active() is not None:
+        raise SpecialistInstallError(
+            "concurrent_mutation",
+            f"{slug!r}: an active install appeared under a concurrent install "
+            f"while acquiring the lock; refusing to double-activate — re-inspect "
+            f"and retry")
+
+
 @dataclass(frozen=True, slots=True)
 class DependencyResolution:
     kind: str
@@ -684,10 +742,17 @@ def commit_specialist_install(
             role=role, persona=persona, component_root=root,
             dependency_digests=dependency_digests,
         )
-        instance_dir.stage_desired(InstanceTuple(
-            root=root, binding=placeholder_binding, config_snapshot=dict(config),
-            config_digest=placeholder_binding.effective_config_digest,
-        ))
+        # F1 (round 4): stage_desired for the placeholder is an InstanceDir
+        # write — it MUST hold MATERIALIZE_LOCK like every other one. F2: this
+        # stages a desired for a not-yet-active slug; re-check under the lock
+        # that a concurrent full install has not activated it meanwhile
+        # (staging a pending placeholder over a live active would corrupt state).
+        with specialist_materialize.MATERIALIZE_LOCK:
+            _refuse_if_active_present(instance_dir, slug=inspection.slug)
+            instance_dir.stage_desired(InstanceTuple(
+                root=root, binding=placeholder_binding, config_snapshot=dict(config),
+                config_digest=placeholder_binding.effective_config_digest,
+            ))
         return SpecialistInstance(
             slug=inspection.slug, stable_agent_id=f"specialist:{inspection.slug}",
             state="pending-configuration", active=None, desired=instance_dir.desired(),
@@ -741,6 +806,9 @@ def commit_specialist_install(
     # mutation. Staging+commit+materialize+marker is now one atomic locked unit.
     last_activation_error: str | None = None
     with specialist_materialize.MATERIALIZE_LOCK:
+        # F2 (round 4): fail closed if a concurrent install activated this slug
+        # while we blocked on the lock — never double-activate over a winner.
+        _refuse_if_active_present(instance_dir, slug=inspection.slug)
         instance_dir.stage_desired(InstanceTuple(
             root=root, binding=binding, config_snapshot=dict(config),
             config_digest=effective_config_digest,
@@ -985,9 +1053,16 @@ def upgrade_specialist(
     if not satisfied:
         placeholder = _build_upgrade_binding(
             effective_config_digest=active_before.binding.effective_config_digest)
-        instance_dir.stage_desired(InstanceTuple(
-            root=root, binding=placeholder, config_snapshot=merged_config,
-            config_digest=placeholder.effective_config_digest))
+        # F1 (round 4): the placeholder stage_desired is an InstanceDir write —
+        # hold MATERIALIZE_LOCK. F2: `active_before` was read before the lock;
+        # re-read inside it and refuse if a concurrent uninstall removed the
+        # slug or a concurrent upgrade changed its root (staging here would else
+        # recreate a just-removed InstanceDir).
+        with specialist_materialize.MATERIALIZE_LOCK:
+            _require_active_unchanged(instance_dir, active_before, slug=slug)
+            instance_dir.stage_desired(InstanceTuple(
+                root=root, binding=placeholder, config_snapshot=merged_config,
+                config_digest=placeholder.effective_config_digest))
         note = f"missing required config/secret: {missing}"
         if dropped_keys:
             note += f"; dropped_config_keys={dropped_keys}"
@@ -1016,10 +1091,19 @@ def upgrade_specialist(
             safety_kernel=(Path(__file__).parent / "defaults" / "personality"
                            / "safety-kernel.md").read_text(encoding="utf-8"))
     except ValueError as exc:
-        instance_dir.stage_desired(InstanceTuple(
-            root=root, binding=active_before.binding, config_snapshot=merged_config,
-            config_digest=active_before.binding.effective_config_digest))
-        instance_dir.discard_desired(reason=str(exc))
+        # F1 (round 4): this error-path stage_desired + discard_desired are
+        # InstanceDir writes — hold MATERIALIZE_LOCK. F2: `active_before` was
+        # read before the lock; re-read inside it and refuse if a concurrent
+        # uninstall/upgrade won, so recording this compile error never
+        # resurrects a just-removed slug's InstanceDir (stage_desired would
+        # recreate specialists/<slug>/desired.yaml). The concurrent-mutation
+        # refusal supersedes the (now-moot) compile error for a vanished slug.
+        with specialist_materialize.MATERIALIZE_LOCK:
+            _require_active_unchanged(instance_dir, active_before, slug=slug)
+            instance_dir.stage_desired(InstanceTuple(
+                root=root, binding=active_before.binding, config_snapshot=merged_config,
+                config_digest=active_before.binding.effective_config_digest))
+            instance_dir.discard_desired(reason=str(exc))
         return SpecialistInstance(
             slug=slug, stable_agent_id=f"specialist:{slug}", state="error",
             active=active_before, desired=None, last_activation_error=str(exc))
@@ -1036,6 +1120,11 @@ def upgrade_specialist(
     # commit_specialist_install's F1 note.
     note = f"dropped_config_keys={dropped_keys}" if dropped_keys else None
     with specialist_materialize.MATERIALIZE_LOCK:
+        # F2 (round 4): `active_before` was read before the lock; re-read inside
+        # it and refuse if a concurrent uninstall removed the slug or a
+        # concurrent upgrade/rollback committed a different active — never
+        # commit this upgrade over a concurrent winner or recreate a removed dir.
+        _require_active_unchanged(instance_dir, active_before, slug=slug)
         instance_dir.stage_desired(InstanceTuple(
             root=root, binding=binding, config_snapshot=merged_config, config_digest=effective_config_digest))
         committed = instance_dir.commit_desired_to_active()  # new binding digest -> new session epoch
@@ -1079,6 +1168,17 @@ def rollback_specialist(
     prior = load_instance_tuple(prior_path)
     if prior is None:
         raise SpecialistInstallError("no_prior_tuple", f"{slug!r} has no retained prior tuple")
+
+    # F2 (round 4): capture the CURRENT active BEFORE the lock (like upgrade's
+    # `active_before`) so the in-lock re-read below can detect a concurrent
+    # uninstall/upgrade/rollback that ran while we validated + blocked on the
+    # lock. Rollback replaces the running active with `prior`; a rollback with
+    # no current active would be a resurrection (staging `prior` recreates a
+    # just-removed InstanceDir), so require an active to roll back FROM.
+    active_before = instance_dir.active()
+    if active_before is None:
+        raise SpecialistInstallError(
+            "no_active_tuple", f"{slug!r} has no active install to roll back")
 
     # `prior.root` is ALWAYS the component root (the override fix never
     # touches `root`), independent of prior.binding.mode.
@@ -1131,6 +1231,11 @@ def rollback_specialist(
     # concurrent same-slug mutation — see commit_specialist_install's F1 note.
     last_activation_error: str | None = None
     with specialist_materialize.MATERIALIZE_LOCK:
+        # F2 (round 4): re-read active under the lock and refuse if it vanished
+        # (concurrent uninstall) or its root changed (concurrent upgrade/rollback)
+        # since `active_before` — never roll back over a concurrent winner or
+        # resurrect a removed InstanceDir.
+        _require_active_unchanged(instance_dir, active_before, slug=slug)
         instance_dir.stage_desired(prior)
         committed = instance_dir.commit_desired_to_active()
         try:
