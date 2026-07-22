@@ -1,5 +1,20 @@
 # Changelog
 
+## [Unreleased]
+
+### Changed
+
+- Specialists are now installed from a component repository instead of
+  being bundled with the app image. The `finance` specialist and a new
+  Magic — The Gathering rules judge (`mtg`) move to their own repositories;
+  reinstall `finance` via the configurator's install recipe
+  (`specialist_install_inspect` → `specialist_install_commit`). The
+  configurator's toolset also covers `specialist_upgrade`,
+  `specialist_rollback`, and `specialist_uninstall` for an installed
+  specialist, plus a `persona_install_inspect` / `persona_install_commit` /
+  `persona_apply` flow for adopting a specialist's bundled default persona
+  or swapping in another.
+
 ## [0.99.0] - 2026-07-20
 
 Memory failures are no longer mistaken for "no memories found".
