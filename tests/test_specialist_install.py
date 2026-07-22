@@ -474,15 +474,11 @@ def test_commit_survives_a_materialize_failure_and_self_heals_on_next_reconcile(
     committed tuple — and the NEXT current_specialist_roles_dir call must
     repair the operational files with no operator action.
 
-    Deviation from the brief's draft (disclosed in the N1b slice-B report):
-    `reconcile_specialist_roles_overlay` (already merged in slice A) requires
-    its `installed_index` argument to expose `installed_component_role_dirs()`
-    — a method Task N1b Step 17 adds to the REAL `InstalledSpecialistIndex`
-    in specialist_registry.py, which is explicitly a LATER slice out of scope
-    here. `_IndexWithRoleDirs` below is a test-local subclass supplying
-    exactly Step 17's own documented implementation, so this test can drive
-    the real `current_specialist_roles_dir` end-to-end without touching
-    specialist_registry.py itself.
+    N1b slice C converges this test onto the REAL `InstalledSpecialistIndex.
+    installed_component_role_dirs()` (Step 17, specialist_registry.py) — the
+    test-local `_IndexWithRoleDirs` forward shim slice B carried is gone;
+    this drives `current_specialist_roles_dir` end-to-end against the real
+    index, no subclass needed.
     """
     import specialist_materialize
 
@@ -524,24 +520,7 @@ def test_commit_survives_a_materialize_failure_and_self_heals_on_next_reconcile(
     assert "pending reconcile" in instance.last_activation_error
     assert not (agents_specialists_dir / "mtg").exists()  # materialize genuinely never ran
 
-    class _IndexWithRoleDirs(InstalledSpecialistIndex):
-        """Step-17 forward shim — see this test's docstring above."""
-
-        def installed_component_role_dirs(self) -> dict:
-            out = {}
-            for slug in self.installed_slugs():
-                instance_ = self.get_instance(slug)
-                tuple_ = (instance_.active or instance_.desired) if instance_ is not None else None
-                if tuple_ is None:
-                    continue
-                try:
-                    _, _, root_checksum = parse_component_root(tuple_.root)
-                except ValueError:
-                    continue
-                out[slug] = self._dir / "store" / root_checksum.removeprefix("sha256:")
-            return out
-
-    index = _IndexWithRoleDirs(specialists_dir=str(specialists_dir))
+    index = InstalledSpecialistIndex(specialists_dir=str(specialists_dir))
     index.load()
     roles_dir = specialist_materialize.current_specialist_roles_dir(
         installed_index=index, specialists_dir=specialists_dir,

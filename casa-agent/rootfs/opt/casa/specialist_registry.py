@@ -443,6 +443,33 @@ class InstalledSpecialistIndex:
                 active=active, desired=desired, last_activation_error=None,
             )
 
+    def installed_component_role_dirs(self) -> "dict[str, Path]":
+        """slug -> the CAS directory HOLDING role/{role.yaml,doctrine.md}
+        (i.e. the component root, not the role/ subdir itself —
+        specialist_materialize._copy_role_dir appends 'role' itself,
+        mirroring reconcile_specialist_roles_overlay's other branch which
+        also receives a component root and descends into 'role').
+
+        Plan 2, Task N1b Step 17: an active tuple is authoritative; a
+        pending-configuration slug (desired only, no active) still resolves
+        so its role artifact is visible for inspection/upgrade paths —
+        `_reconcile_specialist_operational_files` (specialist_materialize.py)
+        is the SEPARATE gate that keeps a pending-configuration slug
+        non-loadable regardless of this overlay entry existing."""
+        from specialist_install import parse_component_root
+
+        out: dict[str, Path] = {}
+        for slug, instance in self._instances.items():
+            tuple_ = instance.active or instance.desired
+            if tuple_ is None:
+                continue
+            try:
+                _, _, checksum = parse_component_root(tuple_.root)
+            except ValueError:
+                continue
+            out[slug] = self._dir / "store" / checksum.removeprefix("sha256:")
+        return out
+
 
 # Module-level accessor over the ONE process-wide index casa_core.py constructs at
 # boot — mirrors the established module-level pattern (e.g. tools.active_semantic_memory,
