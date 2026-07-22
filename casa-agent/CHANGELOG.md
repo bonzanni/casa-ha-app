@@ -1,6 +1,23 @@
 # Changelog
 
-## [Unreleased]
+## [0.100.0] - 2026-07-22
+
+Personality Phase A: residents with swappable personas, and specialists
+installed from repositories instead of the app image.
+
+### Added
+
+- **Personas.** Each of the three residents (the assistant, the butler,
+  and the new concierge) now serves with a compiled persona — a versioned,
+  swappable identity pack that defines its name, voice, and character
+  traits. Ellen, Tina, and Gary are the defaults; swapping a persona is an
+  explicit operation and takes effect on restart, never mid-conversation.
+- **The concierge (Gary) is a day-one resident**, alongside the assistant
+  and the butler.
+- **Speaker attribution in memory.** Memories now record who was serving
+  when they were written, and recalled memories carry that attribution —
+  so after a persona swap, older memories still name the persona that
+  originally handled them.
 
 ### Changed
 
