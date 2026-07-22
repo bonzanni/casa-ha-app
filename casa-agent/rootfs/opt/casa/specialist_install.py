@@ -234,6 +234,7 @@ def inspect_specialist_repo(
     installed_index: "InstalledSpecialistIndex | None" = None,
     mode: "Literal['install', 'upgrade']" = "install",
     target_slug: str | None = None,
+    specialists_dir: Path = Path("/config/specialists"),
 ) -> InspectionResult:
     """Fetch for inspection into a NON-PERSISTENT staging directory (spec §6
     N1) — no CAS write, no binding, no activation. Every check that can
@@ -279,7 +280,7 @@ def inspect_specialist_repo(
                 f"upgrade target_slug={target_slug!r} but the fetched component declares "
                 f"slug={component.slug!r} — a slug rename is a fresh install, not an upgrade")
         from personality_binding import InstanceDir
-        if InstanceDir(Path("/config/specialists") / target_slug).active() is None:
+        if InstanceDir(specialists_dir / target_slug).active() is None:
             raise SpecialistInstallError(
                 "no_active_tuple", f"{target_slug!r} has no active install to upgrade")
         fixed_role_slots = _discover_image_role_slots() - {target_slug}
@@ -308,6 +309,12 @@ def inspect_specialist_repo(
 
     required = component.config_schema.get("required", [])
     secret_names = set(component.config_schema.get("secret_names", []))
+    logger.info(
+        "inspect_specialist_repo passed all gates: mode=%s slug=%s component_id=%s "
+        "version=%s root_digest=%s (staged at %s, not yet activated)",
+        mode, component.slug, component.component_id, component.version,
+        root_digest, component_dir,
+    )
     return InspectionResult(
         component_id=component.component_id, version=component.version, slug=component.slug,
         component_checksum=component.checksum, root_digest=root_digest,
