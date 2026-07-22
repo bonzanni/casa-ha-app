@@ -1129,30 +1129,44 @@ class TestAsyncMode:
         cm = ChannelManager()
         init_tools(cm, bus, reg, agent_role_map={"assistant": _caller_cfg(delegates=("finance",))})
 
-        _FakeSpecialistClient.reset(response="async reply", delay=0.05)
-        with patch("tools.ClaudeSDKClient", _FakeSpecialistClient), \
+        # Gate the fake specialist's body on an event instead of asserting a
+        # wall-clock bound (which flakes on slow/loaded CI runners): the
+        # handler resolving while the gate is still CLOSED proves async mode
+        # returned without waiting for the specialist body — a regression
+        # that awaits the body deadlocks on the gate and fails the wait_for.
+        _FakeSpecialistClient.reset(response="async reply")
+        gate = asyncio.Event()
+
+        class _GatedClient(_FakeSpecialistClient):
+            async def receive_response(self):
+                await gate.wait()
+                async for msg in super().receive_response():
+                    yield msg
+
+        with patch("tools.ClaudeSDKClient", _GatedClient), \
              patch("plugin_registry.resolve_for",
                    return_value=ResolutionResult(registry_valid=True)):
-            t0 = asyncio.get_event_loop().time()
-            result = await _with_origin(
-                delegate_to_agent.handler({
-                    "agent": "finance", "task": "x", "context": "",
-                    "mode": "async",
-                }),
-                _origin(),
+            result = await asyncio.wait_for(
+                _with_origin(
+                    delegate_to_agent.handler({
+                        "agent": "finance", "task": "x", "context": "",
+                        "mode": "async",
+                    }),
+                    _origin(),
+                ),
+                timeout=10.0,
             )
-            t1 = asyncio.get_event_loop().time()
             payload = json.loads(result["content"][0]["text"])
             assert payload["status"] == "pending"
             assert payload["mode"] == "async"
-            # Returned without waiting for the specialist body.
-            assert (t1 - t0) < 0.04
 
-            # Wait for background completion (keep patch active so the
-            # specialist task uses the fake, not the real SDK).
-            await asyncio.sleep(0.15)
-
-            # Verify a NOTIFICATION landed.
+            # Release the body and wait for the background-completion
+            # NOTIFICATION (bounded poll, not a fixed sleep; keep the patch
+            # active so the specialist task uses the fake, not the real SDK).
+            gate.set()
+            async with asyncio.timeout(5.0):
+                while bus.queues["assistant"].empty():
+                    await asyncio.sleep(0)
             assert not bus.queues["assistant"].empty()
 
 

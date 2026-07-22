@@ -1,5 +1,13 @@
 # Changelog
 
+## [0.100.1] - 2026-07-22
+
+### Fixed
+
+- No functional changes. Hardened three timing-sensitive tests that could
+  fail on slow CI runners (wall-clock bounds and fixed sleeps replaced with
+  condition waits), restoring a reliable release gate.
+
 ## [0.100.0] - 2026-07-22
 
 Personality Phase A: residents with swappable personas, and specialists

@@ -1090,13 +1090,24 @@ class TestPosterOwnsClearWave5:
 
         t1 = asyncio.ensure_future(wired["ask"](_FakeRequest(
             _anchor_payload(eid, "a1"))))
-        await asyncio.sleep(0.02)
+        await _wait_until(lambda: drv.ask_inflight(eid) == "a1")
+
         relay = asyncio.ensure_future(seq.post_for_block(ASK_TOOL, _ANCHOR_HASH))
-        await asyncio.sleep(0.02)
-        assert seq.registry.by_request_id("a1").posting is True
+        intent = seq.registry.by_request_id("a1")
+        # Await the arming boundary itself (state == "armed" AND posting is
+        # True are both set synchronously, before the poster's first await,
+        # inside the relay task's very first scheduler turn) instead of
+        # asserting immediately after a fixed real-time sleep — a slow/loaded
+        # runner may not have granted that turn yet within a tight bound.
+        await _wait_until(
+            lambda: intent.state == "armed" and intent.posting is True)
 
         t1.cancel()
-        await asyncio.sleep(0.02)
+        # Wait for the cancellation to actually be DELIVERED and its fully
+        # synchronous post-wins no-op path to run t1 to completion — not a
+        # fixed sleep (the post-wins path re-raises synchronously without
+        # touching the gate, so this never waits on the parked poster).
+        await _wait_until(t1.cancelled)
         assert drv.ask_inflight(eid) == "a1"        # the cancel lost
 
         gate.set()
