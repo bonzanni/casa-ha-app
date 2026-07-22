@@ -137,11 +137,12 @@ def materialize_specialist_operational_files(
 
     One documented, unavoidable exception: the very FIRST call for a slug
     whose `slug_dir` is still a REAL, non-symlink directory from the
-    pre-this-fix layout (verified: the image ships
-    `defaults/agents/specialists/finance/`, which `config_sync` places at
-    `/config/agents/specialists/finance/` as an ordinary directory — Task
-    N2's no-gap cutover installs `finance` through this exact pipeline,
-    so this branch is not hypothetical). Converting a real, non-empty
+    pre-this-fix layout (prior image versions shipped
+    `defaults/agents/specialists/finance/`, which `config_sync` placed at
+    `/config/agents/specialists/finance/` as an ordinary directory — a
+    deployment upgrading across Task N2's no-gap cutover re-installs
+    `finance` through this exact pipeline, so this branch is not
+    hypothetical). Converting a real, non-empty
     directory's NAME into a symlink cannot be done as a single syscall
     either (verified: replacing a real non-empty directory with a symlink
     also raises `OSError`, `EISDIR`/`ENOTEMPTY`-class — a directory-to-
