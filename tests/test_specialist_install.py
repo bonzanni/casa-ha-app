@@ -10,8 +10,11 @@ import specialist_install
 from specialist_install import (
     DependencyResolution,
     SpecialistInstallError,
+    commit_specialist_install,
+    parse_component_root,
     resolve_dependency_closure,
 )
+from specialist_install_consent import SpecialistInstallAckStore, install_consent_identity
 from specialist_component import compute_component_checksum, load_specialist_component
 from personality_binding import BindingRecord, InstanceDir, InstanceTuple, compute_binding_digest
 from specialist_registry import InstalledSpecialistIndex
@@ -395,3 +398,204 @@ def test_inspect_specialist_repo_rejects_forbidden_markers(
             installed_index=index,
         )
     assert exc_info.value.kind == "forbidden_markers"
+
+
+# ---------------------------------------------------------------------------
+# commit_specialist_install (Step 12)
+# ---------------------------------------------------------------------------
+
+
+def _staged_inspection(tmp_path: Path) -> "specialist_install.InspectionResult":
+    from specialist_install import InspectionResult, compute_install_root_digest
+
+    root = _write_component(tmp_path / "component", slug="mtg")
+    component = load_specialist_component(root, root / "manifest.json")
+    deps = resolve_dependency_closure(component, root)
+    root_digest = compute_install_root_digest(
+        component, deps, manifest_bytes=(root / "manifest.json").read_bytes())
+    return InspectionResult(
+        component_id=component.component_id, version=component.version, slug=component.slug,
+        component_checksum=component.checksum, root_digest=root_digest,
+        mission=str(component.role.role["mission"]),
+        default_persona_ref=component.default_persona_ref,
+        default_persona_checksum=component.default_persona_checksum,
+        required_config_names=(), required_secret_names=(), dependencies=deps, staged_dir=root,
+    )
+
+
+def test_commit_refuses_without_a_recorded_consent_ack(tmp_path: Path) -> None:
+    inspection = _staged_inspection(tmp_path)
+    acks = SpecialistInstallAckStore(path=tmp_path / "acks.json")  # never recorded
+    with pytest.raises(SpecialistInstallError) as raised:
+        commit_specialist_install(
+            inspection=inspection, config={}, secret_names_provided=frozenset(), acks=acks,
+            specialists_dir=tmp_path / "specialists",
+            agents_specialists_dir=tmp_path / "agents-specialists",
+        )
+    assert raised.value.kind == "consent_missing"
+    assert not (tmp_path / "specialists" / "mtg").exists()  # nothing persisted
+
+
+def test_commit_persists_cas_writes_active_tuple_and_materializes_operational_files(
+    tmp_path: Path,
+) -> None:
+    inspection = _staged_inspection(tmp_path)
+    acks = SpecialistInstallAckStore(path=tmp_path / "acks.json")
+    identity = install_consent_identity(
+        component_id=inspection.component_id, version=inspection.version,
+        component_checksum=inspection.root_digest, slug=inspection.slug)
+    acks.record(identity=identity, component_id=inspection.component_id, version=inspection.version,
+                component_checksum=inspection.root_digest, slug=inspection.slug)
+
+    instance = commit_specialist_install(
+        inspection=inspection, config={}, secret_names_provided=frozenset(), acks=acks,
+        specialists_dir=tmp_path / "specialists",
+        agents_specialists_dir=tmp_path / "agents-specialists",
+    )
+    assert instance.state == "active"
+    assert instance.active is not None
+    assert instance.active.binding.mode == "component-default"
+    assert instance.last_activation_error is None  # happy path: no self-heal note needed
+    component_id, version, checksum = parse_component_root(instance.active.root)
+    assert checksum == inspection.root_digest
+
+    cas_role = tmp_path / "specialists" / "store" / checksum.removeprefix("sha256:") / "role"
+    assert (cas_role / "role.yaml").is_file()
+    op_dir = tmp_path / "agents-specialists" / "mtg"
+    for name in ("character.yaml", "voice.yaml", "response_shape.yaml", "runtime.yaml"):
+        assert (op_dir / name).is_file(), name
+
+
+def test_commit_survives_a_materialize_failure_and_self_heals_on_next_reconcile(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Round-4 fix (finding #2): commit_desired_to_active runs BEFORE
+    materialize, so a materialize failure must NOT roll back the already-
+    committed tuple — and the NEXT current_specialist_roles_dir call must
+    repair the operational files with no operator action.
+
+    Deviation from the brief's draft (disclosed in the N1b slice-B report):
+    `reconcile_specialist_roles_overlay` (already merged in slice A) requires
+    its `installed_index` argument to expose `installed_component_role_dirs()`
+    — a method Task N1b Step 17 adds to the REAL `InstalledSpecialistIndex`
+    in specialist_registry.py, which is explicitly a LATER slice out of scope
+    here. `_IndexWithRoleDirs` below is a test-local subclass supplying
+    exactly Step 17's own documented implementation, so this test can drive
+    the real `current_specialist_roles_dir` end-to-end without touching
+    specialist_registry.py itself.
+    """
+    import specialist_materialize
+
+    inspection = _staged_inspection(tmp_path)
+    acks = SpecialistInstallAckStore(path=tmp_path / "acks.json")
+    identity = install_consent_identity(
+        component_id=inspection.component_id, version=inspection.version,
+        component_checksum=inspection.root_digest, slug=inspection.slug)
+    acks.record(identity=identity, component_id=inspection.component_id, version=inspection.version,
+                component_checksum=inspection.root_digest, slug=inspection.slug)
+
+    original_materialize = specialist_materialize.materialize_specialist_operational_files
+    call_count = {"n": 0}
+
+    def _flaky_materialize(**kwargs):
+        call_count["n"] += 1
+        if call_count["n"] == 1:
+            raise OSError("simulated disk-full on first materialize")
+        return original_materialize(**kwargs)
+
+    monkeypatch.setattr(specialist_materialize, "materialize_specialist_operational_files",
+                         _flaky_materialize)
+    # commit_specialist_install does a LOCAL `import specialist_materialize` — same
+    # module object from sys.modules, so patching the attribute above is sufficient;
+    # no separate patch of specialist_install's own namespace is needed or correct
+    # (it has no module-level `specialist_materialize` name to patch).
+
+    specialists_dir = tmp_path / "specialists"
+    agents_specialists_dir = tmp_path / "agents-specialists"
+    instance = commit_specialist_install(
+        inspection=inspection, config={}, secret_names_provided=frozenset(), acks=acks,
+        specialists_dir=specialists_dir, agents_specialists_dir=agents_specialists_dir,
+    )
+    # The tuple is committed and active DESPITE the materialize failure —
+    # never rolled back for a derived-cache write failure.
+    assert instance.state == "active"
+    assert instance.active is not None
+    assert instance.last_activation_error is not None
+    assert "pending reconcile" in instance.last_activation_error
+    assert not (agents_specialists_dir / "mtg").exists()  # materialize genuinely never ran
+
+    class _IndexWithRoleDirs(InstalledSpecialistIndex):
+        """Step-17 forward shim — see this test's docstring above."""
+
+        def installed_component_role_dirs(self) -> dict:
+            out = {}
+            for slug in self.installed_slugs():
+                instance_ = self.get_instance(slug)
+                tuple_ = instance_.active if instance_ is not None else None
+                if tuple_ is None:
+                    continue
+                try:
+                    _, _, root_checksum = parse_component_root(tuple_.root)
+                except ValueError:
+                    continue
+                out[slug] = self._dir / "store" / root_checksum.removeprefix("sha256:")
+            return out
+
+    index = _IndexWithRoleDirs(specialists_dir=str(specialists_dir))
+    index.load()
+    roles_dir = specialist_materialize.current_specialist_roles_dir(
+        installed_index=index, specialists_dir=specialists_dir,
+        agents_specialists_dir=agents_specialists_dir,
+    )
+    assert roles_dir  # roles overlay still reconciled even though op-files needed a retry
+    op_dir = agents_specialists_dir / "mtg"
+    for name in ("character.yaml", "voice.yaml", "response_shape.yaml", "runtime.yaml"):
+        assert (op_dir / name).is_file(), name  # self-healed with no operator action
+
+
+def test_commit_with_missing_required_config_yields_pending_configuration(tmp_path: Path) -> None:
+    root = _write_component(tmp_path / "component", slug="mtg")
+    manifest_path = root / "manifest.json"
+    manifest = json.loads(manifest_path.read_text())
+    # This test's component declares no required config in its schema — rebuild
+    # with one required, non-secret key to exercise the pending path.
+    (root / "config-schema.json").write_text(
+        json.dumps({"required": ["timezone"], "secret_names": []}), encoding="utf-8")
+    files = {
+        "role/role.yaml": (root / "role" / "role.yaml").read_bytes(),
+        "role/doctrine.md": (root / "role" / "doctrine.md").read_bytes(),
+        "config-schema.json": (root / "config-schema.json").read_bytes(),
+    }
+    manifest["checksum"] = compute_component_checksum(files)
+    manifest_path.write_text(json.dumps(manifest), encoding="utf-8")
+
+    from specialist_install import InspectionResult, compute_install_root_digest
+
+    component = load_specialist_component(root, manifest_path)
+    deps = resolve_dependency_closure(component, root)
+    root_digest = compute_install_root_digest(
+        component, deps, manifest_bytes=manifest_path.read_bytes())
+    inspection = InspectionResult(
+        component_id=component.component_id, version=component.version, slug=component.slug,
+        component_checksum=component.checksum, root_digest=root_digest, mission="x",
+        default_persona_ref=component.default_persona_ref,
+        default_persona_checksum=component.default_persona_checksum,
+        required_config_names=("timezone",), required_secret_names=(), dependencies=deps,
+        staged_dir=root,
+    )
+    acks = SpecialistInstallAckStore(path=tmp_path / "acks.json")
+    identity = install_consent_identity(
+        component_id=inspection.component_id, version=inspection.version,
+        component_checksum=inspection.root_digest, slug=inspection.slug)
+    acks.record(identity=identity, component_id=inspection.component_id, version=inspection.version,
+                component_checksum=inspection.root_digest, slug=inspection.slug)
+
+    instance = commit_specialist_install(
+        inspection=inspection, config={}, secret_names_provided=frozenset(), acks=acks,
+        specialists_dir=tmp_path / "specialists",
+        agents_specialists_dir=tmp_path / "agents-specialists",
+    )
+    assert instance.state == "pending-configuration"
+    assert instance.active is None
+    assert instance.desired is not None
+    assert not (tmp_path / "agents-specialists" / "mtg").exists()  # not materialized while pending

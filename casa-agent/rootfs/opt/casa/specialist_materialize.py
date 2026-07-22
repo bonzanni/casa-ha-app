@@ -20,6 +20,7 @@ logger = logging.getLogger(__name__)
 if TYPE_CHECKING:
     from persona_pack import PersonaPack
     from role_slot import RoleSlot
+    from specialist_registry import InstalledSpecialistIndex
 
 _DEFAULT_OVERLAY_ROOT = Path("/config/specialists/.roles-overlay")
 
@@ -302,3 +303,124 @@ def _write_specialist_operational_files(
     }
     (slug_dir / "runtime.yaml").write_text(
         yaml.safe_dump(runtime, sort_keys=False), encoding="utf-8")
+
+
+def current_specialist_roles_dir(
+    installed_index: "InstalledSpecialistIndex | None" = None,
+    *,
+    specialists_dir: Path = Path("/config/specialists"),
+    agents_specialists_dir: Path = Path("/config/agents/specialists"),
+) -> str:
+    """The ONE function every specialist load/reload call site uses to get
+    `roles_dir` (Round-2, finding #1). Freshly loads an `InstalledSpecialistIndex`
+    (or reuses the caller's, e.g. the one `set_active_installed_index` already
+    tracks) and reconciles the overlay — cheap (a `shutil.rmtree` + copy of a
+    handful of small role.yaml/doctrine.md files) and safe to redo on EVERY
+    call, exactly matching `reconcile_specialist_roles_overlay`'s own
+    'fully rebuilt from source of truth on every call, never accretes stale
+    entries' contract. No caller needs to separately track an overlay path —
+    it always reflects CURRENTLY installed specialists at call time.
+
+    Round-4 fix (this review pass, finding #2): in addition to the roles
+    overlay, this is now ALSO the self-healing seam for the legacy
+    TIER_FILES 4-file operational set (character.yaml/voice.yaml/
+    response_shape.yaml/runtime.yaml) `materialize_specialist_operational_
+    files` writes. `commit_specialist_install`/`upgrade_specialist`/
+    `rollback_specialist` (specialist_install.py) commit the InstanceDir
+    tuple to `active.yaml` FIRST — the single authoritative, atomically-
+    written source of truth — and only THEN materialize the operational
+    files as a best-effort side effect (a failure there is caught and
+    logged, never rolled back). A crash or write failure between those two
+    steps can therefore leave an ACTIVELY-committed slug with stale or
+    missing operational files. This function closes that gap
+    deterministically and unconditionally, every call: for every slug with
+    an ACTIVE tuple (never a slug with only a `desired` tuple —
+    pending-configuration specialists must stay non-loadable, matching
+    `commit_specialist_install`'s own invariant), it re-derives role+
+    persona from the SAME CAS-persisted bytes the active tuple's `root`
+    references and calls `materialize_specialist_operational_files` again
+    — an idempotent, deterministic rebuild FROM the tuple, never a diff or
+    patch. One slug's re-materialize failure is caught and logged
+    (mirroring `load_all_specialists`/`load_all_executors`'s per-entry
+    isolation) so it can never block reconciling every OTHER installed
+    slug, the roles-overlay rebuild, or the caller's reload/boot — that one
+    slug simply stays stale until the NEXT reconcile call, which is exactly
+    the self-healing property this function exists to provide.
+
+    HERMETICITY FIX (N1b slice-B controller resolution, disclosed in that
+    slice's report): passes `overlay_root=specialists_dir / ".roles-overlay"`
+    explicitly to `reconcile_specialist_roles_overlay` — identical to the
+    DEFAULT overlay root in production (where `specialists_dir` defaults to
+    `/config/specialists`, matching `specialist_roles_overlay_root()`'s own
+    `/config/specialists/.roles-overlay`), but correct whenever a caller
+    (e.g. a test, or a future `specialists_dir` override) passes a different
+    `specialists_dir` — the un-parameterized default would otherwise silently
+    write to the real `/config/specialists/.roles-overlay` regardless."""
+    from specialist_registry import InstalledSpecialistIndex
+
+    index = installed_index
+    if index is None:
+        index = InstalledSpecialistIndex(specialists_dir=str(specialists_dir))
+        index.load()
+
+    _reconcile_specialist_operational_files(
+        installed_index=index, specialists_dir=specialists_dir,
+        agents_specialists_dir=agents_specialists_dir,
+    )
+    return str(reconcile_specialist_roles_overlay(
+        installed_index=index, overlay_root=specialists_dir / ".roles-overlay",
+    ))
+
+
+def _reconcile_specialist_operational_files(
+    *, installed_index: "InstalledSpecialistIndex", specialists_dir: Path, agents_specialists_dir: Path,
+) -> None:
+    """Round-4 fix (finding #2)'s per-slug self-heal loop — see
+    `current_specialist_roles_dir`'s docstring for the full rationale.
+    Deliberately SEPARATE from `reconcile_specialist_roles_overlay`: that
+    function serves every installed-OR-pending slug (publishing
+    role.yaml/doctrine.md for a not-yet-active candidate is harmless — it
+    is never enough by itself to make agent_loader.load_all_specialists
+    treat the slug as loadable); this one serves ONLY slugs with a
+    committed `active` tuple, matching `commit_specialist_install`'s "a
+    pending-configuration candidate must not appear loadable" invariant
+    exactly — regenerating legacy op-files for a pending-configuration slug
+    would make it loadable and would be a real regression, not a
+    self-heal."""
+    from role_slot import materialize_role
+    from role_artifact import load_role_artifact
+    from persona_pack import load_persona_pack
+    from specialist_install import parse_component_root, cas_store_dir
+
+    for slug in sorted(installed_index.installed_slugs()):
+        instance = installed_index.get_instance(slug)
+        if instance is None or instance.active is None:
+            continue  # pending-configuration/error: never materialize, never loadable
+        try:
+            _, _, checksum = parse_component_root(instance.active.root)
+            cas_dir = cas_store_dir(checksum, store_root=specialists_dir / "store")
+            if instance.active.binding.mode == "override":
+                # N1d-coupled path (kept verbatim from the brief's draft,
+                # disclosed in the N1b slice-B report): this branch is
+                # unreachable until Plan 2's N1d builds a way to install an
+                # 'override'-mode binding for a specialist — today,
+                # commit_specialist_install only ever produces
+                # 'component-default' bindings. personas_root is fixed at
+                # /config/personas, the persona-install tree N1d will add.
+                personas_root = Path("/config/personas")
+                persona = load_persona_pack(
+                    personas_root / instance.active.binding.persona_id
+                    / instance.active.binding.persona_version / "pack",
+                    personas_root / instance.active.binding.persona_id
+                    / instance.active.binding.persona_version / "manifest.json",
+                )
+            else:
+                persona = load_persona_pack(
+                    cas_dir / "persona" / "pack", cas_dir / "persona" / "manifest.json")
+            role = materialize_role(source=load_role_artifact(cas_dir / "role"), options={})
+            materialize_specialist_operational_files(
+                agents_specialists_dir=agents_specialists_dir, slug=slug, role=role, persona=persona)
+        except Exception:  # noqa: BLE001 — one slug's failure must never block its siblings/the caller
+            logger.warning(
+                "specialist %r: operational-file self-heal failed this reconcile pass "
+                "(will retry next call)", slug, exc_info=True)

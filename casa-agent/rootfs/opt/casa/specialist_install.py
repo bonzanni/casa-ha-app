@@ -1,16 +1,20 @@
 from __future__ import annotations
 
 import logging
+import os
+import shutil
 import uuid
 from dataclasses import dataclass
 from pathlib import Path
-from typing import TYPE_CHECKING, Literal
+from typing import TYPE_CHECKING, Literal, Mapping
 
 from canonical_bytes import reject_forbidden_markers, to_plain_json
 from specialist_component import SpecialistComponent, load_specialist_component
 from specialist_lifecycle import check_slug_uniqueness
 
 if TYPE_CHECKING:
+    from specialist_install_consent import SpecialistInstallAckStore
+    from specialist_lifecycle import SpecialistInstance
     from specialist_registry import InstalledSpecialistIndex
 
 logger = logging.getLogger(__name__)
@@ -324,4 +328,251 @@ def inspect_specialist_repo(
         required_config_names=tuple(n for n in required if n not in secret_names),
         required_secret_names=tuple(n for n in required if n in secret_names),
         dependencies=dependencies, staged_dir=component_dir,
+    )
+
+
+# ---------------------------------------------------------------------------
+# CAS addressing (Step 11)
+# ---------------------------------------------------------------------------
+#
+# The CAS store root is /config/specialists/store/<component_checksum-without-
+# "sha256:"-prefix>/ (content-addressed, spec §2.5), holding the fetched
+# component verbatim (role/, persona/, corpus/, config-schema.json,
+# manifest.json) after validation. BindingRecord.component_root (Task 7's
+# free-form str | None field) is set to
+# f"{component_id}@{version}#{component_checksum}" — human-readable AND
+# parseable, so InstalledSpecialistIndex can recover the CAS directory from a
+# loaded active.yaml/desired.yaml without a second sidecar file.
+
+
+def component_root_string(*, component_id: str, version: str, component_checksum: str) -> str:
+    return f"{component_id}@{version}#{component_checksum}"
+
+
+def parse_component_root(component_root: str) -> tuple[str, str, str]:
+    """Inverse of component_root_string. Raises ValueError on a malformed root
+    (never silently returns a partial tuple — a corrupt InstanceTuple's root
+    must fail closed, not resolve to a guessed CAS path)."""
+    head, sep, checksum = component_root.rpartition("#")
+    if not sep or not checksum.startswith("sha256:"):
+        raise ValueError(f"malformed component_root: {component_root!r}")
+    component_id, sep2, version = head.rpartition("@")
+    if not sep2:
+        raise ValueError(f"malformed component_root: {component_root!r}")
+    return component_id, version, checksum
+
+
+def cas_store_dir(
+    component_checksum: str, *, store_root: Path = Path("/config/specialists/store"),
+) -> Path:
+    return store_root / component_checksum.removeprefix("sha256:")
+
+
+def commit_specialist_install(
+    *, inspection: "InspectionResult", config: "Mapping[str, str]",
+    secret_names_provided: frozenset[str], acks: "SpecialistInstallAckStore",
+    specialists_dir: Path = Path("/config/specialists"),
+    agents_specialists_dir: Path = Path("/config/agents/specialists"),
+) -> "SpecialistInstance":
+    """The ONLY function that writes into the CAS/specialists tree (spec §6
+    N1: "consent precedes any persistent CAS install/activation"). Order:
+    verify consent -> persist to CAS -> compile (persona↔role compatibility)
+    -> stage the InstanceDir tuple as desired -> commit the tuple to active
+    -> materialize the runtime files as a best-effort follow-up. Commit is
+    skipped entirely for a pending-configuration candidate — an
+    uninstantiable specialist must not appear loadable.
+
+    Round-4 fix (this review pass, finding #2 — supersedes round 2's
+    "materialize BEFORE commit" ordering below). `InstanceDir.
+    commit_desired_to_active()` (Plan 1) is the single authoritative,
+    atomically-written record — writing `active.yaml` via
+    `atomic_write_instance_tuple` is itself a single `os.replace`-backed
+    write, and re-running the whole method on a later boot is a documented
+    safe no-op. The operational files this function materializes afterward
+    are a DERIVED CACHE of that tuple, not a second source of truth, so
+    committing first and materializing second (rather than the reverse) is
+    safe: if materialize fails here (disk full, permission error, a racing
+    uninstall), the failure is caught, logged, and surfaced as a non-fatal
+    `last_activation_error` on the returned `SpecialistInstance` — the
+    already-committed tuple is NOT rolled back, because
+    `specialist_materialize.current_specialist_roles_dir` (threaded through
+    every boot/`casa_reload` call site per Correction #1) unconditionally
+    re-materializes every ACTIVE slug's operational files from its tuple on
+    every subsequent call, so this slug self-heals on the very next
+    reconcile with no operator action required."""
+    from personality_binding import (
+        InstanceDir, InstanceTuple, check_persona_requirements,
+        compute_effective_config_digest, materialize_component_default_binding,
+    )
+    from persona_pack import load_persona_pack
+    from prompt_compiler import compile_prompt_bundle
+    from role_slot import materialize_role
+    from role_artifact import load_role_artifact
+    from specialist_lifecycle import SpecialistInstance, satisfy_config
+    from specialist_component import load_specialist_component
+    from specialist_install_consent import install_consent_identity
+    import specialist_materialize
+
+    identity = install_consent_identity(
+        component_id=inspection.component_id, version=inspection.version,
+        component_checksum=inspection.root_digest, slug=inspection.slug,
+    )
+    if not acks.is_acked(identity):
+        raise SpecialistInstallError(
+            "consent_missing",
+            f"no recorded operator approval for {inspection.component_id}@"
+            f"{inspection.version} (root digest {inspection.root_digest})",
+        )
+
+    # Round-3 fix (finding #1 — CAS-before-verify): CAS addressing is keyed
+    # by the FULL-CLOSURE root_digest, not the narrow component_checksum —
+    # the operator's approval attests to the whole closure, so the CAS
+    # directory identity must too. CRITICALLY, the copy from
+    # `inspection.staged_dir` lands in a TEMPORARY staging directory first —
+    # never directly at the final, content-addressed `cas_dir` — so a
+    # digest mismatch below can never leave a wrong-digest-named CAS
+    # directory behind (a poisoned CAS entry a later `cas_dir.exists()`
+    # check for this SAME digest would then trust forever, since CAS
+    # content is treated as immutable once present at its digest path).
+    cas_dir = cas_store_dir(inspection.root_digest, store_root=specialists_dir / "store")
+    if not cas_dir.exists():
+        staging_root = specialists_dir / "store" / ".staging"
+        staging_root.mkdir(parents=True, exist_ok=True, mode=0o700)
+        cas_staging_dir = staging_root / uuid.uuid4().hex
+        shutil.copytree(inspection.staged_dir, cas_staging_dir, dirs_exist_ok=False, symlinks=True)
+        for path in cas_staging_dir.rglob("*"):
+            if path.is_file():
+                path.chmod(0o400)
+        try:
+            # Reload + recompute the FULL dependency closure and root digest
+            # from the STAGED (not-yet-CAS) bytes and compare to the
+            # operator-acknowledged digest BEFORE this content is ever
+            # visible under its content-addressed name. A mismatch discards
+            # the staging dir and raises; `cas_dir` is never created for a
+            # component that fails verification.
+            staged_component = load_specialist_component(
+                cas_staging_dir, cas_staging_dir / "manifest.json")
+            staged_deps = resolve_dependency_closure(staged_component, cas_staging_dir)
+            staged_unavailable = [d for d in staged_deps if not d.available]
+            if staged_unavailable:
+                detail = "; ".join(
+                    f"{d.kind}:{d.identifier}: {d.detail}" for d in staged_unavailable)
+                raise SpecialistInstallError("dependency_unavailable", detail)
+            staged_root_digest = compute_install_root_digest(
+                staged_component, staged_deps,
+                manifest_bytes=(cas_staging_dir / "manifest.json").read_bytes())
+            if staged_root_digest != inspection.root_digest:
+                raise SpecialistInstallError(
+                    "checksum_changed",
+                    "staged component no longer matches the approved inspection")
+        except Exception:
+            shutil.rmtree(cas_staging_dir, ignore_errors=True)
+            raise
+        # Verified: atomically publish into the final content-addressed
+        # location. `os.replace` is a single directory rename on the same
+        # filesystem (/config always is) — no partially-written or
+        # wrong-digest CAS state is ever observable at `cas_dir`.
+        os.replace(cas_staging_dir, cas_dir)
+
+    # Re-load from the now-final (or, for a digest an earlier install
+    # already verified and published, pre-existing) CAS directory.
+    component = load_specialist_component(cas_dir, cas_dir / "manifest.json")
+    role = materialize_role(source=load_role_artifact(cas_dir / "role"), options={})
+    persona = load_persona_pack(cas_dir / "persona" / "pack", cas_dir / "persona" / "manifest.json")
+
+    # Re-run the FULL dependency closure against the final CAS path and
+    # re-derive the root digest ONE more time, immediately before any tuple
+    # is staged — this is the "reject unavailable/changed bytes immediately
+    # before persistence/activation" gate. A dependency that flips
+    # unavailable, or a root digest that no longer matches what the
+    # operator acked, aborts here even though the bytes are already in CAS
+    # (CAS content is immutable/content-addressed, so this can only happen
+    # if `inspection` itself was stale/tampered, or the digest already
+    # existed in CAS from a prior, still-valid install — never trust
+    # `inspection` past this point).
+    fresh_deps = resolve_dependency_closure(component, cas_dir)
+    unavailable = [d for d in fresh_deps if not d.available]
+    if unavailable:
+        detail = "; ".join(f"{d.kind}:{d.identifier}: {d.detail}" for d in unavailable)
+        raise SpecialistInstallError("dependency_unavailable", detail)
+    fresh_root_digest = compute_install_root_digest(
+        component, fresh_deps, manifest_bytes=(cas_dir / "manifest.json").read_bytes())
+    if fresh_root_digest != inspection.root_digest:
+        raise SpecialistInstallError(
+            "checksum_changed", "CAS-persisted component no longer matches the approved inspection")
+
+    satisfied, missing = satisfy_config(
+        schema=component.config_schema, provided_non_secret=config,
+        provided_secret_names=secret_names_provided,
+    )
+    root = component_root_string(
+        component_id=component.component_id, version=component.version,
+        component_checksum=fresh_root_digest,
+    )
+    instance_dir = InstanceDir(specialists_dir / inspection.slug)
+    dependency_digests = tuple(sorted(d.digest for d in fresh_deps))
+
+    if not satisfied:
+        # Fail closed into pending-configuration: a desired candidate is
+        # staged so the operator can see WHAT is missing, but nothing
+        # activates and nothing materializes into the runtime load path.
+        placeholder_binding = materialize_component_default_binding(
+            role=role, persona=persona, component_root=root,
+            dependency_digests=dependency_digests,
+        )
+        instance_dir.stage_desired(InstanceTuple(
+            root=root, binding=placeholder_binding, config_snapshot=dict(config),
+            config_digest=placeholder_binding.effective_config_digest,
+        ))
+        return SpecialistInstance(
+            slug=inspection.slug, stable_agent_id=f"specialist:{inspection.slug}",
+            state="pending-configuration", active=None, desired=instance_dir.desired(),
+            last_activation_error=f"missing required config/secret: {missing}",
+        )
+
+    check_persona_requirements(role.normalized, persona)  # raises ValueError if incompatible
+    effective_config_digest = compute_effective_config_digest(dict(config))
+    binding = materialize_component_default_binding(
+        role=role, persona=persona, component_root=root,
+        dependency_digests=dependency_digests, effective_config_digest=effective_config_digest,
+    )
+    # compile_prompt_bundle both VALIDATES (ceilings, persona/role/binding
+    # cross-consistency) and produces the bundle materialize_operational_files'
+    # sibling agent_loader wiring (a later slice) will recompile identically
+    # at load time — compiling here is a pre-activation GATE, not a cache.
+    compile_prompt_bundle(
+        role=role, persona=persona, binding=binding,
+        platform_frame=(Path(__file__).parent / "defaults" / "personality"
+                         / "platform-frame.md").read_text(encoding="utf-8"),
+        safety_kernel=(Path(__file__).parent / "defaults" / "personality"
+                       / "safety-kernel.md").read_text(encoding="utf-8"),
+    )
+
+    instance_dir.stage_desired(InstanceTuple(
+        root=root, binding=binding, config_snapshot=dict(config),
+        config_digest=effective_config_digest,
+    ))
+    # Round-4 fix (finding #2): commit FIRST — the tuple is the single
+    # authoritative record (see this function's docstring) — then
+    # materialize the operational files as a best-effort derived-cache
+    # write. A materialize failure here does NOT roll back the commit; it
+    # is caught, logged, and surfaced as a non-fatal last_activation_error.
+    # `specialist_materialize.current_specialist_roles_dir` re-materializes
+    # every ACTIVE slug's operational files from its tuple on every
+    # subsequent boot/reload call, so this slug self-heals automatically.
+    committed = instance_dir.commit_desired_to_active()
+    last_activation_error: str | None = None
+    try:
+        specialist_materialize.materialize_specialist_operational_files(
+            agents_specialists_dir=agents_specialists_dir, slug=inspection.slug, role=role, persona=persona,
+        )
+    except Exception as exc:  # noqa: BLE001
+        logger.warning(
+            "specialist install %r: operational-file materialize failed post-commit "
+            "(%s); will self-heal on next reconcile", inspection.slug, exc, exc_info=True)
+        last_activation_error = f"operational files pending reconcile: {exc}"
+
+    return SpecialistInstance(
+        slug=inspection.slug, stable_agent_id=f"specialist:{inspection.slug}",
+        state="active", active=committed, desired=None, last_activation_error=last_activation_error,
     )
