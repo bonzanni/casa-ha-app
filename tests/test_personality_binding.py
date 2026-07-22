@@ -253,3 +253,35 @@ def test_materialize_component_default_binding_sets_mode_and_component_root() ->
     assert binding.component_root == "casa-test/mtg@0.1.0"
     assert binding.image_default_root is None
     assert binding.override_source is None
+
+
+def test_materialize_override_binding_default_args_produce_the_pre_n1c_digest() -> None:
+    """Task N1c extends materialize_override_binding with two new optional
+    kwargs (dependency_digests, effective_config_digest) so upgrade_specialist/
+    rollback_specialist can preserve an override-bound specialist's persona
+    pin while still capturing the new component's dependency closure. This
+    pins the additive-only guarantee: a call with NO new kwargs — exactly
+    the shape every existing caller (reconcile_resident_binding,
+    tools.py's resident_persona_swap) uses — must produce the IDENTICAL
+    binding_digest a hand-built compute_binding_digest call (with the same
+    implicit defaults _build already used pre-N1c: dependency_digests=(),
+    effective_config_digest=EMPTY_CONFIG_DIGEST) produces."""
+    from personality_binding import compute_binding_digest, materialize_override_binding
+
+    role = _specialist_role()
+    persona = _judge_persona()
+
+    binding = materialize_override_binding(
+        role=role, persona=persona, override_source="operator:casa/judge@0.1.0",
+    )
+    expected_digest = compute_binding_digest(
+        stable_agent_id=role.role_id, role_checksum=role.checksum,
+        persona_id=persona.persona_id, persona_version=persona.version,
+        persona_checksum=persona.checksum, compiler_schema_version=RENDERER_VERSION,
+        dependency_digests=(), effective_config_digest=EMPTY_CONFIG_DIGEST,
+    )
+    assert binding.binding_digest == expected_digest
+    assert binding.mode == "override"
+    assert binding.override_source == "operator:casa/judge@0.1.0"
+    assert binding.dependency_digests == ()
+    assert binding.effective_config_digest == EMPTY_CONFIG_DIGEST

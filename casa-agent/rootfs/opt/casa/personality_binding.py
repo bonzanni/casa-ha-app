@@ -101,10 +101,28 @@ def materialize_image_default_binding(
 
 def materialize_override_binding(
     *, role: RoleSlot, persona: PersonaPack, override_source: str,
+    dependency_digests: tuple[str, ...] = (), effective_config_digest: str = EMPTY_CONFIG_DIGEST,
 ) -> BindingRecord:
+    """Task N1c extension (Controller resolution #1): `dependency_digests`/
+    `effective_config_digest` are additive optional kwargs, passed straight
+    through to `_build` (which already accepts both — every OTHER binding
+    mode already threads them). Existing resident callers
+    (`reconcile_resident_binding` above, `tools.py resident_persona_swap`)
+    pass neither and get byte-identical behavior: `_build`'s own defaults
+    for these two params are these exact same values, so the digest and
+    every other field are unchanged for a resident override. This lets
+    `upgrade_specialist`/`rollback_specialist` (specialist_install.py)
+    preserve an OVERRIDE-bound specialist's persona pin across an upgrade
+    while still capturing the new component's dependency closure and the
+    operator's re-validated config in the binding digest, exactly the way
+    `materialize_component_default_binding` already does for the
+    component-default mode."""
     if role.kind not in {"resident", "specialist"}:
         raise ValueError("override binding is resident- or specialist-only")
-    return _build(role=role, persona=persona, mode="override", override_source=override_source)
+    return _build(
+        role=role, persona=persona, mode="override", override_source=override_source,
+        dependency_digests=dependency_digests, effective_config_digest=effective_config_digest,
+    )
 
 
 def materialize_component_default_binding(
@@ -277,7 +295,27 @@ class InstanceDir:
         active_path = self._path("active.yaml")
         prior_path = self._path("active.prior.yaml")
         current_active = load_instance_tuple(active_path)
-        if current_active is not None and current_active.binding.binding_digest == candidate.binding.binding_digest:
+        # Task N1c fix: compare the FULL tuple (root included), not just
+        # binding_digest. binding_digest deliberately excludes `root`
+        # (compute_binding_digest's eight normative fields never include it
+        # — see test_digest_input_set_matches_the_normative_eight_fields),
+        # so two installed-component versions that bump only the manifest
+        # version (role.yaml/doctrine.md/persona/dependency-digest bytes all
+        # unchanged) share the SAME binding_digest while their `root`
+        # (component_id@version#checksum) genuinely differs — upgrade_
+        # specialist's own test_upgrade_commits_a_new_active_tuple_and_
+        # retains_the_prior_as_rollback_target exercises exactly this case.
+        # Under the old binding_digest-only check that scenario was
+        # mis-detected as a crash-retry no-op and silently skipped writing
+        # the new (different-root) active.yaml at all. Both `candidate` and
+        # `current_active` are round-tripped through the SAME
+        # load_instance_tuple/verify_instance_tuple path, so this equality
+        # is a fair, symmetric comparison — the true crash-retry case (this
+        # exact tuple, root included, already written to active.yaml before
+        # a crash) is unaffected: it is still recognized and short-circuits
+        # exactly as before (see test_commit_is_crash_retry_idempotent_and_
+        # preserves_true_prior).
+        if current_active is not None and current_active == candidate:
             # Crash-retry / no-op recommit (§4.1): a previous run already wrote
             # `candidate` to active.yaml but died before unlinking desired.yaml.
             # active.yaml already IS the candidate, so do NOT rotate prior again
