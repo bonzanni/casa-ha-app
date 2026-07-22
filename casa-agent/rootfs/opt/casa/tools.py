@@ -1017,10 +1017,24 @@ def _build_specialist_options(
         mcp_servers = {}
     skills = "all" if getattr(cfg.tools, "skills", "all") == "all" else None
 
+    # Plan 2, Task N1b Step 22: prefer the compiled prompt bundle (an
+    # installed component's activated binding — agent_loader's
+    # activate_binding_for_config seam) over the legacy _compose_prompt
+    # output. A specialist with no active binding (still bundled-in-image,
+    # or pending-configuration) keeps cfg.compiled_prompt_bundle is None and
+    # falls back unchanged.
+    from prompt_compiler import projection_for
+
+    compiled_bundle = getattr(cfg, "compiled_prompt_bundle", None)
+    resolved_system_prompt = (
+        projection_for(compiled_bundle, channel="text", origin_route=None).system_prompt
+        if compiled_bundle is not None else cfg.system_prompt
+    )
+
     return ClaudeAgentOptions(
         model=cfg.model,
         cli_path=CLAUDE_CLI_PATH,
-        system_prompt=cfg.system_prompt,
+        system_prompt=resolved_system_prompt,
         allowed_tools=allowed_tools,
         disallowed_tools=_with_subagent_spawn_disallowed(cfg.tools.disallowed),
         permission_mode=cfg.tools.permission_mode or "acceptEdits",
