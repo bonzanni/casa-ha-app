@@ -37,6 +37,11 @@ from claude_agent_sdk import (
     TextBlock as _TB,
 )
 
+try:
+    from tests.role_artifact_stub import STUB_ROLE_ARTIFACT
+except ImportError:
+    from role_artifact_stub import STUB_ROLE_ARTIFACT
+
 pytestmark = [pytest.mark.asyncio, pytest.mark.unit]
 
 AGENTS = Path(__file__).resolve().parents[1] / "casa-agent" / "rootfs" / "opt" / "casa" / "defaults" / "agents"
@@ -60,6 +65,18 @@ class _CaptureSem(SemanticMemory):
                      tags_match="any", budget="mid"):
         self.recall_calls.append({"tags": list(tags)})
         return "some fact"
+
+    async def recall_items(self, bank, query, *, tags, max_tokens, clearance,
+                           types=("world", "experience", "observation"),
+                           tags_match="any", budget="mid"):
+        self.recall_calls.append({"tags": list(tags), "clearance": clearance})
+        from personality_types import RecallHit
+        return (RecallHit(
+            text="some fact", memory_type="world", sensitivity="friends",
+            application_tags=(), provenance=None, backend_id="b1", document_id=None,
+            chunk_id=None, source_fact_ids=None, metadata=None, context=None,
+            score=None,
+        ),)
 
     async def profile(self, bank):
         return ""
@@ -96,7 +113,7 @@ class _CaptureClient:
 
 
 def _agent(tmp_path, role: str, *, seed_resumed: str | None = None) -> tuple[Agent, _CaptureSem]:
-    cfg = AgentConfig(
+    cfg = AgentConfig(role_artifact=STUB_ROLE_ARTIFACT, 
         role=role,
         model="claude-sonnet-4-6",
         system_prompt=f"You are {role}.",

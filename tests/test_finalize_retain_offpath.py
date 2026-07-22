@@ -96,7 +96,12 @@ async def test_finalize_does_not_block_on_classification(tmp_path, monkeypatch):
     gate.set()
     await asyncio.gather(*list(tools_mod._specialist_bg_tasks), return_exceptions=True)
     assert len(sem.retain_calls) == 1
-    assert sem.retain_calls[0]["items"][0]["document_id"] == f"engagement:{rec.id}:summary:0"
+    # Task 10: content-addressed agent id (m-a- space) instead of the retired
+    # doc_prefix:idx scheme; the payload identifies the engagement summary.
+    import json
+    item = sem.retain_calls[0]["items"][0]
+    assert item["document_id"].startswith("m-a-")
+    assert json.loads(item["content"])["kind"] == "engagement_summary"
 
 
 async def test_deferred_reload_waits_for_retain(tmp_path, monkeypatch):

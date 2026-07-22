@@ -16,6 +16,12 @@ from __future__ import annotations
 
 import hashlib
 import re
+from typing import TYPE_CHECKING
+
+from speaker_provenance import validate_speaker_provenance
+
+if TYPE_CHECKING:
+    from personality_types import SpeakerProvenance
 
 _BANK_NAME_RE = re.compile(r"^[A-Za-z0-9_-]+$")
 # Conservative cap. The server accepted 100 chars with no published limit;
@@ -66,3 +72,33 @@ def content_document_id(speaker: str, text: str) -> str:
     """
     digest = hashlib.sha256(f"{speaker}\x00{text}".encode("utf-8")).hexdigest()
     return f"m-{digest[:24]}"
+
+
+def agent_document_id(provenance: "SpeakerProvenance", text: str) -> str:
+    """Content-stable ``document_id`` for a memory turn authored by an AGENT
+    (resident / specialist / executor / the unattributed ``system`` identity) —
+    the agent-side analogue of :func:`content_document_id` (which keys user turns
+    on their ``user_peer``). Personality Task 10.
+
+    Idempotency is keyed on the AGENT'S IDENTITY, not its exact persona VERSION:
+    the digest folds in ``speaker_kind``/``role_id``/``persona_id`` but NOT
+    ``persona_version``/``binding_digest``. So the same fact retained by Tina
+    ``casa/tina@0.1.0`` and by Tina ``casa/tina@0.2.0`` upserts to the SAME
+    Hindsight document (a persona bump is not a new author), while a DIFFERENT
+    persona (``casa/ellen``) saying the same words is a distinct document. This
+    mirrors ``content_document_id``'s "same speaker + same text = one document"
+    contract at the resolution the personality model cares about (persona
+    identity), not the churn-prone binding version.
+
+    A ``user`` provenance is rejected — user turns must use
+    :func:`content_document_id` so their id keys on the trusted ``user_peer``,
+    never on an agent identity. The ``m-a-`` prefix namespaces agent ids apart
+    from the user-turn ``m-`` space so the two can never collide."""
+    validate_speaker_provenance(provenance)
+    if provenance.speaker_kind == "user":
+        raise ValueError("agent_document_id cannot be used for a user provenance")
+    digest = hashlib.sha256(
+        ("agent\0" + provenance.speaker_kind + "\0" + (provenance.role_id or "") + "\0"
+         + (provenance.persona_id or "") + "\0" + text).encode("utf-8")
+    ).hexdigest()
+    return f"m-a-{digest[:24]}"

@@ -1,0 +1,36 @@
+api_version: casa.role/v1
+id: executor:configurator
+kind: executor
+slot: configurator
+mission: Apply bounded Casa configuration changes, commit them, and reload or restart as required.
+enabled: true
+model: {source: fixed, value: sonnet}
+tools:
+  # Task N1b added specialist_install_inspect/specialist_install_commit;
+  # Task N1c added specialist_upgrade/specialist_rollback/specialist_uninstall;
+  # Task N1d (final consolidation) added persona_install_inspect/
+  # persona_install_commit/persona_apply — 8 plan-added tool names total,
+  # all appended to the SAME flow list below.
+  allowed: [Read, Write, Edit, Bash, Glob, Grep, mcp__casa-framework__config_git_commit, mcp__casa-framework__casa_reload, mcp__casa-framework__casa_reload_triggers, mcp__casa-framework__casa_restart_supervised, mcp__casa-framework__query_engager, mcp__casa-framework__emit_completion, mcp__casa-framework__cleanup_engagement_topics, mcp__casa-framework__plugin_add, mcp__casa-framework__plugin_update, mcp__casa-framework__plugin_assign, mcp__casa-framework__plugin_unassign, mcp__casa-framework__plugin_remove, mcp__casa-framework__trigger_ack_revoke, mcp__casa-framework__plugin_list, mcp__casa-framework__verify_plugin_state, mcp__casa-framework__set_plugin_env_reference, mcp__casa-framework__list_vault_items, mcp__casa-framework__get_item_fields, mcp__casa-framework__resident_persona_swap, mcp__casa-framework__resident_persona_reset, mcp__casa-framework__specialist_install_inspect, mcp__casa-framework__specialist_install_commit, mcp__casa-framework__specialist_upgrade, mcp__casa-framework__specialist_rollback, mcp__casa-framework__specialist_uninstall, mcp__casa-framework__persona_install_inspect, mcp__casa-framework__persona_install_commit, mcp__casa-framework__persona_apply]
+  disallowed: []
+  permission_mode: acceptEdits
+  max_turns: 40
+  skills: all
+  voice_guard: none
+mcp_servers: [casa-framework]
+channels: []
+memory: {token_budget: 2000, read_strategy: per_turn}
+session: {strategy: ephemeral, idle_timeout_seconds: 0}
+disclosure: {policy: executor-internal, overrides: {}}
+delegates: []
+executors: []
+triggers: []
+hooks: {pre_tool_use: []}
+tts: {tag_dialect: none, error_phrases: {}}
+response:
+  text: {register: precise, max_status_sentences: 4}
+  voice: {register: unavailable}
+  restricted_webhook: {register: unavailable}
+persona: {policy: forbidden}
+requires: {plugins: [], tools: []}
+doctrine_file: doctrine.md

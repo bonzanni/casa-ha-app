@@ -13,6 +13,11 @@ from unittest.mock import AsyncMock
 
 import pytest
 
+try:
+    from tests.role_artifact_stub import STUB_ROLE_ARTIFACT
+except ImportError:
+    from role_artifact_stub import STUB_ROLE_ARTIFACT
+
 pytestmark = [pytest.mark.unit]
 
 REPO = Path(__file__).resolve().parents[1]
@@ -182,7 +187,7 @@ async def test_resident_specialist_and_executor_options_use_verified_cli(
     )
     monkeypatch.setattr(tools_mod, "_mcp_registry", None)
 
-    cfg = AgentConfig(
+    cfg = AgentConfig(role_artifact=STUB_ROLE_ARTIFACT, 
         role="butler",
         model="claude-haiku-4-5",
         system_prompt="You are Tina.",

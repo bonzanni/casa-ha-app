@@ -10,11 +10,13 @@ from __future__ import annotations
 import json
 import logging
 import os
+from pathlib import Path
 from typing import Any
 
 import yaml
 import jsonschema
 
+from canonical_bytes import canonical_json_bytes
 from config import (
     AgentConfig,
     CharacterConfig,
@@ -35,8 +37,22 @@ from config import (
     _substitute_env,
 )
 from policies import PolicyLibrary, render_disclosure_section
+from role_artifact import RoleArtifactSource, load_role_artifact
+from role_slot import (
+    EMPTY_CONFIG_DIGEST,
+    FIXED_RESIDENT_SLOTS,
+    _ha_model_options,
+    compute_executor_identity,
+    materialize_role,
+)
 
 SCHEMA_DIR = os.path.join(os.path.dirname(__file__), "defaults", "schema")
+
+# Personality Phase A, Task 5: the only image-owned canonical role layout,
+# defaults/roles/<kind>/<slot>/{role.yaml,doctrine.md}. ``roles_dir`` kwargs
+# threaded through the loader functions below default to this and let tests
+# inject a synthetic tree instead of patching the filesystem.
+DEFAULT_ROLES_DIR = os.path.join(os.path.dirname(__file__), "defaults", "roles")
 
 # --- Tier file-set rules ---------------------------------------------------
 
@@ -154,7 +170,9 @@ _SCHEMA_BY_POLICY_FILE: dict[str, tuple[str, str]] = {
 }
 
 
-def validate_config_repo(config_dir: str) -> list[str]:
+def validate_config_repo(
+    config_dir: str, *, roles_dir: str | None = None,
+) -> list[str]:
     """E-G v0.31.0 pre-commit gate. Walk schema-bearing YAML in
     *config_dir/agents/* and *config_dir/policies/* and return a list of
     error messages — one per file that fails schema validation. Empty
@@ -165,6 +183,9 @@ def validate_config_repo(config_dir: str) -> list[str]:
     The check uses the same ``_validate`` codepath as boot-time loading,
     so a passing pre-commit gate guarantees a green boot validation for
     every file the configurator can edit.
+
+    ``roles_dir`` — see ``load_agent_from_dir``; propagated to the
+    boot-parity replay below (both the resident and specialist loads).
 
     **Agents/ walk.** Recursive; ``.git/`` skipped. Basename lookup in
     ``_SCHEMA_BY_FILENAME``. The original E-G repro path is the
@@ -279,7 +300,9 @@ def validate_config_repo(config_dir: str) -> list[str]:
             # "no assistant" onto it.
             resident_dir_names.add(entry)
             try:
-                cfg = load_agent_from_dir(path, policies=policy_lib)
+                cfg = load_agent_from_dir(
+                    path, policies=policy_lib, roles_dir=roles_dir,
+                )
             except Exception as exc:
                 # Broad by design (mandate: 'a validation error must be
                 # reported, never itself crash the gate'). load_agent_from_dir
@@ -354,7 +377,9 @@ def validate_config_repo(config_dir: str) -> list[str]:
         specialist_configs: dict[str, AgentConfig] = {}
         specialists_dir = os.path.join(agents_root, "specialists")
         try:
-            spec_found, _spec_failed = load_all_specialists(specialists_dir)
+            spec_found, _spec_failed = load_all_specialists(
+                specialists_dir, roles_dir=roles_dir,
+            )
         except LoadError:
             # A collection-level specialist error (non-directory under
             # specialists/) is boot-non-fatal: SpecialistRegistry.load catches
@@ -413,9 +438,104 @@ def _read_yaml(path: str) -> dict[str, Any]:
         raise LoadError(f"{path}: YAML parse error: {exc}") from exc
 
 
-def _infer_tier(runtime_data: dict[str, Any]) -> str:
-    channels = runtime_data.get("channels") or []
-    return "resident" if channels else "specialist"
+def _declared_kind(runtime_data: dict[str, Any], source: str) -> str:
+    """Personality Phase A, Task 6: replaces the former ``_infer_tier``
+    channels-presence guess. ``runtime.yaml``'s ``kind`` field (added by
+    Task 6's revised ``runtime.v1.json``) is now the explicit, authoritative
+    source for which ``defaults/roles/<kind>/<slot>/`` directory this agent's
+    canonical role artifact is loaded from — no more inference from whether
+    ``channels`` happens to be non-empty."""
+    kind = runtime_data.get("kind")
+    if kind not in {"resident", "specialist", "executor"}:
+        raise LoadError(f"{source}: kind is required and must be resident, specialist, or executor")
+    return kind
+
+
+# --- Canonical role artifact loading (Personality Phase A, Task 5) --------
+#
+# The image-owned canonical layout is defaults/roles/<kind>/<slot>/. This is
+# a SEPARATE tree from the per-agent-directory operational files above
+# (character.yaml, runtime.yaml, prompts/system.md, ...) — those remain
+# legacy operational inputs through Phase A and are never read as
+# role-artifact inputs. Task 6 removes the transitional tier-inference
+# above and consumes RoleArtifactSource for model resolution and the role
+# checksum; Task 5 only wires the loader seam and cross-validates that the
+# artifact found on disk actually matches the directory it was loaded for.
+
+
+def _load_role_artifact_for(
+    tier: str, role_from_path: str, roles_dir: str | None,
+) -> RoleArtifactSource:
+    """Load and cross-validate the canonical role artifact for one resident
+    or specialist agent directory (``tier`` is ``resident``/``specialist``
+    here; executors use ``_load_executor_role_artifact`` below)."""
+    base = roles_dir or DEFAULT_ROLES_DIR
+    role_dir = Path(base) / tier / role_from_path
+    try:
+        artifact = load_role_artifact(role_dir)
+    except (OSError, ValueError, yaml.YAMLError,
+            jsonschema.exceptions.ValidationError) as exc:
+        raise LoadError(
+            f"agent {role_from_path!r} ({tier}): role artifact load failed "
+            f"at {role_dir}: {exc}"
+        ) from exc
+    found_kind = artifact.role.get("kind")
+    if found_kind != tier:
+        raise LoadError(
+            f"agent {role_from_path!r}: role artifact kind {found_kind!r} "
+            f"at {role_dir} does not match directory tier {tier!r}"
+        )
+    found_slot = artifact.role.get("slot")
+    if found_slot != role_from_path:
+        raise LoadError(
+            f"agent {role_from_path!r}: role artifact slot {found_slot!r} "
+            f"at {role_dir} does not match directory name {role_from_path!r}"
+        )
+    expected_id = f"{tier}:{role_from_path}"
+    if artifact.role.get("id") != expected_id:
+        raise LoadError(
+            f"agent {role_from_path!r}: role artifact id "
+            f"{artifact.role.get('id')!r} at {role_dir} does not match "
+            f"expected {expected_id!r}"
+        )
+    return artifact
+
+
+def _load_executor_role_artifact(
+    entry: str, roles_dir: str | None,
+) -> RoleArtifactSource:
+    """Load and cross-validate the canonical role artifact for one executor
+    type directory. Executors are checked more strictly (id, kind, AND
+    slot) since ``load_all_executors`` has no separate directory-name
+    cross-check elsewhere in its per-entry loop the way residents/
+    specialists get from ``character.yaml``'s role field."""
+    base = roles_dir or DEFAULT_ROLES_DIR
+    role_dir = Path(base) / "executor" / entry
+    try:
+        artifact = load_role_artifact(role_dir)
+    except (OSError, ValueError, yaml.YAMLError,
+            jsonschema.exceptions.ValidationError) as exc:
+        raise LoadError(
+            f"executor {entry!r}: role artifact load failed at {role_dir}: {exc}"
+        ) from exc
+    role = artifact.role
+    if role.get("kind") != "executor":
+        raise LoadError(
+            f"executor {entry!r}: role artifact kind {role.get('kind')!r} "
+            f"at {role_dir} must be 'executor'"
+        )
+    if role.get("slot") != entry:
+        raise LoadError(
+            f"executor {entry!r}: role artifact slot {role.get('slot')!r} "
+            f"at {role_dir} does not match executor type {entry!r}"
+        )
+    expected_id = f"executor:{entry}"
+    if role.get("id") != expected_id:
+        raise LoadError(
+            f"executor {entry!r}: role artifact id {role.get('id')!r} at "
+            f"{role_dir} does not match expected {expected_id!r}"
+        )
+    return artifact
 
 
 def _check_file_set(agent_dir: str, tier: str, role: str) -> None:
@@ -705,7 +825,31 @@ def _build_runtime_fields(
     cfg: AgentConfig, runtime: dict[str, Any],
 ) -> None:
     """Populate the legacy runtime fields on *cfg* from runtime.yaml data."""
-    cfg.model = resolve_model(runtime["model"])
+    role_slot_value = materialize_role(source=cfg.role_artifact, options=_ha_model_options())
+    if runtime["kind"] != role_slot_value.kind:
+        raise LoadError(
+            f"runtime kind {runtime['kind']!r} does not match canonical role kind "
+            f"{role_slot_value.kind!r}"
+        )
+    # NOTE (foundation-hardening reconciliation): a raw ``!=`` here is WRONG.
+    # ``runtime["model"]`` comes from runtime.yaml via the ordinary YAML path
+    # (``model.allowed`` is a plain ``list``); ``cfg.role_artifact.role["model"]``
+    # is deep-frozen (``allowed`` is a ``tuple``, the mapping a ``MappingProxyType``).
+    # ``list != tuple`` and ``dict != MappingProxyType`` ALWAYS in Python, so the
+    # raw comparison would raise ``LoadError`` on every ha_option resident even when
+    # the two files agree. Compare CANONICAL bytes instead (canonical_json_bytes now
+    # normalizes frozen->plain and rfc8785 sorts keys, so this is a pure structural
+    # equality of the two model blocks).
+    if canonical_json_bytes(runtime["model"]) != canonical_json_bytes(cfg.role_artifact.role["model"]):
+        raise LoadError(
+            "runtime.yaml model declaration does not match the canonical role.yaml model block"
+        )
+    cfg.role_slot = role_slot_value
+    cfg.kind = role_slot_value.kind
+    cfg.role_id = role_slot_value.role_id
+    cfg.resolved_model = role_slot_value.resolved_model.effective
+    cfg.model = role_slot_value.resolved_model.sdk_model
+    cfg.role_checksum = role_slot_value.checksum
     cfg.enabled = bool(runtime.get("enabled", True))
 
     tools = runtime.get("tools") or {}
@@ -781,21 +925,42 @@ def _compose_prompt(
 # --- Public API ------------------------------------------------------------
 
 
+def _resident_bindings_root(bindings_dir: str | None) -> Path:
+    """Personality Phase A, Task 8: the per-resident instance-tuple root
+    (``<root>/resident-<slot>/``). Explicit ``bindings_dir`` wins; else the
+    ``CASA_BINDINGS_DIR`` env override (mirrors ``CASA_CONFIG_DIR`` in
+    config_sync.py); else the shipped ``/config/bindings`` container path.
+    Tests point this at a tmp dir so a resident load never writes under the
+    real ``/config`` tree."""
+    return Path(
+        bindings_dir or os.environ.get("CASA_BINDINGS_DIR", "/config/bindings")
+    )
+
+
 def load_agent_from_dir(
     agent_dir: str, *, policies: PolicyLibrary | None,
+    roles_dir: str | None = None, bindings_dir: str | None = None,
 ) -> AgentConfig:
     """Load one agent directory. Strict: every error raises LoadError.
 
     ``policies`` may be None for specialist loads (specialists have no
     disclosure.yaml). It must be non-None for residents or the composer
     raises at Disclosure-render time.
+
+    ``roles_dir`` overrides the image-owned ``defaults/roles/`` root used
+    to load and cross-validate the canonical role artifact (Personality
+    Phase A, Task 5). Defaults to the real shipped tree; tests inject a
+    synthetic ``roles_dir`` instead of patching the filesystem.
+
+    ``bindings_dir`` overrides the resident instance-tuple root (Task 8)
+    used by boot-time binding reconciliation; see ``_resident_bindings_root``.
     """
     if not os.path.isdir(agent_dir):
         raise LoadError(f"not a directory: {agent_dir}")
 
     role_from_path = os.path.basename(agent_dir.rstrip(os.sep))
 
-    # Peek runtime.yaml first to infer tier before the file-set check.
+    # Peek runtime.yaml first — its explicit `kind` field selects the tier.
     runtime_path = os.path.join(agent_dir, "runtime.yaml")
     if not os.path.exists(runtime_path):
         raise LoadError(
@@ -803,9 +968,18 @@ def load_agent_from_dir(
         )
     runtime_data = _read_yaml(runtime_path)
     _validate(runtime_data, "runtime", runtime_path)
-    tier = _infer_tier(runtime_data)
+    tier = _declared_kind(runtime_data, runtime_path)
 
     _check_file_set(agent_dir, tier, role_from_path)
+
+    # Load the canonical role artifact BEFORE constructing cfg — Step 7 makes
+    # AgentConfig.role_artifact a required (kw_only) constructor field with no
+    # default, so it must be supplied AT construction, never assigned onto an
+    # already-built cfg (the former `cfg = AgentConfig(role=role_from_path)`,
+    # followed by a POST-construction `cfg.role_artifact = ...` further down,
+    # would otherwise raise `TypeError: missing 1 required keyword-only
+    # argument: 'role_artifact'` immediately — this reordering IS the fix).
+    role_artifact = _load_role_artifact_for(tier, role_from_path, roles_dir)
 
     # character.yaml — mandatory, validate then parse.
     char_path = os.path.join(agent_dir, "character.yaml")
@@ -817,7 +991,7 @@ def load_agent_from_dir(
             f"{char_data['role']!r} must match directory name"
         )
 
-    cfg = AgentConfig(role=role_from_path)
+    cfg = AgentConfig(role=role_from_path, role_artifact=role_artifact)
     cfg.character = _build_character(char_data, agent_dir=agent_dir)
 
     # voice.yaml
@@ -832,7 +1006,10 @@ def load_agent_from_dir(
     _validate(rs_data, "response_shape", rs_path)
     cfg.response_shape = _build_response_shape(rs_data)
 
-    # runtime.yaml — already read + validated; build fields.
+    # runtime.yaml — already read + validated; build fields. cfg.role_artifact
+    # is already populated (passed into the constructor above) — the former
+    # standalone `cfg.role_artifact = _load_role_artifact_for(...)` line is
+    # DELETED, not merely moved; there is exactly one assignment site now.
     _build_runtime_fields(cfg, runtime_data)
 
     # disclosure.yaml — resident only (file-set check guarantees presence).
@@ -887,11 +1064,146 @@ def load_agent_from_dir(
     # Compose the system prompt.
     cfg.system_prompt = _compose_prompt(cfg, policies)
 
+    # Personality Phase A, Task 8: activate the resident's persona binding and
+    # compile its immutable per-surface prompt bundle. Runs LAST so every legacy
+    # validation/compose error keeps its ordering; residents are the only kind
+    # that carries a persona/binding/compiled bundle (specialists join in Plan 2,
+    # executors never). A resident fails to load ONLY when reconciliation itself
+    # raises (no active tuple exists AND the fresh attempt failed).
+    if cfg.kind == "resident":
+        _activate_resident_binding(cfg, role_from_path, bindings_dir)
+    elif cfg.kind == "specialist":
+        # Personality Phase A, Task N1b Step 19: the specialist counterpart
+        # to the resident block above — activates the INSTALLED component's
+        # binding (Plan 2's /config/specialists/<slug>/ InstanceDir tree,
+        # not /config/bindings/) so an installed specialist gets the same
+        # compiled_prompt_bundle/speaker_provenance seam residents get. A
+        # specialist with no active tuple (pending-configuration, or the
+        # legacy bundled `finance` before Task N2's cutover) is a no-op —
+        # activate_binding_for_config leaves cfg.compiled_prompt_bundle=None
+        # and tools.py's system-prompt seam falls back to the legacy
+        # cfg.system_prompt path.
+        #
+        # Wrapped into LoadError (unlike the resident block, which only
+        # wraps its two sub-calls): load_all_specialists' per-directory loop
+        # (agent_loader.py, load_all_specialists) isolates siblings by
+        # catching ONLY LoadError — a raw ValueError/OSError escaping here
+        # would poison every OTHER specialist's load in the same scan, not
+        # just this one, so every recoverable failure this call can raise
+        # (InstanceDir/parse_component_root/persona-pack loading/
+        # compile_prompt_bundle validation all raise ValueError or a
+        # ValueError subclass; a missing platform-frame/safety-kernel file
+        # raises OSError) is folded into LoadError here.
+        from specialist_install import activate_binding_for_config
+
+        try:
+            activate_binding_for_config(cfg)  # production root: the function's own default
+        except (ValueError, OSError) as exc:
+            raise LoadError(
+                f"agent {role_from_path!r}: specialist binding activation failed: {exc}"
+            ) from exc
+
     return cfg
+
+
+def _activate_resident_binding(
+    cfg: AgentConfig, role_from_path: str, bindings_dir: str | None,
+) -> None:
+    """Reconcile + compile the resident binding onto *cfg* (Task 8, Step 8)."""
+    from persona_pack import load_persona_pack
+    from personality_binding import (
+        IMAGE_DEFAULT_PERSONA_BY_SLOT,
+        InstanceDir,
+        reconcile_resident_binding,
+    )
+    from personality_types import SpeakerProvenance
+    from prompt_compiler import compile_prompt_bundle
+
+    # Image-owned personas ship under defaults/personas/ (module-relative, so
+    # this resolves identically in the container and under tests). Operator
+    # overrides live under <CASA_CONFIG_DIR>/personas/.
+    personas_root = Path(SCHEMA_DIR).parent / "personas"
+    override_root = Path(os.environ.get("CASA_CONFIG_DIR", "/config")) / "personas"
+
+    def _pack(root: Path, ref: str) -> "PersonaPack | None":
+        persona_id, _, version = ref.partition("@")
+        pack_dir = root / persona_id / version / "pack"
+        manifest_path = root / persona_id / version / "manifest.json"
+        if pack_dir.is_dir() and manifest_path.is_file():
+            return load_persona_pack(pack_dir, manifest_path)
+        return None
+
+    def _load_default(ref: str):
+        pack = _pack(personas_root, ref)
+        if pack is None:
+            raise ValueError(f"image-default persona {ref!r} is not present under {personas_root}")
+        return pack
+
+    def _load_override(ref: str):
+        for root in (override_root, personas_root):
+            pack = _pack(root, ref)
+            if pack is not None:
+                return pack
+        raise ValueError(
+            f"override persona {ref!r} is unavailable — run resident_persona_reset to recover"
+        )
+
+    instance_dir = InstanceDir(
+        _resident_bindings_root(bindings_dir) / f"resident-{cfg.role_slot.slot}"
+    )
+    try:
+        active_tuple = reconcile_resident_binding(
+            role=cfg.role_slot, image_default_persona_loader=_load_default,
+            override_persona_loader=_load_override, instance_dir=instance_dir,
+        )
+    except ValueError as exc:
+        raise LoadError(
+            f"agent {role_from_path!r}: resident binding reconciliation failed: {exc}"
+        ) from exc
+
+    # Fix 2 (Personality Phase A review): reconcile_resident_binding can
+    # return a RETAINED last-known-good tuple WITHOUT itself raising (e.g.
+    # nothing staged, and the persona blob backing the current active
+    # override has since vanished from disk — reconcile's internal load
+    # attempt fails, is caught internally, and the retained active is handed
+    # back unchanged since an active tuple exists). The (re)load below then
+    # loads that SAME persona a second time; it must translate a missing/
+    # invalid blob to LoadError exactly like the reconcile call above, not
+    # escape as a raw ValueError.
+    try:
+        if active_tuple.binding.mode == "image-default":
+            bound_persona = _load_default(IMAGE_DEFAULT_PERSONA_BY_SLOT[cfg.role_slot.slot])
+        else:
+            bound_persona = _load_override(
+                f"{active_tuple.binding.persona_id}@{active_tuple.binding.persona_version}"
+            )
+    except ValueError as exc:
+        raise LoadError(
+            f"agent {role_from_path!r}: bound persona "
+            f"{active_tuple.binding.persona_id}@{active_tuple.binding.persona_version} "
+            f"failed to reload after reconciliation: {exc}"
+        ) from exc
+    platform_frame = (Path(SCHEMA_DIR).parent / "personality" / "platform-frame.md").read_text(encoding="utf-8")
+    safety_kernel = (Path(SCHEMA_DIR).parent / "personality" / "safety-kernel.md").read_text(encoding="utf-8")
+    bundle = compile_prompt_bundle(
+        role=cfg.role_slot, persona=bound_persona, binding=active_tuple.binding,
+        platform_frame=platform_frame, safety_kernel=safety_kernel,
+    )
+    cfg.persona_pack = bound_persona
+    cfg.binding = active_tuple.binding
+    cfg.compiled_prompt_bundle = bundle
+    cfg.binding_digest = active_tuple.binding.binding_digest
+    cfg.speaker_provenance = SpeakerProvenance(
+        speaker_kind="resident", role_id=cfg.role_slot.role_id,
+        persona_id=bound_persona.persona_id, persona_version=bound_persona.version,
+        display_name=bound_persona.identity["display_name"],
+        binding_digest=active_tuple.binding.binding_digest,
+    )
 
 
 def load_all_agents(
     agents_dir: str, *, policies: PolicyLibrary | None,
+    roles_dir: str | None = None, bindings_dir: str | None = None,
 ) -> dict[str, AgentConfig]:
     """Walk *agents_dir* for resident directories.
 
@@ -899,6 +1211,9 @@ def load_all_agents(
     Plan 2 Tier 3), and any dotdir. Each subdirectory's name becomes
     the agent role. Raises ``LoadError`` on the first malformed agent —
     strict-mode from day one.
+
+    ``roles_dir``/``bindings_dir`` — see ``load_agent_from_dir``; propagated
+    unchanged.
     """
     found: dict[str, AgentConfig] = {}
     if not os.path.isdir(agents_dir):
@@ -912,13 +1227,39 @@ def load_all_agents(
                 f"unexpected non-directory at agents/{entry} — each agent "
                 f"is a directory; flat YAML files are no longer supported"
             )
-        cfg = load_agent_from_dir(path, policies=policies)
+        cfg = load_agent_from_dir(
+            path, policies=policies, roles_dir=roles_dir, bindings_dir=bindings_dir,
+        )
         found[cfg.role] = cfg
+
+    # Personality Phase A, Task 6, Step 9: fail closed on drift from the
+    # fixed three-slot resident set (spec: assistant/butler/concierge are
+    # the only residents that ever exist) — both against what actually
+    # LOADED and against what the image-owned defaults/roles/resident/ tree
+    # itself declares, so a stray fourth resident directory (either an
+    # agents/ instance or an orphaned roles/ directory) fails the load
+    # instead of silently boot with an unexpected resident set.
+    resident_slots = {
+        cfg.role_slot.slot for cfg in found.values()
+        if cfg.kind == "resident" and cfg.role_slot is not None
+    }
+    if resident_slots != set(FIXED_RESIDENT_SLOTS):
+        raise LoadError(
+            f"resident set {sorted(resident_slots)} does not match the fixed slots "
+            f"{FIXED_RESIDENT_SLOTS}"
+        )
+    role_dirs_base = Path(roles_dir or DEFAULT_ROLES_DIR) / "resident"
+    role_dirs = {p.name for p in role_dirs_base.iterdir() if p.is_dir()}
+    if role_dirs != set(FIXED_RESIDENT_SLOTS):
+        raise LoadError(
+            f"defaults/roles/resident contains {sorted(role_dirs)}, expected exactly "
+            f"{FIXED_RESIDENT_SLOTS}"
+        )
     return found
 
 
 def load_all_specialists(
-    specialists_dir: str,
+    specialists_dir: str, *, roles_dir: str | None = None,
 ) -> tuple[dict[str, AgentConfig], list[tuple[str, str]]]:
     """Walk *specialists_dir* for specialist directories.
 
@@ -955,7 +1296,7 @@ def load_all_specialists(
                 f"supported"
             )
         try:
-            cfg = load_agent_from_dir(path, policies=None)
+            cfg = load_agent_from_dir(path, policies=None, roles_dir=roles_dir)
         except LoadError as exc:
             failed.append((entry, str(exc)))
             continue
@@ -964,7 +1305,7 @@ def load_all_specialists(
 
 
 def load_all_executors(
-    base_dir: str,
+    base_dir: str, *, roles_dir: str | None = None,
 ) -> tuple[dict[str, "ExecutorDefinition"], list[tuple[str, str]]]:
     """Scan ``<base_dir>/executors/*/`` and return ``(loaded, failed)``.
 
@@ -981,6 +1322,15 @@ def load_all_executors(
     A collection-level error (e.g. ``executors_root`` missing) still
     short-circuits with an empty ``(out, failed)`` per the existing
     early-return contract.
+
+    Personality Phase A, Task 5: each executor type also gets its
+    canonical role artifact loaded from ``<roles_dir or DEFAULT_ROLES_DIR>/
+    executor/<type>/`` and cross-validated (id, kind, and slot must match
+    the executor type). A missing or mismatched artifact is a per-executor
+    failure like any other, isolated the same way. The existing
+    ``definition.yaml``, prompt, hooks, observer, and doctrine directory
+    remain operational inputs during Phase A — they are not checksum
+    inputs. Executors have no persona and no binding.
     """
     from config import ExecutorDefinition, resolve_model
 
@@ -1040,6 +1390,20 @@ def load_all_executors(
                     f"{prompt_name!r} not found"
                 )
 
+            role_artifact = _load_executor_role_artifact(entry, roles_dir)
+
+            # Personality Phase A, Task 6: materialize the canonical role
+            # (kind/model resolution/checksum) and derive the role-only
+            # identity triple (spec §2.3) — executors have no persona and no
+            # binding, so effective_config_digest is always EMPTY_CONFIG_DIGEST
+            # today (see role_slot.compute_executor_identity's docstring).
+            executor_role_slot = materialize_role(
+                source=role_artifact, options=_ha_model_options(),
+            )
+            executor_identity = compute_executor_identity(
+                role=executor_role_slot, effective_config_digest=EMPTY_CONFIG_DIGEST,
+            )
+
             memory_block = defn.get("memory") or {}
             d = ExecutorDefinition(
                 type=defn["type"],
@@ -1056,6 +1420,11 @@ def load_all_executors(
                 hooks_path=hooks_abs,
                 observer_policy_path=observer_abs,
                 doctrine_dir=doctrine_abs,
+                role_artifact=role_artifact,
+                role_id=executor_role_slot.role_id,
+                role_checksum=executor_role_slot.checksum,
+                resolved_model=executor_role_slot.resolved_model.effective,
+                effective_config_digest=executor_identity.effective_config_digest,
                 # Plan 4a additions
                 extra_dirs=list(defn.get("extra_dirs", [])),
                 mirror_chat_to_topic=bool(defn.get("mirror_chat_to_topic", True)),

@@ -1,5 +1,37 @@
 # Changelog
 
+## [0.100.0] - 2026-07-22
+
+Personality Phase A: residents with swappable personas, and specialists
+installed from repositories instead of the app image.
+
+### Added
+
+- **Personas.** Each of the three residents (the assistant, the butler,
+  and the new concierge) now serves with a compiled persona — a versioned,
+  swappable identity pack that defines its name, voice, and character
+  traits. Ellen, Tina, and Gary are the defaults; swapping a persona is an
+  explicit operation and takes effect on restart, never mid-conversation.
+- **The concierge (Gary) is a day-one resident**, alongside the assistant
+  and the butler.
+- **Speaker attribution in memory.** Memories now record who was serving
+  when they were written, and recalled memories carry that attribution —
+  so after a persona swap, older memories still name the persona that
+  originally handled them.
+
+### Changed
+
+- Specialists are now installed from a component repository instead of
+  being bundled with the app image. The `finance` specialist and a new
+  Magic — The Gathering rules judge (`mtg`) move to their own repositories;
+  reinstall `finance` via the configurator's install recipe
+  (`specialist_install_inspect` → `specialist_install_commit`). The
+  configurator's toolset also covers `specialist_upgrade`,
+  `specialist_rollback`, and `specialist_uninstall` for an installed
+  specialist, plus a `persona_install_inspect` / `persona_install_commit` /
+  `persona_apply` flow for adopting a specialist's bundled default persona
+  or swapping in another.
+
 ## [0.99.0] - 2026-07-20
 
 Memory failures are no longer mistaken for "no memories found".

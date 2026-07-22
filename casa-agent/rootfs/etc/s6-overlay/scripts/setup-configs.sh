@@ -15,6 +15,13 @@ mkdir -p "$CONFIG_DIR/agents" \
          "$CONFIG_DIR/agents/specialists" \
          "$CONFIG_DIR/agents/executors" \
          "$CONFIG_DIR/policies" \
+         "$CONFIG_DIR/bindings" \
+         "$CONFIG_DIR/bindings/resident-assistant" \
+         "$CONFIG_DIR/bindings/resident-butler" \
+         "$CONFIG_DIR/bindings/resident-concierge" \
+         "$CONFIG_DIR/specialists" \
+         "$CONFIG_DIR/specialists/.staging" \
+         "$CONFIG_DIR/specialists/.roles-overlay" \
          "$CONFIG_DIR/schema" \
          "$DATA_DIR/sdk-sessions" \
          "$DATA_DIR/casa-s6-services" \
@@ -146,6 +153,8 @@ elif [ ! -d "$CONFIG_DIR/.git" ]; then
 !agents/**
 !policies/
 !policies/**
+!bindings/
+!bindings/**
 !schema/
 !schema/**
 # Unified plugin architecture (v0.71.0): the registry is config — the single
@@ -156,6 +165,17 @@ elif [ ! -d "$CONFIG_DIR/.git" ]; then
 !plugins/registry.json
 plugins/store/
 plugins/.staging/
+# Installed-specialist data model (Task 13): registry.json is config — same
+# audit-trail rationale as plugins/registry.json above. ONLY the per-slug
+# active/desired/prior tuples and the top-level registry are tracked; the
+# content-addressed component store and staging are binaries, never tracked.
+!specialists/
+!specialists/registry.json
+!specialists/*/active.yaml
+!specialists/*/desired.yaml
+!specialists/*/active.prior.yaml
+specialists/store/
+specialists/.staging/
 !.gitignore
 EOF
     git add -A 2>/dev/null || true
@@ -191,8 +211,12 @@ export CASA_IMAGE_VERSION="$(bashio::addon.version 2>/dev/null || echo unknown)"
 # validator saw the literal "${...}" and reported a bogus "Unknown model
 # shortname" in config-sync-report.json. Export them here for env-parity with
 # boot so the validation is faithful (a genuinely bad model still fails).
-export PRIMARY_AGENT_MODEL="$(bashio::config 'primary_agent_model')"
-export VOICE_AGENT_MODEL="$(bashio::config 'voice_agent_model')"
+_casa_primary_model="$(bashio::config 'primary_agent_model')"
+_casa_voice_model="$(bashio::config 'voice_agent_model')"
+[ -n "$_casa_primary_model" ] && [ "$_casa_primary_model" != "null" ] || _casa_primary_model=opus
+[ -n "$_casa_voice_model" ] && [ "$_casa_voice_model" != "null" ] || _casa_voice_model=haiku
+export PRIMARY_AGENT_MODEL="$_casa_primary_model"
+export VOICE_AGENT_MODEL="$_casa_voice_model"
 python3 /opt/casa/config_sync.py || bashio::log.warning "config_sync exited non-zero (non-fatal)"
 
 # Initialize session registry if missing

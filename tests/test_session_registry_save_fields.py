@@ -6,6 +6,7 @@ from __future__ import annotations
 import pytest
 
 from session_registry import SessionRegistry
+from session_reg_helpers import STUB_BINDING_DIGEST, STUB_SPEAKER_PROV, STUB_USER_PROV
 
 pytestmark = [pytest.mark.unit]
 
@@ -16,7 +17,7 @@ def reg(tmp_path):
 
 
 async def test_try_begin_save_is_once_only(reg):
-    await reg.register("voice-room1", "assistant", "sid-1")
+    await reg.register("voice-room1", "assistant", "sid-1", binding_digest=STUB_BINDING_DIGEST, speaker_provenance=STUB_SPEAKER_PROV, user_provenance=STUB_USER_PROV)
     assert await reg.try_begin_save("voice-room1") is True   # first claim wins
     assert await reg.try_begin_save("voice-room1") is False  # already claimed
     # marker is set so a crashed save can be detected/retried by the reaper
@@ -24,7 +25,7 @@ async def test_try_begin_save_is_once_only(reg):
 
 
 async def test_finish_save_removes_entry(reg):
-    await reg.register("voice-room1", "assistant", "sid-1")
+    await reg.register("voice-room1", "assistant", "sid-1", binding_digest=STUB_BINDING_DIGEST, speaker_provenance=STUB_SPEAKER_PROV, user_provenance=STUB_USER_PROV)
     await reg.try_begin_save("voice-room1")
     await reg.finish_save("voice-room1")
     assert reg.get("voice-room1") is None
@@ -38,10 +39,10 @@ async def test_finish_save_spares_entry_reregistered_mid_save(reg):
     """M24: reaper claims a cold session, then a user turn re-registers the
     channel with a NEW sid before the multi-minute save finishes.
     finish_save(old_sid) must NOT delete the new registration."""
-    await reg.register("telegram-123", "assistant", "old-sid")
+    await reg.register("telegram-123", "assistant", "old-sid", binding_digest=STUB_BINDING_DIGEST, speaker_provenance=STUB_SPEAKER_PROV, user_provenance=STUB_USER_PROV)
     assert await reg.try_begin_save("telegram-123") is True
     # user turn completes mid-save: register() overwrites the claimed entry
-    await reg.register("telegram-123", "assistant", "new-sid")
+    await reg.register("telegram-123", "assistant", "new-sid", binding_digest=STUB_BINDING_DIGEST, speaker_provenance=STUB_SPEAKER_PROV, user_provenance=STUB_USER_PROV)
     # reaper's save completes for the OLD sid
     await reg.finish_save("telegram-123", "old-sid")
     entry = reg.get("telegram-123")
@@ -50,7 +51,7 @@ async def test_finish_save_spares_entry_reregistered_mid_save(reg):
 
 
 async def test_finish_save_pops_when_sid_matches(reg):
-    await reg.register("telegram-123", "assistant", "old-sid")
+    await reg.register("telegram-123", "assistant", "old-sid", binding_digest=STUB_BINDING_DIGEST, speaker_provenance=STUB_SPEAKER_PROV, user_provenance=STUB_USER_PROV)
     await reg.try_begin_save("telegram-123")
     await reg.finish_save("telegram-123", "old-sid")
     assert reg.get("telegram-123") is None
@@ -58,17 +59,17 @@ async def test_finish_save_pops_when_sid_matches(reg):
 
 async def test_finish_save_none_sid_pops_unconditionally(reg):
     """Back-compat: passing no sid preserves the old unconditional pop."""
-    await reg.register("telegram-123", "assistant", "old-sid")
+    await reg.register("telegram-123", "assistant", "old-sid", binding_digest=STUB_BINDING_DIGEST, speaker_provenance=STUB_SPEAKER_PROV, user_provenance=STUB_USER_PROV)
     await reg.try_begin_save("telegram-123")
-    await reg.register("telegram-123", "assistant", "new-sid")
+    await reg.register("telegram-123", "assistant", "new-sid", binding_digest=STUB_BINDING_DIGEST, speaker_provenance=STUB_SPEAKER_PROV, user_provenance=STUB_USER_PROV)
     await reg.finish_save("telegram-123")
     assert reg.get("telegram-123") is None
 
 
 async def test_clear_save_claim_spares_reregistered_entry(reg):
     """M24: clear_save_claim(old_sid) must not touch a newer registration."""
-    await reg.register("telegram-123", "assistant", "old-sid")
+    await reg.register("telegram-123", "assistant", "old-sid", binding_digest=STUB_BINDING_DIGEST, speaker_provenance=STUB_SPEAKER_PROV, user_provenance=STUB_USER_PROV)
     await reg.try_begin_save("telegram-123")
-    await reg.register("telegram-123", "assistant", "new-sid")
+    await reg.register("telegram-123", "assistant", "new-sid", binding_digest=STUB_BINDING_DIGEST, speaker_provenance=STUB_SPEAKER_PROV, user_provenance=STUB_USER_PROV)
     await reg.clear_save_claim("telegram-123", "old-sid")
     assert reg.get("telegram-123")["sdk_session_id"] == "new-sid"

@@ -140,7 +140,8 @@ class TestLoaderResolvesPromptFile:
                     "schema_version: 1\npolicy: standard\n")
         self._write(d / "runtime.yaml", """\
             schema_version: 1
-            model: sonnet
+            kind: resident
+            model: {source: ha_option, option: primary_agent_model, default: opus, allowed: [opus, sonnet, haiku]}
             tools:
               allowed: [Read]
             channels: [telegram]

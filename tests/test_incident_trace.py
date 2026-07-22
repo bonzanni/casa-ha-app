@@ -15,6 +15,11 @@ import pytest
 
 from plugin_fixtures import entry, mk_artifact, mk_registry
 
+try:
+    from tests.role_artifact_stub import STUB_ROLE_ARTIFACT
+except ImportError:
+    from role_artifact_stub import STUB_ROLE_ARTIFACT
+
 pytestmark = pytest.mark.unit
 
 
@@ -86,7 +91,7 @@ def test_stale_active_binding_is_never_green(monkeypatch, tmp_path):
     reg_new.write_text(json.dumps({"schema_version": 1, "plugins": [e_new]}))
 
     ar = AgentRegistry.build(residents={},
-                             specialists={"finance": AgentConfig(role="finance")})
+                             specialists={"finance": AgentConfig(role_artifact=STUB_ROLE_ARTIFACT, role="finance")})
     agent = _make_agent(tmp_path, role="finance", agent_registry=ar)
 
     def _verify(reg_path):

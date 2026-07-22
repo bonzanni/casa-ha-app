@@ -15,6 +15,11 @@ from plugin_fixtures import (
     mk_registry as _mk_registry,
 )
 
+try:
+    from tests.role_artifact_stub import STUB_ROLE_ARTIFACT
+except ImportError:
+    from role_artifact_stub import STUB_ROLE_ARTIFACT
+
 pytestmark = pytest.mark.unit
 
 
@@ -214,8 +219,8 @@ def test_tier_for_role():
     from agent_registry import AgentRegistry
     from config import AgentConfig
     reg = AgentRegistry.build(
-        residents={"assistant": AgentConfig(role="assistant")},
-        specialists={"finance": AgentConfig(role="finance")},
+        residents={"assistant": AgentConfig(role_artifact=STUB_ROLE_ARTIFACT, role="assistant")},
+        specialists={"finance": AgentConfig(role_artifact=STUB_ROLE_ARTIFACT, role="finance")},
     )
     assert reg.tier_for_role("assistant") == "resident"
     assert reg.tier_for_role("finance") == "specialist"

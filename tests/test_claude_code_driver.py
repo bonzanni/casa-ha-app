@@ -26,7 +26,7 @@ def _make_defn(tmp_path, plugins=None):
         for p in plugins:
             (pdir / p).mkdir()
         plugins_dir = str(pdir)
-    return ExecutorDefinition(
+    return ExecutorDefinition(role_artifact=STUB_ROLE_ARTIFACT, 
         type="hello-driver",
         description="Test harness executor type for claude_code driver.",
         model="sonnet",
@@ -1189,6 +1189,11 @@ class TestRedirectLane:
 
 # Convenience aliases for the exact copies (asserted above).
 from drivers.claude_code_driver import _RECEIPT_COPY as RECEIPT  # noqa: E402
+
+try:
+    from tests.role_artifact_stub import STUB_ROLE_ARTIFACT
+except ImportError:
+    from role_artifact_stub import STUB_ROLE_ARTIFACT
 
 
 class TestSpawnBackgroundTasksInbound:

@@ -16,7 +16,10 @@ from __future__ import annotations
 import logging
 import os
 from dataclasses import dataclass, field
+from pathlib import Path
 from typing import Any
+
+import yaml
 
 from config import AgentConfig
 from job_registry import (
@@ -25,6 +28,11 @@ from job_registry import (
     JobRegistry,
     VoiceJob,
 )
+from personality_binding import InstanceDir
+from personality_types import SpeakerProvenance
+# Forward re-export for future Plan 2 / Task 14 callers (module-level-accessor
+# precedent this file already follows, e.g. _active_index below).
+from specialist_lifecycle import InstanceState, SpecialistInstance, check_slug_uniqueness  # noqa: F401
 
 logger = logging.getLogger(__name__)
 
@@ -101,7 +109,7 @@ class SpecialistRegistry:
 
     # -- Loading / validation -------------------------------------------------
 
-    def load(self) -> None:
+    def load(self, *, roles_dir: str | None = None) -> None:
         """Scan ``self._dir`` for specialist directories and register valid ones.
 
         O-2b (v0.37.9): per-specialist failures are tracked in
@@ -109,6 +117,13 @@ class SpecialistRegistry:
         so :mod:`reload` can surface them to ``casactl`` callers. One
         malformed specialist does not poison its siblings — see
         :func:`agent_loader.load_all_specialists`.
+
+        Plan 2, Task N1b: ``roles_dir``, when given, overrides the image-only
+        default so an installed specialist's role artifact (which cannot
+        live under ``defaults/roles/``) is found. Production always passes
+        the reconciled overlay root (``casa_core.py``); tests and every
+        other pre-existing caller omit it and get the unchanged image-only
+        behavior.
         """
         from agent_loader import LoadError, load_all_specialists
 
@@ -116,7 +131,7 @@ class SpecialistRegistry:
         self._disabled_names.clear()
         self._load_failures = []
         try:
-            found, failed = load_all_specialists(self._dir)
+            found, failed = load_all_specialists(self._dir, roles_dir=roles_dir)
         except LoadError as exc:
             # Collection-level error (e.g. non-directory under specialists/).
             logger.error("Specialist load failed at collection level: %s", exc)
@@ -233,9 +248,33 @@ class SpecialistRegistry:
     async def register_delegation(self, record: DelegationRecord) -> None:
         await self._job_registry.load()
         origin = dict(record.origin)
+        # Task 12: creating_speaker is the DELEGATING caller's own identity,
+        # carried on origin["speaker_provenance"] by Task 10 Step 7's
+        # origin_var wiring; executing_speaker is the target specialist's own
+        # binding, read off the config this registry already loaded. `record`
+        # carries no AgentConfig of any kind — both values MUST come from one
+        # of these two already-accessible places, never a new parameter.
+        creating_speaker = origin.get("speaker_provenance")
+        if not isinstance(creating_speaker, SpeakerProvenance):
+            creating_speaker = SpeakerProvenance(speaker_kind="system")
+        specialist_cfg = self._configs.get(record.agent)
+        # Task 14 (whole-branch review): reuse the ONE canonical executing-speaker
+        # fallback (agent.speaker_provenance_for_role) instead of re-implementing
+        # it. For a bound specialist it returns cfg.speaker_provenance; for an
+        # unbound one it returns the honest unattributed `system` identity, never
+        # "executor:<slug>" (a specialist's kind is never "executor"). Lazy import
+        # mirrors tools.py's reuse of the same helper (no circular import).
+        import agent as agent_mod
+        executing_speaker = (
+            agent_mod.speaker_provenance_for_role(specialist_cfg)
+            if specialist_cfg is not None
+            else SpeakerProvenance(speaker_kind="system")
+        )
         await self._job_registry.create(VoiceJob(
             id=record.id,
             parent_job_id=None,
+            creating_speaker=creating_speaker,
+            executing_speaker=executing_speaker,
             creating_role=str(origin.get("role") or "assistant"),
             specialist_role=record.agent,
             specialist_display_name=record.agent,
@@ -322,3 +361,160 @@ class SpecialistRegistry:
             "user_id": job.creator_user_id,
             "user_text": job.task,
         }
+
+
+# ---------------------------------------------------------------------------
+# Installed-specialist data model (Task 13) — a SEPARATE concern layered onto
+# the legacy SpecialistRegistry above (bundled /config/agents/specialists/
+# per-agent-directory tier-2 loading + in-flight delegation tracking). The
+# NEW tree this introduces, /config/specialists/<slug>/{active,desired}.yaml,
+# is a DIFFERENT directory from SpecialistRegistry._dir's legacy tree — do
+# not conflate them. This is DATA MODEL ONLY (spec Plan 1): no fetch/
+# consent/CAS-persist/compile runtime — that is Plan 2's N1.
+# ---------------------------------------------------------------------------
+
+
+def _discover_image_role_slots(roles_dir: str | None = None) -> frozenset[str]:
+    """Spec §2.4: the slug-collision authority is EVERY image role's bare slot,
+    across ALL THREE kinds (resident, executor, AND specialist) — never a
+    hand-maintained per-kind constant (the bug this replaces: a resident+executor
+    -only hard-coded set silently omitted the bundled specialist:finance, so an
+    install with slug 'finance' would have collided undetected). Scans
+    defaults/roles/<kind>/<slug>/role.yaml for every kind directory PRESENT under
+    roles_dir — no kind is special-cased, so a future fourth kind, a renamed
+    executor, or a newly-bundled transitional specialist needs no matching edit
+    here. Lazy-imports agent_loader.DEFAULT_ROLES_DIR (mirrors this module's
+    existing local-import convention for agent_loader, see load() above) to avoid
+    a module-level circular import."""
+    from agent_loader import DEFAULT_ROLES_DIR
+
+    base = Path(roles_dir or DEFAULT_ROLES_DIR)
+    slots: set[str] = set()
+    for kind_dir in sorted(p for p in base.iterdir() if p.is_dir()):
+        for role_dir in sorted(p for p in kind_dir.iterdir() if p.is_dir()):
+            role_yaml = role_dir / "role.yaml"
+            if not role_yaml.is_file():
+                continue
+            data = yaml.safe_load(role_yaml.read_text(encoding="utf-8"))
+            slots.add(str(data["slot"]))
+    return frozenset(slots)
+
+
+# Computed once at import — the image's OWN role tree is static content, never
+# mutated at runtime (an INSTALLED specialist lives in a separate tree,
+# /config/specialists/, layered on top by InstalledSpecialistIndex below).
+_IMAGE_ROLE_SLOTS = _discover_image_role_slots()
+
+
+class InstalledSpecialistIndex:
+    """Tracks 0..N INSTALLED specialist components under /config/specialists/<slug>/ —
+    a DIFFERENT tree from SpecialistRegistry._dir's legacy bundled
+    /config/agents/specialists/<role>/ (finance today). Populated at boot by
+    scanning for active.yaml/desired.yaml pairs; Plan 2's N1 is what actually
+    WRITES a new one via InstanceDir.stage_desired/commit_desired_to_active."""
+
+    def __init__(self, specialists_dir: str = "/config/specialists") -> None:
+        self._dir = Path(specialists_dir)
+        self._instances: dict[str, SpecialistInstance] = {}
+
+    def installed_slugs(self) -> frozenset[str]:
+        return frozenset(self._instances)
+
+    def all_collision_slugs(self) -> frozenset[str]:
+        return _IMAGE_ROLE_SLOTS | self.installed_slugs()
+
+    def get_instance(self, slug: str) -> SpecialistInstance | None:
+        return self._instances.get(slug)
+
+    def load(self) -> None:
+        """A slug directory with only a desired.yaml (no active.yaml) is a
+        brand-new specialist still in pending-configuration with NO running
+        active tuple (spec §4.1) — this Plan defines that state; Plan 2's N1
+        is what produces one.
+
+        Round-5 fix (F3 race-safety): builds the new instance map in a LOCAL
+        dict and swaps `self._instances` to it in a single (GIL-atomic)
+        attribute store, rather than `clear()`-ing then repopulating in place.
+        `current_specialist_roles_dir` now RE-LOADS the already-published
+        process-wide index in-lock (in a worker thread); a concurrent
+        admin/inspection reader (`installed_slugs()` -> `frozenset(self.
+        _instances)`) on the event loop must never observe a half-cleared or
+        mid-repopulation dict ('dict changed size during iteration'). The swap
+        makes every reader see either the complete OLD map or the complete NEW
+        one, never a transient in-between."""
+        instances: dict[str, SpecialistInstance] = {}
+        if self._dir.is_dir():
+            for entry in sorted(self._dir.iterdir()):
+                if not entry.is_dir() or entry.name in {"store", ".staging"}:
+                    continue
+                slug = entry.name
+                instance_dir = InstanceDir(entry)
+                active, desired = instance_dir.active(), instance_dir.desired()
+                if active is None and desired is None:
+                    continue
+                state: InstanceState = (
+                    "active" if active is not None else "pending-configuration" if desired is not None else "error"
+                )
+                instances[slug] = SpecialistInstance(
+                    slug=slug, stable_agent_id=f"specialist:{slug}", state=state,
+                    active=active, desired=desired, last_activation_error=None,
+                )
+        self._instances = instances
+
+    def installed_component_role_dirs(self) -> "dict[str, Path]":
+        """slug -> the CAS directory HOLDING role/{role.yaml,doctrine.md}
+        (i.e. the component root, not the role/ subdir itself —
+        specialist_materialize._copy_role_dir appends 'role' itself,
+        mirroring reconcile_specialist_roles_overlay's other branch which
+        also receives a component root and descends into 'role').
+
+        Plan 2, Task N1b Step 17: an active tuple is authoritative; a
+        pending-configuration slug (desired only, no active) still resolves
+        so its role artifact is visible for inspection/upgrade paths —
+        `_reconcile_specialist_operational_files` (specialist_materialize.py)
+        is the SEPARATE gate that keeps a pending-configuration slug
+        non-loadable regardless of this overlay entry existing."""
+        from specialist_install import parse_component_root
+
+        out: dict[str, Path] = {}
+        for slug, instance in self._instances.items():
+            tuple_ = instance.active or instance.desired
+            if tuple_ is None:
+                continue
+            try:
+                _, _, checksum = parse_component_root(tuple_.root)
+            except ValueError:
+                continue
+            out[slug] = self._dir / "store" / checksum.removeprefix("sha256:")
+        return out
+
+
+# Module-level accessor over the ONE process-wide index casa_core.py constructs at
+# boot — mirrors the established module-level pattern (e.g. tools.active_semantic_memory,
+# tools.py:3549) other registries in this codebase already use for tool-module access
+# without threading a runtime object through every call. Plan 2's N1 and Task 14's
+# admin handlers read through this seam.
+_active_index: "InstalledSpecialistIndex | None" = None
+
+
+def set_active_installed_index(index: "InstalledSpecialistIndex") -> None:
+    global _active_index
+    _active_index = index
+
+
+def live_installed_specialist_slugs() -> frozenset[str]:
+    return _active_index.installed_slugs() if _active_index is not None else frozenset()
+
+
+def live_collision_slugs() -> frozenset[str]:
+    if _active_index is None:
+        return _IMAGE_ROLE_SLOTS
+    return _active_index.all_collision_slugs()
+
+
+def get_installed_instance(slug: str) -> "SpecialistInstance | None":
+    """Task 14: thin module-level wrapper over the process-wide
+    ``_active_index``, so admin/inspection code (``personality_admin_handlers``)
+    can look up a specialist's lifecycle state without threading the index
+    through every call site — same seam as ``live_installed_specialist_slugs``."""
+    return _active_index.get_instance(slug) if _active_index is not None else None

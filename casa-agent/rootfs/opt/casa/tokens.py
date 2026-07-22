@@ -145,6 +145,11 @@ def format_turn_summary(
     role: str,
     channel: str,
     usage: dict[str, int],
+    *,
+    role_checksum: str | None = None,
+    binding_digest: str | None = None,
+    dependency_digests: tuple[str, ...] = (),
+    effective_config_digest: str | None = None,
 ) -> str:
     """Render the per-turn ``turn_tokens`` log line.
 
@@ -165,12 +170,32 @@ def format_turn_summary(
     Tracking them separately surfaces a stable-prefix regression
     (``cache_write > 0`` every turn means our prompt prefix is changing
     each turn and the cache is never paying off).
+
+    Task 14 (personality Phase A): four keyword-only, ALL-optional
+    provenance fields extend the line so an operator correlating
+    ``explain``/``persona diff`` output with the token log can tie a
+    turn to the exact role/binding/dependency set that produced it.
+    Every existing positional/keyword call site (and every existing
+    ``cache_read``/``cache_write`` field) is unchanged when these are
+    omitted — the base line renders byte-identical to before this task.
     """
     inp = int(usage.get("input_tokens", 0) or 0)
     out = int(usage.get("output_tokens", 0) or 0)
     cr = int(usage.get("cache_read_input_tokens", 0) or 0)
     cw = int(usage.get("cache_creation_input_tokens", 0) or 0)
-    return (
+    line = (
         f"turn_tokens role={role} channel={channel} "
         f"input={inp} output={out} cache_read={cr} cache_write={cw}"
     )
+    extras: list[str] = []
+    if role_checksum is not None:
+        extras.append(f"role_checksum={role_checksum}")
+    if binding_digest is not None:
+        extras.append(f"binding_digest={binding_digest}")
+    if dependency_digests:
+        extras.append(f"dependency_digests={','.join(dependency_digests)}")
+    if effective_config_digest is not None:
+        extras.append(f"effective_config_digest={effective_config_digest}")
+    if extras:
+        line += " " + " ".join(extras)
+    return line

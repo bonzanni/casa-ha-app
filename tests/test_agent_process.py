@@ -11,13 +11,20 @@ from unittest.mock import AsyncMock, patch
 import pytest
 
 import retry as retry_mod
-from agent import Agent
+from agent import Agent, ResumeDecision
 from bus import BusMessage, MessageType
 from channels import ChannelManager
 from config import AgentConfig, CharacterConfig, MemoryConfig, ToolsConfig
 from mcp_registry import McpServerRegistry
 from semantic_memory import SemanticMemory
 from session_registry import SessionRegistry, build_scoped_session_key
+from session_reg_helpers import (
+    RESIDENT_DIGEST,
+    STUB_SPEAKER_PROV,
+    STUB_USER_PROV,
+    resident_prov,
+    resident_role_id,
+)
 
 from claude_agent_sdk import (
     AssistantMessage as _SDKAssistantMessage,
@@ -30,6 +37,11 @@ from claude_agent_sdk import (
 
 from error_kinds import VoiceToolLoopError
 from voice_turn_guard import VoiceTurnGuard
+
+try:
+    from tests.role_artifact_stub import STUB_ROLE_ARTIFACT
+except ImportError:
+    from role_artifact_stub import STUB_ROLE_ARTIFACT
 
 pytestmark = [pytest.mark.asyncio, pytest.mark.unit]
 
@@ -117,9 +129,10 @@ class FakeSemanticMemory(SemanticMemory):
     <memory_context>). Calls are recorded so tests can assert the channel-aware
     load contract (overlay at fresh-session start; recall text-only)."""
 
-    def __init__(self, overlay: str = "", facts: str = "") -> None:
+    def __init__(self, overlay: str = "", facts: str = "", provenance=None) -> None:
         self._overlay = overlay
         self._facts = facts
+        self._provenance = provenance
         self.profile_calls: list[str] = []
         self.recall_calls: list[dict] = []
         self.retain_calls: list[tuple] = []
@@ -137,6 +150,25 @@ class FakeSemanticMemory(SemanticMemory):
             "max_tokens": max_tokens, "budget": budget,
         })
         return self._facts
+
+    async def recall_items(
+        self, bank, query, *, tags, max_tokens, clearance,
+        types=("world", "experience", "observation"),
+        tags_match="any", budget="mid",
+    ):
+        self.recall_calls.append({
+            "bank": bank, "query": query, "tags": tags,
+            "max_tokens": max_tokens, "budget": budget, "clearance": clearance,
+        })
+        if not self._facts:
+            return ()
+        from personality_types import RecallHit
+        return (RecallHit(
+            text=self._facts, memory_type="world", sensitivity="friends",
+            application_tags=(), provenance=self._provenance, backend_id="b1",
+            document_id=None, chunk_id=None, source_fact_ids=None, metadata=None,
+            context=None, score=None,
+        ),)
 
     async def profile(self, bank):
         self.profile_calls.append(bank)
@@ -228,7 +260,7 @@ def _make_agent(
     role: str = "assistant",
     semantic_memory: SemanticMemory | None = None,
 ) -> Agent:
-    cfg = AgentConfig(
+    cfg = AgentConfig(role_artifact=STUB_ROLE_ARTIFACT,
         role=role,
         model="claude-sonnet-4-6",
         system_prompt="You are helpful.",
@@ -238,6 +270,12 @@ def _make_agent(
             token_budget=1000,
             read_strategy="per_turn",
         ),
+        # Task 9: a real resident identity triple so session registration and
+        # the resume gate operate on canonical {role_id, binding_digest}.
+        role_id=resident_role_id(role),
+        kind="resident",
+        binding_digest=RESIDENT_DIGEST,
+        speaker_provenance=resident_prov(role),
     )
     return Agent(
         config=cfg,
@@ -541,7 +579,7 @@ async def test_system_prompt_memory_context_only_when_nonempty(tmp_path):
     # live pool decision hook instead to force a fresh session (assertions
     # unchanged; §4.3 recall fires only on is_fresh).
     with patch("sdk_client_pool._default_make_client", FakeClient), \
-         patch.object(agent2._pool, "_decide", return_value=("new", False)):
+         patch.object(agent2._pool, "_decide", return_value=ResumeDecision("new", None, False, None, "missing")):
         await agent2._process(_msg("telegram", "123", "hi"))
     prompt2 = FakeClient.captured_options.system_prompt
     assert "<memory_context>" in prompt2
@@ -549,11 +587,38 @@ async def test_system_prompt_memory_context_only_when_nonempty(tmp_path):
     assert "[nicola] hi" in prompt2
 
 
+async def test_auto_recall_injects_attributed_memory_context(tmp_path):
+    """Task 11 (Step 9): the pre-turn auto-recall now injects an ATTRIBUTED
+    <memory_context> — each hit rendered with its recorded source — instead of
+    a bare digest string. A telegram turn reads at private clearance, so the
+    resident source (role + persona) is spoken; raw provenance/tier tags never
+    escape into the prompt."""
+    from personality_types import SpeakerProvenance
+
+    prov = SpeakerProvenance(
+        speaker_kind="resident", role_id="resident:butler",
+        persona_id="casa.personas/tina", persona_version="1.0.0",
+        display_name="Tina", binding_digest="sha256:" + "5" * 64,
+    )
+    sem = FakeSemanticMemory(facts="the thermostat is set to 20C", provenance=prov)
+    agent = _make_agent(tmp_path, role="assistant", semantic_memory=sem)
+    with patch("sdk_client_pool._default_make_client", FakeClient), \
+         patch.object(agent._pool, "_decide",
+                      return_value=ResumeDecision("new", None, False, None, "missing")):
+        await agent._process(_msg("telegram", "123", "hi"))
+    prompt = FakeClient.captured_options.system_prompt
+    assert "<memory_context>" in prompt
+    assert "Tina previously said: the thermostat is set to 20C" in prompt
+    assert "[source: resident:butler" in prompt
+    assert "casa-source-" not in prompt   # reserved tag never escapes
+    assert "sha256:" not in prompt        # binding digest never escapes
+
+
 async def test_memory_failure_does_not_break_response(tmp_path, caplog):
     import logging
 
     class BrokenSemanticMemory(FakeSemanticMemory):
-        async def recall(self, *a, **kw):
+        async def recall_items(self, *a, **kw):
             raise RuntimeError("hindsight down")
 
     sem = BrokenSemanticMemory()
@@ -1056,6 +1121,8 @@ class TestTokenBudgetMonitoring:
         """The recorder should see one call per turn with the digest
         size estimated from the assembled memory_blocks (spec §4.3:
         the recall facts wrapped in <memory_context>)."""
+        from personality_types import RecallHit, SpeakerProvenance
+        from recall_renderer import render_recall
         from tokens import estimate_tokens
         FakeClient.reset()
         FakeClient.usage = {
@@ -1064,7 +1131,10 @@ class TestTokenBudgetMonitoring:
             "cache_read_input_tokens": 0,
             "cache_creation_input_tokens": 0,
         }
-        facts = "x" * 8000
+        # Task 11: the recorded block is now the ATTRIBUTED render of the recall
+        # hits (bounded by token_budget), not the raw facts string. Keep the
+        # fact small enough to render fully so the expected size is exact.
+        facts = "x" * 100
         # Overlay empty so the recorded block is exactly the recall context.
         sem = FakeSemanticMemory(overlay="", facts=facts)
         agent = _make_agent(tmp_path, role="assistant", semantic_memory=sem)
@@ -1079,8 +1149,18 @@ class TestTokenBudgetMonitoring:
         with patch("sdk_client_pool._default_make_client", FakeClient):
             await agent._process(_msg("telegram", "123", "hi"))
 
+        digest = render_recall(
+            (RecallHit(
+                text=facts, memory_type="world", sensitivity="friends",
+                application_tags=(), provenance=None, backend_id="b1",
+                document_id=None, chunk_id=None, source_fact_ids=None,
+                metadata=None, context=None, score=None,
+            ),),
+            current_speaker=SpeakerProvenance(speaker_kind="system"),
+            surface="text", clearance="private", token_budget=1000,
+        )
         expected = estimate_tokens(
-            f"<memory_context>\n{facts}\n</memory_context>"
+            f"<memory_context>\n{digest}\n</memory_context>"
         )
         expected_channel_key = build_scoped_session_key("telegram", "assistant", "123")
         assert observed == [(f"{expected_channel_key}-assistant", expected, 1000)]
@@ -1097,10 +1177,13 @@ class TestTokenBudgetMonitoring:
             "cache_read_input_tokens": 0, "cache_creation_input_tokens": 0,
         }
         # 5000-token estimate vs 1000 budget → overrun.
-        # §4.3: recall (and thus the oversized memory_blocks) only fires on a
-        # FRESH session, so force every turn fresh — the budget streak is keyed
-        # on channel_key+role, which is stable across these five fresh turns.
-        sem = FakeSemanticMemory(facts="x" * 20000)
+        # §4.3: the oversized memory_block only fires on a FRESH session, so
+        # force every turn fresh — the budget streak is keyed on
+        # channel_key+role, stable across these five fresh turns. Task 11: the
+        # RECALL digest is now bounded by token_budget, so the oversized block
+        # is driven through the (un-capped) mental-model overlay instead — the
+        # budget-overrun machinery under test is identical either way.
+        sem = FakeSemanticMemory(overlay="x" * 20000, facts="")
         agent = _make_agent(tmp_path, role="assistant", semantic_memory=sem)
 
         caplog.set_level(_logging.WARNING, logger="tokens")
@@ -1108,7 +1191,7 @@ class TestTokenBudgetMonitoring:
         # captured ``decide`` by reference at construction, so patching the
         # module-level ``agent._resume_decision`` would not reach it.
         with patch("sdk_client_pool._default_make_client", FakeClient), \
-             patch.object(agent._pool, "_decide", return_value=("new", False)):
+             patch.object(agent._pool, "_decide", return_value=ResumeDecision("new", None, False, None, "missing")):
             for _ in range(5):
                 await agent._process(_msg("telegram", "123", "hi"))
 
@@ -1209,7 +1292,7 @@ def _make_agent_with_registry(
     """Like _make_agent, but takes a pre-constructed SessionRegistry so
     tests can pre-populate entries.
     """
-    cfg = AgentConfig(
+    cfg = AgentConfig(role_artifact=STUB_ROLE_ARTIFACT,
         role=role,
         model="claude-sonnet-4-6",
         system_prompt="You are helpful.",
@@ -1219,6 +1302,11 @@ def _make_agent_with_registry(
             token_budget=1000,
             read_strategy="per_turn",
         ),
+        # Task 9: real resident identity triple (see _make_agent).
+        role_id=resident_role_id(role),
+        kind="resident",
+        binding_digest=RESIDENT_DIGEST,
+        speaker_provenance=resident_prov(role),
     )
     return Agent(
         config=cfg,
@@ -1246,7 +1334,10 @@ class TestResumeResilience:
         reg = SessionRegistry(str(tmp_path / "sessions.json"))
         await reg.register(
             build_scoped_session_key("voice", "butler", "probe-scope"),
-            "butler", "stale-sid-abc",
+            resident_role_id("butler"), "stale-sid-abc",
+            binding_digest=RESIDENT_DIGEST,
+            speaker_provenance=resident_prov("butler"),
+            user_provenance=STUB_USER_PROV,
         )
 
         agent = _make_agent_with_registry(reg, role="butler")
@@ -1279,7 +1370,10 @@ class TestResumeResilience:
         reg = SessionRegistry(str(tmp_path / "sessions.json"))
         await reg.register(
             build_scoped_session_key("telegram", "butler", "202"),
-            "butler", "STALE-SID-1",
+            resident_role_id("butler"), "STALE-SID-1",
+            binding_digest=RESIDENT_DIGEST,
+            speaker_provenance=resident_prov("butler"),
+            user_provenance=STUB_USER_PROV,
         )
 
         agent = _make_agent_with_registry(reg, role="butler")
@@ -1323,7 +1417,10 @@ class TestResumeResilience:
         reg = SessionRegistry(str(tmp_path / "sessions.json"))
         await reg.register(
             build_scoped_session_key("voice", "butler", "probe-scope"),
-            "butler", "stale-sid-abc",
+            resident_role_id("butler"), "stale-sid-abc",
+            binding_digest=RESIDENT_DIGEST,
+            speaker_provenance=resident_prov("butler"),
+            user_provenance=STUB_USER_PROV,
         )
 
         agent = _make_agent_with_registry(reg, role="butler")
@@ -1371,7 +1468,10 @@ class TestResumeResilience:
         reg = SessionRegistry(str(tmp_path / "sessions.json"))
         await reg.register(
             build_scoped_session_key("voice", "butler", "probe-scope"),
-            "butler", "stale-sid-xyz",
+            resident_role_id("butler"), "stale-sid-xyz",
+            binding_digest=RESIDENT_DIGEST,
+            speaker_provenance=resident_prov("butler"),
+            user_provenance=STUB_USER_PROV,
         )
 
         agent = _make_agent_with_registry(reg, role="butler")
@@ -1399,7 +1499,12 @@ class TestResumeResilience:
 
         reg = SessionRegistry(str(tmp_path / "sessions.json"))
         expected_channel_key = build_scoped_session_key("voice", "butler", "probe-scope")
-        await reg.register(expected_channel_key, "butler", "stale-sid-xyz")
+        await reg.register(
+            expected_channel_key, resident_role_id("butler"), "stale-sid-xyz",
+            binding_digest=RESIDENT_DIGEST,
+            speaker_provenance=resident_prov("butler"),
+            user_provenance=STUB_USER_PROV,
+        )
 
         agent = _make_agent_with_registry(reg, role="butler")
 
@@ -1849,14 +1954,12 @@ class TestSaveBeforeOverwrite:
 
         retain_calls: list[dict] = []
 
-        async def _fake_retain_cold(
-            *, sid, role, directory, user_peer, channel, semantic_memory,
-        ):
+        async def _fake_retain_cold(old, *, directory, channel, semantic_memory):
             retain_calls.append({
-                "sid": sid,
-                "role": role,
+                "sid": old.sdk_session_id,
+                "role": old.agent,
                 "directory": directory,
-                "user_peer": user_peer,
+                "user_peer": old.user_provenance.user_peer if old.user_provenance else None,
                 "channel": channel,
             })
 
@@ -1870,15 +1973,21 @@ class TestSaveBeforeOverwrite:
         FakeClient.reset()
 
         reg = SessionRegistry(str(tmp_path / "sessions.json"))
-        # Inject a stale entry: sdk_session_id present, last_active > 12 h ago.
+        # Inject a stale entry under the canonical resident identity (Task 9):
+        # sdk_session_id present, last_active > 12 h ago → expired, retain_old.
+        # Seeded via register() so it carries a real stored user_provenance.
+        from personality_types import SpeakerProvenance
         stale_ts = (
             datetime.now(timezone.utc) - timedelta(hours=13)
         ).isoformat()
-        reg._data[build_scoped_session_key("telegram", "assistant", "123")] = {
-            "agent": "assistant",
-            "sdk_session_id": "old-stale-sid",
-            "last_active": stale_ts,
-        }
+        cold_key = build_scoped_session_key("telegram", "assistant", "123")
+        await reg.register(
+            cold_key, resident_role_id("assistant"), "old-stale-sid",
+            binding_digest=RESIDENT_DIGEST,
+            speaker_provenance=resident_prov("assistant"),
+            user_provenance=SpeakerProvenance(speaker_kind="user", user_peer="nicola"),
+        )
+        reg._data[cold_key]["last_active"] = stale_ts
 
         agent = _make_agent_with_registry(reg, role="assistant")
 
@@ -1900,7 +2009,8 @@ class TestSaveBeforeOverwrite:
         )
         call = retain_calls[0]
         assert call["sid"] == "old-stale-sid", call
-        assert call["role"] == "assistant", call
+        # Task 9/10: the snapshot carries the canonical role_id as ``agent``.
+        assert call["role"] == "resident:assistant", call
         assert call["directory"].endswith("agent-home/assistant"), call
         assert call["user_peer"] == "nicola", call
         assert call["channel"] == "telegram", call
@@ -1914,7 +2024,7 @@ class TestSaveBeforeOverwrite:
         save_calls: list[dict] = []
 
         async def _fake_save(channel_key, session_registry, semantic_memory,
-                             *, role, directory, user_peer, channel):
+                             *, directory, channel):
             save_calls.append({"channel_key": channel_key})
 
         monkeypatch.setattr(agent_mod, "save_session", _fake_save)
@@ -1926,9 +2036,10 @@ class TestSaveBeforeOverwrite:
             datetime.now(timezone.utc) - timedelta(minutes=5)
         ).isoformat()
         reg._data[build_scoped_session_key("telegram", "assistant", "456")] = {
-            "agent": "assistant",
+            "agent": resident_role_id("assistant"),
             "sdk_session_id": "fresh-live-sid",
             "last_active": fresh_ts,
+            "binding_digest": RESIDENT_DIGEST,
         }
 
         agent = _make_agent_with_registry(reg, role="assistant")
@@ -1962,9 +2073,10 @@ class TestSaveBeforeOverwrite:
             datetime.now(timezone.utc) - timedelta(minutes=5)
         ).isoformat()
         reg._data[build_scoped_session_key("telegram", "assistant", "789")] = {
-            "agent": "assistant",
+            "agent": resident_role_id("assistant"),
             "sdk_session_id": "live-sid-resume",
             "last_active": fresh_ts,
+            "binding_digest": RESIDENT_DIGEST,
         }
 
         fake = FakeSemanticMemory(overlay="should-not-appear", facts="should-not-appear")

@@ -53,6 +53,30 @@ _FIELD_MISSING = object()
 _STALE_KIND_DEFAULT = "plain"
 
 
+# Personality Task 10: origin dicts are snapshotted off ``agent.origin_var``,
+# which — like every ContextVar-carried origin — may hold LIVE, non-JSON objects
+# for in-process reads only (a SpeakerProvenance dataclass, the voice foreground
+# handoff reservation, the progress sink, a capabilities frozenset). Those must
+# never reach the tombstone's ``json.dumps``; the tombstone is a durable record
+# of the engagement, and none of these live objects are meaningful once restored.
+# Strip them at the serialization boundary (they stay on the in-memory
+# ``rec.origin`` for live use).
+_NON_PERSISTABLE_ORIGIN_KEYS = frozenset({
+    "speaker_provenance",
+    "_voice_handoff_reservation",
+    "_progress_sink",
+    "voice_route_capabilities",
+    "voice_deadline",
+})
+
+
+def _persistable_origin(origin: dict[str, Any]) -> dict[str, Any]:
+    """A JSON-safe copy of *origin* for tombstone persistence: drops the known
+    live/non-serializable ContextVar-carried keys (see
+    ``_NON_PERSISTABLE_ORIGIN_KEYS``)."""
+    return {k: v for k, v in origin.items() if k not in _NON_PERSISTABLE_ORIGIN_KEYS}
+
+
 def normalize_stale_mid_entry(entry: Any) -> dict[str, Any]:
     """v0.84.0 (round-4 §D6): a ``stale_mids`` entry is ``{"mid": int, "kind":
     str}`` with ``kind ∈ {"reanchored", "plain"}`` — ``reanchored`` renders the
@@ -433,7 +457,7 @@ class EngagementRegistry:
                 "last_idle_reminder_ts": rec.last_idle_reminder_ts,
                 "completed_at": rec.completed_at,
                 "sdk_session_id": rec.sdk_session_id,
-                "origin": dict(rec.origin),
+                "origin": _persistable_origin(rec.origin),
                 "task": rec.task,
                 "pinned_message_id": rec.pinned_message_id,
                 "progress_message_id": rec.progress_message_id,

@@ -73,7 +73,8 @@ def _seed_resident_with_disclosure(base: Path, role: str = "assistant") -> Path:
     _w(d / "disclosure.yaml", "schema_version: 1\npolicy: standard\n")
     _w(d / "runtime.yaml", """\
         schema_version: 1
-        model: sonnet
+        kind: resident
+        model: {source: ha_option, option: primary_agent_model, default: opus, allowed: [opus, sonnet, haiku]}
         tools:
           allowed: [Read, Write]
         channels: [telegram]
@@ -202,12 +203,30 @@ class TestCasaReloadTriggersResident:
         # error refers to policies/disclosure.yaml.
         assert "polic" in payload.get("message", "").lower()
 
-    async def test_specialist_path_still_works(self, tmp_path, configurator_origin):
+    async def test_specialist_path_still_works(
+        self, tmp_path, configurator_origin, monkeypatch,
+    ):
         """Specialists have NO disclosure.yaml. The fix must not
         regress this path (loading policies is harmless - agent_loader
         only consults the library when the agent has a disclosure)."""
         import agent as agent_mod
         from tools import casa_reload_triggers
+
+        # Personality Phase A, Task 5: agent_loader.load_agent_from_dir now
+        # requires a canonical role artifact under
+        # defaults/roles/specialist/<slot>/ for every specialist it loads.
+        # This test's synthetic 'casa-probe-x' specialist has no real
+        # shipped artifact and this call path (the casa_reload_triggers MCP
+        # tool) has no roles_dir override to inject one — redirect
+        # agent_loader's module-level DEFAULT_ROLES_DIR for the duration of
+        # the test instead.
+        try:
+            from tests.test_agent_loader import _seed_role_artifact
+        except ImportError:
+            from test_agent_loader import _seed_role_artifact
+        roles_dir = tmp_path / "roles"
+        _seed_role_artifact(roles_dir, "specialist", "casa-probe-x")
+        monkeypatch.setattr("agent_loader.DEFAULT_ROLES_DIR", str(roles_dir))
 
         recorded: list[tuple[str, list, list]] = []
         fake_registry = MagicMock()
@@ -234,7 +253,8 @@ class TestCasaReloadTriggersResident:
         _w(spec_dir / "response_shape.yaml", "schema_version: 1\n")
         _w(spec_dir / "runtime.yaml", """\
             schema_version: 1
-            model: sonnet
+            kind: specialist
+            model: {source: fixed, value: sonnet}
             enabled: false
             memory:
               token_budget: 0

@@ -14,6 +14,11 @@ import pytest
 
 import tools
 
+try:
+    from tests.role_artifact_stub import STUB_ROLE_ARTIFACT
+except ImportError:
+    from role_artifact_stub import STUB_ROLE_ARTIFACT
+
 pytestmark = [pytest.mark.unit]
 
 
@@ -22,21 +27,33 @@ pytestmark = [pytest.mark.unit]
 # ---------------------------------------------------------------------------
 
 
+def _hit(text):
+    from personality_types import RecallHit
+    return RecallHit(
+        text=text, memory_type="world", sensitivity="friends",
+        application_tags=(), provenance=None, backend_id="b1", document_id=None,
+        chunk_id=None, source_fact_ids=None, metadata=None, context=None, score=None,
+    )
+
+
 class _FakeSem:
     def __init__(self, recall_ret: str = ""):
         self.recall_calls: list[dict] = []
         self.retain_calls: list[dict] = []
         self._recall_ret = recall_ret
 
-    async def recall(self, bank, query, *, tags, max_tokens, budget="mid", **kw):
+    async def recall_items(self, bank, query, *, tags, max_tokens, clearance,
+                           types=("world", "experience", "observation"),
+                           tags_match="any", budget="mid"):
         self.recall_calls.append({
             "bank": bank,
             "query": query,
             "tags": sorted(tags),
             "max_tokens": max_tokens,
             "budget": budget,
+            "clearance": clearance,
         })
-        return self._recall_ret
+        return (_hit(self._recall_ret),) if self._recall_ret else ()
 
     async def retain(self, bank, items, *, async_=True):
         self.retain_calls.append({"bank": bank, "items": items})
@@ -93,7 +110,7 @@ def _specialist_cfg(role: str = "finance", token_budget: int = 4000):
     from config import (
         AgentConfig, CharacterConfig, MemoryConfig, SessionConfig, ToolsConfig,
     )
-    return AgentConfig(
+    return AgentConfig(role_artifact=STUB_ROLE_ARTIFACT, 
         role=role,
         model="claude-sonnet-4-6",
         system_prompt=f"You are {role}",
@@ -211,11 +228,16 @@ async def test_write_retain_telegram(monkeypatch):
     assert rc["bank"] == "casa"
     items = rc["items"]
     assert len(items) == 2  # user turn + assistant turn
-    assert items[0]["document_id"] == "delegation:cid42:finance:0"
-    assert items[1]["document_id"] == "delegation:cid42:finance:1"
+    # Task 10: content-addressed ids (the retired doc_prefix:idx scheme is gone).
+    # This fixture's origin carries no caller speaker_provenance and the cfg has
+    # no bound identity, so both parties fall back to the honest unattributed
+    # "system" identity → both ids live in the m-a- agent id space, distinct by
+    # their differing text.
+    assert all(i["document_id"].startswith("m-a-") for i in items)
+    assert items[0]["document_id"] != items[1]["document_id"]
     # classify stub: "cashflow" in user text → private; assistant text no → friends
-    assert items[0]["tags"] == ["private"]
-    assert items[1]["tags"] == ["friends"]
+    assert [i["tags"][0] for i in items] == ["private", "friends"]
+    assert all(sum(1 for t in i["tags"] if t.startswith("casa-source-")) == 1 for i in items)
 
 
 # ---------------------------------------------------------------------------
@@ -277,7 +299,7 @@ async def test_recall_unavailable_injects_status_note(monkeypatch):
     from semantic_memory import RecallUnavailable
 
     class _DownSem(_FakeSem):
-        async def recall(self, *a, **k):
+        async def recall_items(self, *a, **k):
             raise RecallUnavailable("http_504")
 
     cfg = _specialist_cfg(role="finance", token_budget=4000)

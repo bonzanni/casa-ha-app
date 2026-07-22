@@ -19,11 +19,16 @@ from config import AgentConfig, CharacterConfig, ToolsConfig
 from mcp_registry import McpServerRegistry
 from session_registry import SessionRegistry
 
+try:
+    from tests.role_artifact_stub import STUB_ROLE_ARTIFACT
+except ImportError:
+    from role_artifact_stub import STUB_ROLE_ARTIFACT
+
 pytestmark = [pytest.mark.unit]
 
 
 def _construct(tmp_path, **cfg_kw) -> None:
-    cfg = AgentConfig(
+    cfg = AgentConfig(role_artifact=STUB_ROLE_ARTIFACT, 
         role=cfg_kw.get("role", "assistant"),
         model=cfg_kw.get("model", "claude-sonnet-4-6"),
         enabled=cfg_kw.get("enabled", True),

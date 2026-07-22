@@ -13,6 +13,7 @@ import pytest
 
 from session_registry import SessionRegistry
 from session_sweeper import SessionSweeper
+from session_reg_helpers import STUB_BINDING_DIGEST, STUB_SPEAKER_PROV, STUB_USER_PROV
 
 
 pytestmark = pytest.mark.asyncio
@@ -325,7 +326,7 @@ class TestConcurrency:
         # Fire sweep + register concurrently on the same event loop.
         await asyncio.gather(
             sweeper._sweep_once(),
-            reg.register("telegram-new", "assistant", "sdk-new"),
+            reg.register("telegram-new", "assistant", "sdk-new", binding_digest=STUB_BINDING_DIGEST, speaker_provenance=STUB_SPEAKER_PROV, user_provenance=STUB_USER_PROV),
         )
 
         remaining = reg.all_entries()
@@ -369,7 +370,7 @@ class TestConcurrency:
         await asyncio.sleep(0)
 
         register_task = asyncio.create_task(
-            reg.register("telegram-new", "assistant", "sdk-new"),
+            reg.register("telegram-new", "assistant", "sdk-new", binding_digest=STUB_BINDING_DIGEST, speaker_provenance=STUB_SPEAKER_PROV, user_provenance=STUB_USER_PROV),
         )
         await asyncio.sleep(0.02)
         assert not register_task.done(), \

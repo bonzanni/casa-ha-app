@@ -26,6 +26,26 @@ from specialist_registry import (
     SpecialistRegistry,
 )
 
+try:
+    from tests.role_artifact_stub import STUB_ROLE_ARTIFACT
+except ImportError:
+    from role_artifact_stub import STUB_ROLE_ARTIFACT
+
+# Personality Phase A, Task N2: SpecialistRegistry.load() -> agent_loader
+# .load_all_specialists() -> load_agent_from_dir() requires a canonical role
+# artifact under defaults/roles/specialist/<slot>/ for every specialist it
+# loads. Task N2's no-gap cutover removed the real (and only) shipped
+# specialist, finance, from the image — every test here that seeds a
+# synthetic 'finance' specialist dir and calls reg.load() now needs a
+# test-owned roles_dir carrying a synthetic finance role artifact instead.
+# Reused from test_specialist_registry.py (single implementation, no
+# copy-paste divergence — mirrors the cross-module _seed_role_artifact
+# import test_specialist_registry.py itself already does).
+try:
+    from tests.test_specialist_registry import _use_synthetic_roles_dir
+except ImportError:
+    from test_specialist_registry import _use_synthetic_roles_dir
+
 pytestmark = pytest.mark.asyncio
 
 
@@ -49,7 +69,8 @@ def _seed_specialist_dir(
     (d / "response_shape.yaml").write_text("schema_version: 1\n", encoding="utf-8")
     (d / "runtime.yaml").write_text(textwrap.dedent(f"""\
         schema_version: 1
-        model: sonnet
+        kind: specialist
+        model: {{source: fixed, value: sonnet}}
         enabled: {str(enabled).lower()}
         tools:
           allowed: [Read]
@@ -67,7 +88,7 @@ def _seed_specialist_dir(
 
 
 def _specialist_cfg(role: str = "finance", enabled: bool = True) -> AgentConfig:
-    return AgentConfig(
+    return AgentConfig(role_artifact=STUB_ROLE_ARTIFACT, 
         role=role,
         model="claude-sonnet-4-6",
         system_prompt="You are " + role,
@@ -187,7 +208,7 @@ def _caller_cfg(role: str = "assistant", delegates: tuple[str, ...] = ("finance"
     doesn't declare, so every fixture that drives `delegate_to_agent`
     must seed the caller into `agent_role_map` with the target declared.
     """
-    cfg = AgentConfig(role=role)
+    cfg = AgentConfig(role_artifact=STUB_ROLE_ARTIFACT, role=role)
     cfg.delegates = [DelegateEntry(agent=d, purpose="p", when="w") for d in delegates]
     return cfg
 
@@ -221,7 +242,7 @@ class TestUnknownAgent:
 
 
 class TestDisabledAgent:
-    async def test_returns_unknown_agent_error(self, tmp_path):
+    async def test_returns_unknown_agent_error(self, tmp_path, monkeypatch):
         """Disabled specialists are filtered at load-time — get() returns None,
         the tool cannot distinguish them from truly unknown names. Both
         paths collapse to kind=unknown_agent."""
@@ -230,6 +251,7 @@ class TestDisabledAgent:
         specialists = tmp_path / "ex"
         specialists.mkdir()
         _seed_specialist_dir(specialists, "finance", enabled=False)
+        _use_synthetic_roles_dir(monkeypatch, tmp_path, "finance")
         reg = SpecialistRegistry(str(specialists),
                                  tombstone_path=str(tmp_path / "del.json"))
         reg.load()
@@ -254,12 +276,13 @@ class TestDisabledAgent:
 
 
 class TestSyncOk:
-    async def test_returns_specialist_text(self, tmp_path):
+    async def test_returns_specialist_text(self, tmp_path, monkeypatch):
         from tools import delegate_to_agent, init_tools
 
         specialists = tmp_path / "ex"
         specialists.mkdir()
         _seed_specialist_dir(specialists, "finance", enabled=True)
+        _use_synthetic_roles_dir(monkeypatch, tmp_path, "finance")
         reg = SpecialistRegistry(str(specialists),
                                  tombstone_path=str(tmp_path / "del.json"))
         reg.load()
@@ -289,12 +312,13 @@ class TestSyncOk:
 
 
 class TestSyncError:
-    async def test_specialist_raises_is_reported_as_error(self, tmp_path):
+    async def test_specialist_raises_is_reported_as_error(self, tmp_path, monkeypatch):
         from tools import delegate_to_agent, init_tools
 
         specialists = tmp_path / "ex"
         specialists.mkdir()
         _seed_specialist_dir(specialists, "finance", enabled=True)
+        _use_synthetic_roles_dir(monkeypatch, tmp_path, "finance")
         reg = SpecialistRegistry(str(specialists),
                                  tombstone_path=str(tmp_path / "del.json"))
         reg.load()
@@ -425,6 +449,7 @@ class TestVoiceStructuredResult:
         specialists = tmp_path / "ex"
         specialists.mkdir()
         _seed_specialist_dir(specialists, "finance", enabled=True)
+        _use_synthetic_roles_dir(monkeypatch, tmp_path, "finance")
         reg = SpecialistRegistry(
             str(specialists), tombstone_path=str(tmp_path / "del.json"),
         )
@@ -488,6 +513,7 @@ class TestVoiceStructuredResult:
         specialists = tmp_path / "ex"
         specialists.mkdir()
         _seed_specialist_dir(specialists, "finance", enabled=True)
+        _use_synthetic_roles_dir(monkeypatch, tmp_path, "finance")
         tombstone_path = tmp_path / "del.json"
         reg = SpecialistRegistry(
             str(specialists), tombstone_path=str(tombstone_path),
@@ -545,6 +571,7 @@ class TestVoiceStructuredResult:
         specialists = tmp_path / "ex"
         specialists.mkdir()
         _seed_specialist_dir(specialists, "finance", enabled=True)
+        _use_synthetic_roles_dir(monkeypatch, tmp_path, "finance")
         reg = SpecialistRegistry(
             str(specialists), tombstone_path=str(tmp_path / "del.json"),
         )
@@ -598,6 +625,7 @@ class TestVoiceStructuredResult:
         specialists = tmp_path / "ex"
         specialists.mkdir()
         _seed_specialist_dir(specialists, "finance", enabled=True)
+        _use_synthetic_roles_dir(monkeypatch, tmp_path, "finance")
         reg = SpecialistRegistry(
             str(specialists), tombstone_path=str(tmp_path / "del.json"),
         )
@@ -649,6 +677,7 @@ class TestVoiceStructuredResult:
         specialists = tmp_path / "ex"
         specialists.mkdir()
         _seed_specialist_dir(specialists, "finance", enabled=True)
+        _use_synthetic_roles_dir(monkeypatch, tmp_path, "finance")
         tombstone_path = tmp_path / "del.json"
         reg = SpecialistRegistry(
             str(specialists), tombstone_path=str(tombstone_path),
@@ -726,6 +755,7 @@ class TestVoiceStructuredResult:
         specialists = tmp_path / "ex"
         specialists.mkdir()
         _seed_specialist_dir(specialists, "finance", enabled=True)
+        _use_synthetic_roles_dir(monkeypatch, tmp_path, "finance")
         reg = SpecialistRegistry(
             str(specialists), tombstone_path=str(tmp_path / "del.json"),
         )
@@ -801,6 +831,7 @@ class TestVoiceStructuredResult:
         specialists = tmp_path / "ex"
         specialists.mkdir()
         _seed_specialist_dir(specialists, "finance", enabled=True)
+        _use_synthetic_roles_dir(monkeypatch, tmp_path, "finance")
         reg = SpecialistRegistry(
             str(specialists), tombstone_path=str(tmp_path / "del.json"),
         )
@@ -856,6 +887,7 @@ class TestVoiceStructuredResult:
         specialists = tmp_path / "ex"
         specialists.mkdir()
         _seed_specialist_dir(specialists, "finance", enabled=True)
+        _use_synthetic_roles_dir(monkeypatch, tmp_path, "finance")
         reg = SpecialistRegistry(
             str(specialists), tombstone_path=str(tmp_path / "del.json"),
         )
@@ -992,6 +1024,7 @@ class TestTimeoutDegrades:
         specialists = tmp_path / "ex"
         specialists.mkdir()
         _seed_specialist_dir(specialists, "finance", enabled=True)
+        _use_synthetic_roles_dir(monkeypatch, tmp_path, "finance")
         reg = SpecialistRegistry(str(specialists),
                                  tombstone_path=str(tmp_path / "del.json"))
         reg.load()
@@ -1031,6 +1064,7 @@ class TestTimeoutDegrades:
         specialists = tmp_path / "ex"
         specialists.mkdir()
         _seed_specialist_dir(specialists, "finance", enabled=True)
+        _use_synthetic_roles_dir(monkeypatch, tmp_path, "finance")
         reg = SpecialistRegistry(str(specialists),
                                  tombstone_path=str(tmp_path / "del.json"))
         reg.load()
@@ -1080,12 +1114,13 @@ class TestTimeoutDegrades:
 
 
 class TestAsyncMode:
-    async def test_returns_pending_immediately(self, tmp_path):
+    async def test_returns_pending_immediately(self, tmp_path, monkeypatch):
         from tools import delegate_to_agent, init_tools
 
         specialists = tmp_path / "ex"
         specialists.mkdir()
         _seed_specialist_dir(specialists, "finance", enabled=True)
+        _use_synthetic_roles_dir(monkeypatch, tmp_path, "finance")
         reg = SpecialistRegistry(str(specialists),
                                  tombstone_path=str(tmp_path / "del.json"))
         reg.load()
@@ -1127,7 +1162,7 @@ class TestAsyncMode:
 
 
 class TestCancellation:
-    async def test_caller_cancel_cancels_specialist_task(self, tmp_path):
+    async def test_caller_cancel_cancels_specialist_task(self, tmp_path, monkeypatch):
         """If the outer turn is cancelled (voice barge-in), the in-flight
         specialist task must be cancelled too — no NOTIFICATION posts."""
         from tools import delegate_to_agent, init_tools
@@ -1135,6 +1170,7 @@ class TestCancellation:
         specialists = tmp_path / "ex"
         specialists.mkdir()
         _seed_specialist_dir(specialists, "finance", enabled=True)
+        _use_synthetic_roles_dir(monkeypatch, tmp_path, "finance")
         reg = SpecialistRegistry(str(specialists),
                                  tombstone_path=str(tmp_path / "del.json"))
         reg.load()

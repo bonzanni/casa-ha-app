@@ -24,6 +24,7 @@ from aiohttp import web
 from agent import _classify_error
 from bus import BusMessage, MessageBus, MessageType
 from channel_authz import agent_allowed_on
+from personality_types import TrustedOrigin, TrustedUserOriginInput
 from channels import Channel
 from log_cid import new_cid
 from provenance import sanitize_external_context
@@ -591,6 +592,16 @@ class VoiceChannel(Channel):
                 # context contains route-shaped spoof fields.
                 "_voice_transport": "sse",
             },
+            # Task 9: anonymous but trusted voice speaker — server-created
+            # ingress identity (never decoded from the SSE payload).
+            trusted_user_origin=TrustedUserOriginInput(
+                surface="voice",
+                server_origin=TrustedOrigin(
+                    route="voice", is_authenticated=True, clearance="friends",
+                ),
+                authenticated_user=None,
+                user_peer="voice_speaker",
+            ),
         )
 
         try:
@@ -1000,6 +1011,16 @@ class VoiceChannel(Channel):
                 "_voice_handoff_reservation": reservation,
                 **trusted_route_context,
             },
+            # Task 9: anonymous but trusted voice speaker — server-created
+            # ingress identity (never decoded from the WS frame).
+            trusted_user_origin=TrustedUserOriginInput(
+                surface="voice",
+                server_origin=TrustedOrigin(
+                    route="voice", is_authenticated=True, clearance="friends",
+                ),
+                authenticated_user=None,
+                user_peer="voice_speaker",
+            ),
         )
 
         request_task = asyncio.create_task(

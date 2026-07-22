@@ -10,6 +10,15 @@ import pytest
 pytestmark = [pytest.mark.asyncio, pytest.mark.unit]
 
 
+def _ctx_hits(text):
+    from personality_types import RecallHit
+    return (RecallHit(
+        text=text, memory_type="world", sensitivity="friends",
+        application_tags=(), provenance=None, backend_id="b1", document_id=None,
+        chunk_id=None, source_fact_ids=None, metadata=None, context=None, score=None,
+    ),)
+
+
 class TestQueryEngager:
     async def test_returns_ok_when_memory_has_context(self, tmp_path, monkeypatch):
         from engagement_registry import EngagementRegistry
@@ -30,7 +39,7 @@ class TestQueryEngager:
         )
         # Inject a recording semantic-memory fake whose recall returns context.
         memory = MagicMock()
-        memory.recall = AsyncMock(return_value="Lesina paid in March.")
+        memory.recall_items = AsyncMock(return_value=_ctx_hits("Lesina paid in March."))
         import agent as agent_mod
         monkeypatch.setattr(agent_mod, "active_semantic_memory", memory,
                             raising=False)
@@ -69,7 +78,7 @@ class TestQueryEngager:
         )
         # Empty recall → query_engager returns unknown before synth runs.
         memory = MagicMock()
-        memory.recall = AsyncMock(return_value="")
+        memory.recall_items = AsyncMock(return_value=())
         import agent as agent_mod
         monkeypatch.setattr(agent_mod, "active_semantic_memory", memory,
                             raising=False)
@@ -219,7 +228,7 @@ class TestSynthesizeAnswerMaxTokens:
             trigger_registry=MagicMock(), engagement_registry=reg,
         )
         memory = MagicMock()
-        memory.recall = AsyncMock(return_value="some context")
+        memory.recall_items = AsyncMock(return_value=_ctx_hits("some context"))
         import agent as agent_mod
         monkeypatch.setattr(agent_mod, "active_semantic_memory", memory,
                             raising=False)

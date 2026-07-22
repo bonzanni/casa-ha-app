@@ -27,6 +27,12 @@ from config import AgentConfig, CharacterConfig, MemoryConfig, ToolsConfig
 from mcp_registry import McpServerRegistry
 from semantic_memory import SemanticMemory
 from session_registry import SessionRegistry, build_scoped_session_key
+from session_reg_helpers import RESIDENT_DIGEST, resident_prov, resident_role_id
+
+try:
+    from tests.role_artifact_stub import STUB_ROLE_ARTIFACT
+except ImportError:
+    from role_artifact_stub import STUB_ROLE_ARTIFACT
 
 
 # --------------------------------------------------------------------------
@@ -119,6 +125,19 @@ class FakeSemanticMemory(SemanticMemory):
                      tags_match="any", budget="mid"):
         return self._facts
 
+    async def recall_items(self, bank, query, *, tags, max_tokens, clearance,
+                           types=("world", "experience", "observation"),
+                           tags_match="any", budget="mid"):
+        if not self._facts:
+            return ()
+        from personality_types import RecallHit
+        return (RecallHit(
+            text=self._facts, memory_type="world", sensitivity="friends",
+            application_tags=(), provenance=None, backend_id="b1", document_id=None,
+            chunk_id=None, source_fact_ids=None, metadata=None, context=None,
+            score=None,
+        ),)
+
     async def profile(self, bank):
         return self._overlay
 
@@ -132,13 +151,17 @@ def scripted_factory(monkeypatch):
 
 @pytest.fixture
 async def agent_fixture(tmp_path, scripted_factory):
-    cfg = AgentConfig(
+    cfg = AgentConfig(role_artifact=STUB_ROLE_ARTIFACT,
         role="assistant",
         model="claude-sonnet-4-6",
         system_prompt="You are helpful.",
         character=CharacterConfig(name="Test"),
         tools=ToolsConfig(allowed=["Read"], permission_mode="acceptEdits"),
         memory=MemoryConfig(token_budget=1000, read_strategy="per_turn"),
+        role_id=resident_role_id("assistant"),
+        kind="resident",
+        binding_digest=RESIDENT_DIGEST,
+        speaker_provenance=resident_prov("assistant"),
     )
     agent = Agent(
         config=cfg,
@@ -506,7 +529,7 @@ async def test_facade_schema_refresh_reconnects_only_butler_with_new_config(
 
     def make_agent(role):
         return Agent(
-            config=AgentConfig(
+            config=AgentConfig(role_artifact=STUB_ROLE_ARTIFACT,
                 role=role,
                 model="claude-sonnet-4-6",
                 system_prompt="You are helpful.",
@@ -519,6 +542,10 @@ async def test_facade_schema_refresh_reconnects_only_butler_with_new_config(
                 memory=MemoryConfig(
                     token_budget=1000, read_strategy="per_turn",
                 ),
+                role_id=resident_role_id(role),
+                kind="resident",
+                binding_digest=RESIDENT_DIGEST,
+                speaker_provenance=resident_prov(role),
             ),
             session_registry=sessions,
             mcp_registry=registry,

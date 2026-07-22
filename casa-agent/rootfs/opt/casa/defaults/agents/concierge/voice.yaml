@@ -1,0 +1,4 @@
+schema_version: 1
+tone: [friendly, brisk]
+cadence: short
+forbidden_patterns: []

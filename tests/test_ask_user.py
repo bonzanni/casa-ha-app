@@ -929,8 +929,14 @@ class TestRuntimeYamlGrants:
         assert ASK_TOOL in _allowed(AGENTS / "assistant" / "runtime.yaml")
 
     def test_every_specialist_has_ask_user(self):
+        """Task N2's no-gap cutover removed the only bundled specialist
+        (finance) from the image — specialists now install from a
+        component repository and the image ships none by default, so
+        this FOR-ALL invariant is vacuously true over an empty set today.
+        Keep the loop (rather than a hard 'must have one' assertion) so a
+        regression that bundles a specialist again without the grant is
+        still caught."""
         specialist_runtimes = list((AGENTS / "specialists").glob("*/runtime.yaml"))
-        assert specialist_runtimes, "expected at least one specialist runtime.yaml"
         for rt in specialist_runtimes:
             assert ASK_TOOL in _allowed(rt), f"{rt} missing {ASK_TOOL}"
 

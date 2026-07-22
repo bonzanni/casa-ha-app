@@ -1017,10 +1017,24 @@ def _build_specialist_options(
         mcp_servers = {}
     skills = "all" if getattr(cfg.tools, "skills", "all") == "all" else None
 
+    # Plan 2, Task N1b Step 22: prefer the compiled prompt bundle (an
+    # installed component's activated binding — agent_loader's
+    # activate_binding_for_config seam) over the legacy _compose_prompt
+    # output. A specialist with no active binding (still bundled-in-image,
+    # or pending-configuration) keeps cfg.compiled_prompt_bundle is None and
+    # falls back unchanged.
+    from prompt_compiler import projection_for
+
+    compiled_bundle = getattr(cfg, "compiled_prompt_bundle", None)
+    resolved_system_prompt = (
+        projection_for(compiled_bundle, channel="text", origin_route=None).system_prompt
+        if compiled_bundle is not None else cfg.system_prompt
+    )
+
     return ClaudeAgentOptions(
         model=cfg.model,
         cli_path=CLAUDE_CLI_PATH,
-        system_prompt=cfg.system_prompt,
+        system_prompt=resolved_system_prompt,
         allowed_tools=allowed_tools,
         disallowed_tools=_with_subagent_spawn_disallowed(cfg.tools.disallowed),
         permission_mode=cfg.tools.permission_mode or "acceptEdits",
@@ -1448,6 +1462,25 @@ async def _run_delegated_agent(
     # turn (async delegations especially), and a pooled client's origin_var
     # holder can be rewritten by the NEXT turn while this one is in flight.
     parent = _snapshot_origin()
+    from personality_types import RetainedTurn, SpeakerProvenance
+
+    # Task 10: the caller's REAL identity, read back off the origin snapshot
+    # Agent._process now stamps. Absent (a legacy/test ingress that predates this
+    # wiring, or the caller is itself an executor/unbound specialist) → the
+    # explicit unattributed "system" identity (every field null is a VALID
+    # provenance, speaker_provenance.py's system branch). NEVER fabricate a
+    # persona for the caller.
+    caller_provenance = parent.get("speaker_provenance")
+    if not isinstance(caller_provenance, SpeakerProvenance):
+        caller_provenance = SpeakerProvenance(speaker_kind="system")
+    # The EXECUTING agent's own identity, via the SAME cfg.kind-based fallback
+    # policy SessionRegistry.register's callers use (Task 9): a resident (or a
+    # bound specialist, once Plan 2 lands) keeps its real persona; an executor
+    # gets a stable executor identity; an unbound Plan-1 specialist gets the
+    # honest "system" identity — never mislabeled "executor:<slug>". One policy,
+    # not two; resolves itself when Plan 2 populates cfg.speaker_provenance.
+    executing_provenance = agent_mod.speaker_provenance_for_role(cfg)
+
     child_origin = {
         **parent,
         "delegation_depth": int(parent.get("delegation_depth", 0)) + 1,
@@ -1455,6 +1488,10 @@ async def _run_delegated_agent(
         # distinct from parent["role"] (the caller) — turn_provenance()
         # compares the two to classify this turn as "delegated".
         "execution_role": cfg.role,
+        # Mirrors execution_role: child_origin carries the EXECUTING agent's own
+        # provenance forward, not the caller's — so a NESTED delegation's
+        # "parent" sees the immediately-enclosing agent's identity.
+        "speaker_provenance": executing_provenance,
     }
 
     # Resolve caller display name; fall back to role.
@@ -1588,11 +1625,12 @@ async def _run_delegated_agent(
     if cfg.memory.token_budget > 0 and text:
         sem = getattr(agent_mod, "active_semantic_memory", None)
         if sem is not None:
-            cid = str(parent.get("cid", "-"))
             bg = asyncio.create_task(retain_delegated(
                 sem, origin_channel=str(parent.get("channel", "")),
-                doc_prefix=f"delegation:{cid}:{cfg.role}",
-                turns=[("user", task_text), ("assistant", text)],
+                turns=[
+                    RetainedTurn(task_text, caller_provenance),
+                    RetainedTurn(text, executing_provenance),
+                ],
             ))
             _specialist_bg_tasks.add(bg)
             bg.add_done_callback(_specialist_bg_tasks.discard)
@@ -2229,12 +2267,39 @@ def _new_voice_job(
     task_text: str,
     context_text: str,
     handoff_id: str | None = None,
+    creating_speaker: SpeakerProvenance | None = None,
 ) -> VoiceJob:
-    """Build the durable ACCEPTED row from trusted turn provenance."""
+    """Build the durable ACCEPTED row from trusted turn provenance.
+
+    Task 12: ``creating_speaker`` defaults to the CURRENT turn's caller
+    identity off ``origin["speaker_provenance"]`` (Task 10 Step 7's
+    origin_var wiring), falling back to the explicit unattributed "system"
+    identity — the same policy Task 10 Step 7b uses. An explicit override is
+    passed by the continuation call site, which must copy the ORIGINAL job's
+    creator rather than whoever is invoking ``continue_voice_job`` now.
+    ``executing_speaker`` is always the target ``cfg``'s own identity via the
+    one fallback policy (``agent_mod.speaker_provenance_for_role``): real
+    persona if bound, a stable executor identity for an executor, else the
+    honest "system" identity for an unbound Plan-1 specialist — never
+    mislabeled "executor:<slug>".
+    """
+    import agent as agent_mod
+    from personality_types import SpeakerProvenance
+
     raw_user_id = origin.get("user_id")
+    if creating_speaker is None:
+        creating_speaker = origin.get("speaker_provenance")
+    if not isinstance(creating_speaker, SpeakerProvenance):
+        creating_speaker = SpeakerProvenance(speaker_kind="system")
+    executing_speaker = (
+        agent_mod.speaker_provenance_for_role(cfg)
+        if cfg is not None else SpeakerProvenance(speaker_kind="system")
+    )
     return VoiceJob(
         id=job_id,
         parent_job_id=parent_job_id,
+        creating_speaker=creating_speaker,
+        executing_speaker=executing_speaker,
         creating_role=str(
             origin.get("execution_role") or origin.get("role") or "assistant"
         ),
@@ -2489,8 +2554,15 @@ async def _start_voice_async_job(
     handoff: _PermitHandoff,
     handoff_reservation: Any | None = None,
     parent_job_id: str | None = None,
+    creating_speaker: SpeakerProvenance | None = None,
 ) -> dict:
-    """Persist ACCEPTED, bind RUNNING task/permit ownership, return metadata."""
+    """Persist ACCEPTED, bind RUNNING task/permit ownership, return metadata.
+
+    Task 12: ``creating_speaker`` is the continuation caller's override — the
+    ORIGINAL parent job's creator — passed by the ``continue_voice_job``
+    resume branch (``parent_job_id`` is not None there). A fresh delegation
+    (``parent_job_id`` is None) leaves it unset so ``_new_voice_job`` derives
+    it from the current turn's own origin."""
     registry = _specialist_registry.job_registry
     await registry.load()
     # Apply result TTL before the atomic route-capacity check so an expired
@@ -2507,6 +2579,7 @@ async def _start_voice_async_job(
         task_text=task_text,
         context_text=context_text,
         handoff_id=handoff_id,
+        creating_speaker=creating_speaker,
     )
     actor = _job_actor_from_origin(origin)
     if parent_job_id is not None and actor is None:
@@ -3445,6 +3518,11 @@ async def continue_voice_job(args: dict) -> dict:
             origin=origin,
             task_text=continuation_input,
             context_text="",
+            # Task 12: the continuation keeps the ORIGINAL job's creator —
+            # never whoever is invoking continue_voice_job now — while
+            # executing_speaker (derived above from the current cfg) picks
+            # up the specialist's CURRENT binding.
+            creating_speaker=parent.creating_speaker,
         )
         try:
             prompted = await registry.create_prompted_delivery(
@@ -3509,6 +3587,9 @@ async def continue_voice_job(args: dict) -> dict:
                     permit=permit,
                     handoff=handoff,
                     parent_job_id=parent.id,
+                    # Task 12: copy the ORIGINAL job's creator verbatim —
+                    # never whoever is invoking continue_voice_job now.
+                    creating_speaker=parent.creating_speaker,
                 )
             finally:
                 if handoff.transferred:
@@ -3530,6 +3611,17 @@ async def continue_voice_job(args: dict) -> dict:
 # ---------------------------------------------------------------------------
 # recall_memory — spec §4.3
 # ---------------------------------------------------------------------------
+
+
+def _recall_surface(channel: str, origin: dict) -> str:
+    """Attribution surface for a recall render (Task 11): voice speaks aloud;
+    an untrusted webhook_trigger turn is ``restricted_webhook`` (never names a
+    person, regardless of clearance); everything else is ``text``."""
+    if channel == "voice":
+        return "voice"
+    if origin.get("_origin_route") == "webhook_trigger":
+        return "restricted_webhook"
+    return "text"
 
 
 @tool(
@@ -3568,30 +3660,45 @@ async def recall_memory(args: dict) -> dict:
     # webhook_trigger turn reads at its declared clearance (public floor, never
     # private); /invoke stays private; missing/unknown route on the webhook
     # channel fails closed to public.
+    from personality_types import SpeakerProvenance
     from sensitivity import clearance_for_origin, readable_tiers
-    tags = readable_tiers(clearance_for_origin(
+    clearance = clearance_for_origin(
         origin.get("_origin_route"), origin.get("_origin_clearance"), channel,
-    ))
+    )
+    tags = readable_tiers(clearance)
 
     budget = "low" if channel == "voice" else "mid"
     tokens = (
         getattr(getattr(caller_cfg, "memory", None), "token_budget", 2000)
         if caller_cfg else 2000
     )
+    # Attribution surface + the recalling agent's own identity (Task 11). The
+    # render itself is driven by each hit's recorded provenance; current_speaker
+    # is honest metadata only.
+    surface = _recall_surface(channel, origin)
+    current_speaker = (
+        getattr(caller_cfg, "speaker_provenance", None)
+        or SpeakerProvenance(speaker_kind="system")
+    )
     from hindsight_ids import bank_id
+    from recall_health import default_telemetry, observed_recall
+    from recall_renderer import render_recall
     try:
-        digest = await sem.recall(
-            bank_id("casa"), query,
-            tags=tags, max_tokens=tokens, budget=budget,
+        hits = await observed_recall(
+            path="direct_tool", telemetry=default_telemetry(),
+            operation=lambda: sem.recall_items(
+                bank_id("casa"), query, tags=tags, max_tokens=tokens,
+                clearance=clearance, budget=budget,
+            ),
         )
     except Exception as exc:  # noqa: BLE001
         # Three-outcome contract (v0.99.0): a failed recall must NOT report
         # status=ok with an empty digest — the model would then (per doctrine)
         # tell the user Casa has no such information, which is false. Any
-        # failure here (typed RecallUnavailable or unexpected) means memory
-        # could not be checked. Only RecallUnavailable's slug reasons are
-        # trusted in logs; anything else logs its TYPE (an arbitrary .reason
-        # attribute could carry content).
+        # failure here (typed RecallUnavailable — incl. RecallProtocolError — or
+        # unexpected) means memory could not be checked. Only RecallUnavailable's
+        # slug reasons are trusted in logs; anything else logs its TYPE (an
+        # arbitrary .reason attribute could carry content).
         reason = (
             exc.reason if isinstance(exc, RecallUnavailable)
             else type(exc).__name__
@@ -3607,6 +3714,10 @@ async def recall_memory(args: dict) -> dict:
                 "say the information doesn't exist or that you don't have it."
             ),
         })
+    digest = render_recall(
+        hits, current_speaker=current_speaker, surface=surface,
+        clearance=clearance, token_budget=tokens,
+    )
     return _result({"status": "ok", "memory": digest})
 
 
@@ -3960,6 +4071,7 @@ async def _fetch_executor_archive(
     try:
         digest = await delegated_recall(
             sem, query=task, origin_channel=origin_channel, max_tokens=token_budget,
+            path="executor_archive",
         )
     except RecallUnavailable:
         return ""
@@ -4890,6 +5002,14 @@ async def _finalize_engagement(
     # promptly; the deferred-reload path below drains them first (H-1).
     retain_tasks: list[asyncio.Task] = []
     import agent as agent_mod
+    from personality_types import RetainedTurn, SpeakerProvenance
+    # Task 10: the structured summary is a platform record authored on behalf of
+    # the finalized engagement. Attribute it to the identity on the current
+    # origin snapshot when one is present; otherwise the honest, unattributed
+    # "system" identity — NEVER a fabricated persona.
+    _summary_prov = _snapshot_origin().get("speaker_provenance")
+    if not isinstance(_summary_prov, SpeakerProvenance):
+        _summary_prov = SpeakerProvenance(speaker_kind="system")
     sem = getattr(agent_mod, "active_semantic_memory", None)
     if sem is not None:
         summary = json.dumps({
@@ -4907,8 +5027,7 @@ async def _finalize_engagement(
         })
         bg = asyncio.create_task(retain_delegated(
             sem, origin_channel=str(engagement.origin.get("channel", "")),
-            doc_prefix=f"engagement:{engagement.id}:summary",
-            turns=[("assistant", summary)],
+            turns=[RetainedTurn(summary, _summary_prov)],
         ))
         _specialist_bg_tasks.add(bg)
         bg.add_done_callback(_specialist_bg_tasks.discard)
@@ -4949,8 +5068,9 @@ async def _finalize_engagement(
             )
 
     # Per-executor-type structured summary (only kind=executor), retained
-    # tier-tagged on the shared bank with a DISTINCT doc_prefix so it does not
-    # clobber the engagement_summary item above.
+    # tier-tagged on the shared bank. Its content differs from the engagement
+    # summary above, so its content-addressed document_id (Task 10) is distinct
+    # and the two never clobber each other.
     # `sem` is the active_semantic_memory resolved in step 5 above.
     if engagement.kind == "executor" and sem is not None:
         type_summary = json.dumps({
@@ -4968,8 +5088,7 @@ async def _finalize_engagement(
         })
         bg = asyncio.create_task(retain_delegated(
             sem, origin_channel=str(engagement.origin.get("channel", "")),
-            doc_prefix=f"engagement:{engagement.id}:executor_summary",
-            turns=[("assistant", type_summary)],
+            turns=[RetainedTurn(type_summary, _summary_prov)],
         ))
         _specialist_bg_tasks.add(bg)
         bg.add_done_callback(_specialist_bg_tasks.discard)
@@ -5523,7 +5642,7 @@ async def query_engager(args: dict) -> dict:
             context = await delegated_recall(
                 sem, query=question,
                 origin_channel=str(engagement.origin.get("channel", "")),
-                max_tokens=2000,
+                max_tokens=2000, path="query_engager",
             )
         except RecallUnavailable:
             # Distinct from status=unknown (a genuine zero-hit): the engager's
@@ -6610,6 +6729,424 @@ async def plugin_update(args: dict) -> dict:
         return _result(core)
 
 
+@tool(
+    "specialist_install_inspect",
+    "Fetch a specialist component repo for inspection (non-persistent staging, no CAS write). "
+    "Returns the component's mission, default persona, required config/secret names, and "
+    "dependency-closure availability, or a structured error. On success this ALSO posts the "
+    "operator's DM Approve/Deny consent keyboard — specialist_install_commit will refuse until "
+    "that tap lands. Pass mode='upgrade' + target_slug=<slug> when re-inspecting the SAME repo "
+    "for an already-installed specialist (otherwise the collision check refuses it).",
+    {"type": "object", "properties": {
+        "repo": {"type": "string"}, "ref": {"type": "string"},
+        "subdir": {"type": "string"}, "expected_revision": {"type": "string"},
+        "mode": {"type": "string", "enum": ["install", "upgrade"]},
+        "target_slug": {"type": "string"}},
+     "required": ["repo", "ref"]},
+)
+async def specialist_install_inspect(args: dict) -> dict:
+    from specialist_install import SpecialistInstallError, inspect_specialist_repo
+
+    try:
+        result = await asyncio.to_thread(
+            inspect_specialist_repo, args["repo"], args["ref"], subdir=args.get("subdir", ""),
+            expected_revision=args.get("expected_revision"),
+            mode=args.get("mode", "install"), target_slug=args.get("target_slug"),
+        )
+    except SpecialistInstallError as exc:
+        return _result({"ok": False, "kind": exc.kind, "detail": exc.detail})
+
+    # Round-2 fix (finding #3): CREATE the structural approval challenge here
+    # — the prior draft returned inspection data and left
+    # prompt_specialist_install_consent uncalled anywhere in production, so
+    # the DM keyboard the recipe tells the LLM to "wait for" never posted.
+    # Mirrors the REAL production pattern trigger_reconcile._fire_consent_
+    # prompts (trigger_reconcile.py) already uses for plugin-trigger
+    # consent: the module-level ChallengeCoordinator singleton (CHALLENGES,
+    # already imported at module scope from authz_grants — no separate
+    # import needed here), the configured Telegram DM channel, and the
+    # validated operator identity.
+    from specialist_install_consent import SpecialistInstallAckStore, prompt_specialist_install_consent
+    import trigger_consent
+
+    channel = _channel_manager.get("telegram") if _channel_manager is not None else None
+    op = trigger_consent.operator_identity(channel) if channel is not None else None
+    if channel is not None and op is not None:
+        chat_id, operator_id = op
+        acks = SpecialistInstallAckStore()
+
+        async def _reconcile_cb() -> None:
+            # Intentionally a no-op: commit happens via a LATER, explicit
+            # specialist_install_commit call (the recipe polls for
+            # consent_missing rather than this callback auto-committing) —
+            # this callback exists only to satisfy prompt_specialist_install_
+            # consent's signature; recording the ack (which it does
+            # synchronously, before this callback ever runs) is the only
+            # side effect that matters here.
+            return
+
+        try:
+            # Round-3 fix (finding #3): register_challenge (authz_grants.py)
+            # calls `asyncio.get_running_loop().create_task(...)` SYNCHRONOUSLY
+            # — it requires the CALLING thread to already be inside a running
+            # event loop. `asyncio.to_thread` hands this call to a worker
+            # thread with NO running loop of its own, so `register_challenge`
+            # would raise `RuntimeError: no running event loop` there — a
+            # RuntimeError this `except Exception` swallows, so the DM
+            # keyboard silently never posts and the recipe's "wait for
+            # consent" step never resolves. Call directly on the event loop
+            # instead, exactly the way the real production pattern
+            # (`trigger_reconcile._fire_consent_prompts`, calling
+            # `trigger_consent.prompt_trigger_consent`) already does: a plain
+            # synchronous call, with NO `asyncio.to_thread` wrapper, from
+            # inside this coroutine (which IS running on the event loop).
+            prompt_specialist_install_consent(
+                coordinator=CHALLENGES,
+                channel=channel, chat_id=chat_id, operator_id=operator_id, inspection=result,
+                acks=acks, reconcile_cb=_reconcile_cb,
+            )
+        except Exception:  # noqa: BLE001 — inspection result still returned; recipe reports "waiting"
+            logger.exception("specialist install consent prompt failed to post")
+
+    return _result({
+        "ok": True, "component_id": result.component_id, "version": result.version,
+        "slug": result.slug, "component_checksum": result.component_checksum,
+        "root_digest": result.root_digest,
+        "mission": result.mission, "default_persona_ref": result.default_persona_ref,
+        "required_config_names": list(result.required_config_names),
+        "required_secret_names": list(result.required_secret_names),
+        "dependencies": [{"kind": d.kind, "identifier": d.identifier, "available": d.available}
+                          for d in result.dependencies],
+        "staged_dir": str(result.staged_dir),
+    })
+
+
+@tool(
+    "specialist_install_commit",
+    "Persist an INSPECTED specialist component to CAS, compile, and activate it — REFUSES unless "
+    "the operator has approved the install via the DM consent keyboard "
+    "(prompt_specialist_install_consent). Supply the component_id/version/root_digest/slug "
+    "exactly as returned by specialist_install_inspect.",
+    {"type": "object", "properties": {
+        "component_id": {"type": "string"}, "version": {"type": "string"},
+        "root_digest": {"type": "string"}, "slug": {"type": "string"},
+        "staged_dir": {"type": "string"},
+        "config": {"type": "object", "additionalProperties": {"type": "string"}},
+        "secret_names_provided": {"type": "array", "items": {"type": "string"}}},
+     "required": ["component_id", "version", "root_digest", "slug", "staged_dir"]},
+)
+async def specialist_install_commit(args: dict) -> dict:
+    from specialist_install import (
+        InspectionResult, SpecialistInstallError, commit_specialist_install,
+        compute_install_root_digest, resolve_dependency_closure,
+    )
+    from specialist_install_consent import SpecialistInstallAckStore
+    from specialist_component import load_specialist_component
+
+    staged_dir = Path(args["staged_dir"])
+    try:
+        component = load_specialist_component(staged_dir, staged_dir / "manifest.json")
+    except (ValueError, OSError) as exc:
+        return _result({"ok": False, "kind": "staged_dir_invalid", "detail": str(exc)})
+    if component.slug != args["slug"]:
+        return _result({"ok": False, "kind": "checksum_changed",
+                         "detail": "staged component no longer matches the approved inspection"})
+    # Round-2 fix (finding #2/#3): re-run the FULL dependency closure and
+    # recompute the root digest from the RELOADED staged bytes — never trust
+    # the caller-supplied root_digest/component_checksum args directly. An
+    # unavailable/changed dependency, or a root digest that no longer
+    # matches what the operator approved, is rejected HERE, before anything
+    # is persisted or activated.
+    deps = resolve_dependency_closure(component, staged_dir)
+    unavailable = [d for d in deps if not d.available]
+    if unavailable:
+        detail = "; ".join(f"{d.kind}:{d.identifier}: {d.detail}" for d in unavailable)
+        return _result({"ok": False, "kind": "dependency_unavailable", "detail": detail})
+    root_digest = compute_install_root_digest(
+        component, deps, manifest_bytes=(staged_dir / "manifest.json").read_bytes())
+    if root_digest != args["root_digest"]:
+        return _result({"ok": False, "kind": "checksum_changed",
+                         "detail": "staged component no longer matches the approved inspection"})
+    inspection = InspectionResult(
+        component_id=component.component_id, version=component.version, slug=component.slug,
+        component_checksum=component.checksum, root_digest=root_digest,
+        mission=str(component.role.role.get("mission", "")),
+        default_persona_ref=component.default_persona_ref,
+        default_persona_checksum=component.default_persona_checksum,
+        required_config_names=(), required_secret_names=(), dependencies=deps, staged_dir=staged_dir,
+    )
+    try:
+        instance = await asyncio.to_thread(
+            commit_specialist_install, inspection=inspection, config=args.get("config") or {},
+            secret_names_provided=frozenset(args.get("secret_names_provided") or []),
+            acks=SpecialistInstallAckStore(),
+        )
+    except SpecialistInstallError as exc:
+        return _result({"ok": False, "kind": exc.kind, "detail": exc.detail})
+    return _result({"ok": True, "slug": instance.slug, "state": instance.state,
+                     "activation_committed": instance.state == "active"})
+
+
+@tool(
+    "specialist_upgrade",
+    "Transactionally upgrade an installed specialist to a new version — the current install keeps "
+    "running until the new version validates+compiles successfully. Supply component_id/version/"
+    "root_digest/staged_dir exactly as returned by specialist_install_inspect(mode='upgrade', "
+    "target_slug=<slug>).",
+    {"type": "object", "properties": {
+        "slug": {"type": "string"}, "component_id": {"type": "string"},
+        "version": {"type": "string"}, "root_digest": {"type": "string"},
+        "staged_dir": {"type": "string"},
+        "config": {"type": "object", "additionalProperties": {"type": "string"}},
+        "secret_names_provided": {"type": "array", "items": {"type": "string"}}},
+     "required": ["slug", "component_id", "version", "root_digest", "staged_dir"]},
+)
+async def specialist_upgrade(args: dict) -> dict:
+    from specialist_component import load_specialist_component
+    from specialist_install import (
+        InspectionResult, SpecialistInstallError, compute_install_root_digest,
+        resolve_dependency_closure, upgrade_specialist,
+    )
+    from specialist_install_consent import SpecialistInstallAckStore
+
+    staged_dir = Path(args["staged_dir"])
+    component = load_specialist_component(staged_dir, staged_dir / "manifest.json")
+    # Same fresh re-validation as specialist_install_commit — upgrade must
+    # not trust a caller-supplied digest either.
+    deps = resolve_dependency_closure(component, staged_dir)
+    unavailable = [d for d in deps if not d.available]
+    if unavailable:
+        detail = "; ".join(f"{d.kind}:{d.identifier}: {d.detail}" for d in unavailable)
+        return _result({"ok": False, "kind": "dependency_unavailable", "detail": detail})
+    root_digest = compute_install_root_digest(
+        component, deps, manifest_bytes=(staged_dir / "manifest.json").read_bytes())
+    if root_digest != args["root_digest"]:
+        return _result({"ok": False, "kind": "checksum_changed",
+                         "detail": "staged component no longer matches the approved inspection"})
+    inspection = InspectionResult(
+        component_id=component.component_id, version=component.version, slug=component.slug,
+        component_checksum=component.checksum, root_digest=root_digest,
+        mission=str(component.role.role.get("mission", "")),
+        default_persona_ref=component.default_persona_ref,
+        default_persona_checksum=component.default_persona_checksum,
+        required_config_names=(), required_secret_names=(), dependencies=deps, staged_dir=staged_dir,
+    )
+    try:
+        instance = await asyncio.to_thread(
+            upgrade_specialist, slug=args["slug"], inspection=inspection,
+            config=args.get("config") or {},
+            secret_names_provided=frozenset(args.get("secret_names_provided") or []),
+            acks=SpecialistInstallAckStore(),
+        )
+    except SpecialistInstallError as exc:
+        return _result({"ok": False, "kind": exc.kind, "detail": exc.detail})
+    return _result({"ok": True, "slug": instance.slug, "state": instance.state})
+
+
+@tool(
+    "specialist_rollback",
+    "Restore an installed specialist's retained prior version (the state before its most recent "
+    "upgrade). Fails if no prior version was retained.",
+    {"type": "object", "properties": {"slug": {"type": "string"}}, "required": ["slug"]},
+)
+async def specialist_rollback(args: dict) -> dict:
+    from specialist_install import SpecialistInstallError, rollback_specialist
+
+    try:
+        instance = await asyncio.to_thread(rollback_specialist, slug=args["slug"])
+    except SpecialistInstallError as exc:
+        return _result({"ok": False, "kind": exc.kind, "detail": exc.detail})
+    return _result({"ok": True, "slug": instance.slug, "state": instance.state})
+
+
+@tool(
+    "specialist_uninstall",
+    "Remove an installed specialist entirely (its binding, config, and legacy operational files). "
+    "Does not affect a hand-authored (non-installed) specialist of the same name.",
+    {"type": "object", "properties": {"slug": {"type": "string"}}, "required": ["slug"]},
+)
+async def specialist_uninstall(args: dict) -> dict:
+    from specialist_install import uninstall_specialist
+
+    await asyncio.to_thread(uninstall_specialist, slug=args["slug"])
+    return _result({"ok": True, "slug": args["slug"]})
+
+
+@tool(
+    "persona_install_inspect",
+    "Fetch a persona-only repository for inspection (non-persistent staging). Returns the persona "
+    "id/version/checksum/display name, or a structured error. On success this ALSO posts the "
+    "operator's DM Approve/Deny consent keyboard.",
+    {"type": "object", "properties": {
+        "repo": {"type": "string"}, "ref": {"type": "string"}, "subdir": {"type": "string"},
+        "expected_revision": {"type": "string"}}, "required": ["repo", "ref"]},
+)
+async def persona_install_inspect(args: dict) -> dict:
+    from persona_install import PersonaInstallAckStore, inspect_persona_repo
+    from persona_install_consent import prompt_persona_install_consent
+    from specialist_install import SpecialistInstallError
+
+    try:
+        result = await asyncio.to_thread(
+            inspect_persona_repo, args["repo"], args["ref"], subdir=args.get("subdir", ""),
+            expected_revision=args.get("expected_revision"))
+    except SpecialistInstallError as exc:
+        return _result({"ok": False, "kind": exc.kind, "detail": exc.detail})
+
+    # Same structural-consent wiring as specialist_install_inspect above —
+    # CREATE the challenge here rather than leaving it uncalled (Round-2
+    # fix, finding #3, the bare-persona sibling of that same gap). CHALLENGES
+    # is the same module-level singleton already imported at the top of this
+    # file (`from authz_grants import CHALLENGES, ...`).
+    import trigger_consent
+
+    channel = _channel_manager.get("telegram") if _channel_manager is not None else None
+    op = trigger_consent.operator_identity(channel) if channel is not None else None
+    if channel is not None and op is not None:
+        chat_id, operator_id = op
+        acks = PersonaInstallAckStore()
+
+        async def _reconcile_cb() -> None:
+            return  # commit happens via a later, explicit persona_install_commit call
+
+        try:
+            # Round-3 fix (finding #3): same event-loop requirement as
+            # `specialist_install_inspect` above — `register_challenge`
+            # (authz_grants.py:586) calls `asyncio.get_running_loop().
+            # create_task(...)` synchronously, so it must run ON the event
+            # loop, not inside an `asyncio.to_thread` worker thread (which
+            # has no running loop and would raise, silently swallowed by
+            # this `except`). Call directly, mirroring
+            # `trigger_reconcile._fire_consent_prompts`'s synchronous call to
+            # `trigger_consent.prompt_trigger_consent`
+            # (trigger_reconcile.py:350-353).
+            prompt_persona_install_consent(
+                coordinator=CHALLENGES,
+                channel=channel, chat_id=chat_id, operator_id=operator_id, inspection=result,
+                acks=acks, reconcile_cb=_reconcile_cb,
+            )
+        except Exception:  # noqa: BLE001
+            logger.exception("persona install consent prompt failed to post")
+
+    return _result({"ok": True, "persona_id": result.persona_id, "version": result.version,
+                     "checksum": result.checksum, "display_name": result.display_name,
+                     "staged_dir": str(result.staged_dir)})
+
+
+@tool(
+    "persona_install_commit",
+    "Persist an INSPECTED persona to /config/personas — REFUSES unless the operator has approved "
+    "via the DM consent keyboard.",
+    {"type": "object", "properties": {
+        "persona_id": {"type": "string"}, "version": {"type": "string"},
+        "checksum": {"type": "string"}, "staged_dir": {"type": "string"}},
+     "required": ["persona_id", "version", "checksum", "staged_dir"]},
+)
+async def persona_install_commit(args: dict) -> dict:
+    from persona_install import PersonaInspectionResult, PersonaInstallAckStore, commit_persona_install
+    from persona_pack import PersonaPackError, load_persona_pack
+    from specialist_install import SpecialistInstallError
+
+    staged_dir = Path(args["staged_dir"])
+    # Round-2 fix (finding #3): reload the staged bytes and cross-check the
+    # RECOMPUTED persona_id/version/checksum against the caller-supplied
+    # args, rather than trusting them directly — mirrors
+    # specialist_install_commit's existing (correct) pattern.
+    try:
+        pack = load_persona_pack(staged_dir / "pack", staged_dir / "manifest.json")
+    except (PersonaPackError, OSError) as exc:
+        return _result({"ok": False, "kind": "staged_dir_invalid", "detail": str(exc)})
+    if (pack.persona_id != args["persona_id"] or pack.version != args["version"]
+            or pack.checksum != args["checksum"]):
+        return _result({"ok": False, "kind": "checksum_changed",
+                         "detail": "staged persona no longer matches the approved inspection"})
+    inspection = PersonaInspectionResult(
+        persona_id=pack.persona_id, version=pack.version, checksum=pack.checksum,
+        display_name=pack.identity.get("display_name", pack.persona_id), staged_dir=staged_dir)
+    try:
+        pack = await asyncio.to_thread(
+            commit_persona_install, inspection=inspection, acks=PersonaInstallAckStore())
+    except SpecialistInstallError as exc:
+        return _result({"ok": False, "kind": exc.kind, "detail": exc.detail})
+    return _result({"ok": True, "persona_id": pack.persona_id, "version": pack.version,
+                     "checksum": pack.checksum})
+
+
+@tool(
+    "persona_apply",
+    "Apply an installed persona as an override binding to a resident slot (assistant/butler/"
+    "concierge) or an installed specialist slug. Restart-to-swap: takes effect on the target "
+    "agent's next restart (residents) or next casa_reload (specialists).",
+    {"type": "object", "properties": {
+        "target_role_id": {"type": "string"}, "persona_id": {"type": "string"},
+        "persona_version": {"type": "string"}}, "required": ["target_role_id", "persona_id", "persona_version"]},
+)
+async def persona_apply(args: dict) -> dict:
+    from persona_install import apply_persona_override, validate_persona_path_segments
+    from persona_pack import PersonaPackError, load_persona_pack
+    from role_slot import materialize_role
+    from role_artifact import load_role_artifact
+    from specialist_install import SpecialistInstallError, validate_specialist_slug
+
+    kind, _, slot = args["target_role_id"].partition(":")
+    # F1: persona_id/persona_version index `/config/personas/<id>/<version>/`
+    # and `slot` indexes both the image-roles tree and the InstanceDir tree —
+    # validate every caller-supplied path segment before any join.
+    try:
+        validate_persona_path_segments(args["persona_id"], args["persona_version"])
+        validate_specialist_slug(slot)
+    except SpecialistInstallError as exc:
+        return _result({"ok": False, "kind": exc.kind, "detail": exc.detail})
+    personas_root = Path("/config/personas") / args["persona_id"] / args["persona_version"]
+    try:
+        persona = load_persona_pack(personas_root / "pack", personas_root / "manifest.json")
+    except (PersonaPackError, OSError) as exc:
+        return _result({"ok": False, "kind": "persona_unavailable", "detail": str(exc)})
+
+    if kind == "resident":
+        # Controller resolution #2 (task-n1d-brief deviation): the brief
+        # hard-coded Path("/opt/casa/defaults/roles/resident") — use the
+        # canonical image-roles seam (agent_loader.DEFAULT_ROLES_DIR)
+        # instead, identical in production but correct under test/dev
+        # layouts where the image tree isn't rooted at /opt/casa.
+        import agent_loader
+
+        role_dir = Path(agent_loader.DEFAULT_ROLES_DIR) / "resident" / slot
+        instance_dir_root = Path("/config/bindings") / f"resident-{slot}"
+    elif kind == "specialist":
+        from specialist_registry import InstalledSpecialistIndex
+
+        index = InstalledSpecialistIndex()
+        index.load()
+        role_dirs = index.installed_component_role_dirs()
+        if slot not in role_dirs:
+            return _result({"ok": False, "kind": "not_installed", "slug": slot})
+        role_dir = role_dirs[slot] / "role"
+        instance_dir_root = Path("/config/specialists") / slot
+    else:
+        return _result({"ok": False, "kind": "invalid_target", "target_role_id": args["target_role_id"]})
+
+    role = materialize_role(source=load_role_artifact(role_dir), options={})
+    try:
+        committed = await asyncio.to_thread(
+            apply_persona_override, target_role_id=args["target_role_id"], persona=persona,
+            role=role, instance_dir_root=instance_dir_root)
+    except ValueError as exc:
+        return _result({"ok": False, "kind": "incompatible", "detail": str(exc)})
+    except SpecialistInstallError as exc:
+        # Fix-round-1 (finding IMPORTANT): installed_component_role_dirs()
+        # legitimately resolves a pending-configuration specialist (desired-
+        # only, active=None — a real state per specialist_registry.py), so
+        # apply_persona_override's specialist branch can reach here and raise
+        # SpecialistInstallError("no_active_tuple", ...) for a target this
+        # tool otherwise accepted. Without this clause that escaped as an
+        # unstructured MCP error instead of the tool's {ok, kind} contract.
+        return _result({"ok": False, "kind": exc.kind, "detail": exc.detail})
+    return _result({"ok": True, "target_role_id": args["target_role_id"],
+                     "binding_digest": committed.binding.binding_digest,
+                     "restart_required": kind == "resident"})
+
+
 def _find_entry(data, name: str) -> dict | None:
     return next((e for e in data.raw.get("plugins", [])
                  if isinstance(e, dict) and e.get("name") == name), None)
@@ -7302,6 +7839,161 @@ async def get_item_fields(args: dict) -> dict:
     ))
 
 
+# --- Personality Phase A, Task 8: resident persona swap / reset -------------
+#
+# Both tools STAGE a desired instance tuple (InstanceDir.stage_desired) rather
+# than committing directly — the actual `active := desired` commit happens at
+# the NEXT BOOT's reconcile_resident_binding (agent_loader), which re-validates
+# against the then-current role checksum before committing. This keeps exactly
+# one commit code path (boot-time reconciliation), so a personality-identity
+# change is always restart-to-swap. `active_runtime` is the established
+# module-level accessor (mirrors active_semantic_memory), set by casa_core as
+# `agent.active_runtime = runtime`.
+
+_PERSONA_ROOTS = (Path("/config/personas"), Path("/opt/casa/defaults/personas"))
+
+
+def _resolve_local_persona(ref: str):
+    """Load an ALREADY LOCALLY PRESENT persona pack by exact ref (this plan does
+    not fetch a bare persona from a remote repo). Persona bytes are installed
+    under /config/personas/<ns>/<slug>/<version>/ (or the image defaults) by the
+    same out-of-band means as any other locally-staged content; this only loads
+    and validates what is already there."""
+    from persona_pack import load_persona_pack
+
+    persona_id, _, version = ref.partition("@")
+    for root in _PERSONA_ROOTS:
+        pack_dir = root / persona_id / version / "pack"
+        manifest_path = root / persona_id / version / "manifest.json"
+        if pack_dir.is_dir() and manifest_path.is_file():
+            return load_persona_pack(pack_dir, manifest_path)
+    raise ValueError(f"persona {ref!r} is not present under any configured persona root")
+
+
+async def _stage_and_report(role_id: str, slot: str, binding) -> dict:
+    from personality_binding import InstanceDir, InstanceTuple
+    import specialist_materialize
+
+    # Resolve the bindings root through the SAME seam agent_loader's boot-time
+    # reconcile uses (agent_loader._resident_bindings_root — honors an explicit
+    # arg, then CASA_BINDINGS_DIR, then /config/bindings). This tool and the
+    # next boot's reconcile_resident_binding() MUST agree on the on-disk
+    # directory for a given slot, or a staged swap/reset is silently never
+    # picked up (see tests/test_reconcile_resident_binding.py's round-trip
+    # regression test).
+    import agent_loader
+
+    instance_dir = InstanceDir(agent_loader._resident_bindings_root(None) / f"resident-{slot}")
+    root = binding.override_source or binding.image_default_root or ""
+    tuple_ = InstanceTuple(
+        root=root, binding=binding, config_snapshot={}, config_digest=binding.effective_config_digest,
+    )
+
+    # Round-5 fix (F2b): the resident InstanceDir write shares the
+    # personality-instance mutation lock (specialist_materialize.MATERIALIZE_LOCK)
+    # with every specialist writer and with apply_persona_override's resident
+    # branch. This tool handler runs on the EVENT LOOP, so acquiring the
+    # threading.Lock synchronously here would block asyncio; offload the minimal
+    # InstanceDir-write section (active re-read + stage_desired, both in-lock) to
+    # a worker thread via asyncio.to_thread — the same off-loop pattern reload's
+    # _specialist_roles_dir uses. Validation/reporting stay loop-side.
+    def _locked_stage():
+        with specialist_materialize.MATERIALIZE_LOCK:
+            active = instance_dir.active()
+            instance_dir.stage_desired(tuple_)
+            return active
+
+    active = await asyncio.to_thread(_locked_stage)
+    return {
+        "ok": True, "role": role_id, "persona": f"{binding.persona_id}@{binding.persona_version}",
+        "activation": "restart_required",
+        "prior_persona": (f"{active.binding.persona_id}@{active.binding.persona_version}" if active else None),
+    }
+
+
+def _resolve_resident_role(role_id: str):
+    """Resolve a fixed resident slot's live RoleSlot from the Task 8
+    ``active_runtime.role_slots`` registry, or a structured-error result."""
+    from role_slot import FIXED_RESIDENT_SLOTS
+
+    slot = role_id.split(":", 1)[1] if ":" in role_id else ""
+    if slot not in FIXED_RESIDENT_SLOTS:
+        return None, slot, _result({"ok": False, "kind": "invalid_role"})
+    import agent as agent_mod
+    runtime = getattr(agent_mod, "active_runtime", None)
+    if runtime is None:
+        return None, slot, _result({"ok": False, "kind": "runtime_unavailable"})
+    role = runtime.role_slots.get(role_id)
+    if role is None:
+        return None, slot, _result({"ok": False, "kind": "role_not_loaded"})
+    return role, slot, None
+
+
+@tool(
+    "resident_persona_swap",
+    "Stage an OVERRIDE persona binding for a fixed resident slot (assistant/"
+    "butler/concierge) from an already locally-present persona pack. Validates "
+    "role/persona compatibility BEFORE staging anything. Takes effect only after "
+    "casa_restart_supervised (personality-identity changes are restart-to-swap, "
+    "never hot-reloaded).",
+    {"type": "object", "properties": {
+        "role": {"enum": ["resident:assistant", "resident:butler", "resident:concierge"]},
+        "persona_ref": {"type": "string"},
+    }, "required": ["role", "persona_ref"]},
+)
+async def resident_persona_swap(args: dict) -> dict:
+    from personality_binding import check_persona_requirements, materialize_override_binding
+
+    role_id = args["role"]
+    role, slot, err = _resolve_resident_role(role_id)
+    if err is not None:
+        return err
+    try:
+        persona = _resolve_local_persona(args["persona_ref"])
+        check_persona_requirements(role.normalized, persona)  # rejects BEFORE any staging
+    except ValueError as exc:
+        return _result({"ok": False, "kind": "incompatible_or_missing_persona", "detail": str(exc)})
+    binding = materialize_override_binding(
+        role=role, persona=persona, override_source=f"operator:{args['persona_ref']}",
+    )
+    return _result(await _stage_and_report(role_id, slot, binding))
+
+
+@tool(
+    "resident_persona_reset",
+    "Stage a reset for a fixed resident slot's binding back to the CURRENT "
+    "in-image default persona, undoing any override (spec §2.3/§4.4's "
+    "always-available reset). Takes effect only after casa_restart_supervised.",
+    {"type": "object", "properties": {
+        "role": {"enum": ["resident:assistant", "resident:butler", "resident:concierge"]},
+    }, "required": ["role"]},
+)
+async def resident_persona_reset(args: dict) -> dict:
+    from personality_binding import (
+        IMAGE_DEFAULT_PERSONA_BY_SLOT,
+        check_persona_requirements,
+        materialize_image_default_binding,
+    )
+
+    role_id = args["role"]
+    role, slot, err = _resolve_resident_role(role_id)
+    if err is not None:
+        return err
+    default_ref = IMAGE_DEFAULT_PERSONA_BY_SLOT[slot]
+    # Run the SAME resolve-then-validate-before-staging sequence as
+    # resident_persona_swap — a missing/uninstalled default persona blob or a
+    # compatibility failure is returned as a structured error, never an
+    # unhandled ValueError out of the handler, and nothing is staged before
+    # validation passes.
+    try:
+        persona = _resolve_local_persona(default_ref)
+        check_persona_requirements(role.normalized, persona)  # rejects BEFORE any staging
+    except ValueError as exc:
+        return _result({"ok": False, "kind": "incompatible_or_missing_persona", "detail": str(exc)})
+    binding = materialize_image_default_binding(role=role, persona=persona, image_default_root=default_ref)
+    return _result(await _stage_and_report(role_id, slot, binding))
+
+
 # Module-level tool registry — iterated by create_casa_tools() for the SDK
 # path and by the MCP HTTP bridge (mcp_bridge._build_tool_dispatch) for
 # real `claude` CLI engagements. Adding a tool here exposes it on both
@@ -7342,6 +8034,23 @@ CASA_TOOLS: tuple = (
     set_plugin_env_reference,
     list_vault_items,
     get_item_fields,
+    # Personality Phase A, Task 8 — configurator-only resident persona control.
+    resident_persona_swap,
+    resident_persona_reset,
+    # Personality Phase A, Plan 2 Task N1b — configurator-only specialist
+    # install-from-repo tools.
+    specialist_install_inspect,
+    specialist_install_commit,
+    # Personality Phase A, Plan 2 Task N1c — configurator-only specialist
+    # upgrade/rollback/uninstall tools.
+    specialist_upgrade,
+    specialist_rollback,
+    specialist_uninstall,
+    # Personality Phase A, Plan 2 Task N1d — configurator-only bare-persona
+    # repo install/apply tools.
+    persona_install_inspect,
+    persona_install_commit,
+    persona_apply,
 )
 
 

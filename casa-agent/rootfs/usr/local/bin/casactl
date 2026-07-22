@@ -14,6 +14,11 @@ Usage:
     casactl reload --scope=config_sync
     casactl reload --scope=full [--include-env]
     casactl restart-supervised
+    casactl persona inspect <ref>
+    casactl persona render <ref> --role <role-id> --projection {text,voice,restricted_webhook}
+    casactl persona diff --role <role-id> --to <ref>
+    casactl specialist status <slug>
+    casactl explain <correlation_id> [--show-sensitive]
 """
 from __future__ import annotations
 
@@ -90,6 +95,64 @@ def _cmd_reload(args: argparse.Namespace) -> int:
     return 0 if result.get("status") == "ok" else 1
 
 
+def _print_admin_result(path: str, body: dict) -> int:
+    """Task 14: shared POST-then-print helper for the persona/specialist/
+    explain admin routes. Reuses ``_post_via_unix_socket`` (same dispatch
+    path as ``_cmd_reload``) rather than duplicating the raw-HTTP-over-Unix-
+    socket logic."""
+    try:
+        status, result = _post_via_unix_socket(path, body)
+    except FileNotFoundError:
+        print(f"error: socket not found at {SOCKET_PATH} - "
+              "is casa-main running?", file=sys.stderr)
+        return 2
+    except OSError as exc:
+        print(f"error: socket request failed: {exc}", file=sys.stderr)
+        return 2
+    stream = sys.stdout if 200 <= status < 300 else sys.stderr
+    print(json.dumps(result, ensure_ascii=False, indent=2, sort_keys=True), file=stream)
+    return 0 if 200 <= status < 300 else 1
+
+
+def _cmd_persona(args: argparse.Namespace) -> int:
+    if args.persona_cmd == "inspect":
+        return _print_admin_result("/admin/personality/inspect", {"persona": args.persona})
+    if args.persona_cmd == "render":
+        return _print_admin_result(
+            "/admin/personality/render",
+            {"persona": args.persona, "role": args.role, "projection": args.projection},
+        )
+    return _print_admin_result("/admin/personality/diff", {"role": args.role, "to": args.to})
+
+
+def _cmd_specialist(args: argparse.Namespace) -> int:
+    return _print_admin_result("/admin/specialist/status", {"slug": args.slug})
+
+
+def _cmd_explain(args: argparse.Namespace) -> int:
+    confirmed = False
+    if args.show_sensitive:
+        if not sys.stdin.isatty():
+            print("error: --show-sensitive requires an interactive TTY", file=sys.stderr)
+            return 2
+        answer = input(
+            "Sensitive output can include full prompts and memory text. "
+            "Type SHOW to continue: ",
+        )
+        if answer != "SHOW":
+            print("cancelled", file=sys.stderr)
+            return 2
+        confirmed = True
+    return _print_admin_result(
+        "/admin/explain",
+        {
+            "correlation_id": args.correlation_id,
+            "show_sensitive": args.show_sensitive,
+            "confirmed": confirmed,
+        },
+    )
+
+
 def _cmd_restart_supervised(args: argparse.Namespace) -> int:
     """Direct Supervisor POST - same as the MCP tool's out-of-engagement path."""
     import urllib.request
@@ -142,11 +205,39 @@ def main() -> int:
         help="Full Supervisor-driven addon restart (slow, ~10-15s).",
     )
 
+    persona = sub.add_parser("persona", help="Inspect/render/diff a persona.")
+    persona_sub = persona.add_subparsers(dest="persona_cmd", required=True)
+    persona_sub.add_parser("inspect").add_argument("persona")
+    render_p = persona_sub.add_parser("render")
+    render_p.add_argument("persona")
+    render_p.add_argument("--role", required=True)
+    render_p.add_argument("--projection", required=True,
+                          choices=["text", "voice", "restricted_webhook"])
+    diff_p = persona_sub.add_parser("diff")
+    diff_p.add_argument("--role", required=True)
+    diff_p.add_argument("--to", required=True)
+
+    specialist = sub.add_parser("specialist", help="Specialist lifecycle status.")
+    specialist_sub = specialist.add_subparsers(dest="specialist_cmd", required=True)
+    specialist_sub.add_parser("status").add_argument("slug")
+
+    explain_p = sub.add_parser(
+        "explain", help="Show provenance for a correlation id.",
+    )
+    explain_p.add_argument("correlation_id")
+    explain_p.add_argument("--show-sensitive", action="store_true")
+
     args = parser.parse_args()
     if args.cmd == "reload":
         return _cmd_reload(args)
     if args.cmd == "restart-supervised":
         return _cmd_restart_supervised(args)
+    if args.cmd == "persona":
+        return _cmd_persona(args)
+    if args.cmd == "specialist":
+        return _cmd_specialist(args)
+    if args.cmd == "explain":
+        return _cmd_explain(args)
     return 1
 
 

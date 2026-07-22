@@ -1,0 +1,41 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "casa:role.v1",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["api_version", "id", "kind", "slot", "mission", "enabled", "model", "tools", "mcp_servers", "channels", "memory", "session", "disclosure", "delegates", "executors", "triggers", "hooks", "tts", "response", "persona", "requires", "doctrine_file"],
+  "properties": {
+    "api_version": {"const": "casa.role/v1"},
+    "id": {"type": "string", "pattern": "^(resident|specialist|executor):[a-z0-9][a-z0-9-]*$"},
+    "kind": {"enum": ["resident", "specialist", "executor"]},
+    "slot": {"type": "string", "pattern": "^[a-z0-9][a-z0-9-]*$"},
+    "mission": {"type": "string", "minLength": 1, "maxLength": 500},
+    "enabled": {"type": "boolean"},
+    "model": {"oneOf": [
+      {"type": "object", "additionalProperties": false, "required": ["source", "value"], "properties": {"source": {"const": "fixed"}, "value": {"enum": ["opus", "sonnet", "haiku"]}}},
+      {"type": "object", "additionalProperties": false, "required": ["source", "option", "default", "allowed"], "properties": {"source": {"const": "ha_option"}, "option": {"enum": ["primary_agent_model", "voice_agent_model"]}, "default": {"enum": ["opus", "sonnet", "haiku"]}, "allowed": {"type": "array", "minItems": 1, "uniqueItems": true, "items": {"enum": ["opus", "sonnet", "haiku"]}}}}
+    ]},
+    "tools": {"type": "object", "additionalProperties": false, "required": ["allowed", "disallowed", "permission_mode", "max_turns", "skills", "voice_guard"], "properties": {"allowed": {"type": "array", "uniqueItems": true, "items": {"type": "string", "minLength": 1}}, "disallowed": {"type": "array", "uniqueItems": true, "items": {"type": "string", "minLength": 1}}, "permission_mode": {"type": "string", "minLength": 1}, "max_turns": {"type": "integer", "minimum": 1}, "skills": {"enum": ["all", "none"]}, "voice_guard": {"enum": ["none", "ha_direct"]}}},
+    "mcp_servers": {"type": "array", "uniqueItems": true, "items": {"type": "string", "minLength": 1}},
+    "channels": {"type": "array", "uniqueItems": true, "items": {"type": "string", "minLength": 1}},
+    "memory": {"type": "object", "additionalProperties": false, "required": ["token_budget", "read_strategy"], "properties": {"token_budget": {"type": "integer", "minimum": 0}, "read_strategy": {"enum": ["per_turn", "cached"]}}},
+    "session": {"type": "object", "additionalProperties": false, "required": ["strategy", "idle_timeout_seconds"], "properties": {"strategy": {"enum": ["persistent", "pooled", "ephemeral"]}, "idle_timeout_seconds": {"type": "integer", "minimum": 0}}},
+    "disclosure": {"type": "object", "additionalProperties": false, "required": ["policy", "overrides"], "properties": {"policy": {"type": "string", "minLength": 1}, "overrides": {"type": "object"}}},
+    "delegates": {"type": "array", "items": {"type": "object"}},
+    "executors": {"type": "array", "items": {"type": "object"}},
+    "triggers": {"type": "array", "items": {"type": "object"}},
+    "hooks": {"type": "object", "additionalProperties": false, "required": ["pre_tool_use"], "properties": {"pre_tool_use": {"type": "array", "items": {"type": "object"}}}},
+    "tts": {"type": "object", "additionalProperties": false, "required": ["tag_dialect", "error_phrases"], "properties": {"tag_dialect": {"enum": ["square_brackets", "parens", "none"]}, "error_phrases": {"type": "object", "additionalProperties": {"type": "string"}}}},
+    "response": {"type": "object", "additionalProperties": false, "required": ["text", "voice", "restricted_webhook"], "properties": {"text": {"$ref": "#/$defs/responseProjection"}, "voice": {"$ref": "#/$defs/responseProjection"}, "restricted_webhook": {"$ref": "#/$defs/responseProjection"}}},
+    "persona": {"oneOf": [
+      {"type": "object", "additionalProperties": false, "required": ["policy", "compatibility"], "properties": {"policy": {"const": "required"}, "compatibility": {"type": "array", "minItems": 1, "items": {"type": "string", "minLength": 1}}}},
+      {"type": "object", "additionalProperties": false, "required": ["policy", "compatibility"], "properties": {"policy": {"const": "optional-but-bound"}, "compatibility": {"type": "array", "minItems": 1, "items": {"type": "string", "minLength": 1}}}},
+      {"type": "object", "additionalProperties": false, "required": ["policy"], "properties": {"policy": {"const": "forbidden"}}}
+    ]},
+    "requires": {"type": "object", "additionalProperties": false, "required": ["plugins", "tools"], "properties": {"plugins": {"type": "array", "items": {"type": "string"}}, "tools": {"type": "array", "items": {"type": "string"}}}},
+    "doctrine_file": {"const": "doctrine.md"}
+  },
+  "$defs": {
+    "responseProjection": {"type": "object", "additionalProperties": false, "required": ["register"], "properties": {"register": {"type": "string", "minLength": 1}, "max_confirmation_sentences": {"type": "integer", "minimum": 0}, "max_status_sentences": {"type": "integer", "minimum": 0}, "first_clause_max_words": {"type": "integer", "minimum": 1}, "first_clause_requires_early_punctuation": {"type": "boolean"}}}
+  }
+}

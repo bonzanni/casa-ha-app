@@ -547,6 +547,7 @@ The `configurator` is the first Tier 3 Executor - knows Casa's configuration sur
 | Surface | Create | Read | Update | Delete |
 |---|---|---|---|---|
 | Specialist agents (Tier 2) | yes | yes | yes | yes |
+| Specialists from a repository (install/upgrade/rollback/uninstall) | yes | yes | yes | yes |
 | Resident agents (Tier 1) | rare | yes | yes | blocked by default |
 | Per-agent YAMLs | yes | yes | yes | yes |
 | Per-agent prompts | yes | yes | yes | yes |
@@ -557,7 +558,9 @@ The `configurator` is the first Tier 3 Executor - knows Casa's configuration sur
 
 Plugin management uses the registry tools (`plugin_add`, `plugin_update`,
 `plugin_assign`, `plugin_unassign`, `plugin_remove`, `plugin_list`,
-`verify_plugin_state`) — see [Plugins](#plugins-v0710).
+`verify_plugin_state`) — see [Plugins](#plugins-v0710). Repository-installed
+specialists use their own recipe — see
+[Installing a specialist from a repository](#installing-a-specialist-from-a-repository).
 
 Not yet supported:
 
@@ -733,29 +736,31 @@ app past 0.78.0.
   issues; Casa also DMs the operator when a *new* issue appears and affected
   agents prepend a one-line first-contact notice.
 
-## Enabling a bundled-disabled specialist
+## Installing a specialist from a repository
 
-Casa ships some Tier 2 specialist agents disabled by default (`finance`
-today; others in future releases). They are "bundled but disabled" —
-the YAML is shipped, but the specialist is not registered for delegation
-dispatch until you opt in.
+Specialists are no longer bundled with the app image — each one (the
+`finance` specialist, a Magic — The Gathering rules judge, and any future
+ones) lives in its own repository and is installed on demand through the
+configurator. Ask Ellen, for example: *"Install the finance specialist
+from casa-org/casa-finance-specialist"*.
 
-To enable one:
+What happens:
 
-1. Open the Casa app config folder at `/config/agents/specialists/`
-   (host path: `/addon_configs/{REPO}_casa-agent/agents/specialists/`).
-2. Edit the specialist's YAML file (for example `finance.yaml`).
-3. Change `enabled: false` to `enabled: true`.
-4. Restart the Casa app.
+1. The configurator inspects the repository and reports the specialist's
+   mission, its default persona, and any configuration or secrets it
+   needs.
+2. You approve the install from a DM Approve/Deny prompt — nothing is
+   installed without that tap.
+3. Once approved (and any required configuration supplied), the
+   specialist activates and Casa reloads so residents can delegate to it.
 
-After restart, check the app log for the
-`Specialists: enabled=[...] disabled=[...]` summary line to confirm
-your specialist moved into the enabled set. Residents can now invoke
-it via `delegate_to_agent(agent="<role>", ...)`.
-
-To disable it again, set `enabled: false` and restart. Your edits to
-the YAML file persist across app updates — Casa only seeds from
-bundled defaults when the file is absent.
+The same repository-driven flow covers **upgrading** to a newer version,
+**rolling back** to the previous one, and **uninstalling** a specialist —
+just ask Ellen (e.g. *"Upgrade the finance specialist"*, *"Roll back
+finance to the previous version"*, *"Uninstall the finance specialist"*).
+You can also swap which persona an installed specialist uses (its bundled
+default, or another installed persona) by asking Ellen to apply a
+different persona to it.
 
 ## Claude Code driver (v0.13.1)
 

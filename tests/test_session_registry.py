@@ -8,6 +8,7 @@ import time
 import pytest
 
 from session_registry import SessionRegistry
+from session_reg_helpers import STUB_BINDING_DIGEST, STUB_SPEAKER_PROV, STUB_USER_PROV
 
 pytestmark = [pytest.mark.asyncio, pytest.mark.unit]
 
@@ -16,7 +17,7 @@ class TestSessionRegistry:
     async def test_register_and_get(self, tmp_path):
         path = str(tmp_path / "sessions.json")
         reg = SessionRegistry(path)
-        await reg.register("tg:123", "assistant", "sdk-1")
+        await reg.register("tg:123", "assistant", "sdk-1", binding_digest=STUB_BINDING_DIGEST, speaker_provenance=STUB_SPEAKER_PROV, user_provenance=STUB_USER_PROV)
 
         entry = reg.get("tg:123")
         assert entry is not None
@@ -32,7 +33,7 @@ class TestSessionRegistry:
     async def test_touch_updates_last_active(self, tmp_path):
         path = str(tmp_path / "sessions.json")
         reg = SessionRegistry(path)
-        await reg.register("tg:123", "assistant", "sdk-1")
+        await reg.register("tg:123", "assistant", "sdk-1", binding_digest=STUB_BINDING_DIGEST, speaker_provenance=STUB_SPEAKER_PROV, user_provenance=STUB_USER_PROV)
 
         ts1 = reg.get("tg:123")["last_active"]
         await asyncio.sleep(0.05)
@@ -46,7 +47,7 @@ class TestSessionRegistry:
         path = str(tmp_path / "sessions.json")
 
         r1 = SessionRegistry(path)
-        await r1.register("tg:42", "butler", "sdk-2")
+        await r1.register("tg:42", "butler", "sdk-2", binding_digest=STUB_BINDING_DIGEST, speaker_provenance=STUB_SPEAKER_PROV, user_provenance=STUB_USER_PROV)
 
         r2 = SessionRegistry(path)
         entry = r2.get("tg:42")
@@ -56,7 +57,7 @@ class TestSessionRegistry:
     async def test_remove(self, tmp_path):
         path = str(tmp_path / "sessions.json")
         reg = SessionRegistry(path)
-        await reg.register("tg:99", "assistant", "sdk-3")
+        await reg.register("tg:99", "assistant", "sdk-3", binding_digest=STUB_BINDING_DIGEST, speaker_provenance=STUB_SPEAKER_PROV, user_provenance=STUB_USER_PROV)
         assert reg.get("tg:99") is not None
 
         await reg.remove("tg:99")
@@ -65,8 +66,8 @@ class TestSessionRegistry:
     async def test_all_entries(self, tmp_path):
         path = str(tmp_path / "sessions.json")
         reg = SessionRegistry(path)
-        await reg.register("a", "assistant", "s1")
-        await reg.register("b", "butler", "s2")
+        await reg.register("a", "assistant", "s1", binding_digest=STUB_BINDING_DIGEST, speaker_provenance=STUB_SPEAKER_PROV, user_provenance=STUB_USER_PROV)
+        await reg.register("b", "butler", "s2", binding_digest=STUB_BINDING_DIGEST, speaker_provenance=STUB_SPEAKER_PROV, user_provenance=STUB_USER_PROV)
 
         entries = reg.all_entries()
         assert set(entries.keys()) == {"a", "b"}
@@ -83,7 +84,7 @@ class TestConcurrency:
         reg = SessionRegistry(path)
 
         async def reg_one(i: int) -> None:
-            await reg.register(f"tg:{i}", "assistant", f"sdk-{i}")
+            await reg.register(f"tg:{i}", "assistant", f"sdk-{i}", binding_digest=STUB_BINDING_DIGEST, speaker_provenance=STUB_SPEAKER_PROV, user_provenance=STUB_USER_PROV)
 
         await asyncio.gather(*(reg_one(i) for i in range(50)))
 
@@ -101,11 +102,11 @@ class TestConcurrency:
         path = str(tmp_path / "sessions.json")
         reg = SessionRegistry(path)
         # Seed an entry so touch() has something to update.
-        await reg.register("tg:1", "assistant", "sdk-OLD")
+        await reg.register("tg:1", "assistant", "sdk-OLD", binding_digest=STUB_BINDING_DIGEST, speaker_provenance=STUB_SPEAKER_PROV, user_provenance=STUB_USER_PROV)
 
         # Now race: register overwrites with sdk-NEW, touch updates last_active.
         await asyncio.gather(
-            reg.register("tg:1", "assistant", "sdk-NEW"),
+            reg.register("tg:1", "assistant", "sdk-NEW", binding_digest=STUB_BINDING_DIGEST, speaker_provenance=STUB_SPEAKER_PROV, user_provenance=STUB_USER_PROV),
             reg.touch("tg:1"),
         )
 
@@ -118,7 +119,7 @@ class TestConcurrency:
         """public save() must acquire; _save_locked() must not (caller holds)."""
         path = str(tmp_path / "sessions.json")
         reg = SessionRegistry(path)
-        await reg.register("tg:1", "assistant", "sdk-1")
+        await reg.register("tg:1", "assistant", "sdk-1", binding_digest=STUB_BINDING_DIGEST, speaker_provenance=STUB_SPEAKER_PROV, user_provenance=STUB_USER_PROV)
 
         # Holding the lock, _save_locked must succeed without deadlock.
         async with reg._lock:
@@ -139,7 +140,7 @@ class TestClearSdkSession:
     async def test_removes_sdk_session_id_field(self, tmp_path):
         path = str(tmp_path / "sessions.json")
         reg = SessionRegistry(path)
-        await reg.register("voice:scope-a", "butler", "sid-123")
+        await reg.register("voice:scope-a", "butler", "sid-123", binding_digest=STUB_BINDING_DIGEST, speaker_provenance=STUB_SPEAKER_PROV, user_provenance=STUB_USER_PROV)
         assert reg.get("voice:scope-a")["sdk_session_id"] == "sid-123"
 
         await reg.clear_sdk_session("voice:scope-a")
@@ -151,7 +152,7 @@ class TestClearSdkSession:
     async def test_keeps_last_active_and_agent(self, tmp_path):
         path = str(tmp_path / "sessions.json")
         reg = SessionRegistry(path)
-        await reg.register("voice:scope-a", "butler", "sid-123")
+        await reg.register("voice:scope-a", "butler", "sid-123", binding_digest=STUB_BINDING_DIGEST, speaker_provenance=STUB_SPEAKER_PROV, user_provenance=STUB_USER_PROV)
         before = reg.get("voice:scope-a")["last_active"]
 
         await reg.clear_sdk_session("voice:scope-a")
@@ -173,7 +174,7 @@ class TestClearSdkSession:
         import json
         path = str(tmp_path / "sessions.json")
         reg = SessionRegistry(path)
-        await reg.register("voice:scope-a", "butler", "sid-123")
+        await reg.register("voice:scope-a", "butler", "sid-123", binding_digest=STUB_BINDING_DIGEST, speaker_provenance=STUB_SPEAKER_PROV, user_provenance=STUB_USER_PROV)
 
         await reg.clear_sdk_session("voice:scope-a")
 
@@ -226,7 +227,7 @@ class TestCrashSafety:
 
         p = tmp_path / "sessions.json"
         reg = SessionRegistry(str(p))
-        await reg.register("tg:1", "assistant", "sdk-OLD")
+        await reg.register("tg:1", "assistant", "sdk-OLD", binding_digest=STUB_BINDING_DIGEST, speaker_provenance=STUB_SPEAKER_PROV, user_provenance=STUB_USER_PROV)
         assert json.loads(p.read_text(encoding="utf-8"))["tg:1"]["sdk_session_id"] == "sdk-OLD"
 
         def boom(*args, **kwargs):

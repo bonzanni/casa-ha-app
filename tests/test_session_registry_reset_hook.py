@@ -5,6 +5,7 @@ from __future__ import annotations
 import pytest
 
 from session_registry import SessionRegistry
+from session_reg_helpers import STUB_BINDING_DIGEST, STUB_SPEAKER_PROV, STUB_USER_PROV
 
 pytestmark = pytest.mark.asyncio
 
@@ -38,7 +39,7 @@ async def test_notify_reset_survives_listener_error(tmp_path):
 async def test_reset_channel_notifies_before_save(tmp_path, monkeypatch):
     import session_saver
     reg = SessionRegistry(str(tmp_path / "sessions.json"))
-    await reg.register("telegram-1", "assistant", "sid-1")
+    await reg.register("telegram-1", "assistant", "sid-1", binding_digest=STUB_BINDING_DIGEST, speaker_provenance=STUB_SPEAKER_PROV, user_provenance=STUB_USER_PROV)
     order = []
 
     async def listener(key): order.append(f"reset:{key}")

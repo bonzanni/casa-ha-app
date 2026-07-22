@@ -42,7 +42,8 @@ def _seed_specialist_dir(
     channels_part = channels if channels is not None else []
     (d / "runtime.yaml").write_text(textwrap.dedent(f"""\
         schema_version: 1
-        model: sonnet
+        kind: specialist
+        model: {{source: fixed, value: sonnet}}
         enabled: {str(enabled).lower()}
         tools:
           allowed: [Read]
@@ -53,6 +54,28 @@ def _seed_specialist_dir(
           strategy: {strategy}
     """), encoding="utf-8")
     return d
+
+
+def _use_synthetic_roles_dir(monkeypatch, tmp_path, *slots: str) -> None:
+    """Personality Phase A, Task 5: SpecialistRegistry.load() -> agent_loader
+    .load_all_specialists() -> load_agent_from_dir() now requires a canonical
+    role artifact under defaults/roles/specialist/<slot>/ for every
+    specialist it loads (cross-validated on kind/slot). The real shipped
+    image only carries 'finance'; tests here deliberately use synthetic
+    specialist names to probe registry mechanics (token budgets, summary
+    logging, disabled-role sorting) unrelated to role-artifact content.
+    SpecialistRegistry has no roles_dir override (out of Task 5's scope —
+    it isn't in the brief's file list), so redirect agent_loader's module-
+    level DEFAULT_ROLES_DIR for the duration of the test instead."""
+    try:
+        from tests.test_agent_loader import _seed_role_artifact
+    except ImportError:
+        from test_agent_loader import _seed_role_artifact
+
+    roles_dir = tmp_path / "roles"
+    for slot in slots:
+        _seed_role_artifact(roles_dir, "specialist", slot)
+    monkeypatch.setattr("agent_loader.DEFAULT_ROLES_DIR", str(roles_dir))
 
 
 # ---------------------------------------------------------------------------
@@ -80,12 +103,13 @@ class TestLoader:
         reg.load()
         assert reg.get("finance") is None
 
-    async def test_loads_enabled_specialist(self, tmp_path):
+    async def test_loads_enabled_specialist(self, tmp_path, monkeypatch):
         from specialist_registry import SpecialistRegistry
 
         specialists = tmp_path / "specialists"
         specialists.mkdir()
         _seed_specialist_dir(specialists, "finance", enabled=True)
+        _use_synthetic_roles_dir(monkeypatch, tmp_path, "finance")
         reg = SpecialistRegistry(str(specialists),
                                  tombstone_path=str(tmp_path / "del.json"))
         reg.load()
@@ -127,7 +151,7 @@ class TestValidation:
         failures = reg.load_failures()
         assert any(name == "bogus" for name, _ in failures)
 
-    async def test_accepts_non_zero_token_budget(self, tmp_path, caplog):
+    async def test_accepts_non_zero_token_budget(self, tmp_path, caplog, monkeypatch):
         """M4b: specialists may opt into Honcho memory by setting
         memory.token_budget > 0. The validator must accept this."""
         import logging
@@ -136,6 +160,7 @@ class TestValidation:
         specialists = tmp_path / "specialists"
         specialists.mkdir()
         _seed_specialist_dir(specialists, "rich", token_budget=1000)
+        _use_synthetic_roles_dir(monkeypatch, tmp_path, "rich")
         reg = SpecialistRegistry(str(specialists),
                                  tombstone_path=str(tmp_path / "del.json"))
         with caplog.at_level(logging.ERROR):
@@ -193,7 +218,7 @@ class TestValidation:
 
 class TestEnabledFiltering:
     async def test_disabled_specialist_parsed_but_skipped(
-        self, tmp_path, caplog,
+        self, tmp_path, caplog, monkeypatch,
     ):
         import logging
         from specialist_registry import SpecialistRegistry
@@ -201,6 +226,7 @@ class TestEnabledFiltering:
         specialists = tmp_path / "specialists"
         specialists.mkdir()
         _seed_specialist_dir(specialists, "finance", enabled=False)
+        _use_synthetic_roles_dir(monkeypatch, tmp_path, "finance")
         reg = SpecialistRegistry(str(specialists),
                                  tombstone_path=str(tmp_path / "del.json"))
         with caplog.at_level(logging.INFO):
@@ -395,6 +421,94 @@ class TestDelegationLifecycle:
 
 
 # ---------------------------------------------------------------------------
+# Task 12: register_delegation's typed creating/executing speaker provenance
+# ---------------------------------------------------------------------------
+
+
+class TestRegisterDelegationSpeakerProvenance:
+    async def test_sources_creating_from_origin_and_executing_from_configs(
+        self, tmp_path,
+    ):
+        """creating_speaker comes from record.origin["speaker_provenance"]
+        (Task 10 Step 7's origin_var wiring); executing_speaker comes from
+        the specialist's own AgentConfig.speaker_provenance, already held in
+        self._configs (populated by load()) — record carries neither."""
+        from config import AgentConfig
+        from personality_types import SpeakerProvenance
+        from specialist_registry import DelegationRecord, SpecialistRegistry
+
+        try:
+            from tests.role_artifact_stub import STUB_ROLE_ARTIFACT
+        except ImportError:
+            from role_artifact_stub import STUB_ROLE_ARTIFACT
+
+        reg = SpecialistRegistry(str(tmp_path / "specialists"),
+                                  tombstone_path=str(tmp_path / "del.json"))
+        reg.load()  # empty dir — no specialists on disk
+        finance_provenance = SpeakerProvenance(
+            speaker_kind="specialist", role_id="specialist:finance",
+            persona_id="casa/finance", persona_version="0.1.0",
+            display_name="Finance", binding_digest="sha256:" + "e" * 64,
+        )
+        reg._configs["finance"] = AgentConfig(
+            role_artifact=STUB_ROLE_ARTIFACT, role="finance",
+            speaker_provenance=finance_provenance,
+        )
+
+        caller = SpeakerProvenance(
+            speaker_kind="resident", role_id="resident:assistant",
+            persona_id="casa/ellen", persona_version="0.1.0",
+            display_name="Ellen", binding_digest="sha256:" + "1" * 64,
+        )
+        record = DelegationRecord(
+            id="d1", agent="finance", started_at=0.0,
+            origin={"role": "assistant", "channel": "telegram",
+                    "speaker_provenance": caller},
+        )
+        await reg.register_delegation(record)
+        job = reg.job_registry.get("d1")
+        assert job.creating_speaker == caller
+        assert job.executing_speaker == finance_provenance
+        assert job.executing_speaker.speaker_kind in {"specialist", "system"}
+        assert job.executing_speaker.speaker_kind != "executor"
+
+    async def test_falls_back_to_system_never_none(self, tmp_path):
+        """No speaker_provenance on origin (legacy/test caller), and the
+        specialist isn't in _configs at all — both fall back to an explicit
+        system identity, never None, never a fabricated persona."""
+        from specialist_registry import DelegationRecord, SpecialistRegistry
+
+        reg = SpecialistRegistry(str(tmp_path / "specialists"),
+                                  tombstone_path=str(tmp_path / "del.json"))
+        reg.load()
+        record = DelegationRecord(
+            id="d2", agent="unknown-specialist", started_at=0.0, origin={},
+        )
+        await reg.register_delegation(record)
+        job = reg.job_registry.get("d2")
+        assert job.creating_speaker.speaker_kind == "system"
+        assert job.executing_speaker.speaker_kind == "system"
+
+    async def test_non_provenance_origin_value_also_falls_back_to_system(
+        self, tmp_path,
+    ):
+        """A non-SpeakerProvenance value under the reserved key (a stale/
+        malformed legacy caller) must not be trusted as-is."""
+        from specialist_registry import DelegationRecord, SpecialistRegistry
+
+        reg = SpecialistRegistry(str(tmp_path / "specialists"),
+                                  tombstone_path=str(tmp_path / "del.json"))
+        reg.load()
+        record = DelegationRecord(
+            id="d3", agent="finance", started_at=0.0,
+            origin={"speaker_provenance": {"speaker_kind": "resident"}},
+        )
+        await reg.register_delegation(record)
+        job = reg.job_registry.get("d3")
+        assert job.creating_speaker.speaker_kind == "system"
+
+
+# ---------------------------------------------------------------------------
 # TestDelegationComplete dataclass shape
 # ---------------------------------------------------------------------------
 
@@ -432,7 +546,7 @@ class TestDelegationCompleteShape:
 
 class TestSummaryLog:
     async def test_summary_line_present_with_mixed_enabled_disabled(
-        self, tmp_path, caplog,
+        self, tmp_path, caplog, monkeypatch,
     ):
         import logging
         from specialist_registry import SpecialistRegistry
@@ -441,6 +555,7 @@ class TestSummaryLog:
         specialists.mkdir()
         _seed_specialist_dir(specialists, "foo", enabled=True)
         _seed_specialist_dir(specialists, "bar", enabled=False)
+        _use_synthetic_roles_dir(monkeypatch, tmp_path, "foo", "bar")
 
         reg = SpecialistRegistry(str(specialists),
                                  tombstone_path=str(tmp_path / "del.json"))
@@ -502,7 +617,7 @@ class TestDisabledAccessors:
         reg.load()
         assert reg.is_disabled("nonexistent") is False
 
-    async def test_is_disabled_true_for_bundled_disabled(self, tmp_path):
+    async def test_is_disabled_true_for_bundled_disabled(self, tmp_path, monkeypatch):
         """A specialist with enabled:false in runtime.yaml lands in
         _disabled_names; is_disabled returns True."""
         from specialist_registry import SpecialistRegistry
@@ -510,13 +625,14 @@ class TestDisabledAccessors:
         specialists = tmp_path / "specialists"
         specialists.mkdir()
         _seed_specialist_dir(specialists, "finance", enabled=False)
+        _use_synthetic_roles_dir(monkeypatch, tmp_path, "finance")
         reg = SpecialistRegistry(str(specialists),
                                  tombstone_path=str(tmp_path / "del.json"))
         reg.load()
         assert reg.is_disabled("finance") is True
         assert reg.get("finance") is None  # confirm not enabled
 
-    async def test_is_disabled_false_for_enabled_specialist(self, tmp_path):
+    async def test_is_disabled_false_for_enabled_specialist(self, tmp_path, monkeypatch):
         """An enabled specialist is NOT disabled — it's in _configs, not
         _disabled_names. is_disabled returns False."""
         from specialist_registry import SpecialistRegistry
@@ -524,13 +640,16 @@ class TestDisabledAccessors:
         specialists = tmp_path / "specialists"
         specialists.mkdir()
         _seed_specialist_dir(specialists, "finance", enabled=True)
+        _use_synthetic_roles_dir(monkeypatch, tmp_path, "finance")
         reg = SpecialistRegistry(str(specialists),
                                  tombstone_path=str(tmp_path / "del.json"))
         reg.load()
         assert reg.is_disabled("finance") is False
         assert reg.get("finance") is not None
 
-    async def test_disabled_roles_returns_sorted_defensive_copy(self, tmp_path):
+    async def test_disabled_roles_returns_sorted_defensive_copy(
+        self, tmp_path, monkeypatch,
+    ):
         from specialist_registry import SpecialistRegistry
 
         specialists = tmp_path / "specialists"
@@ -538,6 +657,7 @@ class TestDisabledAccessors:
         _seed_specialist_dir(specialists, "zeta", enabled=False)
         _seed_specialist_dir(specialists, "alpha", enabled=False)
         _seed_specialist_dir(specialists, "beta", enabled=False)
+        _use_synthetic_roles_dir(monkeypatch, tmp_path, "zeta", "alpha", "beta")
         reg = SpecialistRegistry(str(specialists),
                                  tombstone_path=str(tmp_path / "del.json"))
         reg.load()
@@ -556,13 +676,14 @@ class TestSpecialistBootCapabilities:
     verification has a log oracle for specialist targets too."""
 
     async def test_load_logs_agent_capabilities_for_enabled_specialist(
-        self, tmp_path, caplog
+        self, tmp_path, caplog, monkeypatch,
     ):
         import logging
 
         from specialist_registry import SpecialistRegistry
 
         _seed_specialist_dir(tmp_path, "finance", enabled=True)
+        _use_synthetic_roles_dir(monkeypatch, tmp_path, "finance")
         reg = SpecialistRegistry(str(tmp_path), tombstone_path=str(tmp_path / "d.json"))
         with caplog.at_level(logging.INFO):
             reg.load()
@@ -571,13 +692,58 @@ class TestSpecialistBootCapabilities:
         assert cap, "no agent_capabilities line logged for the enabled specialist at load"
         assert "model=" in cap[0] and "tool_count=" in cap[0]
 
-    async def test_disabled_specialist_gets_no_capabilities_line(self, tmp_path, caplog):
+    async def test_disabled_specialist_gets_no_capabilities_line(self, tmp_path, caplog, monkeypatch):
         import logging
 
         from specialist_registry import SpecialistRegistry
 
         _seed_specialist_dir(tmp_path, "finance", enabled=False)
+        _use_synthetic_roles_dir(monkeypatch, tmp_path, "finance")
         reg = SpecialistRegistry(str(tmp_path), tombstone_path=str(tmp_path / "d.json"))
         with caplog.at_level(logging.INFO):
             reg.load()
         assert not any("agent_capabilities" in r.getMessage() for r in caplog.records)
+
+
+class TestInstalledSpecialistIndexCollisionSet:
+    """Task 13: the slug-collision authority is EVERY image role's bare slot,
+    across ALL THREE kinds (resident, executor, AND specialist) — a prior
+    draft's hard-coded resident+executor-only set silently omitted the
+    bundled specialist:finance, which this regression-gated permanently.
+
+    Task N2's no-gap cutover removed finance (the only bundled specialist)
+    from the image, so `all_collision_slugs` can no longer be proven against
+    a REAL specialist-kind image slot — this test now monkeypatches the
+    frozen `_IMAGE_ROLE_SLOTS` module global (computed once at import from
+    the real image tree) to a synthetic set that still includes a
+    specialist-kind slug, preserving the exact invariant under test:
+    `all_collision_slugs` unions the FULL image role-slot set (whichever
+    kinds it spans) with the installed-specialist set, never a hand-picked
+    per-kind subset."""
+
+    async def test_all_collision_slugs_includes_every_image_role_kind(self, monkeypatch) -> None:
+        from specialist_registry import InstalledSpecialistIndex
+
+        monkeypatch.setattr(
+            "specialist_registry._IMAGE_ROLE_SLOTS",
+            frozenset({"assistant", "butler", "concierge", "configurator",
+                       "plugin-developer", "testspecialist"}),
+        )
+        index = InstalledSpecialistIndex(specialists_dir="/nonexistent")
+        index.load()  # zero installed specialists — this still asserts the IMAGE role set
+        collisions = index.all_collision_slugs()
+        assert "testspecialist" in collisions  # a specialist-kind image slot — the bug this fixes
+        assert {"assistant", "butler", "concierge", "configurator",
+                "plugin-developer", "testspecialist"} <= collisions
+
+    async def test_discover_image_role_slots_scans_every_kind_directory(self, tmp_path) -> None:
+        """Unit-level proof the discovery walks resident/executor/specialist alike —
+        not a hand-picked per-kind constant."""
+        from specialist_registry import _discover_image_role_slots
+
+        for kind, slot in (("resident", "assistant"), ("executor", "configurator"),
+                            ("specialist", "finance")):
+            role_dir = tmp_path / kind / slot
+            role_dir.mkdir(parents=True)
+            (role_dir / "role.yaml").write_text(f"slot: {slot}\n", encoding="utf-8")
+        assert _discover_image_role_slots(str(tmp_path)) == {"assistant", "configurator", "finance"}

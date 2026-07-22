@@ -10,7 +10,7 @@ from contextvars import ContextVar
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from types import MappingProxyType
-from typing import Any, Awaitable, Callable, Mapping
+from typing import Any, Awaitable, Callable, Literal, Mapping
 
 from claude_agent_sdk import (
     AssistantMessage,
@@ -37,10 +37,13 @@ from hooks import resolve_hooks
 from log_cid import cid_var
 import sdk_logging
 from mcp_registry import McpServerRegistry
-from channel_trust import channel_trust_display, user_peer_for_channel
+from channel_trust import channel_trust_display
 from timekeeping import resolve_tz
 from hindsight_ids import bank_id
 from sensitivity import clearance_for_origin, readable_tiers
+from personality_types import SpeakerProvenance
+from recall_renderer import provenance_view, render_recall
+from speaker_provenance import UserProvenance, provenance_from_mapping
 from session_saver import freshness_window, retain_cold_session, save_session
 from semantic_memory import NoOpSemanticMemory, RecallUnavailable, SemanticMemory
 from session_registry import (
@@ -87,6 +90,67 @@ active_semantic_memory = None     # SemanticMemory | None, set by casa_core.main
 # tasks still see the right origin.
 origin_var: ContextVar[dict | None] = ContextVar("origin_var", default=None)
 
+# Personality Task 14 / GH #199: the per-turn explanation draft. ``_build_options``
+# is the ONLY seam that observes the selected prompt projection + the auto-recall
+# hits, so it stashes those fields here; ``_process`` reads the draft at
+# end-of-turn and writes exactly one ``ExplanationStore.record()``. Same-task only
+# — ``_build_options`` is awaited directly inside the turn coroutine (both the
+# bypass path and via the pool's ``turn()``), so a mutable draft dict set here is
+# visible where the record is written, exactly like ``origin_var``. A warm-reuse
+# pool turn SKIPS ``_build_options`` and leaves the draft empty; ``_process`` then
+# records only the deterministic projection/identity fields it can derive itself
+# (honest partial record — no recall ran, the cached prompt was reused).
+_explain_draft_var: ContextVar[dict | None] = ContextVar(
+    "casa_explain_draft", default=None,
+)
+
+
+def _projection_name_for_turn(channel: str, origin_route: str | None) -> str:
+    """Name the bundle projection actually SERVED for this turn, in lockstep
+    with ``prompt_compiler.projection_for`` — the function that selects the
+    served projection on ``_build_options``' normal path (``webhook_trigger``
+    → restricted_webhook, voice → voice, else text).
+
+    Mg (whole-branch review): this MUST mirror ``projection_for``'s predicate
+    (``origin_route == "webhook_trigger"``), NOT a broader
+    ``channel == "webhook" and route != "invoke"`` test. ``_build_options``
+    handles the untrusted-webhook short-circuit SEPARATELY and records
+    "restricted_webhook" directly there (that path never reaches this
+    function); every call site that DOES reach here — the warm-reuse pool
+    record path and the normal-path stash — needs the projection
+    ``projection_for`` chose, and ``projection_for`` deliberately falls back
+    to the text surface for a missing/unknown webhook route rather than
+    treating it as restricted."""
+    if origin_route == "webhook_trigger":
+        return "restricted_webhook"
+    if channel == "voice":
+        return "voice"
+    return "text"
+
+
+def _attribution_label(hit, *, clearance: str | None) -> str:
+    """Derive an HONEST, operator-safe attribution label for one recall hit from
+    its clearance/surface-gated provenance view. Never emits the hit's raw
+    ``application_tags`` (which may carry reserved ``casa-source-`` tags the store
+    rejects) and never a person's display name — only speaker_kind + role/persona
+    IDS, so the label is safe to expose in the DEFAULT (non-sensitive) explain
+    output."""
+    view = provenance_view(
+        hit.provenance, clearance=clearance or "public", surface="text",
+    )
+    if view is None:
+        return "unattributed"
+    if view.speaker_kind == "user":
+        return "user"
+    parts = [view.speaker_kind]
+    if view.role_id:
+        parts.append(view.role_id)
+    label = ":".join(parts)
+    if view.persona_id and view.persona_version:
+        label += f"/{view.persona_id}@{view.persona_version}"
+    return label
+
+
 # Type alias for the streaming callback
 OnTokenCallback = Callable[[str], Awaitable[None]]
 
@@ -131,32 +195,141 @@ def _render_executors_block(executors) -> str:
     return "\n".join(lines)
 
 
-def _resume_decision(
-    channel: str, entry: dict | None, now: datetime, *, role: str | None = None,
-) -> tuple[str, bool]:
-    """Spec §3.3/§4.2: resume iff an entry exists and is within its channel
-    freshness window; otherwise start new — and if a stale entry with a live
-    sdk_session_id exists, signal save-before-overwrite (next-turn-after-gap).
-    Returns (decision, save_old): decision in {"resume","new"}; save_old True
-    only when starting new over a stale-but-present session.
+@dataclass(frozen=True, slots=True)
+class SessionEntrySnapshot:
+    """An immutable copy of a persisted session entry, decoded once under the
+    entry lock so no later mutation of the source dict can bleed into a
+    resume/retain decision (Task 9). ``binding_digest``/``speaker_provenance``/
+    ``user_provenance`` are absent (``None``) on legacy pre-Task-9 entries."""
+    agent: str
+    sdk_session_id: str
+    last_active: str | None
+    scope_class: str | None
+    binding_digest: str | None
+    speaker_provenance: SpeakerProvenance | None
+    user_provenance: SpeakerProvenance | None
 
-    A2: ``role``, when given, is a STRICT resume gate — an entry recorded
-    under a different (or absent) agent is never resumed, even if it's
-    otherwise fresh. Two residents sharing one channel_key's device/scope
-    must never hijack each other's SDK session. An agent-less entry seen
-    alongside a role is defense-in-depth (migrate_to_v2 already drops those)."""
-    if not entry or not entry.get("sdk_session_id"):
-        return ("new", False)
-    if role is not None and entry.get("agent") != role:
-        return ("new", False)
-    la = entry.get("last_active")
+
+@dataclass(frozen=True, slots=True)
+class ResumeDecision:
+    """The structured outcome of the resume gate (replaces the former
+    ``(decision, save_old)`` tuple). ``retain_old``/``old`` drive
+    save-before-overwrite of a superseded cold session."""
+    action: Literal["resume", "new"]
+    resume_sid: str | None
+    retain_old: bool
+    old: SessionEntrySnapshot | None
+    reason: Literal[
+        "missing", "role_mismatch", "binding_mismatch",
+        "fresh", "expired", "invalid_entry",
+    ]
+
+
+def _decode_provenance(raw: object) -> SpeakerProvenance | None:
+    if raw is None:
+        return None
     try:
-        last = datetime.fromisoformat(la) if isinstance(la, str) else None
+        return provenance_from_mapping(raw)
+    except ValueError:
+        return None  # a corrupt stored snapshot is treated as absent, never fabricated
+
+
+def snapshot_session_entry(entry: dict | None) -> SessionEntrySnapshot | None:
+    """Decode a persisted entry into an immutable snapshot, or ``None`` when
+    there is nothing resumable (no entry / no sid / no agent)."""
+    if not entry or not entry.get("sdk_session_id") or not entry.get("agent"):
+        return None
+    return SessionEntrySnapshot(
+        agent=str(entry["agent"]),
+        sdk_session_id=str(entry["sdk_session_id"]),
+        last_active=entry.get("last_active"),
+        scope_class=entry.get("scope_class"),
+        binding_digest=entry.get("binding_digest"),
+        speaker_provenance=_decode_provenance(entry.get("speaker_provenance")),
+        user_provenance=_decode_provenance(entry.get("user_provenance")),
+    )
+
+
+def agent_home_for_role_id(role_id: str) -> str:
+    """Map a canonical ``kind:slot`` role id to its on-disk agent home — the
+    transcript cwd ``get_session_messages``/``delete_session`` read.
+
+    Bare ``/config/agent-home/<slot>`` for EVERY kind (resident, specialist,
+    executor) — this MUST stay byte-for-byte consistent with the actual
+    provisioning in ``agent_home.py``'s ``provision_agent_home`` (``agent_dir
+    = home_root / role``, a bare slug — no ``{kind}s/`` nesting) and with
+    ``Agent._process``'s own ``agent_home = f"/config/agent-home/{self.config.role}"``
+    derivation. Global slug uniqueness (enforced elsewhere) means bare slugs
+    never collide across kinds, so the bare form is safe for all of them
+    (executors get no provisioned home directory at all today, but any
+    session-entry lookup for one must still resolve to the same bare path
+    a resident/specialist would use). If a future plan changes the on-disk
+    layout (e.g. nesting specialists under ``specialists/<slot>``), BOTH this
+    function AND ``agent_home.py``'s provisioning must change together.
+
+    Raises ``ValueError`` on a non-canonical (short, pre-Task-9) role
+    string."""
+    kind, separator, slot = role_id.partition(":")
+    if separator != ":" or kind not in {"resident", "specialist", "executor"} or not slot:
+        raise ValueError(f"invalid canonical role id {role_id!r}")
+    return f"/config/agent-home/{slot}"
+
+
+def speaker_provenance_for_role(cfg: AgentConfig) -> SpeakerProvenance:
+    """Task 9 (finding 3): the ONE fallback policy for a config's own executing
+    identity when ``cfg.speaker_provenance`` is unset — used at every
+    ``SessionRegistry.register`` call site so a nullable ``cfg.speaker_provenance``
+    never reaches ``register``'s non-null ``validate_speaker_provenance`` gate.
+
+    - A resident (Task 8 always activates this) keeps its real persona identity.
+    - ``cfg.kind == "executor"`` (never persona/binding-bearing per the taxonomy)
+      gets a stable, honestly-labeled executor identity.
+    - Anything else with NO activated binding yet (an unbound Plan-1 specialist,
+      or an identity-less unit-test config) gets the explicit unattributed
+      ``system`` identity — a VALID provenance (every field null) that is honest
+      about "unattributed" rather than fabricating a persona. Resolves itself the
+      moment Plan 2 populates ``cfg.speaker_provenance`` for specialists."""
+    if cfg.speaker_provenance is not None:
+        return cfg.speaker_provenance
+    if cfg.kind == "executor" and cfg.role_id:
+        return SpeakerProvenance(speaker_kind="executor", role_id=cfg.role_id)
+    return SpeakerProvenance(speaker_kind="system")
+
+
+def _resume_decision(
+    channel: str, entry: dict | None, now: datetime, *,
+    role_id: str, binding_digest: str,
+) -> ResumeDecision:
+    """Spec §3.3/§4.2 + personality Task 9: resume iff a stored entry exists,
+    matches this config's ``{role_id, binding_digest}`` identity, AND is within
+    its channel freshness window. A role or binding mismatch — or a stale but
+    present session — signals save-before-overwrite via ``retain_old``/``old``.
+
+    The role gate is checked BEFORE the digest gate so a legacy short-role
+    entry (``"butler"``) is reported as ``role_mismatch`` against a canonical
+    ``"resident:butler"`` lookup and never resumed. For a specialist/executor
+    with no binding populated, both stored and looked-up ``binding_digest`` are
+    ``""`` — the digest gate degrades to a no-op and resume falls back to
+    role-id-only gating, byte-for-byte matching the prior behavior."""
+    old = snapshot_session_entry(entry)
+    if old is None:
+        return ResumeDecision("new", None, False, None, "missing")
+    if old.agent != role_id:
+        return ResumeDecision("new", None, True, old, "role_mismatch")
+    if (old.binding_digest or "") != (binding_digest or ""):
+        return ResumeDecision("new", None, True, old, "binding_mismatch")
+    try:
+        last = (
+            datetime.fromisoformat(old.last_active)
+            if isinstance(old.last_active, str) else None
+        )
     except ValueError:
         last = None
-    if last is not None and (now - last) <= freshness_window(channel):
-        return ("resume", False)
-    return ("new", True)
+    if last is None:
+        return ResumeDecision("new", None, True, old, "invalid_entry")
+    if (now - last) <= freshness_window(channel):
+        return ResumeDecision("resume", old.sdk_session_id, False, old, "fresh")
+    return ResumeDecision("new", None, True, old, "expired")
 
 
 @dataclass(frozen=True)
@@ -416,7 +589,8 @@ class Agent:
             # impossible post-A2 collision-safety, but defense-in-depth) never
             # resumes.
             decide=lambda ch, entry, now: _resume_decision(
-                ch, entry, now, role=self.config.role,
+                ch, entry, now,
+                role_id=self.config.role_id, binding_digest=self.config.binding_digest,
             ),
             origin_ctxvar=origin_var, cid_ctxvar=cid_var,
             engagement_ctxvar=_engagement_var,
@@ -666,7 +840,6 @@ class Agent:
             self.config.role,
             msg.context.get("chat_id"),
         )
-        user_peer = user_peer_for_channel(msg.channel)
         user_text = str(msg.content)
 
         # The origin snapshot is set into ``origin_var`` for this task (so the
@@ -692,6 +865,17 @@ class Agent:
             "message_type": msg.type.value,
             "source": msg.source,
             "execution_role": self.config.role,
+            # Provenance foundation (Task 9/10): the real identity of the agent
+            # whose turn this is — a live SpeakerProvenance dataclass (or None
+            # for a config not yet bound to a persona: an executor, or a Plan-1
+            # specialist before Plan 2's N1 wires its binding). This is what lets
+            # a delegated turn attribute its CALLER correctly instead of having
+            # no provenance to read at all. Stored as a LIVE object (never a
+            # mapping) because origin_var is an in-process ContextVar — exactly
+            # like the _voice_handoff_reservation object carried below. It is
+            # NEVER persisted: engagement tombstones strip it (see
+            # engagement_registry._persistable_origin).
+            "speaker_provenance": self.config.speaker_provenance,
         }
         # Reserved provenance markers (synthetic turn replay, button
         # answers) ride on msg.context when a LATER task (ask_user/button
@@ -750,6 +934,15 @@ class Agent:
                     and callable(getattr(reservation, "commit", None))):
                 origin_snapshot["_voice_handoff_reservation"] = reservation
         origin_token = origin_var.set(origin_snapshot)
+        # Task 14 / #199: per-turn explanation scaffolding. ``explain_draft`` is
+        # populated by ``_build_options`` (projection + recall attributions);
+        # ``turn_state`` captures the on_message ``state`` dict of whichever
+        # attempt produced the response (its ``tool_names_by_id`` are the turn's
+        # tool calls). Both are read once at end-of-turn to record the
+        # explanation — a store failure there never touches the user's reply.
+        explain_draft: dict[str, Any] = {}
+        explain_token = _explain_draft_var.set(explain_draft)
+        turn_state: dict[str, Any] = {}
         try:
             # Resolve cwd to the agent-home (Plan 4b §5.1). Residents live at
             # /config/agent-home/<role>/; configured cwd on
@@ -758,6 +951,25 @@ class Agent:
                 self.config.cwd
                 or f"/config/agent-home/{self.config.role}"
             )
+
+            # Task 9: build this turn's persisted user identity ONCE, from the
+            # server-created typed ingress field (never free-text
+            # origin/context), so the pooled ``_publish``, the bypass path, and
+            # the final ``register()`` all persist the SAME identity. A turn
+            # with no trusted ingress (scheduled heartbeat, webhook trigger,
+            # delegation-completion synthesis, internal/test turn) has no human
+            # author — it is recorded with the honest unattributed ``system``
+            # identity, never a fabricated user.
+            trusted = msg.trusted_user_origin
+            if trusted is not None:
+                user_provenance = UserProvenance.from_origin(
+                    surface=trusted.surface,
+                    server_origin=trusted.server_origin,
+                    authenticated_user=trusted.authenticated_user,
+                    user_peer=trusted.user_peer,
+                )
+            else:
+                user_provenance = SpeakerProvenance(speaker_kind="system")
 
             # <current_time> rides on the per-turn query text (NOT the cached
             # system prompt) so the agent still knows the wall-clock time to
@@ -810,6 +1022,7 @@ class Agent:
                 on_message, state = self._make_on_message(
                     on_token, turn_guard,
                 )
+                turn_state["state"] = state
 
                 async def _build(is_fresh, resume_sid):
                     # Recorded HERE too (not just via on_decision below) so a
@@ -829,11 +1042,14 @@ class Agent:
                     nonlocal session_published
                     await self._session_registry.register(
                         channel_key=channel_key,
-                        agent=self.config.role,
+                        agent=self.config.role_id,
                         sdk_session_id=sid,
                         scope_class=(
                             "webhook_oneshot" if is_webhook_oneshot else None
                         ),
+                        binding_digest=self.config.binding_digest,
+                        speaker_provenance=speaker_provenance_for_role(self.config),
+                        user_provenance=user_provenance,
                     )
                     session_published = True
 
@@ -841,8 +1057,9 @@ class Agent:
                     channel_key=channel_key, channel=msg.channel,
                     prompt=prompt_text, origin=origin_snapshot,
                     cid=cid_var.get(), build_options=_build,
-                    on_stale_old=lambda old_sid: self._spawn_cold_retain(
-                        old_sid, agent_home, user_peer, msg.channel,
+                    binding_digest=self.config.binding_digest,
+                    on_stale_old=lambda old: self._spawn_cold_retain(
+                        old, directory=agent_home, channel=msg.channel,
                     ),
                     on_message=on_message,
                     on_success=_publish,
@@ -871,27 +1088,27 @@ class Agent:
                     else None
                 )
                 existing = self._session_registry.get(channel_key)
-                decision, save_old = _resume_decision(
+                decision = _resume_decision(
                     msg.channel, existing, datetime.now(timezone.utc),
-                    role=self.config.role,
+                    role_id=self.config.role_id,
+                    binding_digest=self.config.binding_digest,
                 )
                 resume_sid = (
-                    existing.get("sdk_session_id")
-                    if decision == "resume" and existing else None
+                    decision.resume_sid if decision.action == "resume" else None
                 )
                 last_resume["sid"] = resume_sid
-                if decision == "resume":
+                if decision.action == "resume":
                     await self._session_registry.touch(channel_key)
-                elif save_old and (existing or {}).get("sdk_session_id"):
+                elif decision.retain_old and decision.old is not None:
                     # next-turn-after-gap: register() below overwrites this
-                    # channel's pointer, so retain the OLD sid in the BACKGROUND
-                    # (claim-free / registry-decoupled — cannot race register();
-                    # per-item classification runs off the hot path, tier §2.4).
+                    # channel's pointer, so retain the OLD immutable snapshot in
+                    # the BACKGROUND (claim-free / registry-decoupled — cannot
+                    # race register(); per-item classification runs off the hot
+                    # path, tier §2.4).
                     self._spawn_cold_retain(
-                        existing["sdk_session_id"], agent_home, user_peer,
-                        msg.channel,
+                        decision.old, directory=agent_home, channel=msg.channel,
                     )
-                # else ("new", False): no prior entry → nothing to save
+                # else ("new", retain_old=False): no prior entry → nothing to save
                 options = await self._build_options(
                     channel=msg.channel, channel_key=channel_key,
                     is_fresh=resume_sid is None, resume_sid=resume_sid,
@@ -904,6 +1121,7 @@ class Agent:
                 on_message, state = self._make_on_message(
                     on_token, turn_guard,
                 )
+                turn_state["state"] = state
                 try:
                     await client.open()
                     async with client.lock:
@@ -955,12 +1173,25 @@ class Agent:
             # Per-turn telemetry (spec 5.2 §5.2). Microsecond cost — string
             # format + one logger.info — and runs after streaming has
             # already flushed via on_token, so it is not on the voice
-            # critical path.
+            # critical path. Task 14: also carries binding provenance (when
+            # this role is persona-bound) so a `turn_tokens` line can be tied
+            # back to the exact role/binding/dependency set via `casactl
+            # explain`/`persona diff` — omitted (None/empty) for roles with
+            # no binding, which keeps the line byte-identical to pre-Task-14.
+            _binding = self.config.binding
             logger.info(
                 format_turn_summary(
                     self.config.role,
                     msg.channel or "-",
                     usage,
+                    role_checksum=self.config.role_checksum or None,
+                    binding_digest=self.config.binding_digest or None,
+                    dependency_digests=(
+                        _binding.dependency_digests if _binding is not None else ()
+                    ),
+                    effective_config_digest=(
+                        _binding.effective_config_digest if _binding is not None else None
+                    ),
                 ),
             )
 
@@ -979,14 +1210,158 @@ class Agent:
             if sdk_session_id and not session_published:
                 await self._session_registry.register(
                     channel_key=channel_key,
-                    agent=self.config.role,
+                    agent=self.config.role_id,
                     sdk_session_id=sdk_session_id,
                     scope_class="webhook_oneshot" if is_webhook_oneshot else None,
+                    binding_digest=self.config.binding_digest,
+                    speaker_provenance=speaker_provenance_for_role(self.config),
+                    user_provenance=user_provenance,
                 )
+
+            # Task 14 / #199: record this turn's provenance so an operator can
+            # `casactl explain <cid>` it. Fail-safe (never raises) and off the
+            # streaming path — on_token already flushed the reply above.
+            await self._record_turn_explanation(
+                channel=msg.channel or "-",
+                turn_state=turn_state,
+                explain_draft=explain_draft,
+            )
 
             return response_text or None
         finally:
+            _explain_draft_var.reset(explain_token)
             origin_var.reset(origin_token)
+
+    def _stash_explanation_draft(
+        self, *, projection: str, bundle, system_prompt: str,
+        facts: str, hits: tuple, clearance: str | None,
+    ) -> None:
+        """Populate this turn's ``_explain_draft_var`` with the projection +
+        prompt + recall attributions that only ``_build_options`` observes.
+        Reads/writes the per-turn draft dict in place; a no-op when no draft is
+        bound (e.g. ``_build_options`` called directly by a unit test). Never
+        raises into the options path."""
+        draft = _explain_draft_var.get(None)
+        if draft is None:
+            return
+        try:
+            if bundle is not None:
+                proj_obj = getattr(bundle, projection)
+                draft["static_prompt_digest"] = proj_obj.digest
+                draft["static_prompt_estimated_tokens"] = proj_obj.estimated_tokens
+            else:
+                draft["static_prompt_digest"] = ""
+                draft["static_prompt_estimated_tokens"] = 0
+            draft["projection"] = projection
+            # Distinct tiers touched, insertion-ordered; attributions are the
+            # clearance-gated, casa-source-free labels (never raw tags).
+            draft["memory_tiers"] = tuple(
+                dict.fromkeys(h.sensitivity for h in hits)
+            )
+            draft["memory_attributions"] = tuple(
+                _attribution_label(h, clearance=clearance) for h in hits
+            )
+            draft["system_prompt"] = system_prompt
+            draft["memory_text"] = facts or None
+        except Exception:  # noqa: BLE001
+            logger.debug("explanation draft stash skipped", exc_info=True)
+
+    async def _record_turn_explanation(
+        self, *, channel: str, turn_state: dict, explain_draft: dict,
+    ) -> None:
+        """Write ONE ExplanationStore record for the turn just completed so an
+        operator can ``casactl explain <cid>`` it. Fail-safe by contract: any
+        error (no store bound, an unrecordable ``"-"`` cid, a store write fault)
+        is swallowed at debug level — the user's reply has already been produced
+        and must never be delayed or failed by this telemetry.
+
+        F7 (whole-branch review): ``ExplanationStore.record`` does a synchronous
+        file write PLUS a prune that globs+stats up to EXPLANATION_MAX_RECORDS
+        entries. Running that on the event loop blocked it every turn. The
+        entire record is assembled here on the loop from task-local state
+        (contextvars, ``self.config``, the per-turn draft/turn_state locals —
+        all immutable by the time it is built), then ONLY the blocking
+        ``store.record(record)`` is handed to ``asyncio.to_thread``; a fault in
+        the thread re-raises into this same fail-safe try/except and is
+        swallowed, exactly as before."""
+        runtime = active_runtime
+        store = getattr(runtime, "explanation_store", None) if runtime else None
+        if store is None:
+            return
+        cid = cid_var.get()
+        try:
+            from explanation_store import ExplanationRecord
+
+            route = (origin_var.get(None) or {}).get("_origin_route")
+            _bundle = (
+                self.config.compiled_prompt_bundle
+                if self.config.kind == "resident" else None
+            )
+            # Prefer what _build_options observed; else derive deterministically
+            # (a warm-reuse pool turn skips _build_options — projection selection
+            # is still deterministic from channel+route+bundle).
+            projection = explain_draft.get("projection")
+            static_digest = explain_draft.get("static_prompt_digest")
+            static_tokens = explain_draft.get("static_prompt_estimated_tokens")
+            if projection is None:
+                if _bundle is not None:
+                    projection = _projection_name_for_turn(channel, route)
+                    proj_obj = getattr(_bundle, projection)
+                    static_digest = proj_obj.digest
+                    static_tokens = proj_obj.estimated_tokens
+                else:
+                    projection = "legacy"
+                    static_digest = ""
+                    static_tokens = 0
+            binding = self.config.binding
+            state = turn_state.get("state") or {}
+            tool_calls = tuple(sorted({
+                name
+                for name in (state.get("tool_names_by_id") or {}).values()
+                if name
+            }))
+            record = ExplanationRecord(
+                correlation_id=cid,
+                role_id=self.config.role_id,
+                kind=self.config.kind or "",
+                resolved_model=self.config.model,
+                persona_ref=(
+                    f"{binding.persona_id}@{binding.persona_version}"
+                    if binding is not None else None
+                ),
+                role_checksum=self.config.role_checksum or "",
+                binding_digest=self.config.binding_digest or None,
+                dependency_digests=(
+                    binding.dependency_digests if binding is not None else ()
+                ),
+                effective_config_digest=(
+                    binding.effective_config_digest if binding is not None else None
+                ),
+                # Residents have no lifecycle state (a specialist-instance
+                # concept); honestly None rather than fabricated.
+                lifecycle_state=None,
+                projection=projection,
+                static_prompt_digest=static_digest or "",
+                static_prompt_estimated_tokens=int(static_tokens or 0),
+                memory_tiers=tuple(explain_draft.get("memory_tiers", ())),
+                memory_attributions=tuple(
+                    explain_draft.get("memory_attributions", ())
+                ),
+                tool_calls=tool_calls,
+                # Denials happen inside PreToolUse hooks and are not surfaced to
+                # this seam (see GH #199): recorded empty, an honest gap.
+                denials=(),
+                system_prompt=explain_draft.get("system_prompt"),
+                memory_text=explain_draft.get("memory_text"),
+            )
+            # F7: the blocking write+prune runs off the event loop. `record`
+            # is a fully-built immutable dataclass; nothing task-local is read
+            # inside the thread.
+            await asyncio.to_thread(store.record, record)
+        except Exception:  # noqa: BLE001
+            logger.debug(
+                "explanation record skipped cid=%s", cid, exc_info=True,
+            )
 
     async def _build_options(
         self, *, channel: str, channel_key: str, is_fresh: bool,
@@ -1011,14 +1386,35 @@ class Agent:
         # webhook_trigger turns are SCHEDULED → bypass the client pool → fresh
         # options per turn, so this branch is pool-key-neutral.
         _route = (origin_var.get(None) or {}).get("_origin_route")
+        # Personality Phase A, Task 8: a resident config carries a compiled
+        # per-surface prompt bundle; specialists/executors keep None and stay on
+        # the legacy self.config.system_prompt path untouched.
+        _bundle = (
+            self.config.compiled_prompt_bundle
+            if self.config.kind == "resident" else None
+        )
         if channel == "webhook" and _route != "invoke":
+            # An untrusted webhook origin ALWAYS takes the restricted_webhook
+            # projection (persona-stripped) for a resident — never route through
+            # projection_for here, which would fall back to the text surface for
+            # a missing/unknown route and leak the persona to an untrusted origin.
+            restricted_prompt = (
+                _bundle.restricted_webhook.system_prompt
+                if _bundle is not None else self.config.system_prompt
+            )
             restricted = build_restricted_webhook_options(
                 model=self.config.model,
                 role=self.config.role,
-                system_prompt=self.config.system_prompt,
+                system_prompt=restricted_prompt,
                 max_turns=self.config.tools.max_turns,
                 agent_home=agent_home,
                 resume_sid=resume_sid,
+            )
+            # #199: an untrusted webhook turn does no recall — record the
+            # restricted projection + its persona-stripped prompt, memory empty.
+            self._stash_explanation_draft(
+                projection="restricted_webhook", bundle=_bundle,
+                system_prompt=restricted_prompt, facts="", hits=(), clearance=None,
             )
             return sdk_logging.with_stderr_callback(restricted, engagement_id=None)
 
@@ -1029,6 +1425,11 @@ class Agent:
         bank = _memory_bank()
         overlay_digest = ""
         facts = ""
+        # #199: the recall hits (+ the clearance they were gated at) feed the
+        # explanation record's memory attributions; empty unless a recall
+        # actually succeeds below.
+        _recall_hits: tuple = ()
+        _recall_clearance_used: str | None = None
         if load_plan.push_overlay and _overlay_allowed(channel):
             try:
                 overlay_digest = await self._semantic_memory.profile(bank)
@@ -1047,20 +1448,35 @@ class Agent:
             )
         elif load_plan.auto_recall:
             _recall_t0 = time.monotonic()
+            _recall_clearance = _current_origin_clearance(channel)
             try:
                 # Bounded deadline: never the full HTTP timeout. No synchronous
                 # retry on failure — a 504 means the reranker is overloaded and
                 # retrying makes it worse (the seam itself only retries
                 # connection-level drops, never HTTP errors).
-                facts = await asyncio.wait_for(
-                    self._semantic_memory.recall(
+                #
+                # Task 11: the awaited method is now the typed, attributed
+                # recall_items; the OWN _RecallBreaker/wait_for/record_* logic
+                # around it is UNCHANGED (this site is NOT wrapped in the new
+                # recall_health breaker). On success the hits are rendered with
+                # their recorded attribution before assignment to ``facts``.
+                _hits = await asyncio.wait_for(
+                    self._semantic_memory.recall_items(
                         bank, user_text, tags=_recall_tier_tags(channel),
                         max_tokens=self.config.memory.token_budget,
+                        clearance=_recall_clearance,
                         budget="mid",  # auto_recall is always non-voice (see _plan_load); voice uses the recall_memory pull tool at budget=low
                     ),
                     timeout=_AUTO_RECALL_TIMEOUT_S,
                 )
                 self._recall_breaker.record_success()
+                _recall_hits = _hits
+                _recall_clearance_used = _recall_clearance
+                facts = render_recall(
+                    _hits, current_speaker=speaker_provenance_for_role(self.config),
+                    surface="text", clearance=_recall_clearance,
+                    token_budget=self.config.memory.token_budget,
+                )
             except (RecallUnavailable, asyncio.TimeoutError) as exc:
                 self._recall_breaker.record_failure()
                 logger.warning(
@@ -1096,8 +1512,19 @@ class Agent:
                 self.config.memory.token_budget,
             )
 
-        # 3. System prompt = composed-prompt + runtime-injected blocks.
-        system_parts = [self.config.system_prompt]
+        # 3. System prompt = composed-prompt + runtime-injected blocks. For a
+        # resident, the base is the immutable compiled projection selected for
+        # this surface (text/voice); specialists/executors keep the legacy
+        # composed self.config.system_prompt (Plan 1 does not touch their
+        # prompt composition).
+        if _bundle is not None:
+            from prompt_compiler import projection_for
+            base_system_prompt = projection_for(
+                _bundle, channel=channel, origin_route=_route,
+            ).system_prompt
+        else:
+            base_system_prompt = self.config.system_prompt
+        system_parts = [base_system_prompt]
         if memory_blocks:
             system_parts.append("\n" + memory_blocks)
         system_parts.append(
@@ -1121,6 +1548,19 @@ class Agent:
         # prompt caching for the whole conversation every turn (see M27). It
         # rides on the per-turn query text (built in _process).
         system_prompt = "\n".join(system_parts)
+
+        # #199: stash the projection + assembled prompt + recall attributions for
+        # this turn's explanation record. A resident's projection name is derived
+        # in lockstep with the projection_for selection above; a
+        # specialist/executor (no bundle) records the honest "legacy" projection.
+        self._stash_explanation_draft(
+            projection=(
+                _projection_name_for_turn(channel, _route)
+                if _bundle is not None else "legacy"
+            ),
+            bundle=_bundle, system_prompt=system_prompt,
+            facts=facts, hits=_recall_hits, clearance=_recall_clearance_used,
+        )
 
         # 4. Hooks — resolved from hooks.yaml at load time by agent_loader.
         #    I-2 (v0.69.8): always inject the agent-home settings.json
@@ -1475,18 +1915,23 @@ class Agent:
             return resolution
 
     def _spawn_cold_retain(
-        self, sid: str, directory: str, user_peer: str, channel: str,
+        self, old: SessionEntrySnapshot, *, directory: str, channel: str,
     ) -> None:
         """Retain a cold prior session in the background (claim-free; cannot race
         register()). Tracked so it isn't GC'd; failures are swallowed in
-        retain_cold_session and never reach the turn."""
+        retain_cold_session and never reach the turn.
+
+        Task 9/10: takes the immutable ``SessionEntrySnapshot`` the resume gate
+        produced (``decision.old``) and passes it straight through to the reduced
+        ``retain_cold_session``, which reads the speaker/user provenance off the
+        snapshot itself. A legacy/corrupt snapshot with no usable provenance
+        retains nothing (never invents authorship)."""
         task = asyncio.create_task(
             retain_cold_session(
-                sid=sid, role=self.config.role, directory=directory,
-                user_peer=user_peer, channel=channel,
+                old, directory=directory, channel=channel,
                 semantic_memory=self._semantic_memory,
             ),
-            name=f"cold-retain-{sid}",
+            name=f"cold-retain-{old.sdk_session_id}",
         )
         self._bg_tasks.add(task)
         task.add_done_callback(self._bg_tasks.discard)

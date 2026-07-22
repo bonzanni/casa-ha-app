@@ -12,6 +12,7 @@ from enum import Enum
 from typing import Any, Callable, Coroutine
 
 from log_cid import cid_var
+from personality_types import TrustedUserOriginInput
 
 logger = logging.getLogger(__name__)
 
@@ -37,6 +38,12 @@ class BusMessage:
     context: dict[str, Any] = field(default_factory=dict)
     timestamp: datetime = field(default_factory=lambda: datetime.now(timezone.utc))
     priority: int = 1
+    # Personality Task 9: server-created per-turn ingress identity, set by an
+    # authenticated channel AFTER external-context sanitization (never decoded
+    # from payload/free-text). ``None`` for author-less turns (scheduled,
+    # webhook trigger, synthetic, internal) — those record a ``system``
+    # user identity, not a fabricated user.
+    trusted_user_origin: TrustedUserOriginInput | None = None
 
 
 # Type alias for handler callbacks

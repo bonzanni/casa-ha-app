@@ -1,0 +1,35 @@
+schema_version: 1
+kind: resident
+model:
+  source: ha_option
+  option: voice_agent_model
+  default: haiku
+  allowed: [opus, sonnet, haiku]
+enabled: true
+tools:
+  allowed:
+    - WebSearch
+    - mcp__casa-framework__delegate_to_agent
+  disallowed: [Bash, Write, Edit, Read, Glob, Grep, WebFetch, NotebookEdit, Agent, Task]
+  permission_mode: dontAsk
+  max_turns: 6
+mcp_server_names:
+  - casa-framework
+memory:
+  token_budget: 0
+  read_strategy: cached
+channels:
+  - ha_voice
+session:
+  strategy: pooled
+  idle_timeout: 300
+tts:
+  tag_dialect: square_brackets
+voice_errors:
+  timeout:       "[apologetic] That took too long — ask me again?"
+  rate_limit:    "[flat] Give me a minute, I'm swamped."
+  sdk_error:     "[apologetic] I couldn't reach my brain. Try again?"
+  memory_error:  ""
+  channel_error: "[flat] Something went wrong sending that."
+  unknown:       "[flat] Sorry, something went wrong."
+cwd: ""

@@ -26,6 +26,8 @@ _GITIGNORE_CONTENT = """\
 !agents/**
 !policies/
 !policies/**
+!bindings/
+!bindings/**
 !schema/
 !schema/**
 # Unified plugin architecture (v0.71.0): the registry is config — the single
@@ -36,6 +38,17 @@ _GITIGNORE_CONTENT = """\
 !plugins/registry.json
 plugins/store/
 plugins/.staging/
+# Installed-specialist data model (Task 13): registry.json is config — same
+# audit-trail rationale as plugins/registry.json above. ONLY the per-slug
+# active/desired/prior tuples and the top-level registry are tracked; the
+# content-addressed component store and staging are binaries, never tracked.
+!specialists/
+!specialists/registry.json
+!specialists/*/active.yaml
+!specialists/*/desired.yaml
+!specialists/*/active.prior.yaml
+specialists/store/
+specialists/.staging/
 !.gitignore
 """
 

@@ -18,6 +18,11 @@ from specialist_limits import SpecialistLimiter
 from specialist_registry import SpecialistRegistry
 from test_agent_process import _make_agent
 
+try:
+    from tests.role_artifact_stub import STUB_ROLE_ARTIFACT
+except ImportError:
+    from role_artifact_stub import STUB_ROLE_ARTIFACT
+
 
 pytestmark = [pytest.mark.unit, pytest.mark.asyncio]
 
@@ -83,11 +88,11 @@ async def test_voice_job_completion_never_reenters_gary(
     specialists = SpecialistRegistry(
         str(tmp_path / "specialists"), job_registry=registry,
     )
-    caller = AgentConfig(role="concierge")
+    caller = AgentConfig(role_artifact=STUB_ROLE_ARTIFACT, role="concierge")
     caller.delegates = [
         DelegateEntry(agent="judge", purpose="rules", when="rules question"),
     ]
-    judge = AgentConfig(
+    judge = AgentConfig(role_artifact=STUB_ROLE_ARTIFACT, 
         role="judge",
         character=CharacterConfig(name="Judge"),
         model="claude-sonnet-4-6",

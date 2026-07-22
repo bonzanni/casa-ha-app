@@ -10,9 +10,9 @@ Spec: docs/superpowers/specs/2026-05-02-granular-reload-design.md §2.
 """
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from pathlib import Path
-from typing import TYPE_CHECKING, Any
+from typing import TYPE_CHECKING, Any, Mapping
 
 if TYPE_CHECKING:
     from agent import Agent
@@ -24,7 +24,12 @@ if TYPE_CHECKING:
     from executor_registry import ExecutorRegistry
     from job_registry import JobRegistry
     from mcp_registry import McpServerRegistry
+    from personality_binding import BindingRecord
+    from persona_pack import PersonaPack
     from policies import PolicyLibrary
+    from prompt_compiler import CompiledPromptBundle
+    from role_slot import RoleSlot
+    from explanation_store import ExplanationStore
     from semantic_memory import SemanticMemory
     from session_registry import SessionRegistry
     from specialist_registry import SpecialistRegistry
@@ -87,3 +92,24 @@ class CasaRuntime:
     job_registry: "JobRegistry | None" = None
     voice_route_registry: "VoiceRouteRegistry | None" = None
     voice_delivery_coordinator: "VoiceDeliveryCoordinator | None" = None
+
+    # Personality Phase A, Task 8: read-only persona/binding registries derived
+    # from the loaded resident configs at boot (and rebuilt by reloads). Keyed
+    # per the interface note: role_slots by role_id, persona_packs by
+    # "<persona_id>@<version>", bindings/compiled_prompt_bundles by role_id.
+    # Defaulted (empty) so every existing narrow CasaRuntime(...) test
+    # constructor keeps compiling unchanged — MUST stay after the fields above
+    # (dataclass-ordering rule).
+    role_slots: "Mapping[str, RoleSlot]" = field(default_factory=dict)
+    persona_packs: "Mapping[str, PersonaPack]" = field(default_factory=dict)
+    bindings: "Mapping[str, BindingRecord]" = field(default_factory=dict)
+    compiled_prompt_bundles: "Mapping[str, CompiledPromptBundle]" = field(default_factory=dict)
+
+    # Personality Phase A, Task 14: lean per-correlation-id explanation store
+    # (inspect/explain telemetry). Constructed once at boot
+    # (ExplanationStore(Path("/data/explanations"))) and preserved verbatim
+    # across reload.py's mutate-in-place candidate-registry swap (reload.py
+    # never reconstructs CasaRuntime). Defaulted (None) so every existing
+    # narrow CasaRuntime(...) test constructor keeps compiling unchanged —
+    # MUST stay the final field (dataclass-ordering rule).
+    explanation_store: "ExplanationStore | None" = None

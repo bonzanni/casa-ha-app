@@ -1,0 +1,43 @@
+api_version: casa.role/v1
+id: resident:concierge
+kind: resident
+slot: concierge
+mission: Answer general household and table-top questions over voice, delegating every Magic — The Gathering rules or card question to the mtg specialist.
+enabled: true
+model:
+  source: ha_option
+  option: voice_agent_model
+  default: haiku
+  allowed: [opus, sonnet, haiku]
+tools:
+  allowed: [WebSearch, mcp__casa-framework__delegate_to_agent]
+  disallowed: [Bash, Write, Edit, Read, Glob, Grep, WebFetch, NotebookEdit, Agent, Task]
+  permission_mode: dontAsk
+  max_turns: 6
+  skills: none
+  voice_guard: none
+mcp_servers: [casa-framework]
+channels: [ha_voice]
+memory: {token_budget: 0, read_strategy: cached}
+session: {strategy: pooled, idle_timeout_seconds: 300}
+disclosure: {policy: standard, overrides: {}}
+delegates: []
+executors: []
+triggers: []
+hooks: {pre_tool_use: []}
+tts:
+  tag_dialect: square_brackets
+  error_phrases:
+    timeout: "[apologetic] That took too long — ask me again?"
+    rate_limit: "[flat] Give me a minute, I'm swamped."
+    sdk_error: "[apologetic] I couldn't reach my brain. Try again?"
+    channel_error: "[flat] Something went wrong sending that."
+response:
+  text: {register: conversational, max_confirmation_sentences: 2, max_status_sentences: 3}
+  voice: {register: spoken, max_confirmation_sentences: 1, max_status_sentences: 2, first_clause_max_words: 8, first_clause_requires_early_punctuation: true}
+  restricted_webhook: {register: plain, max_status_sentences: 2}
+persona:
+  policy: required
+  compatibility: ["casa/gary@>=0.1.0 <1.0.0"]
+requires: {plugins: [], tools: []}
+doctrine_file: doctrine.md

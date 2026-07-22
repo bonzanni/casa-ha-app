@@ -1,5 +1,10 @@
 schema_version: 1
-model: "${VOICE_AGENT_MODEL}"
+kind: resident
+model:
+  source: ha_option
+  option: voice_agent_model
+  default: haiku
+  allowed: [opus, sonnet, haiku]
 enabled: true
 tools:
   allowed:

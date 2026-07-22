@@ -27,3 +27,13 @@ opentelemetry-api>=1.43.0
 # §A.6.1) confirmed FastMCP `instructions=` kwarg + `Server.create_initialization_options(
 # experimental_capabilities={...})` bootstrap path on this version range.
 mcp>=1.28.1,<2
+# Personality Phase A (Task 2): RFC 8785 (JSON Canonicalization Scheme)
+# canonical bytes for the immutable speaker-provenance codec — the
+# `casa-source-v1.` reserved Hindsight tag must encode a byte-stable
+# canonical JSON payload so encode/decode round trips are deterministic.
+rfc8785==0.1.4
+# Personality Phase A (Task 3): ACCEPTED-CommonMark validation for the
+# strict persona-pack loader's persona.md parsing (markdown_sections.py) —
+# rejects unsupported Markdown tokens/raw HTML and does byte-preserving
+# source-slice section extraction.
+markdown-it-py==4.0.0

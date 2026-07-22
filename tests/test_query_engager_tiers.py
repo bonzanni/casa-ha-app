@@ -12,6 +12,15 @@ import pytest
 pytestmark = [pytest.mark.unit]
 
 
+def _hit(text):
+    from personality_types import RecallHit
+    return RecallHit(
+        text=text, memory_type="world", sensitivity="friends",
+        application_tags=(), provenance=None, backend_id="b1", document_id=None,
+        chunk_id=None, source_fact_ids=None, metadata=None, context=None, score=None,
+    )
+
+
 class _Sem:
     """Recording fake mirroring tests/test_delegated_memory.py's _Sem shape."""
 
@@ -20,12 +29,14 @@ class _Sem:
         self.retain_calls = []
         self._recall_ret = recall_ret
 
-    async def recall(self, bank, query, *, tags, max_tokens, budget="mid", **kw):
+    async def recall_items(self, bank, query, *, tags, max_tokens, clearance,
+                           types=("world", "experience", "observation"),
+                           tags_match="any", budget="mid"):
         self.recall_calls.append({
             "bank": bank, "query": query, "tags": sorted(tags),
-            "max_tokens": max_tokens, "budget": budget,
+            "max_tokens": max_tokens, "budget": budget, "clearance": clearance,
         })
-        return self._recall_ret
+        return (_hit(self._recall_ret),) if self._recall_ret else ()
 
     async def retain(self, bank, items, *, async_=True):
         self.retain_calls.append({"bank": bank, "items": items})
@@ -121,7 +132,7 @@ async def test_unavailable_recall_returns_unavailable_not_unknown(tmp_path, monk
     from tools import query_engager, engagement_var
 
     class _Down(_Sem):
-        async def recall(self, *a, **k): raise RecallUnavailable("http_504")
+        async def recall_items(self, *a, **k): raise RecallUnavailable("http_504")
 
     reg = EngagementRegistry(tombstone_path=str(tmp_path / "e.json"), bus=None)
     rec = await reg.create(

@@ -136,6 +136,16 @@ async def start_internal_unix_runner(
         build_admin_reload_handler(runtime=runtime),
     )
 
+    # Task 14 (personality Phase A): lean inspection/explain admin routes —
+    # POST /admin/personality/{inspect,render,diff}, /admin/specialist/status,
+    # /admin/explain. Unix-socket-only: registered on internal_app alone,
+    # NEVER on the public 8099 app (see casa_core.py's `app` router further
+    # down). Skipped when runtime is None (some test/fallback boot paths).
+    if runtime is not None:
+        from personality_admin_handlers import register_personality_admin_routes
+
+        register_personality_admin_routes(internal_app, runtime=runtime)
+
     # E-12 (v0.37.0): /internal/channel/* family — POSTed by per-engagement
     # casa-engagement-channel MCP servers proxying outbound traffic to Telegram.
     # Only registered if a TelegramChannel instance is available (production
@@ -2033,8 +2043,18 @@ async def main() -> None:
         resident ever sets a non-empty ``config.cwd``, its transcript lands
         there instead and the reaper/save would look in the wrong dir; keep
         ``config.cwd`` empty for residents. (Formula also duplicated in
-        session_sweeper/session_saver/agent.py — consolidate in a cleanup.)"""
-        return f"/config/agent-home/{role}"
+        session_sweeper/session_saver/agent.py — consolidate in a cleanup.)
+
+        Task 9: the reaper/sweeper read the stored ``agent`` field, which now
+        holds the canonical role_id (``resident:butler``). Route it through
+        ``agent_home_for_role_id`` (which returns the SAME bare-slug path
+        agent.py writes transcripts to); a legacy short-role entry falls back
+        to the bare-slug formula."""
+        from agent import agent_home_for_role_id
+        try:
+            return agent_home_for_role_id(role)
+        except ValueError:
+            return f"/config/agent-home/{role}"
 
     # 3. Message bus
     bus = MessageBus()
@@ -2097,7 +2117,8 @@ async def main() -> None:
 
     # 7. Framework tools
     from tools import create_casa_tools, init_tools
-    from specialist_registry import SpecialistRegistry
+    import specialist_registry as specialist_registry_module
+    from specialist_registry import InstalledSpecialistIndex, SpecialistRegistry
     from job_registry import JobRegistry
 
     # One durable owner for both delegated execution and voice-delivery state.
@@ -2111,11 +2132,49 @@ async def main() -> None:
     await job_registry.load()
     recovered_jobs = await job_registry.recover_after_restart()
 
+    # Task 13: the NEW installed-specialist data model — a SEPARATE tree
+    # (/config/specialists/<slug>/) and a SEPARATE object from the legacy
+    # SpecialistRegistry below (bundled /config/agents/specialists/). Wired
+    # here, before any channel/bus loop starts, so the module-level accessor
+    # (specialist_registry.live_collision_slugs/live_installed_specialist_slugs)
+    # is populated for the rest of boot — same ordering guarantee Task 8
+    # established for the four compiled-personality registries.
+    #
+    # Task N1b Step 25 (Round-4 fix, finding #2): moved BEFORE
+    # SpecialistRegistry construction/.load() (was after, Task 13 baseline)
+    # so this SAME index doubles as the source current_specialist_roles_dir
+    # reconciles the roles overlay from below — one InstalledSpecialistIndex
+    # object, not two, and boot self-heals any installed specialist's
+    # operational files (not just the roles overlay) the identical way every
+    # casa_reload call site does (specialist_materialize.py, reload.py).
+    installed_specialist_index = InstalledSpecialistIndex(
+        os.path.join(CONFIG_DIR, "specialists"),
+    )
+    installed_specialist_index.load()
+    specialist_registry_module.set_active_installed_index(installed_specialist_index)
+
+    # Round 6, F3: current_specialist_roles_dir acquires MATERIALIZE_LOCK (a
+    # threading.Lock) for its in-lock index reload + op-file self-heal + overlay
+    # rebuild. Boot is one-time single-threaded init, but to keep the
+    # no-sync-lock-on-the-event-loop invariant ABSOLUTE (no boot exception), run
+    # it in a worker thread — the index reload + in-lock publish (publish=True,
+    # round 6 F2) + reconcile all move off the loop in one hop. publish=True lets
+    # the in-lock body republish the SAME object set_active_installed_index
+    # already tracks above (idempotent; authoritative publish is now in-lock).
+    from specialist_materialize import current_specialist_roles_dir
+    roles_overlay = await asyncio.to_thread(
+        current_specialist_roles_dir,
+        installed_index=installed_specialist_index,
+        specialists_dir=Path(os.path.join(CONFIG_DIR, "specialists")),
+        agents_specialists_dir=Path(os.path.join(CONFIG_DIR, "agents", "specialists")),
+        publish=True,
+    )
+
     specialist_registry = SpecialistRegistry(
         os.path.join(CONFIG_DIR, "agents", "specialists"),
         job_registry=job_registry,
     )
-    specialist_registry.load()
+    specialist_registry.load(roles_dir=str(roles_overlay))
 
     from engagement_registry import EngagementRegistry
     engagement_registry = EngagementRegistry(
@@ -2151,7 +2210,42 @@ async def main() -> None:
     policy_lib = load_policies(
         os.path.join(CONFIG_DIR, "policies", "disclosure.yaml"),
     )
-    role_configs = load_all_agents(agents_dir, policies=policy_lib)
+    # Round 6, F1 (loop-safety consistency): load_all_agents reconciles every
+    # resident's binding via personality_binding.reconcile_resident_binding, which
+    # now acquires MATERIALIZE_LOCK (a threading.Lock) around its stage/commit/
+    # discard. Run the boot scan in a worker thread so that acquisition never
+    # happens on the event loop — matching the F3 treatment of
+    # current_specialist_roles_dir above and the reload paths (which already reach
+    # load_agent_from_dir via asyncio.to_thread). Pure sync function; returns the
+    # same role_configs dict.
+    role_configs = await asyncio.to_thread(
+        load_all_agents, agents_dir, policies=policy_lib,
+    )
+
+    # Personality Phase A, Task 8: derive the read-only persona/binding
+    # registries from the loaded resident configs. Residents are the only
+    # source of role_slot/binding/compiled_prompt_bundle in Plan 1;
+    # specialists/executors carry a role_slot too (for lookups) but no
+    # binding/bundle.
+    from types import MappingProxyType as _MappingProxyType
+    _role_slots: dict = {}
+    _persona_packs: dict = {}
+    _bindings: dict = {}
+    _compiled_prompt_bundles: dict = {}
+    for cfg in role_configs.values():
+        if cfg.role_slot is None:
+            continue
+        _role_slots[cfg.role_id] = cfg.role_slot
+        if cfg.persona_pack is not None:
+            _persona_packs[f"{cfg.persona_pack.persona_id}@{cfg.persona_pack.version}"] = cfg.persona_pack
+        if cfg.binding is not None:
+            _bindings[cfg.role_id] = cfg.binding
+        if cfg.compiled_prompt_bundle is not None:
+            _compiled_prompt_bundles[cfg.role_id] = cfg.compiled_prompt_bundle
+    _role_slots = _MappingProxyType(_role_slots)
+    _persona_packs = _MappingProxyType(_persona_packs)
+    _bindings = _MappingProxyType(_bindings)
+    _compiled_prompt_bundles = _MappingProxyType(_compiled_prompt_bundles)
 
     specialist_configs = specialist_registry.all_configs()
     from agent_registry import AgentRegistry
@@ -2160,6 +2254,11 @@ async def main() -> None:
     )
     # Task C.2: build the CasaRuntime container.
     from runtime import CasaRuntime
+    # Task 14: constructed exactly once at boot, preserved verbatim across
+    # every reload (reload.py mutates runtime.role_configs/agents in place
+    # and never reconstructs CasaRuntime).
+    from explanation_store import ExplanationStore
+    explanation_store = ExplanationStore(Path(DATA_DIR) / "explanations")
     runtime = CasaRuntime(
         agents={},                            # populated below at line ~984
         role_configs=role_configs,
@@ -2181,6 +2280,11 @@ async def main() -> None:
         defaults_root="/opt/casa",
         semantic_memory=semantic_memory,
         job_registry=job_registry,
+        role_slots=_role_slots,
+        persona_packs=_persona_packs,
+        bindings=_bindings,
+        compiled_prompt_bundles=_compiled_prompt_bundles,
+        explanation_store=explanation_store,
     )
     # Task 6 (spec §4.6): specialist concurrency cap + per-role cost
     # telemetry. `specialist_max_concurrency` bounds delegations in flight

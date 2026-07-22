@@ -10,6 +10,11 @@ import pytest
 
 from config import ExecutorDefinition, ExecutorMemoryConfig
 
+try:
+    from tests.role_artifact_stub import STUB_ROLE_ARTIFACT
+except ImportError:
+    from role_artifact_stub import STUB_ROLE_ARTIFACT
+
 
 _SCHEMA_PATH = os.path.join(
     os.path.dirname(__file__), "..", "casa-agent", "rootfs", "opt", "casa",
@@ -39,7 +44,7 @@ def test_default_memory_config_disabled():
 
 
 def test_executor_definition_default_memory_field():
-    defn = ExecutorDefinition(
+    defn = ExecutorDefinition(role_artifact=STUB_ROLE_ARTIFACT, 
         type="x", description="x" * 20, model="sonnet", driver="in_casa",
     )
     assert isinstance(defn.memory, ExecutorMemoryConfig)
@@ -108,6 +113,10 @@ def test_load_all_executors_parses_memory_block(tmp_path):
 
 def test_load_all_executors_defaults_memory_when_block_absent(tmp_path):
     from agent_loader import load_all_executors
+    try:
+        from tests.test_load_all_executors import _seed_executor_role_artifact
+    except ImportError:
+        from test_load_all_executors import _seed_executor_role_artifact
 
     base = tmp_path
     exec_dir = base / "executors" / "smoke"
@@ -121,7 +130,9 @@ def test_load_all_executors_defaults_memory_when_block_absent(tmp_path):
         encoding="utf-8",
     )
     (exec_dir / "prompt.md").write_text("hello {task}", encoding="utf-8")
+    roles_dir = str(base / "roles")
+    _seed_executor_role_artifact(roles_dir, "smoke")
 
-    out, _failed = load_all_executors(str(base))
+    out, _failed = load_all_executors(str(base), roles_dir=roles_dir)
     assert out["smoke"].memory.enabled is False
     assert out["smoke"].memory.token_budget == 2000

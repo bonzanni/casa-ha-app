@@ -15,6 +15,11 @@ from specialist_registry import DelegationComplete
 from mcp_registry import McpServerRegistry
 from session_registry import SessionRegistry
 
+try:
+    from tests.role_artifact_stub import STUB_ROLE_ARTIFACT
+except ImportError:
+    from role_artifact_stub import STUB_ROLE_ARTIFACT
+
 pytestmark = pytest.mark.asyncio
 
 
@@ -71,7 +76,7 @@ class _FakeClient:
 
 
 def _make_agent(tmp_path, role="assistant") -> Agent:
-    cfg = AgentConfig(
+    cfg = AgentConfig(role_artifact=STUB_ROLE_ARTIFACT, 
         role=role, model="claude-sonnet-4-6",
         system_prompt="Be helpful.",
         character=CharacterConfig(name="Test"),

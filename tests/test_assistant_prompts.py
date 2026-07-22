@@ -240,41 +240,17 @@ def test_butler_prompt_teaches_protected_tool_challenge_only():
     )
 
 
-def test_finance_specialist_prompt_teaches_protected_tool_challenge():
-    """v0.77.0 [W2] doctrine anchor: the finance specialist prompt gets
-    the protected-tool challenge/retry paragraph, including the
-    no-narration rule and the timing-invariant fallback sentence
-    (specialists never relay a delegated specialist's confirmation —
-    that's the delegator's job — so the relay/re-delegate paragraph is
-    intentionally absent here)."""
-    agents_dir = _system_md_path().parent.parent.parent
-    finance_path = (
-        agents_dir / "specialists" / "finance" / "prompts" / "system.md"
-    )
-    text = _collapse_ws(finance_path.read_text(encoding="utf-8"))
-    doctrine_anchors = [
-        "your call will be refused and a confirmation button posted to the "
-        "user",
-        "Do not announce, describe, or explain the approval prompt",
-        "Prefer zero narration",
-        "I won't run this action without your approval.",
-        "END YOUR TURN",
-        "retry the SAME call with EXACTLY the same arguments",
-    ]
-    for anchor in doctrine_anchors:
-        assert anchor in text, (
-            f"finance system.md missing v0.77.0 protected-tool doctrine "
-            f"anchor: {anchor!r}"
-        )
-    assert "re-delegate the exact same action" not in text, (
-        "finance system.md should NOT carry the resident-only relay/"
-        "re-delegate paragraph — that's Ellen/butler's job, not the "
-        "specialist's."
-    )
-    assert "apply the same no-narration rule" not in text, (
-        "finance system.md should NOT carry the Ellen-only relay "
-        "no-narration sentence — finance has no relay paragraph at all."
-    )
+# test_finance_specialist_prompt_teaches_protected_tool_challenge removed
+# (Task N2 controller fix wave): Task N2's no-gap cutover deleted
+# defaults/agents/specialists/finance/ (and its hand-authored
+# prompts/system.md) from the image entirely — specialists now install
+# from a component repository, so finance's specific doctrine-anchor
+# content no longer lives in this repo to assert against. Unlike
+# test_every_specialist_has_ask_user's FOR-ALL loop or
+# test_real_shipped_role_artifact_loads' enumerated-real-dirs list, there
+# is no synthetic equivalent to keep: this test audited one hand-authored
+# file's exact prose, and that file's ownership moved to the finance
+# component repo.
 
 
 def test_system_prompt_forbids_engage_executor_context_bleed(system_md_text):

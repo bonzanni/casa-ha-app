@@ -17,7 +17,6 @@ from datetime import datetime, timedelta, timezone
 from typing import Awaitable, Callable
 
 from channel_policy import writes_to_bank
-from channel_trust import user_peer_for_channel
 from session_saver import freshness_window, save_session
 
 logger = logging.getLogger(__name__)
@@ -89,17 +88,33 @@ class FreshnessReaper:
                         await self._reg.clear_save_claim(key)
                     else:
                         continue  # a save is genuinely in-flight → let it finish
+                # Task 10: decode the entry into an immutable snapshot. A legacy
+                # pre-Task-9 entry or one with corrupt/absent provenance yields
+                # either None (unusable entry) or a snapshot whose provenance
+                # fields are None (save_session refuses to retain those — "never
+                # retain with invented authorship" — and would otherwise be
+                # retried every sweep forever). Drop the stale pointer in both
+                # cases rather than handing it to a save that can't succeed.
+                from agent import snapshot_session_entry
+                snapshot = snapshot_session_entry(entry)
+                if (
+                    snapshot is None
+                    or snapshot.speaker_provenance is None
+                    or snapshot.user_provenance is None
+                ):
+                    await self._reg.remove(key)
+                    continue
                 if not writes_to_bank(channel):
                     # Recall-only channel (voice): nothing to persist; drop the cold
                     # pointer so the registry does not accumulate dead voice entries.
                     await self._reg.remove(key)
                     continue
-                role = entry.get("agent", "assistant")
-                user_peer = user_peer_for_channel(channel)
+                # The reduced save_session reads speaker/user provenance from the
+                # entry snapshot itself; only the transcript directory (routed
+                # through the injected role→home resolver) and channel are passed.
                 await self._save(
-                    key, self._reg, self._sem, role=role,
-                    directory=self._dir_for(role), user_peer=user_peer,
-                    channel=channel,
+                    key, self._reg, self._sem,
+                    directory=self._dir_for(snapshot.agent), channel=channel,
                 )
             except asyncio.CancelledError:
                 raise

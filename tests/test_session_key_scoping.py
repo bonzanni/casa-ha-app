@@ -10,6 +10,13 @@ import copy, json, re
 from datetime import datetime, timedelta, timezone
 from unittest.mock import patch
 import pytest
+from session_reg_helpers import (
+    RESIDENT_DIGEST,
+    STUB_BINDING_DIGEST,
+    STUB_SPEAKER_PROV,
+    STUB_USER_PROV,
+    resident_role_id,
+)
 pytestmark = [pytest.mark.unit]
 
 
@@ -40,27 +47,42 @@ class TestScopedKey:
 
 class TestResumeRoleCheck:
     def _entry(self, agent=None):
-        e = {"sdk_session_id": "s1", "last_active": datetime.now(timezone.utc).isoformat()}
+        e = {
+            "sdk_session_id": "s1",
+            "last_active": datetime.now(timezone.utc).isoformat(),
+            "binding_digest": RESIDENT_DIGEST,
+        }
         if agent is not None:
             e["agent"] = agent
         return e
 
     def test_mismatched_agent_starts_new(self):
         from agent import _resume_decision
-        d, _ = _resume_decision("voice", self._entry("butler"), datetime.now(timezone.utc), role="concierge")
-        assert d == "new"
+        d = _resume_decision(
+            "voice", self._entry(resident_role_id("butler")),
+            datetime.now(timezone.utc),
+            role_id=resident_role_id("concierge"), binding_digest=RESIDENT_DIGEST,
+        )
+        assert d.action == "new"
 
     def test_matching_agent_resumes(self):
         from agent import _resume_decision
-        d, _ = _resume_decision("voice", self._entry("butler"), datetime.now(timezone.utc), role="butler")
-        assert d == "resume"
+        d = _resume_decision(
+            "voice", self._entry(resident_role_id("butler")),
+            datetime.now(timezone.utc),
+            role_id=resident_role_id("butler"), binding_digest=RESIDENT_DIGEST,
+        )
+        assert d.action == "resume"
 
     def test_legacy_entry_without_agent_still_starts_new_when_role_given(self):
         # Strict: migration drops agent-less voice entries, so any agent-less
-        # entry seen with a role is treated as non-matching (defense in depth).
+        # entry seen with a role is treated as non-matching (missing snapshot).
         from agent import _resume_decision
-        d, _ = _resume_decision("voice", self._entry(None), datetime.now(timezone.utc), role="butler")
-        assert d == "new"
+        d = _resume_decision(
+            "voice", self._entry(None), datetime.now(timezone.utc),
+            role_id=resident_role_id("butler"), binding_digest=RESIDENT_DIGEST,
+        )
+        assert d.action == "new"
 
 
 class TestResumeAuthorityRoleBound:
@@ -91,10 +113,14 @@ class TestResumeAuthorityRoleBound:
         now = datetime.now(timezone.utc)
         fresh = {"agent": "concierge", "sdk_session_id": "cx",
                  "last_active": (now - timedelta(minutes=2)).isoformat()}
-        assert butler._pool._decide("voice", fresh, now)[0] == "new"
-        # Sanity: a role-MATCHING fresh entry still resumes through the wrapper.
-        match = dict(fresh, agent="butler")
-        assert butler._pool._decide("voice", match, now)[0] == "resume"
+        assert butler._pool._decide("voice", fresh, now).action == "new"
+        # Sanity: a role+binding-MATCHING fresh entry still resumes through the
+        # wrapper (Task 9: the entry must carry butler's canonical role_id AND
+        # its binding_digest, not the short slug).
+        match = dict(
+            fresh, agent=resident_role_id("butler"), binding_digest=RESIDENT_DIGEST,
+        )
+        assert butler._pool._decide("voice", match, now).action == "resume"
 
     async def test_bypass_path_binds_role(self, tmp_path, monkeypatch):
         # Seam (b): pool OFF → _process takes _attempt_bypass_turn. A fresh
@@ -117,8 +143,8 @@ class TestResumeAuthorityRoleBound:
         assert FakeClient.captured_options.resume is None, (
             "bypass path resumed a different agent's session — role not bound"
         )
-        # The turn re-registered the key under butler's own identity.
-        assert reg.get(key)["agent"] == "butler"
+        # The turn re-registered the key under butler's own canonical identity.
+        assert reg.get(key)["agent"] == resident_role_id("butler")
 
 
 class TestMigration:
@@ -200,7 +226,7 @@ class TestWebhookOneshotScopeClassSurvivesV2:
         reg = SessionRegistry(str(tmp_path / "sessions.json"))
         uuid_scope = "550e8400-e29b-41d4-a716-446655440000"
         key = build_scoped_session_key("webhook", "assistant", uuid_scope)
-        await reg.register(key, "assistant", "sid-1", scope_class="webhook_oneshot")
+        await reg.register(key, "assistant", "sid-1", scope_class="webhook_oneshot", binding_digest=STUB_BINDING_DIGEST, speaker_provenance=STUB_SPEAKER_PROV, user_provenance=STUB_USER_PROV)
 
         # Backdate last_active so it's older than the webhook TTL (1 day)
         # but younger than the general session TTL (30 days).

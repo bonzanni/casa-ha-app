@@ -7,11 +7,17 @@ and the ``${ENV}`` substitution helper used by the loader.
 
 from __future__ import annotations
 
+import dataclasses
 import logging
 import os
 import re
 from dataclasses import dataclass, field
-from typing import Any
+from typing import TYPE_CHECKING, Any
+
+if TYPE_CHECKING:
+    from persona_pack import PersonaPack
+    from role_artifact import RoleArtifactSource
+    from role_slot import RoleSlot
 
 logger = logging.getLogger(__name__)
 
@@ -218,6 +224,29 @@ class AgentConfig:
     hooks: HooksConfig = field(default_factory=HooksConfig)
     system_prompt: str = ""
     requires: RequiresConfig = field(default_factory=RequiresConfig)
+    # Personality Phase A, Task 5/6: the image-owned canonical role artifact
+    # (defaults/roles/<kind>/<slot>/{role.yaml,doctrine.md}) this agent was
+    # loaded against. REQUIRED as of Task 6 (kw_only, no default) — every
+    # AgentConfig is now backed by a real role artifact; a caller building one
+    # outside agent_loader.load_agent_from_dir (unit-test fixtures probing
+    # unrelated subsystems) must pass a stand-in explicitly
+    # (tests/role_artifact_stub.py). Task 6 consumes this exact source for
+    # model resolution and the role checksum.
+    role_artifact: RoleArtifactSource = dataclasses.field(kw_only=True)
+    # --- Personality Phase A, Task 6 additive fields -----------------------
+    # Populated by agent_loader._build_runtime_fields from the materialized
+    # RoleSlot; role_slot/persona_pack/binding/compiled_prompt_bundle/
+    # speaker_provenance stay None until Task 7/8 wire persona binding.
+    role_id: str = dataclasses.field(default="", kw_only=True)
+    kind: str = dataclasses.field(default="", kw_only=True)
+    resolved_model: str = dataclasses.field(default="", kw_only=True)
+    role_checksum: str = dataclasses.field(default="", kw_only=True)
+    role_slot: "RoleSlot | None" = dataclasses.field(default=None, kw_only=True)
+    persona_pack: "PersonaPack | None" = dataclasses.field(default=None, kw_only=True)
+    binding: "BindingRecord | None" = dataclasses.field(default=None, kw_only=True)
+    compiled_prompt_bundle: "CompiledPromptBundle | None" = dataclasses.field(default=None, kw_only=True)
+    binding_digest: str = dataclasses.field(default="", kw_only=True)
+    speaker_provenance: "SpeakerProvenance | None" = dataclasses.field(default=None, kw_only=True)
 
 
 @dataclass
@@ -261,3 +290,16 @@ class ExecutorDefinition:
     plugins_dir: str = ""   # absolute path to per-executor plugins/ dir; "" = none
     # --- M4 addition (engagement memory) ---
     memory: ExecutorMemoryConfig = field(default_factory=ExecutorMemoryConfig)
+    # --- Personality Phase A, Task 5/6 addition ---
+    # The image-owned canonical role artifact at defaults/roles/executor/<type>/.
+    # Executors have no persona and no binding (see role.yaml persona: forbidden).
+    # REQUIRED as of Task 6 (kw_only, no default) — see AgentConfig's identical
+    # note above; unit-test fixtures pass tests/role_artifact_stub.py's stand-in.
+    role_artifact: RoleArtifactSource = dataclasses.field(kw_only=True)
+    # Personality Phase A, Task 6: the role-only identity triple (spec §2.3),
+    # populated by agent_loader.load_all_executors via materialize_role +
+    # compute_executor_identity.
+    role_id: str = dataclasses.field(default="", kw_only=True)
+    role_checksum: str = dataclasses.field(default="", kw_only=True)
+    resolved_model: str = dataclasses.field(default="", kw_only=True)
+    effective_config_digest: str = dataclasses.field(default="", kw_only=True)

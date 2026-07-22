@@ -7,11 +7,16 @@ import pytest
 from agent_registry import AgentRegistry, KnownAgent
 from config import AgentConfig, CharacterConfig
 
+try:
+    from tests.role_artifact_stub import STUB_ROLE_ARTIFACT
+except ImportError:
+    from role_artifact_stub import STUB_ROLE_ARTIFACT
+
 pytestmark = pytest.mark.asyncio
 
 
 def _cfg(role: str, name: str, card: str = "") -> AgentConfig:
-    return AgentConfig(
+    return AgentConfig(role_artifact=STUB_ROLE_ARTIFACT, 
         role=role,
         character=CharacterConfig(name=name, card=card),
     )

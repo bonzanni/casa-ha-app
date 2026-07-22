@@ -5,8 +5,16 @@ from datetime import datetime, timedelta, timezone
 import pytest
 
 from freshness_reaper import FreshnessReaper
+from session_reg_helpers import STUB_SPEAKER_PROV, STUB_USER_PROV
+from speaker_provenance import provenance_mapping
 
 pytestmark = [pytest.mark.unit]
+
+_PROV_FIELDS = {
+    "sdk_session_id": "sid-1",
+    "speaker_provenance": provenance_mapping(STUB_SPEAKER_PROV),
+    "user_provenance": provenance_mapping(STUB_USER_PROV),
+}
 
 
 class _Reg:
@@ -28,7 +36,7 @@ class _Reg:
         self._e.get(key, {}).pop("consolidated_at", None)
 
 
-async def _save_fn(key, reg, sem, *, role, directory, user_peer, channel):
+async def _save_fn(key, reg, sem, *, directory, channel):
     reg.saved.append((key, channel))
     return True
 
@@ -39,8 +47,8 @@ def _old_iso():
 
 async def test_reaper_saves_telegram_not_voice():
     reg = _Reg({
-        "telegram-1": {"agent": "assistant", "last_active": _old_iso()},
-        "voice-1": {"agent": "butler", "last_active": _old_iso()},
+        "telegram-1": {"agent": "assistant", "last_active": _old_iso(), **_PROV_FIELDS},
+        "voice-1": {"agent": "butler", "last_active": _old_iso(), **_PROV_FIELDS},
     })
     reaper = FreshnessReaper(
         registry=reg, semantic_memory=object(),

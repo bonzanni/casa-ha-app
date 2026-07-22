@@ -10,10 +10,13 @@ import pytest
 import yaml
 
 from job_registry import DeliveryState, ExecutionState, JobRegistry, VoiceJob
+from personality_types import SpeakerProvenance
 import tools
 
 
 pytestmark = pytest.mark.unit
+
+_SYSTEM_SPEAKER = SpeakerProvenance(speaker_kind="system")
 
 _ENV_KEYS = (
     "VOICE_ROUTE_FRESHNESS_SECONDS",
@@ -168,6 +171,7 @@ def _accepted_job(
     return VoiceJob(
         id="job-1",
         parent_job_id=None,
+        creating_speaker=_SYSTEM_SPEAKER, executing_speaker=_SYSTEM_SPEAKER,
         creating_role="concierge",
         specialist_role="judge",
         specialist_display_name="Judge",

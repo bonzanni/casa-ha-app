@@ -15,7 +15,12 @@ import asyncio
 import logging
 
 from claude_runtime import CLAUDE_CLI_PATH
-from sensitivity import DEFAULT_TIER, SENSITIVITY_PROMPT, parse_tier
+# Re-export the canonical sensitivity-tier set (single source of truth is
+# sensitivity.py:TIERS) so consumers gate on ``from tier_classifier import
+# TIERS, classify_tier`` — classify_tier only ever returns a member of it.
+from sensitivity import DEFAULT_TIER, SENSITIVITY_PROMPT, TIERS, parse_tier
+
+__all__ = ["classify_tier", "TIERS"]
 
 logger = logging.getLogger(__name__)
 

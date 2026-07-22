@@ -97,8 +97,40 @@ class FakeRegistry:
         self.touched.append(key)
 
 
+from agent import ResumeDecision, SessionEntrySnapshot
+
+
+def _snap(entry):
+    """Build a SessionEntrySnapshot from a test reg entry (which may omit the
+    'agent' field the production snapshot_session_entry requires)."""
+    if entry is None:
+        return None
+    return SessionEntrySnapshot(
+        agent=entry.get("agent", "resident:test"),
+        sdk_session_id=entry.get("sdk_session_id", ""),
+        last_active=entry.get("last_active"),
+        scope_class=entry.get("scope_class"),
+        binding_digest=entry.get("binding_digest"),
+        speaker_provenance=None, user_provenance=None,
+    )
+
+
+def _resume_dec(entry):
+    return ResumeDecision(
+        "resume", entry["sdk_session_id"], False, _snap(entry), "fresh",
+    )
+
+
+def _new_dec(entry=None, *, retain_old=False):
+    return ResumeDecision(
+        "new", None, retain_old,
+        _snap(entry) if retain_old else None,
+        "expired" if retain_old else "missing",
+    )
+
+
 def _decide_resume(channel, entry, now):
-    return ("resume", False) if entry and entry.get("sdk_session_id") else ("new", False)
+    return _resume_dec(entry) if entry and entry.get("sdk_session_id") else _new_dec()
 
 
 def _mk_pool(registry, *, decide=_decide_resume, **kw):
@@ -420,7 +452,7 @@ async def test_decision_new_closes_old_awaits_disconnect_then_stale_cb():
     reg.data["tg-1"] = {"sdk_session_id": "sid-old", "last_active": "x"}
     order = []
     def decide(channel, entry, now):
-        return ("resume", False) if not order else ("new", True)
+        return _resume_dec(entry) if not order else _new_dec(entry, retain_old=True)
     pool = _mk_pool(reg, decide=decide)
     made = []
     def mk(opts):
@@ -438,7 +470,7 @@ async def test_decision_new_closes_old_awaits_disconnect_then_stale_cb():
         return await pool.turn(channel_key="tg-1", channel="telegram",
                                prompt="p", origin={}, cid="c",
                                build_options=build_options,
-                               on_stale_old=lambda s: order.append(f"stale:{s}"),
+                               on_stale_old=lambda s: order.append(f"stale:{s.sdk_session_id}"),
                                on_message=on_message)
     t = asyncio.create_task(go()); await asyncio.sleep(0.01)
     made[0].script = [[_mk_result("sid-old")]]

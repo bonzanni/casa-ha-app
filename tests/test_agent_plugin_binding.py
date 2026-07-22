@@ -23,11 +23,16 @@ from mcp_registry import McpServerRegistry
 from session_registry import SessionRegistry
 from plugin_fixtures import entry, mk_artifact, mk_registry
 
+try:
+    from tests.role_artifact_stub import STUB_ROLE_ARTIFACT
+except ImportError:
+    from role_artifact_stub import STUB_ROLE_ARTIFACT
+
 pytestmark = pytest.mark.unit
 
 
 def _make_agent(tmp_path, role="assistant", agent_registry=None) -> Agent:
-    cfg = AgentConfig(
+    cfg = AgentConfig(role_artifact=STUB_ROLE_ARTIFACT, 
         role=role,
         model="claude-sonnet-4-6",
         system_prompt="You are helpful.",

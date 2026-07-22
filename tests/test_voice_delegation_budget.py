@@ -29,11 +29,16 @@ from casa_core_middleware import cid_middleware
 from channels.voice.channel import VoiceChannel
 from config import AgentConfig, DelegateEntry
 
+try:
+    from tests.role_artifact_stub import STUB_ROLE_ARTIFACT
+except ImportError:
+    from role_artifact_stub import STUB_ROLE_ARTIFACT
+
 pytestmark = pytest.mark.unit
 
 
 def _cfg(role: str, delegates: tuple[str, ...] = ()) -> AgentConfig:
-    cfg = AgentConfig(role=role)
+    cfg = AgentConfig(role_artifact=STUB_ROLE_ARTIFACT, role=role)
     cfg.delegates = [DelegateEntry(agent=d, purpose="p", when="w") for d in delegates]
     return cfg
 

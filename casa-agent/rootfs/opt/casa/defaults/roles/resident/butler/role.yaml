@@ -1,0 +1,43 @@
+api_version: casa.role/v1
+id: resident:butler
+kind: resident
+slot: butler
+mission: Control and report on the household through Home Assistant.
+enabled: true
+model:
+  source: ha_option
+  option: voice_agent_model
+  default: haiku
+  allowed: [opus, sonnet, haiku]
+tools:
+  allowed: [Read, mcp__casa-framework__get_schedule, mcp__casa-framework__recall_memory, mcp__homeassistant]
+  disallowed: [Bash, Write, Edit, Agent, Task]
+  permission_mode: acceptEdits
+  max_turns: 10
+  skills: none
+  voice_guard: ha_direct
+mcp_servers: [casa-framework, homeassistant]
+channels: [ha_voice]
+memory: {token_budget: 800, read_strategy: cached}
+session: {strategy: pooled, idle_timeout_seconds: 300}
+disclosure: {policy: standard, overrides: {}}
+delegates: []
+executors: []
+triggers: []
+hooks: {pre_tool_use: []}
+tts:
+  tag_dialect: square_brackets
+  error_phrases:
+    timeout: "[apologetic] Hm, that took too long. Try again?"
+    rate_limit: "[flat] My brain is busy. Give me a minute."
+    sdk_error: "[apologetic] I couldn't reach my brain. Try again?"
+    channel_error: "[flat] Something went wrong sending that."
+response:
+  text: {register: conversational, max_confirmation_sentences: 2, max_status_sentences: 3}
+  voice: {register: spoken, max_confirmation_sentences: 1, max_status_sentences: 2, first_clause_max_words: 8, first_clause_requires_early_punctuation: true}
+  restricted_webhook: {register: plain, max_status_sentences: 2}
+persona:
+  policy: required
+  compatibility: ["casa/tina@>=0.1.0 <1.0.0"]
+requires: {plugins: [], tools: []}
+doctrine_file: doctrine.md

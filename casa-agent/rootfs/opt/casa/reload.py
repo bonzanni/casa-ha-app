@@ -219,6 +219,86 @@ import os
 from pathlib import Path
 
 
+async def _specialist_roles_dir(runtime: Any) -> str:
+    """Task N1b Step 25b (Round-2, finding #1 — the P0 this whole plan exists
+    to close): the ONE place every specialist-tier reload call site in this
+    module gets its ``roles_dir``. Reconciles the roles overlay (+
+    self-heals the legacy operational-file set — see
+    ``specialist_materialize.current_specialist_roles_dir``'s own docstring)
+    fresh on every call, exactly matching that function's own
+    'safe to redo on EVERY call' contract.
+
+    Deviation from the brief's own snippet (disclosed in the N1b slice-C
+    report): the brief calls ``specialist_materialize.
+    current_specialist_roles_dir()`` bare, relying on that function's
+    hardcoded ``/config/specialists`` + ``/config/agents/specialists``
+    defaults. Every handler in this module already derives its own
+    filesystem roots from ``runtime.config_dir``/``runtime.agents_dir``
+    (never a hardcoded ``/config``) — this helper does the same, deriving
+    ``specialists_dir``/``agents_specialists_dir`` from the SAME runtime
+    fields, so a reload dispatched against a non-default config_dir (every
+    existing test in this suite passes a tmp_path-backed one) reconciles
+    under ITS OWN tree, never attempting to write the real host /config.
+    In production runtime.config_dir IS CONFIG_DIR ("/config",
+    casa_core.py), so this resolves identically to the brief's bare call —
+    zero behavior change there.
+
+    Stale-index fix (Plan 2 review, no GH issue): boot (casa_core.py)
+    constructs its own ``InstalledSpecialistIndex`` and publishes it via
+    ``specialist_registry.set_active_installed_index`` so admin/inspection
+    reads (``live_installed_specialist_slugs``/``live_collision_slugs``/
+    ``get_installed_instance`` — Task-14 handlers) see live state. Every
+    install/upgrade/rollback/uninstall + reload path funnels through THIS
+    helper on every specialist-tier reload, but until now it only asked
+    ``current_specialist_roles_dir`` to load a fresh index INTERNALLY and
+    discarded it — the process-wide ``_active_index`` stayed pinned at
+    boot-time state forever. Building the index HERE (mirroring
+    casa_core.py's own boot sequence exactly) and handing it to
+    ``current_specialist_roles_dir`` (as ``installed_index=``, so it is reused
+    rather than loaded twice) with ``publish=True`` makes every boot/reload path
+    refresh the global — the publish now happens IN-LOCK inside that helper
+    (round 6, F2), last-wins-consistent across concurrent reload workers, rather
+    than pre-lock here.
+
+    F3 (round 3): ``current_specialist_roles_dir`` now acquires
+    ``specialist_materialize.MATERIALIZE_LOCK`` and does bounded file I/O
+    (index load + per-slug op-file self-heal + roles-overlay rebuild). A
+    concurrent install/materialize holding that lock would otherwise stall
+    ALL asyncio processing, because every specialist-tier reload call site used
+    to invoke this helper SYNCHRONOUSLY on the event-loop thread. This whole
+    resolve now runs in a worker thread via ``asyncio.to_thread`` — one hop,
+    the index build + publish + reconcile move off the loop together — so the
+    lock is only ever contended between worker threads, never against the
+    loop. Callers ``await`` it (``await _specialist_roles_dir(runtime) if tier
+    == 'specialist' else None`` keeps the resolve lazy for non-specialist
+    tiers)."""
+    import specialist_materialize
+    from specialist_registry import InstalledSpecialistIndex
+
+    def _resolve() -> str:
+        specialists_dir = Path(runtime.config_dir) / "specialists"
+        index = InstalledSpecialistIndex(str(specialists_dir))
+        index.load()
+        # Round 6, F2 (index-publication coherence): publish the index INSIDE
+        # `current_specialist_roles_dir` (pass `publish=True`), NOT here pre-lock.
+        # Publishing under MATERIALIZE_LOCK — right after the in-lock re-load, on
+        # the SAME object whose overlay is then rebuilt — is last-wins-consistent
+        # across two concurrent reload workers: the process-wide global can no
+        # longer be left pinned to worker A's stale object while worker B built
+        # the overlay last. (Was: a pre-lock `set_active_installed_index(index)`
+        # here in each worker, which raced.) The in-lock re-load of this same
+        # object also keeps the published global and the overlay reflecting the
+        # exact state committed under the lock.
+        return specialist_materialize.current_specialist_roles_dir(
+            installed_index=index,
+            specialists_dir=specialists_dir,
+            agents_specialists_dir=Path(runtime.agents_dir) / "specialists",
+            publish=True,
+        )
+
+    return await asyncio.to_thread(_resolve)
+
+
 async def reload_triggers(runtime: Any, *, role: str | None = None) -> list[str]:
     """Soft-reload triggers for one role. Ports tools.casa_reload_triggers body
     to the runtime/dispatcher contract; full lineage in spec §3.
@@ -234,12 +314,14 @@ async def reload_triggers(runtime: Any, *, role: str | None = None) -> list[str]
     base = runtime.config_dir
     agents_dir = runtime.agents_dir
     agent_dir: str | None = None
-    for candidate in (
-        os.path.join(agents_dir, role),
-        os.path.join(agents_dir, "specialists", role),
+    tier: str | None = None
+    for candidate, candidate_tier in (
+        (os.path.join(agents_dir, role), "resident"),
+        (os.path.join(agents_dir, "specialists", role), "specialist"),
     ):
         if os.path.isdir(candidate):
             agent_dir = candidate
+            tier = candidate_tier
             break
     if agent_dir is None:
         raise ReloadError(
@@ -257,14 +339,56 @@ async def reload_triggers(runtime: Any, *, role: str | None = None) -> list[str]
     except Exception as exc:  # noqa: BLE001
         raise ReloadError("load_error", f"policies: {exc}") from exc
 
+    # Task N1b Step 25b: an installed specialist's role artifact lives ONLY
+    # under the reconciled roles overlay (never agent_loader.DEFAULT_ROLES_DIR)
+    # — a site the brief's own reload.py snippets MISSED (they only covered
+    # the specialist_registry.load call below), which would otherwise vanish
+    # a component-only specialist (no image fallback) on its very first
+    # `casa_reload(scope="triggers", role=<slug>)` after install.
     import agent_loader
+    roles_dir = await _specialist_roles_dir(runtime) if tier == "specialist" else None
     try:
         cfg = await asyncio.to_thread(
             agent_loader.load_agent_from_dir,
-            agent_dir, policies=policy_lib,
+            agent_dir, policies=policy_lib, roles_dir=roles_dir,
         )
     except Exception as exc:  # noqa: BLE001
         raise ReloadError("load_error", str(exc)) from exc
+
+    # Personality Phase A, Task 14 (round-3 review): restart-to-swap invariant.
+    # The load_agent_from_dir above may have committed a STAGED persona swap
+    # desired->active on disk, yielding a NEW role_checksum/binding_digest on
+    # cfg while the LIVE resident still runs the OLD identity. A trigger reload
+    # must NEVER activate that change — only a supervised restart may. So for a
+    # RESIDENT whose personality identity moved, refuse the WHOLE operation here
+    # BEFORE anything mutates: no reregister_for, no cache write, no specialist
+    # reload. The trigger registry, runtime.role_configs, AND the trigger
+    # reconciler's view (trigger_reconcile reads role_configs[role].channels to
+    # authorize plugin webhook ingress) all stay consistently OLD, so the
+    # restart the swap already requires activates everything together — no mixed
+    # state. (Round 2 kept the OLD cache but still reregistered the NEW triggers,
+    # a half-applied design two reviewers flagged: it left webhook ingress
+    # authorized by the stale cached channels while NEW triggers were live, and
+    # misreported the registered trigger list.) Raising mirrors reload_agent's
+    # direct-path contract; dispatch() converts this ReloadError to a structured
+    # error, and reload_full does NOT compose this handler, so nothing cascades
+    # through the raise. The on-disk active.yaml commit from load_agent_from_dir
+    # may already have happened — idempotent with the mandatory restart's own
+    # boot-time reconcile (same note reload_agent carries at ~:598).
+    if role in runtime.role_configs and _resident_identity_changed(
+        cfg, runtime.role_configs.get(role),
+    ):
+        logger.warning(
+            "reload_triggers(%s): personality identity changed on disk "
+            "(role_checksum or binding_digest differs) — refusing the trigger "
+            "reload to avoid mixed state; restart required to activate", role,
+        )
+        raise ReloadError(
+            "restart_required",
+            f"role={role} personality identity changed; restart via "
+            f"casa_restart_supervised to activate (trigger reload refused to "
+            f"avoid mixed state)",
+        )
 
     try:
         await asyncio.to_thread(
@@ -274,16 +398,19 @@ async def reload_triggers(runtime: Any, *, role: str | None = None) -> list[str]
     except Exception as exc:  # noqa: BLE001
         raise ReloadError("reregister_failed", str(exc)) from exc
 
-    # Q-1 fix (v0.35.2): refresh the runtime cache so back-compat
-    # consumers (tools.casa_reload_triggers emits `registered=[...]`
-    # by reading runtime.role_configs[role].triggers) see the
-    # post-reload state, not the boot-time list. Mirrors the resident
-    # vs specialist branching of reload_agent at lines 339-348.
+    # Q-1 fix (v0.35.2): refresh the runtime cache so back-compat consumers
+    # (tools.casa_reload_triggers emits `registered=[...]` by reading
+    # runtime.role_configs[role].triggers) see the post-reload state, not the
+    # boot-time list. Mirrors the resident vs specialist branching of
+    # reload_agent. A resident whose personality identity changed never reaches
+    # here — it was refused above — so this unconditional write can never
+    # poison the shared restart-to-swap baseline: cfg's identity always matches
+    # the live baseline on this path.
     if role in runtime.role_configs:
         runtime.role_configs[role] = cfg
     else:
         try:
-            await asyncio.to_thread(runtime.specialist_registry.load)
+            await asyncio.to_thread(runtime.specialist_registry.load, roles_dir=roles_dir)
         except Exception as exc:  # noqa: BLE001
             raise ReloadError("specialist_reload_failed", str(exc)) from exc
 
@@ -486,6 +613,46 @@ async def _teardown_role(runtime: Any, role: str) -> None:
         )
 
 
+def _resident_identity_changed(new_cfg: Any, live_cfg: Any) -> bool:
+    """True iff a resident's personality identity moved between the live config
+    and a freshly-loaded one — i.e. its ``role_checksum`` OR ``binding_digest``
+    differs (a role.yaml/doctrine edit, or a staged persona swap/reset that
+    ``load_agent_from_dir``'s reconcile committed desired->active).
+
+    Personality Phase A, Task 8/Task 14: this is the ONE canonical restart-to-swap
+    predicate, shared by every reload path that could otherwise hot-swap a live
+    resident (reload_agent, the policies cascade, the bulk agents sweep). A
+    ``None`` ``live_cfg`` (a fresh add, or a non-resident with no live entry) is
+    NOT a change -> False. ``getattr`` defaults keep it inert for non-resident
+    tiers and narrow test stand-ins whose cfgs carry neither field.
+
+    ``runtime.role_configs`` mutation audit (the comparison BASELINE this
+    predicate reads — every production writer must either be identity-guarded
+    or provably not an activation path, else a staged identity change can be
+    laundered through a poisoned baseline):
+      * reload_agent's post-guard commit — guarded (raises restart_required
+        first).
+      * the policies-cascade swap (_reload_role_after_policies) — guarded
+        (skip+warn).
+      * the bulk agents-sweep ADD loop — iterates on_disk - known only (a live
+        resident never enters it) + guarded as defense-in-depth.
+      * reload_triggers' Q-1 cache refresh — refuses outright (raises
+        restart_required BEFORE any mutation) on an identity change.
+      * the bulk sweep's EVICT ``role_configs.pop(...)`` — deletion-only
+        (removes the baseline entry with its agent; never installs a new
+        digest), not an activation path, no guard needed.
+      * boot-time construction in casa_core — no live baseline exists yet.
+    Any NEW writer must be classified against this list."""
+    if live_cfg is None:
+        return False
+    return (
+        getattr(new_cfg, "role_checksum", None)
+        != getattr(live_cfg, "role_checksum", None)
+        or getattr(new_cfg, "binding_digest", None)
+        != getattr(live_cfg, "binding_digest", None)
+    )
+
+
 async def reload_agent(runtime: Any, *, role: str | None = None) -> list[str]:
     """Atomic-swap reload of a single role's Agent + AgentConfig.
 
@@ -521,14 +688,45 @@ async def reload_agent(runtime: Any, *, role: str | None = None) -> list[str]:
         raise ReloadError("load_error", f"policies: {exc}") from exc
 
     import agent_loader
+    # Task N1b Step 25b: an installed specialist's role artifact lives ONLY
+    # under the reconciled roles overlay, never agent_loader.DEFAULT_ROLES_DIR.
+    roles_dir = await _specialist_roles_dir(runtime) if tier == "specialist" else None
     try:
         new_cfg = await asyncio.to_thread(
             agent_loader.load_agent_from_dir, agent_dir, policies=policy_lib,
+            roles_dir=roles_dir,
         )
     except Exception as exc:  # noqa: BLE001
         raise ReloadError("load_error", str(exc)) from exc
 
     actions = ["load_config"]
+
+    # Personality Phase A, Task 8, Step 9: refuse a hot-swap across a
+    # personality-identity change. A resident whose role_checksum OR
+    # binding_digest moved (a role.yaml/doctrine edit, or a staged persona
+    # swap/reset) is restart-to-swap, never hot-reloaded — the compiled prompt
+    # bundle and session epoch are bound to that identity. Runs BEFORE
+    # _construct_agent, so a rejected reload wastes no work and leaves every
+    # live registry/agent untouched (read-only on this path). getattr defaults
+    # keep this inert for non-resident tiers and narrow test stand-ins whose
+    # cfgs carry neither field.
+    if tier == "resident" and _resident_identity_changed(
+        new_cfg, runtime.role_configs.get(role),
+    ):
+        logger.warning(
+            "reload_agent(%s): personality identity changed (role_checksum or "
+            "binding_digest differs) — refusing hot-swap, restart required", role,
+        )
+        # Note: the load_agent_from_dir() call above may have already committed a
+        # staged desired->active binding to DISK via reconcile before this guard
+        # fires — harmless, since that's idempotent with the mandatory restart's
+        # own boot-time reconcile and this guard leaves the live in-memory
+        # agent/registries untouched either way.
+        raise ReloadError(
+            "restart_required",
+            f"role={role} personality identity changed; restart via "
+            f"casa_restart_supervised to activate",
+        )
 
     # v0.74.1 (Sol B1, live proxy-drive finding): a DISABLED specialist must
     # not be constructed or (re)registered. Reload used to install it into
@@ -545,7 +743,7 @@ async def reload_agent(runtime: Any, *, role: str | None = None) -> list[str]:
         _schedule_agent_close(old_agent, runtime=runtime, role=role)
         await _teardown_role(runtime, role)
         try:
-            await asyncio.to_thread(runtime.specialist_registry.load)
+            await asyncio.to_thread(runtime.specialist_registry.load, roles_dir=roles_dir)
         except Exception as exc:  # noqa: BLE001
             raise ReloadError("specialist_reload_failed", str(exc)) from exc
         from agent_registry import AgentRegistry
@@ -584,7 +782,7 @@ async def reload_agent(runtime: Any, *, role: str | None = None) -> list[str]:
         # config dict. Mirrors specialist_registry.load() pattern but just
         # for one role.
         try:
-            await asyncio.to_thread(runtime.specialist_registry.load)
+            await asyncio.to_thread(runtime.specialist_registry.load, roles_dir=roles_dir)
         except Exception as exc:  # noqa: BLE001
             raise ReloadError("specialist_reload_failed", str(exc)) from exc
     runtime.agents[role] = new_agent
@@ -664,10 +862,34 @@ async def _reload_role_after_policies(runtime: Any, role: str) -> None:
         return  # role disappeared between scan and re-load — silently skip
 
     import agent_loader
+    # Task N1b Step 25b: same roles_dir threading as reload_agent above.
+    roles_dir = await _specialist_roles_dir(runtime) if tier == "specialist" else None
     new_cfg = await asyncio.to_thread(
         agent_loader.load_agent_from_dir,
-        agent_dir, policies=runtime.policy_lib,
+        agent_dir, policies=runtime.policy_lib, roles_dir=roles_dir,
     )
+
+    # Personality Phase A, Task 14 (whole-branch review): restart-to-swap must
+    # hold on the POLICY cascade too. A resident whose role_checksum OR
+    # binding_digest moved (a doctrine edit, or a staged persona swap/reset that
+    # the load above committed desired->active on disk) is restart-to-swap —
+    # never hot-reloaded. Unlike reload_agent's single-role path we do NOT raise
+    # (that would abort the whole cascade for every OTHER role); we SKIP just
+    # this role, leaving its LIVE agent + cfg + registries untouched, so its
+    # deferred policy change lands only on the mandatory supervised restart. The
+    # on-disk desired->active commit is harmless — idempotent with that
+    # restart's own boot-time reconcile. Every identity-UNCHANGED role still
+    # reloads below to pick up the new policy_lib.
+    if tier == "resident" and _resident_identity_changed(
+        new_cfg, runtime.role_configs.get(role),
+    ):
+        logger.warning(
+            "policies cascade: role=%s personality identity changed "
+            "(role_checksum or binding_digest differs) — skipping hot-swap; the "
+            "policy change activates on a supervised restart", role,
+        )
+        return
+
     new_agent = await asyncio.to_thread(
         _construct_agent, cfg=new_cfg, runtime=runtime,
     )
@@ -845,6 +1067,23 @@ async def reload_agents(runtime: Any, *, role: str | None = None) -> list[str]:
                 os.path.join(agents_dir, r),
                 policies=policy_lib,
             )
+            # Personality Phase A, Task 14 (whole-branch review): enforce
+            # restart-to-swap on the bulk sweep with the ONE canonical
+            # predicate. This loop only adds genuinely-new residents (r is not
+            # in role_configs), so ``live_cfg`` is None and the predicate is
+            # False — a fresh add's first activation is legitimate. An identity
+            # change on an ALREADY-LIVE resident is never reconstructed here (a
+            # known resident is not in this add set) and stays restart-to-swap;
+            # sharing the predicate guarantees a live resident can never be
+            # hot-swapped onto a new binding via scope=agents even if this path
+            # is later broadened to refresh existing residents.
+            if _resident_identity_changed(new_cfg, runtime.role_configs.get(r)):
+                logger.warning(
+                    "reload_agents: role=%s personality identity changed "
+                    "(role_checksum or binding_digest differs) — leaving the "
+                    "live agent in place; restart required to activate", r,
+                )
+                continue
             await asyncio.to_thread(
                 agent_home.provision_agent_home,
                 role=r,
@@ -875,6 +1114,8 @@ async def reload_agents(runtime: Any, *, role: str | None = None) -> list[str]:
         # A:§3.3/§3.4 (r2-B5 enumerated seam): purge+cancel BEFORE teardown —
         # the role is about to become undispatchable entirely.
         _invalidate_role_grants(r)
+        # Deletion-only baseline write: eviction, not activation — see the
+        # role_configs mutation audit on _resident_identity_changed.
         runtime.role_configs.pop(r, None)
         old_agent = runtime.agents.pop(r, None)  # AR-7: capture before drop
         _schedule_agent_close(old_agent)  # F12
@@ -901,7 +1142,11 @@ async def reload_agents(runtime: Any, *, role: str | None = None) -> list[str]:
     known_specialists_before = set(
         runtime.specialist_registry.all_configs().keys())
     try:
-        await asyncio.to_thread(runtime.specialist_registry.load)
+        roles_dir = await _specialist_roles_dir(runtime)
+        await asyncio.to_thread(
+            runtime.specialist_registry.load,
+            roles_dir=roles_dir,
+        )
     except Exception as exc:  # noqa: BLE001
         logger.warning("specialist_registry.load failed: %s", exc)
 
