@@ -235,6 +235,13 @@ class TestReloadTriggers:
 
         (Specialists can't actually carry triggers per the file-set
         rules - this test asserts the codepath fires for symmetry.)
+
+        Task N1b Step 25b: the refresh call now threads roles_dir (the
+        reconciled specialist roles overlay) through — the fix this whole
+        task exists to make. The assertion below was updated from
+        ``assert_called_once_with()`` (zero args) to pin the NEW call
+        signature; this is not a guard being loosened, it is the exact
+        code path Step 25b intentionally changes.
         """
         from reload import dispatch, register_handler, reload_triggers
         register_handler("triggers", reload_triggers)
@@ -264,7 +271,8 @@ class TestReloadTriggers:
 
         assert result["status"] == "ok"
         assert "finance" not in runtime.role_configs
-        runtime.specialist_registry.load.assert_called_once_with()
+        runtime.specialist_registry.load.assert_called_once()
+        assert runtime.specialist_registry.load.call_args.kwargs["roles_dir"]
 
 
 class TestReloadAgent:
@@ -852,7 +860,7 @@ class TestReloadAgentsSpecialistReporting:
         runtime.specialist_registry.all_configs = MagicMock(
             side_effect=lambda: dict(configs))
         runtime.specialist_registry.load = MagicMock(
-            side_effect=lambda: configs.update(
+            side_effect=lambda **kw: configs.update(
                 {"probe": MagicMock(role="probe")}))
 
         result = await dispatch("agents", runtime=runtime)
@@ -876,7 +884,7 @@ class TestReloadAgentsSpecialistReporting:
         runtime.specialist_registry.all_configs = MagicMock(
             side_effect=lambda: dict(configs))
         runtime.specialist_registry.load = MagicMock(
-            side_effect=configs.clear)
+            side_effect=lambda **kw: configs.clear())
 
         result = await dispatch("agents", runtime=runtime)
         assert result["status"] == "ok"
@@ -910,7 +918,7 @@ class TestReloadAgentsSpecialistReporting:
         runtime.specialist_registry.all_configs = MagicMock(
             side_effect=lambda: dict(configs))
         runtime.specialist_registry.load = MagicMock(
-            side_effect=configs.clear)
+            side_effect=lambda **kw: configs.clear())
 
         result = await dispatch("agents", runtime=runtime)
         assert result["status"] == "ok"

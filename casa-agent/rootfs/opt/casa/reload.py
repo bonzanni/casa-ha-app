@@ -219,6 +219,37 @@ import os
 from pathlib import Path
 
 
+def _specialist_roles_dir(runtime: Any) -> str:
+    """Task N1b Step 25b (Round-2, finding #1 — the P0 this whole plan exists
+    to close): the ONE place every specialist-tier reload call site in this
+    module gets its ``roles_dir``. Reconciles the roles overlay (+
+    self-heals the legacy operational-file set — see
+    ``specialist_materialize.current_specialist_roles_dir``'s own docstring)
+    fresh on every call, exactly matching that function's own
+    'safe to redo on EVERY call' contract.
+
+    Deviation from the brief's own snippet (disclosed in the N1b slice-C
+    report): the brief calls ``specialist_materialize.
+    current_specialist_roles_dir()`` bare, relying on that function's
+    hardcoded ``/config/specialists`` + ``/config/agents/specialists``
+    defaults. Every handler in this module already derives its own
+    filesystem roots from ``runtime.config_dir``/``runtime.agents_dir``
+    (never a hardcoded ``/config``) — this helper does the same, deriving
+    ``specialists_dir``/``agents_specialists_dir`` from the SAME runtime
+    fields, so a reload dispatched against a non-default config_dir (every
+    existing test in this suite passes a tmp_path-backed one) reconciles
+    under ITS OWN tree, never attempting to write the real host /config.
+    In production runtime.config_dir IS CONFIG_DIR ("/config",
+    casa_core.py), so this resolves identically to the brief's bare call —
+    zero behavior change there."""
+    import specialist_materialize
+
+    return specialist_materialize.current_specialist_roles_dir(
+        specialists_dir=Path(runtime.config_dir) / "specialists",
+        agents_specialists_dir=Path(runtime.agents_dir) / "specialists",
+    )
+
+
 async def reload_triggers(runtime: Any, *, role: str | None = None) -> list[str]:
     """Soft-reload triggers for one role. Ports tools.casa_reload_triggers body
     to the runtime/dispatcher contract; full lineage in spec §3.
@@ -234,12 +265,14 @@ async def reload_triggers(runtime: Any, *, role: str | None = None) -> list[str]
     base = runtime.config_dir
     agents_dir = runtime.agents_dir
     agent_dir: str | None = None
-    for candidate in (
-        os.path.join(agents_dir, role),
-        os.path.join(agents_dir, "specialists", role),
+    tier: str | None = None
+    for candidate, candidate_tier in (
+        (os.path.join(agents_dir, role), "resident"),
+        (os.path.join(agents_dir, "specialists", role), "specialist"),
     ):
         if os.path.isdir(candidate):
             agent_dir = candidate
+            tier = candidate_tier
             break
     if agent_dir is None:
         raise ReloadError(
@@ -257,11 +290,18 @@ async def reload_triggers(runtime: Any, *, role: str | None = None) -> list[str]
     except Exception as exc:  # noqa: BLE001
         raise ReloadError("load_error", f"policies: {exc}") from exc
 
+    # Task N1b Step 25b: an installed specialist's role artifact lives ONLY
+    # under the reconciled roles overlay (never agent_loader.DEFAULT_ROLES_DIR)
+    # — a site the brief's own reload.py snippets MISSED (they only covered
+    # the specialist_registry.load call below), which would otherwise vanish
+    # a component-only specialist (no image fallback) on its very first
+    # `casa_reload(scope="triggers", role=<slug>)` after install.
     import agent_loader
+    roles_dir = _specialist_roles_dir(runtime) if tier == "specialist" else None
     try:
         cfg = await asyncio.to_thread(
             agent_loader.load_agent_from_dir,
-            agent_dir, policies=policy_lib,
+            agent_dir, policies=policy_lib, roles_dir=roles_dir,
         )
     except Exception as exc:  # noqa: BLE001
         raise ReloadError("load_error", str(exc)) from exc
@@ -321,7 +361,7 @@ async def reload_triggers(runtime: Any, *, role: str | None = None) -> list[str]
         runtime.role_configs[role] = cfg
     else:
         try:
-            await asyncio.to_thread(runtime.specialist_registry.load)
+            await asyncio.to_thread(runtime.specialist_registry.load, roles_dir=roles_dir)
         except Exception as exc:  # noqa: BLE001
             raise ReloadError("specialist_reload_failed", str(exc)) from exc
 
@@ -599,9 +639,13 @@ async def reload_agent(runtime: Any, *, role: str | None = None) -> list[str]:
         raise ReloadError("load_error", f"policies: {exc}") from exc
 
     import agent_loader
+    # Task N1b Step 25b: an installed specialist's role artifact lives ONLY
+    # under the reconciled roles overlay, never agent_loader.DEFAULT_ROLES_DIR.
+    roles_dir = _specialist_roles_dir(runtime) if tier == "specialist" else None
     try:
         new_cfg = await asyncio.to_thread(
             agent_loader.load_agent_from_dir, agent_dir, policies=policy_lib,
+            roles_dir=roles_dir,
         )
     except Exception as exc:  # noqa: BLE001
         raise ReloadError("load_error", str(exc)) from exc
@@ -650,7 +694,7 @@ async def reload_agent(runtime: Any, *, role: str | None = None) -> list[str]:
         _schedule_agent_close(old_agent, runtime=runtime, role=role)
         await _teardown_role(runtime, role)
         try:
-            await asyncio.to_thread(runtime.specialist_registry.load)
+            await asyncio.to_thread(runtime.specialist_registry.load, roles_dir=roles_dir)
         except Exception as exc:  # noqa: BLE001
             raise ReloadError("specialist_reload_failed", str(exc)) from exc
         from agent_registry import AgentRegistry
@@ -689,7 +733,7 @@ async def reload_agent(runtime: Any, *, role: str | None = None) -> list[str]:
         # config dict. Mirrors specialist_registry.load() pattern but just
         # for one role.
         try:
-            await asyncio.to_thread(runtime.specialist_registry.load)
+            await asyncio.to_thread(runtime.specialist_registry.load, roles_dir=roles_dir)
         except Exception as exc:  # noqa: BLE001
             raise ReloadError("specialist_reload_failed", str(exc)) from exc
     runtime.agents[role] = new_agent
@@ -769,9 +813,11 @@ async def _reload_role_after_policies(runtime: Any, role: str) -> None:
         return  # role disappeared between scan and re-load — silently skip
 
     import agent_loader
+    # Task N1b Step 25b: same roles_dir threading as reload_agent above.
+    roles_dir = _specialist_roles_dir(runtime) if tier == "specialist" else None
     new_cfg = await asyncio.to_thread(
         agent_loader.load_agent_from_dir,
-        agent_dir, policies=runtime.policy_lib,
+        agent_dir, policies=runtime.policy_lib, roles_dir=roles_dir,
     )
 
     # Personality Phase A, Task 14 (whole-branch review): restart-to-swap must
@@ -1047,7 +1093,10 @@ async def reload_agents(runtime: Any, *, role: str | None = None) -> list[str]:
     known_specialists_before = set(
         runtime.specialist_registry.all_configs().keys())
     try:
-        await asyncio.to_thread(runtime.specialist_registry.load)
+        await asyncio.to_thread(
+            runtime.specialist_registry.load,
+            roles_dir=_specialist_roles_dir(runtime),
+        )
     except Exception as exc:  # noqa: BLE001
         logger.warning("specialist_registry.load failed: %s", exc)
 

@@ -2132,24 +2132,39 @@ async def main() -> None:
     await job_registry.load()
     recovered_jobs = await job_registry.recover_after_restart()
 
-    specialist_registry = SpecialistRegistry(
-        os.path.join(CONFIG_DIR, "agents", "specialists"),
-        job_registry=job_registry,
-    )
-    specialist_registry.load()
-
     # Task 13: the NEW installed-specialist data model — a SEPARATE tree
     # (/config/specialists/<slug>/) and a SEPARATE object from the legacy
-    # SpecialistRegistry above (bundled /config/agents/specialists/). Wired
+    # SpecialistRegistry below (bundled /config/agents/specialists/). Wired
     # here, before any channel/bus loop starts, so the module-level accessor
     # (specialist_registry.live_collision_slugs/live_installed_specialist_slugs)
     # is populated for the rest of boot — same ordering guarantee Task 8
     # established for the four compiled-personality registries.
+    #
+    # Task N1b Step 25 (Round-4 fix, finding #2): moved BEFORE
+    # SpecialistRegistry construction/.load() (was after, Task 13 baseline)
+    # so this SAME index doubles as the source current_specialist_roles_dir
+    # reconciles the roles overlay from below — one InstalledSpecialistIndex
+    # object, not two, and boot self-heals any installed specialist's
+    # operational files (not just the roles overlay) the identical way every
+    # casa_reload call site does (specialist_materialize.py, reload.py).
     installed_specialist_index = InstalledSpecialistIndex(
         os.path.join(CONFIG_DIR, "specialists"),
     )
     installed_specialist_index.load()
     specialist_registry_module.set_active_installed_index(installed_specialist_index)
+
+    from specialist_materialize import current_specialist_roles_dir
+    roles_overlay = current_specialist_roles_dir(
+        installed_index=installed_specialist_index,
+        specialists_dir=Path(os.path.join(CONFIG_DIR, "specialists")),
+        agents_specialists_dir=Path(os.path.join(CONFIG_DIR, "agents", "specialists")),
+    )
+
+    specialist_registry = SpecialistRegistry(
+        os.path.join(CONFIG_DIR, "agents", "specialists"),
+        job_registry=job_registry,
+    )
+    specialist_registry.load(roles_dir=str(roles_overlay))
 
     from engagement_registry import EngagementRegistry
     engagement_registry = EngagementRegistry(
