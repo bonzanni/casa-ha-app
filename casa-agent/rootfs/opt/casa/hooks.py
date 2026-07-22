@@ -1374,6 +1374,26 @@ def make_managed_component_guard() -> HookCallback:
     return _hook
 
 
+def managed_component_guard_matcher():
+    """A ``HookMatcher`` wrapping :func:`make_managed_component_guard`,
+    injected CODE-SIDE into every executor session (round-4 Terra P0) the
+    same way :func:`agent_home_settings_guard_matcher` is (I-2, v0.69.8).
+
+    Rationale: definition.yaml editing is a legitimate configurator recipe
+    (executor/enable|disable|edit-definition), and definition.yaml's
+    ``hooks_file:`` key is a config-editable POINTER to the hook-policy
+    file. hooks.yaml itself is guard-protected, but repointing ``hooks_file``
+    at a hollow yaml would shed every yaml-declared policy on the next
+    session. Code-side injection makes the yaml additive-only: no
+    definition/hooks-file manipulation can remove this guard."""
+    from claude_agent_sdk import HookMatcher
+    policy = HOOK_POLICIES["managed_component_guard"]
+    return HookMatcher(
+        matcher=policy["matcher"],
+        hooks=[policy["factory"]()],
+    )
+
+
 # ---------------------------------------------------------------------------
 # commit_size_guard - Plan 3 (asks user before batch commits > N files)
 # ---------------------------------------------------------------------------
@@ -1845,6 +1865,16 @@ def build_policy_callbacks_from_hooks_yaml(
             if k not in ("policy", "matcher", "timeout")
         }
         out[name] = (policy["matcher"], policy["factory"](**params))
+    # Round-4 (Terra P0): managed_component_guard is CODE-MANDATORY for
+    # executor sessions — the resolved set always carries it regardless of
+    # what the (config-editable, pointer-redirectable) hooks.yaml declares.
+    # Dict-key dedupe: a yaml declaration simply pre-fills the same entry.
+    # See managed_component_guard_matcher (SDK path) and
+    # drivers.hook_bridge.translate_hooks_to_settings (CC settings path).
+    if "managed_component_guard" not in out:
+        policy = HOOK_POLICIES["managed_component_guard"]
+        out["managed_component_guard"] = (
+            policy["matcher"], policy["factory"]())
     return out
 
 

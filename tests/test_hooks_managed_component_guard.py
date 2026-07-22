@@ -699,6 +699,141 @@ async def test_managed_source_read_shapes_pass(cmd):
     assert out == {}, cmd
 
 
+# ------------------------------------------------------------------
+# Round-4 (Terra P0): managed_component_guard is CODE-MANDATORY for
+# executor sessions. definition.yaml's `hooks_file:` is a config-editable
+# pointer (executor/edit-definition is a legitimate recipe); repointing it
+# at a hollow yaml must not shed the guard on the next session. Covered on
+# BOTH drivers: in_casa (tools._build_executor_options) and claude_code
+# (drivers.hook_bridge.translate_hooks_to_settings +
+# hooks.build_policy_callbacks_from_hooks_yaml).
+# ------------------------------------------------------------------
+
+
+_SPECIALIST_WRITE = {
+    "tool_name": "Write",
+    "tool_input": {"file_path": "/config/agents/specialists/x/runtime.yaml"},
+}
+
+
+async def _stack_denies_managed(opts) -> bool:
+    """Invoke every PreToolUse callback in built ClaudeAgentOptions against
+    a specialist hand-write; True iff any returns a managed deny."""
+    for matcher in opts.hooks["PreToolUse"]:
+        for cb in matcher.hooks:
+            out = await cb(dict(_SPECIALIST_WRITE), None, {})
+            if out and _decision(out) == "deny" \
+                    and "managed_component_guard" in _reason(out):
+                return True
+    return False
+
+
+class TestGuardIsCodeMandatoryInCasa:
+    def _defn(self, hooks_path):
+        from types import SimpleNamespace
+        return SimpleNamespace(
+            hooks_path=hooks_path, mcp_server_names=[], tools_allowed=["Read"],
+            model="sonnet", permission_mode="acceptEdits",
+            tools_disallowed=[], driver="in_casa",
+        )
+
+    def _build(self, hooks_path):
+        import tools
+        return tools._build_executor_options(
+            self._defn(hooks_path), executor_type="configurator",
+            plugin_paths=[],
+        )
+
+    async def test_yaml_without_guard_still_denies(self, tmp_path):
+        """(a) hooks.yaml exists but does NOT declare the policy."""
+        p = tmp_path / "hooks.yaml"
+        p.write_text(
+            "pre_tool_use:\n"
+            "  - policy: path_scope\n"
+            "    writable: [/config]\n"
+            "    readable: [/config]\n",
+            encoding="utf-8")
+        assert await _stack_denies_managed(self._build(str(p)))
+
+    async def test_hollow_hooks_yaml_still_denies(self, tmp_path):
+        """(b) the Terra regression: hooks_file repointed at a hollow yaml."""
+        p = tmp_path / "hollow.yaml"
+        p.write_text("pre_tool_use: []\n", encoding="utf-8")
+        assert await _stack_denies_managed(self._build(str(p)))
+
+    async def test_missing_hooks_file_still_denies(self):
+        """(b') hooks_file pointing nowhere (defn.hooks_path unusable)."""
+        assert await _stack_denies_managed(self._build(None))
+
+    async def test_declared_guard_not_double_appended(self):
+        """(3) The shipped yaml declares the policy — the code-side append
+        dedupes on the declared name, so the stack is yaml entries + the
+        settings guard only (and still denies)."""
+        import yaml as yaml_mod
+        shipped = _EXECUTORS_DIR / "configurator" / "hooks.yaml"
+        n_declared = len(
+            yaml_mod.safe_load(shipped.read_text(encoding="utf-8"))
+            ["pre_tool_use"])
+        opts = self._build(str(shipped))
+        # + 1 = agent_home_settings_guard matcher; no second managed guard.
+        assert len(opts.hooks["PreToolUse"]) == n_declared + 1
+        assert await _stack_denies_managed(opts)
+
+
+class TestGuardIsCodeMandatoryClaudeCode:
+    async def test_hollow_yaml_settings_carry_guard_entry(self):
+        """(c) CC settings emission: a hollow hooks.yaml still emits the
+        hook_proxy.sh managed_component_guard PreToolUse entry."""
+        from drivers.hook_bridge import translate_hooks_to_settings
+        settings = translate_hooks_to_settings(
+            {}, proxy_script_path="/opt/casa/scripts/hook_proxy.sh")
+        pre = settings["hooks"]["PreToolUse"]
+        cmds = [h["command"] for e in pre for h in e["hooks"]]
+        assert "/opt/casa/scripts/hook_proxy.sh managed_component_guard" in cmds
+
+    async def test_shipped_yaml_settings_not_double_emitted(self):
+        """(3) Shipped plugin-developer yaml declares the policy (bare ->
+        matcher '.*' covers) — exactly one guard entry emitted."""
+        import yaml as yaml_mod
+        from drivers.hook_bridge import translate_hooks_to_settings
+        for executor in ("configurator", "plugin-developer"):
+            raw = yaml_mod.safe_load(
+                (_EXECUTORS_DIR / executor / "hooks.yaml")
+                .read_text(encoding="utf-8"))
+            settings = translate_hooks_to_settings(
+                raw, proxy_script_path="/opt/casa/scripts/hook_proxy.sh")
+            cmds = [h["command"]
+                    for e in settings["hooks"]["PreToolUse"]
+                    for h in e["hooks"]]
+            guard = [c for c in cmds if c.endswith("managed_component_guard")]
+            assert len(guard) == 1, (executor, cmds)
+
+    async def test_narrowed_matcher_declaration_does_not_satisfy_mandate(self):
+        """A yaml-declared guard with a NARROW matcher (matchers are
+        attacker-editable on the CC path) does not suppress the canonical
+        appended entry."""
+        from drivers.hook_bridge import translate_hooks_to_settings
+        settings = translate_hooks_to_settings(
+            {"pre_tool_use": [
+                {"policy": "managed_component_guard", "matcher": "Read"}]},
+            proxy_script_path="/opt/casa/scripts/hook_proxy.sh")
+        pre = settings["hooks"]["PreToolUse"]
+        canonical = [e for e in pre if e["matcher"] == "Write|Edit|Bash"]
+        assert len(canonical) == 1
+
+    async def test_resolved_policy_set_always_carries_guard(self):
+        """(2) Server side: build_policy_callbacks_from_hooks_yaml injects
+        the guard into the resolved set regardless of yaml contents, and
+        the callback denies a specialist hand-write."""
+        from hooks import build_policy_callbacks_from_hooks_yaml
+        built = build_policy_callbacks_from_hooks_yaml({})
+        assert "managed_component_guard" in built
+        matcher, cb = built["managed_component_guard"]
+        assert matcher == "Write|Edit|Bash"
+        out = await cb(dict(_SPECIALIST_WRITE), None, {})
+        assert _decision(out) == "deny"
+
+
 @pytest.mark.parametrize("cmd,route_marker", [
     ("cp /tmp/x /config/plugins/store/y", "plugin_add"),
     ("cp /config/specialists/a /config/specialists/b",

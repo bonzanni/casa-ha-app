@@ -1090,12 +1090,28 @@ def _build_executor_options(
     # shell since v0.101.0, but plugin-developer keeps Bash and hooks.yaml is
     # operator-editable) — inject the same code-side guard so a Bash write to
     # /config/plugins or settings.json is denied regardless of yaml policy.
-    from hooks import agent_home_settings_guard_matcher
+    from hooks import (
+        agent_home_settings_guard_matcher,
+        managed_component_guard_matcher,
+    )
     resolved_hooks = dict(resolved_hooks)
     resolved_hooks["PreToolUse"] = [
         *resolved_hooks.get("PreToolUse", []),
         agent_home_settings_guard_matcher(),
     ]
+    # Round-4 (Terra P0): managed_component_guard is CODE-MANDATORY, exactly
+    # like the settings guard above — definition.yaml's `hooks_file:` is a
+    # config-editable pointer (executor/edit-definition is a legitimate
+    # recipe), so a session whose hooks.yaml was repointed/hollowed must
+    # still carry the guard; yaml policies are additive-only. Skipped only
+    # when the yaml itself already declared the policy (resolve_hooks then
+    # built the identical canonical matcher+factory — avoid the duplicate;
+    # the yaml cannot alter either: the matcher comes from HOOK_POLICIES and
+    # the factory rejects params). The resume path inherits this
+    # automatically (build_engagement_resume_options -> this builder).
+    if not any(e.get("policy") == "managed_component_guard"
+               for e in (hooks_cfg.pre_tool_use or [])):
+        resolved_hooks["PreToolUse"].append(managed_component_guard_matcher())
 
     if plugin_paths is not None:
         sdk_plugins = [{"type": "local", "path": p} for p in plugin_paths]

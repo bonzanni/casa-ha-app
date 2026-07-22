@@ -19,7 +19,9 @@ does not apply it to anything by itself; see `recipes/persona/apply.md` for that
 3. Wait for the operator's DM tap (Approve/Deny) to resolve. There is no polling tool — the
    `persona_install_commit` call in the next step will itself refuse with `kind: "consent_missing"`
    if the tap has not landed yet; on that specific error, tell the operator you are waiting for
-   their DM response and stop (do not loop-retry).
+   their DM response AND that after tapping Approve they should send any message here (e.g.
+   "approved") to continue — the tap alone does not resume this engagement (#217) — then stop
+   (do not loop-retry).
 4. Once approved: `persona_install_commit(persona_id=..., version=..., checksum=..., staged_dir=...)`
    using the EXACT values `persona_install_inspect` returned.
 5. Tell the operator the persona is installed but NOT applied to anything yet — installing and
