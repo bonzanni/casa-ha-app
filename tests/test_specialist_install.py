@@ -766,3 +766,161 @@ def test_uninstall_removes_the_instance_dir_and_operational_files(tmp_path: Path
     assert not os.path.lexists(op_dir)  # Round-4 fix (finding #1): symlink itself is gone, not
                                           # just dangling (shutil.rmtree silently no-ops on a symlink)
     assert not content_dir.exists()  # and its versioned content directory with it
+
+
+# ---------------------------------------------------------------------------
+# cas_pin_roots / persona_pin_roots (Task N1d, spec §4.4)
+# ---------------------------------------------------------------------------
+
+
+def test_cas_pin_roots_includes_active_desired_and_prior_checksums(tmp_path: Path) -> None:
+    from specialist_install import cas_pin_roots, upgrade_specialist
+    from specialist_install_consent import SpecialistInstallAckStore, install_consent_identity
+
+    specialists_dir, agents_specialists_dir, v1 = _installed_mtg(tmp_path)
+    v2 = _v2_inspection(tmp_path)
+    acks = SpecialistInstallAckStore(path=tmp_path / "acks.json")
+    identity = install_consent_identity(component_id=v2.component_id, version=v2.version,
+                                         component_checksum=v2.root_digest, slug=v2.slug)
+    acks.record(identity=identity, component_id=v2.component_id, version=v2.version,
+                component_checksum=v2.root_digest, slug=v2.slug)
+    upgrade_specialist(slug="mtg", inspection=v2, config={}, secret_names_provided=frozenset(),
+                        acks=acks, specialists_dir=specialists_dir,
+                        agents_specialists_dir=agents_specialists_dir)
+
+    # cas_pin_roots parses component_root, which embeds the full-closure
+    # root_digest (Round-2, finding #2) — not the narrow component_checksum.
+    pinned = cas_pin_roots(specialists_dir)
+    assert v1.root_digest in pinned  # retained via active.prior.yaml
+    assert v2.root_digest in pinned  # current active
+
+
+def test_cas_pin_roots_on_missing_directory_returns_empty(tmp_path: Path) -> None:
+    from specialist_install import cas_pin_roots
+
+    assert cas_pin_roots(tmp_path / "does-not-exist") == frozenset()
+
+
+def test_cas_pin_roots_pins_an_override_bound_specialists_component_root(tmp_path: Path) -> None:
+    """Round-2 fix (finding #8/#4's exposed bug): an OVERRIDE-mode specialist
+    binding has `binding.component_root is None` (only component-default
+    populates it) — cas_pin_roots must still pin the component blob via
+    `InstanceTuple.root` (which apply_persona_override never rewrites for a
+    specialist target), not via `binding.component_root`."""
+    from persona_install import apply_persona_override
+    from persona_pack import load_persona_pack
+    from specialist_install import cas_pin_roots, cas_store_dir, parse_component_root
+    from personality_binding import InstanceDir
+    from role_artifact import load_role_artifact
+    from role_slot import materialize_role
+
+    specialists_dir, _agents_dir, v1 = _installed_mtg(tmp_path)
+    active = InstanceDir(specialists_dir / "mtg").active()
+    _, _, checksum = parse_component_root(active.root)
+    cas_dir = cas_store_dir(checksum, store_root=specialists_dir / "store")
+    role = materialize_role(source=load_role_artifact(cas_dir / "role"), options={})
+
+    # persona_id/version must satisfy the mtg role's persona_requirements
+    # ("casa/judge@>=0.1.0 <1.0.0", from _write_component above) — a
+    # DIFFERENT version of the SAME compatible slug, not an unrelated one.
+    override_dir = tmp_path / "judge2-repo"
+    persona_yaml = {
+        "api_version": "casa.persona/v1", "id": "casa/judge", "version": "0.2.0",
+        "trait_schema_version": 1,
+        "identity": {"display_name": "Judge Two", "pronouns": {
+            "subject": "they", "object": "them", "possessive_adjective": "their",
+            "possessive_pronoun": "theirs", "reflexive": "themself"}},
+        "relationship_posture": "established", "archetype": "adjudicator",
+        "traits": {"warmth": 2, "formality": 4, "candor": 5, "attunement": 3,
+                    "curiosity": 3, "levity": 1, "social_energy": 2, "optimism": 3},
+        "quirks": [],
+    }
+    (override_dir / "pack").mkdir(parents=True)
+    (override_dir / "pack" / "persona.yaml").write_text(
+        yaml.safe_dump(persona_yaml, sort_keys=False), encoding="utf-8")
+    core = "Q" * 350
+    (override_dir / "pack" / "persona.md").write_text(
+        f"# Core\n\n{core}\n\n## Negative space\n\nNever guesses.\n", encoding="utf-8")
+    rows = []
+    for name in sorted(os.listdir(override_dir / "pack")):
+        text = canonical_text((override_dir / "pack" / name).read_text(encoding="utf-8"))
+        rows.append({"path": name, "type": "file", "executable": False,
+                      "checksum": checksum_bytes(text.encode("utf-8"))})
+    payload = {"api_version": "casa.persona.manifest/v1", "files": rows}
+    payload["checksum"] = checksum_bytes(canonical_json_bytes(payload))
+    (override_dir / "manifest.json").write_text(json.dumps(payload), encoding="utf-8")
+    persona = load_persona_pack(override_dir / "pack", override_dir / "manifest.json")
+
+    apply_persona_override(
+        target_role_id="specialist:mtg", persona=persona, role=role,
+        instance_dir_root=specialists_dir / "mtg",
+    )
+    pinned = cas_pin_roots(specialists_dir)
+    assert v1.root_digest in pinned  # the component blob is STILL pinned post-override
+
+
+def test_persona_pin_roots_always_includes_image_defaults(tmp_path: Path) -> None:
+    from specialist_install import persona_pin_roots
+    from personality_binding import IMAGE_DEFAULT_PERSONA_BY_SLOT
+
+    pinned = persona_pin_roots(
+        bindings_dir=tmp_path / "bindings", specialists_dir=tmp_path / "specialists")
+    for ref in IMAGE_DEFAULT_PERSONA_BY_SLOT.values():
+        assert ref in pinned
+
+
+def test_persona_pin_roots_includes_a_resident_override_binding(tmp_path: Path) -> None:
+    from persona_install import apply_persona_override
+    from persona_pack import load_persona_pack
+    from role_artifact import load_role_artifact
+    from role_slot import materialize_role
+    from specialist_install import persona_pin_roots
+    from test_persona_install import _write_persona_repo
+
+    role_dir = (
+        Path(__file__).resolve().parent.parent
+        / "casa-agent/rootfs/opt/casa/defaults/roles/resident/assistant"
+    )
+    role = materialize_role(source=load_role_artifact(role_dir), options={})
+    persona_dir = tmp_path / "ellen-repo"
+    _write_persona_repo(persona_dir, persona_id="casa/ellen", version="0.1.0")
+    persona = load_persona_pack(persona_dir / "pack", persona_dir / "manifest.json")
+
+    bindings_dir = tmp_path / "bindings"
+    apply_persona_override(
+        target_role_id="resident:assistant", persona=persona, role=role,
+        instance_dir_root=bindings_dir / "resident-assistant",
+    )
+
+    pinned = persona_pin_roots(bindings_dir=bindings_dir, specialists_dir=tmp_path / "specialists")
+    assert "casa/ellen@0.1.0" in pinned
+
+
+def test_persona_pin_roots_includes_an_override_bound_specialist(tmp_path: Path) -> None:
+    from persona_install import apply_persona_override
+    from persona_pack import load_persona_pack
+    from personality_binding import InstanceDir
+    from role_artifact import load_role_artifact
+    from role_slot import materialize_role
+    from specialist_install import cas_store_dir, parse_component_root, persona_pin_roots
+    from test_persona_install import _write_persona_repo
+
+    specialists_dir, _agents_dir, _v1 = _installed_mtg(tmp_path)
+    active = InstanceDir(specialists_dir / "mtg").active()
+    _, _, checksum = parse_component_root(active.root)
+    cas_dir = cas_store_dir(checksum, store_root=specialists_dir / "store")
+    role = materialize_role(source=load_role_artifact(cas_dir / "role"), options={})
+
+    # persona_id/version must satisfy the mtg role's persona_requirements
+    # ("casa/judge@>=0.1.0 <1.0.0", from _write_component above).
+    persona_dir = tmp_path / "judge3-repo"
+    _write_persona_repo(persona_dir, persona_id="casa/judge", version="0.3.0")
+    persona = load_persona_pack(persona_dir / "pack", persona_dir / "manifest.json")
+
+    apply_persona_override(
+        target_role_id="specialist:mtg", persona=persona, role=role,
+        instance_dir_root=specialists_dir / "mtg",
+    )
+
+    pinned = persona_pin_roots(bindings_dir=tmp_path / "bindings", specialists_dir=specialists_dir)
+    assert "casa/judge@0.3.0" in pinned

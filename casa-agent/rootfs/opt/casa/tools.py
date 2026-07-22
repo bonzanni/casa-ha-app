@@ -6972,6 +6972,163 @@ async def specialist_uninstall(args: dict) -> dict:
     return _result({"ok": True, "slug": args["slug"]})
 
 
+@tool(
+    "persona_install_inspect",
+    "Fetch a persona-only repository for inspection (non-persistent staging). Returns the persona "
+    "id/version/checksum/display name, or a structured error. On success this ALSO posts the "
+    "operator's DM Approve/Deny consent keyboard.",
+    {"type": "object", "properties": {
+        "repo": {"type": "string"}, "ref": {"type": "string"}, "subdir": {"type": "string"},
+        "expected_revision": {"type": "string"}}, "required": ["repo", "ref"]},
+)
+async def persona_install_inspect(args: dict) -> dict:
+    from persona_install import PersonaInstallAckStore, inspect_persona_repo
+    from persona_install_consent import prompt_persona_install_consent
+    from specialist_install import SpecialistInstallError
+
+    try:
+        result = await asyncio.to_thread(
+            inspect_persona_repo, args["repo"], args["ref"], subdir=args.get("subdir", ""),
+            expected_revision=args.get("expected_revision"))
+    except SpecialistInstallError as exc:
+        return _result({"ok": False, "kind": exc.kind, "detail": exc.detail})
+
+    # Same structural-consent wiring as specialist_install_inspect above —
+    # CREATE the challenge here rather than leaving it uncalled (Round-2
+    # fix, finding #3, the bare-persona sibling of that same gap). CHALLENGES
+    # is the same module-level singleton already imported at the top of this
+    # file (`from authz_grants import CHALLENGES, ...`).
+    import trigger_consent
+
+    channel = _channel_manager.get("telegram") if _channel_manager is not None else None
+    op = trigger_consent.operator_identity(channel) if channel is not None else None
+    if channel is not None and op is not None:
+        chat_id, operator_id = op
+        acks = PersonaInstallAckStore()
+
+        async def _reconcile_cb() -> None:
+            return  # commit happens via a later, explicit persona_install_commit call
+
+        try:
+            # Round-3 fix (finding #3): same event-loop requirement as
+            # `specialist_install_inspect` above — `register_challenge`
+            # (authz_grants.py:586) calls `asyncio.get_running_loop().
+            # create_task(...)` synchronously, so it must run ON the event
+            # loop, not inside an `asyncio.to_thread` worker thread (which
+            # has no running loop and would raise, silently swallowed by
+            # this `except`). Call directly, mirroring
+            # `trigger_reconcile._fire_consent_prompts`'s synchronous call to
+            # `trigger_consent.prompt_trigger_consent`
+            # (trigger_reconcile.py:350-353).
+            prompt_persona_install_consent(
+                coordinator=CHALLENGES,
+                channel=channel, chat_id=chat_id, operator_id=operator_id, inspection=result,
+                acks=acks, reconcile_cb=_reconcile_cb,
+            )
+        except Exception:  # noqa: BLE001
+            logger.exception("persona install consent prompt failed to post")
+
+    return _result({"ok": True, "persona_id": result.persona_id, "version": result.version,
+                     "checksum": result.checksum, "display_name": result.display_name,
+                     "staged_dir": str(result.staged_dir)})
+
+
+@tool(
+    "persona_install_commit",
+    "Persist an INSPECTED persona to /config/personas — REFUSES unless the operator has approved "
+    "via the DM consent keyboard.",
+    {"type": "object", "properties": {
+        "persona_id": {"type": "string"}, "version": {"type": "string"},
+        "checksum": {"type": "string"}, "staged_dir": {"type": "string"}},
+     "required": ["persona_id", "version", "checksum", "staged_dir"]},
+)
+async def persona_install_commit(args: dict) -> dict:
+    from persona_install import PersonaInspectionResult, PersonaInstallAckStore, commit_persona_install
+    from persona_pack import PersonaPackError, load_persona_pack
+    from specialist_install import SpecialistInstallError
+
+    staged_dir = Path(args["staged_dir"])
+    # Round-2 fix (finding #3): reload the staged bytes and cross-check the
+    # RECOMPUTED persona_id/version/checksum against the caller-supplied
+    # args, rather than trusting them directly — mirrors
+    # specialist_install_commit's existing (correct) pattern.
+    try:
+        pack = load_persona_pack(staged_dir / "pack", staged_dir / "manifest.json")
+    except (PersonaPackError, OSError) as exc:
+        return _result({"ok": False, "kind": "staged_dir_invalid", "detail": str(exc)})
+    if (pack.persona_id != args["persona_id"] or pack.version != args["version"]
+            or pack.checksum != args["checksum"]):
+        return _result({"ok": False, "kind": "checksum_changed",
+                         "detail": "staged persona no longer matches the approved inspection"})
+    inspection = PersonaInspectionResult(
+        persona_id=pack.persona_id, version=pack.version, checksum=pack.checksum,
+        display_name=pack.identity.get("display_name", pack.persona_id), staged_dir=staged_dir)
+    try:
+        pack = await asyncio.to_thread(
+            commit_persona_install, inspection=inspection, acks=PersonaInstallAckStore())
+    except SpecialistInstallError as exc:
+        return _result({"ok": False, "kind": exc.kind, "detail": exc.detail})
+    return _result({"ok": True, "persona_id": pack.persona_id, "version": pack.version,
+                     "checksum": pack.checksum})
+
+
+@tool(
+    "persona_apply",
+    "Apply an installed persona as an override binding to a resident slot (assistant/butler/"
+    "concierge) or an installed specialist slug. Restart-to-swap: takes effect on the target "
+    "agent's next restart (residents) or next casa_reload (specialists).",
+    {"type": "object", "properties": {
+        "target_role_id": {"type": "string"}, "persona_id": {"type": "string"},
+        "persona_version": {"type": "string"}}, "required": ["target_role_id", "persona_id", "persona_version"]},
+)
+async def persona_apply(args: dict) -> dict:
+    from persona_install import apply_persona_override
+    from persona_pack import PersonaPackError, load_persona_pack
+    from role_slot import materialize_role
+    from role_artifact import load_role_artifact
+
+    kind, _, slot = args["target_role_id"].partition(":")
+    personas_root = Path("/config/personas") / args["persona_id"] / args["persona_version"]
+    try:
+        persona = load_persona_pack(personas_root / "pack", personas_root / "manifest.json")
+    except (PersonaPackError, OSError) as exc:
+        return _result({"ok": False, "kind": "persona_unavailable", "detail": str(exc)})
+
+    if kind == "resident":
+        # Controller resolution #2 (task-n1d-brief deviation): the brief
+        # hard-coded Path("/opt/casa/defaults/roles/resident") — use the
+        # canonical image-roles seam (agent_loader.DEFAULT_ROLES_DIR)
+        # instead, identical in production but correct under test/dev
+        # layouts where the image tree isn't rooted at /opt/casa.
+        import agent_loader
+
+        role_dir = Path(agent_loader.DEFAULT_ROLES_DIR) / "resident" / slot
+        instance_dir_root = Path("/config/bindings") / f"resident-{slot}"
+    elif kind == "specialist":
+        from specialist_registry import InstalledSpecialistIndex
+
+        index = InstalledSpecialistIndex()
+        index.load()
+        role_dirs = index.installed_component_role_dirs()
+        if slot not in role_dirs:
+            return _result({"ok": False, "kind": "not_installed", "slug": slot})
+        role_dir = role_dirs[slot] / "role"
+        instance_dir_root = Path("/config/specialists") / slot
+    else:
+        return _result({"ok": False, "kind": "invalid_target", "target_role_id": args["target_role_id"]})
+
+    role = materialize_role(source=load_role_artifact(role_dir), options={})
+    try:
+        committed = await asyncio.to_thread(
+            apply_persona_override, target_role_id=args["target_role_id"], persona=persona,
+            role=role, instance_dir_root=instance_dir_root)
+    except ValueError as exc:
+        return _result({"ok": False, "kind": "incompatible", "detail": str(exc)})
+    return _result({"ok": True, "target_role_id": args["target_role_id"],
+                     "binding_digest": committed.binding.binding_digest,
+                     "restart_required": kind == "resident"})
+
+
 def _find_entry(data, name: str) -> dict | None:
     return next((e for e in data.raw.get("plugins", [])
                  if isinstance(e, dict) and e.get("name") == name), None)
@@ -7855,6 +8012,11 @@ CASA_TOOLS: tuple = (
     specialist_upgrade,
     specialist_rollback,
     specialist_uninstall,
+    # Personality Phase A, Plan 2 Task N1d — configurator-only bare-persona
+    # repo install/apply tools.
+    persona_install_inspect,
+    persona_install_commit,
+    persona_apply,
 )
 
 
