@@ -861,8 +861,11 @@ def agent_home_settings_guard_matcher():
 # and any unexpected Exception returns the deny shape (CancelledError
 # re-raises). Same accepted residual as the other Bash guards: argv-level
 # inspection, not a sandbox — obfuscated writes (source'd scripts, busybox
-# applets, git-apply, interpreters reading code from files/stdin) need the
-# outer boundary. Round-2 W1 (ratified): for the CONFIGURATOR that Bash
+# applets, git-apply, interpreters reading code from files/stdin, and
+# variable-built destinations like `d=/config; printf x > "$d/plugins/…"`)
+# need the outer boundary; filesystem-level containment for the
+# plugin-developer's shell is tracked as #216. Round-2 W1 (ratified): for
+# the CONFIGURATOR that Bash
 # vector is now closed at the capability layer — Bash was removed from its
 # toolset (role.yaml + definition.yaml). The Bash branch below stays fully
 # intact: the plugin-developer keeps Bash, and an operator who deliberately
@@ -897,8 +900,8 @@ _MANAGED_ROUTE_PLUGINS = (
     "plugin_unassign / plugin_remove (doctrine/recipes/plugin/)."
 )
 _MANAGED_ROUTE_BINDINGS = (
-    "Bindings/personas: use resident_persona_swap / persona_apply "
-    "(doctrine/recipes/persona/)."
+    "Bindings/personas: use resident_persona_swap / resident_persona_reset "
+    "/ persona_apply (doctrine/recipes/persona/)."
 )
 _MANAGED_ROUTE_PERSONAS = (
     "Personas: use persona_install_inspect / persona_install_commit / "
@@ -1134,6 +1137,18 @@ def _dest_family_writes_managed(argv: list[str]) -> bool:
             elif a.startswith("--target-directory="):
                 if _token_resolves_managed(a.split("=", 1)[1]):
                     return True
+            elif a.startswith("-t") and len(a) > 2:
+                # GNU cp/install attached form ``-tDIR`` (round-3 S2). rsync's
+                # ``-t`` is preserve-times and never takes a directory, so a
+                # cluster like ``-tv`` reaching here must NOT downgrade the
+                # parse: only a slash-bearing suffix is treated as a target;
+                # anything else marks the shape ambiguous (fail-closed).
+                suffix = a[2:]
+                if "/" in suffix:
+                    if _token_resolves_managed(suffix):
+                        return True
+                else:
+                    ambiguous = True
             elif a.startswith("--remove-source"):
                 ambiguous = True  # rsync mutates its SOURCE too
             i += 1

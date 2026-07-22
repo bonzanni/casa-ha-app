@@ -17,8 +17,8 @@ hand-edited.
 
 1. `specialist_install_inspect(repo=..., ref=...)`. On any `ok: false`, report the `kind`/`detail`
    verbatim and stop — do NOT retry with fabricated inputs.
-2. Summarize the inspection result in the topic (mission, default persona, dependencies, required
-   config/secret names) and post it via `ask_user` so the operator sees it BEFORE the DM consent
+2. Summarize the inspection result as a plain message in the topic (mission, default persona,
+   dependencies, required config/secret names) so the operator sees it BEFORE the DM consent
    prompt fires — the DM keyboard (posted server-side by `prompt_specialist_install_consent`, not by
    this recipe) is the actual approval gate; this step is purely informational context in-topic.
 3. Wait for the operator's DM tap (Approve/Deny) to resolve. There is no polling tool — the

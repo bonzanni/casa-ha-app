@@ -720,3 +720,55 @@ async def test_destination_aware_write_shapes_deny(cmd, route_marker):
     )
     assert _decision(out) == "deny", cmd
     assert route_marker in _reason(out), cmd
+
+
+# ------------------------------------------------------------------
+# Round-3 S2: GNU attached-form `-tDIR` target directory (cp/install)
+# ------------------------------------------------------------------
+
+
+@pytest.mark.parametrize("command", [
+    "cp -t/config/plugins /tmp/x",
+    "install -t/config/agents/specialists/finance /tmp/payload",
+    "cp -t/config/personas/pack /tmp/manifest.yaml",
+])
+async def test_bash_attached_target_directory_denied(command):
+    out = await _hook()(
+        {"tool_name": "Bash", "tool_input": {"command": command}}, None, {})
+    assert _decision(out) == "deny", command
+
+
+async def test_bash_rsync_times_cluster_does_not_downgrade_dest_check():
+    # rsync's -t is preserve-times, NOT a target directory: a cluster like
+    # `-tv` must not be misread as target "v" (which would turn the managed
+    # last operand into an ignored "source").
+    out = await _hook()({"tool_name": "Bash", "tool_input": {
+        "command": "rsync -tv /tmp/evil /config/plugins/registry.json"}},
+        None, {})
+    assert _decision(out) == "deny"
+
+
+async def test_bash_attached_target_nonmanaged_copy_still_reads_ok():
+    # Attached -t pointing OUTSIDE managed trees with a managed SOURCE:
+    # single-operand shape is ambiguous -> fail-closed deny is accepted; the
+    # unambiguous separate-form read (two operands, non-managed dest) passes.
+    out = await _hook()({"tool_name": "Bash", "tool_input": {
+        "command": "cp /config/plugins/store/x/manifest.json /tmp/out.json"}},
+        None, {})
+    assert out == {}
+
+
+# ------------------------------------------------------------------
+# Round-3 S4: bindings route names the FULL lifecycle set
+# ------------------------------------------------------------------
+
+
+async def test_bindings_route_names_all_lifecycle_tools():
+    out = await _hook()(
+        {"tool_name": "Write",
+         "tool_input": {"file_path": "/config/bindings/ellen.yaml"}},
+        None, {},
+    )
+    for marker in ("resident_persona_swap", "resident_persona_reset",
+                   "persona_apply"):
+        assert marker in _reason(out), marker

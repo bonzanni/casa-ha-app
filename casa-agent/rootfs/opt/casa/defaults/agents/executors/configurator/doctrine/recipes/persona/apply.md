@@ -11,9 +11,9 @@
 5. If `ok: true` and `restart_required: true` (residents): tell the operator the swap is staged and
    takes effect on the resident's next restart (`casa_restart_supervised`) — a resident's binding
    change is NEVER hot-swapped (Plan 1 Task 8's `ReloadError("restart_required", ...)` guard).
-6. If `ok: true` and `restart_required: false` (specialists): `casa_reload(scope="agents")` activates
-   it immediately.
-7. `config_git_commit`, `emit_completion`.
+6. `config_git_commit` first, then — if `ok: true` and `restart_required: false` (specialists) —
+   `casa_reload(scope="agents")` activates it immediately, then `emit_completion`
+   (canonical commit -> reload -> emit order, see `completion.md`).
 
 ## Common mistakes
 

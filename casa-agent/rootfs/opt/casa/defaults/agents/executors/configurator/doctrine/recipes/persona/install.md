@@ -12,7 +12,7 @@ does not apply it to anything by itself; see `recipes/persona/apply.md` for that
 
 1. `persona_install_inspect(repo=..., ref=...)`. On any `ok: false`, report the `kind`/`detail`
    verbatim and stop — do NOT retry with fabricated inputs.
-2. Post the result (display name, persona id/version, checksum) in-topic via `ask_user` so the
+2. Post the result (display name, persona id/version, checksum) as a plain in-topic message so the
    operator sees it BEFORE the DM consent prompt fires — the DM keyboard (posted server-side by
    `prompt_persona_install_consent`, not by this recipe) is the actual approval gate; this step is
    purely informational context in-topic.

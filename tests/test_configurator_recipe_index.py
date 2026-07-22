@@ -84,3 +84,26 @@ def test_cross_recipe_references_resolve():
     for p in RECIPES_DIR.rglob("*.md"):
         for ref in re.findall(r"recipes/([a-z0-9-]+/[a-z0-9_-]+)\.md", p.read_text(encoding="utf-8")):
             assert ref in on_disk, f"{p.relative_to(RECIPES_DIR)} references missing recipe {ref}.md"
+
+
+def test_lifecycle_recipes_order_commit_before_reload_before_emit():
+    """completion.md's canonical order is commit -> reload -> emit_completion.
+    Round-1 found the inversion in 4 recipes and round-3 found a 5th
+    (uninstall.md) — so pin it mechanically for EVERY recipe that stages all
+    three calls as numbered steps."""
+    for p in RECIPES_DIR.rglob("*.md"):
+        text = p.read_text(encoding="utf-8")
+        positions = {}
+        for marker in ("config_git_commit", "casa_reload", "emit_completion"):
+            # First numbered step naming the call. m.end() (not the line
+            # start) so three calls staged in-order on ONE step line — like
+            # upgrade.md step 6 — compare correctly.
+            m = re.search(rf"^\s*\d+\.\s[^\n]*?{marker}", text, re.M)
+            if m:
+                positions[marker] = m.end()
+        if len(positions) == 3:
+            assert (positions["config_git_commit"]
+                    < positions["casa_reload"]
+                    < positions["emit_completion"]), (
+                f"{p.relative_to(RECIPES_DIR)} violates the canonical "
+                "commit -> reload -> emit_completion order")

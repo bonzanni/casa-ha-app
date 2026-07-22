@@ -239,3 +239,25 @@ def test_every_option_has_a_translation() -> None:
     translated = set((trans.get("configuration") or {}).keys())
     missing = schema_keys - translated
     assert not missing, f"schema options with no en.yaml translation: {sorted(missing)}"
+
+
+def test_configurator_definition_and_role_allowlists_are_identical() -> None:
+    """#210 true root cause (round-3, both reviewers): Plan 2 added the
+    specialist/persona pipeline tools to role.yaml only, but the RUNTIME
+    allowlist flows from definition.yaml (load_all_executors ->
+    ClaudeAgentOptions.allowed_tools) — so the live configurator had no
+    typed install path and hand-authored instead. The two lists must never
+    drift again."""
+    defn = yaml.safe_load(
+        (AGENTS / "executors/configurator/definition.yaml")
+        .read_text(encoding="utf-8"))
+    role = yaml.safe_load(
+        (Path(__file__).resolve().parents[1]
+         / "casa-agent/rootfs/opt/casa/defaults/roles/executor/configurator"
+         / "role.yaml").read_text(encoding="utf-8"))
+    defn_allowed = set((defn.get("tools") or {}).get("allowed") or [])
+    role_allowed = set((role.get("tools") or {}).get("allowed") or [])
+    assert defn_allowed == role_allowed, (
+        "configurator tool allowlists drifted:\n"
+        f"  only in definition.yaml: {sorted(defn_allowed - role_allowed)}\n"
+        f"  only in role.yaml:       {sorted(role_allowed - defn_allowed)}")
