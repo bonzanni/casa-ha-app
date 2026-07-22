@@ -198,3 +198,58 @@ def test_tampered_active_file_is_rejected_on_load(tmp_path: Path) -> None:
     active_path.write_text(text.replace("0.1.0", "9.9.9"), encoding="utf-8")
     with pytest.raises(ValueError, match="digest"):
         d.active()
+
+
+def _specialist_role() -> "RoleSlot":
+    from role_slot import RoleSlot, ResolvedModel
+    return RoleSlot(
+        role_id="specialist:mtg", kind="specialist", slot="mtg", mission="x",
+        resolved_model=ResolvedModel(source="fixed", effective="sonnet",
+                                      sdk_model="claude-sonnet-4-6", option=None),
+        normalized={}, doctrine="Doctrine.\n", checksum="sha256:" + "1" * 64,
+    )
+
+
+def _judge_persona() -> "PersonaPack":
+    from persona_pack import PersonaPack, PersonaManifest
+    return PersonaPack(
+        persona_id="casa/judge", version="0.1.0", trait_schema_version=1,
+        identity={"display_name": "Judge", "pronouns": {
+            "subject": "they", "object": "them", "possessive_adjective": "their",
+            "possessive_pronoun": "theirs", "reflexive": "themself"}},
+        relationship_posture="established", archetype="adjudicator",
+        traits={"warmth": 2, "formality": 4, "candor": 5, "attunement": 3,
+                 "curiosity": 3, "levity": 1, "social_energy": 2, "optimism": 3},
+        quirks=(), markdown="# Core\n\nJudges rules.\n\n## Negative space\n\nNever guesses.\n",
+        examples=(), manifest=PersonaManifest(files=(), checksum="sha256:" + "3" * 64),
+        checksum="sha256:" + "2" * 64,
+    )
+
+
+def test_materialize_component_default_binding_is_specialist_only() -> None:
+    import pytest
+    from personality_binding import materialize_component_default_binding
+    from role_slot import RoleSlot, ResolvedModel
+
+    resident_role = RoleSlot(
+        role_id="resident:butler", kind="resident", slot="butler", mission="x",
+        resolved_model=ResolvedModel(source="fixed", effective="haiku",
+                                      sdk_model="claude-haiku-4-5", option=None),
+        normalized={}, doctrine="Doctrine.\n", checksum="sha256:" + "1" * 64,
+    )
+    with pytest.raises(ValueError, match="specialist-only"):
+        materialize_component_default_binding(
+            role=resident_role, persona=_judge_persona(), component_root="casa-test/mtg@0.1.0",
+        )
+
+
+def test_materialize_component_default_binding_sets_mode_and_component_root() -> None:
+    from personality_binding import materialize_component_default_binding
+
+    binding = materialize_component_default_binding(
+        role=_specialist_role(), persona=_judge_persona(), component_root="casa-test/mtg@0.1.0",
+    )
+    assert binding.mode == "component-default"
+    assert binding.component_root == "casa-test/mtg@0.1.0"
+    assert binding.image_default_root is None
+    assert binding.override_source is None

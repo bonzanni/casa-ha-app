@@ -107,6 +107,23 @@ def materialize_override_binding(
     return _build(role=role, persona=persona, mode="override", override_source=override_source)
 
 
+def materialize_component_default_binding(
+    *, role: RoleSlot, persona: PersonaPack, component_root: str,
+    dependency_digests: tuple[str, ...] = (), effective_config_digest: str = EMPTY_CONFIG_DIGEST,
+) -> BindingRecord:
+    """Spec §2.3's third binding mode — specialist-only, tracks the default
+    persona pinned by the INSTALLED component (as opposed to image-default,
+    which tracks the image's own default, or override, which pins an exact
+    operator-chosen digest). Reuses the SAME `_build` helper Task 7's other
+    two materializers use — one binding-construction path, three modes."""
+    if role.kind != "specialist":
+        raise ValueError("component-default binding is specialist-only")
+    return _build(
+        role=role, persona=persona, mode="component-default", component_root=component_root,
+        dependency_digests=dependency_digests, effective_config_digest=effective_config_digest,
+    )
+
+
 def _raw_from_binding(record: BindingRecord) -> dict[str, object]:
     return {
         "api_version": "casa.binding/v1",
