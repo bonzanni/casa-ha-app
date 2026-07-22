@@ -1,17 +1,22 @@
 # Safety - destructive ops and what hooks block
 
-Hooks run BEFORE your tool call. If a hook denies, you'll see a message starting with the policy name (casa_config_guard, commit_size_guard, path_scope, block_dangerous_bash, managed_component_guard). Do not try to work around it - ask the user in the engagement topic.
+Hooks run BEFORE your tool call. If a hook denies, you'll see a message starting with the policy name (casa_config_guard, commit_size_guard, path_scope, managed_component_guard). Denials come in two classes:
+
+- **Confirmation-gated** (destructive-adjacent ops below): ask the user in the engagement topic; if they agree, retry and the framework may let it through.
+- **Non-overridable** (managed component trees, hook-policy files): there is NO retry path - no user agreement lifts them, and editing hook files is itself denied. Use the typed tool or recipe the denial message names.
+
+You have no shell: Bash is not in your toolset. Edit files with Write/Edit, search with Grep/Glob, and mutate managed components only through the typed tools.
 
 ## Fully blocked (no override)
 
 - Write/Edit anywhere under /data/** - runtime state; touching it corrupts memory.
 - Write/Edit under /config/schema/** - authoritative code; breaks load path.
 - Write/Edit under /opt/casa/** - addon source tree.
-- rm -rf, shutdown, reboot, dd if=, curl with POST/data, ssh, scp in Bash.
+- Write/Edit of managed component state (agents/specialists/**, specialists/**, bindings/**, personas/**, plugins/**) and of any agent's hooks.yaml - managed_component_guard.
 
 ## Destructive-adjacent (ask the user first)
 
-- rm -rf /config/agents/<resident> - removing a resident. Hook denies by default.
+- Anything that would remove a resident - residents are fixed (the resident/create and resident/delete recipes are retired stubs); hooks deny resident deletion.
 - Any change to policies/scopes.yaml - classifier is trained on this corpus. Show the user the diff before committing.
 - Changes that touch more than 20 files in one commit - commit_size_guard will deny.
 

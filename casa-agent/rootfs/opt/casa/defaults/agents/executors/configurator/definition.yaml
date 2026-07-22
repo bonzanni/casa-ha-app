@@ -9,11 +9,16 @@ model: sonnet
 driver: in_casa
 enabled: true
 tools:
+  # v0.101.0 round-2 W1 (Sol+Terra ratified): NO Bash — the configurator has
+  # no legitimate shell dependency (recipes use typed tools + Read/Write/
+  # Edit/Grep/Glob), and argv inspection can never close the script-writer/
+  # unmodeled-binary bypass class. This list feeds ClaudeAgentOptions.
+  # allowed_tools (agent_loader.load_all_executors -> tools_allowed ->
+  # tools._build_executor_options). Keep the canonical role.yaml in sync.
   allowed:
     - Read
     - Write
     - Edit
-    - Bash
     - Glob
     - Grep
     - mcp__casa-framework__config_git_commit

@@ -1086,9 +1086,10 @@ def _build_executor_options(
         hooks_cfg = HooksConfig(pre_tool_use=list(raw.get("pre_tool_use") or []))
 
     resolved_hooks = resolve_hooks(hooks_cfg, default_cwd="/config")
-    # Sol #5: in_casa executors (e.g. configurator, cwd=/config, Bash allowed)
-    # could `echo > /config/plugins/registry.json` — inject the same code-side
-    # guard so a Bash write to /config/plugins or settings.json is denied.
+    # Sol #5: in_casa executors run with cwd=/config (the configurator has no
+    # shell since v0.101.0, but plugin-developer keeps Bash and hooks.yaml is
+    # operator-editable) — inject the same code-side guard so a Bash write to
+    # /config/plugins or settings.json is denied regardless of yaml policy.
     from hooks import agent_home_settings_guard_matcher
     resolved_hooks = dict(resolved_hooks)
     resolved_hooks["PreToolUse"] = [

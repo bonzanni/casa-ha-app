@@ -137,6 +137,28 @@ def test_every_allowed_tool_resolves() -> None:
     assert not violations, "dangling tool grants:\n  " + "\n  ".join(violations)
 
 
+def test_configurator_has_no_bash_but_plugin_developer_keeps_it() -> None:
+    """Round-2 W1 (Sol+Terra ratified, v0.101.0): the configurator's Bash was
+    removed at the capability layer — argv inspection (managed_component_guard)
+    can never close the script-writer/unmodeled-binary bypass class, and a
+    doctrine audit found no legitimate configurator Bash dependency. Pinned in
+    BOTH the runtime allowlist source (definition.yaml — feeds
+    ClaudeAgentOptions.allowed_tools via agent_loader.load_all_executors ->
+    tools._build_executor_options) and the canonical role artifact
+    (role.yaml). The plugin-developer KEEPS Bash (it builds plugins)."""
+    by_role = {r: d for r, _, d in _agent_configs()}
+    cfg_allowed = (by_role["configurator"].get("tools") or {}).get("allowed") or []
+    assert "Bash" not in cfg_allowed, (
+        "configurator definition.yaml must NOT allow Bash (round-2 W1)")
+    pd_allowed = (by_role["plugin-developer"].get("tools") or {}).get("allowed") or []
+    assert "Bash" in pd_allowed, "plugin-developer must keep Bash"
+    role_yaml = yaml.safe_load(
+        (CASA / "defaults" / "roles" / "executor" / "configurator" /
+         "role.yaml").read_text(encoding="utf-8"))
+    assert "Bash" not in ((role_yaml.get("tools") or {}).get("allowed") or []), (
+        "configurator role.yaml must NOT allow Bash (round-2 W1)")
+
+
 def test_required_self_use_tools_present() -> None:
     """Invariant C: verified must-call tools are granted."""
     by_role = {r: d for r, _, d in _agent_configs()}

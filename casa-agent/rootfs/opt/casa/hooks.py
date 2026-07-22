@@ -860,7 +860,13 @@ def agent_home_settings_guard_matcher():
 # control response, NOT a deny — so the whole body runs inside try/except
 # and any unexpected Exception returns the deny shape (CancelledError
 # re-raises). Same accepted residual as the other Bash guards: argv-level
-# inspection, not a sandbox — obfuscated writes need the outer boundary.
+# inspection, not a sandbox — obfuscated writes (source'd scripts, busybox
+# applets, git-apply, interpreters reading code from files/stdin) need the
+# outer boundary. Round-2 W1 (ratified): for the CONFIGURATOR that Bash
+# vector is now closed at the capability layer — Bash was removed from its
+# toolset (role.yaml + definition.yaml). The Bash branch below stays fully
+# intact: the plugin-developer keeps Bash, and an operator who deliberately
+# re-adds Bash to an executor still gets this guard as the inner layer.
 #
 # Round-2 hardening (Sol+Terra adversarial review):
 #   F1  Bash commands also enforce the hooks.yaml policy-file rule.
@@ -878,25 +884,37 @@ def agent_home_settings_guard_matcher():
 # ---------------------------------------------------------------------------
 
 
+# Round-2 W5 (Sol): routes name the FULL lifecycle toolset per prefix, not
+# just the install/add door — a deny on an upgrade/removal attempt must
+# route to the matching typed tool, not send the model back to install.
 _MANAGED_ROUTE_SPECIALISTS = (
-    "Specialists: use specialist_install_inspect / specialist_install_commit "
-    "(doctrine/recipes/specialist/install.md)."
+    "Specialists: use specialist_install_inspect / specialist_install_commit, "
+    "specialist_upgrade, specialist_rollback, specialist_uninstall "
+    "(doctrine/recipes/specialist/)."
 )
 _MANAGED_ROUTE_PLUGINS = (
-    "Plugins: use plugin_add / plugin_assign (doctrine/recipes/plugin/)."
+    "Plugins: use plugin_add / plugin_update / plugin_assign / "
+    "plugin_unassign / plugin_remove (doctrine/recipes/plugin/)."
 )
 _MANAGED_ROUTE_BINDINGS = (
     "Bindings/personas: use resident_persona_swap / persona_apply "
     "(doctrine/recipes/persona/)."
 )
+_MANAGED_ROUTE_PERSONAS = (
+    "Personas: use persona_install_inspect / persona_install_commit / "
+    "persona_apply (doctrine/recipes/persona/)."
+)
 
 # Managed prefix -> routing sentence. Prefixes are matched against
 # _normalize_path output (so `..` traversal and `//` collapse can't slip
 # through); first match wins (the prefixes are disjoint after normalization).
+# Round-2 W2 (Sol): /config/personas added — persona installs are
+# consent-gated exactly like specialists, so their tree is managed too.
 _MANAGED_PREFIX_ROUTES: tuple[tuple[str, str], ...] = (
     ("/config/agents/specialists", _MANAGED_ROUTE_SPECIALISTS),
     ("/config/specialists", _MANAGED_ROUTE_SPECIALISTS),
     ("/config/bindings", _MANAGED_ROUTE_BINDINGS),
+    ("/config/personas", _MANAGED_ROUTE_PERSONAS),
     ("/config/plugins", _MANAGED_ROUTE_PLUGINS),
 )
 
@@ -987,79 +1005,163 @@ _MANAGED_PATH_TOKEN_RE = re.compile(r"/[^\s'\"`;|&<>()]*")
 _MANAGED_REL_TOKEN_RE = re.compile(
     r"(?<![\w./-])"
     r"(?:\.{1,2}/)*"
-    r"(?:agents|specialists|bindings|plugins|config)"
+    r"(?:agents|specialists|bindings|personas|plugins|config)"
     r"(?:/[^\s'\"`;|&<>()]*|(?![\w.-]))"
 )
 
 
+def _token_candidates(tok: str) -> list[str]:
+    """Normalized absolute candidates for one path token: an absolute token
+    as-is; a relative token joined against /config (the executor cwd),
+    against / (the ``config/...`` spelling), and with any leading ./ or ../
+    segments stripped then joined against /config. The stripped candidate
+    covers the deeper-cwd shape (``../specialists/x`` typed from
+    /config/agents lands in a managed tree even though the same token from
+    /config does not) — the fail-closed bias governs the tie."""
+    if tok.startswith("/"):
+        return [_normalize_path(tok)]
+    out = [_normalize_path("/config/" + tok), _normalize_path("/" + tok)]
+    stripped = re.sub(r"^(?:\.{1,2}/)+", "", tok)
+    if stripped and stripped != tok:
+        out.append(_normalize_path("/config/" + stripped))
+    return out
+
+
+def _token_resolves_managed(tok: str) -> bool:
+    """True iff any resolution candidate of ``tok`` hits managed state
+    (lexical or via symlink), the resolution errors, or the token is
+    runtime-expanded (``$var`` / backtick) and therefore unknowable —
+    ambiguity denies (round-2 W3, fail-closed)."""
+    if not tok or "$" in tok or "`" in tok:
+        return True
+    return any(_managed_real_hit(c) is not None for c in _token_candidates(tok))
+
+
 def _managed_candidate_paths(command: str) -> list[str]:
     """Normalized absolute candidates for every path-shaped token in a Bash
-    command: absolute tokens as-is; relative tokens joined against /config
-    (the executor cwd), against / (the ``config/...`` spelling), and with
-    any leading ./ or ../ segments stripped then joined against /config.
-    The stripped candidate covers the deeper-cwd shape (``../specialists/x``
-    typed from /config/agents lands in a managed tree even though the same
-    token from /config does not) — the fail-closed bias governs the tie.
-    """
+    command — absolute tokens plus relative tokens whose first segment is a
+    managed root name (see ``_token_candidates`` for the join rules)."""
     out: list[str] = []
     seen: set[str] = set()
 
     def _add(path: str) -> None:
-        norm = _normalize_path(path)
-        if norm not in seen:
-            seen.add(norm)
-            out.append(norm)
+        if path not in seen:
+            seen.add(path)
+            out.append(path)
 
     for tok in _MANAGED_PATH_TOKEN_RE.findall(command):
-        _add(tok)
+        for cand in _token_candidates(tok):
+            _add(cand)
     for tok in _MANAGED_REL_TOKEN_RE.findall(command):
-        _add("/config/" + tok)
-        _add("/" + tok)
-        stripped = re.sub(r"^(?:\.{1,2}/)+", "", tok)
-        if stripped and stripped != tok:
-            _add("/config/" + stripped)
+        for cand in _token_candidates(tok):
+            _add(cand)
     return out
 
 # Benign redirects, stripped BEFORE the write-operator test so the common
-# verification forms (`cat x 2>/dev/null`, `cmd 2>&1 | head`) don't read as
-# writes. Writing to /dev/null mutates nothing.
-_MANAGED_BENIGN_REDIRECT_RE = re.compile(r"[0-9]*>>?\s*/dev/null\b|[0-9]+>&[0-9]+")
+# verification forms (`cat x 2>/dev/null`, `cmd 2>&1 | head`, `>&2`) don't
+# read as writes. Writing to /dev/null or duplicating an fd mutates nothing.
+_MANAGED_BENIGN_REDIRECT_RE = re.compile(r"[0-9]*>>?\s*/dev/null\b|[0-9]*>&[0-9]+")
 
 # Round-2 F5 restructure (Sol): the old single ANYWHERE regex matched write
 # VERBS inside argument text — `grep -r install /config/plugins/store`
-# false-denied on \binstall\b. Split into (a) operators that are
-# write-shaped anywhere in the raw text — redirects, in-place edit flags,
+# false-denied on \binstall\b. Split into (a) operand-mutating operators
+# that are write-shaped anywhere in the raw text — in-place edit flags and
 # find's action predicates — and (b) verbs that must sit in COMMAND
 # POSITION (argv[0] of a pipeline segment via _split_pipeline, allowing
 # wrapper prefixes: sudo/nohup/timeout <arg>/env/command/xargs and the git
 # subcommand shape). Benign redirects are stripped before the operator
 # test. `find <managed> -delete` still denies (path-first, operator
 # anywhere); the fail-closed bias keeps the operator class order-blind.
+#
+# Round-2 W3 refinement (Sol): redirects and the cp/rsync/install family
+# are TARGET-aware — a redirect denies only when its target resolves
+# managed or is unresolvable ($var, substitution, missing), and
+# cp/rsync/install deny on a managed DESTINATION (copying FROM a managed
+# tree elsewhere is a legitimate read). Blanket any-operand treatment
+# stays for verbs that mutate their operands (rm/rmdir/ln/touch/mkdir/
+# chmod/chown/truncate/shred/tee/dd/tar/unzip, sed -i/perl -i,
+# -delete/-exec) AND for mv — mv also mutates its SOURCE (removes it), so
+# destination-only checking would let `mv /config/plugins/x /tmp` gut a
+# managed tree. Ambiguous shapes deny (fail-closed).
 _MANAGED_WRITE_ANYWHERE_RE = re.compile(
-    r"(?:>>?|\bsed\s+-i|\bperl\s+-i|-delete\b|-exec\b)",
+    r"(?:\bsed\s+-i|\bperl\s+-i|-delete\b|-exec\b)",
     re.IGNORECASE | re.DOTALL,
 )
 
-_MANAGED_WRITE_VERBS = frozenset({
-    "tee", "dd", "cp", "mv", "mkdir", "rm", "rmdir", "ln", "touch",
-    "install", "rsync", "chmod", "chown", "truncate", "shred", "tar",
-    "unzip",
+# A redirect and its target token (scanned AFTER the benign strip). An
+# empty/unparseable target (quoted, `$var`, `>(cmd)`, end-of-string) is
+# ambiguous -> treated as managed by _token_resolves_managed.
+_MANAGED_REDIRECT_RE = re.compile(r"[0-9]*>>?\s*([^\s'\"`;|&<>()]*)")
+
+_MANAGED_BLANKET_WRITE_VERBS = frozenset({
+    "tee", "dd", "mv", "mkdir", "rm", "rmdir", "ln", "touch",
+    "chmod", "chown", "truncate", "shred", "tar", "unzip",
 })
+_MANAGED_DEST_WRITE_VERBS = frozenset({"cp", "rsync", "install"})
 _MANAGED_GIT_WRITE_SUBCMDS = frozenset({
     "checkout", "restore", "clean", "reset",
 })
 
 
-def _argv_command_verb(argv: list[str], *, _depth: int = 0) -> bool:
-    """True iff this pipeline segment's command-position program is a
-    managed write verb, unwrapping wrapper prefixes (``sudo``, ``nohup``,
-    ``timeout <arg>``, ``env``, ``command``, ``xargs``, ...), wrapper
-    shells (``bash -c '...'``) and ``eval``."""
+def _dest_family_writes_managed(argv: list[str]) -> bool:
+    """cp/rsync/install mutate their DESTINATION (round-2 W3): True iff the
+    last path operand resolves managed, an explicit ``-t`` /
+    ``--target-directory`` target resolves managed, or the operand shape is
+    ambiguous (options after operands, ``--remove-source*``, a single
+    operand, no parseable target) AND any operand resolves managed.
+    Copying FROM a managed tree elsewhere is a legitimate read."""
+    args = argv[1:]
+    operands: list[str] = []
+    ambiguous = False
+    seen_ddash = False
+    i = 0
+    while i < len(args):
+        a = args[i]
+        if not seen_ddash and a == "--":
+            seen_ddash = True
+            i += 1
+            continue
+        if not seen_ddash and a.startswith("-") and a != "-":
+            if operands:
+                ambiguous = True  # option-terminated / interleaved options
+            if a in ("-t", "--target-directory"):
+                if i + 1 < len(args):
+                    if _token_resolves_managed(args[i + 1]):
+                        return True
+                    i += 2
+                    continue
+                ambiguous = True
+            elif a.startswith("--target-directory="):
+                if _token_resolves_managed(a.split("=", 1)[1]):
+                    return True
+            elif a.startswith("--remove-source"):
+                ambiguous = True  # rsync mutates its SOURCE too
+            i += 1
+            continue
+        operands.append(a)
+        i += 1
+    if not operands:
+        return False
+    if len(operands) < 2:
+        ambiguous = True  # cannot tell source from destination
+    targets = operands if ambiguous else operands[-1:]
+    return any(_token_resolves_managed(t) for t in targets)
+
+
+def _argv_managed_write(argv: list[str], *, _depth: int = 0) -> bool:
+    """True iff this pipeline segment's command-position program writes into
+    managed state: blanket operand-mutating verbs (the caller holds the
+    managed-token precondition), destination-aware cp/rsync/install, and
+    git write subcommands — unwrapping wrapper prefixes (``sudo``,
+    ``nohup``, ``timeout <arg>``, ``env``, ``command``, ``xargs``, ...),
+    wrapper shells (``bash -c '...'``) and ``eval``."""
     if _depth > 3 or not argv:
         return False
     prog = os.path.basename(argv[0])
-    if prog in _MANAGED_WRITE_VERBS:
+    if prog in _MANAGED_BLANKET_WRITE_VERBS:
         return True
+    if prog in _MANAGED_DEST_WRITE_VERBS:
+        return _dest_family_writes_managed(argv)
     if prog == "git":
         j = 1
         while j < len(argv):
@@ -1076,13 +1178,13 @@ def _argv_command_verb(argv: list[str], *, _depth: int = 0) -> bool:
         j = 1
         while j < len(argv) and argv[j].startswith("-"):
             j += 1
-        return _argv_command_verb(argv[j:], _depth=_depth + 1)
+        return _argv_managed_write(argv[j:], _depth=_depth + 1)
     if prog == "xargs":
         wrapped = _xargs_wrapped_argv(argv)
-        return bool(wrapped) and _argv_command_verb(wrapped, _depth=_depth + 1)
+        return bool(wrapped) and _argv_managed_write(wrapped, _depth=_depth + 1)
     if prog in _EXEC_WRAPPER_ARG_FLAGS:
         wrapped = _exec_wrapper_tail(argv)
-        return bool(wrapped) and _argv_command_verb(wrapped, _depth=_depth + 1)
+        return bool(wrapped) and _argv_managed_write(wrapped, _depth=_depth + 1)
     if prog in _WRAPPER_SHELLS:
         for j in range(1, len(argv) - 1):
             if argv[j] == "-c":
@@ -1094,15 +1196,21 @@ def _argv_command_verb(argv: list[str], *, _depth: int = 0) -> bool:
 
 
 def _managed_write_shape(command: str, *, _depth: int = 0) -> bool:
-    """True iff the command is write-shaped: a write OPERATOR anywhere
-    (after stripping benign /dev/null and fd-dup redirects) or a write VERB
-    in command position of any pipeline segment."""
+    """True iff the command writes into managed state, given the caller's
+    managed-token precondition: an operand-mutating OPERATOR anywhere
+    (after stripping benign /dev/null and fd-dup redirects), a redirect
+    whose TARGET resolves managed or is unresolvable, or a write VERB in
+    command position of any pipeline segment (destination-aware for the
+    cp/rsync/install family — round-2 W3)."""
     if _depth > 3:
         return False
     scan = _MANAGED_BENIGN_REDIRECT_RE.sub(" ", command)
     if _MANAGED_WRITE_ANYWHERE_RE.search(scan):
         return True
-    return any(_argv_command_verb(argv, _depth=_depth)
+    for m in _MANAGED_REDIRECT_RE.finditer(scan):
+        if _token_resolves_managed(m.group(1)):
+            return True
+    return any(_argv_managed_write(argv, _depth=_depth)
                for argv in _split_pipeline(command))
 
 

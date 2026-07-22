@@ -636,3 +636,87 @@ async def test_command_position_verbs_still_deny(cmd, route_marker):
     )
     assert _decision(out) == "deny", cmd
     assert route_marker in _reason(out), cmd
+
+
+# ------------------------------------------------------------------
+# Round-2 W2 (Sol): /config/personas is managed — persona installs are
+# consent-gated exactly like specialists
+# ------------------------------------------------------------------
+
+
+@pytest.mark.parametrize("tool_name", ["Write", "Edit"])
+@pytest.mark.parametrize("path", [
+    "/config/personas/warm-helper/0.1.0/persona.yaml",
+    "personas/warm-helper/0.1.0/persona.yaml",   # relative (F2 applies too)
+])
+async def test_personas_write_edit_denied(tool_name, path):
+    out = await _hook()(
+        {"tool_name": tool_name, "tool_input": {"file_path": path}},
+        None, {},
+    )
+    assert _decision(out) == "deny", path
+    assert "persona_install_inspect" in _reason(out), path
+
+
+@pytest.mark.parametrize("cmd", [
+    "cp /tmp/p.yaml /config/personas/warm-helper/0.1.0/persona.yaml",
+    "echo x > personas/warm-helper/0.1.0/persona.yaml",
+    "rm -rf /config/personas/warm-helper",
+])
+async def test_personas_bash_write_denied(cmd):
+    out = await _hook()(
+        {"tool_name": "Bash", "tool_input": {"command": cmd}}, None, {},
+    )
+    assert _decision(out) == "deny", cmd
+    assert "persona_install_inspect" in _reason(out), cmd
+
+
+async def test_personas_bash_read_passes():
+    out = await _hook()(
+        {"tool_name": "Bash",
+         "tool_input": {"command": "ls -la /config/personas"}}, None, {},
+    )
+    assert out == {}
+
+
+# ------------------------------------------------------------------
+# Round-2 W3 (Sol): target-aware redirects and cp/rsync/install
+# destinations — reading FROM a managed tree is not a write
+# ------------------------------------------------------------------
+
+
+@pytest.mark.parametrize("cmd", [
+    # Copy FROM managed = read of managed, write elsewhere.
+    "cp /config/plugins/store/x/file /tmp/out",
+    # stderr redirect to a NON-managed target is not a managed write.
+    "grep pat /config/plugins/store/x 2>/tmp/error",
+    "grep pat /config/specialists/x 2>&1 | head",
+])
+async def test_managed_source_read_shapes_pass(cmd):
+    out = await _hook()(
+        {"tool_name": "Bash", "tool_input": {"command": cmd}}, None, {},
+    )
+    assert out == {}, cmd
+
+
+@pytest.mark.parametrize("cmd,route_marker", [
+    ("cp /tmp/x /config/plugins/store/y", "plugin_add"),
+    ("cp /config/specialists/a /config/specialists/b",
+     "specialist_install_inspect"),
+    ("echo x > /config/specialists/f", "specialist_install_inspect"),
+    # mv mutates its SOURCE too (removes it) — stays blanket, not
+    # destination-only (deviation from the literal W3 family list; see
+    # the _MANAGED_BLANKET_WRITE_VERBS comment).
+    ("mv /config/plugins/store/x /tmp/", "plugin_add"),
+    # Option-terminated operand shape is ambiguous -> any managed operand
+    # denies (fail-closed).
+    ("cp /config/plugins/store/x /tmp/y -S .bak", "plugin_add"),
+    # Runtime-expanded redirect target is unknowable -> ambiguous -> deny.
+    ("cat /config/bindings/ellen.yaml > $OUT", "resident_persona_swap"),
+])
+async def test_destination_aware_write_shapes_deny(cmd, route_marker):
+    out = await _hook()(
+        {"tool_name": "Bash", "tool_input": {"command": cmd}}, None, {},
+    )
+    assert _decision(out) == "deny", cmd
+    assert route_marker in _reason(out), cmd

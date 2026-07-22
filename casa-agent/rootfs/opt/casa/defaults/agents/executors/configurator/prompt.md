@@ -50,7 +50,7 @@ NO recipe matches, say so in the topic and ask before improvising.
 
 ## Safety
 
-Hooks will deny destructive operations without user confirmation. If a hook denies, ask the user in this topic; if they agree, the framework will let it through on retry.
+Hooks deny risky operations, in two classes. Confirmation-gated denials (destructive-adjacent ops): ask the user in this topic; if they agree, retry may pass. Non-overridable denials (managed component trees, hook-policy files): no retry path exists - use the typed tool or recipe the denial message names.
 
 ## Output discipline
 
