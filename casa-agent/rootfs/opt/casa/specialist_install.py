@@ -205,15 +205,36 @@ def resolve_dependency_closure(
     return tuple(out)
 
 
+def _extract_full_line_yaml_comments(text: str) -> str:
+    """Task N2 fix: role.yaml's own legitimate flow-style syntax (e.g.
+    `disclosure: {policy: delegated, overrides: {}}`, used by every
+    hand-authored role.yaml this repo ships, finance's and mtg's included)
+    contains a literal `}}` byte-for-byte identical to the forbidden
+    template-close marker — role_artifact.py's own loader deliberately
+    never raw-text-scans role.yaml for exactly this reason (see its module
+    docstring), relying on the parsed-leaf scan instead. This function
+    narrows _validate_untrusted_bytes's raw scan to just the full-line
+    comments (a line whose stripped form starts with '#') — the ONE thing
+    the parsed-leaf scan structurally cannot see (YAML comments never
+    survive parsing) and the ONLY threat model this belt-and-suspenders
+    check exists to close (see
+    tests/test_specialist_install.py's `_write_component_with_role_yaml_
+    comment_marker`) — without re-raw-scanning the structural YAML bytes
+    that collide with a forbidden marker by pure syntactic coincidence."""
+    return "\n".join(line for line in text.splitlines() if line.strip().startswith("#"))
+
+
 def _validate_untrusted_bytes(component: SpecialistComponent) -> None:
     """Extra check role_artifact.load_role_artifact does not perform: reject
-    templating/HTML/delimiter markers in the FETCHED role.yaml/doctrine.md,
-    which are adversarial input, unlike image-owned role artifacts."""
+    templating/HTML/delimiter markers hidden in a YAML COMMENT of the
+    FETCHED role.yaml (invisible to the parsed-leaf scan, since comments
+    never survive YAML parsing), plus the doctrine.md prose — both
+    adversarial input, unlike image-owned role artifacts."""
     import yaml
 
     role_text = component.role.role_path.read_text(encoding="utf-8")
     try:
-        reject_forbidden_markers(role_text)
+        reject_forbidden_markers(_extract_full_line_yaml_comments(role_text))
         reject_forbidden_markers(component.role.doctrine)
     except ValueError as exc:
         raise SpecialistInstallError("forbidden_markers", str(exc)) from exc
