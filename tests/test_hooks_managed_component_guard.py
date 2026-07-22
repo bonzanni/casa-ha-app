@@ -907,3 +907,47 @@ async def test_bindings_route_names_all_lifecycle_tools():
     for marker in ("resident_persona_swap", "resident_persona_reset",
                    "persona_apply"):
         assert marker in _reason(out), marker
+
+
+# ------------------------------------------------------------------
+# Round-7 (Terra): git subcommands allowlisted read-only, not denylisted
+# ------------------------------------------------------------------
+
+
+@pytest.mark.parametrize("command", [
+    "git -C /config/agents/specialists apply /tmp/patch",
+    # NOTE: a `git apply` whose -C target is a NON-managed parent (e.g.
+    # /config or the executors dir) with the mutation hidden in the patch
+    # CONTENT is the opaque-content residual (same class as script files /
+    # stdin) — closed for the configurator at the capability layer (no
+    # shell), tracked for plugin-developer under #216.
+    "git -C /config/specialists am /tmp/series.mbox",
+    "git -C /config/plugins stash pop",
+    "git -C /config/bindings mv a.yaml b.yaml",
+    "git -C /config/personas rm -r pack",
+    "git -C /config/agents/specialists checkout -- finance/runtime.yaml",
+])
+async def test_bash_git_mutating_subcommands_denied(command):
+    out = await _hook()(
+        {"tool_name": "Bash", "tool_input": {"command": command}}, None, {})
+    assert _decision(out) == "deny", command
+
+
+@pytest.mark.parametrize("command", [
+    "git -C /config log --oneline -5",
+    "git -C /config/agents/specialists status",
+    "git -C /config diff HEAD~1 -- agents/specialists/finance/runtime.yaml",
+    "git -C /config show HEAD:agents/specialists/finance/runtime.yaml",
+    "git -C /config/plugins ls-files",
+])
+async def test_bash_git_readonly_subcommands_pass(command):
+    out = await _hook()(
+        {"tool_name": "Bash", "tool_input": {"command": command}}, None, {})
+    assert out == {}, command
+
+
+async def test_bash_git_unknown_subcommand_fails_closed():
+    out = await _hook()({"tool_name": "Bash", "tool_input": {
+        "command": "git -C /config/specialists filter-branch --force"}},
+        None, {})
+    assert _decision(out) == "deny"

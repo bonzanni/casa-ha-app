@@ -1101,8 +1101,17 @@ _MANAGED_BLANKET_WRITE_VERBS = frozenset({
     "chmod", "chown", "truncate", "shred", "tar", "unzip",
 })
 _MANAGED_DEST_WRITE_VERBS = frozenset({"cp", "rsync", "install"})
-_MANAGED_GIT_WRITE_SUBCMDS = frozenset({
-    "checkout", "restore", "clean", "reset",
+# Round-7 (Terra): git subcommands are ALLOWLISTED read-only, not
+# denylisted write — git has dozens of mutating subcommands (apply, am,
+# stash, mv, rm, worktree, config, checkout-index, ...) and enumerating
+# them is a losing game. Any subcommand not in this set counts as
+# write-shaped when a managed token is present (fail-closed).
+_MANAGED_GIT_READONLY_SUBCMDS = frozenset({
+    "log", "show", "diff", "status", "blame", "shortlog", "describe",
+    "rev-parse", "rev-list", "ls-files", "ls-tree", "ls-remote",
+    "cat-file", "grep", "reflog", "name-rev", "merge-base",
+    "count-objects", "fsck", "help", "version", "var", "check-ignore",
+    "check-attr", "show-ref", "for-each-ref", "cherry", "whatchanged",
 })
 
 
@@ -1187,7 +1196,11 @@ def _argv_managed_write(argv: list[str], *, _depth: int = 0) -> bool:
             if a.startswith("-"):
                 j += 1
                 continue
-            return a in _MANAGED_GIT_WRITE_SUBCMDS
+            return a not in _MANAGED_GIT_READONLY_SUBCMDS
+        # Bare `git` / options-only: no subcommand reached — treat as
+        # write-shaped only if we couldn't classify (fail-closed keeps
+        # parity with the unparseable-shape rule elsewhere); a bare `git`
+        # mutates nothing, so allow.
         return False
     if prog == "command":
         j = 1
