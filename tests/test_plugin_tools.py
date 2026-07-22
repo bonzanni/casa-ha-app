@@ -1002,6 +1002,28 @@ async def test_plugin_add_unknown_resident_role_still_reload_failed(
     assert payload["reload_errors"]
 
 
+async def test_plugin_add_specialist_target_ignores_resident_name_collision(
+        monkeypatch, tmp_path):
+    """Round-1 review P1: a specialist: target is installed ONLY at
+    agents/specialists/<role>. A resident dir sharing the bare name must NOT
+    read as installed — that would dispatch a cross-tier RESIDENT reload for
+    a specialist target instead of reporting it pending."""
+    import agent as agent_mod
+    st = _State()
+    tools_mod = _wire(monkeypatch, tmp_path, st, publish=_pr())
+    # agents/mtg exists as a RESIDENT-position dir; specialists/mtg does not.
+    monkeypatch.setattr(agent_mod, "active_runtime",
+                        _dir_runtime(tmp_path, roles=["mtg"]), raising=False)
+    r = await tools_mod.plugin_add.handler({
+        "name": "probe", "repo": "o/r", "ref": "v1",
+        "targets": ["specialist:mtg"]})
+    payload = json.loads(r["content"][0]["text"])
+    assert payload["ok"] is True
+    assert payload["pending_targets"] == ["specialist:mtg"]
+    assert payload["reload_errors"] == []
+    assert "dispatch:mtg" not in st.log     # the resident was NOT reloaded
+
+
 async def test_plugin_add_mixed_live_reload_and_pending_specialist(
         monkeypatch, tmp_path):
     """One live resident reload ok + one pending specialist: ok:true, only

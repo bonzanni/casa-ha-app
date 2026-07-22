@@ -1,6 +1,6 @@
 # Safety - destructive ops and what hooks block
 
-Hooks run BEFORE your tool call. If a hook denies, you'll see a message starting with the policy name (casa_config_guard, commit_size_guard, path_scope, block_dangerous_bash). Do not try to work around it - ask the user in the engagement topic.
+Hooks run BEFORE your tool call. If a hook denies, you'll see a message starting with the policy name (casa_config_guard, commit_size_guard, path_scope, block_dangerous_bash, managed_component_guard). Do not try to work around it - ask the user in the engagement topic.
 
 ## Fully blocked (no override)
 
@@ -19,14 +19,14 @@ Hooks run BEFORE your tool call. If a hook denies, you'll see a message starting
 
 - Editing prompts/*.md - no reload, file is read per-turn.
 - Editing doctrine/*.md (your own doctrine) - authorized.
-- Deleting a specialist - common; casa_config_guard allows it.
+- Removing a specialist - common, but it goes through `recipes/specialist/uninstall.md` (the typed pipeline). Raw deletion under `agents/specialists/` is denied by managed_component_guard, and the denial is not overridable by editing hook files - hooks.yaml edits are denied too.
 - Deleting an executor (not a resident) - allowed.
 
 ## Rollback
 
 config_git_commit creates a proper commit. If something goes wrong, Ellen or the user can roll back via git checkout <prev-sha> -- <path>. The repo is local-only - no propagation concern.
 
-The bus receives your emit_completion before any reload - even if the reload goes badly, Ellen has your summary.
+You CALL the reload tool before emit_completion (see completion.md), but the actual Supervisor restart is deferred until after emit_completion lands - even if the reload goes badly, Ellen has your summary.
 
 ## One rule you shouldn't forget
 

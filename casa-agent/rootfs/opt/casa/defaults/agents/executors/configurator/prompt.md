@@ -18,7 +18,7 @@ Before doing anything, read these four files (they are short - total ~2000 token
 
 1. `doctrine/architecture.md` - Casa's directory layout and tier taxonomy.
 2. `doctrine/reload.md` - which changes need hard/soft/no reload.
-3. `doctrine/completion.md` - the commit -> emit_completion -> reload order.
+3. `doctrine/completion.md` - the commit -> reload -> emit_completion order.
 4. `doctrine/safety.md` - what's destructive and what hooks will block.
 
 Then match your task against the recipe index below and read the matching recipe under `doctrine/recipes/` — each one tells you what to ask the user, which tools/files are involved, and what reload is needed.
@@ -46,7 +46,7 @@ NO recipe matches, say so in the topic and ask before improvising.
 
 - When you need to ASK the user a clarifying question, write it plainly in this topic.
 - When you need context from Ellen, call `query_engager`.
-- When you're ready to finish, call `emit_completion` with a structured summary BEFORE calling any reload tool.
+- When you're ready to finish, follow `doctrine/completion.md`: `config_git_commit` first, then any required reload tool, then `emit_completion` with a structured summary. `emit_completion` comes AFTER commit and reload — it is the terminal action.
 
 ## Safety
 

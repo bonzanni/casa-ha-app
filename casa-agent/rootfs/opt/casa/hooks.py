@@ -861,6 +861,20 @@ def agent_home_settings_guard_matcher():
 # and any unexpected Exception returns the deny shape (CancelledError
 # re-raises). Same accepted residual as the other Bash guards: argv-level
 # inspection, not a sandbox — obfuscated writes need the outer boundary.
+#
+# Round-2 hardening (Sol+Terra adversarial review):
+#   F1  Bash commands also enforce the hooks.yaml policy-file rule.
+#   F2  RELATIVE paths (cwd is /config — tools.py ClaudeAgentOptions) are
+#       resolved against /config before the prefix test, for Write/Edit
+#       file_path and for Bash path tokens.
+#   F3  In addition to the lexical test, paths are os.path.realpath-resolved
+#       so a symlink in a writable area can't tunnel into a managed tree;
+#       OSError during resolution denies (fail-closed).
+#   F4  Inline-interpreter invocations (python/perl/ruby/node -c/-e) that
+#       mention a managed token deny regardless of write verbs.
+#   F5  Write VERBS must sit in command position (wrapper prefixes allowed);
+#       only true operators (>, >>, sed -i, perl -i, -delete, -exec) match
+#       anywhere — `grep -r install /config/plugins/store` passes.
 # ---------------------------------------------------------------------------
 
 
@@ -897,6 +911,12 @@ _MANAGED_INTERNAL_DENY = (
     "not executed."
 )
 
+_MANAGED_RESOLVE_DENY = (
+    "managed_component_guard: {tool} blocked — could not resolve {path!r} "
+    "(realpath error); failing closed. Use the typed pipeline tools for "
+    "managed component state."
+)
+
 
 def _managed_prefix_route(norm: str) -> tuple[str, str] | None:
     """Return ``(prefix, route)`` for the managed prefix containing ``norm``,
@@ -904,6 +924,46 @@ def _managed_prefix_route(norm: str) -> tuple[str, str] | None:
     for prefix, route in _MANAGED_PREFIX_ROUTES:
         if _has_prefix(norm, [prefix]):
             return prefix, route
+    return None
+
+
+def _managed_path_hit(norm: str) -> tuple[str, str, str] | None:
+    """Lexical managed-state test for one normalized absolute path.
+
+    Returns ``("prefix", <prefix>, <route>)`` when ``norm`` is under a
+    managed prefix, ``("hooks_yaml", norm, "")`` when it names a hook-policy
+    file under /config/agents/ (round-2 F1 shares this with the Bash
+    branch), else ``None``.
+    """
+    hit = _managed_prefix_route(norm)
+    if hit is not None:
+        prefix, route = hit
+        return ("prefix", prefix, route)
+    if (norm.startswith(_RESIDENT_ROOT + "/")
+            and PurePosixPath(norm).name == "hooks.yaml"):
+        return ("hooks_yaml", norm, "")
+    return None
+
+
+def _managed_real_hit(norm: str) -> tuple[str, str, str] | None:
+    """Lexical test PLUS symlink resolution (round-2 F3).
+
+    The lexical test alone is defeated by a symlink in a writable area that
+    points into a managed tree; ``os.path.realpath`` alone would miss
+    not-yet-existing paths whose lexical form is managed (realpath resolves
+    only EXISTING ancestor components). So: lexical first, then realpath on
+    a lexical miss. Any ``OSError`` during resolution returns a
+    ``("resolve_error", ...)`` hit — the caller denies (fail-closed).
+    """
+    hit = _managed_path_hit(norm)
+    if hit is not None:
+        return hit
+    try:
+        real = os.path.realpath(norm)
+    except OSError:
+        return ("resolve_error", norm, "")
+    if real != norm:
+        return _managed_path_hit(_normalize_path(real))
     return None
 
 
@@ -915,46 +975,222 @@ def _managed_prefix_route(norm: str) -> tuple[str, str] | None:
 # the path token).
 _MANAGED_PATH_TOKEN_RE = re.compile(r"/[^\s'\"`;|&<>()]*")
 
+# Round-2 F2: executors run with cwd=/config (tools.py sets
+# ClaudeAgentOptions cwd="/config"), so `echo x > agents/specialists/x/
+# runtime.yaml` names managed state without a single absolute token.
+# Relative tokens whose FIRST path segment is a managed root name
+# (optionally ./ or ../ prefixed) are extracted and resolved against
+# /config. `config` is in the set for the cwd=/ spelling
+# (`config/plugins/x`), covered by the "/"-join candidate. A BARE root word
+# (`rm -rf plugins` from /config) also matches — fail-closed: a prose word
+# like `plugins` in a write-shaped command is an accepted false positive.
+_MANAGED_REL_TOKEN_RE = re.compile(
+    r"(?<![\w./-])"
+    r"(?:\.{1,2}/)*"
+    r"(?:agents|specialists|bindings|plugins|config)"
+    r"(?:/[^\s'\"`;|&<>()]*|(?![\w.-]))"
+)
+
+
+def _managed_candidate_paths(command: str) -> list[str]:
+    """Normalized absolute candidates for every path-shaped token in a Bash
+    command: absolute tokens as-is; relative tokens joined against /config
+    (the executor cwd), against / (the ``config/...`` spelling), and with
+    any leading ./ or ../ segments stripped then joined against /config.
+    The stripped candidate covers the deeper-cwd shape (``../specialists/x``
+    typed from /config/agents lands in a managed tree even though the same
+    token from /config does not) — the fail-closed bias governs the tie.
+    """
+    out: list[str] = []
+    seen: set[str] = set()
+
+    def _add(path: str) -> None:
+        norm = _normalize_path(path)
+        if norm not in seen:
+            seen.add(norm)
+            out.append(norm)
+
+    for tok in _MANAGED_PATH_TOKEN_RE.findall(command):
+        _add(tok)
+    for tok in _MANAGED_REL_TOKEN_RE.findall(command):
+        _add("/config/" + tok)
+        _add("/" + tok)
+        stripped = re.sub(r"^(?:\.{1,2}/)+", "", tok)
+        if stripped and stripped != tok:
+            _add("/config/" + stripped)
+    return out
+
 # Benign redirects, stripped BEFORE the write-operator test so the common
 # verification forms (`cat x 2>/dev/null`, `cmd 2>&1 | head`) don't read as
 # writes. Writing to /dev/null mutates nothing.
 _MANAGED_BENIGN_REDIRECT_RE = re.compile(r"[0-9]*>>?\s*/dev/null\b|[0-9]+>&[0-9]+")
 
-# A write-shaped operator/verb ANYWHERE in the command. Deliberately
-# order-insensitive, unlike _PLUGINS_WRITE_RE's verb-then-path shape:
-# `find <managed> -delete` puts the path FIRST, and the fail-closed bias
-# prefers a false positive (a read that also mentions a write verb) over a
-# hand-write slipping through. The enumerated read-only verbs (cat, ls,
-# grep, find without -delete/-exec, git log/diff/status) match nothing
-# here, so the configurator's normal verification workflow passes.
-_MANAGED_WRITE_OP_RE = re.compile(
-    r"(?:>>?|\btee\b|\bdd\b|\bcp\b|\bmv\b|\bmkdir\b|\brm\b|\brmdir\b|"
-    r"\bln\b|\btouch\b|\binstall\b|\brsync\b|\bchmod\b|\bchown\b|"
-    r"\btruncate\b|\bshred\b|sed\s+-i|\bperl\s+-i|\btar\b|\bunzip\b|"
-    r"\bgit\s+checkout\b|\bgit\s+restore\b|\bgit\s+clean\b|\bgit\s+reset\b|"
-    r"-delete\b|-exec\b)",
+# Round-2 F5 restructure (Sol): the old single ANYWHERE regex matched write
+# VERBS inside argument text — `grep -r install /config/plugins/store`
+# false-denied on \binstall\b. Split into (a) operators that are
+# write-shaped anywhere in the raw text — redirects, in-place edit flags,
+# find's action predicates — and (b) verbs that must sit in COMMAND
+# POSITION (argv[0] of a pipeline segment via _split_pipeline, allowing
+# wrapper prefixes: sudo/nohup/timeout <arg>/env/command/xargs and the git
+# subcommand shape). Benign redirects are stripped before the operator
+# test. `find <managed> -delete` still denies (path-first, operator
+# anywhere); the fail-closed bias keeps the operator class order-blind.
+_MANAGED_WRITE_ANYWHERE_RE = re.compile(
+    r"(?:>>?|\bsed\s+-i|\bperl\s+-i|-delete\b|-exec\b)",
     re.IGNORECASE | re.DOTALL,
 )
 
+_MANAGED_WRITE_VERBS = frozenset({
+    "tee", "dd", "cp", "mv", "mkdir", "rm", "rmdir", "ln", "touch",
+    "install", "rsync", "chmod", "chown", "truncate", "shred", "tar",
+    "unzip",
+})
+_MANAGED_GIT_WRITE_SUBCMDS = frozenset({
+    "checkout", "restore", "clean", "reset",
+})
 
-def _bash_managed_prefix_route(command: str) -> tuple[str, str] | None:
-    """Return ``(prefix, route)`` if the Bash command mentions a managed
-    prefix as a path-shaped token, else ``None``. Mention alone is not a
-    deny — the caller also requires a write operator."""
-    for tok in _MANAGED_PATH_TOKEN_RE.findall(command):
-        hit = _managed_prefix_route(_normalize_path(tok))
+
+def _argv_command_verb(argv: list[str], *, _depth: int = 0) -> bool:
+    """True iff this pipeline segment's command-position program is a
+    managed write verb, unwrapping wrapper prefixes (``sudo``, ``nohup``,
+    ``timeout <arg>``, ``env``, ``command``, ``xargs``, ...), wrapper
+    shells (``bash -c '...'``) and ``eval``."""
+    if _depth > 3 or not argv:
+        return False
+    prog = os.path.basename(argv[0])
+    if prog in _MANAGED_WRITE_VERBS:
+        return True
+    if prog == "git":
+        j = 1
+        while j < len(argv):
+            a = argv[j]
+            if a in ("-C", "-c"):  # these take a separate argument
+                j += 2
+                continue
+            if a.startswith("-"):
+                j += 1
+                continue
+            return a in _MANAGED_GIT_WRITE_SUBCMDS
+        return False
+    if prog == "command":
+        j = 1
+        while j < len(argv) and argv[j].startswith("-"):
+            j += 1
+        return _argv_command_verb(argv[j:], _depth=_depth + 1)
+    if prog == "xargs":
+        wrapped = _xargs_wrapped_argv(argv)
+        return bool(wrapped) and _argv_command_verb(wrapped, _depth=_depth + 1)
+    if prog in _EXEC_WRAPPER_ARG_FLAGS:
+        wrapped = _exec_wrapper_tail(argv)
+        return bool(wrapped) and _argv_command_verb(wrapped, _depth=_depth + 1)
+    if prog in _WRAPPER_SHELLS:
+        for j in range(1, len(argv) - 1):
+            if argv[j] == "-c":
+                return _managed_write_shape(argv[j + 1], _depth=_depth + 1)
+        return False
+    if prog == "eval" and len(argv) > 1:
+        return _managed_write_shape(" ".join(argv[1:]), _depth=_depth + 1)
+    return False
+
+
+def _managed_write_shape(command: str, *, _depth: int = 0) -> bool:
+    """True iff the command is write-shaped: a write OPERATOR anywhere
+    (after stripping benign /dev/null and fd-dup redirects) or a write VERB
+    in command position of any pipeline segment."""
+    if _depth > 3:
+        return False
+    scan = _MANAGED_BENIGN_REDIRECT_RE.sub(" ", command)
+    if _MANAGED_WRITE_ANYWHERE_RE.search(scan):
+        return True
+    return any(_argv_command_verb(argv, _depth=_depth)
+               for argv in _split_pipeline(command))
+
+
+# Round-2 F4 (Sol): interpreter escape — `python3 -c "open('agents/...',
+# 'w')..."` mutates managed state only inside inline code, where the write
+# operator/verb tests cannot see it. When an interpreter runs INLINE CODE
+# (-c/-e/-E/--eval style) AND any managed token appears anywhere in the
+# command, deny regardless of write verbs — the code body is opaque, so a
+# read-only inline one-liner over a managed path is also denied (accepted
+# false positive; fail-closed). Accepted residual, unchanged in kind from
+# round 1: this is argv-level inspection, not a sandbox — an interpreter
+# reading code from stdin or a script file, or assembling paths at runtime
+# inside the code, still needs the outer filesystem/privilege boundary.
+_MANAGED_INTERPRETER_RE = re.compile(r"python[0-9.]*|perl|ruby|node|nodejs")
+
+
+def _argv_is_inline_interpreter(argv: list[str]) -> bool:
+    """True iff argv invokes python/perl/ruby/node with an inline-code
+    flag (-c, -e, -E, --eval, --print, or a short-flag cluster carrying
+    one, e.g. ``perl -we``)."""
+    if not argv:
+        return False
+    if _MANAGED_INTERPRETER_RE.fullmatch(os.path.basename(argv[0])) is None:
+        return False
+    for a in argv[1:]:
+        if a in ("--eval", "--print"):
+            return True
+        if (a.startswith("-") and not a.startswith("--")
+                and any(ch in a[1:] for ch in "ceE")):
+            return True
+    return False
+
+
+def _managed_inline_interpreter(command: str, *, _depth: int = 0) -> bool:
+    """True iff any pipeline segment (unwrapping wrapper shells, ``eval``,
+    ``xargs``, and exec-wrapper prefixes) invokes an inline interpreter."""
+    if _depth > 3:
+        return False
+    for argv in _split_pipeline(command):
+        if _argv_is_inline_interpreter(argv):
+            return True
+        prog = os.path.basename(argv[0]) if argv else ""
+        if prog in _WRAPPER_SHELLS:
+            for j in range(1, len(argv) - 1):
+                if argv[j] == "-c" and _managed_inline_interpreter(
+                        argv[j + 1], _depth=_depth + 1):
+                    return True
+        elif prog == "eval" and len(argv) > 1:
+            if _managed_inline_interpreter(
+                    " ".join(argv[1:]), _depth=_depth + 1):
+                return True
+        elif prog == "xargs":
+            wrapped = _xargs_wrapped_argv(argv)
+            if wrapped and _argv_is_inline_interpreter(wrapped):
+                return True
+        elif prog in _EXEC_WRAPPER_ARG_FLAGS:
+            wrapped = _exec_wrapper_tail(argv)
+            if wrapped and _argv_is_inline_interpreter(wrapped):
+                return True
+    return False
+
+
+def _bash_managed_prefix_route(command: str) -> tuple[str, str, str] | None:
+    """Return the first managed hit — ``("prefix", prefix, route)``,
+    ``("hooks_yaml", path, "")`` or ``("resolve_error", path, "")`` — for
+    any path-shaped token (absolute or relative, lexical or
+    symlink-resolved) in the Bash command, else ``None``. A prefix or
+    hooks_yaml hit alone is not a deny — the caller also requires a write
+    shape or an inline-interpreter invocation; resolve_error always
+    denies (fail-closed)."""
+    for norm in _managed_candidate_paths(command):
+        hit = _managed_real_hit(norm)
         if hit is not None:
             return hit
     return None
 
 
 def make_managed_component_guard() -> HookCallback:
-    """Deny hand-edits of managed component state (#210).
+    """Deny hand-edits of managed component state (#210, round-2 hardened).
 
-    Write/Edit: denied when the normalized ``file_path`` is under any managed
-    prefix, or names a ``hooks.yaml`` under ``/config/agents/`` (policy-file
-    self-editing). Bash: denied when the command mentions a managed prefix
-    AND contains a write-shaped operator/verb; read-only mentions pass.
+    Write/Edit: denied when the ``file_path`` — resolved against /config
+    when relative (F2), normalized, and symlink-resolved (F3) — is under
+    any managed prefix or names a ``hooks.yaml`` under ``/config/agents/``
+    (policy-file self-editing). Bash: denied when the command carries a
+    managed path token (absolute or relative, lexical or symlink-resolved;
+    hooks.yaml included — F1) AND is write-shaped (F5: operators anywhere,
+    verbs in command position) or invokes an inline interpreter (F4);
+    read-only mentions pass. A realpath OSError denies (fail-closed).
     """
     async def _hook(
         input_data: dict[str, Any],
@@ -965,30 +1201,44 @@ def make_managed_component_guard() -> HookCallback:
             tool_name = input_data.get("tool_name", "")
             if tool_name in ("Write", "Edit"):
                 raw = input_data.get("tool_input", {}).get("file_path", "")
-                norm = _normalize_path(raw)
-                hit = _managed_prefix_route(norm)
+                # Round-2 F2: cwd is /config (tools.py ClaudeAgentOptions),
+                # so a RELATIVE file_path can name managed state.
+                norm = _normalize_path(
+                    raw if raw.startswith("/") else "/config/" + raw)
+                hit = _managed_real_hit(norm)
                 if hit is not None:
-                    _prefix, route = hit
+                    kind, _subject, route = hit
+                    if kind == "hooks_yaml":
+                        return _deny(_MANAGED_HOOKS_YAML_DENY.format(
+                            tool=tool_name, path=raw))
+                    if kind == "resolve_error":
+                        return _deny(_MANAGED_RESOLVE_DENY.format(
+                            tool=tool_name, path=raw))
                     return _deny(
                         f"managed_component_guard: {tool_name} blocked — "
                         f"{raw!r} is managed component state; hand-editing "
                         f"is forbidden. {route}"
                     )
-                if (norm.startswith(_RESIDENT_ROOT + "/")
-                        and PurePosixPath(norm).name == "hooks.yaml"):
-                    return _deny(_MANAGED_HOOKS_YAML_DENY.format(
-                        tool=tool_name, path=raw))
             elif tool_name == "Bash":
                 command = input_data.get("tool_input", {}).get("command", "")
                 hit = _bash_managed_prefix_route(command)
                 if hit is not None:
-                    prefix, route = hit
-                    scan = _MANAGED_BENIGN_REDIRECT_RE.sub(" ", command)
-                    if _MANAGED_WRITE_OP_RE.search(scan):
+                    kind, subject, route = hit
+                    if kind == "resolve_error":
+                        return _deny(_MANAGED_RESOLVE_DENY.format(
+                            tool="Bash", path=subject))
+                    write_shape = _managed_write_shape(command)
+                    if write_shape or _managed_inline_interpreter(command):
+                        if kind == "hooks_yaml":
+                            return _deny(_MANAGED_HOOKS_YAML_DENY.format(
+                                tool="Bash", path=subject))
+                        verb = ("writes into" if write_shape
+                                else "runs inline interpreter code against")
                         return _deny(
                             f"managed_component_guard: Bash blocked — this "
-                            f"command writes into managed component state "
-                            f"({prefix}/); hand-editing is forbidden. {route}"
+                            f"command {verb} managed component state "
+                            f"({subject}/); hand-editing is forbidden. "
+                            f"{route}"
                         )
             return {}
         except asyncio.CancelledError:

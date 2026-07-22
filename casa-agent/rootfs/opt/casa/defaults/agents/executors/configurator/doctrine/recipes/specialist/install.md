@@ -32,10 +32,11 @@ hand-edited.
    operator supplies them via a follow-up `specialist_install_commit` call with the SAME
    `staged_dir` (re-inspect if `staged_dir` has been cleaned up — staging is not guaranteed durable
    across a restart).
-6. If `state == "active"`: `casa_reload(scope="agents")` (mandatory — see `completion.md`), then
-   wire delegation per `recipes/delegate/wire.md`.
+6. If `state == "active"`: wire delegation per `recipes/delegate/wire.md`.
 7. `config_git_commit(message="install specialist <slug> from <repo>@<ref>")`.
-8. `emit_completion(status="ok", text="Installed specialist <slug> from <repo>@<ref>; reloaded and
+8. `casa_reload(scope="agents")` (mandatory — see `completion.md`; an `active` install is on disk
+   but not in the live registry until reload runs).
+9. `emit_completion(status="ok", text="Installed specialist <slug> from <repo>@<ref>; reloaded and
    wired for delegation.")`.
 
 ## Common mistakes

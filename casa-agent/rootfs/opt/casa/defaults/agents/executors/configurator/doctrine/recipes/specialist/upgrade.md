@@ -13,7 +13,8 @@
 4. If `state == "pending-configuration"`: the OLD version is still live and answering delegations —
    tell the operator exactly which new config/secret names the new version needs; nothing broke.
 5. If `state == "error"`: report the validation failure; the OLD version is still live, unchanged.
-6. If `state == "active"`: `casa_reload(scope="agents")`, `config_git_commit`, `emit_completion`.
+6. If `state == "active"`: `config_git_commit`, `casa_reload(scope="agents")`, `emit_completion`
+   (canonical commit -> reload -> emit order — see `completion.md`).
 
 ## Common mistakes
 

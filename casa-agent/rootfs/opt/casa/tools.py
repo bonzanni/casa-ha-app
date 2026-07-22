@@ -6226,17 +6226,16 @@ def _specialist_target_pending(runtime, role: str) -> bool:
     artifact — so a plugin mutation may legitimately target a specialist
     that is not installed yet. That constraint is invisible from here (the
     registry only sees the target string), hence this explicit predicate.
-    Mirrors reload.reload_agent's OWN tier detection (agents/<role> for
-    residents, agents/specialists/<role> for specialists) so the pre-check
-    can never drift from the dispatch it short-circuits: exactly the roles
-    reload would refuse as ``unknown_role`` classify as pending. A runtime
-    without an ``agents_dir`` (narrow test stand-ins) never classifies
-    pending — dispatch keeps its established behavior."""
+    A ``specialist:`` target is installed ONLY at agents/specialists/<role>
+    — a bare agents/<role> hit is a RESIDENT sharing the name, and letting
+    it through would dispatch a cross-tier resident reload for a specialist
+    target (Sol/Terra round-1 P1). A runtime without an ``agents_dir``
+    (narrow test stand-ins) never classifies pending — dispatch keeps its
+    established behavior."""
     agents_dir = getattr(runtime, "agents_dir", None)
     if not agents_dir:
         return False
-    return not (os.path.isdir(os.path.join(agents_dir, role))
-                or os.path.isdir(os.path.join(agents_dir, "specialists", role)))
+    return not os.path.isdir(os.path.join(agents_dir, "specialists", role))
 
 
 def _stale_absent_targets(targets: list, name: str, runtime) -> list[str]:
