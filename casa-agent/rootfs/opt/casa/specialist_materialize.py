@@ -35,15 +35,30 @@ _DEFAULT_OVERLAY_ROOT = Path("/config/specialists/.roles-overlay")
 # rebuild do only bounded local file IO) — so a per-slug lock table would add
 # machinery for no measurable benefit.
 #
-# THE INVARIANT (round 4, F1 — state it once, here): NO InstanceDir write
-# (stage_desired / commit_desired_to_active / discard_desired) and NO
+# THE INVARIANT (round 4, F1 / round 5, F2 — state it once, here): this is the
+# PERSONALITY-INSTANCE MUTATION LOCK, covering BOTH instance trees — the
+# specialist tree (/config/specialists/<slug>/) AND the resident tree
+# (/config/bindings/resident-<slot>/). NO InstanceDir write (stage_desired /
+# commit_desired_to_active / discard_desired) in EITHER tree, and NO
 # operational-file/overlay mutation (materialize_specialist_operational_files,
 # uninstall's op-symlink+content+InstanceDir removal, the roles-overlay
 # rmtree+rebuild, the per-slug op-file self-heal) ever happens outside this
-# lock. Every such writer either takes the lock itself or asserts it is held
-# (the `_locked` helpers below). Read-only gates — network fetch, git resolve,
-# CAS staging/verify, prompt compile, persona/role loads — all run OUTSIDE the
-# lock (they complete before the writer's `with MATERIALIZE_LOCK:` opens).
+# lock. The specialist writers live in specialist_install.py; the resident +
+# cross-tier persona-override writers are persona_install.apply_persona_override
+# (both branches) and tools._stage_and_report (round 5, F2). Every such writer
+# either takes the lock itself or asserts it is held (the `_locked` helpers
+# below). Read-only gates — network fetch, git resolve, CAS staging/verify,
+# prompt compile, persona/role loads — all run OUTSIDE the lock (they complete
+# before the writer's `with MATERIALIZE_LOCK:` opens).
+#
+# LOOP-SAFETY (round 5): this is a threading.Lock, and it MUST NEVER be acquired
+# synchronously on the asyncio event loop — a concurrent holder would stall all
+# async processing. Every acquirer runs in a worker thread: specialist_install.py
+# writers are reached via tools.py `asyncio.to_thread`; apply_persona_override is
+# offloaded by tools.persona_apply's `asyncio.to_thread`; tools._stage_and_report
+# offloads its own in-lock section; current_specialist_roles_dir is reached from
+# reload.py via `asyncio.to_thread` (and from casa_core boot, before the loop
+# starts). No path acquires it on the loop thread.
 #
 # Round 4, F3 (deadlock analysis): the lock is NOT reentrant, so there is
 # exactly ONE acquisition on any path. `current_specialist_roles_dir` acquires
@@ -529,12 +544,28 @@ def current_specialist_roles_dir(
     # self-heal AND the destructive roles-overlay rmtree+rebuild, so concurrent
     # reload worker threads (reload.py resolves each reload's roles_dir in its
     # own asyncio.to_thread) can never delete one another's half-built overlay
-    # or interleave a stale-snapshot op-file write. The index was loaded above
-    # (a snapshot); the self-heal loop RE-READS each active tuple from disk
-    # inside this lock, so a commit that lands between the snapshot and here
-    # still wins. Calls the `_locked` internals directly — the lock is not
-    # reentrant, so their public lock-acquiring wrappers must NOT be used here.
+    # or interleave a stale-snapshot op-file write. Calls the `_locked`
+    # internals directly — the lock is not reentrant, so their public
+    # lock-acquiring wrappers must NOT be used here.
+    #
+    # Round 5, F3 (stale index snapshot): `index` was loaded OFF-lock — by the
+    # caller (reload._specialist_roles_dir / casa_core boot) or above for a
+    # None caller. An install/uninstall that COMMITS (also under this lock)
+    # between that off-lock load and acquiring the lock here would otherwise be
+    # invisible to BOTH reconciles below: the roles-overlay rebuild
+    # (`installed_component_role_dirs()`) would omit a just-installed slug or
+    # RESURRECT a just-removed one, and the op-file self-heal loop (which
+    # iterates `installed_slugs()`) would skip a newly-installed slug entirely.
+    # RE-LOAD the index IN-LOCK, before either reconcile, so both see exactly
+    # the state committed under this same lock. reload/casa_core publish the
+    # SAME `index` object they pass here via set_active_installed_index, and
+    # InstalledSpecialistIndex.load() swaps its instance map atomically, so this
+    # in-lock reload ALSO refreshes the process-wide global by reference —
+    # admin/inspection reads (live_installed_specialist_slugs / get_installed_
+    # instance) never lag the overlay this call built. (A None-caller `index` is
+    # never the global; reloading it in-lock is a harmless cheap double-scan.)
     with MATERIALIZE_LOCK:
+        index.load()
         _reconcile_specialist_operational_files_locked(
             installed_index=index, specialists_dir=specialists_dir,
             agents_specialists_dir=agents_specialists_dir,

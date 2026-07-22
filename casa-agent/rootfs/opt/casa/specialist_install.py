@@ -84,22 +84,33 @@ def is_safe_corpus_identifier(identifier: object) -> bool:
 def _require_active_unchanged(instance_dir, active_before, *, slug: str) -> None:
     """F2: upgrade/rollback captured `active_before` BEFORE taking the lock. A
     concurrent uninstall (which removes specialists/<slug>, active.yaml
-    included) or a concurrent upgrade/rollback (which commits a different
-    active) may have won while we blocked on the lock. Require the active tuple
-    to still EXIST and carry the SAME `root` identity it had at `active_before`;
-    a vanished or root-changed active means a concurrent mutation won —
-    refuse, so we never stage/commit over it (or recreate a just-removed
-    InstanceDir). Comparing `root` (component_id@version#checksum) is the right
-    identity axis: it is the field that genuinely differs across install
-    versions even when binding_digest collides (see
-    InstanceDir.commit_desired_to_active's Task-N1c note)."""
+    included) or a concurrent upgrade/rollback/persona-override (which commits a
+    different active) may have won while we blocked on the lock. Require the
+    active tuple to still EXIST and be BYTE-FOR-BYTE the tuple captured at
+    `active_before`; a vanished or in-ANY-way-changed active means a concurrent
+    mutation won — refuse, so we never stage/commit over it (or recreate a
+    just-removed InstanceDir).
+
+    Round-5 fix (F1): compare the FULL tuple (`re_read != active_before`), not
+    just `root`. `root` alone (component_id@version#checksum) misses a
+    concurrent SAME-ROOT mutation — a config-only upgrade (different
+    config_digest/binding on an unchanged component version) or a persona
+    override (mode=override, root unchanged) commits a genuinely different
+    active tuple that a root-only check waves through, letting this caller
+    silently overwrite it with the stale `active_before`. Full-tuple equality
+    is the SAME convention InstanceDir.commit_desired_to_active already uses for
+    its crash-retry short-circuit (`current_active == candidate`, root
+    included); both sides here are round-tripped through the same
+    load_instance_tuple/verify_instance_tuple path, so the comparison is fair
+    and symmetric (frozen-dataclass value equality over root+binding+
+    config_snapshot+config_digest)."""
     current = instance_dir.active()
-    if current is None or current.root != active_before.root:
+    if current is None or current != active_before:
         raise SpecialistInstallError(
             "concurrent_mutation",
             f"{slug!r}: the active install changed under a concurrent mutation "
-            f"(uninstall/upgrade/rollback) while acquiring the lock; refusing to "
-            f"overwrite it — retry the operation")
+            f"(uninstall/upgrade/rollback/persona-override) while acquiring the lock; "
+            f"refusing to overwrite it — retry the operation")
 
 
 def _refuse_if_active_present(instance_dir, *, slug: str) -> None:

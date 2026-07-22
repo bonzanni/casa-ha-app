@@ -264,21 +264,35 @@ def apply_persona_override(
     from personality_binding import (
         InstanceDir, InstanceTuple, check_persona_requirements, materialize_override_binding,
     )
+    import specialist_materialize
 
     check_persona_requirements(role.normalized, persona)
     override_source = f"{persona.persona_id}@{persona.version}"
     instance_dir = InstanceDir(instance_dir_root)
 
+    # Round-5 fix (F2, the MISSED InstanceDir writer): both branches below write
+    # an InstanceDir (stage_desired + commit_desired_to_active) — the SAME
+    # personality-instance mutations every specialist_install.py writer performs
+    # under specialist_materialize.MATERIALIZE_LOCK. They must take that lock too
+    # (its invariant is: NO InstanceDir write, resident OR specialist tree, ever
+    # happens outside it). LOOP-SAFETY: this function's sole production caller,
+    # tools.persona_apply, offloads it via asyncio.to_thread, so it always runs
+    # in a WORKER THREAD — acquiring the threading.Lock synchronously here never
+    # blocks the event loop.
+
     if role.kind != "specialist":
-        # Resident path — UNCHANGED from the original draft, matches Plan 1's
-        # own resident_persona_swap byte-for-byte (root is descriptive only).
+        # Resident path — root is descriptive only. F2b: extend the SAME lock to
+        # the resident InstanceDir write for uniformity, so a concurrent
+        # tools._stage_and_report resident swap (also offloaded to a worker
+        # thread) can never interleave desired.yaml writes on the same resident.
         binding = materialize_override_binding(
             role=role, persona=persona, override_source=override_source)
-        instance_dir.stage_desired(InstanceTuple(
-            root=override_source, binding=binding, config_snapshot={},
-            config_digest=binding.effective_config_digest,
-        ))
-        return instance_dir.commit_desired_to_active()
+        with specialist_materialize.MATERIALIZE_LOCK:
+            instance_dir.stage_desired(InstanceTuple(
+                root=override_source, binding=binding, config_snapshot={},
+                config_digest=binding.effective_config_digest,
+            ))
+            return instance_dir.commit_desired_to_active()
 
     # Specialist path — root MUST stay the component root; config/dependency
     # state carries forward from whatever is currently active.
@@ -286,7 +300,7 @@ def apply_persona_override(
     # role.v1.json's slot pattern), but the caller-built `instance_dir_root`
     # is derived from that slot upstream — re-assert the canonical slug shape
     # so a hostile target can never index the specialist InstanceDir tree.
-    from specialist_install import validate_specialist_slug
+    from specialist_install import validate_specialist_slug, _require_active_unchanged
     validate_specialist_slug(role.slot)
     active_before = instance_dir.active()
     if active_before is None:
@@ -300,16 +314,30 @@ def apply_persona_override(
     # unchanged. Round-2 (finding #4) extends the Plan 1 signature with two
     # optional keyword-only params (already landed in N1c — see
     # personality_binding.materialize_override_binding), additive and
-    # defaulted so every existing resident call site is unaffected.
+    # defaulted so every existing resident call site is unaffected. The binding
+    # is built from `active_before` OUTSIDE the lock (read-only work); the
+    # in-lock revalidation below guarantees that snapshot is still current.
     binding = materialize_override_binding(
         role=role, persona=persona, override_source=override_source,
         dependency_digests=active_before.binding.dependency_digests,
         effective_config_digest=active_before.binding.effective_config_digest,
     )
-    instance_dir.stage_desired(InstanceTuple(
-        root=active_before.root,                       # UNCHANGED — still the component root
-        binding=binding,
-        config_snapshot=active_before.config_snapshot,  # UNCHANGED — override never touches config
-        config_digest=active_before.config_digest,
-    ))
-    return instance_dir.commit_desired_to_active()
+    # F2a: re-read + stage + commit under MATERIALIZE_LOCK. `active_before` was
+    # read BEFORE the lock; a concurrent uninstall (resurrection — staging here
+    # would recreate a just-removed InstanceDir), a config-only upgrade, or
+    # another override may have committed a different active while we built the
+    # binding and blocked on the lock. `_require_active_unchanged` re-reads the
+    # active tuple in-lock and refuses (typed concurrent_mutation) unless it is
+    # byte-for-byte `active_before` — which also subsumes the vanished-active
+    # (no_active_tuple) case, since a removed active re-reads as None. Never
+    # commit this override over a concurrent winner, and never overwrite it with
+    # a binding derived from the now-stale `active_before`.
+    with specialist_materialize.MATERIALIZE_LOCK:
+        _require_active_unchanged(instance_dir, active_before, slug=role.slot)
+        instance_dir.stage_desired(InstanceTuple(
+            root=active_before.root,                       # UNCHANGED — still the component root
+            binding=binding,
+            config_snapshot=active_before.config_snapshot,  # UNCHANGED — override never touches config
+            config_digest=active_before.config_digest,
+        ))
+        return instance_dir.commit_desired_to_active()

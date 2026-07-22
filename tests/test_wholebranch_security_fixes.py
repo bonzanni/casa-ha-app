@@ -932,3 +932,235 @@ def test_concurrent_current_specialist_roles_dir_threads_build_complete_overlay(
             for slug in expected_slugs:
                 assert (overlay / slug / "role.yaml").is_file()
                 assert (overlay / slug / "doctrine.md").is_file()
+
+
+# ==========================================================================
+# Round 5 — whole-branch fix wave 5: full-tuple revalidation (F1), the missed
+# InstanceDir writers persona_install.apply_persona_override + tools._stage_and_
+# report (F2), and the in-lock index reload in current_specialist_roles_dir (F3).
+# ==========================================================================
+
+
+def _load_specialist_persona_role(specialists_dir: Path, slug: str):
+    """Load the (persona, role) pair from an installed specialist's CAS bytes —
+    exactly what apply_persona_override's specialist caller (tools.persona_apply)
+    resolves before applying an override."""
+    from persona_pack import load_persona_pack
+    from role_slot import materialize_role
+    from role_artifact import load_role_artifact
+    from personality_binding import InstanceDir
+    from specialist_install import parse_component_root, cas_store_dir
+
+    active = InstanceDir(specialists_dir / slug).active()
+    _, _, checksum = parse_component_root(active.root)
+    cas_dir = cas_store_dir(checksum, store_root=specialists_dir / "store")
+    persona = load_persona_pack(cas_dir / "persona" / "pack", cas_dir / "persona" / "manifest.json")
+    role = materialize_role(source=load_role_artifact(cas_dir / "role"), options={})
+    return persona, role
+
+
+# -- F1: full-tuple revalidation catches a concurrent SAME-ROOT mutation that a
+#        root-only check waved through (silent overwrite of the concurrent win).-
+
+
+def test_upgrade_refuses_when_a_same_root_config_mutation_races_before_the_lock(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    import prompt_compiler
+    from personality_binding import InstanceDir, InstanceTuple
+
+    v1, acks1 = _approved_inspection(tmp_path, slug="mtg", version_suffix="-v1")
+    specialists_dir = tmp_path / "specialists"
+    agents_dir = tmp_path / "agents"
+    commit_specialist_install(
+        inspection=v1, config={}, secret_names_provided=frozenset(), acks=acks1,
+        specialists_dir=specialists_dir, agents_specialists_dir=agents_dir)
+    v2, acks2 = _approved_inspection(
+        tmp_path, slug="mtg", version_suffix="-v2", version_override="0.2.0")
+
+    # Hook the pre-activation compile (runs AFTER active_before was read, BEFORE
+    # the in-lock re-check) to re-commit the active tuple with an ALTERED
+    # config_snapshot. root, binding, and config_digest are all UNCHANGED, so a
+    # root-only revalidation cannot see this mutation — the exact same-root case
+    # the F1 full-tuple fix must now catch.
+    real_compile = prompt_compiler.compile_prompt_bundle
+    fired = {"done": False}
+
+    def _compile_then_config_mutate(*a, **k):
+        result = real_compile(*a, **k)
+        if not fired["done"]:
+            fired["done"] = True
+            idir = InstanceDir(specialists_dir / "mtg")
+            active = idir.active()
+            idir.stage_desired(InstanceTuple(
+                root=active.root, binding=active.binding,
+                config_snapshot={**dict(active.config_snapshot), "_probe": "raced"},
+                config_digest=active.config_digest))
+            idir.commit_desired_to_active()
+        return result
+
+    monkeypatch.setattr(prompt_compiler, "compile_prompt_bundle", _compile_then_config_mutate)
+
+    with pytest.raises(SpecialistInstallError) as exc:
+        upgrade_specialist(
+            slug="mtg", inspection=v2, config={}, secret_names_provided=frozenset(), acks=acks2,
+            specialists_dir=specialists_dir, agents_specialists_dir=agents_dir)
+    assert exc.value.kind == "concurrent_mutation"
+    assert fired["done"] is True
+    # RED pre-fix: root-only revalidation passed (both roots are v1), so the
+    # upgrade committed v2 OVER the raced config mutation — silently losing it.
+    # Post-fix the raced config survives untouched and the version is still v1.
+    active = InstanceDir(specialists_dir / "mtg").active()
+    assert active is not None
+    assert active.config_snapshot.get("_probe") == "raced"
+    _, version, _ = parse_component_root(active.root)
+    assert version == "0.1.0"
+
+
+# -- F2a: apply_persona_override's specialist branch stages+commits UNDER the
+#         lock, with full-tuple revalidation against its pre-lock active_before.-
+
+
+def test_apply_persona_override_specialist_stages_under_the_lock(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from persona_install import apply_persona_override
+
+    specialists_dir, agents_dir = _install_active(tmp_path, slug="mtg")
+    persona, role = _load_specialist_persona_role(specialists_dir, "mtg")
+
+    seen = _record_stage_lockstate(monkeypatch)
+    committed = apply_persona_override(
+        target_role_id="specialist:mtg", persona=persona, role=role,
+        instance_dir_root=specialists_dir / "mtg")
+
+    assert committed.binding.mode == "override"
+    # RED pre-fix: the specialist branch staged+committed with NO lock held.
+    assert seen == [True]
+
+
+def test_apply_persona_override_specialist_refuses_when_uninstall_races_before_the_lock(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    import personality_binding
+    from persona_install import apply_persona_override
+    from personality_binding import InstanceDir
+
+    specialists_dir, agents_dir = _install_active(tmp_path, slug="mtg")
+    persona, role = _load_specialist_persona_role(specialists_dir, "mtg")
+
+    # materialize_override_binding is the read-only gate apply_persona_override
+    # runs AFTER reading active_before but BEFORE taking the lock — hook it to
+    # uninstall the slug (the concurrent mutation that removes active.yaml).
+    real_mob = personality_binding.materialize_override_binding
+    fired = {"done": False}
+
+    def _mob_then_uninstall(*a, **k):
+        result = real_mob(*a, **k)
+        if not fired["done"]:
+            fired["done"] = True
+            uninstall_specialist(
+                slug="mtg", specialists_dir=specialists_dir, agents_specialists_dir=agents_dir)
+        return result
+
+    monkeypatch.setattr(personality_binding, "materialize_override_binding", _mob_then_uninstall)
+
+    with pytest.raises(SpecialistInstallError) as exc:
+        apply_persona_override(
+            target_role_id="specialist:mtg", persona=persona, role=role,
+            instance_dir_root=specialists_dir / "mtg")
+    assert exc.value.kind == "concurrent_mutation"
+    assert fired["done"] is True
+    # RED pre-fix: the un-locked branch staged+committed after the uninstall,
+    # RESURRECTING the removed slug's InstanceDir. Post-fix nothing is recreated.
+    assert InstanceDir(specialists_dir / "mtg").active() is None
+    assert not (specialists_dir / "mtg" / "desired.yaml").exists()
+    assert not (agents_dir / "mtg").exists()
+
+
+# -- F2b: the resident staging in tools._stage_and_report is offloaded to a
+#         worker thread and runs its InstanceDir write UNDER the shared lock. ---
+
+
+def test_stage_and_report_resident_stages_under_the_lock_off_loop(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    import asyncio
+    import agent_loader
+    import tools
+    from personality_binding import InstanceDir, materialize_override_binding
+    from test_reconcile_resident_binding import _persona, _role
+
+    monkeypatch.setenv("CASA_BINDINGS_DIR", str(tmp_path / "bindings"))
+    role = _role()
+    persona = _persona("casa/gary", "0.2.0")
+    binding = materialize_override_binding(
+        role=role, persona=persona, override_source="operator:casa/gary@0.2.0")
+
+    seen = _record_stage_lockstate(monkeypatch)
+    result = asyncio.run(tools._stage_and_report(role.role_id, role.slot, binding))
+
+    assert result["ok"] is True
+    assert result["persona"] == "casa/gary@0.2.0"
+    # RED pre-fix: the resident stage ran with NO lock held (and on the loop).
+    assert seen == [True]
+    # The desired tuple was actually staged under the CASA_BINDINGS_DIR seam.
+    idir = InstanceDir(agent_loader._resident_bindings_root(None) / f"resident-{role.slot}")
+    assert idir.desired() is not None
+
+
+# -- F3: current_specialist_roles_dir RE-LOADS the index in-lock, so an
+#        install/uninstall committed after the caller's off-lock snapshot is
+#        reflected in the overlay (new slug present / removed slug omitted). ----
+
+
+def test_roles_dir_in_lock_reload_includes_a_slug_installed_after_the_snapshot(
+    tmp_path: Path,
+) -> None:
+    import specialist_materialize
+    from specialist_registry import InstalledSpecialistIndex
+
+    specialists_dir, agents_dir = _install_active(tmp_path, slug="mtg")
+    # Snapshot the index BEFORE "research" is installed — mirrors reload/boot
+    # loading the index OFF-lock before current_specialist_roles_dir runs.
+    snapshot = InstalledSpecialistIndex(specialists_dir=str(specialists_dir))
+    snapshot.load()
+    assert set(snapshot.installed_slugs()) == {"mtg"}
+
+    # "research" commits AFTER the snapshot, BEFORE the reconcile below.
+    _install_active(tmp_path, slug="research")
+
+    overlay = Path(specialist_materialize.current_specialist_roles_dir(
+        installed_index=snapshot, specialists_dir=specialists_dir,
+        agents_specialists_dir=agents_dir)) / "specialist"
+
+    # RED pre-fix: the overlay was built from the stale snapshot, omitting the
+    # just-installed "research". Post-fix the in-lock reload includes it.
+    assert (overlay / "research" / "role.yaml").is_file()
+    assert (overlay / "mtg" / "role.yaml").is_file()
+
+
+def test_roles_dir_in_lock_reload_omits_a_slug_uninstalled_after_the_snapshot(
+    tmp_path: Path,
+) -> None:
+    import specialist_materialize
+    from specialist_registry import InstalledSpecialistIndex
+
+    specialists_dir, agents_dir = _install_active(tmp_path, slug="mtg")
+    _install_active(tmp_path, slug="research")
+    snapshot = InstalledSpecialistIndex(specialists_dir=str(specialists_dir))
+    snapshot.load()
+    assert set(snapshot.installed_slugs()) == {"mtg", "research"}
+
+    # "research" is uninstalled AFTER the snapshot, BEFORE the reconcile below.
+    uninstall_specialist(
+        slug="research", specialists_dir=specialists_dir, agents_specialists_dir=agents_dir)
+
+    overlay = Path(specialist_materialize.current_specialist_roles_dir(
+        installed_index=snapshot, specialists_dir=specialists_dir,
+        agents_specialists_dir=agents_dir)) / "specialist"
+
+    # RED pre-fix: the stale snapshot still listed "research", so the overlay
+    # RESURRECTED it from retained CAS bytes. Post-fix the in-lock reload drops it.
+    assert not (overlay / "research").exists()
+    assert (overlay / "mtg" / "role.yaml").is_file()

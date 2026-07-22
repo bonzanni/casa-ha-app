@@ -278,6 +278,16 @@ async def _specialist_roles_dir(runtime: Any) -> str:
         index = InstalledSpecialistIndex(str(specialists_dir))
         index.load()
         set_active_installed_index(index)
+        # Round-5 F3 (disclosed double-load): this pre-lock load+publish gives
+        # admin/inspection reads a valid (if momentarily one-reconcile-stale)
+        # index the instant it is published. `current_specialist_roles_dir` then
+        # RE-LOADS this SAME object IN-LOCK before it rebuilds the overlay, so
+        # the published global and the overlay both reflect the state committed
+        # under MATERIALIZE_LOCK — an install/uninstall racing between this
+        # off-lock load and the lock can no longer leave the overlay omitting a
+        # new slug or resurrecting a removed one. The second (in-lock) scan is a
+        # cheap disk re-read; the pre-lock load stays so the object is never
+        # published un-loaded.
         return specialist_materialize.current_specialist_roles_dir(
             installed_index=index,
             specialists_dir=specialists_dir,

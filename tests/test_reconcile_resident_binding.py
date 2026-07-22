@@ -9,6 +9,8 @@ leaves the last-known-good active binding running instead of crash-looping.
 
 from __future__ import annotations
 
+import asyncio
+
 from personality_binding import (
     IMAGE_DEFAULT_PERSONA_BY_SLOT,
     InstanceDir,
@@ -163,7 +165,9 @@ def test_tool_stage_and_loader_reconcile_share_the_same_bindings_root(tmp_path, 
     override_binding = materialize_override_binding(
         role=role, persona=override, override_source="operator:casa/gary@0.2.0",
     )
-    tools._stage_and_report(role.role_id, role.slot, override_binding)
+    # Round-5 F2b: _stage_and_report is now async (its InstanceDir write runs
+    # under MATERIALIZE_LOCK, offloaded via asyncio.to_thread) — drive it here.
+    asyncio.run(tools._stage_and_report(role.role_id, role.slot, override_binding))
 
     # The next boot's reconcile, reading through the LOADER's seam, must see
     # and promote the tool-staged override.

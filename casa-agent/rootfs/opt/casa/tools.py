@@ -7870,8 +7870,9 @@ def _resolve_local_persona(ref: str):
     raise ValueError(f"persona {ref!r} is not present under any configured persona root")
 
 
-def _stage_and_report(role_id: str, slot: str, binding) -> dict:
+async def _stage_and_report(role_id: str, slot: str, binding) -> dict:
     from personality_binding import InstanceDir, InstanceTuple
+    import specialist_materialize
 
     # Resolve the bindings root through the SAME seam agent_loader's boot-time
     # reconcile uses (agent_loader._resident_bindings_root — honors an explicit
@@ -7883,11 +7884,26 @@ def _stage_and_report(role_id: str, slot: str, binding) -> dict:
     import agent_loader
 
     instance_dir = InstanceDir(agent_loader._resident_bindings_root(None) / f"resident-{slot}")
-    active = instance_dir.active()
     root = binding.override_source or binding.image_default_root or ""
-    instance_dir.stage_desired(InstanceTuple(
+    tuple_ = InstanceTuple(
         root=root, binding=binding, config_snapshot={}, config_digest=binding.effective_config_digest,
-    ))
+    )
+
+    # Round-5 fix (F2b): the resident InstanceDir write shares the
+    # personality-instance mutation lock (specialist_materialize.MATERIALIZE_LOCK)
+    # with every specialist writer and with apply_persona_override's resident
+    # branch. This tool handler runs on the EVENT LOOP, so acquiring the
+    # threading.Lock synchronously here would block asyncio; offload the minimal
+    # InstanceDir-write section (active re-read + stage_desired, both in-lock) to
+    # a worker thread via asyncio.to_thread — the same off-loop pattern reload's
+    # _specialist_roles_dir uses. Validation/reporting stay loop-side.
+    def _locked_stage():
+        with specialist_materialize.MATERIALIZE_LOCK:
+            active = instance_dir.active()
+            instance_dir.stage_desired(tuple_)
+            return active
+
+    active = await asyncio.to_thread(_locked_stage)
     return {
         "ok": True, "role": role_id, "persona": f"{binding.persona_id}@{binding.persona_version}",
         "activation": "restart_required",
@@ -7940,7 +7956,7 @@ async def resident_persona_swap(args: dict) -> dict:
     binding = materialize_override_binding(
         role=role, persona=persona, override_source=f"operator:{args['persona_ref']}",
     )
-    return _result(_stage_and_report(role_id, slot, binding))
+    return _result(await _stage_and_report(role_id, slot, binding))
 
 
 @tool(
@@ -7975,7 +7991,7 @@ async def resident_persona_reset(args: dict) -> dict:
     except ValueError as exc:
         return _result({"ok": False, "kind": "incompatible_or_missing_persona", "detail": str(exc)})
     binding = materialize_image_default_binding(role=role, persona=persona, image_default_root=default_ref)
-    return _result(_stage_and_report(role_id, slot, binding))
+    return _result(await _stage_and_report(role_id, slot, binding))
 
 
 # Module-level tool registry — iterated by create_casa_tools() for the SDK

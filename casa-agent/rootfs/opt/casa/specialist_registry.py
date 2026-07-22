@@ -430,25 +430,36 @@ class InstalledSpecialistIndex:
         """A slug directory with only a desired.yaml (no active.yaml) is a
         brand-new specialist still in pending-configuration with NO running
         active tuple (spec §4.1) — this Plan defines that state; Plan 2's N1
-        is what produces one."""
-        self._instances.clear()
-        if not self._dir.is_dir():
-            return
-        for entry in sorted(self._dir.iterdir()):
-            if not entry.is_dir() or entry.name in {"store", ".staging"}:
-                continue
-            slug = entry.name
-            instance_dir = InstanceDir(entry)
-            active, desired = instance_dir.active(), instance_dir.desired()
-            if active is None and desired is None:
-                continue
-            state: InstanceState = (
-                "active" if active is not None else "pending-configuration" if desired is not None else "error"
-            )
-            self._instances[slug] = SpecialistInstance(
-                slug=slug, stable_agent_id=f"specialist:{slug}", state=state,
-                active=active, desired=desired, last_activation_error=None,
-            )
+        is what produces one.
+
+        Round-5 fix (F3 race-safety): builds the new instance map in a LOCAL
+        dict and swaps `self._instances` to it in a single (GIL-atomic)
+        attribute store, rather than `clear()`-ing then repopulating in place.
+        `current_specialist_roles_dir` now RE-LOADS the already-published
+        process-wide index in-lock (in a worker thread); a concurrent
+        admin/inspection reader (`installed_slugs()` -> `frozenset(self.
+        _instances)`) on the event loop must never observe a half-cleared or
+        mid-repopulation dict ('dict changed size during iteration'). The swap
+        makes every reader see either the complete OLD map or the complete NEW
+        one, never a transient in-between."""
+        instances: dict[str, SpecialistInstance] = {}
+        if self._dir.is_dir():
+            for entry in sorted(self._dir.iterdir()):
+                if not entry.is_dir() or entry.name in {"store", ".staging"}:
+                    continue
+                slug = entry.name
+                instance_dir = InstanceDir(entry)
+                active, desired = instance_dir.active(), instance_dir.desired()
+                if active is None and desired is None:
+                    continue
+                state: InstanceState = (
+                    "active" if active is not None else "pending-configuration" if desired is not None else "error"
+                )
+                instances[slug] = SpecialistInstance(
+                    slug=slug, stable_agent_id=f"specialist:{slug}", state=state,
+                    active=active, desired=desired, last_activation_error=None,
+                )
+        self._instances = instances
 
     def installed_component_role_dirs(self) -> "dict[str, Path]":
         """slug -> the CAS directory HOLDING role/{role.yaml,doctrine.md}
