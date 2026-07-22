@@ -7086,6 +7086,7 @@ async def persona_apply(args: dict) -> dict:
     from persona_pack import PersonaPackError, load_persona_pack
     from role_slot import materialize_role
     from role_artifact import load_role_artifact
+    from specialist_install import SpecialistInstallError
 
     kind, _, slot = args["target_role_id"].partition(":")
     personas_root = Path("/config/personas") / args["persona_id"] / args["persona_version"]
@@ -7124,6 +7125,15 @@ async def persona_apply(args: dict) -> dict:
             role=role, instance_dir_root=instance_dir_root)
     except ValueError as exc:
         return _result({"ok": False, "kind": "incompatible", "detail": str(exc)})
+    except SpecialistInstallError as exc:
+        # Fix-round-1 (finding IMPORTANT): installed_component_role_dirs()
+        # legitimately resolves a pending-configuration specialist (desired-
+        # only, active=None — a real state per specialist_registry.py), so
+        # apply_persona_override's specialist branch can reach here and raise
+        # SpecialistInstallError("no_active_tuple", ...) for a target this
+        # tool otherwise accepted. Without this clause that escaped as an
+        # unstructured MCP error instead of the tool's {ok, kind} contract.
+        return _result({"ok": False, "kind": exc.kind, "detail": exc.detail})
     return _result({"ok": True, "target_role_id": args["target_role_id"],
                      "binding_digest": committed.binding.binding_digest,
                      "restart_required": kind == "resident"})

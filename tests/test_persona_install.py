@@ -28,7 +28,7 @@ from specialist_install import SpecialistInstallError
 
 
 def _write_persona_repo(root: Path, *, persona_id: str = "casa/newton",
-                        version: str = "0.1.0") -> Path:
+                        version: str = "0.1.0", negative_space: str = "Never condescends.") -> Path:
     pack_dir = root / "pack"
     pack_dir.mkdir(parents=True)
     persona_yaml = {
@@ -45,7 +45,7 @@ def _write_persona_repo(root: Path, *, persona_id: str = "casa/newton",
     (pack_dir / "persona.yaml").write_text(yaml.safe_dump(persona_yaml, sort_keys=False), encoding="utf-8")
     core = "Y" * 350
     (pack_dir / "persona.md").write_text(
-        f"# Core\n\n{core}\n\n## Negative space\n\nNever condescends.\n", encoding="utf-8")
+        f"# Core\n\n{core}\n\n## Negative space\n\n{negative_space}\n", encoding="utf-8")
     # persona_pack._admit_files sorts admitted files by NAME — the manifest
     # row order must match that, not source-declaration order (see the
     # module docstring's DRIFT WARNING disclosure above).
@@ -118,11 +118,12 @@ def test_inspect_persona_repo_missing_manifest_raises(tmp_path: Path, monkeypatc
 
 
 def _inspection_from_repo(tmp_path: Path, *, persona_id: str = "casa/newton",
-                          version: str = "0.1.0") -> PersonaInspectionResult:
+                          version: str = "0.1.0",
+                          negative_space: str = "Never condescends.") -> PersonaInspectionResult:
     from persona_pack import load_persona_pack
 
-    staged = tmp_path / f"staged-{persona_id.replace('/', '-')}-{version}"
-    _write_persona_repo(staged, persona_id=persona_id, version=version)
+    staged = tmp_path / f"staged-{persona_id.replace('/', '-')}-{version}-{abs(hash(negative_space))}"
+    _write_persona_repo(staged, persona_id=persona_id, version=version, negative_space=negative_space)
     pack = load_persona_pack(staged / "pack", staged / "manifest.json")
     return PersonaInspectionResult(
         persona_id=pack.persona_id, version=pack.version, checksum=pack.checksum,
@@ -190,6 +191,72 @@ def test_commit_persona_install_is_idempotent_once_already_committed(tmp_path: P
 
     pack_again = commit_persona_install(inspection=inspection, acks=acks, personas_root=personas_root)
     assert pack_again.checksum == inspection.checksum
+
+
+def _ack_and_commit(tmp_path: Path, acks_path: Path, personas_root: Path, inspection):
+    from persona_install import (
+        PersonaInstallAckStore, commit_persona_install, persona_install_consent_identity,
+    )
+
+    acks = PersonaInstallAckStore(path=acks_path)
+    identity = persona_install_consent_identity(
+        persona_id=inspection.persona_id, version=inspection.version, checksum=inspection.checksum)
+    acks.record(identity=identity, persona_id=inspection.persona_id,
+                version=inspection.version, checksum=inspection.checksum)
+    return commit_persona_install(inspection=inspection, acks=acks, personas_root=personas_root)
+
+
+def test_commit_persona_install_same_version_different_content_raises_version_content_conflict(
+    tmp_path: Path,
+) -> None:
+    """Fix-round-1 CRITICAL regression (b): re-committing the SAME
+    persona_id@version with DIFFERENT approved content must never silently
+    return the stale on-disk pack — dest is keyed by a MUTABLE version
+    string, not a content digest, so "dest already exists" does not imply
+    "dest matches this inspection". Must raise version_content_conflict and
+    leave the on-disk bytes from the FIRST install completely unchanged."""
+    from persona_install import commit_persona_install
+    from specialist_install import SpecialistInstallError
+
+    personas_root = tmp_path / "personas"
+    first = _inspection_from_repo(tmp_path, negative_space="Never condescends.")
+    first_pack = _ack_and_commit(tmp_path, tmp_path / "acks1.json", personas_root, first)
+    assert first_pack.checksum == first.checksum
+
+    second = _inspection_from_repo(
+        tmp_path, negative_space="Always double-checks the units.")
+    assert second.checksum != first.checksum  # genuinely different content, same id@version
+
+    with pytest.raises(SpecialistInstallError) as raised:
+        _ack_and_commit(tmp_path, tmp_path / "acks2.json", personas_root, second)
+    assert raised.value.kind == "version_content_conflict"
+
+    # The on-disk bytes from the first, approved install must be UNCHANGED —
+    # never silently replaced by the second, unapproved-for-this-path content.
+    from persona_pack import load_persona_pack
+    dest = personas_root / first.persona_id / first.version
+    reloaded = load_persona_pack(dest / "pack", dest / "manifest.json")
+    assert reloaded.checksum == first.checksum
+    assert reloaded.checksum != second.checksum
+
+
+def test_commit_persona_install_corrupt_dest_fails_closed(tmp_path: Path) -> None:
+    """Fix-round-1 CRITICAL regression: if `dest` exists but is unreadable/
+    corrupt (load_persona_pack raises), commit_persona_install must fail
+    closed with the same typed error rather than crashing raw with an
+    unstructured exception."""
+    from persona_install import commit_persona_install
+    from specialist_install import SpecialistInstallError
+
+    personas_root = tmp_path / "personas"
+    inspection = _inspection_from_repo(tmp_path)
+    dest = personas_root / inspection.persona_id / inspection.version
+    dest.mkdir(parents=True)
+    (dest / "manifest.json").write_text("not valid json at all {{{", encoding="utf-8")
+
+    with pytest.raises(SpecialistInstallError) as raised:
+        _ack_and_commit(tmp_path, tmp_path / "acks.json", personas_root, inspection)
+    assert raised.value.kind == "version_content_conflict"
 
 
 # ---------------------------------------------------------------------------
@@ -361,10 +428,13 @@ def test_apply_persona_override_specialist_preserves_root_and_dependency_state(t
     override_dir = tmp_path / "newton-repo"
     _write_persona_repo(override_dir, persona_id="casa/newton", version="0.1.0")
     persona = load_persona_pack(override_dir / "pack", override_dir / "manifest.json")
-    # This fixture's role has no persona_requirements compatibility list
-    # (persona.policy == "required" with no `compatibility` key), so
-    # check_persona_requirements accepts any persona — matches the "no
-    # constraint declared" branch, not a bypass.
+    # This fixture's role.yaml sets persona.compatibility to a wildcard
+    # entry ("casa/*@>=0.0.0 <99.0.0" — see _write_specialist_component
+    # above), which check_persona_requirements matches against ANY slug in
+    # the "casa" namespace within that version range. That's an explicit,
+    # broad admission rule — not an absence of a compatibility list — and
+    # this override's casa/newton@0.1.0 satisfies it same as the bundled
+    # casa/judge@0.1.0 default would.
 
     committed = apply_persona_override(
         target_role_id="specialist:mtg-n1d", persona=persona, role=role,

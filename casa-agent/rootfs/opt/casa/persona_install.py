@@ -130,7 +130,7 @@ def commit_persona_install(
     import os
     import shutil
 
-    from persona_pack import load_persona_pack
+    from persona_pack import PersonaPackError, load_persona_pack
 
     identity = persona_install_consent_identity(
         persona_id=inspection.persona_id, version=inspection.version, checksum=inspection.checksum)
@@ -139,37 +139,75 @@ def commit_persona_install(
             "consent_missing", "no recorded operator approval for this persona install")
 
     dest = personas_root / inspection.persona_id / inspection.version
-    if not (dest / "manifest.json").is_file():
-        # Round-3 fix (finding #1): this was the ONE commit path in the
-        # whole plan that copied inspection-time bytes straight into their
-        # FINAL location with NO verification step at all — no reload, no
-        # re-derived checksum, nothing between "operator approved this
-        # checksum" and "these bytes are now live at `dest`". Mirror the
-        # specialist pipeline: stage into a TEMP directory under
-        # `personas_root`, reload + recompute the checksum from THOSE
-        # staged bytes, compare to `inspection.checksum`, and only then
-        # atomically `os.replace` the verified temp directory into `dest`.
-        # A mismatch/failure leaves no partial or wrong-checksum content at
-        # `dest`.
-        staging_parent = personas_root / ".staging"
-        staging_parent.mkdir(parents=True, exist_ok=True, mode=0o700)
-        staging_dest = staging_parent / uuid.uuid4().hex
-        staging_dest.mkdir(parents=True, mode=0o700)
+    if (dest / "manifest.json").is_file():
+        # Fix-round-1 (finding CRITICAL): `dest` is keyed by persona_id +
+        # a MUTABLE version string, NOT a content digest (unlike the
+        # specialist CAS, where path == digest makes "exists" imply
+        # "correct"). So "dest already exists" is NOT proof that what's
+        # there matches this inspection's approved bytes — a persona_id@
+        # version can be re-committed with genuinely different content
+        # (e.g. an operator edited the repo but forgot to bump version).
+        # Fail CLOSED: reload what's actually on disk and compare its
+        # checksum to the approved inspection.checksum before ever
+        # returning it. Never silently substitute the stale on-disk pack
+        # for the just-approved one, and never silently overwrite an
+        # existing version's bytes either — versions are immutable, so a
+        # genuine content change must bump the version, not clobber `dest`.
         try:
-            shutil.copytree(inspection.staged_dir / "pack", staging_dest / "pack")
-            shutil.copy2(inspection.staged_dir / "manifest.json", staging_dest / "manifest.json")
-            staged_pack = load_persona_pack(staging_dest / "pack", staging_dest / "manifest.json")
-            if (staged_pack.persona_id != inspection.persona_id
-                    or staged_pack.version != inspection.version
-                    or staged_pack.checksum != inspection.checksum):
-                raise SpecialistInstallError(
-                    "checksum_changed",
-                    "staged persona no longer matches the approved inspection")
-        except Exception:
-            shutil.rmtree(staging_dest, ignore_errors=True)
-            raise
-        dest.parent.mkdir(parents=True, exist_ok=True)
-        os.replace(staging_dest, dest)
+            existing_pack = load_persona_pack(dest / "pack", dest / "manifest.json")
+        except (PersonaPackError, OSError) as exc:
+            # dest exists but is unreadable/corrupt — do not attempt to
+            # repair or replace it automatically; that would risk masking
+            # a tampered or half-written directory. Fail closed with the
+            # same typed error, disclosing that manual removal is required.
+            raise SpecialistInstallError(
+                "version_content_conflict",
+                f"{inspection.persona_id}@{inspection.version} already exists at {dest} "
+                f"but is corrupt or unreadable ({exc}); manual removal of the local copy "
+                "is required before retrying this install") from exc
+        if existing_pack.checksum != inspection.checksum:
+            raise SpecialistInstallError(
+                "version_content_conflict",
+                f"{inspection.persona_id}@{inspection.version} already exists locally with "
+                f"different content (on-disk checksum {existing_pack.checksum!r} != approved "
+                f"{inspection.checksum!r}); re-publish under a new version — an existing "
+                "persona version's bytes are never silently replaced")
+        # Genuine idempotent re-commit: on-disk content matches what was
+        # just approved, so returning it is correct (round-3's original
+        # short-circuit, now justified by an actual checksum comparison
+        # rather than mere path existence).
+        return existing_pack
+
+    # Round-3 fix (finding #1): this was the ONE commit path in the
+    # whole plan that copied inspection-time bytes straight into their
+    # FINAL location with NO verification step at all — no reload, no
+    # re-derived checksum, nothing between "operator approved this
+    # checksum" and "these bytes are now live at `dest`". Mirror the
+    # specialist pipeline: stage into a TEMP directory under
+    # `personas_root`, reload + recompute the checksum from THOSE
+    # staged bytes, compare to `inspection.checksum`, and only then
+    # atomically `os.replace` the verified temp directory into `dest`.
+    # A mismatch/failure leaves no partial or wrong-checksum content at
+    # `dest`.
+    staging_parent = personas_root / ".staging"
+    staging_parent.mkdir(parents=True, exist_ok=True, mode=0o700)
+    staging_dest = staging_parent / uuid.uuid4().hex
+    staging_dest.mkdir(parents=True, mode=0o700)
+    try:
+        shutil.copytree(inspection.staged_dir / "pack", staging_dest / "pack")
+        shutil.copy2(inspection.staged_dir / "manifest.json", staging_dest / "manifest.json")
+        staged_pack = load_persona_pack(staging_dest / "pack", staging_dest / "manifest.json")
+        if (staged_pack.persona_id != inspection.persona_id
+                or staged_pack.version != inspection.version
+                or staged_pack.checksum != inspection.checksum):
+            raise SpecialistInstallError(
+                "checksum_changed",
+                "staged persona no longer matches the approved inspection")
+    except Exception:
+        shutil.rmtree(staging_dest, ignore_errors=True)
+        raise
+    dest.parent.mkdir(parents=True, exist_ok=True)
+    os.replace(staging_dest, dest)
     return load_persona_pack(dest / "pack", dest / "manifest.json")
 
 
