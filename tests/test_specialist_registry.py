@@ -103,12 +103,13 @@ class TestLoader:
         reg.load()
         assert reg.get("finance") is None
 
-    async def test_loads_enabled_specialist(self, tmp_path):
+    async def test_loads_enabled_specialist(self, tmp_path, monkeypatch):
         from specialist_registry import SpecialistRegistry
 
         specialists = tmp_path / "specialists"
         specialists.mkdir()
         _seed_specialist_dir(specialists, "finance", enabled=True)
+        _use_synthetic_roles_dir(monkeypatch, tmp_path, "finance")
         reg = SpecialistRegistry(str(specialists),
                                  tombstone_path=str(tmp_path / "del.json"))
         reg.load()
@@ -217,7 +218,7 @@ class TestValidation:
 
 class TestEnabledFiltering:
     async def test_disabled_specialist_parsed_but_skipped(
-        self, tmp_path, caplog,
+        self, tmp_path, caplog, monkeypatch,
     ):
         import logging
         from specialist_registry import SpecialistRegistry
@@ -225,6 +226,7 @@ class TestEnabledFiltering:
         specialists = tmp_path / "specialists"
         specialists.mkdir()
         _seed_specialist_dir(specialists, "finance", enabled=False)
+        _use_synthetic_roles_dir(monkeypatch, tmp_path, "finance")
         reg = SpecialistRegistry(str(specialists),
                                  tombstone_path=str(tmp_path / "del.json"))
         with caplog.at_level(logging.INFO):
@@ -615,7 +617,7 @@ class TestDisabledAccessors:
         reg.load()
         assert reg.is_disabled("nonexistent") is False
 
-    async def test_is_disabled_true_for_bundled_disabled(self, tmp_path):
+    async def test_is_disabled_true_for_bundled_disabled(self, tmp_path, monkeypatch):
         """A specialist with enabled:false in runtime.yaml lands in
         _disabled_names; is_disabled returns True."""
         from specialist_registry import SpecialistRegistry
@@ -623,13 +625,14 @@ class TestDisabledAccessors:
         specialists = tmp_path / "specialists"
         specialists.mkdir()
         _seed_specialist_dir(specialists, "finance", enabled=False)
+        _use_synthetic_roles_dir(monkeypatch, tmp_path, "finance")
         reg = SpecialistRegistry(str(specialists),
                                  tombstone_path=str(tmp_path / "del.json"))
         reg.load()
         assert reg.is_disabled("finance") is True
         assert reg.get("finance") is None  # confirm not enabled
 
-    async def test_is_disabled_false_for_enabled_specialist(self, tmp_path):
+    async def test_is_disabled_false_for_enabled_specialist(self, tmp_path, monkeypatch):
         """An enabled specialist is NOT disabled — it's in _configs, not
         _disabled_names. is_disabled returns False."""
         from specialist_registry import SpecialistRegistry
@@ -637,6 +640,7 @@ class TestDisabledAccessors:
         specialists = tmp_path / "specialists"
         specialists.mkdir()
         _seed_specialist_dir(specialists, "finance", enabled=True)
+        _use_synthetic_roles_dir(monkeypatch, tmp_path, "finance")
         reg = SpecialistRegistry(str(specialists),
                                  tombstone_path=str(tmp_path / "del.json"))
         reg.load()
@@ -672,13 +676,14 @@ class TestSpecialistBootCapabilities:
     verification has a log oracle for specialist targets too."""
 
     async def test_load_logs_agent_capabilities_for_enabled_specialist(
-        self, tmp_path, caplog
+        self, tmp_path, caplog, monkeypatch,
     ):
         import logging
 
         from specialist_registry import SpecialistRegistry
 
         _seed_specialist_dir(tmp_path, "finance", enabled=True)
+        _use_synthetic_roles_dir(monkeypatch, tmp_path, "finance")
         reg = SpecialistRegistry(str(tmp_path), tombstone_path=str(tmp_path / "d.json"))
         with caplog.at_level(logging.INFO):
             reg.load()
@@ -687,12 +692,13 @@ class TestSpecialistBootCapabilities:
         assert cap, "no agent_capabilities line logged for the enabled specialist at load"
         assert "model=" in cap[0] and "tool_count=" in cap[0]
 
-    async def test_disabled_specialist_gets_no_capabilities_line(self, tmp_path, caplog):
+    async def test_disabled_specialist_gets_no_capabilities_line(self, tmp_path, caplog, monkeypatch):
         import logging
 
         from specialist_registry import SpecialistRegistry
 
         _seed_specialist_dir(tmp_path, "finance", enabled=False)
+        _use_synthetic_roles_dir(monkeypatch, tmp_path, "finance")
         reg = SpecialistRegistry(str(tmp_path), tombstone_path=str(tmp_path / "d.json"))
         with caplog.at_level(logging.INFO):
             reg.load()
@@ -703,16 +709,32 @@ class TestInstalledSpecialistIndexCollisionSet:
     """Task 13: the slug-collision authority is EVERY image role's bare slot,
     across ALL THREE kinds (resident, executor, AND specialist) — a prior
     draft's hard-coded resident+executor-only set silently omitted the
-    bundled specialist:finance, which this regression-gates permanently."""
+    bundled specialist:finance, which this regression-gated permanently.
 
-    async def test_all_collision_slugs_includes_the_bundled_specialist_finance(self) -> None:
+    Task N2's no-gap cutover removed finance (the only bundled specialist)
+    from the image, so `all_collision_slugs` can no longer be proven against
+    a REAL specialist-kind image slot — this test now monkeypatches the
+    frozen `_IMAGE_ROLE_SLOTS` module global (computed once at import from
+    the real image tree) to a synthetic set that still includes a
+    specialist-kind slug, preserving the exact invariant under test:
+    `all_collision_slugs` unions the FULL image role-slot set (whichever
+    kinds it spans) with the installed-specialist set, never a hand-picked
+    per-kind subset."""
+
+    async def test_all_collision_slugs_includes_every_image_role_kind(self, monkeypatch) -> None:
         from specialist_registry import InstalledSpecialistIndex
 
+        monkeypatch.setattr(
+            "specialist_registry._IMAGE_ROLE_SLOTS",
+            frozenset({"assistant", "butler", "concierge", "configurator",
+                       "plugin-developer", "testspecialist"}),
+        )
         index = InstalledSpecialistIndex(specialists_dir="/nonexistent")
         index.load()  # zero installed specialists — this still asserts the IMAGE role set
         collisions = index.all_collision_slugs()
-        assert "finance" in collisions  # specialist:finance — the bug this fixes
-        assert {"assistant", "butler", "concierge", "configurator", "plugin-developer", "finance"} <= collisions
+        assert "testspecialist" in collisions  # a specialist-kind image slot — the bug this fixes
+        assert {"assistant", "butler", "concierge", "configurator",
+                "plugin-developer", "testspecialist"} <= collisions
 
     async def test_discover_image_role_slots_scans_every_kind_directory(self, tmp_path) -> None:
         """Unit-level proof the discovery walks resident/executor/specialist alike —

@@ -249,8 +249,16 @@ class TestHappyPath:
         from agent_loader import load_agent_from_dir
 
         agent_dir = _seed_specialist(tmp_path / "specialists", "finance")
+        # Task N2's no-gap cutover removed the real
+        # defaults/roles/specialist/finance/ from the image (finance was the
+        # only bundled specialist) — synthesize the role artifact instead of
+        # relying on the default roles_dir.
+        roles_dir = tmp_path / "roles"
+        _seed_role_artifact(roles_dir, "specialist", "finance")
 
-        cfg = load_agent_from_dir(str(agent_dir), policies=None)
+        cfg = load_agent_from_dir(
+            str(agent_dir), policies=None, roles_dir=str(roles_dir),
+        )
 
         assert cfg.role == "finance"
         assert cfg.enabled is False
@@ -258,7 +266,6 @@ class TestHappyPath:
         # Disclosure, no Delegation section in the prompt.
         assert cfg.system_prompt.startswith("You are Alex.")
         assert "### Disclosure" not in cfg.system_prompt
-        # Real shipped defaults/roles/specialist/finance/ (default roles_dir).
         assert cfg.role_artifact is not None
         assert cfg.role_artifact.role["id"] == "specialist:finance"
         assert cfg.role_artifact.role["kind"] == "specialist"
@@ -740,8 +747,14 @@ class TestLoadAllSpecialists:
 
         specialists_root = tmp_path / "specialists"
         _seed_specialist(specialists_root, "finance")
+        # Task N2's no-gap cutover removed the real image
+        # defaults/roles/specialist/finance/ — synthesize it.
+        roles_dir = tmp_path / "roles"
+        _seed_role_artifact(roles_dir, "specialist", "finance")
 
-        found, failed = load_all_specialists(str(specialists_root))
+        found, failed = load_all_specialists(
+            str(specialists_root), roles_dir=str(roles_dir),
+        )
         assert "finance" in found
         assert failed == []
 
@@ -755,8 +768,12 @@ class TestLoadAllSpecialists:
         _seed_specialist(specialists_root, "finance")
         # Sibling directory with no required files → load fails.
         (specialists_root / "broken").mkdir()
+        roles_dir = tmp_path / "roles"
+        _seed_role_artifact(roles_dir, "specialist", "finance")
 
-        found, failed = load_all_specialists(str(specialists_root))
+        found, failed = load_all_specialists(
+            str(specialists_root), roles_dir=str(roles_dir),
+        )
         assert "finance" in found
         assert any(name == "broken" for name, _ in failed)
         # Error message must name the missing required file so the
@@ -896,13 +913,32 @@ class TestValidateConfigRepo:
         from agent_loader import validate_config_repo
 
         repo = tmp_path / "addon_configs" / "casa-agent"
-        _seed_resident(repo / "agents", "assistant")
+        resident_dir = _seed_resident(repo / "agents", "assistant")
         _seed_specialist(repo / "agents", "finance")
         # A genuinely-bootable repo has a policy library (boot's load_policies
         # is unguarded); without it the add-on crash-loops (M5).
         _policies_file(repo / "policies")
 
-        errors = validate_config_repo(str(repo))
+        # Task N2's no-gap cutover removed the real image
+        # defaults/roles/specialist/finance/ — synthesize a roles_dir
+        # carrying both 'assistant' (resident) and 'finance' (specialist)
+        # since a custom roles_dir replaces the default tree entirely
+        # (mirrors TestValidateConfigRepoBootParity's established idiom).
+        # The synthetic role artifact's model is always the fixed-sonnet
+        # shape, so the resident's runtime.yaml must match it too.
+        roles_dir = tmp_path / "roles"
+        _seed_role_artifact(roles_dir, "resident", "assistant")
+        _seed_role_artifact(roles_dir, "specialist", "finance")
+        _w(resident_dir / "runtime.yaml", """\
+            schema_version: 1
+            kind: resident
+            model: {source: fixed, value: sonnet}
+            tools:
+              allowed: [Read, Write]
+            channels: [telegram]
+        """)
+
+        errors = validate_config_repo(str(repo), roles_dir=str(roles_dir))
         assert errors == []
 
     def test_no_agents_dir_returns_empty(self, tmp_path):
@@ -1063,8 +1099,23 @@ class TestValidateConfigRepo:
             prompt: x
             BOGUS_B: 2
         """)
+        # Task N2's no-gap cutover removed the real image
+        # defaults/roles/specialist/finance/ — synthesize a roles_dir
+        # carrying both 'assistant' and 'finance' (see
+        # test_clean_repo_returns_empty above for the full rationale).
+        roles_dir = tmp_path / "roles"
+        _seed_role_artifact(roles_dir, "resident", "assistant")
+        _seed_role_artifact(roles_dir, "specialist", "finance")
+        _w(agent_dir / "runtime.yaml", """\
+            schema_version: 1
+            kind: resident
+            model: {source: fixed, value: sonnet}
+            tools:
+              allowed: [Read, Write]
+            channels: [telegram]
+        """)
 
-        errors = validate_config_repo(str(repo))
+        errors = validate_config_repo(str(repo), roles_dir=str(roles_dir))
         assert len(errors) == 2
         joined = "\n".join(errors)
         assert "BOGUS_A" in joined

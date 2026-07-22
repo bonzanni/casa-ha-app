@@ -33,10 +33,12 @@ def reconcile_specialist_roles_overlay(
     *, installed_index, overlay_root: "Path | None" = None, image_roles_dir: "str | None" = None,
 ) -> Path:
     """Rebuild <overlay>/specialist/<slug>/{role.yaml,doctrine.md} for EVERY
-    image-bundled specialist role (today: finance, until Task N2's no-gap
-    cutover removes it) PLUS every installed specialist's role artifact, so
-    ONE roles_dir root serves agent_loader.load_all_specialists for every
-    specialist uniformly — residents/executors are unaffected and keep using
+    image-bundled specialist role (Task N2's no-gap cutover means this is
+    normally empty — specialists install from a repository, never authored
+    in-image — but the scan stays kind-general, not hard-coded to zero)
+    PLUS every installed specialist's role artifact, so ONE roles_dir root
+    serves agent_loader.load_all_specialists for every specialist
+    uniformly — residents/executors are unaffected and keep using
     agent_loader.DEFAULT_ROLES_DIR untouched. Deterministic + idempotent:
     fully rebuilt from source of truth on every call (image tree +
     `installed_index.installed_component_role_dirs()`), never hand-edited —

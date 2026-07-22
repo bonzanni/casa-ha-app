@@ -45,7 +45,11 @@ _REAL_ROLE_DIRS = [
     ("resident", "assistant"),
     ("resident", "butler"),
     ("resident", "concierge"),
-    ("specialist", "finance"),
+    # Task N2's no-gap cutover removed the only bundled specialist,
+    # finance, from the image entirely (specialists now install from a
+    # component repository) — defaults/roles/specialist/ no longer
+    # exists, so there is no real shipped specialist role artifact to
+    # enumerate here.
     ("executor", "configurator"),
     ("executor", "plugin-developer"),
 ]

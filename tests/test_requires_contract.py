@@ -12,8 +12,6 @@ the sync/interactive resolution-identity + no-side-effect contracts.
 from __future__ import annotations
 
 import json
-import shutil
-from pathlib import Path
 from unittest.mock import AsyncMock, MagicMock
 
 import pytest
@@ -26,12 +24,17 @@ try:
 except ImportError:
     from role_artifact_stub import STUB_ROLE_ARTIFACT
 
-pytestmark = [pytest.mark.unit]
+# Task N2's no-gap cutover removed the only bundled specialist (finance)
+# from the image entirely — defaults/agents/specialists/ no longer exists,
+# so TestLoaderParsing can no longer shutil.copytree the real shipped tree.
+# Reuse the synthetic seed/role-artifact helpers already established for
+# this in test_agent_loader.py (single implementation, no divergence).
+try:
+    from tests.test_agent_loader import _seed_role_artifact, _seed_specialist
+except ImportError:
+    from test_agent_loader import _seed_role_artifact, _seed_specialist
 
-REPO_ROOT = Path(__file__).resolve().parent.parent
-SPECIALISTS_DIR = (
-    REPO_ROOT / "casa-agent/rootfs/opt/casa/defaults/agents/specialists"
-)
+pytestmark = [pytest.mark.unit]
 
 
 def _cfg(role: str, delegates: tuple[str, ...] = (),
@@ -213,28 +216,34 @@ class TestDeclaredToolsForResolution:
 
 class TestLoaderParsing:
     def test_runtime_requires_parsed(self, tmp_path):
-        shutil.copytree(
-            SPECIALISTS_DIR, tmp_path / "agents" / "specialists",
-        )
-        rt = tmp_path / "agents" / "specialists" / "finance" / "runtime.yaml"
+        specialists_dir = tmp_path / "agents" / "specialists"
+        _seed_specialist(specialists_dir, "finance")
+        roles_dir = tmp_path / "roles"
+        _seed_role_artifact(roles_dir, "specialist", "finance")
+        rt = specialists_dir / "finance" / "runtime.yaml"
         rt.write_text(
             rt.read_text()
             + "requires:\n  plugins: [mtg]\n  tools: [mcp__plugin_mtg_mtg__lookup_rule]\n"
         )
         from agent_loader import load_all_specialists
 
-        found, failed = load_all_specialists(str(tmp_path / "agents" / "specialists"))
+        found, failed = load_all_specialists(
+            str(specialists_dir), roles_dir=str(roles_dir),
+        )
         assert not failed
         assert found["finance"].requires.plugins == ["mtg"]
         assert found["finance"].requires.tools == ["mcp__plugin_mtg_mtg__lookup_rule"]
 
     def test_no_requires_block_defaults_empty(self, tmp_path):
-        shutil.copytree(
-            SPECIALISTS_DIR, tmp_path / "agents" / "specialists",
-        )
+        specialists_dir = tmp_path / "agents" / "specialists"
+        _seed_specialist(specialists_dir, "finance")
+        roles_dir = tmp_path / "roles"
+        _seed_role_artifact(roles_dir, "specialist", "finance")
         from agent_loader import load_all_specialists
 
-        found, failed = load_all_specialists(str(tmp_path / "agents" / "specialists"))
+        found, failed = load_all_specialists(
+            str(specialists_dir), roles_dir=str(roles_dir),
+        )
         assert not failed
         assert found["finance"].requires.plugins == []
         assert found["finance"].requires.tools == []

@@ -247,22 +247,78 @@ def test_materialized_finance_specialist_round_trips_through_the_real_loader(
     ``_write_specialist_operational_files`` writes must be schema-valid for
     the REAL ``agent_loader.load_agent_from_dir`` — the module's entire
     purpose — not merely internally consistent with the writer's own
-    assumptions. Exercises the full pipeline against the REAL bundled
-    finance role artifact (``defaults/roles/specialist/finance``) plus a
-    real-shaped persona, materializes operational files, builds a real
-    roles-overlay via ``reconcile_specialist_roles_overlay``, and then
-    calls the REAL loader. Must FAIL on the pre-fix writer: role.yaml's
-    ``session.idle_timeout_seconds`` / ``tts.error_phrases`` violate
-    ``runtime.v1.json``'s ``additionalProperties: false`` sub-schemas, and
-    the hardcoded ``card: ""`` / ``prompt: ""`` violate
-    ``character.v1.json``'s ``minLength: 1``."""
+    assumptions. Exercises the full pipeline against a SYNTHETIC role
+    artifact holding the exact finance role.yaml/doctrine.md content the
+    image shipped pre-Task-N2-cutover (finance's bundled role directory no
+    longer exists on disk — Task N2 exported it and removed it from the
+    image; this test preserves the loader round-trip's full power on the
+    same bytes) plus a real-shaped persona, materializes operational files,
+    builds a real roles-overlay via ``reconcile_specialist_roles_overlay``
+    pointed at the synthetic tree, and then calls the REAL loader. Must
+    FAIL on the pre-fix writer: role.yaml's ``session.idle_timeout_seconds``
+    / ``tts.error_phrases`` violate ``runtime.v1.json``'s
+    ``additionalProperties: false`` sub-schemas, and the hardcoded
+    ``card: ""`` / ``prompt: ""`` violate ``character.v1.json``'s
+    ``minLength: 1``."""
     import agent_loader
     import role_artifact
     import role_slot
     from persona_pack import PersonaManifest, PersonaPack
 
-    code_root = Path(agent_loader.__file__).resolve().parent
-    finance_role_dir = code_root / "defaults" / "roles" / "specialist" / "finance"
+    finance_role_dir = tmp_path / "synthetic-image-roles" / "specialist" / "finance"
+    finance_role_dir.mkdir(parents=True)
+    (finance_role_dir / "role.yaml").write_text("""\
+api_version: casa.role/v1
+id: specialist:finance
+kind: specialist
+slot: finance
+mission: Retrieve and explain household financial records using deterministic arithmetic.
+enabled: false
+model: {source: fixed, value: sonnet}
+tools:
+  allowed: [Read, Skill, mcp__casa-framework__get_schedule, mcp__casa-framework__send_media, mcp__casa-framework__ask_user]
+  disallowed: [Bash, Write, Edit]
+  permission_mode: acceptEdits
+  max_turns: 10
+  skills: all
+  voice_guard: none
+mcp_servers: [n8n-workflows, casa-framework]
+channels: []
+memory: {token_budget: 4000, read_strategy: per_turn}
+session: {strategy: ephemeral, idle_timeout_seconds: 0}
+disclosure: {policy: delegated, overrides: {}}
+delegates: []
+executors: []
+triggers: []
+hooks: {pre_tool_use: []}
+tts: {tag_dialect: none, error_phrases: {}}
+response:
+  text: {register: precise, max_status_sentences: 3}
+  voice: {register: spoken, max_status_sentences: 2}
+  restricted_webhook: {register: plain, max_status_sentences: 2}
+persona:
+  policy: optional-but-bound
+  compatibility: ["casa/alex@>=0.1.0 <1.0.0"]
+requires: {plugins: [], tools: []}
+doctrine_file: doctrine.md
+""", encoding="utf-8")
+    (finance_role_dir / "doctrine.md").write_text("""\
+# Core doctrine
+
+Answer only finance-scoped delegations. Retrieve source records through assigned tools, route every arithmetic operation through the deterministic finance calculation path, distinguish source data from conclusions, and return a precise task-focused result. Treat recalled material as attributed prior evidence, not personal recollection.
+
+## Text projection
+
+Use concise prose and tables only when they make the figures easier to audit.
+
+## Voice projection
+
+Lead with the result, then give at most the essential supporting figures.
+
+## Restricted webhook projection
+
+Do not expose financial records or persona identity.
+""", encoding="utf-8")
     source = role_artifact.load_role_artifact(finance_role_dir)
     role = role_slot.materialize_role(source=source, options={})
 
@@ -291,7 +347,7 @@ def test_materialized_finance_specialist_round_trips_through_the_real_loader(
     overlay_root = tmp_path / "overlay"
     reconcile_specialist_roles_overlay(
         installed_index=_FakeInstalledIndex({}), overlay_root=overlay_root,
-        image_roles_dir=str(code_root / "defaults" / "roles"),
+        image_roles_dir=str(tmp_path / "synthetic-image-roles"),
     )
 
     cfg = agent_loader.load_agent_from_dir(
