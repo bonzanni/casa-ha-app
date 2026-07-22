@@ -46,6 +46,10 @@ is derived from the fetched manifest** — you never pass it.
      role=<affected role>)` then `verify_plugin_state(name)`. A persisting
      `reload_required` on a target means that agent is still bound to the
      previous artifact — surface it, do not mask it.
+   - `ok:true` with a non-empty `pending_targets` — success: those
+     specialist targets are not installed yet (the documented
+     plugin-before-specialist order). Nothing to retry; the specialist
+     install activates them.
 
 ## Why this is safe
 

@@ -8,7 +8,7 @@ resolver — `op://...` references are resolved to plaintext, plain
 values pass through unchanged.
 
 This recipe covers wiring those vars. The flow is the same whether you
-arrived from `recipes/plugin/install.md` Stage 4 or the operator just
+arrived from `recipes/plugin/add.md` Stage 4 or the operator just
 asked to rotate a secret on an already-installed plugin.
 
 ## When to use

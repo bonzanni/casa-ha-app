@@ -380,3 +380,27 @@ def test_post_sync_backstop_never_crashes(tmp_path: Path) -> None:
 
     report = _run_with_repo(tmp_path, boom)  # must not raise
     assert report.post_sync_errors == []
+
+
+def test_post_sync_real_validator_ignores_stale_specialist_material_dir(
+    tmp_path: Path,
+) -> None:
+    """#213 end-to-end: with the REAL validate_config_repo injected, a live
+    tree carrying a pipeline-materialized specialist (dot-named
+    ``.{slug}.material-*`` content dir + slug symlink) whose runtime.yaml
+    lacks ``kind`` must leave post_sync_errors empty — the exact prod
+    symptom on config-sync-report.json this issue closes."""
+    from agent_loader import validate_config_repo
+    from test_agent_loader import _policies_file, _seed_resident
+
+    live = tmp_path / "live"
+    _seed_resident(live / "agents", "assistant")
+    _policies_file(live / "policies")
+    content = f".demo.material-{'0' * 32}"
+    _write(live, f"agents/specialists/{content}/runtime.yaml",
+           "schema_version: 1\nmodel: {source: fixed, value: sonnet}\n")
+    (live / "agents" / "specialists" / "demo").symlink_to(content)
+
+    report = _run_with_repo(
+        tmp_path, lambda: validate_config_repo(str(live)))
+    assert report.post_sync_errors == []

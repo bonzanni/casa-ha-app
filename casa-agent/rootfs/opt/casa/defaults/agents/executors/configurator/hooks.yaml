@@ -15,5 +15,10 @@ pre_tool_use:
       - /data
       - /config/schema
       - /opt/casa
+  # #210 (v0.101.0): managed component state (specialists, bindings, plugins)
+  # is typed-pipeline-only. path_scope makes /config/agents writable, so
+  # without this a Write/Edit/Bash hand-edit of e.g.
+  # /config/agents/specialists/ would sail through; reads stay allowed.
+  - policy: managed_component_guard
   - policy: commit_size_guard
     max_files: 20

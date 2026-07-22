@@ -6177,6 +6177,23 @@ def _regenerate_plugin_health(extra_issues: list) -> None:
             if verify.get("ready") is not True and not rows:
                 for reason in (verify.get("reasons") or ["not_ready"]):
                     _add(name, None, reason)
+    # #211: a registered plugin targeting a NOT-yet-installed specialist is
+    # the documented plugin-before-specialist install order — WARNING-class
+    # ("target_pending"), never a blocking issue. RECOMPUTABLE like the
+    # trigger issues below (derived fresh on every regeneration, never a
+    # one-shot extra), so it self-clears the moment the specialist installs.
+    import agent as agent_mod
+    runtime = getattr(agent_mod, "active_runtime", None)
+    pending_warnings: list = []
+    if reg.valid:
+        for entry in reg.entries:
+            for target in entry.get("targets") or []:
+                tier, _, role = target.partition(":")
+                if (tier == "specialist"
+                        and _specialist_target_pending(runtime, role)):
+                    pending_warnings.append(PluginIssue(
+                        name=entry.get("name"), target=target,
+                        stage="reload", reason_code="target_pending"))
     # Release B: plugin-trigger issues are a RECOMPUTABLE input — derived
     # fresh on EVERY regeneration (never passed as one-shot extras), so an
     # unrelated health refresh can never erase trigger_pending_ack /
@@ -6186,7 +6203,7 @@ def _regenerate_plugin_health(extra_issues: list) -> None:
     plugin_health.write_report(
         issues=(list(res.issues) + list(extra_issues) + runtime_issues
                 + list(trigger_issues)),
-        warnings=list(res.warnings),
+        warnings=list(res.warnings) + pending_warnings,
         path=_PLUGIN_HEALTH_PATH,
     )
 
@@ -6199,6 +6216,27 @@ async def _notify_plugin_health_if_possible() -> None:
         await casa_core.notify_plugin_health(_bus, path=_PLUGIN_HEALTH_PATH)
     except Exception:  # noqa: BLE001 — never fail a mutation on notify
         logger.debug("plugin health notify skipped", exc_info=True)
+
+
+def _specialist_target_pending(runtime, role: str) -> bool:
+    """True when ``specialist:<role>`` has no agent directory yet (#211).
+
+    Plugin-before-specialist is the DOCUMENTED install order — the
+    specialist's dependency closure hashes the already-installed plugin
+    artifact — so a plugin mutation may legitimately target a specialist
+    that is not installed yet. That constraint is invisible from here (the
+    registry only sees the target string), hence this explicit predicate.
+    Mirrors reload.reload_agent's OWN tier detection (agents/<role> for
+    residents, agents/specialists/<role> for specialists) so the pre-check
+    can never drift from the dispatch it short-circuits: exactly the roles
+    reload would refuse as ``unknown_role`` classify as pending. A runtime
+    without an ``agents_dir`` (narrow test stand-ins) never classifies
+    pending — dispatch keeps its established behavior."""
+    agents_dir = getattr(runtime, "agents_dir", None)
+    if not agents_dir:
+        return False
+    return not (os.path.isdir(os.path.join(agents_dir, role))
+                or os.path.isdir(os.path.join(agents_dir, "specialists", role)))
 
 
 def _stale_absent_targets(targets: list, name: str, runtime) -> list[str]:
@@ -6293,9 +6331,22 @@ async def _reload_and_verify_targets(name: str, targets: list,
     runtime = getattr(agent_mod, "active_runtime", None)
     reloaded: list = []
     reload_errors: list = []
+    pending_targets: list = []
     for target in targets:
         tier, _, role = target.partition(":")
         if tier in ("resident", "specialist") and runtime is not None:
+            if (expect == "present" and tier == "specialist"
+                    and _specialist_target_pending(runtime, role)):
+                # #211: a not-yet-installed specialist target is the
+                # documented plugin-first install order, not a reload
+                # failure — dispatching would only raise unknown_role. The
+                # specialist install itself constructs the role (and its
+                # dependency closure resolves this plugin then). Residents/
+                # executors and genuinely unknown roles keep the hard
+                # failure; expect="absent" keeps its dispatch (removal
+                # semantics unchanged).
+                pending_targets.append(target)
+                continue
             res = await reload_mod.dispatch("agent", runtime=runtime, role=role)
             if res.get("status") == "ok":
                 reloaded.append(target)
@@ -6386,14 +6437,21 @@ async def _reload_and_verify_targets(name: str, targets: list,
     result = {
         # Spec §E pinned payload: activation_committed = the registry pin
         # landed (this sequencer only runs post-commit); runtime_ready =
-        # reload + verify agree desired==active; ok = both; kind is present
-        # on EVERY payload (None on success). is_error is NOT a payload
-        # field — _result derives the outer MCP flag from ok:false.
+        # reload + verify agree desired==active AND no target is pending;
+        # ok = the mutation succeeded (a pending specialist target — #211's
+        # plugin-before-specialist install order — is NOT an error, but the
+        # plugin only becomes runtime-ready on that target once the
+        # specialist installs); kind is present on EVERY payload (None on
+        # success). pending_targets = specialist targets whose role is not
+        # installed yet (reload deferred to the specialist install).
+        # is_error is NOT a payload field — _result derives the outer MCP
+        # flag from ok:false.
         "ok": ok,
         "kind": None,
         "activation_committed": True,
-        "runtime_ready": ok,
+        "runtime_ready": ok and not pending_targets,
         "reloaded": reloaded, "reload_errors": reload_errors,
+        "pending_targets": pending_targets,
         "verify": verify,
     }
     if not ok:

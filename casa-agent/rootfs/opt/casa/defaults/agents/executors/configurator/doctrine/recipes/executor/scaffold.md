@@ -13,7 +13,7 @@ break load.
    today: configurator (you), plugin-developer (Plan 4b).
 2. Check if the user's actual need is a **specialist** (Tier 2,
    role-keyed helper). Usually it is — see
-   `recipes/specialist/create.md`.
+   `recipes/specialist/install.md`.
 3. If they genuinely want a new executor type, emit
    `emit_completion(status="partial")` describing the deferral and
    pointing at the framework-level work needed.

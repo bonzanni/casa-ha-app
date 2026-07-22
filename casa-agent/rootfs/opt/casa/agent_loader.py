@@ -169,6 +169,12 @@ _SCHEMA_BY_POLICY_FILE: dict[str, tuple[str, str]] = {
     "disclosure.yaml": ("policy-disclosure", "v1"),
 }
 
+# Non-resident subtrees at the agents/ root: Tier 2 specialists and Tier 3
+# executors, each loaded on its own isolated, boot-non-fatal path. Shared by
+# ``load_all_agents`` and ``validate_config_repo``'s boot-parity replay so
+# the two skip sets cannot drift (#213).
+_NON_RESIDENT_AGENT_DIRS: tuple[str, ...] = ("specialists", "executors")
+
 
 def validate_config_repo(
     config_dir: str, *, roles_dir: str | None = None,
@@ -187,7 +193,10 @@ def validate_config_repo(
     ``roles_dir`` — see ``load_agent_from_dir``; propagated to the
     boot-parity replay below (both the resident and specialist loads).
 
-    **Agents/ walk.** Recursive; ``.git/`` skipped. Basename lookup in
+    **Agents/ walk.** Recursive; dot-dirs (``.git/``, the specialist
+    pipeline's ``.{slug}.material-*`` content dirs) and the top-level
+    ``specialists/`` subtree skipped (#213 — see the scope-boundary note
+    in the boot-parity pass below). Basename lookup in
     ``_SCHEMA_BY_FILENAME``. The original E-G repro path is the
     configurator inventing fields under ``agents/<role>/character.yaml``.
 
@@ -200,16 +209,29 @@ def validate_config_repo(
     every commit (closed in v0.31.1 by scoping agents/ only, which left
     the policies/ blast radius open until v0.37.12).
 
-    Skips ``.git/`` and any file whose basename is not in either map
-    (markdown, plain text, etc.).
+    Skips dot-dirs, the pipeline-managed ``specialists/`` subtree, and
+    any file whose basename is not in either map (markdown, plain text,
+    etc.).
     """
     errors: list[str] = []
 
     agents_root = os.path.join(config_dir, "agents")
     if os.path.isdir(agents_root):
         for root, dirs, files in os.walk(agents_root):
-            if ".git" in dirs:
-                dirs.remove(".git")
+            # Dot-dirs are pruned at EVERY level: ``.git/``, plus the
+            # specialist pipeline's ``.{slug}.material-*`` content dirs
+            # (specialist_materialize) under agents/specialists/.
+            dirs[:] = [d for d in dirs if not d.startswith(".")]
+            # #213: specialists/ is pipeline-managed territory — the
+            # digest-aware load_all_specialists replay below is its sole
+            # validation authority (per-specialist failures are
+            # boot-non-fatal and deliberately not gate errors). Walking it
+            # here double-validates the materialized files and false-flags
+            # them. executors/ deliberately STAYS in the walk: nothing else
+            # schema-validates an executor's hooks.yaml (load_all_executors
+            # validates only definition.yaml).
+            if root == agents_root and "specialists" in dirs:
+                dirs.remove("specialists")
             for name in files:
                 schema_name = _SCHEMA_BY_FILENAME.get(name)
                 if schema_name is None:
@@ -278,7 +300,7 @@ def validate_config_repo(
         for entry in sorted(os.listdir(agents_root)):
             # Mirror load_all_agents' skip set exactly (specialists/executors
             # are loaded on isolated, boot-non-fatal paths; dotdirs skipped).
-            if entry.startswith(".") or entry in ("specialists", "executors"):
+            if entry.startswith(".") or entry in _NON_RESIDENT_AGENT_DIRS:
                 continue
             path = os.path.join(agents_root, entry)
             if not os.path.isdir(path):
@@ -355,6 +377,14 @@ def validate_config_repo(
         # required), and the boot mismatch surfaces only because config_sync
         # restores that image-owned file after the commit. That reconciler
         # backstop lives in config_sync, not in this gate.
+        #
+        # The same boundary governs the per-file walk above (#213): the
+        # specialist subtree (including its dot-named ``.{slug}.material-*``
+        # content dirs) is pipeline-managed and validated by the digest-aware
+        # load_all_specialists replay below — per-file schema validation there
+        # would double-validate the materialized files and false-flag them.
+        # executors/ is the deliberate exception and stays in the walk: its
+        # hooks.yaml has no other schema gate.
         if policy_lib is not None and "assistant" not in resident_dir_names:
             errors.append(
                 "no enabled resident with role 'assistant' — Casa cannot boot "
@@ -1219,7 +1249,7 @@ def load_all_agents(
     if not os.path.isdir(agents_dir):
         return found
     for entry in sorted(os.listdir(agents_dir)):
-        if entry.startswith(".") or entry in ("specialists", "executors"):
+        if entry.startswith(".") or entry in _NON_RESIDENT_AGENT_DIRS:
             continue
         path = os.path.join(agents_dir, entry)
         if not os.path.isdir(path):

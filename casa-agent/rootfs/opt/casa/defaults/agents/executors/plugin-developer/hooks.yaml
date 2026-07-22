@@ -12,6 +12,12 @@ pre_tool_use:
       - /config/plugins/store
   - policy: commit_size_guard
     max_files: 50
+  # #210 (v0.101.0): managed component state (specialists, bindings, plugins)
+  # is typed-pipeline-only. path_scope already denies Write/Edit outside
+  # /data/engagements/, but Bash write-forms into /config/{agents/specialists,
+  # specialists,bindings} had no guard (only /config/plugins/ was denied).
+  # Reads (the store inspection above) stay allowed.
+  - policy: managed_component_guard
   - policy: self_containment_guard
   # R4 (v0.89.0, buttons-always): forward Skill loads to the internal resolver
   # so it can inject the buttons-always reminder when a sub-skill (e.g.

@@ -1,34 +1,10 @@
-# Recipe: delete a specialist
+# Recipe: delete a specialist — RETIRED
 
-Common and allowed. casa_config_guard does NOT block deleting specialists.
+`rm -rf` of specialist directories is no longer supported (hooks deny it):
+installed specialists are managed components with pipeline-owned on-disk state.
 
-## Ask the user
-
-1. **Which specialist?**
-2. **Are you sure?** Mostly for the re-wiring.
-
-## Steps
-
-1. Find all references:
-
-    grep -r "<role>" /config/agents/*/delegates.yaml
-
-2. For each resident delegating to this specialist, remove the entry from their delegates.yaml. See recipes/delegate/unwire.md.
-3. Delete the directory:
-
-    rm -rf /config/agents/specialists/<role>
-
-4. config_git_commit(message="remove <role> specialist + unwire delegates")
-5. casa_reload(scope="agents")
-6. emit_completion(status="ok", text="Removed <role>; committed SHA <sha>; called casa_reload(scope='agents') to evict the deleted agent.")
-
-Reload **before** emit_completion (canonical order — see completion.md). Skipping the reload leaves Ellen still trying to delegate to a deleted specialist until the next reload.
-
-## What NOT to do
-
-- Don't leave dangling delegate entries.
-- Don't delete while a delegation is in flight.
-
-## Rollback
-
-git revert <sha> + casa_reload(scope="agents").
+- To remove an installed specialist: follow `recipes/specialist/uninstall.md`
+  (transactional — also handles delegate unwiring and reload).
+- If a stray/legacy directory exists under `agents/specialists/` that the loader
+  reports as failed, tell the operator; cleaning up non-pipeline state is an
+  operator decision, not a configurator mutation.

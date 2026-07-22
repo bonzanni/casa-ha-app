@@ -741,6 +741,58 @@ def test_regen_keeps_unassigned_target_postcondition_row(monkeypatch):
                for i in captured["issues"])
 
 
+def test_verify_uninstalled_specialist_target_dormant_not_blocking(
+        tmp_path, monkeypatch):
+    """#211 symmetry: a registered plugin whose specialist target is NOT yet
+    installed (no constructed agent) grades dormant + ready — the documented
+    plugin-before-specialist install order must never surface as a blocking
+    verify reason."""
+    import agent as agent_mod
+    store = tmp_path / "store"
+    e = entry("probe", ["specialist:mtg"])
+    mk_artifact(store, "probe", e["artifact_id"])
+    mk_registry(tmp_path, [e])
+    monkeypatch.setattr(agent_mod, "active_runtime", _runtime(agents={}),
+                        raising=False)
+    r = _verify(tmp_path)
+    assert r["ready"] is True
+    row = r["targets"][0]
+    assert row["state"] == "dormant"
+    assert row["ready"] is True and row["reasons"] == []
+
+
+def test_regen_emits_target_pending_warning_for_uninstalled_specialist(
+        monkeypatch, tmp_path):
+    """#211: the health regeneration recomputes a WARNING-class
+    "target_pending" row (never a blocking issue) for a registered plugin
+    targeting a specialist with no agent directory yet; it self-clears once
+    the directory exists."""
+    import agent as agent_mod
+    agents_dir = tmp_path / "agents"
+    (agents_dir / "specialists").mkdir(parents=True)
+    monkeypatch.setattr(
+        agent_mod, "active_runtime",
+        SimpleNamespace(agents={}, agents_dir=str(agents_dir)), raising=False)
+    captured = _regen_harness(
+        monkeypatch,
+        entries=[{"name": "probe", "targets": ["specialist:mtg"]}],
+        verify_stub=lambda *, plugin_name: {"ready": True, "targets": []},
+        extras=[])
+    assert any(w.reason_code == "target_pending"
+               and w.target == "specialist:mtg"
+               for w in captured["warnings"])
+    assert all(i.reason_code != "target_pending" for i in captured["issues"])
+
+    # Specialist installed (directory present) → the warning self-clears.
+    (agents_dir / "specialists" / "mtg").mkdir()
+    captured = _regen_harness(
+        monkeypatch,
+        entries=[{"name": "probe", "targets": ["specialist:mtg"]}],
+        verify_stub=lambda *, plugin_name: {"ready": True, "targets": []},
+        extras=[])
+    assert all(w.reason_code != "target_pending" for w in captured["warnings"])
+
+
 def test_regen_keeps_rows_for_unregistered_plugins(monkeypatch):
     """A plugin_remove postcondition row targets a plugin the fresh pass no
     longer covers — kept."""

@@ -843,6 +843,165 @@ def agent_home_settings_guard_matcher():
 
 
 # ---------------------------------------------------------------------------
+# managed_component_guard — #210 (v0.101.0): typed-pipeline-only state
+#
+# On a fresh install the configurator hand-authored specialist files under
+# /config/agents/specialists/ via Bash instead of the typed
+# specialist_install_* pipeline. Nothing blocked it: its path_scope makes
+# /config/agents writable, and only /config/plugins/ Bash-writes were
+# specially denied (the settings guard above). This policy denies ANY
+# hand-edit — Write/Edit by normalized path, Bash by write-shaped commands —
+# of the managed component trees, and ROUTES the model to the typed tool
+# for the matched tree. Reads stay allowed: the configurator legitimately
+# inspects these trees to verify pipeline outcomes.
+#
+# Fail-closed (#210, same rationale as make_resident_authz_hook in
+# authz_grants.py): an ESCAPED callback exception becomes an SDK error
+# control response, NOT a deny — so the whole body runs inside try/except
+# and any unexpected Exception returns the deny shape (CancelledError
+# re-raises). Same accepted residual as the other Bash guards: argv-level
+# inspection, not a sandbox — obfuscated writes need the outer boundary.
+# ---------------------------------------------------------------------------
+
+
+_MANAGED_ROUTE_SPECIALISTS = (
+    "Specialists: use specialist_install_inspect / specialist_install_commit "
+    "(doctrine/recipes/specialist/install.md)."
+)
+_MANAGED_ROUTE_PLUGINS = (
+    "Plugins: use plugin_add / plugin_assign (doctrine/recipes/plugin/)."
+)
+_MANAGED_ROUTE_BINDINGS = (
+    "Bindings/personas: use resident_persona_swap / persona_apply "
+    "(doctrine/recipes/persona/)."
+)
+
+# Managed prefix -> routing sentence. Prefixes are matched against
+# _normalize_path output (so `..` traversal and `//` collapse can't slip
+# through); first match wins (the prefixes are disjoint after normalization).
+_MANAGED_PREFIX_ROUTES: tuple[tuple[str, str], ...] = (
+    ("/config/agents/specialists", _MANAGED_ROUTE_SPECIALISTS),
+    ("/config/specialists", _MANAGED_ROUTE_SPECIALISTS),
+    ("/config/bindings", _MANAGED_ROUTE_BINDINGS),
+    ("/config/plugins", _MANAGED_ROUTE_PLUGINS),
+)
+
+_MANAGED_HOOKS_YAML_DENY = (
+    "managed_component_guard: {tool} blocked — {path!r} is a hook-policy file "
+    "(hooks.yaml under /config/agents/). An executor must never edit hook "
+    "policy files; ask the user if a policy change is truly needed."
+)
+
+_MANAGED_INTERNAL_DENY = (
+    "managed_component_guard: internal error — failing closed; the call was "
+    "not executed."
+)
+
+
+def _managed_prefix_route(norm: str) -> tuple[str, str] | None:
+    """Return ``(prefix, route)`` for the managed prefix containing ``norm``,
+    or ``None``. ``norm`` must already be ``_normalize_path``-normalized."""
+    for prefix, route in _MANAGED_PREFIX_ROUTES:
+        if _has_prefix(norm, [prefix]):
+            return prefix, route
+    return None
+
+
+# Path-shaped tokens in a Bash command (start at '/', stop at whitespace,
+# quotes, backticks, and shell operators). Each token is normalized before
+# the prefix test, so `//config//plugins/x` and
+# `/config/agents/specialists/../../plugins/x` both resolve — and a
+# `bash -c '...'` wrapper needs no unwrapping (the raw string still carries
+# the path token).
+_MANAGED_PATH_TOKEN_RE = re.compile(r"/[^\s'\"`;|&<>()]*")
+
+# Benign redirects, stripped BEFORE the write-operator test so the common
+# verification forms (`cat x 2>/dev/null`, `cmd 2>&1 | head`) don't read as
+# writes. Writing to /dev/null mutates nothing.
+_MANAGED_BENIGN_REDIRECT_RE = re.compile(r"[0-9]*>>?\s*/dev/null\b|[0-9]+>&[0-9]+")
+
+# A write-shaped operator/verb ANYWHERE in the command. Deliberately
+# order-insensitive, unlike _PLUGINS_WRITE_RE's verb-then-path shape:
+# `find <managed> -delete` puts the path FIRST, and the fail-closed bias
+# prefers a false positive (a read that also mentions a write verb) over a
+# hand-write slipping through. The enumerated read-only verbs (cat, ls,
+# grep, find without -delete/-exec, git log/diff/status) match nothing
+# here, so the configurator's normal verification workflow passes.
+_MANAGED_WRITE_OP_RE = re.compile(
+    r"(?:>>?|\btee\b|\bdd\b|\bcp\b|\bmv\b|\bmkdir\b|\brm\b|\brmdir\b|"
+    r"\bln\b|\btouch\b|\binstall\b|\brsync\b|\bchmod\b|\bchown\b|"
+    r"\btruncate\b|\bshred\b|sed\s+-i|\bperl\s+-i|\btar\b|\bunzip\b|"
+    r"\bgit\s+checkout\b|\bgit\s+restore\b|\bgit\s+clean\b|\bgit\s+reset\b|"
+    r"-delete\b|-exec\b)",
+    re.IGNORECASE | re.DOTALL,
+)
+
+
+def _bash_managed_prefix_route(command: str) -> tuple[str, str] | None:
+    """Return ``(prefix, route)`` if the Bash command mentions a managed
+    prefix as a path-shaped token, else ``None``. Mention alone is not a
+    deny — the caller also requires a write operator."""
+    for tok in _MANAGED_PATH_TOKEN_RE.findall(command):
+        hit = _managed_prefix_route(_normalize_path(tok))
+        if hit is not None:
+            return hit
+    return None
+
+
+def make_managed_component_guard() -> HookCallback:
+    """Deny hand-edits of managed component state (#210).
+
+    Write/Edit: denied when the normalized ``file_path`` is under any managed
+    prefix, or names a ``hooks.yaml`` under ``/config/agents/`` (policy-file
+    self-editing). Bash: denied when the command mentions a managed prefix
+    AND contains a write-shaped operator/verb; read-only mentions pass.
+    """
+    async def _hook(
+        input_data: dict[str, Any],
+        tool_use_id: str | None,
+        context: dict[str, Any],
+    ) -> dict[str, Any]:
+        try:
+            tool_name = input_data.get("tool_name", "")
+            if tool_name in ("Write", "Edit"):
+                raw = input_data.get("tool_input", {}).get("file_path", "")
+                norm = _normalize_path(raw)
+                hit = _managed_prefix_route(norm)
+                if hit is not None:
+                    _prefix, route = hit
+                    return _deny(
+                        f"managed_component_guard: {tool_name} blocked — "
+                        f"{raw!r} is managed component state; hand-editing "
+                        f"is forbidden. {route}"
+                    )
+                if (norm.startswith(_RESIDENT_ROOT + "/")
+                        and PurePosixPath(norm).name == "hooks.yaml"):
+                    return _deny(_MANAGED_HOOKS_YAML_DENY.format(
+                        tool=tool_name, path=raw))
+            elif tool_name == "Bash":
+                command = input_data.get("tool_input", {}).get("command", "")
+                hit = _bash_managed_prefix_route(command)
+                if hit is not None:
+                    prefix, route = hit
+                    scan = _MANAGED_BENIGN_REDIRECT_RE.sub(" ", command)
+                    if _MANAGED_WRITE_OP_RE.search(scan):
+                        return _deny(
+                            f"managed_component_guard: Bash blocked — this "
+                            f"command writes into managed component state "
+                            f"({prefix}/); hand-editing is forbidden. {route}"
+                        )
+            return {}
+        except asyncio.CancelledError:
+            raise
+        except Exception:  # noqa: BLE001 — fail closed, never let it escape
+            _logger.exception(
+                "managed_component_guard internal error — denying")
+            return _deny(_MANAGED_INTERNAL_DENY)
+
+    return _hook
+
+
+# ---------------------------------------------------------------------------
 # commit_size_guard - Plan 3 (asks user before batch commits > N files)
 # ---------------------------------------------------------------------------
 
@@ -1195,6 +1354,14 @@ def _casa_config_guard_factory(**kwargs: Any) -> HookCallback:
     )
 
 
+def _managed_component_guard_factory(**kwargs: Any) -> HookCallback:
+    if kwargs:
+        raise UnknownPolicyError(
+            f"managed_component_guard takes no parameters; got {list(kwargs)}"
+        )
+    return make_managed_component_guard()
+
+
 def _commit_size_guard_factory(**kwargs: Any) -> HookCallback:
     max_files = int(kwargs.pop("max_files", 20))
     if kwargs:
@@ -1217,6 +1384,10 @@ HOOK_POLICIES: dict[str, dict[str, Any]] = {
     "casa_config_guard": {
         "matcher": "Write|Edit|Bash",
         "factory": _casa_config_guard_factory,
+    },
+    "managed_component_guard": {
+        "matcher": "Write|Edit|Bash",
+        "factory": _managed_component_guard_factory,
     },
     "commit_size_guard": {
         "matcher": "Write|Edit",
