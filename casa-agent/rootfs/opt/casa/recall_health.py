@@ -1,11 +1,14 @@
 # casa-agent/rootfs/opt/casa/recall_health.py
 """Recall telemetry + circuit breaker for the structured-recall call sites
-(personality Task 11).
+(personality Task 11, GH #200).
 
-``observed_recall`` wraps a typed-recall coroutine and records exactly one
-telemetry event per outcome (hits / zero_hits / unavailable), re-raising
-``RecallUnavailable`` after recording so the three-outcome discipline is
-preserved end to end.
+``observed_recall`` wraps a typed-recall coroutine, gates it through a
+per-``path`` :class:`RecallCircuitBreaker`, and records exactly one telemetry
+event per outcome (hits / zero_hits / unavailable). An OPEN breaker fast-fails
+BEFORE the wrapped coroutine is invoked by raising ``RecallUnavailable`` with
+reason ``"circuit_open"`` — never a fabricated zero-hit — and a genuine
+``RecallUnavailable`` from the operation itself is re-raised after recording,
+so the three-outcome discipline is preserved end to end either way.
 
 ``RecallCircuitBreaker`` is a NEW breaker for the four call sites that have no
 breaker today (direct-tool, delegated, query_engager, executor-archive). It is
@@ -13,6 +16,12 @@ VERIFIED distinct from — and never a replacement for — ``agent.py``'s existi
 per-``Agent`` ``_RecallBreaker``, which continues to gate the pre-turn
 automatic recall exactly as it does today. Monotonic time is injected so tests
 drive recovery without patching ``asyncio.sleep``.
+
+Breakers are cached one-per-``path`` in a process-wide registry (module-level
+``_PATH_BREAKERS``) so failures on one path never trip another.
+``reset_recall_breakers()`` clears that registry — a test-only seam so
+per-process breaker state never leaks across tests; call it from an autouse
+fixture scoped to the tests that exercise it, never repo-wide.
 """
 from __future__ import annotations
 
@@ -71,19 +80,36 @@ async def observed_recall(
     *, path: RecallPath, telemetry: RecallTelemetry,
     operation: Callable[[], Awaitable[tuple[RecallHit, ...]]],
 ) -> tuple[RecallHit, ...]:
-    """Run ``operation`` (a typed recall), record one telemetry event, and
-    return its hits. A ``RecallUnavailable`` (incl. ``RecallProtocolError``) is
-    recorded as ``outcome=unavailable`` and RE-RAISED — never swallowed into a
-    zero-hit — so callers keep the unavailable-vs-zero-hit distinction."""
+    """Run ``operation`` (a typed recall) through the per-``path`` circuit
+    breaker, record one telemetry event, and return its hits.
+
+    If the ``path`` breaker is OPEN, ``operation`` is never invoked: this
+    fast-fails by raising ``RecallUnavailable("circuit_open")`` — the SAME
+    typed unavailable outcome a live backend failure produces, never a
+    fabricated zero-hit. Otherwise a ``RecallUnavailable`` (incl.
+    ``RecallProtocolError``) from ``operation`` itself is recorded as
+    ``outcome=unavailable``, counted as a breaker failure, and RE-RAISED —
+    never swallowed into a zero-hit — so callers keep the
+    unavailable-vs-zero-hit distinction. Any other outcome (hits OR zero
+    hits — a genuine empty result is success) counts as a breaker success."""
+    breaker = _breaker_for(path)
     started = time.monotonic()
+    if not breaker.try_acquire():
+        telemetry.record(RecallTelemetryEvent(
+            path, "unavailable", "circuit_open",
+            int((time.monotonic() - started) * 1000), 0,
+        ))
+        raise RecallUnavailable("circuit_open")
     try:
         hits = await operation()
     except RecallUnavailable as exc:
+        breaker.failure()
         telemetry.record(RecallTelemetryEvent(
             path, "unavailable", exc.reason,
             int((time.monotonic() - started) * 1000), 0,
         ))
         raise
+    breaker.success()
     telemetry.record(RecallTelemetryEvent(
         path, "hits" if hits else "zero_hits", "ok",
         int((time.monotonic() - started) * 1000), len(hits),
@@ -135,3 +161,29 @@ class RecallCircuitBreaker:
         self._failures += 1
         if was_half_open or self._failures >= self._threshold:
             self._opened_at = self._now()
+
+
+# Process-wide, one breaker per RecallPath — a failing path (e.g. Hindsight
+# down) must never trip an unrelated path. Lazily populated with the standard
+# threshold/recovery policy (no per-path override — same policy for all four
+# call sites; do not invent new policy here).
+_PATH_BREAKERS: dict[str, RecallCircuitBreaker] = {}
+
+
+def _breaker_for(path: str) -> RecallCircuitBreaker:
+    breaker = _PATH_BREAKERS.get(path)
+    if breaker is None:
+        breaker = RecallCircuitBreaker()
+        _PATH_BREAKERS[path] = breaker
+    return breaker
+
+
+def reset_recall_breakers() -> None:
+    """Test-only seam: drop all per-path breaker state.
+
+    ``RecallCircuitBreaker`` instances are cached process-wide in
+    ``_PATH_BREAKERS`` (keyed by path), so without this a breaker OPENed by
+    one test would fast-fail an unrelated test's calls on the same path. Call
+    from an autouse fixture scoped to the test file(s) that exercise gating —
+    never repo-wide."""
+    _PATH_BREAKERS.clear()
