@@ -42,7 +42,7 @@ from timekeeping import resolve_tz
 from hindsight_ids import bank_id
 from sensitivity import clearance_for_origin, readable_tiers
 from personality_types import SpeakerProvenance
-from recall_renderer import render_recall
+from recall_renderer import provenance_view, render_recall
 from speaker_provenance import UserProvenance, provenance_from_mapping
 from session_saver import freshness_window, retain_cold_session, save_session
 from semantic_memory import NoOpSemanticMemory, RecallUnavailable, SemanticMemory
@@ -89,6 +89,55 @@ active_semantic_memory = None     # SemanticMemory | None, set by casa_core.main
 # asyncio.create_task snapshots the value, so late-completing specialist
 # tasks still see the right origin.
 origin_var: ContextVar[dict | None] = ContextVar("origin_var", default=None)
+
+# Personality Task 14 / GH #199: the per-turn explanation draft. ``_build_options``
+# is the ONLY seam that observes the selected prompt projection + the auto-recall
+# hits, so it stashes those fields here; ``_process`` reads the draft at
+# end-of-turn and writes exactly one ``ExplanationStore.record()``. Same-task only
+# — ``_build_options`` is awaited directly inside the turn coroutine (both the
+# bypass path and via the pool's ``turn()``), so a mutable draft dict set here is
+# visible where the record is written, exactly like ``origin_var``. A warm-reuse
+# pool turn SKIPS ``_build_options`` and leaves the draft empty; ``_process`` then
+# records only the deterministic projection/identity fields it can derive itself
+# (honest partial record — no recall ran, the cached prompt was reused).
+_explain_draft_var: ContextVar[dict | None] = ContextVar(
+    "casa_explain_draft", default=None,
+)
+
+
+def _projection_name_for_turn(channel: str, origin_route: str | None) -> str:
+    """The bundle projection ``_build_options`` selects for this surface, kept in
+    lockstep with the selection there (the restricted_webhook short-circuit for
+    an untrusted webhook origin + ``prompt_compiler.projection_for``)."""
+    if channel == "webhook" and origin_route != "invoke":
+        return "restricted_webhook"
+    if channel == "voice":
+        return "voice"
+    return "text"
+
+
+def _attribution_label(hit, *, clearance: str | None) -> str:
+    """Derive an HONEST, operator-safe attribution label for one recall hit from
+    its clearance/surface-gated provenance view. Never emits the hit's raw
+    ``application_tags`` (which may carry reserved ``casa-source-`` tags the store
+    rejects) and never a person's display name — only speaker_kind + role/persona
+    IDS, so the label is safe to expose in the DEFAULT (non-sensitive) explain
+    output."""
+    view = provenance_view(
+        hit.provenance, clearance=clearance or "public", surface="text",
+    )
+    if view is None:
+        return "unattributed"
+    if view.speaker_kind == "user":
+        return "user"
+    parts = [view.speaker_kind]
+    if view.role_id:
+        parts.append(view.role_id)
+    label = ":".join(parts)
+    if view.persona_id and view.persona_version:
+        label += f"/{view.persona_id}@{view.persona_version}"
+    return label
+
 
 # Type alias for the streaming callback
 OnTokenCallback = Callable[[str], Awaitable[None]]
@@ -873,6 +922,15 @@ class Agent:
                     and callable(getattr(reservation, "commit", None))):
                 origin_snapshot["_voice_handoff_reservation"] = reservation
         origin_token = origin_var.set(origin_snapshot)
+        # Task 14 / #199: per-turn explanation scaffolding. ``explain_draft`` is
+        # populated by ``_build_options`` (projection + recall attributions);
+        # ``turn_state`` captures the on_message ``state`` dict of whichever
+        # attempt produced the response (its ``tool_names_by_id`` are the turn's
+        # tool calls). Both are read once at end-of-turn to record the
+        # explanation — a store failure there never touches the user's reply.
+        explain_draft: dict[str, Any] = {}
+        explain_token = _explain_draft_var.set(explain_draft)
+        turn_state: dict[str, Any] = {}
         try:
             # Resolve cwd to the agent-home (Plan 4b §5.1). Residents live at
             # /config/agent-home/<role>/; configured cwd on
@@ -952,6 +1010,7 @@ class Agent:
                 on_message, state = self._make_on_message(
                     on_token, turn_guard,
                 )
+                turn_state["state"] = state
 
                 async def _build(is_fresh, resume_sid):
                     # Recorded HERE too (not just via on_decision below) so a
@@ -1050,6 +1109,7 @@ class Agent:
                 on_message, state = self._make_on_message(
                     on_token, turn_guard,
                 )
+                turn_state["state"] = state
                 try:
                     await client.open()
                     async with client.lock:
@@ -1146,9 +1206,137 @@ class Agent:
                     user_provenance=user_provenance,
                 )
 
+            # Task 14 / #199: record this turn's provenance so an operator can
+            # `casactl explain <cid>` it. Fail-safe (never raises) and off the
+            # streaming path — on_token already flushed the reply above.
+            self._record_turn_explanation(
+                channel=msg.channel or "-",
+                turn_state=turn_state,
+                explain_draft=explain_draft,
+            )
+
             return response_text or None
         finally:
+            _explain_draft_var.reset(explain_token)
             origin_var.reset(origin_token)
+
+    def _stash_explanation_draft(
+        self, *, projection: str, bundle, system_prompt: str,
+        facts: str, hits: tuple, clearance: str | None,
+    ) -> None:
+        """Populate this turn's ``_explain_draft_var`` with the projection +
+        prompt + recall attributions that only ``_build_options`` observes.
+        Reads/writes the per-turn draft dict in place; a no-op when no draft is
+        bound (e.g. ``_build_options`` called directly by a unit test). Never
+        raises into the options path."""
+        draft = _explain_draft_var.get(None)
+        if draft is None:
+            return
+        try:
+            if bundle is not None:
+                proj_obj = getattr(bundle, projection)
+                draft["static_prompt_digest"] = proj_obj.digest
+                draft["static_prompt_estimated_tokens"] = proj_obj.estimated_tokens
+            else:
+                draft["static_prompt_digest"] = ""
+                draft["static_prompt_estimated_tokens"] = 0
+            draft["projection"] = projection
+            # Distinct tiers touched, insertion-ordered; attributions are the
+            # clearance-gated, casa-source-free labels (never raw tags).
+            draft["memory_tiers"] = tuple(
+                dict.fromkeys(h.sensitivity for h in hits)
+            )
+            draft["memory_attributions"] = tuple(
+                _attribution_label(h, clearance=clearance) for h in hits
+            )
+            draft["system_prompt"] = system_prompt
+            draft["memory_text"] = facts or None
+        except Exception:  # noqa: BLE001
+            logger.debug("explanation draft stash skipped", exc_info=True)
+
+    def _record_turn_explanation(
+        self, *, channel: str, turn_state: dict, explain_draft: dict,
+    ) -> None:
+        """Write ONE ExplanationStore record for the turn just completed so an
+        operator can ``casactl explain <cid>`` it. Fail-safe by contract: any
+        error (no store bound, an unrecordable ``"-"`` cid, a store write fault)
+        is swallowed at debug level — the user's reply has already been produced
+        and must never be delayed or failed by this telemetry."""
+        runtime = active_runtime
+        store = getattr(runtime, "explanation_store", None) if runtime else None
+        if store is None:
+            return
+        cid = cid_var.get()
+        try:
+            from explanation_store import ExplanationRecord
+
+            route = (origin_var.get(None) or {}).get("_origin_route")
+            _bundle = (
+                self.config.compiled_prompt_bundle
+                if self.config.kind == "resident" else None
+            )
+            # Prefer what _build_options observed; else derive deterministically
+            # (a warm-reuse pool turn skips _build_options — projection selection
+            # is still deterministic from channel+route+bundle).
+            projection = explain_draft.get("projection")
+            static_digest = explain_draft.get("static_prompt_digest")
+            static_tokens = explain_draft.get("static_prompt_estimated_tokens")
+            if projection is None:
+                if _bundle is not None:
+                    projection = _projection_name_for_turn(channel, route)
+                    proj_obj = getattr(_bundle, projection)
+                    static_digest = proj_obj.digest
+                    static_tokens = proj_obj.estimated_tokens
+                else:
+                    projection = "legacy"
+                    static_digest = ""
+                    static_tokens = 0
+            binding = self.config.binding
+            state = turn_state.get("state") or {}
+            tool_calls = tuple(sorted({
+                name
+                for name in (state.get("tool_names_by_id") or {}).values()
+                if name
+            }))
+            record = ExplanationRecord(
+                correlation_id=cid,
+                role_id=self.config.role_id,
+                kind=self.config.kind or "",
+                resolved_model=self.config.model,
+                persona_ref=(
+                    f"{binding.persona_id}@{binding.persona_version}"
+                    if binding is not None else None
+                ),
+                role_checksum=self.config.role_checksum or "",
+                binding_digest=self.config.binding_digest or None,
+                dependency_digests=(
+                    binding.dependency_digests if binding is not None else ()
+                ),
+                effective_config_digest=(
+                    binding.effective_config_digest if binding is not None else None
+                ),
+                # Residents have no lifecycle state (a specialist-instance
+                # concept); honestly None rather than fabricated.
+                lifecycle_state=None,
+                projection=projection,
+                static_prompt_digest=static_digest or "",
+                static_prompt_estimated_tokens=int(static_tokens or 0),
+                memory_tiers=tuple(explain_draft.get("memory_tiers", ())),
+                memory_attributions=tuple(
+                    explain_draft.get("memory_attributions", ())
+                ),
+                tool_calls=tool_calls,
+                # Denials happen inside PreToolUse hooks and are not surfaced to
+                # this seam (see GH #199): recorded empty, an honest gap.
+                denials=(),
+                system_prompt=explain_draft.get("system_prompt"),
+                memory_text=explain_draft.get("memory_text"),
+            )
+            store.record(record)
+        except Exception:  # noqa: BLE001
+            logger.debug(
+                "explanation record skipped cid=%s", cid, exc_info=True,
+            )
 
     async def _build_options(
         self, *, channel: str, channel_key: str, is_fresh: bool,
@@ -1197,6 +1385,12 @@ class Agent:
                 agent_home=agent_home,
                 resume_sid=resume_sid,
             )
+            # #199: an untrusted webhook turn does no recall — record the
+            # restricted projection + its persona-stripped prompt, memory empty.
+            self._stash_explanation_draft(
+                projection="restricted_webhook", bundle=_bundle,
+                system_prompt=restricted_prompt, facts="", hits=(), clearance=None,
+            )
             return sdk_logging.with_stderr_callback(restricted, engagement_id=None)
 
         # 2b. Memory context (spec §4.3) — channel-aware load on the
@@ -1206,6 +1400,11 @@ class Agent:
         bank = _memory_bank()
         overlay_digest = ""
         facts = ""
+        # #199: the recall hits (+ the clearance they were gated at) feed the
+        # explanation record's memory attributions; empty unless a recall
+        # actually succeeds below.
+        _recall_hits: tuple = ()
+        _recall_clearance_used: str | None = None
         if load_plan.push_overlay and _overlay_allowed(channel):
             try:
                 overlay_digest = await self._semantic_memory.profile(bank)
@@ -1246,6 +1445,8 @@ class Agent:
                     timeout=_AUTO_RECALL_TIMEOUT_S,
                 )
                 self._recall_breaker.record_success()
+                _recall_hits = _hits
+                _recall_clearance_used = _recall_clearance
                 facts = render_recall(
                     _hits, current_speaker=speaker_provenance_for_role(self.config),
                     surface="text", clearance=_recall_clearance,
@@ -1322,6 +1523,19 @@ class Agent:
         # prompt caching for the whole conversation every turn (see M27). It
         # rides on the per-turn query text (built in _process).
         system_prompt = "\n".join(system_parts)
+
+        # #199: stash the projection + assembled prompt + recall attributions for
+        # this turn's explanation record. A resident's projection name is derived
+        # in lockstep with the projection_for selection above; a
+        # specialist/executor (no bundle) records the honest "legacy" projection.
+        self._stash_explanation_draft(
+            projection=(
+                _projection_name_for_turn(channel, _route)
+                if _bundle is not None else "legacy"
+            ),
+            bundle=_bundle, system_prompt=system_prompt,
+            facts=facts, hits=_recall_hits, clearance=_recall_clearance_used,
+        )
 
         # 4. Hooks — resolved from hooks.yaml at load time by agent_loader.
         #    I-2 (v0.69.8): always inject the agent-home settings.json
