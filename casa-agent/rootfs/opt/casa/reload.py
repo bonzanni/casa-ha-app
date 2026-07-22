@@ -535,7 +535,25 @@ def _resident_identity_changed(new_cfg: Any, live_cfg: Any) -> bool:
     resident (reload_agent, the policies cascade, the bulk agents sweep). A
     ``None`` ``live_cfg`` (a fresh add, or a non-resident with no live entry) is
     NOT a change -> False. ``getattr`` defaults keep it inert for non-resident
-    tiers and narrow test stand-ins whose cfgs carry neither field."""
+    tiers and narrow test stand-ins whose cfgs carry neither field.
+
+    ``runtime.role_configs`` mutation audit (the comparison BASELINE this
+    predicate reads — every production writer must either be identity-guarded
+    or provably not an activation path, else a staged identity change can be
+    laundered through a poisoned baseline):
+      * reload_agent's post-guard commit — guarded (raises restart_required
+        first).
+      * the policies-cascade swap (_reload_role_after_policies) — guarded
+        (skip+warn).
+      * the bulk agents-sweep ADD loop — iterates on_disk - known only (a live
+        resident never enters it) + guarded as defense-in-depth.
+      * reload_triggers' Q-1 cache refresh — refuses outright (raises
+        restart_required BEFORE any mutation) on an identity change.
+      * the bulk sweep's EVICT ``role_configs.pop(...)`` — deletion-only
+        (removes the baseline entry with its agent; never installs a new
+        digest), not an activation path, no guard needed.
+      * boot-time construction in casa_core — no live baseline exists yet.
+    Any NEW writer must be classified against this list."""
     if live_cfg is None:
         return False
     return (
@@ -1001,6 +1019,8 @@ async def reload_agents(runtime: Any, *, role: str | None = None) -> list[str]:
         # A:§3.3/§3.4 (r2-B5 enumerated seam): purge+cancel BEFORE teardown —
         # the role is about to become undispatchable entirely.
         _invalidate_role_grants(r)
+        # Deletion-only baseline write: eviction, not activation — see the
+        # role_configs mutation audit on _resident_identity_changed.
         runtime.role_configs.pop(r, None)
         old_agent = runtime.agents.pop(r, None)  # AR-7: capture before drop
         _schedule_agent_close(old_agent)  # F12
