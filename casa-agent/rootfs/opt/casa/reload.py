@@ -241,11 +241,33 @@ def _specialist_roles_dir(runtime: Any) -> str:
     under ITS OWN tree, never attempting to write the real host /config.
     In production runtime.config_dir IS CONFIG_DIR ("/config",
     casa_core.py), so this resolves identically to the brief's bare call —
-    zero behavior change there."""
+    zero behavior change there.
+
+    Stale-index fix (Plan 2 review, no GH issue): boot (casa_core.py)
+    constructs its own ``InstalledSpecialistIndex`` and publishes it via
+    ``specialist_registry.set_active_installed_index`` so admin/inspection
+    reads (``live_installed_specialist_slugs``/``live_collision_slugs``/
+    ``get_installed_instance`` — Task-14 handlers) see live state. Every
+    install/upgrade/rollback/uninstall + reload path funnels through THIS
+    helper on every specialist-tier reload, but until now it only asked
+    ``current_specialist_roles_dir`` to load a fresh index INTERNALLY and
+    discarded it — the process-wide ``_active_index`` stayed pinned at
+    boot-time state forever. Building the index HERE (mirroring
+    casa_core.py's own boot sequence exactly) and publishing it before
+    handing it to ``current_specialist_roles_dir`` (as ``installed_index=``,
+    so it is reused rather than loaded twice) makes every boot/reload path
+    refresh the global."""
     import specialist_materialize
+    from specialist_registry import InstalledSpecialistIndex, set_active_installed_index
+
+    specialists_dir = Path(runtime.config_dir) / "specialists"
+    index = InstalledSpecialistIndex(str(specialists_dir))
+    index.load()
+    set_active_installed_index(index)
 
     return specialist_materialize.current_specialist_roles_dir(
-        specialists_dir=Path(runtime.config_dir) / "specialists",
+        installed_index=index,
+        specialists_dir=specialists_dir,
         agents_specialists_dir=Path(runtime.agents_dir) / "specialists",
     )
 

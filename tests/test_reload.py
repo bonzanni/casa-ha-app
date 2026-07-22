@@ -11,6 +11,24 @@ import pytest
 pytestmark = [pytest.mark.asyncio, pytest.mark.unit]
 
 
+@pytest.fixture(autouse=True)
+def _restore_active_specialist_index():
+    """Stale-index fix (Plan 2 review, no GH issue): reload.py's
+    `_specialist_roles_dir` — invoked by every specialist-tier reload path
+    this file exercises (`reload_agents` in particular, unconditionally) —
+    now publishes its freshly loaded `InstalledSpecialistIndex` via
+    `specialist_registry.set_active_installed_index`, a process-wide global.
+    Save/restore it around every test in this file so that real refresh can
+    never leak into an unrelated test file (mirrors the same pattern already
+    used in tests/test_personality_admin_handlers.py for its own, mocked,
+    mutations of this global)."""
+    import specialist_registry as specialist_registry_mod
+
+    original = specialist_registry_mod._active_index
+    yield
+    specialist_registry_mod._active_index = original
+
+
 def _make_runtime():
     from runtime import CasaRuntime
     return CasaRuntime(
