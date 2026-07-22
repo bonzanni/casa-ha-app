@@ -2214,12 +2214,21 @@ class TestRestartToSwapGuardCascades:
 
     async def test_reload_triggers_two_step_laundering_is_blocked(
             self, tmp_path, monkeypatch, caplog):
-        """Task 14: the trigger-reload MUST NOT launder a staged identity change
-        into a later hot-swap. Step 1: scope=triggers on a resident whose on-disk
-        binding_digest moved reregisters triggers (the path's purpose) but must
-        PRESERVE the OLD cfg as the comparison baseline in role_configs. Step 2:
-        a subsequent scope=agent then still fires restart_required, because the
-        baseline was not poisoned NEW-vs-NEW."""
+        """Task 14 (round-3 contract): a trigger-reload on a resident whose
+        on-disk personality identity moved REFUSES the whole operation rather
+        than half-applying it. Step 1: scope=triggers RAISES restart_required
+        (structured error via dispatch); NOTHING mutates — the trigger registry
+        is never reregistered, role_configs still holds the OLD digest, and the
+        live agent is unchanged. Step 2 (laundering proof): a subsequent
+        scope=agent STILL fires restart_required, because the baseline was never
+        poisoned NEW-vs-NEW.
+
+        This reworks the round-2 test (which asserted the OLD design: reregister
+        NEW triggers but keep the OLD cache). Two reviewers flagged that as a
+        half-applied, mixed-state design; refusing outright kills P1 (stale
+        cached channels authorizing webhook ingress) and P2 (misreported
+        registered list) at the root. Intended semantics change, not an
+        assertion weakening."""
         import logging
         from types import SimpleNamespace
         from reload import (dispatch, register_handler, reload_agent,
@@ -2274,15 +2283,16 @@ class TestRestartToSwapGuardCascades:
         # --- Step 1: trigger reload with a STAGED identity change on disk ---
         with caplog.at_level(logging.WARNING, logger="reload"):
             r1 = await dispatch("triggers", runtime=runtime, role="gary")
-        assert r1["status"] == "ok"
-        # The path's purpose still works: NEW triggers were reregistered.
-        runtime.trigger_registry.reregister_for.assert_called_once_with(
-            "gary", [disk_cfg.triggers[0]], ["telegram"],
-        )
-        # BASELINE PRESERVED: role_configs still carries the OLD identity — the
-        # cache overwrite was refused because identity changed.
+        # REFUSED OUTRIGHT: structured restart_required error, nothing applied.
+        assert r1["status"] == "error"
+        assert r1["kind"] == "restart_required"
+        # NOTHING mutated: the trigger registry was never reregistered.
+        runtime.trigger_registry.reregister_for.assert_not_called()
+        # BASELINE PRESERVED: role_configs still carries the OLD identity.
         assert runtime.role_configs["gary"] is live_cfg
         assert runtime.role_configs["gary"].binding_digest == "OLD"
+        # The live agent object is unchanged.
+        assert runtime.agents["gary"] is old_gary
         assert "gary" in caplog.text
         assert "restart" in caplog.text.lower()
 
@@ -2336,3 +2346,58 @@ class TestRestartToSwapGuardCascades:
         assert runtime.role_configs["gary"] is new_cfg
         names = [t.name for t in runtime.role_configs["gary"].triggers]
         assert names == ["boot-trigger", "probe-q1"]
+
+    async def test_reload_triggers_identity_change_leaves_no_mixed_state(
+            self, tmp_path, monkeypatch, caplog):
+        """P1 (Sol) no-mixed-state proof: when the on-disk cfg's personality
+        identity moved AND its channels ALSO differ (webhook removed), the
+        refused scope=triggers must leave everything the trigger reconciler
+        consumes consistently OLD. The reconciler authorizes plugin webhook
+        ingress from runtime.role_configs[role].channels; the round-2 design
+        would have kept the OLD cache (still listing 'webhook') while
+        reregistering the NEW triggers — mixed state. The round-3 refusal keeps
+        cache channels AND the trigger registry both untouched-OLD.
+
+        Kept at the reload_triggers seam (no full webhook-ingress e2e)."""
+        import logging
+        from types import SimpleNamespace
+        from reload import dispatch, register_handler, reload_triggers
+        register_handler("triggers", reload_triggers)
+
+        agents_dir = tmp_path / "agents"
+        (agents_dir / "gary").mkdir(parents=True)
+
+        # On-disk cfg: identity moved OLD->NEW *and* channels dropped 'webhook'.
+        disk_cfg = SimpleNamespace(
+            role="gary", role_checksum="RC_G", binding_digest="NEW",
+            marker="reloaded",
+            triggers=[SimpleNamespace(name="probe-new")],
+            channels=["telegram"],
+        )
+        monkeypatch.setattr("agent_loader.load_agent_from_dir",
+                            lambda d, **kw: disk_cfg)
+        monkeypatch.setattr("policies.load_policies",
+                            lambda *a, **kw: MagicMock())
+
+        live_cfg = SimpleNamespace(
+            role="gary", role_checksum="RC_G", binding_digest="OLD",
+            marker="live",
+            triggers=[SimpleNamespace(name="boot-trigger")],
+            channels=["telegram", "webhook"],
+        )
+        runtime = _make_runtime()
+        runtime.config_dir = str(tmp_path)
+        runtime.agents_dir = str(agents_dir)
+        runtime.role_configs = {"gary": live_cfg}
+        runtime.trigger_registry.reregister_for = MagicMock()
+
+        with caplog.at_level(logging.WARNING, logger="reload"):
+            result = await dispatch("triggers", runtime=runtime, role="gary")
+        assert result["status"] == "error"
+        assert result["kind"] == "restart_required"
+        # NO MIXED STATE: cache channels still the OLD set (webhook still there),
+        # so the reconciler's ingress-authorization view is unchanged...
+        assert runtime.role_configs["gary"] is live_cfg
+        assert runtime.role_configs["gary"].channels == ["telegram", "webhook"]
+        # ...and the trigger registry was never touched.
+        runtime.trigger_registry.reregister_for.assert_not_called()

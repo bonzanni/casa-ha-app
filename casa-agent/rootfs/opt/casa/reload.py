@@ -266,6 +266,41 @@ async def reload_triggers(runtime: Any, *, role: str | None = None) -> list[str]
     except Exception as exc:  # noqa: BLE001
         raise ReloadError("load_error", str(exc)) from exc
 
+    # Personality Phase A, Task 14 (round-3 review): restart-to-swap invariant.
+    # The load_agent_from_dir above may have committed a STAGED persona swap
+    # desired->active on disk, yielding a NEW role_checksum/binding_digest on
+    # cfg while the LIVE resident still runs the OLD identity. A trigger reload
+    # must NEVER activate that change — only a supervised restart may. So for a
+    # RESIDENT whose personality identity moved, refuse the WHOLE operation here
+    # BEFORE anything mutates: no reregister_for, no cache write, no specialist
+    # reload. The trigger registry, runtime.role_configs, AND the trigger
+    # reconciler's view (trigger_reconcile reads role_configs[role].channels to
+    # authorize plugin webhook ingress) all stay consistently OLD, so the
+    # restart the swap already requires activates everything together — no mixed
+    # state. (Round 2 kept the OLD cache but still reregistered the NEW triggers,
+    # a half-applied design two reviewers flagged: it left webhook ingress
+    # authorized by the stale cached channels while NEW triggers were live, and
+    # misreported the registered trigger list.) Raising mirrors reload_agent's
+    # direct-path contract; dispatch() converts this ReloadError to a structured
+    # error, and reload_full does NOT compose this handler, so nothing cascades
+    # through the raise. The on-disk active.yaml commit from load_agent_from_dir
+    # may already have happened — idempotent with the mandatory restart's own
+    # boot-time reconcile (same note reload_agent carries at ~:598).
+    if role in runtime.role_configs and _resident_identity_changed(
+        cfg, runtime.role_configs.get(role),
+    ):
+        logger.warning(
+            "reload_triggers(%s): personality identity changed on disk "
+            "(role_checksum or binding_digest differs) — refusing the trigger "
+            "reload to avoid mixed state; restart required to activate", role,
+        )
+        raise ReloadError(
+            "restart_required",
+            f"role={role} personality identity changed; restart via "
+            f"casa_restart_supervised to activate (trigger reload refused to "
+            f"avoid mixed state)",
+        )
+
     try:
         await asyncio.to_thread(
             runtime.trigger_registry.reregister_for,
@@ -274,40 +309,16 @@ async def reload_triggers(runtime: Any, *, role: str | None = None) -> list[str]
     except Exception as exc:  # noqa: BLE001
         raise ReloadError("reregister_failed", str(exc)) from exc
 
-    # Q-1 fix (v0.35.2): refresh the runtime cache so back-compat
-    # consumers (tools.casa_reload_triggers emits `registered=[...]`
-    # by reading runtime.role_configs[role].triggers) see the
-    # post-reload state, not the boot-time list. Mirrors the resident
-    # vs specialist branching of reload_agent at lines 339-348.
+    # Q-1 fix (v0.35.2): refresh the runtime cache so back-compat consumers
+    # (tools.casa_reload_triggers emits `registered=[...]` by reading
+    # runtime.role_configs[role].triggers) see the post-reload state, not the
+    # boot-time list. Mirrors the resident vs specialist branching of
+    # reload_agent. A resident whose personality identity changed never reaches
+    # here — it was refused above — so this unconditional write can never
+    # poison the shared restart-to-swap baseline: cfg's identity always matches
+    # the live baseline on this path.
     if role in runtime.role_configs:
-        # Personality Phase A, Task 14 (restart-to-swap invariant): the
-        # load_agent_from_dir above may have committed a STAGED persona swap
-        # desired->active on disk, yielding a NEW binding_digest on cfg while
-        # the LIVE agent still runs the OLD binding. Overwriting the cache
-        # unconditionally would poison the shared restart-to-swap baseline
-        # (runtime.role_configs is the comparison baseline for _resident_
-        # identity_changed): a SUBSEQUENT reload_agent / policy cascade would
-        # then compare NEW-vs-NEW, see no change, and HOT-SWAP the identity —
-        # two-step laundering of a change that MUST activate only via a
-        # supervised restart. So when the freshly-loaded cfg's personality
-        # identity moved, we keep the OLD cfg as the baseline and refuse the
-        # cache write. Trigger reregistration above already ran (triggers are
-        # not identity-bearing; refreshing them is this path's whole purpose).
-        # Documented side effect: the Q-1 back-compat consumer
-        # (tools.casa_reload_triggers reading role_configs[role].triggers)
-        # sees the boot-time trigger list until the restart the swap already
-        # requires — it self-heals on that restart's boot-time reconcile.
-        if _resident_identity_changed(cfg, runtime.role_configs.get(role)):
-            logger.warning(
-                "reload_triggers(%s): personality identity changed on disk "
-                "(role_checksum or binding_digest differs) — preserving the "
-                "OLD config as the restart-to-swap baseline; the identity "
-                "change activates on a supervised restart. Triggers were "
-                "reregistered; the back-compat trigger list stays boot-time "
-                "until that restart.", role,
-            )
-        else:
-            runtime.role_configs[role] = cfg
+        runtime.role_configs[role] = cfg
     else:
         try:
             await asyncio.to_thread(runtime.specialist_registry.load)
