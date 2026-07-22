@@ -106,10 +106,22 @@ _explain_draft_var: ContextVar[dict | None] = ContextVar(
 
 
 def _projection_name_for_turn(channel: str, origin_route: str | None) -> str:
-    """The bundle projection ``_build_options`` selects for this surface, kept in
-    lockstep with the selection there (the restricted_webhook short-circuit for
-    an untrusted webhook origin + ``prompt_compiler.projection_for``)."""
-    if channel == "webhook" and origin_route != "invoke":
+    """Name the bundle projection actually SERVED for this turn, in lockstep
+    with ``prompt_compiler.projection_for`` — the function that selects the
+    served projection on ``_build_options``' normal path (``webhook_trigger``
+    → restricted_webhook, voice → voice, else text).
+
+    Mg (whole-branch review): this MUST mirror ``projection_for``'s predicate
+    (``origin_route == "webhook_trigger"``), NOT a broader
+    ``channel == "webhook" and route != "invoke"`` test. ``_build_options``
+    handles the untrusted-webhook short-circuit SEPARATELY and records
+    "restricted_webhook" directly there (that path never reaches this
+    function); every call site that DOES reach here — the warm-reuse pool
+    record path and the normal-path stash — needs the projection
+    ``projection_for`` chose, and ``projection_for`` deliberately falls back
+    to the text surface for a missing/unknown webhook route rather than
+    treating it as restricted."""
+    if origin_route == "webhook_trigger":
         return "restricted_webhook"
     if channel == "voice":
         return "voice"
@@ -1209,7 +1221,7 @@ class Agent:
             # Task 14 / #199: record this turn's provenance so an operator can
             # `casactl explain <cid>` it. Fail-safe (never raises) and off the
             # streaming path — on_token already flushed the reply above.
-            self._record_turn_explanation(
+            await self._record_turn_explanation(
                 channel=msg.channel or "-",
                 turn_state=turn_state,
                 explain_draft=explain_draft,
@@ -1254,14 +1266,24 @@ class Agent:
         except Exception:  # noqa: BLE001
             logger.debug("explanation draft stash skipped", exc_info=True)
 
-    def _record_turn_explanation(
+    async def _record_turn_explanation(
         self, *, channel: str, turn_state: dict, explain_draft: dict,
     ) -> None:
         """Write ONE ExplanationStore record for the turn just completed so an
         operator can ``casactl explain <cid>`` it. Fail-safe by contract: any
         error (no store bound, an unrecordable ``"-"`` cid, a store write fault)
         is swallowed at debug level — the user's reply has already been produced
-        and must never be delayed or failed by this telemetry."""
+        and must never be delayed or failed by this telemetry.
+
+        F7 (whole-branch review): ``ExplanationStore.record`` does a synchronous
+        file write PLUS a prune that globs+stats up to EXPLANATION_MAX_RECORDS
+        entries. Running that on the event loop blocked it every turn. The
+        entire record is assembled here on the loop from task-local state
+        (contextvars, ``self.config``, the per-turn draft/turn_state locals —
+        all immutable by the time it is built), then ONLY the blocking
+        ``store.record(record)`` is handed to ``asyncio.to_thread``; a fault in
+        the thread re-raises into this same fail-safe try/except and is
+        swallowed, exactly as before."""
         runtime = active_runtime
         store = getattr(runtime, "explanation_store", None) if runtime else None
         if store is None:
@@ -1332,7 +1354,10 @@ class Agent:
                 system_prompt=explain_draft.get("system_prompt"),
                 memory_text=explain_draft.get("memory_text"),
             )
-            store.record(record)
+            # F7: the blocking write+prune runs off the event loop. `record`
+            # is a fully-built immutable dataclass; nothing task-local is read
+            # inside the thread.
+            await asyncio.to_thread(store.record, record)
         except Exception:  # noqa: BLE001
             logger.debug(
                 "explanation record skipped cid=%s", cid, exc_info=True,

@@ -285,13 +285,13 @@ tools:
 mcp_servers: [n8n-workflows, casa-framework]
 channels: []
 memory: {token_budget: 4000, read_strategy: per_turn}
-session: {strategy: ephemeral, idle_timeout_seconds: 0}
+session: {strategy: ephemeral, idle_timeout_seconds: 900}
 disclosure: {policy: delegated, overrides: {}}
 delegates: []
 executors: []
 triggers: []
 hooks: {pre_tool_use: []}
-tts: {tag_dialect: none, error_phrases: {}}
+tts: {tag_dialect: none, error_phrases: {timeout: "One moment while I check.", failure: "I could not complete that."}}
 response:
   text: {register: precise, max_status_sentences: 3}
   voice: {register: spoken, max_status_sentences: 2}
@@ -357,3 +357,22 @@ Do not expose financial records or persona identity.
     assert cfg.role == "finance"
     assert cfg.kind == "specialist"
     assert cfg.role_artifact.role["id"] == "specialist:finance"
+
+    # Mb (whole-branch review): a schema-VALID round-trip is not enough — the
+    # projected values must be CORRECT, not merely loadable. A wrong
+    # field-name mapping (role.yaml's `idle_timeout_seconds`/`error_phrases`/
+    # descriptive `register` vs the operational schema's `idle_timeout`/
+    # top-level `voice_errors`/coarse enum) would still load but silently
+    # drop or misplace the value. Assert the concrete mappings.
+    assert cfg.session.strategy == "ephemeral"
+    assert cfg.session.idle_timeout == 900  # idle_timeout_seconds -> idle_timeout
+    # error_phrases (role.yaml tts sub-block) moves to the top-level
+    # voice_errors runtime key, preserved verbatim — NON-EMPTY fixture proves
+    # it is carried, not merely defaulted-empty.
+    assert cfg.voice_errors == {
+        "timeout": "One moment while I check.",
+        "failure": "I could not complete that.",
+    }
+    # role.yaml's descriptive `register: precise` (text/written projection)
+    # maps to the coarse operational enum value `written`, never passed through.
+    assert cfg.response_shape.register == "written"

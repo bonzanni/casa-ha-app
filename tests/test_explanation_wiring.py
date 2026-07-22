@@ -247,16 +247,25 @@ def test_turn_records_memory_attributions_without_reserved_tags(tmp_path, monkey
 
 
 def test_projection_name_matches_build_options_selection():
-    """The recorded projection name must track _build_options' selection: an
-    untrusted webhook origin → restricted_webhook, voice → voice, else text."""
+    """The recorded projection name must track prompt_compiler.projection_for's
+    selection (Mg): webhook_trigger → restricted_webhook, voice → voice, else
+    text. The untrusted-webhook short-circuit in _build_options records
+    "restricted_webhook" directly and never routes through this function, so —
+    matching projection_for — a webhook turn with a missing/unknown route
+    resolves to text here, not restricted."""
     from agent import _projection_name_for_turn
 
     assert _projection_name_for_turn("webhook", "webhook_trigger") == "restricted_webhook"
-    assert _projection_name_for_turn("webhook", None) == "restricted_webhook"
+    # projection_for falls back to the text surface for a missing/unknown
+    # webhook route — this function mirrors that exactly.
+    assert _projection_name_for_turn("webhook", None) == "text"
     # An explicit server-stamped invoke webhook is a trusted origin → text.
     assert _projection_name_for_turn("webhook", "invoke") == "text"
     assert _projection_name_for_turn("voice", None) == "voice"
     assert _projection_name_for_turn("telegram", None) == "text"
+    # A voice channel carrying a webhook_trigger route still takes restricted,
+    # exactly as projection_for does (route wins over channel).
+    assert _projection_name_for_turn("voice", "webhook_trigger") == "restricted_webhook"
 
 
 def test_attribution_label_is_id_based_never_casa_source():
@@ -321,3 +330,51 @@ def test_explanation_store_failure_never_fails_the_turn(tmp_path, monkeypatch):
         asyncio.run(run())
     finally:
         cid_var.reset(token)
+
+
+def test_explanation_record_runs_off_the_event_loop(tmp_path, monkeypatch):
+    """F7 (whole-branch review): the ExplanationStore write+prune must run via
+    ``asyncio.to_thread`` — off the event loop — and a fault inside that thread
+    must STILL never propagate into the user turn. Captures the thread ident
+    ``record()`` runs on and proves (a) it differs from the loop thread and
+    (b) even a RuntimeError raised in the worker thread is swallowed."""
+    import threading
+
+    loop_ident = threading.get_ident()
+    seen: dict = {}
+
+    class _ThreadCheckingStore:
+        def record(self, record):
+            seen["ident"] = threading.get_ident()
+            # A fault inside the worker thread re-raises into _process's
+            # fail-safe try/except — it must NOT fail the turn.
+            raise RuntimeError("boom in worker thread")
+
+    sm = AsyncMock()
+    sm.profile.return_value = ""
+    from semantic_memory import RecallUnavailable
+    sm.recall_items.side_effect = RecallUnavailable("not_configured")
+    agent = _make_agent(tmp_path, semantic_memory=sm)
+
+    monkeypatch.setattr(
+        agent_mod, "active_runtime",
+        SimpleNamespace(explanation_store=_ThreadCheckingStore()), raising=False,
+    )
+    token = cid_var.set("c-explain-offloop-1")
+    try:
+        async def run():
+            with patch("sdk_client_pool._default_make_client", _FakeClient):
+                msg = BusMessage(
+                    type=MessageType.REQUEST, source="telegram",
+                    target="assistant", content="hi",
+                    channel="telegram", context={"chat_id": "7"},
+                )
+                return await agent._process(msg, on_token=None)
+
+        # Completes without raising despite the in-thread fault.
+        asyncio.run(run())
+    finally:
+        cid_var.reset(token)
+
+    assert seen.get("ident") is not None, "store.record was never invoked"
+    assert seen["ident"] != loop_ident, "store.record ran on the event-loop thread, not a worker"
