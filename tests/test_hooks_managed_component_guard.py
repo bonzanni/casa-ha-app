@@ -951,3 +951,43 @@ async def test_bash_git_unknown_subcommand_fails_closed():
         "command": "git -C /config/specialists filter-branch --force"}},
         None, {})
     assert _decision(out) == "deny"
+
+
+# ------------------------------------------------------------------
+# Round-8 (Sol): --output on read-only git subcommands is a write
+# ------------------------------------------------------------------
+
+
+@pytest.mark.parametrize("command", [
+    "git -C /config log --output=/config/plugins/stolen.txt",
+    "git -C /config show HEAD --output /config/agents/specialists/finance/x",
+    "git -C /config diff --output=$OUT agents/specialists/finance/runtime.yaml",
+    "git log --output /config/plugins/exfil.json",
+])
+async def test_bash_git_output_option_write_denied(command):
+    out = await _hook()(
+        {"tool_name": "Bash", "tool_input": {"command": command}}, None, {})
+    assert _decision(out) == "deny", command
+
+
+async def test_bash_git_output_to_nonmanaged_from_managed_read_passes():
+    out = await _hook()({"tool_name": "Bash", "tool_input": {
+        "command": "git -C /config log --output=/tmp/export.txt -- "
+                   "agents/specialists/finance/runtime.yaml"}}, None, {})
+    assert out == {}
+
+
+async def test_bash_git_config_injection_pre_subcommand_denied():
+    # Round-8 (Terra): -c/--paginate/--exec-path before the subcommand can
+    # execute arbitrary commands with the payload argv-visible.
+    out = await _hook()({"tool_name": "Bash", "tool_input": {
+        "command": "git -c core.pager='sh -c \"touch /config/plugins/x\"' "
+                   "--paginate log"}}, None, {})
+    assert _decision(out) == "deny"
+
+
+async def test_bash_git_no_pager_read_still_passes():
+    out = await _hook()({"tool_name": "Bash", "tool_input": {
+        "command": "git --no-pager -C /config log --oneline -- "
+                   "agents/specialists/finance/runtime.yaml"}}, None, {})
+    assert out == {}

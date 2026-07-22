@@ -1187,15 +1187,35 @@ def _argv_managed_write(argv: list[str], *, _depth: int = 0) -> bool:
     if prog in _MANAGED_DEST_WRITE_VERBS:
         return _dest_family_writes_managed(argv)
     if prog == "git":
+        # Round-8 (Sol): even read-only subcommands write via
+        # `--output[=]<file>` — resolve the destination like a redirect
+        # target: managed or unresolvable denies; writing elsewhere from a
+        # managed read stays legal.
+        for k, a in enumerate(argv[1:], start=1):
+            if a.startswith("--output="):
+                if _token_resolves_managed(a.split("=", 1)[1]):
+                    return True
+            elif a == "--output":
+                if k + 1 >= len(argv) or _token_resolves_managed(argv[k + 1]):
+                    return True
         j = 1
         while j < len(argv):
             a = argv[j]
-            if a in ("-C", "-c"):  # these take a separate argument
+            if a == "-C":  # takes a separate argument
                 j += 2
                 continue
-            if a.startswith("-"):
+            if a == "--no-pager":
                 j += 1
                 continue
+            if a.startswith("-"):
+                # Round-8 (Terra): any OTHER pre-subcommand option is
+                # write-shaped — `-c core.pager='sh -c ...'`, `--paginate`,
+                # `--exec-path`, `--config-env` etc. can execute arbitrary
+                # commands, and the payload is argv-visible (NOT the
+                # opaque-content residual). Only -C <dir> and --no-pager
+                # are recognized read-safe here; post-subcommand options
+                # have subcommand-local meanings and are not affected.
+                return True
             return a not in _MANAGED_GIT_READONLY_SUBCMDS
         # Bare `git` / options-only: no subcommand reached — treat as
         # write-shaped only if we couldn't classify (fail-closed keeps
