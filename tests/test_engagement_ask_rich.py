@@ -35,6 +35,17 @@ from test_engagement_ask_lifecycle import _FakeDriver, _FakeRequest, _body
 pytestmark = pytest.mark.asyncio
 
 
+async def _wait_until(predicate, *, timeout: float = 5.0) -> None:
+    """Poll *predicate* until it holds, bounded by WALL-CLOCK time (not a
+    fixed real-time sleep), so a slow/loaded runner gets real slack while a
+    fast run resolves in a handful of scheduler turns. Cheap when fast,
+    tolerant when slow, and no weaker than the fixed sleep it replaces — it
+    still raises (``TimeoutError``) if the condition never fires."""
+    async with asyncio.timeout(timeout):
+        while not predicate():
+            await asyncio.sleep(0)
+
+
 # ===========================================================================
 # Part (b) · primitive: post_ask_body_rich — SINGLE-ATTEMPT rich send
 # ===========================================================================
@@ -242,7 +253,16 @@ async def test_single_select_settle_edit_renders_rich(real_env):
     task = asyncio.ensure_future(real_env["ask"](_FakeRequest(_payload(
         engagement_id=eid, request_id="s1",
         question="Deploy **prod**?", options=["Yes", "No"]))))
-    await asyncio.sleep(0.02)
+    # Await the actual posted-and-live boundary (keyboard physically sent AND
+    # the request live+unclaimed in the broker) instead of a fixed real-time
+    # sleep — on a slow/loaded runner the handler's pre-register awaits can
+    # outlast a tight sleep and the deliver below would report "stale" for a
+    # not-yet-live key; delivering before the keyboard post would settle an
+    # ask with no message to edit.
+    await _wait_until(lambda: real_env["bot"].send_message.await_count >= 1
+                      and real_env["broker"].is_live_unclaimed(
+                          namespace="engagement_ask", scope=eid,
+                          request_id="s1"))
     assert real_env["broker"].deliver(
         namespace="engagement_ask", scope=eid, request_id="s1",
         option_index=0, actor_id=555) == "delivered"
