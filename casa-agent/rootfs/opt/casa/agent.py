@@ -1653,6 +1653,13 @@ class Agent:
             resume=resume_sid,
             setting_sources=["project"],
             skills=skills,
+            # Task 5 verified: no runtime-identity string to fix here — this
+            # passes only `rp.path`, never `rp.name`/`rp.manifest_name`. The
+            # CLI loads `.claude-plugin/plugin.json` itself from that path
+            # and namespaces the plugin's own tools off `plugin.json.name`,
+            # which for an owned artifact already IS the manifest name (the
+            # scoped `<owner>.<manifest_name>` form only ever lives in the
+            # REGISTRY, never written into the artifact's own plugin.json).
             plugins=[{"type": "local", "path": rp.path}
                      for rp in resolution.plugins],
             # P-5b: in-casa agents have no permission relay — fail closed on

@@ -904,7 +904,14 @@ def _resolution_from_recorded(plugin_artifacts) -> "plugin_registry.ResolutionRe
             continue
         plugins.append(ResolvedPlugin(
             name=pa.get("name", ""), artifact_id=pa.get("artifact_id", ""),
-            path=path, version=str(manifest.get("version", "")), manifest=manifest))
+            path=path, version=str(manifest.get("version", "")), manifest=manifest,
+            # Task 5: thread the recorded manifest_name (added to the
+            # serialized shape below) so a RESUMED session reproduces the
+            # exact same runtime identity (grant/namespace strings) the
+            # original launch used. `.get("manifest_name", "")` tolerates
+            # engagements recorded before this field existed — those fall
+            # back to the registry name via runtime_name(), same as before.
+            manifest_name=pa.get("manifest_name", "") if isinstance(pa, dict) else ""))
     return ResolutionResult(registry_valid=True, plugins=plugins, issues=issues)
 
 
@@ -1810,6 +1817,17 @@ def _delegation_scope(origin: dict, agent_name: str) -> str:
     return f"{chat_id}:{agent_name}"
 
 
+def _missing_required_plugins(required: list[str], plugins) -> list[str]:
+    """A5 requires.plugins gate (spec §2.1, Task 5): the entries of
+    `required` NOT present among `plugins`' RUNTIME identities
+    (`plugin_registry.runtime_name` — an owned artifact's `manifest_name`,
+    else its registry name). A `requires.plugins: ["mtg"]` declaration is
+    satisfied by an owned `mtg.mtg` registry entry (runtime name "mtg"),
+    never by matching the scoped registry name directly."""
+    names = {plugin_registry.runtime_name(rp) for rp in plugins}
+    return [p for p in required if p not in names]
+
+
 async def _prelaunch(
     agent_name: str, origin: dict, mode: str,
     task_text: str = "", context_text: str = "",
@@ -2003,10 +2021,10 @@ async def _prelaunch(
                 if _agent_registry is not None else None) or "specialist"
         resolution = await asyncio.to_thread(
             plugin_registry.resolve_for, f"{tier}:{agent_name}")
-        names = {rp.name for rp in resolution.plugins}
         declared = declared_tools_for_resolution(resolution)
         servers = set(grants_for_resolution(resolution))  # server actually attached
-        missing_plugins = [p for p in req.plugins if p not in names]
+        missing_plugins = _missing_required_plugins(
+            req.plugins, resolution.plugins)
         missing_tools = [
             t for t in req.tools
             if t not in declared or t.rsplit("__", 1)[0] not in servers
@@ -2887,7 +2905,10 @@ async def delegate_to_agent(args: dict) -> dict:
                               if _agent_registry is not None else None) or "specialist"
                 _spec_res = plugin_registry.resolve_for(f"{_spec_tier}:{agent_name}")
             _spec_arts = tuple(
-                {"name": rp.name, "artifact_id": rp.artifact_id, "path": rp.path}
+                {"name": rp.name, "artifact_id": rp.artifact_id, "path": rp.path,
+                 # Task 5: recorded so a resumed session reproduces the same
+                 # runtime identity via _resolution_from_recorded (above).
+                 "manifest_name": rp.manifest_name}
                 for rp in _spec_res.plugins)
             # Create record
             rec = await _engagement_registry.create(
@@ -4277,7 +4298,10 @@ async def engage_executor(args: dict) -> dict:
                             f"{not_ready} (see /data/plugin-health.json)"),
             })
         arts = tuple(
-            {"name": rp.name, "artifact_id": rp.artifact_id, "path": rp.path}
+            {"name": rp.name, "artifact_id": rp.artifact_id, "path": rp.path,
+             # Task 5: recorded so a resumed session reproduces the same
+             # runtime identity via _resolution_from_recorded (above).
+             "manifest_name": rp.manifest_name}
             for rp in res.plugins)
         return res, arts, None
 

@@ -118,10 +118,12 @@ def test_resolved_plugin_carries_manifest_name(tmp_path, monkeypatch):
 
 
 def test_resolved_plugin_constructor_regression():
-    # Every pre-Task-3 call site constructs ResolvedPlugin WITHOUT
-    # manifest_name (Terra plan-r1: tools.py:905-907, 7755-7757 + test
-    # fixtures) — the field must default, and runtime_name() must fall back
-    # to `name` when it is absent.
+    # A call site with nothing to thread (test fixtures; an unowned entry)
+    # constructs ResolvedPlugin WITHOUT manifest_name — the field must
+    # default, and runtime_name() must fall back to `name` when it is
+    # absent. (Task 5 threads manifest_name through tools.py:905-907 and
+    # 7755-7757 from real recorded/registry data — this test is about the
+    # bare-constructor default, not those call sites.)
     rp = ResolvedPlugin(name="x", artifact_id="a" * 64, path="/p",
                         version="1", manifest={})
     assert rp.manifest_name == ""

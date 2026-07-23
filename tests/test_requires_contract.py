@@ -611,7 +611,8 @@ class TestInteractiveRequiresDenial:
         # requires gate produced (identity check via the recorded artifacts).
         create_kwargs = eng_reg.create.await_args.kwargs
         assert create_kwargs["plugin_artifacts"] == tuple(
-            {"name": rp.name, "artifact_id": rp.artifact_id, "path": rp.path}
+            {"name": rp.name, "artifact_id": rp.artifact_id, "path": rp.path,
+             "manifest_name": rp.manifest_name}
             for rp in resolution.plugins
         )
         # The builder received the SAME object (identity, not equality).

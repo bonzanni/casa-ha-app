@@ -317,10 +317,15 @@ class ResolvedPlugin:
     version: str
     manifest: dict
     # spec §2: the plugin's manifest-declared name for an OWNED entry (e.g.
-    # "mtg" for registry name "mtg.mtg"); "" for unowned/pre-Task-3 call
-    # sites, which must keep constructing without this kwarg (Terra plan-r1:
-    # tools.py:905-907, 7755-7757 + test fixtures). Use runtime_name(rp), not
-    # this field directly, to get the effective runtime identity.
+    # "mtg" for registry name "mtg.mtg"); "" for unowned entries and any
+    # call site with nothing to thread (test fixtures; a resumed engagement
+    # recorded before this field existed, tools.py:_resolution_from_recorded).
+    # Task 5 threads it through the resume path too (tools.py:
+    # _resolution_from_recorded reads `pa["manifest_name"]`; the two
+    # plugin_artifacts-recording sites write it) so a resumed session
+    # reproduces the exact runtime identity the original launch used. Use
+    # runtime_name(rp), not this field directly, to get the effective
+    # runtime identity.
     manifest_name: str = ""
 
 
