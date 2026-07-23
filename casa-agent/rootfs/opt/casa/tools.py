@@ -6528,6 +6528,29 @@ async def _reload_and_verify_targets(name: str, targets: list,
     return result
 
 
+def _bundle_binding_blocked(v: dict) -> bool:
+    """P1-3: True iff a `_tool_verify_plugin_state` result shows a genuine
+    integrity/binding failure that must roll a bundle commit back — as opposed
+    to mere config-pending readiness (unresolved secrets / missing sysreq
+    bins), which is a verified-legal terminal state (spec §3.2) and must NOT
+    trigger compensation.
+
+    verify's top-level `reasons` list carries ONLY integrity/binding codes
+    (registry_invalid / not_registered / entry-issue reason codes /
+    artifact_missing / artifact_invalid / corrupt_artifact / mcp_invalid /
+    mcp_command_missing / mcp_reserved_env) — never secrets/tools readiness,
+    which surface separately as the generic 'not_ready' row fallback. So a
+    non-empty top-level `reasons` is always blocking; a per-target row blocks
+    only on a code OTHER than 'not_ready' (reload_required / verify_unstable /
+    authorization_missing)."""
+    if v.get("reasons"):
+        return True
+    for row in v.get("targets") or []:
+        if any(code != "not_ready" for code in (row.get("reasons") or [])):
+            return True
+    return False
+
+
 async def _bundle_reload_and_verify(
     slug: str, *, removed_artifact_ids: list, targets_removed: list) -> dict:
     """Task 10 bundle sequencer (spec §3.2d) — the post-mutation half of a
@@ -6593,11 +6616,16 @@ async def _bundle_reload_and_verify(
         v = await asyncio.to_thread(_tool_verify_plugin_state, plugin_name=name)
         verify[name] = v
         # Whole-branch B: a not-ready owned binding (desired != active) is a
-        # sequencer FAILURE, not a silent success. A config-pending specialist
-        # is still verified-legal: its owned entries activate at commit and
-        # their artifacts/secrets verify ready even while the specialist role is
-        # dormant (spec §3.2 pending-config semantics).
-        if v.get("ready") is not True:
+        # sequencer FAILURE, not a silent success. P1-3: gate ONLY on
+        # integrity/binding failures (artifact/mcp/registry-entry reasons +
+        # reload_required/verify_unstable), NOT operator-config readiness.
+        # verify's top-level `ready` folds in unresolved secrets and missing
+        # sysreq bins, but a config-pending specialist is a verified-legal
+        # terminal state (spec §3.2): its owned entries activate at commit and
+        # are inert until configured. Rolling such an install back would be a
+        # spurious compensation. `_bundle_binding_blocked` inspects the reason
+        # codes so an env-declaring bundled plugin awaiting its secret passes.
+        if _bundle_binding_blocked(v):
             not_ready.append(name)
 
     # Whole-branch B/C (uninstall): every removed scoped name must be ABSENT
@@ -6627,25 +6655,70 @@ async def _bundle_reload_and_verify(
     }
 
 
-async def _bundle_compensate(txn, *, targets_removed: list) -> None:
+async def _bundle_compensate(txn) -> bool:
     """Whole-branch B: shared compensation for a FAILED bundle sequencer — roll
     the disk state back, run a best-effort compensating sequencer over the
     restored state (un-publishing the runtime state with the new set's artifact
-    ids), and ALWAYS complete the journal. Never raises out (a rollback/
-    sequencer failure here is logged; boot reconciliation is the backstop)."""
+    ids), then complete the journal. Never raises out. Returns True when the
+    disk rollback succeeded (journal completed), False when it raised (journal
+    left in-progress for boot reconciliation; the caller surfaces
+    `compensation_failed`).
+
+    P1-1: complete the journal ONLY after a SUCCESSFUL disk rollback. A
+    rollback that raises (e.g. an unreadable registry — `rollback_disk` fails
+    closed rather than persist a partial doc) must leave the in-progress
+    journal on disk so boot reconciliation re-runs the rollback or quarantines
+    the slug; completing it here would strand a half-rolled-back mutation with
+    no recovery.
+
+    P1-2: derive the compensating-sequencer direction from the RESTORED
+    before-state, not the forward op. When the before-state has no installed
+    specialist (its `active.yaml` was absent — e.g. a failed FRESH install),
+    the just-created live agent must be EVICTED and verified absent
+    (uninstall-shaped sweep); otherwise the prior generation's agent is
+    reconstructed (install-shaped). Reusing the forward install-shaped call
+    left a fresh-install rollback's live agent reachable."""
     import specialist_bundle_journal
     try:
-        try:
-            await asyncio.to_thread(txn.rollback_disk)
-            await _bundle_reload_and_verify(
-                txn.slug, removed_artifact_ids=list(txn.new_artifact_ids),
-                targets_removed=targets_removed)
-        except Exception:  # noqa: BLE001 — best-effort compensation
-            logger.warning("bundle compensation failed for %s", txn.slug,
-                           exc_info=True)
-    finally:
-        await asyncio.to_thread(specialist_bundle_journal.complete,
-                                txn.journal_path)
+        await asyncio.to_thread(txn.rollback_disk)
+    except Exception:  # noqa: BLE001 — leave the journal for boot reconcile
+        logger.warning(
+            "bundle disk rollback failed for %s; leaving the in-progress "
+            "journal for boot reconciliation", txn.slug, exc_info=True)
+        return False
+    # Direction from the restored before-state: an absent prior active.yaml
+    # means the specialist should NOT exist after compensation → evict + verify
+    # absent; a present one means a prior generation is being restored →
+    # reconstruct.
+    before_tuple_files = getattr(txn, "before_tuple_files", None) or {}
+    installed_before = before_tuple_files.get("active.yaml") is not None
+    comp_targets = [] if installed_before else [f"specialist:{txn.slug}"]
+    try:
+        await _bundle_reload_and_verify(
+            txn.slug, removed_artifact_ids=list(txn.new_artifact_ids),
+            targets_removed=comp_targets)
+    except Exception:  # noqa: BLE001 — best-effort; boot is the backstop
+        logger.warning("bundle compensating sequencer failed for %s", txn.slug,
+                       exc_info=True)
+    await asyncio.to_thread(specialist_bundle_journal.complete, txn.journal_path)
+    return True
+
+
+async def _bundle_seq_failure(txn, seq: dict, *, slug: str) -> dict:
+    """Whole-branch B: a sequencer that returned ok:false — compensate and
+    build the ok:false envelope. P1-1: when the disk rollback could not
+    complete (`_bundle_compensate` returns False, journal left in-progress for
+    boot reconciliation), tag the envelope `compensation_failed` so the caller
+    surfaces that the runtime state may be inconsistent until the next boot."""
+    compensated = await _bundle_compensate(txn)
+    env = {"ok": False, "kind": seq.get("kind") or "bundle_sequence_failed",
+           "slug": slug, "reload_errors": seq.get("reload_errors"),
+           "not_ready": seq.get("not_ready"),
+           "absent_violations": seq.get("absent_violations"),
+           "verify": seq.get("verify")}
+    if not compensated:
+        env["compensation_failed"] = True
+    return env
 
 
 def _prune_bundle_receipt(receipt_id: "str | None") -> None:
@@ -7302,18 +7375,13 @@ async def specialist_install_commit(args: dict) -> dict:
                 txn.slug, removed_artifact_ids=list(txn.removed_artifact_ids),
                 targets_removed=[])
         except Exception:
-            await _bundle_compensate(txn, targets_removed=[])
+            await _bundle_compensate(txn)
             raise
         # Whole-branch B: a not-ready owned binding / postcondition failure is a
         # FAILED mutation — compensate + surface ok:false, never complete the
         # journal + report success.
         if not seq.get("ok", True):
-            await _bundle_compensate(txn, targets_removed=[])
-            return _result({"ok": False, "kind": seq.get("kind") or "bundle_sequence_failed",
-                            "slug": txn.slug, "reload_errors": seq.get("reload_errors"),
-                            "not_ready": seq.get("not_ready"),
-                            "absent_violations": seq.get("absent_violations"),
-                            "verify": seq.get("verify")})
+            return _result(await _bundle_seq_failure(txn, seq, slug=txn.slug))
         await asyncio.to_thread(specialist_bundle_journal.complete, txn.journal_path)
         _prune_bundle_receipt(receipt.receipt_id)
     return _result({"ok": True, "slug": instance.slug, "state": instance.state,
@@ -7398,15 +7466,10 @@ async def specialist_upgrade(args: dict) -> dict:
                 txn.slug, removed_artifact_ids=list(txn.removed_artifact_ids),
                 targets_removed=[])
         except Exception:
-            await _bundle_compensate(txn, targets_removed=[])
+            await _bundle_compensate(txn)
             raise
         if not seq.get("ok", True):
-            await _bundle_compensate(txn, targets_removed=[])
-            return _result({"ok": False, "kind": seq.get("kind") or "bundle_sequence_failed",
-                            "slug": txn.slug, "reload_errors": seq.get("reload_errors"),
-                            "not_ready": seq.get("not_ready"),
-                            "absent_violations": seq.get("absent_violations"),
-                            "verify": seq.get("verify")})
+            return _result(await _bundle_seq_failure(txn, seq, slug=txn.slug))
         await asyncio.to_thread(specialist_bundle_journal.complete, txn.journal_path)
         _prune_bundle_receipt(receipt.receipt_id)
     return _result({"ok": True, "slug": instance.slug, "state": instance.state,
@@ -7437,15 +7500,10 @@ async def specialist_rollback(args: dict) -> dict:
                 txn.slug, removed_artifact_ids=list(txn.removed_artifact_ids),
                 targets_removed=[])
         except Exception:
-            await _bundle_compensate(txn, targets_removed=[])
+            await _bundle_compensate(txn)
             raise
         if not seq.get("ok", True):
-            await _bundle_compensate(txn, targets_removed=[])
-            return _result({"ok": False, "kind": seq.get("kind") or "bundle_sequence_failed",
-                            "slug": txn.slug, "reload_errors": seq.get("reload_errors"),
-                            "not_ready": seq.get("not_ready"),
-                            "absent_violations": seq.get("absent_violations"),
-                            "verify": seq.get("verify")})
+            return _result(await _bundle_seq_failure(txn, seq, slug=txn.slug))
         await asyncio.to_thread(specialist_bundle_journal.complete, txn.journal_path)
     return _result({"ok": True, "slug": instance.slug, "state": instance.state,
                      "reloaded": seq["reloaded"], "verify": seq["verify"]})
@@ -7479,15 +7537,10 @@ async def specialist_uninstall(args: dict) -> dict:
                 txn.slug, removed_artifact_ids=list(txn.removed_artifact_ids),
                 targets_removed=targets_removed)
         except Exception:
-            await _bundle_compensate(txn, targets_removed=targets_removed)
+            await _bundle_compensate(txn)
             raise
         if not seq.get("ok", True):
-            await _bundle_compensate(txn, targets_removed=targets_removed)
-            return _result({"ok": False, "kind": seq.get("kind") or "bundle_sequence_failed",
-                            "slug": slug, "reload_errors": seq.get("reload_errors"),
-                            "not_ready": seq.get("not_ready"),
-                            "absent_violations": seq.get("absent_violations"),
-                            "verify": seq.get("verify")})
+            return _result(await _bundle_seq_failure(txn, seq, slug=slug))
         await asyncio.to_thread(specialist_bundle_journal.complete, txn.journal_path)
     return _result({"ok": True, "slug": slug, "reloaded": seq["reloaded"],
                      "verify": seq["verify"]})

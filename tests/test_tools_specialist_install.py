@@ -290,6 +290,197 @@ async def test_commit_seq_not_ready_compensates_and_reports_ok_false(
 
 
 @pytest.mark.asyncio
+async def test_compensate_fresh_install_runs_uninstall_shaped_sweep(monkeypatch) -> None:
+    """P1-2: compensating a FAILED fresh install (before-state carries no
+    active.yaml) must run the uninstall-shaped sequencer — evict the just-
+    created live agent + verify absent — not the install-shaped reconstruct.
+    Reusing the forward install-shaped call left the fresh-install rollback's
+    live agent reachable."""
+    from types import SimpleNamespace
+    import tools as tools_mod
+    import specialist_bundle_journal
+
+    captured: dict = {}
+
+    async def _seq(slug, *, removed_artifact_ids, targets_removed):
+        captured["targets_removed"] = list(targets_removed)
+        captured["removed"] = list(removed_artifact_ids)
+        return {"ok": True, "reloaded": [], "verify": {}}
+
+    monkeypatch.setattr(tools_mod, "_bundle_reload_and_verify", _seq)
+    completed: list = []
+    monkeypatch.setattr(specialist_bundle_journal, "complete",
+                        lambda p: completed.append(p))
+
+    txn = SimpleNamespace(
+        slug="mtg", new_artifact_ids=("NEWAID",), journal_path="/tmp/j.json",
+        before_tuple_files={"active.yaml": None},   # NOT installed before
+        rollback_disk=lambda: None)
+    ok = await tools_mod._bundle_compensate(txn)
+
+    assert ok is True
+    assert captured["targets_removed"] == ["specialist:mtg"]   # evict sweep
+    assert captured["removed"] == ["NEWAID"]                    # un-publish the new set
+    assert completed == ["/tmp/j.json"]                        # journal completed
+
+
+@pytest.mark.asyncio
+async def test_compensate_upgrade_reconstructs_prior_generation(monkeypatch) -> None:
+    """P1-2 converse: compensating a FAILED upgrade (before-state HAD an
+    active.yaml — the specialist stays installed after the rollback)
+    reconstructs the prior generation's agent (install-shaped, targets_removed
+    empty), never evicts it."""
+    from types import SimpleNamespace
+    import tools as tools_mod
+    import specialist_bundle_journal
+
+    captured: dict = {}
+
+    async def _seq(slug, *, removed_artifact_ids, targets_removed):
+        captured["targets_removed"] = list(targets_removed)
+        return {"ok": True, "reloaded": [], "verify": {}}
+
+    monkeypatch.setattr(tools_mod, "_bundle_reload_and_verify", _seq)
+    monkeypatch.setattr(specialist_bundle_journal, "complete", lambda p: None)
+
+    txn = SimpleNamespace(
+        slug="mtg", new_artifact_ids=("NEWAID",), journal_path="/tmp/j.json",
+        before_tuple_files={"active.yaml": "id: specialist:mtg\n"},  # installed before
+        rollback_disk=lambda: None)
+    await tools_mod._bundle_compensate(txn)
+
+    assert captured["targets_removed"] == []   # reconstruct, not evict
+
+
+@pytest.mark.asyncio
+async def test_seq_failure_with_failed_rollback_tags_compensation_failed(
+    monkeypatch, tmp_path,
+) -> None:
+    """P1-1: when the sequencer fails AND the disk rollback itself raises (e.g.
+    an unreadable registry — rollback_disk fails closed rather than persist a
+    partial doc), the journal is LEFT in-progress (boot reconciliation is the
+    backstop) and the ok:false envelope is tagged compensation_failed."""
+    from types import SimpleNamespace
+    from test_specialist_install import _write_component
+    from specialist_component import load_specialist_component
+    from specialist_install import compute_install_root_digest, resolve_dependency_closure
+    import specialist_install
+    import specialist_bundle_journal
+    import tools as tools_mod
+    from tools import specialist_install_commit
+
+    staged = _write_component(tmp_path / "staged", slug="mtg")
+    component = load_specialist_component(staged, staged / "manifest.json")
+    deps = resolve_dependency_closure(component, staged)
+    root_digest = compute_install_root_digest(
+        component, deps, manifest_bytes=(staged / "manifest.json").read_bytes())
+    _inject_fake_receipt(monkeypatch)
+
+    completed: list = []
+
+    def _boom_rollback():
+        raise RuntimeError("registry unreadable — cannot roll back")
+
+    txn = SimpleNamespace(
+        slug="mtg", removed_artifact_ids=(), new_artifact_ids=("NEWAID",),
+        journal_path="/tmp/j.json", before_tuple_files={"active.yaml": None},
+        rollback_disk=_boom_rollback)
+    monkeypatch.setattr(specialist_install, "commit_specialist_install",
+                        lambda *a, **k: (SimpleNamespace(slug="mtg", state="active"), txn))
+    monkeypatch.setattr(specialist_bundle_journal, "complete",
+                        lambda p: completed.append(p))
+
+    async def _seq(slug, *, removed_artifact_ids, targets_removed):
+        return {"ok": False, "kind": "postcondition_failed", "reloaded": [],
+                "reload_errors": [], "not_ready": ["mtg.mtg"],
+                "absent_violations": [], "verify": {}}
+
+    monkeypatch.setattr(tools_mod, "_bundle_reload_and_verify", _seq)
+
+    payload = _payload(await specialist_install_commit.handler({
+        "component_id": component.component_id, "version": component.version,
+        "slug": "mtg", "staged_dir": str(staged), "root_digest": root_digest,
+        "receipt_id": "a" * 32,
+    }))
+    assert payload["ok"] is False
+    assert payload["kind"] == "postcondition_failed"
+    assert payload["compensation_failed"] is True   # rollback failed → boot backstop
+    assert completed == []                           # journal LEFT in-progress
+
+
+@pytest.mark.asyncio
+async def test_sequencer_passes_env_pending_owned_plugin_real_verify(
+    monkeypatch, tmp_path,
+) -> None:
+    """P1-3: an owned bundled plugin declaring an UNRESOLVED secret lands in
+    pending-configuration — the REAL _tool_verify_plugin_state reports top-level
+    ready=False (secret unresolved) with NO integrity/binding reason, and the
+    REAL bundle sequencer must NOT treat that as a not-ready failure (no
+    compensation). Only the reload/agent/health I/O seams are stubbed — verify
+    and the sequencer's gate run for real against a real registry + store
+    artifact."""
+    import agent as agent_mod
+    import plugin_registry
+    import tools as tools_mod
+    import system_requirements.manifest as mani
+    import plugin_env_conf as pec
+    from plugin_fixtures import entry, mk_artifact
+    from plugin_store import content_checksum, write_metadata
+
+    store = tmp_path / "store"
+    reg_path = tmp_path / "registry.json"
+    # Owned entry whose (repo/ref/revision/subdir) match mk_artifact's metadata
+    # defaults (o/r, v1, git:aaa…, "") so artifact_verdict passes. The plugin's
+    # .mcp.json declares ${MTG_API_KEY} — an unresolved secret.
+    e = entry("mtg.mtg", ["specialist:mtg"])
+    e["owner"] = "specialist:mtg"
+    e["manifest_name"] = "mtg"
+    root = mk_artifact(store, "mtg.mtg", e["artifact_id"], manifest_name="mtg",
+                       mcp_servers={"s": {"env": {"K": "${MTG_API_KEY}"}}})
+    # An OWNED artifact's metadata must carry manifest_name too (artifact_verdict
+    # checks it for owned entries); mk_artifact doesn't forward it, so re-stamp
+    # the metadata with the same identity + manifest_name (content unchanged).
+    write_metadata(root, name="mtg.mtg", repo="o/r", ref="v1",
+                   revision="git:" + "a" * 40, subdir="", artifact_id=e["artifact_id"],
+                   version="1.0.0", checksum=content_checksum(root), manifest_name="mtg")
+    reg_path.write_text(
+        json.dumps({"schema_version": 1, "plugins": [e]}), encoding="utf-8")
+
+    # Redirect the production-default registry/store/manifest/env-conf reads at
+    # tmp — verify (called from the sequencer with NO test seams) uses them.
+    real_load = plugin_registry.load_registry
+    monkeypatch.setattr(plugin_registry, "load_registry",
+                        lambda path=reg_path: real_load(path))
+    monkeypatch.setattr(plugin_registry, "STORE_ROOT", store)
+    monkeypatch.setattr(mani, "MANIFEST_PATH", tmp_path / "sysreq.yaml")      # absent → no sysreqs
+    monkeypatch.setattr(pec, "PLUGIN_ENV_CONF_PATH", tmp_path / "plugin-env.conf")  # absent → secret unresolved
+    monkeypatch.delenv("MTG_API_KEY", raising=False)
+
+    # Non-verify I/O seams: no runtime, no snapshot reload, no health/notify/invalidate.
+    monkeypatch.setattr(agent_mod, "active_runtime", None, raising=False)
+    monkeypatch.setattr(plugin_registry, "reload_snapshot", lambda *a, **k: None)
+    monkeypatch.setattr(tools_mod, "_regenerate_plugin_health", lambda issues: None)
+
+    async def _notify():
+        return None
+
+    monkeypatch.setattr(tools_mod, "_notify_plugin_health_if_possible", _notify)
+    monkeypatch.setattr(tools_mod, "_invalidate_lifecycle", lambda **k: None)
+
+    seq = await tools_mod._bundle_reload_and_verify(
+        "mtg", removed_artifact_ids=[], targets_removed=[])
+
+    v = seq["verify"]["mtg.mtg"]
+    assert v["ready"] is False                       # config-pending (secret unresolved)
+    assert v["secrets"][0]["var"] == "MTG_API_KEY"
+    assert v["secrets"][0]["status"] == "unresolved"
+    assert v["reasons"] == []                         # NO integrity/binding failure
+    # ...yet the sequencer does NOT compensate — pending-config is verified-legal.
+    assert seq["not_ready"] == []
+    assert seq["ok"] is True
+
+
+@pytest.mark.asyncio
 async def test_bundle_sequencer_uninstall_evicts_and_verifies_absent(monkeypatch) -> None:
     """Whole-branch C: the uninstall sequencer runs the full agents add/EVICT
     sweep (not a single-role reconstruct) and fails the postcondition unless the
