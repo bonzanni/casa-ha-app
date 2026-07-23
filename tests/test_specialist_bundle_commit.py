@@ -200,3 +200,246 @@ def test_commit_owned_plugins_is_noop_without_a_staged_desired(tmp_path: Path) -
     write_owned_plugins(owned_plugins_path(tmp_path), _doc())
     d.commit_owned_plugins_desired_to_active()     # no desired staged
     assert read_owned_plugins(owned_plugins_path(tmp_path)) is not None
+
+
+# ===========================================================================
+# 2b — journaled bundle install transaction (pure-python against
+# commit_specialist_install with a real inspect-built receipt)
+# ===========================================================================
+
+import json as _json
+import shutil as _shutil
+
+import specialist_install
+import specialist_receipt
+
+try:
+    from tests.specialist_fixtures import write_bundled_plugin, write_minimal_component
+except ImportError:
+    from specialist_fixtures import write_bundled_plugin, write_minimal_component
+
+
+@pytest.fixture(autouse=True)
+def _fresh_registry_snapshot(tmp_path):
+    """Point the process-global plugin_registry snapshot at a fresh tmp
+    registry (mirrors tests/test_specialist_bundled_inspect.py)."""
+    plugin_registry.reload_snapshot(registry_path=tmp_path / "snap-registry.json",
+                                    store_root=tmp_path / "snap-store")
+    yield
+
+
+def _subdir_stub(component_root: Path):
+    """A resolve_and_fetch stub that respects `subdir` — copies
+    `component_root/subdir` (or the whole tree when subdir is empty) into
+    `dest`, exactly like a real fetch of `repo@ref:subdir`."""
+    def _stub(repo, ref, subdir, dest, *, expected_revision=None):
+        src = component_root / subdir if subdir else component_root
+        _shutil.copytree(src, dest)
+        return "a" * 40
+    return _stub
+
+
+class _Ctx:
+    def __init__(self, **kw):
+        self.__dict__.update(kw)
+
+
+def _prep(tmp_path: Path, monkeypatch, *, with_plugin: bool = True,
+          slug: str = "mtg", ack: bool = True):
+    """Build a component (optionally with a bundled `mtg` plugin), inspect it
+    (stubbed fetch), load its receipt, and record consent. Returns a context
+    with everything commit_specialist_install needs."""
+    from specialist_install_consent import SpecialistInstallAckStore, install_consent_identity
+    from specialist_registry import InstalledSpecialistIndex
+
+    comp, mpath = write_minimal_component(tmp_path, slug=slug)
+    if with_plugin:
+        digest = write_bundled_plugin(comp, "mtg")
+        manifest = _json.loads(mpath.read_text(encoding="utf-8"))
+        manifest["dependencies"].append({
+            "kind": "plugin/implementation", "identifier": "mtg", "digest": digest,
+            "source": {"type": "bundled", "path": "plugins/mtg"},
+        })
+        mpath.write_text(_json.dumps(manifest), encoding="utf-8")
+
+    monkeypatch.setattr(specialist_install, "resolve_and_fetch", _subdir_stub(comp))
+    idx = InstalledSpecialistIndex(specialists_dir=str(tmp_path / "installed-index"))
+    idx.load()
+    inspection = specialist_install.inspect_specialist_repo(
+        "org/repo", "main", staging_root=tmp_path / "staging",
+        installed_index=idx, receipts_dir=tmp_path / "receipts")
+    receipt = specialist_receipt.load(inspection.receipt_id, receipts_dir=tmp_path / "receipts")
+    assert receipt is not None
+
+    acks = SpecialistInstallAckStore(path=tmp_path / "acks.json")
+    if ack:
+        identity = install_consent_identity(
+            component_id=inspection.component_id, version=inspection.version,
+            root_digest=inspection.root_digest, slug=inspection.slug,
+            receipt_digest=inspection.receipt_digest)
+        acks.record(identity=identity, component_id=inspection.component_id,
+                    version=inspection.version, component_checksum=inspection.root_digest,
+                    slug=inspection.slug, receipt_digest=inspection.receipt_digest)
+
+    return _Ctx(
+        comp=comp, inspection=inspection, receipt=receipt, acks=acks, slug=slug,
+        kw=dict(
+            inspection=inspection, receipt=receipt, config={},
+            secret_names_provided=frozenset(), acks=acks,
+            specialists_dir=tmp_path / "specialists",
+            agents_specialists_dir=tmp_path / "agents",
+            registry_path=tmp_path / "registry.json",
+            plugin_store_root=tmp_path / "store",
+            ops_dir=tmp_path / "ops"),
+    )
+
+
+def _owned(reg_path: Path, slug: str) -> list[dict]:
+    data = plugin_registry.load_registry(reg_path)
+    return plugin_registry.owned_entries_for(slug, data)
+
+
+def test_bundle_install_happy_path(tmp_path: Path, monkeypatch) -> None:
+    from personality_binding import owned_plugins_path, read_owned_plugins
+
+    ctx = _prep(tmp_path, monkeypatch)
+    instance, txn = specialist_install.commit_specialist_install(**ctx.kw)
+
+    assert instance.state == "active"
+    # owned entry appears with owner + manifest_name + scoped name + target
+    owned = _owned(ctx.kw["registry_path"], "mtg")
+    assert len(owned) == 1
+    e = owned[0]
+    assert e["name"] == "mtg.mtg" and e["manifest_name"] == "mtg"
+    assert e["owner"] == "specialist:mtg" and e["targets"] == ["specialist:mtg"]
+    # artifact published to the store under the scoped name
+    assert (tmp_path / "store" / "mtg.mtg" / e["artifact_id"]).is_dir()
+    # sidecar written (active generation) with the owned plugin + provenance
+    sidecar = read_owned_plugins(owned_plugins_path(tmp_path / "specialists" / "mtg"))
+    assert sidecar["plugins"][0]["name"] == "mtg.mtg"
+    assert sidecar["component_source"]["repo"] == "org/repo"
+    # sync phase leaves the journal in-progress+committed; the TOOL layer
+    # completes it after the sequencer (2e). txn carries its path + artifacts.
+    assert Path(txn.journal_path).is_file()
+    payload = _json.loads(Path(txn.journal_path).read_text())
+    assert payload["state"] == "in-progress" and "committed" in payload["steps_done"]
+    assert txn.new_artifact_ids == (e["artifact_id"],)
+    assert txn.removed_artifact_ids == ()
+
+
+def test_bundle_install_refuses_without_consent(tmp_path: Path, monkeypatch) -> None:
+    ctx = _prep(tmp_path, monkeypatch, ack=False)
+    with pytest.raises(specialist_install.SpecialistInstallError) as ei:
+        specialist_install.commit_specialist_install(**ctx.kw)
+    assert ei.value.kind == "consent_missing"
+    assert _owned(ctx.kw["registry_path"], "mtg") == []
+
+
+def test_bundle_install_receipt_drift_on_mutated_tree(tmp_path: Path, monkeypatch) -> None:
+    ctx = _prep(tmp_path, monkeypatch)
+    # Tamper the staged plugin tree AND make recovery reproduce the drift.
+    staged_plugin = ctx.inspection.staged_dir / "plugins" / "mtg"
+    (staged_plugin / "tampered.txt").write_text("x", encoding="utf-8")
+    monkeypatch.setattr(specialist_install, "resolve_and_fetch",
+                        _subdir_stub(ctx.inspection.staged_dir))
+    with pytest.raises(specialist_install.SpecialistInstallError) as ei:
+        specialist_install.commit_specialist_install(**ctx.kw)
+    assert ei.value.kind == "receipt_drift"
+    assert _owned(ctx.kw["registry_path"], "mtg") == []       # registry untouched
+
+
+def test_bundle_install_published_vs_attested_tamper(tmp_path: Path, monkeypatch) -> None:
+    import plugin_store
+    ctx = _prep(tmp_path, monkeypatch)
+    monkeypatch.setattr(plugin_store, "read_metadata",
+                        lambda root: {"content_checksum": "deadbeef"})
+    with pytest.raises(specialist_install.SpecialistInstallError) as ei:
+        specialist_install.commit_specialist_install(**ctx.kw)
+    assert ei.value.kind == "receipt_drift"
+    assert _owned(ctx.kw["registry_path"], "mtg") == []       # rolled back
+    assert list((tmp_path / "ops").glob("*.json")) == []      # journal completed
+
+
+def test_bundle_install_post_swap_failure_rolls_back(tmp_path: Path, monkeypatch) -> None:
+    import personality_binding
+    ctx = _prep(tmp_path, monkeypatch)
+    orig = personality_binding.InstanceDir.commit_desired_to_active
+
+    def _boom(self):
+        raise RuntimeError("tuple commit exploded")
+
+    monkeypatch.setattr(personality_binding.InstanceDir, "commit_desired_to_active", _boom)
+    with pytest.raises(RuntimeError):
+        specialist_install.commit_specialist_install(**ctx.kw)
+    # registry restored (owned entry removed) + journal pruned
+    assert _owned(ctx.kw["registry_path"], "mtg") == []
+    assert list((tmp_path / "ops").glob("*.json")) == []
+    monkeypatch.setattr(personality_binding.InstanceDir, "commit_desired_to_active", orig)
+
+
+def test_bundle_install_pending_config_keeps_owned_entries(tmp_path: Path, monkeypatch) -> None:
+    from personality_binding import owned_plugins_desired_path, read_owned_plugins
+    import specialist_lifecycle
+    ctx = _prep(tmp_path, monkeypatch)
+    monkeypatch.setattr(specialist_lifecycle, "satisfy_config",
+                        lambda **kw: (False, ["API_KEY"]))
+    instance, txn = specialist_install.commit_specialist_install(**ctx.kw)
+
+    assert instance.state == "pending-configuration"
+    # owned entries STILL registered (activate at commit regardless)
+    assert len(_owned(ctx.kw["registry_path"], "mtg")) == 1
+    # sidecar staged as DESIRED (picked up on a later activation rotation)
+    desired = read_owned_plugins(owned_plugins_desired_path(tmp_path / "specialists" / "mtg"))
+    assert desired is not None and desired["plugins"][0]["name"] == "mtg.mtg"
+    # sync phase leaves the journal in-progress+committed (tool completes it)
+    assert Path(txn.journal_path).is_file()
+
+
+def test_bundle_install_plugin_less_component(tmp_path: Path, monkeypatch) -> None:
+    from personality_binding import owned_plugins_path, read_owned_plugins
+    ctx = _prep(tmp_path, monkeypatch, with_plugin=False)
+    assert ctx.receipt.plugins == ()
+    instance, txn = specialist_install.commit_specialist_install(**ctx.kw)
+
+    assert instance.state == "active"
+    assert _owned(ctx.kw["registry_path"], "mtg") == []       # no owned plugins
+    # sidecar STILL written: plugins:[] with a real component_source
+    sidecar = read_owned_plugins(owned_plugins_path(tmp_path / "specialists" / "mtg"))
+    assert sidecar["plugins"] == []
+    assert sidecar["component_source"]["repo"] == "org/repo"
+
+
+def test_bundle_install_recovers_vanished_staging(tmp_path: Path, monkeypatch) -> None:
+    ctx = _prep(tmp_path, monkeypatch)
+    # Wipe ALL staging post-consent; commit must recover from the receipt.
+    _shutil.rmtree(ctx.inspection.staged_dir, ignore_errors=True)
+    # recovery fetch reproduces the ORIGINAL (clean) component bytes
+    monkeypatch.setattr(specialist_install, "resolve_and_fetch", _subdir_stub(ctx.comp))
+    instance, txn = specialist_install.commit_specialist_install(**ctx.kw)
+
+    assert instance.state == "active"
+    owned = _owned(ctx.kw["registry_path"], "mtg")
+    assert len(owned) == 1 and owned[0]["name"] == "mtg.mtg"
+
+
+def test_bundle_crash_reconcile_restores(tmp_path: Path, monkeypatch) -> None:
+    """A half-applied bundle op (owned entry swapped in, journal still
+    in-progress) is rolled back by reconcile_boot."""
+    import specialist_bundle_journal
+    ctx = _prep(tmp_path, monkeypatch)
+    reg = ctx.kw["registry_path"]
+    # simulate the swap having happened with NO prior owned set...
+    entry = _owned_entry("mtg", "mtg")
+    plugin_registry.apply_owned_swap(slug="mtg", new_entries=[entry], registry_path=reg)
+    assert len(_owned(reg, "mtg")) == 1
+    # ...and an in-progress journal capturing the empty before-state.
+    specialist_bundle_journal.begin(
+        "install", "mtg", before_entries=[], before_tuple_files={},
+        ack_records=[], ops_dir=tmp_path / "ops2")
+
+    actions = specialist_bundle_journal.reconcile_boot(
+        ops_dir=tmp_path / "ops2", registry_path=reg,
+        specialists_dir=tmp_path / "specialists", acks_path=tmp_path / "acks.json")
+
+    assert actions == [{"slug": "mtg", "action": "rolled_back"}]
+    assert _owned(reg, "mtg") == []                            # owned entry removed
