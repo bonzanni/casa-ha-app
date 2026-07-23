@@ -11,9 +11,17 @@ Remove the matching entry. Leave `delegates: []` if it was the last.
 - Unwiring an INSTALLED specialist being removed: recipes/specialist/uninstall.md handles it.
 - Unwiring because this resident shouldn't delegate (but another does): confirm which resident.
 
-## Reload — MANDATORY before emit_completion
+## Finishing — depends on HOW you got here
 
-`delegates.yaml` is part of the resident's AgentConfig — use the
+**As a SUBROUTINE of a larger recipe** (e.g. `specialist/uninstall.md` step 1
+sends you here to unwire before removing the specialist): do ONLY the
+`delegates.yaml` edit above, then RETURN to the calling recipe. Do NOT commit,
+reload, or `emit_completion` here — the caller performs a SINGLE commit +
+reload + `emit_completion` for the whole operation. Calling `emit_completion`
+here would terminate the engagement mid-uninstall.
+
+**As a STANDALONE request** (the user directly asked to unwire and nothing
+else): `delegates.yaml` is part of the resident's AgentConfig — use the
 `agent` scope for that role. Canonical order:
 
     config_git_commit(message="unwire <target> from <resident>'s delegates")

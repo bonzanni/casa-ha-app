@@ -19,9 +19,9 @@ Everything you edit lives under `/config/`:
           system.md
           <trigger-name>.md        # one per scheduled/webhook trigger
       specialists/
-        <role>/                    # tier 2 (e.g. finance)
-          character.yaml
-          runtime.yaml
+        <slug>/                    # tier 2 (e.g. finance) — MANAGED, do NOT hand-edit:
+          character.yaml           # materialized/symlinked by the install pipeline
+          runtime.yaml             # from /config/specialists/<slug>/ (see note below)
           response_shape.yaml
           voice.yaml
           hooks.yaml               # optional
@@ -40,12 +40,24 @@ Everything you edit lives under `/config/`:
 
 Read-only to you (hook-blocked): `/data/**` (runtime state), `/config/schema/**`, `/opt/casa/**`.
 
+**Installed specialists are managed, not hand-authored.** A specialist you
+install lives in a separate content-addressed tree at `/config/specialists/<slug>/`
+(an `active.yaml` tuple pinning component-id / version / root-digest, plus the
+compiled bundle in the store). The install pipeline materializes/symlinks it into
+`agents/specialists/<slug>/` for the loader — you never create or edit those files
+by hand. `managed_component_guard` denies raw Write/Edit/Bash writes under
+`/config/agents/specialists/`, `/config/specialists/`, `/config/personas/`, and
+`/config/plugins/`. Add, upgrade, or remove a specialist ONLY through the pipeline
+tools (`recipes/specialist/install.md`, `recipes/specialist/upgrade.md`,
+`recipes/specialist/uninstall.md`). Legacy hand-authored specialist directories are
+refused by the loader — `recipes/specialist/create.md` is a retired stub.
+
 ## Tier taxonomy
 
 | Tier | Name | What it is | Where it lives |
 |---|---|---|---|
 | 1 | Resident | Long-lived agent owning a channel (Ellen=telegram+voice, Tina=voice). Has memory budget, delegates (to residents and specialists). | agents/<role>/ |
-| 2 | Specialist | Role-keyed helper (e.g. finance/Alex). Called by residents via delegate_to_agent. No channel, ephemeral session. | agents/specialists/<role>/ |
+| 2 | Specialist | Role-keyed helper (e.g. finance/Alex). Called by residents via delegate_to_agent. No channel, ephemeral session. Installed from a repository via the pipeline; managed, not hand-edited. | agents/specialists/<slug>/ (materialized from /config/specialists/<slug>/) |
 | 3 | Executor | Task-bounded, ephemeral agent (e.g. you - configurator). Engaged via engage_executor. Runs in a dedicated Telegram topic. | agents/executors/<type>/ |
 
 Any resident may delegate (`delegate_to_agent`) to any other agent listed in its `delegates.yaml`. Only the assistant (Ellen) may engage executors via `executors.yaml`.

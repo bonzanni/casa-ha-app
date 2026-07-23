@@ -12,7 +12,7 @@ addon. For changes that genuinely need a process restart, use
 | `triggers` | `casa_reload_triggers(role=...)` | <1s | yes | triggers.yaml edits for an EXISTING agent (legacy alias for `casa_reload(scope='triggers', role=...)`) |
 | `policies` | `casa_reload(scope='policies')` | <1s | no | `policies/disclosure.yaml` edits |
 | `plugin_env` | `casa_reload(scope='plugin_env')` | <1s | no | `set_plugin_env_reference` calls / `plugin-env.conf` edits |
-| `agents` | `casa_reload(scope='agents')` | <1s | no | created or deleted ANY resident or specialist directory under `agents/` |
+| `agents` | `casa_reload(scope='agents')` | <1s | no | a specialist install/uninstall (pipeline) materialized or removed a specialist directory under `agents/specialists/`; also a persona-apply on a specialist |
 | `executors` | `casa_reload(scope='executors')` | <1s | no | executor `definition.yaml` edits; create/delete an executor; flip `enabled` / `permission_mode` / `tools.allowed` on an executor |
 | `config_sync` | `casa_reload(scope='config_sync')` | <1s | no | re-run the default-sync reconciler live (adds/updates from image defaults), then cascades `agents` + `policies` reloads |
 | `full` | `casa_reload(scope='full')` | <1s | no | catch-all when unsure or multiple categories edited |
@@ -38,8 +38,8 @@ changes, addon options.json mutations, or kernel concerns.
 | Edit an executor's `definition.yaml` | `executors` |
 | Create or delete an executor | `executors` |
 | Edit an executor's `prompt.md` / `observer.yaml` / `doctrine/*` | none (lazy-read per turn); `hooks.yaml` is NOT editable by you (see above) |
-| Create a NEW resident or specialist | `agents` |
-| Delete a resident or specialist | `agents` |
+| Install a specialist (pipeline) — new `agents/specialists/<slug>/` | `agents` — REQUIRED explicitly after `config_git_commit`; `specialist_install_commit` does NOT reload (see `recipes/specialist/install.md`) |
+| Uninstall a specialist (pipeline) — removed `agents/specialists/<slug>/` | `agents` — REQUIRED explicitly after `config_git_commit`; `specialist_uninstall` does NOT reload (see `recipes/specialist/uninstall.md`) |
 | `plugin_add`/`plugin_update`/`plugin_assign`/`plugin_unassign`/`plugin_remove` | none — the tool self-sequences its own reload + verify (§3.9) |
 | `set_plugin_env_reference` | `plugin_env` |
 | Multiple categories edited in one engagement | `full` |
@@ -67,7 +67,7 @@ your subprocess being killed mid-emission.
 - Touched only triggers for one agent → `triggers`.
 - Touched a single role's other YAMLs → `agent` for that role.
 - Touched policies/*.yaml → `policies`.
-- Created or deleted an agent → `agents`.
+- Installed or uninstalled a specialist via the pipeline → call `casa_reload(scope="agents")` yourself after `config_git_commit` (the install/uninstall tools do NOT reload; only the `plugin_*` tools self-sequence their own reload).
 - Edited an executor's `definition.yaml` (enable / permission_mode / allowed tools / model) → `executors`.
 - Created or deleted an executor → `executors`.
 - Touched `plugin-env.conf` (via `set_plugin_env_reference`) → `plugin_env`.

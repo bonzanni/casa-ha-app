@@ -1,6 +1,26 @@
 # Changelog
 
-## [0.102.0] - 2026-07-23
+## [0.103.0] - 2026-07-23
+
+### Fixed
+
+- **The assistant can now install specialists, plugins, and personas from their
+  repositories.** Its routing guidance still described the pre-install-from-repo
+  world and literally told it to say installing a component "is not yet
+  supported" — so a request like "install the finance specialist from its repo"
+  was declined instead of handed to the configurator. The doctrine is
+  reconciled: repository installs (and specialist upgrades/rollbacks/uninstalls,
+  plugin add/update/remove, and persona install/apply/reset) route to the
+  configurator, while building a brand-new plugin from scratch still routes to
+  the plugin-developer — the two are kept clearly distinct, and read-only
+  configuration questions are still answered directly.
+- Reconciled several stale configurator instructions to match how the system
+  actually works today: installed specialists are managed components (not
+  hand-edited directories), specialist install/uninstall require an explicit
+  reload, wiring/unwiring a delegate during an install/uninstall no longer ends
+  the task early, and the install recipes no longer tell the operator to send a
+  second message after approving — a single approval now carries the install
+  through (v0.102.0).
 
 ### Fixed
 

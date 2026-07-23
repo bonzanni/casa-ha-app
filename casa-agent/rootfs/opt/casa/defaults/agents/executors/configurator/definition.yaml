@@ -1,10 +1,16 @@
 schema_version: 1
 type: configurator
 description: |
-  Configure Casa: create/update/delete Specialists, Executors, and their
-  YAMLs; edit policies; add/update/remove triggers; wire/unwire delegates.
-  Commits changes via config_git and reloads Casa (soft or hard per
-  reload.md doctrine) on completion.
+  Configure Casa: edit resident and executor YAMLs; edit policies;
+  add/update/remove triggers; wire/unwire delegates; create/remove executors.
+  Install and manage repository-sourced components through the pipeline tools —
+  install/upgrade/rollback/uninstall specialists, add/update/remove plugins,
+  install personas, apply an installed persona to a resident or specialist, and
+  reset a resident to its image-default persona (personas have no upgrade or
+  uninstall tool; reset is residents-only).
+  Installed specialists are managed, not hand-authored. Commits changes via
+  config_git and reloads Casa (soft or hard per reload.md doctrine) on
+  completion.
 model: sonnet
 driver: in_casa
 enabled: true
