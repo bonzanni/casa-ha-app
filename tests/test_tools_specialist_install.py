@@ -315,7 +315,7 @@ import asyncio
 from types import SimpleNamespace
 
 
-def _fake_inspection(tmp_path, *, plugin_resolutions=()):
+def _fake_inspection(tmp_path, *, plugin_resolutions=(), receipt_digest=""):
     return SimpleNamespace(
         component_id="casa.spec.mtg", version="1.0.0", slug="mtg",
         component_checksum="sha256:" + "a" * 64,
@@ -329,12 +329,18 @@ def _fake_inspection(tmp_path, *, plugin_resolutions=()):
         # populates these (specialist_install.py InspectionResult) — every
         # fake here mirrors that so the ok_payload's receipt_id/
         # receipt_digest/plugins wiring is exercised the same as production.
-        receipt_id="d" * 32, receipt_digest="",
+        # `receipt_digest` defaults to "" (legacy-shaped fake) but callers
+        # exercising the fix-round-1 (task-13) pre-auth identity fix pass a
+        # real digest — specialist_receipt.compute_receipt_digest's own
+        # docstring: a REAL inspect_specialist_repo call ALWAYS issues a
+        # non-empty receipt_digest, plugins or not.
+        receipt_id="d" * 32, receipt_digest=receipt_digest,
         plugin_resolutions=plugin_resolutions,
     )
 
 
-def _wire_inspect(monkeypatch, tmp_path, *, channel=None, plugin_resolutions=()):
+def _wire_inspect(monkeypatch, tmp_path, *, channel=None, plugin_resolutions=(),
+                   receipt_digest=""):
     """Patch the network/disk seams: inspect returns a fake staged result,
     the ack store lives under tmp_path (never /data), and _channel_manager
     serves ``channel`` (None = no telegram channel configured)."""
@@ -343,7 +349,8 @@ def _wire_inspect(monkeypatch, tmp_path, *, channel=None, plugin_resolutions=())
     from specialist_install_consent import SpecialistInstallAckStore
     import tools as tools_mod
 
-    fake = _fake_inspection(tmp_path, plugin_resolutions=plugin_resolutions)
+    fake = _fake_inspection(
+        tmp_path, plugin_resolutions=plugin_resolutions, receipt_digest=receipt_digest)
     monkeypatch.setattr(
         specialist_install, "inspect_specialist_repo", lambda *a, **k: fake)
     tmp_acks = tmp_path / "acks.json"
@@ -417,6 +424,134 @@ async def test_inspect_with_preacked_ledger_skips_keyboard(
     assert payload["ok"] is True
     assert payload["consent"] == "pre_authorized"
     assert payload["root_digest"] == fake.root_digest
+
+
+@pytest.mark.asyncio
+async def test_inspect_preacked_with_receipt_digest_is_pre_authorized(
+    monkeypatch, tmp_path,
+) -> None:
+    """Fix round 1 (task-13 e2e finding): a REAL inspect_specialist_repo call
+    ALWAYS issues a non-empty receipt_digest (specialist_receipt.compute_
+    receipt_digest — plugins or not), and the consent-record path
+    (prompt_specialist_install_consent's _on_commit_sync) and the commit/
+    upgrade consent gates (specialist_install.py) all bind receipt_digest
+    into the identity. Before this fix, specialist_install_inspect's own
+    pre-auth check computed the identity WITHOUT receipt_digest, so an ack
+    recorded (the normal way, with the digest) was never recognized here —
+    the keyboard re-posted, and in a Telegram-less container this fell all
+    the way to consent_channel_unavailable. Record the ack exactly the way
+    _on_commit_sync does (WITH receipt_digest) and assert inspect now
+    recognizes it as pre-authorized with no keyboard attempt."""
+    import specialist_install_consent
+    from specialist_install_consent import install_consent_identity
+    from tools import specialist_install_inspect
+
+    receipt_digest = "sha256:" + "f" * 64
+    fake, tmp_store_cls = _wire_inspect(
+        monkeypatch, tmp_path, channel=None, receipt_digest=receipt_digest)
+    identity = install_consent_identity(
+        component_id=fake.component_id, version=fake.version,
+        root_digest=fake.root_digest, slug=fake.slug, receipt_digest=receipt_digest)
+    tmp_store_cls().record(
+        identity=identity, component_id=fake.component_id, version=fake.version,
+        component_checksum=fake.root_digest, slug=fake.slug, receipt_digest=receipt_digest)
+
+    def _must_not_post(**kwargs):
+        raise AssertionError("keyboard must not be attempted on a pre-acked install")
+
+    monkeypatch.setattr(
+        specialist_install_consent, "prompt_specialist_install_consent", _must_not_post)
+
+    payload = _payload(await specialist_install_inspect.handler(
+        {"repo": "owner/repo", "ref": "main"}))
+    assert payload["ok"] is True
+    assert payload["consent"] == "pre_authorized"
+    assert payload["receipt_digest"] == receipt_digest
+
+
+@pytest.mark.asyncio
+async def test_inspect_legacy_ack_without_receipt_digest_fails_closed(
+    monkeypatch, tmp_path,
+) -> None:
+    """Converse of the fix above: an ack recorded the OLD/legacy way — its
+    identity computed WITHOUT receipt_digest, e.g. by the pre-fix buggy
+    inspect code, or a genuinely pre-Task-7 ack — must NOT satisfy a fresh
+    inspection that carries a real (non-empty) receipt_digest. Fail-closed:
+    the ledger lookup misses, so the tool falls through past the
+    pre-authorized branch to the keyboard-post attempt; with no telegram
+    channel wired that surfaces as consent_channel_unavailable rather than
+    silently treating a digest-less legacy ack as covering the bundled
+    closure."""
+    from specialist_install_consent import install_consent_identity
+    from tools import specialist_install_inspect
+
+    receipt_digest = "sha256:" + "f" * 64
+    fake, tmp_store_cls = _wire_inspect(
+        monkeypatch, tmp_path, channel=None, receipt_digest=receipt_digest)
+    legacy_identity = install_consent_identity(
+        component_id=fake.component_id, version=fake.version,
+        root_digest=fake.root_digest, slug=fake.slug)  # no receipt_digest — legacy shape
+    tmp_store_cls().record(
+        identity=legacy_identity, component_id=fake.component_id, version=fake.version,
+        component_checksum=fake.root_digest, slug=fake.slug)  # no receipt_digest recorded either
+
+    payload = _payload(await specialist_install_inspect.handler(
+        {"repo": "owner/repo", "ref": "main"}))
+    assert payload["ok"] is False
+    assert payload["kind"] == "consent_channel_unavailable"
+    assert "consent" not in payload
+
+
+@pytest.mark.asyncio
+async def test_preacked_receipt_digest_identity_also_satisfies_real_commit(
+    tmp_path,
+) -> None:
+    """Round-trips the fix: the SAME ack (identity computed WITH
+    receipt_digest, exactly as inspect now records/checks it) also satisfies
+    the real commit_specialist_install consent gate — proving the
+    follow-on commit succeeds once inspect's pre-auth check stops rejecting
+    a receipt-digest-bound ack. Uses a hand-built InspectionResult (receipt=
+    None keeps commit_specialist_install on its legacy, non-bundle-journal
+    path) since only the consent-identity gate is under test here."""
+    from test_specialist_install import _write_component
+    from specialist_component import load_specialist_component
+    from specialist_install import (
+        InspectionResult, commit_specialist_install, compute_install_root_digest,
+        resolve_dependency_closure,
+    )
+    from specialist_install_consent import SpecialistInstallAckStore, install_consent_identity
+
+    staged = _write_component(tmp_path / "staged", slug="mtg")
+    component = load_specialist_component(staged, staged / "manifest.json")
+    deps = resolve_dependency_closure(component, staged)
+    root_digest = compute_install_root_digest(
+        component, deps, manifest_bytes=(staged / "manifest.json").read_bytes())
+    receipt_digest = "sha256:" + "f" * 64
+
+    inspection = InspectionResult(
+        component_id=component.component_id, version=component.version, slug=component.slug,
+        component_checksum=component.checksum, root_digest=root_digest,
+        mission=str(component.role.role["mission"]),
+        default_persona_ref=component.default_persona_ref,
+        default_persona_checksum=component.default_persona_checksum,
+        required_config_names=(), required_secret_names=(), dependencies=deps,
+        staged_dir=staged, receipt_digest=receipt_digest,
+    )
+    acks = SpecialistInstallAckStore(path=tmp_path / "acks.json")
+    identity = install_consent_identity(
+        component_id=inspection.component_id, version=inspection.version,
+        root_digest=inspection.root_digest, slug=inspection.slug,
+        receipt_digest=inspection.receipt_digest)
+    acks.record(identity=identity, component_id=inspection.component_id,
+                version=inspection.version, component_checksum=inspection.root_digest,
+                slug=inspection.slug, receipt_digest=inspection.receipt_digest)
+
+    instance = commit_specialist_install(
+        inspection=inspection, receipt=None, config={}, secret_names_provided=frozenset(),
+        acks=acks, specialists_dir=tmp_path / "specialists",
+        agents_specialists_dir=tmp_path / "agents-specialists",
+    )
+    assert instance.state == "active"
 
 
 @pytest.mark.asyncio

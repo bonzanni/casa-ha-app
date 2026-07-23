@@ -6970,11 +6970,18 @@ async def specialist_install_inspect(args: dict) -> dict:
     # refused / async delivery failed) — the flow then stranded forever at
     # commit's consent_missing with zero diagnosis. Now: (1) if the ack
     # ledger ALREADY holds a consent for this EXACT identity — the same
-    # install_consent_identity(component_id, version, root_digest, slug)
-    # binding specialist_install_commit re-validates against re-staged
-    # bytes — no keyboard is required or attempted (preserves the
-    # pre-authorized/synthetic-ack path and the Telegram-less container
-    # e2e); (2) otherwise the post is VERIFIED via the coordinator's
+    # install_consent_identity(component_id, version, root_digest, slug,
+    # receipt_digest) binding specialist_install_commit/upgrade_specialist
+    # re-validate against re-staged bytes — no keyboard is required or
+    # attempted (preserves the pre-authorized/synthetic-ack path and the
+    # Telegram-less container e2e). Fix round 1 (task-13 e2e finding): this
+    # identity used to omit `receipt_digest`, so an ack recorded WITH a
+    # receipt digest (the consent-prompt and commit/upgrade gates all include
+    # it) was never recognized as pre-authorized here — the keyboard would
+    # re-post even though an operator had already approved this exact
+    # bundled-plugin closure. Now threads `result.receipt_digest` through so
+    # this identity matches what every other call site computes.
+    # (2) otherwise the post is VERIFIED via the coordinator's
     # settled-post machinery (ChallengeHandle.settled_post, authz_grants) and
     # every failure is a STRUCTURED ok:false the recipe reports verbatim.
     from specialist_install_consent import (
@@ -7016,6 +7023,7 @@ async def specialist_install_inspect(args: dict) -> dict:
     identity = install_consent_identity(
         component_id=result.component_id, version=result.version,
         root_digest=result.root_digest, slug=result.slug,
+        receipt_digest=result.receipt_digest,
     )
     if acks.is_acked(identity):
         # Spec §E: consent = "pre_authorized" | "keyboard_posted" on ok:true.
