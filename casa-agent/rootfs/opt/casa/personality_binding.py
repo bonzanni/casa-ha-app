@@ -436,6 +436,33 @@ class OwnedPluginsSidecarError(ValueError):
     than silently discard the prior owned set as if it were empty."""
 
 
+def _valid_owned_source(source: object) -> bool:
+    """P2: an owned row's `source` sub-mapping, per the sidecar contract
+    written by `_owned_sidecar_doc`/`_owned_entry_for` (specialist_install.py)
+    — always `{"type": "github", "repo", "ref", "revision", "subdir"}`. A
+    non-mapping (or field-incomplete) `source` must fail validation HERE so
+    `read_owned_plugins` raises the typed `OwnedPluginsSidecarError` — leaving
+    it unchecked lets a bogus `source` (e.g. a bare string) pass `_valid_owned_row`
+    and then blow up later as an untyped exception where a caller (rollback's
+    `_prior_owned_entry`) indexes `src["repo"]`/`src["ref"]`/`src["revision"]`."""
+    if not isinstance(source, dict):
+        return False
+    if source.get("type") != "github":
+        return False
+    for key in ("repo", "ref", "revision"):
+        if not isinstance(source.get(key), str) or not source[key]:
+            return False
+    if not isinstance(source.get("subdir", ""), str):
+        return False
+    if not plugin_registry.REVISION_RE.match(source["revision"]):
+        return False
+    try:
+        plugin_registry.normalize_subdir(source.get("subdir", ""))
+    except ValueError:
+        return False
+    return True
+
+
 def _valid_owned_row(row: object) -> bool:
     if not isinstance(row, dict):
         return False
@@ -449,6 +476,8 @@ def _valid_owned_row(row: object) -> bool:
     if not isinstance(mname, str) or name.partition(".")[2] != mname:
         return False
     if not isinstance(row.get("version", ""), str):
+        return False
+    if not _valid_owned_source(row.get("source")):
         return False
     return True
 

@@ -1857,10 +1857,12 @@ def upgrade_specialist(
                 registry_path=registry_path, specialists_dir=specialists_dir,
                 acks_path=acks.path)
         except BaseException:
-            try:
-                rollback_txn.rollback_disk()
-            finally:
-                specialist_bundle_journal.complete(journal)
+            # P1-1: complete the journal ONLY after a SUCCESSFUL rollback. A
+            # rollback that raises leaves the in-progress journal on disk so boot
+            # reconciliation re-runs it (or quarantines the slug) — completing here
+            # would strand a half-rolled-back mutation with no recovery.
+            rollback_txn.rollback_disk()
+            specialist_bundle_journal.complete(journal)
             raise
     finally:
         shutil.rmtree(workspace, ignore_errors=True)

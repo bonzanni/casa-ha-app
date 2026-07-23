@@ -531,6 +531,48 @@ def test_bundle_upgrade_failing_preflight_leaves_old_generation(tmp_path: Path, 
     assert len(owned) == 1 and owned[0]["artifact_id"] == v1_aid
 
 
+def test_upgrade_sync_phase_rollback_failure_leaves_journal_in_progress(
+    tmp_path: Path, monkeypatch,
+) -> None:
+    """P1-1 (upgrade sync phase): mirrors
+    test_sync_phase_rollback_failure_leaves_journal_in_progress for the
+    UPGRADE handler — the upgrade sync-phase failure handler must use the
+    same rollback-then-complete ordering as install/rollback/uninstall: a
+    sync-phase failure whose rollback_disk() ITSELF raises must NOT complete
+    the journal — it stays in-progress on disk so boot reconciliation
+    re-runs the rollback (or quarantines the slug). Completing it regardless
+    (the old try/finally) would strand a half-rolled-back mutation with no
+    recovery."""
+    import personality_binding
+    from specialist_bundle_journal import BundleTxn
+
+    ctx = _prep(tmp_path, monkeypatch)
+    specialist_install.commit_specialist_install(**ctx.kw)
+    kw2 = _prep_v2(tmp_path, monkeypatch, ctx)
+
+    def _boom_commit(self):
+        raise RuntimeError("tuple commit exploded")
+
+    def _boom_rollback(self):
+        raise RuntimeError("registry unreadable — rollback failed")
+
+    monkeypatch.setattr(personality_binding.InstanceDir,
+                        "commit_desired_to_active", _boom_commit)
+    monkeypatch.setattr(BundleTxn, "rollback_disk", _boom_rollback)
+
+    before_journals = set((tmp_path / "ops").glob("*.json"))
+
+    with pytest.raises(RuntimeError):
+        specialist_install.upgrade_specialist(**kw2)
+
+    # A NEW journal was created for the upgrade attempt, and it was NOT
+    # completed — the in-progress file survives for boot reconcile.
+    new_journals = set((tmp_path / "ops").glob("*.json")) - before_journals
+    assert len(new_journals) == 1
+    payload = _json.loads(next(iter(new_journals)).read_text())
+    assert payload["state"] == "in-progress"
+
+
 def test_bundle_rollback_restores_prior_owned_rows(tmp_path: Path, monkeypatch) -> None:
     ctx = _prep(tmp_path, monkeypatch)
     specialist_install.commit_specialist_install(**ctx.kw)
@@ -662,9 +704,17 @@ def test_read_owned_plugins_distinguishes_absent_from_malformed(tmp_path: Path) 
 
     # A present file missing schema_version / component_source (the pre-fix
     # "valid-empty" shapes that used to slip through as a bare dict) now raises.
+    # P2: a row whose `source` is a non-mapping ("bogus") must ALSO raise here
+    # rather than pass row validation and blow up later as an untyped
+    # exception in a caller that indexes src["repo"]/src["ref"]/src["revision"]
+    # (rollback's `_prior_owned_entry`).
     for bad in ({}, {"schema_version": 2, "component_source": {}, "plugins": []},
                 {"schema_version": 1, "plugins": []},           # no component_source
-                {"schema_version": 1, "component_source": {}}): # no plugins list
+                {"schema_version": 1, "component_source": {}},  # no plugins list
+                {"schema_version": 1, "component_source": {}, "plugins": [
+                    {"name": "mtg.mtg", "manifest_name": "mtg", "version": "1.0.0",
+                     "artifact_id": "a" * 64, "source": "bogus"},
+                ]}):
         p.write_text(_json.dumps(bad), encoding="utf-8")
         with pytest.raises(OwnedPluginsSidecarError):
             read_owned_plugins(p)
@@ -702,6 +752,30 @@ def test_rollback_refuses_a_malformed_prior_sidecar(tmp_path: Path, monkeypatch)
             plugin_store_root=tmp_path / "store", ops_dir=tmp_path / "ops")
     assert ei.value.kind == "rollback_sidecar_invalid"
     # active generation untouched (still v2) — refusal happened pre-mutation
+    assert _owned(reg, "mtg")[0]["artifact_id"] == v2_aid
+
+    # P2: an otherwise well-formed prior sidecar whose row `source` is a
+    # non-mapping ("bogus") must ALSO refuse as rollback_sidecar_invalid — not
+    # leak an untyped exception from _prior_owned_entry's src["repo"] indexing.
+    bogus_doc = {
+        "schema_version": 1,
+        "component_source": {"repo": "org/repo", "ref": "main",
+                              "revision": "git:" + "a" * 40, "subdir": ""},
+        "plugins": [
+            {"name": "mtg.mtg", "manifest_name": "mtg", "version": "0.1.0",
+             "artifact_id": "b" * 64, "digest": "sha256:" + "c" * 64,
+             "source": "bogus"},
+        ],
+    }
+    prior.write_text(_json.dumps(bogus_doc), encoding="utf-8")
+
+    with pytest.raises(specialist_install.SpecialistInstallError) as ei2:
+        specialist_install.rollback_specialist(
+            slug="mtg", bundle=True, acks=ctx.acks,
+            specialists_dir=tmp_path / "specialists",
+            agents_specialists_dir=tmp_path / "agents", registry_path=reg,
+            plugin_store_root=tmp_path / "store", ops_dir=tmp_path / "ops")
+    assert ei2.value.kind == "rollback_sidecar_invalid"
     assert _owned(reg, "mtg")[0]["artifact_id"] == v2_aid
 
 
