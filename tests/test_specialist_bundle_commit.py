@@ -574,3 +574,47 @@ def test_bundle_rollback_refuses_missing_retained_artifact(tmp_path: Path, monke
     assert ei.value.kind == "rollback_artifact_missing"
     # active generation untouched (still v2)
     assert _owned(reg, "mtg")[0]["artifact_id"] == v2_aid
+
+
+# ===========================================================================
+# 2d — uninstall cascade + ack retirement
+# ===========================================================================
+
+def test_bundle_uninstall_cascade(tmp_path: Path, monkeypatch) -> None:
+    from specialist_install_consent import install_consent_identity
+
+    ctx = _prep(tmp_path, monkeypatch)
+    specialist_install.commit_specialist_install(**ctx.kw)
+    reg = ctx.kw["registry_path"]
+    owned = _owned(reg, "mtg")
+    v1_aid = owned[0]["artifact_id"]
+    assert len(owned) == 1
+
+    # An OPERATOR-installed (unowned) plugin that targets the specialist —
+    # survives the cascade untouched.
+    data = plugin_registry.load_registry(reg)
+    survivor = _unowned_entry("operator-tool")
+    survivor["targets"] = ["specialist:mtg"]
+    data.raw["plugins"].append(survivor)
+    plugin_registry.save_registry(data, reg)
+
+    # A consent ack exists for the slug (from _prep) — assert it is present.
+    assert ctx.acks.snapshot_slug("mtg")
+
+    txn = specialist_install.uninstall_specialist(
+        slug="mtg", bundle=True, acks=ctx.acks,
+        specialists_dir=tmp_path / "specialists", agents_specialists_dir=tmp_path / "agents",
+        registry_path=reg, ops_dir=tmp_path / "ops")
+
+    # owned entry removed; operator-owned survivor untouched
+    assert _owned(reg, "mtg") == []
+    names = {e["name"] for e in plugin_registry.load_registry(reg).entries}
+    assert "operator-tool" in names
+    # all slug acks retired
+    assert ctx.acks.snapshot_slug("mtg") == []
+    # slug tree deleted; txn carries every pre-swap artifact id (retained on disk)
+    assert not (tmp_path / "specialists" / "mtg").exists()
+    assert txn.removed_artifact_ids == (v1_aid,)
+    assert (tmp_path / "store" / "mtg.mtg" / v1_aid).is_dir()   # artifact RETAINED
+    # journal in-progress+committed (tool completes it after the sequencer)
+    assert Path(txn.journal_path).is_file()

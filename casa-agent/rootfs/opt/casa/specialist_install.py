@@ -2212,6 +2212,80 @@ def _rollback_core(
 
 
 def uninstall_specialist(
+    *, slug: str, bundle: bool = False,
+    acks: "SpecialistInstallAckStore | None" = None,
+    specialists_dir: Path = Path("/config/specialists"),
+    agents_specialists_dir: Path = Path("/config/agents/specialists"),
+    registry_path: "Path | None" = None,
+    ops_dir: "Path | None" = None,
+) -> "None | object":
+    """Bundle-aware uninstall (Task 10). Without `bundle=True` (legacy/direct
+    callers) this removes the instance + op files and returns None. WITH
+    `bundle=True` (the tool layer) it wraps the core removal in the journaled
+    cascade (spec §3.5): journal the before-state (owned entries, tuple bytes,
+    AND the slug's consent-ack records — all captured BEFORE the slug tree is
+    deleted), atomically swap the owned entries OUT (new_entries=[]), delete the
+    slug tree, retire ALL of the slug's consent acks, and return a BundleTxn
+    whose removed_artifact_ids are every pre-swap owned artifact id (drives the
+    sequencer's grant/challenge invalidation). Operator-owned entries targeting
+    the slug are never touched (they carry no owner)."""
+    if not bundle:
+        return _uninstall_core(
+            slug=slug, specialists_dir=specialists_dir,
+            agents_specialists_dir=agents_specialists_dir)
+
+    import plugin_registry
+    import specialist_bundle_journal
+    from specialist_bundle_journal import BundleTxn
+
+    if registry_path is None:
+        registry_path = plugin_registry.REGISTRY_PATH
+    if acks is None:
+        from specialist_install_consent import SpecialistInstallAckStore
+        acks = SpecialistInstallAckStore()
+
+    validate_specialist_slug(slug)
+    slug_dir = specialists_dir / slug
+    _reg = plugin_registry.load_registry(registry_path)
+    before_owned = plugin_registry.owned_entries_for(slug, _reg)
+    before_tuple_files = _tuple_files_snapshot(slug_dir)
+    ack_records = acks.snapshot_slug(slug)
+    _begin_kwargs = {} if ops_dir is None else {"ops_dir": ops_dir}
+    journal = specialist_bundle_journal.begin(
+        "uninstall", slug, before_entries=before_owned,
+        before_tuple_files=before_tuple_files, ack_records=ack_records,
+        **_begin_kwargs)
+    rollback_txn = BundleTxn(
+        journal_path=journal, slug=slug, before_entries=before_owned,
+        before_tuple_files=before_tuple_files, ack_records=ack_records,
+        registry_path=registry_path, specialists_dir=specialists_dir,
+        acks_path=acks.path)
+    try:
+        before_entries, _ = plugin_registry.apply_owned_swap(
+            slug=slug, new_entries=[], registry_path=registry_path)
+        all_ids = tuple(dict.fromkeys(
+            e["artifact_id"] for e in before_entries
+            if isinstance(e.get("artifact_id"), str)))
+        _uninstall_core(slug=slug, specialists_dir=specialists_dir,
+                        agents_specialists_dir=agents_specialists_dir)
+        acks.retire_slug(slug)
+        specialist_bundle_journal.mark_step(journal, "committed")
+        txn = BundleTxn(
+            journal_path=journal, slug=slug, before_entries=before_entries,
+            before_tuple_files=before_tuple_files, ack_records=ack_records,
+            removed_artifact_ids=all_ids, new_artifact_ids=(),
+            registry_path=registry_path, specialists_dir=specialists_dir,
+            acks_path=acks.path)
+    except BaseException:
+        try:
+            rollback_txn.rollback_disk()
+        finally:
+            specialist_bundle_journal.complete(journal)
+        raise
+    return txn
+
+
+def _uninstall_core(
     *, slug: str, specialists_dir: Path = Path("/config/specialists"),
     agents_specialists_dir: Path = Path("/config/agents/specialists"),
 ) -> None:
