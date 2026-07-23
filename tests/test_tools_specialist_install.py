@@ -370,3 +370,200 @@ async def test_inspect_prompt_exception_is_structured(monkeypatch, tmp_path) -> 
     assert payload["ok"] is False
     assert payload["kind"] == "consent_prompt_failed"
     assert "registration blew up" in payload["detail"]
+
+
+# ---------------------------------------------------------------------------
+# v0.102.0 (#217): the inspect tool captures the requesting configurator
+# engagement into reconcile_cb; on Approve+ack that callback delivers a
+# synthetic RESUME turn through the channel's resume-if-needed delivery seam
+# (deliver_system_turn) so the install proceeds without a manual operator
+# nudge. reconcile_cb runs from the tap-callback finish hook — it must NEVER
+# raise into it. These tests drive reconcile_cb directly (captured off the
+# prompt kwargs), so they never depend on Telegram delivery mechanics.
+# ---------------------------------------------------------------------------
+
+
+def _capture_reconcile(monkeypatch):
+    """Patch prompt_specialist_install_consent to a posting stub that records
+    the reconcile_cb the inspect tool built, and return the capture dict."""
+    import specialist_install_consent
+
+    cap: dict = {}
+
+    def _prompt(**kwargs):
+        cap["reconcile_cb"] = kwargs["reconcile_cb"]
+        return _Handle(settled="posted")
+
+    monkeypatch.setattr(
+        specialist_install_consent, "prompt_specialist_install_consent", _prompt)
+    return cap
+
+
+def _resume_channel(*, registry, deliver):
+    return SimpleNamespace(
+        chat_id="123", _engagement_registry=registry, deliver_system_turn=deliver)
+
+
+@pytest.mark.asyncio
+async def test_reconcile_cb_resumes_the_captured_engagement(monkeypatch, tmp_path) -> None:
+    from tools import specialist_install_inspect, engagement_var
+
+    delivered: list = []
+    rec = SimpleNamespace(id="eng-abc", driver="in_casa")
+    registry = SimpleNamespace(get=lambda eid: rec if eid == "eng-abc" else None)
+
+    async def _deliver(r, text):
+        delivered.append((r, text))
+
+    _wire_inspect(monkeypatch, tmp_path,
+                  channel=_resume_channel(registry=registry, deliver=_deliver))
+    cap = _capture_reconcile(monkeypatch)
+
+    token = engagement_var.set(SimpleNamespace(id="eng-abc"))
+    try:
+        payload = _payload(await specialist_install_inspect.handler(
+            {"repo": "owner/repo", "ref": "main"}))
+    finally:
+        engagement_var.reset(token)
+    assert payload["consent"] == "keyboard_posted"
+
+    # The tap-callback finish hook fires reconcile_cb after Approve+ack.
+    await cap["reconcile_cb"]()
+    assert len(delivered) == 1
+    assert delivered[0][0] is rec  # resolved for the captured engagement id
+    assert "specialist_install_commit" in delivered[0][1]
+    assert "specialist:mtg" in delivered[0][1]  # _fake_inspection slug
+
+
+@pytest.mark.asyncio
+async def test_reconcile_cb_swallows_a_delivery_failure(monkeypatch, tmp_path) -> None:
+    from tools import specialist_install_inspect, engagement_var
+
+    rec = SimpleNamespace(id="eng-abc", driver="in_casa")
+    registry = SimpleNamespace(get=lambda eid: rec)
+
+    async def _deliver(r, text):
+        raise RuntimeError("delivery blew up")
+
+    _wire_inspect(monkeypatch, tmp_path,
+                  channel=_resume_channel(registry=registry, deliver=_deliver))
+    cap = _capture_reconcile(monkeypatch)
+
+    token = engagement_var.set(SimpleNamespace(id="eng-abc"))
+    try:
+        await specialist_install_inspect.handler({"repo": "owner/repo", "ref": "main"})
+    finally:
+        engagement_var.reset(token)
+
+    # Fail-safe: reconcile_cb never propagates into the tap-callback path.
+    await cap["reconcile_cb"]()  # must not raise
+
+
+@pytest.mark.asyncio
+async def test_reconcile_cb_is_a_noop_when_the_engagement_is_gone(monkeypatch, tmp_path) -> None:
+    from tools import specialist_install_inspect, engagement_var
+
+    delivered: list = []
+    registry = SimpleNamespace(get=lambda eid: None)  # engagement TTL-expired / gone
+
+    async def _deliver(r, text):
+        delivered.append((r, text))
+
+    _wire_inspect(monkeypatch, tmp_path,
+                  channel=_resume_channel(registry=registry, deliver=_deliver))
+    cap = _capture_reconcile(monkeypatch)
+
+    token = engagement_var.set(SimpleNamespace(id="eng-abc"))
+    try:
+        await specialist_install_inspect.handler({"repo": "owner/repo", "ref": "main"})
+    finally:
+        engagement_var.reset(token)
+
+    await cap["reconcile_cb"]()
+    assert delivered == []
+
+
+@pytest.mark.asyncio
+async def test_reconcile_cb_is_a_noop_when_no_engagement_was_captured(
+    monkeypatch, tmp_path,
+) -> None:
+    from tools import specialist_install_inspect
+
+    delivered: list = []
+    rec = SimpleNamespace(id="eng-abc", driver="in_casa")
+    registry = SimpleNamespace(get=lambda eid: rec)
+
+    async def _deliver(r, text):
+        delivered.append((r, text))
+
+    _wire_inspect(monkeypatch, tmp_path,
+                  channel=_resume_channel(registry=registry, deliver=_deliver))
+    cap = _capture_reconcile(monkeypatch)
+
+    # engagement_var is left at its default (None) — no configurator context.
+    await specialist_install_inspect.handler({"repo": "owner/repo", "ref": "main"})
+    await cap["reconcile_cb"]()
+    assert delivered == []
+
+
+@pytest.mark.asyncio
+async def test_second_commit_on_an_active_slug_is_a_clean_typed_error(
+    monkeypatch, tmp_path,
+) -> None:
+    """#5 idempotency: a resume turn PLUS a stray manual nudge could each fire
+    specialist_install_commit. The second commit, on the now-active slug, must
+    fail closed with a clean typed kind the LLM handles — never corrupt state
+    or raise unstructured. commit_specialist_install's `_refuse_if_active_present`
+    raises SpecialistInstallError("concurrent_mutation"); the tool maps it to
+    ok:false/kind."""
+    from test_specialist_install import _write_component
+    from specialist_component import load_specialist_component
+    from specialist_install import compute_install_root_digest, resolve_dependency_closure
+    import specialist_install
+    from tools import specialist_install_commit
+
+    staged = _write_component(tmp_path / "staged", slug="mtg")
+    component = load_specialist_component(staged, staged / "manifest.json")
+    deps = resolve_dependency_closure(component, staged)
+    root_digest = compute_install_root_digest(
+        component, deps, manifest_bytes=(staged / "manifest.json").read_bytes())
+
+    # Stand in for commit_specialist_install raising the already-active guard —
+    # the SAME SpecialistInstallError("concurrent_mutation") _refuse_if_active_
+    # present raises on a second commit of a live slug. Verifies the tool's
+    # typed-error mapping, not the CAS machinery (covered in test_specialist_install).
+    from specialist_install import SpecialistInstallError
+
+    def _already_active(*args, **kwargs):
+        raise SpecialistInstallError(
+            "concurrent_mutation", "'mtg': an active install appeared under a "
+            "concurrent install while acquiring the lock")
+
+    monkeypatch.setattr(specialist_install, "commit_specialist_install", _already_active)
+
+    # Consent must be present so the flow reaches commit_specialist_install.
+    import specialist_install_consent
+    from specialist_install_consent import (
+        SpecialistInstallAckStore, install_consent_identity,
+    )
+    tmp_acks = tmp_path / "acks.json"
+
+    class _TmpAckStore(SpecialistInstallAckStore):
+        def __init__(self, path=None):  # noqa: ARG002
+            super().__init__(path=tmp_acks)
+
+    monkeypatch.setattr(
+        specialist_install_consent, "SpecialistInstallAckStore", _TmpAckStore)
+    identity = install_consent_identity(
+        component_id=component.component_id, version=component.version,
+        root_digest=root_digest, slug=component.slug)
+    _TmpAckStore().record(
+        identity=identity, component_id=component.component_id, version=component.version,
+        component_checksum=root_digest, slug=component.slug)
+
+    payload = _payload(await specialist_install_commit.handler({
+        "component_id": component.component_id, "version": component.version,
+        "slug": component.slug, "staged_dir": str(staged), "root_digest": root_digest,
+    }))
+    assert payload["ok"] is False
+    assert payload["kind"] == "concurrent_mutation"

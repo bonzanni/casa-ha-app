@@ -1602,3 +1602,210 @@ class TestUpdateTopicState:
             engagement_id=rec.id, new_state="awaiting",
         )
         assert rec.current_state_emoji == "🟡"
+
+
+# ---------------------------------------------------------------------------
+# v0.102.0 (#217): deliver_system_turn — the resume-if-suspended-then-deliver
+# seam a background reconcile callback uses to proceed a paused configurator
+# engagement after an operator taps Approve. Mirrors the resume step
+# handle_update runs before a topic-routed delivery, then hands the turn to the
+# SAME _deliver_turn_bg task the operator's manual message uses.
+# ---------------------------------------------------------------------------
+
+
+class _FakeResumeDriver:
+    """Records resume/is_alive against a live-set; a resumed engagement joins
+    the set so a subsequent is_alive is True (matches in_casa_driver's
+    _clients membership contract). ``resume_error`` makes resume raise."""
+
+    def __init__(self, alive: set | None = None, *, resume_error=None):
+        self.alive = alive if alive is not None else set()
+        self.resume_error = resume_error
+        self.events: list = []
+
+    def is_alive(self, rec):
+        return rec.id in self.alive
+
+    async def resume(self, rec, session_id):
+        self.events.append(("resume", rec.id, session_id))
+        if self.resume_error is not None:
+            raise self.resume_error
+        self.alive.add(rec.id)
+
+
+def _mk_topic_update(*, thread_id, text="continue", user_id=77):
+    u = MagicMock()
+    u.message = MagicMock()
+    u.message.chat = MagicMock()
+    u.message.chat.id = -1001
+    u.message.text = text
+    u.message.message_thread_id = thread_id
+    u.message.from_user = MagicMock(id=user_id)
+    u.message.message_id = 999
+    return u
+
+
+class TestDeliverSystemTurn:
+    """v0.102.0 (#217): deliver_system_turn + the shared _resume_and_ready core.
+    Both the operator-message path (handle_update) and the system-turn path use
+    ONE resume/lifecycle helper under ONE per-topic lock — no second resume
+    implementation, no duplicate ClaudeSDKClient on a system-vs-manual race."""
+
+    def _mk(self, fake_telegram_bot, engagement_fixture, *, alive=None,
+            resume_error=None):
+        from channels.telegram import TelegramChannel
+        ch = TelegramChannel(
+            bot=fake_telegram_bot, chat_id=100, engagement_supergroup_id=-1001,
+        )
+        ch._engagement_registry = engagement_fixture.registry
+        drv = _FakeResumeDriver(alive, resume_error=resume_error)
+        ch._engagement_driver = drv
+        sent: list = []
+
+        async def _send(rec, text, *, tg_message_id=None):
+            sent.append((rec.id, text))
+            return None
+
+        ch._driver_send_user_turn = _send
+        return ch, drv, sent
+
+    async def test_resumes_a_suspended_engagement_before_delivering(
+        self, fake_telegram_bot, engagement_fixture,
+    ):
+        rec = engagement_fixture.active_record  # driver="in_casa"
+        rec.sdk_session_id = "sess-1"
+        ch, drv, sent = self._mk(fake_telegram_bot, engagement_fixture)
+
+        await ch.deliver_system_turn(rec, "proceed with the recipe now")
+        await asyncio.gather(*list(ch._turn_tasks))  # drain the spawned turn
+
+        assert drv.events == [("resume", rec.id, "sess-1")]  # resumed once
+        assert sent == [(rec.id, "proceed with the recipe now")]  # then delivered
+
+    async def test_delivers_without_resume_when_already_alive(
+        self, fake_telegram_bot, engagement_fixture,
+    ):
+        rec = engagement_fixture.active_record
+        rec.sdk_session_id = "sess-1"
+        ch, drv, sent = self._mk(
+            fake_telegram_bot, engagement_fixture, alive={rec.id})
+
+        await ch.deliver_system_turn(rec, "go")
+        await asyncio.gather(*list(ch._turn_tasks))
+
+        assert drv.events == []  # already alive — resume never attempted
+        assert sent == [(rec.id, "go")]
+
+    async def test_terminal_record_skips_resume_and_delivery(
+        self, fake_telegram_bot, engagement_fixture,
+    ):
+        """A delayed Approve landing on a completed/cancelled/error engagement
+        must NOT resume or deliver — _resume_and_ready gates it out."""
+        import time
+        rec = engagement_fixture.active_record
+        rec.sdk_session_id = "sess-1"
+        ch, drv, sent = self._mk(fake_telegram_bot, engagement_fixture)
+        await engagement_fixture.registry.mark_completed(rec.id, time.time())
+
+        await ch.deliver_system_turn(rec, "too late")
+        await asyncio.gather(*list(ch._turn_tasks))
+
+        assert drv.events == []          # never resumed a terminal record
+        assert sent == []                # never delivered
+        assert not ch._turn_tasks        # no doomed background turn spawned
+
+    async def test_orphan_without_session_marks_error_and_skips(
+        self, fake_telegram_bot, engagement_fixture,
+    ):
+        """Dead record with NO sdk_session_id -> orphan branch (mark_error +
+        cleanup), no doomed turn spawned."""
+        rec = engagement_fixture.active_record
+        rec.sdk_session_id = None
+        ch, drv, sent = self._mk(fake_telegram_bot, engagement_fixture)  # not alive
+
+        assert await ch._resume_and_ready(rec) is False
+        assert drv.events == []                   # nothing to resume
+        assert rec.status == "error"              # orphan_no_session marked
+        assert sent == []
+
+    async def test_resume_failure_two_strike_marks_error_and_skips(
+        self, fake_telegram_bot, engagement_fixture,
+    ):
+        """resume raises -> fail-count increments; the 2nd strike marks
+        resume_failed and returns False (no delivery)."""
+        rec = engagement_fixture.active_record
+        rec.sdk_session_id = "sess-1"
+        ch, drv, sent = self._mk(
+            fake_telegram_bot, engagement_fixture,
+            resume_error=RuntimeError("rotated"))
+
+        assert await ch._resume_and_ready(rec) is False   # strike 1
+        assert rec.origin["_resume_fail_count"] == 1
+        assert rec.status != "error"                       # not yet terminal
+        assert await ch._resume_and_ready(rec) is False   # strike 2
+        assert rec.origin["_resume_fail_count"] == 2
+        assert rec.status == "error"                       # resume_failed marked
+        assert len(drv.events) == 2                         # attempted both times
+        assert sent == []
+
+    async def test_idle_engagement_stamps_user_turn_before_delivery(
+        self, fake_telegram_bot, engagement_fixture,
+    ):
+        """An idle (but deliverable) engagement -> update_user_turn advances it
+        back to active before _resume_and_ready returns True."""
+        rec = engagement_fixture.active_record
+        rec.sdk_session_id = "sess-1"
+        ch, drv, sent = self._mk(fake_telegram_bot, engagement_fixture)
+        await engagement_fixture.registry.mark_idle(rec.id)
+        assert rec.status == "idle"
+
+        assert await ch._resume_and_ready(rec) is True
+        assert rec.status == "active"      # update_user_turn flipped idle->active
+        assert drv.events == [("resume", rec.id, "sess-1")]
+
+    async def test_system_and_manual_turn_serialize_to_a_single_resume(
+        self, fake_telegram_bot, engagement_fixture,
+    ):
+        """The whole finding: a concurrent operator nudge (handle_update) and a
+        system turn (deliver_system_turn) on the SAME suspended engagement must
+        resume EXACTLY ONCE — the shared per-topic lock serializes them, so no
+        duplicate ClaudeSDKClient / parallel recipe."""
+        rec = engagement_fixture.active_record
+        rec.sdk_session_id = "sess-1"
+        ch, drv, sent = self._mk(fake_telegram_bot, engagement_fixture)
+
+        u = _mk_topic_update(thread_id=rec.topic_id, text="operator nudge")
+        await asyncio.gather(
+            ch.handle_update(u),
+            ch.deliver_system_turn(rec, "system resume"),
+        )
+        await asyncio.gather(*list(ch._turn_tasks))
+
+        resumes = [e for e in drv.events if e[0] == "resume"]
+        assert len(resumes) == 1                 # serialized — one resume only
+        assert rec.id in drv.alive               # exactly one live client
+        assert len(sent) == 2                    # both turns still delivered
+
+    async def test_manual_topic_path_routes_through_shared_helper(
+        self, fake_telegram_bot, engagement_fixture, monkeypatch,
+    ):
+        """Extraction regression: handle_update now routes its resume/lifecycle
+        through the SAME _resume_and_ready helper the system path uses."""
+        from channels.telegram import TelegramChannel
+        ch = TelegramChannel(
+            bot=fake_telegram_bot, chat_id=100, engagement_supergroup_id=-1001,
+        )
+        ch._engagement_registry = engagement_fixture.registry
+        ch._driver_send_user_turn = AsyncMock()
+        rec = engagement_fixture.active_record
+
+        spy = AsyncMock(return_value=True)
+        monkeypatch.setattr(ch, "_resume_and_ready", spy)
+
+        u = _mk_topic_update(thread_id=rec.topic_id, text="please continue")
+        await ch.handle_update(u)
+        await asyncio.gather(*list(ch._turn_tasks))
+
+        spy.assert_awaited_once()
+        assert spy.await_args.args[0].id == rec.id
+        ch._driver_send_user_turn.assert_awaited_once()

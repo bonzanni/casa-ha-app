@@ -6918,15 +6918,48 @@ async def specialist_install_inspect(args: dict) -> dict:
         })
     chat_id, operator_id = op
 
+    # v0.102.0 (#217): auto-resume the paused configurator engagement after the
+    # operator taps Approve. Capture the requesting engagement HERE —
+    # engagement_var is LIVE (this tool runs inside the configurator's own
+    # turn). The ack is recorded synchronously before _reconcile_cb ever fires
+    # (specialist_install_consent._on_commit_sync); without the resume the
+    # install stalled at commit's consent_missing until the operator sent a
+    # manual topic nudge.
+    eng = engagement_var.get(None)
+
     async def _reconcile_cb() -> None:
-        # Intentionally a no-op: commit happens via a LATER, explicit
-        # specialist_install_commit call (the recipe polls for
-        # consent_missing rather than this callback auto-committing) —
-        # this callback exists only to satisfy prompt_specialist_install_
-        # consent's signature; recording the ack (which it does
-        # synchronously, before this callback ever runs) is the only
-        # side effect that matters here.
-        return
+        # Post-Approve+ack: deliver a synthetic RESUME turn so the LLM finishes
+        # the WHOLE recipe itself (commit + delegation wiring + config_git +
+        # reload + emit_completion) — never commit server-side, the recipe does
+        # far more than commit. FAIL-SAFE: this runs from the tap-callback
+        # finish hook and must NEVER raise into it; any failure (engagement
+        # gone, TTL-expired driver dead, channel seam missing) is logged and
+        # swallowed, leaving the operator's manual nudge as the fallback.
+        # IDEMPOTENT: a resume turn PLUS a stray manual nudge are both safe — a
+        # second specialist_install_commit on the now-active slug fails closed
+        # with a clean typed `concurrent_mutation` the LLM handles.
+        if eng is None:
+            return
+        try:
+            registry = getattr(channel, "_engagement_registry", None)
+            deliver = getattr(channel, "deliver_system_turn", None)
+            if registry is None or deliver is None:
+                return
+            rec = registry.get(eng.id)
+            if rec is None:
+                return
+            await deliver(
+                rec,
+                "The operator approved the install consent for "
+                f"specialist:{result.slug}. Continue the recipe now without "
+                "waiting for further input: call specialist_install_commit with "
+                "the staged values, then finish the recipe (wire delegation, "
+                "config_git_commit, casa_reload, emit_completion).",
+            )
+        except Exception:  # noqa: BLE001 — tap-callback path: never raise
+            logger.warning(
+                "post-consent auto-resume failed (slug=%s) — operator can nudge "
+                "manually", result.slug, exc_info=True)
 
     try:
         # Round-3 fix (finding #3): register_challenge (authz_grants.py)
@@ -7211,8 +7244,42 @@ async def persona_install_inspect(args: dict) -> dict:
         })
     chat_id, operator_id = op
 
+    # v0.102.0 (#217): mirror specialist_install_inspect — auto-resume the
+    # paused configurator engagement after Approve+ack so the recipe finishes
+    # on its own instead of stalling until a manual topic nudge. engagement_var
+    # is LIVE here (this tool runs inside the configurator's own turn).
+    eng = engagement_var.get(None)
+
     async def _reconcile_cb() -> None:
-        return  # commit happens via a later, explicit persona_install_commit call
+        # Post-Approve+ack: deliver a synthetic RESUME turn so the LLM finishes
+        # the whole persona recipe itself (commit + config_git + reload +
+        # emit_completion). FAIL-SAFE: runs from the tap-callback finish hook,
+        # must NEVER raise into it — any failure is logged and swallowed, with
+        # the operator's manual nudge as the fallback. IDEMPOTENT: a resume turn
+        # plus a stray manual nudge are both safe — persona_install_commit on
+        # the SAME approved persona is a checksum-verified no-op re-commit.
+        if eng is None:
+            return
+        try:
+            registry = getattr(channel, "_engagement_registry", None)
+            deliver = getattr(channel, "deliver_system_turn", None)
+            if registry is None or deliver is None:
+                return
+            rec = registry.get(eng.id)
+            if rec is None:
+                return
+            await deliver(
+                rec,
+                "The operator approved the install consent for persona "
+                f"{result.persona_id}. Continue the recipe now without waiting "
+                "for further input: call persona_install_commit with the staged "
+                "values, then finish the recipe (config_git_commit, casa_reload, "
+                "emit_completion).",
+            )
+        except Exception:  # noqa: BLE001 — tap-callback path: never raise
+            logger.warning(
+                "post-consent persona auto-resume failed (persona_id=%s) — "
+                "operator can nudge manually", result.persona_id, exc_info=True)
 
     try:
         # Round-3 fix (finding #3): same event-loop requirement as

@@ -1,5 +1,18 @@
 # Changelog
 
+## [0.102.0] - 2026-07-23
+
+### Fixed
+
+- **Tapping "Approve" on an install now finishes the job.** When you asked a
+  specialist or persona to be installed from a repository and approved the
+  consent prompt, the approval was recorded but the assistant sometimes waited
+  for a second nudge before actually installing. Now a single Approve resumes
+  the work and carries it through — commit, wiring, and reload — with no extra
+  message. Under the hood the approval and the paused task are joined through
+  one shared, lock-serialized resume path, so a stray follow-up message or a
+  cancel can't start the install twice or revive a finished one.
+
 ## [0.101.0] - 2026-07-23
 
 Install-from-repo, first try. A fresh-install verification run exposed why a

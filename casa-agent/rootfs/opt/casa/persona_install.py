@@ -233,7 +233,40 @@ def commit_persona_install(
         shutil.rmtree(staging_dest, ignore_errors=True)
         raise
     dest.parent.mkdir(parents=True, exist_ok=True)
-    os.replace(staging_dest, dest)
+    try:
+        os.replace(staging_dest, dest)
+    except OSError as exc:
+        # Publication race (Sol P2, #217): two concurrent commits of the SAME
+        # persona_id@version can both miss the is_file() precheck above, both
+        # stage into their own temp dir, then race here — the loser's
+        # `os.replace` onto a now-populated `dest` directory fails (POSIX
+        # rename requires an empty destination directory: ENOTEMPTY). Never
+        # leak the losing staging dir or surface a raw OSError. Clean up, then
+        # reconcile against what actually got published: identical content
+        # (same persona_id@version+checksum — which is all that could have
+        # won this exact race) is an IDEMPOTENT success; different content
+        # surfaces the SAME typed version_content_conflict the pre-race
+        # is_file() branch raises. Mirrors the specialist path's fail-closed
+        # `_refuse_if_active_present` guard against a concurrent winner.
+        shutil.rmtree(staging_dest, ignore_errors=True)
+        try:
+            published = load_persona_pack(dest / "pack", dest / "manifest.json")
+        except (PersonaPackError, OSError) as read_exc:
+            raise SpecialistInstallError(
+                "version_content_conflict",
+                f"{inspection.persona_id}@{inspection.version}: a concurrent "
+                f"publish raced this commit and the winning copy is unreadable "
+                f"({read_exc}); manual removal of the local copy is required "
+                "before retrying this install") from exc
+        if published.checksum != inspection.checksum:
+            raise SpecialistInstallError(
+                "version_content_conflict",
+                f"{inspection.persona_id}@{inspection.version} was published "
+                f"concurrently with different content (on-disk checksum "
+                f"{published.checksum!r} != approved {inspection.checksum!r}); "
+                "re-publish under a new version — an existing persona version's "
+                "bytes are never silently replaced") from exc
+        return published
     return load_persona_pack(dest / "pack", dest / "manifest.json")
 
 
