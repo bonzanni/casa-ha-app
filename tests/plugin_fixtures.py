@@ -67,3 +67,31 @@ def mk_registry(tmp_path: Path, entries: list[dict]) -> Path:
     p.write_text(json.dumps({"schema_version": 1, "plugins": entries}),
                  encoding="utf-8")
     return p
+
+
+def owned_entry(name="mtg.mtg", owner="specialist:mtg", manifest_name="mtg",
+                targets=None, revision: str = "git:" + "a" * 40,
+                repo: str = "bonzanni/casa-mtg-specialist",
+                subdir: str = "plugins/mtg", **over) -> dict:
+    """A valid specialist-owned registry entry (spec §2 invariant).
+
+    Mirrors ``tests/test_plugin_registry_owned.py``'s local ``_entry()``
+    (Task 3) — extracted here so later test files can build an owned entry
+    without duplicating the ``compute_artifact_id`` wiring. That file keeps
+    its own local ``_entry``; this is imported by newer test files only.
+    """
+    targets = targets if targets is not None else [owner]
+    e = {
+        "name": name,
+        "source": {"type": "github", "repo": repo, "ref": "v0.2.0",
+                   "revision": revision, "subdir": subdir},
+        "artifact_id": compute_artifact_id(
+            repo=repo, revision=revision, subdir=subdir, name=name),
+        "version": "1.0.0", "targets": targets,
+    }
+    if owner is not None:
+        e["owner"] = owner
+    if manifest_name is not None:
+        e["manifest_name"] = manifest_name
+    e.update(over)
+    return e

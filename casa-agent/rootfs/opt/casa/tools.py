@@ -6674,6 +6674,11 @@ def _plugin_update_sync(*, name: str, new_ref: str,
                   if isinstance(e, dict) and e.get("name") == name), None)
     if entry is None:
         return {"ok": False, "kind": "not_registered", "name": name}
+    owner = plugin_registry.entry_owner(entry)
+    if owner is not None:
+        return {"ok": False, "kind": "owned_by_specialist", "owner": owner,
+                "detail": (f"{name!r} is managed by {owner}'s bundle — use "
+                          "specialist_upgrade / specialist_uninstall")}
     # A:§3.3 (r1-B8): capture the OLD artifact_id BEFORE the mutation — the
     # caller invalidates its grants/challenges only after this commits.
     old_artifact_id = entry.get("artifact_id")
@@ -7455,6 +7460,11 @@ def _plugin_assign_sync(*, name: str, target: str) -> dict:
     entry = _find_entry(data, name)
     if entry is None:
         return {"ok": False, "kind": "not_registered", "name": name}
+    owner = plugin_registry.entry_owner(entry)
+    if owner is not None:
+        return {"ok": False, "kind": "owned_by_specialist", "owner": owner,
+                "detail": (f"{name!r} is managed by {owner}'s bundle — use "
+                          "specialist_upgrade / specialist_uninstall")}
     targets = entry.setdefault("targets", [])
     was_assigned = target in targets
     if not was_assigned:
@@ -7471,6 +7481,11 @@ def _plugin_unassign_sync(*, name: str, target: str) -> dict:
     entry = _find_entry(data, name)
     if entry is None:
         return {"ok": False, "kind": "not_registered", "name": name}
+    owner = plugin_registry.entry_owner(entry)
+    if owner is not None:
+        return {"ok": False, "kind": "owned_by_specialist", "owner": owner,
+                "detail": (f"{name!r} is managed by {owner}'s bundle — use "
+                          "specialist_upgrade / specialist_uninstall")}
     targets = entry.get("targets") or []
     was_assigned = target in targets
     if was_assigned:
@@ -7487,6 +7502,11 @@ def _plugin_remove_sync(*, name: str) -> dict:
     entry = _find_entry(data, name)
     if entry is None:
         return {"ok": False, "kind": "not_registered", "name": name}
+    owner = plugin_registry.entry_owner(entry)
+    if owner is not None:
+        return {"ok": False, "kind": "owned_by_specialist", "owner": owner,
+                "detail": (f"{name!r} is managed by {owner}'s bundle — use "
+                          "specialist_upgrade / specialist_uninstall")}
     targets = list(entry.get("targets") or [])
     # A:§3.3 (r1-B8): capture the artifact_id + targets BEFORE the mutation —
     # the caller invalidates grants/challenges by artifact AND by each
