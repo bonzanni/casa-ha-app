@@ -9,6 +9,7 @@ import plugin_boot
 import plugin_health
 import plugin_registry
 import plugin_store
+import specialist_bundle_journal
 from plugin_registry import PluginIssue, RegistryData, ResolutionResult
 
 pytestmark = pytest.mark.unit
@@ -89,6 +90,36 @@ def test_boot_resolve_issues_reach_health(monkeypatch, tmp_path):
     reports = _wire(monkeypatch, tmp_path, resolve_issues=[issue])
     assert plugin_boot.main() == 0
     assert any(i.reason_code == "artifact_invalid" for i in reports["issues"])
+
+
+def test_boot_calls_bundle_reconcile_before_reload_snapshot(monkeypatch, tmp_path):
+    """Task 9: crash-safe bundle-op journal reconciliation must run BEFORE
+    the plugin snapshot loads."""
+    _wire(monkeypatch, tmp_path)
+    order = []
+    monkeypatch.setattr(specialist_bundle_journal, "reconcile_boot",
+                        lambda *a, **k: order.append("reconcile") or [])
+    monkeypatch.setattr(plugin_registry, "reload_snapshot",
+                        lambda *a, **k: order.append("reload"))
+    assert plugin_boot.main() == 0
+    assert order == ["reconcile", "reload"]
+
+
+def test_boot_bundle_reconcile_exception_degrades_boot_not_blocks(monkeypatch, tmp_path):
+    """§3.6 degrade-and-boot: a reconciliation failure (even one that
+    escapes reconcile_boot's own internal quarantine handling) must never
+    stop the rest of boot from proceeding."""
+    reports = _wire(monkeypatch, tmp_path)
+
+    def _boom(*a, **k):
+        raise RuntimeError("bundle reconcile boom")
+    monkeypatch.setattr(specialist_bundle_journal, "reconcile_boot", _boom)
+    reloaded = {"called": False}
+    monkeypatch.setattr(plugin_registry, "reload_snapshot",
+                        lambda *a, **k: reloaded.__setitem__("called", True))
+    assert plugin_boot.main() == 0
+    assert reloaded["called"] is True
+    assert "issues" in reports
 
 
 def test_boot_exception_returns_zero_with_boot_exception(monkeypatch, tmp_path):
