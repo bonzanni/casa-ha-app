@@ -102,3 +102,48 @@ def write_minimal_component(tmp_path: Path, *, slug: str = "mtg-test",
     manifest_path = root / "manifest.json"
     manifest_path.write_text(json.dumps(manifest), encoding="utf-8")
     return root, manifest_path
+
+
+def write_bundled_plugin(
+    component_dir: Path, name: str = "mtg", *,
+    triggers: object = None, sysreqs: list[dict] | None = None,
+    env_names: list[str] | None = None,
+) -> str:
+    """Task 8: write a minimal, real-shaped plugin tree at
+    ``component_dir / "plugins" / name`` (mirroring `plugin_store`'s own
+    parsing functions — ``manifest_sysreqs`` reads
+    ``casa.systemRequirements``, ``manifest_triggers``/`validate_manifest`
+    reads ``casa.triggers``, `plugin_env_extractor.extract_env_vars` reads
+    `${VAR}` references in an `.mcp.json` server's ``env`` block) and return
+    the digest a manifest dependency row's ``digest`` field must pin
+    (``"sha256:" + plugin_store.content_checksum(plugin_dir)``) for the tree
+    to resolve ``available=True`` against `resolve_dependency_closure`.
+
+    ``env_names`` (when given) are declared on a ``url``-form MCP server —
+    deliberately NOT a ``command`` server — so `plugin_store.
+    mcp_command_verdicts` (which only checks `command` servers) never flags
+    a "missing" verdict for an executable/PATH entry that may not exist in
+    the test sandbox; this fixture is about env-name extraction, not
+    command resolvability.
+    """
+    import plugin_store
+
+    plugin_dir = component_dir / "plugins" / name
+    (plugin_dir / ".claude-plugin").mkdir(parents=True, exist_ok=True)
+    manifest: dict = {"name": name, "version": "0.1.0"}
+    casa: dict = {}
+    if sysreqs is not None:
+        casa["systemRequirements"] = sysreqs
+    if triggers is not None:
+        casa["triggers"] = triggers
+    if casa:
+        manifest["casa"] = casa
+    (plugin_dir / ".claude-plugin" / "plugin.json").write_text(
+        json.dumps(manifest), encoding="utf-8")
+    if env_names:
+        mcp = {"mcpServers": {"main": {
+            "url": "https://example.invalid/mcp",
+            "env": {n: f"${{{n}}}" for n in env_names},
+        }}}
+        (plugin_dir / ".mcp.json").write_text(json.dumps(mcp), encoding="utf-8")
+    return "sha256:" + plugin_store.content_checksum(plugin_dir)

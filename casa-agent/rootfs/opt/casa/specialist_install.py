@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import json
 import logging
 import os
 import re
@@ -156,6 +157,15 @@ class InspectionResult:
     required_secret_names: tuple[str, ...]
     dependencies: tuple[DependencyResolution, ...]
     staged_dir: Path
+    # Task 8 additions (spec §3.2.1) — defaulted so every pre-Task-8
+    # constructor call (production and test) keeps working unchanged.
+    # ``receipt_id``/``receipt_digest`` are "" and ``plugin_resolutions`` is
+    # () for a hand-built InspectionResult that predates the trusted-source
+    # receipt; a real inspect_specialist_repo call always populates all three
+    # (every inspect issues a receipt, plugin-less components included).
+    receipt_id: str = ""
+    receipt_digest: str = ""
+    plugin_resolutions: "tuple" = ()
 
 
 def compute_install_root_digest(
@@ -309,6 +319,56 @@ def resolve_dependency_closure(
                 available=available,
                 detail="" if available else "bundled corpus checksum does not match manifest"))
         elif dep.kind == "plugin/implementation":
+            if dep.source is not None:
+                # Task 8 (spec §1/§3.2.1): a SOURCED dep resolves its tree from
+                # component_dir itself — bundled -> the manifest-declared
+                # subtree, github -> the ".dep-plugins" convention every
+                # closure call site (inspect/CAS-staging/final-CAS/rollback)
+                # shares unconditionally (see inspect_specialist_repo's
+                # github-fetch loop) — instead of an already-installed
+                # registry plugin (the sourceless/legacy branch below).
+                if dep.source.type == "bundled":
+                    tree = component_dir / dep.source.path
+                else:
+                    tree = component_dir / ".dep-plugins" / dep.identifier
+                if not tree.is_dir():
+                    out.append(DependencyResolution(
+                        kind=dep.kind, identifier=dep.identifier, digest=dep.digest,
+                        available=False, detail="sourced plugin tree missing"))
+                    continue
+                if dep.source.type == "bundled":
+                    # Containment: specialist_component's loader already
+                    # rejects a non-canonical (absolute/traversal) path
+                    # string, but a symlinked component_dir (or a path
+                    # component that is itself a symlink) could still let the
+                    # RESOLVED tree escape — assert the resolved location
+                    # stays inside the resolved component_dir before this
+                    # tree is ever read/hashed.
+                    try:
+                        tree.resolve().relative_to(component_dir.resolve())
+                    except ValueError:
+                        out.append(DependencyResolution(
+                            kind=dep.kind, identifier=dep.identifier, digest=dep.digest,
+                            available=False,
+                            detail="bundled plugin path escapes the component"))
+                        continue
+                detail = _validate_sourced_plugin_tree(
+                    tree, slug=component.slug, identifier=dep.identifier)
+                if detail:
+                    out.append(DependencyResolution(
+                        kind=dep.kind, identifier=dep.identifier, digest=dep.digest,
+                        available=False, detail=detail))
+                    continue
+                digest = "sha256:" + content_checksum(tree)
+                out.append(DependencyResolution(
+                    kind=dep.kind, identifier=dep.identifier, digest=dep.digest,
+                    available=(digest == dep.digest),
+                    detail="" if digest == dep.digest else
+                           "sourced plugin content does not match the pinned digest"))
+                continue
+            # Legacy/sourceless (spec §1 "no source -> legacy behavior"):
+            # UNCHANGED — the dependency must already be plugin_add-installed.
+            #
             # Round-2 fix (finding #6): a registry entry's `artifact_id` is
             # `plugin_registry.compute_artifact_id` — sha256(repo + "\n" +
             # revision + "\n" + subdir + "\n" + name), an IDENTITY hash of the
@@ -370,6 +430,190 @@ def resolve_dependency_closure(
     return tuple(out)
 
 
+# Task 8 (spec §1, §3.2.1) — prohibition/error-code prefixes a sourced
+# plugin's validation detail can start with. `inspect_specialist_repo` scans
+# the closure's unavailable rows for these prefixes and raises the matching
+# SpecialistInstallError kind INSTEAD OF the generic `dependency_unavailable`
+# (Sol plan-r1: a bundle transaction must surface WHY a sourced dep was
+# refused, not fold every refusal into one undifferentiated code).
+BUNDLED_SYSREQS_UNSUPPORTED = "bundled_sysreqs_unsupported"
+BUNDLED_TRIGGERS_UNSUPPORTED = "bundled_triggers_unsupported"
+ENV_NAME_COLLISION = "env_name_collision"
+_PROHIBITION_KIND_PREFIXES = (
+    BUNDLED_SYSREQS_UNSUPPORTED, BUNDLED_TRIGGERS_UNSUPPORTED, ENV_NAME_COLLISION,
+)
+
+
+def _env_name_conflicts(tree_env_names: "set[str]", *, exclude_owner: str) -> "list[str]":
+    """Global env-name collision check (spec §1 "Global-namespace collision
+    preflight"; brief Step 7). `tree_env_names` are the `${VAR}` references a
+    sourced plugin's OWN `.mcp.json` requires (plugin_env_extractor —
+    ownership-blind, NOT plugin_env_conf, which stores VALUES not per-plugin
+    ownership). The installed-side inventory is the same extraction run over
+    every OTHER validated installed artifact's `.mcp.json`
+    (`plugin_registry.resolve_all().plugins`), excluding entries owned by
+    `exclude_owner` (the slug's own set, being replaced on upgrade — its own
+    prior env names are not a collision with its own new ones).
+
+    A monkeypatchable module-level seam by design (Step 3 of the Task 8
+    brief) — tests stub this directly rather than building a real registry +
+    store fixture to exercise the collision-kind wiring."""
+    import plugin_env_extractor
+    import plugin_registry
+
+    owned_names = {
+        e["name"] for e in plugin_registry.owned_entries_for(
+            exclude_owner, plugin_registry.snapshot_registry())
+    }
+    installed_names: "set[str]" = set()
+    for rp in plugin_registry.resolve_all().plugins:
+        if rp.name in owned_names:
+            continue
+        installed_names |= plugin_env_extractor.extract_env_vars(Path(rp.path) / ".mcp.json")
+    return sorted(tree_env_names & installed_names)
+
+
+def _manifest_name_collisions(component: SpecialistComponent) -> "list[str]":
+    """Per-target manifest-name precheck (spec §2.1, brief): a sourced dep's
+    `identifier` becomes its OWNED entry's effective runtime name
+    (`manifest_name`). If some OTHER already-registered entry targeting this
+    same `specialist:<slug>` already resolves to that same effective name,
+    committing this install would collide at load time (the registry's own
+    per-target uniqueness invariant would then quarantine one of them). Fail
+    BEFORE any staging/consent, not after. Entries owned by THIS slug are
+    excluded — an upgrade legitimately replaces its own prior owned set with
+    identical names."""
+    import plugin_registry
+
+    sourced_idents = {
+        d.identifier for d in component.dependencies
+        if d.kind == "plugin/implementation" and d.source is not None
+    }
+    if not sourced_idents:
+        return []
+    target = f"specialist:{component.slug}"
+    collisions: list[str] = []
+    for entry in plugin_registry.snapshot_registry().entries:
+        if target not in entry.get("targets", []):
+            continue
+        if plugin_registry.entry_owner(entry) == target:
+            continue  # this slug's own (prior) owned set — replaced, not a collision
+        effective = entry.get("manifest_name") or entry.get("name")
+        if effective in sourced_idents:
+            collisions.append(effective)
+    return collisions
+
+
+def _validate_sourced_plugin_tree(tree: Path, *, slug: str, identifier: str) -> str:
+    """Full validation of a sourced (bundled/github) plugin dependency's
+    staged tree (spec §1/§3.2.1, brief Step 2). Returns "" when the tree is
+    clean; otherwise a non-empty detail string — for the four prefixes in
+    `_PROHIBITION_KIND_PREFIXES`, `inspect_specialist_repo` raises that exact
+    kind; every other non-empty detail flows into the generic
+    `dependency_unavailable`.
+
+    Order (Sol plan-r1 — prohibition codes must never be preempted by
+    `validate_manifest`'s own `apt_requirements_rejected`/`triggers_invalid`,
+    which are legacy per-plugin refusals, not this bundle's distinct codes):
+
+    1. Normalize FIRST (`plugin_store.strip_bytecode_derivatives`) — the SAME
+       normalization `_stage_and_swap` applies at publish, run before any
+       digest is computed so receipt attestation covers exactly the bytes
+       publish will checksum.
+    2. Reject an escaping symlink (`plugin_store._reject_escaping_symlinks`).
+    3. Prohibitions on the RAW manifest, read directly (before
+       `validate_manifest` gets a chance to raise its OWN, differently-coded,
+       refusal for the same underlying key): any `manifest_sysreqs` row ⇒
+       `bundled_sysreqs_unsupported`; any `casa.triggers` KEY present (even
+       malformed) ⇒ `bundled_triggers_unsupported`.
+    4. `plugin_store.validate_manifest` (identity: `plugin.json::name` must
+       equal `identifier`; this is also where a non-prohibited
+       `apt_requirements_rejected`/`triggers_invalid`/`name_mismatch`/etc.
+       surfaces for anything the raw-manifest prohibitions above did not
+       already catch — impossible for sysreqs/triggers by construction, but
+       real for name mismatches and malformed protectedTools).
+    5. Untrusted-bytes marker scan over `plugin.json`, every `*.md`, and every
+       `.mcp.json` under the tree (symlinks already vetted in step 2).
+    6. Reserved-env + command-verdict gates over the tree's `.mcp.json`
+       (`plugin_store.reserved_env_violations` / `mcp_command_verdicts`).
+    7. Env-name collision (`_env_name_conflicts`) against every OTHER
+       installed plugin's required env names, excluding this slug's own
+       (prior) owned set.
+    """
+    import plugin_env_extractor
+    import plugin_registry
+    import plugin_store
+
+    plugin_store.strip_bytecode_derivatives(tree)
+    try:
+        plugin_store._reject_escaping_symlinks(tree)
+    except plugin_store.StoreError as exc:
+        return f"{exc.reason_code}: {exc}"
+
+    manifest_path = tree / ".claude-plugin" / "plugin.json"
+    try:
+        raw_manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+    except (OSError, ValueError) as exc:
+        return f"manifest_invalid: plugin.json missing/unparseable: {exc}"
+    if not isinstance(raw_manifest, dict):
+        return "manifest_invalid: plugin.json is not an object"
+
+    if plugin_store.manifest_sysreqs(raw_manifest):
+        return (f"{BUNDLED_SYSREQS_UNSUPPORTED}: a sourced/bundled plugin dependency "
+                "must not declare casa.systemRequirements")
+    casa = raw_manifest.get("casa")
+    if isinstance(casa, dict) and "triggers" in casa:
+        return (f"{BUNDLED_TRIGGERS_UNSUPPORTED}: a sourced/bundled plugin dependency "
+                "must not declare casa.triggers")
+
+    scoped = plugin_registry.scoped_name(slug, identifier)
+    try:
+        plugin_store.validate_manifest(tree, scoped, manifest_name=identifier)
+    except plugin_store.StoreError as exc:
+        return f"{exc.reason_code}: {exc}"
+
+    try:
+        reject_forbidden_markers(manifest_path.read_text(encoding="utf-8"))
+        for md_path in sorted(tree.rglob("*.md")):
+            reject_forbidden_markers(md_path.read_text(encoding="utf-8"))
+        for mcp_path in sorted(tree.rglob(".mcp.json")):
+            reject_forbidden_markers(mcp_path.read_text(encoding="utf-8"))
+    except ValueError as exc:
+        return f"forbidden_markers: {exc}"
+    except OSError as exc:
+        return f"forbidden_markers: unreadable file during marker scan: {exc}"
+
+    mcp_json_path = tree / ".mcp.json"
+    reserved = plugin_store.reserved_env_violations(mcp_json_path)
+    if reserved:
+        return "mcp_reserved_env: " + "; ".join(reserved)
+    missing = [v for v in plugin_store.mcp_command_verdicts(mcp_json_path, tree)
+               if v.get("status") == "missing"]
+    if missing:
+        return "mcp_command_missing: " + "; ".join(
+            f"{v['server']}:{v['ref']} ({v.get('reason', '')})" for v in missing)
+
+    tree_env_names = plugin_env_extractor.extract_env_vars(mcp_json_path)
+    conflicts = _env_name_conflicts(tree_env_names, exclude_owner=slug)
+    if conflicts:
+        return f"{ENV_NAME_COLLISION}: colliding env name(s): " + ", ".join(conflicts)
+
+    return ""
+
+
+def _sourced_plugin_manifest_version(tree: Path) -> str:
+    """The receipt row's `version` — read AFTER `_validate_sourced_plugin_tree`
+    has already fully validated the manifest; mirrors `validate_manifest`'s
+    own missing-version default (`"0.0.0"`) without re-running the whole
+    validation gate a second time just to extract one field."""
+    try:
+        manifest = json.loads((tree / ".claude-plugin" / "plugin.json").read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        return "0.0.0"
+    version = manifest.get("version") if isinstance(manifest, dict) else None
+    return version if isinstance(version, str) and version else "0.0.0"
+
+
 def _extract_full_line_yaml_comments(text: str) -> str:
     """Task N2 fix: role.yaml's own legitimate flow-style syntax (e.g.
     `disclosure: {policy: delegated, overrides: {}}`, used by every
@@ -425,6 +669,7 @@ def inspect_specialist_repo(
     mode: "Literal['install', 'upgrade']" = "install",
     target_slug: str | None = None,
     specialists_dir: Path = Path("/config/specialists"),
+    receipts_dir: Path = Path("/config/specialists/.receipts"),
 ) -> InspectionResult:
     """Fetch for inspection into a NON-PERSISTENT staging directory (spec §6
     N1) — no CAS write, no binding, no activation. Every check that can
@@ -439,7 +684,20 @@ def inspect_specialist_repo(
     upgrade mode does not weaken that for any OTHER slug, it narrowly
     excludes only `target_slug` after independently confirming an active
     instance of that exact slug already exists (never usable to backdoor a
-    fresh install past collision checks under a false 'upgrade' claim)."""
+    fresh install past collision checks under a false 'upgrade' claim).
+
+    Task 8 (spec §1/§3.2.1): fetches every github-sourced plugin dependency
+    into `.dep-plugins/<identifier>` under the SAME staging dir, runs a
+    per-target manifest-name collision precheck, resolves the full
+    dependency closure (now including sourced-plugin validation), raises a
+    prohibition's OWN kind (bundled_sysreqs_unsupported/
+    bundled_triggers_unsupported/env_name_collision) ahead of the generic
+    dependency_unavailable, and — for EVERY inspection, plugin-less
+    components included — mints and persists a trusted source receipt
+    (`specialist_receipt`) so a bundled/declared plugin closure's provenance
+    is bound into consent (`receipt_digest`) and available to commit."""
+    import plugin_registry
+    import specialist_receipt
     from specialist_registry import InstalledSpecialistIndex, _discover_image_role_slots
 
     if mode == "upgrade" and not target_slug:
@@ -451,7 +709,8 @@ def inspect_specialist_repo(
 
     staging_root.mkdir(parents=True, exist_ok=True, mode=0o700)
     component_dir = staging_root / uuid.uuid4().hex
-    resolve_and_fetch(repo, ref, subdir, component_dir, expected_revision=expected_revision)
+    component_revision = resolve_and_fetch(
+        repo, ref, subdir, component_dir, expected_revision=expected_revision)
 
     manifest_path = component_dir / "manifest.json"
     if not manifest_path.is_file():
@@ -462,6 +721,20 @@ def inspect_specialist_repo(
         raise SpecialistInstallError("manifest_invalid", str(exc)) from exc
 
     _validate_untrusted_bytes(component)
+
+    # Task 8: fetch every github-sourced plugin dependency INTO this same
+    # staging tree, at the `.dep-plugins/<identifier>` convention every
+    # closure call site (inspect/CAS-staging/final-CAS/rollback) shares
+    # unconditionally — `dep.identifier` is already PLUGIN_IDENT_RE-validated
+    # (specialist_component's loader), so this join is safe without a
+    # separate containment check. Revision-pinned: `resolve_and_fetch` itself
+    # refuses a moved `ref` against `dep.source.revision`.
+    for dep in component.dependencies:
+        if dep.kind == "plugin/implementation" and dep.source is not None \
+                and dep.source.type == "github":
+            dest = component_dir / ".dep-plugins" / dep.identifier
+            resolve_and_fetch(dep.source.repo, dep.source.ref, "", dest,
+                              expected_revision=dep.source.revision)
 
     index = installed_index or InstalledSpecialistIndex()
     if installed_index is None:
@@ -492,22 +765,73 @@ def inspect_specialist_repo(
     except ValueError as exc:
         raise SpecialistInstallError("slug_collision", str(exc)) from exc
 
+    manifest_name_collisions = _manifest_name_collisions(component)
+    if manifest_name_collisions:
+        raise SpecialistInstallError(
+            "manifest_name_collision",
+            f"specialist:{component.slug} already resolves an entry with effective "
+            f"manifest name(s) {sorted(set(manifest_name_collisions))!r} — a sourced "
+            "plugin dependency must not collide with it")
+
     dependencies = resolve_dependency_closure(component, component_dir)
     unavailable = [d for d in dependencies if not d.available]
     if unavailable:
+        # Task 8: a prohibition (sysreqs/triggers/env-collision) aborts with
+        # its OWN kind, not the generic dependency_unavailable — scan every
+        # unavailable row first (Sol plan-r1).
+        for d in unavailable:
+            for prefix in _PROHIBITION_KIND_PREFIXES:
+                if d.detail.startswith(prefix):
+                    raise SpecialistInstallError(prefix, f"{d.kind}:{d.identifier}: {d.detail}")
         detail = "; ".join(f"{d.kind}:{d.identifier}: {d.detail}" for d in unavailable)
         raise SpecialistInstallError("dependency_unavailable", detail)
 
     root_digest = compute_install_root_digest(
         component, dependencies, manifest_bytes=manifest_path.read_bytes())
 
+    # Task 8: build one PluginReceiptRow per sourced plugin dependency
+    # (dependencies is 1:1 positional with component.dependencies — every
+    # row appended by resolve_dependency_closure's per-dependency loop, and
+    # any additional synthetic persona-count row would have been `available=
+    # False` and already raised above, so this dict is exhaustive here).
+    resolved_by_identity = {(d.kind, d.identifier): d for d in dependencies}
+    plugin_rows: list[specialist_receipt.PluginReceiptRow] = []
+    for dep in component.dependencies:
+        if dep.kind != "plugin/implementation" or dep.source is None:
+            continue
+        resolution = resolved_by_identity[(dep.kind, dep.identifier)]
+        if dep.source.type == "bundled":
+            tree = component_dir / dep.source.path
+            row_repo, row_ref, row_revision = repo, ref, f"git:{component_revision}"
+            row_subdir = f"{subdir}/{dep.source.path}" if subdir else dep.source.path
+        else:
+            tree = component_dir / ".dep-plugins" / dep.identifier
+            row_repo, row_ref, row_revision = dep.source.repo, dep.source.ref, dep.source.revision
+            row_subdir = ""
+        plugin_rows.append(specialist_receipt.PluginReceiptRow(
+            identifier=dep.identifier,
+            scoped_name=plugin_registry.scoped_name(component.slug, dep.identifier),
+            manifest_name=dep.identifier,
+            version=_sourced_plugin_manifest_version(tree),
+            source_type=dep.source.type,
+            repo=row_repo, ref=row_ref, revision=row_revision, subdir=row_subdir,
+            content_digest=resolution.digest, staged_path=str(tree),
+        ))
+
+    receipt = specialist_receipt.build_receipt(
+        slug=component.slug, component_repo=repo, component_ref=ref,
+        component_revision=f"git:{component_revision}", component_subdir=subdir,
+        component_staged_path=str(component_dir), plugins=tuple(plugin_rows),
+    )
+    specialist_receipt.persist(receipt, receipts_dir=receipts_dir)
+
     required = component.config_schema.get("required", [])
     secret_names = set(component.config_schema.get("secret_names", []))
     logger.info(
         "inspect_specialist_repo passed all gates: mode=%s slug=%s component_id=%s "
-        "version=%s root_digest=%s (staged at %s, not yet activated)",
+        "version=%s root_digest=%s receipt_id=%s (staged at %s, not yet activated)",
         mode, component.slug, component.component_id, component.version,
-        root_digest, component_dir,
+        root_digest, receipt.receipt_id, component_dir,
     )
     return InspectionResult(
         component_id=component.component_id, version=component.version, slug=component.slug,
@@ -518,6 +842,8 @@ def inspect_specialist_repo(
         required_config_names=tuple(n for n in required if n not in secret_names),
         required_secret_names=tuple(n for n in required if n in secret_names),
         dependencies=dependencies, staged_dir=component_dir,
+        receipt_id=receipt.receipt_id, receipt_digest=receipt.receipt_digest,
+        plugin_resolutions=tuple(plugin_rows),
     )
 
 
@@ -637,9 +963,13 @@ def commit_specialist_install(
     # agrees (mirroring upgrade_specialist's slug_mismatch treatment).
     validate_specialist_slug(inspection.slug)
 
+    # Task 8 seam (Task 7 P0): thread the trusted-source receipt digest into
+    # the consent identity — `getattr` keeps this call working against a
+    # hand-built/legacy InspectionResult that predates the field (default "").
     identity = install_consent_identity(
         component_id=inspection.component_id, version=inspection.version,
         root_digest=inspection.root_digest, slug=inspection.slug,
+        receipt_digest=getattr(inspection, "receipt_digest", ""),
     )
     if not acks.is_acked(identity):
         raise SpecialistInstallError(
@@ -947,9 +1277,11 @@ def upgrade_specialist(
     # Validate at the top before any filesystem operation.
     validate_specialist_slug(slug)
 
+    # Task 8 seam (Task 7 P0): see commit_specialist_install's identical note.
     identity = install_consent_identity(
         component_id=inspection.component_id, version=inspection.version,
-        root_digest=inspection.root_digest, slug=inspection.slug)
+        root_digest=inspection.root_digest, slug=inspection.slug,
+        receipt_digest=getattr(inspection, "receipt_digest", ""))
     if not acks.is_acked(identity):
         raise SpecialistInstallError("consent_missing", "no recorded operator approval for the upgrade")
 

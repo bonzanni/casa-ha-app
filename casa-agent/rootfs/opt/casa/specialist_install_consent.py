@@ -225,36 +225,24 @@ def render_install_consent_message(inspection: Any) -> str:
     deps = ", ".join(f"{d.kind}:{d.identifier}" for d in inspection.dependencies)
     dep_digest_lines = "".join(
         f"  - {d.kind}:{d.identifier} = {d.digest}\n" for d in inspection.dependencies)
-    # Task 7: defensive per-plugin block — Task 8 adds a `source` attribute
-    # (a `PluginDepResolution`) to plugin-kind dependency resolutions,
-    # carrying the bundled plugin's scoped/manifest name, version, MCP
-    # servers, protected tools, and required env var names. Render this
-    # block ONLY for a dependency that actually HAS a `source` (via
-    # `getattr(..., None)`, never a hard attribute access), so this function
-    # keeps rendering unchanged for every legacy inspection that predates
-    # Task 8 — and for any non-plugin dependency (persona/corpus) today.
+    # Task 8: one block per sourced plugin dependency, from the REAL
+    # `specialist_receipt.PluginReceiptRow`s Task 8 attaches at
+    # `inspection.plugin_resolutions` (Task 7's sketch used provisional
+    # per-dependency `getattr` field names before that type existed — this
+    # replaces it with the real field set: identifier/scoped_name/
+    # manifest_name/version/source_type/content_digest; no mcp_servers/
+    # protected_tools/env_names — those never made it into the receipt row
+    # contract). `getattr(..., ())` keeps this rendering unchanged (empty
+    # section) for any legacy inspection object that predates the field.
     plugin_blocks: list[str] = []
-    for d in inspection.dependencies:
-        source = getattr(d, "source", None)
-        if source is None:
-            continue
-        scoped_name = getattr(source, "scoped_name", None)
-        manifest_name = getattr(source, "manifest_name", None)
-        version = getattr(source, "version", None)
-        mcp_servers = getattr(source, "mcp_servers", None)
-        protected_tools = getattr(source, "protected_tools", None)
-        env_names = getattr(source, "env_names", None)
-        lines = [f"  Bundled plugin {scoped_name or d.identifier}:"]
-        if manifest_name is not None:
-            lines.append(f"    manifest name: {manifest_name}")
-        if version is not None:
-            lines.append(f"    version: {version}")
-        if mcp_servers is not None:
-            lines.append(f"    mcp servers: {', '.join(mcp_servers) or '(none)'}")
-        if protected_tools is not None:
-            lines.append(f"    protected tools: {', '.join(protected_tools) or '(none)'}")
-        if env_names is not None:
-            lines.append(f"    env: {', '.join(env_names) or '(none)'}")
+    for row in getattr(inspection, "plugin_resolutions", ()) or ():
+        lines = [
+            f"  Bundled plugin {row.scoped_name}:",
+            f"    manifest name: {row.manifest_name}",
+            f"    version: {row.version}",
+            f"    source: {row.source_type}",
+            f"    content digest: {row.content_digest}",
+        ]
         plugin_blocks.append("\n".join(lines))
     plugin_section = ("\n".join(plugin_blocks) + "\n") if plugin_blocks else ""
     return (

@@ -229,5 +229,6 @@ def test_clean_image_install_of_the_exported_finance_bundle_succeeds(tmp_path: P
         "casa-org/casa-finance-specialist", "v0.1.0",
         staging_root=tmp_path / "staging", installed_index=InstalledSpecialistIndex(
             specialists_dir=str(tmp_path / "specialists")),
+        receipts_dir=tmp_path / "receipts",
     )
     assert result.slug == "finance"  # no SpecialistInstallError("slug_collision", ...) raised
