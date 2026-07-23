@@ -54,6 +54,8 @@ chain, from the tool the configurator sees to the doctrine it reads.
   load time, and executors without a matching image role refuse to load — an
   executor's editable configuration can narrow its tools but never extend them.
 
+## [0.100.2] - 2026-07-22
+
 ### Fixed
 
 - No functional changes. Reconciled the container e2e delegation suite to
