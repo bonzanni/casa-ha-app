@@ -52,6 +52,8 @@ jobs:
         run: bash test-local/e2e/test_specialist_delegation.sh
       - name: Specialist install-from-repo + persona-swap epoch (final gate)
         run: bash test-local/e2e/test_specialist_install_from_repo.sh
+      - name: Bundled specialist one-flow install + uninstall cascade
+        run: bash test-local/e2e/test_bundled_specialist_install.sh
       - name: E2E - scheduling
         run: bash test-local/e2e/test_scheduling.sh
       - name: Engagement E-block
