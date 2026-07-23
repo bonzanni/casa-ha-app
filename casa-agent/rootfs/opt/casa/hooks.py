@@ -1306,8 +1306,23 @@ def _managed_write_shape(command: str, *, _depth: int = 0) -> bool:
     for m in _MANAGED_REDIRECT_RE.finditer(scan):
         if _token_resolves_managed(m.group(1)):
             return True
+    # Round-10 (Sol): env-assignment-prefixed commands are write-shaped —
+    # `GIT_EXTERNAL_DIFF='sh -c "cp ... <managed>"' git diff ...` (or
+    # LD_PRELOAD/PATH injection) modifies EXECUTION, and _split_pipeline
+    # strips the assignments before classification ever sees them. One
+    # rule ends the variable-enumeration game; a rare read like
+    # `LANG=C grep ... <managed>` false-denies only when a managed token
+    # is present (fail-closed; the configurator has no shell at all).
+    if _MANAGED_ENV_PREFIX_RE.search(command):
+        return True
     return any(_argv_managed_write(argv, _depth=_depth)
                for argv in _split_pipeline(command))
+
+
+# Segment-leading VAR=... (start of command or right after ; | & && ||).
+# Anchored to segment starts so `grep "X=1" <path>` never matches.
+_MANAGED_ENV_PREFIX_RE = re.compile(
+    r"(?:^|[;|&]\s*)[A-Za-z_][A-Za-z0-9_]*=")
 
 
 # Round-2 F4 (Sol): interpreter escape — `python3 -c "open('agents/...',

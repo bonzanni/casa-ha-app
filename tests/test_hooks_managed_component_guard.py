@@ -1023,3 +1023,29 @@ async def test_bash_git_safe_postsubcommand_options_pass(command):
     out = await _hook()(
         {"tool_name": "Bash", "tool_input": {"command": command}}, None, {})
     assert out == {}, command
+
+
+# ------------------------------------------------------------------
+# Round-10 (Sol): env-assignment-prefixed commands are write-shaped
+# ------------------------------------------------------------------
+
+
+@pytest.mark.parametrize("command", [
+    ("GIT_EXTERNAL_DIFF='sh -c \"cp /tmp/x /config/plugins/registry.json\"' "
+     "git -C /config diff HEAD~1 HEAD -- agents/specialists/finance"),
+    "LD_PRELOAD=/tmp/evil.so cat /config/specialists/finance/active.yaml",
+    "PATH=/tmp/bin:$PATH ls /config/bindings",
+    "cd /tmp; GIT_PAGER='tee /config/plugins/x' git -C /config log -- plugins/",
+])
+async def test_bash_env_prefixed_commands_denied(command):
+    out = await _hook()(
+        {"tool_name": "Bash", "tool_input": {"command": command}}, None, {})
+    assert _decision(out) == "deny", command
+
+
+async def test_bash_env_shape_inside_args_not_confused():
+    # X=1 as an ARGUMENT (not segment-leading) must not trip the env rule.
+    out = await _hook()({"tool_name": "Bash", "tool_input": {
+        "command": "grep 'MODE=1' /config/plugins/store/x/plugin.json"}},
+        None, {})
+    assert out == {}
