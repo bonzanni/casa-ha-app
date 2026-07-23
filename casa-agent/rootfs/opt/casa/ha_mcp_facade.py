@@ -435,6 +435,23 @@ def _filter_live_context(
             )
             return payload
 
+        if isinstance(decoded.get("result"), str):
+            # Current HA GetLiveContext contract: a curated envelope
+            # {"success": bool, "result": "<text overview>"} whose `result`
+            # string already lists only Assist-exposed entities scoped to what
+            # the caller asked for. The legacy top-level-key domain filter must
+            # NOT run here — every top-level key ("success", "result") fails the
+            # `key.partition(".")[0] == domain` test, so it would drop the whole
+            # overview and Tina would see zero devices (issue #223). Pass the
+            # payload through unchanged; the distinct log keeps a future
+            # contract change observable.
+            logger.info(
+                "Home Assistant live-context filter passthrough: "
+                "content_count=%d shape=success_result",
+                len(filtered_content),
+            )
+            return payload
+
         selected = {
             key: value
             for key, value in decoded.items()
