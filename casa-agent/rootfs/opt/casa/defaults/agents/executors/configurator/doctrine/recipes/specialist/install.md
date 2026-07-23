@@ -6,21 +6,32 @@ hand-created directories; see recipes/specialist/create.md). Installed specialis
 their identity, persona binding, and runtime files are all derived from the component, never
 hand-edited.
 
+A component may declare bundled or repo-sourced plugin dependencies (e.g. mtg's `mtg` plugin).
+These are NEVER installed separately: `specialist_install_inspect` resolves and validates the whole
+dependency closure (persona, corpus, plugins) in one pass, ONE consent DM covers the specialist AND
+every dependency together, and `specialist_install_commit` activates all of it atomically. Do not
+call `plugin_add` for a specialist's declared plugin — see `recipes/plugin/add.md`.
+
 ## Ask the user
 
 1. **Repository locator** (`owner/repo` + a ref — branch/tag/sha).
 2. Nothing else up front — `specialist_install_inspect` reports the component's own declared
-   mission, default persona, and required config/secret names; ask the operator to supply THOSE by
-   name once inspection returns.
+   mission, default persona, dependencies (including any bundled/declared plugin), and required
+   config/secret names; ask the operator to supply THOSE by name once inspection returns.
 
 ## Steps
 
 1. `specialist_install_inspect(repo=..., ref=...)`. On any `ok: false`, report the `kind`/`detail`
-   verbatim and stop — do NOT retry with fabricated inputs.
+   verbatim and stop — do NOT retry with fabricated inputs. On `ok: true` the result carries a
+   `receipt_id` for this exact inspected closure — hold onto it verbatim; `specialist_install_commit`
+   requires it back unchanged.
 2. Summarize the inspection result as a plain message in the topic (mission, default persona,
-   dependencies, required config/secret names) so the operator sees it BEFORE the DM consent
-   prompt fires — the DM keyboard (posted server-side by `prompt_specialist_install_consent`, not by
-   this recipe) is the actual approval gate; this step is purely informational context in-topic.
+   dependencies — including what any bundled plugin needs — required config/secret names) so the
+   operator sees it BEFORE the DM consent prompt fires — the DM keyboard (posted server-side by
+   `prompt_specialist_install_consent`, not by this recipe) is the actual approval gate, and it
+   already covers the WHOLE install (the specialist AND every dependency) in ONE consent; this step
+   is purely informational context in-topic. There is no separate consent, and no separate
+   `plugin_add`, for a dependency plugin — ever.
 3. Wait for the operator's DM tap (Approve/Deny) to resolve. There is no polling tool — the
    `specialist_install_commit` call in the next step will itself refuse with `kind:
    "consent_missing"` if the tap has not landed yet; on that specific error, tell the operator you
@@ -29,12 +40,14 @@ hand-edited.
    do NOT ask for a second message by default; only if that automatic resume fails to deliver
    would the operator need to send any message in the topic to continue.
 4. Once approved: `specialist_install_commit(component_id=..., version=..., root_digest=...,
-   slug=..., staged_dir=..., config={...}, secret_names_provided=[...])` using the EXACT values
-   `specialist_install_inspect` returned.
+   slug=..., staged_dir=..., receipt_id=..., config={...}, secret_names_provided=[...])` using the
+   EXACT values `specialist_install_inspect` returned, `receipt_id` included. Omitting it (or
+   passing a stale one from an earlier inspect) refuses with `kind: "receipt_required"` — re-run
+   inspect and retry with the fresh id; never fabricate one.
 5. If `state == "pending-configuration"`: report which config/secret names are still missing; the
    operator supplies them via a follow-up `specialist_install_commit` call with the SAME
-   `staged_dir` (re-inspect if `staged_dir` has been cleaned up — staging is not guaranteed durable
-   across a restart).
+   `staged_dir` and `receipt_id` (re-inspect if `staged_dir` has been cleaned up — staging is not
+   guaranteed durable across a restart, and a re-inspect mints a fresh `receipt_id` too).
 6. If `state == "active"`: wire delegation by applying ONLY the edit steps of
    `recipes/delegate/wire.md` (edit `delegates.yaml` idempotently + ensure the
    delegate tool is allowed). Do NOT run wire.md's own commit/reload/emit_completion
@@ -51,9 +64,17 @@ hand-edited.
 - Calling `specialist_install_commit` before the operator has actually tapped Approve — it will
   correctly refuse (`kind: "consent_missing"`); this is not a bug to work around, it IS the consent
   gate.
+- Calling `specialist_install_commit` without `receipt_id`, or with one carried over from an
+  EARLIER inspect — it refuses with `kind: "receipt_required"`; always use the id the LATEST
+  `specialist_install_inspect` call returned.
+- Calling `plugin_add`/`plugin_assign` for a dependency the component already declares — it never
+  needs a separate add; inspect + commit install it as part of the SAME bundle. Once active, those
+  tools (and `plugin_update`/`plugin_unassign`/`plugin_remove`) refuse the owned entry with `kind:
+  "owned_by_specialist"` — use `specialist_upgrade`/`specialist_uninstall` on the SLUG instead.
 - Forgetting `casa_reload(scope="agents")` — an `active` install is on disk but not in the live
   registry until reload runs.
 - Re-approving a DIFFERENT re-fetch under the same slug: a second `specialist_install_inspect` call
-  yields a NEW `root_digest` if the repo moved (or any bundled persona/corpus/plugin dependency
-  changed), which requires a NEW consent DM — the old approval never carries over (see
-  `install_consent_identity`'s four-field binding, now keyed on `root_digest`).
+  yields a NEW `root_digest` (and a NEW `receipt_id`) if the repo moved (or any bundled
+  persona/corpus/plugin dependency changed), which requires a NEW consent DM — the old approval
+  never carries over (see `install_consent_identity`'s four-field binding, now keyed on
+  `root_digest`).

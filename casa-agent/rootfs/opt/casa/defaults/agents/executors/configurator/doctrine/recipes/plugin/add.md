@@ -61,7 +61,24 @@ means every target agrees. The result carries the same phase fields as
 but a target didn't come up; retry the reload/verify, not the add. Exception:
 `ok:true` with a non-empty `pending_targets` (e.g. `["specialist:mtg"]`) is
 **success, not a failure** — the plugin targets a specialist that is not
-installed yet, which is the documented order (plugin first, then the
-specialist install picks it up). Do NOT retry, work around, or remove the
-plugin; proceed to the specialist install. Report the outcome and
+installed yet. `plugin_add` (this recipe) is needed only for an
+OPERATOR-owned plugin: a specialist with bundled or repo-declared plugin
+dependencies (its manifest's `dependencies`, `kind: "plugin/implementation"`)
+installs them in the SAME flow as the specialist itself —
+`specialist_install_inspect` + `specialist_install_commit`, see
+`recipes/specialist/install.md` — never a separate `plugin_add`. Do NOT
+retry, work around, or remove the plugin; if `pending_targets` names a
+specialist slug, proceed to that specialist's install and it will pick the
+plugin up automatically as one of its own declared dependencies (or, if the
+specialist is never going to declare it, the plugin simply stays pending —
+that is a valid end state, not an error). Report the outcome and
 `emit_completion(...)`.
+
+A plugin registry entry a specialist's install/upgrade OWNS (registry name
+`<slug>.<name>`) can never be managed through this recipe or `remove.md` /
+`update.md` / an assign-unassign step: `plugin_add` itself can't collide with
+one (owned names are scoped), but `plugin_update` / `plugin_remove` /
+`plugin_assign` / `plugin_unassign` all refuse an owned entry outright with
+`kind: "owned_by_specialist"` (plus the owning slug). Use
+`specialist_upgrade` / `specialist_uninstall` on the SLUG instead of trying to
+touch the owned entry directly.

@@ -80,15 +80,23 @@ def export_finance_component(
 
 def export_mtg_component(
     *, defaults_root: Path = Path("casa-agent/rootfs/opt/casa/defaults"), corpus_source: Path,
-    mtg_plugin_content_checksum: str,
+    mtg_plugin_root: Path,
 ) -> ExportBundle:
     """corpus_source: an operator-supplied directory holding the MTG CR/oracle
     text (not present in this repo — see this task's Baseline note).
-    mtg_plugin_content_checksum: the ALREADY plugin_add-installed mtg
-    plugin's published artifact checksum (read from plugin_registry at
-    export time by the operator running this tool, passed in explicitly —
-    export never re-derives it, matching this plan's Global Constraints
-    reuse of tools._plugin_assign_sync rather than a duplicated lookup)."""
+    mtg_plugin_root: the operator-supplied mtg plugin implementation tree
+    (bundled INTO the component at `plugins/mtg/`, matching the read side's
+    `source: {type: bundled, path: plugins/mtg}` convention —
+    `resolve_dependency_closure`'s `plugin/implementation` branch resolves a
+    bundled dep from `component_dir / source.path`). The tree is normalized
+    (`plugin_store.strip_bytecode_derivatives`) on a COPY before it is either
+    hashed or written into the bundle, so the digest this function computes
+    always matches what a fresh `content_checksum` over the bundle's own
+    `plugins/mtg/` entries recomputes."""
+    import shutil
+    import tempfile
+
+    import plugin_store
     from persona_pack import load_persona_pack
     from plugin_store import content_checksum
     from specialist_install import is_safe_corpus_identifier
@@ -118,6 +126,23 @@ def export_mtg_component(
     # this is the write side of the same digest).
     corpus_digest = "sha256:" + content_checksum(corpus_source)
 
+    # Normalize a COPY of the operator-supplied plugin tree (never mutate the
+    # caller's own directory), strip bytecode derivatives the SAME way
+    # publish-time staging does (plugin_store._stage_and_swap) so the digest
+    # this function computes always matches what resolve_dependency_closure
+    # recomputes from the bundle's own `plugins/mtg/` tree at install time,
+    # then read the normalized bytes straight into the bundle.
+    plugin_files: dict[str, bytes] = {}
+    with tempfile.TemporaryDirectory() as td:
+        copied_plugin_dir = Path(td) / "mtg-plugin"
+        shutil.copytree(mtg_plugin_root, copied_plugin_dir)
+        plugin_store.strip_bytecode_derivatives(copied_plugin_dir)
+        plugin_digest = "sha256:" + plugin_store.content_checksum(copied_plugin_dir)
+        for path in sorted(copied_plugin_dir.rglob("*")):
+            if path.is_file():
+                rel = path.relative_to(copied_plugin_dir)
+                plugin_files[f"plugins/mtg/{rel.as_posix()}"] = path.read_bytes()
+
     manifest = _build_manifest(
         component_id="casa/mtg", version="0.1.0", role_files=role_files,
         config_schema=config_schema, default_persona_ref=persona_ref,
@@ -125,14 +150,15 @@ def export_mtg_component(
         dependencies=[
             {"kind": "persona", "identifier": persona_ref, "digest": pack.checksum},
             {"kind": "corpus/data", "identifier": corpus_identifier, "digest": corpus_digest},
-            {"kind": "plugin/implementation", "identifier": "mtg",
-             "digest": mtg_plugin_content_checksum},
+            {"kind": "plugin/implementation", "identifier": "mtg", "digest": plugin_digest,
+             "source": {"type": "bundled", "path": "plugins/mtg"}},
         ],
     )
     files: dict[str, bytes] = {
         "manifest.json": manifest, **role_files, "config-schema.json": config_schema,
         **_persona_bundle_files(persona_dir / "pack"),
         "persona/manifest.json": (persona_dir / "manifest.json").read_bytes(),
+        **plugin_files,
     }
     for path in sorted(corpus_source.rglob("*")):
         if path.is_file():

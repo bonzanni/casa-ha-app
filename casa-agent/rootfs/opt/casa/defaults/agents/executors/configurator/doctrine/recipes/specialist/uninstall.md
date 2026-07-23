@@ -4,7 +4,13 @@
    `/config/agents/*/delegates.yaml`) and unwire them first by applying ONLY the
    edit step of `recipes/delegate/unwire.md` (do NOT run its commit/reload/emit_completion
    — steps 3–5 below do that once) — an uninstall does NOT auto-unwire delegates.
-2. `specialist_uninstall(slug=...)`.
+2. `specialist_uninstall(slug=...)`. This cascades: any plugin registry entry the slug's
+   install/upgrade OWNS (registry name `<slug>.<name>`) is removed automatically as part of this
+   ONE call — never `plugin_remove` it yourself (it refuses an owned entry with `kind:
+   "owned_by_specialist"` anyway). An OPERATOR-installed plugin that merely TARGETS the slug (its
+   `targets` list names `specialist:<slug>`) is a DIFFERENT thing and is left alone — it is not
+   removed, just left with a target nothing currently answers (surfaces as `pending_targets` the
+   next time it is reloaded/verified).
 3. `config_git_commit(message="uninstall specialist <slug>")`.
 4. `casa_reload(scope="agents")` — evicts the removed agent from the live
    registry (canonical commit → reload → emit order, see `completion.md`).
@@ -20,3 +26,6 @@ model).
   removed specialist will fail to resolve on the next delegation attempt.
 - Skipping `casa_reload(scope="agents")` — the on-disk instance is gone but the live registry still
   holds the (now orphaned) loaded agent until reload runs.
+- Assuming an operator-installed plugin that targeted the removed slug is gone too — it is NOT
+  cascaded out; only slug-OWNED entries are. Tell the operator it survived as a `pending_targets`
+  entry, and let them decide whether to retarget it or reinstall the specialist.
