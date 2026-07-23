@@ -400,6 +400,77 @@ async def test_live_context_domain_is_never_forwarded_upstream():
 
 
 @pytest.mark.asyncio
+async def test_live_context_success_result_envelope_passes_through(caplog):
+    # Regression for issue #223: current HA GetLiveContext returns a
+    # {"success": bool, "result": "<text overview>"} envelope, not a dict
+    # keyed by domain.entity ids. The old filter kept only top-level keys
+    # whose prefix matched the domain, dropping every device (the live bug
+    # logged object_count=1 input_count=2 output_count=0). The result text
+    # must survive untouched.
+    overview = (
+        "Live Context: An overview of the areas and the devices in this "
+        "smart home:\n"
+        "- names: Bathroom\n  domain: light\n  state: on\n"
+        "- names: Kitchen\n  domain: light\n  state: off\n"
+    )
+    raw = json.dumps({"success": True, "result": overview})
+    upstream = FakeHaSession(
+        tools=[live_context_tool()],
+        results={"GetLiveContext": text_result(raw)},
+    )
+    facade = make_facade(upstream)
+
+    await facade.start()
+    try:
+        with caplog.at_level(logging.INFO):
+            result = await invoke_sdk_tool(
+                facade.server_config,
+                "GetLiveContext",
+                {"domain": "light"},
+            )
+        assert upstream.calls == [("GetLiveContext", {})]
+        # The envelope is passed through verbatim — the device data survives.
+        payload = json.loads(result["content"][0]["text"])
+        assert payload == {"success": True, "result": overview}
+        assert "Bathroom" in payload["result"]
+        assert "Kitchen" in payload["result"]
+        assert "domain: light" in payload["result"]
+        # Truthful, distinct log so a future contract change is observable;
+        # the old buggy "output_count=0" line must not appear.
+        assert "filter passthrough" in caplog.text
+        assert "shape=success_result" in caplog.text
+        assert "output_count=0" not in caplog.text
+    finally:
+        await facade.aclose()
+
+
+@pytest.mark.asyncio
+async def test_live_context_without_domain_is_returned_unchanged():
+    # No `domain` argument means the facade must not touch the response at
+    # all (the filter is never entered) — the full envelope reaches the caller.
+    overview = json.dumps(
+        {"success": True, "result": "Live Context: everything here"},
+    )
+    upstream = FakeHaSession(
+        tools=[live_context_tool()],
+        results={"GetLiveContext": text_result(overview)},
+    )
+    facade = make_facade(upstream)
+
+    await facade.start()
+    try:
+        result = await invoke_sdk_tool(
+            facade.server_config,
+            "GetLiveContext",
+            {},
+        )
+        assert upstream.calls == [("GetLiveContext", {})]
+        assert result["content"][0]["text"] == overview
+    finally:
+        await facade.aclose()
+
+
+@pytest.mark.asyncio
 async def test_unparseable_live_context_is_returned_unchanged():
     raw = "Kitchen light: on\nOffice climate: idle"
     upstream = FakeHaSession(

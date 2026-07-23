@@ -1,5 +1,16 @@
 # Changelog
 
+## [0.104.0] - 2026-07-23
+
+### Fixed
+
+- **Voice control of Home Assistant devices works again.** The voice butler
+  (Tina) could not see any devices — lights, switches, everything — when asked
+  to control them by voice. Home Assistant changed the shape of its live-context
+  response, and Casa's filter was still written for the old shape, so it discarded
+  the entire device list. The filter now understands the current format and passes
+  the device overview through, with a regression test pinned to the real shape.
+
 ## [0.103.0] - 2026-07-23
 
 ### Fixed
