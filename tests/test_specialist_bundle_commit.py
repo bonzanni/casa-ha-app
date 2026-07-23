@@ -618,3 +618,133 @@ def test_bundle_uninstall_cascade(tmp_path: Path, monkeypatch) -> None:
     assert (tmp_path / "store" / "mtg.mtg" / v1_aid).is_dir()   # artifact RETAINED
     # journal in-progress+committed (tool completes it after the sequencer)
     assert Path(txn.journal_path).is_file()
+
+
+# ===========================================================================
+# 2e — receipt-required guard (Task 10 review round 1, F1 defense-in-depth):
+# a direct in-process caller must not be able to walk the legacy no-receipt
+# path with a component that declares a source-bearing plugin dependency —
+# the sourced dep resolves "available" straight off the component's own
+# staged tree, but no plugin is ever published/registered, leaving an inert
+# dangling pin. `commit_specialist_install`/`upgrade_specialist` must refuse
+# BEFORE any InstanceDir/registry mutation; sourceless components must keep
+# installing/upgrading via the legacy path exactly as before.
+# ===========================================================================
+
+def test_commit_refuses_sourced_dep_component_without_a_receipt(tmp_path: Path, monkeypatch) -> None:
+    ctx = _prep(tmp_path, monkeypatch)          # component DOES declare a sourced plugin dep
+    kw = dict(ctx.kw)
+    kw["receipt"] = None
+    reg_path = kw["registry_path"]
+    before_registry_bytes = reg_path.read_bytes() if reg_path.is_file() else None
+
+    with pytest.raises(specialist_install.SpecialistInstallError) as ei:
+        specialist_install.commit_specialist_install(**kw)
+
+    assert ei.value.kind == "receipt_required"
+    # nothing durable: no owned entries, no instance tree, registry byte-identical
+    assert _owned(reg_path, "mtg") == []
+    assert not (tmp_path / "specialists" / "mtg").exists()
+    after_registry_bytes = reg_path.read_bytes() if reg_path.is_file() else None
+    assert after_registry_bytes == before_registry_bytes
+    assert list((tmp_path / "ops").glob("*.json")) == []   # no journal even begun
+
+
+def test_commit_sourceless_component_still_installs_without_a_receipt(
+    tmp_path: Path, monkeypatch,
+) -> None:
+    """Regression companion to the guard above, using THIS file's bundle-
+    shaped fixtures (with_plugin=False -> no `source`-bearing dependency at
+    all) as a belt-and-suspenders check alongside
+    tests/test_specialist_install.py::
+    test_commit_persists_cas_writes_active_tuple_and_materializes_operational_files
+    (a differently-shaped fixture that also calls commit_specialist_install
+    with no `receipt` kwarg at all — verified still passing)."""
+    ctx = _prep(tmp_path, monkeypatch, with_plugin=False)
+    kw = dict(ctx.kw)
+    kw["receipt"] = None
+
+    instance = specialist_install.commit_specialist_install(**kw)
+
+    assert instance.state == "active"
+    assert _owned(kw["registry_path"], "mtg") == []   # nothing to own; nothing to guard
+
+
+def test_upgrade_refuses_sourced_dep_component_without_a_receipt(
+    tmp_path: Path, monkeypatch,
+) -> None:
+    ctx = _prep(tmp_path, monkeypatch)
+    specialist_install.commit_specialist_install(**ctx.kw)   # v1 active, published via bundle mode
+    reg = ctx.kw["registry_path"]
+    v1_aid = _owned(reg, "mtg")[0]["artifact_id"]
+    slug_dir = tmp_path / "specialists" / "mtg"
+    before_tuple_bytes = specialist_install._tuple_files_snapshot(slug_dir)
+
+    kw2 = _prep_v2(tmp_path, monkeypatch, ctx)   # v2 component ALSO declares a sourced plugin dep
+    kw2["receipt"] = None
+
+    with pytest.raises(specialist_install.SpecialistInstallError) as ei:
+        specialist_install.upgrade_specialist(**kw2)
+
+    assert ei.value.kind == "receipt_required"
+    # old generation fully untouched
+    owned = _owned(reg, "mtg")
+    assert len(owned) == 1 and owned[0]["artifact_id"] == v1_aid
+    assert specialist_install._tuple_files_snapshot(slug_dir) == before_tuple_bytes
+
+
+# ===========================================================================
+# 2f — uninstall stranding guard (due-diligence companion): a non-bundle
+# uninstall DELETES the InstanceDir tree outright, so any owned registry
+# entries a prior bundle install/upgrade published for this slug would
+# become PERMANENTLY orphaned (owner points at a specialist that no longer
+# exists) — a strictly worse, unrecoverable version of the same dangling-pin
+# gap. rollback_specialist is NOT guarded: its non-bundle core never touches
+# the registry and never deletes the slug, so nothing is ever stranded —
+# worst case is a stale registry generation that the next bundle-aware
+# upgrade/rollback/uninstall reconciles.
+# ===========================================================================
+
+def test_uninstall_without_bundle_refuses_when_owned_entries_would_be_stranded(
+    tmp_path: Path, monkeypatch,
+) -> None:
+    ctx = _prep(tmp_path, monkeypatch)
+    specialist_install.commit_specialist_install(**ctx.kw)   # publishes one owned entry
+    reg = ctx.kw["registry_path"]
+    assert len(_owned(reg, "mtg")) == 1
+    slug_dir = tmp_path / "specialists" / "mtg"
+    assert slug_dir.exists()
+
+    with pytest.raises(specialist_install.SpecialistInstallError) as ei:
+        specialist_install.uninstall_specialist(
+            slug="mtg", specialists_dir=tmp_path / "specialists",
+            agents_specialists_dir=tmp_path / "agents", registry_path=reg)
+
+    assert ei.value.kind == "bundle_required"
+    # nothing removed: the owned entry AND the instance tree both survive
+    assert len(_owned(reg, "mtg")) == 1
+    assert slug_dir.exists()
+
+
+def test_uninstall_without_bundle_still_works_when_nothing_is_owned(
+    tmp_path: Path, monkeypatch,
+) -> None:
+    """Regression: legacy uninstall callers that never published anything
+    through the bundle path must be unaffected by the new stranding guard.
+    Already covered from a plain (non-bundle-installed) fixture by
+    tests/test_specialist_install.py::
+    test_uninstall_removes_the_instance_dir_and_operational_files; this one
+    re-checks it against a REAL (bundle-installed, plugin-less) registry_path
+    that resolves but has nothing owned."""
+    ctx = _prep(tmp_path, monkeypatch, with_plugin=False)
+    specialist_install.commit_specialist_install(**ctx.kw)   # bundle install, no owned plugins
+    reg = ctx.kw["registry_path"]
+    assert _owned(reg, "mtg") == []
+    slug_dir = tmp_path / "specialists" / "mtg"
+    assert slug_dir.exists()
+
+    specialist_install.uninstall_specialist(
+        slug="mtg", specialists_dir=tmp_path / "specialists",
+        agents_specialists_dir=tmp_path / "agents", registry_path=reg)
+
+    assert not slug_dir.exists()

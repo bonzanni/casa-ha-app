@@ -1222,6 +1222,46 @@ def _removed_artifact_ids(before_entries: "list[dict]",
     return tuple(dict.fromkeys(removed))
 
 
+def _reject_receiptless_sourced_deps(
+    component: "SpecialistComponent", *, receipt: "SourceReceipt | None",
+) -> None:
+    """Task 10 review, defense-in-depth (F1): the journaled bundle publish/
+    registry-swap path (spec §3.2/§3.4) only engages when the tool layer
+    supplies a trusted-source `receipt` (`bundle_mode` in
+    commit_specialist_install / the receipt-aware branch of upgrade_specialist).
+    A direct in-process caller can otherwise walk the ORIGINAL legacy
+    no-receipt path with a component that DECLARES a source-bearing
+    `plugin/implementation` dependency — `resolve_dependency_closure` resolves
+    it available straight off the component tree (no fetch needed, the tree
+    is already staged), so every other gate passes, but no plugin is ever
+    published to the store or registered as owned. The result is an installed/
+    upgraded specialist pinned to a dependency that no `casa.triggers`/tool
+    surface can ever see — an inert dangling pin, silently violating the
+    F1 doctrine that validators live at the lifecycle-function boundary every
+    caller (sanctioned or not) routes through.
+
+    Fires for BOTH the fresh-staging and vanished/reused-staging CAS paths —
+    callers place this right after the CAS-resident `component` is loaded and
+    slug-checked, before either the persona/role load or the dependency-
+    closure resolution, so it is BEFORE any InstanceDir mutation. Sourceless,
+    persona-only, and corpus-only components (every dependency has
+    `source is None`, which includes non-`plugin/implementation` kinds and
+    bundled/no-op-source plugin deps that don't need registry publication) are
+    untouched — the legacy call-site fleet keeps working unchanged."""
+    if receipt is not None:
+        return
+    sourced = sorted(
+        d.identifier for d in component.dependencies
+        if d.kind == "plugin/implementation" and d.source is not None
+    )
+    if sourced:
+        raise SpecialistInstallError(
+            "receipt_required",
+            f"component {component.component_id!r} bundles source-declared "
+            f"plugin dependencies ({', '.join(sourced)}); a source receipt is "
+            "mandatory to install or upgrade it")
+
+
 def commit_specialist_install(
     *, inspection: "InspectionResult", receipt: "SourceReceipt | None" = None,
     config: "Mapping[str, str]",
@@ -1382,6 +1422,7 @@ def commit_specialist_install(
                 "slug_mismatch",
                 f"CAS component slug {component.slug!r} does not match the approved "
                 f"inspection slug {inspection.slug!r}")
+        _reject_receiptless_sourced_deps(component, receipt=receipt)
         role = materialize_role(source=load_role_artifact(cas_dir / "role"), options={})
         persona = load_persona_pack(cas_dir / "persona" / "pack", cas_dir / "persona" / "manifest.json")
 
@@ -1652,7 +1693,8 @@ def upgrade_specialist(
         return _upgrade_core(
             slug=slug, inspection=inspection, config=config,
             secret_names_provided=secret_names_provided, acks=acks,
-            specialists_dir=specialists_dir, agents_specialists_dir=agents_specialists_dir)
+            specialists_dir=specialists_dir, agents_specialists_dir=agents_specialists_dir,
+            receipt=None)
 
     if registry_path is None:
         registry_path = plugin_registry.REGISTRY_PATH
@@ -1690,7 +1732,8 @@ def upgrade_specialist(
             instance = _upgrade_core(
                 slug=slug, inspection=eff_inspection, config=config,
                 secret_names_provided=secret_names_provided, acks=acks,
-                specialists_dir=specialists_dir, agents_specialists_dir=agents_specialists_dir)
+                specialists_dir=specialists_dir, agents_specialists_dir=agents_specialists_dir,
+                receipt=receipt)
             if instance.state == "active":
                 published = _publish_owned_plugins(
                     slug, receipt, tree_paths, store_root=plugin_store_root)
@@ -1732,6 +1775,7 @@ def _upgrade_core(
     secret_names_provided: frozenset[str], acks: "SpecialistInstallAckStore",
     specialists_dir: Path = Path("/config/specialists"),
     agents_specialists_dir: Path = Path("/config/agents/specialists"),
+    receipt: "SourceReceipt | None" = None,
 ) -> "SpecialistInstance":
     """Spec §2.4/§4.1's transactional reinstall/upgrade: stage the new
     version as desired, validate+compile it fully BEFORE touching active,
@@ -1748,7 +1792,13 @@ def _upgrade_core(
     best-effort follow-up, not a second gate (see commit_specialist_install's
     docstring for the full rationale: the tuple is the single authoritative
     record; the operational files are a self-healing derived cache
-    current_specialist_roles_dir rebuilds on every boot/reload)."""
+    current_specialist_roles_dir rebuilds on every boot/reload).
+
+    `receipt` (threaded through by both of upgrade_specialist's call sites —
+    None on the legacy no-receipt path, the real receipt on the bundle path)
+    is used ONLY for `_reject_receiptless_sourced_deps`'s defense-in-depth
+    check below; this function never publishes/registers plugins itself
+    (upgrade_specialist's bundle branch does that after this returns)."""
     from personality_binding import (
         InstanceDir, InstanceTuple, check_persona_requirements, compute_effective_config_digest,
         materialize_component_default_binding, materialize_override_binding,
@@ -1825,6 +1875,7 @@ def _upgrade_core(
         raise SpecialistInstallError(
             "slug_mismatch",
             f"component slug {component.slug!r} does not match the requested upgrade slug {slug!r}")
+    _reject_receiptless_sourced_deps(component, receipt=receipt)
     fresh_deps = resolve_dependency_closure(component, cas_dir)
     fresh_unavailable = [d for d in fresh_deps if not d.available]
     if fresh_unavailable:
@@ -2228,13 +2279,33 @@ def uninstall_specialist(
     slug tree, retire ALL of the slug's consent acks, and return a BundleTxn
     whose removed_artifact_ids are every pre-swap owned artifact id (drives the
     sequencer's grant/challenge invalidation). Operator-owned entries targeting
-    the slug are never touched (they carry no owner)."""
+    the slug are never touched (they carry no owner).
+
+    Task 10 review, defense-in-depth (F1, due-diligence companion to
+    `_reject_receiptless_sourced_deps`): unlike a fresh install/upgrade, a
+    non-bundle uninstall doesn't merely skip publishing — it DELETES the
+    InstanceDir tree outright, so any owned registry entries a prior bundle
+    install/upgrade published for this slug would become PERMANENTLY
+    orphaned (owner points at a `specialist:<slug>` that no longer exists,
+    with no future reconcile able to notice). That is a strictly worse,
+    unrecoverable version of the dangling-pin gap, so refuse the legacy path
+    outright when owned entries exist rather than silently stranding them."""
+    import plugin_registry
+
     if not bundle:
+        _existing_owned = plugin_registry.owned_entries_for(
+            slug, plugin_registry.load_registry(
+                registry_path if registry_path is not None else plugin_registry.REGISTRY_PATH))
+        if _existing_owned:
+            raise SpecialistInstallError(
+                "bundle_required",
+                f"{slug!r} has {len(_existing_owned)} owned plugin registry "
+                "entries from a prior bundle install/upgrade; uninstall must "
+                "use bundle=True so they are cascaded out, not stranded")
         return _uninstall_core(
             slug=slug, specialists_dir=specialists_dir,
             agents_specialists_dir=agents_specialists_dir)
 
-    import plugin_registry
     import specialist_bundle_journal
     from specialist_bundle_journal import BundleTxn
 
