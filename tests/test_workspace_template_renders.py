@@ -115,7 +115,12 @@ def test_template_path_writes_translated_hooks(tmp_path, executor_defaults):
             hooks_yaml_data={"pre_tool_use": [{"policy": "block_dangerous_bash"}]})
     settings = json.loads((dest / ".claude" / "settings.json").read_text())
     assert "PreToolUse" in settings["hooks"]
-    assert len(settings["hooks"]["PreToolUse"]) == 1
+    # Declared entry + the code-mandatory managed_component_guard entry
+    # (round-4 Terra P0: yaml policies are additive-only).
+    pre = settings["hooks"]["PreToolUse"]
+    assert len(pre) == 2
+    assert pre[1]["hooks"][0]["command"].endswith(
+        "hook_proxy.sh managed_component_guard")
 
 
 def test_template_path_handles_bundled_plugin_developer(tmp_path):

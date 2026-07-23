@@ -843,6 +843,654 @@ def agent_home_settings_guard_matcher():
 
 
 # ---------------------------------------------------------------------------
+# managed_component_guard — #210 (v0.101.0): typed-pipeline-only state
+#
+# On a fresh install the configurator hand-authored specialist files under
+# /config/agents/specialists/ via Bash instead of the typed
+# specialist_install_* pipeline. Nothing blocked it: its path_scope makes
+# /config/agents writable, and only /config/plugins/ Bash-writes were
+# specially denied (the settings guard above). This policy denies ANY
+# hand-edit — Write/Edit by normalized path, Bash by write-shaped commands —
+# of the managed component trees, and ROUTES the model to the typed tool
+# for the matched tree. Reads stay allowed: the configurator legitimately
+# inspects these trees to verify pipeline outcomes.
+#
+# Fail-closed (#210, same rationale as make_resident_authz_hook in
+# authz_grants.py): an ESCAPED callback exception becomes an SDK error
+# control response, NOT a deny — so the whole body runs inside try/except
+# and any unexpected Exception returns the deny shape (CancelledError
+# re-raises). Same accepted residual as the other Bash guards: argv-level
+# inspection, not a sandbox — obfuscated writes (source'd scripts, busybox
+# applets, git-apply, interpreters reading code from files/stdin, and
+# variable-built destinations like `d=/config; printf x > "$d/plugins/…"`)
+# need the outer boundary; filesystem-level containment for the
+# plugin-developer's shell is tracked as #216. Round-2 W1 (ratified): for
+# the CONFIGURATOR that Bash
+# vector is now closed at the capability layer — Bash was removed from its
+# toolset (role.yaml + definition.yaml). The Bash branch below stays fully
+# intact: the plugin-developer keeps Bash, and an operator who deliberately
+# re-adds Bash to an executor still gets this guard as the inner layer.
+#
+# Round-2 hardening (Sol+Terra adversarial review):
+#   F1  Bash commands also enforce the hooks.yaml policy-file rule.
+#   F2  RELATIVE paths (cwd is /config — tools.py ClaudeAgentOptions) are
+#       resolved against /config before the prefix test, for Write/Edit
+#       file_path and for Bash path tokens.
+#   F3  In addition to the lexical test, paths are os.path.realpath-resolved
+#       so a symlink in a writable area can't tunnel into a managed tree;
+#       OSError during resolution denies (fail-closed).
+#   F4  Inline-interpreter invocations (python/perl/ruby/node -c/-e) that
+#       mention a managed token deny regardless of write verbs.
+#   F5  Write VERBS must sit in command position (wrapper prefixes allowed);
+#       only true operators (>, >>, sed -i, perl -i, -delete, -exec) match
+#       anywhere — `grep -r install /config/plugins/store` passes.
+# ---------------------------------------------------------------------------
+
+
+# Round-2 W5 (Sol): routes name the FULL lifecycle toolset per prefix, not
+# just the install/add door — a deny on an upgrade/removal attempt must
+# route to the matching typed tool, not send the model back to install.
+_MANAGED_ROUTE_SPECIALISTS = (
+    "Specialists: use specialist_install_inspect / specialist_install_commit, "
+    "specialist_upgrade, specialist_rollback, specialist_uninstall "
+    "(doctrine/recipes/specialist/)."
+)
+_MANAGED_ROUTE_PLUGINS = (
+    "Plugins: use plugin_add / plugin_update / plugin_assign / "
+    "plugin_unassign / plugin_remove (doctrine/recipes/plugin/)."
+)
+_MANAGED_ROUTE_BINDINGS = (
+    "Bindings/personas: use resident_persona_swap / resident_persona_reset "
+    "/ persona_apply (doctrine/recipes/persona/)."
+)
+_MANAGED_ROUTE_PERSONAS = (
+    "Personas: use persona_install_inspect / persona_install_commit / "
+    "persona_apply (doctrine/recipes/persona/)."
+)
+
+# Managed prefix -> routing sentence. Prefixes are matched against
+# _normalize_path output (so `..` traversal and `//` collapse can't slip
+# through); first match wins (the prefixes are disjoint after normalization).
+# Round-2 W2 (Sol): /config/personas added — persona installs are
+# consent-gated exactly like specialists, so their tree is managed too.
+_MANAGED_PREFIX_ROUTES: tuple[tuple[str, str], ...] = (
+    ("/config/agents/specialists", _MANAGED_ROUTE_SPECIALISTS),
+    ("/config/specialists", _MANAGED_ROUTE_SPECIALISTS),
+    ("/config/bindings", _MANAGED_ROUTE_BINDINGS),
+    ("/config/personas", _MANAGED_ROUTE_PERSONAS),
+    ("/config/plugins", _MANAGED_ROUTE_PLUGINS),
+)
+
+_MANAGED_HOOKS_YAML_DENY = (
+    "managed_component_guard: {tool} blocked — {path!r} is a hook-policy file "
+    "(hooks.yaml under /config/agents/). An executor must never edit hook "
+    "policy files; ask the user if a policy change is truly needed."
+)
+
+_MANAGED_INTERNAL_DENY = (
+    "managed_component_guard: internal error — failing closed; the call was "
+    "not executed."
+)
+
+_MANAGED_RESOLVE_DENY = (
+    "managed_component_guard: {tool} blocked — could not resolve {path!r} "
+    "(realpath error); failing closed. Use the typed pipeline tools for "
+    "managed component state."
+)
+
+
+def _managed_prefix_route(norm: str) -> tuple[str, str] | None:
+    """Return ``(prefix, route)`` for the managed prefix containing ``norm``,
+    or ``None``. ``norm`` must already be ``_normalize_path``-normalized."""
+    for prefix, route in _MANAGED_PREFIX_ROUTES:
+        if _has_prefix(norm, [prefix]):
+            return prefix, route
+    return None
+
+
+def _managed_path_hit(norm: str) -> tuple[str, str, str] | None:
+    """Lexical managed-state test for one normalized absolute path.
+
+    Returns ``("prefix", <prefix>, <route>)`` when ``norm`` is under a
+    managed prefix, ``("hooks_yaml", norm, "")`` when it names a hook-policy
+    file under /config/agents/ (round-2 F1 shares this with the Bash
+    branch), else ``None``.
+    """
+    hit = _managed_prefix_route(norm)
+    if hit is not None:
+        prefix, route = hit
+        return ("prefix", prefix, route)
+    if (norm.startswith(_RESIDENT_ROOT + "/")
+            and PurePosixPath(norm).name == "hooks.yaml"):
+        return ("hooks_yaml", norm, "")
+    return None
+
+
+def _managed_real_hit(norm: str) -> tuple[str, str, str] | None:
+    """Lexical test PLUS symlink resolution (round-2 F3).
+
+    The lexical test alone is defeated by a symlink in a writable area that
+    points into a managed tree; ``os.path.realpath`` alone would miss
+    not-yet-existing paths whose lexical form is managed (realpath resolves
+    only EXISTING ancestor components). So: lexical first, then realpath on
+    a lexical miss. Any ``OSError`` during resolution returns a
+    ``("resolve_error", ...)`` hit — the caller denies (fail-closed).
+    """
+    hit = _managed_path_hit(norm)
+    if hit is not None:
+        return hit
+    try:
+        real = os.path.realpath(norm)
+    except OSError:
+        return ("resolve_error", norm, "")
+    if real != norm:
+        return _managed_path_hit(_normalize_path(real))
+    return None
+
+
+# Path-shaped tokens in a Bash command (start at '/', stop at whitespace,
+# quotes, backticks, and shell operators). Each token is normalized before
+# the prefix test, so `//config//plugins/x` and
+# `/config/agents/specialists/../../plugins/x` both resolve — and a
+# `bash -c '...'` wrapper needs no unwrapping (the raw string still carries
+# the path token).
+_MANAGED_PATH_TOKEN_RE = re.compile(r"/[^\s'\"`;|&<>()]*")
+
+# Round-2 F2: executors run with cwd=/config (tools.py sets
+# ClaudeAgentOptions cwd="/config"), so `echo x > agents/specialists/x/
+# runtime.yaml` names managed state without a single absolute token.
+# Relative tokens whose FIRST path segment is a managed root name
+# (optionally ./ or ../ prefixed) are extracted and resolved against
+# /config. `config` is in the set for the cwd=/ spelling
+# (`config/plugins/x`), covered by the "/"-join candidate. A BARE root word
+# (`rm -rf plugins` from /config) also matches — fail-closed: a prose word
+# like `plugins` in a write-shaped command is an accepted false positive.
+_MANAGED_REL_TOKEN_RE = re.compile(
+    r"(?<![\w./-])"
+    r"(?:\.{1,2}/)*"
+    r"(?:agents|specialists|bindings|personas|plugins|config)"
+    r"(?:/[^\s'\"`;|&<>()]*|(?![\w.-]))"
+)
+
+
+def _token_candidates(tok: str) -> list[str]:
+    """Normalized absolute candidates for one path token: an absolute token
+    as-is; a relative token joined against /config (the executor cwd),
+    against / (the ``config/...`` spelling), and with any leading ./ or ../
+    segments stripped then joined against /config. The stripped candidate
+    covers the deeper-cwd shape (``../specialists/x`` typed from
+    /config/agents lands in a managed tree even though the same token from
+    /config does not) — the fail-closed bias governs the tie."""
+    if tok.startswith("/"):
+        return [_normalize_path(tok)]
+    out = [_normalize_path("/config/" + tok), _normalize_path("/" + tok)]
+    stripped = re.sub(r"^(?:\.{1,2}/)+", "", tok)
+    if stripped and stripped != tok:
+        out.append(_normalize_path("/config/" + stripped))
+    return out
+
+
+def _token_resolves_managed(tok: str) -> bool:
+    """True iff any resolution candidate of ``tok`` hits managed state
+    (lexical or via symlink), the resolution errors, or the token is
+    runtime-expanded (``$var`` / backtick) and therefore unknowable —
+    ambiguity denies (round-2 W3, fail-closed)."""
+    if not tok or "$" in tok or "`" in tok:
+        return True
+    return any(_managed_real_hit(c) is not None for c in _token_candidates(tok))
+
+
+def _managed_candidate_paths(command: str) -> list[str]:
+    """Normalized absolute candidates for every path-shaped token in a Bash
+    command — absolute tokens plus relative tokens whose first segment is a
+    managed root name (see ``_token_candidates`` for the join rules)."""
+    out: list[str] = []
+    seen: set[str] = set()
+
+    def _add(path: str) -> None:
+        if path not in seen:
+            seen.add(path)
+            out.append(path)
+
+    for tok in _MANAGED_PATH_TOKEN_RE.findall(command):
+        for cand in _token_candidates(tok):
+            _add(cand)
+    for tok in _MANAGED_REL_TOKEN_RE.findall(command):
+        for cand in _token_candidates(tok):
+            _add(cand)
+    return out
+
+# Benign redirects, stripped BEFORE the write-operator test so the common
+# verification forms (`cat x 2>/dev/null`, `cmd 2>&1 | head`, `>&2`) don't
+# read as writes. Writing to /dev/null or duplicating an fd mutates nothing.
+_MANAGED_BENIGN_REDIRECT_RE = re.compile(r"[0-9]*>>?\s*/dev/null\b|[0-9]*>&[0-9]+")
+
+# Round-2 F5 restructure (Sol): the old single ANYWHERE regex matched write
+# VERBS inside argument text — `grep -r install /config/plugins/store`
+# false-denied on \binstall\b. Split into (a) operand-mutating operators
+# that are write-shaped anywhere in the raw text — in-place edit flags and
+# find's action predicates — and (b) verbs that must sit in COMMAND
+# POSITION (argv[0] of a pipeline segment via _split_pipeline, allowing
+# wrapper prefixes: sudo/nohup/timeout <arg>/env/command/xargs and the git
+# subcommand shape). Benign redirects are stripped before the operator
+# test. `find <managed> -delete` still denies (path-first, operator
+# anywhere); the fail-closed bias keeps the operator class order-blind.
+#
+# Round-2 W3 refinement (Sol): redirects and the cp/rsync/install family
+# are TARGET-aware — a redirect denies only when its target resolves
+# managed or is unresolvable ($var, substitution, missing), and
+# cp/rsync/install deny on a managed DESTINATION (copying FROM a managed
+# tree elsewhere is a legitimate read). Blanket any-operand treatment
+# stays for verbs that mutate their operands (rm/rmdir/ln/touch/mkdir/
+# chmod/chown/truncate/shred/tee/dd/tar/unzip, sed -i/perl -i,
+# -delete/-exec) AND for mv — mv also mutates its SOURCE (removes it), so
+# destination-only checking would let `mv /config/plugins/x /tmp` gut a
+# managed tree. Ambiguous shapes deny (fail-closed).
+_MANAGED_WRITE_ANYWHERE_RE = re.compile(
+    r"(?:\bsed\s+-i|\bperl\s+-i|-delete\b|-exec\b)",
+    re.IGNORECASE | re.DOTALL,
+)
+
+# A redirect and its target token (scanned AFTER the benign strip). An
+# empty/unparseable target (quoted, `$var`, `>(cmd)`, end-of-string) is
+# ambiguous -> treated as managed by _token_resolves_managed.
+_MANAGED_REDIRECT_RE = re.compile(r"[0-9]*>>?\s*([^\s'\"`;|&<>()]*)")
+
+_MANAGED_BLANKET_WRITE_VERBS = frozenset({
+    "tee", "dd", "mv", "mkdir", "rm", "rmdir", "ln", "touch",
+    "chmod", "chown", "truncate", "shred", "tar", "unzip",
+})
+_MANAGED_DEST_WRITE_VERBS = frozenset({"cp", "rsync", "install"})
+# Round-7 (Terra): git subcommands are ALLOWLISTED read-only, not
+# denylisted write — git has dozens of mutating subcommands (apply, am,
+# stash, mv, rm, worktree, config, checkout-index, ...) and enumerating
+# them is a losing game. Any subcommand not in this set counts as
+# write-shaped when a managed token is present (fail-closed).
+# Round-9 (Sol): multi-action subcommands whose DEFAULT action is a read
+# but which mutate via sub-actions or options (reflog expire/delete,
+# fsck --lost-found) are excluded outright — the option allowlist below
+# cannot see sub-action operands.
+_MANAGED_GIT_READONLY_SUBCMDS = frozenset({
+    "log", "show", "diff", "status", "blame", "shortlog", "describe",
+    "rev-parse", "rev-list", "ls-files", "ls-tree", "ls-remote",
+    "cat-file", "grep", "name-rev", "merge-base",
+    "help", "version", "var", "check-ignore",
+    "check-attr", "show-ref",
+})
+# Round-9 (Sol): the same inversion at OPTION level — even read-only
+# subcommands carry command-executing or writing options (`grep
+# --open-files-in-pager=<cmd>` / `-O<pager>`). Post-subcommand options
+# must match this conservative safe set (exact name, `name=`-prefixed
+# value form, or a bare `-<digits>` count); ANYTHING else is
+# write-shaped when a managed token is present. Operands (revisions,
+# paths, everything after `--`) are not options and pass freely.
+_MANAGED_GIT_SAFE_OPTS = frozenset({
+    "-p", "-n", "-s", "-u", "-w", "-c", "-r", "-t", "-z", "-l",
+    "--oneline", "--stat", "--numstat", "--shortstat", "--name-only",
+    "--name-status", "--graph", "--decorate", "--all", "--short",
+    "--long", "--porcelain", "--cached", "--staged", "--no-color",
+    "--follow", "--reverse", "--patch", "--no-patch", "--raw",
+    "--first-parent", "--merges", "--no-merges", "--line-number",
+    "--count", "--ignore-case", "-i", "--fixed-strings", "-F",
+    "--extended-regexp", "-E", "--recursive", "--no-pager",
+})
+_MANAGED_GIT_SAFE_OPT_PREFIXES = (
+    "--pretty=", "--format=", "--color=", "--abbrev=", "--max-count=",
+    "--date=", "--since=", "--until=", "--grep=", "--author=",
+    "--diff-filter=", "--relative-date",
+)
+
+
+def _dest_family_writes_managed(argv: list[str]) -> bool:
+    """cp/rsync/install mutate their DESTINATION (round-2 W3): True iff the
+    last path operand resolves managed, an explicit ``-t`` /
+    ``--target-directory`` target resolves managed, or the operand shape is
+    ambiguous (options after operands, ``--remove-source*``, a single
+    operand, no parseable target) AND any operand resolves managed.
+    Copying FROM a managed tree elsewhere is a legitimate read."""
+    args = argv[1:]
+    operands: list[str] = []
+    ambiguous = False
+    seen_ddash = False
+    i = 0
+    while i < len(args):
+        a = args[i]
+        if not seen_ddash and a == "--":
+            seen_ddash = True
+            i += 1
+            continue
+        if not seen_ddash and a.startswith("-") and a != "-":
+            if operands:
+                ambiguous = True  # option-terminated / interleaved options
+            if a in ("-t", "--target-directory"):
+                if i + 1 < len(args):
+                    if _token_resolves_managed(args[i + 1]):
+                        return True
+                    i += 2
+                    continue
+                ambiguous = True
+            elif a.startswith("--target-directory="):
+                if _token_resolves_managed(a.split("=", 1)[1]):
+                    return True
+            elif a.startswith("-t") and len(a) > 2:
+                # GNU cp/install attached form ``-tDIR`` (round-3 S2). rsync's
+                # ``-t`` is preserve-times and never takes a directory, so a
+                # cluster like ``-tv`` reaching here must NOT downgrade the
+                # parse: only a slash-bearing suffix is treated as a target;
+                # anything else marks the shape ambiguous (fail-closed).
+                suffix = a[2:]
+                if "/" in suffix:
+                    if _token_resolves_managed(suffix):
+                        return True
+                else:
+                    ambiguous = True
+            elif a.startswith("--remove-source"):
+                ambiguous = True  # rsync mutates its SOURCE too
+            i += 1
+            continue
+        operands.append(a)
+        i += 1
+    if not operands:
+        return False
+    if len(operands) < 2:
+        ambiguous = True  # cannot tell source from destination
+    targets = operands if ambiguous else operands[-1:]
+    return any(_token_resolves_managed(t) for t in targets)
+
+
+def _argv_managed_write(argv: list[str], *, _depth: int = 0) -> bool:
+    """True iff this pipeline segment's command-position program writes into
+    managed state: blanket operand-mutating verbs (the caller holds the
+    managed-token precondition), destination-aware cp/rsync/install, and
+    git write subcommands — unwrapping wrapper prefixes (``sudo``,
+    ``nohup``, ``timeout <arg>``, ``env``, ``command``, ``xargs``, ...),
+    wrapper shells (``bash -c '...'``) and ``eval``."""
+    if _depth > 3 or not argv:
+        return False
+    prog = os.path.basename(argv[0])
+    if prog in _MANAGED_BLANKET_WRITE_VERBS:
+        return True
+    if prog in _MANAGED_DEST_WRITE_VERBS:
+        return _dest_family_writes_managed(argv)
+    if prog == "git":
+        # Round-8 (Sol): even read-only subcommands write via
+        # `--output[=]<file>` — resolve the destination like a redirect
+        # target: managed or unresolvable denies; writing elsewhere from a
+        # managed read stays legal.
+        for k, a in enumerate(argv[1:], start=1):
+            if a.startswith("--output="):
+                if _token_resolves_managed(a.split("=", 1)[1]):
+                    return True
+            elif a == "--output":
+                if k + 1 >= len(argv) or _token_resolves_managed(argv[k + 1]):
+                    return True
+        j = 1
+        while j < len(argv):
+            a = argv[j]
+            if a == "-C":  # takes a separate argument
+                j += 2
+                continue
+            if a == "--no-pager":
+                j += 1
+                continue
+            if a.startswith("-"):
+                # Round-8 (Terra): any OTHER pre-subcommand option is
+                # write-shaped — `-c core.pager='sh -c ...'`, `--paginate`,
+                # `--exec-path`, `--config-env` etc. can execute arbitrary
+                # commands, and the payload is argv-visible (NOT the
+                # opaque-content residual). Only -C <dir> and --no-pager
+                # are recognized read-safe here.
+                return True
+            if a not in _MANAGED_GIT_READONLY_SUBCMDS:
+                return True
+            # Round-9 (Sol): post-subcommand options must ALSO be
+            # allowlisted — `grep --open-files-in-pager=<cmd>` / `-O<pager>`
+            # execute arbitrary commands from a "read-only" subcommand.
+            # Everything after `--` is operands (paths/revisions), never
+            # options. `--output` was resolved above.
+            past_ddash = False
+            for opt in argv[j + 1:]:
+                if opt == "--":
+                    past_ddash = True
+                    continue
+                if past_ddash or not opt.startswith("-") or opt == "-":
+                    continue
+                if opt in _MANAGED_GIT_SAFE_OPTS:
+                    continue
+                if opt.startswith(_MANAGED_GIT_SAFE_OPT_PREFIXES):
+                    continue
+                if re.fullmatch(r"-\d+", opt):  # `git log -5`
+                    continue
+                if opt == "--output" or opt.startswith("--output="):
+                    continue  # already resolved above
+                return True
+            return False
+        # Bare `git` / options-only: no subcommand reached — treat as
+        # write-shaped only if we couldn't classify (fail-closed keeps
+        # parity with the unparseable-shape rule elsewhere); a bare `git`
+        # mutates nothing, so allow.
+        return False
+    if prog == "command":
+        j = 1
+        while j < len(argv) and argv[j].startswith("-"):
+            j += 1
+        return _argv_managed_write(argv[j:], _depth=_depth + 1)
+    if prog == "xargs":
+        wrapped = _xargs_wrapped_argv(argv)
+        return bool(wrapped) and _argv_managed_write(wrapped, _depth=_depth + 1)
+    if prog in _EXEC_WRAPPER_ARG_FLAGS:
+        wrapped = _exec_wrapper_tail(argv)
+        return bool(wrapped) and _argv_managed_write(wrapped, _depth=_depth + 1)
+    if prog in _WRAPPER_SHELLS:
+        for j in range(1, len(argv) - 1):
+            if argv[j] == "-c":
+                return _managed_write_shape(argv[j + 1], _depth=_depth + 1)
+        return False
+    if prog == "eval" and len(argv) > 1:
+        return _managed_write_shape(" ".join(argv[1:]), _depth=_depth + 1)
+    return False
+
+
+def _managed_write_shape(command: str, *, _depth: int = 0) -> bool:
+    """True iff the command writes into managed state, given the caller's
+    managed-token precondition: an operand-mutating OPERATOR anywhere
+    (after stripping benign /dev/null and fd-dup redirects), a redirect
+    whose TARGET resolves managed or is unresolvable, or a write VERB in
+    command position of any pipeline segment (destination-aware for the
+    cp/rsync/install family — round-2 W3)."""
+    if _depth > 3:
+        return False
+    scan = _MANAGED_BENIGN_REDIRECT_RE.sub(" ", command)
+    if _MANAGED_WRITE_ANYWHERE_RE.search(scan):
+        return True
+    for m in _MANAGED_REDIRECT_RE.finditer(scan):
+        if _token_resolves_managed(m.group(1)):
+            return True
+    # Round-10 (Sol): env-assignment-prefixed commands are write-shaped —
+    # `GIT_EXTERNAL_DIFF='sh -c "cp ... <managed>"' git diff ...` (or
+    # LD_PRELOAD/PATH injection) modifies EXECUTION, and _split_pipeline
+    # strips the assignments before classification ever sees them. One
+    # rule ends the variable-enumeration game; a rare read like
+    # `LANG=C grep ... <managed>` false-denies only when a managed token
+    # is present (fail-closed; the configurator has no shell at all).
+    if _MANAGED_ENV_PREFIX_RE.search(command):
+        return True
+    return any(_argv_managed_write(argv, _depth=_depth)
+               for argv in _split_pipeline(command))
+
+
+# Segment-leading VAR=... (start of command or right after ; | & && ||).
+# Anchored to segment starts so `grep "X=1" <path>` never matches.
+_MANAGED_ENV_PREFIX_RE = re.compile(
+    r"(?:^|[;|&]\s*)[A-Za-z_][A-Za-z0-9_]*=")
+
+
+# Round-2 F4 (Sol): interpreter escape — `python3 -c "open('agents/...',
+# 'w')..."` mutates managed state only inside inline code, where the write
+# operator/verb tests cannot see it. When an interpreter runs INLINE CODE
+# (-c/-e/-E/--eval style) AND any managed token appears anywhere in the
+# command, deny regardless of write verbs — the code body is opaque, so a
+# read-only inline one-liner over a managed path is also denied (accepted
+# false positive; fail-closed). Accepted residual, unchanged in kind from
+# round 1: this is argv-level inspection, not a sandbox — an interpreter
+# reading code from stdin or a script file, or assembling paths at runtime
+# inside the code, still needs the outer filesystem/privilege boundary.
+_MANAGED_INTERPRETER_RE = re.compile(r"python[0-9.]*|perl|ruby|node|nodejs")
+
+
+def _argv_is_inline_interpreter(argv: list[str]) -> bool:
+    """True iff argv invokes python/perl/ruby/node with an inline-code
+    flag (-c, -e, -E, --eval, --print, or a short-flag cluster carrying
+    one, e.g. ``perl -we``)."""
+    if not argv:
+        return False
+    if _MANAGED_INTERPRETER_RE.fullmatch(os.path.basename(argv[0])) is None:
+        return False
+    for a in argv[1:]:
+        if a in ("--eval", "--print"):
+            return True
+        if (a.startswith("-") and not a.startswith("--")
+                and any(ch in a[1:] for ch in "ceE")):
+            return True
+    return False
+
+
+def _managed_inline_interpreter(command: str, *, _depth: int = 0) -> bool:
+    """True iff any pipeline segment (unwrapping wrapper shells, ``eval``,
+    ``xargs``, and exec-wrapper prefixes) invokes an inline interpreter."""
+    if _depth > 3:
+        return False
+    for argv in _split_pipeline(command):
+        if _argv_is_inline_interpreter(argv):
+            return True
+        prog = os.path.basename(argv[0]) if argv else ""
+        if prog in _WRAPPER_SHELLS:
+            for j in range(1, len(argv) - 1):
+                if argv[j] == "-c" and _managed_inline_interpreter(
+                        argv[j + 1], _depth=_depth + 1):
+                    return True
+        elif prog == "eval" and len(argv) > 1:
+            if _managed_inline_interpreter(
+                    " ".join(argv[1:]), _depth=_depth + 1):
+                return True
+        elif prog == "xargs":
+            wrapped = _xargs_wrapped_argv(argv)
+            if wrapped and _argv_is_inline_interpreter(wrapped):
+                return True
+        elif prog in _EXEC_WRAPPER_ARG_FLAGS:
+            wrapped = _exec_wrapper_tail(argv)
+            if wrapped and _argv_is_inline_interpreter(wrapped):
+                return True
+    return False
+
+
+def _bash_managed_prefix_route(command: str) -> tuple[str, str, str] | None:
+    """Return the first managed hit — ``("prefix", prefix, route)``,
+    ``("hooks_yaml", path, "")`` or ``("resolve_error", path, "")`` — for
+    any path-shaped token (absolute or relative, lexical or
+    symlink-resolved) in the Bash command, else ``None``. A prefix or
+    hooks_yaml hit alone is not a deny — the caller also requires a write
+    shape or an inline-interpreter invocation; resolve_error always
+    denies (fail-closed)."""
+    for norm in _managed_candidate_paths(command):
+        hit = _managed_real_hit(norm)
+        if hit is not None:
+            return hit
+    return None
+
+
+def make_managed_component_guard() -> HookCallback:
+    """Deny hand-edits of managed component state (#210, round-2 hardened).
+
+    Write/Edit: denied when the ``file_path`` — resolved against /config
+    when relative (F2), normalized, and symlink-resolved (F3) — is under
+    any managed prefix or names a ``hooks.yaml`` under ``/config/agents/``
+    (policy-file self-editing). Bash: denied when the command carries a
+    managed path token (absolute or relative, lexical or symlink-resolved;
+    hooks.yaml included — F1) AND is write-shaped (F5: operators anywhere,
+    verbs in command position) or invokes an inline interpreter (F4);
+    read-only mentions pass. A realpath OSError denies (fail-closed).
+    """
+    async def _hook(
+        input_data: dict[str, Any],
+        tool_use_id: str | None,
+        context: dict[str, Any],
+    ) -> dict[str, Any]:
+        try:
+            tool_name = input_data.get("tool_name", "")
+            if tool_name in ("Write", "Edit"):
+                raw = input_data.get("tool_input", {}).get("file_path", "")
+                # Round-2 F2: cwd is /config (tools.py ClaudeAgentOptions),
+                # so a RELATIVE file_path can name managed state.
+                norm = _normalize_path(
+                    raw if raw.startswith("/") else "/config/" + raw)
+                hit = _managed_real_hit(norm)
+                if hit is not None:
+                    kind, _subject, route = hit
+                    if kind == "hooks_yaml":
+                        return _deny(_MANAGED_HOOKS_YAML_DENY.format(
+                            tool=tool_name, path=raw))
+                    if kind == "resolve_error":
+                        return _deny(_MANAGED_RESOLVE_DENY.format(
+                            tool=tool_name, path=raw))
+                    return _deny(
+                        f"managed_component_guard: {tool_name} blocked — "
+                        f"{raw!r} is managed component state; hand-editing "
+                        f"is forbidden. {route}"
+                    )
+            elif tool_name == "Bash":
+                command = input_data.get("tool_input", {}).get("command", "")
+                hit = _bash_managed_prefix_route(command)
+                if hit is not None:
+                    kind, subject, route = hit
+                    if kind == "resolve_error":
+                        return _deny(_MANAGED_RESOLVE_DENY.format(
+                            tool="Bash", path=subject))
+                    write_shape = _managed_write_shape(command)
+                    if write_shape or _managed_inline_interpreter(command):
+                        if kind == "hooks_yaml":
+                            return _deny(_MANAGED_HOOKS_YAML_DENY.format(
+                                tool="Bash", path=subject))
+                        verb = ("writes into" if write_shape
+                                else "runs inline interpreter code against")
+                        return _deny(
+                            f"managed_component_guard: Bash blocked — this "
+                            f"command {verb} managed component state "
+                            f"({subject}/); hand-editing is forbidden. "
+                            f"{route}"
+                        )
+            return {}
+        except asyncio.CancelledError:
+            raise
+        except Exception:  # noqa: BLE001 — fail closed, never let it escape
+            _logger.exception(
+                "managed_component_guard internal error — denying")
+            return _deny(_MANAGED_INTERNAL_DENY)
+
+    return _hook
+
+
+def managed_component_guard_matcher():
+    """A ``HookMatcher`` wrapping :func:`make_managed_component_guard`,
+    injected CODE-SIDE into every executor session (round-4 Terra P0) the
+    same way :func:`agent_home_settings_guard_matcher` is (I-2, v0.69.8).
+
+    Rationale: definition.yaml editing is a legitimate configurator recipe
+    (executor/enable|disable|edit-definition), and definition.yaml's
+    ``hooks_file:`` key is a config-editable POINTER to the hook-policy
+    file. hooks.yaml itself is guard-protected, but repointing ``hooks_file``
+    at a hollow yaml would shed every yaml-declared policy on the next
+    session. Code-side injection makes the yaml additive-only: no
+    definition/hooks-file manipulation can remove this guard."""
+    from claude_agent_sdk import HookMatcher
+    policy = HOOK_POLICIES["managed_component_guard"]
+    return HookMatcher(
+        matcher=policy["matcher"],
+        hooks=[policy["factory"]()],
+    )
+
+
+# ---------------------------------------------------------------------------
 # commit_size_guard - Plan 3 (asks user before batch commits > N files)
 # ---------------------------------------------------------------------------
 
@@ -1195,6 +1843,14 @@ def _casa_config_guard_factory(**kwargs: Any) -> HookCallback:
     )
 
 
+def _managed_component_guard_factory(**kwargs: Any) -> HookCallback:
+    if kwargs:
+        raise UnknownPolicyError(
+            f"managed_component_guard takes no parameters; got {list(kwargs)}"
+        )
+    return make_managed_component_guard()
+
+
 def _commit_size_guard_factory(**kwargs: Any) -> HookCallback:
     max_files = int(kwargs.pop("max_files", 20))
     if kwargs:
@@ -1217,6 +1873,10 @@ HOOK_POLICIES: dict[str, dict[str, Any]] = {
     "casa_config_guard": {
         "matcher": "Write|Edit|Bash",
         "factory": _casa_config_guard_factory,
+    },
+    "managed_component_guard": {
+        "matcher": "Write|Edit|Bash",
+        "factory": _managed_component_guard_factory,
     },
     "commit_size_guard": {
         "matcher": "Write|Edit",
@@ -1301,6 +1961,16 @@ def build_policy_callbacks_from_hooks_yaml(
             if k not in ("policy", "matcher", "timeout")
         }
         out[name] = (policy["matcher"], policy["factory"](**params))
+    # Round-4 (Terra P0): managed_component_guard is CODE-MANDATORY for
+    # executor sessions — the resolved set always carries it regardless of
+    # what the (config-editable, pointer-redirectable) hooks.yaml declares.
+    # Dict-key dedupe: a yaml declaration simply pre-fills the same entry.
+    # See managed_component_guard_matcher (SDK path) and
+    # drivers.hook_bridge.translate_hooks_to_settings (CC settings path).
+    if "managed_component_guard" not in out:
+        policy = HOOK_POLICIES["managed_component_guard"]
+        out["managed_component_guard"] = (
+            policy["matcher"], policy["factory"]())
     return out
 
 

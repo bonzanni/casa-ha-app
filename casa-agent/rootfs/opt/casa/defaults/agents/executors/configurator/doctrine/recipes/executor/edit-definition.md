@@ -22,9 +22,10 @@ Use for any structural change to an executor's definition file —
   name AND `type:` field; they must match.
 - Do not flip `schema_version:` — it's pinned at `1`.
 - Do not edit `driver:` from `in_casa` to `claude_code` (or vice
-  versa) without also auditing the executor's `prompt.md` and
-  `hooks.yaml` — the two drivers have different MCP / tool surface
-  conventions.
+  versa) without also reviewing the executor's `prompt.md` and
+  `hooks.yaml` (read-only for you — hook-policy changes are an
+  operator/image action) — the two drivers have different MCP / tool
+  surface conventions.
 
 ## Per-file isolation (v0.37.1 B-1b)
 

@@ -8,7 +8,7 @@ Remove the matching entry. Leave `delegates: []` if it was the last.
 
 ## Don't forget the reverse cases
 
-- Unwiring because the specialist is being DELETED: part of recipes/specialist/delete.md.
+- Unwiring an INSTALLED specialist being removed: recipes/specialist/uninstall.md handles it.
 - Unwiring because this resident shouldn't delegate (but another does): confirm which resident.
 
 ## Reload — MANDATORY before emit_completion

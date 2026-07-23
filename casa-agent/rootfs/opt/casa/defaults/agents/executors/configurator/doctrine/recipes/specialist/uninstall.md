@@ -1,10 +1,12 @@
 # Recipe: uninstall an installed specialist
 
-1. Find all delegate references (`grep -r "<slug>" /config/agents/*/delegates.yaml`) and unwire them
-   first (`recipes/delegate/unwire.md`) — an uninstall does NOT auto-unwire delegates.
+1. Find all delegate references (Grep tool: pattern `<slug>` across
+   `/config/agents/*/delegates.yaml`) and unwire them first
+   (`recipes/delegate/unwire.md`) — an uninstall does NOT auto-unwire delegates.
 2. `specialist_uninstall(slug=...)`.
-3. `casa_reload(scope="agents")` — evicts the removed agent from the live registry.
-4. `config_git_commit(message="uninstall specialist <slug>")`.
+3. `config_git_commit(message="uninstall specialist <slug>")`.
+4. `casa_reload(scope="agents")` — evicts the removed agent from the live
+   registry (canonical commit → reload → emit order, see `completion.md`).
 5. `emit_completion(...)`.
 
 CAS blobs are NOT deleted by uninstall (retained for a possible future re-install at the same

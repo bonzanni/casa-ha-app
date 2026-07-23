@@ -58,5 +58,10 @@ won't start without them. Then read `verify_plugin_state(name)`: `ready:true`
 means every target agrees. The result carries the same phase fields as
 `plugin_update` (`activation_committed` / `runtime_ready`) — on
 `activation_committed:true, runtime_ready:false` the registry entry exists
-but a target didn't come up; retry the reload/verify, not the add. Report
-the outcome and `emit_completion(...)`.
+but a target didn't come up; retry the reload/verify, not the add. Exception:
+`ok:true` with a non-empty `pending_targets` (e.g. `["specialist:mtg"]`) is
+**success, not a failure** — the plugin targets a specialist that is not
+installed yet, which is the documented order (plugin first, then the
+specialist install picks it up). Do NOT retry, work around, or remove the
+plugin; proceed to the specialist install. Report the outcome and
+`emit_completion(...)`.

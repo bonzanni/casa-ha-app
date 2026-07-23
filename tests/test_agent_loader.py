@@ -1623,6 +1623,95 @@ class TestValidateConfigRepoBootParity:
         ), errors
 
 
+class TestValidateConfigRepoWalkScope:
+    """#213: the per-file schema walk must not descend into pipeline
+    territory. agents/specialists/** (both the slug dir and the dot-named
+    ``.{slug}.material-*`` content dirs specialist_materialize writes) is
+    validated ONLY by the digest-aware load_all_specialists replay, whose
+    per-specialist failures are boot-non-fatal and deliberately not gate
+    errors. Live repro: config-sync-report.json post_sync_errors flagged
+    agents/specialists/{mtg,finance}/runtime.yaml \"'kind' is a required
+    property\" on a bootable prod tree."""
+
+    def test_specialist_dir_missing_kind_not_flagged(self, tmp_path):
+        """A REAL agents/specialists/<slug>/ dir whose runtime.yaml lacks
+        ``kind`` (the pre-symlink legacy layout of the live repro) must not
+        produce a per-file schema error."""
+        from agent_loader import validate_config_repo
+
+        repo = tmp_path / "cfg"
+        _seed_resident(repo / "agents", "assistant")
+        _policies_file(repo / "policies")
+        _w(repo / "agents" / "specialists" / "demo" / "runtime.yaml", """\
+            schema_version: 1
+            model: {source: fixed, value: sonnet}
+        """)
+
+        errors = validate_config_repo(str(repo))
+        assert errors == [], errors
+
+    def test_materialized_specialist_layout_not_flagged(self, tmp_path):
+        """The current materialized layout: a dot-named content dir plus the
+        agents/specialists/<slug> symlink pointing at it
+        (specialist_materialize). Neither side may trip the walk."""
+        import os
+        from agent_loader import validate_config_repo
+
+        repo = tmp_path / "cfg"
+        _seed_resident(repo / "agents", "assistant")
+        _policies_file(repo / "policies")
+        spec_root = repo / "agents" / "specialists"
+        content = f".demo.material-{'0' * 32}"
+        _w(spec_root / content / "runtime.yaml", """\
+            schema_version: 1
+            model: {source: fixed, value: sonnet}
+        """)
+        os.symlink(content, spec_root / "demo")
+
+        errors = validate_config_repo(str(repo))
+        assert errors == [], errors
+
+    def test_resident_missing_kind_still_flagged(self, tmp_path):
+        """Regression guard on the prune: a RESIDENT runtime.yaml lacking
+        ``kind`` is configurator territory and must still be refused."""
+        from agent_loader import validate_config_repo
+
+        repo = tmp_path / "cfg"
+        d = _seed_resident(repo / "agents", "assistant")
+        _policies_file(repo / "policies")
+        _w(d / "runtime.yaml", """\
+            schema_version: 1
+            model: {source: ha_option, option: primary_agent_model,
+                    default: opus, allowed: [opus, sonnet, haiku]}
+        """)
+
+        errors = validate_config_repo(str(repo))
+        assert any(
+            "runtime.yaml" in e and "kind" in e for e in errors
+        ), errors
+
+    def test_executor_hooks_yaml_still_schema_gated(self, tmp_path):
+        """#213 executor-coverage decision: executors/ deliberately STAYS in
+        the walk. load_all_executors schema-validates only definition.yaml;
+        an executor's hooks.yaml is consumed unvalidated (workspace /
+        hook_bridge / casa_core read it straight off disk), so this walk is
+        its sole schema gate — pruning executors/ would silently drop it."""
+        from agent_loader import validate_config_repo
+
+        repo = tmp_path / "cfg"
+        _seed_resident(repo / "agents", "assistant")
+        _policies_file(repo / "policies")
+        _w(repo / "agents" / "executors" / "task" / "hooks.yaml", """\
+            schema_version: 1
+            BOGUS_HOOK_KEY: true
+        """)
+
+        errors = validate_config_repo(str(repo))
+        assert len(errors) == 1, errors
+        assert "hooks.yaml" in errors[0]
+        assert "BOGUS_HOOK_KEY" in errors[0]
+
+
 class TestSpecialistBindingActivation:
     """Task N1b, Steps 19-21: agent_loader's specialist counterpart to the
     Task 8 resident binding-activation block."""

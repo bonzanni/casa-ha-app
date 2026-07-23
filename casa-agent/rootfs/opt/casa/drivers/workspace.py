@@ -60,6 +60,15 @@ def _build_cc_permissions(defn) -> dict:
     patterns; non-matching entries (e.g. Casa-internal tool names) are
     dropped with a WARNING. ``permission_mode`` falls through to
     ``"acceptEdits"`` when empty (matches ExecutorDefinition default).
+
+    Round-6 P0-1 (Sol): the emitted block ALWAYS carries a ``deny`` list —
+    ``defn.tools_disallowed`` plus the code-mandatory Q-1 sub-agent-spawn
+    denial (Agent/Task bypass allow-lists; only an explicit deny is
+    enforced) plus ``Bash`` whenever the clamped allowlist does not carry
+    it (P0-2 belt+suspenders — harmless for the plugin-developer, which
+    legitimately allows Bash). This is the claude_code-driver parity of
+    the merge tools._build_executor_options performs for in_casa; before
+    it, ``tools_disallowed`` landed NOWHERE on this driver path.
     """
     allow: list[str] = []
     for entry in defn.tools_allowed:
@@ -71,7 +80,15 @@ def _build_cc_permissions(defn) -> dict:
                 "not a valid CC permission pattern",
                 defn.type, entry,
             )
-    return {"allow": allow, "defaultMode": defn.permission_mode or "acceptEdits"}
+    deny = [t for t in getattr(defn, "tools_disallowed", []) or [] if t]
+    for t in ("Agent", "Task"):  # Q-1 set (_SUBAGENT_SPAWN_TOOLS)
+        if t not in deny:
+            deny.append(t)
+    if ("Bash" not in deny
+            and not any(a == "Bash" or a.startswith("Bash(") for a in allow)):
+        deny.append("Bash")
+    return {"allow": allow, "deny": deny,
+            "defaultMode": defn.permission_mode or "acceptEdits"}
 
 
 class WorkspaceConfigError(ValueError):

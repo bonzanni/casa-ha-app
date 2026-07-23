@@ -54,6 +54,16 @@ SCHEMA_DIR = os.path.join(os.path.dirname(__file__), "defaults", "schema")
 # inject a synthetic tree instead of patching the filesystem.
 DEFAULT_ROLES_DIR = os.path.join(os.path.dirname(__file__), "defaults", "roles")
 
+# Round-6 P0-2 (Sol): executor permission modes ranked by permissiveness.
+# The image-owned role artifact's tools.permission_mode is the CEILING a
+# definition.yaml may not exceed (shipped: configurator=acceptEdits,
+# plugin-developer=auto). "bypassPermissions" is deliberately ABSENT — it
+# would reduce allowed_tools to mere auto-approval and is NEVER honored for
+# executors, whatever the role says; see load_all_executors for the clamp.
+_EXECUTOR_PERMISSION_MODE_RANK: dict[str, int] = {
+    "plan": 0, "default": 1, "acceptEdits": 2, "dontAsk": 3, "auto": 4,
+}
+
 # --- Tier file-set rules ---------------------------------------------------
 
 # NOTE: `plugins.yaml` is legacy, ignored since v0.71.0 (unified plugin
@@ -169,6 +179,12 @@ _SCHEMA_BY_POLICY_FILE: dict[str, tuple[str, str]] = {
     "disclosure.yaml": ("policy-disclosure", "v1"),
 }
 
+# Non-resident subtrees at the agents/ root: Tier 2 specialists and Tier 3
+# executors, each loaded on its own isolated, boot-non-fatal path. Shared by
+# ``load_all_agents`` and ``validate_config_repo``'s boot-parity replay so
+# the two skip sets cannot drift (#213).
+_NON_RESIDENT_AGENT_DIRS: tuple[str, ...] = ("specialists", "executors")
+
 
 def validate_config_repo(
     config_dir: str, *, roles_dir: str | None = None,
@@ -187,7 +203,10 @@ def validate_config_repo(
     ``roles_dir`` — see ``load_agent_from_dir``; propagated to the
     boot-parity replay below (both the resident and specialist loads).
 
-    **Agents/ walk.** Recursive; ``.git/`` skipped. Basename lookup in
+    **Agents/ walk.** Recursive; dot-dirs (``.git/``, the specialist
+    pipeline's ``.{slug}.material-*`` content dirs) and the top-level
+    ``specialists/`` subtree skipped (#213 — see the scope-boundary note
+    in the boot-parity pass below). Basename lookup in
     ``_SCHEMA_BY_FILENAME``. The original E-G repro path is the
     configurator inventing fields under ``agents/<role>/character.yaml``.
 
@@ -200,16 +219,29 @@ def validate_config_repo(
     every commit (closed in v0.31.1 by scoping agents/ only, which left
     the policies/ blast radius open until v0.37.12).
 
-    Skips ``.git/`` and any file whose basename is not in either map
-    (markdown, plain text, etc.).
+    Skips dot-dirs, the pipeline-managed ``specialists/`` subtree, and
+    any file whose basename is not in either map (markdown, plain text,
+    etc.).
     """
     errors: list[str] = []
 
     agents_root = os.path.join(config_dir, "agents")
     if os.path.isdir(agents_root):
         for root, dirs, files in os.walk(agents_root):
-            if ".git" in dirs:
-                dirs.remove(".git")
+            # Dot-dirs are pruned at EVERY level: ``.git/``, plus the
+            # specialist pipeline's ``.{slug}.material-*`` content dirs
+            # (specialist_materialize) under agents/specialists/.
+            dirs[:] = [d for d in dirs if not d.startswith(".")]
+            # #213: specialists/ is pipeline-managed territory — the
+            # digest-aware load_all_specialists replay below is its sole
+            # validation authority (per-specialist failures are
+            # boot-non-fatal and deliberately not gate errors). Walking it
+            # here double-validates the materialized files and false-flags
+            # them. executors/ deliberately STAYS in the walk: nothing else
+            # schema-validates an executor's hooks.yaml (load_all_executors
+            # validates only definition.yaml).
+            if root == agents_root and "specialists" in dirs:
+                dirs.remove("specialists")
             for name in files:
                 schema_name = _SCHEMA_BY_FILENAME.get(name)
                 if schema_name is None:
@@ -278,7 +310,7 @@ def validate_config_repo(
         for entry in sorted(os.listdir(agents_root)):
             # Mirror load_all_agents' skip set exactly (specialists/executors
             # are loaded on isolated, boot-non-fatal paths; dotdirs skipped).
-            if entry.startswith(".") or entry in ("specialists", "executors"):
+            if entry.startswith(".") or entry in _NON_RESIDENT_AGENT_DIRS:
                 continue
             path = os.path.join(agents_root, entry)
             if not os.path.isdir(path):
@@ -355,6 +387,14 @@ def validate_config_repo(
         # required), and the boot mismatch surfaces only because config_sync
         # restores that image-owned file after the commit. That reconciler
         # backstop lives in config_sync, not in this gate.
+        #
+        # The same boundary governs the per-file walk above (#213): the
+        # specialist subtree (including its dot-named ``.{slug}.material-*``
+        # content dirs) is pipeline-managed and validated by the digest-aware
+        # load_all_specialists replay below — per-file schema validation there
+        # would double-validate the materialized files and false-flag them.
+        # executors/ is the deliberate exception and stays in the walk: its
+        # hooks.yaml has no other schema gate.
         if policy_lib is not None and "assistant" not in resident_dir_names:
             errors.append(
                 "no enabled resident with role 'assistant' — Casa cannot boot "
@@ -1219,7 +1259,7 @@ def load_all_agents(
     if not os.path.isdir(agents_dir):
         return found
     for entry in sorted(os.listdir(agents_dir)):
-        if entry.startswith(".") or entry in ("specialists", "executors"):
+        if entry.startswith(".") or entry in _NON_RESIDENT_AGENT_DIRS:
             continue
         path = os.path.join(agents_dir, entry)
         if not os.path.isdir(path):
@@ -1404,6 +1444,75 @@ def load_all_executors(
                 role=executor_role_slot, effective_config_digest=EMPTY_CONFIG_DIGEST,
             )
 
+            # Round-5 (Terra P0): the canonical role artifact is the
+            # immutable capability CEILING. definition.yaml is legitimately
+            # editable in operation (executor/enable|disable|edit-definition
+            # recipes), so a compromised/mistaken session could re-add a tool
+            # (e.g. Bash) that the image-owned role artifact
+            # (defaults/roles/executor/<type>/role.yaml — not operator-
+            # writable, covered by role_checksum) deliberately does not
+            # grant: capability self-escalation through the operational
+            # file. Clamp the effective allowlist to the INTERSECTION —
+            # definition.yaml may only narrow the role's grant, never exceed
+            # it. A role artifact without a tools.allowed list yields an
+            # EMPTY ceiling (fail-closed). Dropped entries are a tamper
+            # signal — logged loudly, never silent. (tools.disallowed is
+            # deliberately NOT clamped: it can only remove capability, so
+            # definition editing cannot escalate through it.)
+            declared_allowed = list(tools.get("allowed", []))
+            role_ceiling = set(
+                (role_artifact.role.get("tools") or {}).get("allowed") or [])
+            effective_allowed = [
+                t for t in declared_allowed if t in role_ceiling]
+            dropped_beyond_ceiling = [
+                t for t in declared_allowed if t not in role_ceiling]
+            if dropped_beyond_ceiling:
+                logger.error(
+                    "executor %r: definition.yaml grants tools beyond its "
+                    "role ceiling; dropped: %s (role.yaml under "
+                    "defaults/roles/executor/%s/ is the immutable "
+                    "capability ceiling — definition.yaml may only narrow "
+                    "it; treat an unexpected drop as a tamper signal)",
+                    entry, dropped_beyond_ceiling, entry,
+                )
+
+            # Round-6 P0-2 (Sol): permission_mode is a definition-editable
+            # capability field — a self-edit to "bypassPermissions" would
+            # turn the clamped allowlist into mere auto-approval and
+            # resurrect everything the allowlist excludes. The role
+            # artifact's required tools.permission_mode (role.v1.json — a
+            # free string; shipped: configurator=acceptEdits,
+            # plugin-developer=auto) is the CEILING: the definition may
+            # declare an equally- or less-permissive mode, never a more
+            # permissive one, and "bypassPermissions" is NEVER honored for
+            # an executor regardless of the role (it has no rank).
+            # Downgrades log the same tamper-signal style as the tool clamp
+            # above. (defaults/schema/executor.v1.json — what _validate()
+            # checks definition.yaml against — deliberately keeps its wider
+            # enum: a tampered value must DEGRADE to a safe mode here, not
+            # brick the executor at schema validation.)
+            declared_mode = tools.get("permission_mode", "acceptEdits")
+            role_mode = (
+                (role_artifact.role.get("tools") or {}).get("permission_mode"))
+            mode_ceiling = _EXECUTOR_PERMISSION_MODE_RANK.get(
+                role_mode, _EXECUTOR_PERMISSION_MODE_RANK["acceptEdits"])
+            if (declared_mode not in _EXECUTOR_PERMISSION_MODE_RANK
+                    or _EXECUTOR_PERMISSION_MODE_RANK[declared_mode]
+                    > mode_ceiling):
+                effective_mode = (
+                    role_mode
+                    if role_mode in _EXECUTOR_PERMISSION_MODE_RANK
+                    else "acceptEdits")
+                logger.error(
+                    "executor %r: definition.yaml permission_mode %r exceeds "
+                    "what executors may run at (role ceiling %r; "
+                    "bypassPermissions is never honored); downgraded to %r "
+                    "— treat as a tamper signal",
+                    entry, declared_mode, role_mode, effective_mode,
+                )
+            else:
+                effective_mode = declared_mode
+
             memory_block = defn.get("memory") or {}
             d = ExecutorDefinition(
                 type=defn["type"],
@@ -1411,9 +1520,9 @@ def load_all_executors(
                 model=resolve_model(defn["model"]),
                 driver=defn["driver"],
                 enabled=defn.get("enabled", True),
-                tools_allowed=list(tools.get("allowed", [])),
+                tools_allowed=effective_allowed,
                 tools_disallowed=list(tools.get("disallowed", [])),
-                permission_mode=tools.get("permission_mode", "acceptEdits"),
+                permission_mode=effective_mode,
                 mcp_server_names=list(defn.get("mcp_server_names", [])),
                 idle_reminder_days=int(defn.get("idle_reminder_days", 7)),
                 prompt_template_path=prompt_abs,

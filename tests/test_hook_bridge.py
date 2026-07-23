@@ -26,7 +26,9 @@ class TestHookBridgeTranslate:
 
         assert "hooks" in settings
         pre = settings["hooks"]["PreToolUse"]
-        assert len(pre) == 2
+        # Two declared entries + the code-mandatory managed_component_guard
+        # (round-4 Terra P0: yaml policies are additive-only).
+        assert len(pre) == 3
 
         first = pre[0]
         assert first["matcher"] == "Write|Edit"
@@ -34,13 +36,25 @@ class TestHookBridgeTranslate:
         assert first["hooks"][0]["command"].endswith(
             "hook_proxy.sh casa_config_guard"
         )
+        assert pre[-1]["hooks"][0]["command"].endswith(
+            "hook_proxy.sh managed_component_guard"
+        )
 
-    def test_empty_hooks_yaml_produces_empty_hooks(self):
+    def test_empty_hooks_yaml_still_carries_managed_guard(self):
+        """Round-4 Terra P0 regression: a hollow hooks.yaml (definition.yaml's
+        `hooks_file:` repointed at an empty file) used to emit ZERO hooks —
+        the next session then loaded no pre_tool_use policies at all. The
+        managed guard entry is now code-mandatory."""
         from drivers.hook_bridge import translate_hooks_to_settings
         settings = translate_hooks_to_settings(
             {}, proxy_script_path="/opt/casa/scripts/hook_proxy.sh",
         )
-        assert settings == {"hooks": {}}
+        pre = settings["hooks"]["PreToolUse"]
+        assert len(pre) == 1
+        assert pre[0]["matcher"] == "Write|Edit|Bash"
+        assert pre[0]["hooks"][0]["command"].endswith(
+            "hook_proxy.sh managed_component_guard"
+        )
 
     def test_translates_bundled_plugin_developer_hooks_yaml(self):
         """L-1b regression: bundled snake_case hooks.yaml must translate."""

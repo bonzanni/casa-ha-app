@@ -9,11 +9,16 @@ model: sonnet
 driver: in_casa
 enabled: true
 tools:
+  # v0.101.0 round-2 W1 (Sol+Terra ratified): NO Bash — the configurator has
+  # no legitimate shell dependency (recipes use typed tools + Read/Write/
+  # Edit/Grep/Glob), and argv inspection can never close the script-writer/
+  # unmodeled-binary bypass class. This list feeds ClaudeAgentOptions.
+  # allowed_tools (agent_loader.load_all_executors -> tools_allowed ->
+  # tools._build_executor_options). Keep the canonical role.yaml in sync.
   allowed:
     - Read
     - Write
     - Edit
-    - Bash
     - Glob
     - Grep
     - mcp__casa-framework__config_git_commit
@@ -38,6 +43,22 @@ tools:
     - mcp__casa-framework__set_plugin_env_reference
     - mcp__casa-framework__list_vault_items
     - mcp__casa-framework__get_item_fields
+    # Personality Phase A component lifecycle (#210 root cause, v0.101.0):
+    # these were added to role.yaml only — THIS file is what the runtime
+    # enforces (see the chain comment above), so the live configurator had
+    # no typed install path and fell back to hand-authoring. The two lists
+    # are equality-tested (test_capability_parity.py) so they cannot drift
+    # again.
+    - mcp__casa-framework__resident_persona_swap
+    - mcp__casa-framework__resident_persona_reset
+    - mcp__casa-framework__specialist_install_inspect
+    - mcp__casa-framework__specialist_install_commit
+    - mcp__casa-framework__specialist_upgrade
+    - mcp__casa-framework__specialist_rollback
+    - mcp__casa-framework__specialist_uninstall
+    - mcp__casa-framework__persona_install_inspect
+    - mcp__casa-framework__persona_install_commit
+    - mcp__casa-framework__persona_apply
   permission_mode: acceptEdits
 mcp_server_names:
   - casa-framework

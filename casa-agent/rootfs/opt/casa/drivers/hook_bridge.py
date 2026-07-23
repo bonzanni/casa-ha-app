@@ -22,6 +22,14 @@ def translate_hooks_to_settings(
     Reads snake_case keys (``pre_tool_use``, ``post_tool_use``) per
     ``defaults/schema/hooks.v1.json``; emits PascalCase
     (``PreToolUse``, ``PostToolUse``) per CC settings.json shape.
+
+    Round-4 (Terra P0): the emitted ``PreToolUse`` block ALWAYS carries a
+    ``managed_component_guard`` entry, whatever the yaml declares. Both
+    claude_code workspace settings writers (drivers.workspace legacy +
+    template paths) route through this function, and definition.yaml's
+    ``hooks_file:`` key is a config-editable POINTER — repointing it at a
+    hollow yaml previously emitted ZERO hooks, shedding every policy for
+    the next session. Yaml policies are additive-only.
     """
     out: dict = {"hooks": {}}
     for snake, pascal in (
@@ -51,4 +59,27 @@ def translate_hooks_to_settings(
                 "hooks": [cc_hook],
             })
         out["hooks"][pascal] = out_entries
+
+    # Round-4 (Terra P0) mandatory guard entry. The canonical matcher comes
+    # from HOOK_POLICIES so the two paths can't drift. Dedupe: skip only
+    # when the yaml already emitted the policy with a COVERING matcher (the
+    # canonical one, or the ".*" default a bare declaration gets) — a
+    # yaml-supplied narrower matcher does not count, since the matcher is
+    # attacker-editable on this path (unlike the SDK path, where matchers
+    # come from HOOK_POLICIES). A duplicate deny would be harmless; the
+    # skip just avoids trivial double-emission for the shipped files.
+    from hooks import HOOK_POLICIES
+    canonical_matcher = HOOK_POLICIES["managed_component_guard"]["matcher"]
+    guard_cmd = f"{proxy_script_path} managed_component_guard"
+    pre = out["hooks"].setdefault("PreToolUse", [])
+    already = any(
+        e.get("matcher") in (".*", canonical_matcher)
+        and any(h.get("command") == guard_cmd for h in e.get("hooks", []))
+        for e in pre
+    )
+    if not already:
+        pre.append({
+            "matcher": canonical_matcher,
+            "hooks": [{"type": "command", "command": guard_cmd}],
+        })
     return out

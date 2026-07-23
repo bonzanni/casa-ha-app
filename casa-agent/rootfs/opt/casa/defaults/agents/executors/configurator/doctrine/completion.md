@@ -76,7 +76,7 @@ even though your sub-action narrative was correct.
 immediately. The platform defers the actual Supervisor restart POST
 until after `emit_completion` runs and the engagement finalizes, so
 your subprocess is never killed mid-completion. There is no longer a
-race; you may interpose Read or Bash tool_uses between `casa_reload`
+race; you may interpose Read tool_uses between `casa_reload`
 and `emit_completion` if needed. Soft reload (`casa_reload_triggers`)
 likewise has no race.
 

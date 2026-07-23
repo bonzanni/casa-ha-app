@@ -7,7 +7,8 @@ pinned in CAS from when it was active.
    (rollback is one step back, not "pick a version").
 2. `specialist_rollback(slug=...)`. If it returns `kind: "no_prior_tuple"`, there is nothing to roll
    back to (either never upgraded, or already rolled back once).
-3. `casa_reload(scope="agents")`, `config_git_commit`, `emit_completion`.
+3. `config_git_commit`, `casa_reload(scope="agents")`, `emit_completion` (canonical
+   commit -> reload -> emit order — see `completion.md`).
 
 ## Common mistakes
 

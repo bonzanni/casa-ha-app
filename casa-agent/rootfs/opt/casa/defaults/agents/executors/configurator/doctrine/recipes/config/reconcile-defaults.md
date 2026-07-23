@@ -18,25 +18,24 @@ casa always boots — but the operator's previous version is preserved first:
 
 ## Steps
 
-1. **Read the report:** `/data/config-sync-report.json`. The fields that mean "a
-   customization was overwritten" are `conflicts[]`, `schema_forced[]`, and `casabak[]`.
-   (`updated[]`/`deleted[]` are routine default-tracking — nothing to reconcile.)
+(You have no shell — every step below uses Read/Edit and typed tools only.)
 
-2. **For each overwritten `path` with a `pre_sync_sha`:** show the operator what was lost:
+1. **Read the report** with the Read tool: `/data/config-sync-report.json` (this single
+   file is readable by policy). The fields that mean "a customization was overwritten"
+   are `conflicts[]`, `schema_forced[]`, and `casabak[]`. (`updated[]`/`deleted[]` are
+   routine default-tracking — nothing to reconcile.)
 
-   ```
-   git -C /config diff <pre_sync_sha> -- <path>
-   ```
-
-   This is "their previous content" → "the new default". For a `casabak` entry instead,
-   diff the sidecar:
-
-   ```
-   diff /config/<path>.casabak /config/<path>
-   ```
+2. **Show the operator what was lost.** For a `casabak` entry: Read BOTH
+   `/config/<path>.casabak` (their previous content) and `/config/<path>` (the new
+   default) and summarize the meaningful differences in-topic. For a `conflicts[]` /
+   `schema_forced[]` entry with a `pre_sync_sha`: the previous content is preserved in
+   the `/config` git history at that commit — you cannot render git diffs yourself, so
+   tell the operator the file and `pre_sync_sha`, describe the CURRENT content, and ask
+   them what of their customization should carry forward (they can view the old version
+   via the HA terminal if needed).
 
 3. **Ask the operator** whether to keep the new default as-is, or carry their change
-   forward on top of it. Do not assume — present the diff and let them decide.
+   forward on top of it. Do not assume — present what you found and let them decide.
 
 4. **If carrying forward:** re-apply the operator's intent on top of the new default using
    the normal per-artifact edit recipes (e.g. `voice/edit`, `prompt/edit`,
@@ -49,11 +48,12 @@ casa always boots — but the operator's previous version is preserved first:
    sync + cascade). Never restore content that fails validation — that is exactly what the
    backstop overwrote to keep casa booting.
 
-6. **Clean up:** once handled, delete any `<file>.casabak` sidecars you reconciled. The
-   git history remains as the durable archive.
+6. **Report leftovers:** you cannot delete files. List any `<file>.casabak` sidecars you
+   reconciled and tell the operator they can be removed manually (or left — the git
+   history is the durable archive either way).
 
 ## Notes
 
 - Carry-over is **always operator-initiated and post-boot.** Never block boot on it.
 - If the operator wants nothing carried over, just confirm — the new defaults already
-  apply and `.casabak` files can be removed.
+  apply; mention any `.casabak` sidecars for manual cleanup.

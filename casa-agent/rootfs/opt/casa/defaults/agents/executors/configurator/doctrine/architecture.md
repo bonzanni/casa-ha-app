@@ -62,7 +62,7 @@ Any resident may delegate (`delegate_to_agent`) to any other agent listed in its
 | response_shape.yaml | required | required | forbidden |
 | voice.yaml | required | required | forbidden |
 | triggers.yaml | optional | forbidden | forbidden |
-| hooks.yaml | optional | optional | optional |
+| hooks.yaml (NOT editable by you — operator/image action) | optional | optional | optional |
 | prompts/system.md | required | required | forbidden (uses prompt.md) |
 | prompts/<name>.md | per-trigger | - | - |
 | definition.yaml | forbidden | forbidden | required |

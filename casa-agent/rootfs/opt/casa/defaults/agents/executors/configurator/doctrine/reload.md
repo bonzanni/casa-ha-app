@@ -33,11 +33,11 @@ changes, addon options.json mutations, or kernel concerns.
 | Edit delegates.yaml | `agent` for that role |
 | Edit disclosure.yaml | `agent` for that role |
 | Edit voice.yaml | `agent` for that role |
-| Edit hooks.yaml | `agent` for that role |
+| hooks.yaml (any agent's) | NOT editable by you — hook-policy files are denied unconditionally; policy changes are an operator/image action |
 | Edit policies/disclosure.yaml | `policies` |
 | Edit an executor's `definition.yaml` | `executors` |
 | Create or delete an executor | `executors` |
-| Edit an executor's `prompt.md` / `hooks.yaml` / `observer.yaml` / `doctrine/*` | none (lazy-read per turn) |
+| Edit an executor's `prompt.md` / `observer.yaml` / `doctrine/*` | none (lazy-read per turn); `hooks.yaml` is NOT editable by you (see above) |
 | Create a NEW resident or specialist | `agents` |
 | Delete a resident or specialist | `agents` |
 | `plugin_add`/`plugin_update`/`plugin_assign`/`plugin_unassign`/`plugin_remove` | none — the tool self-sequences its own reload + verify (§3.9) |

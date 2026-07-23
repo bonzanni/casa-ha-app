@@ -191,3 +191,182 @@ async def test_specialist_uninstall_tool_calls_uninstall_specialist_and_reports_
     assert payload["ok"] is True
     assert payload["slug"] == "mtg"
     assert calls == [{"slug": "mtg"}]
+
+
+# ---------------------------------------------------------------------------
+# Round-5b (Sol P1): specialist_install_inspect must verify the consent
+# keyboard can actually post — or skip it entirely when the ack ledger
+# already holds this exact install identity — instead of returning ok:true
+# into a flow that strands forever at commit's consent_missing.
+# ---------------------------------------------------------------------------
+
+import asyncio
+from types import SimpleNamespace
+
+
+def _fake_inspection(tmp_path):
+    return SimpleNamespace(
+        component_id="casa.spec.mtg", version="1.0.0", slug="mtg",
+        component_checksum="sha256:" + "a" * 64,
+        root_digest="sha256:" + "b" * 64,
+        mission="Answer MTG rules questions.",
+        default_persona_ref="mtg-judge@1.0.0",
+        default_persona_checksum="sha256:" + "c" * 64,
+        required_config_names=(), required_secret_names=(),
+        dependencies=(), staged_dir=tmp_path / "staged",
+    )
+
+
+def _wire_inspect(monkeypatch, tmp_path, *, channel=None):
+    """Patch the network/disk seams: inspect returns a fake staged result,
+    the ack store lives under tmp_path (never /data), and _channel_manager
+    serves ``channel`` (None = no telegram channel configured)."""
+    import specialist_install
+    import specialist_install_consent
+    from specialist_install_consent import SpecialistInstallAckStore
+    import tools as tools_mod
+
+    fake = _fake_inspection(tmp_path)
+    monkeypatch.setattr(
+        specialist_install, "inspect_specialist_repo", lambda *a, **k: fake)
+    tmp_acks = tmp_path / "acks.json"
+
+    class _TmpAckStore(SpecialistInstallAckStore):
+        def __init__(self, path=None):  # noqa: ARG002 — tool calls with no args
+            super().__init__(path=tmp_acks)
+
+    monkeypatch.setattr(
+        specialist_install_consent, "SpecialistInstallAckStore", _TmpAckStore)
+    monkeypatch.setattr(
+        tools_mod, "_channel_manager", SimpleNamespace(get=lambda name: channel))
+    return fake, _TmpAckStore
+
+
+class _Handle:
+    """Stub ChallengeHandle: refused / settled-post outcome / never-settles."""
+
+    def __init__(self, refused=None, settled="posted", hang=False):
+        self.refused = refused
+        self._settled = settled
+        self._hang = hang
+
+    async def settled_post(self):
+        if self._hang:
+            await asyncio.Event().wait()  # cancelled by the tool's wait_for bound
+        return self._settled
+
+
+@pytest.mark.asyncio
+async def test_inspect_without_channel_returns_consent_channel_unavailable(
+    monkeypatch, tmp_path,
+) -> None:
+    from tools import specialist_install_inspect
+    _wire_inspect(monkeypatch, tmp_path, channel=None)
+
+    payload = _payload(await specialist_install_inspect.handler(
+        {"repo": "owner/repo", "ref": "main"}))
+    assert payload["ok"] is False
+    assert payload["kind"] == "consent_channel_unavailable"
+    assert "no telegram channel" in payload["detail"]
+
+
+@pytest.mark.asyncio
+async def test_inspect_with_preacked_ledger_skips_keyboard(
+    monkeypatch, tmp_path,
+) -> None:
+    """Pre-authorized path: valid ledger consent for this EXACT identity
+    (the same install_consent_identity binding commit validates) -> ok:true
+    with NO keyboard attempt — works with no Telegram at all."""
+    import specialist_install_consent
+    from specialist_install_consent import install_consent_identity
+    from tools import specialist_install_inspect
+
+    fake, tmp_store_cls = _wire_inspect(monkeypatch, tmp_path, channel=None)
+    identity = install_consent_identity(
+        component_id=fake.component_id, version=fake.version,
+        root_digest=fake.root_digest, slug=fake.slug)
+    tmp_store_cls().record(
+        identity=identity, component_id=fake.component_id, version=fake.version,
+        component_checksum=fake.root_digest, slug=fake.slug)
+
+    def _must_not_post(**kwargs):
+        raise AssertionError("keyboard must not be attempted on a pre-acked install")
+
+    monkeypatch.setattr(
+        specialist_install_consent, "prompt_specialist_install_consent", _must_not_post)
+
+    payload = _payload(await specialist_install_inspect.handler(
+        {"repo": "owner/repo", "ref": "main"}))
+    assert payload["ok"] is True
+    assert payload["consent"] == "pre_authorized"
+    assert payload["root_digest"] == fake.root_digest
+
+
+@pytest.mark.asyncio
+async def test_inspect_happy_path_posts_keyboard(monkeypatch, tmp_path) -> None:
+    import specialist_install_consent
+    from tools import specialist_install_inspect
+
+    calls: list[dict] = []
+
+    def _prompt(**kwargs):
+        calls.append(kwargs)
+        return _Handle(settled="posted")
+
+    _wire_inspect(monkeypatch, tmp_path, channel=SimpleNamespace(chat_id="123"))
+    monkeypatch.setattr(
+        specialist_install_consent, "prompt_specialist_install_consent", _prompt)
+
+    payload = _payload(await specialist_install_inspect.handler(
+        {"repo": "owner/repo", "ref": "main"}))
+    assert payload["ok"] is True
+    assert payload["consent"] == "keyboard_posted"
+    assert len(calls) == 1
+    assert calls[0]["chat_id"] == 123 and calls[0]["operator_id"] == 123
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("handle,expected_kind", [
+    (_Handle(refused="args_too_large"), "consent_prompt_refused"),
+    (_Handle(settled="delivery_failed"), "consent_delivery_failed"),
+    (_Handle(settled="inactive"), "consent_prompt_inactive"),
+    (_Handle(hang=True), "consent_post_unsettled"),
+])
+async def test_inspect_post_failures_are_structured(
+    monkeypatch, tmp_path, handle, expected_kind,
+) -> None:
+    import specialist_install_consent
+    import tools as tools_mod
+    from tools import specialist_install_inspect
+
+    _wire_inspect(monkeypatch, tmp_path, channel=SimpleNamespace(chat_id="123"))
+    monkeypatch.setattr(
+        specialist_install_consent, "prompt_specialist_install_consent",
+        lambda **kwargs: handle)
+    # Bounded: shrink the settle bound instead of waiting 30s (and never
+    # patch <module>.asyncio.sleep — memory-cage rule).
+    monkeypatch.setattr(tools_mod, "_INSTALL_CONSENT_POST_TIMEOUT_S", 0.05)
+
+    payload = _payload(await specialist_install_inspect.handler(
+        {"repo": "owner/repo", "ref": "main"}))
+    assert payload["ok"] is False
+    assert payload["kind"] == expected_kind
+
+
+@pytest.mark.asyncio
+async def test_inspect_prompt_exception_is_structured(monkeypatch, tmp_path) -> None:
+    import specialist_install_consent
+    from tools import specialist_install_inspect
+
+    def _boom(**kwargs):
+        raise RuntimeError("registration blew up")
+
+    _wire_inspect(monkeypatch, tmp_path, channel=SimpleNamespace(chat_id="123"))
+    monkeypatch.setattr(
+        specialist_install_consent, "prompt_specialist_install_consent", _boom)
+
+    payload = _payload(await specialist_install_inspect.handler(
+        {"repo": "owner/repo", "ref": "main"}))
+    assert payload["ok"] is False
+    assert payload["kind"] == "consent_prompt_failed"
+    assert "registration blew up" in payload["detail"]

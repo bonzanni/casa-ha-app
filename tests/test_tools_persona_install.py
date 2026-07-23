@@ -279,3 +279,167 @@ async def test_persona_apply_on_a_pending_configuration_specialist_reports_no_ac
     payload = _payload(result)
     assert payload["ok"] is False
     assert payload["kind"] == "no_active_tuple"
+
+
+# ---------------------------------------------------------------------------
+# Round-5b (Sol P1): persona_install_inspect — same ledger-precedence +
+# verified-keyboard-post contract as specialist_install_inspect (see
+# tests/test_tools_specialist_install.py for the specialist variant).
+# ---------------------------------------------------------------------------
+
+import asyncio
+from types import SimpleNamespace
+
+
+def _fake_persona_inspection(tmp_path):
+    return SimpleNamespace(
+        persona_id="warm-helper", version="1.0.0",
+        checksum="sha256:" + "d" * 64, display_name="Warm Helper",
+        staged_dir=tmp_path / "staged",
+    )
+
+
+def _wire_persona_inspect(monkeypatch, tmp_path, *, channel=None):
+    import persona_install
+    from persona_install import PersonaInstallAckStore
+    import tools as tools_mod
+
+    fake = _fake_persona_inspection(tmp_path)
+    monkeypatch.setattr(
+        persona_install, "inspect_persona_repo", lambda *a, **k: fake)
+    tmp_acks = tmp_path / "persona_acks.json"
+
+    class _TmpAckStore(PersonaInstallAckStore):
+        def __init__(self, path=None):  # noqa: ARG002 — tool calls with no args
+            super().__init__(path=tmp_acks)
+
+    monkeypatch.setattr(persona_install, "PersonaInstallAckStore", _TmpAckStore)
+    monkeypatch.setattr(
+        tools_mod, "_channel_manager", SimpleNamespace(get=lambda name: channel))
+    return fake, _TmpAckStore
+
+
+class _Handle:
+    def __init__(self, refused=None, settled="posted", hang=False):
+        self.refused = refused
+        self._settled = settled
+        self._hang = hang
+
+    async def settled_post(self):
+        if self._hang:
+            await asyncio.Event().wait()  # cancelled by the tool's wait_for bound
+        return self._settled
+
+
+@pytest.mark.asyncio
+async def test_persona_inspect_without_channel_returns_consent_channel_unavailable(
+    monkeypatch, tmp_path,
+) -> None:
+    from tools import persona_install_inspect
+    _wire_persona_inspect(monkeypatch, tmp_path, channel=None)
+
+    payload = _payload(await persona_install_inspect.handler(
+        {"repo": "owner/repo", "ref": "main"}))
+    assert payload["ok"] is False
+    assert payload["kind"] == "consent_channel_unavailable"
+    assert "no telegram channel" in payload["detail"]
+
+
+@pytest.mark.asyncio
+async def test_persona_inspect_with_preacked_ledger_skips_keyboard(
+    monkeypatch, tmp_path,
+) -> None:
+    import persona_install_consent
+    from persona_install import persona_install_consent_identity
+    from tools import persona_install_inspect
+
+    fake, tmp_store_cls = _wire_persona_inspect(monkeypatch, tmp_path, channel=None)
+    identity = persona_install_consent_identity(
+        persona_id=fake.persona_id, version=fake.version, checksum=fake.checksum)
+    tmp_store_cls().record(
+        identity=identity, persona_id=fake.persona_id, version=fake.version,
+        checksum=fake.checksum)
+
+    def _must_not_post(**kwargs):
+        raise AssertionError("keyboard must not be attempted on a pre-acked install")
+
+    monkeypatch.setattr(
+        persona_install_consent, "prompt_persona_install_consent", _must_not_post)
+
+    payload = _payload(await persona_install_inspect.handler(
+        {"repo": "owner/repo", "ref": "main"}))
+    assert payload["ok"] is True
+    assert payload["consent"] == "pre_authorized"
+    assert payload["checksum"] == fake.checksum
+
+
+@pytest.mark.asyncio
+async def test_persona_inspect_happy_path_posts_keyboard(monkeypatch, tmp_path) -> None:
+    import persona_install_consent
+    from tools import persona_install_inspect
+
+    calls: list[dict] = []
+
+    def _prompt(**kwargs):
+        calls.append(kwargs)
+        return _Handle(settled="posted")
+
+    _wire_persona_inspect(monkeypatch, tmp_path, channel=SimpleNamespace(chat_id="123"))
+    monkeypatch.setattr(
+        persona_install_consent, "prompt_persona_install_consent", _prompt)
+
+    payload = _payload(await persona_install_inspect.handler(
+        {"repo": "owner/repo", "ref": "main"}))
+    assert payload["ok"] is True
+    assert payload["consent"] == "keyboard_posted"
+    assert len(calls) == 1
+    assert calls[0]["chat_id"] == 123 and calls[0]["operator_id"] == 123
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("handle,expected_kind", [
+    (_Handle(refused="args_too_large"), "consent_prompt_refused"),
+    (_Handle(settled="delivery_failed"), "consent_delivery_failed"),
+    (_Handle(settled="inactive"), "consent_prompt_inactive"),
+    (_Handle(hang=True), "consent_post_unsettled"),
+])
+async def test_persona_inspect_post_failures_are_structured(
+    monkeypatch, tmp_path, handle, expected_kind,
+) -> None:
+    import persona_install_consent
+    import tools as tools_mod
+    from tools import persona_install_inspect
+
+    _wire_persona_inspect(monkeypatch, tmp_path, channel=SimpleNamespace(chat_id="123"))
+    monkeypatch.setattr(
+        persona_install_consent, "prompt_persona_install_consent",
+        lambda **kwargs: handle)
+    # Bounded: shrink the settle bound instead of waiting 30s (never patch
+    # <module>.asyncio.sleep — memory-cage rule).
+    monkeypatch.setattr(tools_mod, "_INSTALL_CONSENT_POST_TIMEOUT_S", 0.05)
+
+    payload = _payload(await persona_install_inspect.handler(
+        {"repo": "owner/repo", "ref": "main"}))
+    assert payload["ok"] is False
+    assert payload["kind"] == expected_kind
+
+
+@pytest.mark.asyncio
+async def test_persona_inspect_prompt_exception_is_structured(
+    monkeypatch, tmp_path,
+) -> None:
+    import persona_install_consent
+    from tools import persona_install_inspect
+
+    def _boom(**kwargs):
+        raise RuntimeError("registration blew up")
+
+    _wire_persona_inspect(monkeypatch, tmp_path, channel=SimpleNamespace(chat_id="123"))
+    monkeypatch.setattr(
+        persona_install_consent, "prompt_persona_install_consent", _boom)
+
+    payload = _payload(await persona_install_inspect.handler(
+        {"repo": "owner/repo", "ref": "main"}))
+    assert payload["ok"] is False
+    assert payload["kind"] == "consent_prompt_failed"
+    assert "registration blew up" in payload["detail"]

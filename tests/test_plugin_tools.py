@@ -915,3 +915,192 @@ async def test_noop_unassign_invalidates_nothing(monkeypatch, tmp_path):
     assert payload["ok"] is True and payload["was_assigned"] is False
     assert not any(e.startswith(("purge_artifact", "purge_role", "cancel_matching"))
                   for e in st.log)
+
+
+# --- #211: pending specialist targets (plugin-before-specialist order) -------
+
+def _dir_runtime(tmp_path, *, agents=None, roles=()):
+    """A runtime stand-in with a REAL agents_dir tree, so the sequencer's
+    pending pre-check exercises the same dir-existence source of truth
+    reload.reload_agent consults (agents/<role>, agents/specialists/<role>)."""
+    from types import SimpleNamespace
+    agents_dir = tmp_path / "agents"
+    (agents_dir / "specialists").mkdir(parents=True, exist_ok=True)
+    for role in roles:
+        (agents_dir / role).mkdir(parents=True, exist_ok=True)
+    return SimpleNamespace(agents=dict(agents or {}), agents_dir=str(agents_dir))
+
+
+async def test_plugin_add_pending_specialist_target_reports_ok(
+        monkeypatch, tmp_path):
+    """#211: adding a plugin that targets a NOT-yet-installed specialist is
+    the documented install order (the specialist's dependency closure hashes
+    the installed plugin artifact) — ok:true + pending_targets, never
+    reload_failed, and no blocking health issue."""
+    import agent as agent_mod
+    import plugin_health
+    st = _State()
+    hp = tmp_path / "plugin-health.json"
+    tools_mod = _wire(monkeypatch, tmp_path, st, publish=_pr())
+    monkeypatch.setattr(agent_mod, "active_runtime",
+                        _dir_runtime(tmp_path), raising=False)
+    r = await tools_mod.plugin_add.handler({
+        "name": "probe", "repo": "o/r", "ref": "v1",
+        "targets": ["specialist:mtg"]})
+    payload = json.loads(r["content"][0]["text"])
+    assert payload["ok"] is True
+    assert payload["kind"] is None
+    assert payload["activation_committed"] is True
+    assert payload["runtime_ready"] is False        # pending ≠ ready
+    assert payload["pending_targets"] == ["specialist:mtg"]
+    assert payload["reload_errors"] == []
+    assert payload["reloaded"] == []
+    assert r.get("is_error") is not True
+    assert "dispatch:mtg" not in st.log             # reload never dispatched
+    report = plugin_health.load_report(hp)
+    assert all(i["reason_code"] != "reload_failed" for i in report["issues"])
+
+
+async def test_plugin_add_installed_specialist_target_still_dispatches(
+        monkeypatch, tmp_path):
+    """A specialist whose agent directory EXISTS is not pending — the reload
+    dispatch (and its failure semantics) are unchanged."""
+    import agent as agent_mod
+    st = _State()
+    tools_mod = _wire(monkeypatch, tmp_path, st, publish=_pr(),
+                      dispatch_status="error")
+    monkeypatch.setattr(
+        agent_mod, "active_runtime",
+        _dir_runtime(tmp_path, roles=["specialists/mtg"]), raising=False)
+    r = await tools_mod.plugin_add.handler({
+        "name": "probe", "repo": "o/r", "ref": "v1",
+        "targets": ["specialist:mtg"]})
+    payload = json.loads(r["content"][0]["text"])
+    assert payload["ok"] is False
+    assert payload["kind"] == "reload_failed"
+    assert payload["pending_targets"] == []
+    assert "dispatch:mtg" in st.log
+
+
+async def test_plugin_add_unknown_resident_role_still_reload_failed(
+        monkeypatch, tmp_path):
+    """Regression: resident targets NEVER classify pending — an unknown
+    resident role keeps today's hard failure exactly."""
+    import agent as agent_mod
+    st = _State()
+    tools_mod = _wire(monkeypatch, tmp_path, st, publish=_pr(),
+                      dispatch_status="error")
+    monkeypatch.setattr(agent_mod, "active_runtime",
+                        _dir_runtime(tmp_path), raising=False)
+    r = await tools_mod.plugin_add.handler({
+        "name": "probe", "repo": "o/r", "ref": "v1",
+        "targets": ["resident:ghost"]})
+    payload = json.loads(r["content"][0]["text"])
+    assert payload["ok"] is False
+    assert payload["kind"] == "reload_failed"
+    assert payload["pending_targets"] == []
+    assert payload["reload_errors"]
+
+
+async def test_plugin_add_specialist_target_ignores_resident_name_collision(
+        monkeypatch, tmp_path):
+    """Round-1 review P1: a specialist: target is installed ONLY at
+    agents/specialists/<role>. A resident dir sharing the bare name must NOT
+    read as installed — that would dispatch a cross-tier RESIDENT reload for
+    a specialist target instead of reporting it pending."""
+    import agent as agent_mod
+    st = _State()
+    tools_mod = _wire(monkeypatch, tmp_path, st, publish=_pr())
+    # agents/mtg exists as a RESIDENT-position dir; specialists/mtg does not.
+    monkeypatch.setattr(agent_mod, "active_runtime",
+                        _dir_runtime(tmp_path, roles=["mtg"]), raising=False)
+    r = await tools_mod.plugin_add.handler({
+        "name": "probe", "repo": "o/r", "ref": "v1",
+        "targets": ["specialist:mtg"]})
+    payload = json.loads(r["content"][0]["text"])
+    assert payload["ok"] is True
+    assert payload["pending_targets"] == ["specialist:mtg"]
+    assert payload["reload_errors"] == []
+    assert "dispatch:mtg" not in st.log     # the resident was NOT reloaded
+
+
+async def test_plugin_add_mixed_live_reload_and_pending_specialist(
+        monkeypatch, tmp_path):
+    """One live resident reload ok + one pending specialist: ok:true, only
+    the specialist is pending, runtime_ready stays false."""
+    import agent as agent_mod
+    st = _State()
+    tools_mod = _wire(monkeypatch, tmp_path, st, publish=_pr())
+    monkeypatch.setattr(
+        agent_mod, "active_runtime",
+        _dir_runtime(tmp_path, roles=["assistant"]), raising=False)
+    r = await tools_mod.plugin_add.handler({
+        "name": "probe", "repo": "o/r", "ref": "v1",
+        "targets": ["resident:assistant", "specialist:mtg"]})
+    payload = json.loads(r["content"][0]["text"])
+    assert payload["ok"] is True
+    assert payload["kind"] is None
+    assert payload["reloaded"] == ["resident:assistant"]
+    assert payload["pending_targets"] == ["specialist:mtg"]
+    assert payload["runtime_ready"] is False
+    assert "dispatch:assistant" in st.log and "dispatch:mtg" not in st.log
+
+
+async def test_plugin_add_mixed_reload_error_and_pending_specialist(
+        monkeypatch, tmp_path):
+    """One REAL reload error + one pending specialist: errors win (ok:false,
+    kind reload_failed) but pending_targets is still reported."""
+    import agent as agent_mod
+    st = _State()
+    tools_mod = _wire(monkeypatch, tmp_path, st, publish=_pr(),
+                      dispatch_status="error")
+    monkeypatch.setattr(
+        agent_mod, "active_runtime",
+        _dir_runtime(tmp_path, roles=["assistant"]), raising=False)
+    r = await tools_mod.plugin_add.handler({
+        "name": "probe", "repo": "o/r", "ref": "v1",
+        "targets": ["resident:assistant", "specialist:mtg"]})
+    payload = json.loads(r["content"][0]["text"])
+    assert payload["ok"] is False
+    assert payload["kind"] == "reload_failed"
+    assert payload["pending_targets"] == ["specialist:mtg"]
+    assert [e["target"] for e in payload["reload_errors"]] == \
+        ["resident:assistant"]
+
+
+async def test_plugin_assign_pending_specialist_gets_same_treatment(
+        monkeypatch, tmp_path):
+    """plugin_assign uses the same sequencer — assigning to a still-
+    uninstalled specialist is pending, not reload_failed."""
+    import agent as agent_mod
+    st = _State()
+    _registered(st, targets=[])
+    tools_mod = _wire(monkeypatch, tmp_path, st, publish=_pr())
+    monkeypatch.setattr(agent_mod, "active_runtime",
+                        _dir_runtime(tmp_path), raising=False)
+    r = await tools_mod.plugin_assign.handler({
+        "name": "probe", "target": "specialist:mtg"})
+    payload = json.loads(r["content"][0]["text"])
+    assert payload["ok"] is True
+    assert payload["pending_targets"] == ["specialist:mtg"]
+    assert payload["runtime_ready"] is False
+    assert "dispatch:mtg" not in st.log
+
+
+async def test_plugin_unassign_absent_path_still_dispatches(
+        monkeypatch, tmp_path):
+    """Regression: expect='absent' (unassign/remove) NEVER classifies
+    pending — the reload dispatch still runs even when the specialist's
+    agent directory is absent."""
+    import agent as agent_mod
+    st = _State()
+    _registered(st, targets=["specialist:mtg"])
+    tools_mod = _wire(monkeypatch, tmp_path, st, publish=_pr())
+    monkeypatch.setattr(agent_mod, "active_runtime",
+                        _dir_runtime(tmp_path), raising=False)
+    r = await tools_mod.plugin_unassign.handler({
+        "name": "probe", "target": "specialist:mtg"})
+    payload = json.loads(r["content"][0]["text"])
+    assert payload["ok"] is True
+    assert payload["pending_targets"] == []
+    assert "dispatch:mtg" in st.log             # absent path unchanged
