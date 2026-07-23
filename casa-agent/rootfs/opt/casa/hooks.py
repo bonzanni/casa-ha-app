@@ -1106,13 +1106,39 @@ _MANAGED_DEST_WRITE_VERBS = frozenset({"cp", "rsync", "install"})
 # stash, mv, rm, worktree, config, checkout-index, ...) and enumerating
 # them is a losing game. Any subcommand not in this set counts as
 # write-shaped when a managed token is present (fail-closed).
+# Round-9 (Sol): multi-action subcommands whose DEFAULT action is a read
+# but which mutate via sub-actions or options (reflog expire/delete,
+# fsck --lost-found) are excluded outright — the option allowlist below
+# cannot see sub-action operands.
 _MANAGED_GIT_READONLY_SUBCMDS = frozenset({
     "log", "show", "diff", "status", "blame", "shortlog", "describe",
     "rev-parse", "rev-list", "ls-files", "ls-tree", "ls-remote",
-    "cat-file", "grep", "reflog", "name-rev", "merge-base",
-    "count-objects", "fsck", "help", "version", "var", "check-ignore",
-    "check-attr", "show-ref", "for-each-ref", "cherry", "whatchanged",
+    "cat-file", "grep", "name-rev", "merge-base",
+    "help", "version", "var", "check-ignore",
+    "check-attr", "show-ref",
 })
+# Round-9 (Sol): the same inversion at OPTION level — even read-only
+# subcommands carry command-executing or writing options (`grep
+# --open-files-in-pager=<cmd>` / `-O<pager>`). Post-subcommand options
+# must match this conservative safe set (exact name, `name=`-prefixed
+# value form, or a bare `-<digits>` count); ANYTHING else is
+# write-shaped when a managed token is present. Operands (revisions,
+# paths, everything after `--`) are not options and pass freely.
+_MANAGED_GIT_SAFE_OPTS = frozenset({
+    "-p", "-n", "-s", "-u", "-w", "-c", "-r", "-t", "-z", "-l",
+    "--oneline", "--stat", "--numstat", "--shortstat", "--name-only",
+    "--name-status", "--graph", "--decorate", "--all", "--short",
+    "--long", "--porcelain", "--cached", "--staged", "--no-color",
+    "--follow", "--reverse", "--patch", "--no-patch", "--raw",
+    "--first-parent", "--merges", "--no-merges", "--line-number",
+    "--count", "--ignore-case", "-i", "--fixed-strings", "-F",
+    "--extended-regexp", "-E", "--recursive", "--no-pager",
+})
+_MANAGED_GIT_SAFE_OPT_PREFIXES = (
+    "--pretty=", "--format=", "--color=", "--abbrev=", "--max-count=",
+    "--date=", "--since=", "--until=", "--grep=", "--author=",
+    "--diff-filter=", "--relative-date",
+)
 
 
 def _dest_family_writes_managed(argv: list[str]) -> bool:
@@ -1213,10 +1239,32 @@ def _argv_managed_write(argv: list[str], *, _depth: int = 0) -> bool:
                 # `--exec-path`, `--config-env` etc. can execute arbitrary
                 # commands, and the payload is argv-visible (NOT the
                 # opaque-content residual). Only -C <dir> and --no-pager
-                # are recognized read-safe here; post-subcommand options
-                # have subcommand-local meanings and are not affected.
+                # are recognized read-safe here.
                 return True
-            return a not in _MANAGED_GIT_READONLY_SUBCMDS
+            if a not in _MANAGED_GIT_READONLY_SUBCMDS:
+                return True
+            # Round-9 (Sol): post-subcommand options must ALSO be
+            # allowlisted — `grep --open-files-in-pager=<cmd>` / `-O<pager>`
+            # execute arbitrary commands from a "read-only" subcommand.
+            # Everything after `--` is operands (paths/revisions), never
+            # options. `--output` was resolved above.
+            past_ddash = False
+            for opt in argv[j + 1:]:
+                if opt == "--":
+                    past_ddash = True
+                    continue
+                if past_ddash or not opt.startswith("-") or opt == "-":
+                    continue
+                if opt in _MANAGED_GIT_SAFE_OPTS:
+                    continue
+                if opt.startswith(_MANAGED_GIT_SAFE_OPT_PREFIXES):
+                    continue
+                if re.fullmatch(r"-\d+", opt):  # `git log -5`
+                    continue
+                if opt == "--output" or opt.startswith("--output="):
+                    continue  # already resolved above
+                return True
+            return False
         # Bare `git` / options-only: no subcommand reached — treat as
         # write-shaped only if we couldn't classify (fail-closed keeps
         # parity with the unparseable-shape rule elsewhere); a bare `git`

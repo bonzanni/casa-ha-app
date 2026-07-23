@@ -991,3 +991,35 @@ async def test_bash_git_no_pager_read_still_passes():
         "command": "git --no-pager -C /config log --oneline -- "
                    "agents/specialists/finance/runtime.yaml"}}, None, {})
     assert out == {}
+
+
+# ------------------------------------------------------------------
+# Round-9 (Sol): post-subcommand option allowlist on read-only git
+# ------------------------------------------------------------------
+
+
+@pytest.mark.parametrize("command", [
+    ("git -C /config grep --open-files-in-pager="
+     "'cp /tmp/x /config/plugins/registry.json' pattern"),
+    "git -C /config grep -Ovim pattern -- agents/specialists/",
+    "git -C /config/specialists fsck --lost-found",
+    "git -C /config/agents/specialists reflog expire --expire=now --all",
+    "git -C /config log --exec-path=/tmp/evil -- agents/specialists/x",
+])
+async def test_bash_git_unsafe_postsubcommand_options_denied(command):
+    out = await _hook()(
+        {"tool_name": "Bash", "tool_input": {"command": command}}, None, {})
+    assert _decision(out) == "deny", command
+
+
+@pytest.mark.parametrize("command", [
+    "git -C /config log --oneline --graph -5 -- agents/specialists/finance",
+    "git -C /config grep -n -i persona -- bindings/",
+    "git -C /config diff --stat --name-only HEAD~1 -- agents/specialists/",
+    "git -C /config log --pretty=format:%H --max-count=3 -- plugins/",
+    "git -C /config show --name-status HEAD -- agents/specialists/finance",
+])
+async def test_bash_git_safe_postsubcommand_options_pass(command):
+    out = await _hook()(
+        {"tool_name": "Bash", "tool_input": {"command": command}}, None, {})
+    assert out == {}, command

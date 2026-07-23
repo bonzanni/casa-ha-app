@@ -35,7 +35,9 @@ report "X isn't enabled".
 
 ## What it does NOT pick up
 
-- New `prompt.md` / `hooks.yaml` / `observer.yaml` / `doctrine/*`
-  content (lazy-read per turn).
+- New `prompt.md` / `observer.yaml` / `doctrine/*` content (lazy-read
+  per turn). (`hooks.yaml` is NOT editable by you — hook-policy files
+  are denied unconditionally; policy changes are an operator/image
+  action.)
 - New executor TYPES (those need a fresh add of the directory —
   also handled by `executors`).
