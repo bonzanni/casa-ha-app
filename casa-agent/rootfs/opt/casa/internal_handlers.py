@@ -332,9 +332,20 @@ def build_admin_reload_handler(*, runtime):
                 status=500,
             )
 
-        result = await reload_mod.dispatch(
-            scope, runtime=active, role=role, include_env=include_env,
-        )
+        # Task 10 manual-reload fencing (spec §3.1, ENTRY-POINT-ONLY): the
+        # /admin/reload route is a second full-reload entry point alongside the
+        # casa_reload tool. A FULL reload reloads the plugin snapshot, so it
+        # must acquire _PLUGIN_TOOLS_LOCK BEFORE dispatch — never inside
+        # reload.py (AB/BA deadlock vs reload's own writer/reader lock). Global
+        # order everywhere: _PLUGIN_TOOLS_LOCK -> reload writer/reader lock.
+        if scope == "full":
+            import tools as tools_mod
+            async with tools_mod._PLUGIN_TOOLS_LOCK:
+                result = await reload_mod.dispatch(
+                    scope, runtime=active, role=role, include_env=include_env)
+        else:
+            result = await reload_mod.dispatch(
+                scope, runtime=active, role=role, include_env=include_env)
         status_code = 200 if result.get("status") == "ok" else 500
         return web.json_response(result, status=status_code)
 

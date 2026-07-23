@@ -4007,9 +4007,20 @@ async def casa_reload(args: dict) -> dict:
         })
 
     from reload import dispatch
-    result = await dispatch(
-        scope, runtime=runtime, role=role, include_env=include_env,
-    )
+    # Task 10 manual-reload fencing (spec §3.1, ENTRY-POINT-ONLY): a FULL reload
+    # reloads the plugin snapshot, so it must serialize against an in-flight
+    # bundle transaction. Acquire _PLUGIN_TOOLS_LOCK BEFORE dispatch("full")
+    # (never inside reload.py — that would AB/BA-deadlock against reload's own
+    # global writer/reader lock, which the bundle op's dispatch("agent") already
+    # takes on the reader side while holding _PLUGIN_TOOLS_LOCK). Global lock
+    # order everywhere: _PLUGIN_TOOLS_LOCK -> reload writer/reader lock.
+    if scope == "full":
+        async with _PLUGIN_TOOLS_LOCK:
+            result = await dispatch(
+                scope, runtime=runtime, role=role, include_env=include_env)
+    else:
+        result = await dispatch(
+            scope, runtime=runtime, role=role, include_env=include_env)
 
     # Drain pending-reload guard if engagement-bound.
     eng = engagement_var.get(None)
