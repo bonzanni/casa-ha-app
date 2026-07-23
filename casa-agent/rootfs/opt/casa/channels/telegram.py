@@ -1478,74 +1478,27 @@ class TelegramChannel(Channel):
                             await self._rollback_answer(rec, answer_token)
                             return
 
-                    # Resume suspended client if needed (in_casa driver only — the
-                    # claude_code driver has s6 keeping the subprocess alive across
-                    # Casa restarts, and its engagements never have sdk_session_id).
-                    if rec.driver != "claude_code" and self._engagement_driver is not None:
-                        drv = self._engagement_driver
-                        if not drv.is_alive(rec) and rec.sdk_session_id:
-                            fail_count = rec.origin.get("_resume_fail_count", 0)
-                            try:
-                                await drv.resume(rec, rec.sdk_session_id)
-                                rec.origin["_resume_fail_count"] = 0
-                            except Exception as exc:  # noqa: BLE001
-                                fail_count += 1
-                                rec.origin["_resume_fail_count"] = fail_count
-                                logger.warning(
-                                    "resume failed (%d/2) for engagement %s: %s",
-                                    fail_count, rec.id[:8], exc,
-                                )
-                                if fail_count >= 2:
-                                    await self._engagement_registry.mark_error(
-                                        rec.id, kind="resume_failed", message=str(exc),
-                                    )
-                                await self.send_to_topic(
-                                    thread_id,
-                                    f"Could not resume this engagement: {exc}. "
-                                    f"Start a fresh one if needed.",
-                                )
-                                if fail_count >= 2:
-                                    # [AR-1] (v0.65.0): this terminal path
-                                    # bypasses finalize — title-mark, close +
-                                    # ledger the topic here (best-effort,
-                                    # never raises). After the notice: posting
-                                    # into a just-closed topic works only
-                                    # while the bot keeps can_manage_topics —
-                                    # mirror the funnel's send-then-close
-                                    # order.
-                                    await self._cleanup_error_topic(rec)
-                                return
-                        elif not drv.is_alive(rec):
-                            # No session to resume — orphan
-                            await self._engagement_registry.mark_error(
-                                rec.id, kind="orphan_no_session",
-                                message="no sdk_session_id to resume with",
-                            )
-                            await self.send_to_topic(
-                                thread_id, "This engagement can't be resumed.",
-                            )
-                            # [AR-1] (v0.65.0): this terminal path bypasses
-                            # finalize — title-mark, close + ledger the topic
-                            # here (best-effort, never raises). After the
-                            # notice — the funnel's send-then-close order.
-                            await self._cleanup_error_topic(rec)
-                            return
+                    # Resume-if-suspended + lifecycle gate + idle→active turn
+                    # stamp — the SINGLE shared core (``_resume_and_ready``),
+                    # run UNDER this per-topic lock. A False return means the
+                    # record went terminal, resume was exhausted (2-strike), or
+                    # it is an unresumable orphan (each already surfaced +
+                    # cleaned up inside the helper); do NOT deliver — the finally
+                    # rolls the answered/inbound reservations back. The status
+                    # re-check inside still runs under the lock, preserving the
+                    # Bug-10 guarantee (a cancel that already finalised the
+                    # driver blanks the turn here before any task is spawned).
+                    # v0.79.0 (§3, F2/F5): the high-water advance + narration
+                    # seal happened at TRUE handler entry above (before command
+                    # handling and any suspension).
+                    if not await self._resume_and_ready(rec):
+                        return
 
                     # M9 (v0.52.0): deliver the user turn in a tracked background
                     # task so the per-topic lock (and, in polling mode, PTB's
                     # update fetcher) is NOT held across the whole multi-minute
                     # SDK turn — a subsequent /cancel can then acquire the lock
-                    # and interrupt the in-flight turn. The status re-check above
-                    # still ran under the lock, preserving the Bug-10 guarantee
-                    # (a cancel that already finalised the driver blanks the turn
-                    # here before any task is spawned).
-                    # v0.79.0 (§3, F2/F5): the high-water advance + narration seal
-                    # now happens at TRUE handler entry above (before command
-                    # handling and any suspension) — see the block after the
-                    # active-status check.
-                    if self._engagement_registry is not None:
-                        import time as _time
-                        await self._engagement_registry.update_user_turn(rec.id, _time.time())
+                    # and interrupt the in-flight turn.
                     if self._driver_send_user_turn is not None:
                         # §A3: the message becomes a delivered user turn — TRANSFER
                         # reservation ownership to the background task, which
@@ -1701,6 +1654,121 @@ class TelegramChannel(Channel):
         # rolls the reservation back; an accepted enqueue already promoted it.
         if disposition in ("dropped_full", "error"):
             await self._rollback_answer(rec, answer_token)
+
+    async def _resume_and_ready(self, rec) -> bool:
+        """Resume-if-suspended + lifecycle gate for one engagement turn, run
+        UNDER the per-topic handler lock (``_engagement_handler_locks[topic]``).
+        Returns True when ``rec`` is live and deliverable; False when the caller
+        must NOT deliver — a terminal record, resume exhausted (2-strike), or an
+        unresumable orphan (each already surfaced + cleaned up here).
+
+        Bug 10 / v0.65.0 / §A3: this is the SINGLE resume+lifecycle core shared
+        by the operator-message path (``handle_update``) and the system-turn
+        path (``deliver_system_turn`` — v0.102.0 #217 post-consent auto-resume).
+        Keeping ONE copy under ONE lock is what stops a manual nudge and a
+        system resume from both observing a suspended in_casa driver and
+        double-opening its ``ClaudeSDKClient`` / lock. Operator-message-specific
+        bookkeeping (answered/inbound reservations, reply-threading, the finally
+        rollback) stays in ``handle_update`` AROUND this call; only the
+        resume/lifecycle core lives here."""
+        # Re-resolve under the lock: a driver-side result-finalize can flip the
+        # record terminal between handler entry and here. Only active/idle
+        # records are deliverable; a terminal one aborts before any resume.
+        reg = self._engagement_registry
+        if reg is not None:
+            latest = reg.get(rec.id)
+            if latest is None or latest.status not in ("active", "idle"):
+                return False
+            rec = latest
+
+        # Resume suspended client if needed (in_casa driver only — the
+        # claude_code driver has s6 keeping the subprocess alive across Casa
+        # restarts, and its engagements never have sdk_session_id).
+        if rec.driver != "claude_code" and self._engagement_driver is not None:
+            drv = self._engagement_driver
+            if not drv.is_alive(rec) and rec.sdk_session_id:
+                fail_count = rec.origin.get("_resume_fail_count", 0)
+                try:
+                    await drv.resume(rec, rec.sdk_session_id)
+                    rec.origin["_resume_fail_count"] = 0
+                except Exception as exc:  # noqa: BLE001
+                    fail_count += 1
+                    rec.origin["_resume_fail_count"] = fail_count
+                    logger.warning(
+                        "resume failed (%d/2) for engagement %s: %s",
+                        fail_count, rec.id[:8], exc,
+                    )
+                    if fail_count >= 2 and reg is not None:
+                        await reg.mark_error(
+                            rec.id, kind="resume_failed", message=str(exc),
+                        )
+                    await self.send_to_topic(
+                        rec.topic_id,
+                        f"Could not resume this engagement: {exc}. "
+                        f"Start a fresh one if needed.",
+                    )
+                    if fail_count >= 2:
+                        # [AR-1] (v0.65.0): this terminal path bypasses finalize
+                        # — title-mark, close + ledger the topic here
+                        # (best-effort, never raises). After the notice: posting
+                        # into a just-closed topic works only while the bot keeps
+                        # can_manage_topics — mirror the funnel's send-then-close
+                        # order.
+                        await self._cleanup_error_topic(rec)
+                    return False
+            elif not drv.is_alive(rec):
+                # No session to resume — orphan.
+                if reg is not None:
+                    await reg.mark_error(
+                        rec.id, kind="orphan_no_session",
+                        message="no sdk_session_id to resume with",
+                    )
+                await self.send_to_topic(
+                    rec.topic_id, "This engagement can't be resumed.",
+                )
+                # [AR-1] (v0.65.0): terminal path bypasses finalize — see above.
+                await self._cleanup_error_topic(rec)
+                return False
+
+        # v0.79.0 (§3): stamp the idle→active user turn so idle-reminder +
+        # retention accounting see fresh activity before delivery.
+        if reg is not None:
+            import time as _time
+            await reg.update_user_turn(rec.id, _time.time())
+        return True
+
+    async def deliver_system_turn(self, rec, text: str) -> None:
+        """Resume-if-suspended (under the per-topic lock), then deliver a
+        synthetic system-authored turn to engagement ``rec`` — the seam a
+        background reconcile callback uses to PROCEED a paused configurator
+        engagement after an operator tap (v0.102.0 #217: post-consent install
+        auto-resume).
+
+        Acquires the SAME ``_engagement_handler_locks[rec.topic_id]`` lock the
+        operator-message path holds, so a concurrent manual nudge and this
+        system turn can never both resume a suspended in_casa driver (no
+        duplicate ``ClaudeSDKClient``/parallel recipe). Inside the lock it runs
+        the shared ``_resume_and_ready`` gate — abandoning delivery (False) for
+        a terminal/unresumable engagement, which the helper already surfaced +
+        cleaned up — then hands the turn to the SAME ``_deliver_turn_bg`` task
+        the manual path uses, with the operator-message kwargs at their no-op
+        defaults (a system turn has no operator message, reply-thread, or answer
+        to carry). The turn is spawned as a tracked background task (in_casa
+        turns stream the whole recipe to completion), so the lock is released as
+        soon as the resume + dispatch is done — this never blocks the caller (a
+        tap-callback finish hook) for the turn's duration."""
+        lock = self._engagement_handler_locks.setdefault(
+            rec.topic_id, asyncio.Lock())
+        async with lock:
+            if not await self._resume_and_ready(rec):
+                logger.info(
+                    "post-consent auto-resume skipped for engagement %s — not "
+                    "deliverable (terminal/unresumable); operator can re-nudge",
+                    rec.id[:8])
+                return
+            task = asyncio.create_task(self._deliver_turn_bg(rec, text))
+            self._turn_tasks.add(task)
+            task.add_done_callback(self._turn_tasks.discard)
 
     async def _maybe_redirect_main_feed(self, user_id: int | None) -> None:
         if user_id is None:

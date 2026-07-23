@@ -443,3 +443,87 @@ async def test_persona_inspect_prompt_exception_is_structured(
     assert payload["ok"] is False
     assert payload["kind"] == "consent_prompt_failed"
     assert "registration blew up" in payload["detail"]
+
+
+# ---------------------------------------------------------------------------
+# v0.102.0 (#217): persona_install_inspect mirrors specialist_install_inspect —
+# it captures the requesting configurator engagement and, on Approve+ack,
+# reconcile_cb delivers a synthetic RESUME turn through the channel's
+# resume-if-needed seam so the persona recipe finishes without a manual nudge.
+# reconcile_cb runs from the tap-callback finish hook and must never raise.
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_persona_reconcile_cb_resumes_the_captured_engagement(
+    monkeypatch, tmp_path,
+) -> None:
+    import persona_install_consent
+    from tools import persona_install_inspect, engagement_var
+
+    cap: dict = {}
+
+    def _prompt(**kwargs):
+        cap["reconcile_cb"] = kwargs["reconcile_cb"]
+        return _Handle(settled="posted")
+
+    delivered: list = []
+    rec = SimpleNamespace(id="eng-p", driver="in_casa")
+    registry = SimpleNamespace(get=lambda eid: rec if eid == "eng-p" else None)
+
+    async def _deliver(r, text):
+        delivered.append((r, text))
+
+    channel = SimpleNamespace(
+        chat_id="123", _engagement_registry=registry, deliver_system_turn=_deliver)
+    _wire_persona_inspect(monkeypatch, tmp_path, channel=channel)
+    monkeypatch.setattr(
+        persona_install_consent, "prompt_persona_install_consent", _prompt)
+
+    token = engagement_var.set(SimpleNamespace(id="eng-p"))
+    try:
+        payload = _payload(await persona_install_inspect.handler(
+            {"repo": "owner/repo", "ref": "main"}))
+    finally:
+        engagement_var.reset(token)
+    assert payload["consent"] == "keyboard_posted"
+
+    await cap["reconcile_cb"]()
+    assert len(delivered) == 1
+    assert delivered[0][0] is rec
+    assert "persona_install_commit" in delivered[0][1]
+    assert "warm-helper" in delivered[0][1]  # _fake_persona_inspection persona_id
+
+
+@pytest.mark.asyncio
+async def test_persona_reconcile_cb_swallows_a_delivery_failure(
+    monkeypatch, tmp_path,
+) -> None:
+    import persona_install_consent
+    from tools import persona_install_inspect, engagement_var
+
+    cap: dict = {}
+
+    def _prompt(**kwargs):
+        cap["reconcile_cb"] = kwargs["reconcile_cb"]
+        return _Handle(settled="posted")
+
+    rec = SimpleNamespace(id="eng-p", driver="in_casa")
+    registry = SimpleNamespace(get=lambda eid: rec)
+
+    async def _deliver(r, text):
+        raise RuntimeError("delivery blew up")
+
+    channel = SimpleNamespace(
+        chat_id="123", _engagement_registry=registry, deliver_system_turn=_deliver)
+    _wire_persona_inspect(monkeypatch, tmp_path, channel=channel)
+    monkeypatch.setattr(
+        persona_install_consent, "prompt_persona_install_consent", _prompt)
+
+    token = engagement_var.set(SimpleNamespace(id="eng-p"))
+    try:
+        await persona_install_inspect.handler({"repo": "owner/repo", "ref": "main"})
+    finally:
+        engagement_var.reset(token)
+
+    await cap["reconcile_cb"]()  # fail-safe: must not raise

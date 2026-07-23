@@ -465,3 +465,76 @@ def test_apply_persona_override_specialist_without_active_tuple_raises(tmp_path:
             instance_dir_root=tmp_path / "specialists" / "never-installed",
         )
     assert raised.value.kind == "no_active_tuple"
+
+
+# ---------------------------------------------------------------------------
+# Sol P2 (#217): commit_persona_install publication-race safety. Two concurrent
+# commits of the SAME persona_id@version can both miss the is_file() precheck,
+# both stage, then race on os.replace — the loser's rename onto a now-populated
+# dest fails (ENOTEMPTY). It must never leak its staging dir or raise a raw
+# OSError: identical winning content is an idempotent success; different content
+# surfaces the SAME typed version_content_conflict as the pre-race branch.
+# ---------------------------------------------------------------------------
+
+
+def test_commit_persona_install_publication_race_resolves_idempotently(
+    tmp_path: Path, monkeypatch,
+) -> None:
+    from persona_install import commit_persona_install  # noqa: F401 — exercised via _ack_and_commit
+
+    personas_root = tmp_path / "personas"
+    inspection = _inspection_from_repo(tmp_path, negative_space="Never condescends.")
+    target_dest = personas_root / inspection.persona_id / inspection.version
+
+    real_replace = os.replace
+
+    def _racing_replace(src, dst):
+        # Only intercept the publication rename; everything else (ack-store
+        # atomic writes, etc.) delegates to the real os.replace.
+        if Path(dst) == target_dest:
+            real_replace(src, dst)  # the concurrent winner publishes IDENTICAL bytes
+            raise OSError(39, "Directory not empty")  # ENOTEMPTY — our rename loses
+        return real_replace(src, dst)
+
+    monkeypatch.setattr(os, "replace", _racing_replace)
+
+    pack = _ack_and_commit(tmp_path, tmp_path / "acks.json", personas_root, inspection)
+    assert pack.checksum == inspection.checksum  # typed idempotent pack, never a raw OSError
+    staging = personas_root / ".staging"
+    assert not staging.exists() or not any(staging.iterdir())  # no leaked staging dir
+
+
+def test_commit_persona_install_publication_race_different_content_is_typed_conflict(
+    tmp_path: Path, monkeypatch,
+) -> None:
+    import shutil
+
+    from persona_pack import load_persona_pack
+
+    personas_root = tmp_path / "personas"
+    ours = _inspection_from_repo(tmp_path, negative_space="Never condescends.")
+    theirs = _inspection_from_repo(
+        tmp_path, negative_space="Always double-checks the units.")
+    assert theirs.checksum != ours.checksum
+    target_dest = personas_root / ours.persona_id / ours.version
+
+    real_replace = os.replace
+
+    def _racing_replace(src, dst):
+        if Path(dst) == target_dest:
+            # A concurrent winner publishes DIFFERENT bytes first.
+            target_dest.parent.mkdir(parents=True, exist_ok=True)
+            shutil.copytree(theirs.staged_dir / "pack", target_dest / "pack")
+            shutil.copy2(theirs.staged_dir / "manifest.json", target_dest / "manifest.json")
+            raise OSError(39, "Directory not empty")
+        return real_replace(src, dst)
+
+    monkeypatch.setattr(os, "replace", _racing_replace)
+
+    with pytest.raises(SpecialistInstallError) as raised:
+        _ack_and_commit(tmp_path, tmp_path / "acks.json", personas_root, ours)
+    assert raised.value.kind == "version_content_conflict"  # typed, never raw OSError
+    staging = personas_root / ".staging"
+    assert not staging.exists() or not any(staging.iterdir())  # loser's staging cleaned up
+    published = load_persona_pack(target_dest / "pack", target_dest / "manifest.json")
+    assert published.checksum == theirs.checksum  # winner's bytes intact
