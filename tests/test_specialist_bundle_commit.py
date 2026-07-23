@@ -625,9 +625,13 @@ def test_uninstall_journals_the_retired_acks_atomically(tmp_path: Path, monkeypa
 
 
 def test_read_owned_plugins_rejects_traversal_and_bad_artifact_id(tmp_path: Path) -> None:
-    # Whole-branch F: a tampered sidecar with a traversal name or a non-hex
-    # artifact_id fails the whole doc closed (never reaches a store-path join).
-    from personality_binding import owned_plugins_path, read_owned_plugins, write_owned_plugins
+    # Whole-branch F + P1-4: a tampered PRESENT sidecar with a traversal name or
+    # a non-hex artifact_id fails the whole doc closed — but as a typed RAISE
+    # (never a store-path join, and never silently read as an empty owned set).
+    from personality_binding import (
+        OwnedPluginsSidecarError, owned_plugins_path, read_owned_plugins,
+        write_owned_plugins,
+    )
     good = _doc()
     write_owned_plugins(owned_plugins_path(tmp_path), good)
     assert read_owned_plugins(owned_plugins_path(tmp_path)) is not None
@@ -635,12 +639,70 @@ def test_read_owned_plugins_rejects_traversal_and_bad_artifact_id(tmp_path: Path
     poisoned = _doc()
     poisoned["plugins"][0]["name"] = "../../../etc/passwd"
     write_owned_plugins(owned_plugins_path(tmp_path), poisoned)
-    assert read_owned_plugins(owned_plugins_path(tmp_path)) is None
+    with pytest.raises(OwnedPluginsSidecarError):
+        read_owned_plugins(owned_plugins_path(tmp_path))
 
     bad_aid = _doc()
     bad_aid["plugins"][0]["artifact_id"] = "../evil"
     write_owned_plugins(owned_plugins_path(tmp_path), bad_aid)
-    assert read_owned_plugins(owned_plugins_path(tmp_path)) is None
+    with pytest.raises(OwnedPluginsSidecarError):
+        read_owned_plugins(owned_plugins_path(tmp_path))
+
+
+def test_read_owned_plugins_distinguishes_absent_from_malformed(tmp_path: Path) -> None:
+    # P1-4: an ABSENT sidecar returns None (legacy/pre-feature ⇒ empty owned
+    # set); a PRESENT file that is not the full v1 shape RAISES — the two must
+    # be distinguishable so a rollback never treats an unreadable sidecar as
+    # "nothing was owned".
+    from personality_binding import (
+        OwnedPluginsSidecarError, owned_plugins_path, read_owned_plugins,
+    )
+    p = owned_plugins_path(tmp_path)
+    assert read_owned_plugins(p) is None                       # absent → None
+
+    # A present file missing schema_version / component_source (the pre-fix
+    # "valid-empty" shapes that used to slip through as a bare dict) now raises.
+    for bad in ({}, {"schema_version": 2, "component_source": {}, "plugins": []},
+                {"schema_version": 1, "plugins": []},           # no component_source
+                {"schema_version": 1, "component_source": {}}): # no plugins list
+        p.write_text(_json.dumps(bad), encoding="utf-8")
+        with pytest.raises(OwnedPluginsSidecarError):
+            read_owned_plugins(p)
+
+    # A present, unreadable (corrupt YAML) file also raises, not None.
+    p.write_text("{ this: is: not: valid", encoding="utf-8")
+    with pytest.raises(OwnedPluginsSidecarError):
+        read_owned_plugins(p)
+
+
+def test_rollback_refuses_a_malformed_prior_sidecar(tmp_path: Path, monkeypatch) -> None:
+    # P1-4: a PRESENT-but-malformed prior owned-plugins sidecar must fail the
+    # rollback with a typed rollback_sidecar_invalid error BEFORE any durable
+    # mutation — never silently roll back to an empty owned set (dropping the
+    # prior owned plugins the rollback exists to restore).
+    from personality_binding import owned_plugins_prior_path
+
+    ctx = _prep(tmp_path, monkeypatch)
+    specialist_install.commit_specialist_install(**ctx.kw)
+    reg = ctx.kw["registry_path"]
+    kw2 = _prep_v2(tmp_path, monkeypatch, ctx)
+    specialist_install.upgrade_specialist(**kw2)          # v1 rotated into the prior sidecar
+    v2_aid = _owned(reg, "mtg")[0]["artifact_id"]
+
+    # Corrupt the prior sidecar in place (a present file that is not valid v1).
+    prior = owned_plugins_prior_path(tmp_path / "specialists" / "mtg")
+    assert prior.exists()
+    prior.write_text("{ not: valid: yaml", encoding="utf-8")
+
+    with pytest.raises(specialist_install.SpecialistInstallError) as ei:
+        specialist_install.rollback_specialist(
+            slug="mtg", bundle=True, acks=ctx.acks,
+            specialists_dir=tmp_path / "specialists",
+            agents_specialists_dir=tmp_path / "agents", registry_path=reg,
+            plugin_store_root=tmp_path / "store", ops_dir=tmp_path / "ops")
+    assert ei.value.kind == "rollback_sidecar_invalid"
+    # active generation untouched (still v2) — refusal happened pre-mutation
+    assert _owned(reg, "mtg")[0]["artifact_id"] == v2_aid
 
 
 def test_bundle_uninstall_cascade(tmp_path: Path, monkeypatch) -> None:
@@ -811,3 +873,91 @@ def test_uninstall_without_bundle_still_works_when_nothing_is_owned(
         agents_specialists_dir=tmp_path / "agents", registry_path=reg)
 
     assert not slug_dir.exists()
+
+
+# ===========================================================================
+# 2g — P1-1 (sync-phase journal-complete) + P2-5 (uninstall retire/begin)
+# ===========================================================================
+
+def test_sync_phase_rollback_failure_leaves_journal_in_progress(
+    tmp_path: Path, monkeypatch,
+) -> None:
+    """P1-1 (sync phase): a sync-phase failure whose rollback_disk() ITSELF
+    raises must NOT complete the journal — it stays in-progress on disk so boot
+    reconciliation re-runs the rollback (or quarantines). Completing it would
+    strand a half-rolled-back mutation with no recovery."""
+    import personality_binding
+    from specialist_bundle_journal import BundleTxn
+
+    ctx = _prep(tmp_path, monkeypatch)
+
+    def _boom_commit(self):
+        raise RuntimeError("tuple commit exploded")
+
+    def _boom_rollback(self):
+        raise RuntimeError("registry unreadable — rollback failed")
+
+    monkeypatch.setattr(personality_binding.InstanceDir,
+                        "commit_desired_to_active", _boom_commit)
+    monkeypatch.setattr(BundleTxn, "rollback_disk", _boom_rollback)
+
+    with pytest.raises(RuntimeError):
+        specialist_install.commit_specialist_install(**ctx.kw)
+
+    # Journal NOT completed — the in-progress file survives for boot reconcile.
+    journals = list((tmp_path / "ops").glob("*.json"))
+    assert len(journals) == 1
+    payload = _json.loads(journals[0].read_text())
+    assert payload["state"] == "in-progress"
+
+
+def test_sync_phase_rollback_success_completes_journal(
+    tmp_path: Path, monkeypatch,
+) -> None:
+    """P1-1 companion: when rollback_disk SUCCEEDS on a sync-phase failure, the
+    journal IS completed (pruned) as before — the fix only withholds completion
+    when the rollback itself fails."""
+    import personality_binding
+
+    ctx = _prep(tmp_path, monkeypatch)
+
+    def _boom_commit(self):
+        raise RuntimeError("tuple commit exploded")
+
+    monkeypatch.setattr(personality_binding.InstanceDir,
+                        "commit_desired_to_active", _boom_commit)
+
+    with pytest.raises(RuntimeError):
+        specialist_install.commit_specialist_install(**ctx.kw)
+
+    assert _owned(ctx.kw["registry_path"], "mtg") == []          # registry restored
+    assert list((tmp_path / "ops").glob("*.json")) == []          # journal completed/pruned
+
+
+def test_uninstall_begin_failure_restores_retired_acks(
+    tmp_path: Path, monkeypatch,
+) -> None:
+    """P2-5: uninstall retires the slug's consent acks BEFORE begin(); if
+    begin() then raises, the retired records must be restored so a begin
+    failure leaves the ack ledger untouched — never silently drops the
+    operator's approval."""
+    import specialist_bundle_journal
+
+    ctx = _prep(tmp_path, monkeypatch)
+    specialist_install.commit_specialist_install(**ctx.kw)
+    assert len(ctx.acks.snapshot_slug("mtg")) == 1               # one ack present
+
+    def _boom_begin(*a, **k):
+        raise OSError("ops dir unwritable")
+
+    monkeypatch.setattr(specialist_bundle_journal, "begin", _boom_begin)
+
+    with pytest.raises(OSError):
+        specialist_install.uninstall_specialist(
+            slug="mtg", bundle=True, acks=ctx.acks,
+            specialists_dir=tmp_path / "specialists",
+            agents_specialists_dir=tmp_path / "agents",
+            registry_path=ctx.kw["registry_path"], ops_dir=tmp_path / "ops")
+
+    # The retired ack was restored — the failed uninstall left the ledger intact.
+    assert len(ctx.acks.snapshot_slug("mtg")) == 1

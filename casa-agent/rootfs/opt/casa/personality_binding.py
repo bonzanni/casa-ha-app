@@ -13,6 +13,7 @@ from typing import Callable, Literal, Mapping
 import jsonschema
 import yaml
 
+import plugin_registry
 from canonical_bytes import checksum_json
 from persona_pack import PersonaPack
 from role_slot import (  # noqa: F401 — re-exported for existing callers (Task 6 owns these)
@@ -416,11 +417,23 @@ def owned_plugins_prior_path(directory: Path) -> Path:
 # path later joins into a store path (`store_root / row["name"] /
 # row["artifact_id"]`). A tampered/corrupt sidecar with a traversal `name`
 # ("../../etc") or a bogus `artifact_id` must NEVER reach a filesystem join —
-# validate the grammar on READ (mirrors plugin_registry.OWNED_NAME_RE + the
-# 72-byte scoped-name invariant) and fail the whole doc closed if any row is
-# malformed.
-_OWNED_NAME_RE = re.compile(r"^[a-z0-9][a-z0-9-]{0,31}\.[a-z0-9][a-z0-9-]{0,39}$")
+# validate the grammar on READ and fail the whole doc closed if malformed.
+#
+# P2-7: the owned scoped-name grammar has a canonical home — reuse
+# `plugin_registry.OWNED_NAME_RE` (single source of truth) rather than copying
+# the pattern. `_ARTIFACT_ID_RE` has no canonical constant in plugin_registry
+# (artifact ids are raw sha256 hexdigests from `compute_artifact_id`); a test
+# asserts this local pattern matches that output shape.
+_OWNED_NAME_RE = plugin_registry.OWNED_NAME_RE
 _ARTIFACT_ID_RE = re.compile(r"^[0-9a-f]{64}$")
+
+
+class OwnedPluginsSidecarError(ValueError):
+    """P1-4: a PRESENT owned-plugins sidecar that fails strict v1 validation.
+    Distinct from an ABSENT sidecar (legacy/pre-feature generation) so a
+    rollback/boot caller can tell "no owned set to restore" apart from "the
+    recorded owned set is unreadable" — the latter must refuse loudly rather
+    than silently discard the prior owned set as if it were empty."""
 
 
 def _valid_owned_row(row: object) -> bool:
@@ -440,29 +453,43 @@ def _valid_owned_row(row: object) -> bool:
     return True
 
 
-def read_owned_plugins(path: Path) -> "dict | None":
-    """Load an owned-plugins sidecar document, or None if absent/malformed.
-    The document shape is
-    `{"schema_version": 1, "component_source": {...}, "plugins": [...]}`.
+def _valid_owned_doc(raw: object) -> bool:
+    """P1-4: the complete v1 document shape — `schema_version == 1`, a
+    `component_source` mapping, and a `plugins` list of grammar-valid rows."""
+    if not isinstance(raw, dict):
+        return False
+    if raw.get("schema_version") != 1:
+        return False
+    if not isinstance(raw.get("component_source"), dict):
+        return False
+    plugins = raw.get("plugins")
+    if not isinstance(plugins, list) or not all(_valid_owned_row(r) for r in plugins):
+        return False
+    return True
 
-    Whole-branch F: the `plugins` list is schema/grammar-validated here (row
-    shape + `name`/`artifact_id`/`manifest_name` grammar) so a downstream
-    store-path join can trust every row — any malformed row fails the whole
-    doc closed (returns None)."""
+
+def read_owned_plugins(path: Path) -> "dict | None":
+    """Load an owned-plugins sidecar document.
+
+    Returns None ONLY when the file is ABSENT (a legacy/pre-feature generation
+    ⇒ empty owned set). A PRESENT file is validated against the full v1 shape
+    `{"schema_version": 1, "component_source": {...}, "plugins": [...]}` — row
+    grammar included, so a downstream store-path join can trust every row — and
+    a malformed present file raises `OwnedPluginsSidecarError` (P1-4) rather
+    than returning None. Collapsing malformed-present into None let a rollback
+    silently discard the prior owned set (treating an unreadable sidecar as
+    "nothing was owned"); the typed error forces the caller to refuse."""
     p = Path(path)
     if not p.exists():
         return None
     try:
         raw = yaml.safe_load(p.read_text(encoding="utf-8"))
-    except (OSError, yaml.YAMLError):
-        return None
-    if not isinstance(raw, dict):
-        return None
-    plugins = raw.get("plugins")
-    if plugins is not None:
-        if not isinstance(plugins, list) or not all(
-                _valid_owned_row(r) for r in plugins):
-            return None
+    except (OSError, yaml.YAMLError) as exc:
+        raise OwnedPluginsSidecarError(
+            f"owned-plugins sidecar {p} is present but unreadable: {exc}")
+    if not _valid_owned_doc(raw):
+        raise OwnedPluginsSidecarError(
+            f"owned-plugins sidecar {p} failed v1 validation")
     return raw
 
 

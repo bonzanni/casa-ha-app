@@ -1650,12 +1650,16 @@ def commit_specialist_install(
                     acks_path=acks.path)
             except BaseException:
                 # Sync-phase failure: nothing was reloaded, so restore disk
-                # state from the before-state and complete the journal here
-                # (spec §3.2 failure handling — no sequencer needed).
-                try:
-                    rollback_txn.rollback_disk()
-                finally:
-                    specialist_bundle_journal.complete(journal)
+                # state from the before-state (spec §3.2 failure handling — no
+                # sequencer needed). P1-1: complete the journal ONLY after a
+                # SUCCESSFUL rollback — if rollback_disk() raises (e.g. an
+                # unreadable registry, which fails closed rather than persist a
+                # partial doc), leave the in-progress journal on disk so boot
+                # reconciliation re-runs the rollback or quarantines the slug.
+                # Completing it here would strand a half-rolled-back mutation
+                # with no recovery.
+                rollback_txn.rollback_disk()
+                specialist_bundle_journal.complete(journal)
                 raise
     finally:
         if workspace is not None:
@@ -2166,7 +2170,8 @@ def rollback_specialist(
     import specialist_bundle_journal
     from specialist_bundle_journal import BundleTxn
     from personality_binding import (
-        InstanceDir, owned_plugins_prior_path, read_owned_plugins,
+        InstanceDir, OwnedPluginsSidecarError, owned_plugins_prior_path,
+        read_owned_plugins,
     )
     import specialist_materialize
 
@@ -2187,8 +2192,16 @@ def rollback_specialist(
     slug_dir = specialists_dir / slug
 
     # Prior owned set from its sidecar (missing sidecar but present prior tuple
-    # ⇒ pre-feature generation ⇒ empty owned set, spec §3.4).
-    prior_sidecar = read_owned_plugins(owned_plugins_prior_path(slug_dir))
+    # ⇒ pre-feature generation ⇒ empty owned set, spec §3.4). P1-4: a PRESENT
+    # but malformed prior sidecar raises OwnedPluginsSidecarError — refuse the
+    # rollback with a typed error rather than silently proceeding with an empty
+    # owned set (which would drop the prior owned plugins the rollback exists to
+    # restore). This preflight runs BEFORE any durable mutation, so nothing is
+    # touched on refusal.
+    try:
+        prior_sidecar = read_owned_plugins(owned_plugins_prior_path(slug_dir))
+    except OwnedPluginsSidecarError as exc:
+        raise SpecialistInstallError("rollback_sidecar_invalid", str(exc))
     prior_rows = list(prior_sidecar.get("plugins") or []) if prior_sidecar else []
 
     # Preflight retained artifacts BEFORE any durable mutation.
@@ -2252,10 +2265,12 @@ def rollback_specialist(
             registry_path=registry_path, specialists_dir=specialists_dir,
             acks_path=acks.path)
     except BaseException:
-        try:
-            rollback_txn.rollback_disk()
-        finally:
-            specialist_bundle_journal.complete(journal)
+        # P1-1: complete the journal ONLY after a SUCCESSFUL rollback. A
+        # rollback that raises leaves the in-progress journal on disk so boot
+        # reconciliation re-runs it (or quarantines the slug) — completing here
+        # would strand a half-rolled-back mutation with no recovery.
+        rollback_txn.rollback_disk()
+        specialist_bundle_journal.complete(journal)
         raise
     return instance, txn
 
@@ -2439,12 +2454,28 @@ def uninstall_specialist(
     # before begin means a crash in the (tiny) gap loses only the acks — a
     # fail-closed outcome (the operator simply re-approves), never registry/
     # tuple corruption (those mutations all follow begin).
+    #
+    # Accepted residual (COMMENT-ONLY, Fable #4): a consent tap racing this
+    # uninstall could re-record a slug ack in the window between this retire and
+    # the tool-layer journal-complete — leaving a stale identity-bound ack. It
+    # is fail-closed: the ack is bound to a specific install identity tuple, so
+    # any FUTURE install of this slug computes a different identity and never
+    # matches it (the stale record can authorize nothing).
     ack_records = acks.retire_slug(slug)
     _begin_kwargs = {} if ops_dir is None else {"ops_dir": ops_dir}
-    journal = specialist_bundle_journal.begin(
-        "uninstall", slug, before_entries=before_owned,
-        before_tuple_files=before_tuple_files, ack_records=ack_records,
-        **_begin_kwargs)
+    # P2-5: retire_slug already removed the records from the live ledger; if
+    # begin() now raises (an unwritable ops dir, say) those retired records
+    # would be lost with no journal to restore them from. Restore exactly the
+    # retire_slug() return before propagating, so a begin failure leaves the
+    # ack ledger untouched.
+    try:
+        journal = specialist_bundle_journal.begin(
+            "uninstall", slug, before_entries=before_owned,
+            before_tuple_files=before_tuple_files, ack_records=ack_records,
+            **_begin_kwargs)
+    except BaseException:
+        acks.restore_records(ack_records)
+        raise
     rollback_txn = BundleTxn(
         journal_path=journal, slug=slug, before_entries=before_owned,
         before_tuple_files=before_tuple_files, ack_records=ack_records,
@@ -2467,10 +2498,12 @@ def uninstall_specialist(
             registry_path=registry_path, specialists_dir=specialists_dir,
             acks_path=acks.path)
     except BaseException:
-        try:
-            rollback_txn.rollback_disk()
-        finally:
-            specialist_bundle_journal.complete(journal)
+        # P1-1: complete the journal ONLY after a SUCCESSFUL rollback. A
+        # rollback that raises leaves the in-progress journal on disk so boot
+        # reconciliation re-runs it (or quarantines the slug) — completing here
+        # would strand a half-rolled-back mutation with no recovery.
+        rollback_txn.rollback_disk()
+        specialist_bundle_journal.complete(journal)
         raise
     return txn
 

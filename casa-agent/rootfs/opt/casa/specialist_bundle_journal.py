@@ -78,7 +78,13 @@ def _fsync_write(path: Path, data: str) -> None:
     try:
         fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
         try:
-            os.write(fd, data.encode("utf-8"))
+            # P2-6: a single os.write() may write fewer bytes than requested
+            # (a "short write"), silently truncating the journal — the exact
+            # torn-payload state os.replace was chosen to avoid. Loop until the
+            # whole buffer is on the fd before fsync/replace.
+            buf = memoryview(data.encode("utf-8"))
+            while buf:
+                buf = buf[os.write(fd, buf):]
             os.fsync(fd)
         finally:
             os.close(fd)

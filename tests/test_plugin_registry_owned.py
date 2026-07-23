@@ -178,3 +178,22 @@ def test_resolved_plugin_constructor_regression():
                         version="1", manifest={})
     assert rp.manifest_name == ""
     assert runtime_name(rp) == "x"
+
+
+def test_owned_sidecar_grammar_reuses_canonical_patterns():
+    # P2-7: personality_binding's owned-plugins sidecar validation must NOT
+    # copy the owned scoped-name grammar — it reuses the canonical
+    # plugin_registry.OWNED_NAME_RE (the single source of truth). The
+    # artifact-id pattern has no canonical constant (ids are raw sha256
+    # hexdigests from compute_artifact_id); assert the local pattern matches
+    # that exact output shape and rejects the edges.
+    import personality_binding as pb
+
+    assert pb._OWNED_NAME_RE is plugin_registry.OWNED_NAME_RE
+
+    aid = compute_artifact_id(
+        repo="o/r", revision=REV, subdir="plugins/mtg", name="mtg.mtg")
+    assert pb._ARTIFACT_ID_RE.match(aid)          # real 64-hex id matches
+    assert not pb._ARTIFACT_ID_RE.match(aid[:-1])  # 63 chars rejected
+    assert not pb._ARTIFACT_ID_RE.match(aid + "0")  # 65 chars rejected
+    assert not pb._ARTIFACT_ID_RE.match("../evil")  # traversal rejected

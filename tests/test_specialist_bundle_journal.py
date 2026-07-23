@@ -585,3 +585,25 @@ def test_bundletxn_rollback_disk_deletes_files_recorded_as_absent(tmp_path):
     txn.rollback_disk()
 
     assert not (slug_dir / "desired.yaml").exists()
+
+
+def test_fsync_write_completes_under_short_writes(tmp_path, monkeypatch):
+    """P2-6: _fsync_write must loop until the WHOLE buffer is written — a
+    single os.write() may write fewer bytes than requested (a short write),
+    which would silently truncate the journal (the torn-payload state
+    os.replace was chosen to avoid). Force ≤8-byte writes and assert the full
+    payload still lands intact."""
+    import os
+
+    real_write = os.write
+
+    def _short_write(fd, data):
+        return real_write(fd, data[:8])   # at most 8 bytes/call → forces the loop
+
+    monkeypatch.setattr(journal.os, "write", _short_write)
+
+    payload = ("x" * 250) + "\n"           # far larger than one short write
+    target = tmp_path / "journal.json"
+    journal._fsync_write(target, payload)
+
+    assert target.read_text(encoding="utf-8") == payload
