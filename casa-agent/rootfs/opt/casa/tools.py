@@ -7754,7 +7754,8 @@ def _tool_verify_plugin_state(
         pass
     rp = ResolvedPlugin(name=plugin_name, artifact_id=str(artifact_id),
                         path=str(path), version=str(entry.get("version", "")),
-                        manifest=manifest)
+                        manifest=manifest,
+                        manifest_name=entry.get("manifest_name") or plugin_name)
     # Sol #16: a PRESENT-but-malformed .mcp.json silently degrades grants/secrets
     # to [] (indistinguishable from skill-only), so a broken MCP server would
     # otherwise verify ready. Treat it as a blocking reason.

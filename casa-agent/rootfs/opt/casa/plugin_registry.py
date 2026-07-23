@@ -35,6 +35,29 @@ REVISION_RE = re.compile(r"^(git:[0-9a-f]{40}|legacy-content:[0-9a-f]{64})$")
 _SOURCE_TYPES = {"github", "bundled"}
 _REPO_RE = re.compile(r"^[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+$")
 
+# spec §2: an OWNED entry (one belonging to a specialist plugin bundle, not an
+# operator-installed one) carries a scoped `<slug>.<manifest_name>` name and an
+# `owner: specialist:<slug>` field. Bounds match the Task 2 slug grammar
+# (32 bytes) for the owner slug component; the manifest_name component keeps
+# the pre-existing 40-byte NAME_RE-shaped bound.
+OWNED_NAME_RE = re.compile(r"^[a-z0-9][a-z0-9-]{0,31}\.[a-z0-9][a-z0-9-]{0,39}$")
+OWNER_RE = re.compile(r"^specialist:[a-z0-9][a-z0-9-]{0,31}$")
+
+
+def scoped_name(slug: str, manifest_name: str) -> str:
+    return f"{slug}.{manifest_name}"
+
+
+def entry_owner(entry: dict) -> str | None:
+    """The entry's validated `owner`, or None if absent/malformed."""
+    o = entry.get("owner")
+    return o if isinstance(o, str) and OWNER_RE.match(o) else None
+
+
+def owned_entries_for(slug: str, data: "RegistryData") -> list[dict]:
+    """Every entry in `data` owned by specialist `slug`."""
+    return [e for e in data.entries if entry_owner(e) == f"specialist:{slug}"]
+
 
 def normalize_repo(repo: str) -> str:
     return repo.strip().lower()
@@ -89,8 +112,25 @@ def _entry_error(entry: object) -> str | None:
     if not isinstance(entry, dict):
         return "not_a_mapping"
     name = entry.get("name")
-    if not isinstance(name, str) or not NAME_RE.match(name):
-        return "bad_name"
+    owner = entry.get("owner")
+    if owner is None:
+        if not isinstance(name, str) or not NAME_RE.match(name):
+            return "bad_name"
+    else:
+        # Owned invariant (spec §2, ONE check): owner shape, scoped name,
+        # prefix==owner slug, exclusive specialist target, manifest_name
+        # present and == suffix.
+        if not isinstance(name, str) or not OWNED_NAME_RE.match(name):
+            return "owned_invariant"
+        if not isinstance(owner, str) or not OWNER_RE.match(owner):
+            return "owned_invariant"
+        slug_part, _, mname_part = name.partition(".")
+        if owner != f"specialist:{slug_part}":
+            return "owned_invariant"
+        if entry.get("manifest_name") != mname_part:
+            return "owned_invariant"
+        if entry.get("targets") != [owner]:
+            return "owned_invariant"
     src = entry.get("source")
     if not isinstance(src, dict):
         return "bad_source"
@@ -187,6 +227,29 @@ def _validate_doc(raw: object) -> tuple[list[dict], list[PluginIssue], bool]:
             kept_ids.add(id(group[0]))
     # Preserve original file order for kept entries.
     ordered = [e for e in entries if id(e) in kept_ids]
+
+    # (target, effective manifest name) uniqueness — spec §2.1. The effective
+    # runtime name of an owned entry is its manifest_name; of an unowned
+    # entry, its name. Collision invalidates the OWNED entrant(s) only.
+    by_rt: dict[tuple[str, str], list[dict]] = {}
+    for e in ordered:
+        eff = e.get("manifest_name") or e["name"]
+        for t in e.get("targets", []):
+            by_rt.setdefault((t, eff), []).append(e)
+    dropped: set[int] = set()
+    for (t, eff), group in by_rt.items():
+        if len(group) <= 1:
+            continue
+        for e in group:
+            if e.get("owner") is not None and id(e) not in dropped:
+                dropped.add(id(e))
+                issues.append(PluginIssue(
+                    name=e["name"], target=t, stage="registry",
+                    reason_code="manifest_name_collision",
+                    artifact_id=e.get("artifact_id"),
+                    scoped_targets=_own_targets(e)))
+    if dropped:
+        ordered = [e for e in ordered if id(e) not in dropped]
     return ordered, issues, True
 
 
@@ -253,6 +316,18 @@ class ResolvedPlugin:
     path: str
     version: str
     manifest: dict
+    # spec §2: the plugin's manifest-declared name for an OWNED entry (e.g.
+    # "mtg" for registry name "mtg.mtg"); "" for unowned/pre-Task-3 call
+    # sites, which must keep constructing without this kwarg (Terra plan-r1:
+    # tools.py:905-907, 7755-7757 + test fixtures). Use runtime_name(rp), not
+    # this field directly, to get the effective runtime identity.
+    manifest_name: str = ""
+
+
+def runtime_name(rp: "ResolvedPlugin") -> str:
+    """The ONE accessor for a resolved plugin's effective runtime identity
+    (Task 5): its manifest_name if owned, else its registry name."""
+    return rp.manifest_name or rp.name
 
 
 @dataclass
@@ -387,6 +462,7 @@ def _resolve_entry(entry: dict, snap: "_Snapshot", target: str | None,
         name=name, artifact_id=artifact_id, path=str(path),
         version=str(manifest.get("version", entry.get("version", ""))),
         manifest=manifest,
+        manifest_name=entry.get("manifest_name") or name,
     ), None, warning
 
 
