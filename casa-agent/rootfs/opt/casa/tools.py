@@ -6557,38 +6557,109 @@ async def _bundle_reload_and_verify(
     # 2. ONE snapshot reload.
     await asyncio.to_thread(plugin_registry.reload_snapshot)
 
-    # 3. ONE specialist-agent reload — only when the slug is still installed
-    # (an uninstall passes targets_removed; a pending specialist has no role).
+    # 3. agents-level reconstruction / eviction.
     runtime = getattr(agent_mod, "active_runtime", None)
     reloaded: list = []
     reload_errors: list = []
     uninstalling = bool(targets_removed)
-    if runtime is not None and not uninstalling and \
-            not _specialist_target_pending(runtime, slug):
-        res = await reload_mod.dispatch("agent", runtime=runtime, role=slug)
-        if res.get("status") == "ok":
-            reloaded.append(f"specialist:{slug}")
-        else:
-            reload_errors.append({"target": f"specialist:{slug}", **res})
+    if runtime is not None:
+        if uninstalling:
+            # Whole-branch C: the removed specialist's live agent + bus
+            # registration must be EVICTED. A single-role dispatch("agent")
+            # would raise unknown_role for a just-deleted slug and skip
+            # eviction entirely (the old code did exactly that — it only
+            # reloaded on the non-uninstall branch). Run the full agents
+            # add/evict sweep (reload_agents) instead — it pops the removed
+            # specialist from runtime.agents and deregisters its bus consumer
+            # (evicted_specialist_<role>).
+            res = await reload_mod.dispatch("agents", runtime=runtime)
+            if res.get("status") == "ok":
+                reloaded.append(f"evicted:specialist:{slug}")
+            else:
+                reload_errors.append({"target": f"specialist:{slug}", **res})
+        elif not _specialist_target_pending(runtime, slug):
+            res = await reload_mod.dispatch("agent", runtime=runtime, role=slug)
+            if res.get("status") == "ok":
+                reloaded.append(f"specialist:{slug}")
+            else:
+                reload_errors.append({"target": f"specialist:{slug}", **res})
 
     # 4. desired==active verify for every owned entry the slug now carries.
     reg = plugin_registry.load_registry()
     verify: dict = {}
+    not_ready: list = []
     for entry in plugin_registry.owned_entries_for(slug, reg):
         name = entry.get("name")
-        verify[name] = await asyncio.to_thread(
-            _tool_verify_plugin_state, plugin_name=name)
+        v = await asyncio.to_thread(_tool_verify_plugin_state, plugin_name=name)
+        verify[name] = v
+        # Whole-branch B: a not-ready owned binding (desired != active) is a
+        # sequencer FAILURE, not a silent success. A config-pending specialist
+        # is still verified-legal: its owned entries activate at commit and
+        # their artifacts/secrets verify ready even while the specialist role is
+        # dormant (spec §3.2 pending-config semantics).
+        if v.get("ready") is not True:
+            not_ready.append(name)
+
+    # Whole-branch B/C (uninstall): every removed scoped name must be ABSENT
+    # from the specialist's resolution and the specialist agent must be gone.
+    absent_violations: list = []
+    if uninstalling:
+        resolved_names = await asyncio.to_thread(
+            lambda: {rp.name for rp in
+                     plugin_registry.resolve_for(f"specialist:{slug}").plugins})
+        absent_violations = sorted(
+            n for n in resolved_names if n.startswith(f"{slug}."))
+        if runtime is not None and slug in (getattr(runtime, "agents", {}) or {}):
+            absent_violations.append(f"agent:{slug}")
 
     # 5. ONE health regeneration + notify.
     await asyncio.to_thread(_regenerate_plugin_health, [])
     await _notify_plugin_health_if_possible()
 
-    ok = not reload_errors
+    ok = not reload_errors and not not_ready and not absent_violations
     return {
-        "ok": ok, "kind": None if ok else "reload_failed",
+        "ok": ok,
+        "kind": (None if ok else "reload_failed" if reload_errors
+                 else "postcondition_failed"),
         "reloaded": reloaded, "reload_errors": reload_errors,
+        "not_ready": not_ready, "absent_violations": absent_violations,
         "verify": verify, "removed_artifact_ids": list(removed_artifact_ids),
     }
+
+
+async def _bundle_compensate(txn, *, targets_removed: list) -> None:
+    """Whole-branch B: shared compensation for a FAILED bundle sequencer — roll
+    the disk state back, run a best-effort compensating sequencer over the
+    restored state (un-publishing the runtime state with the new set's artifact
+    ids), and ALWAYS complete the journal. Never raises out (a rollback/
+    sequencer failure here is logged; boot reconciliation is the backstop)."""
+    import specialist_bundle_journal
+    try:
+        try:
+            await asyncio.to_thread(txn.rollback_disk)
+            await _bundle_reload_and_verify(
+                txn.slug, removed_artifact_ids=list(txn.new_artifact_ids),
+                targets_removed=targets_removed)
+        except Exception:  # noqa: BLE001 — best-effort compensation
+            logger.warning("bundle compensation failed for %s", txn.slug,
+                           exc_info=True)
+    finally:
+        await asyncio.to_thread(specialist_bundle_journal.complete,
+                                txn.journal_path)
+
+
+def _prune_bundle_receipt(receipt_id: "str | None") -> None:
+    """Whole-branch N: delete a CONSUMED source receipt after its bundle
+    transaction completes (a receipt is single-use — install/upgrade). Best
+    effort: a prune failure never fails the (already-committed) mutation; the
+    boot-time age sweep is the backstop."""
+    if not receipt_id:
+        return
+    try:
+        import specialist_receipt
+        specialist_receipt.delete(receipt_id)
+    except Exception:  # noqa: BLE001 — pruning is best-effort
+        logger.warning("receipt prune failed for %s", receipt_id, exc_info=True)
 
 
 def _safe_remove_manifest(name: str) -> None:
@@ -7231,13 +7302,20 @@ async def specialist_install_commit(args: dict) -> dict:
                 txn.slug, removed_artifact_ids=list(txn.removed_artifact_ids),
                 targets_removed=[])
         except Exception:
-            await asyncio.to_thread(txn.rollback_disk)
-            await _bundle_reload_and_verify(
-                txn.slug, removed_artifact_ids=list(txn.new_artifact_ids),
-                targets_removed=[])
-            await asyncio.to_thread(specialist_bundle_journal.complete, txn.journal_path)
+            await _bundle_compensate(txn, targets_removed=[])
             raise
+        # Whole-branch B: a not-ready owned binding / postcondition failure is a
+        # FAILED mutation — compensate + surface ok:false, never complete the
+        # journal + report success.
+        if not seq.get("ok", True):
+            await _bundle_compensate(txn, targets_removed=[])
+            return _result({"ok": False, "kind": seq.get("kind") or "bundle_sequence_failed",
+                            "slug": txn.slug, "reload_errors": seq.get("reload_errors"),
+                            "not_ready": seq.get("not_ready"),
+                            "absent_violations": seq.get("absent_violations"),
+                            "verify": seq.get("verify")})
         await asyncio.to_thread(specialist_bundle_journal.complete, txn.journal_path)
+        _prune_bundle_receipt(receipt.receipt_id)
     return _result({"ok": True, "slug": instance.slug, "state": instance.state,
                      "activation_committed": instance.state == "active",
                      "reloaded": seq["reloaded"], "verify": seq["verify"]})
@@ -7275,7 +7353,14 @@ async def specialist_upgrade(args: dict) -> dict:
                                   "from specialist_install_inspect(mode='upgrade')"})
 
     staged_dir = Path(args["staged_dir"])
-    component = load_specialist_component(staged_dir, staged_dir / "manifest.json")
+    # Whole-branch M: guard the staged component load (mirrors
+    # specialist_install_commit's staged_dir_invalid mapping) — a vanished/
+    # corrupt staging dir must surface as a structured envelope, not a raw
+    # ValueError/OSError out of the tool.
+    try:
+        component = load_specialist_component(staged_dir, staged_dir / "manifest.json")
+    except (ValueError, OSError) as exc:
+        return _result({"ok": False, "kind": "staged_dir_invalid", "detail": str(exc)})
     # Same fresh re-validation as specialist_install_commit — upgrade must
     # not trust a caller-supplied digest either.
     deps = resolve_dependency_closure(component, staged_dir)
@@ -7313,13 +7398,17 @@ async def specialist_upgrade(args: dict) -> dict:
                 txn.slug, removed_artifact_ids=list(txn.removed_artifact_ids),
                 targets_removed=[])
         except Exception:
-            await asyncio.to_thread(txn.rollback_disk)
-            await _bundle_reload_and_verify(
-                txn.slug, removed_artifact_ids=list(txn.new_artifact_ids),
-                targets_removed=[])
-            await asyncio.to_thread(specialist_bundle_journal.complete, txn.journal_path)
+            await _bundle_compensate(txn, targets_removed=[])
             raise
+        if not seq.get("ok", True):
+            await _bundle_compensate(txn, targets_removed=[])
+            return _result({"ok": False, "kind": seq.get("kind") or "bundle_sequence_failed",
+                            "slug": txn.slug, "reload_errors": seq.get("reload_errors"),
+                            "not_ready": seq.get("not_ready"),
+                            "absent_violations": seq.get("absent_violations"),
+                            "verify": seq.get("verify")})
         await asyncio.to_thread(specialist_bundle_journal.complete, txn.journal_path)
+        _prune_bundle_receipt(receipt.receipt_id)
     return _result({"ok": True, "slug": instance.slug, "state": instance.state,
                      "reloaded": seq["reloaded"], "verify": seq["verify"]})
 
@@ -7348,12 +7437,15 @@ async def specialist_rollback(args: dict) -> dict:
                 txn.slug, removed_artifact_ids=list(txn.removed_artifact_ids),
                 targets_removed=[])
         except Exception:
-            await asyncio.to_thread(txn.rollback_disk)
-            await _bundle_reload_and_verify(
-                txn.slug, removed_artifact_ids=list(txn.new_artifact_ids),
-                targets_removed=[])
-            await asyncio.to_thread(specialist_bundle_journal.complete, txn.journal_path)
+            await _bundle_compensate(txn, targets_removed=[])
             raise
+        if not seq.get("ok", True):
+            await _bundle_compensate(txn, targets_removed=[])
+            return _result({"ok": False, "kind": seq.get("kind") or "bundle_sequence_failed",
+                            "slug": txn.slug, "reload_errors": seq.get("reload_errors"),
+                            "not_ready": seq.get("not_ready"),
+                            "absent_violations": seq.get("absent_violations"),
+                            "verify": seq.get("verify")})
         await asyncio.to_thread(specialist_bundle_journal.complete, txn.journal_path)
     return _result({"ok": True, "slug": instance.slug, "state": instance.state,
                      "reloaded": seq["reloaded"], "verify": seq["verify"]})
@@ -7366,27 +7458,36 @@ async def specialist_rollback(args: dict) -> dict:
     {"type": "object", "properties": {"slug": {"type": "string"}}, "required": ["slug"]},
 )
 async def specialist_uninstall(args: dict) -> dict:
-    from specialist_install import uninstall_specialist
+    from specialist_install import SpecialistInstallError, uninstall_specialist
     from specialist_install_consent import SpecialistInstallAckStore
     import specialist_bundle_journal
 
     slug = args["slug"]
+    targets_removed = [f"specialist:{slug}"]
     async with _PLUGIN_TOOLS_LOCK:
-        txn = await asyncio.to_thread(
-            uninstall_specialist, slug=slug, bundle=True,
-            acks=SpecialistInstallAckStore())
-        targets_removed = [f"specialist:{slug}"]
+        # Whole-branch M: map a typed refusal (invalid_slug / bundle_required)
+        # to a structured ok:false envelope, never a raw exception out of the
+        # tool — the same guard the other four bundle tools already have.
+        try:
+            txn = await asyncio.to_thread(
+                uninstall_specialist, slug=slug, bundle=True,
+                acks=SpecialistInstallAckStore())
+        except SpecialistInstallError as exc:
+            return _result({"ok": False, "kind": exc.kind, "detail": exc.detail})
         try:
             seq = await _bundle_reload_and_verify(
                 txn.slug, removed_artifact_ids=list(txn.removed_artifact_ids),
                 targets_removed=targets_removed)
         except Exception:
-            await asyncio.to_thread(txn.rollback_disk)
-            await _bundle_reload_and_verify(
-                txn.slug, removed_artifact_ids=list(txn.new_artifact_ids),
-                targets_removed=targets_removed)
-            await asyncio.to_thread(specialist_bundle_journal.complete, txn.journal_path)
+            await _bundle_compensate(txn, targets_removed=targets_removed)
             raise
+        if not seq.get("ok", True):
+            await _bundle_compensate(txn, targets_removed=targets_removed)
+            return _result({"ok": False, "kind": seq.get("kind") or "bundle_sequence_failed",
+                            "slug": slug, "reload_errors": seq.get("reload_errors"),
+                            "not_ready": seq.get("not_ready"),
+                            "absent_violations": seq.get("absent_violations"),
+                            "verify": seq.get("verify")})
         await asyncio.to_thread(specialist_bundle_journal.complete, txn.journal_path)
     return _result({"ok": True, "slug": slug, "reloaded": seq["reloaded"],
                      "verify": seq["verify"]})

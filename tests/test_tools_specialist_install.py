@@ -16,14 +16,19 @@ def _payload(result: dict) -> dict:
     return json.loads(result["content"][0]["text"])
 
 
-def _inject_fake_receipt(monkeypatch, *, plugins=()):
+def _inject_fake_receipt(monkeypatch, *, plugins=(), slug="mtg"):
     """Task 10: the commit/upgrade tools require a loadable receipt (by opaque
     id) before anything else. Inject a fake so tests exercising the LATER gates
     (root_digest, consent) reach them. receipt_digest="" so the consent
-    identity matches acks recorded with the default receipt_digest."""
+    identity matches acks recorded with the default receipt_digest.
+
+    Whole-branch D: the fake carries `slug` (matching the component under test)
+    so `_assert_receipt_matches_inspection`'s id/digest/slug binding passes — a
+    real SourceReceipt always has a slug."""
     import specialist_receipt
     from types import SimpleNamespace
-    fake = SimpleNamespace(receipt_id="a" * 32, receipt_digest="", plugins=tuple(plugins))
+    fake = SimpleNamespace(receipt_id="a" * 32, receipt_digest="", slug=slug,
+                           plugins=tuple(plugins))
     monkeypatch.setattr(specialist_receipt, "load", lambda rid, *a, **k: fake)
     return fake
 
@@ -222,6 +227,149 @@ async def test_commit_sequencer_failure_compensates_with_new_artifact_ids(
     assert rolled_back == [True]                 # disk restored
     assert seq_calls == [[], ["NEWAID"]]         # compensating pass un-publishes the NEW set
     assert completed == ["/tmp/j.json"]          # journal completed
+
+
+@pytest.mark.asyncio
+async def test_commit_seq_not_ready_compensates_and_reports_ok_false(
+    monkeypatch, tmp_path,
+) -> None:
+    """Whole-branch B: a sequencer that returns ok:false (a not-ready owned
+    binding / failed postcondition — NOT an exception) must compensate (roll the
+    disk back, un-publish, complete the journal) and surface ok:false, never
+    complete the journal + report success."""
+    from types import SimpleNamespace
+    from test_specialist_install import _write_component
+    from specialist_component import load_specialist_component
+    from specialist_install import compute_install_root_digest, resolve_dependency_closure
+    import specialist_install
+    import specialist_bundle_journal
+    import tools as tools_mod
+    from tools import specialist_install_commit
+
+    staged = _write_component(tmp_path / "staged", slug="mtg")
+    component = load_specialist_component(staged, staged / "manifest.json")
+    deps = resolve_dependency_closure(component, staged)
+    root_digest = compute_install_root_digest(
+        component, deps, manifest_bytes=(staged / "manifest.json").read_bytes())
+    _inject_fake_receipt(monkeypatch)
+
+    rolled_back = []
+    completed = []
+    txn = SimpleNamespace(
+        slug="mtg", removed_artifact_ids=(), new_artifact_ids=("NEWAID",),
+        journal_path="/tmp/j.json",
+        rollback_disk=lambda: rolled_back.append(True))
+    monkeypatch.setattr(specialist_install, "commit_specialist_install",
+                        lambda *a, **k: (SimpleNamespace(slug="mtg", state="active"), txn))
+    monkeypatch.setattr(specialist_bundle_journal, "complete",
+                        lambda p: completed.append(p))
+
+    seq_calls = []
+
+    async def _seq(slug, *, removed_artifact_ids, targets_removed):
+        seq_calls.append(list(removed_artifact_ids))
+        if len(seq_calls) == 1:
+            return {"ok": False, "kind": "postcondition_failed", "reloaded": [],
+                    "reload_errors": [], "not_ready": ["mtg.mtg"],
+                    "absent_violations": [], "verify": {}}
+        return {"ok": True, "reloaded": [], "verify": {}}
+
+    monkeypatch.setattr(tools_mod, "_bundle_reload_and_verify", _seq)
+
+    result = await specialist_install_commit.handler({
+        "component_id": component.component_id, "version": component.version,
+        "slug": "mtg", "staged_dir": str(staged), "root_digest": root_digest,
+        "receipt_id": "a" * 32,
+    })
+    payload = _payload(result)
+    assert payload["ok"] is False
+    assert payload["kind"] == "postcondition_failed"
+    assert rolled_back == [True]                  # disk restored
+    assert seq_calls == [[], ["NEWAID"]]          # compensating pass un-publishes NEW set
+    assert completed == ["/tmp/j.json"]           # journal completed (not left dangling)
+
+
+@pytest.mark.asyncio
+async def test_bundle_sequencer_uninstall_evicts_and_verifies_absent(monkeypatch) -> None:
+    """Whole-branch C: the uninstall sequencer runs the full agents add/EVICT
+    sweep (not a single-role reconstruct) and fails the postcondition unless the
+    removed specialist's agent + scoped names are absent."""
+    from types import SimpleNamespace
+    import agent as agent_mod
+    import plugin_registry
+    import reload as reload_mod
+    import tools as tools_mod
+
+    calls = []
+
+    async def _dispatch(scope, *, runtime, role=None):
+        calls.append((scope, role))
+        return {"status": "ok"}
+
+    monkeypatch.setattr(reload_mod, "dispatch", _dispatch)
+    monkeypatch.setattr(plugin_registry, "reload_snapshot", lambda *a, **k: None)
+    monkeypatch.setattr(plugin_registry, "load_registry", lambda *a, **k: SimpleNamespace())
+    monkeypatch.setattr(plugin_registry, "owned_entries_for", lambda slug, reg: [])
+    monkeypatch.setattr(plugin_registry, "resolve_for",
+                        lambda t: SimpleNamespace(plugins=[]))
+    monkeypatch.setattr(tools_mod, "_regenerate_plugin_health", lambda issues: None)
+
+    async def _notify():
+        return None
+
+    monkeypatch.setattr(tools_mod, "_notify_plugin_health_if_possible", _notify)
+    monkeypatch.setattr(tools_mod, "_invalidate_lifecycle", lambda **k: None)
+
+    # Agent already evicted -> the full agents sweep is dispatched, ok.
+    monkeypatch.setattr(agent_mod, "active_runtime",
+                        SimpleNamespace(agents={}, agents_dir=None), raising=False)
+    seq = await tools_mod._bundle_reload_and_verify(
+        "mtg", removed_artifact_ids=[], targets_removed=["specialist:mtg"])
+    assert ("agents", None) in calls          # full add/evict sweep, not ("agent","mtg")
+    assert seq["ok"] is True
+
+    # Agent STILL registered -> absent violation -> ok False.
+    monkeypatch.setattr(agent_mod, "active_runtime",
+                        SimpleNamespace(agents={"mtg": object()}, agents_dir=None),
+                        raising=False)
+    seq2 = await tools_mod._bundle_reload_and_verify(
+        "mtg", removed_artifact_ids=[], targets_removed=["specialist:mtg"])
+    assert seq2["ok"] is False
+    assert "agent:mtg" in seq2["absent_violations"]
+
+
+@pytest.mark.asyncio
+async def test_uninstall_tool_maps_bundle_required_to_envelope(monkeypatch) -> None:
+    # Whole-branch M: a typed refusal from uninstall_specialist must surface as
+    # a structured ok:false, not a raw exception.
+    import specialist_install
+    from specialist_install import SpecialistInstallError
+    from tools import specialist_uninstall
+
+    def _boom(*, slug, **kwargs):
+        raise SpecialistInstallError("bundle_required", "owned entries present")
+
+    monkeypatch.setattr(specialist_install, "uninstall_specialist", _boom)
+    result = await specialist_uninstall.handler({"slug": "mtg"})
+    payload = _payload(result)
+    assert payload["ok"] is False
+    assert payload["kind"] == "bundle_required"
+
+
+@pytest.mark.asyncio
+async def test_upgrade_tool_maps_bad_staged_dir(monkeypatch, tmp_path) -> None:
+    # Whole-branch M: a vanished/corrupt staged_dir surfaces as staged_dir_invalid
+    # (mirrors specialist_install_commit's guard), never a raw OSError.
+    from tools import specialist_upgrade
+    _inject_fake_receipt(monkeypatch)
+    result = await specialist_upgrade.handler({
+        "slug": "mtg", "component_id": "c/x", "version": "1.0.0",
+        "root_digest": "sha256:" + "a" * 64,
+        "staged_dir": str(tmp_path / "does-not-exist"), "receipt_id": "a" * 32,
+    })
+    payload = _payload(result)
+    assert payload["ok"] is False
+    assert payload["kind"] == "staged_dir_invalid"
 
 
 @pytest.mark.asyncio
