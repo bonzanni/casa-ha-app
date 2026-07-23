@@ -228,14 +228,15 @@ def _fresh_registry_snapshot(tmp_path):
     yield
 
 
-def _subdir_stub(component_root: Path):
+def _subdir_stub(component_root: Path, sha: str = "a" * 40):
     """A resolve_and_fetch stub that respects `subdir` — copies
     `component_root/subdir` (or the whole tree when subdir is empty) into
-    `dest`, exactly like a real fetch of `repo@ref:subdir`."""
+    `dest`, exactly like a real fetch of `repo@ref:subdir`. `sha` distinguishes
+    generations (a real fetch would resolve a different commit per ref)."""
     def _stub(repo, ref, subdir, dest, *, expected_revision=None):
         src = component_root / subdir if subdir else component_root
         _shutil.copytree(src, dest)
-        return "a" * 40
+        return sha
     return _stub
 
 
@@ -443,3 +444,133 @@ def test_bundle_crash_reconcile_restores(tmp_path: Path, monkeypatch) -> None:
 
     assert actions == [{"slug": "mtg", "action": "rolled_back"}]
     assert _owned(reg, "mtg") == []                            # owned entry removed
+
+
+# ===========================================================================
+# 2c — bundle upgrade / rollback transactions
+# ===========================================================================
+
+def _prep_v2(tmp_path: Path, monkeypatch, base_ctx, *, ref: str = "v2",
+             marker: str = "v2") -> dict:
+    """Build a v2 mtg component (changed plugin content + bumped version, SAME
+    slug + tmp paths), inspect it in upgrade mode, record consent, and return
+    the kwargs for upgrade_specialist(receipt=...)."""
+    import plugin_store
+    from specialist_install_consent import install_consent_identity
+    from specialist_registry import InstalledSpecialistIndex
+
+    comp2, mpath2 = write_minimal_component(tmp_path / marker, slug="mtg")
+    write_bundled_plugin(comp2, "mtg")
+    (comp2 / "plugins" / "mtg" / "README.md").write_text(marker, encoding="utf-8")
+    digest = "sha256:" + plugin_store.content_checksum(comp2 / "plugins" / "mtg")
+    manifest = _json.loads(mpath2.read_text(encoding="utf-8"))
+    manifest["version"] = "0.2.0"
+    manifest["dependencies"].append({
+        "kind": "plugin/implementation", "identifier": "mtg", "digest": digest,
+        "source": {"type": "bundled", "path": "plugins/mtg"}})
+    mpath2.write_text(_json.dumps(manifest), encoding="utf-8")
+
+    monkeypatch.setattr(specialist_install, "resolve_and_fetch", _subdir_stub(comp2, "b" * 40))
+    idx = InstalledSpecialistIndex(specialists_dir=str(tmp_path / "installed-index"))
+    idx.load()
+    insp2 = specialist_install.inspect_specialist_repo(
+        "org/repo", ref, staging_root=tmp_path / "staging2", installed_index=idx,
+        mode="upgrade", target_slug="mtg", specialists_dir=tmp_path / "specialists",
+        receipts_dir=tmp_path / "receipts")
+    receipt2 = specialist_receipt.load(insp2.receipt_id, receipts_dir=tmp_path / "receipts")
+    acks = base_ctx.acks
+    identity = install_consent_identity(
+        component_id=insp2.component_id, version=insp2.version,
+        root_digest=insp2.root_digest, slug="mtg", receipt_digest=insp2.receipt_digest)
+    acks.record(identity=identity, component_id=insp2.component_id, version=insp2.version,
+                component_checksum=insp2.root_digest, slug="mtg",
+                receipt_digest=insp2.receipt_digest)
+    return dict(
+        slug="mtg", inspection=insp2, receipt=receipt2, config={},
+        secret_names_provided=frozenset(), acks=acks,
+        specialists_dir=tmp_path / "specialists", agents_specialists_dir=tmp_path / "agents",
+        registry_path=tmp_path / "registry.json", plugin_store_root=tmp_path / "store",
+        ops_dir=tmp_path / "ops")
+
+
+def test_bundle_upgrade_replaces_owned_set_in_one_swap(tmp_path: Path, monkeypatch) -> None:
+    ctx = _prep(tmp_path, monkeypatch)
+    specialist_install.commit_specialist_install(**ctx.kw)
+    reg = ctx.kw["registry_path"]
+    v1_aid = _owned(reg, "mtg")[0]["artifact_id"]
+
+    kw2 = _prep_v2(tmp_path, monkeypatch, ctx)
+    instance, txn = specialist_install.upgrade_specialist(**kw2)
+
+    assert instance.state == "active"
+    owned = _owned(reg, "mtg")
+    assert len(owned) == 1                        # one entry, swapped atomically
+    assert owned[0]["artifact_id"] != v1_aid      # new artifact
+    assert owned[0]["version"] == "0.1.0"         # plugin manifest version (unchanged)
+    assert v1_aid in txn.removed_artifact_ids     # old artifact invalidation-driving
+    assert owned[0]["artifact_id"] in txn.new_artifact_ids
+
+
+def test_bundle_upgrade_failing_preflight_leaves_old_generation(tmp_path: Path, monkeypatch) -> None:
+    ctx = _prep(tmp_path, monkeypatch)
+    specialist_install.commit_specialist_install(**ctx.kw)
+    reg = ctx.kw["registry_path"]
+    v1_aid = _owned(reg, "mtg")[0]["artifact_id"]
+
+    kw2 = _prep_v2(tmp_path, monkeypatch, ctx)
+    # tamper the v2 staged plugin tree AND make recovery reproduce the drift
+    staged_plugin = kw2["inspection"].staged_dir / "plugins" / "mtg"
+    (staged_plugin / "tampered.txt").write_text("x", encoding="utf-8")
+    monkeypatch.setattr(specialist_install, "resolve_and_fetch",
+                        _subdir_stub(kw2["inspection"].staged_dir))
+    with pytest.raises(specialist_install.SpecialistInstallError) as ei:
+        specialist_install.upgrade_specialist(**kw2)
+    assert ei.value.kind == "receipt_drift"
+    # old generation fully untouched
+    owned = _owned(reg, "mtg")
+    assert len(owned) == 1 and owned[0]["artifact_id"] == v1_aid
+
+
+def test_bundle_rollback_restores_prior_owned_rows(tmp_path: Path, monkeypatch) -> None:
+    ctx = _prep(tmp_path, monkeypatch)
+    specialist_install.commit_specialist_install(**ctx.kw)
+    reg = ctx.kw["registry_path"]
+    v1_aid = _owned(reg, "mtg")[0]["artifact_id"]
+    kw2 = _prep_v2(tmp_path, monkeypatch, ctx)
+    _, up_txn = specialist_install.upgrade_specialist(**kw2)
+    v2_aid = _owned(reg, "mtg")[0]["artifact_id"]
+    assert v2_aid != v1_aid
+
+    instance, txn = specialist_install.rollback_specialist(
+        slug="mtg", bundle=True, acks=ctx.acks,
+        specialists_dir=tmp_path / "specialists", agents_specialists_dir=tmp_path / "agents",
+        registry_path=reg, plugin_store_root=tmp_path / "store", ops_dir=tmp_path / "ops")
+
+    assert instance.state == "active"
+    owned = _owned(reg, "mtg")
+    assert len(owned) == 1 and owned[0]["artifact_id"] == v1_aid   # prior owned set restored
+    assert v2_aid in txn.removed_artifact_ids
+
+
+def test_bundle_rollback_refuses_missing_retained_artifact(tmp_path: Path, monkeypatch) -> None:
+    ctx = _prep(tmp_path, monkeypatch)
+    specialist_install.commit_specialist_install(**ctx.kw)
+    reg = ctx.kw["registry_path"]
+    v1_aid = _owned(reg, "mtg")[0]["artifact_id"]
+    kw2 = _prep_v2(tmp_path, monkeypatch, ctx)
+    specialist_install.upgrade_specialist(**kw2)
+    v2_aid = _owned(reg, "mtg")[0]["artifact_id"]
+    # simulate the retained v1 artifact being missing/corrupt on disk
+    import plugin_store
+    monkeypatch.setattr(plugin_store, "artifact_verdict",
+                        lambda *a, **k: "corrupt_artifact")
+
+    with pytest.raises(specialist_install.SpecialistInstallError) as ei:
+        specialist_install.rollback_specialist(
+            slug="mtg", bundle=True, acks=ctx.acks,
+            specialists_dir=tmp_path / "specialists",
+            agents_specialists_dir=tmp_path / "agents", registry_path=reg,
+            plugin_store_root=tmp_path / "store", ops_dir=tmp_path / "ops")
+    assert ei.value.kind == "rollback_artifact_missing"
+    # active generation untouched (still v2)
+    assert _owned(reg, "mtg")[0]["artifact_id"] == v2_aid

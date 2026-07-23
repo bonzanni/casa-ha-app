@@ -1613,6 +1613,121 @@ def activate_binding_for_config(cfg, *, specialists_root: Path = Path("/config/s
 
 
 def upgrade_specialist(
+    *, slug: str, inspection: "InspectionResult", receipt: "SourceReceipt | None" = None,
+    config: "Mapping[str, str]",
+    secret_names_provided: frozenset[str], acks: "SpecialistInstallAckStore",
+    specialists_dir: Path = Path("/config/specialists"),
+    agents_specialists_dir: Path = Path("/config/agents/specialists"),
+    registry_path: "Path | None" = None,
+    plugin_store_root: "Path | None" = None,
+    ops_dir: "Path | None" = None,
+) -> "SpecialistInstance | tuple[SpecialistInstance, object]":
+    """Bundle-aware upgrade (Task 10). Without a `receipt` (legacy/direct
+    callers) this is the original transactional upgrade returning a single
+    `SpecialistInstance`. WITH a receipt (the tool layer) it wraps the core
+    upgrade in the journaled bundle transaction: journal the before-state,
+    run the core tuple commit, then — ONLY when the upgrade actually activates
+    — publish the new owned plugin set, atomically swap it into the registry,
+    and rotate the owned-plugins sidecar; a pending/error outcome leaves the
+    old owned generation fully untouched (spec §3.4). Returns
+    `(instance, BundleTxn)`.
+
+    Delta (code): the owned-plugins sidecar rotates in a SEPARATE
+    MATERIALIZE_LOCK step immediately after the core tuple commit (the lock is
+    non-reentrant and the core takes it internally). The journal's before-state
+    covers the crash window; the sidecar is provenance metadata read only by
+    lifecycle ops that serialize under _PLUGIN_TOOLS_LOCK, so a momentary
+    tuple-vs-sidecar desync is not a runtime hazard."""
+    import dataclasses
+
+    import plugin_registry
+    import specialist_bundle_journal
+    from specialist_bundle_journal import BundleTxn
+    from specialist_lifecycle import SpecialistInstance  # noqa: F401 (typing)
+    import plugin_store
+    import specialist_materialize
+    from personality_binding import InstanceDir
+
+    if receipt is None:
+        return _upgrade_core(
+            slug=slug, inspection=inspection, config=config,
+            secret_names_provided=secret_names_provided, acks=acks,
+            specialists_dir=specialists_dir, agents_specialists_dir=agents_specialists_dir)
+
+    if registry_path is None:
+        registry_path = plugin_registry.REGISTRY_PATH
+    if plugin_store_root is None:
+        plugin_store_root = plugin_store.STORE_ROOT
+
+    validate_specialist_slug(slug)
+    workspace = specialists_dir / ".bundle-staging" / uuid.uuid4().hex
+    workspace.mkdir(parents=True, exist_ok=True, mode=0o700)
+    instance = None
+    txn = None
+    try:
+        tree_paths = _resolve_owned_tree_paths(receipt, workspace=workspace)
+        eff_inspection = inspection
+        if not Path(inspection.staged_dir).is_dir():
+            recovered = _recover_component_staging(receipt, workspace=workspace)
+            eff_inspection = dataclasses.replace(inspection, staged_dir=recovered)
+
+        slug_dir = specialists_dir / slug
+        _reg = plugin_registry.load_registry(registry_path)
+        before_owned = plugin_registry.owned_entries_for(slug, _reg)
+        before_tuple_files = _tuple_files_snapshot(slug_dir)
+        ack_records = acks.snapshot_slug(slug)
+        _begin_kwargs = {} if ops_dir is None else {"ops_dir": ops_dir}
+        journal = specialist_bundle_journal.begin(
+            "upgrade", slug, before_entries=before_owned,
+            before_tuple_files=before_tuple_files, ack_records=ack_records,
+            receipt_digest=receipt.receipt_digest, **_begin_kwargs)
+        rollback_txn = BundleTxn(
+            journal_path=journal, slug=slug, before_entries=before_owned,
+            before_tuple_files=before_tuple_files, ack_records=ack_records,
+            registry_path=registry_path, specialists_dir=specialists_dir,
+            acks_path=acks.path)
+        try:
+            instance = _upgrade_core(
+                slug=slug, inspection=eff_inspection, config=config,
+                secret_names_provided=secret_names_provided, acks=acks,
+                specialists_dir=specialists_dir, agents_specialists_dir=agents_specialists_dir)
+            if instance.state == "active":
+                published = _publish_owned_plugins(
+                    slug, receipt, tree_paths, store_root=plugin_store_root)
+                new_entries = [_owned_entry_for(slug, row, res) for row, res in published]
+                before_entries, _ = plugin_registry.apply_owned_swap(
+                    slug=slug, new_entries=new_entries, registry_path=registry_path)
+                new_artifact_ids = {res.artifact_id for _, res in published}
+                removed = _removed_artifact_ids(before_entries, new_artifact_ids)
+                sidecar_doc = _owned_sidecar_doc(slug, receipt, published)
+                with specialist_materialize.MATERIALIZE_LOCK:
+                    InstanceDir(slug_dir).stage_desired_owned_plugins(sidecar_doc)
+                    InstanceDir(slug_dir).commit_owned_plugins_desired_to_active()
+            else:
+                # pending/error: old owned generation untouched (spec §3.4).
+                before_entries = before_owned
+                removed = ()
+                new_artifact_ids = set()
+            specialist_bundle_journal.mark_step(journal, "committed")
+            txn = BundleTxn(
+                journal_path=journal, slug=slug, before_entries=before_entries,
+                before_tuple_files=before_tuple_files, ack_records=ack_records,
+                removed_artifact_ids=removed,
+                new_artifact_ids=tuple(sorted(new_artifact_ids)),
+                registry_path=registry_path, specialists_dir=specialists_dir,
+                acks_path=acks.path)
+        except BaseException:
+            try:
+                rollback_txn.rollback_disk()
+            finally:
+                specialist_bundle_journal.complete(journal)
+            raise
+    finally:
+        shutil.rmtree(workspace, ignore_errors=True)
+    return instance, txn
+
+
+def _upgrade_core(
     *, slug: str, inspection: "InspectionResult", config: "Mapping[str, str]",
     secret_names_provided: frozenset[str], acks: "SpecialistInstallAckStore",
     specialists_dir: Path = Path("/config/specialists"),
@@ -1860,7 +1975,133 @@ def upgrade_specialist(
         desired=None, last_activation_error=note)
 
 
+def _prior_owned_entry(slug: str, row: dict) -> dict:
+    """Build a registry entry from a prior-generation owned-plugins sidecar row
+    (rollback restore, spec §3.4)."""
+    import plugin_registry
+
+    src = row.get("source") or {}
+    return {
+        "name": row["name"],
+        "owner": f"specialist:{slug}",
+        "manifest_name": row["manifest_name"],
+        "targets": [f"specialist:{slug}"],
+        "version": row["version"],
+        "source": {"type": "github", "repo": src["repo"], "ref": src["ref"],
+                   "revision": src["revision"],
+                   "subdir": plugin_registry.normalize_subdir(src.get("subdir", ""))},
+        "artifact_id": row["artifact_id"],
+    }
+
+
 def rollback_specialist(
+    *, slug: str, bundle: bool = False,
+    acks: "SpecialistInstallAckStore | None" = None,
+    specialists_dir: Path = Path("/config/specialists"),
+    agents_specialists_dir: Path = Path("/config/agents/specialists"),
+    registry_path: "Path | None" = None,
+    plugin_store_root: "Path | None" = None,
+    ops_dir: "Path | None" = None,
+) -> "SpecialistInstance | tuple[SpecialistInstance, object]":
+    """Bundle-aware rollback (Task 10). Without `bundle=True` (legacy/direct
+    callers) this restores the prior instance tuple and returns a single
+    `SpecialistInstance`. WITH `bundle=True` (the tool layer) it wraps the core
+    rollback in the journaled bundle transaction: read the prior generation's
+    owned-plugins sidecar, PREFLIGHT that every retained artifact is still
+    present+valid (`artifact_verdict`; a missing/corrupt one is a typed
+    `rollback_artifact_missing` with the active tuple untouched), journal the
+    before-state, atomically swap the prior owned set back into the registry,
+    roll the tuple + sidecar back, and return `(instance, BundleTxn)` with
+    `removed_artifact_ids = current-minus-prior`."""
+    import plugin_registry
+    import plugin_store
+    import specialist_bundle_journal
+    from specialist_bundle_journal import BundleTxn
+    from personality_binding import (
+        InstanceDir, owned_plugins_prior_path, read_owned_plugins,
+    )
+    import specialist_materialize
+
+    if not bundle:
+        return _rollback_core(
+            slug=slug, specialists_dir=specialists_dir,
+            agents_specialists_dir=agents_specialists_dir)
+
+    if registry_path is None:
+        registry_path = plugin_registry.REGISTRY_PATH
+    if plugin_store_root is None:
+        plugin_store_root = plugin_store.STORE_ROOT
+    if acks is None:
+        from specialist_install_consent import SpecialistInstallAckStore
+        acks = SpecialistInstallAckStore()
+
+    validate_specialist_slug(slug)
+    slug_dir = specialists_dir / slug
+
+    # Prior owned set from its sidecar (missing sidecar but present prior tuple
+    # ⇒ pre-feature generation ⇒ empty owned set, spec §3.4).
+    prior_sidecar = read_owned_plugins(owned_plugins_prior_path(slug_dir))
+    prior_rows = list(prior_sidecar.get("plugins") or []) if prior_sidecar else []
+
+    # Preflight retained artifacts BEFORE any durable mutation.
+    for row in prior_rows:
+        src = row.get("source") or {}
+        store_path = Path(plugin_store_root) / row["name"] / row["artifact_id"]
+        verdict = plugin_store.artifact_verdict(
+            store_path, name=row["name"], repo=src.get("repo", ""),
+            revision=src.get("revision", ""), subdir=src.get("subdir", ""),
+            artifact_id=row["artifact_id"], manifest_name=row["manifest_name"])
+        if verdict is not None:
+            raise SpecialistInstallError(
+                "rollback_artifact_missing",
+                f"retained artifact for {row['name']!r} is unavailable ({verdict})")
+
+    _reg = plugin_registry.load_registry(registry_path)
+    before_owned = plugin_registry.owned_entries_for(slug, _reg)
+    before_tuple_files = _tuple_files_snapshot(slug_dir)
+    ack_records = acks.snapshot_slug(slug)
+    _begin_kwargs = {} if ops_dir is None else {"ops_dir": ops_dir}
+    journal = specialist_bundle_journal.begin(
+        "rollback", slug, before_entries=before_owned,
+        before_tuple_files=before_tuple_files, ack_records=ack_records,
+        **_begin_kwargs)
+    rollback_txn = BundleTxn(
+        journal_path=journal, slug=slug, before_entries=before_owned,
+        before_tuple_files=before_tuple_files, ack_records=ack_records,
+        registry_path=registry_path, specialists_dir=specialists_dir,
+        acks_path=acks.path)
+    try:
+        prior_entries = [_prior_owned_entry(slug, r) for r in prior_rows]
+        before_entries, _ = plugin_registry.apply_owned_swap(
+            slug=slug, new_entries=prior_entries, registry_path=registry_path)
+        prior_ids = {r["artifact_id"] for r in prior_rows}
+        removed = _removed_artifact_ids(before_entries, prior_ids)
+        instance = _rollback_core(
+            slug=slug, specialists_dir=specialists_dir,
+            agents_specialists_dir=agents_specialists_dir)
+        prior_doc = prior_sidecar or {"schema_version": 1,
+                                      "component_source": {}, "plugins": []}
+        with specialist_materialize.MATERIALIZE_LOCK:
+            InstanceDir(slug_dir).stage_desired_owned_plugins(prior_doc)
+            InstanceDir(slug_dir).commit_owned_plugins_desired_to_active()
+        specialist_bundle_journal.mark_step(journal, "committed")
+        txn = BundleTxn(
+            journal_path=journal, slug=slug, before_entries=before_entries,
+            before_tuple_files=before_tuple_files, ack_records=ack_records,
+            removed_artifact_ids=removed,
+            new_artifact_ids=tuple(sorted(prior_ids)),
+            registry_path=registry_path, specialists_dir=specialists_dir,
+            acks_path=acks.path)
+    except BaseException:
+        try:
+            rollback_txn.rollback_disk()
+        finally:
+            specialist_bundle_journal.complete(journal)
+        raise
+    return instance, txn
+
+
+def _rollback_core(
     *, slug: str, specialists_dir: Path = Path("/config/specialists"),
     agents_specialists_dir: Path = Path("/config/agents/specialists"),
 ) -> "SpecialistInstance":
