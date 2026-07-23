@@ -6517,6 +6517,69 @@ async def _reload_and_verify_targets(name: str, targets: list,
     return result
 
 
+async def _bundle_reload_and_verify(
+    slug: str, *, removed_artifact_ids: list, targets_removed: list) -> dict:
+    """Task 10 bundle sequencer (spec §3.2d) — the post-mutation half of a
+    specialist-bundle transaction, run by the tool layer while holding
+    `_PLUGIN_TOOLS_LOCK` (the sync lifecycle function already committed the
+    registry swap + tuple/sidecar and returned its BundleTxn). Bundle-shaped
+    (many owned plugins, one specialist role), mirroring
+    `_reload_and_verify_targets` but for the whole owned set:
+
+      1. grant/challenge invalidation FIRST — per removed/replaced artifact id
+         (the SAME `_invalidate_lifecycle` call plugin_update/plugin_remove use)
+         AND the specialist role + any removed targets, BEFORE the first reload;
+      2. ONE plugin-snapshot reload;
+      3. ONE specialist-agent reload (only when the slug is installed — skipped
+         for an uninstall or a still-pending specialist target);
+      4. desired==active verify for every owned entry the slug now has;
+      5. ONE health regeneration + notify.
+    """
+    import agent as agent_mod
+    import reload as reload_mod
+
+    # 1. invalidation FIRST (before any reload await).
+    for aid in removed_artifact_ids:
+        _invalidate_lifecycle(artifact_id=aid)
+    _invalidate_lifecycle(roles=[f"specialist:{slug}", *targets_removed])
+
+    # 2. ONE snapshot reload.
+    await asyncio.to_thread(plugin_registry.reload_snapshot)
+
+    # 3. ONE specialist-agent reload — only when the slug is still installed
+    # (an uninstall passes targets_removed; a pending specialist has no role).
+    runtime = getattr(agent_mod, "active_runtime", None)
+    reloaded: list = []
+    reload_errors: list = []
+    uninstalling = bool(targets_removed)
+    if runtime is not None and not uninstalling and \
+            not _specialist_target_pending(runtime, slug):
+        res = await reload_mod.dispatch("agent", runtime=runtime, role=slug)
+        if res.get("status") == "ok":
+            reloaded.append(f"specialist:{slug}")
+        else:
+            reload_errors.append({"target": f"specialist:{slug}", **res})
+
+    # 4. desired==active verify for every owned entry the slug now carries.
+    reg = plugin_registry.load_registry()
+    verify: dict = {}
+    for entry in plugin_registry.owned_entries_for(slug, reg):
+        name = entry.get("name")
+        verify[name] = await asyncio.to_thread(
+            _tool_verify_plugin_state, plugin_name=name)
+
+    # 5. ONE health regeneration + notify.
+    await asyncio.to_thread(_regenerate_plugin_health, [])
+    await _notify_plugin_health_if_possible()
+
+    ok = not reload_errors
+    return {
+        "ok": ok, "kind": None if ok else "reload_failed",
+        "reloaded": reloaded, "reload_errors": reload_errors,
+        "verify": verify, "removed_artifact_ids": list(removed_artifact_ids),
+    }
+
+
 def _safe_remove_manifest(name: str) -> None:
     """Sol round-4: remove the plugin's sysreq manifest row, tolerating failure
     (unwritable/malformed manifest) so a cleanup error never bypasses the
@@ -7064,10 +7127,10 @@ async def _settle_install_consent_post(handle) -> "dict | None":
     {"type": "object", "properties": {
         "component_id": {"type": "string"}, "version": {"type": "string"},
         "root_digest": {"type": "string"}, "slug": {"type": "string"},
-        "staged_dir": {"type": "string"},
+        "staged_dir": {"type": "string"}, "receipt_id": {"type": "string"},
         "config": {"type": "object", "additionalProperties": {"type": "string"}},
         "secret_names_provided": {"type": "array", "items": {"type": "string"}}},
-     "required": ["component_id", "version", "root_digest", "slug", "staged_dir"]},
+     "required": ["component_id", "version", "root_digest", "slug", "staged_dir", "receipt_id"]},
 )
 async def specialist_install_commit(args: dict) -> dict:
     from specialist_install import (
@@ -7076,6 +7139,18 @@ async def specialist_install_commit(args: dict) -> dict:
     )
     from specialist_install_consent import SpecialistInstallAckStore
     from specialist_component import load_specialist_component
+    import specialist_bundle_journal
+    import specialist_receipt
+
+    # Task 10: the trusted source receipt is loaded by opaque id ONLY — never
+    # from caller-supplied coordinates. Required for EVERY install (plugin-less
+    # components included); a missing/unloadable id fails closed.
+    receipt_id = args.get("receipt_id")
+    receipt = specialist_receipt.load(receipt_id) if receipt_id else None
+    if receipt is None:
+        return _result({"ok": False, "kind": "receipt_required",
+                        "detail": "specialist_install_commit requires a valid receipt_id "
+                                  "from specialist_install_inspect"})
 
     staged_dir = Path(args["staged_dir"])
     try:
@@ -7085,12 +7160,6 @@ async def specialist_install_commit(args: dict) -> dict:
     if component.slug != args["slug"]:
         return _result({"ok": False, "kind": "checksum_changed",
                          "detail": "staged component no longer matches the approved inspection"})
-    # Round-2 fix (finding #2/#3): re-run the FULL dependency closure and
-    # recompute the root digest from the RELOADED staged bytes — never trust
-    # the caller-supplied root_digest/component_checksum args directly. An
-    # unavailable/changed dependency, or a root digest that no longer
-    # matches what the operator approved, is rejected HERE, before anything
-    # is persisted or activated.
     deps = resolve_dependency_closure(component, staged_dir)
     unavailable = [d for d in deps if not d.available]
     if unavailable:
@@ -7108,17 +7177,34 @@ async def specialist_install_commit(args: dict) -> dict:
         default_persona_ref=component.default_persona_ref,
         default_persona_checksum=component.default_persona_checksum,
         required_config_names=(), required_secret_names=(), dependencies=deps, staged_dir=staged_dir,
+        receipt_id=receipt.receipt_id, receipt_digest=receipt.receipt_digest,
+        plugin_resolutions=receipt.plugins,
     )
-    try:
-        instance = await asyncio.to_thread(
-            commit_specialist_install, inspection=inspection, config=args.get("config") or {},
-            secret_names_provided=frozenset(args.get("secret_names_provided") or []),
-            acks=SpecialistInstallAckStore(),
-        )
-    except SpecialistInstallError as exc:
-        return _result({"ok": False, "kind": exc.kind, "detail": exc.detail})
+    async with _PLUGIN_TOOLS_LOCK:
+        try:
+            instance, txn = await asyncio.to_thread(
+                commit_specialist_install, inspection=inspection, receipt=receipt,
+                config=args.get("config") or {},
+                secret_names_provided=frozenset(args.get("secret_names_provided") or []),
+                acks=SpecialistInstallAckStore(),
+            )
+        except SpecialistInstallError as exc:
+            return _result({"ok": False, "kind": exc.kind, "detail": exc.detail})
+        try:
+            seq = await _bundle_reload_and_verify(
+                txn.slug, removed_artifact_ids=list(txn.removed_artifact_ids),
+                targets_removed=[])
+        except Exception:
+            await asyncio.to_thread(txn.rollback_disk)
+            await _bundle_reload_and_verify(
+                txn.slug, removed_artifact_ids=list(txn.new_artifact_ids),
+                targets_removed=[])
+            await asyncio.to_thread(specialist_bundle_journal.complete, txn.journal_path)
+            raise
+        await asyncio.to_thread(specialist_bundle_journal.complete, txn.journal_path)
     return _result({"ok": True, "slug": instance.slug, "state": instance.state,
-                     "activation_committed": instance.state == "active"})
+                     "activation_committed": instance.state == "active",
+                     "reloaded": seq["reloaded"], "verify": seq["verify"]})
 
 
 @tool(
@@ -7130,10 +7216,10 @@ async def specialist_install_commit(args: dict) -> dict:
     {"type": "object", "properties": {
         "slug": {"type": "string"}, "component_id": {"type": "string"},
         "version": {"type": "string"}, "root_digest": {"type": "string"},
-        "staged_dir": {"type": "string"},
+        "staged_dir": {"type": "string"}, "receipt_id": {"type": "string"},
         "config": {"type": "object", "additionalProperties": {"type": "string"}},
         "secret_names_provided": {"type": "array", "items": {"type": "string"}}},
-     "required": ["slug", "component_id", "version", "root_digest", "staged_dir"]},
+     "required": ["slug", "component_id", "version", "root_digest", "staged_dir", "receipt_id"]},
 )
 async def specialist_upgrade(args: dict) -> dict:
     from specialist_component import load_specialist_component
@@ -7142,6 +7228,15 @@ async def specialist_upgrade(args: dict) -> dict:
         resolve_dependency_closure, upgrade_specialist,
     )
     from specialist_install_consent import SpecialistInstallAckStore
+    import specialist_bundle_journal
+    import specialist_receipt
+
+    receipt_id = args.get("receipt_id")
+    receipt = specialist_receipt.load(receipt_id) if receipt_id else None
+    if receipt is None:
+        return _result({"ok": False, "kind": "receipt_required",
+                        "detail": "specialist_upgrade requires a valid receipt_id "
+                                  "from specialist_install_inspect(mode='upgrade')"})
 
     staged_dir = Path(args["staged_dir"])
     component = load_specialist_component(staged_dir, staged_dir / "manifest.json")
@@ -7164,17 +7259,33 @@ async def specialist_upgrade(args: dict) -> dict:
         default_persona_ref=component.default_persona_ref,
         default_persona_checksum=component.default_persona_checksum,
         required_config_names=(), required_secret_names=(), dependencies=deps, staged_dir=staged_dir,
+        receipt_id=receipt.receipt_id, receipt_digest=receipt.receipt_digest,
+        plugin_resolutions=receipt.plugins,
     )
-    try:
-        instance = await asyncio.to_thread(
-            upgrade_specialist, slug=args["slug"], inspection=inspection,
-            config=args.get("config") or {},
-            secret_names_provided=frozenset(args.get("secret_names_provided") or []),
-            acks=SpecialistInstallAckStore(),
-        )
-    except SpecialistInstallError as exc:
-        return _result({"ok": False, "kind": exc.kind, "detail": exc.detail})
-    return _result({"ok": True, "slug": instance.slug, "state": instance.state})
+    async with _PLUGIN_TOOLS_LOCK:
+        try:
+            instance, txn = await asyncio.to_thread(
+                upgrade_specialist, slug=args["slug"], inspection=inspection, receipt=receipt,
+                config=args.get("config") or {},
+                secret_names_provided=frozenset(args.get("secret_names_provided") or []),
+                acks=SpecialistInstallAckStore(),
+            )
+        except SpecialistInstallError as exc:
+            return _result({"ok": False, "kind": exc.kind, "detail": exc.detail})
+        try:
+            seq = await _bundle_reload_and_verify(
+                txn.slug, removed_artifact_ids=list(txn.removed_artifact_ids),
+                targets_removed=[])
+        except Exception:
+            await asyncio.to_thread(txn.rollback_disk)
+            await _bundle_reload_and_verify(
+                txn.slug, removed_artifact_ids=list(txn.new_artifact_ids),
+                targets_removed=[])
+            await asyncio.to_thread(specialist_bundle_journal.complete, txn.journal_path)
+            raise
+        await asyncio.to_thread(specialist_bundle_journal.complete, txn.journal_path)
+    return _result({"ok": True, "slug": instance.slug, "state": instance.state,
+                     "reloaded": seq["reloaded"], "verify": seq["verify"]})
 
 
 @tool(
@@ -7185,12 +7296,31 @@ async def specialist_upgrade(args: dict) -> dict:
 )
 async def specialist_rollback(args: dict) -> dict:
     from specialist_install import SpecialistInstallError, rollback_specialist
+    from specialist_install_consent import SpecialistInstallAckStore
+    import specialist_bundle_journal
 
-    try:
-        instance = await asyncio.to_thread(rollback_specialist, slug=args["slug"])
-    except SpecialistInstallError as exc:
-        return _result({"ok": False, "kind": exc.kind, "detail": exc.detail})
-    return _result({"ok": True, "slug": instance.slug, "state": instance.state})
+    slug = args["slug"]
+    async with _PLUGIN_TOOLS_LOCK:
+        try:
+            instance, txn = await asyncio.to_thread(
+                rollback_specialist, slug=slug, bundle=True,
+                acks=SpecialistInstallAckStore())
+        except SpecialistInstallError as exc:
+            return _result({"ok": False, "kind": exc.kind, "detail": exc.detail})
+        try:
+            seq = await _bundle_reload_and_verify(
+                txn.slug, removed_artifact_ids=list(txn.removed_artifact_ids),
+                targets_removed=[])
+        except Exception:
+            await asyncio.to_thread(txn.rollback_disk)
+            await _bundle_reload_and_verify(
+                txn.slug, removed_artifact_ids=list(txn.new_artifact_ids),
+                targets_removed=[])
+            await asyncio.to_thread(specialist_bundle_journal.complete, txn.journal_path)
+            raise
+        await asyncio.to_thread(specialist_bundle_journal.complete, txn.journal_path)
+    return _result({"ok": True, "slug": instance.slug, "state": instance.state,
+                     "reloaded": seq["reloaded"], "verify": seq["verify"]})
 
 
 @tool(
@@ -7201,9 +7331,29 @@ async def specialist_rollback(args: dict) -> dict:
 )
 async def specialist_uninstall(args: dict) -> dict:
     from specialist_install import uninstall_specialist
+    from specialist_install_consent import SpecialistInstallAckStore
+    import specialist_bundle_journal
 
-    await asyncio.to_thread(uninstall_specialist, slug=args["slug"])
-    return _result({"ok": True, "slug": args["slug"]})
+    slug = args["slug"]
+    async with _PLUGIN_TOOLS_LOCK:
+        txn = await asyncio.to_thread(
+            uninstall_specialist, slug=slug, bundle=True,
+            acks=SpecialistInstallAckStore())
+        targets_removed = [f"specialist:{slug}"]
+        try:
+            seq = await _bundle_reload_and_verify(
+                txn.slug, removed_artifact_ids=list(txn.removed_artifact_ids),
+                targets_removed=targets_removed)
+        except Exception:
+            await asyncio.to_thread(txn.rollback_disk)
+            await _bundle_reload_and_verify(
+                txn.slug, removed_artifact_ids=list(txn.new_artifact_ids),
+                targets_removed=targets_removed)
+            await asyncio.to_thread(specialist_bundle_journal.complete, txn.journal_path)
+            raise
+        await asyncio.to_thread(specialist_bundle_journal.complete, txn.journal_path)
+    return _result({"ok": True, "slug": slug, "reloaded": seq["reloaded"],
+                     "verify": seq["verify"]})
 
 
 @tool(
