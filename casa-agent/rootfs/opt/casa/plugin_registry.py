@@ -412,6 +412,7 @@ def reload_snapshot(*, registry_path: Path = REGISTRY_PATH,
                         revision=entry["source"]["revision"],
                         subdir=entry["source"].get("subdir", ""),
                         artifact_id=entry["artifact_id"],
+                        manifest_name=entry.get("manifest_name"),
                     )
         _snapshot = _Snapshot(
             registry=reg, registry_path=Path(registry_path),

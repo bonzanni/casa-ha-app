@@ -7740,7 +7740,8 @@ def _tool_verify_plugin_state(
         verdict = plugin_store.artifact_verdict(
             path, name=plugin_name, repo=src.get("repo", ""),
             revision=revision, subdir=src.get("subdir", ""),
-            artifact_id=str(artifact_id))
+            artifact_id=str(artifact_id),
+            manifest_name=entry.get("manifest_name"))
         if verdict is None:
             checksum_valid = True
         else:
