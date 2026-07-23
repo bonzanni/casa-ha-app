@@ -98,3 +98,9 @@ def test_duplicate_corpus_data_rejected(tmp_path):
     ])
     with pytest.raises(ValueError, match="duplicate"):
         load_specialist_component(cdir, mpath)
+
+
+def test_slug_over_32_bytes_rejected():
+    from specialist_component import is_valid_slug
+    assert is_valid_slug("a" * 32)
+    assert not is_valid_slug("a" * 33)

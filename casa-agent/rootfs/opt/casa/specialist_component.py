@@ -12,7 +12,7 @@ import jsonschema
 from canonical_bytes import canonical_json_bytes, checksum_bytes
 from role_artifact import RoleArtifactSource, load_role_artifact
 
-_SLUG_RE = re.compile(r"^[a-z0-9][a-z0-9-]*$")
+_SLUG_RE = re.compile(r"^[a-z0-9][a-z0-9-]{0,31}$")
 PLUGIN_IDENT_RE = re.compile(r"^[a-z0-9][a-z0-9-]{0,39}$")
 MAX_SCOPED_NAME_BYTES = 72
 
@@ -20,7 +20,8 @@ MAX_SCOPED_NAME_BYTES = 72
 def is_valid_slug(slug: object) -> bool:
     """Canonical specialist-slug predicate — the SAME regex the loader
     enforces below (``_SLUG_RE``) and role.v1.json's ``slot`` pattern
-    (``^[a-z0-9][a-z0-9-]*$``). Exposed so every lifecycle entry point
+    (``^[a-z0-9][a-z0-9-]{0,31}$`` — bound to 32 bytes). Exposed so every
+    lifecycle entry point
     (uninstall/upgrade/rollback/override/inspect) can validate a
     caller-supplied slug against ONE authority before it ever reaches a
     ``Path`` join — a slug like ``../../..`` or ``/data`` must never index a
