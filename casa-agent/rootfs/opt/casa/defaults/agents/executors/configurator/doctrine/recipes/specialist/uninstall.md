@@ -1,8 +1,9 @@
 # Recipe: uninstall an installed specialist
 
 1. Find all delegate references (Grep tool: pattern `<slug>` across
-   `/config/agents/*/delegates.yaml`) and unwire them first
-   (`recipes/delegate/unwire.md`) — an uninstall does NOT auto-unwire delegates.
+   `/config/agents/*/delegates.yaml`) and unwire them first by applying ONLY the
+   edit step of `recipes/delegate/unwire.md` (do NOT run its commit/reload/emit_completion
+   — steps 3–5 below do that once) — an uninstall does NOT auto-unwire delegates.
 2. `specialist_uninstall(slug=...)`.
 3. `config_git_commit(message="uninstall specialist <slug>")`.
 4. `casa_reload(scope="agents")` — evicts the removed agent from the live

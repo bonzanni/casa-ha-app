@@ -253,6 +253,121 @@ def test_butler_prompt_teaches_protected_tool_challenge_only():
 # component repo.
 
 
+def _configurator_card() -> dict:
+    """Parse executors.yaml and return the configurator executor card
+    specifically (not a whole-file substring scan)."""
+    import yaml
+
+    executors_path = _system_md_path().parent.parent / "executors.yaml"
+    doc = yaml.safe_load(executors_path.read_text(encoding="utf-8"))
+    for entry in doc.get("executors", []):
+        if entry.get("executor_type") == "configurator":
+            return entry
+    raise AssertionError("configurator executor card not found in executors.yaml")
+
+
+def test_configurator_card_routes_repo_installs_with_correct_lifecycles():
+    """v0.103.0 doctrine reconcile: the configurator card must (a) route
+    repository installs of an existing component to ITSELF, (b) keep the
+    read-only/factual-question non-dispatch guard, and (c) enumerate each
+    component kind's OWN lifecycle verbs — critically, personas are
+    install/apply/reset ONLY (no persona upgrade, no persona uninstall).
+    Parses the configurator card and makes focused assertions on its
+    purpose+when text rather than scanning the whole file."""
+    card = _configurator_card()
+    blob = _collapse_ws(f"{card['purpose']}\n{card['when']}")
+    low = blob.lower()
+
+    # (a) Repository install of all three component kinds is co-located IN the
+    #     configurator card and routed to itself.
+    for kind in ("specialist", "plugin", "persona"):
+        assert kind in low, f"configurator card must mention the {kind} lifecycle"
+    assert "repositor" in low and "install" in low, (
+        "configurator card must route repository installs to itself"
+    )
+
+    # (b) The read-only/factual-question non-dispatch guard survives — Ellen
+    #     must NOT engage the configurator for a factual config question.
+    assert "read-only" in low and "answer directly" in low, (
+        "configurator card must keep the read-only/factual-question guard"
+    )
+    assert "not yet supported" not in low, (
+        "configurator card must not decline installs as 'not yet supported'"
+    )
+
+    # (c) Per-kind lifecycle verbs: specialists get the full four (incl.
+    #     rollback), personas get apply/reset and NOTHING that implies
+    #     upgrade/uninstall.
+    assert "rollback" in low, "specialist lifecycle must include rollback"
+    for verb in ("apply", "reset"):
+        assert verb in low, f"persona lifecycle must include {verb}"
+    assert re.search(r"no upgrade and no uninstall", low), (
+        "configurator card must state personas have NO upgrade and NO "
+        "uninstall (persona lifecycle is install/apply/reset only)"
+    )
+
+    # (d) reset is residents-only and restores the image default — the card
+    #     must not imply a specialist reset or that reset is a persona-content
+    #     operation (resident_persona_reset resets a resident to its default).
+    assert re.search(r"reset[^.]*resident", low), (
+        "card must scope persona reset to residents"
+    )
+    assert re.search(r"(residents-only|resident[- ]only)", low) or re.search(
+        r"reset a resident", low
+    ), "card must state reset is residents-only"
+
+    # (e) no bare engage_executor(task=..., context=...) example — it would
+    #     contradict the card's own mandatory `brief`-envelope rule.
+    assert not re.search(r"task\s*=\s*['\"<.]", blob), (
+        "configurator card must not show a bare task= engage_executor example "
+        "in any quoted/placeholder form (it must use the brief envelope)"
+    )
+    assert "brief" in low, "configurator card must reference the brief envelope"
+
+
+def test_create_vs_install_distinction_pinned(system_md_text):
+    """The create-vs-install distinction must stay explicit in BOTH the
+    configurator card and the system prompt: build a NEW plugin from scratch
+    -> plugin-developer; install an EXISTING repository component (specialist/
+    plugin/persona) -> configurator. Over-broadening (dropping the create
+    side) would mis-route brand-new plugin builds; over-narrowing (dropping
+    the install side) reintroduces the 'not yet supported' decline."""
+    card = _configurator_card()
+    # Strip markdown emphasis (**bold**) — it is not semantic and must not
+    # break a literal "configurator job" match.
+    card_low = _collapse_ws(f"{card['purpose']}\n{card['when']}").lower().replace("*", "")
+    system_low = _collapse_ws(system_md_text).lower().replace("*", "")
+
+    # Bind each routing CONCEPT to its TARGET within one CLAUSE. The bound
+    # stops at BOTH periods and semicolons ([^.;]*) so the install clause's
+    # target cannot leak from the adjacent create clause (the card separates
+    # the two routes with a semicolon) — flipping either target fails.
+    assert re.search(
+        r"install[^.;]*existing[^.;]*(component|repositor)[^.;]*configurator", card_low
+    ), "configurator card must route installing an EXISTING component to the configurator"
+    assert re.search(
+        r"(create|build)[^.;]*new[^.;]*plugin[^.;]*plugin-developer", card_low
+    ), "configurator card must route CREATING a NEW plugin to plugin-developer"
+
+    # system.md: the install section's routing sentence must bind the
+    # existing-component install to the literal "configurator job" (not merely
+    # any later 'configurator' mention), AND explicitly exclude plugin-developer.
+    assert re.search(
+        r"already-published component[^.]*configurator job", system_low
+    ), "system.md install section must bind existing-component installs to a 'configurator job'"
+    assert re.search(
+        r"configurator job[^.]*not plugin-developer", system_low
+    ), "system.md install section must explicitly exclude plugin-developer for installs"
+
+    # system.md must not reintroduce the decline wording.
+    assert "not yet supported" not in system_low, (
+        "system.md must not decline installs as 'not yet supported'"
+    )
+    assert re.search(r"no upgrade and no uninstall", system_low), (
+        "system.md persona bullet must state NO upgrade and NO uninstall"
+    )
+
+
 def test_system_prompt_forbids_engage_executor_context_bleed(system_md_text):
     """O-6 (v0.37.9): Ellen's ``engage_executor`` ``task=`` arg must
     carry ONLY the new task description — not the cumulative

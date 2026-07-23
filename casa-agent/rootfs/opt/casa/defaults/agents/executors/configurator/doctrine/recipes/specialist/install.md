@@ -24,9 +24,10 @@ hand-edited.
 3. Wait for the operator's DM tap (Approve/Deny) to resolve. There is no polling tool — the
    `specialist_install_commit` call in the next step will itself refuse with `kind:
    "consent_missing"` if the tap has not landed yet; on that specific error, tell the operator you
-   are waiting for their DM response AND that after tapping Approve they should send any message
-   here (e.g. "approved") to continue — the tap alone does not resume this engagement (#217) —
-   then stop (do not loop-retry).
+   are waiting for their DM response and then stop (do not loop-retry). After Approve the install
+   normally continues automatically — a synthetic resume turn carries this recipe forward — so you
+   do NOT ask for a second message by default; only if that automatic resume fails to deliver
+   would the operator need to send any message in the topic to continue.
 4. Once approved: `specialist_install_commit(component_id=..., version=..., root_digest=...,
    slug=..., staged_dir=..., config={...}, secret_names_provided=[...])` using the EXACT values
    `specialist_install_inspect` returned.
@@ -34,7 +35,11 @@ hand-edited.
    operator supplies them via a follow-up `specialist_install_commit` call with the SAME
    `staged_dir` (re-inspect if `staged_dir` has been cleaned up — staging is not guaranteed durable
    across a restart).
-6. If `state == "active"`: wire delegation per `recipes/delegate/wire.md`.
+6. If `state == "active"`: wire delegation by applying ONLY the edit steps of
+   `recipes/delegate/wire.md` (edit `delegates.yaml` idempotently + ensure the
+   delegate tool is allowed). Do NOT run wire.md's own commit/reload/emit_completion
+   — steps 7–9 below perform the single commit + reload + completion for the
+   whole install.
 7. `config_git_commit(message="install specialist <slug> from <repo>@<ref>")`.
 8. `casa_reload(scope="agents")` (mandatory — see `completion.md`; an `active` install is on disk
    but not in the live registry until reload runs).
