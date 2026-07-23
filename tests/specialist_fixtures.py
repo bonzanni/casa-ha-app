@@ -108,6 +108,8 @@ def write_bundled_plugin(
     component_dir: Path, name: str = "mtg", *,
     triggers: object = None, sysreqs: list[dict] | None = None,
     env_names: list[str] | None = None,
+    protected_tools: list | None = None,
+    mcp_command_servers: dict[str, dict] | None = None,
 ) -> str:
     """Task 8: write a minimal, real-shaped plugin tree at
     ``component_dir / "plugins" / name`` (mirroring `plugin_store`'s own
@@ -125,6 +127,18 @@ def write_bundled_plugin(
     a "missing" verdict for an executable/PATH entry that may not exist in
     the test sandbox; this fixture is about env-name extraction, not
     command resolvability.
+
+    ``protected_tools`` (fix-round-1, spec §3.2) is written verbatim to
+    ``casa.protectedTools`` — pass the legacy string form or the
+    ``{"name": ..., "summary": ...}`` object form, per
+    ``plugin_store.manifest_protected_tools``.
+
+    ``mcp_command_servers`` (fix-round-1) are merged into ``mcpServers``
+    ALONGSIDE any ``env_names``-derived url server — each value is a raw
+    server config dict (e.g. ``{"command": "python3", "args": [...]}}``);
+    callers are responsible for using a command that resolves cleanly
+    against `plugin_store.mcp_command_verdicts` in the test sandbox (e.g.
+    ``python3``), same convention as ``tests/plugin_fixtures.py``.
     """
     import plugin_store
 
@@ -136,14 +150,21 @@ def write_bundled_plugin(
         casa["systemRequirements"] = sysreqs
     if triggers is not None:
         casa["triggers"] = triggers
+    if protected_tools is not None:
+        casa["protectedTools"] = protected_tools
     if casa:
         manifest["casa"] = casa
     (plugin_dir / ".claude-plugin" / "plugin.json").write_text(
         json.dumps(manifest), encoding="utf-8")
+    servers: dict = {}
     if env_names:
-        mcp = {"mcpServers": {"main": {
+        servers["main"] = {
             "url": "https://example.invalid/mcp",
             "env": {n: f"${{{n}}}" for n in env_names},
-        }}}
-        (plugin_dir / ".mcp.json").write_text(json.dumps(mcp), encoding="utf-8")
+        }
+    if mcp_command_servers:
+        servers.update(mcp_command_servers)
+    if servers:
+        (plugin_dir / ".mcp.json").write_text(
+            json.dumps({"mcpServers": servers}), encoding="utf-8")
     return "sha256:" + plugin_store.content_checksum(plugin_dir)

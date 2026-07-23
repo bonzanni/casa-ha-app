@@ -17,6 +17,7 @@ from specialist_install import (
     inspect_specialist_repo,
     resolve_dependency_closure,
 )
+from specialist_install_consent import render_install_consent_message
 from specialist_registry import InstalledSpecialistIndex
 
 try:
@@ -239,3 +240,124 @@ def test_sourceless_dep_unchanged(tmp_path: Path, monkeypatch: pytest.MonkeyPatc
     plugin_rows = [r for r in resolutions if r.kind == "plugin/implementation"]
     assert len(plugin_rows) == 1
     assert plugin_rows[0].available is True
+
+
+# ---------------------------------------------------------------------------
+# Fix-round-1 (consent-review CRITICAL, spec §3.2): the receipt row must
+# enumerate a bundled plugin's MCP servers/commands, protected tools, and
+# secrets surface (env names) — not just identity + a content digest.
+# ---------------------------------------------------------------------------
+
+
+def test_bundled_dep_receipt_row_carries_consent_surfaces(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    component_dir, manifest_path = write_minimal_component(tmp_path, slug="mtg-test")
+    digest = write_bundled_plugin(
+        component_dir, "mtg",
+        protected_tools=["danger_tool"],
+        env_names=["SOME_API_KEY"],
+        mcp_command_servers={"tools": {"command": "python3", "args": ["-m", "mtgserver"]}},
+    )
+    _add_dependency_row(manifest_path, _bundled_dep_row("mtg", digest, "plugins/mtg"))
+
+    result = _inspect(tmp_path, component_dir, monkeypatch=monkeypatch)
+
+    row = result.plugin_resolutions[0]
+    assert row.mcp_servers == (
+        "main: url https://example.invalid/mcp",
+        "tools: python3 -m mtgserver",
+    )
+    assert row.protected_tools == ("danger_tool",)
+    assert row.env_names == ("SOME_API_KEY",)
+
+    # Round-trip through the persisted (attested) receipt sidecar.
+    loaded = specialist_receipt.load(result.receipt_id, receipts_dir=tmp_path / "receipts")
+    assert loaded is not None
+    loaded_row = loaded.plugins[0]
+    assert loaded_row.mcp_servers == row.mcp_servers
+    assert loaded_row.protected_tools == row.protected_tools
+    assert loaded_row.env_names == row.env_names
+
+    # The three fields are ATTESTED — they must move the receipt digest, not
+    # just ride along inert. A row stripped of them must hash differently.
+    bare_row = specialist_receipt.PluginReceiptRow(
+        identifier=row.identifier, scoped_name=row.scoped_name,
+        manifest_name=row.manifest_name, version=row.version,
+        source_type=row.source_type, repo=row.repo, ref=row.ref,
+        revision=row.revision, subdir=row.subdir,
+        content_digest=row.content_digest, staged_path=row.staged_path,
+    )
+    bare_digest = specialist_receipt.compute_receipt_digest(
+        slug=result.slug, component_repo="org/repo", component_ref="main",
+        component_revision="git:" + "a" * 40, component_subdir="",
+        plugins=(bare_row,),
+    )
+    assert bare_digest != loaded.receipt_digest
+
+
+def test_render_consent_message_includes_bundled_plugin_surfaces(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    component_dir, manifest_path = write_minimal_component(tmp_path, slug="mtg-test")
+    digest = write_bundled_plugin(
+        component_dir, "mtg",
+        protected_tools=["danger_tool"],
+        env_names=["SOME_API_KEY"],
+        mcp_command_servers={"tools": {"command": "python3", "args": ["-m", "mtgserver"]}},
+    )
+    _add_dependency_row(manifest_path, _bundled_dep_row("mtg", digest, "plugins/mtg"))
+
+    result = _inspect(tmp_path, component_dir, monkeypatch=monkeypatch)
+
+    text = render_install_consent_message(result)
+
+    # Non-vacuous: the literal server name, protected-tool name, and env
+    # name must all appear — not just a generic "see receipt" placeholder.
+    assert "tools: python3 -m mtgserver" in text
+    assert "danger_tool" in text
+    assert "SOME_API_KEY" in text
+
+
+# ---------------------------------------------------------------------------
+# Minor-2 regression: strip-before-checksum must apply BEFORE both the
+# declared-digest comparison (inspect must still pass) and the receipt row's
+# content_digest (must equal the STRIPPED tree's digest, never the raw
+# on-disk-with-cruft digest).
+# ---------------------------------------------------------------------------
+
+
+def test_bundled_pycache_stripped_before_checksum_and_inspect(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    component_dir, manifest_path = write_minimal_component(tmp_path, slug="mtg-test")
+    # `stripped_digest` is computed over a CLEAN tree — no bytecode cruft yet.
+    stripped_digest = write_bundled_plugin(component_dir, "mtg")
+
+    plugin_dir = component_dir / "plugins" / "mtg"
+    pycache_dir = plugin_dir / "__pycache__"
+    pycache_dir.mkdir()
+    (pycache_dir / "x.cpython-311.pyc").write_bytes(b"fake-bytecode")
+    (plugin_dir / "x.pyc").write_bytes(b"fake-bytecode")
+
+    # The manifest pins the STRIPPED-tree digest — exactly what a real
+    # publish (`_stage_and_swap`) would have computed after its own strip.
+    _add_dependency_row(manifest_path, _bundled_dep_row("mtg", stripped_digest, "plugins/mtg"))
+
+    result = _inspect(tmp_path, component_dir, monkeypatch=monkeypatch)
+
+    row = result.plugin_resolutions[0]
+    assert row.content_digest == stripped_digest
+
+    loaded = specialist_receipt.load(result.receipt_id, receipts_dir=tmp_path / "receipts")
+    assert loaded is not None
+    assert loaded.plugins[0].content_digest == stripped_digest
+
+    # The staged tree itself must have been stripped in place (belt-and-
+    # suspenders on the mechanism, not just the resulting digest). Note:
+    # `result.staged_dir` is the STAGING COPY `_stub_resolve_and_fetch` made
+    # (via `shutil.copytree`) — a distinct tree from the fixture's original
+    # `component_dir`, which is left untouched.
+    staged_plugin_dir = result.staged_dir / "plugins" / "mtg"
+    assert not (staged_plugin_dir / "__pycache__").exists()
+    assert not (staged_plugin_dir / "x.pyc").exists()

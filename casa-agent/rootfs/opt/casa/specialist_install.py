@@ -10,6 +10,7 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import TYPE_CHECKING, Literal, Mapping
 
+from authored_markers import contains_forbidden_marker
 from canonical_bytes import reject_forbidden_markers, to_plain_json
 from specialist_component import SpecialistComponent, is_valid_slug, load_specialist_component
 from specialist_lifecycle import check_slug_uniqueness
@@ -17,6 +18,7 @@ from specialist_lifecycle import check_slug_uniqueness
 if TYPE_CHECKING:
     from specialist_install_consent import SpecialistInstallAckStore
     from specialist_lifecycle import SpecialistInstance
+    from specialist_receipt import PluginReceiptRow
     from specialist_registry import InstalledSpecialistIndex
 
 logger = logging.getLogger(__name__)
@@ -141,6 +143,16 @@ class DependencyResolution:
     digest: str
     available: bool
     detail: str
+    # Task 8 fix-round-1 (consent-review CRITICAL): the sourced-plugin
+    # surfaces `_validate_sourced_plugin_tree` already parses while
+    # validating — captured here (rather than re-parsed at the
+    # PluginReceiptRow-building site) so the consent DM can enumerate them
+    # (spec §3.2). Empty for every non-sourced-plugin row (persona/corpus/
+    # legacy sourceless plugin) and for a sourced row that failed validation
+    # before reaching the point these are extracted.
+    mcp_servers: tuple[str, ...] = ()
+    protected_tools: tuple[str, ...] = ()
+    env_names: tuple[str, ...] = ()
 
 
 @dataclass(frozen=True, slots=True)
@@ -165,7 +177,7 @@ class InspectionResult:
     # (every inspect issues a receipt, plugin-less components included).
     receipt_id: str = ""
     receipt_digest: str = ""
-    plugin_resolutions: "tuple" = ()
+    plugin_resolutions: tuple["PluginReceiptRow", ...] = ()
 
 
 def compute_install_root_digest(
@@ -352,7 +364,7 @@ def resolve_dependency_closure(
                             available=False,
                             detail="bundled plugin path escapes the component"))
                         continue
-                detail = _validate_sourced_plugin_tree(
+                detail, surfaces = _validate_sourced_plugin_tree(
                     tree, slug=component.slug, identifier=dep.identifier)
                 if detail:
                     out.append(DependencyResolution(
@@ -364,7 +376,10 @@ def resolve_dependency_closure(
                     kind=dep.kind, identifier=dep.identifier, digest=dep.digest,
                     available=(digest == dep.digest),
                     detail="" if digest == dep.digest else
-                           "sourced plugin content does not match the pinned digest"))
+                           "sourced plugin content does not match the pinned digest",
+                    mcp_servers=surfaces.mcp_servers,
+                    protected_tools=surfaces.protected_tools,
+                    env_names=surfaces.env_names))
                 continue
             # Legacy/sourceless (spec §1 "no source -> legacy behavior"):
             # UNCHANGED — the dependency must already be plugin_add-installed.
@@ -504,13 +519,117 @@ def _manifest_name_collisions(component: SpecialistComponent) -> "list[str]":
     return collisions
 
 
-def _validate_sourced_plugin_tree(tree: Path, *, slug: str, identifier: str) -> str:
+@dataclass(frozen=True, slots=True)
+class _PluginSurfaces:
+    """Task 8 fix-round-1 (consent-review CRITICAL, spec §3.2): the three
+    consent-enumeration surfaces `_validate_sourced_plugin_tree` extracts
+    from the manifest/`.mcp.json` it already parses while validating —
+    captured once here (into the row `resolve_dependency_closure` builds)
+    rather than re-parsed at the PluginReceiptRow-building site in
+    `inspect_specialist_repo`. Empty (the default) for a tree that failed
+    validation before reaching the extraction point."""
+    mcp_servers: tuple[str, ...] = ()
+    protected_tools: tuple[str, ...] = ()
+    env_names: tuple[str, ...] = ()
+
+
+_EMPTY_SURFACES = _PluginSurfaces()
+
+
+_MCP_JSON_VAR_RE = re.compile(r"\$\{[A-Za-z_][A-Za-z0-9_]*\}")
+
+
+def _walk_reject_markers_in_json(value: object) -> None:
+    """Parsed-leaf marker scan (mirrors `authored_markers.
+    reject_markers_in_parsed`'s dict/list/str walk) with a `${VAR}` carve-out
+    applied PER STRING LEAF before the marker check. See
+    `_reject_forbidden_markers_in_json` for why both pieces (parsed-leaf, not
+    raw-text; `${VAR}`-stripped, not blanket) are required together."""
+    if isinstance(value, str):
+        if contains_forbidden_marker(_MCP_JSON_VAR_RE.sub("", value)):
+            raise ValueError("template, include, HTML, or delimiter detected")
+    elif isinstance(value, dict):
+        for key, item in value.items():
+            _walk_reject_markers_in_json(key)
+            _walk_reject_markers_in_json(item)
+    elif isinstance(value, (list, tuple)):
+        for item in value:
+            _walk_reject_markers_in_json(item)
+
+
+def _reject_forbidden_markers_in_json(text: str) -> None:
+    """Task 8 fix-round-1 (found while wiring the mcp_servers/protected_tools/
+    env_names consent surfaces): a plain `reject_forbidden_markers(text)`
+    raw-text scan has TWO false-positive sources on real `plugin.json`/
+    `.mcp.json` content, both unconditional:
+
+    1. `${VAR}` env-var interpolation is the UNIVERSAL, legitimate
+       `.mcp.json` syntax every real plugin uses — `${CLAUDE_PLUGIN_ROOT}`
+       in a `command`/`args` entry, `${MY_SECRET}` in an `env` entry (see
+       `tests/test_env_var_extraction.py`, `plugin_env_extractor`'s own
+       module docstring) — never a template-injection attempt.
+    2. Nested JSON objects routinely end two (or more) closing braces in a
+       row — e.g. `{"casa": {"protectedTools": ["x"]}}` or
+       `{"env": {"K": "V"}}` — an exact byte-for-byte match for the
+       forbidden Jinja-close marker `}}`, on pure JSON structural
+       punctuation. `casa.protectedTools`/`casa.systemRequirements`/
+       `casa.triggers` are ALL nested one level under `casa`, so this hits
+       `plugin.json` itself for precisely the shapes this fix-round exists
+       to enumerate. The identical class of false positive already forced a
+       raw-scan carve-out for role.yaml's flow-style YAML
+       (`_extract_full_line_yaml_comments`); `authored_markers.
+       reject_markers_in_parsed` is this codebase's existing canonical fix
+       for exactly this — scan the PARSED tree's string leaves, never the
+       raw structural bytes.
+
+    Both, together, made this scan reject EVERY real `plugin.json` declaring
+    `casa.protectedTools` (etc.) and EVERY real `.mcp.json` a sourced/bundled
+    plugin dependency could ever declare, unconditionally, before step 4
+    (`validate_manifest`)/6/7 below could ever run — silently making Task
+    8's own protectedTools/env-name-collision handling dead code for any
+    plugin with a realistic manifest or MCP server config.
+
+    Fix: parse first, walk parsed string leaves only (immune to JSON's own
+    `}}`), stripping `${VAR}` per leaf before the marker check (still catches
+    a genuine `{{`/`{%`/`!include`/HTML-tag/structural-tag smuggled into any
+    string value). Malformed JSON falls back to the original blanket raw-text
+    scan (`${VAR}`-stripped) — `plugin_store`'s own parse/verdict gates are
+    what actually gate malformed JSON; this is defense in depth over
+    whatever text is there, not the primary check."""
+    try:
+        parsed = json.loads(text)
+    except ValueError:
+        reject_forbidden_markers(_MCP_JSON_VAR_RE.sub("", text))
+        return
+    _walk_reject_markers_in_json(parsed)
+
+
+def _mcp_server_summary(name: str, cfg: "Mapping") -> str:
+    """One-line "name: command arg1 arg2…" consent-surface summary (spec
+    §3.2) for a single validated `.mcp.json` server entry. A `url`-form
+    server (no `command`) summarizes as "name: url <url>" instead — still a
+    single line naming exactly what the operator's tap would approve."""
+    command = cfg.get("command")
+    if isinstance(command, str) and command:
+        args = cfg.get("args")
+        arg_list = [a for a in args if isinstance(a, str)] if isinstance(args, list) else []
+        return f"{name}: " + " ".join([command] + arg_list)
+    url = cfg.get("url")
+    if isinstance(url, str) and url:
+        return f"{name}: url {url}"
+    return f"{name}: (unrecognized server config)"
+
+
+def _validate_sourced_plugin_tree(
+    tree: Path, *, slug: str, identifier: str,
+) -> "tuple[str, _PluginSurfaces]":
     """Full validation of a sourced (bundled/github) plugin dependency's
-    staged tree (spec §1/§3.2.1, brief Step 2). Returns "" when the tree is
-    clean; otherwise a non-empty detail string — for the four prefixes in
-    `_PROHIBITION_KIND_PREFIXES`, `inspect_specialist_repo` raises that exact
-    kind; every other non-empty detail flows into the generic
-    `dependency_unavailable`.
+    staged tree (spec §1/§3.2.1, brief Step 2). Returns `("", surfaces)` when
+    the tree is clean (`surfaces` populated for the consent DM — spec §3.2);
+    otherwise `(detail, _EMPTY_SURFACES)` with a non-empty detail string —
+    for the four prefixes in `_PROHIBITION_KIND_PREFIXES`,
+    `inspect_specialist_repo` raises that exact kind; every other non-empty
+    detail flows into the generic `dependency_unavailable`.
 
     Order (Sol plan-r1 — prohibition codes must never be preempted by
     `validate_manifest`'s own `apt_requirements_rejected`/`triggers_invalid`,
@@ -533,7 +652,11 @@ def _validate_sourced_plugin_tree(tree: Path, *, slug: str, identifier: str) -> 
        already catch — impossible for sysreqs/triggers by construction, but
        real for name mismatches and malformed protectedTools).
     5. Untrusted-bytes marker scan over `plugin.json`, every `*.md`, and every
-       `.mcp.json` under the tree (symlinks already vetted in step 2).
+       `.mcp.json` under the tree (symlinks already vetted in step 2); the
+       `plugin.json`/`.mcp.json` scans (fix-round-1) walk PARSED string
+       leaves (immune to JSON's own structural `}}`) and strip legitimate
+       `${VAR}` env-var interpolation per leaf — see
+       `_reject_forbidden_markers_in_json`. `*.md` prose stays a raw scan.
     6. Reserved-env + command-verdict gates over the tree's `.mcp.json`
        (`plugin_store.reserved_env_violations` / `mcp_command_verdicts`).
     7. Env-name collision (`_env_name_conflicts`) against every OTHER
@@ -548,57 +671,70 @@ def _validate_sourced_plugin_tree(tree: Path, *, slug: str, identifier: str) -> 
     try:
         plugin_store._reject_escaping_symlinks(tree)
     except plugin_store.StoreError as exc:
-        return f"{exc.reason_code}: {exc}"
+        return f"{exc.reason_code}: {exc}", _EMPTY_SURFACES
 
     manifest_path = tree / ".claude-plugin" / "plugin.json"
     try:
         raw_manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
     except (OSError, ValueError) as exc:
-        return f"manifest_invalid: plugin.json missing/unparseable: {exc}"
+        return f"manifest_invalid: plugin.json missing/unparseable: {exc}", _EMPTY_SURFACES
     if not isinstance(raw_manifest, dict):
-        return "manifest_invalid: plugin.json is not an object"
+        return "manifest_invalid: plugin.json is not an object", _EMPTY_SURFACES
 
     if plugin_store.manifest_sysreqs(raw_manifest):
         return (f"{BUNDLED_SYSREQS_UNSUPPORTED}: a sourced/bundled plugin dependency "
-                "must not declare casa.systemRequirements")
+                "must not declare casa.systemRequirements", _EMPTY_SURFACES)
     casa = raw_manifest.get("casa")
     if isinstance(casa, dict) and "triggers" in casa:
         return (f"{BUNDLED_TRIGGERS_UNSUPPORTED}: a sourced/bundled plugin dependency "
-                "must not declare casa.triggers")
+                "must not declare casa.triggers", _EMPTY_SURFACES)
 
     scoped = plugin_registry.scoped_name(slug, identifier)
     try:
         plugin_store.validate_manifest(tree, scoped, manifest_name=identifier)
     except plugin_store.StoreError as exc:
-        return f"{exc.reason_code}: {exc}"
+        return f"{exc.reason_code}: {exc}", _EMPTY_SURFACES
 
     try:
-        reject_forbidden_markers(manifest_path.read_text(encoding="utf-8"))
+        _reject_forbidden_markers_in_json(manifest_path.read_text(encoding="utf-8"))
         for md_path in sorted(tree.rglob("*.md")):
             reject_forbidden_markers(md_path.read_text(encoding="utf-8"))
         for mcp_path in sorted(tree.rglob(".mcp.json")):
-            reject_forbidden_markers(mcp_path.read_text(encoding="utf-8"))
+            _reject_forbidden_markers_in_json(mcp_path.read_text(encoding="utf-8"))
     except ValueError as exc:
-        return f"forbidden_markers: {exc}"
+        return f"forbidden_markers: {exc}", _EMPTY_SURFACES
     except OSError as exc:
-        return f"forbidden_markers: unreadable file during marker scan: {exc}"
+        return f"forbidden_markers: unreadable file during marker scan: {exc}", _EMPTY_SURFACES
 
     mcp_json_path = tree / ".mcp.json"
     reserved = plugin_store.reserved_env_violations(mcp_json_path)
     if reserved:
-        return "mcp_reserved_env: " + "; ".join(reserved)
+        return "mcp_reserved_env: " + "; ".join(reserved), _EMPTY_SURFACES
     missing = [v for v in plugin_store.mcp_command_verdicts(mcp_json_path, tree)
                if v.get("status") == "missing"]
     if missing:
-        return "mcp_command_missing: " + "; ".join(
-            f"{v['server']}:{v['ref']} ({v.get('reason', '')})" for v in missing)
+        return ("mcp_command_missing: " + "; ".join(
+            f"{v['server']}:{v['ref']} ({v.get('reason', '')})" for v in missing), _EMPTY_SURFACES)
 
     tree_env_names = plugin_env_extractor.extract_env_vars(mcp_json_path)
     conflicts = _env_name_conflicts(tree_env_names, exclude_owner=slug)
     if conflicts:
-        return f"{ENV_NAME_COLLISION}: colliding env name(s): " + ", ".join(conflicts)
+        return f"{ENV_NAME_COLLISION}: colliding env name(s): " + ", ".join(conflicts), _EMPTY_SURFACES
 
-    return ""
+    # Task 8 fix-round-1: the consent-enumeration surfaces (spec §3.2),
+    # extracted from state already parsed above — `raw_manifest` (step 3/4)
+    # and `mcp_json_path`/`tree_env_names` (step 6/7) — never re-read from
+    # disk. Sorted for determinism (dict/set iteration order is not a
+    # contract either the manifest author or `extract_env_vars` promises).
+    surfaces = _PluginSurfaces(
+        mcp_servers=tuple(
+            _mcp_server_summary(name, cfg)
+            for name, cfg in sorted(plugin_store.mcp_servers_map(mcp_json_path).items())),
+        protected_tools=tuple(
+            e["name"] for e in plugin_store.manifest_protected_tools(raw_manifest)),
+        env_names=tuple(sorted(tree_env_names)),
+    )
+    return "", surfaces
 
 
 def _sourced_plugin_manifest_version(tree: Path) -> str:
@@ -816,6 +952,12 @@ def inspect_specialist_repo(
             source_type=dep.source.type,
             repo=row_repo, ref=row_ref, revision=row_revision, subdir=row_subdir,
             content_digest=resolution.digest, staged_path=str(tree),
+            # Task 8 fix-round-1 (consent-review CRITICAL): captured by
+            # `_validate_sourced_plugin_tree` during `resolve_dependency_
+            # closure` above — never re-parsed here.
+            mcp_servers=resolution.mcp_servers,
+            protected_tools=resolution.protected_tools,
+            env_names=resolution.env_names,
         ))
 
     receipt = specialist_receipt.build_receipt(

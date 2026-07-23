@@ -53,6 +53,17 @@ class PluginReceiptRow:
     subdir: str
     content_digest: str
     staged_path: str  # NON-attested runtime state — excluded from receipt_digest
+    # Task 8 fix-round-1 (consent-review CRITICAL, spec §3.2): the surfaces the
+    # consent DM must enumerate per plugin — "scoped name, manifest name,
+    # version, MCP servers/commands, protected tools, secrets surface". ALL
+    # THREE are attested (included in ``compute_receipt_digest`` via
+    # ``_attested_row``'s plain ``asdict`` — no exclusion added for them)
+    # because they describe exactly what the operator's consent tap approves;
+    # a tampered mcp_servers/protected_tools/env_names list must invalidate
+    # the receipt digest the same way a tampered digest/repo/ref would.
+    mcp_servers: tuple[str, ...] = ()      # one-line "name: command arg1 arg2…" per server
+    protected_tools: tuple[str, ...] = ()  # names, from plugin_store.manifest_protected_tools
+    env_names: tuple[str, ...] = ()        # required env var names — the secrets surface
 
 
 @dataclass(frozen=True, slots=True)
@@ -134,6 +145,13 @@ def _from_json(raw: dict) -> "SourceReceipt | None":
                 source_type=r["source_type"], repo=r["repo"], ref=r["ref"],
                 revision=r["revision"], subdir=r["subdir"],
                 content_digest=r["content_digest"], staged_path=r["staged_path"],
+                # Task 8 fix-round-1: tolerate a sidecar written before these
+                # fields existed (`.get(..., ())`) rather than fail closed on
+                # every already-staged receipt — the digest recompute below
+                # still fails closed on any genuine tamper.
+                mcp_servers=tuple(r.get("mcp_servers") or ()),
+                protected_tools=tuple(r.get("protected_tools") or ()),
+                env_names=tuple(r.get("env_names") or ()),
             )
             for r in raw["plugins"]
         )

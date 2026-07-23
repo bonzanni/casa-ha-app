@@ -230,10 +230,16 @@ def render_install_consent_message(inspection: Any) -> str:
     # `inspection.plugin_resolutions` (Task 7's sketch used provisional
     # per-dependency `getattr` field names before that type existed — this
     # replaces it with the real field set: identifier/scoped_name/
-    # manifest_name/version/source_type/content_digest; no mcp_servers/
-    # protected_tools/env_names — those never made it into the receipt row
-    # contract). `getattr(..., ())` keeps this rendering unchanged (empty
-    # section) for any legacy inspection object that predates the field.
+    # manifest_name/version/source_type/content_digest/mcp_servers/
+    # protected_tools/env_names). `getattr(..., ())` keeps this rendering
+    # unchanged (empty section) for any legacy inspection object that
+    # predates the field.
+    #
+    # Fix-round-1 (consent-review CRITICAL, spec §3.2): the DM must show
+    # "scoped name, manifest name, version, MCP servers/commands, protected
+    # tools, secrets surface" per plugin — the three list-valued lines below
+    # close that gap; each is omitted entirely when empty (nothing to
+    # approve in that category) rather than rendered as a bare label.
     plugin_blocks: list[str] = []
     for row in getattr(inspection, "plugin_resolutions", ()) or ():
         lines = [
@@ -243,6 +249,12 @@ def render_install_consent_message(inspection: Any) -> str:
             f"    source: {row.source_type}",
             f"    content digest: {row.content_digest}",
         ]
+        if row.mcp_servers:
+            lines.append(f"    MCP servers: {', '.join(row.mcp_servers)}")
+        if row.protected_tools:
+            lines.append(f"    Protected tools: {', '.join(row.protected_tools)}")
+        if row.env_names:
+            lines.append(f"    Secrets required: {', '.join(row.env_names)}")
         plugin_blocks.append("\n".join(lines))
     plugin_section = ("\n".join(plugin_blocks) + "\n") if plugin_blocks else ""
     return (
