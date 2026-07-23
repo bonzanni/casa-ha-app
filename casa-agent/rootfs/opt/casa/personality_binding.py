@@ -412,10 +412,43 @@ def owned_plugins_prior_path(directory: Path) -> Path:
     return Path(directory) / "owned-plugins.prior.yaml"
 
 
+# Whole-branch F: an owned-plugins sidecar is on-disk state a rollback/boot
+# path later joins into a store path (`store_root / row["name"] /
+# row["artifact_id"]`). A tampered/corrupt sidecar with a traversal `name`
+# ("../../etc") or a bogus `artifact_id` must NEVER reach a filesystem join —
+# validate the grammar on READ (mirrors plugin_registry.OWNED_NAME_RE + the
+# 72-byte scoped-name invariant) and fail the whole doc closed if any row is
+# malformed.
+_OWNED_NAME_RE = re.compile(r"^[a-z0-9][a-z0-9-]{0,31}\.[a-z0-9][a-z0-9-]{0,39}$")
+_ARTIFACT_ID_RE = re.compile(r"^[0-9a-f]{64}$")
+
+
+def _valid_owned_row(row: object) -> bool:
+    if not isinstance(row, dict):
+        return False
+    name = row.get("name")
+    if (not isinstance(name, str) or not _OWNED_NAME_RE.match(name)
+            or len(name.encode()) > 72):
+        return False
+    if not _ARTIFACT_ID_RE.match(str(row.get("artifact_id", ""))):
+        return False
+    mname = row.get("manifest_name")
+    if not isinstance(mname, str) or name.partition(".")[2] != mname:
+        return False
+    if not isinstance(row.get("version", ""), str):
+        return False
+    return True
+
+
 def read_owned_plugins(path: Path) -> "dict | None":
     """Load an owned-plugins sidecar document, or None if absent/malformed.
     The document shape is
-    `{"schema_version": 1, "component_source": {...}, "plugins": [...]}`."""
+    `{"schema_version": 1, "component_source": {...}, "plugins": [...]}`.
+
+    Whole-branch F: the `plugins` list is schema/grammar-validated here (row
+    shape + `name`/`artifact_id`/`manifest_name` grammar) so a downstream
+    store-path join can trust every row — any malformed row fails the whole
+    doc closed (returns None)."""
     p = Path(path)
     if not p.exists():
         return None
@@ -423,7 +456,14 @@ def read_owned_plugins(path: Path) -> "dict | None":
         raw = yaml.safe_load(p.read_text(encoding="utf-8"))
     except (OSError, yaml.YAMLError):
         return None
-    return raw if isinstance(raw, dict) else None
+    if not isinstance(raw, dict):
+        return None
+    plugins = raw.get("plugins")
+    if plugins is not None:
+        if not isinstance(plugins, list) or not all(
+                _valid_owned_row(r) for r in plugins):
+            return None
+    return raw
 
 
 def write_owned_plugins(path: Path, doc: dict) -> None:

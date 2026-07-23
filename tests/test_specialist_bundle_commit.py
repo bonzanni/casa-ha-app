@@ -143,7 +143,7 @@ def _doc(plugins: list[dict] | None = None) -> dict:
                              "revision": "git:" + "a" * 40, "subdir": ""},
         "plugins": plugins if plugins is not None else [
             {"name": "mtg.mtg", "manifest_name": "mtg", "version": "1.0.0",
-             "artifact_id": "x" * 64, "digest": "sha256:" + "y" * 64,
+             "artifact_id": "a" * 64, "digest": "sha256:" + "y" * 64,
              "source": {"type": "github", "repo": "acme/mtg-specialist",
                         "ref": "v0.2.0", "revision": "git:" + "a" * 40,
                         "subdir": "plugins/mtg"}},
@@ -579,6 +579,69 @@ def test_bundle_rollback_refuses_missing_retained_artifact(tmp_path: Path, monke
 # ===========================================================================
 # 2d — uninstall cascade + ack retirement
 # ===========================================================================
+
+def test_commit_refuses_receipt_not_matching_inspection(tmp_path: Path, monkeypatch) -> None:
+    # Whole-branch D: a receipt whose id/digest/slug drifts from the acked
+    # inspection is refused (receipt_mismatch) BEFORE consent/publish.
+    import dataclasses
+    ctx = _prep(tmp_path, monkeypatch)
+    mismatched = dataclasses.replace(ctx.receipt, receipt_digest="sha256:" + "f" * 64)
+    kw = dict(ctx.kw)
+    kw["receipt"] = mismatched
+    with pytest.raises(specialist_install.SpecialistInstallError) as ei:
+        specialist_install.commit_specialist_install(**kw)
+    assert ei.value.kind == "receipt_mismatch"
+    assert _owned(ctx.kw["registry_path"], "mtg") == []       # registry untouched
+
+
+def test_uninstall_journals_the_retired_acks_atomically(tmp_path: Path, monkeypatch) -> None:
+    # Whole-branch J: the journal's before-state ack_records is the retire
+    # RETURN (every slug ack present at retire time), not an earlier snapshot —
+    # so an extra same-slug approval is journaled and restorable, never lost.
+    from specialist_install_consent import install_consent_identity
+    ctx = _prep(tmp_path, monkeypatch)
+    specialist_install.commit_specialist_install(**ctx.kw)
+    # A SECOND ack for the same slug (a different identity — e.g. a re-approval).
+    extra = install_consent_identity(
+        component_id=ctx.inspection.component_id, version="9.9.9",
+        root_digest=ctx.inspection.root_digest, slug="mtg")
+    ctx.acks.record(identity=extra, component_id=ctx.inspection.component_id,
+                    version="9.9.9", component_checksum=ctx.inspection.root_digest,
+                    slug="mtg")
+    assert len(ctx.acks.snapshot_slug("mtg")) == 2
+
+    txn = specialist_install.uninstall_specialist(
+        slug="mtg", bundle=True, acks=ctx.acks,
+        specialists_dir=tmp_path / "specialists", agents_specialists_dir=tmp_path / "agents",
+        registry_path=ctx.kw["registry_path"], ops_dir=tmp_path / "ops")
+    payload = _json.loads(Path(txn.journal_path).read_text())
+    # BOTH acks were journaled as the before-state (retire return), and both
+    # removed from the live ledger.
+    assert len(payload["before"]["ack_records"]) == 2
+    assert ctx.acks.snapshot_slug("mtg") == []
+    # rollback restores exactly those two.
+    txn.rollback_disk()
+    assert len(ctx.acks.snapshot_slug("mtg")) == 2
+
+
+def test_read_owned_plugins_rejects_traversal_and_bad_artifact_id(tmp_path: Path) -> None:
+    # Whole-branch F: a tampered sidecar with a traversal name or a non-hex
+    # artifact_id fails the whole doc closed (never reaches a store-path join).
+    from personality_binding import owned_plugins_path, read_owned_plugins, write_owned_plugins
+    good = _doc()
+    write_owned_plugins(owned_plugins_path(tmp_path), good)
+    assert read_owned_plugins(owned_plugins_path(tmp_path)) is not None
+
+    poisoned = _doc()
+    poisoned["plugins"][0]["name"] = "../../../etc/passwd"
+    write_owned_plugins(owned_plugins_path(tmp_path), poisoned)
+    assert read_owned_plugins(owned_plugins_path(tmp_path)) is None
+
+    bad_aid = _doc()
+    bad_aid["plugins"][0]["artifact_id"] = "../evil"
+    write_owned_plugins(owned_plugins_path(tmp_path), bad_aid)
+    assert read_owned_plugins(owned_plugins_path(tmp_path)) is None
+
 
 def test_bundle_uninstall_cascade(tmp_path: Path, monkeypatch) -> None:
     from specialist_install_consent import install_consent_identity

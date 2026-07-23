@@ -136,11 +136,17 @@ assert res.slug == "mtg-test", res.slug
 assert res.component_id == "casa-test/mtg-test", res.component_id
 
 acks = SpecialistInstallAckStore()
+# Whole-branch A: inspect now ALWAYS mints a source receipt (plugin-less
+# components included), so res.receipt_digest is non-empty and the real commit
+# folds it into the consent identity. The recorded ack MUST carry the same
+# receipt_digest or commit's recomputed identity mismatches -> consent_missing.
 identity = install_consent_identity(
     component_id=res.component_id, version=res.version,
-    root_digest=res.root_digest, slug=res.slug)
+    root_digest=res.root_digest, slug=res.slug,
+    receipt_digest=res.receipt_digest)
 acks.record(identity=identity, component_id=res.component_id, version=res.version,
-            component_checksum=res.root_digest, slug=res.slug)
+            component_checksum=res.root_digest, slug=res.slug,
+            receipt_digest=res.receipt_digest)
 
 instance = commit_specialist_install(
     inspection=res, config={}, secret_names_provided=frozenset(), acks=acks)

@@ -169,6 +169,39 @@ def test_env_name_collision_fails(tmp_path: Path, monkeypatch: pytest.MonkeyPatc
     assert exc.value.kind == "env_name_collision"
 
 
+def test_sibling_env_name_collision_detected():
+    # Whole-branch E: two sourced plugins in the SAME bundle each requiring the
+    # same env name collide, even though neither collides with an installed one.
+    from specialist_install import DependencyResolution, _sibling_env_name_collisions
+    deps = (
+        DependencyResolution(kind="plugin/implementation", identifier="a",
+                             digest="sha256:" + "a" * 64, available=True, detail="",
+                             env_names=("SHARED_KEY", "A_ONLY")),
+        DependencyResolution(kind="plugin/implementation", identifier="b",
+                             digest="sha256:" + "b" * 64, available=True, detail="",
+                             env_names=("SHARED_KEY", "B_ONLY")),
+        DependencyResolution(kind="persona", identifier="p@1", digest="x",
+                             available=True, detail=""),
+    )
+    assert _sibling_env_name_collisions(deps) == ["SHARED_KEY"]
+    # A single sourced plugin never self-collides.
+    assert _sibling_env_name_collisions(deps[:1]) == []
+
+
+def test_sibling_env_collision_raises_env_name_collision_in_inspect(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # Whole-branch E: inspect surfaces the sibling collision as env_name_collision.
+    component_dir, manifest_path = write_minimal_component(tmp_path, slug="mtg-test")
+    d1 = write_bundled_plugin(component_dir, "aa", env_names=["SHARED_KEY"])
+    d2 = write_bundled_plugin(component_dir, "bb", env_names=["SHARED_KEY"])
+    _add_dependency_row(manifest_path, _bundled_dep_row("aa", d1, "plugins/aa"))
+    _add_dependency_row(manifest_path, _bundled_dep_row("bb", d2, "plugins/bb"))
+    with pytest.raises(SpecialistInstallError) as exc:
+        _inspect(tmp_path, component_dir, monkeypatch=monkeypatch)
+    assert exc.value.kind == "env_name_collision"
+
+
 def test_manifest_name_collision_precheck(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
     component_dir, manifest_path = write_minimal_component(tmp_path, slug="mtg-test")
     digest = write_bundled_plugin(component_dir, "mtg")

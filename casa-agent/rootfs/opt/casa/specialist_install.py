@@ -488,6 +488,26 @@ def _env_name_conflicts(tree_env_names: "set[str]", *, exclude_owner: str) -> "l
     return sorted(tree_env_names & installed_names)
 
 
+def _sibling_env_name_collisions(
+    dependencies: "tuple[DependencyResolution, ...]",
+) -> "list[str]":
+    """Whole-branch E: `_env_name_conflicts` (per-plugin) only checks a sourced
+    plugin's env names against ALREADY-INSTALLED artifacts — never against its
+    SIBLINGS in the same incoming bundle. Two bundled plugins each requiring the
+    same `${VAR}` would both pass (the name is not yet installed) and both
+    publish, then collide in the global env namespace. Aggregate every sourced
+    plugin's env surface across the closure and flag any name required by more
+    than one sibling. Each DependencyResolution.env_names is already a set, so a
+    duplicate across the aggregate means DISTINCT siblings share the name."""
+    from collections import Counter
+
+    counts: "Counter[str]" = Counter()
+    for dep in dependencies:
+        if dep.kind == "plugin/implementation" and dep.env_names:
+            counts.update(set(dep.env_names))
+    return sorted(name for name, count in counts.items() if count > 1)
+
+
 def _manifest_name_collisions(component: SpecialistComponent) -> "list[str]":
     """Per-target manifest-name precheck (spec §2.1, brief): a sourced dep's
     `identifier` becomes its OWNED entry's effective runtime name
@@ -922,6 +942,15 @@ def inspect_specialist_repo(
         detail = "; ".join(f"{d.kind}:{d.identifier}: {d.detail}" for d in unavailable)
         raise SpecialistInstallError("dependency_unavailable", detail)
 
+    # Whole-branch E: cross-sibling env-name collision (the per-plugin check
+    # only saw installed artifacts). Every remaining dep resolved available.
+    sibling_env = _sibling_env_name_collisions(dependencies)
+    if sibling_env:
+        raise SpecialistInstallError(
+            ENV_NAME_COLLISION,
+            "sourced plugins in this bundle require the same env name(s): "
+            + ", ".join(sibling_env))
+
     root_digest = compute_install_root_digest(
         component, dependencies, manifest_bytes=manifest_path.read_bytes())
 
@@ -1262,6 +1291,38 @@ def _reject_receiptless_sourced_deps(
             "mandatory to install or upgrade it")
 
 
+def _assert_receipt_matches_inspection(
+    receipt: "SourceReceipt | None", inspection: "InspectionResult",
+) -> None:
+    """Whole-branch D: the consent gate is keyed on `inspection.receipt_digest`
+    (via the consent identity), but commit/upgrade then PUBLISH from the
+    separately-supplied `receipt` object. Nothing previously asserted the two
+    describe the same closure — a caller with a valid ack for inspection X could
+    hand a receipt for a different closure Y and commit Y's bytes past X's
+    approval. Fail closed (`receipt_mismatch`) unless the receipt's id, digest,
+    and slug all equal the inspection's AND its per-plugin row set (identifier +
+    attested content digest) matches `inspection.plugin_resolutions`, BEFORE the
+    consent check. Legacy sourceless installs pass `receipt=None` and skip this
+    (their `receipt_digest` is "" — identity unchanged)."""
+    if receipt is None:
+        return
+    if (receipt.receipt_id != inspection.receipt_id
+            or receipt.receipt_digest != getattr(inspection, "receipt_digest", "")
+            or receipt.slug != inspection.slug):
+        raise SpecialistInstallError(
+            "receipt_mismatch",
+            "supplied receipt does not match the approved inspection "
+            "(id/digest/slug)")
+    insp_rows = {(r.identifier, r.content_digest)
+                 for r in getattr(inspection, "plugin_resolutions", ()) or ()}
+    receipt_rows = {(r.identifier, r.content_digest) for r in receipt.plugins}
+    if insp_rows != receipt_rows:
+        raise SpecialistInstallError(
+            "receipt_mismatch",
+            "supplied receipt's plugin row set does not match the approved "
+            "inspection")
+
+
 def commit_specialist_install(
     *, inspection: "InspectionResult", receipt: "SourceReceipt | None" = None,
     config: "Mapping[str, str]",
@@ -1329,6 +1390,10 @@ def commit_specialist_install(
     # re-assert after the post-publish CAS reload that the component's OWN slug
     # agrees (mirroring upgrade_specialist's slug_mismatch treatment).
     validate_specialist_slug(inspection.slug)
+
+    # Whole-branch D: bind the supplied receipt to the approved inspection
+    # BEFORE consent — fail closed on any id/digest/slug/row-set drift.
+    _assert_receipt_matches_inspection(receipt, inspection)
 
     # Task 8 seam (Task 7 P0): thread the trusted-source receipt digest into
     # the consent identity — `getattr` keeps this call working against a
@@ -1544,7 +1609,11 @@ def commit_specialist_install(
             journal = specialist_bundle_journal.begin(
                 "install", inspection.slug, before_entries=before_owned,
                 before_tuple_files=before_tuple_files, ack_records=ack_records,
-                receipt_digest=receipt.receipt_digest, **_begin_kwargs)
+                receipt_digest=receipt.receipt_digest, consent_identity=identity,
+                target_root=component_root_string(
+                    component_id=inspection.component_id, version=inspection.version,
+                    component_checksum=inspection.root_digest),
+                **_begin_kwargs)
             rollback_txn = BundleTxn(
                 journal_path=journal, slug=inspection.slug,
                 before_entries=before_owned, before_tuple_files=before_tuple_files,
@@ -1553,6 +1622,16 @@ def commit_specialist_install(
             try:
                 published = _publish_owned_plugins(
                     inspection.slug, receipt, tree_paths, store_root=plugin_store_root)
+                # Whole-branch O: mark the owned-plugin publication boundary in
+                # the journal. NB the COMPONENT CAS publish (_publish_cas_staging
+                # above) still runs BEFORE begin() — plan step 1b's journal-first
+                # ideal — because that CAS directory is CONTENT-ADDRESSED by
+                # root_digest: a crash after it but before begin leaves an inert,
+                # deduplicated, GC-later residue that no rollback needs to undo
+                # (spec §3.2: "CAS residue is harmless, content-addressed").
+                # The registry-VISIBLE mutations (owned-plugin store publish,
+                # owned_swap, tuple/sidecar) are all inside this journaled block.
+                specialist_bundle_journal.mark_step(journal, "owned_plugins_published")
                 new_entries = [_owned_entry_for(inspection.slug, row, res)
                                for row, res in published]
                 before_entries, _ = plugin_registry.apply_owned_swap(
@@ -1685,6 +1764,7 @@ def upgrade_specialist(
     import specialist_bundle_journal
     from specialist_bundle_journal import BundleTxn
     from specialist_lifecycle import SpecialistInstance  # noqa: F401 (typing)
+    from specialist_install_consent import install_consent_identity
     import plugin_store
     import specialist_materialize
     from personality_binding import InstanceDir
@@ -1722,7 +1802,15 @@ def upgrade_specialist(
         journal = specialist_bundle_journal.begin(
             "upgrade", slug, before_entries=before_owned,
             before_tuple_files=before_tuple_files, ack_records=ack_records,
-            receipt_digest=receipt.receipt_digest, **_begin_kwargs)
+            receipt_digest=receipt.receipt_digest,
+            consent_identity=install_consent_identity(
+                component_id=inspection.component_id, version=inspection.version,
+                root_digest=inspection.root_digest, slug=inspection.slug,
+                receipt_digest=getattr(inspection, "receipt_digest", "")),
+            target_root=component_root_string(
+                component_id=inspection.component_id, version=inspection.version,
+                component_checksum=inspection.root_digest),
+            **_begin_kwargs)
         rollback_txn = BundleTxn(
             journal_path=journal, slug=slug, before_entries=before_owned,
             before_tuple_files=before_tuple_files, ack_records=ack_records,
@@ -1737,6 +1825,11 @@ def upgrade_specialist(
             if instance.state == "active":
                 published = _publish_owned_plugins(
                     slug, receipt, tree_paths, store_root=plugin_store_root)
+                # Whole-branch O: publication boundary (see
+                # commit_specialist_install's note — the component CAS publish is
+                # content-addressed/inert; the registry-visible mutations are all
+                # journaled from here).
+                specialist_bundle_journal.mark_step(journal, "owned_plugins_published")
                 new_entries = [_owned_entry_for(slug, row, res) for row, res in published]
                 before_entries, _ = plugin_registry.apply_owned_swap(
                     slug=slug, new_entries=new_entries, registry_path=registry_path)
@@ -1815,6 +1908,10 @@ def _upgrade_core(
     # it indexes `specialists_dir / slug` (and downstream Path joins) below.
     # Validate at the top before any filesystem operation.
     validate_specialist_slug(slug)
+
+    # Whole-branch D: bind the supplied receipt to the approved inspection
+    # BEFORE consent (see commit_specialist_install's identical note).
+    _assert_receipt_matches_inspection(receipt, inspection)
 
     # Task 8 seam (Task 7 P0): see commit_specialist_install's identical note.
     identity = install_consent_identity(
@@ -2095,9 +2192,20 @@ def rollback_specialist(
     prior_rows = list(prior_sidecar.get("plugins") or []) if prior_sidecar else []
 
     # Preflight retained artifacts BEFORE any durable mutation.
+    store_root_resolved = Path(plugin_store_root).resolve()
     for row in prior_rows:
         src = row.get("source") or {}
+        # Whole-branch F: `read_owned_plugins` already grammar-validated
+        # row["name"]/["artifact_id"], but containment-check the DERIVED store
+        # path too (defense in depth) — a join must never escape the store root
+        # before it is stat'd/hashed by artifact_verdict.
         store_path = Path(plugin_store_root) / row["name"] / row["artifact_id"]
+        try:
+            store_path.resolve().relative_to(store_root_resolved)
+        except ValueError:
+            raise SpecialistInstallError(
+                "rollback_artifact_missing",
+                f"prior owned row {row.get('name')!r} resolves outside the plugin store")
         verdict = plugin_store.artifact_verdict(
             store_path, name=row["name"], repo=src.get("repo", ""),
             revision=src.get("revision", ""), subdir=src.get("subdir", ""),
@@ -2320,7 +2428,18 @@ def uninstall_specialist(
     _reg = plugin_registry.load_registry(registry_path)
     before_owned = plugin_registry.owned_entries_for(slug, _reg)
     before_tuple_files = _tuple_files_snapshot(slug_dir)
-    ack_records = acks.snapshot_slug(slug)
+    # Whole-branch J: retire the slug's consent acks ATOMICALLY (one
+    # _LEDGER_LOCK critical section) and journal EXACTLY the removed records.
+    # The old flow snapshot_slug'd here then retire_slug'd later in a SEPARATE
+    # critical section — a concurrent same-slug approval (a consent tap runs
+    # outside _PLUGIN_TOOLS_LOCK) landing between the two would be deleted by
+    # retire yet absent from the journaled before-state, so a rollback could not
+    # restore it. retire_slug returns exactly what it removed under one lock; we
+    # journal those and rollback restores them via restore_records. Retiring
+    # before begin means a crash in the (tiny) gap loses only the acks — a
+    # fail-closed outcome (the operator simply re-approves), never registry/
+    # tuple corruption (those mutations all follow begin).
+    ack_records = acks.retire_slug(slug)
     _begin_kwargs = {} if ops_dir is None else {"ops_dir": ops_dir}
     journal = specialist_bundle_journal.begin(
         "uninstall", slug, before_entries=before_owned,
@@ -2339,7 +2458,7 @@ def uninstall_specialist(
             if isinstance(e.get("artifact_id"), str)))
         _uninstall_core(slug=slug, specialists_dir=specialists_dir,
                         agents_specialists_dir=agents_specialists_dir)
-        acks.retire_slug(slug)
+        # acks already retired atomically above (whole-branch J).
         specialist_bundle_journal.mark_step(journal, "committed")
         txn = BundleTxn(
             journal_path=journal, slug=slug, before_entries=before_entries,
