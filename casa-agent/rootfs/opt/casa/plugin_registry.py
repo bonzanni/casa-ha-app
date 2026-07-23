@@ -284,6 +284,60 @@ def _revalidate(data: RegistryData) -> None:
     data.entries, data.entry_issues, data.valid = entries, issues, valid
 
 
+def apply_owned_swap(*, slug: str, new_entries: "list[dict]",
+                     registry_path: Path = REGISTRY_PATH,
+                     ) -> "tuple[list[dict], RegistryData]":
+    """The spec's "one atomic registry swap" (§3.2b) for a bundle transaction.
+
+    Loads the registry, CAPTURES then REMOVES every entry owned by
+    `specialist:<slug>`, appends `new_entries`, revalidates, and REFUSES
+    (raises `ValueError("owned_swap_invalid: ...")`) if any new entry would
+    land in `entry_issues` (or be dropped by validation) — a swap must never
+    publish a malformed owned entry. On success it saves atomically and
+    returns `(before_entries, data)`; `before_entries` are independent copies
+    suitable for a later rollback restore. One function serves install
+    (before=[]), upgrade (before=old owned set), uninstall (new_entries=[]),
+    and rollback (new_entries=prior owned set)."""
+    import copy
+
+    registry_path = Path(registry_path)
+    data = load_registry(registry_path)
+    raw = data.raw if isinstance(data.raw, dict) else {}
+    plugins = raw.get("plugins")
+    if not isinstance(plugins, list):
+        plugins = []
+    owner = f"specialist:{slug}"
+    before_entries = [copy.deepcopy(e) for e in plugins
+                      if isinstance(e, dict) and entry_owner(e) == owner]
+    kept = [e for e in plugins
+            if not (isinstance(e, dict) and entry_owner(e) == owner)]
+    kept.extend(copy.deepcopy(e) for e in new_entries)
+    raw["plugins"] = kept
+    raw.setdefault("schema_version", SCHEMA_VERSION)
+    raw.setdefault("seeded_defaults", [])
+    data.raw = raw
+    _revalidate(data)
+
+    # Refuse if any new entry is malformed/collided (flagged as an issue) or
+    # was dropped by validation (e.g. a duplicate-name collision drops both).
+    new_names = {e.get("name") for e in new_entries if isinstance(e, dict)}
+    surviving = {e.get("name") for e in data.entries}
+    bad: set[str] = set()
+    for issue in data.entry_issues:
+        if issue.name in new_names:
+            bad.add(f"{issue.name}:{issue.reason_code}")
+    for nm in new_names:
+        if nm not in surviving:
+            bad.add(f"{nm}:dropped")
+    if not data.valid:
+        bad.add("registry_invalid")
+    if bad:
+        raise ValueError(f"owned_swap_invalid: {', '.join(sorted(bad))}")
+
+    save_registry(data, registry_path)
+    return before_entries, data
+
+
 def seed_defaults(data: RegistryData,
                   default_path: Path = DEFAULT_REGISTRY_PATH) -> bool:
     """§3.1 default seeding without resurrection. A default is added ONLY if

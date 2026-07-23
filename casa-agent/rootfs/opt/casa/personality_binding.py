@@ -363,6 +363,80 @@ class InstanceDir:
         error_path.write_text(yaml.safe_dump(payload, sort_keys=False), encoding="utf-8")
         desired_path.unlink()
 
+    # --- Owned-plugins sidecar triple (Task 10, spec §3.4) ------------------
+    # A specialist's owned-plugin set (and its component source receipt) is
+    # persisted alongside the instance tuple as a MAPPING document, one file
+    # per generation, mirroring the active/desired/prior tuple triple so a
+    # bundle transaction (install/upgrade/rollback) and boot reconciliation
+    # can restore the exact owned set + provenance a generation carried. The
+    # sidecar carries what the tuple cannot: which plugins the specialist owns
+    # and where their bytes came from (closes the provenance gap for
+    # plugin-less components too — `plugins: []` with a real component_source).
+    def stage_desired_owned_plugins(self, doc: dict) -> None:
+        write_owned_plugins(owned_plugins_desired_path(self._dir), doc)
+
+    def commit_owned_plugins_desired_to_active(self) -> None:
+        """Rotate the owned-plugins sidecar triple in lockstep with
+        `commit_desired_to_active`'s tuple rotation: desired->active,
+        active->prior. Called inside the SAME MATERIALIZE_LOCK step. A no-op
+        when no desired sidecar was staged (defensive — every bundle commit
+        stages one first)."""
+        desired = owned_plugins_desired_path(self._dir)
+        active = owned_plugins_path(self._dir)
+        prior = owned_plugins_prior_path(self._dir)
+        if not desired.exists():
+            return
+        if active.exists():
+            # Copy-then-replace (mirrors commit_desired_to_active's
+            # _copy_to_temp) so a crash mid-rotation never destroys the prior
+            # rollback target before the new active is in place.
+            prior.write_bytes(active.read_bytes())
+            os.chmod(prior, 0o600)
+        os.replace(desired, active)
+
+
+# --- Owned-plugins sidecar document (Task 10, spec §3.4) --------------------
+# Path helpers for the TRIPLE, mirroring the tuple filenames. Module functions
+# (not just InstanceDir methods) so boot reconciliation / rollback can address
+# a slug dir directly.
+
+def owned_plugins_desired_path(directory: Path) -> Path:
+    return Path(directory) / "owned-plugins.desired.yaml"
+
+
+def owned_plugins_path(directory: Path) -> Path:
+    return Path(directory) / "owned-plugins.yaml"
+
+
+def owned_plugins_prior_path(directory: Path) -> Path:
+    return Path(directory) / "owned-plugins.prior.yaml"
+
+
+def read_owned_plugins(path: Path) -> "dict | None":
+    """Load an owned-plugins sidecar document, or None if absent/malformed.
+    The document shape is
+    `{"schema_version": 1, "component_source": {...}, "plugins": [...]}`."""
+    p = Path(path)
+    if not p.exists():
+        return None
+    try:
+        raw = yaml.safe_load(p.read_text(encoding="utf-8"))
+    except (OSError, yaml.YAMLError):
+        return None
+    return raw if isinstance(raw, dict) else None
+
+
+def write_owned_plugins(path: Path, doc: dict) -> None:
+    """Atomic write of an owned-plugins sidecar document (same os.replace-backed
+    primitive the instance tuples use)."""
+    path = Path(path)
+    path.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
+    payload = yaml.safe_dump(doc, sort_keys=False)
+    temporary = path.with_suffix(path.suffix + ".tmp")
+    temporary.write_text(payload, encoding="utf-8")
+    os.chmod(temporary, 0o600)
+    os.replace(temporary, path)
+
 
 # --- Resident persona defaults + boot-time reconciliation (Task 8) ----------
 
