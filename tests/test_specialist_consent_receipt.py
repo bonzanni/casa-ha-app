@@ -137,3 +137,43 @@ def test_restore_records_empty_list_is_a_noop(tmp_path):
     s = SpecialistInstallAckStore(p)
     s.restore_records([])
     assert not p.exists()
+
+
+# ---------------------------------------------------------------------------
+# Whole-branch N: receipt pruning (consumed delete + boot age sweep)
+# ---------------------------------------------------------------------------
+
+def _mint_receipt(tmp_path):
+    import specialist_receipt
+    r = specialist_receipt.build_receipt(
+        slug="mtg", component_repo="acme/mtg", component_ref="v0.2.0",
+        component_revision="git:" + "a" * 40, component_subdir="",
+        component_staged_path=str(tmp_path / "staged"), plugins=())
+    specialist_receipt.persist(r, receipts_dir=tmp_path)
+    return r
+
+
+def test_delete_prunes_a_consumed_receipt(tmp_path):
+    import specialist_receipt
+    r = _mint_receipt(tmp_path)
+    assert (tmp_path / f"{r.receipt_id}.json").exists()
+    assert specialist_receipt.delete(r.receipt_id, receipts_dir=tmp_path) is True
+    assert not (tmp_path / f"{r.receipt_id}.json").exists()
+    # Idempotent + fail-closed on a non-opaque id.
+    assert specialist_receipt.delete(r.receipt_id, receipts_dir=tmp_path) is False
+    assert specialist_receipt.delete("../etc/passwd", receipts_dir=tmp_path) is False
+
+
+def test_sweep_aged_removes_only_old_receipts(tmp_path):
+    import os
+    import time
+    import specialist_receipt
+    old = _mint_receipt(tmp_path)
+    fresh = _mint_receipt(tmp_path)
+    old_path = tmp_path / f"{old.receipt_id}.json"
+    old_ts = time.time() - 8 * 24 * 3600
+    os.utime(old_path, (old_ts, old_ts))
+    removed = specialist_receipt.sweep_aged(receipts_dir=tmp_path)
+    assert removed == 1
+    assert not old_path.exists()
+    assert (tmp_path / f"{fresh.receipt_id}.json").exists()

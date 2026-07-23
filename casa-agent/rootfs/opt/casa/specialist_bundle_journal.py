@@ -67,12 +67,29 @@ last_boot_reconcile_actions: list[dict] = []
 
 
 def _fsync_write(path: Path, data: str) -> None:
-    fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+    # Whole-branch K: write a temp file + fsync + os.replace (atomic rename) +
+    # dir fsync, NEVER O_TRUNC in place. An in-place truncate-then-write means a
+    # crash mid-`complete()` tears the payload — `reconcile_boot` then fails
+    # strict validation and QUARANTINES a slug whose op had already FINISHED.
+    # os.replace makes the on-disk journal flip atomically between two intact
+    # states, so a crash leaves either the old bytes or the new bytes, never a
+    # torn hybrid.
+    tmp = path.with_name(path.name + f".tmp-{uuid.uuid4().hex}")
     try:
-        os.write(fd, data.encode("utf-8"))
-        os.fsync(fd)
-    finally:
-        os.close(fd)
+        fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+        try:
+            os.write(fd, data.encode("utf-8"))
+            os.fsync(fd)
+        finally:
+            os.close(fd)
+        os.replace(tmp, path)
+    except BaseException:
+        # A crash mid-write leaves NO orphan temp (and never touches `path`).
+        try:
+            os.unlink(tmp)
+        except OSError:
+            pass
+        raise
     dfd = os.open(path.parent, os.O_RDONLY)
     try:
         os.fsync(dfd)
@@ -87,9 +104,17 @@ def _dump(payload: dict) -> str:
 def begin(op: str, slug: str, *, before_entries: list[dict],
           before_tuple_files: dict[str, "str | None"],
           ack_records: list[dict], receipt_digest: str = "",
+          consent_identity: str = "", target_root: str = "",
           ops_dir: Path = OPS_DIR) -> Path:
     """Write `<slug>.<uuid4hex>.json` with the full before-state, fsynced
-    (file AND directory). Returns the journal path."""
+    (file AND directory). Returns the journal path.
+
+    Whole-branch I: the payload also records `consent_identity` (the computed
+    install/upgrade consent identity string) and `target_root` (the target
+    generation's root string, `component_id@version#root_digest`) — provenance
+    a forensic reader (or a future selective boot reconcile) needs to know
+    exactly which approved artifact this op was landing. Additive: both default
+    to "" and `_valid_payload` tolerates their absence on pre-I journals."""
     ops_dir = Path(ops_dir)
     ops_dir.mkdir(parents=True, exist_ok=True)
     path = ops_dir / f"{slug}.{uuid.uuid4().hex}.json"
@@ -104,6 +129,8 @@ def begin(op: str, slug: str, *, before_entries: list[dict],
             "ack_records": ack_records,
         },
         "receipt_digest": receipt_digest,
+        "consent_identity": consent_identity,
+        "target_root": target_root,
         "steps_done": [],
     }
     _fsync_write(path, _dump(payload))
@@ -153,6 +180,14 @@ class BundleTxn:
         # 1. Registry entries: drop anything currently owned by this slug,
         # reinsert the recorded before-entries, save.
         data = plugin_registry.load_registry(self.registry_path)
+        # Whole-branch G: never reconstruct a partial registry on top of an
+        # unreadable/invalid one — that would drop every non-owned entry and
+        # re-save a truncated doc as authoritative. Raise so boot
+        # reconciliation routes to the quarantine path (reconcile_boot's
+        # rollback try/except) instead of saving partial data.
+        if not data.valid:
+            raise ValueError("registry_invalid: refusing to roll back over an "
+                             "unreadable/invalid registry")
         raw = data.raw if isinstance(data.raw, dict) else {}
         plugins = raw.get("plugins")
         if not isinstance(plugins, list):
@@ -189,6 +224,17 @@ def quarantine(slug: str, *,
     Task 11)."""
     registry_path = Path(registry_path)
     data = plugin_registry.load_registry(registry_path)
+    # Whole-branch G: never save a reconstructed partial doc over an
+    # unreadable/invalid registry — that would discard the original bytes (and
+    # any non-owned entries a schema-invalid doc still holds). An invalid
+    # registry already fails closed (resolve returns registry_valid=False, so
+    # NOTHING resolves — the owned entries are already unreachable); persisting
+    # a truncated `{quarantined_bundles: [...]}` would only make it worse.
+    if not data.valid:
+        logger.warning(
+            "quarantine(%s): registry is invalid — skipping save (already "
+            "fails closed)", slug)
+        return
     raw = data.raw if isinstance(data.raw, dict) else {}
     plugins = raw.get("plugins")
     if isinstance(plugins, list):
@@ -211,6 +257,13 @@ def quarantine_all(*,
     owning slug flagged."""
     registry_path = Path(registry_path)
     data = plugin_registry.load_registry(registry_path)
+    # Whole-branch G: same guard as quarantine() — an invalid registry already
+    # fails closed; do not overwrite it with a reconstructed partial doc.
+    if not data.valid:
+        logger.warning(
+            "quarantine_all: registry is invalid — skipping save (already "
+            "fails closed)")
+        return
     raw = data.raw if isinstance(data.raw, dict) else {}
     plugins = raw.get("plugins")
     slugs: set[str] = set()
@@ -268,6 +321,12 @@ def _valid_payload(payload: Any, slug: str) -> bool:
             isinstance(r, dict) for r in ack_records
         ):
             return False
+        # Whole-branch I (additive): when present these provenance fields must
+        # be strings; absent (old journals) is tolerated.
+        for key in ("consent_identity", "target_root"):
+            value = payload.get(key)
+            if value is not None and not isinstance(value, str):
+                return False
         return True
     except Exception:  # noqa: BLE001 — strict validation must never raise
         return False
@@ -277,10 +336,14 @@ def _quarantine_rename(path: Path) -> None:
     os.replace(path, path.with_name(path.name + ".quarantined"))
 
 
+RECEIPTS_DIR = Path("/config/specialists/.receipts")
+
+
 def reconcile_boot(*, ops_dir: Path = OPS_DIR,
                     registry_path: Path = plugin_registry.REGISTRY_PATH,
                     specialists_dir: Path = SPECIALISTS_DIR,
-                    acks_path: Path = ACKS_PATH) -> list[dict]:
+                    acks_path: Path = ACKS_PATH,
+                    receipts_dir: Path = RECEIPTS_DIR) -> list[dict]:
     """Scan EVERY regular file in `ops_dir` (skipping `*.quarantined`) and
     reconcile it per the module docstring. Runs before the plugin snapshot
     loads. Returns `[{slug, action}]` for the health report; also stashed on
@@ -291,6 +354,18 @@ def reconcile_boot(*, ops_dir: Path = OPS_DIR,
     specialists_dir = Path(specialists_dir)
     acks_path = Path(acks_path)
     actions: list[dict] = []
+
+    # Whole-branch N: age-sweep orphan receipt sidecars (an inspect that never
+    # committed) on every boot, independent of any journal work below. Never
+    # raises — a receipts-dir problem must not block boot.
+    try:
+        import specialist_receipt
+        swept = specialist_receipt.sweep_aged(receipts_dir=receipts_dir)
+        if swept:
+            actions.append({"slug": None, "action": "swept_receipts",
+                            "count": swept})
+    except Exception:  # noqa: BLE001 — degrade-and-boot
+        logger.exception("receipt age-sweep failed")
 
     if not ops_dir.is_dir():
         last_boot_reconcile_actions = actions

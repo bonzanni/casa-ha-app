@@ -81,6 +81,95 @@ def test_complete_writes_complete_state_then_unlinks(tmp_path):
     assert not path.exists()
 
 
+def test_begin_records_consent_identity_and_target_root(tmp_path):
+    # Whole-branch I: the payload records the consent identity + target root.
+    ops_dir = tmp_path / "ops"
+    path = journal.begin(
+        "install", "mtg", before_entries=[], before_tuple_files={},
+        ack_records=[], consent_identity="ident-abc",
+        target_root="casa/mtg@0.2.0#sha256:deadbeef", ops_dir=ops_dir)
+    payload = json.loads(path.read_text(encoding="utf-8"))
+    assert payload["consent_identity"] == "ident-abc"
+    assert payload["target_root"] == "casa/mtg@0.2.0#sha256:deadbeef"
+    assert journal._valid_payload(payload, "mtg") is True
+
+
+def test_valid_payload_tolerates_absent_provenance_but_rejects_nonstring(tmp_path):
+    # Whole-branch I additive: absent (old journal) tolerated; non-string bad.
+    base = {"schema_version": 1, "op": "install", "slug": "mtg",
+            "state": "in-progress",
+            "before": {"registry_entries": [], "tuple_files": {}, "ack_records": []}}
+    assert journal._valid_payload(base, "mtg") is True          # no provenance keys
+    assert journal._valid_payload({**base, "consent_identity": 5}, "mtg") is False
+    assert journal._valid_payload({**base, "target_root": []}, "mtg") is False
+
+
+def test_fsync_write_is_atomic_on_a_torn_write(tmp_path, monkeypatch):
+    # Whole-branch K: a crash mid-write must leave the ORIGINAL bytes intact,
+    # never a torn hybrid that reconcile_boot would quarantine.
+    ops_dir = tmp_path / "ops"
+    path = journal.begin("install", "mtg", before_entries=[], before_tuple_files={},
+                         ack_records=[], ops_dir=ops_dir)
+    original = path.read_text(encoding="utf-8")
+
+    real_write = journal.os.write
+
+    def _boom(fd, data):
+        real_write(fd, data[: len(data) // 2])   # partial write
+        raise OSError("simulated crash mid-write")
+
+    monkeypatch.setattr(journal.os, "write", _boom)
+    with pytest.raises(OSError):
+        journal.mark_step(path, "cas_published")
+    monkeypatch.undo()
+    # The journal on disk is still the intact pre-crash payload — os.replace
+    # never swapped in the torn temp file.
+    assert path.read_text(encoding="utf-8") == original
+    assert json.loads(path.read_text(encoding="utf-8"))["state"] == "in-progress"
+    # No orphaned temp file was left in ops_dir.
+    assert [p.name for p in ops_dir.iterdir()] == [path.name]
+
+
+def test_rollback_over_invalid_registry_quarantines(tmp_path):
+    # Whole-branch G: an in-progress journal whose registry is unreadable must
+    # route to the quarantine path, never save a partial reconstructed doc.
+    ops_dir = tmp_path / "ops"
+    reg = tmp_path / "registry.json"
+    reg.write_text("{ not valid json")
+    entries = [owned_entry()]
+    journal.begin("install", "mtg", before_entries=entries, before_tuple_files={},
+                  ack_records=[], ops_dir=ops_dir)
+    actions = journal.reconcile_boot(
+        ops_dir=ops_dir, registry_path=reg,
+        specialists_dir=tmp_path / "specialists", acks_path=tmp_path / "acks.json")
+    assert actions == [{"slug": "mtg", "action": "quarantine"}]
+    # The unreadable registry was NOT overwritten with partial data.
+    assert reg.read_text() == "{ not valid json"
+
+
+def test_reconcile_boot_sweeps_aged_receipts(tmp_path):
+    # Whole-branch N: boot age-sweeps orphan receipt sidecars.
+    import os
+    import time
+    receipts = tmp_path / "receipts"
+    receipts.mkdir()
+    old = receipts / ("a" * 32 + ".json")
+    old.write_text("{}")
+    fresh = receipts / ("b" * 32 + ".json")
+    fresh.write_text("{}")
+    old_ts = time.time() - 8 * 24 * 3600           # 8 days old
+    os.utime(old, (old_ts, old_ts))
+    ops_dir = tmp_path / "ops"
+    ops_dir.mkdir()
+    actions = journal.reconcile_boot(
+        ops_dir=ops_dir, registry_path=tmp_path / "registry.json",
+        specialists_dir=tmp_path / "specialists", acks_path=tmp_path / "acks.json",
+        receipts_dir=receipts)
+    assert not old.exists()          # aged sidecar swept
+    assert fresh.exists()            # fresh sidecar kept
+    assert {"slug": None, "action": "swept_receipts", "count": 1} in actions
+
+
 # --------------------------------------------------------------------------
 # reconcile_boot: no-op cases
 # --------------------------------------------------------------------------

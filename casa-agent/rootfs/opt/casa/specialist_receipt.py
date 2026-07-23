@@ -190,6 +190,46 @@ def persist(receipt: SourceReceipt, receipts_dir: Path = DEFAULT_RECEIPTS_DIR) -
     atomic_write_text(path, json.dumps(_to_json(receipt), indent=2, sort_keys=True) + "\n", mode=0o600)
 
 
+def delete(receipt_id: str, receipts_dir: Path = DEFAULT_RECEIPTS_DIR) -> bool:
+    """Whole-branch N: prune a CONSUMED receipt sidecar (the commit/upgrade tool
+    calls this after its journal completes). Fails closed on a non-opaque id
+    (never joins an unvalidated id into a path). Returns True if a file was
+    removed."""
+    if not _is_opaque_receipt_id(receipt_id):
+        return False
+    path = Path(receipts_dir) / f"{receipt_id}.json"
+    try:
+        path.unlink()
+        return True
+    except OSError:
+        return False
+
+
+def sweep_aged(*, receipts_dir: Path = DEFAULT_RECEIPTS_DIR,
+               max_age_s: float = 7 * 24 * 3600, now: "float | None" = None) -> int:
+    """Whole-branch N: boot-time age sweep — delete receipt sidecars older than
+    `max_age_s` (default 7 days). An inspect that never reached commit (operator
+    denied, or the flow was abandoned) leaves an orphan receipt behind; without
+    this they accumulate unbounded. Never raises; returns the count removed."""
+    import time as _time
+
+    receipts_dir = Path(receipts_dir)
+    if not receipts_dir.is_dir():
+        return 0
+    cutoff = (now if now is not None else _time.time()) - max_age_s
+    removed = 0
+    for path in receipts_dir.iterdir():
+        if not path.is_file() or path.suffix != ".json":
+            continue
+        try:
+            if path.stat().st_mtime < cutoff:
+                path.unlink()
+                removed += 1
+        except OSError:
+            continue
+    return removed
+
+
 def load(receipt_id: str, receipts_dir: Path = DEFAULT_RECEIPTS_DIR) -> "SourceReceipt | None":
     """Opaque-id lookup — never accepts caller-supplied coordinates. Fails
     closed (returns ``None``) on a missing/malformed/tampered sidecar or a

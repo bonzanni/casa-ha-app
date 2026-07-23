@@ -117,6 +117,56 @@ def test_resolved_plugin_carries_manifest_name(tmp_path, monkeypatch):
     assert res.plugins[0].manifest_name == "mtg"
 
 
+def test_owned_name_73_bytes_rejected():
+    # Whole-branch H: OWNED_NAME_RE structurally admits 32 + 1 + 40 = 73 bytes,
+    # one past the 72-byte scoped-name invariant. The byte bound must reject it.
+    slug = "s" * 32
+    mname = "m" * 40
+    name = f"{slug}.{mname}"                       # 73 bytes
+    assert len(name.encode()) == 73
+    e = _entry(name=name, owner=f"specialist:{slug}", manifest_name=mname,
+               targets=[f"specialist:{slug}"])
+    e["artifact_id"] = compute_artifact_id(
+        repo="bonzanni/casa-mtg-specialist", revision=REV,
+        subdir="plugins/mtg", name=name)
+    assert _entry_error(e) == "owned_invariant"
+    # 72-byte name (39-char manifest) still valid.
+    ok_name = f"{slug}.{'m' * 39}"
+    assert len(ok_name.encode()) == 72
+    ok = _entry(name=ok_name, owner=f"specialist:{slug}", manifest_name="m" * 39,
+                targets=[f"specialist:{slug}"])
+    ok["artifact_id"] = compute_artifact_id(
+        repo="bonzanni/casa-mtg-specialist", revision=REV,
+        subdir="plugins/mtg", name=ok_name)
+    assert _entry_error(ok) is None
+
+
+def test_apply_owned_swap_refuses_invalid_registry(tmp_path):
+    # Whole-branch G: an unreadable/invalid registry must fail the swap closed —
+    # never reconstruct a partial doc that drops pre-existing entries.
+    import pytest
+    reg = tmp_path / "registry.json"
+    reg.write_text("{ this is not json")
+    with pytest.raises(ValueError, match="registry_invalid"):
+        plugin_registry.apply_owned_swap(
+            slug="mtg", new_entries=[_entry()], registry_path=reg)
+    # The bad file is left untouched (nothing saved over it).
+    assert reg.read_text() == "{ this is not json"
+
+
+def test_apply_owned_swap_clears_quarantine_flag(tmp_path):
+    # Whole-branch L: a successful owned swap for a slug clears its stale
+    # quarantined_bundles flag.
+    reg = tmp_path / "registry.json"
+    doc = _doc([])
+    doc["quarantined_bundles"] = ["mtg", "finance"]
+    reg.write_text(json.dumps(doc))
+    plugin_registry.apply_owned_swap(
+        slug="mtg", new_entries=[_entry()], registry_path=reg)
+    saved = json.loads(reg.read_text())
+    assert saved["quarantined_bundles"] == ["finance"]   # mtg cleared, finance kept
+
+
 def test_resolved_plugin_constructor_regression():
     # A call site with nothing to thread (test fixtures; an unowned entry)
     # constructs ResolvedPlugin WITHOUT manifest_name — the field must

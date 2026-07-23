@@ -122,6 +122,13 @@ def _entry_error(entry: object) -> str | None:
         # present and == suffix.
         if not isinstance(name, str) or not OWNED_NAME_RE.match(name):
             return "owned_invariant"
+        # Whole-branch H: OWNED_NAME_RE structurally admits 32+1+40 = 73 bytes,
+        # one past the 72-byte scoped-name invariant (specialist_component's
+        # MAX_SCOPED_NAME_BYTES). Enforce the byte bound here too — the
+        # registry-load invariant must reject a 73-byte owned name that the
+        # regex alone would wave through.
+        if len(name.encode()) > 72:
+            return "owned_invariant"
         if not isinstance(owner, str) or not OWNER_RE.match(owner):
             return "owned_invariant"
         slug_part, _, mname_part = name.partition(".")
@@ -302,6 +309,14 @@ def apply_owned_swap(*, slug: str, new_entries: "list[dict]",
 
     registry_path = Path(registry_path)
     data = load_registry(registry_path)
+    # Whole-branch G: refuse to mutate over an unreadable/invalid registry.
+    # load_registry returns valid=False for an unparseable file (raw={}) OR a
+    # structurally-invalid document. Reconstructing owned entries on top of
+    # that would DROP every pre-existing (operator-owned) entry and re-save a
+    # partial registry as if it were authoritative — the swap must fail closed
+    # with a typed error and touch nothing instead.
+    if not data.valid:
+        raise ValueError("owned_swap_invalid: registry_invalid")
     raw = data.raw if isinstance(data.raw, dict) else {}
     plugins = raw.get("plugins")
     if not isinstance(plugins, list):
@@ -313,6 +328,13 @@ def apply_owned_swap(*, slug: str, new_entries: "list[dict]",
             if not (isinstance(e, dict) and entry_owner(e) == owner)]
     kept.extend(copy.deepcopy(e) for e in new_entries)
     raw["plugins"] = kept
+    # Whole-branch L: a successful owned swap for a slug clears any prior
+    # quarantine flag — the operator has just re-established a valid owned set
+    # (install/upgrade/rollback) or removed it (uninstall), so the stale
+    # `quarantined_bundles` entry must not linger in the health report.
+    qlist = raw.get("quarantined_bundles")
+    if isinstance(qlist, list) and slug in qlist:
+        raw["quarantined_bundles"] = [s for s in qlist if s != slug]
     raw.setdefault("schema_version", SCHEMA_VERSION)
     raw.setdefault("seeded_defaults", [])
     data.raw = raw
