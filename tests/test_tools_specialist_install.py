@@ -315,7 +315,7 @@ import asyncio
 from types import SimpleNamespace
 
 
-def _fake_inspection(tmp_path):
+def _fake_inspection(tmp_path, *, plugin_resolutions=()):
     return SimpleNamespace(
         component_id="casa.spec.mtg", version="1.0.0", slug="mtg",
         component_checksum="sha256:" + "a" * 64,
@@ -325,10 +325,16 @@ def _fake_inspection(tmp_path):
         default_persona_checksum="sha256:" + "c" * 64,
         required_config_names=(), required_secret_names=(),
         dependencies=(), staged_dir=tmp_path / "staged",
+        # Fix round 1 (task-12): a real inspect_specialist_repo call ALWAYS
+        # populates these (specialist_install.py InspectionResult) — every
+        # fake here mirrors that so the ok_payload's receipt_id/
+        # receipt_digest/plugins wiring is exercised the same as production.
+        receipt_id="d" * 32, receipt_digest="",
+        plugin_resolutions=plugin_resolutions,
     )
 
 
-def _wire_inspect(monkeypatch, tmp_path, *, channel=None):
+def _wire_inspect(monkeypatch, tmp_path, *, channel=None, plugin_resolutions=()):
     """Patch the network/disk seams: inspect returns a fake staged result,
     the ack store lives under tmp_path (never /data), and _channel_manager
     serves ``channel`` (None = no telegram channel configured)."""
@@ -337,7 +343,7 @@ def _wire_inspect(monkeypatch, tmp_path, *, channel=None):
     from specialist_install_consent import SpecialistInstallAckStore
     import tools as tools_mod
 
-    fake = _fake_inspection(tmp_path)
+    fake = _fake_inspection(tmp_path, plugin_resolutions=plugin_resolutions)
     monkeypatch.setattr(
         specialist_install, "inspect_specialist_repo", lambda *a, **k: fake)
     tmp_acks = tmp_path / "acks.json"
@@ -411,6 +417,139 @@ async def test_inspect_with_preacked_ledger_skips_keyboard(
     assert payload["ok"] is True
     assert payload["consent"] == "pre_authorized"
     assert payload["root_digest"] == fake.root_digest
+
+
+@pytest.mark.asyncio
+async def test_inspect_ok_payload_surfaces_receipt_and_plugins(monkeypatch, tmp_path) -> None:
+    """Fix round 1 (task-12): specialist_install_commit/specialist_upgrade
+    REQUIRE args["receipt_id"] (their MCP schemas mark it "required") — an
+    ok_payload missing it would dead-end every real install/upgrade at
+    receipt_required. Also asserts the "plugins" tool-payload mirror of what
+    the consent DM already enumerates (render_install_consent_message)."""
+    from specialist_receipt import PluginReceiptRow
+    from specialist_install_consent import install_consent_identity
+    from tools import specialist_install_inspect
+
+    row = PluginReceiptRow(
+        identifier="mtg-corpus", scoped_name="mtg__mtg-corpus", manifest_name="mtg-corpus",
+        version="1.0.0", source_type="plugin", repo="owner/mtg-corpus", ref="main",
+        revision="d" * 40, subdir="", content_digest="sha256:" + "e" * 64,
+        staged_path=str(tmp_path / "staged" / ".dep-plugins" / "mtg-corpus"),
+        mcp_servers=("corpus: python server.py",), protected_tools=("corpus_search",),
+        env_names=("MTG_CORPUS_TOKEN",),
+    )
+    fake, tmp_store_cls = _wire_inspect(
+        monkeypatch, tmp_path, channel=None, plugin_resolutions=(row,))
+    identity = install_consent_identity(
+        component_id=fake.component_id, version=fake.version,
+        root_digest=fake.root_digest, slug=fake.slug)
+    tmp_store_cls().record(
+        identity=identity, component_id=fake.component_id, version=fake.version,
+        component_checksum=fake.root_digest, slug=fake.slug)
+
+    payload = _payload(await specialist_install_inspect.handler(
+        {"repo": "owner/repo", "ref": "main"}))
+
+    assert payload["ok"] is True
+    assert payload["receipt_id"] == fake.receipt_id
+    assert payload["receipt_id"]  # non-empty
+    assert payload["receipt_digest"] == fake.receipt_digest
+    assert payload["plugins"] == [{
+        "scoped_name": "mtg__mtg-corpus", "manifest_name": "mtg-corpus", "version": "1.0.0",
+        "mcp_servers": ["corpus: python server.py"], "protected_tools": ["corpus_search"],
+        "env_names": ["MTG_CORPUS_TOKEN"],
+    }]
+
+
+@pytest.mark.asyncio
+async def test_inspect_receipt_id_round_trips_into_commit(monkeypatch, tmp_path) -> None:
+    """Round trip (fix round 1, task-12): the receipt_id
+    specialist_install_inspect's ok_payload carries, fed back verbatim as
+    args["receipt_id"] into specialist_install_commit, is the id
+    specialist_receipt.load is actually called with — proving the one-flow
+    install the configurator recipe drives (inspect -> commit) is wired end
+    to end rather than dead-ending at receipt_required."""
+    from test_specialist_install import _write_component
+    from specialist_component import load_specialist_component
+    from specialist_install import compute_install_root_digest, resolve_dependency_closure
+    import specialist_install
+    import specialist_install_consent
+    import specialist_receipt
+    import tools as tools_mod
+    from specialist_install_consent import (
+        SpecialistInstallAckStore, install_consent_identity,
+    )
+    from tools import specialist_install_commit, specialist_install_inspect
+
+    staged = _write_component(tmp_path / "staged", slug="mtg")
+    component = load_specialist_component(staged, staged / "manifest.json")
+    deps = resolve_dependency_closure(component, staged)
+    root_digest = compute_install_root_digest(
+        component, deps, manifest_bytes=(staged / "manifest.json").read_bytes())
+
+    real_receipt_id = "9" * 32
+    fake_inspection = SimpleNamespace(
+        component_id=component.component_id, version=component.version, slug=component.slug,
+        component_checksum=component.checksum, root_digest=root_digest,
+        mission="Answer test questions.", default_persona_ref=component.default_persona_ref,
+        default_persona_checksum=component.default_persona_checksum,
+        required_config_names=(), required_secret_names=(), dependencies=deps,
+        staged_dir=staged, receipt_id=real_receipt_id, receipt_digest="",
+        plugin_resolutions=(),
+    )
+    monkeypatch.setattr(
+        specialist_install, "inspect_specialist_repo", lambda *a, **k: fake_inspection)
+    tmp_acks = tmp_path / "acks.json"
+
+    class _TmpAckStore(SpecialistInstallAckStore):
+        def __init__(self, path=None):  # noqa: ARG002 — tool calls with no args
+            super().__init__(path=tmp_acks)
+
+    monkeypatch.setattr(
+        specialist_install_consent, "SpecialistInstallAckStore", _TmpAckStore)
+    monkeypatch.setattr(
+        tools_mod, "_channel_manager", SimpleNamespace(get=lambda name: None))
+    identity = install_consent_identity(
+        component_id=component.component_id, version=component.version,
+        root_digest=root_digest, slug=component.slug)
+    _TmpAckStore().record(
+        identity=identity, component_id=component.component_id, version=component.version,
+        component_checksum=root_digest, slug=component.slug)
+
+    inspect_payload = _payload(await specialist_install_inspect.handler(
+        {"repo": "owner/repo", "ref": "main"}))
+    assert inspect_payload["ok"] is True
+    assert inspect_payload["receipt_id"] == real_receipt_id
+
+    load_calls: list[str] = []
+
+    def _load(rid, *a, **k):
+        load_calls.append(rid)
+        return SimpleNamespace(receipt_id=rid, receipt_digest="", plugins=())
+
+    monkeypatch.setattr(specialist_receipt, "load", _load)
+
+    instance = SimpleNamespace(slug="mtg", state="active")
+    txn = SimpleNamespace(
+        slug="mtg", removed_artifact_ids=(), new_artifact_ids=("AID1",),
+        journal_path=str(tmp_path / "journal.json"))
+    monkeypatch.setattr(
+        specialist_install, "commit_specialist_install", lambda *a, **k: (instance, txn))
+    _stub_bundle_sequencer(monkeypatch)
+
+    commit_payload = _payload(await specialist_install_commit.handler({
+        "component_id": inspect_payload["component_id"], "version": inspect_payload["version"],
+        "slug": inspect_payload["slug"], "staged_dir": inspect_payload["staged_dir"],
+        "root_digest": inspect_payload["root_digest"],
+        "receipt_id": inspect_payload["receipt_id"],
+    }))
+
+    # The receipt loaded is the EXACT id the inspect payload carried — the
+    # round trip works — and the commit reaches success, never dead-ending
+    # at receipt_required.
+    assert load_calls == [real_receipt_id]
+    assert commit_payload["ok"] is True
+    assert commit_payload["slug"] == "mtg"
 
 
 @pytest.mark.asyncio

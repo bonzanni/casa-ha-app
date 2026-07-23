@@ -6993,6 +6993,23 @@ async def specialist_install_inspect(args: dict) -> dict:
         "dependencies": [{"kind": d.kind, "identifier": d.identifier, "available": d.available}
                           for d in result.dependencies],
         "staged_dir": str(result.staged_dir),
+        # Fix round 1 (task-12): specialist_install_commit/specialist_upgrade
+        # REQUIRE args["receipt_id"] (see their "required" schemas below) —
+        # without it in this payload every real install/upgrade dead-ends at
+        # receipt_required. receipt_digest is included too since it is part
+        # of the consent identity binding (install_consent_identity above).
+        "receipt_id": result.receipt_id, "receipt_digest": result.receipt_digest,
+        # Tool-payload mirror of the plugin blocks the consent DM already
+        # enumerates (render_install_consent_message,
+        # specialist_install_consent.py) — lets the calling LLM narrate what
+        # the consent covers without re-deriving it from prose.
+        "plugins": [
+            {"scoped_name": row.scoped_name, "manifest_name": row.manifest_name,
+             "version": row.version, "mcp_servers": list(row.mcp_servers),
+             "protected_tools": list(row.protected_tools),
+             "env_names": list(row.env_names)}
+            for row in result.plugin_resolutions
+        ],
     }
 
     acks = SpecialistInstallAckStore()
