@@ -904,7 +904,14 @@ def _resolution_from_recorded(plugin_artifacts) -> "plugin_registry.ResolutionRe
             continue
         plugins.append(ResolvedPlugin(
             name=pa.get("name", ""), artifact_id=pa.get("artifact_id", ""),
-            path=path, version=str(manifest.get("version", "")), manifest=manifest))
+            path=path, version=str(manifest.get("version", "")), manifest=manifest,
+            # Task 5: thread the recorded manifest_name (added to the
+            # serialized shape below) so a RESUMED session reproduces the
+            # exact same runtime identity (grant/namespace strings) the
+            # original launch used. `.get("manifest_name", "")` tolerates
+            # engagements recorded before this field existed — those fall
+            # back to the registry name via runtime_name(), same as before.
+            manifest_name=pa.get("manifest_name", "") if isinstance(pa, dict) else ""))
     return ResolutionResult(registry_valid=True, plugins=plugins, issues=issues)
 
 
@@ -1810,6 +1817,17 @@ def _delegation_scope(origin: dict, agent_name: str) -> str:
     return f"{chat_id}:{agent_name}"
 
 
+def _missing_required_plugins(required: list[str], plugins) -> list[str]:
+    """A5 requires.plugins gate (spec §2.1, Task 5): the entries of
+    `required` NOT present among `plugins`' RUNTIME identities
+    (`plugin_registry.runtime_name` — an owned artifact's `manifest_name`,
+    else its registry name). A `requires.plugins: ["mtg"]` declaration is
+    satisfied by an owned `mtg.mtg` registry entry (runtime name "mtg"),
+    never by matching the scoped registry name directly."""
+    names = {plugin_registry.runtime_name(rp) for rp in plugins}
+    return [p for p in required if p not in names]
+
+
 async def _prelaunch(
     agent_name: str, origin: dict, mode: str,
     task_text: str = "", context_text: str = "",
@@ -2003,10 +2021,10 @@ async def _prelaunch(
                 if _agent_registry is not None else None) or "specialist"
         resolution = await asyncio.to_thread(
             plugin_registry.resolve_for, f"{tier}:{agent_name}")
-        names = {rp.name for rp in resolution.plugins}
         declared = declared_tools_for_resolution(resolution)
         servers = set(grants_for_resolution(resolution))  # server actually attached
-        missing_plugins = [p for p in req.plugins if p not in names]
+        missing_plugins = _missing_required_plugins(
+            req.plugins, resolution.plugins)
         missing_tools = [
             t for t in req.tools
             if t not in declared or t.rsplit("__", 1)[0] not in servers
@@ -2887,7 +2905,10 @@ async def delegate_to_agent(args: dict) -> dict:
                               if _agent_registry is not None else None) or "specialist"
                 _spec_res = plugin_registry.resolve_for(f"{_spec_tier}:{agent_name}")
             _spec_arts = tuple(
-                {"name": rp.name, "artifact_id": rp.artifact_id, "path": rp.path}
+                {"name": rp.name, "artifact_id": rp.artifact_id, "path": rp.path,
+                 # Task 5: recorded so a resumed session reproduces the same
+                 # runtime identity via _resolution_from_recorded (above).
+                 "manifest_name": rp.manifest_name}
                 for rp in _spec_res.plugins)
             # Create record
             rec = await _engagement_registry.create(
@@ -3986,9 +4007,20 @@ async def casa_reload(args: dict) -> dict:
         })
 
     from reload import dispatch
-    result = await dispatch(
-        scope, runtime=runtime, role=role, include_env=include_env,
-    )
+    # Task 10 manual-reload fencing (spec §3.1, ENTRY-POINT-ONLY): a FULL reload
+    # reloads the plugin snapshot, so it must serialize against an in-flight
+    # bundle transaction. Acquire _PLUGIN_TOOLS_LOCK BEFORE dispatch("full")
+    # (never inside reload.py — that would AB/BA-deadlock against reload's own
+    # global writer/reader lock, which the bundle op's dispatch("agent") already
+    # takes on the reader side while holding _PLUGIN_TOOLS_LOCK). Global lock
+    # order everywhere: _PLUGIN_TOOLS_LOCK -> reload writer/reader lock.
+    if scope == "full":
+        async with _PLUGIN_TOOLS_LOCK:
+            result = await dispatch(
+                scope, runtime=runtime, role=role, include_env=include_env)
+    else:
+        result = await dispatch(
+            scope, runtime=runtime, role=role, include_env=include_env)
 
     # Drain pending-reload guard if engagement-bound.
     eng = engagement_var.get(None)
@@ -4277,7 +4309,10 @@ async def engage_executor(args: dict) -> dict:
                             f"{not_ready} (see /data/plugin-health.json)"),
             })
         arts = tuple(
-            {"name": rp.name, "artifact_id": rp.artifact_id, "path": rp.path}
+            {"name": rp.name, "artifact_id": rp.artifact_id, "path": rp.path,
+             # Task 5: recorded so a resumed session reproduces the same
+             # runtime identity via _resolution_from_recorded (above).
+             "manifest_name": rp.manifest_name}
             for rp in res.plugins)
         return res, arts, None
 
@@ -6493,6 +6528,213 @@ async def _reload_and_verify_targets(name: str, targets: list,
     return result
 
 
+def _bundle_binding_blocked(v: dict) -> bool:
+    """P1-3: True iff a `_tool_verify_plugin_state` result shows a genuine
+    integrity/binding failure that must roll a bundle commit back — as opposed
+    to mere config-pending readiness (unresolved secrets / missing sysreq
+    bins), which is a verified-legal terminal state (spec §3.2) and must NOT
+    trigger compensation.
+
+    verify's top-level `reasons` list carries ONLY integrity/binding codes
+    (registry_invalid / not_registered / entry-issue reason codes /
+    artifact_missing / artifact_invalid / corrupt_artifact / mcp_invalid /
+    mcp_command_missing / mcp_reserved_env) — never secrets/tools readiness,
+    which surface separately as the generic 'not_ready' row fallback. So a
+    non-empty top-level `reasons` is always blocking; a per-target row blocks
+    only on a code OTHER than 'not_ready' (reload_required / verify_unstable /
+    authorization_missing)."""
+    if v.get("reasons"):
+        return True
+    for row in v.get("targets") or []:
+        if any(code != "not_ready" for code in (row.get("reasons") or [])):
+            return True
+    return False
+
+
+async def _bundle_reload_and_verify(
+    slug: str, *, removed_artifact_ids: list, targets_removed: list) -> dict:
+    """Task 10 bundle sequencer (spec §3.2d) — the post-mutation half of a
+    specialist-bundle transaction, run by the tool layer while holding
+    `_PLUGIN_TOOLS_LOCK` (the sync lifecycle function already committed the
+    registry swap + tuple/sidecar and returned its BundleTxn). Bundle-shaped
+    (many owned plugins, one specialist role), mirroring
+    `_reload_and_verify_targets` but for the whole owned set:
+
+      1. grant/challenge invalidation FIRST — per removed/replaced artifact id
+         (the SAME `_invalidate_lifecycle` call plugin_update/plugin_remove use)
+         AND the specialist role + any removed targets, BEFORE the first reload;
+      2. ONE plugin-snapshot reload;
+      3. ONE specialist-agent reload (only when the slug is installed — skipped
+         for an uninstall or a still-pending specialist target);
+      4. desired==active verify for every owned entry the slug now has;
+      5. ONE health regeneration + notify.
+    """
+    import agent as agent_mod
+    import reload as reload_mod
+
+    # 1. invalidation FIRST (before any reload await).
+    for aid in removed_artifact_ids:
+        _invalidate_lifecycle(artifact_id=aid)
+    _invalidate_lifecycle(roles=[f"specialist:{slug}", *targets_removed])
+
+    # 2. ONE snapshot reload.
+    await asyncio.to_thread(plugin_registry.reload_snapshot)
+
+    # 3. agents-level reconstruction / eviction.
+    runtime = getattr(agent_mod, "active_runtime", None)
+    reloaded: list = []
+    reload_errors: list = []
+    uninstalling = bool(targets_removed)
+    if runtime is not None:
+        if uninstalling:
+            # Whole-branch C: the removed specialist's live agent + bus
+            # registration must be EVICTED. A single-role dispatch("agent")
+            # would raise unknown_role for a just-deleted slug and skip
+            # eviction entirely (the old code did exactly that — it only
+            # reloaded on the non-uninstall branch). Run the full agents
+            # add/evict sweep (reload_agents) instead — it pops the removed
+            # specialist from runtime.agents and deregisters its bus consumer
+            # (evicted_specialist_<role>).
+            res = await reload_mod.dispatch("agents", runtime=runtime)
+            if res.get("status") == "ok":
+                reloaded.append(f"evicted:specialist:{slug}")
+            else:
+                reload_errors.append({"target": f"specialist:{slug}", **res})
+        elif not _specialist_target_pending(runtime, slug):
+            res = await reload_mod.dispatch("agent", runtime=runtime, role=slug)
+            if res.get("status") == "ok":
+                reloaded.append(f"specialist:{slug}")
+            else:
+                reload_errors.append({"target": f"specialist:{slug}", **res})
+
+    # 4. desired==active verify for every owned entry the slug now carries.
+    reg = plugin_registry.load_registry()
+    verify: dict = {}
+    not_ready: list = []
+    for entry in plugin_registry.owned_entries_for(slug, reg):
+        name = entry.get("name")
+        v = await asyncio.to_thread(_tool_verify_plugin_state, plugin_name=name)
+        verify[name] = v
+        # Whole-branch B: a not-ready owned binding (desired != active) is a
+        # sequencer FAILURE, not a silent success. P1-3: gate ONLY on
+        # integrity/binding failures (artifact/mcp/registry-entry reasons +
+        # reload_required/verify_unstable), NOT operator-config readiness.
+        # verify's top-level `ready` folds in unresolved secrets and missing
+        # sysreq bins, but a config-pending specialist is a verified-legal
+        # terminal state (spec §3.2): its owned entries activate at commit and
+        # are inert until configured. Rolling such an install back would be a
+        # spurious compensation. `_bundle_binding_blocked` inspects the reason
+        # codes so an env-declaring bundled plugin awaiting its secret passes.
+        if _bundle_binding_blocked(v):
+            not_ready.append(name)
+
+    # Whole-branch B/C (uninstall): every removed scoped name must be ABSENT
+    # from the specialist's resolution and the specialist agent must be gone.
+    absent_violations: list = []
+    if uninstalling:
+        resolved_names = await asyncio.to_thread(
+            lambda: {rp.name for rp in
+                     plugin_registry.resolve_for(f"specialist:{slug}").plugins})
+        absent_violations = sorted(
+            n for n in resolved_names if n.startswith(f"{slug}."))
+        if runtime is not None and slug in (getattr(runtime, "agents", {}) or {}):
+            absent_violations.append(f"agent:{slug}")
+
+    # 5. ONE health regeneration + notify.
+    await asyncio.to_thread(_regenerate_plugin_health, [])
+    await _notify_plugin_health_if_possible()
+
+    ok = not reload_errors and not not_ready and not absent_violations
+    return {
+        "ok": ok,
+        "kind": (None if ok else "reload_failed" if reload_errors
+                 else "postcondition_failed"),
+        "reloaded": reloaded, "reload_errors": reload_errors,
+        "not_ready": not_ready, "absent_violations": absent_violations,
+        "verify": verify, "removed_artifact_ids": list(removed_artifact_ids),
+    }
+
+
+async def _bundle_compensate(txn) -> bool:
+    """Whole-branch B: shared compensation for a FAILED bundle sequencer — roll
+    the disk state back, run a best-effort compensating sequencer over the
+    restored state (un-publishing the runtime state with the new set's artifact
+    ids), then complete the journal. Never raises out. Returns True when the
+    disk rollback succeeded (journal completed), False when it raised (journal
+    left in-progress for boot reconciliation; the caller surfaces
+    `compensation_failed`).
+
+    P1-1: complete the journal ONLY after a SUCCESSFUL disk rollback. A
+    rollback that raises (e.g. an unreadable registry — `rollback_disk` fails
+    closed rather than persist a partial doc) must leave the in-progress
+    journal on disk so boot reconciliation re-runs the rollback or quarantines
+    the slug; completing it here would strand a half-rolled-back mutation with
+    no recovery.
+
+    P1-2: derive the compensating-sequencer direction from the RESTORED
+    before-state, not the forward op. When the before-state has no installed
+    specialist (its `active.yaml` was absent — e.g. a failed FRESH install),
+    the just-created live agent must be EVICTED and verified absent
+    (uninstall-shaped sweep); otherwise the prior generation's agent is
+    reconstructed (install-shaped). Reusing the forward install-shaped call
+    left a fresh-install rollback's live agent reachable."""
+    import specialist_bundle_journal
+    try:
+        await asyncio.to_thread(txn.rollback_disk)
+    except Exception:  # noqa: BLE001 — leave the journal for boot reconcile
+        logger.warning(
+            "bundle disk rollback failed for %s; leaving the in-progress "
+            "journal for boot reconciliation", txn.slug, exc_info=True)
+        return False
+    # Direction from the restored before-state: an absent prior active.yaml
+    # means the specialist should NOT exist after compensation → evict + verify
+    # absent; a present one means a prior generation is being restored →
+    # reconstruct.
+    before_tuple_files = getattr(txn, "before_tuple_files", None) or {}
+    installed_before = before_tuple_files.get("active.yaml") is not None
+    comp_targets = [] if installed_before else [f"specialist:{txn.slug}"]
+    try:
+        await _bundle_reload_and_verify(
+            txn.slug, removed_artifact_ids=list(txn.new_artifact_ids),
+            targets_removed=comp_targets)
+    except Exception:  # noqa: BLE001 — best-effort; boot is the backstop
+        logger.warning("bundle compensating sequencer failed for %s", txn.slug,
+                       exc_info=True)
+    await asyncio.to_thread(specialist_bundle_journal.complete, txn.journal_path)
+    return True
+
+
+async def _bundle_seq_failure(txn, seq: dict, *, slug: str) -> dict:
+    """Whole-branch B: a sequencer that returned ok:false — compensate and
+    build the ok:false envelope. P1-1: when the disk rollback could not
+    complete (`_bundle_compensate` returns False, journal left in-progress for
+    boot reconciliation), tag the envelope `compensation_failed` so the caller
+    surfaces that the runtime state may be inconsistent until the next boot."""
+    compensated = await _bundle_compensate(txn)
+    env = {"ok": False, "kind": seq.get("kind") or "bundle_sequence_failed",
+           "slug": slug, "reload_errors": seq.get("reload_errors"),
+           "not_ready": seq.get("not_ready"),
+           "absent_violations": seq.get("absent_violations"),
+           "verify": seq.get("verify")}
+    if not compensated:
+        env["compensation_failed"] = True
+    return env
+
+
+def _prune_bundle_receipt(receipt_id: "str | None") -> None:
+    """Whole-branch N: delete a CONSUMED source receipt after its bundle
+    transaction completes (a receipt is single-use — install/upgrade). Best
+    effort: a prune failure never fails the (already-committed) mutation; the
+    boot-time age sweep is the backstop."""
+    if not receipt_id:
+        return
+    try:
+        import specialist_receipt
+        specialist_receipt.delete(receipt_id)
+    except Exception:  # noqa: BLE001 — pruning is best-effort
+        logger.warning("receipt prune failed for %s", receipt_id, exc_info=True)
+
+
 def _safe_remove_manifest(name: str) -> None:
     """Sol round-4: remove the plugin's sysreq manifest row, tolerating failure
     (unwritable/malformed manifest) so a cleanup error never bypasses the
@@ -6650,6 +6892,11 @@ def _plugin_update_sync(*, name: str, new_ref: str,
                   if isinstance(e, dict) and e.get("name") == name), None)
     if entry is None:
         return {"ok": False, "kind": "not_registered", "name": name}
+    owner = plugin_registry.entry_owner(entry)
+    if owner is not None:
+        return {"ok": False, "kind": "owned_by_specialist", "owner": owner,
+                "detail": (f"{name!r} is managed by {owner}'s bundle — use "
+                          "specialist_upgrade / specialist_uninstall")}
     # A:§3.3 (r1-B8): capture the OLD artifact_id BEFORE the mutation — the
     # caller invalidates its grants/challenges only after this commits.
     old_artifact_id = entry.get("artifact_id")
@@ -6867,11 +7114,18 @@ async def specialist_install_inspect(args: dict) -> dict:
     # refused / async delivery failed) — the flow then stranded forever at
     # commit's consent_missing with zero diagnosis. Now: (1) if the ack
     # ledger ALREADY holds a consent for this EXACT identity — the same
-    # install_consent_identity(component_id, version, root_digest, slug)
-    # binding specialist_install_commit re-validates against re-staged
-    # bytes — no keyboard is required or attempted (preserves the
-    # pre-authorized/synthetic-ack path and the Telegram-less container
-    # e2e); (2) otherwise the post is VERIFIED via the coordinator's
+    # install_consent_identity(component_id, version, root_digest, slug,
+    # receipt_digest) binding specialist_install_commit/upgrade_specialist
+    # re-validate against re-staged bytes — no keyboard is required or
+    # attempted (preserves the pre-authorized/synthetic-ack path and the
+    # Telegram-less container e2e). Fix round 1 (task-13 e2e finding): this
+    # identity used to omit `receipt_digest`, so an ack recorded WITH a
+    # receipt digest (the consent-prompt and commit/upgrade gates all include
+    # it) was never recognized as pre-authorized here — the keyboard would
+    # re-post even though an operator had already approved this exact
+    # bundled-plugin closure. Now threads `result.receipt_digest` through so
+    # this identity matches what every other call site computes.
+    # (2) otherwise the post is VERIFIED via the coordinator's
     # settled-post machinery (ChallengeHandle.settled_post, authz_grants) and
     # every failure is a STRUCTURED ok:false the recipe reports verbatim.
     from specialist_install_consent import (
@@ -6890,12 +7144,30 @@ async def specialist_install_inspect(args: dict) -> dict:
         "dependencies": [{"kind": d.kind, "identifier": d.identifier, "available": d.available}
                           for d in result.dependencies],
         "staged_dir": str(result.staged_dir),
+        # Fix round 1 (task-12): specialist_install_commit/specialist_upgrade
+        # REQUIRE args["receipt_id"] (see their "required" schemas below) —
+        # without it in this payload every real install/upgrade dead-ends at
+        # receipt_required. receipt_digest is included too since it is part
+        # of the consent identity binding (install_consent_identity above).
+        "receipt_id": result.receipt_id, "receipt_digest": result.receipt_digest,
+        # Tool-payload mirror of the plugin blocks the consent DM already
+        # enumerates (render_install_consent_message,
+        # specialist_install_consent.py) — lets the calling LLM narrate what
+        # the consent covers without re-deriving it from prose.
+        "plugins": [
+            {"scoped_name": row.scoped_name, "manifest_name": row.manifest_name,
+             "version": row.version, "mcp_servers": list(row.mcp_servers),
+             "protected_tools": list(row.protected_tools),
+             "env_names": list(row.env_names)}
+            for row in result.plugin_resolutions
+        ],
     }
 
     acks = SpecialistInstallAckStore()
     identity = install_consent_identity(
         component_id=result.component_id, version=result.version,
         root_digest=result.root_digest, slug=result.slug,
+        receipt_digest=result.receipt_digest,
     )
     if acks.is_acked(identity):
         # Spec §E: consent = "pre_authorized" | "keyboard_posted" on ok:true.
@@ -7035,10 +7307,10 @@ async def _settle_install_consent_post(handle) -> "dict | None":
     {"type": "object", "properties": {
         "component_id": {"type": "string"}, "version": {"type": "string"},
         "root_digest": {"type": "string"}, "slug": {"type": "string"},
-        "staged_dir": {"type": "string"},
+        "staged_dir": {"type": "string"}, "receipt_id": {"type": "string"},
         "config": {"type": "object", "additionalProperties": {"type": "string"}},
         "secret_names_provided": {"type": "array", "items": {"type": "string"}}},
-     "required": ["component_id", "version", "root_digest", "slug", "staged_dir"]},
+     "required": ["component_id", "version", "root_digest", "slug", "staged_dir", "receipt_id"]},
 )
 async def specialist_install_commit(args: dict) -> dict:
     from specialist_install import (
@@ -7047,6 +7319,18 @@ async def specialist_install_commit(args: dict) -> dict:
     )
     from specialist_install_consent import SpecialistInstallAckStore
     from specialist_component import load_specialist_component
+    import specialist_bundle_journal
+    import specialist_receipt
+
+    # Task 10: the trusted source receipt is loaded by opaque id ONLY — never
+    # from caller-supplied coordinates. Required for EVERY install (plugin-less
+    # components included); a missing/unloadable id fails closed.
+    receipt_id = args.get("receipt_id")
+    receipt = specialist_receipt.load(receipt_id) if receipt_id else None
+    if receipt is None:
+        return _result({"ok": False, "kind": "receipt_required",
+                        "detail": "specialist_install_commit requires a valid receipt_id "
+                                  "from specialist_install_inspect"})
 
     staged_dir = Path(args["staged_dir"])
     try:
@@ -7056,12 +7340,6 @@ async def specialist_install_commit(args: dict) -> dict:
     if component.slug != args["slug"]:
         return _result({"ok": False, "kind": "checksum_changed",
                          "detail": "staged component no longer matches the approved inspection"})
-    # Round-2 fix (finding #2/#3): re-run the FULL dependency closure and
-    # recompute the root digest from the RELOADED staged bytes — never trust
-    # the caller-supplied root_digest/component_checksum args directly. An
-    # unavailable/changed dependency, or a root digest that no longer
-    # matches what the operator approved, is rejected HERE, before anything
-    # is persisted or activated.
     deps = resolve_dependency_closure(component, staged_dir)
     unavailable = [d for d in deps if not d.available]
     if unavailable:
@@ -7079,17 +7357,36 @@ async def specialist_install_commit(args: dict) -> dict:
         default_persona_ref=component.default_persona_ref,
         default_persona_checksum=component.default_persona_checksum,
         required_config_names=(), required_secret_names=(), dependencies=deps, staged_dir=staged_dir,
+        receipt_id=receipt.receipt_id, receipt_digest=receipt.receipt_digest,
+        plugin_resolutions=receipt.plugins,
     )
-    try:
-        instance = await asyncio.to_thread(
-            commit_specialist_install, inspection=inspection, config=args.get("config") or {},
-            secret_names_provided=frozenset(args.get("secret_names_provided") or []),
-            acks=SpecialistInstallAckStore(),
-        )
-    except SpecialistInstallError as exc:
-        return _result({"ok": False, "kind": exc.kind, "detail": exc.detail})
+    async with _PLUGIN_TOOLS_LOCK:
+        try:
+            instance, txn = await asyncio.to_thread(
+                commit_specialist_install, inspection=inspection, receipt=receipt,
+                config=args.get("config") or {},
+                secret_names_provided=frozenset(args.get("secret_names_provided") or []),
+                acks=SpecialistInstallAckStore(),
+            )
+        except SpecialistInstallError as exc:
+            return _result({"ok": False, "kind": exc.kind, "detail": exc.detail})
+        try:
+            seq = await _bundle_reload_and_verify(
+                txn.slug, removed_artifact_ids=list(txn.removed_artifact_ids),
+                targets_removed=[])
+        except Exception:
+            await _bundle_compensate(txn)
+            raise
+        # Whole-branch B: a not-ready owned binding / postcondition failure is a
+        # FAILED mutation — compensate + surface ok:false, never complete the
+        # journal + report success.
+        if not seq.get("ok", True):
+            return _result(await _bundle_seq_failure(txn, seq, slug=txn.slug))
+        await asyncio.to_thread(specialist_bundle_journal.complete, txn.journal_path)
+        _prune_bundle_receipt(receipt.receipt_id)
     return _result({"ok": True, "slug": instance.slug, "state": instance.state,
-                     "activation_committed": instance.state == "active"})
+                     "activation_committed": instance.state == "active",
+                     "reloaded": seq["reloaded"], "verify": seq["verify"]})
 
 
 @tool(
@@ -7101,10 +7398,10 @@ async def specialist_install_commit(args: dict) -> dict:
     {"type": "object", "properties": {
         "slug": {"type": "string"}, "component_id": {"type": "string"},
         "version": {"type": "string"}, "root_digest": {"type": "string"},
-        "staged_dir": {"type": "string"},
+        "staged_dir": {"type": "string"}, "receipt_id": {"type": "string"},
         "config": {"type": "object", "additionalProperties": {"type": "string"}},
         "secret_names_provided": {"type": "array", "items": {"type": "string"}}},
-     "required": ["slug", "component_id", "version", "root_digest", "staged_dir"]},
+     "required": ["slug", "component_id", "version", "root_digest", "staged_dir", "receipt_id"]},
 )
 async def specialist_upgrade(args: dict) -> dict:
     from specialist_component import load_specialist_component
@@ -7113,9 +7410,25 @@ async def specialist_upgrade(args: dict) -> dict:
         resolve_dependency_closure, upgrade_specialist,
     )
     from specialist_install_consent import SpecialistInstallAckStore
+    import specialist_bundle_journal
+    import specialist_receipt
+
+    receipt_id = args.get("receipt_id")
+    receipt = specialist_receipt.load(receipt_id) if receipt_id else None
+    if receipt is None:
+        return _result({"ok": False, "kind": "receipt_required",
+                        "detail": "specialist_upgrade requires a valid receipt_id "
+                                  "from specialist_install_inspect(mode='upgrade')"})
 
     staged_dir = Path(args["staged_dir"])
-    component = load_specialist_component(staged_dir, staged_dir / "manifest.json")
+    # Whole-branch M: guard the staged component load (mirrors
+    # specialist_install_commit's staged_dir_invalid mapping) — a vanished/
+    # corrupt staging dir must surface as a structured envelope, not a raw
+    # ValueError/OSError out of the tool.
+    try:
+        component = load_specialist_component(staged_dir, staged_dir / "manifest.json")
+    except (ValueError, OSError) as exc:
+        return _result({"ok": False, "kind": "staged_dir_invalid", "detail": str(exc)})
     # Same fresh re-validation as specialist_install_commit — upgrade must
     # not trust a caller-supplied digest either.
     deps = resolve_dependency_closure(component, staged_dir)
@@ -7135,17 +7448,32 @@ async def specialist_upgrade(args: dict) -> dict:
         default_persona_ref=component.default_persona_ref,
         default_persona_checksum=component.default_persona_checksum,
         required_config_names=(), required_secret_names=(), dependencies=deps, staged_dir=staged_dir,
+        receipt_id=receipt.receipt_id, receipt_digest=receipt.receipt_digest,
+        plugin_resolutions=receipt.plugins,
     )
-    try:
-        instance = await asyncio.to_thread(
-            upgrade_specialist, slug=args["slug"], inspection=inspection,
-            config=args.get("config") or {},
-            secret_names_provided=frozenset(args.get("secret_names_provided") or []),
-            acks=SpecialistInstallAckStore(),
-        )
-    except SpecialistInstallError as exc:
-        return _result({"ok": False, "kind": exc.kind, "detail": exc.detail})
-    return _result({"ok": True, "slug": instance.slug, "state": instance.state})
+    async with _PLUGIN_TOOLS_LOCK:
+        try:
+            instance, txn = await asyncio.to_thread(
+                upgrade_specialist, slug=args["slug"], inspection=inspection, receipt=receipt,
+                config=args.get("config") or {},
+                secret_names_provided=frozenset(args.get("secret_names_provided") or []),
+                acks=SpecialistInstallAckStore(),
+            )
+        except SpecialistInstallError as exc:
+            return _result({"ok": False, "kind": exc.kind, "detail": exc.detail})
+        try:
+            seq = await _bundle_reload_and_verify(
+                txn.slug, removed_artifact_ids=list(txn.removed_artifact_ids),
+                targets_removed=[])
+        except Exception:
+            await _bundle_compensate(txn)
+            raise
+        if not seq.get("ok", True):
+            return _result(await _bundle_seq_failure(txn, seq, slug=txn.slug))
+        await asyncio.to_thread(specialist_bundle_journal.complete, txn.journal_path)
+        _prune_bundle_receipt(receipt.receipt_id)
+    return _result({"ok": True, "slug": instance.slug, "state": instance.state,
+                     "reloaded": seq["reloaded"], "verify": seq["verify"]})
 
 
 @tool(
@@ -7156,12 +7484,29 @@ async def specialist_upgrade(args: dict) -> dict:
 )
 async def specialist_rollback(args: dict) -> dict:
     from specialist_install import SpecialistInstallError, rollback_specialist
+    from specialist_install_consent import SpecialistInstallAckStore
+    import specialist_bundle_journal
 
-    try:
-        instance = await asyncio.to_thread(rollback_specialist, slug=args["slug"])
-    except SpecialistInstallError as exc:
-        return _result({"ok": False, "kind": exc.kind, "detail": exc.detail})
-    return _result({"ok": True, "slug": instance.slug, "state": instance.state})
+    slug = args["slug"]
+    async with _PLUGIN_TOOLS_LOCK:
+        try:
+            instance, txn = await asyncio.to_thread(
+                rollback_specialist, slug=slug, bundle=True,
+                acks=SpecialistInstallAckStore())
+        except SpecialistInstallError as exc:
+            return _result({"ok": False, "kind": exc.kind, "detail": exc.detail})
+        try:
+            seq = await _bundle_reload_and_verify(
+                txn.slug, removed_artifact_ids=list(txn.removed_artifact_ids),
+                targets_removed=[])
+        except Exception:
+            await _bundle_compensate(txn)
+            raise
+        if not seq.get("ok", True):
+            return _result(await _bundle_seq_failure(txn, seq, slug=txn.slug))
+        await asyncio.to_thread(specialist_bundle_journal.complete, txn.journal_path)
+    return _result({"ok": True, "slug": instance.slug, "state": instance.state,
+                     "reloaded": seq["reloaded"], "verify": seq["verify"]})
 
 
 @tool(
@@ -7171,10 +7516,34 @@ async def specialist_rollback(args: dict) -> dict:
     {"type": "object", "properties": {"slug": {"type": "string"}}, "required": ["slug"]},
 )
 async def specialist_uninstall(args: dict) -> dict:
-    from specialist_install import uninstall_specialist
+    from specialist_install import SpecialistInstallError, uninstall_specialist
+    from specialist_install_consent import SpecialistInstallAckStore
+    import specialist_bundle_journal
 
-    await asyncio.to_thread(uninstall_specialist, slug=args["slug"])
-    return _result({"ok": True, "slug": args["slug"]})
+    slug = args["slug"]
+    targets_removed = [f"specialist:{slug}"]
+    async with _PLUGIN_TOOLS_LOCK:
+        # Whole-branch M: map a typed refusal (invalid_slug / bundle_required)
+        # to a structured ok:false envelope, never a raw exception out of the
+        # tool — the same guard the other four bundle tools already have.
+        try:
+            txn = await asyncio.to_thread(
+                uninstall_specialist, slug=slug, bundle=True,
+                acks=SpecialistInstallAckStore())
+        except SpecialistInstallError as exc:
+            return _result({"ok": False, "kind": exc.kind, "detail": exc.detail})
+        try:
+            seq = await _bundle_reload_and_verify(
+                txn.slug, removed_artifact_ids=list(txn.removed_artifact_ids),
+                targets_removed=targets_removed)
+        except Exception:
+            await _bundle_compensate(txn)
+            raise
+        if not seq.get("ok", True):
+            return _result(await _bundle_seq_failure(txn, seq, slug=slug))
+        await asyncio.to_thread(specialist_bundle_journal.complete, txn.journal_path)
+    return _result({"ok": True, "slug": slug, "reloaded": seq["reloaded"],
+                     "verify": seq["verify"]})
 
 
 @tool(
@@ -7431,6 +7800,11 @@ def _plugin_assign_sync(*, name: str, target: str) -> dict:
     entry = _find_entry(data, name)
     if entry is None:
         return {"ok": False, "kind": "not_registered", "name": name}
+    owner = plugin_registry.entry_owner(entry)
+    if owner is not None:
+        return {"ok": False, "kind": "owned_by_specialist", "owner": owner,
+                "detail": (f"{name!r} is managed by {owner}'s bundle — use "
+                          "specialist_upgrade / specialist_uninstall")}
     targets = entry.setdefault("targets", [])
     was_assigned = target in targets
     if not was_assigned:
@@ -7447,6 +7821,11 @@ def _plugin_unassign_sync(*, name: str, target: str) -> dict:
     entry = _find_entry(data, name)
     if entry is None:
         return {"ok": False, "kind": "not_registered", "name": name}
+    owner = plugin_registry.entry_owner(entry)
+    if owner is not None:
+        return {"ok": False, "kind": "owned_by_specialist", "owner": owner,
+                "detail": (f"{name!r} is managed by {owner}'s bundle — use "
+                          "specialist_upgrade / specialist_uninstall")}
     targets = entry.get("targets") or []
     was_assigned = target in targets
     if was_assigned:
@@ -7463,6 +7842,11 @@ def _plugin_remove_sync(*, name: str) -> dict:
     entry = _find_entry(data, name)
     if entry is None:
         return {"ok": False, "kind": "not_registered", "name": name}
+    owner = plugin_registry.entry_owner(entry)
+    if owner is not None:
+        return {"ok": False, "kind": "owned_by_specialist", "owner": owner,
+                "detail": (f"{name!r} is managed by {owner}'s bundle — use "
+                          "specialist_upgrade / specialist_uninstall")}
     targets = list(entry.get("targets") or [])
     # A:§3.3 (r1-B8): capture the artifact_id + targets BEFORE the mutation —
     # the caller invalidates grants/challenges by artifact AND by each
@@ -7740,7 +8124,8 @@ def _tool_verify_plugin_state(
         verdict = plugin_store.artifact_verdict(
             path, name=plugin_name, repo=src.get("repo", ""),
             revision=revision, subdir=src.get("subdir", ""),
-            artifact_id=str(artifact_id))
+            artifact_id=str(artifact_id),
+            manifest_name=entry.get("manifest_name"))
         if verdict is None:
             checksum_valid = True
         else:
@@ -7754,7 +8139,8 @@ def _tool_verify_plugin_state(
         pass
     rp = ResolvedPlugin(name=plugin_name, artifact_id=str(artifact_id),
                         path=str(path), version=str(entry.get("version", "")),
-                        manifest=manifest)
+                        manifest=manifest,
+                        manifest_name=entry.get("manifest_name") or plugin_name)
     # Sol #16: a PRESENT-but-malformed .mcp.json silently degrades grants/secrets
     # to [] (indistinguishable from skill-only), so a broken MCP server would
     # otherwise verify ready. Treat it as a blocking reason.

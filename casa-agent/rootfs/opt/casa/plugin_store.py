@@ -218,13 +218,16 @@ def safe_extract_tar(tar_path: Path, dest: Path) -> None:
 
 def write_metadata(root: Path, *, name: str, repo: str, ref: str,
                    revision: str, subdir: str, artifact_id: str,
-                   version: str, checksum: str) -> None:
+                   version: str, checksum: str,
+                   manifest_name: str | None = None) -> None:
     meta = {
         "schema_version": 1,
         "name": name, "repo": repo, "ref": ref, "revision": revision,
         "subdir": normalize_subdir(subdir), "artifact_id": artifact_id,
         "version": version, "content_checksum": checksum,
     }
+    if manifest_name is not None:
+        meta["manifest_name"] = manifest_name
     p = Path(root) / METADATA_FILENAME
     with open(p, "w", encoding="utf-8") as fh:
         json.dump(meta, fh, indent=2, sort_keys=True)
@@ -507,10 +510,19 @@ def validate_artifact(path: Path) -> bool:
 
 
 def artifact_verdict(path: Path, *, name: str, repo: str, revision: str,
-                     subdir: str, artifact_id: str) -> str | None:
+                     subdir: str, artifact_id: str,
+                     manifest_name: str | None = None) -> str | None:
     """Deep validation against the EXPECTED identity (Sol R2-1).
     None = fully valid; 'artifact_invalid' = metadata/manifest/identity
     problem; 'corrupt_artifact' = identity fine but content checksum fails.
+
+    ``manifest_name`` (Task 4, spec §2.1): for an OWNED registry entry, the
+    plugin's manifest-declared name (e.g. "mtg" for registry name "mtg.mtg")
+    — the registry name is a scoping device, never the plugin's runtime
+    identity. When provided, both the stored metadata's own
+    ``manifest_name`` AND the artifact's ``plugin.json::name`` are checked
+    against it instead of the (scoped) ``name``; ``None`` (unowned/legacy
+    call sites) keeps the pre-Task-4 behavior unchanged.
 
     Sol v0951e-1: a SYMLINKED store path (either level) is rejected outright
     — resolution would otherwise cache an external, still-writable tree as
@@ -528,6 +540,7 @@ def artifact_verdict(path: Path, *, name: str, repo: str, revision: str,
         and _nrepo(str(meta.get("repo", ""))) == _nrepo(repo)
         and meta.get("revision") == revision
         and meta.get("subdir") == normalize_subdir(subdir)
+        and (manifest_name is None or meta.get("manifest_name") == manifest_name)
     )
     if not identity_ok:
         return "artifact_invalid"
@@ -536,7 +549,7 @@ def artifact_verdict(path: Path, *, name: str, repo: str, revision: str,
                               .read_text(encoding="utf-8"))
     except (OSError, ValueError):
         return "artifact_invalid"
-    if not isinstance(manifest, dict) or manifest.get("name") != name:
+    if not isinstance(manifest, dict) or manifest.get("name") != (manifest_name or name):
         return "artifact_invalid"
     try:
         if content_checksum(Path(path)) != meta.get("content_checksum"):
@@ -556,7 +569,7 @@ def artifact_verdict(path: Path, *, name: str, repo: str, revision: str,
     # resolution (per-plugin degradation) rather than routing an invalid
     # trigger — the same upgrade-path posture as protectedTools above.
     try:
-        manifest_triggers(manifest, name)
+        manifest_triggers(manifest, manifest_name or name)
     except StoreError:
         return "triggers_invalid"
     return None
@@ -920,7 +933,14 @@ def manifest_protected_tools(manifest: dict) -> list:
     return out
 
 
-def validate_manifest(root: Path, expected_name: str) -> dict:
+def validate_manifest(root: Path, expected_name: str, *,
+                      manifest_name: str | None = None) -> dict:
+    """``manifest_name`` (Task 4, spec §2.1): for an OWNED registry entry, the
+    caller's expected plugin.json name — the registry name (``expected_name``)
+    is a scoping device, never validated against ``plugin.json::name`` when
+    an owning ``manifest_name`` is supplied. ``None`` (unowned/legacy call
+    sites) keeps the pre-Task-4 behavior of validating against
+    ``expected_name`` directly."""
     mf = Path(root) / ".claude-plugin" / "plugin.json"
     try:
         manifest = json.loads(mf.read_text(encoding="utf-8"))
@@ -930,9 +950,10 @@ def validate_manifest(root: Path, expected_name: str) -> dict:
     if not isinstance(manifest, dict):
         raise StoreError("plugin.json not an object",
                          reason_code="manifest_invalid")
-    if manifest.get("name") != expected_name:
+    expected = manifest_name or expected_name
+    if manifest.get("name") != expected:
         raise StoreError(
-            f"manifest name {manifest.get('name')!r} != {expected_name!r}",
+            f"manifest name {manifest.get('name')!r} != {expected!r}",
             reason_code="name_mismatch",
             detail={"manifest_name": manifest.get("name")})
     if not isinstance(manifest.get("version"), str) or not manifest["version"]:
@@ -953,14 +974,19 @@ def validate_manifest(root: Path, expected_name: str) -> dict:
     manifest_protected_tools(manifest)
     # Release B: a PRESENT-but-malformed casa.triggers refuses the
     # install/update outright (strict; raises triggers_invalid).
-    manifest_triggers(manifest, expected_name)
+    # Task 4: trigger effective names derive from the RUNTIME name
+    # (manifest_name when owned), never the scoped registry name.
+    manifest_triggers(manifest, manifest_name or expected_name)
     return manifest
 
 
 def _stage_and_swap(*, name, repo, ref, revision, subdir, staged: Path,
-                    store_root: Path) -> PublishResult:
+                    store_root: Path, manifest_name: str | None = None,
+                    ) -> PublishResult:
     """Shared tail: strip caches -> validate -> checksum -> metadata-in-
-    staging -> rename."""
+    staging -> rename. ``manifest_name`` (Task 4): threaded through to
+    validate_manifest/artifact_verdict/write_metadata for an OWNED registry
+    entry — see :func:`validate_manifest`."""
     # G7 (v0.95.1): a repo/vendored tree may COMMIT bytecode caches — strip
     # before checksum so the published artifact never contains .pyc (a
     # header-valid .pyc shadows its checksummed .py at import time).
@@ -969,7 +995,7 @@ def _stage_and_swap(*, name, repo, ref, revision, subdir, staged: Path,
         logger.info("publish(%s): stripped %d committed bytecode cache "
                     "entries from staging", name, stripped)
     _reject_escaping_symlinks(staged)            # Sol round-3 H7
-    manifest = validate_manifest(staged, name)
+    manifest = validate_manifest(staged, name, manifest_name=manifest_name)
     artifact_id = compute_artifact_id(repo=repo, revision=revision,
                                       subdir=subdir, name=name)
     dest = Path(store_root) / name / artifact_id
@@ -979,7 +1005,8 @@ def _stage_and_swap(*, name, repo, ref, revision, subdir, staged: Path,
         # mismatch or checksum failure both fail closed (spec 3.2).
         verdict = artifact_verdict(dest, name=name, repo=repo,
                                    revision=revision, subdir=subdir,
-                                   artifact_id=artifact_id)
+                                   artifact_id=artifact_id,
+                                   manifest_name=manifest_name)
         if verdict is None:
             shutil.rmtree(staged, ignore_errors=True)
             return PublishResult(name, artifact_id, revision,
@@ -990,7 +1017,8 @@ def _stage_and_swap(*, name, repo, ref, revision, subdir, staged: Path,
     checksum = content_checksum(staged)
     write_metadata(staged, name=name, repo=repo, ref=ref, revision=revision,
                    subdir=subdir, artifact_id=artifact_id,
-                   version=manifest["version"], checksum=checksum)
+                   version=manifest["version"], checksum=checksum,
+                   manifest_name=manifest_name)
     dest.parent.mkdir(parents=True, exist_ok=True)
     os.rename(staged, dest)
     _freeze_artifact_files(dest)
@@ -1103,7 +1131,11 @@ def publish_from_tree(*, name: str, repo: str, ref: str, revision: str,
                       subdir: str, src_root: Path,
                       store_root: Path = STORE_ROOT,
                       staging_root: Path = STAGING_ROOT,
-                      exclude_git: bool = True) -> PublishResult:
+                      exclude_git: bool = True,
+                      manifest_name: str | None = None) -> PublishResult:
+    """``manifest_name`` (Task 4): the owned entry's manifest-declared name —
+    see :func:`validate_manifest`. ``None`` (default) keeps unowned callers
+    unchanged."""
     subdir = normalize_subdir(subdir)
     artifact_id = compute_artifact_id(repo=repo, revision=revision,
                                       subdir=subdir, name=name)
@@ -1120,7 +1152,8 @@ def publish_from_tree(*, name: str, repo: str, ref: str, revision: str,
             meta.unlink()
         return _stage_and_swap(name=name, repo=repo, ref=ref,
                                revision=revision, subdir=subdir,
-                               staged=staged, store_root=store_root)
+                               staged=staged, store_root=store_root,
+                               manifest_name=manifest_name)
     except BaseException:
         shutil.rmtree(staged, ignore_errors=True)
         raise

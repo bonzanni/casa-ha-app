@@ -35,6 +35,29 @@ REVISION_RE = re.compile(r"^(git:[0-9a-f]{40}|legacy-content:[0-9a-f]{64})$")
 _SOURCE_TYPES = {"github", "bundled"}
 _REPO_RE = re.compile(r"^[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+$")
 
+# spec §2: an OWNED entry (one belonging to a specialist plugin bundle, not an
+# operator-installed one) carries a scoped `<slug>.<manifest_name>` name and an
+# `owner: specialist:<slug>` field. Bounds match the Task 2 slug grammar
+# (32 bytes) for the owner slug component; the manifest_name component keeps
+# the pre-existing 40-byte NAME_RE-shaped bound.
+OWNED_NAME_RE = re.compile(r"^[a-z0-9][a-z0-9-]{0,31}\.[a-z0-9][a-z0-9-]{0,39}$")
+OWNER_RE = re.compile(r"^specialist:[a-z0-9][a-z0-9-]{0,31}$")
+
+
+def scoped_name(slug: str, manifest_name: str) -> str:
+    return f"{slug}.{manifest_name}"
+
+
+def entry_owner(entry: dict) -> str | None:
+    """The entry's validated `owner`, or None if absent/malformed."""
+    o = entry.get("owner")
+    return o if isinstance(o, str) and OWNER_RE.match(o) else None
+
+
+def owned_entries_for(slug: str, data: "RegistryData") -> list[dict]:
+    """Every entry in `data` owned by specialist `slug`."""
+    return [e for e in data.entries if entry_owner(e) == f"specialist:{slug}"]
+
 
 def normalize_repo(repo: str) -> str:
     return repo.strip().lower()
@@ -89,8 +112,32 @@ def _entry_error(entry: object) -> str | None:
     if not isinstance(entry, dict):
         return "not_a_mapping"
     name = entry.get("name")
-    if not isinstance(name, str) or not NAME_RE.match(name):
-        return "bad_name"
+    owner = entry.get("owner")
+    if owner is None:
+        if not isinstance(name, str) or not NAME_RE.match(name):
+            return "bad_name"
+    else:
+        # Owned invariant (spec §2, ONE check): owner shape, scoped name,
+        # prefix==owner slug, exclusive specialist target, manifest_name
+        # present and == suffix.
+        if not isinstance(name, str) or not OWNED_NAME_RE.match(name):
+            return "owned_invariant"
+        # Whole-branch H: OWNED_NAME_RE structurally admits 32+1+40 = 73 bytes,
+        # one past the 72-byte scoped-name invariant (specialist_component's
+        # MAX_SCOPED_NAME_BYTES). Enforce the byte bound here too — the
+        # registry-load invariant must reject a 73-byte owned name that the
+        # regex alone would wave through.
+        if len(name.encode()) > 72:
+            return "owned_invariant"
+        if not isinstance(owner, str) or not OWNER_RE.match(owner):
+            return "owned_invariant"
+        slug_part, _, mname_part = name.partition(".")
+        if owner != f"specialist:{slug_part}":
+            return "owned_invariant"
+        if entry.get("manifest_name") != mname_part:
+            return "owned_invariant"
+        if entry.get("targets") != [owner]:
+            return "owned_invariant"
     src = entry.get("source")
     if not isinstance(src, dict):
         return "bad_source"
@@ -187,6 +234,29 @@ def _validate_doc(raw: object) -> tuple[list[dict], list[PluginIssue], bool]:
             kept_ids.add(id(group[0]))
     # Preserve original file order for kept entries.
     ordered = [e for e in entries if id(e) in kept_ids]
+
+    # (target, effective manifest name) uniqueness — spec §2.1. The effective
+    # runtime name of an owned entry is its manifest_name; of an unowned
+    # entry, its name. Collision invalidates the OWNED entrant(s) only.
+    by_rt: dict[tuple[str, str], list[dict]] = {}
+    for e in ordered:
+        eff = e.get("manifest_name") or e["name"]
+        for t in e.get("targets", []):
+            by_rt.setdefault((t, eff), []).append(e)
+    dropped: set[int] = set()
+    for (t, eff), group in by_rt.items():
+        if len(group) <= 1:
+            continue
+        for e in group:
+            if e.get("owner") is not None and id(e) not in dropped:
+                dropped.add(id(e))
+                issues.append(PluginIssue(
+                    name=e["name"], target=t, stage="registry",
+                    reason_code="manifest_name_collision",
+                    artifact_id=e.get("artifact_id"),
+                    scoped_targets=_own_targets(e)))
+    if dropped:
+        ordered = [e for e in ordered if id(e) not in dropped]
     return ordered, issues, True
 
 
@@ -221,6 +291,75 @@ def _revalidate(data: RegistryData) -> None:
     data.entries, data.entry_issues, data.valid = entries, issues, valid
 
 
+def apply_owned_swap(*, slug: str, new_entries: "list[dict]",
+                     registry_path: Path = REGISTRY_PATH,
+                     ) -> "tuple[list[dict], RegistryData]":
+    """The spec's "one atomic registry swap" (§3.2b) for a bundle transaction.
+
+    Loads the registry, CAPTURES then REMOVES every entry owned by
+    `specialist:<slug>`, appends `new_entries`, revalidates, and REFUSES
+    (raises `ValueError("owned_swap_invalid: ...")`) if any new entry would
+    land in `entry_issues` (or be dropped by validation) — a swap must never
+    publish a malformed owned entry. On success it saves atomically and
+    returns `(before_entries, data)`; `before_entries` are independent copies
+    suitable for a later rollback restore. One function serves install
+    (before=[]), upgrade (before=old owned set), uninstall (new_entries=[]),
+    and rollback (new_entries=prior owned set)."""
+    import copy
+
+    registry_path = Path(registry_path)
+    data = load_registry(registry_path)
+    # Whole-branch G: refuse to mutate over an unreadable/invalid registry.
+    # load_registry returns valid=False for an unparseable file (raw={}) OR a
+    # structurally-invalid document. Reconstructing owned entries on top of
+    # that would DROP every pre-existing (operator-owned) entry and re-save a
+    # partial registry as if it were authoritative — the swap must fail closed
+    # with a typed error and touch nothing instead.
+    if not data.valid:
+        raise ValueError("owned_swap_invalid: registry_invalid")
+    raw = data.raw if isinstance(data.raw, dict) else {}
+    plugins = raw.get("plugins")
+    if not isinstance(plugins, list):
+        plugins = []
+    owner = f"specialist:{slug}"
+    before_entries = [copy.deepcopy(e) for e in plugins
+                      if isinstance(e, dict) and entry_owner(e) == owner]
+    kept = [e for e in plugins
+            if not (isinstance(e, dict) and entry_owner(e) == owner)]
+    kept.extend(copy.deepcopy(e) for e in new_entries)
+    raw["plugins"] = kept
+    # Whole-branch L: a successful owned swap for a slug clears any prior
+    # quarantine flag — the operator has just re-established a valid owned set
+    # (install/upgrade/rollback) or removed it (uninstall), so the stale
+    # `quarantined_bundles` entry must not linger in the health report.
+    qlist = raw.get("quarantined_bundles")
+    if isinstance(qlist, list) and slug in qlist:
+        raw["quarantined_bundles"] = [s for s in qlist if s != slug]
+    raw.setdefault("schema_version", SCHEMA_VERSION)
+    raw.setdefault("seeded_defaults", [])
+    data.raw = raw
+    _revalidate(data)
+
+    # Refuse if any new entry is malformed/collided (flagged as an issue) or
+    # was dropped by validation (e.g. a duplicate-name collision drops both).
+    new_names = {e.get("name") for e in new_entries if isinstance(e, dict)}
+    surviving = {e.get("name") for e in data.entries}
+    bad: set[str] = set()
+    for issue in data.entry_issues:
+        if issue.name in new_names:
+            bad.add(f"{issue.name}:{issue.reason_code}")
+    for nm in new_names:
+        if nm not in surviving:
+            bad.add(f"{nm}:dropped")
+    if not data.valid:
+        bad.add("registry_invalid")
+    if bad:
+        raise ValueError(f"owned_swap_invalid: {', '.join(sorted(bad))}")
+
+    save_registry(data, registry_path)
+    return before_entries, data
+
+
 def seed_defaults(data: RegistryData,
                   default_path: Path = DEFAULT_REGISTRY_PATH) -> bool:
     """§3.1 default seeding without resurrection. A default is added ONLY if
@@ -253,6 +392,23 @@ class ResolvedPlugin:
     path: str
     version: str
     manifest: dict
+    # spec §2: the plugin's manifest-declared name for an OWNED entry (e.g.
+    # "mtg" for registry name "mtg.mtg"); "" for unowned entries and any
+    # call site with nothing to thread (test fixtures; a resumed engagement
+    # recorded before this field existed, tools.py:_resolution_from_recorded).
+    # Task 5 threads it through the resume path too (tools.py:
+    # _resolution_from_recorded reads `pa["manifest_name"]`; the two
+    # plugin_artifacts-recording sites write it) so a resumed session
+    # reproduces the exact runtime identity the original launch used. Use
+    # runtime_name(rp), not this field directly, to get the effective
+    # runtime identity.
+    manifest_name: str = ""
+
+
+def runtime_name(rp: "ResolvedPlugin") -> str:
+    """The ONE accessor for a resolved plugin's effective runtime identity
+    (Task 5): its manifest_name if owned, else its registry name."""
+    return rp.manifest_name or rp.name
 
 
 @dataclass
@@ -337,6 +493,7 @@ def reload_snapshot(*, registry_path: Path = REGISTRY_PATH,
                         revision=entry["source"]["revision"],
                         subdir=entry["source"].get("subdir", ""),
                         artifact_id=entry["artifact_id"],
+                        manifest_name=entry.get("manifest_name"),
                     )
         _snapshot = _Snapshot(
             registry=reg, registry_path=Path(registry_path),
@@ -387,6 +544,7 @@ def _resolve_entry(entry: dict, snap: "_Snapshot", target: str | None,
         name=name, artifact_id=artifact_id, path=str(path),
         version=str(manifest.get("version", entry.get("version", ""))),
         manifest=manifest,
+        manifest_name=entry.get("manifest_name") or name,
     ), None, warning
 
 

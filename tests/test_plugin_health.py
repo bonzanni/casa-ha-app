@@ -1,10 +1,19 @@
 """§3.10 plugin-health report: structured fingerprints, carry-forward dedup,
-first-contact notice."""
+first-contact notice.
+
+Task 11: the report additionally surfaces the specialist-bundle registry's
+`quarantined_bundles` ledger (Task 9) and boot-reconciliation actions (Task 9's
+`specialist_bundle_journal.last_boot_reconcile_actions`), and annotates an
+owned entry's issue/warning row with its `owner` — additive, no fingerprint
+impact (§3.10 hashes only the first five PluginIssue fields)."""
 from __future__ import annotations
+
+import json
 
 import pytest
 
 import plugin_health
+import specialist_bundle_journal
 from plugin_registry import PluginIssue
 
 pytestmark = pytest.mark.unit
@@ -14,6 +23,15 @@ def _issue(name="p", target="specialist:finance", stage="resolve",
            reason_code="corrupt_artifact", artifact_id="a" * 64):
     return PluginIssue(name=name, target=target, stage=stage,
                        reason_code=reason_code, artifact_id=artifact_id)
+
+
+def _registry_doc(*, quarantined_bundles=None, plugins=None) -> dict:
+    return {
+        "schema_version": 1,
+        "seeded_defaults": [],
+        "plugins": plugins or [],
+        "quarantined_bundles": quarantined_bundles or [],
+    }
 
 
 def test_fingerprint_stable_and_field_sensitive():
@@ -124,3 +142,101 @@ def test_first_contact_mixed_issues_keep_degraded_header(tmp_path):
         warnings=[], path=p)
     notice = plugin_health.first_contact_notice("finance", p)
     assert notice.startswith("⚠️ Plugin degraded:")
+
+
+# ---------------------------------------------------------------------------
+# Task 11: bundle ownership + quarantine surfacing
+# ---------------------------------------------------------------------------
+
+def test_report_surfaces_quarantined_bundles_from_registry_doc(tmp_path):
+    hp = tmp_path / "health.json"
+    reg = tmp_path / "registry.json"
+    reg.write_text(json.dumps(_registry_doc(quarantined_bundles=["mtg"])))
+    rep = plugin_health.write_report(issues=[], warnings=[], path=hp,
+                                     registry_path=reg)
+    assert rep["quarantined_bundles"] == ["mtg"]
+    assert plugin_health.load_report(hp)["quarantined_bundles"] == ["mtg"]
+
+
+def test_report_quarantined_bundles_empty_when_registry_absent(tmp_path):
+    hp = tmp_path / "health.json"
+    rep = plugin_health.write_report(
+        issues=[], warnings=[], path=hp,
+        registry_path=tmp_path / "no-such-registry.json")
+    assert rep["quarantined_bundles"] == []
+
+
+def test_owned_entry_issue_row_carries_owner_and_scoped_name(tmp_path):
+    hp = tmp_path / "health.json"
+    reg = tmp_path / "registry.json"
+    reg.write_text(json.dumps(_registry_doc(plugins=[
+        {"name": "mtg.mtg", "owner": "specialist:mtg",
+         "manifest_name": "mtg", "targets": ["specialist:mtg"]},
+    ])))
+    issue = _issue(name="mtg.mtg", target="specialist:mtg",
+                   reason_code="reload_required")
+    rep = plugin_health.write_report(issues=[issue], warnings=[], path=hp,
+                                     registry_path=reg)
+    row = rep["issues"][0]
+    assert row["name"] == "mtg.mtg"                       # already scoped
+    assert row["owner"] == "specialist:mtg"
+
+
+def test_unowned_entry_issue_row_carries_no_owner_key(tmp_path):
+    hp = tmp_path / "health.json"
+    reg = tmp_path / "registry.json"
+    reg.write_text(json.dumps(_registry_doc(plugins=[
+        {"name": "gmail", "targets": ["resident:assistant"]},
+    ])))
+    rep = plugin_health.write_report(
+        issues=[_issue(name="gmail", target="resident:assistant")],
+        warnings=[], path=hp, registry_path=reg)
+    assert "owner" not in rep["issues"][0]
+
+
+def test_boot_reconcile_actions_roundtrip(tmp_path, monkeypatch):
+    hp = tmp_path / "health.json"
+    actions = [{"slug": "mtg", "action": "quarantine"},
+               {"slug": None, "action": "quarantine_all"}]
+    monkeypatch.setattr(specialist_bundle_journal,
+                        "last_boot_reconcile_actions", actions)
+    rep = plugin_health.write_report(issues=[], warnings=[], path=hp,
+                                     registry_path=tmp_path / "none.json")
+    assert rep["boot_reconcile_actions"] == actions
+    assert plugin_health.load_report(hp)["boot_reconcile_actions"] == actions
+
+
+def test_boot_reconcile_actions_empty_by_default(tmp_path, monkeypatch):
+    hp = tmp_path / "health.json"
+    monkeypatch.setattr(specialist_bundle_journal,
+                        "last_boot_reconcile_actions", [])
+    rep = plugin_health.write_report(issues=[], warnings=[], path=hp,
+                                     registry_path=tmp_path / "none.json")
+    assert rep["boot_reconcile_actions"] == []
+
+
+def test_fingerprint_unaffected_by_owner_and_top_level_keys(tmp_path):
+    """An owned entry's fingerprint must be IDENTICAL whether or not the
+    registry annotates it with an owner — the fingerprint (§3.10) hashes only
+    name/target/stage/reason_code/artifact_id, computed before `owner` is
+    ever attached to the serialized row."""
+    hp_bare = tmp_path / "bare.json"
+    hp_owned = tmp_path / "owned.json"
+    reg = tmp_path / "registry.json"
+    reg.write_text(json.dumps(_registry_doc(plugins=[
+        {"name": "mtg.mtg", "owner": "specialist:mtg",
+         "manifest_name": "mtg", "targets": ["specialist:mtg"]},
+    ])))
+    issue = _issue(name="mtg.mtg", target="specialist:mtg")
+
+    rep_bare = plugin_health.write_report(
+        issues=[issue], warnings=[], path=hp_bare,
+        registry_path=tmp_path / "no-registry.json")
+    rep_owned = plugin_health.write_report(
+        issues=[issue], warnings=[], path=hp_owned, registry_path=reg)
+
+    assert "owner" not in rep_bare["issues"][0]
+    assert rep_owned["issues"][0]["owner"] == "specialist:mtg"
+    assert (rep_bare["issues"][0]["fingerprint"]
+            == rep_owned["issues"][0]["fingerprint"]
+            == plugin_health.fingerprint(issue))

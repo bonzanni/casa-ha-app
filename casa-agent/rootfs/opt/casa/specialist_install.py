@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import json
 import logging
 import os
 import re
@@ -9,6 +10,7 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import TYPE_CHECKING, Literal, Mapping
 
+from authored_markers import contains_forbidden_marker
 from canonical_bytes import reject_forbidden_markers, to_plain_json
 from specialist_component import SpecialistComponent, is_valid_slug, load_specialist_component
 from specialist_lifecycle import check_slug_uniqueness
@@ -16,6 +18,7 @@ from specialist_lifecycle import check_slug_uniqueness
 if TYPE_CHECKING:
     from specialist_install_consent import SpecialistInstallAckStore
     from specialist_lifecycle import SpecialistInstance
+    from specialist_receipt import PluginReceiptRow, SourceReceipt
     from specialist_registry import InstalledSpecialistIndex
 
 logger = logging.getLogger(__name__)
@@ -140,6 +143,16 @@ class DependencyResolution:
     digest: str
     available: bool
     detail: str
+    # Task 8 fix-round-1 (consent-review CRITICAL): the sourced-plugin
+    # surfaces `_validate_sourced_plugin_tree` already parses while
+    # validating — captured here (rather than re-parsed at the
+    # PluginReceiptRow-building site) so the consent DM can enumerate them
+    # (spec §3.2). Empty for every non-sourced-plugin row (persona/corpus/
+    # legacy sourceless plugin) and for a sourced row that failed validation
+    # before reaching the point these are extracted.
+    mcp_servers: tuple[str, ...] = ()
+    protected_tools: tuple[str, ...] = ()
+    env_names: tuple[str, ...] = ()
 
 
 @dataclass(frozen=True, slots=True)
@@ -156,6 +169,15 @@ class InspectionResult:
     required_secret_names: tuple[str, ...]
     dependencies: tuple[DependencyResolution, ...]
     staged_dir: Path
+    # Task 8 additions (spec §3.2.1) — defaulted so every pre-Task-8
+    # constructor call (production and test) keeps working unchanged.
+    # ``receipt_id``/``receipt_digest`` are "" and ``plugin_resolutions`` is
+    # () for a hand-built InspectionResult that predates the trusted-source
+    # receipt; a real inspect_specialist_repo call always populates all three
+    # (every inspect issues a receipt, plugin-less components included).
+    receipt_id: str = ""
+    receipt_digest: str = ""
+    plugin_resolutions: tuple["PluginReceiptRow", ...] = ()
 
 
 def compute_install_root_digest(
@@ -309,6 +331,59 @@ def resolve_dependency_closure(
                 available=available,
                 detail="" if available else "bundled corpus checksum does not match manifest"))
         elif dep.kind == "plugin/implementation":
+            if dep.source is not None:
+                # Task 8 (spec §1/§3.2.1): a SOURCED dep resolves its tree from
+                # component_dir itself — bundled -> the manifest-declared
+                # subtree, github -> the ".dep-plugins" convention every
+                # closure call site (inspect/CAS-staging/final-CAS/rollback)
+                # shares unconditionally (see inspect_specialist_repo's
+                # github-fetch loop) — instead of an already-installed
+                # registry plugin (the sourceless/legacy branch below).
+                if dep.source.type == "bundled":
+                    tree = component_dir / dep.source.path
+                else:
+                    tree = component_dir / ".dep-plugins" / dep.identifier
+                if not tree.is_dir():
+                    out.append(DependencyResolution(
+                        kind=dep.kind, identifier=dep.identifier, digest=dep.digest,
+                        available=False, detail="sourced plugin tree missing"))
+                    continue
+                if dep.source.type == "bundled":
+                    # Containment: specialist_component's loader already
+                    # rejects a non-canonical (absolute/traversal) path
+                    # string, but a symlinked component_dir (or a path
+                    # component that is itself a symlink) could still let the
+                    # RESOLVED tree escape — assert the resolved location
+                    # stays inside the resolved component_dir before this
+                    # tree is ever read/hashed.
+                    try:
+                        tree.resolve().relative_to(component_dir.resolve())
+                    except ValueError:
+                        out.append(DependencyResolution(
+                            kind=dep.kind, identifier=dep.identifier, digest=dep.digest,
+                            available=False,
+                            detail="bundled plugin path escapes the component"))
+                        continue
+                detail, surfaces = _validate_sourced_plugin_tree(
+                    tree, slug=component.slug, identifier=dep.identifier)
+                if detail:
+                    out.append(DependencyResolution(
+                        kind=dep.kind, identifier=dep.identifier, digest=dep.digest,
+                        available=False, detail=detail))
+                    continue
+                digest = "sha256:" + content_checksum(tree)
+                out.append(DependencyResolution(
+                    kind=dep.kind, identifier=dep.identifier, digest=dep.digest,
+                    available=(digest == dep.digest),
+                    detail="" if digest == dep.digest else
+                           "sourced plugin content does not match the pinned digest",
+                    mcp_servers=surfaces.mcp_servers,
+                    protected_tools=surfaces.protected_tools,
+                    env_names=surfaces.env_names))
+                continue
+            # Legacy/sourceless (spec §1 "no source -> legacy behavior"):
+            # UNCHANGED — the dependency must already be plugin_add-installed.
+            #
             # Round-2 fix (finding #6): a registry entry's `artifact_id` is
             # `plugin_registry.compute_artifact_id` — sha256(repo + "\n" +
             # revision + "\n" + subdir + "\n" + name), an IDENTITY hash of the
@@ -370,6 +445,331 @@ def resolve_dependency_closure(
     return tuple(out)
 
 
+# Task 8 (spec §1, §3.2.1) — prohibition/error-code prefixes a sourced
+# plugin's validation detail can start with. `inspect_specialist_repo` scans
+# the closure's unavailable rows for these prefixes and raises the matching
+# SpecialistInstallError kind INSTEAD OF the generic `dependency_unavailable`
+# (Sol plan-r1: a bundle transaction must surface WHY a sourced dep was
+# refused, not fold every refusal into one undifferentiated code).
+BUNDLED_SYSREQS_UNSUPPORTED = "bundled_sysreqs_unsupported"
+BUNDLED_TRIGGERS_UNSUPPORTED = "bundled_triggers_unsupported"
+ENV_NAME_COLLISION = "env_name_collision"
+_PROHIBITION_KIND_PREFIXES = (
+    BUNDLED_SYSREQS_UNSUPPORTED, BUNDLED_TRIGGERS_UNSUPPORTED, ENV_NAME_COLLISION,
+)
+
+
+def _env_name_conflicts(tree_env_names: "set[str]", *, exclude_owner: str) -> "list[str]":
+    """Global env-name collision check (spec §1 "Global-namespace collision
+    preflight"; brief Step 7). `tree_env_names` are the `${VAR}` references a
+    sourced plugin's OWN `.mcp.json` requires (plugin_env_extractor —
+    ownership-blind, NOT plugin_env_conf, which stores VALUES not per-plugin
+    ownership). The installed-side inventory is the same extraction run over
+    every OTHER validated installed artifact's `.mcp.json`
+    (`plugin_registry.resolve_all().plugins`), excluding entries owned by
+    `exclude_owner` (the slug's own set, being replaced on upgrade — its own
+    prior env names are not a collision with its own new ones).
+
+    A monkeypatchable module-level seam by design (Step 3 of the Task 8
+    brief) — tests stub this directly rather than building a real registry +
+    store fixture to exercise the collision-kind wiring."""
+    import plugin_env_extractor
+    import plugin_registry
+
+    owned_names = {
+        e["name"] for e in plugin_registry.owned_entries_for(
+            exclude_owner, plugin_registry.snapshot_registry())
+    }
+    installed_names: "set[str]" = set()
+    for rp in plugin_registry.resolve_all().plugins:
+        if rp.name in owned_names:
+            continue
+        installed_names |= plugin_env_extractor.extract_env_vars(Path(rp.path) / ".mcp.json")
+    return sorted(tree_env_names & installed_names)
+
+
+def _sibling_env_name_collisions(
+    dependencies: "tuple[DependencyResolution, ...]",
+) -> "list[str]":
+    """Whole-branch E: `_env_name_conflicts` (per-plugin) only checks a sourced
+    plugin's env names against ALREADY-INSTALLED artifacts — never against its
+    SIBLINGS in the same incoming bundle. Two bundled plugins each requiring the
+    same `${VAR}` would both pass (the name is not yet installed) and both
+    publish, then collide in the global env namespace. Aggregate every sourced
+    plugin's env surface across the closure and flag any name required by more
+    than one sibling. Each DependencyResolution.env_names is already a set, so a
+    duplicate across the aggregate means DISTINCT siblings share the name."""
+    from collections import Counter
+
+    counts: "Counter[str]" = Counter()
+    for dep in dependencies:
+        if dep.kind == "plugin/implementation" and dep.env_names:
+            counts.update(set(dep.env_names))
+    return sorted(name for name, count in counts.items() if count > 1)
+
+
+def _manifest_name_collisions(component: SpecialistComponent) -> "list[str]":
+    """Per-target manifest-name precheck (spec §2.1, brief): a sourced dep's
+    `identifier` becomes its OWNED entry's effective runtime name
+    (`manifest_name`). If some OTHER already-registered entry targeting this
+    same `specialist:<slug>` already resolves to that same effective name,
+    committing this install would collide at load time (the registry's own
+    per-target uniqueness invariant would then quarantine one of them). Fail
+    BEFORE any staging/consent, not after. Entries owned by THIS slug are
+    excluded — an upgrade legitimately replaces its own prior owned set with
+    identical names."""
+    import plugin_registry
+
+    sourced_idents = {
+        d.identifier for d in component.dependencies
+        if d.kind == "plugin/implementation" and d.source is not None
+    }
+    if not sourced_idents:
+        return []
+    target = f"specialist:{component.slug}"
+    collisions: list[str] = []
+    for entry in plugin_registry.snapshot_registry().entries:
+        if target not in entry.get("targets", []):
+            continue
+        if plugin_registry.entry_owner(entry) == target:
+            continue  # this slug's own (prior) owned set — replaced, not a collision
+        effective = entry.get("manifest_name") or entry.get("name")
+        if effective in sourced_idents:
+            collisions.append(effective)
+    return collisions
+
+
+@dataclass(frozen=True, slots=True)
+class _PluginSurfaces:
+    """Task 8 fix-round-1 (consent-review CRITICAL, spec §3.2): the three
+    consent-enumeration surfaces `_validate_sourced_plugin_tree` extracts
+    from the manifest/`.mcp.json` it already parses while validating —
+    captured once here (into the row `resolve_dependency_closure` builds)
+    rather than re-parsed at the PluginReceiptRow-building site in
+    `inspect_specialist_repo`. Empty (the default) for a tree that failed
+    validation before reaching the extraction point."""
+    mcp_servers: tuple[str, ...] = ()
+    protected_tools: tuple[str, ...] = ()
+    env_names: tuple[str, ...] = ()
+
+
+_EMPTY_SURFACES = _PluginSurfaces()
+
+
+_MCP_JSON_VAR_RE = re.compile(r"\$\{[A-Za-z_][A-Za-z0-9_]*\}")
+
+
+def _walk_reject_markers_in_json(value: object) -> None:
+    """Parsed-leaf marker scan (mirrors `authored_markers.
+    reject_markers_in_parsed`'s dict/list/str walk) with a `${VAR}` carve-out
+    applied PER STRING LEAF before the marker check. See
+    `_reject_forbidden_markers_in_json` for why both pieces (parsed-leaf, not
+    raw-text; `${VAR}`-stripped, not blanket) are required together."""
+    if isinstance(value, str):
+        if contains_forbidden_marker(_MCP_JSON_VAR_RE.sub("", value)):
+            raise ValueError("template, include, HTML, or delimiter detected")
+    elif isinstance(value, dict):
+        for key, item in value.items():
+            _walk_reject_markers_in_json(key)
+            _walk_reject_markers_in_json(item)
+    elif isinstance(value, (list, tuple)):
+        for item in value:
+            _walk_reject_markers_in_json(item)
+
+
+def _reject_forbidden_markers_in_json(text: str) -> None:
+    """Task 8 fix-round-1 (found while wiring the mcp_servers/protected_tools/
+    env_names consent surfaces): a plain `reject_forbidden_markers(text)`
+    raw-text scan has TWO false-positive sources on real `plugin.json`/
+    `.mcp.json` content, both unconditional:
+
+    1. `${VAR}` env-var interpolation is the UNIVERSAL, legitimate
+       `.mcp.json` syntax every real plugin uses — `${CLAUDE_PLUGIN_ROOT}`
+       in a `command`/`args` entry, `${MY_SECRET}` in an `env` entry (see
+       `tests/test_env_var_extraction.py`, `plugin_env_extractor`'s own
+       module docstring) — never a template-injection attempt.
+    2. Nested JSON objects routinely end two (or more) closing braces in a
+       row — e.g. `{"casa": {"protectedTools": ["x"]}}` or
+       `{"env": {"K": "V"}}` — an exact byte-for-byte match for the
+       forbidden Jinja-close marker `}}`, on pure JSON structural
+       punctuation. `casa.protectedTools`/`casa.systemRequirements`/
+       `casa.triggers` are ALL nested one level under `casa`, so this hits
+       `plugin.json` itself for precisely the shapes this fix-round exists
+       to enumerate. The identical class of false positive already forced a
+       raw-scan carve-out for role.yaml's flow-style YAML
+       (`_extract_full_line_yaml_comments`); `authored_markers.
+       reject_markers_in_parsed` is this codebase's existing canonical fix
+       for exactly this — scan the PARSED tree's string leaves, never the
+       raw structural bytes.
+
+    Both, together, made this scan reject EVERY real `plugin.json` declaring
+    `casa.protectedTools` (etc.) and EVERY real `.mcp.json` a sourced/bundled
+    plugin dependency could ever declare, unconditionally, before step 4
+    (`validate_manifest`)/6/7 below could ever run — silently making Task
+    8's own protectedTools/env-name-collision handling dead code for any
+    plugin with a realistic manifest or MCP server config.
+
+    Fix: parse first, walk parsed string leaves only (immune to JSON's own
+    `}}`), stripping `${VAR}` per leaf before the marker check (still catches
+    a genuine `{{`/`{%`/`!include`/HTML-tag/structural-tag smuggled into any
+    string value). Malformed JSON falls back to the original blanket raw-text
+    scan (`${VAR}`-stripped) — `plugin_store`'s own parse/verdict gates are
+    what actually gate malformed JSON; this is defense in depth over
+    whatever text is there, not the primary check."""
+    try:
+        parsed = json.loads(text)
+    except ValueError:
+        reject_forbidden_markers(_MCP_JSON_VAR_RE.sub("", text))
+        return
+    _walk_reject_markers_in_json(parsed)
+
+
+def _mcp_server_summary(name: str, cfg: "Mapping") -> str:
+    """One-line "name: command arg1 arg2…" consent-surface summary (spec
+    §3.2) for a single validated `.mcp.json` server entry. A `url`-form
+    server (no `command`) summarizes as "name: url <url>" instead — still a
+    single line naming exactly what the operator's tap would approve."""
+    command = cfg.get("command")
+    if isinstance(command, str) and command:
+        args = cfg.get("args")
+        arg_list = [a for a in args if isinstance(a, str)] if isinstance(args, list) else []
+        return f"{name}: " + " ".join([command] + arg_list)
+    url = cfg.get("url")
+    if isinstance(url, str) and url:
+        return f"{name}: url {url}"
+    return f"{name}: (unrecognized server config)"
+
+
+def _validate_sourced_plugin_tree(
+    tree: Path, *, slug: str, identifier: str,
+) -> "tuple[str, _PluginSurfaces]":
+    """Full validation of a sourced (bundled/github) plugin dependency's
+    staged tree (spec §1/§3.2.1, brief Step 2). Returns `("", surfaces)` when
+    the tree is clean (`surfaces` populated for the consent DM — spec §3.2);
+    otherwise `(detail, _EMPTY_SURFACES)` with a non-empty detail string —
+    for the four prefixes in `_PROHIBITION_KIND_PREFIXES`,
+    `inspect_specialist_repo` raises that exact kind; every other non-empty
+    detail flows into the generic `dependency_unavailable`.
+
+    Order (Sol plan-r1 — prohibition codes must never be preempted by
+    `validate_manifest`'s own `apt_requirements_rejected`/`triggers_invalid`,
+    which are legacy per-plugin refusals, not this bundle's distinct codes):
+
+    1. Normalize FIRST (`plugin_store.strip_bytecode_derivatives`) — the SAME
+       normalization `_stage_and_swap` applies at publish, run before any
+       digest is computed so receipt attestation covers exactly the bytes
+       publish will checksum.
+    2. Reject an escaping symlink (`plugin_store._reject_escaping_symlinks`).
+    3. Prohibitions on the RAW manifest, read directly (before
+       `validate_manifest` gets a chance to raise its OWN, differently-coded,
+       refusal for the same underlying key): any `manifest_sysreqs` row ⇒
+       `bundled_sysreqs_unsupported`; any `casa.triggers` KEY present (even
+       malformed) ⇒ `bundled_triggers_unsupported`.
+    4. `plugin_store.validate_manifest` (identity: `plugin.json::name` must
+       equal `identifier`; this is also where a non-prohibited
+       `apt_requirements_rejected`/`triggers_invalid`/`name_mismatch`/etc.
+       surfaces for anything the raw-manifest prohibitions above did not
+       already catch — impossible for sysreqs/triggers by construction, but
+       real for name mismatches and malformed protectedTools).
+    5. Untrusted-bytes marker scan over `plugin.json`, every `*.md`, and every
+       `.mcp.json` under the tree (symlinks already vetted in step 2); the
+       `plugin.json`/`.mcp.json` scans (fix-round-1) walk PARSED string
+       leaves (immune to JSON's own structural `}}`) and strip legitimate
+       `${VAR}` env-var interpolation per leaf — see
+       `_reject_forbidden_markers_in_json`. `*.md` prose stays a raw scan.
+    6. Reserved-env + command-verdict gates over the tree's `.mcp.json`
+       (`plugin_store.reserved_env_violations` / `mcp_command_verdicts`).
+    7. Env-name collision (`_env_name_conflicts`) against every OTHER
+       installed plugin's required env names, excluding this slug's own
+       (prior) owned set.
+    """
+    import plugin_env_extractor
+    import plugin_registry
+    import plugin_store
+
+    plugin_store.strip_bytecode_derivatives(tree)
+    try:
+        plugin_store._reject_escaping_symlinks(tree)
+    except plugin_store.StoreError as exc:
+        return f"{exc.reason_code}: {exc}", _EMPTY_SURFACES
+
+    manifest_path = tree / ".claude-plugin" / "plugin.json"
+    try:
+        raw_manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+    except (OSError, ValueError) as exc:
+        return f"manifest_invalid: plugin.json missing/unparseable: {exc}", _EMPTY_SURFACES
+    if not isinstance(raw_manifest, dict):
+        return "manifest_invalid: plugin.json is not an object", _EMPTY_SURFACES
+
+    if plugin_store.manifest_sysreqs(raw_manifest):
+        return (f"{BUNDLED_SYSREQS_UNSUPPORTED}: a sourced/bundled plugin dependency "
+                "must not declare casa.systemRequirements", _EMPTY_SURFACES)
+    casa = raw_manifest.get("casa")
+    if isinstance(casa, dict) and "triggers" in casa:
+        return (f"{BUNDLED_TRIGGERS_UNSUPPORTED}: a sourced/bundled plugin dependency "
+                "must not declare casa.triggers", _EMPTY_SURFACES)
+
+    scoped = plugin_registry.scoped_name(slug, identifier)
+    try:
+        plugin_store.validate_manifest(tree, scoped, manifest_name=identifier)
+    except plugin_store.StoreError as exc:
+        return f"{exc.reason_code}: {exc}", _EMPTY_SURFACES
+
+    try:
+        _reject_forbidden_markers_in_json(manifest_path.read_text(encoding="utf-8"))
+        for md_path in sorted(tree.rglob("*.md")):
+            reject_forbidden_markers(md_path.read_text(encoding="utf-8"))
+        for mcp_path in sorted(tree.rglob(".mcp.json")):
+            _reject_forbidden_markers_in_json(mcp_path.read_text(encoding="utf-8"))
+    except ValueError as exc:
+        return f"forbidden_markers: {exc}", _EMPTY_SURFACES
+    except OSError as exc:
+        return f"forbidden_markers: unreadable file during marker scan: {exc}", _EMPTY_SURFACES
+
+    mcp_json_path = tree / ".mcp.json"
+    reserved = plugin_store.reserved_env_violations(mcp_json_path)
+    if reserved:
+        return "mcp_reserved_env: " + "; ".join(reserved), _EMPTY_SURFACES
+    missing = [v for v in plugin_store.mcp_command_verdicts(mcp_json_path, tree)
+               if v.get("status") == "missing"]
+    if missing:
+        return ("mcp_command_missing: " + "; ".join(
+            f"{v['server']}:{v['ref']} ({v.get('reason', '')})" for v in missing), _EMPTY_SURFACES)
+
+    tree_env_names = plugin_env_extractor.extract_env_vars(mcp_json_path)
+    conflicts = _env_name_conflicts(tree_env_names, exclude_owner=slug)
+    if conflicts:
+        return f"{ENV_NAME_COLLISION}: colliding env name(s): " + ", ".join(conflicts), _EMPTY_SURFACES
+
+    # Task 8 fix-round-1: the consent-enumeration surfaces (spec §3.2),
+    # extracted from state already parsed above — `raw_manifest` (step 3/4)
+    # and `mcp_json_path`/`tree_env_names` (step 6/7) — never re-read from
+    # disk. Sorted for determinism (dict/set iteration order is not a
+    # contract either the manifest author or `extract_env_vars` promises).
+    surfaces = _PluginSurfaces(
+        mcp_servers=tuple(
+            _mcp_server_summary(name, cfg)
+            for name, cfg in sorted(plugin_store.mcp_servers_map(mcp_json_path).items())),
+        protected_tools=tuple(
+            e["name"] for e in plugin_store.manifest_protected_tools(raw_manifest)),
+        env_names=tuple(sorted(tree_env_names)),
+    )
+    return "", surfaces
+
+
+def _sourced_plugin_manifest_version(tree: Path) -> str:
+    """The receipt row's `version` — read AFTER `_validate_sourced_plugin_tree`
+    has already fully validated the manifest; mirrors `validate_manifest`'s
+    own missing-version default (`"0.0.0"`) without re-running the whole
+    validation gate a second time just to extract one field."""
+    try:
+        manifest = json.loads((tree / ".claude-plugin" / "plugin.json").read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        return "0.0.0"
+    version = manifest.get("version") if isinstance(manifest, dict) else None
+    return version if isinstance(version, str) and version else "0.0.0"
+
+
 def _extract_full_line_yaml_comments(text: str) -> str:
     """Task N2 fix: role.yaml's own legitimate flow-style syntax (e.g.
     `disclosure: {policy: delegated, overrides: {}}`, used by every
@@ -425,6 +825,7 @@ def inspect_specialist_repo(
     mode: "Literal['install', 'upgrade']" = "install",
     target_slug: str | None = None,
     specialists_dir: Path = Path("/config/specialists"),
+    receipts_dir: Path = Path("/config/specialists/.receipts"),
 ) -> InspectionResult:
     """Fetch for inspection into a NON-PERSISTENT staging directory (spec §6
     N1) — no CAS write, no binding, no activation. Every check that can
@@ -439,7 +840,20 @@ def inspect_specialist_repo(
     upgrade mode does not weaken that for any OTHER slug, it narrowly
     excludes only `target_slug` after independently confirming an active
     instance of that exact slug already exists (never usable to backdoor a
-    fresh install past collision checks under a false 'upgrade' claim)."""
+    fresh install past collision checks under a false 'upgrade' claim).
+
+    Task 8 (spec §1/§3.2.1): fetches every github-sourced plugin dependency
+    into `.dep-plugins/<identifier>` under the SAME staging dir, runs a
+    per-target manifest-name collision precheck, resolves the full
+    dependency closure (now including sourced-plugin validation), raises a
+    prohibition's OWN kind (bundled_sysreqs_unsupported/
+    bundled_triggers_unsupported/env_name_collision) ahead of the generic
+    dependency_unavailable, and — for EVERY inspection, plugin-less
+    components included — mints and persists a trusted source receipt
+    (`specialist_receipt`) so a bundled/declared plugin closure's provenance
+    is bound into consent (`receipt_digest`) and available to commit."""
+    import plugin_registry
+    import specialist_receipt
     from specialist_registry import InstalledSpecialistIndex, _discover_image_role_slots
 
     if mode == "upgrade" and not target_slug:
@@ -451,7 +865,8 @@ def inspect_specialist_repo(
 
     staging_root.mkdir(parents=True, exist_ok=True, mode=0o700)
     component_dir = staging_root / uuid.uuid4().hex
-    resolve_and_fetch(repo, ref, subdir, component_dir, expected_revision=expected_revision)
+    component_revision = resolve_and_fetch(
+        repo, ref, subdir, component_dir, expected_revision=expected_revision)
 
     manifest_path = component_dir / "manifest.json"
     if not manifest_path.is_file():
@@ -462,6 +877,20 @@ def inspect_specialist_repo(
         raise SpecialistInstallError("manifest_invalid", str(exc)) from exc
 
     _validate_untrusted_bytes(component)
+
+    # Task 8: fetch every github-sourced plugin dependency INTO this same
+    # staging tree, at the `.dep-plugins/<identifier>` convention every
+    # closure call site (inspect/CAS-staging/final-CAS/rollback) shares
+    # unconditionally — `dep.identifier` is already PLUGIN_IDENT_RE-validated
+    # (specialist_component's loader), so this join is safe without a
+    # separate containment check. Revision-pinned: `resolve_and_fetch` itself
+    # refuses a moved `ref` against `dep.source.revision`.
+    for dep in component.dependencies:
+        if dep.kind == "plugin/implementation" and dep.source is not None \
+                and dep.source.type == "github":
+            dest = component_dir / ".dep-plugins" / dep.identifier
+            resolve_and_fetch(dep.source.repo, dep.source.ref, "", dest,
+                              expected_revision=dep.source.revision)
 
     index = installed_index or InstalledSpecialistIndex()
     if installed_index is None:
@@ -492,22 +921,88 @@ def inspect_specialist_repo(
     except ValueError as exc:
         raise SpecialistInstallError("slug_collision", str(exc)) from exc
 
+    manifest_name_collisions = _manifest_name_collisions(component)
+    if manifest_name_collisions:
+        raise SpecialistInstallError(
+            "manifest_name_collision",
+            f"specialist:{component.slug} already resolves an entry with effective "
+            f"manifest name(s) {sorted(set(manifest_name_collisions))!r} — a sourced "
+            "plugin dependency must not collide with it")
+
     dependencies = resolve_dependency_closure(component, component_dir)
     unavailable = [d for d in dependencies if not d.available]
     if unavailable:
+        # Task 8: a prohibition (sysreqs/triggers/env-collision) aborts with
+        # its OWN kind, not the generic dependency_unavailable — scan every
+        # unavailable row first (Sol plan-r1).
+        for d in unavailable:
+            for prefix in _PROHIBITION_KIND_PREFIXES:
+                if d.detail.startswith(prefix):
+                    raise SpecialistInstallError(prefix, f"{d.kind}:{d.identifier}: {d.detail}")
         detail = "; ".join(f"{d.kind}:{d.identifier}: {d.detail}" for d in unavailable)
         raise SpecialistInstallError("dependency_unavailable", detail)
 
+    # Whole-branch E: cross-sibling env-name collision (the per-plugin check
+    # only saw installed artifacts). Every remaining dep resolved available.
+    sibling_env = _sibling_env_name_collisions(dependencies)
+    if sibling_env:
+        raise SpecialistInstallError(
+            ENV_NAME_COLLISION,
+            "sourced plugins in this bundle require the same env name(s): "
+            + ", ".join(sibling_env))
+
     root_digest = compute_install_root_digest(
         component, dependencies, manifest_bytes=manifest_path.read_bytes())
+
+    # Task 8: build one PluginReceiptRow per sourced plugin dependency
+    # (dependencies is 1:1 positional with component.dependencies — every
+    # row appended by resolve_dependency_closure's per-dependency loop, and
+    # any additional synthetic persona-count row would have been `available=
+    # False` and already raised above, so this dict is exhaustive here).
+    resolved_by_identity = {(d.kind, d.identifier): d for d in dependencies}
+    plugin_rows: list[specialist_receipt.PluginReceiptRow] = []
+    for dep in component.dependencies:
+        if dep.kind != "plugin/implementation" or dep.source is None:
+            continue
+        resolution = resolved_by_identity[(dep.kind, dep.identifier)]
+        if dep.source.type == "bundled":
+            tree = component_dir / dep.source.path
+            row_repo, row_ref, row_revision = repo, ref, f"git:{component_revision}"
+            row_subdir = f"{subdir}/{dep.source.path}" if subdir else dep.source.path
+        else:
+            tree = component_dir / ".dep-plugins" / dep.identifier
+            row_repo, row_ref, row_revision = dep.source.repo, dep.source.ref, dep.source.revision
+            row_subdir = ""
+        plugin_rows.append(specialist_receipt.PluginReceiptRow(
+            identifier=dep.identifier,
+            scoped_name=plugin_registry.scoped_name(component.slug, dep.identifier),
+            manifest_name=dep.identifier,
+            version=_sourced_plugin_manifest_version(tree),
+            source_type=dep.source.type,
+            repo=row_repo, ref=row_ref, revision=row_revision, subdir=row_subdir,
+            content_digest=resolution.digest, staged_path=str(tree),
+            # Task 8 fix-round-1 (consent-review CRITICAL): captured by
+            # `_validate_sourced_plugin_tree` during `resolve_dependency_
+            # closure` above — never re-parsed here.
+            mcp_servers=resolution.mcp_servers,
+            protected_tools=resolution.protected_tools,
+            env_names=resolution.env_names,
+        ))
+
+    receipt = specialist_receipt.build_receipt(
+        slug=component.slug, component_repo=repo, component_ref=ref,
+        component_revision=f"git:{component_revision}", component_subdir=subdir,
+        component_staged_path=str(component_dir), plugins=tuple(plugin_rows),
+    )
+    specialist_receipt.persist(receipt, receipts_dir=receipts_dir)
 
     required = component.config_schema.get("required", [])
     secret_names = set(component.config_schema.get("secret_names", []))
     logger.info(
         "inspect_specialist_repo passed all gates: mode=%s slug=%s component_id=%s "
-        "version=%s root_digest=%s (staged at %s, not yet activated)",
+        "version=%s root_digest=%s receipt_id=%s (staged at %s, not yet activated)",
         mode, component.slug, component.component_id, component.version,
-        root_digest, component_dir,
+        root_digest, receipt.receipt_id, component_dir,
     )
     return InspectionResult(
         component_id=component.component_id, version=component.version, slug=component.slug,
@@ -518,6 +1013,8 @@ def inspect_specialist_repo(
         required_config_names=tuple(n for n in required if n not in secret_names),
         required_secret_names=tuple(n for n in required if n in secret_names),
         dependencies=dependencies, staged_dir=component_dir,
+        receipt_id=receipt.receipt_id, receipt_digest=receipt.receipt_digest,
+        plugin_resolutions=tuple(plugin_rows),
     )
 
 
@@ -582,12 +1079,260 @@ def _publish_cas_staging(cas_staging_dir: Path, cas_dir: Path) -> None:
         raise
 
 
+# ---------------------------------------------------------------------------
+# Bundle transaction shared helpers (Task 10, spec §3.2-§3.5)
+# ---------------------------------------------------------------------------
+
+
+def _tree_content_digest(tree: Path) -> str:
+    """The `sha256:`-prefixed content checksum a receipt row records — bytecode
+    stripped first, exactly as `plugin_store` does at publish time."""
+    from plugin_store import content_checksum, strip_bytecode_derivatives
+    strip_bytecode_derivatives(tree)
+    return "sha256:" + content_checksum(tree)
+
+
+def _resolve_owned_tree_paths(receipt: "SourceReceipt", *, workspace: Path,
+                              ) -> "dict[str, Path]":
+    """Preflight step (spec §3.2 commit sequence): map every receipt plugin
+    row to the tree whose bytes will be published. Prefer the retained staging
+    tree when it still matches the attested digest; otherwise recover it by
+    re-fetching the row's own pinned coordinates
+    (`resolve_and_fetch(row.repo, row.ref, row.subdir, tmp,
+    expected_revision=row.revision)`), stripping bytecode, and re-verifying the
+    digest. Any mismatch (staged OR recovered) is a `receipt_drift` refusal —
+    the publish path must only ever write the attested bytes."""
+    tree_paths: dict[str, Path] = {}
+    for row in receipt.plugins:
+        staged = Path(row.staged_path) if row.staged_path else None
+        if staged is not None and staged.is_dir() and \
+                _tree_content_digest(staged) == row.content_digest:
+            tree_paths[row.identifier] = staged
+            continue
+        # Vanished/tampered staging — recover from the attested coordinates.
+        # `resolve_and_fetch` populates `recovered` itself (must not pre-exist).
+        recovered = workspace / row.identifier
+        if recovered.exists():
+            shutil.rmtree(recovered, ignore_errors=True)
+        workspace.mkdir(parents=True, exist_ok=True)
+        resolve_and_fetch(row.repo, row.ref, row.subdir, recovered,
+                          expected_revision=row.revision)
+        if _tree_content_digest(recovered) != row.content_digest:
+            raise SpecialistInstallError(
+                "receipt_drift",
+                f"recovered plugin tree {row.scoped_name!r} no longer matches "
+                f"the attested content digest {row.content_digest}")
+        tree_paths[row.identifier] = recovered
+    return tree_paths
+
+
+def _recover_component_staging(receipt: "SourceReceipt", *, workspace: Path) -> Path:
+    """Vanished-component-staging recovery (spec §3.2.1, Terra plan-r2): refetch
+    the component subtree (and its github dep-plugins, at the `.dep-plugins`
+    convention) from the receipt's attested coordinates. The CAS closure/root-
+    digest re-verify in the caller then validates the reproduced bytes are
+    exactly what the operator approved."""
+    comp = workspace / "component"
+    workspace.mkdir(parents=True, exist_ok=True)
+    if comp.exists():
+        shutil.rmtree(comp, ignore_errors=True)
+    resolve_and_fetch(
+        receipt.component_repo, receipt.component_ref, receipt.component_subdir,
+        comp, expected_revision=receipt.component_revision)
+    component = load_specialist_component(comp, comp / "manifest.json")
+    for dep in component.dependencies:
+        if (dep.kind == "plugin/implementation" and dep.source is not None
+                and dep.source.type == "github"):
+            dest = comp / ".dep-plugins" / dep.identifier
+            resolve_and_fetch(dep.source.repo, dep.source.ref, "", dest,
+                              expected_revision=dep.source.revision)
+    return comp
+
+
+def _publish_owned_plugins(
+    slug: str, receipt: "SourceReceipt", tree_paths: "dict[str, Path]",
+    *, store_root: Path,
+) -> "list[tuple[PluginReceiptRow, object]]":
+    """Publish each owned plugin tree to the content-addressed store under its
+    SCOPED name (spec §3.2b). Asserts the published metadata's content checksum
+    IS the attested digest (`receipt_drift` otherwise — published bytes must BE
+    the attested bytes). Returns the (row, PublishResult) pairs in receipt
+    order."""
+    import plugin_store
+
+    # Stage under the store root's sibling (writable wherever store_root is),
+    # not the module-default /config path — keeps unit tests off /config.
+    staging_root = Path(store_root).parent / ".staging"
+    published: list[tuple["PluginReceiptRow", object]] = []
+    for row in receipt.plugins:
+        res = plugin_store.publish_from_tree(
+            name=row.scoped_name, repo=row.repo, ref=row.ref,
+            revision=row.revision, subdir=row.subdir,
+            src_root=tree_paths[row.identifier], store_root=store_root,
+            staging_root=staging_root, manifest_name=row.manifest_name)
+        meta = plugin_store.read_metadata(Path(res.path)) or {}
+        # row.content_digest is `sha256:<hex>`; metadata carries the bare hex.
+        if "sha256:" + str(meta.get("content_checksum")) != row.content_digest:
+            raise SpecialistInstallError(
+                "receipt_drift",
+                f"published artifact {row.scoped_name!r} content checksum "
+                f"does not match the attested digest {row.content_digest}")
+        published.append((row, res))
+    return published
+
+
+def _owned_entry_for(slug: str, row: "PluginReceiptRow", res) -> dict:
+    """Build the registry entry for one owned plugin (spec §3.3): the
+    manifest-level `bundled` term never enters the registry — owned entries
+    always register `source.type = github` with the receipt's coordinates."""
+    import plugin_registry
+
+    return {
+        "name": row.scoped_name,
+        "owner": f"specialist:{slug}",
+        "manifest_name": row.manifest_name,
+        "targets": [f"specialist:{slug}"],
+        "version": res.version,
+        "source": {"type": "github", "repo": row.repo, "ref": row.ref,
+                   "revision": row.revision,
+                   "subdir": plugin_registry.normalize_subdir(row.subdir)},
+        "artifact_id": res.artifact_id,
+    }
+
+
+def _owned_sidecar_doc(
+    slug: str, receipt: "SourceReceipt",
+    published: "list[tuple[PluginReceiptRow, object]]",
+) -> dict:
+    """The owned-plugins sidecar document (spec §3.4): the exact owned set +
+    component source receipt for this generation — written for EVERY
+    specialist, plugin-less ones included (`plugins: []`)."""
+    plugins = []
+    for row, res in published:
+        plugins.append({
+            "name": row.scoped_name, "manifest_name": row.manifest_name,
+            "version": res.version, "artifact_id": res.artifact_id,
+            "digest": row.content_digest,
+            "source": {"type": "github", "repo": row.repo, "ref": row.ref,
+                       "revision": row.revision, "subdir": row.subdir},
+        })
+    return {
+        "schema_version": 1,
+        "component_source": {
+            "repo": receipt.component_repo, "ref": receipt.component_ref,
+            "revision": receipt.component_revision,
+            "subdir": receipt.component_subdir,
+        },
+        "plugins": plugins,
+    }
+
+
+def _tuple_files_snapshot(slug_dir: Path) -> "dict[str, str | None]":
+    """Read the six journalled tuple/sidecar files' bytes (or None when absent)
+    for the bundle-op journal's before-state."""
+    from specialist_bundle_journal import TUPLE_FILENAMES
+
+    out: dict[str, str | None] = {}
+    for name in sorted(TUPLE_FILENAMES):
+        path = slug_dir / name
+        out[name] = path.read_text(encoding="utf-8") if path.is_file() else None
+    return out
+
+
+def _removed_artifact_ids(before_entries: "list[dict]",
+                          new_artifact_ids: "set[str]") -> "tuple[str, ...]":
+    """Pre-swap owned artifact ids that the new owned set no longer carries —
+    drives the sequencer's grant/challenge invalidation (spec §3.2d)."""
+    removed = []
+    for e in before_entries:
+        aid = e.get("artifact_id")
+        if isinstance(aid, str) and aid not in new_artifact_ids:
+            removed.append(aid)
+    return tuple(dict.fromkeys(removed))
+
+
+def _reject_receiptless_sourced_deps(
+    component: "SpecialistComponent", *, receipt: "SourceReceipt | None",
+) -> None:
+    """Task 10 review, defense-in-depth (F1): the journaled bundle publish/
+    registry-swap path (spec §3.2/§3.4) only engages when the tool layer
+    supplies a trusted-source `receipt` (`bundle_mode` in
+    commit_specialist_install / the receipt-aware branch of upgrade_specialist).
+    A direct in-process caller can otherwise walk the ORIGINAL legacy
+    no-receipt path with a component that DECLARES a source-bearing
+    `plugin/implementation` dependency — `resolve_dependency_closure` resolves
+    it available straight off the component tree (no fetch needed, the tree
+    is already staged), so every other gate passes, but no plugin is ever
+    published to the store or registered as owned. The result is an installed/
+    upgraded specialist pinned to a dependency that no `casa.triggers`/tool
+    surface can ever see — an inert dangling pin, silently violating the
+    F1 doctrine that validators live at the lifecycle-function boundary every
+    caller (sanctioned or not) routes through.
+
+    Fires for BOTH the fresh-staging and vanished/reused-staging CAS paths —
+    callers place this right after the CAS-resident `component` is loaded and
+    slug-checked, before either the persona/role load or the dependency-
+    closure resolution, so it is BEFORE any InstanceDir mutation. Sourceless,
+    persona-only, and corpus-only components (every dependency has
+    `source is None`, which includes non-`plugin/implementation` kinds and
+    bundled/no-op-source plugin deps that don't need registry publication) are
+    untouched — the legacy call-site fleet keeps working unchanged."""
+    if receipt is not None:
+        return
+    sourced = sorted(
+        d.identifier for d in component.dependencies
+        if d.kind == "plugin/implementation" and d.source is not None
+    )
+    if sourced:
+        raise SpecialistInstallError(
+            "receipt_required",
+            f"component {component.component_id!r} bundles source-declared "
+            f"plugin dependencies ({', '.join(sourced)}); a source receipt is "
+            "mandatory to install or upgrade it")
+
+
+def _assert_receipt_matches_inspection(
+    receipt: "SourceReceipt | None", inspection: "InspectionResult",
+) -> None:
+    """Whole-branch D: the consent gate is keyed on `inspection.receipt_digest`
+    (via the consent identity), but commit/upgrade then PUBLISH from the
+    separately-supplied `receipt` object. Nothing previously asserted the two
+    describe the same closure — a caller with a valid ack for inspection X could
+    hand a receipt for a different closure Y and commit Y's bytes past X's
+    approval. Fail closed (`receipt_mismatch`) unless the receipt's id, digest,
+    and slug all equal the inspection's AND its per-plugin row set (identifier +
+    attested content digest) matches `inspection.plugin_resolutions`, BEFORE the
+    consent check. Legacy sourceless installs pass `receipt=None` and skip this
+    (their `receipt_digest` is "" — identity unchanged)."""
+    if receipt is None:
+        return
+    if (receipt.receipt_id != inspection.receipt_id
+            or receipt.receipt_digest != getattr(inspection, "receipt_digest", "")
+            or receipt.slug != inspection.slug):
+        raise SpecialistInstallError(
+            "receipt_mismatch",
+            "supplied receipt does not match the approved inspection "
+            "(id/digest/slug)")
+    insp_rows = {(r.identifier, r.content_digest)
+                 for r in getattr(inspection, "plugin_resolutions", ()) or ()}
+    receipt_rows = {(r.identifier, r.content_digest) for r in receipt.plugins}
+    if insp_rows != receipt_rows:
+        raise SpecialistInstallError(
+            "receipt_mismatch",
+            "supplied receipt's plugin row set does not match the approved "
+            "inspection")
+
+
 def commit_specialist_install(
-    *, inspection: "InspectionResult", config: "Mapping[str, str]",
+    *, inspection: "InspectionResult", receipt: "SourceReceipt | None" = None,
+    config: "Mapping[str, str]",
     secret_names_provided: frozenset[str], acks: "SpecialistInstallAckStore",
     specialists_dir: Path = Path("/config/specialists"),
     agents_specialists_dir: Path = Path("/config/agents/specialists"),
-) -> "SpecialistInstance":
+    registry_path: "Path | None" = None,
+    plugin_store_root: "Path | None" = None,
+    ops_dir: "Path | None" = None,
+) -> "SpecialistInstance | tuple[SpecialistInstance, object]":
     """The ONLY function that writes into the CAS/specialists tree (spec §6
     N1: "consent precedes any persistent CAS install/activation"). Order:
     verify consent -> persist to CAS -> compile (persona↔role compatibility)
@@ -625,7 +1370,16 @@ def commit_specialist_install(
     from specialist_lifecycle import SpecialistInstance, satisfy_config
     from specialist_component import load_specialist_component
     from specialist_install_consent import install_consent_identity
+    import plugin_registry
+    import plugin_store
+    import specialist_bundle_journal
+    from specialist_bundle_journal import BundleTxn
     import specialist_materialize
+
+    if registry_path is None:
+        registry_path = plugin_registry.REGISTRY_PATH
+    if plugin_store_root is None:
+        plugin_store_root = plugin_store.STORE_ROOT
 
     # F1 (round 2, inspection.slug traversal): `inspection.slug` is joined as
     # `specialists_dir / inspection.slug` (InstanceDir) and threaded as the
@@ -637,9 +1391,17 @@ def commit_specialist_install(
     # agrees (mirroring upgrade_specialist's slug_mismatch treatment).
     validate_specialist_slug(inspection.slug)
 
+    # Whole-branch D: bind the supplied receipt to the approved inspection
+    # BEFORE consent — fail closed on any id/digest/slug/row-set drift.
+    _assert_receipt_matches_inspection(receipt, inspection)
+
+    # Task 8 seam (Task 7 P0): thread the trusted-source receipt digest into
+    # the consent identity — `getattr` keeps this call working against a
+    # hand-built/legacy InspectionResult that predates the field (default "").
     identity = install_consent_identity(
         component_id=inspection.component_id, version=inspection.version,
         root_digest=inspection.root_digest, slug=inspection.slug,
+        receipt_digest=getattr(inspection, "receipt_digest", ""),
     )
     if not acks.is_acked(identity):
         raise SpecialistInstallError(
@@ -648,198 +1410,264 @@ def commit_specialist_install(
             f"{inspection.version} (root digest {inspection.root_digest})",
         )
 
-    # Round-3 fix (finding #1 — CAS-before-verify): CAS addressing is keyed
-    # by the FULL-CLOSURE root_digest, not the narrow component_checksum —
-    # the operator's approval attests to the whole closure, so the CAS
-    # directory identity must too. CRITICALLY, the copy from
-    # `inspection.staged_dir` lands in a TEMPORARY staging directory first —
-    # never directly at the final, content-addressed `cas_dir` — so a
-    # digest mismatch below can never leave a wrong-digest-named CAS
-    # directory behind (a poisoned CAS entry a later `cas_dir.exists()`
-    # check for this SAME digest would then trust forever, since CAS
-    # content is treated as immutable once present at its digest path).
-    cas_dir = cas_store_dir(inspection.root_digest, store_root=specialists_dir / "store")
-    if not cas_dir.exists():
-        staging_root = specialists_dir / "store" / ".staging"
-        staging_root.mkdir(parents=True, exist_ok=True, mode=0o700)
-        cas_staging_dir = staging_root / uuid.uuid4().hex
-        shutil.copytree(inspection.staged_dir, cas_staging_dir, dirs_exist_ok=False, symlinks=True)
-        for path in cas_staging_dir.rglob("*"):
-            if path.is_file():
-                path.chmod(0o400)
-        try:
-            # Reload + recompute the FULL dependency closure and root digest
-            # from the STAGED (not-yet-CAS) bytes and compare to the
-            # operator-acknowledged digest BEFORE this content is ever
-            # visible under its content-addressed name. A mismatch discards
-            # the staging dir and raises; `cas_dir` is never created for a
-            # component that fails verification.
-            staged_component = load_specialist_component(
-                cas_staging_dir, cas_staging_dir / "manifest.json")
-            staged_deps = resolve_dependency_closure(staged_component, cas_staging_dir)
-            staged_unavailable = [d for d in staged_deps if not d.available]
-            if staged_unavailable:
-                detail = "; ".join(
-                    f"{d.kind}:{d.identifier}: {d.detail}" for d in staged_unavailable)
-                raise SpecialistInstallError("dependency_unavailable", detail)
-            staged_root_digest = compute_install_root_digest(
-                staged_component, staged_deps,
-                manifest_bytes=(cas_staging_dir / "manifest.json").read_bytes())
-            if staged_root_digest != inspection.root_digest:
-                raise SpecialistInstallError(
-                    "checksum_changed",
-                    "staged component no longer matches the approved inspection")
-        except Exception:
-            shutil.rmtree(cas_staging_dir, ignore_errors=True)
-            raise
-        # Verified: atomically publish into the final content-addressed
-        # location. `os.replace` is a single directory rename on the same
-        # filesystem (/config always is) — no partially-written or
-        # wrong-digest CAS state is ever observable at `cas_dir`.
-        _publish_cas_staging(cas_staging_dir, cas_dir)
-
-    # Re-load from the now-final (or, for a digest an earlier install
-    # already verified and published, pre-existing) CAS directory.
-    component = load_specialist_component(cas_dir, cas_dir / "manifest.json")
-    # F1 (round 2): the CAS component's OWN declared slug is authoritative —
-    # assert it agrees with the approved inspection slug (a mismatch means the
-    # inspection was hand-built/tampered to bind slug X's approval to component
-    # Y's bytes). Mirrors upgrade_specialist's slug_mismatch guard.
-    if component.slug != inspection.slug:
-        raise SpecialistInstallError(
-            "slug_mismatch",
-            f"CAS component slug {component.slug!r} does not match the approved "
-            f"inspection slug {inspection.slug!r}")
-    role = materialize_role(source=load_role_artifact(cas_dir / "role"), options={})
-    persona = load_persona_pack(cas_dir / "persona" / "pack", cas_dir / "persona" / "manifest.json")
-
-    # Re-run the FULL dependency closure against the final CAS path and
-    # re-derive the root digest ONE more time, immediately before any tuple
-    # is staged — this is the "reject unavailable/changed bytes immediately
-    # before persistence/activation" gate. A dependency that flips
-    # unavailable, or a root digest that no longer matches what the
-    # operator acked, aborts here even though the bytes are already in CAS
-    # (CAS content is immutable/content-addressed, so this can only happen
-    # if `inspection` itself was stale/tampered, or the digest already
-    # existed in CAS from a prior, still-valid install — never trust
-    # `inspection` past this point).
-    fresh_deps = resolve_dependency_closure(component, cas_dir)
-    unavailable = [d for d in fresh_deps if not d.available]
-    if unavailable:
-        detail = "; ".join(f"{d.kind}:{d.identifier}: {d.detail}" for d in unavailable)
-        raise SpecialistInstallError("dependency_unavailable", detail)
-    fresh_root_digest = compute_install_root_digest(
-        component, fresh_deps, manifest_bytes=(cas_dir / "manifest.json").read_bytes())
-    if fresh_root_digest != inspection.root_digest:
-        raise SpecialistInstallError(
-            "checksum_changed", "CAS-persisted component no longer matches the approved inspection")
-
-    satisfied, missing = satisfy_config(
-        schema=component.config_schema, provided_non_secret=config,
-        provided_secret_names=secret_names_provided,
-    )
-    root = component_root_string(
-        component_id=component.component_id, version=component.version,
-        component_checksum=fresh_root_digest,
-    )
-    instance_dir = InstanceDir(specialists_dir / inspection.slug)
-    dependency_digests = tuple(sorted(d.digest for d in fresh_deps))
-
-    if not satisfied:
-        # Fail closed into pending-configuration: a desired candidate is
-        # staged so the operator can see WHAT is missing, but nothing
-        # activates and nothing materializes into the runtime load path.
-        placeholder_binding = materialize_component_default_binding(
-            role=role, persona=persona, component_root=root,
-            dependency_digests=dependency_digests,
-        )
-        # F1 (round 4): stage_desired for the placeholder is an InstanceDir
-        # write — it MUST hold MATERIALIZE_LOCK like every other one. F2: this
-        # stages a desired for a not-yet-active slug; re-check under the lock
-        # that a concurrent full install has not activated it meanwhile
-        # (staging a pending placeholder over a live active would corrupt state).
-        with specialist_materialize.MATERIALIZE_LOCK:
-            _refuse_if_active_present(instance_dir, slug=inspection.slug)
-            instance_dir.stage_desired(InstanceTuple(
-                root=root, binding=placeholder_binding, config_snapshot=dict(config),
-                config_digest=placeholder_binding.effective_config_digest,
-            ))
-        return SpecialistInstance(
-            slug=inspection.slug, stable_agent_id=f"specialist:{inspection.slug}",
-            state="pending-configuration", active=None, desired=instance_dir.desired(),
-            last_activation_error=f"missing required config/secret: {missing}",
-        )
-
-    # Mc: check_persona_requirements raises a BARE ValueError on
-    # incompatibility. commit_specialist_install has no local ValueError
-    # handler, so it would escape as an unstructured MCP error rather than
-    # the tool's typed {ok, kind} contract (specialist_install_commit catches
-    # only SpecialistInstallError). Wrap it typed.
+    # Task 10 (spec §3.2): the JOURNALED bundle transaction engages only when
+    # the tool layer supplies a trusted source `receipt` (it always does; the
+    # tool loads it by opaque id). Called without one — legacy/direct callers,
+    # and the pre-Task-10 tests — this keeps the original non-journaled
+    # behavior AND the original single-`SpecialistInstance` return, so no
+    # owned-plugin publish/registry-swap/sidecar ever runs and the default
+    # /config registry is never touched. `bundle_mode` returns
+    # `(instance, BundleTxn)`; legacy returns just `instance`.
+    bundle_mode = receipt is not None
+    workspace = None
+    if bundle_mode:
+        workspace = specialists_dir / ".bundle-staging" / uuid.uuid4().hex
+        workspace.mkdir(parents=True, exist_ok=True, mode=0o700)
+    _instance_out: "SpecialistInstance | None" = None
+    _txn_out: "object | None" = None
     try:
-        check_persona_requirements(role.normalized, persona)
-    except ValueError as exc:
-        raise SpecialistInstallError("persona_incompatible", str(exc)) from exc
-    effective_config_digest = compute_effective_config_digest(dict(config))
-    binding = materialize_component_default_binding(
-        role=role, persona=persona, component_root=root,
-        dependency_digests=dependency_digests, effective_config_digest=effective_config_digest,
-    )
-    # compile_prompt_bundle both VALIDATES (ceilings, persona/role/binding
-    # cross-consistency) and produces the bundle materialize_operational_files'
-    # sibling agent_loader wiring (a later slice) will recompile identically
-    # at load time — compiling here is a pre-activation GATE, not a cache.
-    compile_prompt_bundle(
-        role=role, persona=persona, binding=binding,
-        platform_frame=(Path(__file__).parent / "defaults" / "personality"
-                         / "platform-frame.md").read_text(encoding="utf-8"),
-        safety_kernel=(Path(__file__).parent / "defaults" / "personality"
-                       / "safety-kernel.md").read_text(encoding="utf-8"),
-    )
+        if bundle_mode:
+            # Preflight: map every attested plugin tree to the bytes to publish
+            # — retained staging when it still matches the receipt digest, else
+            # recovered from the attested coordinates (receipt_drift on any
+            # mismatch). Vanished component staging is refetched too.
+            tree_paths = _resolve_owned_tree_paths(receipt, workspace=workspace)
+            effective_staged = inspection.staged_dir
+            if not Path(effective_staged).is_dir():
+                effective_staged = _recover_component_staging(receipt, workspace=workspace)
+        else:
+            tree_paths = {}
+            effective_staged = inspection.staged_dir
 
-    # Round-4 fix (finding #2): commit FIRST — the tuple is the single
-    # authoritative record (see this function's docstring) — then
-    # materialize the operational files as a best-effort derived-cache
-    # write. A materialize failure here does NOT roll back the commit; it
-    # is caught, logged, and surfaced as a non-fatal last_activation_error.
-    # `specialist_materialize.current_specialist_roles_dir` re-materializes
-    # every ACTIVE slug's operational files from its tuple on every
-    # subsequent boot/reload call, so this slug self-heals automatically.
-    # F3 (round 2): hold MATERIALIZE_LOCK across commit+materialize so the
-    # self-heal reconcile loop (also under this lock) can never snapshot the
-    # OLD active tuple and then materialize its op-files over this NEW binding's
-    # (new binding paired with old capabilities). The lock spans ONLY this
-    # tuple-commit+materialize; every compile/fetch gate above already ran
-    # outside it. See specialist_materialize.MATERIALIZE_LOCK's deadlock note.
-    # F1 (round 3): stage_desired MUST be inside the lock too — two concurrent
-    # mutations on the same slug could otherwise interleave (A stages, B stages
-    # over desired.yaml, A commits B's tuple while materializing A's op-files),
-    # publishing an active tuple whose op-files/marker belong to a different
-    # mutation. Staging+commit+materialize+marker is now one atomic locked unit.
-    last_activation_error: str | None = None
-    with specialist_materialize.MATERIALIZE_LOCK:
-        # F2 (round 4): fail closed if a concurrent install activated this slug
-        # while we blocked on the lock — never double-activate over a winner.
-        _refuse_if_active_present(instance_dir, slug=inspection.slug)
-        instance_dir.stage_desired(InstanceTuple(
-            root=root, binding=binding, config_snapshot=dict(config),
-            config_digest=effective_config_digest,
-        ))
-        committed = instance_dir.commit_desired_to_active()
-        try:
-            specialist_materialize.materialize_specialist_operational_files(
-                agents_specialists_dir=agents_specialists_dir, slug=inspection.slug, role=role, persona=persona,
-                binding_digest=committed.binding.binding_digest, component_root=committed.root,
+        # Round-3 fix (finding #1 — CAS-before-verify): CAS addressing is keyed
+        # by the FULL-CLOSURE root_digest, not the narrow component_checksum —
+        # the operator's approval attests to the whole closure, so the CAS
+        # directory identity must too. CRITICALLY, the copy from the staged dir
+        # lands in a TEMPORARY staging directory first — never directly at the
+        # final, content-addressed `cas_dir` — so a digest mismatch below can
+        # never leave a wrong-digest-named CAS directory behind.
+        cas_dir = cas_store_dir(inspection.root_digest, store_root=specialists_dir / "store")
+        if not cas_dir.exists():
+            staging_root = specialists_dir / "store" / ".staging"
+            staging_root.mkdir(parents=True, exist_ok=True, mode=0o700)
+            cas_staging_dir = staging_root / uuid.uuid4().hex
+            shutil.copytree(effective_staged, cas_staging_dir, dirs_exist_ok=False, symlinks=True)
+            for path in cas_staging_dir.rglob("*"):
+                if path.is_file():
+                    path.chmod(0o400)
+            try:
+                # Reload + recompute the FULL closure/root digest from the
+                # STAGED (not-yet-CAS) bytes and compare to the acked digest
+                # BEFORE this content is ever visible under its content-
+                # addressed name. A mismatch discards the staging dir + raises.
+                staged_component = load_specialist_component(
+                    cas_staging_dir, cas_staging_dir / "manifest.json")
+                staged_deps = resolve_dependency_closure(staged_component, cas_staging_dir)
+                staged_unavailable = [d for d in staged_deps if not d.available]
+                if staged_unavailable:
+                    detail = "; ".join(
+                        f"{d.kind}:{d.identifier}: {d.detail}" for d in staged_unavailable)
+                    raise SpecialistInstallError("dependency_unavailable", detail)
+                staged_root_digest = compute_install_root_digest(
+                    staged_component, staged_deps,
+                    manifest_bytes=(cas_staging_dir / "manifest.json").read_bytes())
+                if staged_root_digest != inspection.root_digest:
+                    raise SpecialistInstallError(
+                        "checksum_changed",
+                        "staged component no longer matches the approved inspection")
+            except Exception:
+                shutil.rmtree(cas_staging_dir, ignore_errors=True)
+                raise
+            _publish_cas_staging(cas_staging_dir, cas_dir)
+
+        # Re-load from the now-final (or pre-existing) CAS directory.
+        component = load_specialist_component(cas_dir, cas_dir / "manifest.json")
+        if component.slug != inspection.slug:
+            raise SpecialistInstallError(
+                "slug_mismatch",
+                f"CAS component slug {component.slug!r} does not match the approved "
+                f"inspection slug {inspection.slug!r}")
+        _reject_receiptless_sourced_deps(component, receipt=receipt)
+        role = materialize_role(source=load_role_artifact(cas_dir / "role"), options={})
+        persona = load_persona_pack(cas_dir / "persona" / "pack", cas_dir / "persona" / "manifest.json")
+
+        fresh_deps = resolve_dependency_closure(component, cas_dir)
+        unavailable = [d for d in fresh_deps if not d.available]
+        if unavailable:
+            detail = "; ".join(f"{d.kind}:{d.identifier}: {d.detail}" for d in unavailable)
+            raise SpecialistInstallError("dependency_unavailable", detail)
+        fresh_root_digest = compute_install_root_digest(
+            component, fresh_deps, manifest_bytes=(cas_dir / "manifest.json").read_bytes())
+        if fresh_root_digest != inspection.root_digest:
+            raise SpecialistInstallError(
+                "checksum_changed", "CAS-persisted component no longer matches the approved inspection")
+
+        satisfied, missing = satisfy_config(
+            schema=component.config_schema, provided_non_secret=config,
+            provided_secret_names=secret_names_provided,
+        )
+        root = component_root_string(
+            component_id=component.component_id, version=component.version,
+            component_checksum=fresh_root_digest,
+        )
+        instance_dir = InstanceDir(specialists_dir / inspection.slug)
+        dependency_digests = tuple(sorted(d.digest for d in fresh_deps))
+
+        # Persona/compile GATE before any durable mutation (satisfiable path
+        # only; the pending path stages a placeholder with no compile).
+        binding = None
+        effective_config_digest = None
+        if satisfied:
+            try:
+                check_persona_requirements(role.normalized, persona)
+            except ValueError as exc:
+                raise SpecialistInstallError("persona_incompatible", str(exc)) from exc
+            effective_config_digest = compute_effective_config_digest(dict(config))
+            binding = materialize_component_default_binding(
+                role=role, persona=persona, component_root=root,
+                dependency_digests=dependency_digests,
+                effective_config_digest=effective_config_digest,
             )
-        except Exception as exc:  # noqa: BLE001
-            logger.warning(
-                "specialist install %r: operational-file materialize failed post-commit "
-                "(%s); will self-heal on next reconcile", inspection.slug, exc, exc_info=True)
-            last_activation_error = f"operational files pending reconcile: {exc}"
+            compile_prompt_bundle(
+                role=role, persona=persona, binding=binding,
+                platform_frame=(Path(__file__).parent / "defaults" / "personality"
+                                 / "platform-frame.md").read_text(encoding="utf-8"),
+                safety_kernel=(Path(__file__).parent / "defaults" / "personality"
+                               / "safety-kernel.md").read_text(encoding="utf-8"),
+            )
 
-    return SpecialistInstance(
-        slug=inspection.slug, stable_agent_id=f"specialist:{inspection.slug}",
-        state="active", active=committed, desired=None, last_activation_error=last_activation_error,
-    )
+        # Shared stage/commit: pending-configuration stages a placeholder
+        # desired (no activation); the satisfiable path commits the tuple to
+        # active and materializes op-files best-effort. `sidecar_doc` (bundle
+        # mode only) stages+rotates the owned-plugins sidecar in the SAME
+        # locked step as the tuple rotation; None (legacy) touches no sidecar.
+        def _stage_and_commit(sidecar_doc: "dict | None") -> "SpecialistInstance":
+            if not satisfied:
+                placeholder_binding = materialize_component_default_binding(
+                    role=role, persona=persona, component_root=root,
+                    dependency_digests=dependency_digests,
+                )
+                with specialist_materialize.MATERIALIZE_LOCK:
+                    _refuse_if_active_present(instance_dir, slug=inspection.slug)
+                    instance_dir.stage_desired(InstanceTuple(
+                        root=root, binding=placeholder_binding, config_snapshot=dict(config),
+                        config_digest=placeholder_binding.effective_config_digest,
+                    ))
+                    if sidecar_doc is not None:
+                        instance_dir.stage_desired_owned_plugins(sidecar_doc)
+                return SpecialistInstance(
+                    slug=inspection.slug, stable_agent_id=f"specialist:{inspection.slug}",
+                    state="pending-configuration", active=None, desired=instance_dir.desired(),
+                    last_activation_error=f"missing required config/secret: {missing}",
+                )
+            last_activation_error: str | None = None
+            with specialist_materialize.MATERIALIZE_LOCK:
+                _refuse_if_active_present(instance_dir, slug=inspection.slug)
+                instance_dir.stage_desired(InstanceTuple(
+                    root=root, binding=binding, config_snapshot=dict(config),
+                    config_digest=effective_config_digest,
+                ))
+                if sidecar_doc is not None:
+                    instance_dir.stage_desired_owned_plugins(sidecar_doc)
+                committed = instance_dir.commit_desired_to_active()
+                if sidecar_doc is not None:
+                    instance_dir.commit_owned_plugins_desired_to_active()
+                try:
+                    specialist_materialize.materialize_specialist_operational_files(
+                        agents_specialists_dir=agents_specialists_dir, slug=inspection.slug,
+                        role=role, persona=persona,
+                        binding_digest=committed.binding.binding_digest,
+                        component_root=committed.root,
+                    )
+                except Exception as exc:  # noqa: BLE001
+                    logger.warning(
+                        "specialist install %r: operational-file materialize failed "
+                        "post-commit (%s); will self-heal on next reconcile",
+                        inspection.slug, exc, exc_info=True)
+                    last_activation_error = f"operational files pending reconcile: {exc}"
+            return SpecialistInstance(
+                slug=inspection.slug, stable_agent_id=f"specialist:{inspection.slug}",
+                state="active", active=committed, desired=None,
+                last_activation_error=last_activation_error,
+            )
+
+        if not bundle_mode:
+            _instance_out = _stage_and_commit(None)
+        else:
+            # --- Journaled bundle mutation (spec §3.2 steps 1-5) -----------
+            # begin captures the FULL before-state (owned entries, tuple/
+            # sidecar bytes, consent-ack records) BEFORE any durable mutation;
+            # a sync-phase failure rolls it back synchronously in the except
+            # below. The tool layer (holding _PLUGIN_TOOLS_LOCK) owns the
+            # post-mutation sequencer + journal-complete via the returned txn.
+            slug_dir = specialists_dir / inspection.slug
+            _reg = plugin_registry.load_registry(registry_path)
+            before_owned = plugin_registry.owned_entries_for(inspection.slug, _reg)
+            before_tuple_files = _tuple_files_snapshot(slug_dir)
+            ack_records = acks.snapshot_slug(inspection.slug)
+            _begin_kwargs = {} if ops_dir is None else {"ops_dir": ops_dir}
+            journal = specialist_bundle_journal.begin(
+                "install", inspection.slug, before_entries=before_owned,
+                before_tuple_files=before_tuple_files, ack_records=ack_records,
+                receipt_digest=receipt.receipt_digest, consent_identity=identity,
+                target_root=component_root_string(
+                    component_id=inspection.component_id, version=inspection.version,
+                    component_checksum=inspection.root_digest),
+                **_begin_kwargs)
+            rollback_txn = BundleTxn(
+                journal_path=journal, slug=inspection.slug,
+                before_entries=before_owned, before_tuple_files=before_tuple_files,
+                ack_records=ack_records, registry_path=registry_path,
+                specialists_dir=specialists_dir, acks_path=acks.path)
+            try:
+                published = _publish_owned_plugins(
+                    inspection.slug, receipt, tree_paths, store_root=plugin_store_root)
+                # Whole-branch O: mark the owned-plugin publication boundary in
+                # the journal. NB the COMPONENT CAS publish (_publish_cas_staging
+                # above) still runs BEFORE begin() — plan step 1b's journal-first
+                # ideal — because that CAS directory is CONTENT-ADDRESSED by
+                # root_digest: a crash after it but before begin leaves an inert,
+                # deduplicated, GC-later residue that no rollback needs to undo
+                # (spec §3.2: "CAS residue is harmless, content-addressed").
+                # The registry-VISIBLE mutations (owned-plugin store publish,
+                # owned_swap, tuple/sidecar) are all inside this journaled block.
+                specialist_bundle_journal.mark_step(journal, "owned_plugins_published")
+                new_entries = [_owned_entry_for(inspection.slug, row, res)
+                               for row, res in published]
+                before_entries, _ = plugin_registry.apply_owned_swap(
+                    slug=inspection.slug, new_entries=new_entries, registry_path=registry_path)
+                new_artifact_ids = {res.artifact_id for _, res in published}
+                removed = _removed_artifact_ids(before_entries, new_artifact_ids)
+                sidecar_doc = _owned_sidecar_doc(inspection.slug, receipt, published)
+                _instance_out = _stage_and_commit(sidecar_doc)
+                specialist_bundle_journal.mark_step(journal, "committed")
+                _txn_out = BundleTxn(
+                    journal_path=journal, slug=inspection.slug,
+                    before_entries=before_entries, before_tuple_files=before_tuple_files,
+                    ack_records=ack_records, removed_artifact_ids=removed,
+                    new_artifact_ids=tuple(sorted(new_artifact_ids)),
+                    registry_path=registry_path, specialists_dir=specialists_dir,
+                    acks_path=acks.path)
+            except BaseException:
+                # Sync-phase failure: nothing was reloaded, so restore disk
+                # state from the before-state (spec §3.2 failure handling — no
+                # sequencer needed). P1-1: complete the journal ONLY after a
+                # SUCCESSFUL rollback — if rollback_disk() raises (e.g. an
+                # unreadable registry, which fails closed rather than persist a
+                # partial doc), leave the in-progress journal on disk so boot
+                # reconciliation re-runs the rollback or quarantines the slug.
+                # Completing it here would strand a half-rolled-back mutation
+                # with no recovery.
+                rollback_txn.rollback_disk()
+                specialist_bundle_journal.complete(journal)
+                raise
+    finally:
+        if workspace is not None:
+            shutil.rmtree(workspace, ignore_errors=True)
+
+    if bundle_mode:
+        return _instance_out, _txn_out
+    return _instance_out
 
 
 def activate_binding_for_config(cfg, *, specialists_root: Path = Path("/config/specialists")) -> None:
@@ -909,10 +1737,144 @@ def activate_binding_for_config(cfg, *, specialists_root: Path = Path("/config/s
 
 
 def upgrade_specialist(
+    *, slug: str, inspection: "InspectionResult", receipt: "SourceReceipt | None" = None,
+    config: "Mapping[str, str]",
+    secret_names_provided: frozenset[str], acks: "SpecialistInstallAckStore",
+    specialists_dir: Path = Path("/config/specialists"),
+    agents_specialists_dir: Path = Path("/config/agents/specialists"),
+    registry_path: "Path | None" = None,
+    plugin_store_root: "Path | None" = None,
+    ops_dir: "Path | None" = None,
+) -> "SpecialistInstance | tuple[SpecialistInstance, object]":
+    """Bundle-aware upgrade (Task 10). Without a `receipt` (legacy/direct
+    callers) this is the original transactional upgrade returning a single
+    `SpecialistInstance`. WITH a receipt (the tool layer) it wraps the core
+    upgrade in the journaled bundle transaction: journal the before-state,
+    run the core tuple commit, then — ONLY when the upgrade actually activates
+    — publish the new owned plugin set, atomically swap it into the registry,
+    and rotate the owned-plugins sidecar; a pending/error outcome leaves the
+    old owned generation fully untouched (spec §3.4). Returns
+    `(instance, BundleTxn)`.
+
+    Delta (code): the owned-plugins sidecar rotates in a SEPARATE
+    MATERIALIZE_LOCK step immediately after the core tuple commit (the lock is
+    non-reentrant and the core takes it internally). The journal's before-state
+    covers the crash window; the sidecar is provenance metadata read only by
+    lifecycle ops that serialize under _PLUGIN_TOOLS_LOCK, so a momentary
+    tuple-vs-sidecar desync is not a runtime hazard."""
+    import dataclasses
+
+    import plugin_registry
+    import specialist_bundle_journal
+    from specialist_bundle_journal import BundleTxn
+    from specialist_lifecycle import SpecialistInstance  # noqa: F401 (typing)
+    from specialist_install_consent import install_consent_identity
+    import plugin_store
+    import specialist_materialize
+    from personality_binding import InstanceDir
+
+    if receipt is None:
+        return _upgrade_core(
+            slug=slug, inspection=inspection, config=config,
+            secret_names_provided=secret_names_provided, acks=acks,
+            specialists_dir=specialists_dir, agents_specialists_dir=agents_specialists_dir,
+            receipt=None)
+
+    if registry_path is None:
+        registry_path = plugin_registry.REGISTRY_PATH
+    if plugin_store_root is None:
+        plugin_store_root = plugin_store.STORE_ROOT
+
+    validate_specialist_slug(slug)
+    workspace = specialists_dir / ".bundle-staging" / uuid.uuid4().hex
+    workspace.mkdir(parents=True, exist_ok=True, mode=0o700)
+    instance = None
+    txn = None
+    try:
+        tree_paths = _resolve_owned_tree_paths(receipt, workspace=workspace)
+        eff_inspection = inspection
+        if not Path(inspection.staged_dir).is_dir():
+            recovered = _recover_component_staging(receipt, workspace=workspace)
+            eff_inspection = dataclasses.replace(inspection, staged_dir=recovered)
+
+        slug_dir = specialists_dir / slug
+        _reg = plugin_registry.load_registry(registry_path)
+        before_owned = plugin_registry.owned_entries_for(slug, _reg)
+        before_tuple_files = _tuple_files_snapshot(slug_dir)
+        ack_records = acks.snapshot_slug(slug)
+        _begin_kwargs = {} if ops_dir is None else {"ops_dir": ops_dir}
+        journal = specialist_bundle_journal.begin(
+            "upgrade", slug, before_entries=before_owned,
+            before_tuple_files=before_tuple_files, ack_records=ack_records,
+            receipt_digest=receipt.receipt_digest,
+            consent_identity=install_consent_identity(
+                component_id=inspection.component_id, version=inspection.version,
+                root_digest=inspection.root_digest, slug=inspection.slug,
+                receipt_digest=getattr(inspection, "receipt_digest", "")),
+            target_root=component_root_string(
+                component_id=inspection.component_id, version=inspection.version,
+                component_checksum=inspection.root_digest),
+            **_begin_kwargs)
+        rollback_txn = BundleTxn(
+            journal_path=journal, slug=slug, before_entries=before_owned,
+            before_tuple_files=before_tuple_files, ack_records=ack_records,
+            registry_path=registry_path, specialists_dir=specialists_dir,
+            acks_path=acks.path)
+        try:
+            instance = _upgrade_core(
+                slug=slug, inspection=eff_inspection, config=config,
+                secret_names_provided=secret_names_provided, acks=acks,
+                specialists_dir=specialists_dir, agents_specialists_dir=agents_specialists_dir,
+                receipt=receipt)
+            if instance.state == "active":
+                published = _publish_owned_plugins(
+                    slug, receipt, tree_paths, store_root=plugin_store_root)
+                # Whole-branch O: publication boundary (see
+                # commit_specialist_install's note — the component CAS publish is
+                # content-addressed/inert; the registry-visible mutations are all
+                # journaled from here).
+                specialist_bundle_journal.mark_step(journal, "owned_plugins_published")
+                new_entries = [_owned_entry_for(slug, row, res) for row, res in published]
+                before_entries, _ = plugin_registry.apply_owned_swap(
+                    slug=slug, new_entries=new_entries, registry_path=registry_path)
+                new_artifact_ids = {res.artifact_id for _, res in published}
+                removed = _removed_artifact_ids(before_entries, new_artifact_ids)
+                sidecar_doc = _owned_sidecar_doc(slug, receipt, published)
+                with specialist_materialize.MATERIALIZE_LOCK:
+                    InstanceDir(slug_dir).stage_desired_owned_plugins(sidecar_doc)
+                    InstanceDir(slug_dir).commit_owned_plugins_desired_to_active()
+            else:
+                # pending/error: old owned generation untouched (spec §3.4).
+                before_entries = before_owned
+                removed = ()
+                new_artifact_ids = set()
+            specialist_bundle_journal.mark_step(journal, "committed")
+            txn = BundleTxn(
+                journal_path=journal, slug=slug, before_entries=before_entries,
+                before_tuple_files=before_tuple_files, ack_records=ack_records,
+                removed_artifact_ids=removed,
+                new_artifact_ids=tuple(sorted(new_artifact_ids)),
+                registry_path=registry_path, specialists_dir=specialists_dir,
+                acks_path=acks.path)
+        except BaseException:
+            # P1-1: complete the journal ONLY after a SUCCESSFUL rollback. A
+            # rollback that raises leaves the in-progress journal on disk so boot
+            # reconciliation re-runs it (or quarantines the slug) — completing here
+            # would strand a half-rolled-back mutation with no recovery.
+            rollback_txn.rollback_disk()
+            specialist_bundle_journal.complete(journal)
+            raise
+    finally:
+        shutil.rmtree(workspace, ignore_errors=True)
+    return instance, txn
+
+
+def _upgrade_core(
     *, slug: str, inspection: "InspectionResult", config: "Mapping[str, str]",
     secret_names_provided: frozenset[str], acks: "SpecialistInstallAckStore",
     specialists_dir: Path = Path("/config/specialists"),
     agents_specialists_dir: Path = Path("/config/agents/specialists"),
+    receipt: "SourceReceipt | None" = None,
 ) -> "SpecialistInstance":
     """Spec §2.4/§4.1's transactional reinstall/upgrade: stage the new
     version as desired, validate+compile it fully BEFORE touching active,
@@ -929,7 +1891,13 @@ def upgrade_specialist(
     best-effort follow-up, not a second gate (see commit_specialist_install's
     docstring for the full rationale: the tuple is the single authoritative
     record; the operational files are a self-healing derived cache
-    current_specialist_roles_dir rebuilds on every boot/reload)."""
+    current_specialist_roles_dir rebuilds on every boot/reload).
+
+    `receipt` (threaded through by both of upgrade_specialist's call sites —
+    None on the legacy no-receipt path, the real receipt on the bundle path)
+    is used ONLY for `_reject_receiptless_sourced_deps`'s defense-in-depth
+    check below; this function never publishes/registers plugins itself
+    (upgrade_specialist's bundle branch does that after this returns)."""
     from personality_binding import (
         InstanceDir, InstanceTuple, check_persona_requirements, compute_effective_config_digest,
         materialize_component_default_binding, materialize_override_binding,
@@ -947,9 +1915,15 @@ def upgrade_specialist(
     # Validate at the top before any filesystem operation.
     validate_specialist_slug(slug)
 
+    # Whole-branch D: bind the supplied receipt to the approved inspection
+    # BEFORE consent (see commit_specialist_install's identical note).
+    _assert_receipt_matches_inspection(receipt, inspection)
+
+    # Task 8 seam (Task 7 P0): see commit_specialist_install's identical note.
     identity = install_consent_identity(
         component_id=inspection.component_id, version=inspection.version,
-        root_digest=inspection.root_digest, slug=inspection.slug)
+        root_digest=inspection.root_digest, slug=inspection.slug,
+        receipt_digest=getattr(inspection, "receipt_digest", ""))
     if not acks.is_acked(identity):
         raise SpecialistInstallError("consent_missing", "no recorded operator approval for the upgrade")
 
@@ -1004,6 +1978,7 @@ def upgrade_specialist(
         raise SpecialistInstallError(
             "slug_mismatch",
             f"component slug {component.slug!r} does not match the requested upgrade slug {slug!r}")
+    _reject_receiptless_sourced_deps(component, receipt=receipt)
     fresh_deps = resolve_dependency_closure(component, cas_dir)
     fresh_unavailable = [d for d in fresh_deps if not d.available]
     if fresh_unavailable:
@@ -1154,7 +2129,155 @@ def upgrade_specialist(
         desired=None, last_activation_error=note)
 
 
+def _prior_owned_entry(slug: str, row: dict) -> dict:
+    """Build a registry entry from a prior-generation owned-plugins sidecar row
+    (rollback restore, spec §3.4)."""
+    import plugin_registry
+
+    src = row.get("source") or {}
+    return {
+        "name": row["name"],
+        "owner": f"specialist:{slug}",
+        "manifest_name": row["manifest_name"],
+        "targets": [f"specialist:{slug}"],
+        "version": row["version"],
+        "source": {"type": "github", "repo": src["repo"], "ref": src["ref"],
+                   "revision": src["revision"],
+                   "subdir": plugin_registry.normalize_subdir(src.get("subdir", ""))},
+        "artifact_id": row["artifact_id"],
+    }
+
+
 def rollback_specialist(
+    *, slug: str, bundle: bool = False,
+    acks: "SpecialistInstallAckStore | None" = None,
+    specialists_dir: Path = Path("/config/specialists"),
+    agents_specialists_dir: Path = Path("/config/agents/specialists"),
+    registry_path: "Path | None" = None,
+    plugin_store_root: "Path | None" = None,
+    ops_dir: "Path | None" = None,
+) -> "SpecialistInstance | tuple[SpecialistInstance, object]":
+    """Bundle-aware rollback (Task 10). Without `bundle=True` (legacy/direct
+    callers) this restores the prior instance tuple and returns a single
+    `SpecialistInstance`. WITH `bundle=True` (the tool layer) it wraps the core
+    rollback in the journaled bundle transaction: read the prior generation's
+    owned-plugins sidecar, PREFLIGHT that every retained artifact is still
+    present+valid (`artifact_verdict`; a missing/corrupt one is a typed
+    `rollback_artifact_missing` with the active tuple untouched), journal the
+    before-state, atomically swap the prior owned set back into the registry,
+    roll the tuple + sidecar back, and return `(instance, BundleTxn)` with
+    `removed_artifact_ids = current-minus-prior`."""
+    import plugin_registry
+    import plugin_store
+    import specialist_bundle_journal
+    from specialist_bundle_journal import BundleTxn
+    from personality_binding import (
+        InstanceDir, OwnedPluginsSidecarError, owned_plugins_prior_path,
+        read_owned_plugins,
+    )
+    import specialist_materialize
+
+    if not bundle:
+        return _rollback_core(
+            slug=slug, specialists_dir=specialists_dir,
+            agents_specialists_dir=agents_specialists_dir)
+
+    if registry_path is None:
+        registry_path = plugin_registry.REGISTRY_PATH
+    if plugin_store_root is None:
+        plugin_store_root = plugin_store.STORE_ROOT
+    if acks is None:
+        from specialist_install_consent import SpecialistInstallAckStore
+        acks = SpecialistInstallAckStore()
+
+    validate_specialist_slug(slug)
+    slug_dir = specialists_dir / slug
+
+    # Prior owned set from its sidecar (missing sidecar but present prior tuple
+    # ⇒ pre-feature generation ⇒ empty owned set, spec §3.4). P1-4: a PRESENT
+    # but malformed prior sidecar raises OwnedPluginsSidecarError — refuse the
+    # rollback with a typed error rather than silently proceeding with an empty
+    # owned set (which would drop the prior owned plugins the rollback exists to
+    # restore). This preflight runs BEFORE any durable mutation, so nothing is
+    # touched on refusal.
+    try:
+        prior_sidecar = read_owned_plugins(owned_plugins_prior_path(slug_dir))
+    except OwnedPluginsSidecarError as exc:
+        raise SpecialistInstallError("rollback_sidecar_invalid", str(exc))
+    prior_rows = list(prior_sidecar.get("plugins") or []) if prior_sidecar else []
+
+    # Preflight retained artifacts BEFORE any durable mutation.
+    store_root_resolved = Path(plugin_store_root).resolve()
+    for row in prior_rows:
+        src = row.get("source") or {}
+        # Whole-branch F: `read_owned_plugins` already grammar-validated
+        # row["name"]/["artifact_id"], but containment-check the DERIVED store
+        # path too (defense in depth) — a join must never escape the store root
+        # before it is stat'd/hashed by artifact_verdict.
+        store_path = Path(plugin_store_root) / row["name"] / row["artifact_id"]
+        try:
+            store_path.resolve().relative_to(store_root_resolved)
+        except ValueError:
+            raise SpecialistInstallError(
+                "rollback_artifact_missing",
+                f"prior owned row {row.get('name')!r} resolves outside the plugin store")
+        verdict = plugin_store.artifact_verdict(
+            store_path, name=row["name"], repo=src.get("repo", ""),
+            revision=src.get("revision", ""), subdir=src.get("subdir", ""),
+            artifact_id=row["artifact_id"], manifest_name=row["manifest_name"])
+        if verdict is not None:
+            raise SpecialistInstallError(
+                "rollback_artifact_missing",
+                f"retained artifact for {row['name']!r} is unavailable ({verdict})")
+
+    _reg = plugin_registry.load_registry(registry_path)
+    before_owned = plugin_registry.owned_entries_for(slug, _reg)
+    before_tuple_files = _tuple_files_snapshot(slug_dir)
+    ack_records = acks.snapshot_slug(slug)
+    _begin_kwargs = {} if ops_dir is None else {"ops_dir": ops_dir}
+    journal = specialist_bundle_journal.begin(
+        "rollback", slug, before_entries=before_owned,
+        before_tuple_files=before_tuple_files, ack_records=ack_records,
+        **_begin_kwargs)
+    rollback_txn = BundleTxn(
+        journal_path=journal, slug=slug, before_entries=before_owned,
+        before_tuple_files=before_tuple_files, ack_records=ack_records,
+        registry_path=registry_path, specialists_dir=specialists_dir,
+        acks_path=acks.path)
+    try:
+        prior_entries = [_prior_owned_entry(slug, r) for r in prior_rows]
+        before_entries, _ = plugin_registry.apply_owned_swap(
+            slug=slug, new_entries=prior_entries, registry_path=registry_path)
+        prior_ids = {r["artifact_id"] for r in prior_rows}
+        removed = _removed_artifact_ids(before_entries, prior_ids)
+        instance = _rollback_core(
+            slug=slug, specialists_dir=specialists_dir,
+            agents_specialists_dir=agents_specialists_dir)
+        prior_doc = prior_sidecar or {"schema_version": 1,
+                                      "component_source": {}, "plugins": []}
+        with specialist_materialize.MATERIALIZE_LOCK:
+            InstanceDir(slug_dir).stage_desired_owned_plugins(prior_doc)
+            InstanceDir(slug_dir).commit_owned_plugins_desired_to_active()
+        specialist_bundle_journal.mark_step(journal, "committed")
+        txn = BundleTxn(
+            journal_path=journal, slug=slug, before_entries=before_entries,
+            before_tuple_files=before_tuple_files, ack_records=ack_records,
+            removed_artifact_ids=removed,
+            new_artifact_ids=tuple(sorted(prior_ids)),
+            registry_path=registry_path, specialists_dir=specialists_dir,
+            acks_path=acks.path)
+    except BaseException:
+        # P1-1: complete the journal ONLY after a SUCCESSFUL rollback. A
+        # rollback that raises leaves the in-progress journal on disk so boot
+        # reconciliation re-runs it (or quarantines the slug) — completing here
+        # would strand a half-rolled-back mutation with no recovery.
+        rollback_txn.rollback_disk()
+        specialist_bundle_journal.complete(journal)
+        raise
+    return instance, txn
+
+
+def _rollback_core(
     *, slug: str, specialists_dir: Path = Path("/config/specialists"),
     agents_specialists_dir: Path = Path("/config/agents/specialists"),
 ) -> "SpecialistInstance":
@@ -1265,6 +2388,129 @@ def rollback_specialist(
 
 
 def uninstall_specialist(
+    *, slug: str, bundle: bool = False,
+    acks: "SpecialistInstallAckStore | None" = None,
+    specialists_dir: Path = Path("/config/specialists"),
+    agents_specialists_dir: Path = Path("/config/agents/specialists"),
+    registry_path: "Path | None" = None,
+    ops_dir: "Path | None" = None,
+) -> "None | object":
+    """Bundle-aware uninstall (Task 10). Without `bundle=True` (legacy/direct
+    callers) this removes the instance + op files and returns None. WITH
+    `bundle=True` (the tool layer) it wraps the core removal in the journaled
+    cascade (spec §3.5): journal the before-state (owned entries, tuple bytes,
+    AND the slug's consent-ack records — all captured BEFORE the slug tree is
+    deleted), atomically swap the owned entries OUT (new_entries=[]), delete the
+    slug tree, retire ALL of the slug's consent acks, and return a BundleTxn
+    whose removed_artifact_ids are every pre-swap owned artifact id (drives the
+    sequencer's grant/challenge invalidation). Operator-owned entries targeting
+    the slug are never touched (they carry no owner).
+
+    Task 10 review, defense-in-depth (F1, due-diligence companion to
+    `_reject_receiptless_sourced_deps`): unlike a fresh install/upgrade, a
+    non-bundle uninstall doesn't merely skip publishing — it DELETES the
+    InstanceDir tree outright, so any owned registry entries a prior bundle
+    install/upgrade published for this slug would become PERMANENTLY
+    orphaned (owner points at a `specialist:<slug>` that no longer exists,
+    with no future reconcile able to notice). That is a strictly worse,
+    unrecoverable version of the dangling-pin gap, so refuse the legacy path
+    outright when owned entries exist rather than silently stranding them."""
+    import plugin_registry
+
+    if not bundle:
+        _existing_owned = plugin_registry.owned_entries_for(
+            slug, plugin_registry.load_registry(
+                registry_path if registry_path is not None else plugin_registry.REGISTRY_PATH))
+        if _existing_owned:
+            raise SpecialistInstallError(
+                "bundle_required",
+                f"{slug!r} has {len(_existing_owned)} owned plugin registry "
+                "entries from a prior bundle install/upgrade; uninstall must "
+                "use bundle=True so they are cascaded out, not stranded")
+        return _uninstall_core(
+            slug=slug, specialists_dir=specialists_dir,
+            agents_specialists_dir=agents_specialists_dir)
+
+    import specialist_bundle_journal
+    from specialist_bundle_journal import BundleTxn
+
+    if registry_path is None:
+        registry_path = plugin_registry.REGISTRY_PATH
+    if acks is None:
+        from specialist_install_consent import SpecialistInstallAckStore
+        acks = SpecialistInstallAckStore()
+
+    validate_specialist_slug(slug)
+    slug_dir = specialists_dir / slug
+    _reg = plugin_registry.load_registry(registry_path)
+    before_owned = plugin_registry.owned_entries_for(slug, _reg)
+    before_tuple_files = _tuple_files_snapshot(slug_dir)
+    # Whole-branch J: retire the slug's consent acks ATOMICALLY (one
+    # _LEDGER_LOCK critical section) and journal EXACTLY the removed records.
+    # The old flow snapshot_slug'd here then retire_slug'd later in a SEPARATE
+    # critical section — a concurrent same-slug approval (a consent tap runs
+    # outside _PLUGIN_TOOLS_LOCK) landing between the two would be deleted by
+    # retire yet absent from the journaled before-state, so a rollback could not
+    # restore it. retire_slug returns exactly what it removed under one lock; we
+    # journal those and rollback restores them via restore_records. Retiring
+    # before begin means a crash in the (tiny) gap loses only the acks — a
+    # fail-closed outcome (the operator simply re-approves), never registry/
+    # tuple corruption (those mutations all follow begin).
+    #
+    # Accepted residual (COMMENT-ONLY, Fable #4): a consent tap racing this
+    # uninstall could re-record a slug ack in the window between this retire and
+    # the tool-layer journal-complete — leaving a stale identity-bound ack. It
+    # is fail-closed: the ack is bound to a specific install identity tuple, so
+    # any FUTURE install of this slug computes a different identity and never
+    # matches it (the stale record can authorize nothing).
+    ack_records = acks.retire_slug(slug)
+    _begin_kwargs = {} if ops_dir is None else {"ops_dir": ops_dir}
+    # P2-5: retire_slug already removed the records from the live ledger; if
+    # begin() now raises (an unwritable ops dir, say) those retired records
+    # would be lost with no journal to restore them from. Restore exactly the
+    # retire_slug() return before propagating, so a begin failure leaves the
+    # ack ledger untouched.
+    try:
+        journal = specialist_bundle_journal.begin(
+            "uninstall", slug, before_entries=before_owned,
+            before_tuple_files=before_tuple_files, ack_records=ack_records,
+            **_begin_kwargs)
+    except BaseException:
+        acks.restore_records(ack_records)
+        raise
+    rollback_txn = BundleTxn(
+        journal_path=journal, slug=slug, before_entries=before_owned,
+        before_tuple_files=before_tuple_files, ack_records=ack_records,
+        registry_path=registry_path, specialists_dir=specialists_dir,
+        acks_path=acks.path)
+    try:
+        before_entries, _ = plugin_registry.apply_owned_swap(
+            slug=slug, new_entries=[], registry_path=registry_path)
+        all_ids = tuple(dict.fromkeys(
+            e["artifact_id"] for e in before_entries
+            if isinstance(e.get("artifact_id"), str)))
+        _uninstall_core(slug=slug, specialists_dir=specialists_dir,
+                        agents_specialists_dir=agents_specialists_dir)
+        # acks already retired atomically above (whole-branch J).
+        specialist_bundle_journal.mark_step(journal, "committed")
+        txn = BundleTxn(
+            journal_path=journal, slug=slug, before_entries=before_entries,
+            before_tuple_files=before_tuple_files, ack_records=ack_records,
+            removed_artifact_ids=all_ids, new_artifact_ids=(),
+            registry_path=registry_path, specialists_dir=specialists_dir,
+            acks_path=acks.path)
+    except BaseException:
+        # P1-1: complete the journal ONLY after a SUCCESSFUL rollback. A
+        # rollback that raises leaves the in-progress journal on disk so boot
+        # reconciliation re-runs it (or quarantines the slug) — completing here
+        # would strand a half-rolled-back mutation with no recovery.
+        rollback_txn.rollback_disk()
+        specialist_bundle_journal.complete(journal)
+        raise
+    return txn
+
+
+def _uninstall_core(
     *, slug: str, specialists_dir: Path = Path("/config/specialists"),
     agents_specialists_dir: Path = Path("/config/agents/specialists"),
 ) -> None:

@@ -1,5 +1,32 @@
 # Changelog
 
+## [0.105.0] - 2026-07-24
+
+### Added
+
+- **Specialists are now self-contained packages: one repo, one install, one
+  consent.** A specialist's repository can bundle the plugins it needs (or
+  declare them by repository reference), and installing the specialist installs
+  everything in a single flow with a single approval tap — no separate
+  plugin-install step, ever. Bundle-installed plugins are private to their
+  specialist and are removed automatically when the specialist is uninstalled;
+  plugins you install yourself remain yours and are never touched by a
+  specialist's lifecycle.
+- The install approval message now lists exactly what each bundled plugin
+  brings: its tools, protected tools, and the secrets it will need — so you see
+  the full surface of what one tap approves.
+- Installs, upgrades, rollbacks, and uninstalls are now crash-safe: every
+  bundle operation is journaled and reconciled on the next boot, so a power cut
+  mid-install can never leave the system half-configured.
+
+### Changed
+
+- Specialist identifiers (slugs) are now bounded to 32 characters. All existing
+  specialists are well within the bound; a hypothetical pre-existing install
+  with a longer name would need a reinstall under a shorter one.
+- Plugin health now reports which plugins belong to which specialist and
+  surfaces any bundle that was quarantined by boot-time recovery.
+
 ## [0.104.0] - 2026-07-23
 
 ### Fixed

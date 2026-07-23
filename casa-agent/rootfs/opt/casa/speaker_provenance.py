@@ -16,7 +16,7 @@ from personality_types import (
 
 RESERVED_SOURCE_NAMESPACE = "casa-source-"
 RESERVED_SOURCE_PREFIX = "casa-source-v1."
-_ROLE_RE = re.compile(r"^(resident|specialist|executor):[a-z0-9][a-z0-9-]*$")
+_ROLE_RE = re.compile(r"^(resident|specialist|executor):[a-z0-9][a-z0-9-]{0,31}$")
 _PERSONA_RE = re.compile(
     r"^[a-z0-9](?:[a-z0-9.-]*[a-z0-9])?/[a-z0-9][a-z0-9-]*$"
 )

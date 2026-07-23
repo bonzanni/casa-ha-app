@@ -143,6 +143,19 @@ Agent YAML files are stored in `/config/agents/`. Default configs are created on
 
 Each agent config supports: `name`, `role`, `model`, `personality`, `tools`, `mcp_server_names`, `memory`, `session`, `channels`, `tts`, `voice_errors`, and `cwd`. See the default `assistant.yaml` for a full example.
 
+### Installing specialists (v0.105.0)
+
+Specialists install from their repository in one flow: ask the assistant to
+install one, approve the single consent message, done. If the specialist's
+repository bundles plugins (or declares them by repository reference), they are
+installed together with it — the consent message lists each bundled plugin's
+tools and the secrets it will need, so one tap covers the whole package.
+Bundle-installed plugins belong to their specialist: they are private to it and
+removed automatically when the specialist is uninstalled. Plugins you install
+yourself with `plugin_add` are operator-owned — a specialist's lifecycle never
+touches them, and plugin management tools refuse to modify a specialist's
+bundled plugins (manage those through the specialist's own upgrade/uninstall).
+
 ## Voice pipeline
 
 Casa exposes two transports for Home Assistant voice / generic voice clients. The HA-side integration that consumes them ships separately in `casa-ha-integration` (phase 2.4).

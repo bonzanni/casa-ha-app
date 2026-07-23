@@ -21,13 +21,22 @@ INSTALL_CONSENT_TTL_S = 600.0
 _ACKS_PATH = Path("/data/specialist_install_acks.json")
 _SCHEMA_VERSION = 1
 
+# Task 7: ONE process-wide ledger lock (spec §3.5). Multiple
+# SpecialistInstallAckStore *instances* over the same file (e.g. one built
+# per tool call) must never race each other's read-modify-write — a
+# per-instance `threading.Lock()` only serializes calls made through that
+# one instance, not concurrent instances. Every store method acquires this
+# module-level lock, reloads the ledger file fresh, applies its delta, and
+# persists — the store instance holds no authoritative in-memory cache.
+_LEDGER_LOCK = threading.Lock()
+
 
 def install_consent_identity(*, component_id: str, version: str, root_digest: str,
-                              slug: str) -> str:
+                              slug: str, receipt_digest: str = "") -> str:
     """The ONE identity-derivation function for a specialist-install consent
     decision (mirrors plugin_triggers.ack_identity). Binds the approval to
     the EXACT inspected component — a re-fetch that changes any of these
-    four fields yields a different identity, so a stale approval can never
+    fields yields a different identity, so a stale approval can never
     ack a different artifact.
 
     The bound digest is `inspection.root_digest` — compute_install_root_digest's
@@ -43,11 +52,21 @@ def install_consent_identity(*, component_id: str, version: str, root_digest: st
     ack-store JSON field and the identity-hash INPUT KEY both stay
     `"component_checksum"` for backward compatibility — an existing ack file's
     recomputed identity must remain byte-stable — so the value is mapped onto
-    that historical key here rather than renamed through the hash."""
-    return checksum_json({
+    that historical key here rather than renamed through the hash.
+
+    Task 7: `receipt_digest` binds a bundled-plugin receipt (Task 8) into the
+    consent identity so re-approval is required whenever the bundled-plugin
+    closure changes. It joins the hashed payload ONLY when non-empty — the
+    default `receipt_digest=""` MUST hash byte-identically to the pre-Task-7
+    four-key payload, so every legacy ack file recorded before this change
+    keeps recomputing to the same identity on load."""
+    payload = {
         "component_id": component_id, "version": version,
         "component_checksum": root_digest, "slug": slug,
-    })
+    }
+    if receipt_digest:
+        payload["receipt_digest"] = receipt_digest
+    return checksum_json(payload)
 
 
 @dataclass(frozen=True)
@@ -61,14 +80,21 @@ class SpecialistInstallAckStore:
     """Fail-closed, atomically-persisted install-consent acks — structurally
     identical to trigger_acks.TriggerAckStore (whole-store fail-closed load,
     identity recomputed and compared on load, atomic_write_text on every
-    mutation)."""
+    mutation).
+
+    Task 7: the store instance holds NO authoritative in-memory cache. Every
+    method (mutation AND read) acquires the module-level `_LEDGER_LOCK`,
+    re-reads the ledger file fresh (`self._load()`), applies its delta, and
+    (for mutations) persists — never a whole-map rewrite from stale instance
+    state. This makes multiple `SpecialistInstallAckStore` instances over the
+    same file (as the tool layer constructs per call) safe to interleave:
+    correctness over micro-perf, since this file is tiny and reads are rare."""
 
     def __init__(self, path: Path = _ACKS_PATH) -> None:
         self.path = Path(path)
-        self._lock = threading.Lock()
-        self._acks: dict[str, dict[str, Any]] = self._load()
 
     def _load(self) -> dict[str, dict[str, Any]]:
+        # Caller must hold _LEDGER_LOCK.
         try:
             raw = json.loads(self.path.read_text(encoding="utf-8"))
         except (OSError, ValueError):
@@ -86,17 +112,26 @@ class SpecialistInstallAckStore:
                                                 "component_checksum", "slug")}
             if not all(isinstance(v, str) and v for v in fields.values()):
                 return {}
+            receipt_digest = rec.get("receipt_digest", "")
+            if not isinstance(receipt_digest, str):
+                return {}
             # Ma: the persisted field stays "component_checksum" (backward
             # compat); map it onto the honestly-named `root_digest` parameter.
+            # A legacy record has no "receipt_digest" key at all, so
+            # `rec.get("receipt_digest", "")` defaults to "" — the SAME
+            # default `install_consent_identity` uses — recomputing the
+            # exact byte-stable legacy identity.
             if install_consent_identity(
                 component_id=fields["component_id"], version=fields["version"],
                 root_digest=fields["component_checksum"], slug=fields["slug"],
+                receipt_digest=receipt_digest,
             ) != ident:
                 return {}
             out[ident] = rec
         return out
 
     def _persist_locked(self, candidate: dict[str, dict[str, Any]]) -> None:
+        # Caller must hold _LEDGER_LOCK.
         from atomic_io import atomic_write_text
         self.path.parent.mkdir(parents=True, exist_ok=True)
         atomic_write_text(
@@ -106,34 +141,76 @@ class SpecialistInstallAckStore:
         )
 
     def is_acked(self, identity: str) -> bool:
-        with self._lock:
-            return identity in self._acks
+        with _LEDGER_LOCK:
+            return identity in self._load()
 
     def get(self, identity: str) -> "dict[str, Any] | None":
-        with self._lock:
-            rec = self._acks.get(identity)
+        with _LEDGER_LOCK:
+            rec = self._load().get(identity)
             return dict(rec) if rec is not None else None
 
     def record(self, *, identity: str, component_id: str, version: str,
-               component_checksum: str, slug: str) -> None:
+               component_checksum: str, slug: str, receipt_digest: str = "") -> None:
         rec = {"component_id": component_id, "version": version,
                "component_checksum": component_checksum, "slug": slug,
                "ts": int(time.time())}
-        with self._lock:
-            candidate = dict(self._acks)
+        if receipt_digest:
+            rec["receipt_digest"] = receipt_digest
+        with _LEDGER_LOCK:
+            candidate = dict(self._load())
             candidate[identity] = rec
             self._persist_locked(candidate)
-            self._acks = candidate
 
     def revoke(self, identity: str) -> bool:
-        with self._lock:
-            if identity not in self._acks:
+        with _LEDGER_LOCK:
+            acks = self._load()
+            if identity not in acks:
                 return False
-            candidate = dict(self._acks)
+            candidate = dict(acks)
             del candidate[identity]
             self._persist_locked(candidate)
-            self._acks = candidate
             return True
+
+    def retire_slug(self, slug: str) -> list[dict]:
+        """Remove ALL records whose `slug` matches, returning the removed
+        records (for journaling — the caller can `restore_records` them back
+        on a rollback)."""
+        with _LEDGER_LOCK:
+            acks = self._load()
+            removed = [dict(rec) for rec in acks.values() if rec.get("slug") == slug]
+            if not removed:
+                return []
+            kept = {i: r for i, r in acks.items() if r.get("slug") != slug}
+            self._persist_locked(kept)
+            return removed
+
+    def snapshot_slug(self, slug: str) -> list[dict]:
+        """Read-only copy of the slug's records — journal the before-state
+        BEFORE a mutating `begin` so a rollback has something to restore."""
+        with _LEDGER_LOCK:
+            return [dict(rec) for rec in self._load().values() if rec.get("slug") == slug]
+
+    def restore_records(self, records: list[dict]) -> None:
+        """Slug-scoped delta re-insert used by journal rollback/boot
+        reconciliation: each record's identity is recomputed from its OWN
+        fields (including its own `receipt_digest`, defaulting to "" for
+        records without the key) rather than trusted verbatim, and the
+        result is merged into the current ledger under the lock — never a
+        whole-map rewrite that could clobber a concurrent unrelated write."""
+        if not records:
+            return
+        with _LEDGER_LOCK:
+            acks = self._load()
+            candidate = dict(acks)
+            for rec in records:
+                rec = dict(rec)
+                identity = install_consent_identity(
+                    component_id=rec["component_id"], version=rec["version"],
+                    root_digest=rec["component_checksum"], slug=rec["slug"],
+                    receipt_digest=rec.get("receipt_digest", ""),
+                )
+                candidate[identity] = rec
+            self._persist_locked(candidate)
 
 
 def render_install_consent_message(inspection: Any) -> str:
@@ -148,6 +225,38 @@ def render_install_consent_message(inspection: Any) -> str:
     deps = ", ".join(f"{d.kind}:{d.identifier}" for d in inspection.dependencies)
     dep_digest_lines = "".join(
         f"  - {d.kind}:{d.identifier} = {d.digest}\n" for d in inspection.dependencies)
+    # Task 8: one block per sourced plugin dependency, from the REAL
+    # `specialist_receipt.PluginReceiptRow`s Task 8 attaches at
+    # `inspection.plugin_resolutions` (Task 7's sketch used provisional
+    # per-dependency `getattr` field names before that type existed — this
+    # replaces it with the real field set: identifier/scoped_name/
+    # manifest_name/version/source_type/content_digest/mcp_servers/
+    # protected_tools/env_names). `getattr(..., ())` keeps this rendering
+    # unchanged (empty section) for any legacy inspection object that
+    # predates the field.
+    #
+    # Fix-round-1 (consent-review CRITICAL, spec §3.2): the DM must show
+    # "scoped name, manifest name, version, MCP servers/commands, protected
+    # tools, secrets surface" per plugin — the three list-valued lines below
+    # close that gap; each is omitted entirely when empty (nothing to
+    # approve in that category) rather than rendered as a bare label.
+    plugin_blocks: list[str] = []
+    for row in getattr(inspection, "plugin_resolutions", ()) or ():
+        lines = [
+            f"  Bundled plugin {row.scoped_name}:",
+            f"    manifest name: {row.manifest_name}",
+            f"    version: {row.version}",
+            f"    source: {row.source_type}",
+            f"    content digest: {row.content_digest}",
+        ]
+        if row.mcp_servers:
+            lines.append(f"    MCP servers: {', '.join(row.mcp_servers)}")
+        if row.protected_tools:
+            lines.append(f"    Protected tools: {', '.join(row.protected_tools)}")
+        if row.env_names:
+            lines.append(f"    Secrets required: {', '.join(row.env_names)}")
+        plugin_blocks.append("\n".join(lines))
+    plugin_section = ("\n".join(plugin_blocks) + "\n") if plugin_blocks else ""
     return (
         "\U0001F510 Specialist install consent\n\n"
         f"Install '{inspection.component_id}@{inspection.version}' as "
@@ -156,6 +265,7 @@ def render_install_consent_message(inspection: Any) -> str:
         f"Default persona: {inspection.default_persona_ref}\n"
         f"Dependencies: {deps or '(none)'}\n"
         f"{dep_digest_lines}"
+        f"{plugin_section}"
         f"Root digest (approved — component + dependencies): {inspection.root_digest}\n"
         f"Component checksum: {inspection.component_checksum}\n\n"
         "Approve to install; Deny to discard the staged fetch."
@@ -167,9 +277,15 @@ def prompt_specialist_install_consent(
     acks: "SpecialistInstallAckStore",
     reconcile_cb: "Callable[[], Awaitable[None]] | None" = None,
 ) -> Any:
+    # Task 7: thread `receipt_digest` (Task 8's bundled-plugin receipt digest)
+    # into the identity so a bundled-plugin closure change forces
+    # re-approval; `getattr(..., "")` keeps this call working against a
+    # legacy inspection object that predates the field.
+    receipt_digest = getattr(inspection, "receipt_digest", "")
     identity = install_consent_identity(
         component_id=inspection.component_id, version=inspection.version,
         root_digest=inspection.root_digest, slug=inspection.slug,
+        receipt_digest=receipt_digest,
     )
     key = SpecialistInstallConsentKey(
         component_id=inspection.component_id, slug=inspection.slug, identity=identity)
@@ -179,7 +295,8 @@ def prompt_specialist_install_consent(
         if idx == 0:
             acks.record(identity=identity, component_id=inspection.component_id,
                         version=inspection.version,
-                        component_checksum=inspection.root_digest, slug=inspection.slug)
+                        component_checksum=inspection.root_digest, slug=inspection.slug,
+                        receipt_digest=receipt_digest)
             meta["acked"] = True
 
     def _finish_factory(message_id: int, req: Any) -> Callable[[dict], Any]:

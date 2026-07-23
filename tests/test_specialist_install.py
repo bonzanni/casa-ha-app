@@ -242,6 +242,7 @@ def test_inspect_specialist_repo_install_mode_success(tmp_path: Path, monkeypatc
         "org/repo", "main",
         staging_root=tmp_path / "staging",
         installed_index=index,
+        receipts_dir=tmp_path / "receipts",
     )
     assert result.slug == "fresh-specialist"
     assert result.component_checksum == component.checksum
@@ -346,6 +347,7 @@ def test_inspect_specialist_repo_upgrade_mode_succeeds_and_excludes_only_target_
         staging_root=tmp_path / "staging",
         installed_index=index,
         specialists_dir=specialists_dir,
+        receipts_dir=tmp_path / "receipts",
     )
     assert result.slug == target_slug
 

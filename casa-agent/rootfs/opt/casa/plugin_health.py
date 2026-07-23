@@ -38,15 +38,67 @@ def fingerprint(issue) -> str:
     return hashlib.sha256(body.encode("utf-8")).hexdigest()
 
 
-def _issue_dict(issue) -> dict:
-    return {
-        "name": getattr(issue, "name", None),
-        "target": getattr(issue, "target", None),
-        "stage": getattr(issue, "stage", None),
-        "reason_code": getattr(issue, "reason_code", None),
-        "artifact_id": getattr(issue, "artifact_id", None),
+def _issue_dict(issue, owners: dict | None = None) -> dict:
+    def _get(field: str):
+        if isinstance(issue, dict):
+            return issue.get(field)
+        return getattr(issue, field, None)
+    d = {
+        "name": _get("name"),
+        "target": _get("target"),
+        "stage": _get("stage"),
+        "reason_code": _get("reason_code"),
+        "artifact_id": _get("artifact_id"),
         "fingerprint": fingerprint(issue),
     }
+    # Task 11: an owned entry's issue/warning row is additionally annotated
+    # with its bundle owner (`specialist:<slug>`) — the `name` field is
+    # already the entry's SCOPED name (`<slug>.<manifest_name>`, spec §2),
+    # unchanged. Never part of the fingerprint (computed above from the raw
+    # issue, before this key is added).
+    if owners:
+        owner = owners.get(d["name"])
+        if owner is not None:
+            d["owner"] = owner
+    return d
+
+
+def _registry_state(registry_path=None) -> tuple[list, dict]:
+    """Best-effort read of the specialist-bundle registry state Task 9 writes:
+    the `quarantined_bundles` ledger and a `{scoped name: owner}` map for
+    every owned entry currently in the registry. Never raises — a missing or
+    corrupt registry degrades to empty state, matching this module's own
+    boot-must-never-crash tolerance."""
+    try:
+        import plugin_registry
+        path = registry_path if registry_path is not None else plugin_registry.REGISTRY_PATH
+        data = plugin_registry.load_registry(path)
+        raw = data.raw if isinstance(data.raw, dict) else {}
+        quarantined = raw.get("quarantined_bundles")
+        quarantined = list(quarantined) if isinstance(quarantined, list) else []
+        owners: dict = {}
+        for e in (raw.get("plugins") or []):
+            if not isinstance(e, dict):
+                continue
+            owner = plugin_registry.entry_owner(e)
+            name = e.get("name")
+            if owner is not None and isinstance(name, str):
+                owners[name] = owner
+        return quarantined, owners
+    except Exception:  # noqa: BLE001 — health must never crash on a bad registry
+        logger.exception("plugin_health: registry state read failed")
+        return [], {}
+
+
+def _boot_reconcile_actions() -> list:
+    """Task 9's module-level boot-reconciliation actions, if the module has
+    run this boot. Never raises."""
+    try:
+        import specialist_bundle_journal
+        return list(specialist_bundle_journal.last_boot_reconcile_actions)
+    except Exception:  # noqa: BLE001
+        logger.exception("plugin_health: boot reconcile actions read failed")
+        return []
 
 
 def _atomic_write(path: Path, report: dict) -> None:
@@ -64,14 +116,24 @@ def load_report(path: Path = HEALTH_PATH) -> dict | None:
 
 
 def write_report(*, issues: list, warnings: list,
-                 path: Path = HEALTH_PATH) -> dict:
+                 path: Path = HEALTH_PATH,
+                 registry_path=None) -> dict:
     """Regenerate the health report atomically. `notified_fingerprints` are
     carried forward from the previous report but pruned to fingerprints still
-    present (a resolved issue clears its fingerprint). Returns the report."""
+    present (a resolved issue clears its fingerprint). Returns the report.
+
+    Task 11 (additive, no fingerprint impact — §3.10's fingerprint hashes only
+    the first five PluginIssue fields via `fingerprint()`): the report also
+    carries `quarantined_bundles` (the registry raw doc's ledger, Task 9) and
+    `boot_reconcile_actions` (Task 9's `last_boot_reconcile_actions` module
+    state); each owned entry's issue/warning row gains an `owner` field
+    alongside its already-scoped `name`. `registry_path` defaults to
+    `plugin_registry.REGISTRY_PATH` (production) — tests may override it."""
     prev = load_report(path) or {}
     prev_notified = set(prev.get("notified_fingerprints") or [])
-    issue_dicts = [_issue_dict(i) for i in issues]
-    warning_dicts = [_issue_dict(w) for w in warnings]
+    quarantined_bundles, owners = _registry_state(registry_path)
+    issue_dicts = [_issue_dict(i, owners) for i in issues]
+    warning_dicts = [_issue_dict(w, owners) for w in warnings]
     current_fps = {d["fingerprint"] for d in issue_dicts}
     current_fps |= {d["fingerprint"] for d in warning_dicts}
     report = {
@@ -79,6 +141,8 @@ def write_report(*, issues: list, warnings: list,
         "issues": issue_dicts,
         "warnings": warning_dicts,
         "notified_fingerprints": sorted(prev_notified & current_fps),
+        "quarantined_bundles": quarantined_bundles,
+        "boot_reconcile_actions": _boot_reconcile_actions(),
     }
     _atomic_write(path, report)
     return report

@@ -185,24 +185,91 @@ def test_export_finance_component_bundle_writes_and_self_validates(tmp_path: Pat
     validate_export_bundle_self_consistency(bundle)  # raises on any inconsistency — no exception here
 
 
+def _build_mtg_plugin_root(tmp_path: Path) -> Path:
+    """A real (if minimal) plugin tree — the operator-supplied dir
+    `export_mtg_component` now receives directly (it no longer trusts a
+    caller-supplied checksum it never had bytes to back up)."""
+    plugin_root = tmp_path / "mtg-plugin-source"
+    plugin_dir = plugin_root / ".claude-plugin"
+    plugin_dir.mkdir(parents=True)
+    (plugin_dir / "plugin.json").write_text(
+        json.dumps({"name": "mtg", "version": "1.0.0"}), encoding="utf-8")
+    (plugin_root / "skills").mkdir()
+    (plugin_root / "skills" / "lookup.md").write_text(
+        "# lookup skill\n", encoding="utf-8")
+    return plugin_root
+
+
 def test_export_mtg_component_bundles_role_persona_and_corpus(tmp_path: Path) -> None:
     from specialist_export import export_mtg_component, validate_export_bundle_self_consistency
 
     corpus = tmp_path / "corpus-source"
     corpus.mkdir()
     (corpus / "cr.txt").write_text("702.1 Some rule text.\n", encoding="utf-8")
+    plugin_root = _build_mtg_plugin_root(tmp_path)
 
     defaults_root = _build_synthetic_defaults_root(tmp_path)
     bundle = export_mtg_component(
         defaults_root=defaults_root, corpus_source=corpus,
-        mtg_plugin_content_checksum="sha256:" + "5" * 64,
+        mtg_plugin_root=plugin_root,
     )
     assert bundle.slug == "mtg"
     assert "corpus/mtg-rules-corpus/cr.txt" in bundle.files
+    assert "plugins/mtg/.claude-plugin/plugin.json" in bundle.files
+    assert "plugins/mtg/skills/lookup.md" in bundle.files
     manifest = json.loads(bundle.files["manifest.json"])
     kinds = {d["kind"] for d in manifest["dependencies"]}
     assert kinds == {"persona", "corpus/data", "plugin/implementation"}
+    plugin_dep = next(d for d in manifest["dependencies"]
+                       if d["kind"] == "plugin/implementation")
+    assert plugin_dep == {
+        "kind": "plugin/implementation", "identifier": "mtg",
+        "digest": plugin_dep["digest"],
+        "source": {"type": "bundled", "path": "plugins/mtg"},
+    }
+    assert plugin_dep["digest"].startswith("sha256:")
     validate_export_bundle_self_consistency(bundle)
+
+    # The digest is over the COPIED tree exactly as it lands in the bundle
+    # (normalized: bytecode stripped) — recompute it independently from the
+    # bundle's own `plugins/mtg/...` entries to prove the write side and the
+    # read side (resolve_dependency_closure) will always agree.
+    import plugin_store
+
+    reconstructed = tmp_path / "reconstructed-plugin-tree"
+    reconstructed.mkdir()
+    for key, content in bundle.files.items():
+        if not key.startswith("plugins/mtg/"):
+            continue
+        rel = key[len("plugins/mtg/"):]
+        target = reconstructed / rel
+        target.parent.mkdir(parents=True, exist_ok=True)
+        target.write_bytes(content)
+    assert plugin_dep["digest"] == "sha256:" + plugin_store.content_checksum(reconstructed)
+
+
+def test_export_mtg_component_strips_bytecode_from_the_plugin_dependency(tmp_path: Path) -> None:
+    """The bundled plugin tree is normalized (bytecode stripped) BEFORE the
+    digest is computed and BEFORE it is copied into the bundle — a __pycache__
+    directory or stray .pyc in the operator-supplied source tree must never
+    reach the exported bundle or perturb the digest."""
+    from specialist_export import export_mtg_component
+
+    corpus = tmp_path / "corpus-source"
+    corpus.mkdir()
+    (corpus / "cr.txt").write_text("702.1 Some rule text.\n", encoding="utf-8")
+    plugin_root = _build_mtg_plugin_root(tmp_path)
+    pycache = plugin_root / "__pycache__"
+    pycache.mkdir()
+    (pycache / "mod.cpython-311.pyc").write_bytes(b"\x00\x01\x02")
+
+    defaults_root = _build_synthetic_defaults_root(tmp_path)
+    bundle = export_mtg_component(
+        defaults_root=defaults_root, corpus_source=corpus,
+        mtg_plugin_root=plugin_root,
+    )
+    assert not any(k.startswith("plugins/mtg/__pycache__") for k in bundle.files)
+    assert not any(k.endswith(".pyc") for k in bundle.files)
 
 
 def test_clean_image_install_of_the_exported_finance_bundle_succeeds(tmp_path: Path, monkeypatch) -> None:
@@ -229,5 +296,6 @@ def test_clean_image_install_of_the_exported_finance_bundle_succeeds(tmp_path: P
         "casa-org/casa-finance-specialist", "v0.1.0",
         staging_root=tmp_path / "staging", installed_index=InstalledSpecialistIndex(
             specialists_dir=str(tmp_path / "specialists")),
+        receipts_dir=tmp_path / "receipts",
     )
     assert result.slug == "finance"  # no SpecialistInstallError("slug_collision", ...) raised

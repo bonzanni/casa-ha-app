@@ -6,7 +6,7 @@
   "required": ["speaker_kind", "role_id", "persona_id", "persona_version", "display_name", "binding_digest", "user_peer", "user_id"],
   "properties": {
     "speaker_kind": {"enum": ["user", "resident", "specialist", "executor", "system"]},
-    "role_id": {"type": ["string", "null"], "maxLength": 128, "pattern": "^(resident|specialist|executor):[a-z0-9][a-z0-9-]*$"},
+    "role_id": {"type": ["string", "null"], "maxLength": 128, "pattern": "^(resident|specialist|executor):[a-z0-9][a-z0-9-]{0,31}$"},
     "persona_id": {"type": ["string", "null"], "maxLength": 192, "pattern": "^[a-z0-9](?:[a-z0-9.-]*[a-z0-9])?/[a-z0-9][a-z0-9-]*$"},
     "persona_version": {"type": ["string", "null"], "maxLength": 64, "pattern": "^(0|[1-9][0-9]*)\\.(0|[1-9][0-9]*)\\.(0|[1-9][0-9]*)$"},
     "display_name": {"type": ["string", "null"], "minLength": 1, "maxLength": 80},

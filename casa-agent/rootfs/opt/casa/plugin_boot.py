@@ -78,6 +78,19 @@ def main() -> int:
         elif plugin_registry.seed_defaults(data):
             plugin_registry.save_registry(data)
 
+        # Task 9: crash-safe bundle-op journal reconciliation runs BEFORE the
+        # snapshot loads — an incomplete specialist-bundle mutation (install/
+        # upgrade/rollback/uninstall) left by a crash is rolled back or
+        # quarantined here. Degrade-and-boot: a reconciliation failure must
+        # never block svc-casa (reconcile_boot already quarantines internally
+        # and stashes its own module-level `last_boot_reconcile_actions`;
+        # this try/except is belt-and-suspenders for a truly unexpected bug).
+        try:
+            import specialist_bundle_journal
+            specialist_bundle_journal.reconcile_boot()
+        except Exception:  # noqa: BLE001 — spec 3.6: never block svc-casa
+            log.exception("bundle journal reconciliation failed")
+
         plugin_registry.reload_snapshot()
         res = plugin_registry.resolve_all()
         if not res.registry_valid:

@@ -13,6 +13,7 @@ from typing import Callable, Literal, Mapping
 import jsonschema
 import yaml
 
+import plugin_registry
 from canonical_bytes import checksum_json
 from persona_pack import PersonaPack
 from role_slot import (  # noqa: F401 — re-exported for existing callers (Task 6 owns these)
@@ -362,6 +363,175 @@ class InstanceDir:
         payload["_error_reason"] = reason
         error_path.write_text(yaml.safe_dump(payload, sort_keys=False), encoding="utf-8")
         desired_path.unlink()
+
+    # --- Owned-plugins sidecar triple (Task 10, spec §3.4) ------------------
+    # A specialist's owned-plugin set (and its component source receipt) is
+    # persisted alongside the instance tuple as a MAPPING document, one file
+    # per generation, mirroring the active/desired/prior tuple triple so a
+    # bundle transaction (install/upgrade/rollback) and boot reconciliation
+    # can restore the exact owned set + provenance a generation carried. The
+    # sidecar carries what the tuple cannot: which plugins the specialist owns
+    # and where their bytes came from (closes the provenance gap for
+    # plugin-less components too — `plugins: []` with a real component_source).
+    def stage_desired_owned_plugins(self, doc: dict) -> None:
+        write_owned_plugins(owned_plugins_desired_path(self._dir), doc)
+
+    def commit_owned_plugins_desired_to_active(self) -> None:
+        """Rotate the owned-plugins sidecar triple in lockstep with
+        `commit_desired_to_active`'s tuple rotation: desired->active,
+        active->prior. Called inside the SAME MATERIALIZE_LOCK step. A no-op
+        when no desired sidecar was staged (defensive — every bundle commit
+        stages one first)."""
+        desired = owned_plugins_desired_path(self._dir)
+        active = owned_plugins_path(self._dir)
+        prior = owned_plugins_prior_path(self._dir)
+        if not desired.exists():
+            return
+        if active.exists():
+            # Copy-then-replace (mirrors commit_desired_to_active's
+            # _copy_to_temp) so a crash mid-rotation never destroys the prior
+            # rollback target before the new active is in place.
+            prior.write_bytes(active.read_bytes())
+            os.chmod(prior, 0o600)
+        os.replace(desired, active)
+
+
+# --- Owned-plugins sidecar document (Task 10, spec §3.4) --------------------
+# Path helpers for the TRIPLE, mirroring the tuple filenames. Module functions
+# (not just InstanceDir methods) so boot reconciliation / rollback can address
+# a slug dir directly.
+
+def owned_plugins_desired_path(directory: Path) -> Path:
+    return Path(directory) / "owned-plugins.desired.yaml"
+
+
+def owned_plugins_path(directory: Path) -> Path:
+    return Path(directory) / "owned-plugins.yaml"
+
+
+def owned_plugins_prior_path(directory: Path) -> Path:
+    return Path(directory) / "owned-plugins.prior.yaml"
+
+
+# Whole-branch F: an owned-plugins sidecar is on-disk state a rollback/boot
+# path later joins into a store path (`store_root / row["name"] /
+# row["artifact_id"]`). A tampered/corrupt sidecar with a traversal `name`
+# ("../../etc") or a bogus `artifact_id` must NEVER reach a filesystem join —
+# validate the grammar on READ and fail the whole doc closed if malformed.
+#
+# P2-7: the owned scoped-name grammar has a canonical home — reuse
+# `plugin_registry.OWNED_NAME_RE` (single source of truth) rather than copying
+# the pattern. `_ARTIFACT_ID_RE` has no canonical constant in plugin_registry
+# (artifact ids are raw sha256 hexdigests from `compute_artifact_id`); a test
+# asserts this local pattern matches that output shape.
+_OWNED_NAME_RE = plugin_registry.OWNED_NAME_RE
+_ARTIFACT_ID_RE = re.compile(r"^[0-9a-f]{64}$")
+
+
+class OwnedPluginsSidecarError(ValueError):
+    """P1-4: a PRESENT owned-plugins sidecar that fails strict v1 validation.
+    Distinct from an ABSENT sidecar (legacy/pre-feature generation) so a
+    rollback/boot caller can tell "no owned set to restore" apart from "the
+    recorded owned set is unreadable" — the latter must refuse loudly rather
+    than silently discard the prior owned set as if it were empty."""
+
+
+def _valid_owned_source(source: object) -> bool:
+    """P2: an owned row's `source` sub-mapping, per the sidecar contract
+    written by `_owned_sidecar_doc`/`_owned_entry_for` (specialist_install.py)
+    — always `{"type": "github", "repo", "ref", "revision", "subdir"}`. A
+    non-mapping (or field-incomplete) `source` must fail validation HERE so
+    `read_owned_plugins` raises the typed `OwnedPluginsSidecarError` — leaving
+    it unchecked lets a bogus `source` (e.g. a bare string) pass `_valid_owned_row`
+    and then blow up later as an untyped exception where a caller (rollback's
+    `_prior_owned_entry`) indexes `src["repo"]`/`src["ref"]`/`src["revision"]`."""
+    if not isinstance(source, dict):
+        return False
+    if source.get("type") != "github":
+        return False
+    for key in ("repo", "ref", "revision"):
+        if not isinstance(source.get(key), str) or not source[key]:
+            return False
+    if not isinstance(source.get("subdir", ""), str):
+        return False
+    if not plugin_registry.REVISION_RE.match(source["revision"]):
+        return False
+    try:
+        plugin_registry.normalize_subdir(source.get("subdir", ""))
+    except ValueError:
+        return False
+    return True
+
+
+def _valid_owned_row(row: object) -> bool:
+    if not isinstance(row, dict):
+        return False
+    name = row.get("name")
+    if (not isinstance(name, str) or not _OWNED_NAME_RE.match(name)
+            or len(name.encode()) > 72):
+        return False
+    if not _ARTIFACT_ID_RE.match(str(row.get("artifact_id", ""))):
+        return False
+    mname = row.get("manifest_name")
+    if not isinstance(mname, str) or name.partition(".")[2] != mname:
+        return False
+    if not isinstance(row.get("version", ""), str):
+        return False
+    if not _valid_owned_source(row.get("source")):
+        return False
+    return True
+
+
+def _valid_owned_doc(raw: object) -> bool:
+    """P1-4: the complete v1 document shape — `schema_version == 1`, a
+    `component_source` mapping, and a `plugins` list of grammar-valid rows."""
+    if not isinstance(raw, dict):
+        return False
+    if raw.get("schema_version") != 1:
+        return False
+    if not isinstance(raw.get("component_source"), dict):
+        return False
+    plugins = raw.get("plugins")
+    if not isinstance(plugins, list) or not all(_valid_owned_row(r) for r in plugins):
+        return False
+    return True
+
+
+def read_owned_plugins(path: Path) -> "dict | None":
+    """Load an owned-plugins sidecar document.
+
+    Returns None ONLY when the file is ABSENT (a legacy/pre-feature generation
+    ⇒ empty owned set). A PRESENT file is validated against the full v1 shape
+    `{"schema_version": 1, "component_source": {...}, "plugins": [...]}` — row
+    grammar included, so a downstream store-path join can trust every row — and
+    a malformed present file raises `OwnedPluginsSidecarError` (P1-4) rather
+    than returning None. Collapsing malformed-present into None let a rollback
+    silently discard the prior owned set (treating an unreadable sidecar as
+    "nothing was owned"); the typed error forces the caller to refuse."""
+    p = Path(path)
+    if not p.exists():
+        return None
+    try:
+        raw = yaml.safe_load(p.read_text(encoding="utf-8"))
+    except (OSError, yaml.YAMLError) as exc:
+        raise OwnedPluginsSidecarError(
+            f"owned-plugins sidecar {p} is present but unreadable: {exc}")
+    if not _valid_owned_doc(raw):
+        raise OwnedPluginsSidecarError(
+            f"owned-plugins sidecar {p} failed v1 validation")
+    return raw
+
+
+def write_owned_plugins(path: Path, doc: dict) -> None:
+    """Atomic write of an owned-plugins sidecar document (same os.replace-backed
+    primitive the instance tuples use)."""
+    path = Path(path)
+    path.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
+    payload = yaml.safe_dump(doc, sort_keys=False)
+    temporary = path.with_suffix(path.suffix + ".tmp")
+    temporary.write_text(payload, encoding="utf-8")
+    os.chmod(temporary, 0o600)
+    os.replace(temporary, path)
 
 
 # --- Resident persona defaults + boot-time reconciliation (Task 8) ----------

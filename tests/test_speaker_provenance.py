@@ -209,14 +209,16 @@ def test_max_length_user_round_trip() -> None:
 
 
 def test_max_length_agent_round_trip() -> None:
-    scalar_role, byte_role = _FIELD_LIMITS["role_id"]
     scalar_persona, byte_persona = _FIELD_LIMITS["persona_id"]
     scalar_ver, byte_ver = _FIELD_LIMITS["persona_version"]
     scalar_name, byte_name = _FIELD_LIMITS["display_name"]
     # role_id/persona_id/persona_version must still match their regexes, so
     # build max-length values that are also structurally valid rather than
-    # pure filler.
-    role_id = "resident:" + "b" * (scalar_role - len("resident:"))
+    # pure filler. role_id's real ceiling is now the 32-byte-slug bound in
+    # _ROLE_RE (``{0,31}`` after the mandatory first char), which is far
+    # tighter than the 128-byte _FIELD_LIMITS scalar limit — so the
+    # max-length role_id below is bounded by the regex, not the field limit.
+    role_id = "resident:" + "b" * 32
     persona_id = "a/" + "b" * (scalar_persona - 2)
     persona_version = "0.0." + "9" * (scalar_ver - 4)
     display_name = _fill(scalar_name, byte_name)
@@ -272,6 +274,37 @@ def test_role_id_one_byte_over_scalar_limit_fails() -> None:
         speaker_kind="resident",
         role_id=role_id,
         persona_id="casa.personas/tina",
+        persona_version="1.0.0",
+        binding_digest="sha256:" + "5" * 64,
+    )
+    with pytest.raises(ValueError):
+        validate_speaker_provenance(value)
+
+
+def test_role_id_slug_at_32_bytes_accepted() -> None:
+    """_ROLE_RE bounds the slug portion (after ``kind:``) to 32 bytes
+    (``[a-z0-9][a-z0-9-]{0,31}``) — the same bound `specialist_component
+    ._SLUG_RE` and the role/binding/speaker-provenance v1 schemas enforce.
+    A 32-byte slug is the boundary and must still validate."""
+    role_id = "specialist:" + "b" * 32
+    value = SpeakerProvenance(
+        speaker_kind="specialist",
+        role_id=role_id,
+        persona_id="casa.personas/gary",
+        persona_version="1.0.0",
+        binding_digest="sha256:" + "5" * 64,
+    )
+    validate_speaker_provenance(value)
+
+
+def test_role_id_slug_over_32_bytes_rejected() -> None:
+    """One byte past the _ROLE_RE slug bound must be rejected even though
+    it is well within the 128-byte role_id _FIELD_LIMITS scalar limit."""
+    role_id = "specialist:" + "b" * 33
+    value = SpeakerProvenance(
+        speaker_kind="specialist",
+        role_id=role_id,
+        persona_id="casa.personas/gary",
         persona_version="1.0.0",
         binding_digest="sha256:" + "5" * 64,
     )

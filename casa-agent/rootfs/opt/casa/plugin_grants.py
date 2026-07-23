@@ -22,6 +22,7 @@ from pathlib import Path
 
 from claude_agent_sdk import PermissionResultDeny
 
+from plugin_registry import runtime_name
 from text_util import sanitize_segment  # noqa: F401 — re-exported (existing
 # callers/tests import `sanitize_segment` from this module; the canonical
 # implementation now lives in text_util so plugin_store.py — stdlib-only,
@@ -53,11 +54,17 @@ def mcp_json_malformed(rp) -> bool:
 
 def grants_for_resolved(rp) -> list[str]:
     """Server-level grant strings for one resolved plugin (sorted). Skill-only
-    plugins (no ``.mcp.json``) yield ``[]``."""
+    plugins (no ``.mcp.json``) yield ``[]``. Namespaced on the plugin's
+    RUNTIME identity (Task 5, spec §2.1: ``plugin_registry.runtime_name`` —
+    an owned artifact's ``manifest_name``, else its registry name), never the
+    scoped registry name, so an owned ``mtg.mtg`` entry grants
+    ``mcp__plugin_mtg_<server>``, matching the SDK's own plugin-tool
+    namespace (which loads ``plugin.json`` from ``rp.path`` and only ever
+    knows the manifest name)."""
     mcp_json = Path(rp.path) / ".mcp.json"
     if not mcp_json.is_file():
         return []
-    plugin_seg = sanitize_segment(rp.name)
+    plugin_seg = sanitize_segment(runtime_name(rp))
     return sorted(
         f"mcp__plugin_{plugin_seg}_{sanitize_segment(server)}"
         for server in _mcp_servers(mcp_json)
@@ -169,7 +176,10 @@ def protected_map(resolution) -> dict[str, dict]:
         servers = sorted(_mcp_servers(Path(rp.path) / ".mcp.json"))
         if not servers:
             continue
-        plugin_seg = sanitize_segment(rp.name)
+        # Task 5: same runtime-identity namespacing as grants_for_resolved —
+        # the authz hook matches these full tool names against what the SDK
+        # actually calls, which is namespaced on the manifest name.
+        plugin_seg = sanitize_segment(runtime_name(rp))
         for tool_entry in entries:
             tool_seg = sanitize_segment(tool_entry["name"])
             for server in servers:
