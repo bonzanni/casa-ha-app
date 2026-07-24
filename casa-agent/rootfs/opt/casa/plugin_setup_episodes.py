@@ -342,6 +342,21 @@ def _settle_locked(data: dict, plugin: str) -> tuple[bool, list[str]]:
     members = rnd.get("members") or {}
     if not members or any(m.get("state") == "open" for m in members.values()):
         return False, []
+    # Resolve the setup tool FIRST (impl r6, Terra): a plugin that declares
+    # NO casa.setupTool must settle SILENTLY on every path — a denial/expiry
+    # for a legacy trigger plugin (gmail, etc.) must not emit a spurious
+    # "setup tool NOT run" note. The absent-declaration benign default holds
+    # for both approve and deny outcomes.
+    entry = None
+    if _resolve_registry_entry is not None:
+        try:
+            entry = _resolve_registry_entry(plugin)
+        except Exception:  # noqa: BLE001
+            logger.exception("registry resolve failed (plugin=%s)", plugin)
+    setup = (entry or {}).get("setup_tool") if isinstance(entry, dict) else None
+    if not setup:
+        del data["rounds"][plugin]
+        return False, []
     del data["rounds"][plugin]
     denied = [i for i, m in members.items() if m.get("state") == "denied"]
     if denied:
@@ -352,15 +367,6 @@ def _settle_locked(data: dict, plugin: str) -> tuple[bool, list[str]]:
             "if intended."]
     approved_keys = sorted(f"{i}#{m.get('gen', '')}"
                            for i, m in members.items())
-    entry = None
-    if _resolve_registry_entry is not None:
-        try:
-            entry = _resolve_registry_entry(plugin)
-        except Exception:  # noqa: BLE001
-            logger.exception("registry resolve failed (plugin=%s)", plugin)
-    setup = (entry or {}).get("setup_tool") if isinstance(entry, dict) else None
-    if not setup:
-        return False, []
     artifact_id = rnd.get("artifact_id") or ""
     key = _episode_key(plugin, artifact_id, approved_keys)
     consumed = data.setdefault("consumed_keys", [])

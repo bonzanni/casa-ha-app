@@ -501,3 +501,15 @@ async def test_open_round_fresh_nonce_after_decision(wired):
     assert n2 != n1
     assert pse._load()["rounds"]["elevenlabs"]["members"]["id-a"]["state"] \
         == "open"
+
+
+@pytest.mark.asyncio
+async def test_legacy_plugin_denial_is_silent(wired):
+    # impl r6 (Terra): a plugin with NO casa.setupTool must settle silently
+    # on the deny path too — no spurious "setup tool NOT run" note.
+    wired["entry"] = dict(wired["entry"], setup_tool=None)
+    _open(["id-a", "id-b"], plugin="gmail")
+    await _decide(plugin="gmail", identity="id-a", approved=True)
+    await _decide(plugin="gmail", identity="id-b", approved=False)
+    assert pse.episodes() == []
+    assert wired["notes"] == []
