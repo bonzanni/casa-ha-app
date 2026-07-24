@@ -26,6 +26,7 @@ from collections import defaultdict
 from typing import Any, Awaitable, Callable
 
 from aiohttp import web
+from telegram.error import BadRequest
 
 from settle_gate import confirmed_settle_edit
 
@@ -530,13 +531,40 @@ def _make_post_inline_keyboard(
             for row in rows
         ])
 
+        # v0.109.0 (G4): render the body rich when the caller did NOT request
+        # an explicit parse_mode (parse_mode wins — entities and parse_mode
+        # are mutually exclusive at the Bot API; no caller passes parse_mode
+        # today, the passthrough stays for that contract). Plain body / over
+        # caps ⇒ entities None ⇒ the pre-v0.109 plain send, byte-identical.
+        _text = body.get("text") or ""
+        _extra: dict = {}
+        if not body.get("parse_mode") and getattr(
+                telegram_channel, "_rich_text_enabled", False):
+            from channels.tg_richtext import render as _render
+            _display, _entities = _render(_text)
+            if _entities is not None:
+                _text = _display
+                _extra["entities"] = _entities
         try:
-            msg_id = await telegram_channel.send_to_topic(
-                topic_id,
-                body.get("text") or "",
-                reply_markup=keyboard,
-                parse_mode=body.get("parse_mode"),
-            )
+            try:
+                msg_id = await telegram_channel.send_to_topic(
+                    topic_id,
+                    _text,
+                    reply_markup=keyboard,
+                    parse_mode=body.get("parse_mode"),
+                    **_extra,
+                )
+            except BadRequest:
+                if not _extra:
+                    raise
+                # Entity rejection posted NOTHING — one plain resend of the
+                # ORIGINAL text (fail-literal, mirrors the other primitives).
+                msg_id = await telegram_channel.send_to_topic(
+                    topic_id,
+                    body.get("text") or "",
+                    reply_markup=keyboard,
+                    parse_mode=body.get("parse_mode"),
+                )
         except Exception as exc:  # noqa: BLE001
             logger.warning(
                 "post_inline_keyboard failed for engagement=%s topic=%s: %s",

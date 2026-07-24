@@ -2537,6 +2537,18 @@ async def main() -> None:
             return await telegram_channel.send_to_topic_rich(thread_id, text)
         return None
 
+    async def _send_to_topic_paged(
+        thread_id: int, text: str,
+    ) -> int | None:
+        # v0.109.0 (G5): paged rich send for ONE-SHOT terminal posts (the
+        # completion notice) — a summary over the 4096/100-entity caps ships as
+        # several rendered pages instead of raw markdown. Returns the LAST
+        # page's message_id (bottom-most — correct high-water anchor).
+        if telegram_channel is not None:
+            return await telegram_channel.send_response_to_topic(
+                thread_id, text)
+        return None
+
     async def _edit_topic_message(
         thread_id: int, message_id: int, text: str, *, clear_keyboard: bool = False,
     ) -> bool:
@@ -2608,6 +2620,12 @@ async def main() -> None:
         # edit_discrete (keyboard-bearing writes through the single writer).
         send_topic_message_markup=_send_topic_message_markup,
         edit_topic_message_markup=_edit_topic_message_markup,
+        # v0.109.0 (G5): paged rich sender for terminal completion posts.
+        # Explicitly None without a Telegram channel so the sequencer keeps
+        # its ordinary _post_notice_locked path (Sol r2: a non-None sender is
+        # authoritative — never inject a wrapper that can only return None).
+        send_to_topic_paged=(
+            _send_to_topic_paged if telegram_channel is not None else None),
         # v0.79.0 (§5): best-effort pin primitive for the live summary.
         pin_topic_message=_pin_topic_message,
         registry=engagement_registry,
@@ -2749,7 +2767,8 @@ async def main() -> None:
             if rec.driver == "claude_code":
                 await claude_code_driver.post_topic_notice(rec, text)
             else:
-                await telegram_channel.send_to_topic(rec.topic_id, text)
+                # v0.109.0 (G3): notices carry markdown — render rich.
+                await telegram_channel.send_to_topic_rich(rec.topic_id, text)
         telegram_channel._driver_post_notice = _driver_post_notice
 
         async def _finalize_cancel(rec, reason="user"):

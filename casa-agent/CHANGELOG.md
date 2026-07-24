@@ -1,5 +1,19 @@
 # Changelog
 
+## [0.109.0] - 2026-07-24
+
+### Fixed
+
+- Literal `**` markers and unformatted tables no longer appear in several
+  Telegram surfaces that skipped rich-text rendering: the assistant's DM
+  questions with tappable buttons (and their settle edits), engagement
+  completion summaries, engagement notices, and keyboard-bearing topic
+  posts now all render markdown as proper formatting.
+- Very long engagement completion summaries now arrive as several
+  formatted messages instead of one message with raw markdown.
+- Bordered tables without a `|---|` separator row are now recognized and
+  shown in aligned monospace (three or more consistent rows).
+
 ## [0.108.0] - 2026-07-24
 
 ### Removed

@@ -25,6 +25,7 @@ class TestFinalizeEngagement:
 
         telegram = MagicMock()
         telegram.send_to_topic = AsyncMock()
+        telegram.send_response_to_topic = AsyncMock()
         telegram.close_topic = AsyncMock()
         cm = MagicMock()
         cm.get.return_value = telegram
@@ -48,7 +49,7 @@ class TestFinalizeEngagement:
         # Topic closed + icon flipped
         telegram.close_topic.assert_awaited_once_with(thread_id=42)
         # Completion message posted in topic
-        telegram.send_to_topic.assert_awaited()
+        telegram.send_response_to_topic.assert_awaited()  # v0.109.0 rich summary
         # NOTIFICATION sent to Ellen
         bus.notify.assert_awaited_once()
         # Driver cancelled
@@ -75,6 +76,7 @@ class TestFinalizeEngagement:
         order: list[str] = []
         telegram = MagicMock()
         telegram.send_to_topic = AsyncMock()
+        telegram.send_response_to_topic = AsyncMock()
 
         async def _close(*, thread_id):
             order.append("close_topic")
@@ -119,6 +121,7 @@ class TestFinalizeEngagement:
 
         telegram = MagicMock()
         telegram.send_to_topic = AsyncMock()
+        telegram.send_response_to_topic = AsyncMock()
         telegram.close_topic = AsyncMock()
         cm = MagicMock()
         cm.get.return_value = telegram
@@ -211,6 +214,7 @@ class TestFinalizeU3Transition:
 
         telegram = MagicMock()
         telegram.send_to_topic = AsyncMock()
+        telegram.send_response_to_topic = AsyncMock()
         telegram.close_topic = AsyncMock()
         telegram.update_topic_state = AsyncMock()
         cm = MagicMock()
@@ -266,6 +270,7 @@ class TestFinalizeU3Transition:
 
         telegram = MagicMock()
         telegram.send_to_topic = AsyncMock()
+        telegram.send_response_to_topic = AsyncMock()
         telegram.close_topic = AsyncMock()
         telegram.update_topic_state = AsyncMock(
             side_effect=RuntimeError("telegram down"),
@@ -325,6 +330,7 @@ class TestFinalizeEngagementBrokerCleanup:
             order.append("close_topic")
 
         telegram.send_to_topic = AsyncMock(side_effect=_send_to_topic)
+        telegram.send_response_to_topic = AsyncMock(side_effect=_send_to_topic)
         telegram.close_topic = AsyncMock(side_effect=_close_topic)
         cm = MagicMock()
         cm.get.return_value = telegram
@@ -398,6 +404,7 @@ class TestFinalizeEngagementBrokerCleanup:
 
         telegram = MagicMock()
         telegram.send_to_topic = AsyncMock()
+        telegram.send_response_to_topic = AsyncMock()
         telegram.close_topic = AsyncMock()
         cm = MagicMock()
         cm.get.return_value = telegram

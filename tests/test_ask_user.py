@@ -560,6 +560,7 @@ class TestDmReadableButtons:
         bot.send_message = AsyncMock(
             return_value=types.SimpleNamespace(message_id=9))
         ch._bot = bot  # ``bot`` is a read-only property backed by ``_bot``
+        ch._rich_text_enabled = False  # bare __new__ instance (v0.109.0 attr)
 
         options = ["Personal Gmail", "Configure the enterprise SSO integration"]
         body = ("Which account?\n\n1. Personal Gmail\n"

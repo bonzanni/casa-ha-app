@@ -1299,7 +1299,8 @@ class TelegramChannel(Channel):
         if self._driver_post_notice is not None:
             await self._driver_post_notice(rec, text)
         else:
-            await self.send_to_topic(rec.topic_id, text)
+            # v0.109.0 (G3): notices carry agent/platform markdown — render.
+            await self.send_to_topic_rich(rec.topic_id, text)
 
     async def handle_update(
         self, update, _context: ContextTypes.DEFAULT_TYPE | None = None
@@ -2484,14 +2485,22 @@ class TelegramChannel(Channel):
         self, topic_id: int | None, text: str, markup: Any = None,
         *, reply_to: int | None = None,
     ) -> int | None:
-        """A9 (v0.83.0): plain-text topic send carrying an inline keyboard,
-        returning the posted ``message_id`` (markup-capable companion to
-        ``send_to_topic`` for the OUTPUT SEQUENCER's ``post_discrete``).
+        """A9 (v0.83.0): topic send carrying an inline keyboard, returning the
+        posted ``message_id`` (markup-capable companion to ``send_to_topic``
+        for the OUTPUT SEQUENCER's ``post_discrete``).
 
         ``markup`` is an ``InlineKeyboardMarkup`` (passed through), the
         ``output_sequencer.MARKUP_EMPTY`` sentinel (⇒ explicit empty keyboard),
         or ``None`` (⇒ no keyboard, plain send). ``reply_to`` reply-threads the
-        send. Best-effort: returns ``None`` on failure rather than raising."""
+        send. Best-effort: returns ``None`` on failure rather than raising.
+
+        v0.109.0 (G4): the body renders rich, restoring symmetry with the edit
+        sibling (``edit_topic_message_markup`` has rendered since R2c v0.89.0 —
+        a discrete post showed literal ``**`` until its settle-edit re-rendered
+        it). Same contract as R2c: entities on success; no markup / over caps ⇒
+        ORIGINAL raw text plain; an entity ``BadRequest`` (which posted
+        NOTHING) retries ONCE plain — this is not the cancellation-gated ask
+        poster, so the retry cannot double-post an ask."""
         if not self.engagement_supergroup_id:
             return None
         kwargs: dict = {}
@@ -2503,7 +2512,24 @@ class TelegramChannel(Channel):
             kwargs["reply_parameters"] = ReplyParameters(
                 message_id=reply_to, allow_sending_without_reply=True,
             )
+        display, entities = (
+            render(text) if self._rich_text_enabled else (text, None))
         try:
+            if entities is not None:
+                try:
+                    msg = await self.bot.send_message(
+                        chat_id=self.engagement_supergroup_id,
+                        text=display,
+                        message_thread_id=topic_id,
+                        entities=entities,
+                        **kwargs,
+                    )
+                    return msg.message_id
+                except BadRequest as exc:
+                    logger.warning(
+                        "send_topic_message_markup rich send fell back to "
+                        "plain (topic=%s): %s", topic_id, exc,
+                    )
             msg = await self.bot.send_message(
                 chat_id=self.engagement_supergroup_id,
                 text=text,
@@ -2689,10 +2715,35 @@ class TelegramChannel(Channel):
             )]
             for i in range(len(options))
         ])
+        # v0.109.0 (G1): render the BODY rich (DM parity with
+        # ``post_ask_body_rich``) — agent-authored ask bodies are markdown-heavy
+        # and this was the dominant literal-``**`` DM surface. Buttons and
+        # ``callback_data`` are untouched (index-addressed). Single-shot
+        # ``render()``: no markup / over caps ⇒ the ORIGINAL raw text sends
+        # plain. An entity ``BadRequest`` posted NOTHING (Telegram rejected the
+        # send), so ONE plain retry with the original text cannot duplicate the
+        # ask; any other failure keeps the delivery-failure contract (None).
+        display, entities = (
+            render(text) if self._rich_text_enabled else (text, None))
         try:
-            msg = await self.bot.send_message(
-                chat_id=chat_id, text=text, reply_markup=kbd,
-            )
+            if entities is not None:
+                try:
+                    msg = await self.bot.send_message(
+                        chat_id=chat_id, text=display, entities=entities,
+                        reply_markup=kbd,
+                    )
+                except BadRequest as exc:
+                    logger.warning(
+                        "post_dm_keyboard rich send fell back to plain "
+                        "(chat=%s): %s", chat_id, exc,
+                    )
+                    msg = await self.bot.send_message(
+                        chat_id=chat_id, text=text, reply_markup=kbd,
+                    )
+            else:
+                msg = await self.bot.send_message(
+                    chat_id=chat_id, text=text, reply_markup=kbd,
+                )
         except Exception as exc:  # noqa: BLE001 — delivery failure, not fatal
             logger.warning(
                 "post_dm_keyboard send failed (chat=%s): %s", chat_id, exc,
@@ -2709,8 +2760,31 @@ class TelegramChannel(Channel):
         DM analogue of ``edit_topic_message`` (chat-addressed, no supergroup
         guard). "Message is not modified" (an identical re-edit) is tolerated
         as success, not an error, since the desired end state already holds.
+
+        v0.109.0 (G1): the edited body renders rich (the settle-edit rewrites
+        the ask body posted by ``post_dm_keyboard`` — plain here would resurrect
+        literal markers on settle). An entity ``BadRequest`` retries the SAME
+        EDIT plain with the original text — never a new message (Sol+Terra
+        design round: an edit must not become a duplicate post).
         """
+        display, entities = (
+            render(text) if self._rich_text_enabled else (text, None))
         try:
+            if entities is not None:
+                try:
+                    await self.bot.edit_message_text(
+                        chat_id=chat_id, message_id=message_id, text=display,
+                        entities=entities,
+                    )
+                    return True
+                except BadRequest as exc:
+                    if "not modified" in str(exc).lower():
+                        return True
+                    logger.warning(
+                        "edit_dm_message rich edit fell back to plain "
+                        "(chat=%s message_id=%s): %s",
+                        chat_id, message_id, exc,
+                    )
             await self.bot.edit_message_text(
                 chat_id=chat_id, message_id=message_id, text=text,
             )

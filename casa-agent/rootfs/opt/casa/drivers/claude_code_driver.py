@@ -779,6 +779,7 @@ class ClaudeCodeDriver(DriverProtocol):
         delete_topic_message: Callable[[int, int], Awaitable[bool]] | None = None,
         send_topic_message_markup: Callable[..., Awaitable[int | None]] | None = None,
         edit_topic_message_markup: Callable[..., Awaitable[bool]] | None = None,
+        send_to_topic_paged: TopicSender | None = None,
         pin_topic_message: Callable[[int, int], Awaitable[bool]] | None = None,
         registry: Any = None,
         sleep: Callable[[float], Awaitable[None]] = asyncio.sleep,
@@ -803,6 +804,9 @@ class ClaudeCodeDriver(DriverProtocol):
         # needs it to edit the rolling message), while notice/warning callers
         # ignore the return.
         self._send_to_topic = send_to_topic
+        # v0.109.0 (G5): paged rich sender for the ONE-SHOT terminal completion
+        # post — injected into each sequencer as its ``send_paged`` primitive.
+        self._send_to_topic_paged = send_to_topic_paged
         self._edit_topic_message = edit_topic_message
         self._delete_topic_message = delete_topic_message
         # A9 (v0.83.0): markup-capable topic send/edit primitives, injected into
@@ -2409,6 +2413,8 @@ class ClaudeCodeDriver(DriverProtocol):
                 # A9: markup-capable wire for post_discrete/edit_discrete.
                 send_message_markup=self._relay_send_message_markup,
                 edit_message_markup=self._relay_edit_message_markup,
+                # v0.109.0 (G5): paged sender for the terminal completion post.
+                send_paged=self._send_to_topic_paged,
             )
             self._sequencers[engagement.id] = seq
         return seq
