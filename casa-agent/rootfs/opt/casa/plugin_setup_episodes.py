@@ -212,7 +212,18 @@ async def on_consent_decision(*, plugin: str, artifact_id: str,
         async with _lock:
             data = _load()
             rnd = data["rounds"].get(plugin)
-            if not isinstance(rnd, dict) or rnd.get("artifact_id") != artifact_id:
+            if isinstance(rnd, dict) and rnd.get("artifact_id") != artifact_id:
+                # impl r2 (both reviewers): a LATE decision from a superseded
+                # artifact must never replace the CURRENT round — the prompt
+                # path (which only ever runs from a live reconcile) is the
+                # sole authority for starting a new-artifact round. Ignore
+                # the stale decision outright.
+                logger.info(
+                    "stale consent decision ignored (plugin=%s artifact=%s, "
+                    "current round is %s)", plugin, artifact_id,
+                    rnd.get("artifact_id"))
+                return
+            if not isinstance(rnd, dict):
                 # Unknown round (e.g. store reset) — synthesize one so a
                 # decision is never dropped on the floor.
                 rnd = {"artifact_id": artifact_id, "members": {}}
@@ -250,10 +261,20 @@ async def on_consent_decision(*, plugin: str, artifact_id: str,
                     _save(data)  # no setup tool — nothing to do
                 else:
                     key = _episode_key(plugin, artifact_id, approved_keys)
-                    if not any(e.get("key") == key
-                               for e in data["episodes"]):
+                    consumed = data.setdefault("consumed_keys", [])
+                    if (not any(e.get("key") == key
+                                for e in data["episodes"])
+                            and key not in consumed):
                         # Terminal-state hygiene: a fresh episode supersedes
-                        # the plugin's older ones (any status).
+                        # the plugin's older ones (any status) — but their
+                        # KEYS are kept as bounded tombstones so a replayed
+                        # stale decision can never recreate a consumed
+                        # episode and prune the current one (impl r2, Sol).
+                        for old in data["episodes"]:
+                            if (old.get("plugin") == plugin
+                                    and old.get("key")):
+                                consumed.append(old["key"])
+                        del consumed[:-50]
                         data["episodes"] = [
                             e for e in data["episodes"]
                             if e.get("plugin") != plugin]

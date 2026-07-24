@@ -8235,8 +8235,12 @@ def _tool_verify_plugin_state(
     except plugin_store.StoreError:
         _setup_decl = None  # malformed already surfaced via artifact_verdict
     _entry_targets = list(entry.get("targets") or [])
-    if (_setup_decl and _entry_targets
-            and all(str(t).startswith("executor:") for t in _entry_targets)):
+    if _setup_decl and not any(
+            str(t).startswith(("resident:", "specialist:"))
+            for t in _entry_targets):
+        # Executor-only AND empty target lists alike: a declared automatic
+        # setup hook with no invocation path is a configuration error, not a
+        # silent no-op (impl r2 closed the empty-list gap).
         reasons.append("setup_tool_unsupported_target")
     # v0.112.0 (impl r1): the post-consent dispatch names the EXACT
     # namespaced tool `<server-grant>__<setupTool>` — that binding is only

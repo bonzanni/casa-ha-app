@@ -217,6 +217,41 @@ async def test_new_artifact_resets_round(wired):
 
 
 @pytest.mark.asyncio
+async def test_stale_artifact_decision_ignored(wired):
+    # impl r2 (both reviewers): a LATE decision from a superseded artifact
+    # must never replace the current round. prompt A(art-OLD) → update →
+    # prompt B(art-1) → late art-OLD decision → ignored; art-1 completes.
+    _prompt(artifact="art-OLD", identity="id-old")
+    _prompt(artifact="art-1", identity="id-new")      # prompt path resets
+    await _decide(artifact="art-OLD", identity="id-old", approved=False)
+    rounds = pse._load()["rounds"]
+    assert rounds["elevenlabs"]["artifact_id"] == "art-1"   # round intact
+    assert pse.episodes() == []
+    await _decide(artifact="art-1", identity="id-new", approved=True)
+    eps = pse.episodes("pending")
+    assert len(eps) == 1
+    assert eps[0]["approved_identities"] == ["id-new#g1"]
+
+
+@pytest.mark.asyncio
+async def test_consumed_key_replay_never_recreates(wired):
+    # impl r2 (Sol): a replayed stale generation must not recreate its
+    # consumed episode and prune the current one — tombstoned keys refuse
+    # the claim.
+    _prompt()
+    await _decide(gen="g1")
+    await _drain_pending(wired)
+    _prompt()
+    await _decide(gen="g2")                           # supersedes g1
+    eps = pse.episodes()
+    assert len(eps) == 1 and eps[0]["approved_identities"] == ["id-a#g2"]
+    await _decide(gen="g1")                           # stale replay
+    eps = pse.episodes()
+    assert len(eps) == 1
+    assert eps[0]["approved_identities"] == ["id-a#g2"]   # g2 survives
+
+
+@pytest.mark.asyncio
 async def test_settlement_without_setup_tool_is_noop(wired):
     wired["entry"] = dict(wired["entry"], setup_tool=None)
     _prompt(plugin="gmail", artifact="art-9", identity="id-x")

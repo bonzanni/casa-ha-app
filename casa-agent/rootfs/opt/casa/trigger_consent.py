@@ -183,6 +183,15 @@ def prompt_trigger_consent(
                     f"✅ Enabled — POST /webhook/{effective} now "
                     f"routes to {role}",
                 )
+                # v0.112.0 (impl r2): the approval is DURABLE here (ack
+                # persisted + secret minted) — feed the setup evaluator
+                # REGARDLESS of the reconcile outcome below. Gating on the
+                # reconcile stranded the round forever on a transient
+                # reconcile failure (the ack exists, so the trigger is never
+                # re-prompted and the member would stay open). Setup wires
+                # the EXTERNAL side against the minted secret; Casa's route
+                # overlay healing is a separate, surfaced concern.
+                await _feed_setup_episode(approved=True)
                 if reconcile_cb is not None:
                     try:
                         await reconcile_cb()
@@ -196,10 +205,6 @@ def prompt_trigger_consent(
                             f"/webhook/{effective} failed — run "
                             "plugin_verify",
                         )
-                        return  # route NOT live — the episode must not fire
-                # v0.112.0: approval is durable (ack persisted) AND the route
-                # is live (reconcile succeeded) — feed the setup evaluator.
-                await _feed_setup_episode(approved=True)
             else:
                 await channel.edit_dm_message(
                     chat_id, message_id,

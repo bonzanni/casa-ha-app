@@ -3083,10 +3083,15 @@ async def main() -> None:
         return await bus.send_checked(msg) == "accepted"
 
     async def _setup_notify(text: str) -> None:
+        import trigger_consent as _tc
         ch = channel_manager.get("telegram") if channel_manager else None
         if ch is None:
             return
-        await ch.send_response(text, {})
+        # Address the operator DM explicitly (falls back to the channel's
+        # default chat — also the operator — when identity is unresolvable).
+        op = _tc.operator_identity(ch)
+        ctx = {"chat_id": op[0]} if op is not None else {}
+        await ch.send_response(text, ctx)
 
     _pse.configure(
         dispatch=_setup_dispatch, notify_operator=_setup_notify,
