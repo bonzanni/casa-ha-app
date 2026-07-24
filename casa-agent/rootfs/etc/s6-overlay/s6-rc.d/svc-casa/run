@@ -39,8 +39,13 @@ fi
 if bashio::config.true 'webhook_auth_enabled'; then
     export WEBHOOK_SECRET="$(bashio::config 'webhook_secret')"
 fi
-export PRIMARY_AGENT_NAME="$(bashio::config 'primary_agent_name')"
-export VOICE_AGENT_NAME="$(bashio::config 'voice_agent_name')"
+# Compat shim (v0.108.0, one migration cycle): the *_AGENT_NAME options are
+# removed, but an upgraded /config whose baseline character/prompt files
+# drifted from defaults (so the reconciler kept the user copy) may still
+# contain ${PRIMARY_AGENT_NAME}/${VOICE_AGENT_NAME} placeholders — which
+# would now render literally. Export the fixed fallbacks so they resolve.
+export PRIMARY_AGENT_NAME="Ellen"
+export VOICE_AGENT_NAME="Tina"
 export PRIMARY_AGENT_MODEL="$(bashio::config 'primary_agent_model')"
 export VOICE_AGENT_MODEL="$(bashio::config 'voice_agent_model')"
 export ENABLE_TERMINAL="$(bashio::config 'enable_terminal')"

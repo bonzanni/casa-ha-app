@@ -1,5 +1,5 @@
 schema_version: 1
-name: "${PRIMARY_AGENT_NAME}"
+name: "Ellen"
 role: assistant
 archetype: assistant
 card: |

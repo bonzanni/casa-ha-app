@@ -1,5 +1,18 @@
 # Changelog
 
+## [0.108.0] - 2026-07-24
+
+### Removed
+
+- The `primary_agent_name` and `voice_agent_name` options. Agent identity
+  (name, pronouns, persona) is owned by installed personas since the
+  personality system shipped; these options only influenced the built-in
+  fallback identity used when no persona is applied, and that fallback is
+  now fixed to Ellen (assistant) and Tina (butler/voice). If you had set
+  custom names here without a persona, install a persona to name your
+  agents. Stored values of the removed options are pruned automatically on
+  the next start (#227).
+
 ## [0.107.0] - 2026-07-24
 
 ### Changed

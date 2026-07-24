@@ -11,8 +11,6 @@
   "honcho_api_key": "",
   "webhook_auth_enabled": false,
   "webhook_secret": "",
-  "primary_agent_name": "Ellen",
-  "voice_agent_name": "Tina",
   "primary_agent_model": "opus",
   "voice_agent_model": "haiku",
   "enable_terminal": false,

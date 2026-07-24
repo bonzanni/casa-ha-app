@@ -54,14 +54,6 @@ configuration:
       Optional manual override for the webhook secret. Leave empty to use the
       auto-generated one. Used as HMAC key for Casa webhooks and as Telegram's
       secret_token for webhook mode.
-  primary_agent_name:
-    name: Primary Agent Name
-    description: >-
-      Display name for the primary agent. Injected into its personality prompt.
-  voice_agent_name:
-    name: Voice Agent Name
-    description: >-
-      Display name for the voice agent. Injected into its personality prompt.
   primary_agent_model:
     name: Primary Agent Model
     description: >-

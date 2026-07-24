@@ -50,8 +50,6 @@ setting by hand:
 
 | Option | Description |
 |--------|-------------|
-| `primary_agent_name` | Name of the primary agent. Default: `Ellen`. |
-| `voice_agent_name` | Name of the voice agent. Default: `Tina`. |
 | `primary_agent_model` | Model for the primary agent: `opus`, `sonnet`, or `haiku`. Default: `opus`. |
 | `voice_agent_model` | Model for the voice agent. Default: `haiku`. |
 

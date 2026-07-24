@@ -1,5 +1,5 @@
 schema_version: 1
-name: "${VOICE_AGENT_NAME}"
+name: "Tina"
 role: butler
 archetype: housekeeper
 card: |

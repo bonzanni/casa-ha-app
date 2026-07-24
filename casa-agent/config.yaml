@@ -1,6 +1,6 @@
 name: "Casa Agent"
 description: "Personal AI agent framework powered by Claude"
-version: "0.107.0"
+version: "0.108.0"
 slug: casa-agent
 url: https://github.com/bonzanni/casa-ha-app
 image: "ghcr.io/bonzanni/casa-agent"
@@ -38,10 +38,6 @@ options:
   onepassword_default_vault: "Casa"
   webhook_auth_enabled: false
   webhook_secret: ""
-
-  # Agent identity (injected into personality prompts)
-  primary_agent_name: "Ellen"
-  voice_agent_name: "Tina"
 
   # Model selection
   primary_agent_model: "opus"
@@ -85,8 +81,6 @@ schema:
   onepassword_default_vault: str?
   webhook_auth_enabled: bool?
   webhook_secret: password?
-  primary_agent_name: str?
-  voice_agent_name: str?
   primary_agent_model: "list(opus|sonnet|haiku)?"
   voice_agent_model: "list(opus|sonnet|haiku)?"
   enable_terminal: bool?
