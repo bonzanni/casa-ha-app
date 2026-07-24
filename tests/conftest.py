@@ -28,6 +28,26 @@ if _casa_root not in sys.path:
 
 
 # ---------------------------------------------------------------------------
+# Memory cage, invoker-independent half. The documented systemd-run cage
+# (CLAUDE.md) only protects runs that remember to use it; on 2026-07-24 an
+# uncaged pytest (different repo, same machine) hit 22 GB anon RSS and took
+# down the WSL VM. Cap this process's address space so any runaway test dies
+# with MemoryError inside pytest no matter who invoked it. The full unit gate
+# peaks well under 1 GiB RSS; 12 GiB VA is pure backstop. Override with
+# PYTEST_RLIMIT_AS_GB (0 disables). Keep the external systemd-run cage too —
+# RLIMIT_AS is per-process, not per-tree.
+import os as _os
+import resource as _resource
+
+_cap_gb = float(_os.environ.get("PYTEST_RLIMIT_AS_GB", "12"))
+if _cap_gb > 0:
+    _cap_bytes = int(_cap_gb * 1024**3)
+    _soft, _hard = _resource.getrlimit(_resource.RLIMIT_AS)
+    if _soft == _resource.RLIM_INFINITY or _soft > _cap_bytes:
+        _resource.setrlimit(_resource.RLIMIT_AS, (_cap_bytes, _hard))
+
+
+# ---------------------------------------------------------------------------
 # telegram.* stubs — shared canonical exception classes across all tests.
 # ---------------------------------------------------------------------------
 

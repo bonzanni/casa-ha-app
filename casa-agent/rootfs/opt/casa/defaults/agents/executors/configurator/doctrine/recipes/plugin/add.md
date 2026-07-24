@@ -74,6 +74,34 @@ specialist is never going to declare it, the plugin simply stays pending —
 that is a valid end state, not an error). Report the outcome and
 `emit_completion(...)`.
 
+## Setup-tool hand-back — MANDATORY when the plugin ships one
+
+Some plugins ship an MCP **setup tool** (naming convention `setup_*`, e.g.
+`setup_elevenlabs_voicemail`) that (re)points an external service at Casa —
+typically writing a freshly-minted per-trigger secret into the external
+caller's config. Install/update and consent re-approval mint FRESH secrets,
+so until the setup tool runs the external side still holds stale credentials
+and the integration is dead — even though this install "succeeded". The
+operator must never need to remember a follow-up incantation.
+
+You cannot run it yourself: plugin tools surface only on the plugin's
+target agents, never in this engagement. Hand it back instead:
+
+1. **Detect.** A setup tool exists when the plugin-developer handoff or the
+   plugin's manifest `description`/README mentions one, or the published
+   artifact (`/config/plugins/store/<name>/<artifact-id>/`) defines an MCP
+   tool named `setup_*` (Grep the server source).
+2. **Hand back.** Your `emit_completion` MUST then carry
+   `next_steps=[{"action": "run_plugin_setup_tool", "plugin": "<registry
+   name>", "tool": "<setup-tool name>", "targets": [<plugin targets>]}]`,
+   and the completion `text` must state that the integration is NOT live
+   until the setup tool has run.
+
+The engager runs the tool immediately on receiving the completion — no
+operator ask; the install/consent that started this engagement already
+authorizes the wiring. Plugins without a setup tool: `next_steps` stays
+empty as usual.
+
 A plugin registry entry a specialist's install/upgrade OWNS (registry name
 `<slug>.<name>`) can never be managed through this recipe or `remove.md` /
 `update.md` / an assign-unassign step: `plugin_add` itself can't collide with

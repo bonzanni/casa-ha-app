@@ -1,5 +1,15 @@
 # Changelog
 
+## [0.107.0] - 2026-07-24
+
+### Changed
+
+- Installing or updating a plugin that ships a setup tool (one that wires an
+  external service to Casa, like the ElevenLabs voicemail integration) now
+  runs that setup automatically as part of the same install flow — you no
+  longer need to ask for setup afterwards to make the integration live. The
+  manual setup tool remains available for recovery.
+
 ## [0.106.0] - 2026-07-24
 
 ### Changed

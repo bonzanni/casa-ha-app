@@ -63,3 +63,18 @@ up the new code on their next launch.
 
 **No separate casa_reload is needed on the happy path** — `plugin_update`
 reloads + verifies internally. Report the outcome and `emit_completion(...)`.
+
+## Setup-tool hand-back — MANDATORY when the plugin ships one
+
+An update re-mints per-trigger secrets (consent re-approval rotates them),
+so a plugin that ships an MCP **setup tool** (naming convention `setup_*`)
+is left pointing the external service at STALE credentials until that tool
+runs — the update "succeeded" but the integration is dead. You cannot run
+it yourself (plugin tools surface only on the plugin's target agents).
+Detect it exactly as in `recipes/plugin/add.md` (handoff, manifest
+description/README, or Grep the published artifact for a `setup_*` MCP
+tool), and when one exists your `emit_completion` MUST carry
+`next_steps=[{"action": "run_plugin_setup_tool", "plugin": "<registry
+name>", "tool": "<setup-tool name>", "targets": [<plugin targets>]}]` and
+say in `text` that the integration is not live until setup runs. The
+engager runs it immediately — no operator ask.
