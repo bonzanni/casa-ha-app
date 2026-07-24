@@ -75,6 +75,11 @@ _MAX_DISPATCH_ATTEMPTS = 3
 _RETRY_BACKOFF_S = (1.0, 5.0)
 _HEALTH_DECAY_S = 72 * 3600.0
 _TOMBSTONE_CAP = 50
+# impl r7 (Sol): a decided round whose registry resolution is UNAVAILABLE is
+# retained and re-settled on later kicks; after this many failed attempts the
+# plugin is evidently gone (uninstalled) and the round is dropped so it can't
+# accumulate forever.
+_MAX_SETTLE_DEFERRALS = 10
 
 # Wired by casa_core at boot. All optional — absent seams degrade to logging.
 _dispatch: Callable[[str, str, dict], Awaitable[bool]] | None = None
@@ -331,33 +336,61 @@ async def on_consent_decision(*, plugin: str, artifact_id: str,
         _kick.set()
 
 
+def _resolve_setup(plugin: str) -> tuple[bool, str | None]:
+    """Three-state registry resolution (impl r7): ``(resolved_ok, setup)``.
+    ``resolved_ok=False`` means the registry could not be consulted (resolver
+    absent, raised, or returned a non-dict / None) — the caller RETAINS the
+    round and retries. ``(True, None)`` = resolved, no setup tool (legacy).
+    ``(True, "<tool>")`` = resolved with a setup tool."""
+    if _resolve_registry_entry is None:
+        return False, None
+    try:
+        entry = _resolve_registry_entry(plugin)
+    except Exception:  # noqa: BLE001
+        logger.exception("registry resolve failed (plugin=%s)", plugin)
+        return False, None
+    if not isinstance(entry, dict):
+        return False, None
+    return True, entry.get("setup_tool")
+
+
 def _settle_locked(data: dict, plugin: str) -> tuple[bool, list[str]]:
     """Settlement body (caller holds the lock / is yield-free): all members
     decided ⇒ consume the round; ALL approved ⇒ claim an episode; any
-    denial ⇒ operator note, no dispatch. Returns (episode_created, notes).
-    Mutates ``data`` (caller saves)."""
+    denial ⇒ operator note, no dispatch. An UNAVAILABLE registry retains the
+    round for a later re-settle. Returns (episode_created, notes). Mutates
+    ``data`` (caller saves)."""
     rnd = data["rounds"].get(plugin)
     if not isinstance(rnd, dict):
         return False, []
     members = rnd.get("members") or {}
     if not members or any(m.get("state") == "open" for m in members.values()):
         return False, []
-    # Resolve the setup tool FIRST (impl r6, Terra): a plugin that declares
-    # NO casa.setupTool must settle SILENTLY on every path — a denial/expiry
-    # for a legacy trigger plugin (gmail, etc.) must not emit a spurious
-    # "setup tool NOT run" note. The absent-declaration benign default holds
-    # for both approve and deny outcomes.
-    entry = None
-    if _resolve_registry_entry is not None:
-        try:
-            entry = _resolve_registry_entry(plugin)
-        except Exception:  # noqa: BLE001
-            logger.exception("registry resolve failed (plugin=%s)", plugin)
-    setup = (entry or {}).get("setup_tool") if isinstance(entry, dict) else None
-    if not setup:
-        del data["rounds"][plugin]
+    # Resolve the setup tool FIRST (impl r6/r7): THREE-STATE result —
+    #   resolved + no tool  → consume the round SILENTLY (legacy trigger
+    #     plugin like gmail: a denial/expiry must emit no spurious note; the
+    #     absent-declaration benign default holds on approve AND deny);
+    #   resolved + tool      → proceed to episode / deny note;
+    #   UNAVAILABLE (resolver raised or returned None) → RETAIN the decided
+    #     round and re-settle on a later kick, so a transient resolution
+    #     failure right at final approval can't permanently lose a declared
+    #     plugin's setup (impl r7, Sol). Bounded by _MAX_SETTLE_DEFERRALS.
+    resolved_ok, setup = _resolve_setup(plugin)
+    if not resolved_ok:
+        deferrals = int(rnd.get("settle_deferrals") or 0) + 1
+        if deferrals >= _MAX_SETTLE_DEFERRALS:
+            del data["rounds"][plugin]
+            logger.warning(
+                "setup-round dropped (plugin=%s): registry unresolvable "
+                "after %d attempts (plugin gone?)", plugin, deferrals)
+            return False, []
+        rnd["settle_deferrals"] = deferrals
+        logger.info("setup-round settlement deferred (plugin=%s, attempt %d): "
+                    "registry resolution unavailable", plugin, deferrals)
         return False, []
     del data["rounds"][plugin]
+    if not setup:
+        return False, []
     denied = [i for i, m in members.items() if m.get("state") == "denied"]
     if denied:
         return False, [
@@ -393,12 +426,15 @@ def _settle_locked(data: dict, plugin: str) -> tuple[bool, list[str]]:
     return True, []
 
 
-async def _boot_recover() -> None:
-    """First act of the worker (impl r3): recover rounds stranded by a
-    crash between ack persistence and decision recording — any OPEN member
-    whose identity has a persisted ack becomes approved with that ack's
-    generation, then settlement re-runs per plugin."""
-    if _lock is None or _ack_lookup is None:
+async def _recover_and_settle() -> None:
+    """Run on EVERY worker kick (impl r3 + r7): (1) recover rounds stranded
+    by a crash between ack persistence and decision recording — any OPEN
+    member whose identity has a persisted ack becomes approved with that
+    ack's generation; (2) RE-SETTLE every round, so a round that deferred on
+    a transient registry-resolution failure (impl r7, Sol) settles once the
+    plugin resolves again — the reconcile that heals the plugin also kicks
+    the worker. Never raises."""
+    if _lock is None:
         return
     notes: list[str] = []
     created_any = False
@@ -407,29 +443,33 @@ async def _boot_recover() -> None:
             data = _load()
             for plugin in list(data["rounds"].keys()):
                 rnd = data["rounds"][plugin]
-                for identity, m in (rnd.get("members") or {}).items():
-                    if m.get("state") != "open":
-                        continue
-                    try:
-                        gen = _ack_lookup(identity)
-                    except Exception:  # noqa: BLE001
-                        gen = None
-                    if gen is not None:
-                        m.update({"state": "approved", "gen": str(gen)})
-                # Settle EVERY round, changed or not: a crash between the
-                # sync approval record and the finish-hook settlement leaves
-                # a fully-decided round with no episode — recover it too.
+                if _ack_lookup is not None:
+                    for identity, m in (rnd.get("members") or {}).items():
+                        if m.get("state") != "open":
+                            continue
+                        try:
+                            gen = _ack_lookup(identity)
+                        except Exception:  # noqa: BLE001
+                            gen = None
+                        if gen is not None:
+                            m.update({"state": "approved", "gen": str(gen)})
+                # Settle EVERY round, changed or not: covers the crash-window
+                # recovery AND the deferred-resolution retry.
                 created, n = _settle_locked(data, plugin)
                 created_any = created_any or created
                 notes.extend(n)
             _save(data)
     except Exception:  # noqa: BLE001
-        logger.exception("setup-round boot recovery failed")
+        logger.exception("setup-round recover/settle sweep failed")
         return
     for n in notes:
         await _note(n)
     if created_any and _kick is not None:
         _kick.set()
+
+
+# Back-compat alias (tests call the boot sweep by its original name).
+_boot_recover = _recover_and_settle
 
 
 # ---------------------------------------------------------------------------
@@ -449,12 +489,15 @@ def start_worker() -> None:
 
 
 async def _worker() -> None:
-    await _boot_recover()
     while True:
         try:
             assert _kick is not None
             await _kick.wait()
             _kick.clear()
+            # Recover crash-stranded rounds + retry deferred settlements
+            # BEFORE dispatching — a round that just settled here becomes a
+            # pending episode processed in the same pass.
+            await _recover_and_settle()
             for ep in episodes("pending"):
                 try:
                     await _run_episode(ep)

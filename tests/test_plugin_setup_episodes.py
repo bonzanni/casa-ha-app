@@ -85,6 +85,19 @@ def wired(tmp_path, monkeypatch):
     return state
 
 
+def wired_dispatch(state):
+    async def dispatch(role, text, context):
+        state["dispatches"].append((role, text, context))
+        return state["dispatch_ok"]
+    return dispatch
+
+
+def wired_notify(state):
+    async def notify(text):
+        state["notes"].append(text)
+    return notify
+
+
 async def _drain_pending(state):
     for ep in pse.episodes("pending"):
         await pse._run_episode(ep)
@@ -513,3 +526,45 @@ async def test_legacy_plugin_denial_is_silent(wired):
     await _decide(plugin="gmail", identity="id-b", approved=False)
     assert pse.episodes() == []
     assert wired["notes"] == []
+
+
+@pytest.mark.asyncio
+async def test_unavailable_resolution_retains_round_then_recovers(wired):
+    # impl r7 (Sol): if the registry resolver is UNAVAILABLE at final
+    # approval, the decided round is RETAINED (not silently consumed) and
+    # re-settles on a later kick once the plugin resolves — a declared
+    # plugin's setup is never permanently lost.
+    calls = {"n": 0}
+
+    def flaky(plugin):
+        calls["n"] += 1
+        return None if calls["n"] == 1 else wired["entry"]  # 1st fails
+
+    pse.configure(
+        dispatch=wired_dispatch(wired), notify_operator=wired_notify(wired),
+        resolve_registry_entry=flaky, ack_lookup=lambda i: None)
+    _prompt()
+    await _decide()                                   # resolver returns None
+    assert pse.episodes() == []                       # NOT consumed
+    rnd = pse._load()["rounds"]["elevenlabs"]
+    assert rnd["settle_deferrals"] == 1               # retained + counted
+    await pse._recover_and_settle()                   # later kick, now resolves
+    eps = pse.episodes("pending")
+    assert len(eps) == 1
+    assert eps[0]["approved_identities"] == ["id-a#g1"]
+
+
+@pytest.mark.asyncio
+async def test_persistently_unresolvable_round_dropped(wired, monkeypatch):
+    # a plugin uninstalled after consent never resolves — the round must not
+    # accumulate forever; it drops after _MAX_SETTLE_DEFERRALS.
+    monkeypatch.setattr(pse, "_MAX_SETTLE_DEFERRALS", 3)
+    pse.configure(
+        dispatch=wired_dispatch(wired), notify_operator=wired_notify(wired),
+        resolve_registry_entry=lambda p: None, ack_lookup=lambda i: None)
+    _prompt()
+    await _decide()
+    for _ in range(5):
+        await pse._recover_and_settle()
+    assert pse._load()["rounds"] == {}                # dropped, bounded
+    assert pse.episodes() == []
