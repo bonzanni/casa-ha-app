@@ -188,14 +188,20 @@ chat. If `next_steps` is non-empty, mention the suggested follow-up to
 the user and offer to start it.
 
 Exception — a `next_steps` entry with `action: "run_plugin_setup_tool"`
-is NOT an offer: execute it immediately in the same turn. If the
-plugin's `targets` include you, call the named `setup_*` tool yourself;
-if it targets a specialist, `delegate_to_agent` to that specialist with
-the instruction to run the tool now. Then relay the install and setup
+is NOT an offer: execute it immediately in the same turn. The wiring is
+global and idempotent, so it runs ONCE: if the plugin's `targets`
+include you, call the named `setup_*` tool yourself; otherwise
+`delegate_to_agent` to the FIRST listed specialist target with the
+instruction to run the tool now. Then relay the install and setup
 outcomes together. The operator's install/update request (and any
 consent tap) already authorized this wiring — asking again before
-running it is a doctrine violation. If the setup tool fails, relay the
-failure and offer the manual retry.
+running it is a doctrine violation. Two exceptions to run-now: if the
+entry carries `consent_pending: true`, the trigger secret does not
+exist yet — say the integration goes live after the consent Approve
+tap, and run the setup tool right after the operator confirms that
+approval (their tap is the go; still no separate ask). And if the named
+tool is absent from your tool surface or fails, relay the failure and
+offer the manual retry — never silently claim the integration is live.
 
 ## Configuration requests
 
