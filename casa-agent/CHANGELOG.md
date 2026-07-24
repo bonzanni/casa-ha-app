@@ -1,5 +1,21 @@
 # Changelog
 
+## [0.115.0] - 2026-07-24
+
+### Fixed
+
+- Updating a plugin that both wires an external service and declares webhook
+  triggers no longer redundantly re-hands its setup step back to the agent at
+  completion. The `plugin_update` result reported whether Casa now owns the
+  plugin's post-consent setup by re-reading the freshly-resolved plugin
+  snapshot, which could momentarily still be the pre-update artifact — so the
+  flag read false and the mechanical de-duplication (added in 0.112.0) didn't
+  engage. The result is now computed from the manifest of the artifact the
+  update just published. (Harmless before — the setup tool is idempotent and
+  the post-consent hook still ran it exactly once — but the de-duplication is
+  now reliable.) Also fixes a latent error that always forced the flag false
+  even when the snapshot was current (#241).
+
 ## [0.114.0] - 2026-07-24
 
 ### Fixed
