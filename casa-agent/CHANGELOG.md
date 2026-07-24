@@ -1,5 +1,15 @@
 # Changelog
 
+## [0.111.0] - 2026-07-24
+
+### Added
+
+- The configurator can now remove a plugin environment entry
+  (`remove_plugin_env_reference`) — when a plugin update makes a variable
+  optional or a key moves to an add-on option, cleanup no longer needs
+  manual file editing. Removal takes effect on the plugin-env reload, same
+  as setting one (#236).
+
 ## [0.110.0] - 2026-07-24
 
 ### Added

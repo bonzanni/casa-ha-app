@@ -8481,6 +8481,24 @@ async def set_plugin_env_reference(args: dict) -> dict:
 
 
 @tool(
+    "remove_plugin_env_reference",
+    "Remove a VAR line from plugin-env.conf (idempotent; follow with "
+    "casa_reload(scope='plugin_env') to drop it from the effective env).",
+    {"plugin": str, "var_name": str},
+)
+async def remove_plugin_env_reference(args: dict) -> dict:
+    # v0.111.0 (#236): removal counterpart of set_plugin_env_reference —
+    # a plugin update that makes a var optional could not clean up its
+    # now-orphaned entry (path_scope correctly blocks direct file edits).
+    from plugin_env_conf import remove_entry as _remove_env_entry
+    try:
+        removed = _remove_env_entry(args["var_name"])
+    except Exception as exc:  # noqa: BLE001 — invalid name / IO
+        return _result({"ok": False, "error": str(exc)})
+    return _result({"ok": True, "removed": removed})
+
+
+@tool(
     "list_vault_items",
     "List 1Password vault items, optionally filtered by query string and/or vault name.",
     {"query": str, "vault": str},
@@ -8699,6 +8717,7 @@ CASA_TOOLS: tuple = (
     verify_plugin_state,
     verify_plugin_secrets,
     set_plugin_env_reference,
+    remove_plugin_env_reference,   # v0.111.0 (#236) — removal counterpart
     list_vault_items,
     get_item_fields,
     # Personality Phase A, Task 8 — configurator-only resident persona control.
