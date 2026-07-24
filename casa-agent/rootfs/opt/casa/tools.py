@@ -744,6 +744,22 @@ _VOICE_TEARDOWN_BOUND_S: float = 2.0
 # and emit a WARNING citing the engagement id.
 _ENGAGEMENTS_PENDING_RELOAD: set[str] = set()
 
+# #231/#222 (v0.114.0): plugin mutations (plugin_add/update/remove/assign/
+# unassign) activate their change IN-PROCESS via _reload_and_verify_targets
+# (snapshot reload + agent reconstruct + trigger reconcile) BEFORE the
+# configurator persists it with config_git_commit — the reverse of the ordinary
+# commit-then-reload recipe. That trailing commit used to arm
+# _ENGAGEMENTS_PENDING_RELOAD for a change that is already live, so the G-2
+# guard force-reloaded (and, scopeless, errored with scope_required) on every
+# plugin add/update. An engagement whose plugin activation FULLY succeeded (ok
+# + reconcile) is recorded here; config_git_commit then declines to arm the
+# obligation for the imminent persist commit — but ONLY when that commit's
+# changed paths are confined to the plugin registry (`plugins/`). A commit that
+# also touches agents/ or policies/ (Sol/Terra: a mixed single commit) still
+# arms, so a genuinely-unactivated change is never masked. Cleared centrally at
+# engagement finalize (covers cancel/reap paths too).
+_ENGAGEMENTS_PREACTIVATED: set[str] = set()
+
 # H-1 fix (v0.34.0): casa_reload's Supervisor restart races the SDK
 # subprocess — the POST returns in <1s but Supervisor's container kill
 # arrives ~13s later, cancelling the SDK before the model can call
@@ -3940,7 +3956,21 @@ async def config_git_commit(args: dict) -> dict:
         if sha:
             eng = engagement_var.get(None)
             if eng is not None:
-                _ENGAGEMENTS_PENDING_RELOAD.add(eng.id)
+                # #231/#222: a plugin mutation already activated its change
+                # in-process (marked _ENGAGEMENTS_PREACTIVATED). Don't arm the
+                # reload obligation for the commit that merely PERSISTS that
+                # already-live state — but only when this commit is confined to
+                # the plugin registry. A commit that also touches agents/ or
+                # policies/ genuinely owes a reload, so it still arms (the
+                # changed-paths probe fails safe to arming on any git error).
+                preactivated = eng.id in _ENGAGEMENTS_PREACTIVATED
+                paths = config_git.changed_paths(config_dir, sha) if preactivated else []
+                plugins_only = bool(paths) and all(
+                    p.startswith("plugins/") for p in paths)
+                if preactivated and plugins_only:
+                    _ENGAGEMENTS_PREACTIVATED.discard(eng.id)
+                else:
+                    _ENGAGEMENTS_PENDING_RELOAD.add(eng.id)
             return _result({"sha": sha, "message": message})
         # P-3 (v0.69.1): a bare {"sha": ""} left agents looping to reconcile
         # "committed ok" against "file still untracked" when their writes
@@ -5183,6 +5213,13 @@ async def _finalize_engagement(
     # a follow-up engagement reusing the (very short) id slice.
     deferred_pending = engagement.id in _ENGAGEMENTS_DEFERRED_HARD_RELOAD
     _ENGAGEMENTS_DEFERRED_HARD_RELOAD.discard(engagement.id)
+    # Terra review (#231/#222): this runs on EVERY terminal path (emit,
+    # cancel, reap) once the terminal flip is won — the central drain for the
+    # reload-guard module sets, so a cancelled/reaped engagement can't leak
+    # its id into either set. (emit_completion's own guard, running earlier,
+    # keeps ownership of the force-reload decision for the completed path.)
+    _ENGAGEMENTS_PENDING_RELOAD.discard(engagement.id)
+    _ENGAGEMENTS_PREACTIVATED.discard(engagement.id)
     if outcome == "completed" and deferred_pending:
         # H-1: the Supervisor container-kill must be sequenced AFTER the retain
         # writes have landed. Since L33 moved the retains to background tasks,
@@ -5496,6 +5533,10 @@ async def emit_completion(args: dict) -> dict:
     # so the bus message lands after the addon has been told to
     # restart, mirroring the doctrine's own commit-reload-emit order.
     if outcome == "completed" and engagement.id in _ENGAGEMENTS_PENDING_RELOAD:
+        # A plugin-registry persist commit whose change is already live in
+        # process no longer reaches here — config_git_commit declined to arm
+        # the obligation for it (#222). So an outstanding obligation means a
+        # committed config change (agents/policies) that was NOT reloaded.
         logger.warning(
             "Engagement %s emit_completion called with outstanding "
             "reload obligation — config_git_commit landed but no "
@@ -5505,18 +5546,34 @@ async def emit_completion(args: dict) -> dict:
             engagement.id[:8],
         )
         try:
-            # casa_reload is wrapped by @tool — call the underlying
-            # handler so we don't pay the SDK envelope-decoding round
-            # trip from inside Casa's own code path.
-            forced = await casa_reload.handler({})
-            logger.info(
-                "Engagement %s forced casa_reload result: %s",
-                engagement.id[:8],
+            # casa_reload is wrapped by @tool — call the underlying handler so
+            # we don't pay the SDK envelope-decoding round trip from inside
+            # Casa's own code path. scope='full' is the documented catch-all:
+            # the guard cannot know what was committed, and a scopeless call
+            # fails with scope_required (#231) — a no-op exactly when the guard
+            # must activate.
+            forced = await casa_reload.handler({"scope": "full"})
+            decoded = (
                 json.loads(forced["content"][0]["text"])
                 if isinstance(forced, dict)
                 and isinstance(forced.get("content"), list)
                 and forced["content"]
-                else forced,
+                else forced
+            )
+            # Terra review: casa_reload can return is_error (e.g.
+            # not_initialized) WITHOUT raising — surface that at WARNING so a
+            # failed forced reload isn't silently swallowed at INFO.
+            forced_failed = (
+                isinstance(forced, dict) and forced.get("is_error") is True
+            ) or (
+                isinstance(decoded, dict) and decoded.get("status") == "error"
+            )
+            logger.log(
+                logging.WARNING if forced_failed else logging.INFO,
+                "Engagement %s forced casa_reload result: %s%s",
+                engagement.id[:8], decoded,
+                " (FAILED — artifact may remain INERT until manual reload)"
+                if forced_failed else "",
             )
         except Exception as exc:  # noqa: BLE001
             logger.warning(
@@ -5627,7 +5684,10 @@ async def emit_completion(args: dict) -> dict:
         })
     # Drain on terminal paths (e.g., outcome=error or
     # already-terminal short-circuit above) — the engagement is gone.
+    # (_finalize_engagement also drains both sets centrally once it wins the
+    # terminal flip; these keep the non-finalizing short-circuit paths clean.)
     _ENGAGEMENTS_PENDING_RELOAD.discard(engagement.id)
+    _ENGAGEMENTS_PREACTIVATED.discard(engagement.id)
     return _result({"status": "acknowledged"})
 
 
@@ -6417,6 +6477,15 @@ async def _reload_and_verify_targets(name: str, targets: list,
     atomic registry write already happened; now: reload the resolver snapshot
     FIRST, reconstruct affected in-casa agents, desired==active verify, then
     regenerate + notify health. Order is load-bearing (stale-snapshot hazard)."""
+    # #231/#222 (Sol re-review): a fresh mutation attempt SUPERSEDES any prior
+    # pre-activation marker in this engagement. Clear it up front so that if
+    # THIS activation fails, a stale "already activated" credit from an earlier
+    # mutation can't survive to be consumed by a plugins-only persist commit and
+    # mask this un-activated change. The marker is (re)set at the end only when
+    # this attempt fully succeeds (postcondition holds AND reconcile ran).
+    _eng_pre = engagement_var.get(None)
+    if _eng_pre is not None:
+        _ENGAGEMENTS_PREACTIVATED.discard(_eng_pre.id)
     await asyncio.to_thread(plugin_registry.reload_snapshot)   # 1. FIRST
     import agent as agent_mod
     import reload as reload_mod
@@ -6512,14 +6581,28 @@ async def _reload_and_verify_targets(name: str, targets: list,
     # the health regen below via trigger_reconcile.current_issues() (a
     # recomputable input, never a one-shot extra). A reconcile failure keeps
     # the old overlay (fail-safe for ingress) and never fails the mutation.
+    reconcile_ok = True
     try:
         import trigger_reconcile
         await trigger_reconcile.reconcile_from_runtime(runtime)
     except Exception:  # noqa: BLE001
+        reconcile_ok = False
         logger.warning("plugin-trigger reconcile failed", exc_info=True)
     ok = (not snapshot_raced and not reload_errors
           and _postcondition_holds(verify, targets, expect=expect,
                                    name=name, runtime=runtime))
+    # #222/#231: the reload+reconcile above activated this plugin mutation
+    # IN-PROCESS. The configurator persists it with a config_git_commit that
+    # runs AFTER this sequencer returns; that commit would arm the reload
+    # obligation for state that is already live. Record this engagement as
+    # pre-activated so config_git_commit declines to arm the obligation for the
+    # plugin-registry persist commit — but ONLY when the whole activation truly
+    # succeeded (postcondition holds AND trigger reconcile ran). A failed
+    # activation must leave the defensive guard armed (Sol/Terra review).
+    if ok and reconcile_ok:
+        eng = engagement_var.get(None)
+        if eng is not None:
+            _ENGAGEMENTS_PREACTIVATED.add(eng.id)
     mutation_issues = _issues_from_mutation(
         name, reload_errors=reload_errors, verify=verify,
         expect=expect, postcondition_ok=ok,

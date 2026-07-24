@@ -75,6 +75,11 @@ def _wire(monkeypatch, tmp_path, st, *, publish=None, publish_exc=None,
         st.log.append(f"dispatch:{role}")
         return {"status": dispatch_status}
 
+    async def fake_reconcile_from_runtime(runtime):
+        # The sequencer's in-process trigger reconcile — a no-op stub so the
+        # harness doesn't drive the real reconciler against a bare runtime.
+        return None
+
     def fake_reload_snapshot():
         # Sol diff-review B1: the stub must PUBLISH a real frozen snapshot —
         # a non-publishing stub made snapshot_generation() lazily re-invoke
@@ -101,6 +106,9 @@ def _wire(monkeypatch, tmp_path, st, *, publish=None, publish_exc=None,
     monkeypatch.setattr(tools_mod, "_tool_verify_plugin_state",
                         lambda *, plugin_name: {"ready": True})
     monkeypatch.setattr(reload_mod, "dispatch", fake_dispatch)
+    import trigger_reconcile
+    monkeypatch.setattr(trigger_reconcile, "reconcile_from_runtime",
+                        fake_reconcile_from_runtime)
     monkeypatch.setattr(agent_mod, "active_runtime",
                         object() if with_runtime else None, raising=False)
     monkeypatch.setattr(tools_mod, "_PLUGIN_HEALTH_PATH",
@@ -125,6 +133,75 @@ async def test_plugin_add_happy_activates_and_sequences(monkeypatch, tmp_path):
     # resolve → publish → sysreqs → save → snapshot → reload.
     assert st.log == ["resolve", "publish", "install_requirements", "save",
                       "reload_snapshot", "dispatch:assistant"]
+
+
+async def test_plugin_add_marks_engagement_preactivated(monkeypatch, tmp_path):
+    """#222/#231: the in-process reload+reconcile activates the plugin BEFORE
+    the trailing config_git_commit would arm the reload obligation, so a fully
+    successful sequence marks the engagement PRE-ACTIVATED — config_git_commit
+    reads that to skip arming the (scopeless-erroring, redundant) obligation
+    for the plugin-registry persist commit."""
+    import types
+
+    st = _State()
+    tools_mod = _wire(monkeypatch, tmp_path, st, publish=_pr())
+    tools_mod._ENGAGEMENTS_PREACTIVATED.clear()
+    eng = types.SimpleNamespace(id="e" * 32)
+    token = tools_mod.engagement_var.set(eng)
+    try:
+        r = await tools_mod.plugin_add.handler({
+            "name": "probe", "repo": "o/r", "ref": "v1",
+            "targets": ["resident:assistant"]})
+        assert json.loads(r["content"][0]["text"])["ok"] is True
+        assert eng.id in tools_mod._ENGAGEMENTS_PREACTIVATED
+    finally:
+        tools_mod.engagement_var.reset(token)
+        tools_mod._ENGAGEMENTS_PREACTIVATED.discard(eng.id)
+
+
+async def test_plugin_add_reload_error_does_not_mark_preactivated(monkeypatch, tmp_path):
+    """A reload that errored must NOT mark the engagement pre-activated — a
+    real activation miss still needs the guard's forced reload (Sol/Terra:
+    require full success incl. postcondition before suppressing the guard)."""
+    import types
+
+    st = _State()
+    tools_mod = _wire(monkeypatch, tmp_path, st, publish=_pr(),
+                      dispatch_status="error")
+    tools_mod._ENGAGEMENTS_PREACTIVATED.clear()
+    eng = types.SimpleNamespace(id="f" * 32)
+    token = tools_mod.engagement_var.set(eng)
+    try:
+        await tools_mod.plugin_add.handler({
+            "name": "probe", "repo": "o/r", "ref": "v1",
+            "targets": ["resident:assistant"]})
+        assert eng.id not in tools_mod._ENGAGEMENTS_PREACTIVATED
+    finally:
+        tools_mod.engagement_var.reset(token)
+        tools_mod._ENGAGEMENTS_PREACTIVATED.discard(eng.id)
+
+
+async def test_failed_mutation_clears_prior_preactivation_marker(monkeypatch, tmp_path):
+    """Sol re-review: a marker from an earlier SUCCESSFUL mutation must not
+    survive a LATER FAILED mutation in the same engagement — otherwise a
+    plugins-only commit could consume the stale credit and mask the failed
+    (un-activated) change. Each mutation attempt supersedes the marker."""
+    import types
+    st = _State()
+    tools_mod = _wire(monkeypatch, tmp_path, st, publish=_pr(),
+                      dispatch_status="error")   # this activation FAILS
+    eng = types.SimpleNamespace(id="a" * 32)
+    tools_mod._ENGAGEMENTS_PREACTIVATED.add(eng.id)   # a prior success left it
+    token = tools_mod.engagement_var.set(eng)
+    try:
+        await tools_mod.plugin_add.handler({
+            "name": "probe", "repo": "o/r", "ref": "v1",
+            "targets": ["resident:assistant"]})
+        # The failed attempt cleared the stale marker and did NOT re-add it.
+        assert eng.id not in tools_mod._ENGAGEMENTS_PREACTIVATED
+    finally:
+        tools_mod.engagement_var.reset(token)
+        tools_mod._ENGAGEMENTS_PREACTIVATED.discard(eng.id)
 
 
 async def test_plugin_add_ref_not_found_pre_mutation(monkeypatch, tmp_path):

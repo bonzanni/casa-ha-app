@@ -1,5 +1,20 @@
 # Changelog
 
+## [0.114.0] - 2026-07-24
+
+### Fixed
+
+- Adding or updating a plugin no longer logs a spurious warning and a
+  `scope_required` reload error at the end of the engagement. A plugin
+  mutation activates its change in-process (reload + reconcile) before the
+  configurator persists it to git, so the completion-time safety guard saw an
+  "un-activated commit" and force-called a reload that (a) was redundant — the
+  change was already live — and (b) failed because it passed no reload scope.
+  The guard now recognizes that the plugin mutation already activated the
+  change and skips the redundant reload; and when the guard does legitimately
+  need to reload (a config change committed without one), it now reloads with
+  the `full` scope instead of erroring (#231, #222).
+
 ## [0.113.0] - 2026-07-24
 
 ### Security

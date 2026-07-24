@@ -79,6 +79,46 @@ class TestCommitConfig:
         assert sha == ""
 
 
+class TestChangedPaths:
+    """#231/#222: the reload guard uses changed_paths to tell a plugin-registry
+    persist commit (already activated in-process) from a commit that also edits
+    agents/ or policies/ and therefore genuinely owes a reload."""
+
+    def test_lists_paths_touched_by_a_commit(self, tmp_path):
+        from config_git import init_repo, commit_config, changed_paths
+
+        _seed(tmp_path)
+        init_repo(str(tmp_path))
+        (tmp_path / "plugins").mkdir(parents=True, exist_ok=True)
+        (tmp_path / "plugins" / "registry.json").write_text("{}", encoding="utf-8")
+        (tmp_path / "agents" / "new.txt").write_text("y", encoding="utf-8")
+        sha = commit_config(str(tmp_path), "mixed commit")
+
+        paths = changed_paths(str(tmp_path), sha)
+        assert "plugins/registry.json" in paths
+        assert "agents/new.txt" in paths
+
+    def test_plugins_only_commit(self, tmp_path):
+        from config_git import init_repo, commit_config, changed_paths
+
+        _seed(tmp_path)
+        init_repo(str(tmp_path))
+        (tmp_path / "plugins").mkdir(parents=True, exist_ok=True)
+        (tmp_path / "plugins" / "registry.json").write_text("{}", encoding="utf-8")
+        sha = commit_config(str(tmp_path), "persist plugin")
+
+        paths = changed_paths(str(tmp_path), sha)
+        assert paths == ["plugins/registry.json"]
+        assert all(p.startswith("plugins/") for p in paths)
+
+    def test_bad_sha_returns_empty_failsafe(self, tmp_path):
+        from config_git import init_repo, changed_paths
+
+        _seed(tmp_path)
+        init_repo(str(tmp_path))
+        assert changed_paths(str(tmp_path), "deadbeef" * 5) == []
+
+
 class TestSnapshotManualEdits:
     def test_records_snapshot_when_dirty(self, tmp_path):
         from config_git import init_repo, snapshot_manual_edits

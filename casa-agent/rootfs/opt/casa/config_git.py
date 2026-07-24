@@ -122,6 +122,23 @@ def commit_config(config_dir: str, message: str) -> str:
     return _run(config_dir, ["rev-parse", "HEAD"])
 
 
+def changed_paths(config_dir: str, sha: str) -> list[str]:
+    """Return the repo-relative paths a commit touched (vs its first parent).
+
+    Used by the G-2 reload guard (#231/#222) to tell a plugin-registry-only
+    persist commit — already activated in-process — from a commit that also
+    edits agents/ or policies/ and therefore genuinely owes a reload. Returns
+    an empty list on any git error (fail-safe: the caller then arms the reload
+    obligation as usual rather than wrongly suppressing it).
+    """
+    try:
+        out = _run(config_dir,
+                   ["diff-tree", "--no-commit-id", "--name-only", "-r", sha])
+    except Exception:  # noqa: BLE001 — never let a git hiccup break a commit
+        return []
+    return [line for line in out.splitlines() if line.strip()]
+
+
 def snapshot_manual_edits(config_dir: str) -> str | None:
     """Commit any uncommitted changes found in tracked paths. Returns
     the new sha if a commit was made, else None.
