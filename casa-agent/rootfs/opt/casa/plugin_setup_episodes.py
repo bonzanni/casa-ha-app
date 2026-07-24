@@ -330,7 +330,7 @@ async def on_consent_decision(*, plugin: str, artifact_id: str,
                 if m.get("state") != "approved":  # an ack outranks an expiry
                     m["state"] = "denied"
                 rnd["members"][identity] = m
-            created, notes = _settle_locked(data, plugin)
+            created, notes, deferred = _settle_locked(data, plugin)
             _save(data)
     except Exception:  # noqa: BLE001 — consent flow must never see a raise
         logger.exception("setup-episode decision handling failed (plugin=%s)",
@@ -340,6 +340,13 @@ async def on_consent_decision(*, plugin: str, artifact_id: str,
         await _note(n)
     if created and _kick is not None:
         _kick.set()
+    if deferred:
+        # impl r10 (both): a settlement deferred on transient registry
+        # unavailability — with no pending episode yet, _worker_pass sees
+        # nothing to retry, so schedule the delayed self-kick HERE too. The
+        # re-settle runs in _recover_and_settle on the next (self-kicked)
+        # pass; bounded by _MAX_SETTLE_DEFERRALS.
+        _schedule_retry(_RETRY_INTERVAL_S)
 
 
 def _resolve_entry(plugin: str) -> tuple[bool, dict | None]:
@@ -367,18 +374,20 @@ def _resolve_setup(plugin: str) -> tuple[bool, str | None]:
     return (ok, entry.get("setup_tool") if ok and entry else None)
 
 
-def _settle_locked(data: dict, plugin: str) -> tuple[bool, list[str]]:
+def _settle_locked(data: dict, plugin: str) -> tuple[bool, list[str], bool]:
     """Settlement body (caller holds the lock / is yield-free): all members
     decided ⇒ consume the round; ALL approved ⇒ claim an episode; any
     denial ⇒ operator note, no dispatch. An UNAVAILABLE registry retains the
-    round for a later re-settle. Returns (episode_created, notes). Mutates
-    ``data`` (caller saves)."""
+    round for a later re-settle. Returns ``(episode_created, notes,
+    deferred)`` — ``deferred`` True when the round was retained on transient
+    resolution unavailability, so the caller schedules a delayed self-kick
+    (impl r10). Mutates ``data`` (caller saves)."""
     rnd = data["rounds"].get(plugin)
     if not isinstance(rnd, dict):
-        return False, []
+        return False, [], False
     members = rnd.get("members") or {}
     if not members or any(m.get("state") == "open" for m in members.values()):
-        return False, []
+        return False, [], False
     # Resolve the setup tool FIRST (impl r6/r7): THREE-STATE result —
     #   resolved + no tool  → consume the round SILENTLY (legacy trigger
     #     plugin like gmail: a denial/expiry must emit no spurious note; the
@@ -396,28 +405,28 @@ def _settle_locked(data: dict, plugin: str) -> tuple[bool, list[str]]:
             logger.warning(
                 "setup-round dropped (plugin=%s): registry unresolvable "
                 "after %d attempts (plugin gone?)", plugin, deferrals)
-            return False, []
+            return False, [], False
         rnd["settle_deferrals"] = deferrals
         logger.info("setup-round settlement deferred (plugin=%s, attempt %d): "
                     "registry resolution unavailable", plugin, deferrals)
-        return False, []
+        return False, [], True  # deferred — caller schedules a delayed kick
     del data["rounds"][plugin]
     if not setup:
-        return False, []
+        return False, [], False
     denied = [i for i, m in members.items() if m.get("state") == "denied"]
     if denied:
         return False, [
             f"Plugin {plugin}: consent settled with "
             f"{len(denied)} unapproved trigger(s) — its setup tool was NOT "
             "run automatically (it cannot target a subset). Run it manually "
-            "if intended."]
+            "if intended."], False
     approved_keys = sorted(f"{i}#{m.get('gen', '')}"
                            for i, m in members.items())
     artifact_id = rnd.get("artifact_id") or ""
     key = _episode_key(plugin, artifact_id, approved_keys)
     consumed = data.setdefault("consumed_keys", [])
     if any(e.get("key") == key for e in data["episodes"]) or key in consumed:
-        return False, []
+        return False, [], False
     for old in data["episodes"]:
         if old.get("plugin") == plugin and old.get("key"):
             consumed.append(old["key"])
@@ -436,21 +445,23 @@ def _settle_locked(data: dict, plugin: str) -> tuple[bool, list[str]]:
         "created_ts": _now(),
         "updated_ts": _now(),
     })
-    return True, []
+    return True, [], False
 
 
-async def _recover_and_settle() -> None:
+async def _recover_and_settle() -> bool:
     """Run on EVERY worker kick (impl r3 + r7): (1) recover rounds stranded
     by a crash between ack persistence and decision recording — any OPEN
     member whose identity has a persisted ack becomes approved with that
     ack's generation; (2) RE-SETTLE every round, so a round that deferred on
-    a transient registry-resolution failure (impl r7, Sol) settles once the
-    plugin resolves again — the reconcile that heals the plugin also kicks
-    the worker. Never raises."""
+    a transient registry-resolution failure settles once the plugin resolves.
+    Returns True if any round DEFERRED (impl r10) so the caller schedules a
+    delayed self-kick — a decided-but-unresolvable round has no pending
+    episode to drive the retry otherwise. Never raises."""
     if _lock is None:
-        return
+        return False
     notes: list[str] = []
     created_any = False
+    deferred_any = False
     try:
         async with _lock:
             data = _load()
@@ -468,17 +479,19 @@ async def _recover_and_settle() -> None:
                             m.update({"state": "approved", "gen": str(gen)})
                 # Settle EVERY round, changed or not: covers the crash-window
                 # recovery AND the deferred-resolution retry.
-                created, n = _settle_locked(data, plugin)
+                created, n, deferred = _settle_locked(data, plugin)
                 created_any = created_any or created
+                deferred_any = deferred_any or deferred
                 notes.extend(n)
             _save(data)
     except Exception:  # noqa: BLE001
         logger.exception("setup-round recover/settle sweep failed")
-        return
+        return False
     for n in notes:
         await _note(n)
     if created_any and _kick is not None:
         _kick.set()
+    return deferred_any
 
 
 # Back-compat alias (tests call the boot sweep by its original name).
@@ -508,8 +521,7 @@ async def _worker_pass() -> bool:
     does not depend on a future reconcile kick that may have coalesced with
     the one that already fired (resolver failure is internal, not tied to a
     reconcile that would kick again)."""
-    await _recover_and_settle()
-    retry_wanted = False
+    retry_wanted = await _recover_and_settle()
     for ep in episodes("pending"):
         try:
             if await _run_episode(ep):

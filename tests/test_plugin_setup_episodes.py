@@ -651,3 +651,46 @@ async def test_schedule_retry_kicks_after_delay(wired, monkeypatch):
     await asyncio.sleep(0)
     assert slept["d"] == 5.0
     assert pse._kick.is_set()          # woken with no external kick
+
+
+@pytest.mark.asyncio
+async def test_settlement_deferral_signals_retry_via_worker_pass(wired):
+    # impl r10 (both): a round deferred on transient unavailability — with NO
+    # pending episode yet — must still drive a retry. _recover_and_settle
+    # returns True, so _worker_pass returns True and the worker schedules the
+    # delayed self-kick.
+    calls = {"n": 0}
+
+    def flaky(plugin):
+        calls["n"] += 1
+        return None if calls["n"] == 1 else wired["entry"]
+
+    pse.configure(
+        dispatch=wired_dispatch(wired), notify_operator=wired_notify(wired),
+        resolve_registry_entry=flaky, ack_lookup=lambda i: None)
+    _prompt()
+    await _decide()                                   # settle deferred (None)
+    assert pse.episodes() == []
+    assert pse._load()["rounds"]["elevenlabs"]["settle_deferrals"] == 1
+    # a worker pass now: recover/settle sees the deferral → retry_wanted True,
+    # and this pass ALSO resolves (2nd call) so it settles + dispatches.
+    retry = await pse._worker_pass()
+    # the re-settle resolved this pass → episode created + dispatched, no
+    # further deferral
+    assert pse.episodes()[0]["status"] == "dispatched"
+    assert retry is False
+
+
+@pytest.mark.asyncio
+async def test_settlement_deferral_schedules_retry_from_decision(wired, monkeypatch):
+    # the on_consent_decision path also schedules the delayed self-kick when
+    # its settlement defers (no worker pass involved).
+    scheduled = {"n": 0}
+    monkeypatch.setattr(pse, "_schedule_retry",
+                        lambda d: scheduled.__setitem__("n", scheduled["n"] + 1))
+    pse.configure(
+        dispatch=wired_dispatch(wired), notify_operator=wired_notify(wired),
+        resolve_registry_entry=lambda p: None)        # always unavailable
+    _prompt()
+    await _decide()
+    assert scheduled["n"] == 1
