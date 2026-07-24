@@ -91,15 +91,16 @@ async def _drain_pending(state):
 
 
 def _prompt(plugin="elevenlabs", artifact="art-1", identity="id-a"):
-    pse.register_prompt(plugin=plugin, artifact_id=artifact,
-                        identity=identity)
+    return pse.register_prompt(plugin=plugin, artifact_id=artifact,
+                               identity=identity)
 
 
 async def _decide(plugin="elevenlabs", artifact="art-1", identity="id-a",
-                  approved=True, gen="g1"):
+                  approved=True, gen="g1", nonce=""):
     await pse.on_consent_decision(
         plugin=plugin, artifact_id=artifact, identity=identity,
-        approved=approved, approval_gen=gen if approved else "")
+        approved=approved, approval_gen=gen if approved else "",
+        nonce=nonce)
 
 
 # ---------------------------------------------------------------------------
@@ -131,17 +132,17 @@ async def test_round_waits_for_all_members(wired):
 
 
 @pytest.mark.asyncio
-async def test_deny_last_settles_with_earlier_approve(wired):
-    # THE impl-r1 hole: denial persists no ack — settlement must come from
-    # the round ledger, and here it does: the deny DECIDES member b.
+async def test_mixed_round_settles_without_dispatch(wired):
+    # impl r3 all-approved gate: the deny DECIDES member b (settlement still
+    # comes from the round ledger, never ack counting) but a mixed round
+    # must NOT run the plugin-wide setup tool — operator note instead.
     _prompt(identity="id-a")
     _prompt(identity="id-b")
     await _decide(identity="id-a", approved=True)
     assert pse.episodes() == []
     await _decide(identity="id-b", approved=False)
-    eps = pse.episodes("pending")
-    assert len(eps) == 1
-    assert eps[0]["approved_identities"] == ["id-a#g1"]
+    assert pse.episodes() == []
+    assert any("NOT run automatically" in n for n in wired["notes"])
 
 
 @pytest.mark.asyncio
@@ -149,7 +150,7 @@ async def test_deny_only_round_notes_and_skips(wired):
     _prompt()
     await _decide(approved=False)
     assert pse.episodes() == []
-    assert any("no approved triggers" in n for n in wired["notes"])
+    assert any("NOT run automatically" in n for n in wired["notes"])
 
 
 @pytest.mark.asyncio
@@ -164,6 +165,56 @@ async def test_reprompt_reopens_member(wired):
     assert pse.episodes() == []                       # id-b open again
     await _decide(identity="id-b", approved=True, gen="g9")
     assert len(pse.episodes("pending")) == 1
+
+
+@pytest.mark.asyncio
+async def test_stale_nonce_expiry_ignored(wired):
+    # impl r3: a superseded keyboard's late expiry (old nonce) must not
+    # decide the re-prompted member; the fresh keyboard's decision governs.
+    n1 = _prompt(identity="id-a")
+    n2 = _prompt(identity="id-a")                     # re-prompt, new nonce
+    assert n1 and n2 and n1 != n2
+    await _decide(identity="id-a", approved=False, nonce=n1)  # stale expiry
+    rounds = pse._load()["rounds"]
+    assert rounds["elevenlabs"]["members"]["id-a"]["state"] == "open"
+    await _decide(identity="id-a", approved=True, nonce=n2)
+    assert len(pse.episodes("pending")) == 1
+
+
+@pytest.mark.asyncio
+async def test_sync_approval_record_plus_boot_recovery(wired, monkeypatch):
+    # impl r3 crash window: ack persisted + sync approval recorded, process
+    # dies before the finish hook. Boot recovery settles from the ledger.
+    _prompt(identity="id-a")
+    pse.record_approval_sync(plugin="elevenlabs", artifact_id="art-1",
+                             identity="id-a", gen="g7")
+    # "restart": fresh lock/kick, ack lookup available
+    monkeypatch.setattr(pse, "_lock", None)
+    monkeypatch.setattr(pse, "_kick", None)
+    pse.configure(
+        dispatch=lambda *a: None, notify_operator=None,
+        resolve_registry_entry=lambda plugin: wired["entry"],
+        ack_lookup=lambda identity: "g7")
+    await pse._boot_recover()
+    eps = pse.episodes("pending")
+    assert len(eps) == 1
+    assert eps[0]["approved_identities"] == ["id-a#g7"]
+
+
+@pytest.mark.asyncio
+async def test_boot_recovery_approves_open_member_from_ack(wired, monkeypatch):
+    # crash BEFORE even the sync record: the persisted ack alone recovers.
+    _prompt(identity="id-a")
+    monkeypatch.setattr(pse, "_lock", None)
+    monkeypatch.setattr(pse, "_kick", None)
+    pse.configure(
+        dispatch=lambda *a: None, notify_operator=None,
+        resolve_registry_entry=lambda plugin: wired["entry"],
+        ack_lookup=lambda identity: "g8")
+    await pse._boot_recover()
+    eps = pse.episodes("pending")
+    assert len(eps) == 1
+    assert eps[0]["approved_identities"] == ["id-a#g8"]
 
 
 @pytest.mark.asyncio
@@ -192,10 +243,10 @@ async def test_round_ledger_survives_restart(wired, tmp_path, monkeypatch):
     pse.configure(
         dispatch=lambda *a: None, notify_operator=None,
         resolve_registry_entry=lambda plugin: wired["entry"])
-    await _decide(identity="id-b", approved=False)
+    await _decide(identity="id-b", approved=True, gen="g5")
     eps = pse.episodes("pending")
     assert len(eps) == 1
-    assert eps[0]["approved_identities"] == ["id-a#g1"]
+    assert eps[0]["approved_identities"] == ["id-a#g1", "id-b#g5"]
 
 
 @pytest.mark.asyncio

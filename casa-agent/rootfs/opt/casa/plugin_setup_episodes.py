@@ -1,59 +1,59 @@
 """Durable post-consent setup episodes (v0.112.0, casa-plugin-elevenlabs#2).
 
 A plugin that declares ``casa.setupTool`` gets its setup tool run
-AUTOMATICALLY once its trigger-consent round settles with at least one
-approval — the operator's Approve tap is the authorization for the wiring
-that makes the trigger functional. Because plugin MCP tools surface only on
-the plugin's target agents, Casa dispatches a synthetic Casa-authored turn
-to the execution agent rather than calling the tool itself.
+AUTOMATICALLY once its trigger-consent round settles with EVERY prompted
+trigger approved — the operator's Approve taps are the authorization for
+the wiring that makes the triggers functional. Because plugin MCP tools
+surface only on the plugin's target agents, Casa dispatches a synthetic
+Casa-authored turn to the execution agent rather than calling the tool
+itself.
 
-Design (Sol+Terra design round + implementation round 1, 2026-07-24):
+Design (Sol+Terra design round + implementation rounds 1-3, 2026-07-24):
 
-* **Round ledger, not ack counting** (impl r1 P1): the consent ROUND is
-  tracked by this module — every prompted consent registers its identity as
-  an OPEN member (:func:`on_consent_prompted`, fed from the prompt path);
-  every terminal decision (Approve / Deny / expiry) marks its member
-  (:func:`on_consent_decision`). Settlement = ALL members decided. Denials
-  and expiries settle the round exactly like approvals — the reconciler's
-  ``trigger_pending_ack`` state (which a denial never clears) is not
-  consulted. A re-prompt after expiry RE-OPENS the member, so the round
-  waits again.
-* **Durable across the whole consent-to-dispatch interval** (impl r1 P1):
-  the round ledger AND the episodes live in
-  ``/data/plugin-setup-episodes.json`` (atomic tmp+rename), updated on
-  every prompt/decision — a restart mid-round loses nothing.
-* **Single-lock settlement** (impl r1 P1): accumulate + settle-check +
-  episode creation happen under ONE lock acquisition with no awaits
-  in between — concurrent finish callbacks cannot split a round into two
-  episodes. Operator notes and the worker kick happen after release.
-* **Re-consent mints a new episode** (impl r1 P1): approve decisions carry
-  ``identity#gen`` (the persisted ack's approval generation) — a
-  revoke→re-approve or update-rotation with an identical trigger tuple
-  produces a NEW generation, hence a new episode key.
-* **Exact-artifact binding (TOCTOU)**: the episode records the CONSENTED
-  ``artifact_id``; the worker re-resolves at dispatch time and marks the
-  episode ``stale`` (operator note) when the plugin was removed or
-  superseded.
-* **Unambiguous tool binding** (impl r1 P1): the instruction names the
-  EXACT namespaced tool ``<server-grant>__<setupTool>``; a plugin with
-  zero or multiple server grants FAILS the episode with a clear reason
-  (and verify blocks multi-server setup-tool plugins upstream) — never an
-  unqualified or guessed name.
-* **Worker survivability** (impl r1 P1): per-episode failures are isolated
-  and the worker re-kicks itself after an unexpected pass failure, so one
-  bad episode can never strand the rest until the next external kick.
-* **Terminal-state hygiene** (impl r1 P2): a new episode for a plugin
-  prunes that plugin's older episodes, and ``failed``/``stale`` rows decay
-  out of health after :data:`_HEALTH_DECAY_S` — no permanent residue once
-  the situation is resolved or superseded.
-* **No plugin prose**: the synthetic turn is a fixed Casa-authored
-  template; the only plugin-derived interpolations are grammar-validated
-  identifiers. The ``synthetic`` context marker is a RESERVED provenance
-  key external ingress cannot spoof.
-* **Delivery is not success** (disclosed): ``dispatched`` means the bus
-  accepted the turn; the execution agent's reply reports the actual
-  outcome. ``pending``/``failed``/``stale`` surface as plugin-health
-  issues.
+* **Round ledger, not ack counting**: every prompted consent registers an
+  OPEN member with a fresh per-prompt NONCE (:func:`register_prompt`);
+  terminal decisions mark members. Settlement = ALL members decided.
+* **All-approved gate** (impl r3): the episode dispatches only when every
+  member is APPROVED. Any denial settles the round WITHOUT a dispatch and
+  tells the operator — the argument-free setup tool cannot distinguish
+  approved from denied triggers, so a mixed round must not wire blindly.
+* **Crash-safe approval recording** (impl r3): approvals are recorded
+  SYNCHRONOUSLY inside the consent ack commit callback
+  (:func:`record_approval_sync` — same yield-free step that persists the
+  ack), and a BOOT RECOVERY SWEEP (:func:`_boot_recover`, first act of the
+  worker) marks any still-open member whose identity has a persisted ack
+  as approved with that ack's generation — a crash anywhere between ack
+  persistence and settlement recovers on restart.
+* **Prompt nonces** (impl r3): denials/expiries apply only when their
+  nonce matches the member's CURRENT nonce — a late expiry callback from a
+  superseded keyboard (re-prompt of the same identity) cannot decide the
+  fresh prompt. Approvals are exempt: the persisted ack is ground truth.
+* **Stale-artifact fencing** (impl r2): the decision path never replaces
+  an existing round with a different artifact_id — only the prompt path
+  (which runs solely from a live reconcile) starts a new-artifact round.
+* **Re-consent mints a new episode**: approvals carry ``identity#gen``
+  (the ack's approval generation) in the episode key.
+* **Consumed-key tombstones** (impl r2): supersession keeps pruned
+  episodes' keys (bounded) so a replayed stale generation can never
+  recreate a consumed episode.
+* **Exact-artifact binding (TOCTOU)**: the worker re-resolves the registry
+  at dispatch time and marks the episode ``stale`` when the plugin was
+  removed or superseded. (The residual dispatch→agent-turn window is an
+  ACCEPTED, disclosed risk: seconds wide, and the tool is idempotent
+  wiring whose current-artifact consent round re-runs setup regardless.)
+* **Unambiguous tool binding**: exactly one server grant or the episode
+  fails with a clear reason; verify blocks ambiguous plugins upstream.
+* **Worker survivability**: per-episode isolation + self re-kick.
+* **Terminal-state hygiene**: supersession prunes a plugin's older
+  episodes; ``failed``/``stale`` decay out of health after 72h.
+* **Delivery semantics (disclosed)**: ``dispatched`` means the turn was
+  accepted by the in-process bus and the target agent will report the
+  actual outcome to the operator — the durable retry contract covers
+  consent-to-dispatch, not tool execution. User-facing claims are worded
+  accordingly.
+* **No plugin prose**: fixed Casa-authored template; only grammar-
+  validated identifiers interpolated. The ``synthetic`` marker is a
+  RESERVED provenance key external ingress cannot spoof.
 """
 from __future__ import annotations
 
@@ -70,15 +70,17 @@ from typing import Any, Awaitable, Callable
 logger = logging.getLogger(__name__)
 
 STORE_PATH = Path("/data/plugin-setup-episodes.json")
-_SCHEMA_VERSION = 2
+_SCHEMA_VERSION = 3
 _MAX_DISPATCH_ATTEMPTS = 3
 _RETRY_BACKOFF_S = (1.0, 5.0)
 _HEALTH_DECAY_S = 72 * 3600.0
+_TOMBSTONE_CAP = 50
 
 # Wired by casa_core at boot. All optional — absent seams degrade to logging.
 _dispatch: Callable[[str, str, dict], Awaitable[bool]] | None = None
 _notify_operator: Callable[[str], Awaitable[None]] | None = None
 _resolve_registry_entry: Callable[[str], Any] | None = None
+_ack_lookup: Callable[[str], str | None] | None = None
 _sleep: Callable[[float], Awaitable[None]] = asyncio.sleep
 
 _lock: asyncio.Lock | None = None
@@ -91,13 +93,16 @@ def _now() -> float:
 
 
 def configure(*, dispatch, notify_operator, resolve_registry_entry,
-              sleep=asyncio.sleep) -> None:
-    """casa_core boot wiring. Idempotent."""
+              ack_lookup=None, sleep=asyncio.sleep) -> None:
+    """casa_core boot wiring. Idempotent. ``ack_lookup(identity)`` returns
+    the persisted ack's approval generation (or None) — the boot recovery
+    sweep's ground truth."""
     global _dispatch, _notify_operator, _resolve_registry_entry
-    global _sleep, _lock, _kick
+    global _ack_lookup, _sleep, _lock, _kick
     _dispatch = dispatch
     _notify_operator = notify_operator
     _resolve_registry_entry = resolve_registry_entry
+    _ack_lookup = ack_lookup
     _sleep = sleep
     if _lock is None:
         _lock = asyncio.Lock()
@@ -106,24 +111,27 @@ def configure(*, dispatch, notify_operator, resolve_registry_entry,
 
 
 # ---------------------------------------------------------------------------
-# Store: {"schema_version", "rounds": {plugin: {...}}, "episodes": [...]}
+# Store: {"schema_version", "rounds": {plugin: {"artifact_id", "members":
+#   {identity: {"state", "gen", "nonce"}}}}, "episodes": [...],
+#   "consumed_keys": [...]}
 # ---------------------------------------------------------------------------
 
 def _load() -> dict:
     if not STORE_PATH.is_file():
         return {"schema_version": _SCHEMA_VERSION, "rounds": {},
-                "episodes": []}
+                "episodes": [], "consumed_keys": []}
     try:
         data = json.loads(STORE_PATH.read_text(encoding="utf-8"))
         if (not isinstance(data, dict)
                 or not isinstance(data.get("episodes"), list)):
             raise ValueError("malformed store")
         data.setdefault("rounds", {})
+        data.setdefault("consumed_keys", [])
         return data
     except Exception:  # noqa: BLE001 — a corrupt store must not brick boot
         logger.exception("plugin-setup-episodes store unreadable — resetting")
         return {"schema_version": _SCHEMA_VERSION, "rounds": {},
-                "episodes": []}
+                "episodes": [], "consumed_keys": []}
 
 
 def _save(data: dict) -> None:
@@ -140,7 +148,7 @@ def episodes(status: str | None = None) -> list[dict]:
 def health_issues() -> list[dict]:
     """Non-terminal-success episodes for plugin-health regeneration.
     ``failed``/``stale`` rows decay after :data:`_HEALTH_DECAY_S`;
-    ``pending`` never decays (it is actionable until dispatched)."""
+    ``pending`` never decays (actionable until dispatched)."""
     out = []
     cutoff = _now() - _HEALTH_DECAY_S
     for e in episodes():
@@ -171,134 +179,208 @@ def _episode_key(plugin: str, artifact_id: str,
 # Round ledger
 # ---------------------------------------------------------------------------
 
-def register_prompt(*, plugin: str, artifact_id: str, identity: str) -> None:
+def register_prompt(*, plugin: str, artifact_id: str, identity: str) -> str:
     """Register (or RE-OPEN) a round member when its consent keyboard is
-    posted. Fed SYNCHRONOUSLY from the consent prompt path (which runs
-    without awaits inside the event loop, so this read-modify-write cannot
-    interleave with the locked async sections — both are yield-free). The
-    round's membership comes from what was actually ASKED, never inferred
-    from ack state; a re-prompt after expiry RE-OPENS the member so the
-    round waits for the fresh decision. Idempotent; never raises."""
+    posted; returns the member's fresh prompt NONCE (the caller threads it
+    into the decision callbacks so a superseded keyboard's late expiry can
+    never decide the fresh prompt). SYNCHRONOUS + yield-free — cannot
+    interleave with the locked async sections. Never raises (returns ""
+    on failure; a blank nonce simply loses stale-expiry protection for
+    that member, not correctness of decisions)."""
     try:
+        nonce = uuid.uuid4().hex[:8]
         data = _load()
         rnd = data["rounds"].get(plugin)
         if not isinstance(rnd, dict) or rnd.get("artifact_id") != artifact_id:
             rnd = {"artifact_id": artifact_id, "members": {}}
             data["rounds"][plugin] = rnd
-        rnd["members"][identity] = {"state": "open"}
+        rnd["members"][identity] = {"state": "open", "nonce": nonce}
         _save(data)
+        return nonce
     except Exception:  # noqa: BLE001 — prompt path must never see a raise
         logger.exception("setup-round prompt registration failed (plugin=%s)",
                          plugin)
+        return ""
+
+
+def record_approval_sync(*, plugin: str, artifact_id: str, identity: str,
+                         gen: str) -> None:
+    """Record an approval DURABLY in the same yield-free commit step that
+    persists the consent ack (impl r3: a crash after the ack but before the
+    async finish hook must not strand the round — this write happens
+    first; the boot sweep covers a crash even earlier). Approvals are
+    ack-backed ground truth, so no nonce check applies. Never raises."""
+    try:
+        data = _load()
+        rnd = data["rounds"].get(plugin)
+        if isinstance(rnd, dict) and rnd.get("artifact_id") != artifact_id:
+            logger.info("stale approval record ignored (plugin=%s)", plugin)
+            return
+        if not isinstance(rnd, dict):
+            rnd = {"artifact_id": artifact_id, "members": {}}
+            data["rounds"][plugin] = rnd
+        member = rnd["members"].get(identity) or {}
+        member.update({"state": "approved", "gen": gen})
+        rnd["members"][identity] = member
+        _save(data)
+    except Exception:  # noqa: BLE001 — commit callback must never see a raise
+        logger.exception("sync approval record failed (plugin=%s)", plugin)
 
 
 async def on_consent_decision(*, plugin: str, artifact_id: str,
                               identity: str, approved: bool,
-                              approval_gen: str = "") -> None:
-    """Feed ONE terminal consent decision (Approve / Deny / expiry counts as
-    deny). Called AFTER the decision is durable (ack persisted + reconcile
-    succeeded, for approvals). ``approval_gen`` is the persisted ack's
-    approval generation — it keys the episode so a re-approval (new gen)
-    mints a NEW episode even for an identical trigger tuple. Never raises.
-
-    Accumulate + settle-check + episode creation run under ONE lock
-    acquisition (no awaits inside) — concurrent finish callbacks cannot
-    split a round. Notes and the worker kick happen after release."""
+                              approval_gen: str = "",
+                              nonce: str = "") -> None:
+    """Feed ONE terminal consent decision. Approvals re-apply idempotently
+    (the sync record already ran) and then settle; denials/expiries apply
+    ONLY when ``nonce`` matches the member's current nonce (a superseded
+    keyboard's late callback is ignored). Settlement runs under ONE lock
+    acquisition; notes/kick happen after release. Never raises."""
     if _lock is None:
         return
-    note: str | None = None
+    notes: list[str] = []
     created = False
     try:
         async with _lock:
             data = _load()
             rnd = data["rounds"].get(plugin)
             if isinstance(rnd, dict) and rnd.get("artifact_id") != artifact_id:
-                # impl r2 (both reviewers): a LATE decision from a superseded
-                # artifact must never replace the CURRENT round — the prompt
-                # path (which only ever runs from a live reconcile) is the
-                # sole authority for starting a new-artifact round. Ignore
-                # the stale decision outright.
                 logger.info(
                     "stale consent decision ignored (plugin=%s artifact=%s, "
                     "current round is %s)", plugin, artifact_id,
                     rnd.get("artifact_id"))
                 return
             if not isinstance(rnd, dict):
-                # Unknown round (e.g. store reset) — synthesize one so a
-                # decision is never dropped on the floor.
+                # Unknown round (e.g. store reset) — synthesize so a live
+                # decision is never dropped.
                 rnd = {"artifact_id": artifact_id, "members": {}}
                 data["rounds"][plugin] = rnd
-            member = {"state": "approved" if approved else "denied"}
+            member = rnd["members"].get(identity)
             if approved:
-                member["gen"] = approval_gen
-            rnd["members"][identity] = member
-            undecided = [i for i, m in rnd["members"].items()
-                         if m.get("state") == "open"]
-            if undecided:
-                _save(data)
-                return
-            # Round settled — consume it.
-            del data["rounds"][plugin]
-            approved_keys = sorted(
-                f"{i}#{m.get('gen', '')}"
-                for i, m in rnd["members"].items()
-                if m.get("state") == "approved")
-            if not approved_keys:
-                _save(data)
-                note = (f"Plugin {plugin}: consent settled with no approved "
-                        "triggers — its setup tool was not run.")
+                m = member or {}
+                m.update({"state": "approved", "gen": approval_gen})
+                rnd["members"][identity] = m
             else:
-                entry = None
-                if _resolve_registry_entry is not None:
-                    try:
-                        entry = _resolve_registry_entry(plugin)
-                    except Exception:  # noqa: BLE001
-                        logger.exception("registry resolve failed (plugin=%s)",
-                                         plugin)
-                setup = (entry or {}).get("setup_tool") \
-                    if isinstance(entry, dict) else None
-                if not setup:
-                    _save(data)  # no setup tool — nothing to do
-                else:
-                    key = _episode_key(plugin, artifact_id, approved_keys)
-                    consumed = data.setdefault("consumed_keys", [])
-                    if (not any(e.get("key") == key
-                                for e in data["episodes"])
-                            and key not in consumed):
-                        # Terminal-state hygiene: a fresh episode supersedes
-                        # the plugin's older ones (any status) — but their
-                        # KEYS are kept as bounded tombstones so a replayed
-                        # stale decision can never recreate a consumed
-                        # episode and prune the current one (impl r2, Sol).
-                        for old in data["episodes"]:
-                            if (old.get("plugin") == plugin
-                                    and old.get("key")):
-                                consumed.append(old["key"])
-                        del consumed[:-50]
-                        data["episodes"] = [
-                            e for e in data["episodes"]
-                            if e.get("plugin") != plugin]
-                        data["episodes"].append({
-                            "id": uuid.uuid4().hex[:12],
-                            "key": key,
-                            "plugin": plugin,
-                            "artifact_id": artifact_id,
-                            "setup_tool": setup,
-                            "approved_identities": approved_keys,
-                            "status": "pending",
-                            "attempts": 0,
-                            "created_ts": _now(),
-                            "updated_ts": _now(),
-                        })
-                        created = True
+                # Nonce fence (impl r3): a deny/expiry from a SUPERSEDED
+                # keyboard (mismatching nonce) must not decide the current
+                # prompt. Fencing needs both sides to carry a nonce — a
+                # blank on either side degrades to unfenced acceptance.
+                cur_nonce = (member or {}).get("nonce") or ""
+                if (member is not None and member.get("state") == "open"
+                        and nonce and cur_nonce and nonce != cur_nonce):
+                    logger.info(
+                        "stale deny/expiry ignored (plugin=%s identity "
+                        "nonce mismatch)", plugin)
                     _save(data)
+                    return
+                m = member or {}
+                if m.get("state") != "approved":  # an ack outranks an expiry
+                    m["state"] = "denied"
+                rnd["members"][identity] = m
+            created, notes = _settle_locked(data, plugin)
+            _save(data)
     except Exception:  # noqa: BLE001 — consent flow must never see a raise
         logger.exception("setup-episode decision handling failed (plugin=%s)",
                          plugin)
         return
-    if note is not None:
-        await _note(note)
+    for n in notes:
+        await _note(n)
     if created and _kick is not None:
+        _kick.set()
+
+
+def _settle_locked(data: dict, plugin: str) -> tuple[bool, list[str]]:
+    """Settlement body (caller holds the lock / is yield-free): all members
+    decided ⇒ consume the round; ALL approved ⇒ claim an episode; any
+    denial ⇒ operator note, no dispatch. Returns (episode_created, notes).
+    Mutates ``data`` (caller saves)."""
+    rnd = data["rounds"].get(plugin)
+    if not isinstance(rnd, dict):
+        return False, []
+    members = rnd.get("members") or {}
+    if not members or any(m.get("state") == "open" for m in members.values()):
+        return False, []
+    del data["rounds"][plugin]
+    denied = [i for i, m in members.items() if m.get("state") == "denied"]
+    if denied:
+        return False, [
+            f"Plugin {plugin}: consent settled with "
+            f"{len(denied)} unapproved trigger(s) — its setup tool was NOT "
+            "run automatically (it cannot target a subset). Run it manually "
+            "if intended."]
+    approved_keys = sorted(f"{i}#{m.get('gen', '')}"
+                           for i, m in members.items())
+    entry = None
+    if _resolve_registry_entry is not None:
+        try:
+            entry = _resolve_registry_entry(plugin)
+        except Exception:  # noqa: BLE001
+            logger.exception("registry resolve failed (plugin=%s)", plugin)
+    setup = (entry or {}).get("setup_tool") if isinstance(entry, dict) else None
+    if not setup:
+        return False, []
+    artifact_id = rnd.get("artifact_id") or ""
+    key = _episode_key(plugin, artifact_id, approved_keys)
+    consumed = data.setdefault("consumed_keys", [])
+    if any(e.get("key") == key for e in data["episodes"]) or key in consumed:
+        return False, []
+    for old in data["episodes"]:
+        if old.get("plugin") == plugin and old.get("key"):
+            consumed.append(old["key"])
+    del consumed[:-_TOMBSTONE_CAP]
+    data["episodes"] = [e for e in data["episodes"]
+                        if e.get("plugin") != plugin]
+    data["episodes"].append({
+        "id": uuid.uuid4().hex[:12],
+        "key": key,
+        "plugin": plugin,
+        "artifact_id": artifact_id,
+        "setup_tool": setup,
+        "approved_identities": approved_keys,
+        "status": "pending",
+        "attempts": 0,
+        "created_ts": _now(),
+        "updated_ts": _now(),
+    })
+    return True, []
+
+
+async def _boot_recover() -> None:
+    """First act of the worker (impl r3): recover rounds stranded by a
+    crash between ack persistence and decision recording — any OPEN member
+    whose identity has a persisted ack becomes approved with that ack's
+    generation, then settlement re-runs per plugin."""
+    if _lock is None or _ack_lookup is None:
+        return
+    notes: list[str] = []
+    created_any = False
+    try:
+        async with _lock:
+            data = _load()
+            for plugin in list(data["rounds"].keys()):
+                rnd = data["rounds"][plugin]
+                for identity, m in (rnd.get("members") or {}).items():
+                    if m.get("state") != "open":
+                        continue
+                    try:
+                        gen = _ack_lookup(identity)
+                    except Exception:  # noqa: BLE001
+                        gen = None
+                    if gen is not None:
+                        m.update({"state": "approved", "gen": str(gen)})
+                # Settle EVERY round, changed or not: a crash between the
+                # sync approval record and the finish-hook settlement leaves
+                # a fully-decided round with no episode — recover it too.
+                created, n = _settle_locked(data, plugin)
+                created_any = created_any or created
+                notes.extend(n)
+            _save(data)
+    except Exception:  # noqa: BLE001
+        logger.exception("setup-round boot recovery failed")
+        return
+    for n in notes:
+        await _note(n)
+    if created_any and _kick is not None:
         _kick.set()
 
 
@@ -307,8 +389,8 @@ async def on_consent_decision(*, plugin: str, artifact_id: str,
 # ---------------------------------------------------------------------------
 
 def start_worker() -> None:
-    """Boot seam: start the supervised dispatch worker and kick it once so
-    boot-reconciled ``pending`` episodes re-dispatch."""
+    """Boot seam: start the supervised dispatch worker; it runs the boot
+    recovery sweep first, then dispatches ``pending`` episodes."""
     global _worker_task
     if _worker_task is not None and not _worker_task.done():
         return
@@ -319,6 +401,7 @@ def start_worker() -> None:
 
 
 async def _worker() -> None:
+    await _boot_recover()
     while True:
         try:
             assert _kick is not None
@@ -393,7 +476,7 @@ async def _run_episode(ep: dict) -> None:
                                               len(_RETRY_BACKOFF_S) - 1)])
     if ok:
         # Bus accepted — the agent's own reply reports the setup OUTCOME to
-        # the operator (documented: delivery, not result correlation).
+        # the operator (disclosed: delivery, not result correlation).
         _update_episode(ep["id"], status="dispatched", attempts=attempts)
     else:
         _update_episode(ep["id"], status="failed", attempts=attempts,
@@ -416,16 +499,15 @@ def _compose(ep: dict, entry: dict) -> tuple[str | None, str]:
     """Deterministic execution-target selection + the fixed Casa-authored
     instruction. Returns ``(role, instruction)`` or ``(None, reason)``.
 
-    Tool binding is UNAMBIGUOUS or nothing (impl r1 P1): exactly one
-    server-level grant is required to construct the namespaced tool name —
-    zero or several grants fail the episode (verify blocks multi-server
-    setup-tool plugins upstream with ``setup_tool_ambiguous_server``).
+    Tool binding is UNAMBIGUOUS or nothing: exactly one server-level grant
+    is required — zero or several fail the episode (verify blocks such
+    plugins upstream with ``setup_tool_ambiguous_server``).
 
-    Target order (design round): ``resident:assistant`` when targeted; else
-    the lexicographically first resident target; else the first specialist
-    target via assistant delegation (the specialist has no channel — the
-    instruction names the EXACT specialist and tool and forbids
-    substitution). Executor-only targets are refused upstream at verify.
+    Target order: ``resident:assistant`` when targeted; else the
+    lexicographically first resident; else the first specialist via
+    assistant delegation (the specialist has no channel — the instruction
+    names the EXACT specialist and tool and forbids substitution).
+    Executor-only/empty targets are refused upstream at verify.
     """
     grants = sorted(entry.get("granted_tools") or [])
     if len(grants) != 1:

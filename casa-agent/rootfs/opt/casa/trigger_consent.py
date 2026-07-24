@@ -109,6 +109,21 @@ def prompt_trigger_consent(
         plugin=plugin, effective=effective, role=role, auth=auth,
         clearance=clearance)
 
+    # v0.112.0 (elevenlabs#2): register this prompt as an OPEN member of the
+    # plugin's consent ROUND before the keyboard posts — settlement is
+    # evaluated over the round ledger (all asked prompts decided), never
+    # over ack state (a denial persists no ack, so ack counting can never
+    # settle a deny-last round — impl review r1). The returned NONCE fences
+    # this keyboard's deny/expiry callbacks: a superseded keyboard's late
+    # expiry can never decide a re-prompted member (impl r3).
+    setup_nonce = ""
+    try:
+        import plugin_setup_episodes
+        setup_nonce = plugin_setup_episodes.register_prompt(
+            plugin=plugin, artifact_id=artifact_id, identity=identity)
+    except Exception:  # noqa: BLE001
+        logger.exception("setup-round prompt feed failed (plugin=%s)", plugin)
+
     def _on_commit_sync(idx: int, meta: dict) -> None:
         # Telegram callback, IMMEDIATELY after a successful commit (no await
         # between): idx 0 -> persist the ack atomically; idx 1 -> no-op. An
@@ -120,24 +135,26 @@ def prompt_trigger_consent(
                         artifact_id=artifact_id, effective=effective,
                         target=target, auth=auth)
             meta["acked"] = True
-
-    # v0.112.0 (elevenlabs#2): register this prompt as an OPEN member of the
-    # plugin's consent ROUND before the keyboard posts — settlement is
-    # evaluated over the round ledger (all asked prompts decided), never
-    # over ack state (a denial persists no ack, so ack counting can never
-    # settle a deny-last round — impl review r1).
-    try:
-        import plugin_setup_episodes
-        plugin_setup_episodes.register_prompt(
-            plugin=plugin, artifact_id=artifact_id, identity=identity)
-    except Exception:  # noqa: BLE001
-        logger.exception("setup-round prompt feed failed (plugin=%s)", plugin)
+            # v0.112.0 (impl r3): record the approval in the setup-round
+            # ledger in this SAME yield-free step — a crash before the
+            # async finish hook must not strand the round (the boot sweep
+            # covers a crash even earlier, from the persisted ack itself).
+            try:
+                import plugin_setup_episodes
+                rec = acks.get(identity) or {}
+                plugin_setup_episodes.record_approval_sync(
+                    plugin=plugin, artifact_id=artifact_id,
+                    identity=identity, gen=str(rec.get("gen", "")))
+            except Exception:  # noqa: BLE001
+                logger.exception("sync setup-approval record failed "
+                                 "(plugin=%s)", plugin)
 
     async def _feed_setup_episode(approved: bool) -> None:
         # Every TERMINAL decision (approve, deny, expiry) feeds the durable
         # evaluator. Approvals carry the persisted ack's approval GENERATION
-        # so a revoke→re-approve of an identical tuple mints a NEW episode
-        # (impl review r1). Never raises into the finish hook.
+        # (re-approval mints a new episode); denials carry this keyboard's
+        # NONCE so a superseded keyboard's late expiry is ignored. Never
+        # raises into the finish hook.
         try:
             import plugin_setup_episodes
             gen = ""
@@ -149,7 +166,8 @@ def prompt_trigger_consent(
                     gen = ""
             await plugin_setup_episodes.on_consent_decision(
                 plugin=plugin, artifact_id=artifact_id,
-                identity=identity, approved=approved, approval_gen=gen)
+                identity=identity, approved=approved, approval_gen=gen,
+                nonce=setup_nonce)
         except Exception:  # noqa: BLE001
             logger.exception("setup-episode feed failed (plugin=%s)", plugin)
 

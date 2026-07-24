@@ -3093,9 +3093,15 @@ async def main() -> None:
         ctx = {"chat_id": op[0]} if op is not None else {}
         await ch.send_response(text, ctx)
 
+    def _setup_ack_lookup(identity: str) -> str | None:
+        import trigger_acks as _ta
+        rec = _ta.ACKS.get(identity)
+        return str(rec["gen"]) if rec and rec.get("gen") else None
+
     _pse.configure(
         dispatch=_setup_dispatch, notify_operator=_setup_notify,
         resolve_registry_entry=_setup_registry_entry,
+        ack_lookup=_setup_ack_lookup,
     )
     _pse.start_worker()
 
