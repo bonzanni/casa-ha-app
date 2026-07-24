@@ -81,6 +81,7 @@ _dispatch: Callable[[str, str, dict], Awaitable[bool]] | None = None
 _notify_operator: Callable[[str], Awaitable[None]] | None = None
 _resolve_registry_entry: Callable[[str], Any] | None = None
 _ack_lookup: Callable[[str], str | None] | None = None
+_routes_live: Callable[[str], bool] | None = None
 _sleep: Callable[[float], Awaitable[None]] = asyncio.sleep
 
 _lock: asyncio.Lock | None = None
@@ -93,16 +94,22 @@ def _now() -> float:
 
 
 def configure(*, dispatch, notify_operator, resolve_registry_entry,
-              ack_lookup=None, sleep=asyncio.sleep) -> None:
+              ack_lookup=None, routes_live=None,
+              sleep=asyncio.sleep) -> None:
     """casa_core boot wiring. Idempotent. ``ack_lookup(identity)`` returns
     the persisted ack's approval generation (or None) — the boot recovery
-    sweep's ground truth."""
+    sweep's ground truth. ``routes_live(plugin)`` reports whether the
+    plugin's triggers are ROUTED (impl r4, Sol): the worker holds a pending
+    episode until the route overlay is live, so the external service is
+    never pointed at an unrouted endpoint; reconciles call :func:`kick` to
+    retry the gate."""
     global _dispatch, _notify_operator, _resolve_registry_entry
-    global _ack_lookup, _sleep, _lock, _kick
+    global _ack_lookup, _routes_live, _sleep, _lock, _kick
     _dispatch = dispatch
     _notify_operator = notify_operator
     _resolve_registry_entry = resolve_registry_entry
     _ack_lookup = ack_lookup
+    _routes_live = routes_live
     _sleep = sleep
     if _lock is None:
         _lock = asyncio.Lock()
@@ -179,28 +186,44 @@ def _episode_key(plugin: str, artifact_id: str,
 # Round ledger
 # ---------------------------------------------------------------------------
 
-def register_prompt(*, plugin: str, artifact_id: str, identity: str) -> str:
-    """Register (or RE-OPEN) a round member when its consent keyboard is
-    posted; returns the member's fresh prompt NONCE (the caller threads it
-    into the decision callbacks so a superseded keyboard's late expiry can
-    never decide the fresh prompt). SYNCHRONOUS + yield-free — cannot
-    interleave with the locked async sections. Never raises (returns ""
-    on failure; a blank nonce simply loses stale-expiry protection for
-    that member, not correctness of decisions)."""
+def open_round(*, plugin: str, artifact_id: str,
+               identities: list[str]) -> dict[str, str]:
+    """SEAL a consent round's membership BEFORE any keyboard posts (impl
+    r4): the reconciler declares the COMPLETE per-plugin batch it is about
+    to prompt in ONE yield-free call, so a fast Approve on the first
+    keyboard can never settle a round that is still registering its other
+    members. Returns ``{identity: nonce}`` — the caller threads each nonce
+    into that keyboard's decision callbacks (stale-expiry fencing).
+
+    Merges into an existing same-artifact round: listed members are
+    (re)opened with fresh nonces, other members keep their states — a
+    later reconcile batch that re-prompts a subset must not erase earlier
+    decisions. A different artifact starts a fresh round. SYNCHRONOUS +
+    yield-free — cannot interleave with the locked async sections. Never
+    raises (returns {} on failure: unfenced but never incorrect)."""
     try:
-        nonce = uuid.uuid4().hex[:8]
         data = _load()
         rnd = data["rounds"].get(plugin)
         if not isinstance(rnd, dict) or rnd.get("artifact_id") != artifact_id:
             rnd = {"artifact_id": artifact_id, "members": {}}
             data["rounds"][plugin] = rnd
-        rnd["members"][identity] = {"state": "open", "nonce": nonce}
+        nonces: dict[str, str] = {}
+        for identity in identities:
+            nonce = uuid.uuid4().hex[:8]
+            rnd["members"][identity] = {"state": "open", "nonce": nonce}
+            nonces[identity] = nonce
         _save(data)
-        return nonce
+        return nonces
     except Exception:  # noqa: BLE001 — prompt path must never see a raise
-        logger.exception("setup-round prompt registration failed (plugin=%s)",
-                         plugin)
-        return ""
+        logger.exception("setup-round open failed (plugin=%s)", plugin)
+        return {}
+
+
+def kick() -> None:
+    """Wake the worker (episode created elsewhere, or a reconcile just ran
+    and may have made a pending episode's routes live)."""
+    if _kick is not None:
+        _kick.set()
 
 
 def record_approval_sync(*, plugin: str, artifact_id: str, identity: str,
@@ -258,7 +281,11 @@ async def on_consent_decision(*, plugin: str, artifact_id: str,
             member = rnd["members"].get(identity)
             if approved:
                 m = member or {}
-                m.update({"state": "approved", "gen": approval_gen})
+                m["state"] = "approved"
+                # impl r4 (Terra): never overwrite a durably-recorded
+                # generation with a blank from a feed whose acks.get failed.
+                if approval_gen or not m.get("gen"):
+                    m["gen"] = approval_gen
                 rnd["members"][identity] = m
             else:
                 # Nonce fence (impl r3): a deny/expiry from a SUPERSEDED
@@ -452,6 +479,21 @@ async def _run_episode(ep: dict) -> None:
                     "plugin was removed or updated since the consent. A new "
                     "consent round owns the current version.")
         return
+    # impl r4 (Sol): dispatch only against a LIVE route — the durable
+    # approval/settlement happened regardless of the reconcile outcome (a
+    # transient reconcile failure must not strand the round), but the setup
+    # tool must not point the external service at an unrouted endpoint. The
+    # episode stays pending; every reconcile kicks the worker to re-check.
+    if _routes_live is not None:
+        try:
+            live = bool(_routes_live(plugin))
+        except Exception:  # noqa: BLE001
+            logger.exception("episode %s: routes_live check failed", ep["id"])
+            live = False
+        if not live:
+            _update_episode(ep["id"],
+                            last_error="waiting for live trigger route")
+            return
     role, instruction = _compose(ep, entry)
     if role is None:
         _update_episode(ep["id"], status="failed", last_error=instruction)

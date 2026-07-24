@@ -3098,10 +3098,22 @@ async def main() -> None:
         rec = _ta.ACKS.get(identity)
         return str(rec["gen"]) if rec and rec.get("gen") else None
 
+    def _setup_routes_live(plugin: str) -> bool:
+        # impl r4 (Sol): the plugin's triggers are live when the fresh
+        # trigger recompute reports NO trigger_* issue for it (pending ack,
+        # missing channel, unassigned target, missing secret all unroute
+        # the plugin's whole set — per-plugin all-or-nothing).
+        import trigger_reconcile as _tr
+        return not any(
+            str(getattr(i, "reason_code", "")).startswith("trigger_")
+            and getattr(i, "name", "") == plugin
+            for i in _tr.current_issues())
+
     _pse.configure(
         dispatch=_setup_dispatch, notify_operator=_setup_notify,
         resolve_registry_entry=_setup_registry_entry,
         ack_lookup=_setup_ack_lookup,
+        routes_live=_setup_routes_live,
     )
     _pse.start_worker()
 

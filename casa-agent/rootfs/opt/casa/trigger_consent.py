@@ -92,6 +92,7 @@ def prompt_trigger_consent(
     plugin: str, artifact_id: str, effective: str, target: str,
     auth: dict, acks: Any, clearance: str = "public",
     reconcile_cb: "Callable[[], Awaitable[None]] | None" = None,
+    setup_nonce: str = "",
 ) -> Any:
     """Post (or dedupe onto) the consent keyboard for ONE plugin trigger.
 
@@ -109,20 +110,12 @@ def prompt_trigger_consent(
         plugin=plugin, effective=effective, role=role, auth=auth,
         clearance=clearance)
 
-    # v0.112.0 (elevenlabs#2): register this prompt as an OPEN member of the
-    # plugin's consent ROUND before the keyboard posts — settlement is
-    # evaluated over the round ledger (all asked prompts decided), never
-    # over ack state (a denial persists no ack, so ack counting can never
-    # settle a deny-last round — impl review r1). The returned NONCE fences
-    # this keyboard's deny/expiry callbacks: a superseded keyboard's late
-    # expiry can never decide a re-prompted member (impl r3).
-    setup_nonce = ""
-    try:
-        import plugin_setup_episodes
-        setup_nonce = plugin_setup_episodes.register_prompt(
-            plugin=plugin, artifact_id=artifact_id, identity=identity)
-    except Exception:  # noqa: BLE001
-        logger.exception("setup-round prompt feed failed (plugin=%s)", plugin)
+    # v0.112.0 (elevenlabs#2): the plugin's consent ROUND membership was
+    # SEALED by the reconciler (`plugin_setup_episodes.open_round`, one
+    # yield-free batch per plugin BEFORE any keyboard posts — impl r4); the
+    # caller threads this prompt's NONCE in via ``setup_nonce`` so a
+    # superseded keyboard's late deny/expiry can never decide a
+    # re-prompted member.
 
     def _on_commit_sync(idx: int, meta: dict) -> None:
         # Telegram callback, IMMEDIATELY after a successful commit (no await
@@ -223,6 +216,14 @@ def prompt_trigger_consent(
                             f"/webhook/{effective} failed — run "
                             "plugin_verify",
                         )
+                # impl r4: wake the setup worker — either the settlement
+                # above created an episode, or a previously-gated pending
+                # episode may now see its routes live post-reconcile.
+                try:
+                    import plugin_setup_episodes
+                    plugin_setup_episodes.kick()
+                except Exception:  # noqa: BLE001
+                    pass
             else:
                 await channel.edit_dm_message(
                     chat_id, message_id,

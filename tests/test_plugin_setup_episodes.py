@@ -91,8 +91,13 @@ async def _drain_pending(state):
 
 
 def _prompt(plugin="elevenlabs", artifact="art-1", identity="id-a"):
-    return pse.register_prompt(plugin=plugin, artifact_id=artifact,
-                               identity=identity)
+    return pse.open_round(plugin=plugin, artifact_id=artifact,
+                          identities=[identity]).get(identity, "")
+
+
+def _open(identities, plugin="elevenlabs", artifact="art-1"):
+    return pse.open_round(plugin=plugin, artifact_id=artifact,
+                          identities=identities)
 
 
 async def _decide(plugin="elevenlabs", artifact="art-1", identity="id-a",
@@ -121,8 +126,7 @@ async def test_single_prompt_approve_settles(wired):
 
 @pytest.mark.asyncio
 async def test_round_waits_for_all_members(wired):
-    _prompt(identity="id-a")
-    _prompt(identity="id-b")
+    _open(["id-a", "id-b"])
     await _decide(identity="id-a")
     assert pse.episodes() == []           # id-b still open
     await _decide(identity="id-b", gen="g2")
@@ -136,8 +140,7 @@ async def test_mixed_round_settles_without_dispatch(wired):
     # impl r3 all-approved gate: the deny DECIDES member b (settlement still
     # comes from the round ledger, never ack counting) but a mixed round
     # must NOT run the plugin-wide setup tool — operator note instead.
-    _prompt(identity="id-a")
-    _prompt(identity="id-b")
+    _open(["id-a", "id-b"])
     await _decide(identity="id-a", approved=True)
     assert pse.episodes() == []
     await _decide(identity="id-b", approved=False)
@@ -157,10 +160,9 @@ async def test_deny_only_round_notes_and_skips(wired):
 async def test_reprompt_reopens_member(wired):
     # expiry decided the member; the next reconcile re-prompts → the round
     # must WAIT for the fresh decision again.
-    _prompt(identity="id-a")
-    _prompt(identity="id-b")
+    _open(["id-a", "id-b"])
     await _decide(identity="id-b", approved=False)   # expired
-    _prompt(identity="id-b")                          # re-prompted
+    _prompt(identity="id-b")                          # re-prompted (merge)
     await _decide(identity="id-a", approved=True)
     assert pse.episodes() == []                       # id-b open again
     await _decide(identity="id-b", approved=True, gen="g9")
@@ -235,8 +237,7 @@ async def test_reconsent_new_generation_mints_new_episode(wired):
 async def test_round_ledger_survives_restart(wired, tmp_path, monkeypatch):
     # impl-r1: durable ACROSS the consent round — approve a, "restart"
     # (fresh module state, same store file), deny b → episode still fires.
-    _prompt(identity="id-a")
-    _prompt(identity="id-b")
+    _open(["id-a", "id-b"])
     await _decide(identity="id-a", approved=True)
     monkeypatch.setattr(pse, "_lock", None)   # simulate process restart
     monkeypatch.setattr(pse, "_kick", None)
@@ -417,3 +418,58 @@ async def test_health_issues_surface_and_decay(wired, monkeypatch):
     far_future = _time.time() + pse._HEALTH_DECAY_S + 10.0
     monkeypatch.setattr(pse, "_now", lambda: far_future)
     assert pse.health_issues() == []
+
+
+@pytest.mark.asyncio
+async def test_sealed_batch_never_settles_partially(wired):
+    # impl r4: open_round seals BOTH members before any keyboard exists —
+    # a fast approve on the first cannot settle a partial round.
+    _open(["id-a", "id-b"])
+    await _decide(identity="id-a", approved=True)
+    assert pse.episodes() == []                        # sealed: waits for b
+    await _decide(identity="id-b", approved=True, gen="g2")
+    assert len(pse.episodes("pending")) == 1
+
+
+@pytest.mark.asyncio
+async def test_reopened_subset_keeps_earlier_decisions(wired):
+    # a later batch re-prompting a subset must not erase earlier decisions.
+    _open(["id-a", "id-b"])
+    await _decide(identity="id-a", approved=True)
+    _open(["id-b"])                                    # re-prompt subset
+    await _decide(identity="id-b", approved=True, gen="g2")
+    eps = pse.episodes("pending")
+    assert len(eps) == 1
+    assert eps[0]["approved_identities"] == ["id-a#g1", "id-b#g2"]
+
+
+@pytest.mark.asyncio
+async def test_route_gate_holds_dispatch_until_live(wired, monkeypatch):
+    # impl r4 (Sol): a pending episode does not dispatch while the plugin's
+    # routes are down; a later kick after the reconcile heals dispatches.
+    live = {"v": False}
+    monkeypatch.setattr(pse, "_routes_live", lambda plugin: live["v"])
+    _prompt()
+    await _decide()
+    await _drain_pending(wired)
+    assert wired["dispatches"] == []
+    ep = pse.episodes()[0]
+    assert ep["status"] == "pending"
+    assert "waiting for live trigger route" in (ep.get("last_error") or "")
+    live["v"] = True
+    await _drain_pending(wired)                        # post-reconcile kick
+    assert len(wired["dispatches"]) == 1
+    assert pse.episodes()[0]["status"] == "dispatched"
+
+
+@pytest.mark.asyncio
+async def test_blank_feed_gen_preserves_recorded_gen(wired):
+    # impl r4 (Terra): a feed whose acks.get failed (gen="") must not
+    # overwrite the durably-recorded generation.
+    _prompt()
+    pse.record_approval_sync(plugin="elevenlabs", artifact_id="art-1",
+                             identity="id-a", gen="g7")
+    await _decide(gen="")                              # blank async feed
+    eps = pse.episodes("pending")
+    assert len(eps) == 1
+    assert eps[0]["approved_identities"] == ["id-a#g7"]

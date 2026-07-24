@@ -9,11 +9,11 @@
   (`casa.setupTool`); approving the plugin's webhook consent hands that
   setup to the responsible agent automatically — installing or updating
   such a plugin needs zero follow-up input to become fully live. The
-  hand-off is queued durably (it survives restarts anywhere between the
-  consent tap and delivery, and fires once per fully-approved consent
-  round); the agent then runs the tool and reports the outcome, and any
-  failure is reported with a manual fallback. The manual setup tool
-  remains available for recovery.
+  hand-off is queued durably through its dispatch to the agent (it
+  survives restarts up to that point and fires once per fully-approved
+  consent round); the agent then runs the tool and reports the outcome,
+  and any failure is reported with a manual fallback. The manual setup
+  tool remains available for recovery.
 
 ## [0.111.0] - 2026-07-24
 
