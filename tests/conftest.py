@@ -48,11 +48,14 @@ except ValueError:
 if not _math.isfinite(_cap_gb):
     _cap_gb = 0.0
 if _cap_gb > 0:
-    _cap_bytes = int(_cap_gb * 1024**3)
-    _soft, _hard = _resource.getrlimit(_resource.RLIMIT_AS)
-    if _cap_bytes > 0 and (_soft == _resource.RLIM_INFINITY
-                           or _soft > _cap_bytes):
-        _resource.setrlimit(_resource.RLIMIT_AS, (_cap_bytes, _hard))
+    try:
+        _cap_bytes = int(_cap_gb * 1024**3)
+        _soft, _hard = _resource.getrlimit(_resource.RLIMIT_AS)
+        if _cap_bytes > 0 and (_soft == _resource.RLIM_INFINITY
+                               or _soft > _cap_bytes):
+            _resource.setrlimit(_resource.RLIMIT_AS, (_cap_bytes, _hard))
+    except (OverflowError, ValueError, OSError):
+        pass  # unrepresentable override — run uncaged rather than not at all
 
 
 # ---------------------------------------------------------------------------
