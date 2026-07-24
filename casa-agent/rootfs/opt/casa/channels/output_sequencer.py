@@ -463,6 +463,7 @@ class OutputSequencer:
         edit_message: EditMessage,
         send_message_markup: SendMessageMarkup | None = None,
         edit_message_markup: EditMessageMarkup | None = None,
+        send_paged: SendMessage | None = None,
         _now: Callable[[], float] = time.monotonic,
         _sleep: Callable[[float], Awaitable[None]] | None = None,
         slot_hold_s: float = _SLOT_HOLD_S,
@@ -479,6 +480,11 @@ class OutputSequencer:
         # always injects via the driver's _ensure_sequencer wiring).
         self._send_message_markup = send_message_markup
         self._edit_message_markup = edit_message_markup
+        # v0.109.0 (G5): paged rich sender for the terminal completion post —
+        # a summary over the render caps ships as several rendered pages
+        # inside ONE serialized write (never raw markdown). Optional: absent ⇒
+        # completion posts through the ordinary one-message ``send_message``.
+        self._send_paged = send_paged
         self._now = _now
         self._sleep = _sleep or _default_sleep
         self._slot_hold_s = slot_hold_s
@@ -1085,8 +1091,22 @@ class OutputSequencer:
         text through the single writer even though the terminal latch is set — it
         IS the terminal message every other post is forbidden to land below. No
         other caller may post post-terminal; :meth:`post_platform_notice`
-        discards under the latch."""
+        discards under the latch.
+
+        v0.109.0 (G5): when a paged sender is injected, the completion posts
+        through it — an over-cap summary becomes several rendered pages, all
+        inside THIS one serialized write (an indivisible batch; nothing can
+        interleave). The paged sender returns the LAST page's message_id —
+        the correct high-water anchor."""
         async with self._serialized():
+            if self._send_paged is not None:
+                self._seal_narration_locked()
+                mid = await _maybe_await(self._send_paged(self.topic_id, text))
+                if mid is not None and (
+                    self._high_water is None or mid > self._high_water
+                ):
+                    self._high_water = mid
+                return mid
             return await self._post_notice_locked(text, None)
 
     async def _post_notice_locked(

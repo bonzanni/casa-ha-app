@@ -146,6 +146,7 @@ async def test_interaction_violated_appends_violation_line_to_summary(
 
     tch = MagicMock()
     tch.send_to_topic = AsyncMock()
+    tch.send_response_to_topic = AsyncMock()
     tch.close_topic = AsyncMock()
     cm = MagicMock()
     cm.get.return_value = tch
@@ -160,8 +161,8 @@ async def test_interaction_violated_appends_violation_line_to_summary(
         artifacts=[], next_steps=[], driver=None,
     )
 
-    tch.send_to_topic.assert_awaited_once()
-    posted_text = tch.send_to_topic.await_args.args[1]
+    tch.send_response_to_topic.assert_awaited_once()  # v0.109.0 rich summary
+    posted_text = tch.send_response_to_topic.await_args.args[1]
     assert "all done" in posted_text
     assert "review" in posted_text.lower()
 
@@ -184,6 +185,7 @@ async def test_no_interaction_violated_flag_omits_violation_line(
 
     tch = MagicMock()
     tch.send_to_topic = AsyncMock()
+    tch.send_response_to_topic = AsyncMock()
     tch.close_topic = AsyncMock()
     cm = MagicMock()
     cm.get.return_value = tch
@@ -198,8 +200,8 @@ async def test_no_interaction_violated_flag_omits_violation_line(
         artifacts=[], next_steps=[], driver=None,
     )
 
-    tch.send_to_topic.assert_awaited_once()
-    posted_text = tch.send_to_topic.await_args.args[1]
+    tch.send_response_to_topic.assert_awaited_once()  # v0.109.0 rich summary
+    posted_text = tch.send_response_to_topic.await_args.args[1]
     assert posted_text == "Engagement completed. Summary:\nall done"
 
 

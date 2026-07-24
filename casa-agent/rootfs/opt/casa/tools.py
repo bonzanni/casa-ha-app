@@ -4963,10 +4963,21 @@ async def _finalize_engagement(
                             "failed: %s", engagement.id[:8], exc,
                         )
                 if not posted_via_sequencer:
-                    await tch.send_to_topic(
-                        engagement.topic_id,
-                        summary_text,
-                    )
+                    # v0.109.0 (G2/G5): executor completion summaries are
+                    # markdown-heavy — render them, paginating past the
+                    # 4096/100-entity caps (the in_casa configurator path was
+                    # the dominant literal-``**`` topic surface). Channels
+                    # without the paged rich sender keep the plain send.
+                    if hasattr(tch, "send_response_to_topic"):
+                        await tch.send_response_to_topic(
+                            engagement.topic_id,
+                            summary_text,
+                        )
+                    else:
+                        await tch.send_to_topic(
+                            engagement.topic_id,
+                            summary_text,
+                        )
             except Exception as exc:  # noqa: BLE001
                 logger.warning(
                     "finalize engagement %s: send_to_topic failed: %s",

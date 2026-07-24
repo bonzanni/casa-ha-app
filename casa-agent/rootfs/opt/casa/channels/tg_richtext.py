@@ -155,10 +155,21 @@ _TABLE_SEP_CELL_RE = re.compile(r"\s*:?-{3,}:?\s*")
 
 
 def _is_table_block(stripped_rows: list[str]) -> bool:
-    """CONFIDENT markdown table: header + `|---|`-style separator, consistent
-    column counts, and NO markers inside cells (a backtick, asterisk, or
-    escaped pipe makes the block ambiguous — rendering it verbatim as PRE
-    would resurrect literal markers, so it stays with the inline pass)."""
+    """CONFIDENT markdown table, two accepted shapes. Both require NO markers
+    inside cells (a backtick, asterisk, or escaped pipe makes the block
+    ambiguous — rendering it verbatim as PRE would resurrect literal markers,
+    so it stays with the inline pass). Candidate rows already start AND end
+    with ``|`` (enforced by ``_split_tables``).
+
+    1. Separatored (v0.94.0): header + ``|---|``-style separator row,
+       consistent column counts.
+    2. Separator-less (v0.109.0, deliberately NARROW — Sol+Terra design
+       round): agents often emit bordered tables without the separator row.
+       Accepted only with ALL of: >= 3 rows, consistent column count, >= 2
+       columns, and every row containing at least one non-empty cell. Prose
+       almost never yields 3+ consecutive fully-piped consistent lines; a
+       2-row run or ragged columns stays literal.
+    """
     if len(stripped_rows) < 2:
         return False
     for row in stripped_rows:
@@ -168,13 +179,19 @@ def _is_table_block(stripped_rows: list[str]) -> bool:
     def cells(row: str) -> list[str]:
         return row[1:-1].split("|")
 
-    sep = cells(stripped_rows[1])
-    if not all(_TABLE_SEP_CELL_RE.fullmatch(c) for c in sep):
-        return False
     ncols = len(cells(stripped_rows[0]))
-    if len(sep) != ncols:
+    sep = cells(stripped_rows[1])
+    if all(_TABLE_SEP_CELL_RE.fullmatch(c) for c in sep):
+        if len(sep) != ncols:
+            return False
+        return all(len(cells(row)) == ncols for row in stripped_rows)
+    # Separator-less shape.
+    if len(stripped_rows) < 3 or ncols < 2:
         return False
-    return all(len(cells(row)) == ncols for row in stripped_rows)
+    return all(
+        len(cells(row)) == ncols and any(c.strip() for c in cells(row))
+        for row in stripped_rows
+    )
 
 
 def _split_tables(text: str) -> list[tuple[str, str]]:
