@@ -818,6 +818,16 @@ class TelegramChannel(Channel):
                 kwargs: dict[str, Any] = {"url": full_url}
                 if self._webhook_secret:
                     kwargs["secret_token"] = self._webhook_secret
+                    # #214: PTB logs Bot API call parameters (incl.
+                    # secret_token) as a dict at DEBUG. RedactingFilter masks
+                    # the secret_token value by key name; registering the exact
+                    # value too covers any other path that echoes it verbatim —
+                    # belt-and-suspenders on the leak path.
+                    try:
+                        import log_redact
+                        log_redact.register_secret(self._webhook_secret)
+                    except Exception:  # noqa: BLE001 — redaction is best-effort
+                        pass
                 await app.bot.set_webhook(**kwargs)
                 logger.info(
                     "Telegram started (webhook, delivery=%s, url=%s, secret=%s)",
