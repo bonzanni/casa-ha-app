@@ -62,7 +62,12 @@ that reads that file and provisions the external service — e.g. create the
 provider's workspace secret and point its webhook/tool URL at
 `<public_url>/webhook/plg-<plugin>--<name>`. Rollback = point the provider
 back. Because an update rotates the secret, the setup tool must be
-re-runnable (idempotent provisioning, not create-once).
+re-runnable (idempotent provisioning, not create-once). The tool must be
+**argument-free**, its name must start with `setup_`, and your completion
+handoff must name it explicitly — the configurator's install/update
+recipes hand it back to the engager to run automatically
+(`run_plugin_setup_tool`), and that contract only admits argument-free
+idempotent tools.
 
 ## What the webhook turn can — and cannot — do
 

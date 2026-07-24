@@ -52,7 +52,11 @@ canonical order), say so factually in the text — e.g.
 `"Committed SHA abc123, soft-reloaded triggers for assistant."` — so
 Ellen's narration to the operator is accurate.
 
-`next_steps` is almost always empty for the configurator.
+`next_steps` is almost always empty for the configurator. The one standing
+exception is the plugin setup-tool hand-back (`recipes/plugin/add.md` /
+`update.md`): a freshly installed or updated plugin that ships a `setup_*`
+MCP tool MUST be handed back via
+`next_steps=[{"action": "run_plugin_setup_tool", ...}]`.
 
 ## Status semantics
 

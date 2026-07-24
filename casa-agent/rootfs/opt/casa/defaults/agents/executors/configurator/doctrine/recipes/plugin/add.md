@@ -74,6 +74,45 @@ specialist is never going to declare it, the plugin simply stays pending —
 that is a valid end state, not an error). Report the outcome and
 `emit_completion(...)`.
 
+## Setup-tool hand-back — MANDATORY when the plugin ships one
+
+Some plugins ship an MCP **setup tool** (naming convention `setup_*`, e.g.
+`setup_elevenlabs_voicemail`) that (re)points an external service at Casa —
+typically writing a freshly-minted per-trigger secret into the external
+caller's config. Install/update and consent re-approval mint FRESH secrets,
+so until the setup tool runs the external side still holds stale credentials
+and the integration is dead — even though this install "succeeded". The
+operator must never need to remember a follow-up incantation.
+
+You cannot run it yourself: plugin tools surface only on the plugin's
+target agents, never in this engagement. Hand it back instead:
+
+1. **Detect.** The plugin-developer completion handoff is the authoritative
+   source when this install follows one (it names the setup tool). Otherwise
+   check the plugin's manifest `description`/README, or Grep the published
+   artifact (`/config/plugins/store/<name>/<artifact-id>/`) server source
+   for an MCP tool named `setup_*`. If you cannot establish that a setup
+   tool exists, hand back nothing — NEVER guess a tool name.
+2. **Hand back.** Your `emit_completion` MUST then carry ONE `next_steps`
+   entry PER setup tool:
+   `{"action": "run_plugin_setup_tool", "plugin": "<registry name>",
+   "tool": "<setup-tool name>", "targets": [<plugin targets>],
+   "consent_pending": <bool>}`,
+   and the completion `text` must state that the integration is NOT live
+   until the setup tool has run. Set `consent_pending: true` only when a
+   plugin-declared trigger is still awaiting the operator's consent ack at
+   completion time (normally false — the Approve tap resumes this
+   engagement before you get here).
+
+Setup tools in this contract are **argument-free and idempotent** (that is
+the plugin-developer authoring doctrine); a tool that demands arguments is
+not a valid hand-back target — report it in `text` instead of emitting the
+next-step. Wiring is global to the plugin, so it runs ONCE, not per target.
+The engager runs the tool immediately on receiving the completion — no
+operator ask; the install/consent that started this engagement already
+authorizes the wiring. Plugins without a setup tool: `next_steps` stays
+empty as usual.
+
 A plugin registry entry a specialist's install/upgrade OWNS (registry name
 `<slug>.<name>`) can never be managed through this recipe or `remove.md` /
 `update.md` / an assign-unassign step: `plugin_add` itself can't collide with
