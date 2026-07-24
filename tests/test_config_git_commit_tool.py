@@ -67,6 +67,79 @@ class TestConfigGitCommitTool:
         assert "git broke" in payload["message"]
 
 
+class TestConfigGitCommitReloadObligation:
+    """#231/#222 (v0.114.0): config_git_commit arms the G-2 reload obligation
+    (_ENGAGEMENTS_PENDING_RELOAD) on a real SHA — EXCEPT when the commit merely
+    persists a plugin change that _reload_and_verify_targets already activated
+    in-process (engagement in _ENGAGEMENTS_PREACTIVATED) AND the commit is
+    confined to the plugin registry. A commit that also touches agents/ or
+    policies/ still arms, so a genuinely-unactivated change is never masked."""
+
+    @pytest.fixture
+    def _bound_engagement(self):
+        import types
+        import tools as tools_mod
+        eng = types.SimpleNamespace(id="c" * 32)
+        tok = tools_mod.engagement_var.set(eng)
+        tools_mod._ENGAGEMENTS_PENDING_RELOAD.discard(eng.id)
+        tools_mod._ENGAGEMENTS_PREACTIVATED.discard(eng.id)
+        try:
+            yield eng
+        finally:
+            tools_mod.engagement_var.reset(tok)
+            tools_mod._ENGAGEMENTS_PENDING_RELOAD.discard(eng.id)
+            tools_mod._ENGAGEMENTS_PREACTIVATED.discard(eng.id)
+
+    async def test_plain_commit_arms_obligation(
+            self, configurator_origin, _bound_engagement):
+        import tools as tools_mod
+        from tools import config_git_commit
+        with patch("config_git.commit_config", return_value="sha1"), \
+                patch("config_git.changed_paths",
+                      return_value=["agents/assistant/runtime.yaml"]):
+            await config_git_commit.handler({"message": "edit persona"})
+        assert _bound_engagement.id in tools_mod._ENGAGEMENTS_PENDING_RELOAD
+
+    async def test_preactivated_plugins_only_commit_does_not_arm(
+            self, configurator_origin, _bound_engagement):
+        import tools as tools_mod
+        from tools import config_git_commit
+        tools_mod._ENGAGEMENTS_PREACTIVATED.add(_bound_engagement.id)
+        with patch("config_git.commit_config", return_value="sha2"), \
+                patch("config_git.changed_paths",
+                      return_value=["plugins/registry.json"]):
+            await config_git_commit.handler({"message": "persist plugin"})
+        assert _bound_engagement.id not in tools_mod._ENGAGEMENTS_PENDING_RELOAD
+        # The pre-activation credit is consumed by the persist commit.
+        assert _bound_engagement.id not in tools_mod._ENGAGEMENTS_PREACTIVATED
+
+    async def test_preactivated_mixed_commit_still_arms(
+            self, configurator_origin, _bound_engagement):
+        """Terra: a single commit carrying BOTH plugin registry AND an agent
+        YAML edit must still arm — the YAML change was not activated."""
+        import tools as tools_mod
+        from tools import config_git_commit
+        tools_mod._ENGAGEMENTS_PREACTIVATED.add(_bound_engagement.id)
+        with patch("config_git.commit_config", return_value="sha3"), \
+                patch("config_git.changed_paths",
+                      return_value=["plugins/registry.json",
+                                    "agents/assistant/runtime.yaml"]):
+            await config_git_commit.handler({"message": "plugin + persona"})
+        assert _bound_engagement.id in tools_mod._ENGAGEMENTS_PENDING_RELOAD
+
+    async def test_preactivated_but_changed_paths_empty_arms_failsafe(
+            self, configurator_origin, _bound_engagement):
+        """A git error in changed_paths returns [] — fail safe by ARMING
+        rather than wrongly suppressing the obligation."""
+        import tools as tools_mod
+        from tools import config_git_commit
+        tools_mod._ENGAGEMENTS_PREACTIVATED.add(_bound_engagement.id)
+        with patch("config_git.commit_config", return_value="sha4"), \
+                patch("config_git.changed_paths", return_value=[]):
+            await config_git_commit.handler({"message": "persist plugin"})
+        assert _bound_engagement.id in tools_mod._ENGAGEMENTS_PENDING_RELOAD
+
+
 class TestConfigGitCommitRoleGuard:
     """Bug 7 (v0.14.6): config_git_commit must refuse non-configurator
     callers even if their runtime.yaml::tools.allowed lists the tool."""

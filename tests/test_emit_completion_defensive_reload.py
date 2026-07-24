@@ -28,11 +28,12 @@ pytestmark = pytest.mark.asyncio
 
 @pytest.fixture
 def _drain_pending_set():
-    """Tests share module-level state — drain the set per-test so the
+    """Tests share module-level state — drain the sets per-test so the
     engagement-ids from earlier cases don't leak into later ones."""
     import tools as tools_mod
     yield
     tools_mod._ENGAGEMENTS_PENDING_RELOAD.clear()
+    tools_mod._ENGAGEMENTS_PREACTIVATED.clear()
 
 
 async def test_committed_yaml_no_reload_force_calls_casa_reload(
@@ -89,6 +90,14 @@ async def test_committed_yaml_no_reload_force_calls_casa_reload(
         f"expected exactly one forced casa_reload, got {len(forced_calls)}"
     )
 
+    # #231/#222: the forced reload must carry a SCOPE. A scopeless
+    # casa_reload({}) returns kind=scope_required — a no-op exactly when the
+    # guard is supposed to activate the change. 'full' is the documented
+    # catch-all when the guard cannot know what was committed.
+    assert forced_calls == [{"scope": "full"}], (
+        f"forced reload must pass scope='full', got: {forced_calls}"
+    )
+
     # WARNING must mention the engagement id and the guard reason.
     guard_lines = [
         r for r in caplog.records
@@ -104,6 +113,68 @@ async def test_committed_yaml_no_reload_force_calls_casa_reload(
     # Set must be drained so a subsequent emit_completion (idempotent
     # re-call) doesn't re-trigger.
     assert rec.id not in _ENGAGEMENTS_PENDING_RELOAD
+
+
+async def test_preactivated_plugin_add_has_no_pending_obligation(
+    tmp_path, caplog, monkeypatch, _drain_pending_set,
+):
+    """#222/#231: a plugin mutation self-sequences its reload+reconcile
+    in-process; config_git_commit then declines to arm the obligation for the
+    plugin-registry persist commit (tested in test_config_git_commit_tool). So
+    by emit_completion time there is NO pending obligation and the guard must
+    NOT force a reload or log its WARNING — no scary noise on every plugin
+    add. (Marker present, PENDING absent — the emit path must key on PENDING.)"""
+    import tools as tools_mod
+    from engagement_registry import EngagementRegistry
+    from tools import (
+        emit_completion, engagement_var,
+        _ENGAGEMENTS_PENDING_RELOAD,
+        init_tools,
+    )
+
+    reg = EngagementRegistry(tombstone_path=str(tmp_path / "e.json"), bus=None)
+    rec = await reg.create(
+        kind="executor", role_or_type="configurator", driver="in_casa",
+        task="t", origin={"role": "assistant", "channel": "telegram"},
+        topic_id=42,
+    )
+    init_tools(
+        channel_manager=None, bus=None,
+        specialist_registry=MagicMock(), mcp_registry=MagicMock(),
+        trigger_registry=MagicMock(), engagement_registry=reg,
+    )
+
+    # Plugin activated in-process (marker set); commit was suppressed so PENDING
+    # is NOT armed.
+    tools_mod._ENGAGEMENTS_PREACTIVATED.add(rec.id)
+    assert rec.id not in _ENGAGEMENTS_PENDING_RELOAD
+
+    forced_calls = []
+
+    async def _fake_casa_reload(_args: dict) -> dict:
+        forced_calls.append(_args)
+        return {"content": [{"type": "text", "text": '{"supervisor_status": 200}'}]}
+
+    monkeypatch.setattr("tools.casa_reload.handler", _fake_casa_reload)
+
+    token = engagement_var.set(rec)
+    try:
+        with caplog.at_level(logging.WARNING, logger="tools"):
+            await emit_completion.handler({
+                "status": "ok", "text": "done", "artifacts": [], "next_steps": [],
+            })
+    finally:
+        engagement_var.reset(token)
+
+    assert forced_calls == [], (
+        f"no pending obligation ⇒ no forced reload; got: {forced_calls}"
+    )
+    assert not [
+        r for r in caplog.records
+        if "outstanding reload obligation" in r.getMessage()
+    ], "preactivated plugin add must not log the guard WARNING"
+    # The marker is drained centrally at finalize.
+    assert rec.id not in tools_mod._ENGAGEMENTS_PREACTIVATED
 
 
 async def test_reload_already_called_skips_force_call(
