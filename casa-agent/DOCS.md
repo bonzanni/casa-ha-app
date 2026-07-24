@@ -159,6 +159,14 @@ bundled plugins (manage those through the specialist's own upgrade/uninstall).
 
 Casa exposes two transports for Home Assistant voice / generic voice clients. The HA-side integration that consumes them ships separately in `casa-ha-integration` (phase 2.4).
 
+> **`webhook_auth_enabled` is required for voice.** Both transports below are
+> fail-closed: with no webhook secret configured, every voice request is
+> rejected with `401` — the same treatment as `/invoke` and `/telegram/update`.
+> This matters because the external API port can be published, and an unsigned
+> voice turn reaches an agent that can drive Home Assistant. The companion
+> integration signs every request and cannot be configured without a secret, so
+> a working voice setup already satisfies this.
+
 - `POST /api/converse` — Server-Sent Events, per-request. Body:
   `{"prompt", "agent_role", "scope_id", "context"}`. Stream: `event:
   block` frames then `event: done`. HMAC via `X-Webhook-Signature`
@@ -180,9 +188,9 @@ enabled `ha_voice` resident's stable role and display name. The request is
 signed over an empty body with `X-Webhook-Signature`. Enable
 `webhook_auth_enabled` before using discovery; Casa then uses the optional
 `webhook_secret` override or the generated secret stored in
-`/data/webhook_secret`. When authentication is disabled, legacy voice
-transports remain compatible with unsigned turns but discovery returns the
-same generic `401` response used for a missing or invalid signature.
+`/data/webhook_secret`. When authentication is disabled, discovery **and both
+voice transports** return the same generic `401` response used for a missing or
+invalid signature — voice is fail-closed, so unsigned turns are never accepted.
 
 For Supervisor-based setup, Casa also publishes the authenticated endpoint to
 the companion integration through the `casa` discovery service. This requires

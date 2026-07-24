@@ -1,5 +1,20 @@
 # Changelog
 
+## [0.117.0] - 2026-07-24
+
+### Security
+
+- The voice endpoints (`POST /api/converse` and the `/api/converse/ws`
+  WebSocket) now reject every request when no webhook secret is configured,
+  instead of accepting unsigned ones. Because the external API port can be
+  published, an unsigned voice turn was a way to reach an agent that can drive
+  Home Assistant without any credential. Voice now behaves like `/invoke`,
+  `/telegram/update` and voice-agent discovery: no secret means the route is
+  off (`401`). **Voice requires `webhook_auth_enabled`.** The companion Home
+  Assistant integration signs every request and cannot be set up without a
+  secret, so existing voice installations are unaffected; a hand-rolled client
+  that posted unsigned turns must now sign them (#193).
+
 ## [0.116.0] - 2026-07-24
 
 ### Security

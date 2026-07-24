@@ -13,6 +13,8 @@ import pytest
 from aiohttp import web
 from aiohttp.test_utils import TestClient, TestServer
 
+from voice_auth_helpers import SigningVoiceClient, VOICE_TEST_SECRET
+
 from bus import BusMessage, MessageBus, MessageType
 from casa_core_middleware import cid_middleware
 from channels.voice.channel import VoiceChannel
@@ -81,7 +83,7 @@ async def voice_app():
     channel = VoiceChannel(
         bus=bus,
         default_agent="butler",
-        webhook_secret="",
+        webhook_secret=VOICE_TEST_SECRET,
         sse_path="/api/converse",
         ws_path="/api/converse/ws",
         agent_configs={"butler": _FakeAgentConfig()},
@@ -92,7 +94,8 @@ async def voice_app():
 
     app = web.Application(middlewares=[cid_middleware])
     channel.register_routes(app)
-    async with TestClient(TestServer(app)) as client:
+    async with TestClient(TestServer(app)) as _raw_client:
+        client = SigningVoiceClient(_raw_client)
         yield client, bus
     loop_task.cancel()
 
@@ -109,7 +112,7 @@ async def broken_voice_app(monkeypatch):
     channel = VoiceChannel(
         bus=bus,
         default_agent="butler",
-        webhook_secret="",
+        webhook_secret=VOICE_TEST_SECRET,
         sse_path="/api/converse",
         ws_path="/api/converse/ws",
         agent_configs={"butler": butler_cfg},
@@ -125,7 +128,8 @@ async def broken_voice_app(monkeypatch):
 
     app = web.Application(middlewares=[cid_middleware])
     channel.register_routes(app)
-    async with TestClient(TestServer(app)) as client:
+    async with TestClient(TestServer(app)) as _raw_client:
+        client = SigningVoiceClient(_raw_client)
         yield client, bus
 
 
@@ -165,7 +169,7 @@ async def agent_error_voice_app(tmp_path):
     voice_channel = VoiceChannel(
         bus=bus,
         default_agent="butler",
-        webhook_secret="",
+        webhook_secret=VOICE_TEST_SECRET,
         sse_path="/api/converse",
         ws_path="/api/converse/ws",
         agent_configs={"butler": cfg},
@@ -191,7 +195,8 @@ async def agent_error_voice_app(tmp_path):
 
     app = web.Application(middlewares=[cid_middleware])
     voice_channel.register_routes(app)
-    async with TestClient(TestServer(app)) as client:
+    async with TestClient(TestServer(app)) as _raw_client:
+        client = SigningVoiceClient(_raw_client)
         yield client
     loop_task.cancel()
 
@@ -394,7 +399,7 @@ async def voice_app_with_limiter(request):
     channel = VoiceChannel(
         bus=bus,
         default_agent="butler",
-        webhook_secret="",
+        webhook_secret=VOICE_TEST_SECRET,
         sse_path="/api/converse",
         ws_path="/api/converse/ws",
         agent_configs={role: _FakeAgentConfig() for role in roles},
@@ -405,7 +410,8 @@ async def voice_app_with_limiter(request):
 
     app = web.Application(middlewares=[cid_middleware])
     channel.register_routes(app)
-    async with TestClient(TestServer(app)) as client:
+    async with TestClient(TestServer(app)) as _raw_client:
+        client = SigningVoiceClient(_raw_client)
         yield client, limiter
     for task in loop_tasks:
         task.cancel()
@@ -642,7 +648,7 @@ async def voice_app_nonprefix():
     channel = VoiceChannel(
         bus=bus,
         default_agent="butler",
-        webhook_secret="",
+        webhook_secret=VOICE_TEST_SECRET,
         sse_path="/api/converse",
         ws_path="/api/converse/ws",
         agent_configs={"butler": _FakeAgentConfig()},
@@ -651,7 +657,8 @@ async def voice_app_nonprefix():
     )
     app = web.Application(middlewares=[cid_middleware])
     channel.register_routes(app)
-    async with TestClient(TestServer(app)) as client:
+    async with TestClient(TestServer(app)) as _raw_client:
+        client = SigningVoiceClient(_raw_client)
         yield client
     loop_task.cancel()
 
@@ -666,7 +673,7 @@ async def voice_app_shrinking():
     channel = VoiceChannel(
         bus=bus,
         default_agent="butler",
-        webhook_secret="",
+        webhook_secret=VOICE_TEST_SECRET,
         sse_path="/api/converse",
         ws_path="/api/converse/ws",
         agent_configs={"butler": _FakeAgentConfig()},
@@ -675,7 +682,8 @@ async def voice_app_shrinking():
     )
     app = web.Application(middlewares=[cid_middleware])
     channel.register_routes(app)
-    async with TestClient(TestServer(app)) as client:
+    async with TestClient(TestServer(app)) as _raw_client:
+        client = SigningVoiceClient(_raw_client)
         yield client
     loop_task.cancel()
 
@@ -694,7 +702,7 @@ async def voice_app_stalling(monkeypatch):
     channel = VoiceChannel(
         bus=bus,
         default_agent="butler",
-        webhook_secret="",
+        webhook_secret=VOICE_TEST_SECRET,
         sse_path="/api/converse",
         ws_path="/api/converse/ws",
         agent_configs={"butler": _FakeAgentConfig()},
@@ -703,7 +711,8 @@ async def voice_app_stalling(monkeypatch):
     )
     app = web.Application(middlewares=[cid_middleware])
     channel.register_routes(app)
-    async with TestClient(TestServer(app)) as client:
+    async with TestClient(TestServer(app)) as _raw_client:
+        client = SigningVoiceClient(_raw_client)
         yield client
     loop_task.cancel()
 

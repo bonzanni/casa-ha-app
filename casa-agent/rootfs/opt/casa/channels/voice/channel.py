@@ -404,8 +404,24 @@ class VoiceChannel(Channel):
     # --- HMAC ---------------------------------------------------------
 
     def _verify(self, request: web.Request, body: bytes) -> bool:
+        """HMAC-SHA256 of *body* vs ``X-Webhook-Signature``. FAIL-CLOSED.
+
+        #193 (v0.117.0): with no configured secret this returned ``True``, so
+        the SSE turn path and the WS upgrade accepted UNSIGNED requests. The
+        external ``:18065`` server block proxies these routes, so with webhook
+        auth off an attacker could POST an arbitrary prompt to ``/api/converse``
+        and reach the butler (which drives Home Assistant). No secret now means
+        the voice routes are OFF, matching ``/invoke``, ``/telegram/update`` and
+        the voice-agent catalog (which was already fail-closed here).
+
+        Safe for the first-party LAN path: the companion `casa-ha-integration`
+        signs EVERY request and cannot even be configured without a secret —
+        both of its config flows require one and validate it against the
+        already-fail-closed ``/api/voice/agents`` catalog, so a working voice
+        install always has a secret.
+        """
         if not self._webhook_secret:
-            return True
+            return False
         sig = request.headers.get("X-Webhook-Signature", "")
         expected = hmac.new(
             self._webhook_secret.encode(), body, hashlib.sha256,
