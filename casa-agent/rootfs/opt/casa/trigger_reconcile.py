@@ -298,6 +298,18 @@ async def reconcile_plugin_triggers(
             trigger_registry.replace_plugin_overlay({})
             raise
         trigger_registry.replace_plugin_overlay(desired.overlay)
+        # v0.112.0 (impl r5, Terra): the overlay is now live — wake the
+        # setup-episode worker so any pending episode gated on a
+        # previously-down route dispatches. This fires on EVERY reconcile
+        # (consent-driven or a plain casa_reload_triggers heal), not just the
+        # consent finish hook — otherwise an episode whose approval-time
+        # reconcile failed would wait indefinitely for a later heal to notice
+        # it. Cheap (an Event.set); the worker re-checks routes_live itself.
+        try:
+            import plugin_setup_episodes
+            plugin_setup_episodes.kick()
+        except Exception:  # noqa: BLE001 — never break a reconcile on this
+            pass
         # Prompts fire INSIDE the lock (Sol shipB-r2 P1-1): keyboard
         # registration is then ordered BEFORE any later reconcile can
         # acquire the lock — so trigger_ack_revoke's final

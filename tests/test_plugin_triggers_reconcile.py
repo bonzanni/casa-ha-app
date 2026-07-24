@@ -1125,3 +1125,20 @@ async def test_trigger_ack_revoke_unroutes_even_if_reconcile_fails(
     assert payload["ok"] is True
     assert registry.get_webhook_target(eff) is None
     assert not acks.is_acked(_ident_default())
+
+
+async def test_reconcile_kicks_setup_worker(monkeypatch, tmp_path):
+    # v0.112.0 (impl r5, Terra): EVERY reconcile that publishes the overlay
+    # wakes the setup-episode worker so a pending episode gated on a
+    # previously-down route dispatches once the route heals — not only the
+    # consent finish hook. A plain (prompt=False, no consent) reconcile must
+    # still kick.
+    import plugin_setup_episodes
+    kicked = {"n": 0}
+    monkeypatch.setattr(plugin_setup_episodes, "kick",
+                        lambda: kicked.__setitem__("n", kicked["n"] + 1))
+    registry = _registry()
+    await _reconcile(
+        registry, plugins_by_target={}, role_configs={}, acks=TriggerAckStore(path=tmp_path / "acks.json"),
+        tmp_path=tmp_path, prompt=False)
+    assert kicked["n"] >= 1

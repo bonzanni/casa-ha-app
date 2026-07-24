@@ -209,6 +209,21 @@ def open_round(*, plugin: str, artifact_id: str,
             data["rounds"][plugin] = rnd
         nonces: dict[str, str] = {}
         for identity in identities:
+            existing = rnd["members"].get(identity)
+            # impl r5 (Terra): a member that is ALREADY open keeps its nonce.
+            # A reconcile re-firing a prompt while its keyboard is still live
+            # DEDUPES onto that keyboard (coordinator.register_challenge
+            # returns created=False, retaining the ORIGINAL finish callback
+            # and its nonce) — minting a fresh nonce here would desync the
+            # ledger from that retained callback, so the keyboard's eventual
+            # deny/expiry would be rejected as stale and the member would
+            # never decide. A NEW member, or one being RE-OPENED after a
+            # terminal decision (its old keyboard is gone, a fresh keyboard
+            # with our new callback+nonce posts), gets a fresh nonce.
+            if isinstance(existing, dict) and existing.get("state") == "open" \
+                    and existing.get("nonce"):
+                nonces[identity] = existing["nonce"]
+                continue
             nonce = uuid.uuid4().hex[:8]
             rnd["members"][identity] = {"state": "open", "nonce": nonce}
             nonces[identity] = nonce

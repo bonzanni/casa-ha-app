@@ -171,12 +171,14 @@ async def test_reprompt_reopens_member(wired):
 
 @pytest.mark.asyncio
 async def test_stale_nonce_expiry_ignored(wired):
-    # impl r3: a superseded keyboard's late expiry (old nonce) must not
-    # decide the re-prompted member; the fresh keyboard's decision governs.
+    # impl r3/r5: after a member is decided (expired) and RE-OPENED with a
+    # fresh keyboard/nonce, a LATE callback from the FIRST keyboard (old
+    # nonce) must not re-decide the member; the fresh keyboard governs.
     n1 = _prompt(identity="id-a")
-    n2 = _prompt(identity="id-a")                     # re-prompt, new nonce
+    await _decide(identity="id-a", approved=False, nonce=n1)  # keyboard 1 expires
+    n2 = _prompt(identity="id-a")                     # re-prompt, fresh nonce
     assert n1 and n2 and n1 != n2
-    await _decide(identity="id-a", approved=False, nonce=n1)  # stale expiry
+    await _decide(identity="id-a", approved=False, nonce=n1)  # STALE late cb
     rounds = pse._load()["rounds"]
     assert rounds["elevenlabs"]["members"]["id-a"]["state"] == "open"
     await _decide(identity="id-a", approved=True, nonce=n2)
@@ -473,3 +475,29 @@ async def test_blank_feed_gen_preserves_recorded_gen(wired):
     eps = pse.episodes("pending")
     assert len(eps) == 1
     assert eps[0]["approved_identities"] == ["id-a#g7"]
+
+
+@pytest.mark.asyncio
+async def test_open_round_preserves_open_member_nonce(wired):
+    # impl r5 (Terra): a re-seal of an ALREADY-OPEN member keeps its nonce
+    # (its consent keyboard is deduped and still carries the original
+    # callback+nonce) — so a later deny/expiry from that keyboard is NOT
+    # rejected as stale.
+    n1 = _open(["id-a"])["id-a"]
+    n2 = _open(["id-a"])["id-a"]      # reconcile re-fires while keyboard live
+    assert n1 == n2
+    # the retained keyboard's expiry (carrying n1) must decide the member
+    await _decide(identity="id-a", approved=False, nonce=n1)
+    assert any("NOT run automatically" in n for n in wired["notes"])
+
+
+@pytest.mark.asyncio
+async def test_open_round_fresh_nonce_after_decision(wired):
+    # a member RE-OPENED after a terminal decision (old keyboard gone, fresh
+    # keyboard posts) gets a FRESH nonce.
+    n1 = _open(["id-a"])["id-a"]
+    await _decide(identity="id-a", approved=False, nonce=n1)   # expired
+    n2 = _open(["id-a"])["id-a"]                                # re-prompt
+    assert n2 != n1
+    assert pse._load()["rounds"]["elevenlabs"]["members"]["id-a"]["state"] \
+        == "open"
