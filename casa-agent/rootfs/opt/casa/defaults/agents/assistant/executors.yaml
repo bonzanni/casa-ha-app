@@ -14,7 +14,7 @@ executors:
       and restores the built-in default — it is not a persona-content operation). Personas
       have NO upgrade and NO uninstall; apply operates on an installed persona, not a fresh
       repo fetch. Repository locator shape owner/repo@ref, e.g.
-      "install the finance specialist from bonzanni/casa-finance-specialist@v0.1.0". Engage the
+      "install the finance specialist from bonzanni/casa-specialist-finance@v0.1.0". Engage the
       configurator via engage_executor(executor_type='configurator', ...) using the `brief`
       envelope described below — do not hand-construct a bare task string. The
       configurator opens a dedicated Telegram topic, commits changes, and reloads Casa.

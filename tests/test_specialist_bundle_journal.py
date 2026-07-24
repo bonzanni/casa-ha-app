@@ -29,7 +29,7 @@ def _read_registry(path):
 
 def _finance_entry():
     return owned_entry(name="finance.finance", owner="specialist:finance",
-                       manifest_name="finance", repo="bonzanni/casa-finance-specialist")
+                       manifest_name="finance", repo="bonzanni/casa-specialist-finance")
 
 
 # --------------------------------------------------------------------------
@@ -228,7 +228,7 @@ def test_reconcile_boot_rolls_back_inprogress_journal(tmp_path):
     (slug_dir / "active.yaml").write_text("mid-mutation", encoding="utf-8")
     (slug_dir / "desired.yaml").write_text("mid-mutation-desired", encoding="utf-8")
 
-    ack_record = {"component_id": "casa-mtg-specialist", "version": "0.2.0",
+    ack_record = {"component_id": "casa-specialist-mtg", "version": "0.2.0",
                   "component_checksum": "root-digest", "slug": "mtg", "ts": 1}
 
     journal.begin(
@@ -537,7 +537,7 @@ def test_bundletxn_rollback_disk_restores_registry_tuple_files_and_acks(tmp_path
     (slug_dir / "active.yaml").write_text("mid-mutation", encoding="utf-8")
 
     before_entry = owned_entry()
-    ack_record = {"component_id": "casa-mtg-specialist", "version": "0.2.0",
+    ack_record = {"component_id": "casa-specialist-mtg", "version": "0.2.0",
                   "component_checksum": "root-digest", "slug": "mtg", "ts": 1}
 
     txn = journal.BundleTxn(

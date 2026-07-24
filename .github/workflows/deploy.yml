@@ -3,14 +3,14 @@ name: Deploy
 # Container image pipeline for the Casa Agent app.
 #
 # Pull requests touching the app get a validation build (no push). Pushes to
-# master build per-arch images, push them to GHCR (Cosign-signed via the
+# main build per-arch images, push them to GHCR (Cosign-signed via the
 # builder actions), publish the multi-arch manifest — the generic name
 # config.yaml's `image:` points at — and then cut the vX.Y.Z git tag +
 # GitHub Release with the matching CHANGELOG section as notes.
 
 on:
   push:
-    branches: [master]
+    branches: [main]
     paths:
       - "casa-agent/**"
       - ".github/workflows/deploy.yml"

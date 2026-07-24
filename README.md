@@ -9,7 +9,7 @@
 [![Open your Home Assistant instance and show the app store with this repository pre-filled.](https://my.home-assistant.io/badges/supervisor_store.svg)](https://my.home-assistant.io/redirect/supervisor_store/?repository_url=https%3A%2F%2Fgithub.com%2Fbonzanni%2Fcasa-ha-app)
 
 [![QA](https://github.com/bonzanni/casa-ha-app/actions/workflows/qa.yml/badge.svg)](https://github.com/bonzanni/casa-ha-app/actions/workflows/qa.yml)
-[![Version](https://img.shields.io/badge/dynamic/yaml?url=https%3A%2F%2Fraw.githubusercontent.com%2Fbonzanni%2Fcasa-ha-app%2Fmaster%2Fcasa-agent%2Fconfig.yaml&query=%24.version&label=version&color=blue)](casa-agent/CHANGELOG.md)
+[![Version](https://img.shields.io/badge/dynamic/yaml?url=https%3A%2F%2Fraw.githubusercontent.com%2Fbonzanni%2Fcasa-ha-app%2Fmain%2Fcasa-agent%2Fconfig.yaml&query=%24.version&label=version&color=blue)](casa-agent/CHANGELOG.md)
 [![License: MIT](https://img.shields.io/badge/license-MIT-green.svg)](LICENSE)
 ![Supports aarch64 Architecture](https://img.shields.io/badge/aarch64-yes-green.svg)
 ![Supports amd64 Architecture](https://img.shields.io/badge/amd64-yes-green.svg)

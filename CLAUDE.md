@@ -42,10 +42,10 @@ The `tests/conftest.py` auto-adds the code root to `sys.path`.
 > `systemd-run --user --scope -p MemoryMax=8G -p MemorySwapMax=2G venv_test/bin/pytest …`
 
 ## Release flow
-1. Branch `feat/vX.Y.Z-<desc>` off `master`.
+1. Branch `feat/vX.Y.Z-<desc>` off `main`.
 2. Bump `version:` in `casa-agent/config.yaml` and prepend a `casa-agent/CHANGELOG.md` entry.
 3. Commit `release: vX.Y.Z (<summary>)`, push, open a PR, **squash-merge** once CI is green.
-4. Merging to master auto-publishes the GHCR images and creates the `vX.Y.Z` tag +
+4. Merging to main auto-publishes the GHCR images and creates the `vX.Y.Z` tag +
    GitHub Release from the changelog entry (`deploy.yml`) — no manual tagging.
 - **Removing an app option?** Also append its key to `DEPRECATED_OPTION_KEYS` in
   `casa-agent/rootfs/etc/s6-overlay/scripts/setup-configs.sh` (the `deprecated-options-prune`
@@ -78,13 +78,13 @@ current-state spec).
 ## Working norms
 - **Verify against whole files, not thin grep slices** — read around a symbol before
   asserting behaviour.
-- Don't commit or push unless asked; if on `master`, branch first.
+- Don't commit or push unless asked; if on `main`, branch first.
 
 ## Repo hygiene & publishing norms
 This public repo is the storefront for the Casa app (HA renamed "add-ons" → "apps"
 mid-2026). Keep it publish-ready at all times:
-- **Green master.** Ship-fast doesn't wait for CI, but after pushing check the previous
-  QA run (`gh run list --workflow qa.yml --branch master --limit 1`); a red master is
+- **Green main.** Ship-fast doesn't wait for CI, but after pushing check the previous
+  QA run (`gh run list --workflow qa.yml --branch main --limit 1`); a red main is
   stop-the-line before the next release — the e2e tiers cover what the local unit gate
   can't (see the v0.52–v0.57 red streak).
 - **Branches die on merge.** GitHub auto-deletes the remote head; delete the local

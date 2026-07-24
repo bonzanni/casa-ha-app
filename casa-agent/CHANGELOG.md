@@ -1,5 +1,16 @@
 # Changelog
 
+## [0.106.0] - 2026-07-24
+
+### Changed
+
+- Repository naming is now uniform across the Casa ecosystem: specialist
+  repositories follow `casa-specialist-<name>` (matching the existing
+  `casa-plugin-<name>` convention), and all repositories use `main` as their
+  default branch. Old repository names keep working — GitHub redirects them —
+  but examples in the docs and the assistant's install guidance now show the
+  new names.
+
 ## [0.105.0] - 2026-07-24
 
 ### Added

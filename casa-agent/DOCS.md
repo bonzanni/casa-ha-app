@@ -755,7 +755,7 @@ Specialists are no longer bundled with the app image — each one (the
 `finance` specialist, a Magic — The Gathering rules judge, and any future
 ones) lives in its own repository and is installed on demand through the
 configurator. Ask Ellen, for example: *"Install the finance specialist
-from casa-org/casa-finance-specialist"*.
+from casa-org/casa-specialist-finance"*.
 
 What happens:
 
