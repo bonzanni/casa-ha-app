@@ -293,7 +293,7 @@ def test_clean_image_install_of_the_exported_finance_bundle_succeeds(tmp_path: P
     monkeypatch.setattr("specialist_install.resolve_and_fetch", _fake_resolve_and_fetch)
 
     result = inspect_specialist_repo(
-        "casa-org/casa-finance-specialist", "v0.1.0",
+        "casa-org/casa-specialist-finance", "v0.1.0",
         staging_root=tmp_path / "staging", installed_index=InstalledSpecialistIndex(
             specialists_dir=str(tmp_path / "specialists")),
         receipts_dir=tmp_path / "receipts",

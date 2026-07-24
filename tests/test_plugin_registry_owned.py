@@ -16,10 +16,10 @@ def _entry(name="mtg.mtg", owner="specialist:mtg", manifest_name="mtg",
     targets = targets if targets is not None else ["specialist:mtg"]
     e = {
         "name": name,
-        "source": {"type": "github", "repo": "bonzanni/casa-mtg-specialist",
+        "source": {"type": "github", "repo": "bonzanni/casa-specialist-mtg",
                    "ref": "v0.2.0", "revision": REV, "subdir": "plugins/mtg"},
         "artifact_id": compute_artifact_id(
-            repo="bonzanni/casa-mtg-specialist", revision=REV,
+            repo="bonzanni/casa-specialist-mtg", revision=REV,
             subdir="plugins/mtg", name=name),
         "version": "1.0.0", "targets": targets,
     }
@@ -43,7 +43,7 @@ def test_unowned_entry_unchanged():
     e = _entry(name="gmail", owner=None, manifest_name=None,
                targets=["resident:assistant"])
     e["artifact_id"] = compute_artifact_id(
-        repo="bonzanni/casa-mtg-specialist", revision=REV,
+        repo="bonzanni/casa-specialist-mtg", revision=REV,
         subdir="plugins/mtg", name="gmail")
     assert _entry_error(e) is None
 
@@ -57,7 +57,7 @@ def test_operator_dot_name_rejected():
 def test_owner_without_scoped_name_rejected():
     e = _entry(name="mtg", manifest_name="mtg")
     e["artifact_id"] = compute_artifact_id(
-        repo="bonzanni/casa-mtg-specialist", revision=REV,
+        repo="bonzanni/casa-specialist-mtg", revision=REV,
         subdir="plugins/mtg", name="mtg")
     assert _entry_error(e) == "owned_invariant"
 
@@ -89,7 +89,7 @@ def test_per_target_manifest_name_collision_invalidates_owned_entry():
     # with a legacy unowned "mtg" ALSO targeting specialist:mtg.
     legacy = _entry(name="mtg", owner=None, manifest_name=None)
     legacy["artifact_id"] = compute_artifact_id(
-        repo="bonzanni/casa-mtg-specialist", revision=REV,
+        repo="bonzanni/casa-specialist-mtg", revision=REV,
         subdir="plugins/mtg", name="mtg")
     entries, issues, valid = _validate_doc(_doc([legacy, _entry()]))
     assert valid
@@ -127,7 +127,7 @@ def test_owned_name_73_bytes_rejected():
     e = _entry(name=name, owner=f"specialist:{slug}", manifest_name=mname,
                targets=[f"specialist:{slug}"])
     e["artifact_id"] = compute_artifact_id(
-        repo="bonzanni/casa-mtg-specialist", revision=REV,
+        repo="bonzanni/casa-specialist-mtg", revision=REV,
         subdir="plugins/mtg", name=name)
     assert _entry_error(e) == "owned_invariant"
     # 72-byte name (39-char manifest) still valid.
@@ -136,7 +136,7 @@ def test_owned_name_73_bytes_rejected():
     ok = _entry(name=ok_name, owner=f"specialist:{slug}", manifest_name="m" * 39,
                 targets=[f"specialist:{slug}"])
     ok["artifact_id"] = compute_artifact_id(
-        repo="bonzanni/casa-mtg-specialist", revision=REV,
+        repo="bonzanni/casa-specialist-mtg", revision=REV,
         subdir="plugins/mtg", name=ok_name)
     assert _entry_error(ok) is None
 

@@ -71,7 +71,7 @@ def mk_registry(tmp_path: Path, entries: list[dict]) -> Path:
 
 def owned_entry(name="mtg.mtg", owner="specialist:mtg", manifest_name="mtg",
                 targets=None, revision: str = "git:" + "a" * 40,
-                repo: str = "bonzanni/casa-mtg-specialist",
+                repo: str = "bonzanni/casa-specialist-mtg",
                 subdir: str = "plugins/mtg", **over) -> dict:
     """A valid specialist-owned registry entry (spec §2 invariant).
 

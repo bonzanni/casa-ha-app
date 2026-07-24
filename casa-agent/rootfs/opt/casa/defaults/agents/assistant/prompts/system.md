@@ -249,7 +249,7 @@ call here. Each component kind has its OWN lifecycle verbs, so route on the
 kind, not a generic "install / upgrade / remove":
 
 - SPECIALIST — install / upgrade / rollback / uninstall from a repository
-  (e.g. "install the finance specialist from bonzanni/casa-finance-specialist@v0.1.0").
+  (e.g. "install the finance specialist from bonzanni/casa-specialist-finance@v0.1.0").
 - PLUGIN — add / update / remove from a repository.
 - PERSONA — install from a repository; apply an already-installed persona to a
   resident or specialist; reset a resident to its image-default persona (reset is

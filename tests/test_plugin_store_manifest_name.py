@@ -39,18 +39,18 @@ def test_validate_manifest_unowned_unchanged(tmp_path):
 def test_publish_from_tree_and_verdict_roundtrip(tmp_path):
     root = _tree(tmp_path, "mtg")
     res = plugin_store.publish_from_tree(
-        name="mtg.mtg", repo="bonzanni/casa-mtg-specialist", ref="v0.2.0",
+        name="mtg.mtg", repo="bonzanni/casa-specialist-mtg", ref="v0.2.0",
         revision="git:" + "a" * 40, subdir="plugins/mtg", src_root=root,
         store_root=tmp_path / "store", staging_root=tmp_path / "staging",
         manifest_name="mtg")
     verdict = plugin_store.artifact_verdict(
-        Path(res.path), name="mtg.mtg", repo="bonzanni/casa-mtg-specialist",
+        Path(res.path), name="mtg.mtg", repo="bonzanni/casa-specialist-mtg",
         revision="git:" + "a" * 40, subdir="plugins/mtg",
         artifact_id=res.artifact_id, manifest_name="mtg")
     assert verdict is None
     # Without manifest_name the same artifact must FAIL (name != plugin.json.name)
     assert plugin_store.artifact_verdict(
-        Path(res.path), name="mtg.mtg", repo="bonzanni/casa-mtg-specialist",
+        Path(res.path), name="mtg.mtg", repo="bonzanni/casa-specialist-mtg",
         revision="git:" + "a" * 40, subdir="plugins/mtg",
         artifact_id=res.artifact_id) == "artifact_invalid"
 
