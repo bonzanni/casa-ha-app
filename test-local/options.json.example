@@ -14,5 +14,6 @@
   "primary_agent_model": "opus",
   "voice_agent_model": "haiku",
   "enable_terminal": false,
-  "repos": []
+  "repos": [],
+  "context7_api_key": ""
 }

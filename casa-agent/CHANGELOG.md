@@ -1,5 +1,15 @@
 # Changelog
 
+## [0.110.0] - 2026-07-24
+
+### Added
+
+- New `context7_api_key` option: provisions the API key for the bundled
+  Context7 documentation plugin (part of the plugin-developer toolbox). A
+  fresh install now brings Context7 up from the add-on configuration alone —
+  no manual plugin-env editing. An existing plugin env entry, if present,
+  still takes precedence (#232).
+
 ## [0.109.0] - 2026-07-24
 
 ### Fixed
