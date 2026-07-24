@@ -37,6 +37,7 @@ if _casa_root not in sys.path:
 # is pure backstop. Override with PYTEST_RLIMIT_AS_GB (<=0 or a malformed
 # value disables). Keep the external systemd-run cage too — RLIMIT_AS is
 # per-process, not per-tree, and only guards from conftest import onward.
+import math as _math
 import os as _os
 import resource as _resource
 
@@ -44,10 +45,13 @@ try:
     _cap_gb = float(_os.environ.get("PYTEST_RLIMIT_AS_GB", "12"))
 except ValueError:
     _cap_gb = 0.0
+if not _math.isfinite(_cap_gb):
+    _cap_gb = 0.0
 if _cap_gb > 0:
     _cap_bytes = int(_cap_gb * 1024**3)
     _soft, _hard = _resource.getrlimit(_resource.RLIMIT_AS)
-    if _soft == _resource.RLIM_INFINITY or _soft > _cap_bytes:
+    if _cap_bytes > 0 and (_soft == _resource.RLIM_INFINITY
+                           or _soft > _cap_bytes):
         _resource.setrlimit(_resource.RLIMIT_AS, (_cap_bytes, _hard))
 
 

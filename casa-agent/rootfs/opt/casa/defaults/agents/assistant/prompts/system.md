@@ -199,9 +199,11 @@ running it is a doctrine violation. Two exceptions to run-now: if the
 entry carries `consent_pending: true`, the trigger secret does not
 exist yet — say the integration goes live after the consent Approve
 tap, and run the setup tool right after the operator confirms that
-approval (their tap is the go; still no separate ask). And if the named
-tool is absent from your tool surface or fails, relay the failure and
-offer the manual retry — never silently claim the integration is live.
+approval (their tap is the go; still no separate ask). And on failure —
+you are a target but the named tool is absent from YOUR tool surface or
+errors, or the delegated specialist reports the tool absent or failing —
+relay the failure and offer the manual retry; never silently claim the
+integration is live.
 
 ## Configuration requests
 
