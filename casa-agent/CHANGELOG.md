@@ -1,5 +1,18 @@
 # Changelog
 
+## [0.113.0] - 2026-07-24
+
+### Security
+
+- The Telegram webhook secret token is no longer written to container logs
+  when the log level is set to debug. python-telegram-bot logs each Bot API
+  call's parameters — including the `setWebhook` secret token — as a
+  structured payload, which the log redactor previously only scrubbed for
+  plain-text secrets and so let the token through. The redactor now masks
+  credential-named fields inside structured log data (and the token is
+  registered for exact masking as a second layer), so a debug-level log can
+  no longer expose it (#214).
+
 ## [0.112.0] - 2026-07-24
 
 ### Added
