@@ -336,12 +336,12 @@ async def on_consent_decision(*, plugin: str, artifact_id: str,
         _kick.set()
 
 
-def _resolve_setup(plugin: str) -> tuple[bool, str | None]:
-    """Three-state registry resolution (impl r7): ``(resolved_ok, setup)``.
-    ``resolved_ok=False`` means the registry could not be consulted (resolver
-    absent, raised, or returned a non-dict / None) — the caller RETAINS the
-    round and retries. ``(True, None)`` = resolved, no setup tool (legacy).
-    ``(True, "<tool>")`` = resolved with a setup tool."""
+def _resolve_entry(plugin: str) -> tuple[bool, dict | None]:
+    """Three-state registry resolution (impl r7/r8): ``(resolved_ok,
+    entry)``. ``resolved_ok=False`` means the registry could not be consulted
+    (resolver absent, raised, or returned a non-dict / None) — the caller
+    RETAINS state and retries; it must NEVER treat this as a confirmed
+    removal. ``(True, {...})`` = a live resolved entry."""
     if _resolve_registry_entry is None:
         return False, None
     try:
@@ -351,7 +351,14 @@ def _resolve_setup(plugin: str) -> tuple[bool, str | None]:
         return False, None
     if not isinstance(entry, dict):
         return False, None
-    return True, entry.get("setup_tool")
+    return True, entry
+
+
+def _resolve_setup(plugin: str) -> tuple[bool, str | None]:
+    """``(resolved_ok, setup_tool)`` — see :func:`_resolve_entry`.
+    ``(True, None)`` = resolved, no setup tool (legacy)."""
+    ok, entry = _resolve_entry(plugin)
+    return (ok, entry.get("setup_tool") if ok and entry else None)
 
 
 def _settle_locked(data: dict, plugin: str) -> tuple[bool, list[str]]:
@@ -528,20 +535,34 @@ def _update_episode(episode_id: str, **fields) -> None:
 
 async def _run_episode(ep: dict) -> None:
     plugin = ep["plugin"]
-    entry = None
-    if _resolve_registry_entry is not None:
-        try:
-            entry = _resolve_registry_entry(plugin)
-        except Exception:  # noqa: BLE001
-            logger.exception("episode %s: registry resolve failed", ep["id"])
-    if not isinstance(entry, dict) or entry.get("artifact_id") != ep["artifact_id"]:
-        # Removed, or updated to a NEW artifact (whose own consent round will
-        # mint its own episode) — this one must never fire (TOCTOU guard).
+    # impl r8 (Sol+Terra): dispatch-time resolution is THREE-STATE, exactly
+    # like settlement — a transient resolver failure must NOT permanently
+    # mark a durably-settled episode stale (that would lose the setup after
+    # approval). UNAVAILABLE ⇒ keep pending + bounded retry on later kicks;
+    # a valid entry with a DIFFERENT artifact ⇒ confirmed supersession
+    # (stale); the matching artifact ⇒ proceed.
+    resolved_ok, entry = _resolve_entry(plugin)
+    if not resolved_ok:
+        deferrals = int(ep.get("resolve_deferrals") or 0) + 1
+        if deferrals >= _MAX_SETTLE_DEFERRALS:
+            _update_episode(ep["id"], status="stale",
+                            last_error="registry unresolvable after retries "
+                            "(plugin gone?)")
+            await _note(f"Plugin {plugin}: a queued setup run was dropped — "
+                        "the plugin could not be resolved. Run its setup tool "
+                        "manually if it is still installed.")
+            return
+        _update_episode(ep["id"], resolve_deferrals=deferrals,
+                        last_error="waiting for registry resolution")
+        return  # stays pending; a later reconcile kick retries
+    if entry.get("artifact_id") != ep["artifact_id"]:
+        # Updated to a NEW artifact (whose own consent round mints its own
+        # episode) — this one must never fire (confirmed TOCTOU supersession).
         _update_episode(ep["id"], status="stale",
-                        last_error="plugin removed or artifact superseded")
+                        last_error="artifact superseded")
         await _note(f"Plugin {plugin}: a queued setup run was dropped — the "
-                    "plugin was removed or updated since the consent. A new "
-                    "consent round owns the current version.")
+                    "plugin was updated since the consent. A new consent "
+                    "round owns the current version.")
         return
     # impl r4 (Sol): dispatch only against a LIVE route — the durable
     # approval/settlement happened regardless of the reconcile outcome (a

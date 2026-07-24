@@ -568,3 +568,43 @@ async def test_persistently_unresolvable_round_dropped(wired, monkeypatch):
         await pse._recover_and_settle()
     assert pse._load()["rounds"] == {}                # dropped, bounded
     assert pse.episodes() == []
+
+
+@pytest.mark.asyncio
+async def test_run_episode_unavailable_resolution_retries_not_stale(wired):
+    # impl r8 (Sol+Terra): a durably-settled episode whose DISPATCH-time
+    # resolution is transiently unavailable must NOT be marked stale — it
+    # stays pending and dispatches on a later kick once resolution recovers.
+    _prompt()
+    await _decide()                                   # episode created (art-1)
+    calls = {"n": 0}
+
+    def flaky(plugin):
+        calls["n"] += 1
+        return None if calls["n"] == 1 else wired["entry"]
+
+    pse.configure(
+        dispatch=wired_dispatch(wired), notify_operator=wired_notify(wired),
+        resolve_registry_entry=flaky)
+    await _drain_pending(wired)                        # 1st resolve → None
+    assert wired["dispatches"] == []
+    ep = pse.episodes()[0]
+    assert ep["status"] == "pending"                  # NOT stale
+    assert ep["resolve_deferrals"] == 1
+    await _drain_pending(wired)                        # 2nd resolve → entry
+    assert len(wired["dispatches"]) == 1
+    assert pse.episodes()[0]["status"] == "dispatched"
+
+
+@pytest.mark.asyncio
+async def test_run_episode_persistent_unresolve_goes_stale_bounded(wired, monkeypatch):
+    monkeypatch.setattr(pse, "_MAX_SETTLE_DEFERRALS", 3)
+    _prompt()
+    await _decide()
+    pse.configure(
+        dispatch=wired_dispatch(wired), notify_operator=wired_notify(wired),
+        resolve_registry_entry=lambda p: None)
+    for _ in range(5):
+        await _drain_pending(wired)
+    assert pse.episodes()[0]["status"] == "stale"
+    assert wired["dispatches"] == []
