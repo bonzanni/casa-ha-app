@@ -204,6 +204,52 @@ async def test_failed_mutation_clears_prior_preactivation_marker(monkeypatch, tm
         tools_mod._ENGAGEMENTS_PREACTIVATED.discard(eng.id)
 
 
+async def test_resolved_observability_prefers_fresh_manifest(monkeypatch):
+    """#241: setup_via_consent must be computed from the freshly-published
+    manifest (the artifact just activated), NOT a resolve_all() snapshot that
+    can momentarily still hold the OLD artifact (no setupTool) mid-update."""
+    import types
+    import tools as tools_mod
+    import plugin_registry as preg
+    import plugin_store as pstore
+
+    STALE = {"name": "elevenlabs"}                      # old artifact: no setup
+    FRESH = {"name": "elevenlabs",
+             "casa": {"setupTool": "setup_elevenlabs_voicemail",
+                      "triggers": [{"name": "voicemail"}]}}
+    rp = types.SimpleNamespace(name="elevenlabs", manifest=STALE,
+                               manifest_name="elevenlabs")
+    monkeypatch.setattr(preg, "resolve_all",
+                        lambda: types.SimpleNamespace(plugins=[rp]))
+    monkeypatch.setattr(tools_mod, "grants_for_resolved", lambda _rp: [])
+    monkeypatch.setattr(tools_mod, "required_env_vars_for_resolved", lambda _rp: [])
+    monkeypatch.setattr(pstore, "manifest_setup_tool",
+                        lambda m: (m.get("casa") or {}).get("setupTool"))
+    monkeypatch.setattr(pstore, "manifest_triggers",
+                        lambda m, pname: (m.get("casa") or {}).get("triggers", []))
+
+    # The bug: re-deriving from the stale resolved snapshot → false.
+    assert tools_mod._resolved_observability(
+        "elevenlabs")["setup_via_consent"] is False
+    # The fix: the freshly-published manifest is authoritative → true.
+    fresh = tools_mod._resolved_observability("elevenlabs", manifest=FRESH)
+    assert fresh["setup_tool"] == "setup_elevenlabs_voicemail"
+    assert fresh["setup_via_consent"] is True
+
+
+async def test_plugin_update_result_omits_internal_manifest(monkeypatch, tmp_path):
+    """The threaded _published_manifest is an internal carrier — it must be
+    popped before the tool result so the raw manifest never reaches the model."""
+    st = _State()
+    st.raw["plugins"].append(_entry(name="probe"))
+    tools_mod = _wire(monkeypatch, tmp_path, st, publish=_pr(version="2.0.0"))
+    r = await tools_mod.plugin_update.handler({"name": "probe", "new_ref": "v2"})
+    payload = json.loads(r["content"][0]["text"])
+    assert payload["ok"] is True
+    assert "_published_manifest" not in payload
+    assert "setup_via_consent" in payload   # observability fields still present
+
+
 async def test_plugin_add_ref_not_found_pre_mutation(monkeypatch, tmp_path):
     from plugin_store import RefNotFound
     st = _State()

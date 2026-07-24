@@ -6983,7 +6983,11 @@ def _plugin_add_sync(*, name: str, repo: str, ref: str, subdir: str = "",
     plugin_registry.save_registry(data)
     return {"ok": True, "name": name, "targets": targets,
             "artifact_id": result.artifact_id, "version": result.version,
-            "revision": result.revision, "path": result.path}
+            "revision": result.revision, "path": result.path,
+            # #241: hand the JUST-published manifest to _resolved_observability
+            # so setup_via_consent is computed from the activated artifact, not
+            # a possibly-stale resolve_all() snapshot. Popped before the result.
+            "_published_manifest": result.manifest}
 
 
 def _plugin_update_sync(*, name: str, new_ref: str,
@@ -7038,7 +7042,10 @@ def _plugin_update_sync(*, name: str, new_ref: str,
     return {"ok": True, "name": name, "targets": list(entry.get("targets") or []),
             "artifact_id": result.artifact_id, "version": result.version,
             "revision": result.revision, "path": result.path,
-            "old_artifact_id": old_artifact_id}
+            "old_artifact_id": old_artifact_id,
+            # #241: see _plugin_add_sync — compute setup_via_consent from THIS
+            # freshly-published manifest, not a possibly-stale resolve_all().
+            "_published_manifest": result.manifest}
 
 
 def _invalidate_lifecycle(*, artifact_id: "str | None" = None,
@@ -7082,31 +7089,49 @@ def _invalidate_lifecycle(*, artifact_id: "str | None" = None,
         CHALLENGES.cancel_matching(role=role)
 
 
-def _resolved_observability(name: str) -> dict:
+def _setup_fields(manifest: dict, plugin_name: str) -> dict:
+    """setup_tool + setup_via_consent from ONE manifest (setup + triggers)."""
+    import plugin_store as _pstore
+    try:
+        setup = _pstore.manifest_setup_tool(manifest)
+    except Exception:  # noqa: BLE001 — verify already refused it
+        setup = None
+    has_triggers = False
+    try:
+        has_triggers = bool(_pstore.manifest_triggers(manifest, plugin_name))
+    except Exception:  # noqa: BLE001
+        pass
+    return {"setup_tool": setup, "setup_via_consent": bool(setup and has_triggers)}
+
+
+def _resolved_observability(name: str, *, manifest: dict | None = None) -> dict:
     """granted_tools + required_env_vars for the freshly-activated plugin (best
     effort — reads the just-reloaded snapshot; resolve_all finds it regardless
     of target). v0.112.0: also surfaces ``setup_tool`` + ``setup_via_consent``
     (manifest declares ``casa.setupTool`` AND ``casa.triggers``) so the
     configurator recipes can MECHANICALLY skip the completion hand-back for
-    plugins whose setup Casa now owns via the post-consent episode."""
-    import plugin_store as _pstore
+    plugins whose setup Casa now owns via the post-consent episode.
+
+    #241: the setup fields come from ``manifest`` — the manifest of the artifact
+    this mutation JUST published/activated — when provided, NOT from the resolved
+    snapshot. During a plugin_update, ``resolve_all()`` can momentarily still
+    carry the OLD artifact (no ``setupTool``), so re-deriving from it returned
+    ``setup_via_consent: false`` and the recipe skipped the v0.112.0 dedup. The
+    freshly-published manifest is authoritative; fall back to the resolved
+    ``rp.manifest`` only when no manifest was handed in (legacy callers)."""
     for rp in plugin_registry.resolve_all().plugins:
         if rp.name == name:
-            try:
-                setup = _pstore.manifest_setup_tool(rp.manifest)
-            except Exception:  # noqa: BLE001 — verify already refused it
-                setup = None
-            has_triggers = False
-            try:
-                has_triggers = bool(
-                    _pstore.manifest_triggers(rp.manifest,
-                                              runtime_name(rp)))
-            except Exception:  # noqa: BLE001
-                pass
+            setup = _setup_fields(
+                manifest if manifest is not None else rp.manifest,
+                plugin_registry.runtime_name(rp))
             return {"granted_tools": grants_for_resolved(rp),
                     "required_env_vars": required_env_vars_for_resolved(rp),
-                    "setup_tool": setup,
-                    "setup_via_consent": bool(setup and has_triggers)}
+                    **setup}
+    # Not in the resolved snapshot yet (shouldn't happen right after activation)
+    # — still surface the just-published artifact's setup contract if we have it.
+    if manifest is not None:
+        return {"granted_tools": [], "required_env_vars": [],
+                **_setup_fields(manifest, name)}
     return {"granted_tools": [], "required_env_vars": [],
             "setup_tool": None, "setup_via_consent": False}
 
@@ -7151,7 +7176,9 @@ async def plugin_add(args: dict) -> dict:
         seq = await _reload_and_verify_targets(
             core["name"], core["targets"], expect="present")
         core.update(seq)
-        core.update(_resolved_observability(core["name"]))
+        published_manifest = core.pop("_published_manifest", None)
+        core.update(_resolved_observability(
+            core["name"], manifest=published_manifest))
         return _result(core)
 
 
@@ -7188,7 +7215,9 @@ async def plugin_update(args: dict) -> dict:
         seq = await _reload_and_verify_targets(
             core["name"], core["targets"], expect="present")
         core.update(seq)
-        core.update(_resolved_observability(core["name"]))
+        published_manifest = core.pop("_published_manifest", None)
+        core.update(_resolved_observability(
+            core["name"], manifest=published_manifest))
         return _result(core)
 
 
