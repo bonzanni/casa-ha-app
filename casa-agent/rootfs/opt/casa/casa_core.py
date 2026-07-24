@@ -3035,6 +3035,73 @@ async def main() -> None:
         trigger_registry=trigger_registry, role_configs=role_configs,
     )
 
+    # 13d. v0.112.0 (elevenlabs#2): durable post-consent setup episodes —
+    # wire the seams (all late-binding: the channel is resolved at call
+    # time) and start the supervised worker; pending episodes from a prior
+    # boot re-dispatch immediately (crash-safe at-least-once).
+    import plugin_setup_episodes as _pse
+
+    def _setup_pending_for(plugin: str) -> int:
+        import trigger_reconcile as _tr
+        return sum(
+            1 for i in _tr.current_issues()
+            if getattr(i, "reason_code", "") == "trigger_pending_ack"
+            and getattr(i, "name", "") == plugin)
+
+    def _setup_registry_entry(plugin: str) -> dict | None:
+        import plugin_grants as _pg
+        import plugin_registry as _pr
+        import plugin_store as _pstore
+        res = _pr.resolve_all()
+        rp = next((p for p in res.plugins if p.name == plugin), None)
+        if rp is None:
+            return None
+        snap = _pr.snapshot_registry()
+        entry = next(
+            (e for e in snap.entries
+             if isinstance(e, dict) and e.get("name") == plugin), None)
+        try:
+            setup = _pstore.manifest_setup_tool(rp.manifest)
+        except Exception:  # noqa: BLE001 — malformed manifest ⇒ no hook
+            setup = None
+        return {
+            "artifact_id": rp.artifact_id,
+            "targets": list((entry or {}).get("targets") or []),
+            "granted_tools": _pg.grants_for_resolved(rp),
+            "setup_tool": setup,
+        }
+
+    async def _setup_dispatch(role: str, text: str, context: dict) -> bool:
+        import trigger_consent as _tc
+        ch = channel_manager.get("telegram") if channel_manager else None
+        op = _tc.operator_identity(ch) if ch is not None else None
+        if op is None:
+            return False
+        op_chat, op_user = op
+        msg = BusMessage(
+            type=MessageType.CHANNEL_IN, source="telegram", target=role,
+            content=text, channel="telegram",
+            context={
+                "chat_id": op_chat, "user_id": op_user, "cid": new_cid(),
+                **context,  # reserved synthetic/plugin_setup markers —
+                            # Casa-composed internal, never external ingress
+            },
+        )
+        return await bus.send_checked(msg) == "accepted"
+
+    async def _setup_notify(text: str) -> None:
+        ch = channel_manager.get("telegram") if channel_manager else None
+        if ch is None:
+            return
+        await ch.send_response(text, {})
+
+    _pse.configure(
+        dispatch=_setup_dispatch, notify_operator=_setup_notify,
+        pending_consents_for=_setup_pending_for,
+        resolve_registry_entry=_setup_registry_entry,
+    )
+    _pse.start_worker()
+
     runner = web.AppRunner(
         app,
         access_log_class=CasaAccessLogger,

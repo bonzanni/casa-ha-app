@@ -76,6 +76,15 @@ that is a valid end state, not an error). Report the outcome and
 
 ## Setup-tool hand-back — MANDATORY when the plugin ships one
 
+**Mechanical skip (v0.112.0):** when the `plugin_add` result carries
+`setup_via_consent: true` (the manifest declares BOTH `casa.setupTool` and
+`casa.triggers`), do NOT hand back — Casa's durable post-consent episode
+runs the setup tool automatically once the operator's consent settles,
+whether the Approve tap lands during or after this engagement. Say so in
+the completion text. The hand-back below remains ONLY for a setup tool
+without a consent gate (`setup_tool` set, `setup_via_consent: false`) or a
+legacy plugin that names its tool solely in the handoff.
+
 Some plugins ship an MCP **setup tool** (naming convention `setup_*`, e.g.
 `setup_elevenlabs_voicemail`) that (re)points an external service at Casa —
 typically writing a freshly-minted per-trigger secret into the external

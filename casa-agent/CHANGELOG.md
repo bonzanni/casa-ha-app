@@ -1,5 +1,18 @@
 # Changelog
 
+## [0.112.0] - 2026-07-24
+
+### Added
+
+- Plugins that wire an external service (like the ElevenLabs voicemail
+  integration) can now declare their setup tool in the manifest
+  (`casa.setupTool`); approving the plugin's webhook consent runs that
+  setup automatically — installing or updating such a plugin needs zero
+  follow-up input to become fully live. The run is crash-safe (queued
+  durably and retried across restarts), fires once per consent round, and
+  any failure is reported with a manual fallback. The manual setup tool
+  remains available for recovery.
+
 ## [0.111.0] - 2026-07-24
 
 ### Added

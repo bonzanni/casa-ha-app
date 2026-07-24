@@ -6279,9 +6279,23 @@ def _regenerate_plugin_health(extra_issues: list) -> None:
     # trigger_channel_missing. current_issues() never raises.
     import trigger_reconcile
     trigger_issues = trigger_reconcile.current_issues()
+    # v0.112.0: setup-episode state (pending/failed/stale) is likewise a
+    # RECOMPUTABLE input, derived fresh from the durable episode store — a
+    # dropped or failed post-consent setup dispatch stays visible until it
+    # resolves. Never raises into a health pass.
+    setup_issues: list = []
+    try:
+        import plugin_setup_episodes
+        for row in plugin_setup_episodes.health_issues():
+            setup_issues.append(PluginIssue(
+                name=row.get("plugin") or "", target=None, stage="setup",
+                reason_code=row.get("kind") or "setup_episode",
+                artifact_id=None))
+    except Exception:  # noqa: BLE001
+        logger.debug("setup-episode health merge skipped", exc_info=True)
     plugin_health.write_report(
         issues=(list(res.issues) + list(extra_issues) + runtime_issues
-                + list(trigger_issues)),
+                + list(trigger_issues) + setup_issues),
         warnings=list(res.warnings) + pending_warnings,
         path=_PLUGIN_HEALTH_PATH,
     )
@@ -6988,12 +7002,30 @@ def _invalidate_lifecycle(*, artifact_id: "str | None" = None,
 def _resolved_observability(name: str) -> dict:
     """granted_tools + required_env_vars for the freshly-activated plugin (best
     effort — reads the just-reloaded snapshot; resolve_all finds it regardless
-    of target)."""
+    of target). v0.112.0: also surfaces ``setup_tool`` + ``setup_via_consent``
+    (manifest declares ``casa.setupTool`` AND ``casa.triggers``) so the
+    configurator recipes can MECHANICALLY skip the completion hand-back for
+    plugins whose setup Casa now owns via the post-consent episode."""
+    import plugin_store as _pstore
     for rp in plugin_registry.resolve_all().plugins:
         if rp.name == name:
+            try:
+                setup = _pstore.manifest_setup_tool(rp.manifest)
+            except Exception:  # noqa: BLE001 — verify already refused it
+                setup = None
+            has_triggers = False
+            try:
+                has_triggers = bool(
+                    _pstore.manifest_triggers(rp.manifest,
+                                              runtime_name(rp)))
+            except Exception:  # noqa: BLE001
+                pass
             return {"granted_tools": grants_for_resolved(rp),
-                    "required_env_vars": required_env_vars_for_resolved(rp)}
-    return {"granted_tools": [], "required_env_vars": []}
+                    "required_env_vars": required_env_vars_for_resolved(rp),
+                    "setup_tool": setup,
+                    "setup_via_consent": bool(setup and has_triggers)}
+    return {"granted_tools": [], "required_env_vars": [],
+            "setup_tool": None, "setup_via_consent": False}
 
 
 @tool(
@@ -8193,6 +8225,19 @@ def _tool_verify_plugin_state(
     protected_tool_summaries = {
         e["name"]: e["summary"] for e in protected_entries if e.get("summary")
     }
+    # v0.112.0: a declared casa.setupTool with NO invocation path (targets
+    # exclusively executor:* — executors have no channel and no post-consent
+    # dispatch) is a configuration error, not a silent no-op (Sol design
+    # round). Blocking, same tier as the other configured-state reasons.
+    try:
+        _setup_decl = (plugin_store.manifest_setup_tool(manifest)
+                       if checksum_valid else None)
+    except plugin_store.StoreError:
+        _setup_decl = None  # malformed already surfaced via artifact_verdict
+    _entry_targets = list(entry.get("targets") or [])
+    if (_setup_decl and _entry_targets
+            and all(str(t).startswith("executor:") for t in _entry_targets)):
+        reasons.append("setup_tool_unsupported_target")
 
     # Tools (system-requirements — verify_bin presence). Sol #11: check BOTH the
     # INSTALLED manifest rows AND every requirement the ARTIFACT declares, so a

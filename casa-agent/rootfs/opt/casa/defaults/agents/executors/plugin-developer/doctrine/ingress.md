@@ -63,11 +63,15 @@ provider's workspace secret and point its webhook/tool URL at
 `<public_url>/webhook/plg-<plugin>--<name>`. Rollback = point the provider
 back. Because an update rotates the secret, the setup tool must be
 re-runnable (idempotent provisioning, not create-once). The tool must be
-**argument-free**, its name must start with `setup_`, and your completion
-handoff must name it explicitly — the configurator's install/update
-recipes hand it back to the engager to run automatically
-(`run_plugin_setup_tool`), and that contract only admits argument-free
-idempotent tools.
+**argument-free**, its name must start with `setup_` (grammar
+`^setup_[a-z0-9_]{1,64}$` — lowercase ASCII only), and you must declare it
+in the manifest as **`casa.setupTool`** (v0.112.0) AND name it in your
+completion handoff. With the manifest declaration, Casa runs the tool
+AUTOMATICALLY once the operator's trigger consent settles with an approval
+(durable episode, crash-safe, at-least-once) — the operator never asks for
+setup. A malformed declaration refuses the artifact at verify; a
+declaration on a plugin whose targets are executor-only is a blocking
+verify issue (`setup_tool_unsupported_target` — no invocation path).
 
 ## What the webhook turn can — and cannot — do
 

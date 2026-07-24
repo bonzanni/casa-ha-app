@@ -121,6 +121,20 @@ def prompt_trigger_consent(
                         target=target, auth=auth)
             meta["acked"] = True
 
+    async def _feed_setup_episode(approved: bool) -> None:
+        # v0.112.0 (elevenlabs#2): every TERMINAL decision (approve, deny,
+        # expiry) feeds the durable setup-episode evaluator — evaluating on
+        # deny/expiry too closes the "last decision is Deny suppresses setup
+        # for the earlier Approve" hole (Sol design round). Never raises into
+        # the finish hook.
+        try:
+            import plugin_setup_episodes
+            await plugin_setup_episodes.on_consent_decision(
+                plugin=plugin, artifact_id=artifact_id,
+                identity=identity, approved=approved)
+        except Exception:  # noqa: BLE001
+            logger.exception("setup-episode feed failed (plugin=%s)", plugin)
+
     def _finish_factory(message_id: int, req: Any) -> Callable[[dict], Any]:
         async def _finish(outcome: dict) -> None:
             o = outcome.get("outcome") if isinstance(outcome, dict) else None
@@ -130,6 +144,7 @@ def prompt_trigger_consent(
                     f"⌛ Expired — consent for POST /webhook/"
                     f"{effective} was not answered; it stays unrouted",
                 )
+                await _feed_setup_episode(approved=False)
                 return
             if outcome.get("option_index") == 0:
                 if not req.meta.get("acked"):
@@ -163,12 +178,17 @@ def prompt_trigger_consent(
                             f"/webhook/{effective} failed — run "
                             "plugin_verify",
                         )
+                        return  # route NOT live — the episode must not fire
+                # v0.112.0: approval is durable (ack persisted) AND the route
+                # is live (reconcile succeeded) — feed the setup evaluator.
+                await _feed_setup_episode(approved=True)
             else:
                 await channel.edit_dm_message(
                     chat_id, message_id,
                     f"❌ Denied — POST /webhook/{effective} stays "
                     "unrouted",
                 )
+                await _feed_setup_episode(approved=False)
 
         return _finish
 
