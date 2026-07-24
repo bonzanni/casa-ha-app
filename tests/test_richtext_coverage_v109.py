@@ -212,6 +212,20 @@ def test_separatorless_bordered_table_becomes_pre():
     txt = "| a | b |\n| c | d |\n| e | f |"
     display, pres = _pre_spans(txt)
     assert len(pres) == 1
+    # Content fidelity (Sol r2): EVERY row survives verbatim inside the PRE
+    # span — the emission has no separator-row special-casing to lose row 2.
+    pre = pres[0]
+    covered = display[pre.offset:pre.offset + pre.length]
+    assert covered == "| a | b |\n| c | d |\n| e | f |"
+
+
+def test_separatored_table_content_fidelity():
+    txt = "| h1 | h2 |\n|---|---|\n| a | b |"
+    display, pres = _pre_spans(txt)
+    assert len(pres) == 1
+    pre = pres[0]
+    covered = display[pre.offset:pre.offset + pre.length]
+    assert covered == "| h1 | h2 |\n|---|---|\n| a | b |"
 
 
 def test_separatorless_two_rows_stay_literal():

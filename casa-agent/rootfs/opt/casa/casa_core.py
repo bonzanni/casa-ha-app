@@ -2621,7 +2621,11 @@ async def main() -> None:
         send_topic_message_markup=_send_topic_message_markup,
         edit_topic_message_markup=_edit_topic_message_markup,
         # v0.109.0 (G5): paged rich sender for terminal completion posts.
-        send_to_topic_paged=_send_to_topic_paged,
+        # Explicitly None without a Telegram channel so the sequencer keeps
+        # its ordinary _post_notice_locked path (Sol r2: a non-None sender is
+        # authoritative — never inject a wrapper that can only return None).
+        send_to_topic_paged=(
+            _send_to_topic_paged if telegram_channel is not None else None),
         # v0.79.0 (§5): best-effort pin primitive for the live summary.
         pin_topic_message=_pin_topic_message,
         registry=engagement_registry,
