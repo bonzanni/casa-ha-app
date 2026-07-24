@@ -160,3 +160,19 @@ subprocess inherits):
 contains the `CONTEXT7_API_KEY=...` line (it does after `set_plugin_env_reference`).
 The key takes effect for the next MCP-server spawn (e.g. the next plugin-developer
 engagement). A bad/empty key does NOT break context7 — it falls back to keyless.
+
+## Remove an entry
+
+Use `remove_plugin_env_reference` when a var is no longer needed — a plugin
+update shipped in-code defaults, the operator moved a key to an add-on
+option, or the plugin was removed and left orphaned entries. NEVER try to
+Edit `plugin-env.conf` directly (`path_scope` blocks it — that is by design).
+
+    remove_plugin_env_reference(plugin="<plugin_name>", var_name="<VAR>")
+    # → {ok: true, removed: true|false}   (removed:false = was not present — fine)
+    casa_reload(scope="plugin_env")
+
+The reload is MANDATORY after a removal: it is what drops the key from the
+effective environment (deletion-diff) and regenerates plugin health. Without
+it the old value keeps applying until the next restart. Removal is
+idempotent — report `removed: false` factually, don't retry.

@@ -1,6 +1,7 @@
 """Read/write /config/plugin-env.conf (§5.5).
 
-File is mode 0600. Preserves comments. set_entry upserts a single VAR=value line.
+File is mode 0600. Preserves comments. set_entry upserts a single VAR=value
+line; remove_entry deletes one (v0.111.0, #236).
 """
 from __future__ import annotations
 
@@ -71,3 +72,40 @@ def set_entry(var_name: str, value: str) -> None:
         os.chmod(PLUGIN_ENV_CONF_PATH, 0o600)  # belt-and-braces: repairs a legacy 0644 file
     except PermissionError:
         pass  # non-root in tests
+
+
+def remove_entry(var_name: str) -> bool:
+    """Delete the ``VAR=...`` line for *var_name* (v0.111.0, #236).
+
+    Returns ``True`` when a line was removed, ``False`` when the var was not
+    present (idempotent — callers report, they don't error). Comments and
+    every other line are preserved byte-for-byte; the rewrite keeps the 0600
+    contract. The caller MUST follow with ``casa_reload(scope='plugin_env')``
+    — the reload's deletion-diff (M22) pops the removed key from the
+    effective environment and regenerates plugin health.
+    """
+    if not _VAR_NAME_RE.match(var_name):
+        raise PluginEnvConfError(f"invalid env var name: {var_name!r}")
+    if not PLUGIN_ENV_CONF_PATH.is_file():
+        return False
+
+    lines = PLUGIN_ENV_CONF_PATH.read_text(encoding="utf-8").splitlines(keepends=True)
+    kept: list[str] = []
+    removed = False
+    for line in lines:
+        if (not line.lstrip().startswith("#") and "=" in line
+                and line.split("=", 1)[0].strip() == var_name):
+            removed = True
+            continue
+        kept.append(line)
+    if not removed:
+        return False
+
+    fd = os.open(PLUGIN_ENV_CONF_PATH, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+    with os.fdopen(fd, "w", encoding="utf-8") as fh:
+        fh.write("".join(kept))
+    try:
+        os.chmod(PLUGIN_ENV_CONF_PATH, 0o600)
+    except PermissionError:
+        pass  # non-root in tests
+    return True

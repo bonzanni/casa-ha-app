@@ -74,3 +74,54 @@ def test_first_creation_is_0600_even_without_chmod(tmp_path: Path, monkeypatch) 
         os.umask(old_umask)
 
     assert path.stat().st_mode & 0o777 == 0o600
+
+
+# ---------------------------------------------------------------------------
+# v0.111.0 (#236) — remove_entry
+# ---------------------------------------------------------------------------
+
+def test_remove_entry_deletes_line(tmp_path: Path, monkeypatch) -> None:
+    from plugin_env_conf import read_entries, remove_entry, set_entry
+    path = tmp_path / "plugin-env.conf"
+    monkeypatch.setattr("plugin_env_conf.PLUGIN_ENV_CONF_PATH", path)
+    set_entry("FOO_KEY", "v1")
+    set_entry("BAR_KEY", "v2")
+    assert remove_entry("FOO_KEY") is True
+    entries = read_entries()
+    assert "FOO_KEY" not in entries
+    assert entries["BAR_KEY"] == "v2"
+
+
+def test_remove_entry_absent_is_false(tmp_path: Path, monkeypatch) -> None:
+    from plugin_env_conf import remove_entry, set_entry
+    path = tmp_path / "plugin-env.conf"
+    monkeypatch.setattr("plugin_env_conf.PLUGIN_ENV_CONF_PATH", path)
+    set_entry("FOO_KEY", "v1")
+    assert remove_entry("NOPE_KEY") is False
+    # no file at all → False, no file created
+    monkeypatch.setattr("plugin_env_conf.PLUGIN_ENV_CONF_PATH", tmp_path / "absent.conf")
+    assert remove_entry("FOO_KEY") is False
+    assert not (tmp_path / "absent.conf").exists()
+
+
+def test_remove_entry_preserves_comments_and_mode(tmp_path: Path, monkeypatch) -> None:
+    import os as _os
+    from plugin_env_conf import remove_entry, set_entry
+    path = tmp_path / "plugin-env.conf"
+    monkeypatch.setattr("plugin_env_conf.PLUGIN_ENV_CONF_PATH", path)
+    set_entry("FOO_KEY", "v1")
+    header = path.read_text().splitlines()[0]
+    assert header.startswith("#")
+    assert remove_entry("FOO_KEY") is True
+    text = path.read_text()
+    assert text.splitlines()[0] == header          # comment preserved
+    assert "FOO_KEY" not in text
+    assert _os.stat(path).st_mode & 0o777 == 0o600
+
+
+def test_remove_entry_rejects_bad_name(tmp_path: Path, monkeypatch) -> None:
+    import pytest
+    from plugin_env_conf import PluginEnvConfError, remove_entry
+    monkeypatch.setattr("plugin_env_conf.PLUGIN_ENV_CONF_PATH", tmp_path / "p.conf")
+    with pytest.raises(PluginEnvConfError):
+        remove_entry("bad-name")
