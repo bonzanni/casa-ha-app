@@ -1,42 +1,59 @@
 """Durable post-consent setup episodes (v0.112.0, casa-plugin-elevenlabs#2).
 
 A plugin that declares ``casa.setupTool`` gets its setup tool run
-AUTOMATICALLY once its trigger-consent episode settles with at least one
+AUTOMATICALLY once its trigger-consent round settles with at least one
 approval — the operator's Approve tap is the authorization for the wiring
 that makes the trigger functional. Because plugin MCP tools surface only on
 the plugin's target agents, Casa dispatches a synthetic Casa-authored turn
 to the execution agent rather than calling the tool itself.
 
-Design (Sol+Terra design round, 2026-07-24):
+Design (Sol+Terra design round + implementation round 1, 2026-07-24):
 
-* **Durable, at-least-once**: an episode is persisted to
-  ``/data/plugin-setup-episodes.json`` BEFORE dispatch and reconciled at
-  boot — a restart between consent and dispatch cannot lose the run. The
-  setup tool is argument-free + idempotent by authoring contract, so
-  crash-induced duplicate execution is safe.
-* **Settlement over ALL terminal decisions**: every Approve/Deny/expiry
-  feeds :func:`on_consent_decision`; the episode settles when the plugin
-  has no remaining pending consents. Approved subset non-empty → dispatch;
-  deny-only → a DM note, never a dispatch (the "last decision is Deny"
-  suppression hole from the design round is closed by evaluating on Deny
-  too).
-* **Atomic claim**: episode creation under the module lock, keyed by
-  (plugin, artifact_id, approved-identity digest) — two racing settlement
-  evaluations create ONE episode.
+* **Round ledger, not ack counting** (impl r1 P1): the consent ROUND is
+  tracked by this module — every prompted consent registers its identity as
+  an OPEN member (:func:`on_consent_prompted`, fed from the prompt path);
+  every terminal decision (Approve / Deny / expiry) marks its member
+  (:func:`on_consent_decision`). Settlement = ALL members decided. Denials
+  and expiries settle the round exactly like approvals — the reconciler's
+  ``trigger_pending_ack`` state (which a denial never clears) is not
+  consulted. A re-prompt after expiry RE-OPENS the member, so the round
+  waits again.
+* **Durable across the whole consent-to-dispatch interval** (impl r1 P1):
+  the round ledger AND the episodes live in
+  ``/data/plugin-setup-episodes.json`` (atomic tmp+rename), updated on
+  every prompt/decision — a restart mid-round loses nothing.
+* **Single-lock settlement** (impl r1 P1): accumulate + settle-check +
+  episode creation happen under ONE lock acquisition with no awaits
+  in between — concurrent finish callbacks cannot split a round into two
+  episodes. Operator notes and the worker kick happen after release.
+* **Re-consent mints a new episode** (impl r1 P1): approve decisions carry
+  ``identity#gen`` (the persisted ack's approval generation) — a
+  revoke→re-approve or update-rotation with an identical trigger tuple
+  produces a NEW generation, hence a new episode key.
 * **Exact-artifact binding (TOCTOU)**: the episode records the CONSENTED
-  ``artifact_id``; the worker re-resolves the registry at dispatch time and
-  marks the episode ``stale`` (with an operator note) when the plugin was
-  removed or moved to a different artifact — a delayed episode from version
-  N never fires against version N+1.
-* **No plugin prose**: the synthetic turn is a fixed Casa-authored template;
-  the only plugin-derived interpolations are grammar-validated identifiers
-  (plugin name, namespaced tool name). The ``synthetic`` context marker is
-  a RESERVED provenance key external ingress cannot spoof
-  (``provenance.RESERVED_CONTEXT_KEYS``).
-* **Delivery is not success**: ``dispatched`` means the bus accepted the
-  turn; the execution agent's own reply reports the actual setup outcome to
-  the operator. Episodes stuck ``pending``/``failed``/``stale`` surface as
-  plugin-health issues (documented weaker-than-result-correlated semantics).
+  ``artifact_id``; the worker re-resolves at dispatch time and marks the
+  episode ``stale`` (operator note) when the plugin was removed or
+  superseded.
+* **Unambiguous tool binding** (impl r1 P1): the instruction names the
+  EXACT namespaced tool ``<server-grant>__<setupTool>``; a plugin with
+  zero or multiple server grants FAILS the episode with a clear reason
+  (and verify blocks multi-server setup-tool plugins upstream) — never an
+  unqualified or guessed name.
+* **Worker survivability** (impl r1 P1): per-episode failures are isolated
+  and the worker re-kicks itself after an unexpected pass failure, so one
+  bad episode can never strand the rest until the next external kick.
+* **Terminal-state hygiene** (impl r1 P2): a new episode for a plugin
+  prunes that plugin's older episodes, and ``failed``/``stale`` rows decay
+  out of health after :data:`_HEALTH_DECAY_S` — no permanent residue once
+  the situation is resolved or superseded.
+* **No plugin prose**: the synthetic turn is a fixed Casa-authored
+  template; the only plugin-derived interpolations are grammar-validated
+  identifiers. The ``synthetic`` context marker is a RESERVED provenance
+  key external ingress cannot spoof.
+* **Delivery is not success** (disclosed): ``dispatched`` means the bus
+  accepted the turn; the execution agent's reply reports the actual
+  outcome. ``pending``/``failed``/``stale`` surface as plugin-health
+  issues.
 """
 from __future__ import annotations
 
@@ -53,37 +70,33 @@ from typing import Any, Awaitable, Callable
 logger = logging.getLogger(__name__)
 
 STORE_PATH = Path("/data/plugin-setup-episodes.json")
-_SCHEMA_VERSION = 1
+_SCHEMA_VERSION = 2
 _MAX_DISPATCH_ATTEMPTS = 3
 _RETRY_BACKOFF_S = (1.0, 5.0)
+_HEALTH_DECAY_S = 72 * 3600.0
 
 # Wired by casa_core at boot. All optional — absent seams degrade to logging.
 _dispatch: Callable[[str, str, dict], Awaitable[bool]] | None = None
 _notify_operator: Callable[[str], Awaitable[None]] | None = None
-_pending_consents_for: Callable[[str], int] | None = None
 _resolve_registry_entry: Callable[[str], Any] | None = None
 _sleep: Callable[[float], Awaitable[None]] = asyncio.sleep
 
 _lock: asyncio.Lock | None = None
 _worker_task: asyncio.Task | None = None
 _kick: asyncio.Event | None = None
-# Per-plugin decision accumulator for the OPEN (unsettled) consent episode:
-# {plugin: {"artifact_id": str, "approved": [identity...], "denied": int}}
-_open_decisions: dict[str, dict] = {}
 
 
 def _now() -> float:
     return time.time()
 
 
-def configure(*, dispatch, notify_operator, pending_consents_for,
-              resolve_registry_entry, sleep=asyncio.sleep) -> None:
+def configure(*, dispatch, notify_operator, resolve_registry_entry,
+              sleep=asyncio.sleep) -> None:
     """casa_core boot wiring. Idempotent."""
-    global _dispatch, _notify_operator, _pending_consents_for
-    global _resolve_registry_entry, _sleep, _lock, _kick
+    global _dispatch, _notify_operator, _resolve_registry_entry
+    global _sleep, _lock, _kick
     _dispatch = dispatch
     _notify_operator = notify_operator
-    _pending_consents_for = pending_consents_for
     _resolve_registry_entry = resolve_registry_entry
     _sleep = sleep
     if _lock is None:
@@ -93,21 +106,24 @@ def configure(*, dispatch, notify_operator, pending_consents_for,
 
 
 # ---------------------------------------------------------------------------
-# Store
+# Store: {"schema_version", "rounds": {plugin: {...}}, "episodes": [...]}
 # ---------------------------------------------------------------------------
 
 def _load() -> dict:
     if not STORE_PATH.is_file():
-        return {"schema_version": _SCHEMA_VERSION, "episodes": []}
+        return {"schema_version": _SCHEMA_VERSION, "rounds": {},
+                "episodes": []}
     try:
         data = json.loads(STORE_PATH.read_text(encoding="utf-8"))
-        if not isinstance(data, dict) or not isinstance(
-                data.get("episodes"), list):
+        if (not isinstance(data, dict)
+                or not isinstance(data.get("episodes"), list)):
             raise ValueError("malformed store")
+        data.setdefault("rounds", {})
         return data
     except Exception:  # noqa: BLE001 — a corrupt store must not brick boot
         logger.exception("plugin-setup-episodes store unreadable — resetting")
-        return {"schema_version": _SCHEMA_VERSION, "episodes": []}
+        return {"schema_version": _SCHEMA_VERSION, "rounds": {},
+                "episodes": []}
 
 
 def _save(data: dict) -> None:
@@ -122,12 +138,18 @@ def episodes(status: str | None = None) -> list[dict]:
 
 
 def health_issues() -> list[dict]:
-    """Non-terminal-success episodes for plugin-health regeneration."""
+    """Non-terminal-success episodes for plugin-health regeneration.
+    ``failed``/``stale`` rows decay after :data:`_HEALTH_DECAY_S`;
+    ``pending`` never decays (it is actionable until dispatched)."""
     out = []
+    cutoff = _now() - _HEALTH_DECAY_S
     for e in episodes():
-        if e.get("status") in ("pending", "failed", "stale"):
+        st = e.get("status")
+        if st == "pending" or (
+                st in ("failed", "stale")
+                and float(e.get("updated_ts") or 0) >= cutoff):
             out.append({
-                "kind": f"setup_episode_{e['status']}",
+                "kind": f"setup_episode_{st}",
                 "plugin": e.get("plugin"),
                 "episode": e.get("id"),
                 "detail": e.get("last_error") or "",
@@ -136,98 +158,126 @@ def health_issues() -> list[dict]:
 
 
 def _episode_key(plugin: str, artifact_id: str,
-                 approved: list[str]) -> str:
+                 approved_keys: list[str]) -> str:
     h = hashlib.sha256()
     h.update(plugin.encode())
     h.update(artifact_id.encode())
-    for ident in sorted(approved):
+    for ident in sorted(approved_keys):
         h.update(ident.encode())
     return h.hexdigest()[:24]
 
 
 # ---------------------------------------------------------------------------
-# Settlement
+# Round ledger
 # ---------------------------------------------------------------------------
 
-async def on_consent_decision(*, plugin: str, artifact_id: str,
-                              identity: str, approved: bool) -> None:
-    """Feed ONE terminal consent decision (Approve / Deny / expiry counts as
-    deny). Called by the consent finish hook AFTER the decision is durable
-    (ack persisted + reconcile for approvals). Never raises."""
-    if _lock is None:
-        return  # not configured (tests construct explicitly)
+def register_prompt(*, plugin: str, artifact_id: str, identity: str) -> None:
+    """Register (or RE-OPEN) a round member when its consent keyboard is
+    posted. Fed SYNCHRONOUSLY from the consent prompt path (which runs
+    without awaits inside the event loop, so this read-modify-write cannot
+    interleave with the locked async sections — both are yield-free). The
+    round's membership comes from what was actually ASKED, never inferred
+    from ack state; a re-prompt after expiry RE-OPENS the member so the
+    round waits for the fresh decision. Idempotent; never raises."""
     try:
-        async with _lock:
-            acc = _open_decisions.setdefault(
-                plugin, {"artifact_id": artifact_id, "approved": [],
-                         "denied": 0})
-            # A new artifact generation supersedes the open accumulator.
-            if acc.get("artifact_id") != artifact_id:
-                acc.update({"artifact_id": artifact_id, "approved": [],
-                            "denied": 0})
-            if approved:
-                if identity not in acc["approved"]:
-                    acc["approved"].append(identity)
-            else:
-                acc["denied"] += 1
-        await _maybe_settle(plugin)
-    except Exception:  # noqa: BLE001 — consent flow must never see a raise
-        logger.exception("setup-episode decision handling failed (plugin=%s)",
+        data = _load()
+        rnd = data["rounds"].get(plugin)
+        if not isinstance(rnd, dict) or rnd.get("artifact_id") != artifact_id:
+            rnd = {"artifact_id": artifact_id, "members": {}}
+            data["rounds"][plugin] = rnd
+        rnd["members"][identity] = {"state": "open"}
+        _save(data)
+    except Exception:  # noqa: BLE001 — prompt path must never see a raise
+        logger.exception("setup-round prompt registration failed (plugin=%s)",
                          plugin)
 
 
-async def _maybe_settle(plugin: str) -> None:
-    assert _lock is not None
-    pending = 0
-    if _pending_consents_for is not None:
-        try:
-            pending = _pending_consents_for(plugin)
-        except Exception:  # noqa: BLE001
-            logger.exception("pending-consent count failed (plugin=%s)", plugin)
-            return  # cannot prove settlement — a later decision retries
-    if pending > 0:
+async def on_consent_decision(*, plugin: str, artifact_id: str,
+                              identity: str, approved: bool,
+                              approval_gen: str = "") -> None:
+    """Feed ONE terminal consent decision (Approve / Deny / expiry counts as
+    deny). Called AFTER the decision is durable (ack persisted + reconcile
+    succeeded, for approvals). ``approval_gen`` is the persisted ack's
+    approval generation — it keys the episode so a re-approval (new gen)
+    mints a NEW episode even for an identical trigger tuple. Never raises.
+
+    Accumulate + settle-check + episode creation run under ONE lock
+    acquisition (no awaits inside) — concurrent finish callbacks cannot
+    split a round. Notes and the worker kick happen after release."""
+    if _lock is None:
         return
-    async with _lock:
-        acc = _open_decisions.pop(plugin, None)
-        if acc is None:
-            return
-        approved = acc["approved"]
-        artifact_id = acc["artifact_id"]
-        if not approved:
-            logger.info("consent episode settled with no approvals "
-                        "(plugin=%s) — setup not run", plugin)
-            if _notify_operator is not None:
-                await _notify_operator(
-                    f"Plugin {plugin}: consent settled with no approved "
-                    "triggers — its setup tool was not run.")
-            return
-        entry = None
-        if _resolve_registry_entry is not None:
-            try:
-                entry = _resolve_registry_entry(plugin)
-            except Exception:  # noqa: BLE001
-                logger.exception("registry resolve failed (plugin=%s)", plugin)
-        setup = (entry or {}).get("setup_tool") if isinstance(entry, dict) else None
-        if not setup:
-            return  # plugin declares no setup tool — nothing to do
-        key = _episode_key(plugin, artifact_id, approved)
-        data = _load()
-        if any(e.get("key") == key for e in data["episodes"]):
-            return  # atomic claim: already created by a racing settlement
-        data["episodes"].append({
-            "id": uuid.uuid4().hex[:12],
-            "key": key,
-            "plugin": plugin,
-            "artifact_id": artifact_id,
-            "setup_tool": setup,
-            "approved_identities": sorted(approved),
-            "status": "pending",
-            "attempts": 0,
-            "created_ts": _now(),
-            "updated_ts": _now(),
-        })
-        _save(data)
-    if _kick is not None:
+    note: str | None = None
+    created = False
+    try:
+        async with _lock:
+            data = _load()
+            rnd = data["rounds"].get(plugin)
+            if not isinstance(rnd, dict) or rnd.get("artifact_id") != artifact_id:
+                # Unknown round (e.g. store reset) — synthesize one so a
+                # decision is never dropped on the floor.
+                rnd = {"artifact_id": artifact_id, "members": {}}
+                data["rounds"][plugin] = rnd
+            member = {"state": "approved" if approved else "denied"}
+            if approved:
+                member["gen"] = approval_gen
+            rnd["members"][identity] = member
+            undecided = [i for i, m in rnd["members"].items()
+                         if m.get("state") == "open"]
+            if undecided:
+                _save(data)
+                return
+            # Round settled — consume it.
+            del data["rounds"][plugin]
+            approved_keys = sorted(
+                f"{i}#{m.get('gen', '')}"
+                for i, m in rnd["members"].items()
+                if m.get("state") == "approved")
+            if not approved_keys:
+                _save(data)
+                note = (f"Plugin {plugin}: consent settled with no approved "
+                        "triggers — its setup tool was not run.")
+            else:
+                entry = None
+                if _resolve_registry_entry is not None:
+                    try:
+                        entry = _resolve_registry_entry(plugin)
+                    except Exception:  # noqa: BLE001
+                        logger.exception("registry resolve failed (plugin=%s)",
+                                         plugin)
+                setup = (entry or {}).get("setup_tool") \
+                    if isinstance(entry, dict) else None
+                if not setup:
+                    _save(data)  # no setup tool — nothing to do
+                else:
+                    key = _episode_key(plugin, artifact_id, approved_keys)
+                    if not any(e.get("key") == key
+                               for e in data["episodes"]):
+                        # Terminal-state hygiene: a fresh episode supersedes
+                        # the plugin's older ones (any status).
+                        data["episodes"] = [
+                            e for e in data["episodes"]
+                            if e.get("plugin") != plugin]
+                        data["episodes"].append({
+                            "id": uuid.uuid4().hex[:12],
+                            "key": key,
+                            "plugin": plugin,
+                            "artifact_id": artifact_id,
+                            "setup_tool": setup,
+                            "approved_identities": approved_keys,
+                            "status": "pending",
+                            "attempts": 0,
+                            "created_ts": _now(),
+                            "updated_ts": _now(),
+                        })
+                        created = True
+                    _save(data)
+    except Exception:  # noqa: BLE001 — consent flow must never see a raise
+        logger.exception("setup-episode decision handling failed (plugin=%s)",
+                         plugin)
+        return
+    if note is not None:
+        await _note(note)
+    if created and _kick is not None:
         _kick.set()
 
 
@@ -236,8 +286,8 @@ async def _maybe_settle(plugin: str) -> None:
 # ---------------------------------------------------------------------------
 
 def start_worker() -> None:
-    """Boot seam: start (or restart) the supervised dispatch worker and kick
-    it once so boot-reconciled ``pending`` episodes re-dispatch."""
+    """Boot seam: start the supervised dispatch worker and kick it once so
+    boot-reconciled ``pending`` episodes re-dispatch."""
     global _worker_task
     if _worker_task is not None and not _worker_task.done():
         return
@@ -254,12 +304,22 @@ async def _worker() -> None:
             await _kick.wait()
             _kick.clear()
             for ep in episodes("pending"):
-                await _run_episode(ep)
+                try:
+                    await _run_episode(ep)
+                except asyncio.CancelledError:
+                    raise
+                except Exception:  # noqa: BLE001 — isolate per episode
+                    logger.exception("setup episode %s failed unexpectedly",
+                                     ep.get("id"))
+                    _update_episode(ep.get("id") or "", status="failed",
+                                    last_error="internal error (see log)")
         except asyncio.CancelledError:
             raise
         except Exception:  # noqa: BLE001 — the worker must survive anything
             logger.exception("plugin-setup worker pass failed")
             await _sleep(5.0)
+            if _kick is not None:
+                _kick.set()  # self re-kick: never strand pending episodes
 
 
 def _update_episode(episode_id: str, **fields) -> None:
@@ -335,22 +395,28 @@ def _compose(ep: dict, entry: dict) -> tuple[str | None, str]:
     """Deterministic execution-target selection + the fixed Casa-authored
     instruction. Returns ``(role, instruction)`` or ``(None, reason)``.
 
-    Order (design round): ``resident:assistant`` when targeted; else the
-    lexicographically first resident target; else the first specialist
+    Tool binding is UNAMBIGUOUS or nothing (impl r1 P1): exactly one
+    server-level grant is required to construct the namespaced tool name —
+    zero or several grants fail the episode (verify blocks multi-server
+    setup-tool plugins upstream with ``setup_tool_ambiguous_server``).
+
+    Target order (design round): ``resident:assistant`` when targeted; else
+    the lexicographically first resident target; else the first specialist
     target via assistant delegation (the specialist has no channel — the
     instruction names the EXACT specialist and tool and forbids
-    substitution). Executor-only targets are refused upstream at verify;
-    reaching here anyway reports unsupported.
+    substitution). Executor-only targets are refused upstream at verify.
     """
+    grants = sorted(entry.get("granted_tools") or [])
+    if len(grants) != 1:
+        return None, (f"ambiguous or missing MCP server binding "
+                      f"({len(grants)} server grants)")
+    tool = ep["setup_tool"]
+    namespaced = f"{grants[0]}__{tool}"
     targets = entry.get("targets") or []
     residents = sorted(t.split(":", 1)[1] for t in targets
                        if t.startswith("resident:"))
     specialists = sorted(t.split(":", 1)[1] for t in targets
                          if t.startswith("specialist:"))
-    grants = entry.get("granted_tools") or []
-    tool = ep["setup_tool"]
-    namespaced = next(
-        (f"{g}__{tool}" for g in sorted(grants)), tool)
     base = (
         f"[casa plugin setup · episode {ep['id']}] The operator approved the "
         f"webhook trigger consent for plugin '{ep['plugin']}' and its secret "

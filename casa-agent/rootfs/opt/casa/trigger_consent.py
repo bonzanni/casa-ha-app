@@ -121,17 +121,35 @@ def prompt_trigger_consent(
                         target=target, auth=auth)
             meta["acked"] = True
 
+    # v0.112.0 (elevenlabs#2): register this prompt as an OPEN member of the
+    # plugin's consent ROUND before the keyboard posts — settlement is
+    # evaluated over the round ledger (all asked prompts decided), never
+    # over ack state (a denial persists no ack, so ack counting can never
+    # settle a deny-last round — impl review r1).
+    try:
+        import plugin_setup_episodes
+        plugin_setup_episodes.register_prompt(
+            plugin=plugin, artifact_id=artifact_id, identity=identity)
+    except Exception:  # noqa: BLE001
+        logger.exception("setup-round prompt feed failed (plugin=%s)", plugin)
+
     async def _feed_setup_episode(approved: bool) -> None:
-        # v0.112.0 (elevenlabs#2): every TERMINAL decision (approve, deny,
-        # expiry) feeds the durable setup-episode evaluator — evaluating on
-        # deny/expiry too closes the "last decision is Deny suppresses setup
-        # for the earlier Approve" hole (Sol design round). Never raises into
-        # the finish hook.
+        # Every TERMINAL decision (approve, deny, expiry) feeds the durable
+        # evaluator. Approvals carry the persisted ack's approval GENERATION
+        # so a revoke→re-approve of an identical tuple mints a NEW episode
+        # (impl review r1). Never raises into the finish hook.
         try:
             import plugin_setup_episodes
+            gen = ""
+            if approved:
+                try:
+                    rec = acks.get(identity)
+                    gen = str((rec or {}).get("gen", ""))
+                except Exception:  # noqa: BLE001
+                    gen = ""
             await plugin_setup_episodes.on_consent_decision(
                 plugin=plugin, artifact_id=artifact_id,
-                identity=identity, approved=approved)
+                identity=identity, approved=approved, approval_gen=gen)
         except Exception:  # noqa: BLE001
             logger.exception("setup-episode feed failed (plugin=%s)", plugin)
 

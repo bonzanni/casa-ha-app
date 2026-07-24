@@ -8238,6 +8238,12 @@ def _tool_verify_plugin_state(
     if (_setup_decl and _entry_targets
             and all(str(t).startswith("executor:") for t in _entry_targets)):
         reasons.append("setup_tool_unsupported_target")
+    # v0.112.0 (impl r1): the post-consent dispatch names the EXACT
+    # namespaced tool `<server-grant>__<setupTool>` — that binding is only
+    # unambiguous with exactly ONE MCP server grant. Zero (skill-only) or
+    # several servers make the declaration unexecutable/ambiguous: blocking.
+    if _setup_decl and len(granted) != 1:
+        reasons.append("setup_tool_ambiguous_server")
 
     # Tools (system-requirements — verify_bin presence). Sol #11: check BOTH the
     # INSTALLED manifest rows AND every requirement the ARTIFACT declares, so a

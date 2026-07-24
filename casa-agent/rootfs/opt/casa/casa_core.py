@@ -3041,13 +3041,6 @@ async def main() -> None:
     # boot re-dispatch immediately (crash-safe at-least-once).
     import plugin_setup_episodes as _pse
 
-    def _setup_pending_for(plugin: str) -> int:
-        import trigger_reconcile as _tr
-        return sum(
-            1 for i in _tr.current_issues()
-            if getattr(i, "reason_code", "") == "trigger_pending_ack"
-            and getattr(i, "name", "") == plugin)
-
     def _setup_registry_entry(plugin: str) -> dict | None:
         import plugin_grants as _pg
         import plugin_registry as _pr
@@ -3097,7 +3090,6 @@ async def main() -> None:
 
     _pse.configure(
         dispatch=_setup_dispatch, notify_operator=_setup_notify,
-        pending_consents_for=_setup_pending_for,
         resolve_registry_entry=_setup_registry_entry,
     )
     _pse.start_worker()
