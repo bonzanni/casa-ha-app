@@ -1421,12 +1421,22 @@ def _make_telegram_update_handler(*, get_telegram_channel, webhook_secret: str):
         telegram_channel = get_telegram_channel()
         if telegram_channel is None:
             return web.json_response({"error": "telegram not configured"}, status=404)
-        if webhook_secret:
-            token = request.headers.get("X-Telegram-Bot-Api-Secret-Token", "")
-            if not hmac.compare_digest(
-                token.encode("utf-8"), webhook_secret.encode("utf-8"),
-            ):
-                return web.Response(status=403)
+        # #193: fail-closed when no webhook secret is configured. The Telegram
+        # webhook transport always carries an X-Telegram-Bot-Api-Secret-Token
+        # (set via setWebhook); with no secret this route would accept forged,
+        # unsigned updates and reach the assistant. Reject unconditionally
+        # rather than skip the check — in polling mode the route is registered
+        # but unused, so rejecting is harmless; in webhook mode a secret must be
+        # set. Mirrors the /invoke fail-closed treatment (403 = route disabled,
+        # not merely mis-signed).
+        if not webhook_secret:
+            return web.json_response(
+                {"error": "webhook auth disabled"}, status=403)
+        token = request.headers.get("X-Telegram-Bot-Api-Secret-Token", "")
+        if not hmac.compare_digest(
+            token.encode("utf-8"), webhook_secret.encode("utf-8"),
+        ):
+            return web.Response(status=403)
         payload = await request.json()
         await telegram_channel.process_webhook_update(payload)
         return web.Response(status=200)

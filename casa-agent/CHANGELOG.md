@@ -1,5 +1,19 @@
 # Changelog
 
+## [0.116.0] - 2026-07-24
+
+### Security
+
+- The `POST /telegram/update` webhook endpoint now rejects requests when no
+  webhook secret is configured, instead of accepting them. Previously, with
+  webhook authentication disabled, a forged Telegram update posted to this
+  endpoint would reach the assistant. The endpoint now fails closed (403) with
+  no secret — matching the `/invoke` endpoint — which is safe because the
+  Telegram webhook transport always carries a secret token, and in polling mode
+  the endpoint is unused. Set `webhook_auth_enabled` (and a secret) to use the
+  Telegram webhook transport. Part of #193; the voice-channel siblings in that
+  issue are tracked separately pending a routing decision.
+
 ## [0.115.0] - 2026-07-24
 
 ### Fixed

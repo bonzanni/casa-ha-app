@@ -71,12 +71,16 @@ async def test_non_ascii_token_is_403_not_500():
     await client.close()
 
 
-async def test_no_secret_configured_accepts():
+async def test_no_secret_configured_rejects():
+    # #193: with no webhook secret the route is fail-CLOSED — an unsigned
+    # (potentially forged) update must NOT reach the assistant. 403 signals the
+    # route is disabled, not merely mis-signed (mirrors /invoke). In polling
+    # mode this route is registered but unused, so rejecting is harmless.
     ch = _channel()
     client = await _client("", ch)
     resp = await client.post("/telegram/update", json={"update_id": 1})
-    assert resp.status == 200
-    ch.process_webhook_update.assert_awaited_once()
+    assert resp.status == 403
+    ch.process_webhook_update.assert_not_awaited()
     await client.close()
 
 
