@@ -39,8 +39,6 @@ fi
 if bashio::config.true 'webhook_auth_enabled'; then
     export WEBHOOK_SECRET="$(bashio::config 'webhook_secret')"
 fi
-export PRIMARY_AGENT_NAME="$(bashio::config 'primary_agent_name')"
-export VOICE_AGENT_NAME="$(bashio::config 'voice_agent_name')"
 export PRIMARY_AGENT_MODEL="$(bashio::config 'primary_agent_model')"
 export VOICE_AGENT_MODEL="$(bashio::config 'voice_agent_model')"
 export ENABLE_TERMINAL="$(bashio::config 'enable_terminal')"

@@ -261,8 +261,6 @@ docker cp \
 
 if ! out=$(MSYS_NO_PATHCONV=1 docker exec \
         -e VOICE_AGENT_MODEL=haiku \
-        -e VOICE_AGENT_NAME=Tina \
-        -e PRIMARY_AGENT_NAME=Ellen \
         "$NAME" /opt/casa/venv/bin/python /tmp/ha_delegation_butler.py 2>&1); then
     printf '%s\n' "$out" | tail -30 >&2
     fail "H-3: butler-resident harness exited non-zero"

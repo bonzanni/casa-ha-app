@@ -111,7 +111,7 @@ fi
 # add its key to DEPRECATED_OPTION_KEYS below. Idempotent — only deletes keys
 # actually present, so it is a no-op on clean installs. Seeded from a full
 # git-history audit of every option key ever removed (2026-06-08).
-DEPRECATED_OPTION_KEYS="github_token heartbeat_enabled heartbeat_interval_minutes honcho_api_key honcho_api_url repos scope_threshold telegram_webhook_url subagent_model"
+DEPRECATED_OPTION_KEYS="github_token heartbeat_enabled heartbeat_interval_minutes honcho_api_key honcho_api_url repos scope_threshold telegram_webhook_url subagent_model primary_agent_name voice_agent_name"
 _dop_opts="$(bashio::addon.options 2>/dev/null || echo '{}')"
 for _dop_key in $DEPRECATED_OPTION_KEYS; do
     if bashio::jq.exists "$_dop_opts" ".${_dop_key}"; then
