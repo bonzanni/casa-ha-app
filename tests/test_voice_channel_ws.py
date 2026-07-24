@@ -13,6 +13,8 @@ import pytest
 from aiohttp import web, WSMsgType
 from aiohttp.test_utils import TestClient, TestServer
 
+from voice_auth_helpers import SigningVoiceClient, VOICE_TEST_SECRET
+
 from bus import BusMessage, MessageBus, MessageType
 from channels.voice.channel import VoiceChannel, VoiceHandoffReservation
 from channels.voice.routes import VoiceWsConnection
@@ -195,7 +197,7 @@ async def ws_app():
     memory.profile = AsyncMock(return_value="")
 
     ch = VoiceChannel(
-        bus=bus, default_agent="butler", webhook_secret="",
+        bus=bus, default_agent="butler", webhook_secret=VOICE_TEST_SECRET,
         sse_path="/api/converse", ws_path="/api/converse/ws",
         agent_configs={"butler": _FakeCfg()},
         memory=memory, idle_timeout=300,
@@ -204,7 +206,8 @@ async def ws_app():
     app = web.Application()
     ch.register_routes(app)
 
-    async with TestClient(TestServer(app)) as client:
+    async with TestClient(TestServer(app)) as _raw_client:
+        client = SigningVoiceClient(_raw_client)
         yield client, bus, memory, ch
     loop.cancel()
 
@@ -615,17 +618,18 @@ class TestWSTurn:
     async def test_empty_secret_never_accepts_background_capability(
         self, unsigned_route_ws_app,
     ):
+        """#193 (v0.117.0): with no webhook secret the WS route is fail-CLOSED —
+        the upgrade itself is refused (401) before any frame is exchanged, so a
+        route can never register, let alone claim background capabilities. This
+        supersedes the older guarantee (connection allowed, capabilities
+        dropped) with a strictly stronger one."""
+        from aiohttp import WSServerHandshakeError
+
         client, channel = unsigned_route_ws_app
-        async with client.ws_connect("/api/converse/ws") as ws:
-            await ws.send_json({
-                "type": "voice_route_register", "protocol": 2,
-                "route_id": "entry-1", "agent_role": "butler",
-                "capabilities": [
-                    "background_jobs", "satellite_announce", "voice_handoff",
-                ],
-            })
-            ack = await ws.receive_json()
-            assert ack["accepted_capabilities"] == []
+        with pytest.raises(WSServerHandshakeError) as excinfo:
+            async with client.ws_connect("/api/converse/ws"):
+                pass
+        assert excinfo.value.status == 401
         assert channel.routes.get_connected("entry-1") is None
 
     async def test_cancel_stops_in_flight(self, ws_app):
@@ -802,7 +806,7 @@ async def voice_ws_app_with_limiter(request):
     limiter = RateLimiter(capacity=capacity, window_s=60.0)
 
     channel = VoiceChannel(
-        bus=bus, default_agent="butler", webhook_secret="",
+        bus=bus, default_agent="butler", webhook_secret=VOICE_TEST_SECRET,
         sse_path="/api/converse", ws_path="/api/converse/ws",
         agent_configs={role: _FakeCfg() for role in roles},
         memory=memory, idle_timeout=300,
@@ -811,7 +815,8 @@ async def voice_ws_app_with_limiter(request):
 
     app = web.Application()
     channel.register_routes(app)
-    async with TestClient(TestServer(app)) as client:
+    async with TestClient(TestServer(app)) as _raw_client:
+        client = SigningVoiceClient(_raw_client)
         yield client
     for task in loop_tasks:
         task.cancel()
@@ -988,7 +993,7 @@ async def ws_app_nonprefix():
     loop = asyncio.create_task(bus.run_agent_loop("butler"))
 
     ch = VoiceChannel(
-        bus=bus, default_agent="butler", webhook_secret="",
+        bus=bus, default_agent="butler", webhook_secret=VOICE_TEST_SECRET,
         sse_path="/api/converse", ws_path="/api/converse/ws",
         agent_configs={"butler": _FakeCfg()},
         memory=AsyncMock(), idle_timeout=300,
@@ -996,7 +1001,8 @@ async def ws_app_nonprefix():
     app = web.Application()
     ch.register_routes(app)
 
-    async with TestClient(TestServer(app)) as client:
+    async with TestClient(TestServer(app)) as _raw_client:
+        client = SigningVoiceClient(_raw_client)
         yield client
     loop.cancel()
 
@@ -1009,7 +1015,7 @@ async def ws_app_shrinking():
     loop = asyncio.create_task(bus.run_agent_loop("butler"))
 
     ch = VoiceChannel(
-        bus=bus, default_agent="butler", webhook_secret="",
+        bus=bus, default_agent="butler", webhook_secret=VOICE_TEST_SECRET,
         sse_path="/api/converse", ws_path="/api/converse/ws",
         agent_configs={"butler": _FakeCfg()},
         memory=AsyncMock(), idle_timeout=300,
@@ -1017,7 +1023,8 @@ async def ws_app_shrinking():
     app = web.Application()
     ch.register_routes(app)
 
-    async with TestClient(TestServer(app)) as client:
+    async with TestClient(TestServer(app)) as _raw_client:
+        client = SigningVoiceClient(_raw_client)
         yield client
     loop.cancel()
 
@@ -1034,7 +1041,7 @@ async def ws_app_stalling(monkeypatch):
     loop = asyncio.create_task(bus.run_agent_loop("butler"))
 
     ch = VoiceChannel(
-        bus=bus, default_agent="butler", webhook_secret="",
+        bus=bus, default_agent="butler", webhook_secret=VOICE_TEST_SECRET,
         sse_path="/api/converse", ws_path="/api/converse/ws",
         agent_configs={"butler": _FakeCfg()},
         memory=AsyncMock(), idle_timeout=300,
@@ -1042,7 +1049,8 @@ async def ws_app_stalling(monkeypatch):
     app = web.Application()
     ch.register_routes(app)
 
-    async with TestClient(TestServer(app)) as client:
+    async with TestClient(TestServer(app)) as _raw_client:
+        client = SigningVoiceClient(_raw_client)
         yield client
     loop.cancel()
 

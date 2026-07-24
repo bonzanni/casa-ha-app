@@ -16,6 +16,8 @@ import pytest
 from aiohttp import web, WSMsgType
 from aiohttp.test_utils import TestClient, TestServer
 
+from voice_auth_helpers import SigningVoiceClient, VOICE_TEST_SECRET
+
 from bus import BusMessage, MessageBus, MessageType
 from casa_core_middleware import cid_middleware
 from channels.voice.channel import VoiceChannel
@@ -65,14 +67,15 @@ async def voice_app():
     loop_task = asyncio.create_task(bus.run_agent_loop("butler"))
 
     channel = VoiceChannel(
-        bus=bus, default_agent="butler", webhook_secret="",
+        bus=bus, default_agent="butler", webhook_secret=VOICE_TEST_SECRET,
         sse_path="/api/converse", ws_path="/api/converse/ws",
         agent_configs={"butler": _FakeAgentConfig()},
         memory=_DummyMemory(), idle_timeout=300,
     )
     app = web.Application(middlewares=[cid_middleware])
     channel.register_routes(app)
-    async with TestClient(TestServer(app)) as client:
+    async with TestClient(TestServer(app)) as _raw_client:
+        client = SigningVoiceClient(_raw_client)
         yield client, agent, channel
     loop_task.cancel()
 

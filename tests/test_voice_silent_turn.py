@@ -17,6 +17,8 @@ import pytest
 from aiohttp import web
 from aiohttp.test_utils import TestClient, TestServer
 
+from voice_auth_helpers import SigningVoiceClient, VOICE_TEST_SECRET
+
 from bus import BusMessage, MessageBus, MessageType
 from casa_core_middleware import cid_middleware
 from channels.voice.channel import VoiceChannel
@@ -64,7 +66,7 @@ def _make_channel(bus: MessageBus, cfg=None) -> VoiceChannel:
     return VoiceChannel(
         bus=bus,
         default_agent="butler",
-        webhook_secret="",
+        webhook_secret=VOICE_TEST_SECRET,
         sse_path="/api/converse",
         ws_path="/api/converse/ws",
         agent_configs={"butler": cfg or _FakeAgentConfig()},
@@ -83,7 +85,8 @@ async def silent_voice_app():
     channel = _make_channel(bus)
     app = web.Application(middlewares=[cid_middleware])
     channel.register_routes(app)
-    async with TestClient(TestServer(app)) as client:
+    async with TestClient(TestServer(app)) as _raw_client:
+        client = SigningVoiceClient(_raw_client)
         yield client, bus
     loop_task.cancel()
 
@@ -135,7 +138,8 @@ class TestSseSilentTurnFallback:
             channel = _make_channel(bus, cfg)
             app = web.Application(middlewares=[cid_middleware])
             channel.register_routes(app)
-            async with TestClient(TestServer(app)) as client:
+            async with TestClient(TestServer(app)) as _raw_client:
+                client = SigningVoiceClient(_raw_client)
                 resp = await client.post("/api/converse", json={
                     "prompt": "ping", "agent_role": "butler",
                     "scope_id": "s2",
@@ -171,7 +175,8 @@ class TestSseSilentTurnFallback:
             channel = _make_channel(bus)
             app = web.Application(middlewares=[cid_middleware])
             channel.register_routes(app)
-            async with TestClient(TestServer(app)) as client:
+            async with TestClient(TestServer(app)) as _raw_client:
+                client = SigningVoiceClient(_raw_client)
                 resp = await client.post("/api/converse", json={
                     "prompt": "ping", "agent_role": "butler",
                     "scope_id": "s3",
@@ -197,7 +202,8 @@ class TestWsSilentTurnFallback:
             channel = _make_channel(bus)
             app = web.Application(middlewares=[cid_middleware])
             channel.register_routes(app)
-            async with TestClient(TestServer(app)) as client:
+            async with TestClient(TestServer(app)) as _raw_client:
+                client = SigningVoiceClient(_raw_client)
                 ws = await client.ws_connect("/api/converse/ws")
                 await ws.send_json({
                     "type": "utterance", "utterance_id": "u1",

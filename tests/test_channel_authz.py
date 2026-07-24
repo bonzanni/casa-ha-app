@@ -18,6 +18,8 @@ import pytest
 from aiohttp import web
 from aiohttp.test_utils import TestClient, TestServer
 
+from voice_auth_helpers import SigningVoiceClient, VOICE_TEST_SECRET
+
 from bus import MessageBus
 from casa_core_middleware import cid_middleware
 from channel_authz import CHANNEL_CAPABILITY, agent_allowed_on
@@ -104,7 +106,10 @@ async def voice_app_unauthorized_resident():
     channel = VoiceChannel(
         bus=bus,
         default_agent="assistant",
-        webhook_secret="",
+        # #193 (v0.117.0): voice is fail-closed, so this authz test must get
+        # PAST auth to reach the capability gate it actually exercises — the
+        # signing client supplies a valid signature for this secret.
+        webhook_secret=VOICE_TEST_SECRET,
         sse_path="/api/converse",
         ws_path="/api/converse/ws",
         agent_configs={"assistant": _FakeAgentConfig()},
@@ -113,7 +118,8 @@ async def voice_app_unauthorized_resident():
     )
     app = web.Application(middlewares=[cid_middleware])
     channel.register_routes(app)
-    async with TestClient(TestServer(app)) as client:
+    async with TestClient(TestServer(app)) as _raw_client:
+        client = SigningVoiceClient(_raw_client)
         yield client, bus, channel
 
 

@@ -6,6 +6,8 @@ container).
 """
 
 import asyncio
+import hashlib
+import hmac
 import json
 import os
 import sys
@@ -15,11 +17,34 @@ import aiohttp
 
 HOST_PORT = int(os.environ["HOST_PORT"])
 URL = f"ws://localhost:{HOST_PORT}/api/converse/ws"
+# #193 (v0.117.0): the WS upgrade is fail-closed and HMAC-verified over an
+# EMPTY body, so the driver signs like the companion integration does.
+SECRET = os.environ["WEBHOOK_SECRET_E2E"]
+SIGNATURE = hmac.new(SECRET.encode(), b"", hashlib.sha256).hexdigest()
+HEADERS = {"X-Webhook-Signature": SIGNATURE}
+
+
+async def assert_unsigned_upgrade_refused(session) -> int:
+    """#193: an UNSIGNED upgrade must be refused before any frame flows."""
+    try:
+        async with session.ws_connect(URL, timeout=15):
+            print("FAIL: unsigned WS upgrade was accepted", file=sys.stderr)
+            return 1
+    except aiohttp.WSServerHandshakeError as err:
+        if err.status != 401:
+            print(f"FAIL: unsigned WS upgrade returned {err.status}, expected 401",
+                  file=sys.stderr)
+            return 1
+    print("PASS: unsigned WS upgrade refused with 401")
+    return 0
 
 
 async def main() -> int:
     async with aiohttp.ClientSession() as session:
-        async with session.ws_connect(URL, timeout=15) as ws:
+        rc = await assert_unsigned_upgrade_refused(session)
+        if rc:
+            return rc
+        async with session.ws_connect(URL, timeout=15, headers=HEADERS) as ws:
             await ws.send_json({"type": "stt_start", "scope_id": "e2e-ws"})
             await ws.send_json({
                 "type": "utterance", "utterance_id": "u-1",
