@@ -66,6 +66,12 @@ reloads + verifies internally. Report the outcome and `emit_completion(...)`.
 
 ## Setup-tool hand-back — MANDATORY when the plugin ships one
 
+**Mechanical skip (v0.112.0):** when the `plugin_update` result carries
+`setup_via_consent: true`, do NOT hand back — the re-consent Approve runs
+the setup tool automatically via Casa's durable post-consent episode. Say
+so in the completion text. Hand back only when `setup_tool` is set with
+`setup_via_consent: false`, or for a legacy handoff-only declaration.
+
 An update re-mints per-trigger secrets (consent re-approval rotates them),
 so a plugin that ships an MCP **setup tool** (naming convention `setup_*`)
 is left pointing the external service at STALE credentials until that tool

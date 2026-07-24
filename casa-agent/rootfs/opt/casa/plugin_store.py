@@ -834,6 +834,32 @@ def manifest_triggers(manifest: dict, plugin_name: str) -> list:
     return triggers
 
 
+_SETUP_TOOL_RE = re.compile(r"^setup_[a-z0-9_]{1,64}$")
+
+
+def manifest_setup_tool(manifest: dict) -> str | None:
+    """Guarded + STRICT ``casa.setupTool`` extraction (v0.112.0,
+    casa-plugin-elevenlabs#2). ABSENT → ``None``. PRESENT-but-malformed
+    (non-string, empty, whitespace/qualification, not ``setup_``-prefixed,
+    outside the conservative ASCII tool-name grammar, over-long) is a
+    plugin-author error: raises ``StoreError(reason_code=
+    "setup_tool_invalid")`` — validated on EVERY artifact-verification path
+    like ``casa.triggers``. The declared tool must be argument-free and
+    idempotent (authoring doctrine); Casa auto-runs it once the plugin's
+    trigger-consent episode settles with an approval."""
+    casa = manifest.get("casa")
+    if not isinstance(casa, dict) or "setupTool" not in casa:
+        return None
+    raw = casa.get("setupTool")
+    if not isinstance(raw, str) or not _SETUP_TOOL_RE.fullmatch(raw):
+        raise StoreError(
+            "casa.setupTool invalid: must be a setup_-prefixed lowercase "
+            "ASCII tool name (^setup_[a-z0-9_]{1,64}$), got "
+            f"{raw!r}",
+            reason_code="setup_tool_invalid")
+    return raw
+
+
 def manifest_protected_tools(manifest: dict) -> list:
     """Guarded + STRICT casa.protectedTools extraction (A:§3.7, extended
     v0.78.0 W1), beside manifest_sysreqs. An ABSENT ``casa.protectedTools``
@@ -977,6 +1003,9 @@ def validate_manifest(root: Path, expected_name: str, *,
     # Task 4: trigger effective names derive from the RUNTIME name
     # (manifest_name when owned), never the scoped registry name.
     manifest_triggers(manifest, manifest_name or expected_name)
+    # v0.112.0: a PRESENT-but-malformed casa.setupTool refuses the
+    # install/update outright (strict; raises setup_tool_invalid).
+    manifest_setup_tool(manifest)
     return manifest
 
 

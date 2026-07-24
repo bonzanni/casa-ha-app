@@ -298,6 +298,18 @@ async def reconcile_plugin_triggers(
             trigger_registry.replace_plugin_overlay({})
             raise
         trigger_registry.replace_plugin_overlay(desired.overlay)
+        # v0.112.0 (impl r5, Terra): the overlay is now live — wake the
+        # setup-episode worker so any pending episode gated on a
+        # previously-down route dispatches. This fires on EVERY reconcile
+        # (consent-driven or a plain casa_reload_triggers heal), not just the
+        # consent finish hook — otherwise an episode whose approval-time
+        # reconcile failed would wait indefinitely for a later heal to notice
+        # it. Cheap (an Event.set); the worker re-checks routes_live itself.
+        try:
+            import plugin_setup_episodes
+            plugin_setup_episodes.kick()
+        except Exception:  # noqa: BLE001 — never break a reconcile on this
+            pass
         # Prompts fire INSIDE the lock (Sol shipB-r2 P1-1): keyboard
         # registration is then ordered BEFORE any later reconcile can
         # acquire the lock — so trigger_ack_revoke's final
@@ -345,12 +357,37 @@ def _fire_consent_prompts(
             secrets_dir=secrets_dir, prompt=False, resolver=resolver,
             global_secret_ok=global_secret_ok, regen_health=True)
 
+    # v0.112.0 (impl r4): SEAL each plugin's setup-round membership in ONE
+    # yield-free batch BEFORE any keyboard posts — a fast Approve on the
+    # first keyboard can never settle a round still registering members.
+    import plugin_setup_episodes
+    _ack_identity = ack_identity  # module-level import (plugin_triggers)
+    nonce_by_identity: dict[str, str] = {}
+    by_plugin: dict[tuple, list[dict]] = {}
+    for p in pending:
+        by_plugin.setdefault((p["plugin"], p["artifact_id"]), []).append(p)
+    for (plg, art), items in by_plugin.items():
+        idents = [
+            _ack_identity(plugin=plg, artifact_id=art,
+                          effective=i["effective"], target=i["target"],
+                          auth=i["auth"])
+            for i in items]
+        try:
+            nonce_by_identity.update(plugin_setup_episodes.open_round(
+                plugin=plg, artifact_id=art, identities=idents))
+        except Exception:  # noqa: BLE001 — unfenced, never blocking
+            logger.exception("setup-round open failed (plugin=%s)", plg)
+
     for p in pending:
         try:
+            ident = _ack_identity(
+                plugin=p["plugin"], artifact_id=p["artifact_id"],
+                effective=p["effective"], target=p["target"], auth=p["auth"])
             trigger_consent.prompt_trigger_consent(
                 coordinator=authz_grants.CHALLENGES, channel=channel,
                 chat_id=chat_id, operator_id=operator_id, acks=acks,
-                reconcile_cb=_reconcile_again, **p)
+                reconcile_cb=_reconcile_again,
+                setup_nonce=nonce_by_identity.get(ident, ""), **p)
         except Exception:  # noqa: BLE001 — a prompt failure never breaks
             # the mutation; pending_ack stays in health and re-prompts later.
             logger.exception("trigger consent prompt failed (plugin=%s)",

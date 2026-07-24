@@ -92,6 +92,7 @@ def prompt_trigger_consent(
     plugin: str, artifact_id: str, effective: str, target: str,
     auth: dict, acks: Any, clearance: str = "public",
     reconcile_cb: "Callable[[], Awaitable[None]] | None" = None,
+    setup_nonce: str = "",
 ) -> Any:
     """Post (or dedupe onto) the consent keyboard for ONE plugin trigger.
 
@@ -109,6 +110,13 @@ def prompt_trigger_consent(
         plugin=plugin, effective=effective, role=role, auth=auth,
         clearance=clearance)
 
+    # v0.112.0 (elevenlabs#2): the plugin's consent ROUND membership was
+    # SEALED by the reconciler (`plugin_setup_episodes.open_round`, one
+    # yield-free batch per plugin BEFORE any keyboard posts — impl r4); the
+    # caller threads this prompt's NONCE in via ``setup_nonce`` so a
+    # superseded keyboard's late deny/expiry can never decide a
+    # re-prompted member.
+
     def _on_commit_sync(idx: int, meta: dict) -> None:
         # Telegram callback, IMMEDIATELY after a successful commit (no await
         # between): idx 0 -> persist the ack atomically; idx 1 -> no-op. An
@@ -120,6 +128,41 @@ def prompt_trigger_consent(
                         artifact_id=artifact_id, effective=effective,
                         target=target, auth=auth)
             meta["acked"] = True
+            # v0.112.0 (impl r3): record the approval in the setup-round
+            # ledger in this SAME yield-free step — a crash before the
+            # async finish hook must not strand the round (the boot sweep
+            # covers a crash even earlier, from the persisted ack itself).
+            try:
+                import plugin_setup_episodes
+                rec = acks.get(identity) or {}
+                plugin_setup_episodes.record_approval_sync(
+                    plugin=plugin, artifact_id=artifact_id,
+                    identity=identity, gen=str(rec.get("gen", "")))
+            except Exception:  # noqa: BLE001
+                logger.exception("sync setup-approval record failed "
+                                 "(plugin=%s)", plugin)
+
+    async def _feed_setup_episode(approved: bool) -> None:
+        # Every TERMINAL decision (approve, deny, expiry) feeds the durable
+        # evaluator. Approvals carry the persisted ack's approval GENERATION
+        # (re-approval mints a new episode); denials carry this keyboard's
+        # NONCE so a superseded keyboard's late expiry is ignored. Never
+        # raises into the finish hook.
+        try:
+            import plugin_setup_episodes
+            gen = ""
+            if approved:
+                try:
+                    rec = acks.get(identity)
+                    gen = str((rec or {}).get("gen", ""))
+                except Exception:  # noqa: BLE001
+                    gen = ""
+            await plugin_setup_episodes.on_consent_decision(
+                plugin=plugin, artifact_id=artifact_id,
+                identity=identity, approved=approved, approval_gen=gen,
+                nonce=setup_nonce)
+        except Exception:  # noqa: BLE001
+            logger.exception("setup-episode feed failed (plugin=%s)", plugin)
 
     def _finish_factory(message_id: int, req: Any) -> Callable[[dict], Any]:
         async def _finish(outcome: dict) -> None:
@@ -130,6 +173,7 @@ def prompt_trigger_consent(
                     f"⌛ Expired — consent for POST /webhook/"
                     f"{effective} was not answered; it stays unrouted",
                 )
+                await _feed_setup_episode(approved=False)
                 return
             if outcome.get("option_index") == 0:
                 if not req.meta.get("acked"):
@@ -150,6 +194,15 @@ def prompt_trigger_consent(
                     f"✅ Enabled — POST /webhook/{effective} now "
                     f"routes to {role}",
                 )
+                # v0.112.0 (impl r2): the approval is DURABLE here (ack
+                # persisted + secret minted) — feed the setup evaluator
+                # REGARDLESS of the reconcile outcome below. Gating on the
+                # reconcile stranded the round forever on a transient
+                # reconcile failure (the ack exists, so the trigger is never
+                # re-prompted and the member would stay open). Setup wires
+                # the EXTERNAL side against the minted secret; Casa's route
+                # overlay healing is a separate, surfaced concern.
+                await _feed_setup_episode(approved=True)
                 if reconcile_cb is not None:
                     try:
                         await reconcile_cb()
@@ -163,12 +216,21 @@ def prompt_trigger_consent(
                             f"/webhook/{effective} failed — run "
                             "plugin_verify",
                         )
+                # impl r4: wake the setup worker — either the settlement
+                # above created an episode, or a previously-gated pending
+                # episode may now see its routes live post-reconcile.
+                try:
+                    import plugin_setup_episodes
+                    plugin_setup_episodes.kick()
+                except Exception:  # noqa: BLE001
+                    pass
             else:
                 await channel.edit_dm_message(
                     chat_id, message_id,
                     f"❌ Denied — POST /webhook/{effective} stays "
                     "unrouted",
                 )
+                await _feed_setup_episode(approved=False)
 
         return _finish
 
