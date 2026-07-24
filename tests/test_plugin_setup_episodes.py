@@ -608,3 +608,46 @@ async def test_run_episode_persistent_unresolve_goes_stale_bounded(wired, monkey
         await _drain_pending(wired)
     assert pse.episodes()[0]["status"] == "stale"
     assert wired["dispatches"] == []
+
+
+@pytest.mark.asyncio
+async def test_worker_pass_signals_retry_on_unavailable(wired):
+    # impl r9 (Terra): a pass that DEFERS on transient unavailability returns
+    # True so the worker schedules a delayed self-kick — recovery is not left
+    # to a coalesced reconcile kick.
+    _prompt()
+    await _decide()
+    pse.configure(
+        dispatch=wired_dispatch(wired), notify_operator=wired_notify(wired),
+        resolve_registry_entry=lambda p: None)     # always unavailable
+    assert await pse._worker_pass() is True
+    # a successful resolve dispatches and does NOT ask for retry
+    pse.configure(
+        dispatch=wired_dispatch(wired), notify_operator=wired_notify(wired),
+        resolve_registry_entry=lambda p: wired["entry"])
+    assert await pse._worker_pass() is False
+    assert len(wired["dispatches"]) == 1
+
+
+@pytest.mark.asyncio
+async def test_schedule_retry_kicks_after_delay(wired, monkeypatch):
+    # the delayed self-kick fires the Event after the (injected) backoff, so
+    # the worker wakes without any external kick.
+    import asyncio
+    monkeypatch.setattr(pse, "_lock", None)
+    monkeypatch.setattr(pse, "_kick", None)
+    monkeypatch.setattr(pse, "_retry_task", None)
+    slept = {"d": None}
+
+    async def fake_sleep(d):
+        slept["d"] = d
+
+    pse.configure(
+        dispatch=wired_dispatch(wired), notify_operator=wired_notify(wired),
+        resolve_registry_entry=lambda p: wired["entry"], sleep=fake_sleep)
+    assert not pse._kick.is_set()
+    pse._schedule_retry(5.0)
+    await asyncio.sleep(0)              # let the retry task run
+    await asyncio.sleep(0)
+    assert slept["d"] == 5.0
+    assert pse._kick.is_set()          # woken with no external kick

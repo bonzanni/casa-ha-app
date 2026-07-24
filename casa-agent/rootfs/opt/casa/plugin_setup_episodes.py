@@ -73,6 +73,11 @@ STORE_PATH = Path("/data/plugin-setup-episodes.json")
 _SCHEMA_VERSION = 3
 _MAX_DISPATCH_ATTEMPTS = 3
 _RETRY_BACKOFF_S = (1.0, 5.0)
+# impl r9 (Terra): a dispatch-time resolution-unavailable deferral schedules
+# its own delayed re-kick at this interval, so recovery never depends on a
+# coalesced reconcile kick that already fired. Bounded overall by
+# _MAX_SETTLE_DEFERRALS (the episode goes stale after that many attempts).
+_RETRY_INTERVAL_S = 5.0
 _HEALTH_DECAY_S = 72 * 3600.0
 _TOMBSTONE_CAP = 50
 # impl r7 (Sol): a decided round whose registry resolution is UNAVAILABLE is
@@ -91,6 +96,7 @@ _sleep: Callable[[float], Awaitable[None]] = asyncio.sleep
 
 _lock: asyncio.Lock | None = None
 _worker_task: asyncio.Task | None = None
+_retry_task: asyncio.Task | None = None
 _kick: asyncio.Event | None = None
 
 
@@ -495,26 +501,55 @@ def start_worker() -> None:
         _kick.set()
 
 
+async def _worker_pass() -> bool:
+    """One drain pass: recover/settle rounds, then dispatch pending episodes.
+    Returns True if any episode DEFERRED on transient registry unavailability
+    (impl r9, Terra) — the caller schedules a delayed self-kick so recovery
+    does not depend on a future reconcile kick that may have coalesced with
+    the one that already fired (resolver failure is internal, not tied to a
+    reconcile that would kick again)."""
+    await _recover_and_settle()
+    retry_wanted = False
+    for ep in episodes("pending"):
+        try:
+            if await _run_episode(ep):
+                retry_wanted = True
+        except asyncio.CancelledError:
+            raise
+        except Exception:  # noqa: BLE001 — isolate per episode
+            logger.exception("setup episode %s failed unexpectedly",
+                             ep.get("id"))
+            _update_episode(ep.get("id") or "", status="failed",
+                            last_error="internal error (see log)")
+    return retry_wanted
+
+
+def _schedule_retry(delay: float) -> None:
+    """Fire ONE delayed self-kick (impl r9). Coalesces: a live retry task is
+    not duplicated, so a whole pass of deferred episodes costs one timer."""
+    global _retry_task
+    if _retry_task is not None and not _retry_task.done():
+        return
+
+    async def _later() -> None:
+        try:
+            await _sleep(delay)
+        finally:
+            if _kick is not None:
+                _kick.set()
+
+    _retry_task = asyncio.get_running_loop().create_task(
+        _later(), name="plugin-setup-retry")
+
+
 async def _worker() -> None:
     while True:
         try:
             assert _kick is not None
             await _kick.wait()
             _kick.clear()
-            # Recover crash-stranded rounds + retry deferred settlements
-            # BEFORE dispatching — a round that just settled here becomes a
-            # pending episode processed in the same pass.
-            await _recover_and_settle()
-            for ep in episodes("pending"):
-                try:
-                    await _run_episode(ep)
-                except asyncio.CancelledError:
-                    raise
-                except Exception:  # noqa: BLE001 — isolate per episode
-                    logger.exception("setup episode %s failed unexpectedly",
-                                     ep.get("id"))
-                    _update_episode(ep.get("id") or "", status="failed",
-                                    last_error="internal error (see log)")
+            if await _worker_pass():
+                _schedule_retry(_RETRY_INTERVAL_S)
         except asyncio.CancelledError:
             raise
         except Exception:  # noqa: BLE001 — the worker must survive anything
@@ -533,7 +568,10 @@ def _update_episode(episode_id: str, **fields) -> None:
     _save(data)
 
 
-async def _run_episode(ep: dict) -> None:
+async def _run_episode(ep: dict) -> bool:
+    """Dispatch one pending episode. Returns True iff it DEFERRED on
+    transient registry unavailability (the caller schedules a delayed
+    re-kick); False/None on every terminal or route-gated outcome."""
     plugin = ep["plugin"]
     # impl r8 (Sol+Terra): dispatch-time resolution is THREE-STATE, exactly
     # like settlement — a transient resolver failure must NOT permanently
@@ -554,7 +592,7 @@ async def _run_episode(ep: dict) -> None:
             return
         _update_episode(ep["id"], resolve_deferrals=deferrals,
                         last_error="waiting for registry resolution")
-        return  # stays pending; a later reconcile kick retries
+        return True  # deferred — caller schedules a delayed self-kick
     if entry.get("artifact_id") != ep["artifact_id"]:
         # Updated to a NEW artifact (whose own consent round mints its own
         # episode) — this one must never fire (confirmed TOCTOU supersession).
