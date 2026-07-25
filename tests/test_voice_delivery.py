@@ -1086,16 +1086,26 @@ async def test_a_job_with_no_recorded_endpoint_is_never_offered(delivery):
     A row from before endpoint delivery, or one whose endpoint offered nothing,
     records no promise. The integration refuses such a frame, so offering it on
     every sweep would re-send it once a second until expiry. It must be offered
-    to nobody, and it must not block the device's queue forever either — the
-    next job for that device still gets its turn once this one expires.
+    to nobody — and it must not hold the device's queue hostage either: the
+    next answer for that device gets its turn once the undeliverable one
+    expires.
     """
-    registry, _, route, coordinator, _ = delivery
+    registry, _, route, coordinator, now = delivery
     await registry.create(_ready_job(
-        "legacy-1", sequence=1, device="kitchen", delivery_modality=None))
+        "legacy-1", sequence=1, device="kitchen",
+        delivery_modality=None, expires_at=200.0))
+    await registry.create(_ready_job(
+        "job-2", sequence=2, device="kitchen", expires_at=1000.0))
 
     await coordinator.route_connected(route)
+    assert _offered(route) == [], "the undeliverable head must not be offered"
 
-    assert _offered(route) == []
+    # ...and it must not starve what is behind it.
+    now[0] = 201.0
+    await registry.expire_due()
+    await coordinator.sweep_once()
+
+    assert [frame["job_id"] for frame in _offered(route)] == ["job-2"]
 
 
 @pytest.mark.asyncio
