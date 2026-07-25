@@ -99,6 +99,9 @@ class VoiceDeliveryCoordinator:
         self._jobs.LEASE_SECONDS = self._lease_s
         self._attempts: dict[str, _Attempt] = {}
         self._parked_until: dict[str, float] = {}
+        # Jobs already reported as un-offerable, so the 1s sweep logs the
+        # condition once rather than every tick (#233/#224).
+        self._unoffered_logged: set[str] = set()
         self._lock = asyncio.Lock()
         self._task: asyncio.Task | None = None
 
@@ -464,7 +467,20 @@ class VoiceDeliveryCoordinator:
                 continue
             route = self._routes.get_connected(job.origin_route_id)
             if route is None or self._current_bound(route) is None:
+                # #233/#224: a READY answer with no live route was skipped
+                # SILENTLY on every 1s tick, so a result that never reached the
+                # household looked identical to no result at all. Log it once
+                # per job (the sweep is per-second — this must not spam).
+                if job.id not in self._unoffered_logged:
+                    self._unoffered_logged.add(job.id)
+                    logger.warning(
+                        "voice delivery WAITING reason=route_not_connected "
+                        "job=%s — the answer is ready but its origin route is "
+                        "not currently connected; it will be offered on "
+                        "reconnect, or expire.", job.id[:8],
+                    )
                 continue
+            self._unoffered_logged.discard(job.id)
             attempt = _Attempt(
                 job_id=job.id,
                 route_id=job.origin_route_id,
@@ -490,20 +506,35 @@ class VoiceDeliveryCoordinator:
                 self._attempts.pop(job.id, None)
 
     def _spoken_text(self, job: VoiceJob) -> str:
+        # #233: the answer arrives up to a minute after the question, out of
+        # nowhere, on a speaker. Attribute it so the listener can place it —
+        # channel-owned fixed framing around the specialist's own words. (A
+        # richer, varied phrasing is a deliberate follow-up; fixed text first.)
+        speaker = job.specialist_display_name or "The specialist"
         if job.result is not None:
             try:
                 payload = json.loads(job.result)
                 result = parse_voice_job_result(payload)
-                return spoken_text_for(
+                spoken = spoken_text_for(
                     result,
                     prompted=job.prompted_delivery,
                     identity_clearance=voice_identity_clearance({
                         "channel": "voice",
                     }),
                 )
+                # Attribute ONLY the specialist's own answer. A disclosure
+                # fallback ("Your result is ready; I can't read private
+                # details…") or a clarification prompt is CASA speaking, and
+                # prefixing those would both misattribute them and mangle
+                # policy-approved wording. Comparing against spoken_summary is
+                # the exact test for "this is the specialist's text".
+                if spoken and spoken == result.spoken_summary:
+                    return f"{speaker} says: {spoken}"
+                return spoken
             except (json.JSONDecodeError, TypeError, VoiceJobResultError):
                 pass
-        return "The specialist job could not be completed."
+        return (f"I couldn't get an answer from {speaker} — "
+                "you can ask me again.")
 
     async def _send_revoke(self, attempt: _Attempt, reason: str) -> bool:
         current = self._routes.get_connected(attempt.route_id)

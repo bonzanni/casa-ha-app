@@ -386,7 +386,11 @@ async def test_offer_contains_only_policy_approved_spoken_text(delivery):
     await coordinator.route_connected(route)
 
     offer = _offered(route)[0]
-    assert offer["spoken_text"] == "The policy-approved answer."
+    # v0.120.0 (#233): the answer lands on a speaker up to a minute after the
+    # question, so the specialist's OWN text is attributed. Disclosure
+    # fallbacks and clarifications stay verbatim (see the private cases).
+    assert offer["spoken_text"] == (
+        "Judge says: The policy-approved answer.")
     assert offer == {
         "type": "job_ready",
         "protocol": 1,
@@ -394,7 +398,7 @@ async def test_offer_contains_only_policy_approved_spoken_text(delivery):
         "delivery_attempt_id": offer["delivery_attempt_id"],
         "route_id": "entry-1",
         "origin_device_id": "kitchen",
-        "spoken_text": "The policy-approved answer.",
+        "spoken_text": "Judge says: The policy-approved answer.",
         "ready_at": 103.0,
         "expires_at": 1000.0,
         "delivery_sequence": 1,
@@ -559,8 +563,11 @@ async def test_result_ttl_expiring_across_restart_never_emits_ready_frame(
 @pytest.mark.parametrize(
     ("sensitivity", "expected"),
     [
-        ("household", "HOUSEHOLD_PROMPTED_DETAIL_CANARY"),
+        # household: the specialist's own text -> attributed (v0.120.0 #233).
+        ("household", "Judge says: HOUSEHOLD_PROMPTED_DETAIL_CANARY"),
         (
+            # private: a disclosure fallback is CASA speaking -> verbatim, and
+            # crucially unchanged by the attribution work.
             "private",
             "Your result is ready; I can't read private details on this voice route.",
         ),

@@ -43,6 +43,12 @@ from semantic_memory import SemanticMemory
 
 logger = logging.getLogger(__name__)
 
+# Concierge specialist hand-off wire protocol. The client must echo this (and
+# the job id) in its `handoff_received` receipt; see VoiceHandoff.frame and
+# VoiceHandoffCoordinator.handle. Named rather than repeated as a literal so
+# the offer and the acceptance test can never drift apart again.
+_HANDOFF_PROTOCOL = 2
+
 
 @dataclass(frozen=True)
 class VoiceHandoff:
@@ -51,21 +57,37 @@ class VoiceHandoff:
     utterance_id: str
     handoff_id: str
     text: str
+    job_id: str = ""
 
     @classmethod
     def from_job(cls, utterance_id: str, job: VoiceJob) -> "VoiceHandoff":
-        """Select the fixed acknowledgement without exposing job content."""
+        """Select the fixed acknowledgement without exposing job content.
+
+        The wording SETS AN EXPECTATION (#233): the caller is about to wait
+        tens of seconds for a specialist, and "I will ask X." alone left them
+        with no idea whether an answer was still coming. Channel-owned fixed
+        text — never the model's — so the promise is identical every time.
+        """
         return cls(
             utterance_id=utterance_id,
             handoff_id=job.handoff_id or "",
-            text=f"I will ask {job.specialist_display_name}.",
+            job_id=job.id,
+            text=(f"I'll ask {job.specialist_display_name} — "
+                  "this can take up to a minute."),
         )
 
     def frame(self) -> dict[str, str]:
+        # `job_id` + `protocol` are what the client echoes back in its
+        # `handoff_received` receipt. Casa's coordinator binds that receipt to
+        # a job AND a route; without these fields the client could not produce
+        # an acceptable receipt at all, so every handoff stayed PENDING and the
+        # finished answer expired unspoken (the #233/#224 delivery failure).
         return {
             "type": "handoff",
+            "protocol": _HANDOFF_PROTOCOL,
             "utterance_id": self.utterance_id,
             "handoff_id": self.handoff_id,
+            "job_id": self.job_id,
             "text": self.text,
         }
 
@@ -136,7 +158,7 @@ class VoiceHandoffCoordinator:
         """Build the intentionally metadata-only coordinator frame."""
         return {
             "type": "voice_handoff",
-            "protocol": 2,
+            "protocol": _HANDOFF_PROTOCOL,
             "job_id": job.id,
             "handoff_id": job.handoff_id,
             "specialist_display_name": job.specialist_display_name,
@@ -151,26 +173,56 @@ class VoiceHandoffCoordinator:
             await route.send_json(self._frame(job))
 
     async def handle(self, route: Any, frame: Mapping[str, Any]) -> None:
-        """Accept a receipt only for the server-bound route that owns it."""
-        if (
-            frame.get("type") != "handoff_received"
-            or frame.get("protocol") != 2
-        ):
+        """Accept a receipt only for the server-bound route that owns it.
+
+        EVERY rejection is logged with a reason (#233/#224). These branches
+        used to `return` silently, and a client that sent a receipt without
+        `protocol`/`job_id` was indistinguishable from a client that sent
+        nothing: the hand-off stayed PENDING, the finished answer expired
+        unspoken, and NOTHING appeared in the logs on either side. A refused
+        receipt is now always visible. Reasons only — never frame content.
+        """
+        if frame.get("type") != "handoff_received":
+            return          # not addressed to us; the WS carries other types
+        if frame.get("protocol") != _HANDOFF_PROTOCOL:
+            logger.warning(
+                "voice handoff receipt REFUSED reason=protocol_mismatch "
+                "expected=%s got=%r", _HANDOFF_PROTOCOL,
+                frame.get("protocol"),
+            )
             return
         job_id = _nonempty_identifier(frame.get("job_id"))
         handoff_id = _nonempty_identifier(frame.get("handoff_id"))
         route_id = _nonempty_identifier(getattr(route, "route_id", None))
         if job_id is None or handoff_id is None or route_id is None:
+            logger.warning(
+                "voice handoff receipt REFUSED reason=missing_identifier "
+                "job_id=%s handoff_id=%s route_id=%s",
+                job_id is not None, handoff_id is not None,
+                route_id is not None,
+            )
             return
         job = self._registry.get(job_id)
-        if job is None or job.origin_route_id != route_id:
+        if job is None:
+            logger.warning(
+                "voice handoff receipt REFUSED reason=unknown_job")
+            return
+        if job.origin_route_id != route_id:
+            logger.warning(
+                "voice handoff receipt REFUSED reason=route_mismatch")
             return
         try:
             await self._registry.acknowledge_handoff(job_id, handoff_id)
-        except JobTransitionError:
+        except JobTransitionError as exc:
             # A duplicate receipt is idempotent in the registry; mismatched
-            # IDs and stale lifecycle rows are intentionally silent here.
+            # IDs and stale lifecycle rows are not errors, but they are no
+            # longer invisible.
+            logger.info(
+                "voice handoff receipt not applied reason=%s",
+                type(exc).__name__,
+            )
             return
+        logger.info("voice handoff ACKNOWLEDGED job=%s", job_id[:8])
 
 
 def _nonempty_identifier(value: Any) -> str | None:

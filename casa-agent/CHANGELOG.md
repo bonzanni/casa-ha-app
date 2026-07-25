@@ -1,5 +1,25 @@
 # Changelog
 
+## [0.120.0] - 2026-07-25
+
+### Fixed
+
+- A voice agent's specialist answer is now actually spoken back. The
+  acknowledgement ("I'll ask Judge…") was playing, the specialist was finishing
+  correctly — and then the finished answer was silently discarded, because the
+  Home Assistant integration's confirmation of the hand-off was rejected over a
+  mismatched message format and the hand-off never completed. The message
+  contract is fixed on both sides, and every rejection along that path is now
+  logged with a reason instead of being dropped in silence.
+  **Requires the companion integration v0.7.0 or later** (update it in HACS).
+
+### Changed
+
+- Voice hand-off wording now sets expectations: Casa says it may take up to a
+  minute, and the answer is attributed when it arrives ("Judge says: …") so it
+  makes sense a minute after you asked. Privacy wording is unchanged: results
+  Casa may not read out are still announced with the same protected phrasing.
+
 ## [0.119.0] - 2026-07-25
 
 ### Fixed
