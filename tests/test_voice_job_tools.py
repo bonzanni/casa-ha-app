@@ -1520,3 +1520,33 @@ def test_voice_job_tools_are_registered_on_both_framework_surfaces():
     assert selected == {
         "voice_job_status", "cancel_voice_job", "continue_voice_job",
     }
+
+
+@pytest.mark.asyncio
+async def test_a_device_that_cannot_receive_is_told_apart_from_a_missing_route(
+    tool_env,
+):
+    """The refusal the model reads must name the REAL obstacle.
+
+    Both refusals used to say "requires an acknowledged WebSocket route",
+    which is false for a phone: the route is fine, the DEVICE simply has
+    nowhere to put an answer that arrives a minute later. A model handed the
+    wrong reason cannot tell the user anything useful, and the turn ends in
+    the dead air this whole release exists to remove (#233/#224).
+    """
+    payload = tool_payload(await tool_env.invoke_delegate(
+        voice_origin(voice_delivery_offer=None)))
+
+    assert payload["kind"] == "background_delivery_unavailable"
+    assert payload["reason"] == "no_delivery_endpoint"
+    # It must instruct the model to SAY something rather than promise.
+    assert "device" in payload["message"].lower()
+    assert "do not promise" in payload["message"].lower()
+
+
+@pytest.mark.asyncio
+async def test_an_unacknowledged_route_still_reports_the_route(tool_env):
+    payload = tool_payload(await tool_env.invoke_delegate(
+        voice_origin(voice_transport="sse")))
+
+    assert payload["reason"] == "no_acknowledged_route"

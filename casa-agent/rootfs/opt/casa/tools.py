@@ -1438,7 +1438,7 @@ def validate_voice_handoff_static(
         _log_handoff_decision(
             "background_unavailable", agent_name, origin, requested_mode,
             caller_role, endpoint_can_receive=endpoint_can_receive)
-        return requested_mode, None, _background_delivery_unavailable_result()
+        return requested_mode, None, _background_delivery_unavailable_result(origin)
     _log_handoff_decision(
         "async_handoff", agent_name, origin, requested_mode, caller_role,
         endpoint_can_receive=endpoint_can_receive)
@@ -1596,10 +1596,33 @@ def deferred_delivery_available(origin: dict | None) -> bool:
     return True
 
 
-def _background_delivery_unavailable_result() -> dict:
+def _background_delivery_unavailable_result(origin: dict | None = None) -> dict:
+    """Refuse the hand-off, naming the obstacle the model can act on.
+
+    These two refusals are not interchangeable. "No acknowledged route" is an
+    infrastructure fault the user can do nothing about. "This device cannot
+    receive a deferred answer" is a property of where they are standing, and
+    the model must say so instead of promising a follow-up — a promise nobody
+    can keep is what left the operator waiting in silence (#233/#224).
+    """
+    if isinstance(origin, dict) and selected_delivery_modality(origin) is None:
+        return _result({
+            "status": "error",
+            "kind": "background_delivery_unavailable",
+            "reason": "no_delivery_endpoint",
+            "message": (
+                "This device cannot receive an answer after the conversation "
+                "ends: it has no speaker to announce on and no notification "
+                "target. Do not promise to follow up and do not say you will "
+                "get back to them. Tell the user plainly that you cannot "
+                "reach them on this device later, then either answer now "
+                "yourself or suggest they ask from a device that can."
+            ),
+        })
     return _result({
         "status": "error",
         "kind": "background_delivery_unavailable",
+        "reason": "no_acknowledged_route",
         "message": (
             "Background specialist delivery requires a current, "
             "acknowledged voice WebSocket route."
@@ -2201,7 +2224,7 @@ async def _prelaunch(
         })
     if (channel == "voice" and mode == "async"
             and not deferred_delivery_available(origin)):
-        return None, None, None, _background_delivery_unavailable_result()
+        return None, None, None, _background_delivery_unavailable_result(origin)
 
     # Resolve target. Look in the merged role map (residents + specialists)
     # first; fall back to the specialist registry for back-compat with any
@@ -3805,7 +3828,7 @@ async def continue_voice_job(args: dict) -> dict:
         })
     continuation_input = continuation_input.strip()
     if not deferred_delivery_available(origin):
-        return _background_delivery_unavailable_result()
+        return _background_delivery_unavailable_result(origin)
 
     registry = _specialist_registry.job_registry
     await registry.load()
