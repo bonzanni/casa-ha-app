@@ -1594,6 +1594,65 @@ async def test_an_invalid_specialist_result_logs_why(tool_env):
 
 
 @pytest.mark.asyncio
+async def test_a_cli_aborted_job_is_not_blamed_on_the_envelope(tool_env):
+    """The async path must name the CLI's verdict too (#254).
+
+    `structured_output=None` has two very different causes: the specialist
+    emitted a malformed envelope, or the CLI aborted the run before any
+    envelope existed (max turns, budget, structured-output retries). Both
+    reached the operator as `invalid_specialist_result` with the same reason,
+    which sent the live mtg diagnosis after the wrong specialist behaviour.
+    """
+    import logging
+
+    records: list[str] = []
+
+    class _Capture(logging.Handler):
+        def emit(self, record):
+            records.append(record.getMessage())
+
+    handler = _Capture(level=logging.WARNING)
+    tools.logger.addHandler(handler)
+    try:
+        accepted = tool_payload(await tool_env.invoke_delegate())
+        await tool_env.runner.outputs.put(tools.DelegatedOutput(
+            text="PRIVATE_RESULT_CANARY",
+            structured_output=None,
+            run_subtype="error_max_structured_output_retries",
+        ))
+        job = await tool_env.job_registry.wait_for_terminal(accepted["job_id"])
+        for _ in range(8):
+            await asyncio.sleep(0)
+    finally:
+        tools.logger.removeHandler(handler)
+
+    assert job.failure is not None
+    assert job.failure.kind == "specialist_result_contract_failed"
+    aborted = [m for m in records if "specialist_result_contract_failed" in m]
+    assert aborted, records
+    assert "error_max_structured_output_retries" in aborted[0]
+    assert "PRIVATE_RESULT_CANARY" not in aborted[0]
+
+
+@pytest.mark.asyncio
+async def test_a_turn_limited_job_names_the_turn_limit(tool_env):
+    """`error_max_turns` is a different repair from a contract failure (#254).
+
+    One says "raise max_turns"; the other says "the specialist's own result
+    contract collides with the envelope". Collapsing them into one kind is
+    what made the live failure unactionable.
+    """
+    accepted = tool_payload(await tool_env.invoke_delegate())
+    await tool_env.runner.outputs.put(tools.DelegatedOutput(
+        text="", structured_output=None, run_subtype="error_max_turns",
+    ))
+    job = await tool_env.job_registry.wait_for_terminal(accepted["job_id"])
+
+    assert job.failure is not None
+    assert job.failure.kind == "specialist_turn_limit"
+
+
+@pytest.mark.asyncio
 async def test_handoff_telemetry_names_the_capabilities_that_exist(tool_env):
     """A diagnostic that reports a dead capability is worse than none.
 
