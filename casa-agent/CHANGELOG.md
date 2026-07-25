@@ -1,5 +1,14 @@
 # Changelog
 
+## [0.123.0] - 2026-07-25
+
+### Fixed
+
+- The voice hand-off diagnostic reported on a capability that no longer
+  exists, so it always read as missing. It is the line used to work out why a
+  specialist hand-off was refused, and a permanently-failing field in it points
+  at a cause that cannot be true.
+
 ## [0.122.0] - 2026-07-25
 
 ### Fixed
