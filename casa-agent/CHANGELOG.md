@@ -1,5 +1,21 @@
 # Changelog
 
+## [0.124.0] - 2026-07-25
+
+### Fixed
+
+- Specialists are now told, in the request itself, exactly which result fields
+  a spoken answer must come back with — and that this replaces any result
+  format their own instructions describe. A specialist whose own instructions
+  told it to answer as free text could previously end its turn without ever
+  filling in the fields Casa needs, and the answer was thrown away without the
+  person who asked ever hearing why.
+- A job that Casa's assistant runtime gave up on — because it ran out of
+  turns, hit a spend ceiling, or could not produce a usable answer after
+  several attempts — is no longer reported as "the specialist returned an
+  invalid result". Each of those has a different remedy, and they now say so
+  separately in the log and in the job record.
+
 ## [0.123.0] - 2026-07-25
 
 ### Fixed

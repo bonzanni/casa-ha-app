@@ -1339,12 +1339,62 @@ def _build_world_state_summary() -> str:
 _specialist_bg_tasks: set[asyncio.Task[Any]] = set()
 
 
+# The CLI's own terminal verdicts on a run. Everything that is not
+# ``success`` means the CLI ABORTED the turn and no envelope was ever
+# produced — a state that used to be indistinguishable from a specialist
+# emitting a malformed one (#254).
+_CLI_RUN_SUCCESS = "success"
+_KNOWN_RESULT_SUBTYPES = frozenset({
+    _CLI_RUN_SUCCESS, "error_max_turns", "error_max_budget_usd",
+    "error_max_structured_output_retries", "error_during_execution",
+})
+
+# Each abort mode has a DIFFERENT repair, so each gets its own failure kind:
+# a turn limit is raised in the specialist's role.yaml, a contract failure is
+# a collision between the envelope and the specialist's own result contract,
+# and a budget stop is a spend ceiling. One shared kind made the live mtg
+# failure unactionable.
+_RUN_ABORT_KINDS = {
+    "error_max_turns": "specialist_turn_limit",
+    "error_max_budget_usd": "specialist_budget_exhausted",
+    "error_max_structured_output_retries": "specialist_result_contract_failed",
+    "error_during_execution": "specialist_run_failed",
+}
+_RUN_ABORT_FALLBACK_KIND = "specialist_run_failed"
+
+
+def _run_abort_kind(subtype: str | None) -> str:
+    """The failure kind for a CLI-aborted run, never raising."""
+    return _RUN_ABORT_KINDS.get(subtype or "", _RUN_ABORT_FALLBACK_KIND)
+
+
 @dataclass(frozen=True)
 class DelegatedOutput:
     """Raw text plus the SDK's optional structured result envelope."""
 
     text: str
     structured_output: Any = None
+    # The CLI's terminal verdict, verbatim (``None`` when this producer does
+    # not report one — legacy/test constructions). Kept RAW rather than
+    # allow-listed here so an unknown future subtype still compares unequal to
+    # ``success`` and is treated as an abort; the allow-list is applied at LOG
+    # time, where echoing an unrecognised token would be the risk.
+    run_subtype: str | None = None
+    # Whether a ResultMessage arrived at all. A stream that ends without one
+    # certifies nothing, so it is an abort — the runner does NOT raise on that
+    # path, and treating it as a completed turn sent it to the envelope parser
+    # to be misreported as a malformed result (Sol review, P1).
+    result_message_seen: bool = True
+
+    @property
+    def run_aborted(self) -> bool:
+        """Whether the CLI ended this run without completing the turn."""
+        if not self.result_message_seen:
+            return True
+        return (
+            self.run_subtype is not None
+            and self.run_subtype != _CLI_RUN_SUCCESS
+        )
 
 
 @dataclass(frozen=True)
@@ -1467,6 +1517,22 @@ def _known_token(value: object, allowed: Any) -> str:
     if not isinstance(value, str):
         return _OTHER_TOKEN
     return value if value in allowed else _OTHER_TOKEN
+
+
+def _str_or_none(value: object) -> str | None:
+    """``value`` iff it is genuinely a ``str``, else ``None``.
+
+    TOTAL by construction, like ``_known_token``: a non-``str`` is rejected
+    rather than coerced, so no foreign ``__str__`` is ever executed.
+    """
+    return value if isinstance(value, str) else None
+
+
+def _int_or_none(value: object) -> int | None:
+    """``value`` iff it is a real ``int`` (never a ``bool``), else ``None``."""
+    if isinstance(value, bool) or not isinstance(value, int):
+        return None
+    return value
 
 
 def _known_role(value: object) -> str:
@@ -1673,6 +1739,71 @@ def _discard_structured_stderr(_line: str) -> None:
     """Drain structured-job stderr without placing model content in logs."""
 
 
+# A JSON-Schema property name safe to interpolate into a prompt block: no
+# whitespace, no markup, nothing that could close the block early.
+_FIELD_NAME_RE = re.compile(r"[A-Za-z_][A-Za-z0-9_]{0,63}")
+
+
+def _result_contract_block(output_format: Any) -> str:
+    """State the structured envelope in the prompt, or nothing (#254).
+
+    Casa used to request ``output_format`` through the CLI's ``--json-schema``
+    flag ALONE, which reaches the specialist only as a ``StructuredOutput``
+    tool definition. Nothing in the specialist's prompt said an envelope was
+    expected, so the only result contract in its context was whatever its own
+    doctrine defined — and a specialist doctrine is free to define a
+    conflicting one. mtg's did ("your ENTIRE final message is exactly this
+    YAML", a different field set); the model obeyed its doctrine, called
+    ``StructuredOutput`` with an empty payload, and the CLI aborted the run
+    after exhausting its retries. The answer was thrown away.
+
+    So the envelope is stated where the specialist reads its instructions, and
+    stated as OUTRANKING its own contract. Field NAMES are read off the schema
+    rather than duplicated, so this block cannot drift from the parser.
+    """
+    if output_format is None:
+        return ""
+    # Past this point a structured envelope IS being demanded of the
+    # specialist, so returning "" would silently recreate the exact collision
+    # this block exists to prevent (Sol review, P2). A schema we cannot
+    # describe is a programming error at the single internal call site, not a
+    # runtime condition to degrade around — fail closed and loudly.
+    schema = output_format.get("schema") if isinstance(output_format, dict) else None
+    required = schema.get("required") if isinstance(schema, dict) else None
+    if not isinstance(required, list) or not required:
+        raise ValueError(
+            "output_format must carry a non-empty schema.required field list")
+    # TOTAL by construction, like `_known_token`: a non-`str` name is rejected
+    # rather than coerced (no foreign `__str__` is ever executed), and the
+    # grammar keeps a field name from carrying newlines or markup that would
+    # break out of the block it is interpolated into (Sol review, P2).
+    names: list[str] = []
+    for name in required:
+        if not isinstance(name, str) or not _FIELD_NAME_RE.fullmatch(name):
+            raise ValueError("schema.required entries must be plain field names")
+        if name in names:
+            raise ValueError("schema.required contains a duplicate field name")
+        names.append(name)
+    fields = ", ".join(names)
+    return (
+        "<result_contract>\n"
+        "This task is answered by CALLING THE `StructuredOutput` TOOL with "
+        "every one of these fields populated:\n"
+        f"{fields}\n"
+        "This contract REPLACES any result format your own doctrine, skills, "
+        "or persona describe — including any instruction that your entire "
+        "final message be YAML, JSON, or any other layout. Do the work the "
+        "way your doctrine says; then map the finished answer onto the fields "
+        "above and pass them as the tool's arguments. Prose in your final "
+        "message is not a result: an empty or missing tool payload discards "
+        "the answer and the person who asked hears nothing. If the tool "
+        "reports that your payload failed validation, correct it and call the "
+        "tool again — that retry is the intended recovery, not a duplicate "
+        "answer.\n"
+        "</result_contract>\n\n"
+    )
+
+
 async def _run_delegated_agent(
     cfg, task_text: str, context_text: str, resolution=None,
     output_format=None,
@@ -1786,7 +1917,10 @@ async def _run_delegated_agent(
                     f"</memory_context>\n\n"
                 )
 
-    prompt = f"{delegation_context}\n\n{memory_block}{body_tail}"
+    prompt = (
+        f"{delegation_context}\n\n{memory_block}"
+        f"{_result_contract_block(output_format)}{body_tail}"
+    )
 
     # Off-loop: _build_specialist_options resolves the registry (file IO) —
     # keep it off the shared event loop (H2/M20).
@@ -1870,14 +2004,28 @@ async def _run_delegated_agent(
                 return None if mark is None else int(
                     (mark - _ph_start) * 1000)
 
+            # `got_result` only ever said a ResultMessage ARRIVED — it was
+            # True for a run the CLI had aborted, which is how a max-turns
+            # stop and a structured-output retry exhaustion both reached the
+            # operator as "the specialist returned an invalid result" (#254).
+            # The subtype is allow-listed (an unrecognised token would be
+            # echoing a CLI string we have not vetted); num_turns is an int.
             logger.info(
                 "delegated_phases role=%s options_at_ms=%s connect_at_ms=%s "
                 "query_at_ms=%s first_msg_at_ms=%s used_tool=%s "
-                "first_tool_at_ms=%s msgs=%d got_result=%s total_ms=%d",
+                "first_tool_at_ms=%s msgs=%d got_result=%s subtype=%s "
+                "is_error=%s num_turns=%s structured=%s total_ms=%d",
                 _known_role(getattr(cfg, "role", None)),
                 _at_ms("options"), _at_ms("connect"), _at_ms("query"),
                 _at_ms("first_msg"), _first_tool, _at_ms("first_tool"),
                 _msg_count, result_msg is not None,
+                _known_token(
+                    getattr(result_msg, "subtype", None),
+                    _KNOWN_RESULT_SUBTYPES,
+                ),
+                bool(getattr(result_msg, "is_error", False)),
+                _int_or_none(getattr(result_msg, "num_turns", None)),
+                getattr(result_msg, "structured_output", None) is not None,
                 int((time.monotonic() - _ph_start) * 1000),
             )
         except Exception:  # noqa: BLE001 — diagnostics never break a turn
@@ -1931,6 +2079,11 @@ async def _run_delegated_agent(
             getattr(result_msg, "structured_output", None)
             if result_msg is not None else None
         ),
+        run_subtype=(
+            _str_or_none(getattr(result_msg, "subtype", None))
+            if result_msg is not None else None
+        ),
+        result_message_seen=result_msg is not None,
     )
 
 
@@ -2749,6 +2902,34 @@ async def _run_voice_job_lifecycle(
             )
             return
 
+        # A CLI-aborted run is checked BEFORE the parser (#254): it has no
+        # envelope to be malformed, and "structured_output must be an object"
+        # points the operator at the specialist's field shapes when the actual
+        # repair is a turn limit, a spend ceiling, or a result-contract
+        # collision. Same terminal outcome, honest cause.
+        if output.run_aborted:
+            kind = _run_abort_kind(output.run_subtype)
+            await _persist_voice_terminal(
+                registry.fail_compat(
+                    job_id,
+                    JobFailure(
+                        kind=kind,
+                        message="Specialist could not complete the voice job.",
+                    ),
+                ),
+                registry=registry,
+                job_id=job_id,
+                specialist_role=specialist_role,
+            )
+            logger.warning(
+                "Voice job %s role=%s terminal=failed kind=%s subtype=%s "
+                "elapsed_s=%.2f",
+                job_id[:8], specialist_role, kind,
+                _known_token(output.run_subtype, _KNOWN_RESULT_SUBTYPES),
+                time.time() - started_at,
+            )
+            return
+
         try:
             voice_result = parse_voice_job_result(output.structured_output)
         except VoiceJobResultError as exc:
@@ -3484,6 +3665,34 @@ async def delegate_to_agent(args: dict) -> dict:
 
         delegated_output = finished.result()
         if is_voice:
+            # See _run_voice_job_lifecycle: a run the CLI aborted has no
+            # envelope to be malformed, and must not be reported as one (#254).
+            if delegated_output.run_aborted:
+                from job_registry import JobFailure
+                failure = JobFailure(
+                    kind=_run_abort_kind(delegated_output.run_subtype),
+                    message="Specialist could not complete the voice job.",
+                )
+                await _specialist_registry.job_registry.fail_compat(
+                    delegation_id, failure)
+                elapsed = time.time() - started_at
+                logger.warning(
+                    "Delegation %s → %s aborted by the CLI kind=%s subtype=%s "
+                    "status=failed (%.2fs)",
+                    delegation_id[:8], agent_name, failure.kind,
+                    _known_token(
+                        delegated_output.run_subtype, _KNOWN_RESULT_SUBTYPES),
+                    elapsed,
+                )
+                return _result({
+                    "status": "error",
+                    "delegation_id": delegation_id,
+                    "agent": agent_name,
+                    "kind": failure.kind,
+                    "message": failure.message,
+                    "elapsed_s": elapsed,
+                })
+
             try:
                 voice_result = parse_voice_job_result(
                     delegated_output.structured_output)
