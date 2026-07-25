@@ -45,6 +45,8 @@ _LIVE_STATES = frozenset({
 _BACKGROUND_CAPABILITIES = frozenset({
     "background_jobs", "endpoint_delivery",
 })
+# Delivery dispatches on this; anything else has no honourable destination.
+_DELIVERABLE_MODALITIES = frozenset({"audio", "text"})
 _PARK_REASONS = frozenset({
     # A nack that means "this endpoint cannot take it" must PARK. Without the
     # entry the nack returns the job to READY and _offer_heads_locked() reoffers
@@ -471,6 +473,19 @@ class VoiceDeliveryCoordinator:
             if job.delivery_state is not DeliveryState.READY:
                 continue
             if job.id in self._parked_until:
+                continue
+            if job.delivery_modality not in _DELIVERABLE_MODALITIES:
+                # No recorded promise — a row from before endpoint delivery, or
+                # one whose endpoint offered nothing. The integration would
+                # refuse the frame anyway, so offering it every second would
+                # just churn until expiry. Say so once and let it expire.
+                if job.id not in self._unoffered_logged:
+                    self._unoffered_logged.add(job.id)
+                    logger.warning(
+                        "voice delivery WAITING reason=no_delivery_modality "
+                        "job=%s — this answer records no endpoint it can be "
+                        "delivered to, so it will expire unsent.", job.id[:8],
+                    )
                 continue
             existing = self._attempts.get(job.id)
             if existing is not None and existing.offered:

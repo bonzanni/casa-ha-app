@@ -1361,15 +1361,14 @@ async def test_pre_task_12_legacy_record_decodes_to_a_system_speaker(tmp_path):
     assert job.specialist_role == "mtg-judge"
 
 
-async def test_derived_jobs_inherit_the_parents_delivery_promise(tmp_path):
-    """A follow-up turn that resolved no endpoint keeps the parent's promise.
+async def test_a_continuation_does_not_revive_the_parents_promise(tmp_path):
+    """A live turn that offered no endpoint is an ANSWER, not a gap.
 
-    The child's own turn normally carries its endpoint's offer. When it does
-    not — a client that sent no offer, or a metadata-only re-delivery that has
-    no live turn at all — the child would fall back to "no modality", which is
-    fail-closed: the answer the operator was already promised would never be
-    delivered (#233/#224). Inheritance is scoped to the SAME endpoint, since a
-    promise made about the kitchen speaker says nothing about another device.
+    The continuation has its own utterance. If that utterance carried no
+    delivery offer, the endpoint is telling us it cannot currently receive a
+    deferred answer — the speaker was unplugged, the app was removed. Reviving
+    the parent's older modality would promise audio into a room that can no
+    longer play it, and delivery would refuse it (#233/#224).
     """
     registry = await loaded_registry(
         tmp_path,
@@ -1393,8 +1392,8 @@ async def test_derived_jobs_inherit_the_parents_delivery_promise(tmp_path):
     created = await registry.create_continuation(
         "job-1", child, actor=actor_for_job(),
     )
-    assert created.delivery_modality == "audio"
-    assert registry.get("job-child").delivery_modality == "audio"
+    assert created.delivery_modality is None
+    assert registry.get("job-child").delivery_modality is None
 
 
 async def test_a_childs_own_endpoint_offer_wins_over_the_parents(tmp_path):

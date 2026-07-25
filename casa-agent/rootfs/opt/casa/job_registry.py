@@ -123,18 +123,20 @@ class CancelResult:
 
 
 def _inherit_delivery_modality(parent: VoiceJob, child: VoiceJob) -> VoiceJob:
-    """Carry the parent's delivery promise onto a derived job.
+    """Carry the parent's delivery promise onto a re-delivery of that promise.
 
-    A derived job normally carries its OWN turn's endpoint offer, which is the
-    better evidence and always wins. Two cases leave it unset: a client that
-    sent no offer, and a prompted re-delivery, which has no live turn at all.
-    Leaving those at ``None`` is fail-closed — the answer the operator was
-    already promised would never be delivered (#233/#224).
+    This applies ONLY where there is no live utterance to ask. A prompted
+    re-delivery replays an answer the operator was already promised, so the
+    original promise is the right one to keep.
 
-    Inheritance is scoped to the SAME endpoint on purpose. A promise about the
-    kitchen speaker says nothing about what another device can receive, and
-    inheriting across devices would recreate the original bug: promise audio,
-    then discover at delivery time that nothing there can speak.
+    A continuation is deliberately excluded. It has its own live turn, and a
+    turn that carried no offer is not missing information — it is the endpoint
+    saying it cannot currently receive a deferred answer. Reviving the parent's
+    older modality there would promise audio into a room whose speaker has
+    since gone away, and delivery would refuse it (#233/#224).
+
+    Inheritance is scoped to the SAME endpoint: a promise about the kitchen
+    speaker says nothing about what another device can receive.
     """
     if child.delivery_modality is not None:
         return child
@@ -380,7 +382,6 @@ class JobRegistry:
                     expected="live awaiting-input parent",
                 )
 
-            child = _inherit_delivery_modality(parent, child)
             consumed_parent = replace(
                 parent,
                 awaiting_input=False,

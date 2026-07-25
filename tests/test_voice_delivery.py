@@ -75,6 +75,9 @@ def _ready_job(job_id: str, *, sequence: int, device: str, route="entry-1", **ch
         delivery_attempt_id=None,
         lease_until=None,
         cancel_pending=False,
+        # Every case here is a deliverable job; the legacy no-modality row has
+        # its own test, since it must be offered to nobody.
+        delivery_modality="audio",
     )
     return replace(base, **changes)
 
@@ -407,7 +410,7 @@ async def test_offer_contains_only_policy_approved_spoken_text(delivery):
         "expires_at": 1000.0,
         "delivery_sequence": 1,
         # The client dispatches announce-vs-notify on this (#233/#224).
-        "delivery_modality": None,
+        "delivery_modality": "audio",
     }
     serialized = json.dumps(offer)
     assert "PRIVATE_FULL_RESULT_CANARY" not in serialized
@@ -1074,3 +1077,33 @@ async def test_unknown_and_old_protocol_frames_are_ignored(delivery):
 
     assert registry.get("job-1") == before
     assert route.sent == []
+
+
+@pytest.mark.asyncio
+async def test_a_job_with_no_recorded_endpoint_is_never_offered(delivery):
+    """Fail closed, and stop — do not churn.
+
+    A row from before endpoint delivery, or one whose endpoint offered nothing,
+    records no promise. The integration refuses such a frame, so offering it on
+    every sweep would re-send it once a second until expiry. It must be offered
+    to nobody, and it must not block the device's queue forever either — the
+    next job for that device still gets its turn once this one expires.
+    """
+    registry, _, route, coordinator, _ = delivery
+    await registry.create(_ready_job(
+        "legacy-1", sequence=1, device="kitchen", delivery_modality=None))
+
+    await coordinator.route_connected(route)
+
+    assert _offered(route) == []
+
+
+@pytest.mark.asyncio
+async def test_an_unknown_modality_is_treated_as_no_endpoint(delivery):
+    registry, _, route, coordinator, _ = delivery
+    await registry.create(_ready_job(
+        "weird-1", sequence=1, device="kitchen", delivery_modality="telepathy"))
+
+    await coordinator.route_connected(route)
+
+    assert _offered(route) == []

@@ -62,8 +62,20 @@ _DELIVERY_RECEIPTS = frozenset({"playback_complete", "accepted"})
 def sanitize_delivery_offer(raw: Any) -> dict | None:
     """Accept a client's delivery offer, or reject it.
 
-    It arrives on the authenticated route, but it is still client-supplied, so
-    only a known protocol and modality are honoured and nothing else is kept.
+    **Trust boundary.** Casa cannot see Home Assistant's entity registry, so it
+    cannot independently verify that a device can be announced to or notified.
+    The authenticated integration is the authority on that, by design: it is
+    the component that can see the registry, and it holds the route's HMAC
+    secret. What this function guarantees is narrower — that the value Casa
+    acts on has a known shape, comes from the FRAME on that authenticated
+    route, and can never be a claim a turn's context made about itself
+    (``_voice_delivery_offer`` is in ``provenance.RESERVED_CONTEXT_KEYS``).
+
+    A client holding the route secret can therefore state a capability it does
+    not have. The blast radius is bounded to that client's own devices and ends
+    in a failed delivery, not in disclosure: the answer still has to survive
+    clearance, and delivery still has to find a real endpoint.
+
     An unrecognised receipt degrades to the weakest one rather than the frame
     being dropped — receipt strength affects wording, not authorization.
     """
