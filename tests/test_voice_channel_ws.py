@@ -80,7 +80,7 @@ class _RecordingWs:
 
     voice_route_id = "route-1"
     voice_route_capabilities = frozenset({
-        "background_jobs", "satellite_announce", "voice_handoff",
+        "background_jobs", "endpoint_delivery", "voice_handoff",
     })
     voice_job_control_id = "route-1"
 
@@ -570,16 +570,16 @@ class TestWSTurn:
             "/api/converse/ws", headers=headers,
         ) as ws:
             await ws.send_json({
-                "type": "voice_route_register", "protocol": 2,
+                "type": "voice_route_register", "protocol": 3,
                 "route_id": "entry-1", "agent_role": "concierge",
                 "capabilities": [
-                    "background_jobs", "satellite_announce", "voice_handoff",
+                    "background_jobs", "endpoint_delivery", "voice_handoff",
                 ],
             })
             assert await ws.receive_json() == {
-                "type": "voice_route_registered", "protocol": 2,
+                "type": "voice_route_registered", "protocol": 3,
                 "accepted_capabilities": [
-                    "background_jobs", "satellite_announce", "voice_handoff",
+                    "background_jobs", "endpoint_delivery", "voice_handoff",
                 ],
             }
             bound = channel.routes.get_connected("entry-1")
@@ -599,10 +599,10 @@ class TestWSTurn:
             "/api/converse/ws", headers=headers,
         ) as ws:
             await ws.send_json({
-                "type": "voice_route_register", "protocol": 2,
+                "type": "voice_route_register", "protocol": 3,
                 "route_id": "entry-1", "agent_role": "concierge",
                 "capabilities": [
-                    "background_jobs", "satellite_announce", "voice_handoff",
+                    "background_jobs", "endpoint_delivery", "voice_handoff",
                 ],
             })
             await ws.receive_json()

@@ -88,7 +88,7 @@ _MALICIOUS_CONTEXT = {
     "message_type": "channel_in",
     "source": "telegram",
     "_voice_route_id": "spoofed-entry",
-    "_voice_route_capabilities": ["background_jobs", "satellite_announce"],
+    "_voice_route_capabilities": ["background_jobs", "endpoint_delivery"],
     "_voice_job_control_id": "spoofed-control",
     "_origin_device_id": "spoofed-device",
     "_voice_transport": "ws",
@@ -154,7 +154,7 @@ class TestVoiceWSSanitize:
         class BoundConnection:
             voice_route_id = "entry-trusted"
             voice_route_capabilities = frozenset({
-                "background_jobs", "satellite_announce",
+                "background_jobs", "endpoint_delivery",
             })
             voice_job_control_id = "entry-trusted"
 
@@ -179,7 +179,7 @@ class TestVoiceWSSanitize:
         ctx = agent.captured[-1]
         assert ctx["_voice_route_id"] == "entry-trusted"
         assert ctx["_voice_route_capabilities"] == frozenset({
-            "background_jobs", "satellite_announce",
+            "background_jobs", "endpoint_delivery",
         })
         assert ctx["_voice_job_control_id"] == "entry-trusted"
         assert ctx["_origin_device_id"] == "device-trusted"

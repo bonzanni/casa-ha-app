@@ -10,8 +10,17 @@ from typing import Any, Callable, Mapping
 from channel_authz import agent_allowed_on
 
 
-_PROTOCOL = 2
-_CAPABILITIES = ("background_jobs", "satellite_announce", "voice_handoff")
+# Route protocol 3 (#233/#224). `satellite_announce` is GONE: it asserted a
+# DEVICE fact at connection level, and this socket is shared by every device on
+# the Home Assistant. Casa believed a "capable" route meant the asking device
+# could hear an announcement, promised one to a phone with no speaker, and
+# discarded the finished answer. `endpoint_delivery` asserts something true of
+# the CLIENT instead: it resolves a per-utterance endpoint offer and honours the
+# modality Casa selects. The set is compared for EXACT equality here and in
+# three other places (casa delivery.py, integration const.py + api.py) — they
+# must change together or route registration fails outright.
+_PROTOCOL = 3
+_CAPABILITIES = ("background_jobs", "endpoint_delivery", "voice_handoff")
 _BACKGROUND_CAPABILITIES = frozenset(_CAPABILITIES)
 
 

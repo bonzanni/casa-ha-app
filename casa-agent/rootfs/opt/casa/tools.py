@@ -1364,8 +1364,13 @@ class _PermitHandoff:
     transferred: bool = False
 
 
-_BACKGROUND_ROUTE_CAPABILITIES = frozenset({
-    "background_jobs", "satellite_announce", "voice_handoff",
+# Transport-level route capabilities ONLY (route protocol 3). Endpoint
+# capability — can THIS device hear or read an answer — is negotiated per
+# utterance and lives on the job as `delivery_modality`. `satellite_announce`
+# used to live here and was the bug: a device fact asserted at connection
+# level (#233/#224).
+_ROUTE_TRANSPORT_CAPABILITIES = frozenset({
+    "background_jobs", "endpoint_delivery",
 })
 CONCIERGE_ROLE = "concierge"
 
@@ -1422,21 +1427,21 @@ def validate_voice_handoff_static(
     reservation = origin.get("_voice_handoff_reservation")
     # Computed ONCE and reused by both the branch and its telemetry, so the log
     # can never disagree with the decision actually taken.
-    route_available = background_route_available(origin)
+    endpoint_can_receive = deferred_delivery_available(origin)
     if (
         not requires_voice_handoff(origin, caller_role)
         or not callable(getattr(reservation, "reserve", None))
         or not callable(getattr(reservation, "release", None))
         or not callable(getattr(reservation, "commit", None))
-        or not route_available
+        or not endpoint_can_receive
     ):
         _log_handoff_decision(
             "background_unavailable", agent_name, origin, requested_mode,
-            caller_role, route_available=route_available)
+            caller_role, endpoint_can_receive=endpoint_can_receive)
         return requested_mode, None, _background_delivery_unavailable_result()
     _log_handoff_decision(
         "async_handoff", agent_name, origin, requested_mode, caller_role,
-        route_available=route_available)
+        endpoint_can_receive=endpoint_can_receive)
     return "async", reservation, None
 
 
@@ -1475,7 +1480,7 @@ def _known_role(value: object) -> str:
 
 def _log_handoff_decision(decision: str, agent_name: str, origin: dict,
                           requested_mode: str, caller_role: str, *,
-                          route_available: bool | None = None) -> None:
+                          endpoint_can_receive: bool | None = None) -> None:
     """One INFO line explaining which branch the voice-handoff normalizer took.
 
     Enumerated provenance/capability facts ONLY — never a prompt, task, context
@@ -1487,7 +1492,7 @@ def _log_handoff_decision(decision: str, agent_name: str, origin: dict,
     the failing eligibility term directly queryable rather than inferred.
     Never raises.
 
-    ``route_available`` is passed in by callers that already computed it, so
+    ``endpoint_can_receive`` is passed in by callers that already computed it, so
     telemetry never re-evaluates the capability check and can never disagree
     with the branch that was actually taken (Sol review, Low).
     """
@@ -1512,7 +1517,8 @@ def _log_handoff_decision(decision: str, agent_name: str, origin: dict,
             "channel_is_voice=%s transport=%s requires_handoff=%s "
             "reserve_ok=%s release_ok=%s commit_ok=%s route_id=%s "
             "cap_background_jobs=%s cap_satellite_announce=%s "
-            "cap_voice_handoff=%s cap_other=%d route_available=%s",
+            "cap_voice_handoff=%s cap_other=%d offer_modality=%s "
+            "endpoint_can_receive=%s",
             decision, _known_role(agent_name),
             _known_token(requested_mode, _KNOWN_MODES),
             requested_mode == "sync",
@@ -1533,37 +1539,57 @@ def _log_handoff_decision(decision: str, agent_name: str, origin: dict,
             "background_jobs" in caps,
             "satellite_announce" in caps,
             "voice_handoff" in caps,
-            len(caps - _BACKGROUND_ROUTE_CAPABILITIES),
-            (background_route_available(origin)
-             if route_available is None else route_available),
+            len(caps),
+            selected_delivery_modality(origin),
+            (deferred_delivery_available(origin)
+             if endpoint_can_receive is None else endpoint_can_receive),
         )
     except Exception:  # noqa: BLE001 — diagnostics must never break a turn
         logger.debug("voice_handoff_decision log failed")
 
 
-def background_route_available(origin: dict | None) -> bool:
-    """Return whether the trusted turn origin can accept background audio."""
+def selected_delivery_modality(origin: dict | None) -> str | None:
+    """The modality THIS turn's endpoint offered, or None.
+
+    Set from the per-utterance delivery offer the client attached and the
+    channel sanitized. `None` means the device that asked cannot receive a
+    deferred answer at all.
+    """
+    if not isinstance(origin, dict):
+        return None
+    offer = origin.get("voice_delivery_offer")
+    if not isinstance(offer, dict):
+        return None
+    modality = offer.get("modality")
+    return modality if modality in ("audio", "text") else None
+
+
+def deferred_delivery_available(origin: dict | None) -> bool:
+    """Whether the device that ASKED can receive a deferred answer.
+
+    Replaces the old route-capability check (#233/#224). Route capabilities
+    described the WebSocket connection, which every device on the Home
+    Assistant shares — so a "capable" route said nothing about the device that
+    actually spoke. Casa promised a spoken answer to a phone with no speaker
+    and then discarded the finished ruling. Capability is a property of the
+    ENDPOINT, and v1 answers on the origin endpoint only, so the offer for THIS
+    turn is the whole question.
+
+    The route still matters, but only as transport: a launch after the
+    60-second disconnect grace must still fail closed.
+    """
     if not isinstance(origin, dict):
         return False
     if origin.get("channel") != "voice" or origin.get("voice_transport") != "ws":
         return False
     route_id = origin.get("voice_route_id")
     device_id = origin.get("origin_device_id")
-    capabilities = origin.get("voice_route_capabilities")
     if not isinstance(route_id, str) or not route_id.strip():
         return False
     if not isinstance(device_id, str) or not device_id.strip():
         return False
-    if not isinstance(capabilities, (set, frozenset, list, tuple)):
+    if selected_delivery_modality(origin) is None:
         return False
-    if not _BACKGROUND_ROUTE_CAPABILITIES <= frozenset(
-        item for item in capabilities if isinstance(item, str)
-    ):
-        return False
-    # Per-turn capabilities prove how this origin was authenticated, but they
-    # are not a perpetual lease. Production wires the live registry here so a
-    # launch after the 60-second disconnect grace fails closed. Tests and
-    # migration callers without a runtime retain the connection-bound check.
     routes = getattr(_runtime, "voice_route_registry", None)
     if routes is not None:
         return bool(routes.is_recently_capable(route_id.strip()))
@@ -2174,7 +2200,7 @@ async def _prelaunch(
             ),
         })
     if (channel == "voice" and mode == "async"
-            and not background_route_available(origin)):
+            and not deferred_delivery_available(origin)):
         return None, None, None, _background_delivery_unavailable_result()
 
     # Resolve target. Look in the merged role map (residents + specialists)
@@ -3603,7 +3629,9 @@ def _job_metadata(job: VoiceJob) -> dict:
         and routes is not None
         and (
             connected_route is None
-            or not _BACKGROUND_ROUTE_CAPABILITIES
+            # Transport-level only now: endpoint capability lives on the job
+            # (delivery_modality), not on the route (#233/#224).
+            or not _ROUTE_TRANSPORT_CAPABILITIES
             <= frozenset(connected_capabilities)
         )
     ):
@@ -3773,7 +3801,7 @@ async def continue_voice_job(args: dict) -> dict:
             "message": "input must be a non-empty string.",
         })
     continuation_input = continuation_input.strip()
-    if not background_route_available(origin):
+    if not deferred_delivery_available(origin):
         return _background_delivery_unavailable_result()
 
     registry = _specialist_registry.job_registry

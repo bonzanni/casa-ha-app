@@ -72,10 +72,16 @@ def voice_origin(**overrides) -> dict:
         "voice_transport": "ws",
         "voice_route_id": "entry-1",
         "voice_route_capabilities": frozenset({
-            "background_jobs", "satellite_announce", "voice_handoff",
+            "background_jobs", "endpoint_delivery", "voice_handoff",
         }),
         "origin_device_id": "device-kitchen",
         "voice_job_control_id": "entry-1",
+        # Route protocol 3 (#233/#224): the per-utterance endpoint offer is
+        # what authorizes a deferred answer now — route capabilities describe
+        # the shared socket, not the device that asked.
+        "voice_delivery_offer": {
+            "modality": "audio", "receipt": "playback_complete",
+        },
     }
     origin.update(overrides)
     return origin
@@ -332,7 +338,7 @@ async def test_channel_handoff_commits_real_job_before_cancelling_outer_request(
     class _Ws:
         voice_route_id = "entry-1"
         voice_route_capabilities = frozenset({
-            "background_jobs", "satellite_announce", "voice_handoff",
+            "background_jobs", "endpoint_delivery", "voice_handoff",
         })
         voice_job_control_id = "entry-1"
 
@@ -369,7 +375,7 @@ async def test_channel_handoff_commits_real_job_before_cancelling_outer_request(
             agent_mod.origin_var.reset(token)
 
     monkeypatch.setattr(tools, "_prelaunch", _prelaunch)
-    monkeypatch.setattr(tools, "background_route_available", lambda _origin: True)
+    monkeypatch.setattr(tools, "deferred_delivery_available", lambda _origin: True)
     bus.register("concierge", _concierge)
     loop = asyncio.create_task(bus.run_agent_loop("concierge"))
     concierge_cfg = _caller_cfg()
@@ -540,10 +546,14 @@ async def test_double_terminal_write_failure_reconciles_without_holding_permit(
 
 
 @pytest.mark.asyncio
+# Route protocol 3 (#233/#224): a route with a partial capability set can no
+# longer reach here — registration compares for EXACT equality and rejects it.
+# What DOES reach here is a device that offered no way to receive a deferred
+# answer, which is the live failure (an iPhone with no satellite) this replaces.
 @pytest.mark.parametrize("origin", [
     voice_origin(voice_route_id=None),
-    voice_origin(voice_route_capabilities=frozenset()),
-    voice_origin(voice_route_capabilities=frozenset({"background_jobs"})),
+    voice_origin(voice_delivery_offer=None),
+    voice_origin(voice_delivery_offer={"modality": "smoke-signal"}),
     voice_origin(voice_transport="sse"),
 ])
 async def test_voice_async_without_capable_route_fails_before_side_effect(
@@ -629,11 +639,11 @@ async def test_tool_uses_live_route_freshness_at_launch_and_completion(
     connection = VoiceWsConnection(_Socket())
     await routes.register(connection, {
         "type": "voice_route_register",
-        "protocol": 2,
+        "protocol": 3,
         "route_id": "entry-1",
         "agent_role": "concierge",
         "capabilities": [
-            "background_jobs", "satellite_announce", "voice_handoff",
+            "background_jobs", "endpoint_delivery", "voice_handoff",
         ],
     })
     await routes.disconnect(connection)

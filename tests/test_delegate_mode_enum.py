@@ -135,7 +135,12 @@ class TestBypassIsClosed:
             "voice_route_id": "route-1",
             "origin_device_id": "device-1",
             "voice_route_capabilities": frozenset({
-                "background_jobs", "satellite_announce", "voice_handoff"}),
+                "background_jobs", "endpoint_delivery", "voice_handoff"}),
+            # Route protocol 3 (#233/#224): capability is a property of the
+            # ENDPOINT that asked. A capable route alone no longer authorizes
+            # a deferred answer — the per-utterance offer does.
+            "voice_delivery_offer": {
+                "modality": "audio", "receipt": "playback_complete"},
             "_voice_handoff_reservation": MagicMock(
                 reserve=MagicMock(), release=MagicMock(), commit=MagicMock()),
         }

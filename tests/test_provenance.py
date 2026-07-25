@@ -32,6 +32,11 @@ def test_reserved_context_keys_are_exactly_the_spec_set():
         "_voice_job_control_id",
         "_origin_device_id", "_voice_transport",
         "_voice_handoff_reservation",
+        # #233/#224: the per-utterance delivery offer decides whether Casa
+        # promises a deferred answer and by which modality. It is stamped from
+        # the authenticated route AFTER sanitization; if an external caller
+        # could set it, a client could manufacture a capability it lacks.
+        "_voice_delivery_offer",
         # Release A: unspoofable server-set webhook-origin markers.
         "_origin_route", "_origin_clearance",
     })

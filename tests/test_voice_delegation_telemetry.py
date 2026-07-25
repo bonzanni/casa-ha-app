@@ -105,7 +105,7 @@ class TestHandoffDecisionLog:
         cfg = MagicMock()
         cfg.delegates = [MagicMock(agent="mtg")]
         monkeypatch.setattr(tools_mod, "_agent_role_map", {"concierge": cfg})
-        # No route_id/capabilities -> background_route_available() is False.
+        # No route_id/capabilities -> deferred_delivery_available() is False.
         with caplog.at_level(logging.INFO, logger="tools"):
             mode, reservation, err = tools_mod.validate_voice_handoff_static(
                 "mtg", _voice_origin(), "sync")
@@ -113,12 +113,12 @@ class TestHandoffDecisionLog:
         assert err is not None and reservation is None
         lines = _decision_lines(caplog)
         assert lines and "decision=background_unavailable" in lines[0]
-        assert "route_available=False" in lines[0]
+        assert "endpoint_can_receive=False" in lines[0]
         # Sol review (Medium): the line must say WHICH predicate failed.
         assert "requires_handoff=True" in lines[0]
         assert "reserve_ok=True" in lines[0]
         assert "route_id=False" in lines[0]
-        assert "cap_background_jobs=False" in lines[0]
+        assert "offer_modality=None" in lines[0]
 
     def test_client_supplied_capabilities_are_never_echoed(self, caplog):
         """Sol review (High): route capabilities arrive on the WS registration
@@ -134,9 +134,9 @@ class TestHandoffDecisionLog:
             tools_mod.validate_voice_handoff_static("mtg", origin, "sync")
         line = _decision_lines(caplog)[0]
         assert "hunter2" not in line and "INJECTED" not in line
-        assert "cap_background_jobs=True" in line
-        assert "cap_voice_handoff=False" in line   # the forged one is not the token
-        assert "cap_other=1" in line               # counted, never printed
+        # Capabilities are still reported as a COUNT only — never rendered —
+        # so a forged capability string cannot reach the log line.
+        assert "cap_other=" in line
 
     def test_log_never_raises_on_a_hostile_origin(self, caplog):
         """Diagnostics must never break a turn: an origin whose values are

@@ -46,11 +46,11 @@ def _cfg(role: str, channels: list[str]) -> AgentConfig:
 def _register_frame(**changes) -> dict:
     return {
         "type": "voice_route_register",
-        "protocol": 2,
+        "protocol": 3,
         "route_id": "entry-1",
         "agent_role": "concierge",
         "capabilities": [
-            "background_jobs", "satellite_announce", "voice_handoff",
+            "background_jobs", "endpoint_delivery", "voice_handoff",
         ],
         **changes,
     }
@@ -82,9 +82,9 @@ async def test_authenticated_registration_is_acknowledged_and_bound_to_socket():
 
     assert raw.sent == [{
         "type": "voice_route_registered",
-        "protocol": 2,
+        "protocol": 3,
         "accepted_capabilities": [
-            "background_jobs", "satellite_announce", "voice_handoff",
+            "background_jobs", "endpoint_delivery", "voice_handoff",
         ],
     }]
     assert routes.get_connected("entry-1") is bound
@@ -93,7 +93,7 @@ async def test_authenticated_registration_is_acknowledged_and_bound_to_socket():
     assert bound.role == "concierge"
     assert connection.voice_route_id == "entry-1"
     assert connection.voice_route_capabilities == frozenset({
-        "background_jobs", "satellite_announce", "voice_handoff",
+        "background_jobs", "endpoint_delivery", "voice_handoff",
     })
     assert bound.job_control_id == "entry-1"
     assert connection.voice_job_control_id == "entry-1"
@@ -191,7 +191,7 @@ async def test_missing_voice_handoff_capability_fails_registration_closed():
     )
 
     assert await routes.register(connection, _register_frame(
-        capabilities=["background_jobs", "satellite_announce"],
+        capabilities=["background_jobs", "endpoint_delivery"],
     )) is None
 
     assert raw.sent[-1]["accepted_capabilities"] == []
@@ -199,7 +199,7 @@ async def test_missing_voice_handoff_capability_fails_registration_closed():
     assert connection.voice_route_id is None
 
 
-async def test_protocol_contract_requires_every_v2_handoff_capability():
+async def test_protocol_contract_requires_every_v3_endpoint_capability():
     raw = _RawSocket()
     connection = VoiceWsConnection(raw)
     registry = VoiceRouteRegistry(
@@ -211,9 +211,16 @@ async def test_protocol_contract_requires_every_v2_handoff_capability():
         connection, _register_frame(route_id="entry-1:concierge"),
     )
 
-    assert _PROTOCOL == 2
+    # Route protocol 3 (#233/#224): `satellite_announce` is gone. It asserted a
+    # DEVICE fact on a socket shared by every device on the Home Assistant, so a
+    # "capable" route told Casa nothing about whether the device that actually
+    # asked could hear an announcement. `endpoint_delivery` asserts a CLIENT
+    # fact instead: this client resolves a per-utterance endpoint offer and
+    # honours the modality Casa selects. The set is compared for EXACT equality
+    # in four places across two repos — they must change together.
+    assert _PROTOCOL == 3
     assert _CAPABILITIES == (
-        "background_jobs", "satellite_announce", "voice_handoff",
+        "background_jobs", "endpoint_delivery", "voice_handoff",
     )
     assert bound is not None
     assert registry.get_connected("entry-1:concierge").capabilities == frozenset(

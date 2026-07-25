@@ -38,10 +38,15 @@ _LIVE_STATES = frozenset({
     DeliveryState.PLAYING,
 })
 _BACKGROUND_CAPABILITIES = frozenset({
-    "background_jobs", "satellite_announce",
+    "background_jobs", "endpoint_delivery",
 })
 _PARK_REASONS = frozenset({
-    "satellite_not_found", "satellite_ambiguous",
+    # A nack that means "this endpoint cannot take it" must PARK. Without the
+    # entry the nack returns the job to READY and _offer_heads_locked() reoffers
+    # immediately, churning job_ready<->job_nack every sweep instead of once
+    # (#233/#224 review). With no fallback chain in v1, parking until expiry is
+    # the correct end state.
+    "satellite_not_found", "satellite_ambiguous", "no_text_endpoint",
 })
 
 

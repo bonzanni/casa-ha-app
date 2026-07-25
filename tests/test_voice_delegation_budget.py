@@ -51,6 +51,17 @@ def _voice_origin(**overrides) -> dict:
         "channel": "voice", "chat_id": "c1", "cid": "t", "user_text": "hi",
     }
     origin.update(overrides)
+    # Route protocol 3 (#233/#224): a WS turn that identifies a route AND a
+    # device also carries the per-utterance endpoint offer, because that is
+    # what production sends and what deferred delivery now depends on. Route
+    # capabilities alone no longer authorize anything.
+    if (origin.get("voice_transport") == "ws"
+            and origin.get("voice_route_id")
+            and origin.get("origin_device_id")
+            and "voice_delivery_offer" not in origin):
+        origin["voice_delivery_offer"] = {
+            "modality": "audio", "receipt": "playback_complete",
+        }
     return origin
 
 
@@ -250,13 +261,13 @@ class TestConciergeVoiceHandoffPolicy:
             raise AssertionError("late handoff must not launch a job")
 
         monkeypatch.setattr(tm, "_start_voice_async_job", _start)
-        monkeypatch.setattr(tm, "background_route_available", lambda _origin: True)
+        monkeypatch.setattr(tm, "deferred_delivery_available", lambda _origin: True)
         token = agent_mod.origin_var.set(_voice_origin(
             role="concierge", execution_role="concierge",
             voice_transport="ws", voice_route_id="entry-1",
             origin_device_id="kitchen",
             voice_route_capabilities=frozenset({
-                "background_jobs", "satellite_announce", "voice_handoff",
+                "background_jobs", "endpoint_delivery", "voice_handoff",
             }),
             _voice_handoff_reservation=reservation,
         ))
@@ -311,7 +322,7 @@ class TestConciergeVoiceHandoffPolicy:
             voice_transport="ws", voice_route_id="entry-1",
             origin_device_id="kitchen",
             voice_route_capabilities=frozenset({
-                "background_jobs", "satellite_announce", "voice_handoff",
+                "background_jobs", "endpoint_delivery", "voice_handoff",
             }),
             _voice_handoff_reservation=reservation,
             _progress_sink=progress,
@@ -333,9 +344,12 @@ class TestConciergeVoiceHandoffPolicy:
 
     @pytest.mark.parametrize("overrides", [
         {"voice_route_id": None},
-        {"voice_route_capabilities": frozenset({
-            "background_jobs", "satellite_announce",
-        })},
+        # Route protocol 3 (#233/#224): a route missing a capability can no
+        # longer reach here — registration compares the set for EXACT equality
+        # and rejects it outright. What DOES reach here, and is the live
+        # failure this replaces, is a turn from a device that offered no way to
+        # receive a deferred answer (an iPhone with no satellite).
+        {"voice_delivery_offer": None},
     ])
     async def test_concierge_voice_sync_fails_without_handoff_route(
         self, overrides,
@@ -360,7 +374,7 @@ class TestConciergeVoiceHandoffPolicy:
             voice_transport="ws", voice_route_id="entry-1",
             origin_device_id="kitchen",
             voice_route_capabilities=frozenset({
-                "background_jobs", "satellite_announce", "voice_handoff",
+                "background_jobs", "endpoint_delivery", "voice_handoff",
             }),
             _voice_handoff_reservation=reservation,
         )
@@ -413,7 +427,7 @@ class TestConciergeVoiceHandoffPolicy:
             voice_transport="ws", voice_route_id="entry-1",
             origin_device_id="kitchen",
             voice_route_capabilities=frozenset({
-                "background_jobs", "satellite_announce", "voice_handoff",
+                "background_jobs", "endpoint_delivery", "voice_handoff",
             }),
             _voice_handoff_reservation=reservation,
         ))
@@ -459,7 +473,7 @@ class TestConciergeVoiceHandoffPolicy:
             voice_transport="ws", voice_route_id="entry-1",
             origin_device_id="kitchen",
             voice_route_capabilities=frozenset({
-                "background_jobs", "satellite_announce", "voice_handoff",
+                "background_jobs", "endpoint_delivery", "voice_handoff",
             }),
             _voice_handoff_reservation=reservation,
         ))
@@ -546,7 +560,7 @@ class TestConciergeVoiceHandoffPolicy:
             voice_transport="ws", voice_route_id="entry-1",
             origin_device_id="kitchen",
             voice_route_capabilities=frozenset({
-                "background_jobs", "satellite_announce", "voice_handoff",
+                "background_jobs", "endpoint_delivery", "voice_handoff",
             }),
             _voice_handoff_reservation=_Reservation(),
             _progress_sink=progress,
@@ -1219,7 +1233,7 @@ class TestVoiceDeadlineOriginPropagation:
                 "_voice_transport": "ws",
                 "_voice_route_id": "entry-1",
                 "_voice_route_capabilities": frozenset({
-                    "background_jobs", "satellite_announce", "voice_handoff",
+                    "background_jobs", "endpoint_delivery", "voice_handoff",
                 }),
                 "_origin_device_id": "device-kitchen",
                 "_voice_handoff_reservation": reservation,
@@ -1234,7 +1248,7 @@ class TestVoiceDeadlineOriginPropagation:
         assert origin["voice_transport"] == "ws"
         assert origin["voice_route_id"] == "entry-1"
         assert origin["voice_route_capabilities"] == frozenset({
-            "background_jobs", "satellite_announce", "voice_handoff",
+            "background_jobs", "endpoint_delivery", "voice_handoff",
         })
         assert origin["origin_device_id"] == "device-kitchen"
         assert origin["_voice_handoff_reservation"] is reservation

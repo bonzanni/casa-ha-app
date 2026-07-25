@@ -49,6 +49,35 @@ logger = logging.getLogger(__name__)
 # the offer and the acceptance test can never drift apart again.
 _HANDOFF_PROTOCOL = 2
 
+# Per-utterance delivery offer (#233/#224). The client tells Casa how the
+# device that ASKED can receive a deferred answer, so Casa promises only what
+# that device can do. Route capabilities could never answer this: the socket is
+# shared by every device on the Home Assistant.
+_DELIVERY_OFFER_PROTOCOL = 3
+_DELIVERY_MODALITIES = frozenset({"audio", "text"})
+_DELIVERY_RECEIPTS = frozenset({"playback_complete", "accepted"})
+
+
+def sanitize_delivery_offer(raw: Any) -> dict | None:
+    """Accept a client's delivery offer, or reject it.
+
+    It arrives on the authenticated route, but it is still client-supplied, so
+    only a known protocol and modality are honoured and nothing else is kept.
+    An unrecognised receipt degrades to the weakest one rather than the frame
+    being dropped — receipt strength affects wording, not authorization.
+    """
+    if not isinstance(raw, dict):
+        return None
+    if raw.get("protocol") != _DELIVERY_OFFER_PROTOCOL:
+        return None
+    modality = raw.get("modality")
+    if modality not in _DELIVERY_MODALITIES:
+        return None
+    receipt = raw.get("receipt")
+    if receipt not in _DELIVERY_RECEIPTS:
+        receipt = "accepted"
+    return {"modality": modality, "receipt": receipt}
+
 
 @dataclass(frozen=True)
 class VoiceHandoff:
@@ -1057,6 +1086,9 @@ class VoiceChannel(Channel):
             )
         if origin_device_id is not None:
             trusted_route_context["_origin_device_id"] = origin_device_id
+        delivery_offer = sanitize_delivery_offer(frame.get("delivery_offer"))
+        if delivery_offer is not None:
+            trusted_route_context["_voice_delivery_offer"] = delivery_offer
         if job_control_id is not None:
             trusted_route_context["_voice_job_control_id"] = job_control_id
 

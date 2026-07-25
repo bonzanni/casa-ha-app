@@ -82,7 +82,7 @@ class _Route:
         self.route_id = route_id
         self.role = role
         self.capabilities = frozenset({
-            "background_jobs", "satellite_announce",
+            "background_jobs", "endpoint_delivery",
         })
         self.sent: list[dict] = []
 
@@ -213,11 +213,11 @@ async def test_shared_writer_interleaves_utterances_and_delivery_protocol(
     )
     bound = await routes.register(connection, {
         "type": "voice_route_register",
-        "protocol": 2,
+        "protocol": 3,
         "route_id": "entry-1",
         "agent_role": "concierge",
         "capabilities": [
-            "background_jobs", "satellite_announce", "voice_handoff",
+            "background_jobs", "endpoint_delivery", "voice_handoff",
         ],
     })
     assert bound is not None
@@ -468,11 +468,11 @@ async def test_recently_disconnected_route_accepts_then_waits_and_reoffers(
     first = VoiceWsConnection(first_raw)
     await routes.register(first, {
         "type": "voice_route_register",
-        "protocol": 2,
+        "protocol": 3,
         "route_id": "entry-1",
         "agent_role": "concierge",
         "capabilities": [
-            "background_jobs", "satellite_announce", "voice_handoff",
+            "background_jobs", "endpoint_delivery", "voice_handoff",
         ],
     })
     await routes.disconnect(first)
@@ -512,11 +512,11 @@ async def test_recently_disconnected_route_accepts_then_waits_and_reoffers(
     second = VoiceWsConnection(second_raw)
     bound = await routes.register(second, {
         "type": "voice_route_register",
-        "protocol": 2,
+        "protocol": 3,
         "route_id": "entry-1",
         "agent_role": "concierge",
         "capabilities": [
-            "background_jobs", "satellite_announce", "voice_handoff",
+            "background_jobs", "endpoint_delivery", "voice_handoff",
         ],
     })
     await coordinator.route_connected(bound)
