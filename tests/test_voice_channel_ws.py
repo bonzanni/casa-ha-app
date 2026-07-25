@@ -10,6 +10,8 @@ import weakref
 from unittest.mock import AsyncMock
 
 import pytest
+
+import voice_phrases
 from aiohttp import web, WSMsgType
 from aiohttp.test_utils import TestClient, TestServer
 
@@ -73,6 +75,9 @@ class _HandoffJob:
     id = "job-1"
     handoff_id = "handoff-1"
     specialist_display_name = "Finance"
+    # The endpoint modality the acknowledgement is rendered from (#233/#224):
+    # a real job always carries it, so the double must too.
+    delivery_modality = "audio"
 
 
 class _RecordingWs:
@@ -80,7 +85,7 @@ class _RecordingWs:
 
     voice_route_id = "route-1"
     voice_route_capabilities = frozenset({
-        "background_jobs", "satellite_announce", "voice_handoff",
+        "background_jobs", "endpoint_delivery", "voice_handoff",
     })
     voice_job_control_id = "route-1"
 
@@ -340,7 +345,11 @@ class TestWSTurn:
         assert ws.frames == [{
             "type": "handoff", "protocol": 2, "utterance_id": "utterance-1",
             "handoff_id": "handoff-1", "job_id": "job-1",
-            "text": "I'll ask Finance — this can take up to a minute.",
+            # Wording varies by design (#233); the CONTRACT is what matters:
+            # it names the specialist and sets a wait expectation. On an audio
+            # endpoint it must never imply a notification.
+            "text": voice_phrases.acknowledgement(
+                "Finance", "audio", voice_phrases.seed_for("job-1")),
         }]
         assert ws.write_completed.is_set()
         assert bus.request_cancelled.is_set()
@@ -570,16 +579,16 @@ class TestWSTurn:
             "/api/converse/ws", headers=headers,
         ) as ws:
             await ws.send_json({
-                "type": "voice_route_register", "protocol": 2,
+                "type": "voice_route_register", "protocol": 3,
                 "route_id": "entry-1", "agent_role": "concierge",
                 "capabilities": [
-                    "background_jobs", "satellite_announce", "voice_handoff",
+                    "background_jobs", "endpoint_delivery", "voice_handoff",
                 ],
             })
             assert await ws.receive_json() == {
-                "type": "voice_route_registered", "protocol": 2,
+                "type": "voice_route_registered", "protocol": 3,
                 "accepted_capabilities": [
-                    "background_jobs", "satellite_announce", "voice_handoff",
+                    "background_jobs", "endpoint_delivery", "voice_handoff",
                 ],
             }
             bound = channel.routes.get_connected("entry-1")
@@ -599,10 +608,10 @@ class TestWSTurn:
             "/api/converse/ws", headers=headers,
         ) as ws:
             await ws.send_json({
-                "type": "voice_route_register", "protocol": 2,
+                "type": "voice_route_register", "protocol": 3,
                 "route_id": "entry-1", "agent_role": "concierge",
                 "capabilities": [
-                    "background_jobs", "satellite_announce", "voice_handoff",
+                    "background_jobs", "endpoint_delivery", "voice_handoff",
                 ],
             })
             await ws.receive_json()

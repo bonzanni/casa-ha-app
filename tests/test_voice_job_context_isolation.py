@@ -41,9 +41,11 @@ def _origin() -> dict:
         "voice_transport": "ws",
         "voice_route_id": "entry-1",
         "voice_route_capabilities": frozenset({
-            "background_jobs", "satellite_announce", "voice_handoff",
+            "background_jobs", "endpoint_delivery", "voice_handoff",
         }),
         "origin_device_id": "device-kitchen",
+        "voice_delivery_offer": {
+            "modality": "audio", "receipt": "playback_complete"},
         "voice_job_control_id": "entry-1",
         "_voice_handoff_reservation": reservation,
     }

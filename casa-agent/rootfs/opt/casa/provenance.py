@@ -42,6 +42,12 @@ RESERVED_CONTEXT_KEYS = frozenset({
     "_origin_device_id",
     "_voice_transport",
     "_voice_handoff_reservation",
+    # #233/#224: the per-utterance delivery offer says what the ASKING device
+    # can receive, and Casa promises on the strength of it. It is stamped from
+    # the authenticated route AFTER sanitization; if an external caller could
+    # set it in `context`, a client could manufacture a capability it does not
+    # have and be promised a delivery it can never receive.
+    "_voice_delivery_offer",
     # Release A: unspoofable, server-set origin markers. An external caller
     # (webhook payload, /invoke body) must never set these — the ingress
     # handler stamps them after sanitization so a webhook-origin turn cannot

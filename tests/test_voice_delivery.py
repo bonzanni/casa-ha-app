@@ -8,6 +8,8 @@ import logging
 from dataclasses import replace
 
 import pytest
+
+import voice_phrases
 from unittest.mock import AsyncMock
 
 from bus import BusMessage, MessageBus, MessageType
@@ -73,6 +75,9 @@ def _ready_job(job_id: str, *, sequence: int, device: str, route="entry-1", **ch
         delivery_attempt_id=None,
         lease_until=None,
         cancel_pending=False,
+        # Every case here is a deliverable job; the legacy no-modality row has
+        # its own test, since it must be offered to nobody.
+        delivery_modality="audio",
     )
     return replace(base, **changes)
 
@@ -82,7 +87,7 @@ class _Route:
         self.route_id = route_id
         self.role = role
         self.capabilities = frozenset({
-            "background_jobs", "satellite_announce",
+            "background_jobs", "endpoint_delivery",
         })
         self.sent: list[dict] = []
 
@@ -150,7 +155,7 @@ def _offered(route: _Route) -> list[dict]:
 def _frame(frame_type: str, offer: dict, **changes) -> dict:
     return {
         "type": frame_type,
-        "protocol": 1,
+        "protocol": 2,
         "job_id": offer["job_id"],
         "delivery_attempt_id": offer["delivery_attempt_id"],
         **changes,
@@ -213,11 +218,11 @@ async def test_shared_writer_interleaves_utterances_and_delivery_protocol(
     )
     bound = await routes.register(connection, {
         "type": "voice_route_register",
-        "protocol": 2,
+        "protocol": 3,
         "route_id": "entry-1",
         "agent_role": "concierge",
         "capabilities": [
-            "background_jobs", "satellite_announce", "voice_handoff",
+            "background_jobs", "endpoint_delivery", "voice_handoff",
         ],
     })
     assert bound is not None
@@ -389,19 +394,23 @@ async def test_offer_contains_only_policy_approved_spoken_text(delivery):
     # v0.120.0 (#233): the answer lands on a speaker up to a minute after the
     # question, so the specialist's OWN text is attributed. Disclosure
     # fallbacks and clarifications stay verbatim (see the private cases).
-    assert offer["spoken_text"] == (
-        "Judge says: The policy-approved answer.")
+    assert offer["spoken_text"] == voice_phrases.announcement(
+        "Judge", "The policy-approved answer.", voice_phrases.seed_for("job-1"))
     assert offer == {
         "type": "job_ready",
-        "protocol": 1,
+        "protocol": 2,
         "job_id": "job-1",
         "delivery_attempt_id": offer["delivery_attempt_id"],
         "route_id": "entry-1",
         "origin_device_id": "kitchen",
-        "spoken_text": "Judge says: The policy-approved answer.",
+        "spoken_text": voice_phrases.announcement(
+            "Judge", "The policy-approved answer.",
+            voice_phrases.seed_for("job-1")),
         "ready_at": 103.0,
         "expires_at": 1000.0,
         "delivery_sequence": 1,
+        # The client dispatches announce-vs-notify on this (#233/#224).
+        "delivery_modality": "audio",
     }
     serialized = json.dumps(offer)
     assert "PRIVATE_FULL_RESULT_CANARY" not in serialized
@@ -446,7 +455,7 @@ async def test_private_disclosure_is_re_evaluated_before_authorization(
     ]
     assert authorized[-1] == {
         "type": "job_delivery_authorized",
-        "protocol": 1,
+        "protocol": 2,
         "job_id": "job-1",
         "delivery_attempt_id": offer["delivery_attempt_id"],
     }
@@ -468,11 +477,11 @@ async def test_recently_disconnected_route_accepts_then_waits_and_reoffers(
     first = VoiceWsConnection(first_raw)
     await routes.register(first, {
         "type": "voice_route_register",
-        "protocol": 2,
+        "protocol": 3,
         "route_id": "entry-1",
         "agent_role": "concierge",
         "capabilities": [
-            "background_jobs", "satellite_announce", "voice_handoff",
+            "background_jobs", "endpoint_delivery", "voice_handoff",
         ],
     })
     await routes.disconnect(first)
@@ -512,11 +521,11 @@ async def test_recently_disconnected_route_accepts_then_waits_and_reoffers(
     second = VoiceWsConnection(second_raw)
     bound = await routes.register(second, {
         "type": "voice_route_register",
-        "protocol": 2,
+        "protocol": 3,
         "route_id": "entry-1",
         "agent_role": "concierge",
         "capabilities": [
-            "background_jobs", "satellite_announce", "voice_handoff",
+            "background_jobs", "endpoint_delivery", "voice_handoff",
         ],
     })
     await coordinator.route_connected(bound)
@@ -564,7 +573,7 @@ async def test_result_ttl_expiring_across_restart_never_emits_ready_frame(
     ("sensitivity", "expected"),
     [
         # household: the specialist's own text -> attributed (v0.120.0 #233).
-        ("household", "Judge says: HOUSEHOLD_PROMPTED_DETAIL_CANARY"),
+        ("household", None),   # attributed; computed from the seed below
         (
             # private: a disclosure fallback is CASA speaking -> verbatim, and
             # crucially unchanged by the attribution work.
@@ -594,6 +603,12 @@ async def test_prompted_detail_child_applies_current_route_clearance(
 
     await coordinator.route_connected(route)
 
+    if expected is None:
+        # The specialist's OWN answer is attributed (#233) — wording varies by
+        # seed, so derive it rather than pinning a variant.
+        expected = voice_phrases.announcement(
+            "Judge", "HOUSEHOLD_PROMPTED_DETAIL_CANARY",
+            voice_phrases.seed_for(_offered(route)[0]["job_id"]))
     assert _offered(route)[0]["spoken_text"] == expected
     assert "PRIVATE_PROMPTED_DETAIL_CANARY" not in json.dumps(route.sent)
 
@@ -842,20 +857,20 @@ async def test_restart_reconstructs_live_attempts_and_blocks_pending_cancel_rene
     now[0] = 104.0
     await coordinator.handle(route, {
         "type": "job_claim_renew",
-        "protocol": 1,
+        "protocol": 2,
         "job_id": "claimed-job",
         "delivery_attempt_id": attempt_id,
     })
     await coordinator.handle(route, {
         "type": "job_claim_renew",
-        "protocol": 1,
+        "protocol": 2,
         "job_id": "playing-job",
         "delivery_attempt_id": "playing-attempt",
     })
     pending_before = registry.get("authorized-job")
     await coordinator.handle(route, {
         "type": "job_claim_renew",
-        "protocol": 1,
+        "protocol": 2,
         "job_id": "authorized-job",
         "delivery_attempt_id": "authorized-attempt",
     })
@@ -1055,10 +1070,91 @@ async def test_unknown_and_old_protocol_frames_are_ignored(delivery):
     await registry.create(_ready_job("job-1", sequence=1, device="kitchen"))
     before = registry.get("job-1")
 
-    await coordinator.handle(route, {"type": "future_frame", "protocol": 1})
+    await coordinator.handle(route, {"type": "future_frame", "protocol": 2})
     await coordinator.handle(route, {"type": "job_claimed", "protocol": 0})
     await coordinator.handle(route, {"type": "job_claimed", "protocol": True})
-    await coordinator.handle(route, {"type": "job_claimed", "protocol": 1.0})
+    await coordinator.handle(route, {"type": "job_claimed", "protocol": 2.0})
 
     assert registry.get("job-1") == before
     assert route.sent == []
+
+
+@pytest.mark.asyncio
+async def test_a_job_with_no_recorded_endpoint_is_never_offered(delivery):
+    """Fail closed, and stop — do not churn.
+
+    A row from before endpoint delivery, or one whose endpoint offered nothing,
+    records no promise. The integration refuses such a frame, so offering it on
+    every sweep would re-send it once a second until expiry. It must be offered
+    to nobody — and it must not hold the device's queue hostage either: the
+    next answer for that device gets its turn once the undeliverable one
+    expires.
+    """
+    registry, _, route, coordinator, now = delivery
+    await registry.create(_ready_job(
+        "legacy-1", sequence=1, device="kitchen",
+        delivery_modality=None, expires_at=200.0))
+    await registry.create(_ready_job(
+        "job-2", sequence=2, device="kitchen", expires_at=1000.0))
+
+    await coordinator.route_connected(route)
+    assert _offered(route) == [], "the undeliverable head must not be offered"
+
+    # ...and it must not starve what is behind it.
+    now[0] = 201.0
+    await registry.expire_due()
+    await coordinator.sweep_once()
+
+    assert [frame["job_id"] for frame in _offered(route)] == ["job-2"]
+
+
+@pytest.mark.asyncio
+async def test_an_unknown_modality_is_treated_as_no_endpoint(delivery):
+    registry, _, route, coordinator, _ = delivery
+    await registry.create(_ready_job(
+        "weird-1", sequence=1, device="kitchen", delivery_modality="telepathy"))
+
+    await coordinator.route_connected(route)
+
+    assert _offered(route) == []
+
+
+@pytest.mark.asyncio
+async def test_a_notification_that_never_left_is_reoffered_not_lost(delivery):
+    """The recovery half of a failed push (#233/#224).
+
+    The integration reaches `job_playback_started` and only then does the
+    notification fail. It deliberately does NOT acknowledge delivery, so the
+    answer must not be retired: the lease lapses, the job returns to READY, and
+    it is offered again under a fresh attempt. Without this the operator's
+    answer would sit in PLAYING until it expired — the same silent loss, one
+    step further along.
+    """
+    registry, _, route, coordinator, now = delivery
+    await registry.create(_ready_job(
+        "job-t", sequence=1, device="phone", delivery_modality="text"))
+    await coordinator.route_connected(route)
+    first = _offered(route)[0]
+    assert first["delivery_modality"] == "text"
+
+    await coordinator.handle(route, _frame("job_claimed", first))
+    await coordinator.handle(route, _frame("job_delivery_start", first))
+    await coordinator.handle(route, _frame("job_playback_started", first))
+    assert registry.get("job-t").delivery_state is DeliveryState.PLAYING
+
+    # The push fails. No `job_delivered` follows; the lease simply lapses.
+    now[0] = 200.0
+    await coordinator.sweep_once()
+
+    assert registry.get("job-t").delivery_state is DeliveryState.READY
+    retry = _offered(route)[-1]
+    assert retry["delivery_attempt_id"] != first["delivery_attempt_id"]
+    assert retry["delivery_modality"] == "text"
+
+    # The retry can now complete normally.
+    await coordinator.handle(route, _frame("job_claimed", retry))
+    await coordinator.handle(route, _frame("job_delivery_start", retry))
+    await coordinator.handle(route, _frame("job_playback_started", retry))
+    await coordinator.handle(route, _frame("job_delivered", retry))
+
+    assert registry.get("job-t").delivery_state is DeliveryState.DELIVERED

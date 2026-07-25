@@ -88,10 +88,16 @@ _MALICIOUS_CONTEXT = {
     "message_type": "channel_in",
     "source": "telegram",
     "_voice_route_id": "spoofed-entry",
-    "_voice_route_capabilities": ["background_jobs", "satellite_announce"],
+    "_voice_route_capabilities": ["background_jobs", "endpoint_delivery"],
     "_voice_job_control_id": "spoofed-control",
     "_origin_device_id": "spoofed-device",
     "_voice_transport": "ws",
+    # A caller claiming its own delivery capability. Casa decides this from the
+    # channel-derived offer alone; a promise a client invents for itself is a
+    # promise nothing can keep (#233/#224).
+    "_voice_delivery_offer": {
+        "protocol": 3, "modality": "audio", "receipt": "playback_complete",
+    },
 }
 
 
@@ -113,6 +119,7 @@ class TestVoiceSSESanitize:
         assert "_voice_route_capabilities" not in ctx
         assert "_voice_job_control_id" not in ctx
         assert "_origin_device_id" not in ctx
+        assert "_voice_delivery_offer" not in ctx
         # Casa-owned keys still present.
         assert "chat_id" in ctx and "utterance_id" in ctx and "cid" in ctx
 
@@ -154,7 +161,7 @@ class TestVoiceWSSanitize:
         class BoundConnection:
             voice_route_id = "entry-trusted"
             voice_route_capabilities = frozenset({
-                "background_jobs", "satellite_announce",
+                "background_jobs", "endpoint_delivery",
             })
             voice_job_control_id = "entry-trusted"
 
@@ -179,8 +186,55 @@ class TestVoiceWSSanitize:
         ctx = agent.captured[-1]
         assert ctx["_voice_route_id"] == "entry-trusted"
         assert ctx["_voice_route_capabilities"] == frozenset({
-            "background_jobs", "satellite_announce",
+            "background_jobs", "endpoint_delivery",
         })
         assert ctx["_voice_job_control_id"] == "entry-trusted"
         assert ctx["_origin_device_id"] == "device-trusted"
         assert ctx["_voice_transport"] == "ws"
+        # The caller put an `audio` offer in its own context. The frame carried
+        # none, so the answer is "this endpoint offered nothing" — the caller's
+        # claim must not survive as a capability Casa then promises against.
+        assert ctx.get("_voice_delivery_offer") is None
+
+    async def test_the_delivery_offer_comes_only_from_the_frame(self, voice_app):
+        """The trust boundary, stated as a test.
+
+        Casa cannot see Home Assistant's entity registry; the authenticated
+        integration is the authority on what a device can receive, and it says
+        so in the frame. What Casa guarantees is narrower and is what this
+        pins: the value it acts on is the one the CHANNEL derived from that
+        frame, never one a turn's context claimed for itself.
+        """
+        _client, agent, channel = voice_app
+
+        class BoundConnection:
+            voice_route_id = "entry-trusted"
+            voice_route_capabilities = frozenset({
+                "background_jobs", "endpoint_delivery",
+            })
+            voice_job_control_id = "entry-trusted"
+
+            def __init__(self):
+                self.sent = []
+
+            async def send_json(self, frame):
+                self.sent.append(frame)
+
+        await channel._run_ws_utterance(
+            BoundConnection(),
+            {
+                "text": "hi", "agent_role": "butler", "scope_id": "s",
+                "device_id": "device-trusted",
+                "delivery_offer": {
+                    "protocol": 3, "modality": "text", "receipt": "accepted",
+                },
+                # Contradicts the frame on purpose: audio is the stronger
+                # promise, so preferring it would be the dangerous direction.
+                "context": dict(_MALICIOUS_CONTEXT),
+            },
+            "u-offer",
+            asyncio.get_running_loop().time() + 20.0,
+        )
+
+        offer = agent.captured[-1]["_voice_delivery_offer"]
+        assert offer["modality"] == "text"

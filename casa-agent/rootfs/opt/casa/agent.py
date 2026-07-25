@@ -928,6 +928,10 @@ class Agent:
             # The voice channel installs this private foreground-output
             # reservation after sanitizing external context. Keep only the
             # duck-typed capability object, never a caller-supplied shape.
+            offer = msg.context.get("_voice_delivery_offer")
+            if isinstance(offer, dict) and offer.get("modality") in (
+                    "audio", "text"):
+                origin_snapshot["voice_delivery_offer"] = dict(offer)
             reservation = msg.context.get("_voice_handoff_reservation")
             if (callable(getattr(reservation, "reserve", None))
                     and callable(getattr(reservation, "release", None))

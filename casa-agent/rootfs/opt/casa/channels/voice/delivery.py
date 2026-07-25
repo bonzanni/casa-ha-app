@@ -10,6 +10,7 @@ import uuid
 from dataclasses import dataclass
 from typing import Any, Mapping
 
+import voice_phrases
 from job_registry import DeliveryState, JobTransitionError, VoiceJob
 from voice_job_result import (
     VoiceJobResultError,
@@ -21,7 +22,11 @@ from voice_job_result import (
 
 logger = logging.getLogger(__name__)
 
-_PROTOCOL = 1
+# Bumped to 2 for endpoint delivery (#233/#224): `job_ready` now carries the
+# modality the endpoint promised, and an integration that cannot read it must
+# not act on the frame at all — a v1 peer would announce a `text` delivery on a
+# satellite the job was never promised to.
+_PROTOCOL = 2
 _INBOUND_TYPES = frozenset({
     "job_claimed",
     "job_claim_renew",
@@ -38,10 +43,17 @@ _LIVE_STATES = frozenset({
     DeliveryState.PLAYING,
 })
 _BACKGROUND_CAPABILITIES = frozenset({
-    "background_jobs", "satellite_announce",
+    "background_jobs", "endpoint_delivery",
 })
+# Delivery dispatches on this; anything else has no honourable destination.
+_DELIVERABLE_MODALITIES = frozenset({"audio", "text"})
 _PARK_REASONS = frozenset({
-    "satellite_not_found", "satellite_ambiguous",
+    # A nack that means "this endpoint cannot take it" must PARK. Without the
+    # entry the nack returns the job to READY and _offer_heads_locked() reoffers
+    # immediately, churning job_ready<->job_nack every sweep instead of once
+    # (#233/#224 review). With no fallback chain in v1, parking until expiry is
+    # the correct end state.
+    "satellite_not_found", "satellite_ambiguous", "no_text_endpoint",
 })
 
 
@@ -54,7 +66,7 @@ def _identifier(value: Any) -> str | None:
     return normalized
 
 
-def _is_protocol_one(value: Any) -> bool:
+def _is_current_protocol(value: Any) -> bool:
     return type(value) is int and value == _PROTOCOL
 
 
@@ -178,7 +190,7 @@ class VoiceDeliveryCoordinator:
         frame_type = frame.get("type")
         if (
             frame_type not in _INBOUND_TYPES
-            or not _is_protocol_one(frame.get("protocol"))
+            or not _is_current_protocol(frame.get("protocol"))
         ):
             return
         async with self._lock:
@@ -462,6 +474,19 @@ class VoiceDeliveryCoordinator:
                 continue
             if job.id in self._parked_until:
                 continue
+            if job.delivery_modality not in _DELIVERABLE_MODALITIES:
+                # No recorded promise — a row from before endpoint delivery, or
+                # one whose endpoint offered nothing. The integration would
+                # refuse the frame anyway, so offering it every second would
+                # just churn until expiry. Say so once and let it expire.
+                if job.id not in self._unoffered_logged:
+                    self._unoffered_logged.add(job.id)
+                    logger.warning(
+                        "voice delivery WAITING reason=no_delivery_modality "
+                        "job=%s — this answer records no endpoint it can be "
+                        "delivered to, so it will expire unsent.", job.id[:8],
+                    )
+                continue
             existing = self._attempts.get(job.id)
             if existing is not None and existing.offered:
                 continue
@@ -497,6 +522,8 @@ class VoiceDeliveryCoordinator:
                 "delivery_attempt_id": attempt.attempt_id,
                 "route_id": job.origin_route_id,
                 "origin_device_id": job.origin_device_id,
+                # The client dispatches on this: announce vs notify.
+                "delivery_modality": job.delivery_modality,
                 "spoken_text": spoken_text,
                 "ready_at": job.terminal_at,
                 "expires_at": job.expires_at,
@@ -529,7 +556,8 @@ class VoiceDeliveryCoordinator:
                 # policy-approved wording. Comparing against spoken_summary is
                 # the exact test for "this is the specialist's text".
                 if spoken and spoken == result.spoken_summary:
-                    return f"{speaker} says: {spoken}"
+                    return voice_phrases.announcement(
+                        speaker, spoken, voice_phrases.seed_for(job.id))
                 return spoken
             except (json.JSONDecodeError, TypeError, VoiceJobResultError):
                 pass

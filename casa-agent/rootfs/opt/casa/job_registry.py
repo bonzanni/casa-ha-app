@@ -109,11 +109,40 @@ class VoiceJob:
     # acknowledged the foreground-to-background handoff frame.
     handoff_id: str | None = None
     handoff_state: HandoffState = HandoffState.NONE
+    # How the ORIGIN endpoint said it can receive this answer ("audio"|"text"),
+    # captured at creation from the per-utterance offer (#233/#224). None means
+    # the endpoint offered nothing — or the row predates this field, in which
+    # case delivery must FAIL CLOSED rather than assume audio and announce a
+    # phone's answer on a speaker.
+    delivery_modality: str | None = None
 
 
 @dataclass(frozen=True)
 class CancelResult:
     status: str
+
+
+def _inherit_delivery_modality(parent: VoiceJob, child: VoiceJob) -> VoiceJob:
+    """Carry the parent's delivery promise onto a re-delivery of that promise.
+
+    This applies ONLY where there is no live utterance to ask. A prompted
+    re-delivery replays an answer the operator was already promised, so the
+    original promise is the right one to keep.
+
+    A continuation is deliberately excluded. It has its own live turn, and a
+    turn that carried no offer is not missing information — it is the endpoint
+    saying it cannot currently receive a deferred answer. Reviving the parent's
+    older modality there would promise audio into a room whose speaker has
+    since gone away, and delivery would refuse it (#233/#224).
+
+    Inheritance is scoped to the SAME endpoint: a promise about the kitchen
+    speaker says nothing about what another device can receive.
+    """
+    if child.delivery_modality is not None:
+        return child
+    if child.origin_device_id != parent.origin_device_id:
+        return child
+    return replace(child, delivery_modality=parent.delivery_modality)
 
 
 class JobRegistryError(RuntimeError):
@@ -451,7 +480,7 @@ class JobRegistry:
                 max_active_ready_per_route=max_active_ready_per_route,
             )
             prompted = replace(
-                child,
+                _inherit_delivery_modality(parent, child),
                 started_at=now,
                 terminal_at=now,
                 expires_at=parent.expires_at,
@@ -1297,6 +1326,7 @@ class JobRegistry:
                 ),
                 handoff_id=JobRegistry._optional_str(row.get("handoff_id")),
                 handoff_state=HandoffState(row.get("handoff_state", "NONE")),
+                delivery_modality=row.get("delivery_modality"),
             )
         except (KeyError, TypeError, ValueError) as exc:
             raise JobRegistryError(f"invalid job snapshot row: {exc}") from exc
@@ -1355,6 +1385,7 @@ class JobRegistry:
             "job_control_id": job.job_control_id,
             "handoff_id": job.handoff_id,
             "handoff_state": job.handoff_state.value,
+            "delivery_modality": job.delivery_modality,
         }
 
     async def _write_snapshot_locked(

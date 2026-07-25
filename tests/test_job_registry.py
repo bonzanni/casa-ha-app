@@ -1359,3 +1359,108 @@ async def test_pre_task_12_legacy_record_decodes_to_a_system_speaker(tmp_path):
     # Never derived from the still-present legacy display strings.
     assert job.creating_role == "concierge"
     assert job.specialist_role == "mtg-judge"
+
+
+async def test_a_continuation_does_not_revive_the_parents_promise(tmp_path):
+    """A live turn that offered no endpoint is an ANSWER, not a gap.
+
+    The continuation has its own utterance. If that utterance carried no
+    delivery offer, the endpoint is telling us it cannot currently receive a
+    deferred answer — the speaker was unplugged, the app was removed. Reviving
+    the parent's older modality would promise audio into a room that can no
+    longer play it, and delivery would refuse it (#233/#224).
+    """
+    registry = await loaded_registry(
+        tmp_path,
+        make_job(
+            terminal_at=100.0,
+            expires_at=200.0,
+            execution_state=ExecutionState.SUCCEEDED,
+            delivery_state=DeliveryState.DELIVERED,
+            result='{"status":"needs_clarification"}',
+            awaiting_input=True,
+            continuable_until=200.0,
+            delivery_modality="audio",
+        ),
+        now=120.0,
+    )
+    child = replace(
+        make_job(), id="job-child", parent_job_id="job-1", created_at=120.0,
+        delivery_modality=None,
+    )
+
+    created = await registry.create_continuation(
+        "job-1", child, actor=actor_for_job(),
+    )
+    assert created.delivery_modality is None
+    assert registry.get("job-child").delivery_modality is None
+
+
+async def test_a_childs_own_endpoint_offer_wins_over_the_parents(tmp_path):
+    """The live turn is the better evidence — never overwrite it."""
+    registry = await loaded_registry(
+        tmp_path,
+        make_job(
+            terminal_at=100.0, expires_at=200.0,
+            execution_state=ExecutionState.SUCCEEDED,
+            delivery_state=DeliveryState.DELIVERED,
+            result='{"status":"needs_clarification"}',
+            awaiting_input=True, continuable_until=200.0,
+            delivery_modality="audio",
+        ),
+        now=120.0,
+    )
+    child = replace(
+        make_job(), id="job-child", parent_job_id="job-1", created_at=120.0,
+        delivery_modality="text",
+    )
+    created = await registry.create_continuation(
+        "job-1", child, actor=actor_for_job(),
+    )
+    assert created.delivery_modality == "text"
+
+
+async def test_a_different_endpoint_does_not_inherit_the_promise(tmp_path):
+    """Promising audio because some OTHER device could speak is the bug."""
+    registry = await loaded_registry(
+        tmp_path,
+        make_job(
+            terminal_at=100.0, expires_at=200.0,
+            execution_state=ExecutionState.SUCCEEDED,
+            delivery_state=DeliveryState.DELIVERED,
+            result='{"status":"needs_clarification"}',
+            awaiting_input=True, continuable_until=200.0,
+            delivery_modality="audio",
+        ),
+        now=120.0,
+    )
+    child = replace(
+        make_job(), id="job-child", parent_job_id="job-1", created_at=120.0,
+        origin_device_id="device-hallway", delivery_modality=None,
+    )
+    created = await registry.create_continuation(
+        "job-1", child, actor=actor_for_job(),
+    )
+    assert created.delivery_modality is None
+
+
+async def test_prompted_delivery_inherits_the_delivery_promise(tmp_path):
+    registry = await loaded_registry(
+        tmp_path,
+        make_job(
+            terminal_at=100.0, expires_at=200.0,
+            execution_state=ExecutionState.SUCCEEDED,
+            delivery_state=DeliveryState.DELIVERED,
+            result='{"status":"ok"}',
+            delivery_modality="text",
+        ),
+        now=120.0,
+    )
+    child = replace(
+        make_job(), id="job-child", parent_job_id="job-1", created_at=120.0,
+        delivery_modality=None,
+    )
+    prompted = await registry.create_prompted_delivery(
+        "job-1", child, actor=actor_for_job(),
+    )
+    assert prompted.delivery_modality == "text"
