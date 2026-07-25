@@ -1117,3 +1117,44 @@ async def test_an_unknown_modality_is_treated_as_no_endpoint(delivery):
     await coordinator.route_connected(route)
 
     assert _offered(route) == []
+
+
+@pytest.mark.asyncio
+async def test_a_notification_that_never_left_is_reoffered_not_lost(delivery):
+    """The recovery half of a failed push (#233/#224).
+
+    The integration reaches `job_playback_started` and only then does the
+    notification fail. It deliberately does NOT acknowledge delivery, so the
+    answer must not be retired: the lease lapses, the job returns to READY, and
+    it is offered again under a fresh attempt. Without this the operator's
+    answer would sit in PLAYING until it expired — the same silent loss, one
+    step further along.
+    """
+    registry, _, route, coordinator, now = delivery
+    await registry.create(_ready_job(
+        "job-t", sequence=1, device="phone", delivery_modality="text"))
+    await coordinator.route_connected(route)
+    first = _offered(route)[0]
+    assert first["delivery_modality"] == "text"
+
+    await coordinator.handle(route, _frame("job_claimed", first))
+    await coordinator.handle(route, _frame("job_delivery_start", first))
+    await coordinator.handle(route, _frame("job_playback_started", first))
+    assert registry.get("job-t").delivery_state is DeliveryState.PLAYING
+
+    # The push fails. No `job_delivered` follows; the lease simply lapses.
+    now[0] = 200.0
+    await coordinator.sweep_once()
+
+    assert registry.get("job-t").delivery_state is DeliveryState.READY
+    retry = _offered(route)[-1]
+    assert retry["delivery_attempt_id"] != first["delivery_attempt_id"]
+    assert retry["delivery_modality"] == "text"
+
+    # The retry can now complete normally.
+    await coordinator.handle(route, _frame("job_claimed", retry))
+    await coordinator.handle(route, _frame("job_delivery_start", retry))
+    await coordinator.handle(route, _frame("job_playback_started", retry))
+    await coordinator.handle(route, _frame("job_delivered", retry))
+
+    assert registry.get("job-t").delivery_state is DeliveryState.DELIVERED
