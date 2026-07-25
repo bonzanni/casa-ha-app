@@ -1591,3 +1591,39 @@ async def test_an_invalid_specialist_result_logs_why(tool_env):
     assert "missing required fields" in failures[0]
     # The rejected payload must never reach the log.
     assert "PRIVATE_RESULT_CANARY" not in failures[0]
+
+
+@pytest.mark.asyncio
+async def test_handoff_telemetry_names_the_capabilities_that_exist(tool_env):
+    """A diagnostic that reports a dead capability is worse than none.
+
+    The line said `cap_satellite_announce=False` long after that capability was
+    replaced by `endpoint_delivery`. It is the line an operator reads to work
+    out why a hand-off was refused, and a permanently-false field in it points
+    straight at a cause that cannot be true — which is exactly the wrong turn
+    it invited during the v0.121.0 live verification.
+    """
+    import logging
+
+    records: list[str] = []
+
+    class _Capture(logging.Handler):
+        def emit(self, record):
+            records.append(record.getMessage())
+
+    handler = _Capture(level=logging.INFO)
+    previous = tools.logger.level
+    tools.logger.setLevel(logging.INFO)
+    tools.logger.addHandler(handler)
+    try:
+        await tool_env.invoke_delegate(voice_origin())
+    finally:
+        tools.logger.removeHandler(handler)
+        tools.logger.setLevel(previous)
+
+    decisions = [m for m in records if "voice_handoff_decision" in m]
+    assert decisions, records
+    line = decisions[0]
+    assert "cap_endpoint_delivery=True" in line, line
+    # The route contract no longer has this capability at all.
+    assert "satellite_announce" not in line, line

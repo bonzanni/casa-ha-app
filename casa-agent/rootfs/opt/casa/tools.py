@@ -1516,7 +1516,7 @@ def _log_handoff_decision(decision: str, agent_name: str, origin: dict,
             "role_matches=%s origin_role_is_concierge=%s caller_is_concierge=%s "
             "channel_is_voice=%s transport=%s requires_handoff=%s "
             "reserve_ok=%s release_ok=%s commit_ok=%s route_id=%s "
-            "cap_background_jobs=%s cap_satellite_announce=%s "
+            "cap_background_jobs=%s cap_endpoint_delivery=%s "
             "cap_voice_handoff=%s cap_other=%d offer_modality=%s "
             "endpoint_can_receive=%s",
             decision, _known_role(agent_name),
@@ -1537,7 +1537,7 @@ def _log_handoff_decision(decision: str, agent_name: str, origin: dict,
             callable(getattr(reservation, "commit", None)),
             bool(origin.get("voice_route_id")),
             "background_jobs" in caps,
-            "satellite_announce" in caps,
+            "endpoint_delivery" in caps,
             "voice_handoff" in caps,
             len(caps),
             selected_delivery_modality(origin),
