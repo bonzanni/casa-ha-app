@@ -174,10 +174,10 @@ Casa exposes two transports for Home Assistant voice / generic voice clients. Th
 - `/api/converse/ws` — persistent WebSocket. Conversation frames include
   inbound `stt_start`, `utterance`, `stage`, and `cancel`, with outbound
   `block`, `done`, and `error`. A Home Assistant integration may also register
-  an authenticated protocol-2 delivery route. Concierge specialist handoff
+  an authenticated protocol-3 delivery route. Concierge specialist handoff
   requires that exact socket to acknowledge the complete coordinated capability
-  set: `background_jobs`, `satellite_announce`, and `voice_handoff`. Missing
-  protocol 2 or any one capability fails closed before Casa creates a job;
+  set: `background_jobs`, `endpoint_delivery`, and `voice_handoff`. Missing
+  protocol 3 or any one capability fails closed before Casa creates a job;
   there is no legacy handoff fallback.
 
 ### Voice-agent discovery
@@ -236,6 +236,15 @@ integration; full output, citations, and private detail are never injected back
 into Gary's SDK session. Butler (Tina) keeps its direct, immediate home-control
 behaviour and does not use this asynchronous specialist handoff.
 
+Where the answer arrives is decided when the question is asked, from the asking
+device itself. A device with an announce-capable Assist satellite is answered
+aloud on it. A device with only a Companion notification entity — a phone or a
+tablet — is sent the answer as a notification instead. A device with neither is
+not offered a deferred answer at all: Gary says up front that he cannot follow
+up, rather than promising an answer that cannot be delivered. The
+acknowledgement is worded to match, so "I'll read it out when it lands" is only
+ever said where the answer can be read out.
+
 Home Assistant announces a queued summary immediately when the originating
 satellite is already idle. If it is listening, processing, or responding, the
 integration waits until that interaction finishes and the satellite reaches
@@ -252,8 +261,8 @@ request is still identity/clearance checked and does not add result tokens to
 Gary's context.
 
 Background handoff requires a currently or recently registered,
-HMAC-authenticated protocol-2 WebSocket route with all three coordinated
-capabilities: `background_jobs`, `satellite_announce`, and `voice_handoff`.
+HMAC-authenticated protocol-3 WebSocket route with all three coordinated
+capabilities: `background_jobs`, `endpoint_delivery`, and `voice_handoff`.
 SSE supports synchronous turns but never handoff; an older or incomplete
 WebSocket registration is refused before job creation rather than falling back.
 Delivery is intentionally at least once: if audio succeeds but its

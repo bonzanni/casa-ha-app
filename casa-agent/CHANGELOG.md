@@ -1,5 +1,33 @@
 # Changelog
 
+## [0.121.0] - 2026-07-25
+
+### Fixed
+
+- Asking a voice agent something that needs a specialist from a phone or tablet
+  no longer ends in silence. Casa used to promise "I'll read it out when it
+  lands" on any device, then try to speak the answer through an Assist
+  satellite — which a phone does not have — and the finished answer was
+  discarded. Casa now works out, when the question is asked, what the asking
+  device can actually receive: it speaks the answer on a voice satellite, sends
+  it as a notification to a phone or tablet, and on a device that can do
+  neither it says up front that it cannot follow up rather than promising an
+  answer that never arrives.
+
+### Changed
+
+- The acknowledgement and the follow-up announcement are worded to match how
+  the answer will actually arrive, and vary between requests instead of
+  repeating one fixed sentence.
+
+### Upgrading
+
+- Requires Casa Home Assistant integration **v0.8.0**. Deferred voice answers
+  use a new delivery contract; upgrade Casa first, then the integration. Voice
+  delegation does not deliver while the two versions are mismatched.
+- Deferred answers are a WebSocket-transport feature. Agents configured for SSE
+  acknowledge and complete as before, without deferred delivery.
+
 ## [0.120.0] - 2026-07-25
 
 ### Fixed
