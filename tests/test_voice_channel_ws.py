@@ -333,9 +333,14 @@ class TestWSTurn:
             asyncio.get_running_loop().time() + 20,
         )
 
+        # v0.120.0 (#233/#224): the frame now carries `protocol` + `job_id`
+        # so the client can produce a receipt Casa will ACCEPT (without them
+        # the hand-off stayed PENDING and the answer expired unspoken), and
+        # the wording sets the caller's wait expectation.
         assert ws.frames == [{
-            "type": "handoff", "utterance_id": "utterance-1",
-            "handoff_id": "handoff-1", "text": "I will ask Finance.",
+            "type": "handoff", "protocol": 2, "utterance_id": "utterance-1",
+            "handoff_id": "handoff-1", "job_id": "job-1",
+            "text": "I'll ask Finance — this can take up to a minute.",
         }]
         assert ws.write_completed.is_set()
         assert bus.request_cancelled.is_set()
