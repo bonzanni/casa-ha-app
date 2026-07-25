@@ -38,6 +38,7 @@ from channels.voice.prosodic import ProsodicSplitter
 from channels.voice.routes import VoiceRouteRegistry, VoiceWsConnection
 from channels.voice.session import VoiceSessionPool
 from channels.voice.tts_adapter import TagDialectAdapter
+import voice_phrases
 from job_registry import JobTransitionError, VoiceJob
 from semantic_memory import SemanticMemory
 
@@ -101,8 +102,14 @@ class VoiceHandoff:
             utterance_id=utterance_id,
             handoff_id=job.handoff_id or "",
             job_id=job.id,
-            text=(f"I'll ask {job.specialist_display_name} — "
-                  "this can take up to a minute."),
+            # Rendered from the modality this endpoint actually offered, so the
+            # promise cannot outrun what the device can do. Varied wording,
+            # fixed commitment — and channel-owned, never the model's.
+            text=voice_phrases.acknowledgement(
+                job.specialist_display_name,
+                job.delivery_modality,
+                voice_phrases.seed_for(job.id),
+            ),
         )
 
     def frame(self) -> dict[str, str]:

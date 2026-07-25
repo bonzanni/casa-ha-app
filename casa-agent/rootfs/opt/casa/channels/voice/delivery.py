@@ -10,6 +10,7 @@ import uuid
 from dataclasses import dataclass
 from typing import Any, Mapping
 
+import voice_phrases
 from job_registry import DeliveryState, JobTransitionError, VoiceJob
 from voice_job_result import (
     VoiceJobResultError,
@@ -502,6 +503,8 @@ class VoiceDeliveryCoordinator:
                 "delivery_attempt_id": attempt.attempt_id,
                 "route_id": job.origin_route_id,
                 "origin_device_id": job.origin_device_id,
+                # The client dispatches on this: announce vs notify.
+                "delivery_modality": job.delivery_modality,
                 "spoken_text": spoken_text,
                 "ready_at": job.terminal_at,
                 "expires_at": job.expires_at,
@@ -534,7 +537,8 @@ class VoiceDeliveryCoordinator:
                 # policy-approved wording. Comparing against spoken_summary is
                 # the exact test for "this is the specialist's text".
                 if spoken and spoken == result.spoken_summary:
-                    return f"{speaker} says: {spoken}"
+                    return voice_phrases.announcement(
+                        speaker, spoken, voice_phrases.seed_for(job.id))
                 return spoken
             except (json.JSONDecodeError, TypeError, VoiceJobResultError):
                 pass

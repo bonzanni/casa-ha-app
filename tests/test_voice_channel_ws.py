@@ -10,6 +10,8 @@ import weakref
 from unittest.mock import AsyncMock
 
 import pytest
+
+import voice_phrases
 from aiohttp import web, WSMsgType
 from aiohttp.test_utils import TestClient, TestServer
 
@@ -73,6 +75,9 @@ class _HandoffJob:
     id = "job-1"
     handoff_id = "handoff-1"
     specialist_display_name = "Finance"
+    # The endpoint modality the acknowledgement is rendered from (#233/#224):
+    # a real job always carries it, so the double must too.
+    delivery_modality = "audio"
 
 
 class _RecordingWs:
@@ -340,7 +345,11 @@ class TestWSTurn:
         assert ws.frames == [{
             "type": "handoff", "protocol": 2, "utterance_id": "utterance-1",
             "handoff_id": "handoff-1", "job_id": "job-1",
-            "text": "I'll ask Finance — this can take up to a minute.",
+            # Wording varies by design (#233); the CONTRACT is what matters:
+            # it names the specialist and sets a wait expectation. On an audio
+            # endpoint it must never imply a notification.
+            "text": voice_phrases.acknowledgement(
+                "Finance", "audio", voice_phrases.seed_for("job-1")),
         }]
         assert ws.write_completed.is_set()
         assert bus.request_cancelled.is_set()

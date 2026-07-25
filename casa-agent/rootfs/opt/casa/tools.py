@@ -2588,6 +2588,9 @@ def _new_voice_job(
         scope_id=str(origin.get("chat_id") or origin.get("scope_id") or ""),
         origin_route_id=str(origin["voice_route_id"]),
         origin_device_id=str(origin["origin_device_id"]),
+        # What this endpoint said it can receive (#233/#224). Delivery
+        # dispatches on it, and the spoken promise is rendered from it.
+        delivery_modality=selected_delivery_modality(origin),
         task=task_text,
         context=context_text,
         created_at=time.time(),

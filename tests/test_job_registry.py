@@ -1359,3 +1359,109 @@ async def test_pre_task_12_legacy_record_decodes_to_a_system_speaker(tmp_path):
     # Never derived from the still-present legacy display strings.
     assert job.creating_role == "concierge"
     assert job.specialist_role == "mtg-judge"
+
+
+async def test_derived_jobs_inherit_the_parents_delivery_promise(tmp_path):
+    """A follow-up turn that resolved no endpoint keeps the parent's promise.
+
+    The child's own turn normally carries its endpoint's offer. When it does
+    not — a client that sent no offer, or a metadata-only re-delivery that has
+    no live turn at all — the child would fall back to "no modality", which is
+    fail-closed: the answer the operator was already promised would never be
+    delivered (#233/#224). Inheritance is scoped to the SAME endpoint, since a
+    promise made about the kitchen speaker says nothing about another device.
+    """
+    registry = await loaded_registry(
+        tmp_path,
+        make_job(
+            terminal_at=100.0,
+            expires_at=200.0,
+            execution_state=ExecutionState.SUCCEEDED,
+            delivery_state=DeliveryState.DELIVERED,
+            result='{"status":"needs_clarification"}',
+            awaiting_input=True,
+            continuable_until=200.0,
+            delivery_modality="audio",
+        ),
+        now=120.0,
+    )
+    child = replace(
+        make_job(), id="job-child", parent_job_id="job-1", created_at=120.0,
+        delivery_modality=None,
+    )
+
+    created = await registry.create_continuation(
+        "job-1", child, actor=actor_for_job(),
+    )
+    assert created.delivery_modality == "audio"
+    assert registry.get("job-child").delivery_modality == "audio"
+
+
+async def test_a_childs_own_endpoint_offer_wins_over_the_parents(tmp_path):
+    """The live turn is the better evidence — never overwrite it."""
+    registry = await loaded_registry(
+        tmp_path,
+        make_job(
+            terminal_at=100.0, expires_at=200.0,
+            execution_state=ExecutionState.SUCCEEDED,
+            delivery_state=DeliveryState.DELIVERED,
+            result='{"status":"needs_clarification"}',
+            awaiting_input=True, continuable_until=200.0,
+            delivery_modality="audio",
+        ),
+        now=120.0,
+    )
+    child = replace(
+        make_job(), id="job-child", parent_job_id="job-1", created_at=120.0,
+        delivery_modality="text",
+    )
+    created = await registry.create_continuation(
+        "job-1", child, actor=actor_for_job(),
+    )
+    assert created.delivery_modality == "text"
+
+
+async def test_a_different_endpoint_does_not_inherit_the_promise(tmp_path):
+    """Promising audio because some OTHER device could speak is the bug."""
+    registry = await loaded_registry(
+        tmp_path,
+        make_job(
+            terminal_at=100.0, expires_at=200.0,
+            execution_state=ExecutionState.SUCCEEDED,
+            delivery_state=DeliveryState.DELIVERED,
+            result='{"status":"needs_clarification"}',
+            awaiting_input=True, continuable_until=200.0,
+            delivery_modality="audio",
+        ),
+        now=120.0,
+    )
+    child = replace(
+        make_job(), id="job-child", parent_job_id="job-1", created_at=120.0,
+        origin_device_id="device-hallway", delivery_modality=None,
+    )
+    created = await registry.create_continuation(
+        "job-1", child, actor=actor_for_job(),
+    )
+    assert created.delivery_modality is None
+
+
+async def test_prompted_delivery_inherits_the_delivery_promise(tmp_path):
+    registry = await loaded_registry(
+        tmp_path,
+        make_job(
+            terminal_at=100.0, expires_at=200.0,
+            execution_state=ExecutionState.SUCCEEDED,
+            delivery_state=DeliveryState.DELIVERED,
+            result='{"status":"ok"}',
+            delivery_modality="text",
+        ),
+        now=120.0,
+    )
+    child = replace(
+        make_job(), id="job-child", parent_job_id="job-1", created_at=120.0,
+        delivery_modality=None,
+    )
+    prompted = await registry.create_prompted_delivery(
+        "job-1", child, actor=actor_for_job(),
+    )
+    assert prompted.delivery_modality == "text"
