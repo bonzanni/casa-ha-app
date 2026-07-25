@@ -267,3 +267,42 @@ def test_server_authenticated_speaker_with_private_channel_clearance_is_private(
     assert voice_identity_clearance({
         "channel": "voice", "_authenticated_speaker": True,
     }) == "private"
+
+
+class TestValidationErrorsAreLoggable:
+    """The parser's messages are the ONLY safe diagnostic there can be.
+
+    Every message names fields and never interpolates the rejected payload
+    (that is the module's stated contract), so it is safe to log. Without it a
+    specialist failure reads `kind=invalid_specialist_result` and nothing else
+    — which is what made a live mtg failure undiagnosable from prod logs.
+    """
+
+    _PRIVATE = "PRIVATE_CANARY_SECRET_VALUE"
+
+    @pytest.mark.parametrize("payload", [
+        "not-a-dict",
+        {},
+        {"status": "ok"},
+    ])
+    def test_every_rejection_explains_itself(self, payload):
+        with pytest.raises(VoiceJobResultError) as excinfo:
+            parse_voice_job_result(payload)
+        assert str(excinfo.value).strip(), "a rejection must say what was wrong"
+
+    def test_a_rejection_never_quotes_the_payload(self):
+        bad = {
+            "status": "answered",
+            "spoken_summary": self._PRIVATE,
+            "answer": self._PRIVATE,
+            "clarification": "",
+            "citations": [],
+            "assumptions": [],
+            "provenance": {"note": self._PRIVATE},
+            "sensitivity": "not-a-real-sensitivity",
+            "delivery_ttl_s": 300,
+        }
+        with pytest.raises(VoiceJobResultError) as excinfo:
+            parse_voice_job_result(bad)
+        assert self._PRIVATE not in str(excinfo.value)
+        assert "sensitivity" in str(excinfo.value)
