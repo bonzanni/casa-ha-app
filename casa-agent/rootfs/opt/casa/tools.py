@@ -46,6 +46,7 @@ from claude_agent_sdk import (
     ResultMessage,
     SdkMcpTool,
     TextBlock,
+    ToolUseBlock,
     create_sdk_mcp_server,
     tool,
 )
@@ -1396,6 +1397,16 @@ def validate_voice_handoff_static(
         or origin.get("role") != CONCIERGE_ROLE
         or origin.get("channel") != "voice"
     ):
+        # #233/#224 telemetry: this passthrough leaves the delegation on the
+        # ORDINARY sync path (voice budget, no handoff, no progress block) and
+        # is invisible today. Production ran sync for a concierge voice turn
+        # that this function should have normalized — the two candidate causes
+        # (a `mode` string that isn't exactly "sync"; an origin whose `role`
+        # disagrees with `execution_role`) are indistinguishable without this
+        # line. Enumerated, non-payload fields only.
+        _log_handoff_decision(
+            "passthrough_not_eligible", agent_name, origin, requested_mode,
+            caller_role)
         return requested_mode, None, None
 
     caller_cfg = _agent_role_map.get(caller_role)
@@ -1403,18 +1414,131 @@ def validate_voice_handoff_static(
     # Preserve the established ACL error and ordering for an undeclared
     # target; capability errors must not disclose target configuration.
     if agent_name not in declared:
+        _log_handoff_decision(
+            "passthrough_not_declared", agent_name, origin, requested_mode,
+            caller_role)
         return requested_mode, None, None
 
     reservation = origin.get("_voice_handoff_reservation")
+    # Computed ONCE and reused by both the branch and its telemetry, so the log
+    # can never disagree with the decision actually taken.
+    route_available = background_route_available(origin)
     if (
         not requires_voice_handoff(origin, caller_role)
         or not callable(getattr(reservation, "reserve", None))
         or not callable(getattr(reservation, "release", None))
         or not callable(getattr(reservation, "commit", None))
-        or not background_route_available(origin)
+        or not route_available
     ):
+        _log_handoff_decision(
+            "background_unavailable", agent_name, origin, requested_mode,
+            caller_role, route_available=route_available)
         return requested_mode, None, _background_delivery_unavailable_result()
+    _log_handoff_decision(
+        "async_handoff", agent_name, origin, requested_mode, caller_role,
+        route_available=route_available)
     return "async", reservation, None
+
+
+# #233/#224 (v0.118.0) diagnostics. Tool-call arguments (`mode`, `agent`) are
+# MODEL-SUPPLIED, and role/transport reach us on the origin, so none of them
+# may be echoed. A *syntax* filter is not enough — a short plain token can
+# still be meaningful content (`admin:credential`), so every value is matched
+# against the CLOSED SET of values Casa itself defines and reported as
+# `<other>` when it isn't one (Sol review, Blocking). The diagnosis never
+# depends on the raw value: the booleans beside it carry the signal.
+_KNOWN_MODES = frozenset({"sync", "async", "interactive"})
+_KNOWN_TRANSPORTS = frozenset({"sse", "ws"})
+_OTHER_TOKEN = "<other>"
+
+
+def _known_token(value: object, allowed: Any) -> str:
+    """``value`` iff it is one of ``allowed``, else ``<other>``.
+
+    TOTAL by construction: a non-``str`` is rejected outright rather than
+    coerced, so no foreign ``__str__`` is ever executed (this helper is also
+    called outside the logging try/except) (Sol review, Low).
+    """
+    if not isinstance(value, str):
+        return _OTHER_TOKEN
+    return value if value in allowed else _OTHER_TOKEN
+
+
+def _known_role(value: object) -> str:
+    """A registered agent role, else ``<other>``.
+
+    An unknown role is exactly the H-B signal we are hunting, and ``<other>``
+    reports it without echoing whatever the field actually held.
+    """
+    return _known_token(value, _agent_role_map.keys())
+
+
+def _log_handoff_decision(decision: str, agent_name: str, origin: dict,
+                          requested_mode: str, caller_role: str, *,
+                          route_available: bool | None = None) -> None:
+    """One INFO line explaining which branch the voice-handoff normalizer took.
+
+    Enumerated provenance/capability facts ONLY — never a prompt, task, context
+    or tool input. This is the line that tells apart "the model passed a mode
+    that isn't exactly 'sync'" (``mode_is_sync=False``) from "origin.role
+    disagrees with execution_role" (``role_matches=False``), which produce
+    IDENTICAL observable behaviour: both fall through to the ordinary sync path
+    with the voice budget and no progress block. The per-predicate booleans make
+    the failing eligibility term directly queryable rather than inferred.
+    Never raises.
+
+    ``route_available`` is passed in by callers that already computed it, so
+    telemetry never re-evaluates the capability check and can never disagree
+    with the branch that was actually taken (Sol review, Low).
+    """
+    if not logger.isEnabledFor(logging.INFO):
+        return
+    try:
+        # Route capabilities arrive on the WS route-registration frame, i.e.
+        # they are CLIENT-supplied. Never echo them — report one fixed boolean
+        # per capability Casa actually requires, plus a count of anything else
+        # (Sol review, High). That is both leak-proof and more directly usable
+        # than a rendered list.
+        raw_caps = origin.get("voice_route_capabilities")
+        caps = {c for c in raw_caps if isinstance(c, str)} if isinstance(
+            raw_caps, (set, frozenset, list, tuple)) else set()
+        reservation = origin.get("_voice_handoff_reservation")
+        origin_role = origin.get("role")
+        exec_role = origin.get("execution_role")
+        logger.info(
+            "voice_handoff_decision decision=%s agent=%s mode=%s "
+            "mode_is_sync=%s caller_role=%s origin_role=%s execution_role=%s "
+            "role_matches=%s origin_role_is_concierge=%s caller_is_concierge=%s "
+            "channel_is_voice=%s transport=%s requires_handoff=%s "
+            "reserve_ok=%s release_ok=%s commit_ok=%s route_id=%s "
+            "cap_background_jobs=%s cap_satellite_announce=%s "
+            "cap_voice_handoff=%s cap_other=%d route_available=%s",
+            decision, _known_role(agent_name),
+            _known_token(requested_mode, _KNOWN_MODES),
+            requested_mode == "sync",
+            _known_role(caller_role), _known_role(origin_role),
+            _known_role(exec_role),
+            origin_role == exec_role,
+            origin_role == CONCIERGE_ROLE,
+            caller_role == CONCIERGE_ROLE,
+            origin.get("channel") == "voice",
+            _known_token(origin.get("voice_transport"), _KNOWN_TRANSPORTS),
+            requires_voice_handoff(origin, caller_role),
+            # Which specific predicate failed — otherwise a
+            # background_unavailable line can't say WHY (Sol review, Medium).
+            callable(getattr(reservation, "reserve", None)),
+            callable(getattr(reservation, "release", None)),
+            callable(getattr(reservation, "commit", None)),
+            bool(origin.get("voice_route_id")),
+            "background_jobs" in caps,
+            "satellite_announce" in caps,
+            "voice_handoff" in caps,
+            len(caps - _BACKGROUND_ROUTE_CAPABILITIES),
+            (background_route_available(origin)
+             if route_available is None else route_available),
+        )
+    except Exception:  # noqa: BLE001 — diagnostics must never break a turn
+        logger.debug("voice_handoff_decision log failed")
 
 
 def background_route_available(origin: dict | None) -> bool:
@@ -1624,13 +1748,31 @@ async def _run_delegated_agent(
     # window is transient and self-healing (the next delegation resolves the new
     # artifact); the PERSISTENT stale-binding incident is fully closed. Tracked
     # for a future live-binding registry (docs/ROADMAP-backlog.md).
-    options = await asyncio.to_thread(
-        _build_specialist_options, cfg, resolution=resolution,
-        output_format=output_format)
+    # #233 (v0.118.0) phase telemetry. A delegated specialist is INVISIBLE in
+    # the logs — sdk_logging's system_init/tool_use/turn_done are emitted only
+    # by agent.py's resident loop, and a voice delegation additionally
+    # suppresses SDK protocol diagnostics (output_format set) and skips the
+    # stderr callback. So a delegation cancelled at the voice budget left NO
+    # trace of where its time went. These monotonic stage marks are the
+    # minimum needed to tell "cold CLI/plugin startup" from "slow model/tool
+    # work". Durations and message TYPES only — never prompt/task/tool payload.
+    _ph_start = time.monotonic()
+    _ph: dict[str, float] = {}
+    _msg_count = 0
+    _first_tool = False
     text = ""
     result_msg: ResultMessage | None = None
-    token = agent_mod.origin_var.set(child_origin)
+    token = None
+    # The options build is INSIDE the try (Sol review, Medium): a voice budget
+    # cancellation landing during `_build_specialist_options` would otherwise
+    # produce no phase line at all — and "cancelled before the client even
+    # started" is one of the answers we are looking for.
     try:
+        options = await asyncio.to_thread(
+            _build_specialist_options, cfg, resolution=resolution,
+            output_format=output_format)
+        _ph["options"] = time.monotonic()
+        token = agent_mod.origin_var.set(child_origin)
         client_options = (
             options if output_format is not None
             else sdk_logging.with_stderr_callback(options, engagement_id=None)
@@ -1641,19 +1783,62 @@ async def _run_delegated_agent(
         )
         with sdk_log_guard:
             async with ClaudeSDKClient(client_options) as client:
+                _ph["connect"] = time.monotonic()
                 await client.query(prompt)
+                _ph["query"] = time.monotonic()
                 async for sdk_msg in client.receive_response():
+                    _msg_count += 1
+                    _ph.setdefault("first_msg", time.monotonic())
                     if isinstance(sdk_msg, AssistantMessage):
                         for block in getattr(sdk_msg, "content", []):
                             if isinstance(block, TextBlock):
                                 text += block.text
+                            elif (not _first_tool
+                                    and isinstance(block, ToolUseBlock)):
+                                # Tool NAME only (never its input), allow-listed
+                                # like every other model-influenced token.
+                                # Boolean only — a tool NAME is supplied by
+                                # the MCP server and carries no diagnostic
+                                # value the timing doesn't already give.
+                                _first_tool = True
+                                _ph["first_tool"] = time.monotonic()
                     elif isinstance(sdk_msg, ResultMessage):
                         # Task 6 (spec §4.6): previously discarded — captured
                         # below (in `finally`, so it's recorded even when the
                         # client raises before the loop reaches a ResultMessage).
                         result_msg = sdk_msg
     finally:
-        agent_mod.origin_var.reset(token)
+        # Emitted on EVERY exit — including the CancelledError the voice budget
+        # raises, which is precisely the case we could not see before. It runs
+        # BEFORE the origin_var reset so a reset failure can't skip it (Sol
+        # review, Medium); `token` is None when we were cancelled during the
+        # options build, so the reset is conditional.
+        try:
+            def _at_ms(key: str) -> int | None:
+                """Milestone time since delegation start (NOT a phase duration —
+                subtract two marks for that)."""
+                mark = _ph.get(key)
+                return None if mark is None else int(
+                    (mark - _ph_start) * 1000)
+
+            logger.info(
+                "delegated_phases role=%s options_at_ms=%s connect_at_ms=%s "
+                "query_at_ms=%s first_msg_at_ms=%s used_tool=%s "
+                "first_tool_at_ms=%s msgs=%d got_result=%s total_ms=%d",
+                _known_role(getattr(cfg, "role", None)),
+                _at_ms("options"), _at_ms("connect"), _at_ms("query"),
+                _at_ms("first_msg"), _first_tool, _at_ms("first_tool"),
+                _msg_count, result_msg is not None,
+                int((time.monotonic() - _ph_start) * 1000),
+            )
+        except Exception:  # noqa: BLE001 — diagnostics never break a turn
+            logger.debug("delegated_phases log failed")
+        finally:
+            # In its own finally so even a BaseException escaping the logging
+            # block cannot strand the contextvar (Sol review, Low). `token` is
+            # None when we were cancelled during the options build.
+            if token is not None:
+                agent_mod.origin_var.reset(token)
         # Task 6 (spec §4.6): aggregate cost/usage from the captured
         # ResultMessage. COUNTING is separate (`record_launch`, done by the
         # caller at ownership transfer) so a delegation that fails during

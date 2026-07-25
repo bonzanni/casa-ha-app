@@ -1,5 +1,18 @@
 # Changelog
 
+## [0.118.0] - 2026-07-25
+
+### Added
+
+- Diagnostics for voice specialist hand-offs. When a voice agent hands a
+  question to a specialist, the log now records which delivery route was
+  chosen and why, plus where a delegation spent its time (startup, connection,
+  first reply, first tool call) — including when it is cancelled for exceeding
+  the voice turn budget, which previously left no trace at all. Only timings,
+  routing facts and tool names are recorded; never the question, the answer, or
+  any tool input. Behaviour is unchanged; this is groundwork for fixing the
+  silent-wait and hand-off issues (#233, #224).
+
 ## [0.117.0] - 2026-07-24
 
 ### Security
