@@ -152,7 +152,7 @@ def _offered(route: _Route) -> list[dict]:
 def _frame(frame_type: str, offer: dict, **changes) -> dict:
     return {
         "type": frame_type,
-        "protocol": 1,
+        "protocol": 2,
         "job_id": offer["job_id"],
         "delivery_attempt_id": offer["delivery_attempt_id"],
         **changes,
@@ -395,7 +395,7 @@ async def test_offer_contains_only_policy_approved_spoken_text(delivery):
         "Judge", "The policy-approved answer.", voice_phrases.seed_for("job-1"))
     assert offer == {
         "type": "job_ready",
-        "protocol": 1,
+        "protocol": 2,
         "job_id": "job-1",
         "delivery_attempt_id": offer["delivery_attempt_id"],
         "route_id": "entry-1",
@@ -452,7 +452,7 @@ async def test_private_disclosure_is_re_evaluated_before_authorization(
     ]
     assert authorized[-1] == {
         "type": "job_delivery_authorized",
-        "protocol": 1,
+        "protocol": 2,
         "job_id": "job-1",
         "delivery_attempt_id": offer["delivery_attempt_id"],
     }
@@ -854,20 +854,20 @@ async def test_restart_reconstructs_live_attempts_and_blocks_pending_cancel_rene
     now[0] = 104.0
     await coordinator.handle(route, {
         "type": "job_claim_renew",
-        "protocol": 1,
+        "protocol": 2,
         "job_id": "claimed-job",
         "delivery_attempt_id": attempt_id,
     })
     await coordinator.handle(route, {
         "type": "job_claim_renew",
-        "protocol": 1,
+        "protocol": 2,
         "job_id": "playing-job",
         "delivery_attempt_id": "playing-attempt",
     })
     pending_before = registry.get("authorized-job")
     await coordinator.handle(route, {
         "type": "job_claim_renew",
-        "protocol": 1,
+        "protocol": 2,
         "job_id": "authorized-job",
         "delivery_attempt_id": "authorized-attempt",
     })
@@ -1067,10 +1067,10 @@ async def test_unknown_and_old_protocol_frames_are_ignored(delivery):
     await registry.create(_ready_job("job-1", sequence=1, device="kitchen"))
     before = registry.get("job-1")
 
-    await coordinator.handle(route, {"type": "future_frame", "protocol": 1})
+    await coordinator.handle(route, {"type": "future_frame", "protocol": 2})
     await coordinator.handle(route, {"type": "job_claimed", "protocol": 0})
     await coordinator.handle(route, {"type": "job_claimed", "protocol": True})
-    await coordinator.handle(route, {"type": "job_claimed", "protocol": 1.0})
+    await coordinator.handle(route, {"type": "job_claimed", "protocol": 2.0})
 
     assert registry.get("job-1") == before
     assert route.sent == []

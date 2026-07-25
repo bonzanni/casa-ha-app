@@ -22,7 +22,11 @@ from voice_job_result import (
 
 logger = logging.getLogger(__name__)
 
-_PROTOCOL = 1
+# Bumped to 2 for endpoint delivery (#233/#224): `job_ready` now carries the
+# modality the endpoint promised, and an integration that cannot read it must
+# not act on the frame at all — a v1 peer would announce a `text` delivery on a
+# satellite the job was never promised to.
+_PROTOCOL = 2
 _INBOUND_TYPES = frozenset({
     "job_claimed",
     "job_claim_renew",
@@ -60,7 +64,7 @@ def _identifier(value: Any) -> str | None:
     return normalized
 
 
-def _is_protocol_one(value: Any) -> bool:
+def _is_current_protocol(value: Any) -> bool:
     return type(value) is int and value == _PROTOCOL
 
 
@@ -184,7 +188,7 @@ class VoiceDeliveryCoordinator:
         frame_type = frame.get("type")
         if (
             frame_type not in _INBOUND_TYPES
-            or not _is_protocol_one(frame.get("protocol"))
+            or not _is_current_protocol(frame.get("protocol"))
         ):
             return
         async with self._lock:
