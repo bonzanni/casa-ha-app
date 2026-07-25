@@ -2751,7 +2751,7 @@ async def _run_voice_job_lifecycle(
 
         try:
             voice_result = parse_voice_job_result(output.structured_output)
-        except VoiceJobResultError:
+        except VoiceJobResultError as exc:
             await _persist_voice_terminal(
                 registry.fail_compat(
                     job_id,
@@ -2764,10 +2764,14 @@ async def _run_voice_job_lifecycle(
                 job_id=job_id,
                 specialist_role=specialist_role,
             )
+            # `exc` names the field that failed and never interpolates the
+            # rejected payload (voice_job_result's stated contract), so it is
+            # the one safe diagnostic available. Without it this failure reads
+            # as "invalid" and nothing else, and the specialist cannot be fixed.
             logger.warning(
                 "Voice job %s role=%s terminal=failed "
-                "kind=invalid_specialist_result elapsed_s=%.2f",
-                job_id[:8], specialist_role, time.time() - started_at,
+                "kind=invalid_specialist_result reason=%s elapsed_s=%.2f",
+                job_id[:8], specialist_role, exc, time.time() - started_at,
             )
             return
 
@@ -3483,7 +3487,7 @@ async def delegate_to_agent(args: dict) -> dict:
             try:
                 voice_result = parse_voice_job_result(
                     delegated_output.structured_output)
-            except VoiceJobResultError:
+            except VoiceJobResultError as exc:
                 from job_registry import JobFailure
                 failure = JobFailure(
                     kind="invalid_specialist_result",
@@ -3494,8 +3498,8 @@ async def delegate_to_agent(args: dict) -> dict:
                 elapsed = time.time() - started_at
                 logger.warning(
                     "Delegation %s → %s returned an invalid voice result "
-                    "status=failed (%.2fs)",
-                    delegation_id[:8], agent_name, elapsed,
+                    "reason=%s status=failed (%.2fs)",
+                    delegation_id[:8], agent_name, exc, elapsed,
                 )
                 return _result({
                     "status": "error",

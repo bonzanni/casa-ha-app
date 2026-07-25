@@ -1550,3 +1550,44 @@ async def test_an_unacknowledged_route_still_reports_the_route(tool_env):
         voice_origin(voice_transport="sse")))
 
     assert payload["reason"] == "no_acknowledged_route"
+
+
+@pytest.mark.asyncio
+async def test_an_invalid_specialist_result_logs_why(tool_env):
+    """A failure the operator cannot diagnose is barely better than silence.
+
+    A live mtg job failed with `kind=invalid_specialist_result` and nothing
+    else, so there was no way to tell from prod logs which field the specialist
+    got wrong. The parser's own message names the field and never quotes the
+    payload, which makes it the one diagnostic that is both useful and safe.
+    """
+    import logging
+
+    records: list[str] = []
+
+    class _Capture(logging.Handler):
+        def emit(self, record):
+            records.append(record.getMessage())
+
+    handler = _Capture(level=logging.WARNING)
+    tools.logger.addHandler(handler)
+    try:
+        accepted = tool_payload(await tool_env.invoke_delegate())
+        # A specialist that answers with an incomplete envelope.
+        await tool_env.runner.outputs.put(tools.DelegatedOutput(
+            text="PRIVATE_RESULT_CANARY",
+            structured_output={"status": "answered"},
+        ))
+        await tool_env.job_registry.wait_for_terminal(accepted["job_id"])
+        # The durable write lands before the log line; let the job task finish.
+        for _ in range(8):
+            await asyncio.sleep(0)
+    finally:
+        tools.logger.removeHandler(handler)
+
+    failures = [m for m in records if "invalid_specialist_result" in m]
+    assert failures, records
+    assert "reason=" in failures[0]
+    assert "missing required fields" in failures[0]
+    # The rejected payload must never reach the log.
+    assert "PRIVATE_RESULT_CANARY" not in failures[0]

@@ -1,5 +1,15 @@
 # Changelog
 
+## [0.122.0] - 2026-07-25
+
+### Fixed
+
+- When a specialist answers in a shape Casa cannot accept, the log now says
+  which part was wrong. It previously recorded only that the result was
+  invalid, which was not enough to tell whether the specialist had misbehaved
+  or the request had been malformed. The explanation names fields only and
+  never includes the specialist's own output.
+
 ## [0.121.0] - 2026-07-25
 
 ### Fixed
