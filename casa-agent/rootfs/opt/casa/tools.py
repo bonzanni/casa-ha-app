@@ -2949,7 +2949,25 @@ async def _start_voice_async_job(
 @tool(
     "delegate_to_agent",
     "Delegate a task to another agent (resident or specialist) and return its result.",
-    {"agent": str, "task": str, "context": str, "mode": str},
+    # #233/#224 (v0.119.0): `mode` is an ENUM, not a free string. Live evidence
+    # (2026-07-25) showed the model emitting a value that wasn't exactly "sync";
+    # because `validate_voice_handoff_static` strict-compares against "sync",
+    # that ONE bad token silently bypassed the whole concierge voice-handoff
+    # policy — no background hand-off, no spoken acknowledgement, and the
+    # delegation fell into the sync path where the voice budget killed it. The
+    # MCP input validator now rejects an unrecognised value before the handler
+    # runs, so the class of bug cannot recur. Explicit JSON Schema (not the
+    # {key: type} shorthand) because only that form can express an enum; every
+    # key stays REQUIRED, exactly as the shorthand made them.
+    {"type": "object",
+     "properties": {
+         "agent": {"type": "string"},
+         "task": {"type": "string"},
+         "context": {"type": "string"},
+         "mode": {"type": "string",
+                  "enum": ["sync", "async", "interactive"]},
+     },
+     "required": ["agent", "task", "context", "mode"]},
 )
 async def delegate_to_agent(args: dict) -> dict:
     """Invoke a Tier 2 specialist via the SDK and return its text.
@@ -2968,7 +2986,24 @@ async def delegate_to_agent(args: dict) -> dict:
     agent_name = args.get("agent", "")
     task_text = args.get("task", "")
     context_text = args.get("context", "") or ""
-    mode = args.get("mode", "sync") or "sync"
+    # #233/#224 (v0.119.0) defence in depth behind the schema enum above: an
+    # unrecognised mode is normalized to the documented default rather than
+    # carried through, because carrying it through is precisely what silently
+    # bypassed the voice-handoff policy in production. Loud, never silent — and
+    # the value itself is never echoed (it is model-supplied).
+    # TOTAL over arbitrary JSON (Sol/Terra): `args` can carry any type on the
+    # paths that don't run the schema validator first, and a truthy UNHASHABLE
+    # value (`["sync"]`) would raise TypeError on the membership test.
+    _requested_mode = args.get("mode", "sync") or "sync"
+    mode = (_requested_mode
+            if isinstance(_requested_mode, str) and _requested_mode in _KNOWN_MODES
+            else "sync")
+    if mode != _requested_mode:
+        logger.warning(
+            "delegate_to_agent: unrecognised mode (not one of %s) — coerced to "
+            "'sync'; agent=%s. The tool schema should have rejected this.",
+            sorted(_KNOWN_MODES), _known_role(agent_name),
+        )
 
     # AR-2: snapshot at entry — this handler awaits (channel setup,
     # engagement/delegation dispatch) and must not read a holder that a

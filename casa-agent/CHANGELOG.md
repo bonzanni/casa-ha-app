@@ -1,5 +1,21 @@
 # Changelog
 
+## [0.119.0] - 2026-07-25
+
+### Fixed
+
+- Asking a voice agent a Magic: The Gathering question now works. Gary was
+  passing an unrecognised value for the delegation's delivery mode, and because
+  the mode was accepted as free-form text that single value silently bypassed
+  the whole voice hand-off policy: no background hand-off was created, so the
+  immediate spoken "I will ask ..." acknowledgement never played (the caller
+  heard ~25 seconds of silence) and the specialist's answer was cut off by the
+  voice turn budget instead of being delivered by the speaker. The mode is now
+  a closed set the model cannot deviate from, and an unrecognised value is
+  corrected to the documented default with a warning rather than carried
+  through. On a capable speaker, an MTG question is now acknowledged straight
+  away and answered out loud when the specialist finishes (#233, #224).
+
 ## [0.118.0] - 2026-07-25
 
 ### Added
