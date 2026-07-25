@@ -199,7 +199,11 @@ def _anchor_payload(eid, rid="a1", *, hash=_ANCHOR_HASH, **over):
 
 async def _drive_button(wired, task, rid, *, hash=_BTN_HASH, option_index=0):
     """Drive a pending button ask to an ANSWERED resolution."""
-    await asyncio.sleep(0.02)
+    # ARMED, not merely inflight: the claim is taken while the intent is still
+    # `pending` (TestDoubleCancelWave4 asserts exactly that), so posting on the
+    # claim alone can release the block before the intent arms — the relay then
+    # misses it and the task times out (Sol, r2).
+    await _wait_armed(wired, rid)
     await wired["seq"].post_for_block(ASK_TOOL, hash)
     assert wired["broker"].deliver(
         namespace="engagement_ask", scope=wired["rec"].id, request_id=rid,
@@ -209,12 +213,65 @@ async def _drive_button(wired, task, rid, *, hash=_BTN_HASH, option_index=0):
     return resp
 
 
-async def _drive_anchor(wired, task, *, hash=_ANCHOR_HASH):
-    """Drive a pending anchor ask through its relay-deferred post."""
-    await asyncio.sleep(0.02)
+async def _drive_anchor(wired, task, rid, *, hash=_ANCHOR_HASH):
+    """Drive a pending anchor ask through its relay-deferred post.
+
+    ``rid`` is REQUIRED: waiting for merely *some* inflight claim would let an
+    unrelated concurrent ask satisfy the wait, after which this driver posts
+    and resolves against a claim that was never this task's (Sol + Terra).
+    ARMED rather than merely inflight, for the reason in ``_drive_button``.
+    """
+    await _wait_armed(wired, rid)
     await wired["seq"].post_for_block(ASK_TOOL, hash)
     resp = await asyncio.wait_for(task, timeout=1.0)
     return resp
+
+
+async def _settle_turns(n: int = 8) -> None:
+    """Run *n* scheduler turns so an in-flight cancellation can be handled.
+
+    Used ONLY before a NEGATIVE assertion (nothing changed / still blocked),
+    where there is no positive edge to wait for. A condition wait would return
+    instantly and prove nothing; a wall-clock sleep would be the very thing
+    this module is removing. A bounded turn count is deterministic in the
+    dimension that actually matters here — scheduler turns, not milliseconds.
+
+    KNOWN LIMIT (Terra, r2): a turn count still does not *guarantee* the
+    cancellation path ran, so the negative assertion that immediately follows
+    could in principle pass vacuously. It is not load-bearing on its own —
+    both call sites go on to ``pytest.raises(CancelledError): await t1``,
+    which fails if the cancellation was never delivered. Closing the gap
+    properly needs an instrumented checkpoint in the driver's cancel path;
+    that is a production-scaffolding change, deliberately not bundled into a
+    deflake.
+    """
+    for _ in range(n):
+        await asyncio.sleep(0)
+
+
+async def _wait_armed(wired, rid: str, *, posting: bool | None = None):
+    """Wait until *rid*'s intent is ARMED (optionally also ``posting``).
+
+    Registration is NOT the condition callers want: an intent is registered
+    `pending` first and arms a turn later, so waiting merely for it to exist
+    returns too early. What a caller needs is the state transition itself,
+    which is a condition — not a duration. Every ``sleep(0.02)``-then-assert
+    in this module was really spelling this, and is what made the file need
+    three deflake rounds on slow CI runners.
+    """
+    def _ready() -> bool:
+        intent = wired["seq"].registry.by_request_id(rid)
+        if intent is None or intent.state != "armed":
+            return False
+        return posting is None or intent.posting is posting
+
+    await _wait_until(_ready)
+    return wired["seq"].registry.by_request_id(rid)
+
+
+async def _wait_inflight(wired, eid: str, rid: str) -> None:
+    """Wait until *rid* holds the engagement's single ask-inflight claim."""
+    await _wait_until(lambda: wired["drv"].ask_inflight(eid) == rid)
 
 
 async def _wait_until(predicate, *, timeout: float = 5.0) -> None:
@@ -226,10 +283,20 @@ async def _wait_until(predicate, *, timeout: float = 5.0) -> None:
     fixed ``asyncio.sleep(0.02)`` cannot guarantee on a loaded/slow runner.
     Cheap when fast (resolves in a handful of ``sleep(0)`` turns), tolerant
     when slow, and no weaker than the fixed sleep it replaces — it still
-    raises if the condition never fires."""
+    raises if the condition never fires.
+
+    After the first few turns it backs off to a short delay rather than
+    spinning at ``sleep(0)`` for the whole timeout: this module now waits far
+    more often than when the helper was introduced, and a hot poll would sit
+    badly with this project's standing rule against spinning loops (Sol +
+    Terra). The transitions it waits on resolve in the first turns, so the
+    backoff costs nothing on the happy path and only bounds CPU on the
+    pathological one."""
     async with asyncio.timeout(timeout):
+        turns = 0
         while not predicate():
-            await asyncio.sleep(0)
+            turns += 1
+            await asyncio.sleep(0 if turns <= 8 else 0.001)
 
 
 # ===========================================================================
@@ -391,7 +458,7 @@ class TestMarkerLifecycle:
         wired["chan"].send_returns_none = True  # wire post returns None
         task = asyncio.ensure_future(wired["ask"](_FakeRequest(
             _anchor_payload(eid, "af"))))
-        resp = await _drive_anchor(wired, task)
+        resp = await _drive_anchor(wired, task, "af")
         assert _body(resp)["error"] == "delivery_failed"
         assert wired["drv"].ask_inflight(eid) is None
 
@@ -399,7 +466,7 @@ class TestMarkerLifecycle:
         eid = wired["rec"].id
         task = asyncio.ensure_future(wired["ask"](_FakeRequest(
             _anchor_payload(eid, "as"))))
-        resp = await _drive_anchor(wired, task)
+        resp = await _drive_anchor(wired, task, "as")
         assert _body(resp)["outcome"] == "anchored"
         assert wired["drv"].ask_inflight(eid) is None
 
@@ -453,7 +520,7 @@ class TestAllocationFailure:
         monkeypatch.setattr(wired["reg"], "allocate_question_number", None)
         task = asyncio.ensure_future(wired["ask"](_FakeRequest(
             _anchor_payload(eid, "al"))))
-        resp = await _drive_anchor(wired, task)
+        resp = await _drive_anchor(wired, task, "al")
         body = _body(resp)
         assert body["outcome"] == "anchored"
         assert body["question_number"] is None
@@ -477,7 +544,7 @@ class TestAddFailureCompensation:
         monkeypatch.setattr(wired["reg"], "add_open_question", _boom)
         task = asyncio.ensure_future(wired["ask"](_FakeRequest(
             _anchor_payload(eid, "ac"))))
-        resp = await _drive_anchor(wired, task)
+        resp = await _drive_anchor(wired, task, "ac")
         body = _body(resp)
         # The handler maps the compensated outcome to ok:false internal_error.
         assert body["ok"] is False and body["error"] == "internal_error"
@@ -515,12 +582,12 @@ class TestAddFailureCompensation:
         monkeypatch.setattr(wired["reg"], "add_open_question", _boom_once)
         t1 = asyncio.ensure_future(wired["ask"](_FakeRequest(
             _anchor_payload(eid, "c1"))))
-        await _drive_anchor(wired, t1)
+        await _drive_anchor(wired, t1, "c1")
         orphan_mid = wired["chan"].anchors[0][0]
         # A subsequent ask posts BELOW the compensated orphan (higher id).
         t2 = asyncio.ensure_future(wired["ask"](_FakeRequest(
             _anchor_payload(eid, "c2"))))
-        await _drive_anchor(wired, t2)
+        await _drive_anchor(wired, t2, "c2")
         second_mid = wired["chan"].anchors[1][0]
         assert second_mid > orphan_mid
 
@@ -549,7 +616,7 @@ class TestMarkerCancellationWedge:
         monkeypatch.setattr(wired["reg"], "allocate_question_number", _slow)
         task = asyncio.ensure_future(wired["ask"](_FakeRequest(
             _anchor_payload(eid, "cx"))))
-        await asyncio.sleep(0.02)
+        await _wait_inflight(wired, eid, "cx")
         # Marker claimed, coroutine parked in the awaited allocation.
         assert wired["drv"].ask_inflight(eid) == "cx"
         task.cancel()
@@ -563,7 +630,7 @@ class TestMarkerCancellationWedge:
         gate.set()
         t2 = asyncio.ensure_future(wired["ask"](_FakeRequest(
             _anchor_payload(eid, "cy", hash="anchor-hash-2"))))
-        resp2 = await _drive_anchor(wired, t2, hash="anchor-hash-2")
+        resp2 = await _drive_anchor(wired, t2, "cy", hash="anchor-hash-2")
         assert _body(resp2)["outcome"] == "anchored"
 
     async def test_cancel_mid_allocation_clears_marker_button(
@@ -579,7 +646,7 @@ class TestMarkerCancellationWedge:
         monkeypatch.setattr(wired["reg"], "allocate_question_number", _slow)
         task = asyncio.ensure_future(wired["ask"](_FakeRequest(
             _btn_payload(eid, "cx"))))
-        await asyncio.sleep(0.02)
+        await _wait_inflight(wired, eid, "cx")
         assert wired["drv"].ask_inflight(eid) == "cx"
         task.cancel()
         with pytest.raises(asyncio.CancelledError):
@@ -618,7 +685,7 @@ class TestCancelledIntentTombstone:
         eid, drv = wired["rec"].id, wired["drv"]
         t1 = asyncio.ensure_future(wired["ask"](_FakeRequest(
             _anchor_payload(eid, "a1"))))
-        await asyncio.sleep(0.02)
+        await _wait_inflight(wired, eid, "a1")
         assert drv.ask_inflight(eid) == "a1"            # marker armed
         assert wired["chan"].anchors == []              # nothing posted yet
         t1.cancel()
@@ -634,7 +701,7 @@ class TestCancelledIntentTombstone:
         # A second, DIFFERENT ask posts EXACTLY once.
         t2 = asyncio.ensure_future(wired["ask"](_FakeRequest(
             _anchor_payload(eid, "a2", hash="anchor-hash-2"))))
-        resp2 = await _drive_anchor(wired, t2, hash="anchor-hash-2")
+        resp2 = await _drive_anchor(wired, t2, "a2", hash="anchor-hash-2")
         assert _body(resp2)["outcome"] == "anchored"
         assert len(wired["chan"].anchors) == 1
         # A same-id retry gets the recorded cancelled outcome verbatim (no hang).
@@ -673,13 +740,16 @@ class TestCancelledIntentTombstone:
         # a1 registers, arms, and parks awaiting the relay-deferred post.
         t1 = asyncio.ensure_future(wired["ask"](_FakeRequest(
             _anchor_payload(eid, "a1"))))
-        await asyncio.sleep(0.02)
+        await _wait_inflight(wired, eid, "a1")
         assert drv.ask_inflight(eid) == "a1"
 
         # The relay reaches the block: the poster posts the wire message, then
         # blocks in the gated add_open_question — STILL holding the writer lock.
         relay = asyncio.ensure_future(seq.post_for_block(ASK_TOOL, _ANCHOR_HASH))
-        await asyncio.sleep(0.02)
+        # The condition is the WIRE MESSAGE landing, not `armed` — the intent
+        # armed before the relay ever ran, so waiting on state alone returns
+        # before the poster has posted anything.
+        await _wait_until(lambda: len(chan.anchors) == 1)
         # The poster's wire message has landed but the ledger write (add_open_
         # question) is parked, so the intent is still armed and unresolved.
         intent = seq.registry.by_request_id("a1")
@@ -692,7 +762,10 @@ class TestCancelledIntentTombstone:
         # holds the writer lock mid-post) and NO-OPS — the post wins, the marker
         # stands, and the finally is gated so it does not clear it.
         t1.cancel()
-        await asyncio.sleep(0.02)
+        # NEGATIVE assertion: the claim is already "a1", so a condition wait
+        # would return instantly and prove nothing about the cancel having
+        # run. Give the cancellation real turns to be handled (Terra).
+        await _settle_turns()
 
         # The cancel is stalled behind the post — the marker STILL stands, so a
         # SECOND, different ask is refused question_pending (one-question intact).
@@ -741,7 +814,7 @@ class TestCancelledIntentTombstone:
         monkeypatch.setattr(wired["reg"], "allocate_question_number", _slow)
         task = asyncio.ensure_future(wired["ask"](_FakeRequest(
             _anchor_payload(eid, "cx"))))
-        await asyncio.sleep(0.02)
+        await _wait_inflight(wired, eid, "cx")
         assert drv.ask_inflight(eid) == "cx"
         task.cancel()
         with pytest.raises(asyncio.CancelledError):
@@ -772,7 +845,7 @@ class TestCancelledIntentTombstone:
         monkeypatch.setattr(wired["reg"], "allocate_question_number", _slow)
         task = asyncio.ensure_future(wired["ask"](_FakeRequest(
             _btn_payload(eid, "cx"))))
-        await asyncio.sleep(0.02)
+        await _wait_inflight(wired, eid, "cx")
         assert drv.ask_inflight(eid) == "cx"
         task.cancel()
         with pytest.raises(asyncio.CancelledError):
@@ -822,14 +895,17 @@ class TestDoubleCancelWave4:
 
         t1 = asyncio.ensure_future(wired["ask"](_FakeRequest(
             _anchor_payload(eid, "a1"))))
-        await asyncio.sleep(0.02)
+        await _wait_inflight(wired, eid, "a1")
         assert drv.ask_inflight(eid) == "a1"
 
         # The relay reaches the block: the poster posts the wire message, then
         # blocks in the gated add_open_question — STILL holding the writer lock,
         # with ``posting`` set.
         relay = asyncio.ensure_future(seq.post_for_block(ASK_TOOL, _ANCHOR_HASH))
-        await asyncio.sleep(0.02)
+        await _wait_armed(wired, "a1", posting=True)
+        # `posting` is set before the send completes, so it does NOT imply the
+        # wire message landed — wait for the message itself (Sol + Terra).
+        await _wait_until(lambda: len(chan.anchors) == 1)
         intent = seq.registry.by_request_id("a1")
         assert intent.state == "armed" and intent.posting is True
         assert len(chan.anchors) == 1     # wire message landed; ledger NOT yet
@@ -889,7 +965,7 @@ class TestDoubleCancelWave4:
         monkeypatch.setattr(wired["reg"], "allocate_question_number", _slow)
         t1 = asyncio.ensure_future(wired["ask"](_FakeRequest(
             _anchor_payload(eid, "a1"))))
-        await asyncio.sleep(0.02)
+        await _wait_inflight(wired, eid, "a1")
         assert drv.ask_inflight(eid) == "a1"
         intent = wired["seq"].registry.by_request_id("a1")
         assert intent.state == "pending" and intent.posting is False
@@ -912,7 +988,7 @@ class TestDoubleCancelWave4:
         assert wired["chan"].anchors == []
         t2 = asyncio.ensure_future(wired["ask"](_FakeRequest(
             _anchor_payload(eid, "a2", hash="anchor-hash-2"))))
-        resp2 = await _drive_anchor(wired, t2, hash="anchor-hash-2")
+        resp2 = await _drive_anchor(wired, t2, "a2", hash="anchor-hash-2")
         assert _body(resp2)["outcome"] == "anchored"
         assert len(wired["chan"].anchors) == 1
 
@@ -947,13 +1023,16 @@ class TestAskCancelRoutePostWins:
 
         t1 = asyncio.ensure_future(wired["ask"](_FakeRequest(
             _anchor_payload(eid, "a1"))))
-        await asyncio.sleep(0.02)
+        await _wait_inflight(wired, eid, "a1")
         assert drv.ask_inflight(eid) == "a1"
 
         # The relay reaches the block: the poster posts the wire message then
         # parks in the gated add_open_question — writer lock held, ``posting`` set.
         relay = asyncio.ensure_future(seq.post_for_block(ASK_TOOL, _ANCHOR_HASH))
-        await asyncio.sleep(0.02)
+        await _wait_armed(wired, "a1", posting=True)
+        # `posting` is set before the send completes, so it does NOT imply the
+        # wire message landed — wait for the message itself (Sol + Terra).
+        await _wait_until(lambda: len(chan.anchors) == 1)
         intent = seq.registry.by_request_id("a1")
         assert intent.state == "armed" and intent.posting is True
         assert len(chan.anchors) == 1       # wire message landed; ledger NOT yet
@@ -1063,7 +1142,7 @@ class TestPosterOwnsClearWave5:
         monkeypatch.setattr(chan, "send_to_topic", real_send)
         t2 = asyncio.ensure_future(wired["ask"](_FakeRequest(
             _anchor_payload(eid, "a2", hash="anchor-hash-2"))))
-        resp2 = await _drive_anchor(wired, t2, hash="anchor-hash-2")
+        resp2 = await _drive_anchor(wired, t2, "a2", hash="anchor-hash-2")
         assert _body(resp2)["outcome"] == "anchored"
 
         # The cancelled handler's same-request_id retry short-circuits to the
@@ -1178,11 +1257,14 @@ class TestCompensationCancelInterleaving:
 
         t1 = asyncio.ensure_future(wired["ask"](_FakeRequest(
             _anchor_payload(eid, "a1"))))
-        await asyncio.sleep(0.02)
+        await _wait_inflight(wired, eid, "a1")
         assert drv.ask_inflight(eid) == "a1"
 
         relay = asyncio.ensure_future(seq.post_for_block(ASK_TOOL, _ANCHOR_HASH))
-        await asyncio.sleep(0.02)
+        await _wait_armed(wired, "a1", posting=True)
+        # `posting` is set before the send completes, so it does NOT imply the
+        # wire message landed — wait for the message itself (Sol + Terra).
+        await _wait_until(lambda: len(chan.anchors) == 1)
         intent = seq.registry.by_request_id("a1")
         assert intent.state == "armed" and intent.posting is True
         assert len(chan.anchors) == 1          # orphan wire message landed
@@ -1191,7 +1273,10 @@ class TestCompensationCancelInterleaving:
         # Cancel ONCE — posting=True → the cancel loses, the post wins, the
         # handler's outer finally is gated off (poster owns the marker clear).
         t1.cancel()
-        await asyncio.sleep(0.02)
+        # NEGATIVE assertion: the claim is already "a1", so a condition wait
+        # would return instantly and prove nothing about the cancel having
+        # run. Give the cancellation real turns to be handled (Terra).
+        await _settle_turns()
         assert drv.ask_inflight(eid) == "a1"   # cancel stalled behind the post
 
         # Release → add_open_question RAISES → compensation runs.
@@ -1220,7 +1305,7 @@ class TestCompensationCancelInterleaving:
         monkeypatch.setattr(wired["reg"], "add_open_question", orig_add)
         t2 = asyncio.ensure_future(wired["ask"](_FakeRequest(
             _anchor_payload(eid, "a2", hash="anchor-hash-2"))))
-        resp2 = await _drive_anchor(wired, t2, hash="anchor-hash-2")
+        resp2 = await _drive_anchor(wired, t2, "a2", hash="anchor-hash-2")
         assert _body(resp2)["outcome"] == "anchored"
         assert chan.anchors[1][0] > orphan_mid
 
@@ -1315,7 +1400,7 @@ class TestAnchorLatchedSend:
 
         task = asyncio.ensure_future(wired["ask"](_FakeRequest(
             _anchor_payload(eid, "a1"))))
-        await asyncio.sleep(0.02)
+        await _wait_inflight(wired, eid, "a1")
         assert drv.ask_inflight(eid) == "a1"          # armed, awaiting the post
         # Cancel lands between ARM and the wire.
         get_or_create_gate("a1").set_cancelled()
@@ -1359,7 +1444,7 @@ class TestAnchorLatchedSend:
         eid, chan = wired["rec"].id, wired["chan"]
         task = asyncio.ensure_future(wired["ask"](_FakeRequest(
             _anchor_payload(eid, "d1"))))
-        resp = await _drive_anchor(wired, task)
+        resp = await _drive_anchor(wired, task, "d1")
         assert _body(resp)["outcome"] == "anchored"
         assert len(chan.anchors) == 1                 # exactly ONE physical send
         assert chan.rich_topic_sends == 0             # never the rich double-send
@@ -1381,7 +1466,7 @@ class TestInlineEnumeratedAnchorsAccepted:
         q = "Which stack?\nA — Python MCP + MCPB\nB — Rust bridge"
         task = asyncio.ensure_future(wired["ask"](_FakeRequest(
             _anchor_payload(eid, "e1", question=q))))
-        resp = await _drive_anchor(wired, task)
+        resp = await _drive_anchor(wired, task, "e1")
         body = _body(resp)
         assert body["ok"] is True
         assert body["outcome"] == "anchored"
@@ -1393,7 +1478,7 @@ class TestInlineEnumeratedAnchorsAccepted:
         q = "Pick:\n1. one\n2. two"
         task = asyncio.ensure_future(wired["ask"](_FakeRequest(
             _anchor_payload(eid, "e2", question=q))))
-        resp = await _drive_anchor(wired, task)
+        resp = await _drive_anchor(wired, task, "e2")
         assert _body(resp)["ok"] is True
         assert _body(resp)["outcome"] == "anchored"
 
@@ -1405,7 +1490,7 @@ class TestInlineEnumeratedAnchorsAccepted:
         q = "Which do you want: (a) the fast path or (b) the safe path?"
         task = asyncio.ensure_future(wired["ask"](_FakeRequest(
             _anchor_payload(eid, "e3", question=q))))
-        resp = await _drive_anchor(wired, task)
+        resp = await _drive_anchor(wired, task, "e3")
         body = _body(resp)
         assert body["ok"] is True
         assert body["outcome"] == "anchored"
@@ -1416,7 +1501,7 @@ class TestInlineEnumeratedAnchorsAccepted:
         q = "Which?\nA — Python MCP\njust prose, no second option"
         task = asyncio.ensure_future(wired["ask"](_FakeRequest(
             _anchor_payload(eid, "ok1", question=q))))
-        resp = await _drive_anchor(wired, task)
+        resp = await _drive_anchor(wired, task, "ok1")
         assert _body(resp)["ok"] is True
         assert _body(resp)["outcome"] == "anchored"
 
@@ -1424,7 +1509,7 @@ class TestInlineEnumeratedAnchorsAccepted:
         eid = wired["rec"].id
         task = asyncio.ensure_future(wired["ask"](_FakeRequest(
             _anchor_payload(eid, "ok2", question="What DB name do you want?"))))
-        resp = await _drive_anchor(wired, task)
+        resp = await _drive_anchor(wired, task, "ok2")
         assert _body(resp)["ok"] is True
 
     async def test_button_ask_with_enumerated_question_untouched(self, wired):
@@ -2031,7 +2116,7 @@ class TestIntentLifecycleGatePin:
             wired["ask"](_FakeRequest(_anchor_payload(eid, "a1"))))
         # Drive the relay-deferred anchor post: gate PASSED, intent LIVE (posted,
         # not yet pruned), handler returned (its OWN gate pin already released).
-        await _drive_anchor(wired, task)
+        await _drive_anchor(wired, task, "a1")
 
         gate = ASK_GATES.get("a1")
         # Pre-fix, the handler's own ``finally`` maybe-retires the gate (bound 0,
@@ -2270,7 +2355,7 @@ class TestTerminalIntentAbort:
         rec = wired["rec"]
         t1 = asyncio.ensure_future(wired["ask"](_FakeRequest(
             _anchor_payload(eid, "a1"))))
-        await asyncio.sleep(0.02)
+        await _wait_armed(wired, "a1")
         intent = seq.registry.by_request_id("a1")
         assert intent is not None and intent.state == "armed"   # PASSED+ARMED
         assert chan.anchors == []                               # not posted yet
@@ -2303,9 +2388,11 @@ class TestTerminalIntentAbort:
 
         t1 = asyncio.ensure_future(wired["ask"](_FakeRequest(
             _anchor_payload(eid, "a1"))))
-        await asyncio.sleep(0.02)
+        # Registration barrier: the relay must not start before the ask has
+        # armed, or the causal setup under test is a different one (Terra).
+        await _wait_armed(wired, "a1")
         relay = asyncio.ensure_future(seq.post_for_block(ASK_TOOL, _ANCHOR_HASH))
-        await asyncio.sleep(0.02)
+        await _wait_until(lambda: len(chan.anchors) == 1)
         assert len(chan.anchors) == 1        # wire landed; ledger write parked
 
         # terminalize (via settle) must BLOCK on the writer lock the poster holds.
@@ -2339,7 +2426,7 @@ class TestTerminalGatePinRelease:
         rec = wired["rec"]
         t1 = asyncio.ensure_future(wired["ask"](_FakeRequest(
             _anchor_payload(eid, "gp1"))))
-        await asyncio.sleep(0.02)
+        await _wait_armed(wired, "gp1")
         assert seq.registry.by_request_id("gp1").state == "armed"
         assert "gp1" in _INTENT_GATE_PINS      # gate pinned to the intent (wb2-4)
         assert "gp1" in ASK_GATES

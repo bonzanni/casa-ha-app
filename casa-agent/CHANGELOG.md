@@ -1,5 +1,13 @@
 # Changelog
 
+## [0.124.1] - 2026-07-25
+
+### Fixed
+
+- Test-only: removed a class of timing-sensitive waits from the engagement
+  ask-gate tests that failed intermittently on slower continuous-integration
+  machines. No app behaviour changes.
+
 ## [0.124.0] - 2026-07-25
 
 ### Fixed
