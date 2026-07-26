@@ -865,14 +865,32 @@ _DENY_UNRENDERABLE = (
     "arguments cannot be rendered for confirmation (unserializable / too "
     "large) — narrow the call"
 )
-_DENY_PENDING = "confirmation still pending — waiting for the user's tap"
+_DENY_PENDING = (
+    # #221: same instruction-not-description rule as _DENY_POSTED below. The
+    # old wording ("waiting for the user's tap") is exactly the phrasing the
+    # §Protected tools rule forbids the resident from repeating.
+    "not executed: operator authorization is already outstanding for this "
+    "exact call. Produce NO user-facing narration and end your turn now."
+)
 _DENY_DELIVERY_FAILED = "could not post the confirmation button — try again"
 _DENY_INACTIVE = (
     "the confirmation expired before it could be delivered — call again"
 )
 _DENY_POSTED = (
-    "a confirmation button was posted to the user. After they tap Approve, "
-    "retry the SAME call with EXACTLY the same arguments."
+    # #221: this string is the PROXIMAL cause of a doctrine violation, so it
+    # is written as an instruction, not as a description. The old wording
+    # ("a confirmation button was posted to the user…") described the UI, and
+    # the resident paraphrased it straight back to the operator ("Sent you an
+    # approval prompt — tap Approve when you're ready"), which the §Protected
+    # tools rule in every resident prompt explicitly forbids: the operator
+    # already sees the button, and any "waiting for you" phrasing is false the
+    # moment they tap. Describing the UI to a model invites the model to
+    # relay it. So: NO user-facing fact here at all — not even "the UI was
+    # delivered", which is just as paraphrasable ("I sent the confirmation
+    # separately"). Only the control flow the model needs.
+    "not executed: awaiting operator authorization. Produce NO user-facing "
+    "narration and end your turn now. When authorization arrives, retry the "
+    "SAME call with EXACTLY the same arguments."
 )
 _DENY_INTERNAL = "internal authorization error — the call was not executed"
 
