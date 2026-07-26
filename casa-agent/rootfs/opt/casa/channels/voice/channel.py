@@ -32,7 +32,7 @@ from channels.voice.catalog import (
     VoiceAgentCatalogError,
     build_voice_agent_catalog,
 )
-from channels.voice.prosodic import ProsodicSplitter
+from channels.voice.prosodic import Block, ProsodicSplitter
 from channels.voice.routes import VoiceRouteRegistry, VoiceWsConnection
 from channels.voice.session import VoiceSessionPool
 from channels.voice.tts_adapter import TagDialectAdapter
@@ -360,6 +360,43 @@ def _voice_turn_budget_s() -> float:
     return min(INTEGRATION_TIMEOUT_TOTAL - 3.0, _VOICE_TURN_BUDGET_HARD_CAP_S)
 
 
+def _compose_block(
+    carry_sep: str,
+    block: Block,
+    adapter: TagDialectAdapter,
+    *,
+    fallback_sep: str = "",
+) -> tuple[str, str]:
+    """Render one splitter block into wire text (issue #257).
+
+    Returns ``(wire_text, carry_sep)``. The companion integration streams
+    every block straight into HA's delta stream and concatenates them
+    verbatim, so the separator the splitter carries on ``block.sep`` has to
+    ride ON the wire text — there is no second field HA would join with.
+
+    Three things must not lose a separator:
+
+    * ``TagDialectAdapter.render`` lstrips (dialect ``none``), so the
+      separator is prepended AFTER rendering, never passed through it.
+    * A block whose text renders to nothing (a tag-only block under dialect
+      ``none``) emits no frame at all — the integration drops empty frames,
+      which would take the separator with it. Its separator is carried
+      forward onto the next frame instead, which is why two whitespace runs
+      can legitimately meet here: with the tag deleted, the source really
+      did have whitespace on both sides of it.
+    * ``fallback_sep`` covers a frame this turn wrote OUTSIDE the splitter
+      (the synthetic progress line): nothing downstream carries a separator
+      against it. It applies only when the stream itself supplies none —
+      a fallback, never a summand, or a progress line followed by text that
+      already starts on a new paragraph would gain a stray leading space.
+    """
+    rendered = adapter.render(block.text)
+    stream_sep = carry_sep + block.sep
+    if not rendered:
+        return "", stream_sep
+    return (stream_sep or fallback_sep) + rendered, ""
+
+
 class VoiceChannel(Channel):
     name: str = "voice"
 
@@ -604,6 +641,16 @@ class VoiceChannel(Channel):
         speech_block_sent = False
         progress_sent = False
         first_block_logged = False
+        # #257: two debts to the NEXT wire frame, both mutated only under
+        # write_lock. `carry_sep` is whitespace the CURRENT splitter epoch
+        # owes, taken verbatim from the stream (a block that rendered to
+        # nothing hands its separator on). `fallback_gap` is a gap owed by
+        # something ALREADY ON THE WIRE that no stream whitespace answers
+        # for — the synthetic progress line, or a superseded epoch — and it
+        # applies only when the stream supplies no separator of its own, so
+        # gaps are never summed into a double space.
+        carry_sep = ""
+        fallback_gap = ""
 
         def _log_first_block() -> None:
             nonlocal first_block_logged
@@ -618,6 +665,7 @@ class VoiceChannel(Channel):
 
         async def on_token(accumulated: str) -> None:
             nonlocal last_text, splitter, speech_block_sent
+            nonlocal carry_sep, fallback_gap
             if not accumulated.startswith(last_text):
                 # AR-B (2026-07-11 design §2 point 3): a mid-turn SDK retry
                 # or a divergent canonical correction breaks the
@@ -632,16 +680,44 @@ class VoiceChannel(Channel):
                     "scope_id=%s",
                     len(accumulated), len(last_text), scope_id,
                 )
+                # #257: the discarded epoch's owed whitespace must not be
+                # prefixed verbatim onto the corrected reply (it can stack
+                # onto a gap already owed), but it must not simply vanish
+                # either — if a frame was already written, that whitespace
+                # is what separates it from whatever the new epoch says
+                # ("Old.Hi."). Demote it to the fallback slot: one gap,
+                # applied only if the new epoch brings no separator itself,
+                # and only when something of this turn actually reached the
+                # wire — a gap with no predecessor to anchor it separates
+                # nothing, and would just open the reply with whitespace.
+                # The gap may be owed by the channel (a block that rendered
+                # to nothing) AND still held inside the splitter we are
+                # about to throw away — around a suppressed block the two
+                # runs are adjacent, so they concatenate exactly as they do
+                # in _compose_block. Read the splitter's half BEFORE
+                # replacing it.
+                if progress_sent or speech_block_sent:
+                    fallback_gap = fallback_gap or (
+                        carry_sep + splitter.pending_sep
+                    )
+                carry_sep = ""
                 last_text = ""
                 splitter = ProsodicSplitter()
             delta = accumulated[len(last_text):]
             last_text = accumulated
             for block in splitter.feed(delta):
                 async with write_lock:
+                    text, carry_sep = _compose_block(
+                        carry_sep, block, adapter,
+                        fallback_sep=fallback_gap,
+                    )
+                    if not text:
+                        continue
                     await _write_sse(response, "block", {
-                        "text": adapter.render(block),
+                        "text": text,
                         "final": False,
                     })
+                    fallback_gap = ""
                     _log_first_block()
                     speech_block_sent = True
 
@@ -654,7 +730,7 @@ class VoiceChannel(Channel):
             # Writes a real wire `block` — NOT via on_token, whose
             # cumulative-prefix `last_text` bookkeeping would corrupt on a
             # manually-injected block not part of the accumulated SDK text.
-            nonlocal progress_sent
+            nonlocal progress_sent, fallback_gap
             async with write_lock:
                 if progress_sent or speech_block_sent:
                     return
@@ -662,6 +738,10 @@ class VoiceChannel(Channel):
                     "text": adapter.render(text), "final": False,
                 })
                 progress_sent = True
+                # #257: this line never went through the splitter, so no
+                # block carries a separator against it. Real speech that
+                # follows would otherwise join straight onto its full stop.
+                fallback_gap = " "
 
         error_emitted = False
 
@@ -713,11 +793,17 @@ class VoiceChannel(Channel):
             if error_emitted:
                 return response
             tail = splitter.flush_tail()
-            if tail:
+            tail_text = ""
+            if tail is not None:
+                tail_text, carry_sep = _compose_block(
+                    carry_sep, tail, adapter, fallback_sep=fallback_gap,
+                )
+            if tail_text:
                 await _write_sse(response, "block", {
-                    "text": adapter.render(tail),
+                    "text": tail_text,
                     "final": True,
                 })
+                fallback_gap = ""
                 _log_first_block()
             elif not speech_block_sent:
                 # S-1: zero spoken output for the whole turn — emit a typed
@@ -986,6 +1072,9 @@ class VoiceChannel(Channel):
         write_lock = asyncio.Lock()
         speech_block_sent = False
         progress_sent = False
+        # #257: see the SSE handler — epoch-owned vs progress-owed whitespace.
+        carry_sep = ""
+        fallback_gap = ""
         handoff: asyncio.Future[VoiceHandoff] = (
             asyncio.get_running_loop().create_future()
         )
@@ -1015,6 +1104,7 @@ class VoiceChannel(Channel):
 
         async def on_token(accumulated: str) -> None:
             nonlocal last_text, splitter, speech_block_sent
+            nonlocal carry_sep, fallback_gap
             async with write_lock:
                 # A handoff reserve happens before any async prelaunch gate.
                 # Do not mutate prefix state while held: a later typed failure
@@ -1030,11 +1120,30 @@ class VoiceChannel(Channel):
                         "utterance_id=%s scope_id=%s",
                         len(accumulated), len(last_text), uid, scope_id,
                     )
+                    # Demote the epoch's owed whitespace to the fallback
+                    # slot rather than dropping it, only when this turn has
+                    # already written something, and reading the splitter's
+                    # own held gap before discarding it — see the SSE
+                    # handler for the full rationale.
+                    if progress_sent or speech_block_sent:
+                        fallback_gap = fallback_gap or (
+                            carry_sep + splitter.pending_sep
+                        )
+                    carry_sep = ""
                     last_text = ""
                     splitter = ProsodicSplitter()
                 delta = accumulated[len(last_text):]
                 last_text = accumulated
                 for block in splitter.feed(delta):
+                    text, carry_sep = _compose_block(
+                        carry_sep, block, adapter,
+                        fallback_sep=fallback_gap,
+                    )
+                    if not text:
+                        # Rendered to nothing; its separator is now owed to
+                        # the next frame (#257). Nothing was spoken, so the
+                        # handoff reservation must not be closed out either.
+                        continue
                     # Select speech before starting the asynchronous write.
                     # `reserve()` is synchronous, so this prevents a tool
                     # call from claiming a handoff while this write is in
@@ -1043,15 +1152,16 @@ class VoiceChannel(Channel):
                     reservation.mark_speech_sent()
                     await ws.send_json({
                         "type": "block", "utterance_id": uid,
-                        "text": adapter.render(block), "final": False,
+                        "text": text, "final": False,
                     })
+                    fallback_gap = ""
                     _log_first_block()
 
         async def _progress_sink(text: str) -> None:
             # A4: see the SSE handler's _progress_sink for the full
             # exactly-once / suppress-after-real-speech rationale — the
             # check + write + mutation all happen under the held lock.
-            nonlocal progress_sent
+            nonlocal progress_sent, fallback_gap
             async with write_lock:
                 if reservation.held or progress_sent or speech_block_sent:
                     return
@@ -1060,6 +1170,9 @@ class VoiceChannel(Channel):
                     "text": adapter.render(text), "final": False,
                 })
                 progress_sent = True
+                # #257: see the SSE handler — this synthetic line owes the
+                # next real block a separator.
+                fallback_gap = " "
 
         async def _error_sink(kind: str, spoken: str) -> None:
             nonlocal error_emitted
@@ -1166,11 +1279,17 @@ class VoiceChannel(Channel):
             if error_emitted:
                 return
             tail = splitter.flush_tail()
-            if tail:
+            tail_text = ""
+            if tail is not None:
+                tail_text, carry_sep = _compose_block(
+                    carry_sep, tail, adapter, fallback_sep=fallback_gap,
+                )
+            if tail_text:
                 await ws.send_json({
                     "type": "block", "utterance_id": uid,
-                    "text": adapter.render(tail), "final": True,
+                    "text": tail_text, "final": True,
                 })
+                fallback_gap = ""
                 _log_first_block()
             elif not speech_block_sent:
                 # S-1: zero spoken output — typed empty_turn error, never a
