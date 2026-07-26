@@ -1,5 +1,20 @@
 # Changelog
 
+## [0.126.2] - 2026-07-27
+
+### Changed
+
+- When an agent needs your approval for a protected action, it should no longer
+  add a line of its own about it — you get the approval message with the Approve
+  and Deny buttons and nothing more. Previously an agent might also send
+  something like "Sent you an approval prompt — tap Approve when you're ready",
+  which was already against its instructions and read as stale or simply wrong
+  if you had already tapped. The refusal an agent receives internally used to
+  describe your buttons to it, which is what invited it to repeat them; it now
+  tells the agent to stay quiet instead. Agents follow instructions rather than
+  rules we can enforce, so this makes the extra line much less likely rather
+  than impossible (#221).
+
 ## [0.126.1] - 2026-07-26
 
 ### Fixed

@@ -282,7 +282,18 @@ class TestConsumeAndChallenge:
             out = await _call(hook)
         reason = _deny_reason(out)
         assert reason == _DENY_POSTED
-        assert "confirmation button" in reason and "Approve" in reason
+        # #221: the deny is an INSTRUCTION to the model, not a description of
+        # the operator's UI. It must carry the retry contract…
+        assert "retry the SAME call" in reason
+        # …and it must tell the model to stay silent, because the old
+        # UI-describing wording got paraphrased straight back to the operator
+        # in violation of the §Protected tools no-narration rule.
+        assert "NO user-facing narration" in reason
+        # The guard is the BOUNDARY, not one banned phrase: any statement
+        # ABOUT THE USER is relayable ("posted to the user" and "delivered to
+        # the user" are equally paraphrasable), so the deny must say nothing
+        # about them at all.
+        assert "the user" not in reason
         assert len(channel.posts) == 1  # exactly one keyboard
 
     async def test_pending_dedup_second_call_one_keyboard(self, monkeypatch):
@@ -294,6 +305,12 @@ class TestConsumeAndChallenge:
             out2 = await _call(hook)
         assert _deny_reason(out1) == _DENY_POSTED
         assert _deny_reason(out2) == _DENY_PENDING
+        # #221: the dedup deny is an instruction too — the keyboard is already
+        # in front of the operator, so the model must not narrate it either,
+        # and the same say-nothing-about-them boundary applies.
+        assert "NO user-facing narration" in _deny_reason(out2)
+        assert "waiting for" not in _deny_reason(out2)
+        assert "the user" not in _deny_reason(out2)
         assert len(channel.posts) == 1  # ONE keyboard for both calls
 
     async def test_mint_then_identical_call_allows(self, monkeypatch):
