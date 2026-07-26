@@ -26,7 +26,7 @@ def _make_defn(tmp_path, plugins=None):
         for p in plugins:
             (pdir / p).mkdir()
         plugins_dir = str(pdir)
-    return ExecutorDefinition(role_artifact=STUB_ROLE_ARTIFACT, 
+    return ExecutorDefinition(role_artifact=STUB_ROLE_ARTIFACT,
         type="hello-driver",
         description="Test harness executor type for claude_code driver.",
         model="sonnet",

@@ -89,7 +89,7 @@ async def main():
     await reg.load()
     ch = TelegramChannel(
         bot_token="test-token", chat_id="999", default_agent="assistant",
-        bus=None, webhook_url="", delivery_mode="block",
+        bus=None, webhook_url="",
         engagement_supergroup_id=supergroup,
     )
     # Stand up the PTB Application against the mock TG URL.
@@ -141,7 +141,7 @@ async def main():
     await reg.load()
     ch = TelegramChannel(
         bot_token="test-token", chat_id="999", default_agent="assistant",
-        bus=None, webhook_url="", delivery_mode="block",
+        bus=None, webhook_url="",
         engagement_supergroup_id=supergroup,
     )
     await ch._rebuild()
@@ -210,7 +210,7 @@ async def main():
     reg = EngagementRegistry(tombstone_path="/tmp/_eng_e3.json", bus=None)
     ch = TelegramChannel(
         bot_token="test-token", chat_id="999", default_agent="assistant",
-        bus=None, webhook_url="", delivery_mode="block",
+        bus=None, webhook_url="",
         engagement_supergroup_id=supergroup,
     )
     await ch._rebuild()
@@ -295,7 +295,7 @@ async def main():
     reg = EngagementRegistry(tombstone_path="/tmp/_eng_e4.json", bus=None)
     ch = TelegramChannel(
         bot_token="test-token", chat_id="999", default_agent="assistant",
-        bus=None, webhook_url="", delivery_mode="block",
+        bus=None, webhook_url="",
         engagement_supergroup_id=supergroup,
     )
     await ch._rebuild()
@@ -380,7 +380,7 @@ async def main():
     reg = EngagementRegistry(tombstone_path="/tmp/_eng_e5.json", bus=None)
     ch = TelegramChannel(
         bot_token="test-token", chat_id="999", default_agent="assistant",
-        bus=None, webhook_url="", delivery_mode="block",
+        bus=None, webhook_url="",
         engagement_supergroup_id=supergroup,
     )
     await ch._rebuild()
@@ -489,7 +489,7 @@ async def main():
     reg = EngagementRegistry(tombstone_path="/tmp/_eng_e7.json", bus=None)
     ch = TelegramChannel(
         bot_token="test-token", chat_id="999", default_agent="assistant",
-        bus=None, webhook_url="", delivery_mode="block",
+        bus=None, webhook_url="",
         engagement_supergroup_id=supergroup,
     )
     await ch._rebuild()
@@ -646,7 +646,7 @@ async def main():
     reg = EngagementRegistry(tombstone_path="/tmp/_eng_e9.json", bus=None)
     ch = TelegramChannel(
         bot_token="test-token", chat_id="999", default_agent="assistant",
-        bus=None, webhook_url="", delivery_mode="block",
+        bus=None, webhook_url="",
         engagement_supergroup_id=supergroup,
     )
     await ch._rebuild()
@@ -903,7 +903,7 @@ async def main():
     reg = EngagementRegistry(tombstone_path="/tmp/_eng_e10.json", bus=None)
     ch = TelegramChannel(
         bot_token="test-token", chat_id="999", default_agent="assistant",
-        bus=None, webhook_url="", delivery_mode="block",
+        bus=None, webhook_url="",
         engagement_supergroup_id=supergroup,
     )
     await ch._rebuild()

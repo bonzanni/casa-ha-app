@@ -116,7 +116,7 @@ class _CaptureClient:
 
 
 def _agent(tmp_path, sem) -> Agent:
-    cfg = AgentConfig(role_artifact=STUB_ROLE_ARTIFACT, 
+    cfg = AgentConfig(role_artifact=STUB_ROLE_ARTIFACT,
         role="assistant",
         model="claude-sonnet-4-6",
         system_prompt="You are assistant.",

@@ -123,7 +123,7 @@ async def test_replay_heals_missing_service_dir_with_known_executor(
             return self._defs.get(t)
 
     exec_reg = FakeExecReg({
-        "hello-driver": ExecutorDefinition(role_artifact=STUB_ROLE_ARTIFACT, 
+        "hello-driver": ExecutorDefinition(role_artifact=STUB_ROLE_ARTIFACT,
             type="hello-driver", description="test", model="haiku",
             driver="claude_code", enabled=True,
             tools_allowed=[], tools_disallowed=[], permission_mode="bypassPermissions",
@@ -196,7 +196,7 @@ async def test_replay_rerenders_stale_prev75_run_script(monkeypatch, tmp_path):
         def get(self, t): return self._defs.get(t)
 
     exec_reg = FakeExecReg({
-        "hello-driver": ExecutorDefinition(role_artifact=STUB_ROLE_ARTIFACT, 
+        "hello-driver": ExecutorDefinition(role_artifact=STUB_ROLE_ARTIFACT,
             type="hello-driver", description="test", model="haiku",
             driver="claude_code", enabled=True, tools_allowed=[],
             tools_disallowed=[], permission_mode="acceptEdits",
@@ -303,7 +303,7 @@ async def test_replay_replants_incomplete_pair(monkeypatch, tmp_path):
 
     class FakeExecReg:
         def get(self, t):
-            return ExecutorDefinition(role_artifact=STUB_ROLE_ARTIFACT, 
+            return ExecutorDefinition(role_artifact=STUB_ROLE_ARTIFACT,
                 type="hello-driver", description="test", model="haiku",
                 driver="claude_code", enabled=True,
                 tools_allowed=[], tools_disallowed=[],
@@ -355,7 +355,7 @@ async def test_replay_heals_when_only_log_sibling_survives(
 
     class FakeExecReg:
         def get(self, t):
-            return ExecutorDefinition(role_artifact=STUB_ROLE_ARTIFACT, 
+            return ExecutorDefinition(role_artifact=STUB_ROLE_ARTIFACT,
                 type="hello-driver", description="test", model="haiku",
                 driver="claude_code", enabled=True,
                 tools_allowed=[], tools_disallowed=[],
@@ -414,7 +414,7 @@ async def test_replay_one_bad_heal_does_not_abort_others(
 
     class FakeExecReg:
         def get(self, t):
-            return ExecutorDefinition(role_artifact=STUB_ROLE_ARTIFACT, 
+            return ExecutorDefinition(role_artifact=STUB_ROLE_ARTIFACT,
                 type="hello-driver", description="test", model="haiku",
                 driver="claude_code", enabled=True,
                 tools_allowed=[], tools_disallowed=[],
@@ -467,7 +467,7 @@ async def test_replay_warn_and_skips_heal_when_workspace_missing(
 
     class FakeExecReg:
         def get(self, t):
-            return ExecutorDefinition(role_artifact=STUB_ROLE_ARTIFACT, 
+            return ExecutorDefinition(role_artifact=STUB_ROLE_ARTIFACT,
                 type="hello-driver", description="test", model="haiku",
                 driver="claude_code", enabled=True,
                 tools_allowed=[], tools_disallowed=[],
@@ -509,7 +509,7 @@ def _exec_reg():
     from config import ExecutorDefinition
     class FakeExecReg:
         def get(self, t):
-            return ExecutorDefinition(role_artifact=STUB_ROLE_ARTIFACT, 
+            return ExecutorDefinition(role_artifact=STUB_ROLE_ARTIFACT,
                 type="hello-driver", description="test", model="haiku",
                 driver="claude_code", enabled=True, tools_allowed=[],
                 tools_disallowed=[], permission_mode="bypassPermissions",
@@ -621,7 +621,7 @@ def _brief_defn(tmp_path, *, type_="hello-driver", enabled=True):
     (exec_dir / "prompt.md").write_text(
         "You are {executor_type}.\nTASK:\n{task}\nMEM:{executor_memory}\n"
     )
-    return ExecutorDefinition(role_artifact=STUB_ROLE_ARTIFACT, 
+    return ExecutorDefinition(role_artifact=STUB_ROLE_ARTIFACT,
         type=type_, description="brief executor twenty chars ok!", model="haiku",
         driver="claude_code", enabled=enabled, tools_allowed=[],
         tools_disallowed=[], permission_mode="bypassPermissions",

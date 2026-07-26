@@ -32,7 +32,7 @@ pytestmark = pytest.mark.unit
 
 
 def _make_agent(tmp_path, role="assistant", agent_registry=None) -> Agent:
-    cfg = AgentConfig(role_artifact=STUB_ROLE_ARTIFACT, 
+    cfg = AgentConfig(role_artifact=STUB_ROLE_ARTIFACT,
         role=role,
         model="claude-sonnet-4-6",
         system_prompt="You are helpful.",

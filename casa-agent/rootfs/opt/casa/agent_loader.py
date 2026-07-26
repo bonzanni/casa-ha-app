@@ -1444,6 +1444,44 @@ def load_all_executors(
                 role=executor_role_slot, effective_config_digest=EMPTY_CONFIG_DIGEST,
             )
 
+            # #205: model boot-parity, the third guard on operator edits of
+            # definition.yaml (the tool-allowlist clamp and permission-mode
+            # downgrade below are the other two). `defn["model"]` is what
+            # ACTUALLY runs — tools.py feeds ExecutorDefinition.model straight
+            # into ClaudeAgentOptions.model — while `resolved_model` carries the
+            # image-owned role artifact's choice for identity/checksum only.
+            # Nothing reconciled them, so an edited definition.yaml could
+            # silently run a model the canonical artifact does not declare.
+            #
+            # Residents have had this since Phase A: _build_runtime_fields
+            # LoadErrors when runtime.yaml's model block differs from
+            # role.yaml's. Executors get the same rule.
+            #
+            # FAIL, don't clamp: unlike tools (intersect) and permission_mode
+            # (rank), a model has no "narrower" direction to degrade toward —
+            # there is no safe default between two model IDs, so a disagreement
+            # is unresolvable and the executor must not load. Isolated per
+            # executor like every other failure here (reported in `failed`,
+            # boot-non-fatal), so one bad definition cannot take down its
+            # siblings or the add-on.
+            #
+            # Compare RESOLVED SDK IDs, not raw text: `defn["model"]` is a
+            # shortname ("sonnet") or a full ID, and resolve_model() normalizes
+            # both, so `model: sonnet` and `model: claude-sonnet-4-5-…` agree
+            # rather than false-flagging. `resolved_model.effective` is the
+            # SHORTNAME — comparing against it would mismatch every executor.
+            declared_sdk_model = resolve_model(defn["model"])
+            if declared_sdk_model != executor_role_slot.resolved_model.sdk_model:
+                raise LoadError(
+                    f"executor {entry!r}: definition.yaml model "
+                    f"{defn['model']!r} resolves to {declared_sdk_model!r}, "
+                    f"which disagrees with the canonical role artifact's "
+                    f"{executor_role_slot.resolved_model.sdk_model!r} "
+                    f"(defaults/roles/executor/{entry}/role.yaml is the "
+                    f"authority — definition.yaml may not change the model; "
+                    f"treat an unexpected mismatch as a tamper signal)"
+                )
+
             # Round-5 (Terra P0): the canonical role artifact is the
             # immutable capability CEILING. definition.yaml is legitimately
             # editable in operation (executor/enable|disable|edit-definition

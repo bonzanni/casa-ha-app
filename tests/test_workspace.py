@@ -252,7 +252,7 @@ class TestProvisionWorkspace:
                 (pdir / pname).mkdir()
             plugins_dir = str(pdir)
 
-        return ExecutorDefinition(role_artifact=STUB_ROLE_ARTIFACT, 
+        return ExecutorDefinition(role_artifact=STUB_ROLE_ARTIFACT,
             type=executor_type,
             description="test executor with twenty characters exactly today",
             model="sonnet",
@@ -545,7 +545,7 @@ class TestProvisionWithHooks:
             "  - policy: casa_config_guard\n"
             "    matcher: Write|Edit\n"
         )
-        defn = ExecutorDefinition(role_artifact=STUB_ROLE_ARTIFACT, 
+        defn = ExecutorDefinition(role_artifact=STUB_ROLE_ARTIFACT,
             type="cfg",
             description="A config executor with twenty chars",
             model="sonnet", driver="claude_code",
@@ -578,7 +578,7 @@ class TestBuildCcPermissions:
 
     def _make_minimal_defn(self, tools_allowed, permission_mode="acceptEdits"):
         from config import ExecutorDefinition
-        return ExecutorDefinition(role_artifact=STUB_ROLE_ARTIFACT, 
+        return ExecutorDefinition(role_artifact=STUB_ROLE_ARTIFACT,
             type="test-fixture",
             description="test fixture twenty-character description here",
             model="sonnet",
@@ -661,7 +661,7 @@ class TestDoctrineProvisioning:
         (doctrine / "recipes").mkdir()
         (doctrine / "recipes" / "r.md").write_text("# recipe")
 
-        defn = ExecutorDefinition(role_artifact=STUB_ROLE_ARTIFACT, 
+        defn = ExecutorDefinition(role_artifact=STUB_ROLE_ARTIFACT,
             type="probe", description="d", model="m", driver="claude_code",
             enabled=True, tools_allowed=["Read"], tools_disallowed=[],
             permission_mode="acceptEdits",
@@ -689,7 +689,7 @@ class TestDoctrineProvisioning:
         exec_dir = tmp_path / "executors" / "probe"
         exec_dir.mkdir(parents=True)
         (exec_dir / "prompt.md").write_text("Task: {task}")
-        defn = ExecutorDefinition(role_artifact=STUB_ROLE_ARTIFACT, 
+        defn = ExecutorDefinition(role_artifact=STUB_ROLE_ARTIFACT,
             type="probe", description="d", model="m", driver="claude_code",
             enabled=True, tools_allowed=["Read"], tools_disallowed=[],
             permission_mode="acceptEdits",
@@ -713,7 +713,7 @@ class TestDoctrineProvisioning:
         exec_dir = tmp_path / "executors" / "probe"
         exec_dir.mkdir(parents=True)
         (exec_dir / "prompt.md").write_text("Task: {task}")
-        defn = ExecutorDefinition(role_artifact=STUB_ROLE_ARTIFACT, 
+        defn = ExecutorDefinition(role_artifact=STUB_ROLE_ARTIFACT,
             type="probe", description="d", model="m", driver="claude_code",
             enabled=True, tools_allowed=["Read"], tools_disallowed=[],
             permission_mode="acceptEdits",
@@ -743,7 +743,7 @@ class TestRefreshClaudeMd:
             "You are the {executor_type} executor.\nTASK:\n{task}\n"
             "CTX:{context}\nMEM:{executor_memory}\n"
         )
-        return ExecutorDefinition(role_artifact=STUB_ROLE_ARTIFACT, 
+        return ExecutorDefinition(role_artifact=STUB_ROLE_ARTIFACT,
             type=executor_type, description="test executor twenty chars ok!!",
             model="sonnet", driver="claude_code",
             prompt_template_path=str(exec_dir / "prompt.md"),
@@ -759,7 +759,7 @@ class TestRefreshClaudeMd:
             "EXEC:{executor_type}\nTASK:\n{task}\n"
             "CTX:{context}\nWORLD:{world_state_summary}\nMEM:{executor_memory}\n"
         )
-        return ExecutorDefinition(role_artifact=STUB_ROLE_ARTIFACT, 
+        return ExecutorDefinition(role_artifact=STUB_ROLE_ARTIFACT,
             type=executor_type, description="template executor twenty chars",
             model="sonnet", driver="claude_code",
             prompt_template_path=str(exec_dir / "prompt.md"),

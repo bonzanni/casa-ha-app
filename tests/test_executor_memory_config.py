@@ -44,7 +44,7 @@ def test_default_memory_config_disabled():
 
 
 def test_executor_definition_default_memory_field():
-    defn = ExecutorDefinition(role_artifact=STUB_ROLE_ARTIFACT, 
+    defn = ExecutorDefinition(role_artifact=STUB_ROLE_ARTIFACT,
         type="x", description="x" * 20, model="sonnet", driver="in_casa",
     )
     assert isinstance(defn.memory, ExecutorMemoryConfig)

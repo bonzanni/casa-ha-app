@@ -78,7 +78,7 @@ def test_executor_entry_dataclass_fields():
 
 def test_agent_config_has_executors_field():
     from config import AgentConfig
-    cfg = AgentConfig(role_artifact=STUB_ROLE_ARTIFACT, )
+    cfg = AgentConfig(role_artifact=STUB_ROLE_ARTIFACT)
     assert cfg.executors == []
 
 
@@ -418,3 +418,113 @@ class TestDoctrineDirOptOut:
         loaded, _failed = load_all_executors(str(tmp_path), roles_dir=roles_dir)
         assert loaded["withduct"].doctrine_dir == os.path.join(
             str(tmp_path), "executors", "withduct", "doctrine")
+
+
+class TestExecutorModelBootParity:
+    """#205: definition.yaml may not change the model the role artifact declares.
+
+    ExecutorDefinition.model is what ACTUALLY runs — tools.py feeds it straight
+    into ClaudeAgentOptions.model — while resolved_model carries the image-owned
+    role artifact's choice for identity/checksum only. Nothing reconciled them,
+    so an edited definition.yaml (a legitimately operator-writable file) could
+    silently run a model the canonical artifact does not declare. Residents have
+    had this parity check since Phase A; executors now do too.
+    """
+
+    @staticmethod
+    def _seed(tmp_path, name, *, defn_model, role_model_block=None):
+        import os
+        import textwrap
+        try:
+            from tests.test_load_all_executors import _seed_executor_role_artifact
+        except ImportError:
+            from test_load_all_executors import _seed_executor_role_artifact
+        _write_minimal_executor(str(tmp_path), name, body_override=textwrap.dedent(f"""\
+            schema_version: 1
+            type: {name}
+            description: A reasonably long description that meets minLength 20.
+            model: {defn_model}
+            driver: in_casa
+            enabled: true
+            tools:
+              allowed: [Read]
+              permission_mode: acceptEdits
+        """))
+        roles_dir = os.path.join(str(tmp_path), "roles")
+        kwargs = {} if role_model_block is None else {"model_block": role_model_block}
+        _seed_executor_role_artifact(roles_dir, name, **kwargs)
+        return roles_dir
+
+    def test_matching_shortname_loads(self, tmp_path):
+        """The shipped shape: definition says `sonnet`, role says fixed sonnet."""
+        from agent_loader import load_all_executors
+        roles_dir = self._seed(tmp_path, "agree", defn_model="sonnet")
+        loaded, failed = load_all_executors(str(tmp_path), roles_dir=roles_dir)
+        assert failed == []
+        assert loaded["agree"].model == "claude-sonnet-4-6"
+
+    def test_equivalent_full_model_id_loads(self, tmp_path):
+        """Comparison is on RESOLVED SDK IDs, so a full ID that resolves to the
+        same model as the role's shortname is NOT a mismatch. Comparing raw text
+        would false-flag this and fail a perfectly valid executor."""
+        from agent_loader import load_all_executors
+        roles_dir = self._seed(tmp_path, "fullid", defn_model="claude-sonnet-4-6")
+        loaded, failed = load_all_executors(str(tmp_path), roles_dir=roles_dir)
+        assert failed == []
+        assert loaded["fullid"].model == "claude-sonnet-4-6"
+
+    def test_mismatched_model_is_reported_not_loaded(self, tmp_path):
+        """The bug this closes: definition.yaml quietly wins over the artifact."""
+        from agent_loader import load_all_executors
+        roles_dir = self._seed(tmp_path, "drift", defn_model="opus")
+        loaded, failed = load_all_executors(str(tmp_path), roles_dir=roles_dir)
+        assert "drift" not in loaded, (
+            "an executor whose definition.yaml model disagrees with its "
+            "canonical role artifact must not load"
+        )
+        assert [name for name, _ in failed] == ["drift"]
+        message = failed[0][1]
+        assert "claude-opus-4-6" in message and "claude-sonnet-4-6" in message, (
+            f"the error must name both resolved models; got: {message}"
+        )
+
+    def test_mismatch_is_isolated_from_siblings(self, tmp_path):
+        """Per-executor isolation: one bad definition must not take down its
+        siblings or the add-on (the failure is boot-non-fatal by design)."""
+        from agent_loader import load_all_executors
+        roles_dir = self._seed(tmp_path, "bad", defn_model="haiku")
+        self._seed(tmp_path, "good", defn_model="sonnet")
+        loaded, failed = load_all_executors(str(tmp_path), roles_dir=roles_dir)
+        assert "good" in loaded
+        assert [name for name, _ in failed] == ["bad"]
+
+    def test_ha_option_role_model_resolves_before_comparison(self, tmp_path):
+        """Executor artifacts ship `fixed` today, but role_slot supports
+        `ha_option`. The check must compare against the RESOLVED value so an
+        ha_option artifact keeps working — `resolved_model.effective` is a
+        shortname, which is exactly why the comparison uses sdk_model."""
+        from agent_loader import load_all_executors
+        roles_dir = self._seed(
+            tmp_path, "opt", defn_model="haiku",
+            role_model_block=(
+                "{source: ha_option, option: voice_agent_model, "
+                "default: haiku, allowed: [opus, sonnet, haiku]}"
+            ),
+        )
+        loaded, failed = load_all_executors(str(tmp_path), roles_dir=roles_dir)
+        assert failed == []
+        assert loaded["opt"].model == "claude-haiku-4-5"
+
+    def test_ha_option_mismatch_still_caught(self, tmp_path):
+        """...and an ha_option artifact still catches a genuine disagreement."""
+        from agent_loader import load_all_executors
+        roles_dir = self._seed(
+            tmp_path, "optbad", defn_model="opus",
+            role_model_block=(
+                "{source: ha_option, option: voice_agent_model, "
+                "default: haiku, allowed: [opus, sonnet, haiku]}"
+            ),
+        )
+        loaded, failed = load_all_executors(str(tmp_path), roles_dir=roles_dir)
+        assert "optbad" not in loaded
+        assert [name for name, _ in failed] == ["optbad"]

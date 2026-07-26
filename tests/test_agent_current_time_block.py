@@ -94,7 +94,7 @@ class TestAgentProcessInjects:
         from channels import ChannelManager
         from mcp_registry import McpServerRegistry
         from session_registry import SessionRegistry
-        cfg = AgentConfig(role_artifact=STUB_ROLE_ARTIFACT, 
+        cfg = AgentConfig(role_artifact=STUB_ROLE_ARTIFACT,
             role="assistant",
             model="claude-sonnet-4-6",
             system_prompt="You are Ellen.",

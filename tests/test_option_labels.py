@@ -202,10 +202,31 @@ def _body(resp: web.Response) -> dict:
     return json.loads(resp.text)
 
 
+async def _await_registered(broker, key, *, max_turns: int = 1000) -> None:
+    """Yield the event loop until the ask task has REGISTERED its waiter.
+
+    Replaces a fixed ``asyncio.sleep(0.02)``. The tap below can only be
+    ``delivered`` once the ask task has registered with the broker; taps
+    arriving before that resolve ``stale``. How many event-loop turns the ask
+    needs is machine-dependent, so on a slow CI runner the fixed sleep expired
+    early and the assertion failed with ``'stale' == 'delivered'``. Waiting on
+    the actual precondition is correct at any speed. (Same flake class as the
+    v0.124.1 engagement ask-gate deflake.)
+    """
+    for _ in range(max_turns):
+        if key in broker._live:
+            return
+        await asyncio.sleep(0)
+    raise AssertionError(f"ask never registered {key!r} with the broker")
+
+
 async def _drive_answer(wired, payload, option_index):
     """Post an ask, tap ``option_index``, return the tool response dict."""
     task = asyncio.ensure_future(wired["ask"](_FakeRequest(payload)))
-    await asyncio.sleep(0.02)
+    await _await_registered(
+        wired["broker"],
+        ("engagement_ask", wired["rec"].id, payload["request_id"]),
+    )
     assert wired["broker"].deliver(
         namespace="engagement_ask", scope=wired["rec"].id,
         request_id=payload["request_id"], option_index=option_index,

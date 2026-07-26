@@ -10,9 +10,10 @@ reason ``"circuit_open"`` — never a fabricated zero-hit — and a genuine
 ``RecallUnavailable`` from the operation itself is re-raised after recording,
 so the three-outcome discipline is preserved end to end either way.
 
-``RecallCircuitBreaker`` is a NEW breaker for the four call sites that have no
-breaker today (direct-tool, delegated, query_engager, executor-archive). It is
-VERIFIED distinct from — and never a replacement for — ``agent.py``'s existing
+``RecallCircuitBreaker`` is a NEW breaker for the call sites that have no
+breaker today (direct-tool, specialist-archive, query_engager,
+executor-archive). It is VERIFIED distinct from — and never a replacement
+for — ``agent.py``'s existing
 per-``Agent`` ``_RecallBreaker``, which continues to gate the pre-turn
 automatic recall exactly as it does today. Monotonic time is injected so tests
 drive recovery without patching ``asyncio.sleep``.
@@ -43,7 +44,15 @@ RECALL_BREAKER_RECOVERY_SECONDS = 30.0
 # CLAUDE.md re: unbounded process-wide state).
 RECALL_TELEMETRY_MAX_EVENTS = 4096
 
-RecallPath = Literal["delegated", "direct_tool", "query_engager", "executor_archive"]
+# #205: "specialist_archive" split out of the generic "delegated" default so a
+# specialist's memory read is distinguishable in telemetry and gets its own
+# breaker. "delegated" remains the function default (and the label for any
+# future caller that does not name a path), but has no production call site of
+# its own today — every live caller names one.
+RecallPath = Literal[
+    "delegated", "direct_tool", "query_engager", "executor_archive",
+    "specialist_archive",
+]
 
 
 @dataclass(frozen=True, slots=True)
@@ -72,7 +81,7 @@ _DEFAULT_TELEMETRY = RecallTelemetry()
 
 
 def default_telemetry() -> RecallTelemetry:
-    """The process-wide telemetry sink the four migrated call sites record to."""
+    """The process-wide telemetry sink the migrated call sites record to."""
     return _DEFAULT_TELEMETRY
 
 
@@ -118,7 +127,7 @@ async def observed_recall(
 
 
 class RecallCircuitBreaker:
-    """A NEW breaker for the four call sites (direct-tool, delegated,
+    """A NEW breaker for the call sites (direct-tool, specialist-archive,
     query_engager, executor-archive) that have no breaker today — VERIFIED
     distinct from, and never a replacement for, ``agent.py``'s existing
     per-``Agent`` ``_RecallBreaker``, which continues to gate the pre-turn
@@ -165,8 +174,8 @@ class RecallCircuitBreaker:
 
 # Process-wide, one breaker per RecallPath — a failing path (e.g. Hindsight
 # down) must never trip an unrelated path. Lazily populated with the standard
-# threshold/recovery policy (no per-path override — same policy for all four
-# call sites; do not invent new policy here).
+# threshold/recovery policy (no per-path override — the same policy for every
+# call site; do not invent new policy here).
 _PATH_BREAKERS: dict[str, RecallCircuitBreaker] = {}
 
 

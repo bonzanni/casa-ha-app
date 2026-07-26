@@ -76,7 +76,7 @@ class _FakeClient:
 
 
 def _make_agent(tmp_path, role="assistant") -> Agent:
-    cfg = AgentConfig(role_artifact=STUB_ROLE_ARTIFACT, 
+    cfg = AgentConfig(role_artifact=STUB_ROLE_ARTIFACT,
         role=role, model="claude-sonnet-4-6",
         system_prompt="Be helpful.",
         character=CharacterConfig(name="Test"),
