@@ -33,7 +33,8 @@ def _write_exec(base, name, defn_yaml=None, prompt="Hi."):
 
 
 def _seed_executor_role_artifact(roles_dir, type_name, allowed=(),
-                                 permission_mode="acceptEdits"):
+                                 permission_mode="acceptEdits",
+                                 model_block="{source: fixed, value: sonnet}"):
     """Write a minimal schema-valid canonical role artifact for an
     executor type under a test-owned roles_dir (Personality Phase A,
     Task 5 — load_all_executors now requires one, cross-validated on
@@ -41,7 +42,9 @@ def _seed_executor_role_artifact(roles_dir, type_name, allowed=(),
     types ("configurator", "plugin-developer") already have real
     artifacts under the production defaults/roles/ tree and don't need
     this; synthetic test-only types (e.g. "myx") do. ``allowed`` seeds
-    the role's tools.allowed — the capability CEILING (round-5)."""
+    the role's tools.allowed — the capability CEILING (round-5).
+    ``model_block`` seeds the role's model declaration — the model AUTHORITY
+    (#205); pass an ``ha_option`` block to exercise that resolution path."""
     d = os.path.join(roles_dir, "executor", type_name)
     os.makedirs(d, exist_ok=True)
     with open(os.path.join(d, "role.yaml"), "w") as fh:
@@ -52,7 +55,7 @@ def _seed_executor_role_artifact(roles_dir, type_name, allowed=(),
             slot: {type_name}
             mission: Test fixture executor role.
             enabled: true
-            model: {{source: fixed, value: sonnet}}
+            model: {model_block}
             tools:
               allowed: {list(allowed)}
               disallowed: []
