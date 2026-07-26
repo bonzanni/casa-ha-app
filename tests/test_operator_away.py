@@ -237,12 +237,33 @@ def _payload(eid, **over) -> dict:
     return base
 
 
+async def _await_registered(broker, key, *, max_turns: int = 1000) -> None:
+    """Yield the event loop until the ask task has REGISTERED its waiter.
+
+    Replaces a fixed ``asyncio.sleep(0.02)``. The ask runs as a separate task
+    and the timeout must not fire until that task has registered with the
+    broker — but how many event-loop turns that takes is machine-dependent. On
+    a slow CI runner 0.02s was not always enough: ``_on_timeout`` fired against
+    an unregistered key, became a no-op, the ask never resolved as
+    ``no_answer``, and the assertion died on a missing ``engagement_paused``
+    key. Waiting on the actual precondition is correct at any speed and
+    finishes in microseconds locally. (Same flake class as the v0.124.1
+    engagement ask-gate deflake.)
+    """
+    for _ in range(max_turns):
+        if key in broker._live:
+            return
+        await asyncio.sleep(0)
+    raise AssertionError(f"ask never registered {key!r} with the broker")
+
+
 async def _run_until_timeout(env, payload, key_rid):
     """Drive a button ask, let the relay post, fire the broker timeout, return
     the handler response."""
     task = asyncio.ensure_future(env["ask"](_FakeRequest(payload)))
-    await asyncio.sleep(0.02)
-    env["broker"]._on_timeout(("engagement_ask", env["rec"].id, key_rid))
+    key = ("engagement_ask", env["rec"].id, key_rid)
+    await _await_registered(env["broker"], key)
+    env["broker"]._on_timeout(key)
     resp = await asyncio.wait_for(task, timeout=1.0)
     await env["broker"].drain_hooks()
     return resp
@@ -279,7 +300,7 @@ async def test_racing_inbound_suppresses_away_entry(env):
 
     task = asyncio.ensure_future(env["ask"](
         _FakeRequest(_payload(eid, request_id="e2"))))
-    await asyncio.sleep(0.02)
+    await _await_registered(env["broker"], ("engagement_ask", eid, "e2"))
     # A REAL inbound envelope lands (generation 0 → 1) in the race window
     # BEFORE the timeout finishes — the meta still carries gen 0.
     await driver.spool.enqueue("operator says hi")
