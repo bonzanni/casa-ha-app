@@ -106,12 +106,22 @@ async def test_delegated_recall_wraps_unexpected_errors_as_unavailable():
         )
 
 
-async def test_delegated_recall_empty_query_is_zero_hits_no_call():
+async def test_delegated_recall_empty_query_raises_instead_of_faking_zero_hits():
+    """#201: a blank query is an invalid call, not a zero-hit search.
+
+    This test previously asserted the opposite — that a blank query returns
+    `""`, the value reserved for a genuine zero-hit search. That is what made
+    the bug look deliberate: `query_engager` accepted a blank question, got
+    `""`, and reported `status="unknown"`, which its own tool description
+    defines as "the memory was searched and holds nothing relevant". No search
+    had run. Still no backend call, but the caller can no longer mistake the
+    result for an answer about what Casa remembers.
+    """
     sem = _Sem()
-    out = await delegated_memory.delegated_recall(
-        sem, query="   ", origin_channel="telegram", max_tokens=10,
-    )
-    assert out == ""
+    with pytest.raises(ValueError, match="non-blank query"):
+        await delegated_memory.delegated_recall(
+            sem, query="   ", origin_channel="telegram", max_tokens=10,
+        )
     assert sem.recall_calls == []
 
 

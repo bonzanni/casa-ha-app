@@ -47,6 +47,10 @@ async def delegated_recall(
     denies knowledge Casa actually has. Call sites decide how to degrade
     (typically: proceed with no memory block, without claiming absence).
 
+    A blank ``query`` is a fourth thing — an invalid call, not a result — and
+    raises :class:`ValueError` (#201). It cannot be reported as '' without
+    claiming a search happened.
+
     Task 11: swaps the flat ``recall()`` string for typed ``recall_items()``
     routed through the NEW ``recall_health.observed_recall`` breaker/telemetry
     (``path`` distinguishes the delegated / query_engager / executor_archive
@@ -60,8 +64,24 @@ async def delegated_recall(
     ``mid`` (→300 reranked candidates) is the better default — materially
     higher recall quality — and no longer risks the timeout. Reverted v0.69.4.
     Explicit ``budget=`` (e.g. voice → ``low``) still overrides."""
+    # #201: a blank query used to return the SAME "" as a genuine zero-hit
+    # search. That is a lie the contract above cannot survive — no search ran,
+    # so "nothing was found" is unearned. It reached a user-visible surface:
+    # `query_engager` accepted a blank question and reported status=unknown,
+    # which its own tool description defines as "the memory was searched and
+    # holds nothing relevant" (Sol + Terra, both Blocking).
+    #
+    # A blank query is now a CALLER BUG, not an outcome. Raising makes the
+    # conflation impossible by construction instead of forbidden by comment;
+    # callers that legitimately want silence for an empty task must say so
+    # themselves by not calling. Every call site is guarded — see
+    # `tools.query_engager` (rejects `empty_query` at the tool boundary) and
+    # the two prompt-assembly callers in `tools.py`, which skip the recall.
     if not (query or "").strip():
-        return ""
+        raise ValueError(
+            "delegated_recall requires a non-blank query; a blank one performs "
+            "no search and must not be reported as a zero-hit result (#201)"
+        )
     clearance = clearance_for_channel(origin_channel)
     tags = readable_tiers(clearance)
     if current_speaker is None:

@@ -1893,7 +1893,15 @@ async def _run_delegated_agent(
             "</memory_context>\n\n"
         )
         sem = getattr(agent_mod, "active_semantic_memory", None)
-        if sem is None:
+        if not (task_text or "").strip():
+            # #201: nothing to search FOR, which is not the same as a memory
+            # that could not be checked. Stay silent — no note, no recall.
+            # Ordered BEFORE the `sem is None` test (Sol + Terra, Important):
+            # the other way round, a blank task with no backend wired claimed
+            # "memory could not be checked for this task", which is a statement
+            # about memory health that this turn has no basis to make.
+            digest = ""
+        elif sem is None:
             # No backend wired: same unavailability as a failed check — a
             # silent cold turn reads as "no memories exist".
             memory_block = unavailable_note
@@ -4645,10 +4653,33 @@ async def _fetch_executor_archive(
     ``casa`` bank, keyed on the current ``task`` and filtered to the originating
     engagement's read-clearance (design §3, plan 3). Returns the digest under a
     recognizable header, or "" when the recall is empty or memory could not
-    be checked (RecallUnavailable → run cold; never a fabricated header)."""
+    be checked (RecallUnavailable → run cold; never a fabricated header).
+
+    #201 — why collapsing unavailable into empty is CORRECT here, and what
+    would make it wrong. Elsewhere the distinction is load-bearing: an agent
+    that says "I have no record of that" because the store timed out is lying
+    to the operator. This path never says anything. The return value lands in
+    the executor prompt's ``{executor_memory}`` slot, so "" produces no memory
+    block — silence, not a claim of absence. Adding a third state here would
+    thread a sentinel through two call sites to change nothing.
+
+    That reasoning depends entirely on the prompt template staying silent for
+    the empty case. If an executor prompt ever gains text like "No prior
+    engagements found", running cold starts asserting absence and THIS function
+    needs a real third state. (A blank ``task`` is a separate matter and is
+    guarded below: it is an invalid call, not an unavailable backend, and
+    ``delegated_recall`` rejects it outright.) Pinned for the shipped default
+    templates by tests/test_recall_absence_invariant.py."""
     import agent as agent_mod
     sem = getattr(agent_mod, "active_semantic_memory", None)
     if sem is None:
+        return ""
+    # #201: a blank task has nothing to search FOR. Skip the recall rather than
+    # asking for one — `delegated_recall` now rejects a blank query outright,
+    # because returning "" for it would claim a search that never ran. Here the
+    # empty result is safe (it renders as no memory block at all), but the
+    # helper cannot know that, so the caller states it.
+    if not (task or "").strip():
         return ""
     try:
         digest = await delegated_recall(
@@ -6252,6 +6283,20 @@ async def query_engager(args: dict) -> dict:
         return _result({"status": "error", "kind": "not_in_engagement",
                         "message": "query_engager called outside an engagement"})
     question = args.get("question", "") or ""
+    # #201 (Sol + Terra, Blocking): a blank question performed no search, yet
+    # fell through to `status=unknown` — which this tool's own description
+    # defines as "the memory was searched and holds nothing relevant". An
+    # executor asking a malformed question was told the engager remembers
+    # nothing. Reject it at the boundary, exactly as `recall_memory` does.
+    if not question.strip():
+        return _result({
+            "status": "error", "kind": "empty_query",
+            "message": (
+                "query_engager requires a non-blank question. Nothing was "
+                "searched, so this is not a statement about what the engager "
+                "remembers — ask again with a real question."
+            ),
+        })
     max_tokens = max(1, min(int(args.get("max_tokens") or 500), 4000))
 
     # Retrieve engager-side context: a semantic recall against the shared `casa`

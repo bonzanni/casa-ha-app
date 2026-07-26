@@ -1,5 +1,27 @@
 # Changelog
 
+## [0.125.2] - 2026-07-26
+
+### Fixed
+
+- Asking an assistant's helper a malformed question no longer comes back as
+  "there's nothing in memory about that". A blank question skipped the memory
+  search entirely but was still reported as a completed search that found
+  nothing, so the helper could tell you Casa remembers nothing about a subject
+  it was never asked about. A blank question is now rejected as a mistake, and
+  says so (#201).
+
+### Changed
+
+- Casa's prompt-assembly recall paths now state, and enforce in tests, the rule
+  that makes them safe: when Casa cannot reach long-term memory while preparing
+  an engagement, it stays silent about memory rather than telling the agent
+  there is nothing to remember. Saying "no prior engagements" because the store
+  was briefly unreachable would be a false claim; omitting the section is not.
+  A test now fails if any executor prompt Casa ships is given wording — or a
+  section heading — that turns that silence into a claim. Prompts you have
+  edited yourself are not covered by that check (#201).
+
 ## [0.125.1] - 2026-07-26
 
 ### Fixed
