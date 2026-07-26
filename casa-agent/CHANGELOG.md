@@ -1,5 +1,19 @@
 # Changelog
 
+## [0.126.1] - 2026-07-26
+
+### Fixed
+
+- Spoken replies no longer lose the space between sentences. Every voice agent
+  came back with sentences welded together — "Yep, I'm here.What's on your
+  mind?" — in the Assist transcript and in what some voices read aloud. Casa
+  streams a reply in prosodic blocks, one sentence at a time, and dropped the
+  whitespace between them as noise; Home Assistant then joined the blocks back
+  into one message with nothing in between. The separator now travels with the
+  block, so a reply reads back exactly as the agent wrote it — including the
+  spaces around an em dash, paragraph breaks, and the case where a sentence is
+  cut mid-word at the length limit, where no space is invented (#257).
+
 ## [0.126.0] - 2026-07-26
 
 ### Fixed

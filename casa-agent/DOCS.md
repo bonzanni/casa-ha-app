@@ -170,6 +170,14 @@ Casa exposes two transports for Home Assistant voice / generic voice clients. Th
   protocol 3 or any one capability fails closed before Casa creates a job;
   there is no legacy handoff fallback.
 
+> **Block frames concatenate.** A turn's `block` frames are consecutive slices
+> of one reply, and each frame's `text` carries the whitespace that separated it
+> from the previous block — so joining every `block` of a turn, in order and
+> with nothing in between, reproduces the reply exactly. A client that speaks
+> blocks one at a time should strip each frame's text; a client that displays or
+> re-assembles the turn must not insert its own separator, because a block cut
+> at the length limit can land mid-word and no separator is invented there.
+
 ### Voice-agent discovery
 
 The companion Home Assistant integration discovers enabled residents through
