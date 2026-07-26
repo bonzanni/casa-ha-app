@@ -145,3 +145,61 @@ def test_svc_casa_mcp_run_script_execs_venv_python():
     )
     script = p.read_text(encoding="utf-8")
     assert "exec /opt/casa/venv/bin/python3 /opt/casa/svc_casa_mcp.py" in script
+
+
+def test_run_script_null_normalizes_the_model_options():
+    """#205: the boot path must not export bashio's "null" sentinel as a model.
+
+    `primary_agent_model`/`voice_agent_model` are `list(...)?` — OPTIONAL — in
+    config.yaml's schema, so their `options:` entries are INSTALL-TIME defaults,
+    not a guarantee the key stays present in the stored options. An operator who
+    clears the field leaves it absent and `bashio::config` yields the literal
+    string "null".
+
+    Exported unguarded, that "null" survives `role_slot._ha_model_options`
+    (which defaults only on a BLANK value), reaches `resolve_role_model`, and is
+    rejected as outside the role's allowed list — a RoleValidationError that
+    FATALs every resident at boot.
+
+    setup-configs.sh already applies this exact fallback for its config_sync
+    boot-parity replay, so before the fix the validator could pass while the
+    real boot crash-looped. Guard the parity in BOTH scripts.
+    """
+    script = _read_run_script()
+    for option, var, fallback in (
+        ("primary_agent_model", "PRIMARY_AGENT_MODEL", "opus"),
+        ("voice_agent_model", "VOICE_AGENT_MODEL", "haiku"),
+    ):
+        assert f"bashio::config '{option}'" in script, (
+            f"svc-casa/run must read the {option} add-on option"
+        )
+        assert f'export {var}="$(bashio::config' not in script, (
+            f"{var} must not be exported straight from bashio — an unset "
+            f'optional yields the literal "null" and FATALs role resolution'
+        )
+        assert f'!= "null" ]' in script and f"={fallback}" in script, (
+            f'{var} must fall back to {fallback} when bashio returns "null"'
+        )
+
+
+def test_setup_configs_and_run_script_agree_on_model_fallbacks():
+    """The two scripts export the same model env for the same stored options.
+
+    config_sync's boot-parity validation runs in a SEPARATE s6 oneshot
+    (setup-configs.sh) from the actual boot (svc-casa/run). If only one of them
+    normalizes the "null" sentinel, the validator's verdict stops predicting
+    what boot will do — which is precisely the failure #205 closed.
+    """
+    setup = (
+        Path(__file__).resolve().parent.parent
+        / "casa-agent" / "rootfs" / "etc" / "s6-overlay"
+        / "scripts" / "setup-configs.sh"
+    ).read_text(encoding="utf-8")
+    run = _read_run_script()
+
+    for fallback in ("opus", "haiku"):
+        assert f"={fallback}" in setup and f"={fallback}" in run, (
+            f"both scripts must fall back to {fallback} for the same option"
+        )
+    for var in ("PRIMARY_AGENT_MODEL", "VOICE_AGENT_MODEL"):
+        assert f"export {var}=" in setup and f"export {var}=" in run

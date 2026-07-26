@@ -1915,6 +1915,11 @@ async def _run_delegated_agent(
                     sem, query=task_text,
                     origin_channel=str(parent.get("channel", "")),
                     max_tokens=cfg.memory.token_budget,
+                    # #205: name the path. Left unset this fell to the generic
+                    # "delegated" default, so a specialist's memory read was
+                    # indistinguishable in telemetry from any other delegated
+                    # recall and shared that path's breaker.
+                    path="specialist_archive",
                 )
             except RecallUnavailable:
                 # Delegated turn proceeds cold, but the specialist is TOLD the

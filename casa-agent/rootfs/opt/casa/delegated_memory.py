@@ -53,8 +53,9 @@ async def delegated_recall(
 
     Task 11: swaps the flat ``recall()`` string for typed ``recall_items()``
     routed through the NEW ``recall_health.observed_recall`` breaker/telemetry
-    (``path`` distinguishes the delegated / query_engager / executor_archive
-    callers), then renders each hit with its recorded attribution. The exact
+    (``path`` distinguishes the specialist_archive / query_engager /
+    executor_archive callers), then renders each hit with its recorded
+    attribution. The exact
     unavailable-vs-zero-hit discipline is UNCHANGED — only success-path
     rendering differs.
 

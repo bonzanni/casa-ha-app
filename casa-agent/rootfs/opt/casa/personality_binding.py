@@ -218,9 +218,12 @@ def verify_binding_record(raw: dict) -> BindingRecord:
 
 
 def load_binding(path: Path) -> BindingRecord:
+    """#205: the standalone binding reader. ``verify_binding_record`` already
+    schema-validates against binding.v1.json, so the second validate that used
+    to sit here was pure duplication — and it raised a bare
+    ``jsonschema.ValidationError`` with no file context, pre-empting the
+    path-qualified ``ValueError`` below. One validation, one error shape."""
     raw = yaml.safe_load(path.read_text(encoding="utf-8"))
-    schema = json.loads((_SCHEMA_DIR / "binding.v1.json").read_text(encoding="utf-8"))
-    jsonschema.validate(raw, schema)
     try:
         return verify_binding_record(raw)
     except ValueError as exc:

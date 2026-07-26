@@ -68,8 +68,24 @@ unset _casa_context7_key
 # would now render literally. Export the fixed fallbacks so they resolve.
 export PRIMARY_AGENT_NAME="Ellen"
 export VOICE_AGENT_NAME="Tina"
-export PRIMARY_AGENT_MODEL="$(bashio::config 'primary_agent_model')"
-export VOICE_AGENT_MODEL="$(bashio::config 'voice_agent_model')"
+# #205: guard these two the way setup-configs.sh already does. Both are
+# `list(...)?` — OPTIONAL — in config.yaml's schema, so their `options:` block
+# entries are INSTALL-TIME defaults, not a permanent guarantee that the key is
+# present in the stored options: an operator who clears the field leaves it
+# absent and bashio yields the literal "null". Exported unguarded, that "null"
+# survives role_slot._ha_model_options (which only defaults on a BLANK value)
+# and reaches resolve_role_model, which rejects it as outside the role's
+# allowed list — a RoleValidationError that FATALs every resident at boot.
+# setup-configs.sh:214-219 already applies exactly this fallback for its
+# config_sync boot-parity replay, so the unguarded export here meant the
+# validator could pass while the real boot crash-looped.
+_casa_primary_model="$(bashio::config 'primary_agent_model')"
+_casa_voice_model="$(bashio::config 'voice_agent_model')"
+[ -n "$_casa_primary_model" ] && [ "$_casa_primary_model" != "null" ] || _casa_primary_model=opus
+[ -n "$_casa_voice_model" ] && [ "$_casa_voice_model" != "null" ] || _casa_voice_model=haiku
+export PRIMARY_AGENT_MODEL="$_casa_primary_model"
+export VOICE_AGENT_MODEL="$_casa_voice_model"
+unset _casa_primary_model _casa_voice_model
 export ENABLE_TERMINAL="$(bashio::config 'enable_terminal')"
 export CASA_VERSION="$(bashio::addon.version)"
 

@@ -353,3 +353,49 @@ async def test_sem_none_no_crash(monkeypatch):
     prompt = _FakeSDKClient.captured_prompt
     assert '<memory_context agent="finance" status="unavailable">' in prompt
     assert "could not be checked" in prompt
+
+
+# ---------------------------------------------------------------------------
+# Test 8 (#205): the specialist read is labelled specialist_archive
+# ---------------------------------------------------------------------------
+
+
+async def test_specialist_recall_records_specialist_archive_path(monkeypatch):
+    """The specialist memory read must name its own recall path.
+
+    Before #205 this call site passed no ``path=``, so it fell to
+    ``delegated_recall``'s generic ``"delegated"`` default: its telemetry was
+    indistinguishable from any other delegated recall, and it shared that
+    path's circuit breaker. Guard both halves — the recorded label AND the
+    breaker registry key, since ``recall_health._breaker_for`` caches one
+    breaker per path.
+    """
+    import agent as agent_mod
+    from recall_health import (
+        _PATH_BREAKERS, default_telemetry, reset_recall_breakers,
+    )
+
+    reset_recall_breakers()
+    before = len(default_telemetry().snapshot())
+
+    cfg = _specialist_cfg(role="finance", token_budget=4000)
+    fake_sem = _FakeSem(recall_ret="## Summary\nQ1 spend: EUR 1200\n")
+    monkeypatch.setattr(agent_mod, "active_semantic_memory", fake_sem, raising=False)
+    _set_origin(monkeypatch, channel="telegram")
+    _FakeSDKClient.reset()
+
+    with patch.object(tools, "ClaudeSDKClient", _FakeSDKClient):
+        await tools._run_delegated_agent(
+            cfg, task_text="how is Q1 cashflow?", context_text="")
+
+    new_events = default_telemetry().snapshot()[before:]
+    assert [e.path for e in new_events] == ["specialist_archive"], (
+        "the specialist memory read must record path=specialist_archive, not "
+        "the generic 'delegated' default"
+    )
+    assert "specialist_archive" in _PATH_BREAKERS
+    assert "delegated" not in _PATH_BREAKERS, (
+        "the specialist read must no longer open/consume the generic "
+        "'delegated' breaker"
+    )
+    reset_recall_breakers()
