@@ -2463,9 +2463,8 @@ async def main() -> None:
         # "'NoneType' object has no attribute 'get_me'", leaving
         # engagement_permission_ok=False forever.
         logger.info(
-            "Telegram channel registered (transport=%s, delivery=%s, chat_id=%s)",
+            "Telegram channel registered (transport=%s, chat_id=%s)",
             telegram_transport,
-            telegram_delivery,
             telegram_chat_id,
         )
 

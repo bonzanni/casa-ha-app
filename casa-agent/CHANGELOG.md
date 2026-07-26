@@ -1,5 +1,15 @@
 # Changelog
 
+## [0.125.1] - 2026-07-26
+
+### Fixed
+
+- Casa failed to start on 0.125.0 when a Telegram bot token is configured.
+  Removing the `telegram_delivery_mode` option left one reference to the
+  deleted value behind, in the log line that records the Telegram channel
+  starting, and reaching it crashed the add-on before it finished booting.
+  0.125.0 is withdrawn; upgrade straight to 0.125.1.
+
 ## [0.125.0] - 2026-07-26
 
 ### Removed
