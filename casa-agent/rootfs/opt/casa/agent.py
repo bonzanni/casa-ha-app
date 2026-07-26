@@ -55,7 +55,6 @@ from sdk_client_pool import (
     ManagedSdkClient,
     PoolUnavailable,
     SdkClientPool,
-    pool_enabled,
 )
 from retry import retry_sdk_call
 from tokens import (
@@ -1004,9 +1003,11 @@ class Agent:
                 msg.channel == "webhook"
                 and _is_uuid_scope(str(msg.context.get("chat_id", "")))
             )
+            # v0.125.0 (#228): pooling is unconditional. The `sdk_client_pool`
+            # kill-switch was the v0.66.0 rollback path; that insurance period
+            # is long over and the pool has been the only exercised path since.
             use_pool = (
-                pool_enabled()
-                and msg.type != MessageType.SCHEDULED          # AR-6
+                msg.type != MessageType.SCHEDULED              # AR-6
                 and not is_webhook_oneshot
             )
 

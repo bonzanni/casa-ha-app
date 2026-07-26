@@ -67,19 +67,6 @@ async def test_send_rich_badrequest_falls_back_to_plain_original_once():
     assert "entities" not in last
 
 
-async def test_send_rich_killswitch_off_is_plain():
-    ch, bot = _mk_channel_with_fake_bot()
-    ch._rich_text_enabled = False
-    await ch.send_to_topic_rich(42, "**hi**")
-    kw = bot.send_message.await_args.kwargs
-    assert kw["text"] == "**hi**"
-    assert "entities" not in kw
-
-
-# --------------------------------------------------------------------------
-# edit_topic_message_rich — the narration EDIT primitive
-# --------------------------------------------------------------------------
-
 async def test_edit_rich_bold_edits_with_entities():
     ch, bot = _mk_channel_with_fake_bot()
     ok = await ch.edit_topic_message_rich(42, 999, "**hi**")
@@ -127,19 +114,6 @@ async def test_edit_rich_clear_keyboard_sends_empty_markup():
     assert isinstance(markup, InlineKeyboardMarkup)
     assert not markup.inline_keyboard  # explicit EMPTY keyboard clears the buttons
 
-
-async def test_edit_rich_killswitch_off_is_plain():
-    ch, bot = _mk_channel_with_fake_bot()
-    ch._rich_text_enabled = False
-    await ch.edit_topic_message_rich(42, 999, "**hi**")
-    kw = bot.edit_message_text.await_args.kwargs
-    assert kw["text"] == "**hi**"
-    assert "entities" not in kw
-
-
-# --------------------------------------------------------------------------
-# Relay wiring — REAL OutputSequencer, render on EVERY narration send/edit
-# --------------------------------------------------------------------------
 
 def _wire_sequencer(ch, *, engagement_id: str = "e1", topic_id: int = 42):
     """A real OutputSequencer whose narration wire fns route through the rich

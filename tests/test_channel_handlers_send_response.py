@@ -44,15 +44,6 @@ async def test_send_response_to_topic_badrequest_falls_back_to_original():
     assert "entities" not in last
 
 
-async def test_send_response_to_topic_killswitch_off_delegates():
-    ch, bot = _mk_channel_with_fake_bot()
-    ch._rich_text_enabled = False
-    await ch.send_response_to_topic(42, "**hi**")
-    kw = bot.send_message.await_args.kwargs
-    assert kw["text"] == "**hi**"
-    assert "entities" not in kw
-
-
 def _stub_msg(mid):
     from unittest.mock import MagicMock
     return MagicMock(message_id=mid)

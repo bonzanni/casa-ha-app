@@ -43,10 +43,3 @@ async def test_send_response_timedout_makes_exactly_one_attempt():
     assert bot.send_message.await_count == 1  # no duplicate on non-BadRequest
 
 
-async def test_send_response_killswitch_off_is_plain():
-    ch, bot = _mk_channel_with_fake_bot()
-    ch._rich_text_enabled = False
-    await ch.send_response("**hi**", {"chat_id": "42"})
-    kw = bot.send_message.await_args.kwargs
-    assert kw["text"] == "**hi**"
-    assert "entities" not in kw

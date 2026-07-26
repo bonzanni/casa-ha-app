@@ -12,8 +12,6 @@ import hashlib
 import hmac
 import json
 import logging
-import math
-import os
 import time
 import uuid
 from dataclasses import dataclass
@@ -342,34 +340,24 @@ _DEFAULT_ERROR_LINES = {
 # holds even if INTEGRATION_TIMEOUT_TOTAL is raised later.
 INTEGRATION_TIMEOUT_TOTAL: float = 30.0
 _VOICE_TURN_BUDGET_HARD_CAP_S: float = 27.0
-_VOICE_TURN_BUDGET_MIN_S: float = 10.0
 
 
 def _voice_turn_budget_s() -> float:
     """Effective per-turn delegation budget (spec A4).
 
-    ``min(voice_turn_budget_seconds, INTEGRATION_TIMEOUT_TOTAL - 3)``,
-    configured via the ``VOICE_TURN_BUDGET_SECONDS`` env var (default 27),
-    clamped to the add-on schema's ``[10, 27]`` rail regardless of
-    configuration (defence in depth — HA schema-validates normal config, but
-    a direct env override or schema drift must not slip a sub-10s budget
-    past, which would starve every delegation).
+    ``min(INTEGRATION_TIMEOUT_TOTAL - 3, 27)``. This is derived, not
+    configured: the 3s reserve is what the companion integration needs to
+    return a turn before ITS OWN timeout fires, so the only honest budget is
+    the one the transport actually allows.
 
-    A non-finite configured value (``nan``/``inf``) is REJECTED and falls
-    back to 27 — a NaN budget would propagate through ``min()`` and defeat
-    the deadline entirely (``asyncio.wait(timeout=nan)`` never reliably
-    expires), so it must fail closed here at the source.
+    v0.125.0 (#228) removed the ``voice_turn_budget_seconds`` option and its
+    ``VOICE_TURN_BUDGET_SECONDS`` env var. It offered no operator decision:
+    the value was already hard-capped at 27 here, so every setting other than
+    the default could only shorten a turn and starve delegations — and the
+    sub-10s floor, NaN rejection and schema rail all existed solely to defend
+    against that option being set badly.
     """
-    try:
-        configured = float(os.environ.get("VOICE_TURN_BUDGET_SECONDS", "27"))
-    except (TypeError, ValueError):
-        configured = 27.0
-    if not math.isfinite(configured):
-        configured = 27.0
-    # Floor at the schema minimum, then apply the transport/hard-cap ceilings.
-    configured = max(configured, _VOICE_TURN_BUDGET_MIN_S)
-    budget = min(configured, INTEGRATION_TIMEOUT_TOTAL - 3.0)
-    return min(budget, _VOICE_TURN_BUDGET_HARD_CAP_S)
+    return min(INTEGRATION_TIMEOUT_TOTAL - 3.0, _VOICE_TURN_BUDGET_HARD_CAP_S)
 
 
 class VoiceChannel(Channel):

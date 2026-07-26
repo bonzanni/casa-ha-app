@@ -25,20 +25,31 @@ export TELEGRAM_BOT_TOKEN="$(bashio::config 'telegram_bot_token')"
 export TELEGRAM_CHAT_ID="$(bashio::config 'telegram_chat_id')"
 _tg_transport="$(bashio::config 'telegram_transport')"
 export TELEGRAM_TRANSPORT="${_tg_transport:-polling}"
-export TELEGRAM_DELIVERY_MODE="$(bashio::config 'telegram_delivery_mode')"
-export TELEGRAM_RICH_TEXT="$(bashio::config 'telegram_rich_text')"
 export TELEGRAM_ENGAGEMENT_SUPERGROUP_ID="$(bashio::config 'telegram_engagement_supergroup_id')"
 # telegram_bot_api_base is optional (schema str?); bashio returns "null" when unset.
 _tg_api_base="$(bashio::config 'telegram_bot_api_base')"
 if [ "$_tg_api_base" != "null" ] && [ -n "$_tg_api_base" ]; then
     export TELEGRAM_BOT_API_BASE="$_tg_api_base"
 fi
-# webhook_auth_enabled gates whether the webhook secret check is active;
-# only export WEBHOOK_SECRET when the toggle is on, so setting it to false
-# actually disables auth even if webhook_secret still holds a value.
-if bashio::config.true 'webhook_auth_enabled'; then
-    export WEBHOOK_SECRET="$(bashio::config 'webhook_secret')"
+# v0.125.0 (#228): webhook auth is MANDATORY — the `webhook_auth_enabled`
+# toggle is gone and setup-configs.sh always materializes
+# /data/webhook_secret (the operator override when set, else a generated
+# one). Export the override only when it is a real value: bashio returns the
+# literal string "null" for an unset optional, and casa_core.py treats a
+# non-empty WEBHOOK_SECRET as authoritative over the secret file — exporting
+# "null" would make that literal word the HMAC key while every signer used
+# the file, so nothing would verify.
+#
+# The option is the ONLY source of an override, so clear any inherited value
+# first (Sol review): this runs under `with-contenv`, which imports the
+# container environment, and a WEBHOOK_SECRET arriving that way would outrank
+# /data/webhook_secret in casa_core while every signer still used the file.
+unset WEBHOOK_SECRET
+_webhook_secret="$(bashio::config 'webhook_secret')"
+if [ "$_webhook_secret" != "null" ] && [ -n "$_webhook_secret" ]; then
+    export WEBHOOK_SECRET="$_webhook_secret"
 fi
+unset _webhook_secret
 # v0.110.0 (#232): the context7 plugin is SEEDED (part of the shipped
 # plugin-developer toolbox), so its key is static app config — an add-on
 # option, not an engagement-wired vault secret (that path is for dynamically
@@ -60,14 +71,6 @@ export VOICE_AGENT_NAME="Tina"
 export PRIMARY_AGENT_MODEL="$(bashio::config 'primary_agent_model')"
 export VOICE_AGENT_MODEL="$(bashio::config 'voice_agent_model')"
 export ENABLE_TERMINAL="$(bashio::config 'enable_terminal')"
-# sdk_client_pool: operator-reachable kill-switch for the warm SDK client
-# pool (rollback path). pool_enabled() in sdk_client_pool.py treats
-# off/0/false as disabled and anything else as enabled, so exporting
-# bashio's raw "true"/"false" string works the same way as ENABLE_TERMINAL.
-export SDK_CLIENT_POOL="$(bashio::config 'sdk_client_pool')"
-# Tina's eager Home Assistant facade is default-on with an operator-reachable
-# raw-MCP fallback for diagnosis.
-export TINA_HA_FACADE_ENABLED="$(bashio::config 'tina_ha_facade_enabled')"
 export CASA_VERSION="$(bashio::addon.version)"
 
 # 3.3: scheduler timezone — optional; timekeeping.resolve_tz() falls back
@@ -92,18 +95,15 @@ if [ "$_reap_days" != "null" ] && [ -n "$_reap_days" ]; then
     export ENGAGEMENT_REAP_DAYS="$_reap_days"
 fi
 
-# Task 7 (spec A4/§4.6): voice turn budget + specialist concurrency/cost-alert
-# options. All three ship with a default in the options block above, so
-# bashio never returns "null" here (unlike the optional str?/int? options
-# above) — export unconditionally, matching TELEGRAM_ENGAGEMENT_SUPERGROUP_ID.
-# _voice_turn_budget_s() in channels/voice/channel.py and the
-# specialist_max_concurrency/specialist_cost_alert_threshold reads in
-# casa_core.py still clamp/validate on top of this (e.g. the 27s hard cap) —
-# this export only feeds the env var, it does not itself enforce the cap.
-export VOICE_TURN_BUDGET_SECONDS="$(bashio::config 'voice_turn_budget_seconds')"
-export VOICE_ROUTE_FRESHNESS_SECONDS="$(bashio::config 'voice_route_freshness_seconds')"
-export VOICE_JOB_DELIVERY_TTL_SECONDS="$(bashio::config 'voice_job_delivery_ttl_seconds')"
-export VOICE_JOB_ROUTE_CAP="$(bashio::config 'voice_job_route_cap')"
+# Specialist concurrency/cost-alert options. Both ship with a default in the
+# options block above, so bashio never returns "null" here (unlike the
+# optional str?/int? options above) — export unconditionally, matching
+# TELEGRAM_ENGAGEMENT_SUPERGROUP_ID. casa_core.py still validates on top.
+#
+# v0.125.0 (#228): the four voice_* tuning options that used to be exported
+# here are gone. The turn budget is derived from the transport timeout in
+# channels/voice/channel.py; route freshness, delivery TTL and the route cap
+# are constants in voice_delivery_config.py.
 export SPECIALIST_MAX_CONCURRENCY="$(bashio::config 'specialist_max_concurrency')"
 export SPECIALIST_COST_ALERT_THRESHOLD="$(bashio::config 'specialist_cost_alert_threshold')"
 

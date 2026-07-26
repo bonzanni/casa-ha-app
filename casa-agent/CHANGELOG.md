@@ -1,5 +1,61 @@
 # Changelog
 
+## [0.125.0] - 2026-07-26
+
+### Removed
+
+- Nine add-on options that were not decisions an operator can meaningfully
+  make. Casa's configuration screen is now 18 options instead of 27, and each
+  removed option's alternative code path is gone with it rather than left
+  unreachable:
+  - `sdk_client_pool`, `tina_ha_facade_enabled`, `telegram_rich_text` and
+    `telegram_delivery_mode` were kill-switches kept as rollback insurance
+    when those features shipped. That insurance period is over: warm SDK
+    clients, Tina's ready Home Assistant tools, Markdown replies and
+    streaming Telegram delivery are now simply how Casa works.
+  - `voice_turn_budget_seconds`, `voice_route_freshness_seconds`,
+    `voice_job_delivery_ttl_seconds` and `voice_job_route_cap` were internal
+    tuning constants. The turn budget in particular was already hard-capped,
+    so every value other than the default could only shorten a voice turn and
+    starve specialist hand-offs. The budget is now derived from the voice
+    transport's own timeout; the rest are fixed at their previous defaults.
+
+### Changed
+
+- **Webhook and voice authentication is now always on.** The
+  `webhook_auth_enabled` option is removed and Casa always has a secret —
+  the operator's `webhook_secret` override when set, otherwise one generated
+  in `/data/webhook_secret`. Every external route already refused unsigned
+  requests (v0.116.0, v0.117.0), so the toggle's only remaining effect was to
+  turn webhooks, `/invoke` and voice off entirely, which is a broken install
+  rather than a preference.
+
+### Fixed
+
+- The webhook secret could be exported as the literal string `"null"` when
+  authentication was enabled with no override set. Home Assistant returns
+  that sentinel for an unset optional value, and Casa treats a non-empty
+  exported secret as authoritative over the generated one — so signing used
+  the generated secret while verification used the word "null" and nothing
+  verified. Found while removing the toggle above.
+- A webhook secret left empty by an interrupted first start is now regenerated
+  instead of being trusted forever. Casa only checked that the secret file
+  existed, but the file is created before it is written — so a container
+  stopped at exactly the wrong moment left a zero-byte secret that every later
+  boot accepted. With authentication now mandatory that would reject every
+  webhook, invoke and voice request with no way to turn it off. The secret is
+  also written to a temporary file and moved into place, so the window in
+  which it can be empty no longer exists.
+
+### Upgrading
+
+- No action required. The nine removed keys are pruned from stored
+  configuration on the next boot, so Home Assistant stops reporting them as
+  unknown options.
+- If you had deliberately disabled any of the four kill-switches above, that
+  setting no longer applies; if the feature it disabled causes you a problem,
+  please open an issue rather than pinning an old version.
+
 ## [0.124.1] - 2026-07-25
 
 ### Fixed

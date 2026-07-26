@@ -111,7 +111,7 @@ fi
 # add its key to DEPRECATED_OPTION_KEYS below. Idempotent — only deletes keys
 # actually present, so it is a no-op on clean installs. Seeded from a full
 # git-history audit of every option key ever removed (2026-06-08).
-DEPRECATED_OPTION_KEYS="github_token heartbeat_enabled heartbeat_interval_minutes honcho_api_key honcho_api_url repos scope_threshold telegram_webhook_url subagent_model primary_agent_name voice_agent_name"
+DEPRECATED_OPTION_KEYS="github_token heartbeat_enabled heartbeat_interval_minutes honcho_api_key honcho_api_url repos scope_threshold telegram_webhook_url subagent_model primary_agent_name voice_agent_name telegram_delivery_mode telegram_rich_text webhook_auth_enabled sdk_client_pool tina_ha_facade_enabled voice_turn_budget_seconds voice_route_freshness_seconds voice_job_delivery_ttl_seconds voice_job_route_cap"
 _dop_opts="$(bashio::addon.options 2>/dev/null || echo '{}')"
 for _dop_key in $DEPRECATED_OPTION_KEYS; do
     if bashio::jq.exists "$_dop_opts" ".${_dop_key}"; then
@@ -243,33 +243,47 @@ if [ -e /root/.claude/projects ] && [ ! -L /root/.claude/projects ]; then
 fi
 [ -L /root/.claude/projects ] || ln -s "$PERSIST_PROJECTS" /root/.claude/projects
 
-# Auto-generate webhook secret if auth is enabled and no secret is set.
+# Webhook/voice authentication is MANDATORY (v0.125.0, #228): the
+# `webhook_auth_enabled` toggle is removed, so a secret always exists. Every
+# external route already fails closed without one (v0.116.0/v0.117.0, #193) —
+# the toggle's only remaining effect was to turn those routes off entirely,
+# which is not an operator preference, it is a broken install.
 SECRET_FILE="$DATA_DIR/webhook_secret"
-DISCOVERY_AUTH_ENABLED=false
-if bashio::config.true 'webhook_auth_enabled'; then
-    DISCOVERY_AUTH_ENABLED=true
-    USER_SECRET=$(bashio::config 'webhook_secret')
-    # bashio returns the literal string "null" for an unset optional value.
-    # Treat it exactly like an empty override so auth gets a random secret.
-    if [ "$USER_SECRET" = "null" ]; then
-        USER_SECRET=""
-    fi
-    if [ -n "$USER_SECRET" ]; then
-        printf '%s' "$USER_SECRET" > "$SECRET_FILE"
-    elif [ ! -f "$SECRET_FILE" ] || \
-         [ "$(cat "$SECRET_FILE" 2>/dev/null)" = "null" ]; then
-        head -c 32 /dev/urandom | base64 | tr -d '=/+' | head -c 48 > "$SECRET_FILE"
+USER_SECRET=$(bashio::config 'webhook_secret')
+# bashio returns the literal string "null" for an unset optional value.
+# Treat it exactly like an empty override so auth gets a random secret.
+if [ "$USER_SECRET" = "null" ]; then
+    USER_SECRET=""
+fi
+if [ -n "$USER_SECRET" ]; then
+    printf '%s' "$USER_SECRET" > "$SECRET_FILE"
+elif [ ! -s "$SECRET_FILE" ] || \
+     [ "$(cat "$SECRET_FILE" 2>/dev/null)" = "null" ]; then
+    # -s, not -f (Sol review): the redirection below truncates the file before
+    # the pipeline writes it, so a container killed mid-generation leaves a
+    # ZERO-BYTE secret. With auth mandatory since v0.125.0 that is an install
+    # no route can authenticate and no option can turn off — an empty file must
+    # regenerate, not be trusted. Written to a temp file and moved so the
+    # window where the real path is empty does not exist at all.
+    _secret_tmp="$SECRET_FILE.tmp.$$"
+    if head -c 32 /dev/urandom | base64 | tr -d '=/+' | head -c 48 \
+            > "$_secret_tmp" && [ -s "$_secret_tmp" ]; then
+        mv -f "$_secret_tmp" "$SECRET_FILE"
         bashio::log.info "Auto-generated webhook secret (see /data/webhook_secret)"
+    else
+        rm -f "$_secret_tmp"
+        bashio::log.error "Failed to generate webhook secret"
     fi
-    bashio::log.info "Webhook authentication enabled."
-else
-    rm -f "$SECRET_FILE"
+    unset _secret_tmp
 fi
 
 # Publish Casa's authenticated endpoint to the companion integration through
 # Supervisor discovery. The publisher owns only the returned UUID in /data;
 # it reads the selected secret above and never logs or persists that secret.
-CASA_DISCOVERY_AUTH_ENABLED="$DISCOVERY_AUTH_ENABLED" \
+# Always "true" since v0.125.0 (#228) — the discovery payload field stays in
+# the contract the companion integration reads; only the toggle behind it is
+# gone.
+CASA_DISCOVERY_AUTH_ENABLED=true \
     python3 /opt/casa/supervisor_discovery.py || \
     bashio::log.warning "Supervisor discovery publisher exited non-zero"
 

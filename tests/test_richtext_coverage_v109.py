@@ -77,22 +77,6 @@ async def test_post_dm_keyboard_badrequest_retries_plain_original():
 
 
 @pytest.mark.asyncio
-async def test_post_dm_keyboard_killswitch_off_sends_plain():
-    ch, bot = _mk_channel_with_fake_bot()
-    ch._rich_text_enabled = False
-    await ch.post_dm_keyboard(
-        chat_id=100, request_id="r1", text="**b**", options=["Ok"],
-    )
-    kw = bot.send_message.await_args.kwargs
-    assert kw["text"] == "**b**"
-    assert "entities" not in kw
-
-
-# ===========================================================================
-# G1 · edit_dm_message renders; entity failure retries the EDIT plain
-# ===========================================================================
-
-@pytest.mark.asyncio
 async def test_edit_dm_message_renders_entities():
     ch, bot = _mk_channel_with_fake_bot()
     assert await ch.edit_dm_message(100, 5, "**done**") is True

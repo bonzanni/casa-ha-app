@@ -506,21 +506,17 @@ class TelegramChannel(Channel):
         bus: MessageBus | None = None,
         webhook_url: str = "",
         webhook_path: str = "/telegram/update",
-        delivery_mode: str = "stream",
         webhook_secret: str = "",
         rate_limiter: RateLimiter | None = None,
         bot: Any = None,
         engagement_supergroup_id: int | None = None,
-        rich_text_enabled: bool = True,
     ) -> None:
         self.bot_token = bot_token
-        self._rich_text_enabled = rich_text_enabled
         self.chat_id = chat_id
         self.default_agent = default_agent
         self._bus = bus
         self._webhook_url = webhook_url
         self._webhook_path = webhook_path
-        self._delivery_mode = delivery_mode  # "stream" or "block"
         self._webhook_secret = webhook_secret
         # Rate limiter (spec 5.2 §8). None = unlimited; a limiter with
         # capacity=0 also admits every message.
@@ -830,15 +826,15 @@ class TelegramChannel(Channel):
                         pass
                 await app.bot.set_webhook(**kwargs)
                 logger.info(
-                    "Telegram started (webhook, delivery=%s, url=%s, secret=%s)",
-                    self._delivery_mode, full_url,
+                    "Telegram started (webhook, url=%s, secret=%s)",
+                    full_url,
                     "yes" if self._webhook_secret else "no",
                 )
             else:
                 await app.updater.start_polling()  # type: ignore[union-attr]
                 logger.info(
-                    "Telegram started (polling, delivery=%s, chat_id=%s)",
-                    self._delivery_mode, self.chat_id,
+                    "Telegram started (polling, chat_id=%s)",
+                    self.chat_id,
                 )
         except Exception:
             # PTB 22.7 ordering: stop() raises if not running (guard with
@@ -2437,9 +2433,6 @@ class TelegramChannel(Channel):
         A rollover split can bisect a span across two messages and each half
         degrades to literal independently — degraded, never corrupt.
         """
-        if not self._rich_text_enabled:
-            return await self.edit_topic_message(
-                topic_id, message_id, text, clear_keyboard=clear_keyboard)
         display, entities = render(text)
         if entities is None:
             return await self.edit_topic_message(
@@ -2522,8 +2515,7 @@ class TelegramChannel(Channel):
             kwargs["reply_parameters"] = ReplyParameters(
                 message_id=reply_to, allow_sending_without_reply=True,
             )
-        display, entities = (
-            render(text) if self._rich_text_enabled else (text, None))
+        display, entities = render(text)
         try:
             if entities is not None:
                 try:
@@ -2601,8 +2593,7 @@ class TelegramChannel(Channel):
                     message_id=message_id, **markup_kwargs,
                 )
                 return True
-            display, entities = (
-                render(text) if self._rich_text_enabled else (text, None))
+            display, entities = render(text)
             if entities is None:
                 await self.bot.edit_message_text(
                     chat_id=self.engagement_supergroup_id,
@@ -2733,8 +2724,7 @@ class TelegramChannel(Channel):
         # plain. An entity ``BadRequest`` posted NOTHING (Telegram rejected the
         # send), so ONE plain retry with the original text cannot duplicate the
         # ask; any other failure keeps the delivery-failure contract (None).
-        display, entities = (
-            render(text) if self._rich_text_enabled else (text, None))
+        display, entities = render(text)
         try:
             if entities is not None:
                 try:
@@ -2777,8 +2767,7 @@ class TelegramChannel(Channel):
         EDIT plain with the original text — never a new message (Sol+Terra
         design round: an edit must not become a duplicate post).
         """
-        display, entities = (
-            render(text) if self._rich_text_enabled else (text, None))
+        display, entities = render(text)
         try:
             if entities is not None:
                 try:
@@ -3071,8 +3060,6 @@ class TelegramChannel(Channel):
         across messages and each half degrades to literal independently —
         degraded, never corrupt.
         """
-        if not self._rich_text_enabled:
-            return await self.send_to_topic(thread_id, text, **kwargs)
         display, entities = render(text)
         if entities is None:
             return await self.send_to_topic(thread_id, text, **kwargs)
@@ -3117,8 +3104,6 @@ class TelegramChannel(Channel):
         ``kwargs`` (e.g. ``reply_markup`` for the ask keyboard) forward on both
         paths. Returns the posted ``message_id``.
         """
-        if not self._rich_text_enabled:
-            return await self.send_to_topic(thread_id, text, **kwargs)
         display, entities = render(text)
         if entities is None:
             return await self.send_to_topic(thread_id, text, **kwargs)
@@ -3414,9 +3399,6 @@ class TelegramChannel(Channel):
         if self._app is None:
             logger.warning("Telegram channel not started; cannot send message")
             return
-        if not self._rich_text_enabled:
-            await self.send(message, context)
-            return
         pages = render_paged(message)
         if len(pages) == 1:
             display, entities = pages[0]
@@ -3444,12 +3426,6 @@ class TelegramChannel(Channel):
         target_chat = _resolve_chat_id(context, self.chat_id)
         self._release_typing(context, target_chat)
         if self._app is None:
-            return
-        if not self._rich_text_enabled:
-            await self.finalize_stream(full_text, context, on_token)
-            return
-        if self._delivery_mode != "stream":
-            await self.send_response(full_text, context)
             return
         message_id = _peek_stream_message_id(on_token)
         if message_id is None:
@@ -3514,8 +3490,6 @@ class TelegramChannel(Channel):
         BadRequest; ``kwargs`` (e.g. ``reply_parameters``) attach to the FIRST
         page only. Returns the LAST page's ``message_id`` (the bottom-most
         message — the correct reply anchor for subsequent traffic)."""
-        if not self._rich_text_enabled:
-            return await self.send_to_topic(thread_id, text, **kwargs)
         pages = render_paged(text)
         if len(pages) == 1:
             return await self.send_to_topic_rich(thread_id, text, **kwargs)
@@ -3564,16 +3538,12 @@ class TelegramChannel(Channel):
     def create_on_token(self, context: dict[str, Any]) -> OnTokenCallback:
         """Return a callback for streaming tokens to this chat.
 
-        The callback receives the *accumulated* response text on each
-        token.  In ``stream`` mode it edits the message in place; in
-        ``block`` mode it's a no-op (the final send handles delivery).
+        The callback receives the *accumulated* response text on each token and
+        edits the message in place. v0.125.0 (#228) removed the
+        ``telegram_delivery_mode`` option and with it the ``block`` mode, whose
+        only behaviour was to make this a no-op and let the final send deliver
+        everything at once.
         """
-        if self._delivery_mode != "stream":
-            # Block mode: no-op callback, send() handles everything
-            async def _noop(text: str) -> None:
-                pass
-            return _noop
-
         target_chat = str(_resolve_chat_id(context, self.chat_id))
         # r1-1: release THIS turn's lease by its cid on first-token teardown
         # (captured once — the context is fixed for this callback's turn).
@@ -3640,11 +3610,6 @@ class TelegramChannel(Channel):
         self._release_typing(context, target_chat)
 
         if self._app is None:
-            return
-
-        if self._delivery_mode != "stream":
-            # Block mode: just send
-            await self.send(full_text, context)
             return
 
         # Retrieve state from the closure
@@ -3770,51 +3735,13 @@ class TopicStreamHandle:
 
         if self._message_id is None:
             # No prior emit: fresh message(s). v2 (RC3): send_response_to_topic
-            # paginates internally, so any size delivers rendered — the plain
-            # split-send survives only for the rich-text killswitch.
-            if self._channel._rich_text_enabled:
-                try:
-                    await self._channel.send_response_to_topic(
-                        self._topic_id, full_text,
-                    )
-                    return
-                except TelegramError as exc:
-                    logger.warning("Stream finalize rich send failed: %s", exc)
-                    return
-            for chunk in _split_message(full_text):
-                try:
-                    await bot.send_message(
-                        chat_id=self._channel.engagement_supergroup_id,
-                        message_thread_id=self._topic_id,
-                        text=chunk,
-                    )
-                except TelegramError as exc:
-                    logger.warning("Stream finalize send failed: %s", exc)
-            return
-
-        if not self._channel._rich_text_enabled:
-            # Killswitch: pre-v2 plain behavior (edit, then plain overflow).
-            chunks = _split_message(full_text)
+            # paginates internally, so any size delivers rendered.
             try:
-                await bot.edit_message_text(
-                    chat_id=self._channel.engagement_supergroup_id,
-                    message_id=self._message_id,
-                    text=chunks[0],
+                await self._channel.send_response_to_topic(
+                    self._topic_id, full_text,
                 )
             except TelegramError as exc:
-                if "not modified" not in str(exc).lower():
-                    logger.warning("Stream finalize edit failed: %s", exc)
-            for chunk in chunks[1:]:
-                try:
-                    await bot.send_message(
-                        chat_id=self._channel.engagement_supergroup_id,
-                        message_thread_id=self._topic_id,
-                        text=chunk,
-                    )
-                except TelegramError as exc:
-                    logger.warning(
-                        "Stream finalize overflow send failed: %s", exc,
-                    )
+                logger.warning("Stream finalize rich send failed: %s", exc)
             return
 
         # v2 (RC3): page 1 rich-edits the streamed message; the rest are rich

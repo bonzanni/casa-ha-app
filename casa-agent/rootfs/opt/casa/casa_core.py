@@ -1208,14 +1208,15 @@ async def _start_tina_ha_facade(
     *,
     ha_mcp_url: str,
     supervisor_token: str,
-    env: Mapping[str, str] | None = None,
     tina_role: str = "butler",
 ) -> HomeAssistantFacade | None:
-    """Start and publish Tina's eager Home Assistant facade."""
-    env = env if env is not None else os.environ
-    if env.get("TINA_HA_FACADE_ENABLED", "true").strip().lower() == "false":
-        logger.info("ha_facade_disabled")
-        return None
+    """Start and publish Tina's eager Home Assistant facade.
+
+    v0.125.0 (#228): the facade is unconditional. ``tina_ha_facade_enabled``
+    was a diagnostic fallback to the raw Home Assistant MCP connection; the
+    facade has been the shipped path throughout and the raw connection is not
+    a configuration an operator should be choosing.
+    """
     tina_config = role_configs.get(tina_role)
     if (
         not supervisor_token
@@ -1883,16 +1884,6 @@ async def _authz_grant_sweep() -> None:
 # ------------------------------------------------------------------
 
 
-def _rich_text_enabled_from_env(env: dict) -> bool:
-    """Whether Telegram rich-text rendering is on (kill-switch default: on).
-
-    Mirrors the ``telegram_rich_text`` app option exported as ``TELEGRAM_RICH_TEXT``.
-    """
-    return env.get("TELEGRAM_RICH_TEXT", "true").strip().lower() not in (
-        "false", "0", "off", "no",
-    )
-
-
 async def _notify_recovered_delegations(
     recovered_jobs,
     job_registry,
@@ -2439,8 +2430,6 @@ async def main() -> None:
         from channels.telegram import TelegramChannel
 
         telegram_chat_id = os.environ.get("TELEGRAM_CHAT_ID", "")
-        telegram_delivery = os.environ.get("TELEGRAM_DELIVERY_MODE", "stream")
-        telegram_rich_text = _rich_text_enabled_from_env(os.environ)
         telegram_engagement_supergroup_id = int(os.environ.get(
             "TELEGRAM_ENGAGEMENT_SUPERGROUP_ID", "0",
         ) or "0")
@@ -2462,11 +2451,9 @@ async def main() -> None:
             default_agent=assistant_role,
             bus=bus,
             webhook_url=webhook_url,
-            delivery_mode=telegram_delivery,
             webhook_secret=webhook_secret,
             rate_limiter=telegram_rate_limiter,
             engagement_supergroup_id=telegram_engagement_supergroup_id or None,
-            rich_text_enabled=telegram_rich_text,
         )
         channel_manager.register(telegram_channel)
         # NOTE: setup_engagement_features() needs the bot, which is only
@@ -2922,8 +2909,7 @@ async def main() -> None:
         channel_rows = ""
         if telegram_channel is not None:
             tg_mode = "webhook" if telegram_channel._webhook_url else "polling"
-            tg_delivery = telegram_channel._delivery_mode
-            channel_rows += _row("Telegram", f"{tg_mode}, {tg_delivery}", "on")
+            channel_rows += _row("Telegram", tg_mode, "on")
         else:
             channel_rows += _row("Telegram", "not configured", "off")
 
