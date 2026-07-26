@@ -897,40 +897,30 @@ class TestVoiceTeardown:
 
 
 class TestVoiceTurnBudget:
-    def test_default_is_27(self, monkeypatch):
-        monkeypatch.delenv("VOICE_TURN_BUDGET_SECONDS", raising=False)
-        from channels.voice.channel import _voice_turn_budget_s
-        assert _voice_turn_budget_s() == 27.0
+    def test_budget_is_derived_from_the_transport_timeout(self):
+        """v0.125.0 (#228): the budget is derived, not configured.
 
-    def test_hard_capped_at_27_even_if_configured_higher(self, monkeypatch):
-        monkeypatch.setenv("VOICE_TURN_BUDGET_SECONDS", "100")
-        from channels.voice.channel import _voice_turn_budget_s
+        `voice_turn_budget_seconds` and its VOICE_TURN_BUDGET_SECONDS env var
+        are gone, so the env can no longer shorten a turn — the whole family of
+        clamps that existed to defend against a bad option value (sub-10s
+        floor, NaN rejection, the 27s cap) has nothing left to defend against.
+        """
+        from channels.voice.channel import (
+            INTEGRATION_TIMEOUT_TOTAL,
+            _VOICE_TURN_BUDGET_HARD_CAP_S,
+            _voice_turn_budget_s,
+        )
         assert _voice_turn_budget_s() == 27.0
+        assert _voice_turn_budget_s() == min(
+            INTEGRATION_TIMEOUT_TOTAL - 3.0, _VOICE_TURN_BUDGET_HARD_CAP_S,
+        )
 
-    def test_respects_a_lower_configured_value(self, monkeypatch):
-        monkeypatch.setenv("VOICE_TURN_BUDGET_SECONDS", "10")
-        from channels.voice.channel import _voice_turn_budget_s
-        assert _voice_turn_budget_s() == 10.0
-
-    def test_nan_config_clamped_to_default(self, monkeypatch):
-        """IMPORTANT (re-review) 2: a non-finite VOICE_TURN_BUDGET_SECONDS
-        (nan/inf) must be rejected and fall back to 27 — a NaN budget would
-        propagate through min() and defeat the deadline (hang)."""
-        from channels.voice.channel import _voice_turn_budget_s
-        monkeypatch.setenv("VOICE_TURN_BUDGET_SECONDS", "nan")
-        assert _voice_turn_budget_s() == 27.0
-        monkeypatch.setenv("VOICE_TURN_BUDGET_SECONDS", "inf")
-        assert _voice_turn_budget_s() == 27.0
-
-    def test_below_schema_min_is_floored_to_10(self, monkeypatch):
-        """final-review MINOR 1: a sub-10s value (below the schema's min,
-        e.g. a direct env override) is floored to 10 defensively rather
-        than starving every delegation."""
+    def test_env_override_cannot_shorten_the_budget(self, monkeypatch):
+        """Regression guard: a stale env var from an upgraded install must not
+        resurrect the removed option."""
         from channels.voice.channel import _voice_turn_budget_s
         monkeypatch.setenv("VOICE_TURN_BUDGET_SECONDS", "3")
-        assert _voice_turn_budget_s() == 10.0
-        monkeypatch.setenv("VOICE_TURN_BUDGET_SECONDS", "0")
-        assert _voice_turn_budget_s() == 10.0
+        assert _voice_turn_budget_s() == 27.0
 
 
 # ---------------------------------------------------------------------------

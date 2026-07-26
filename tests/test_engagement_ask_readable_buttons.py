@@ -160,7 +160,6 @@ class TestPostOptionsKeyboardReadable:
         from channels import telegram as tg_mod
 
         ch = tg_mod.TelegramChannel.__new__(tg_mod.TelegramChannel)
-        ch._rich_text_enabled = False
         ch._engagement_registry = MagicMock()
         ch._engagement_registry.get = MagicMock(return_value=MagicMock(topic_id=42))
         ch.send_to_topic = AsyncMock(return_value=101)

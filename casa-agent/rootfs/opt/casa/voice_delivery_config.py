@@ -1,13 +1,29 @@
-"""Validated operator bounds for proactive voice-job delivery."""
+"""Bounds for proactive voice-job delivery.
+
+v0.125.0 (#228): these were three add-on options
+(``voice_route_freshness_seconds``, ``voice_job_delivery_ttl_seconds``,
+``voice_job_route_cap``) read from env. They are internal tuning constants —
+an operator has no basis on which to choose a route-freshness grace period or
+a per-route job cap — so they are now fixed here. The dataclass survives
+because it is the boot snapshot every delivery site reads.
+"""
 
 from __future__ import annotations
 
 import logging
-import os
 from dataclasses import dataclass
 
 
 logger = logging.getLogger(__name__)
+
+#: Grace period in which an authenticated, background-capable route may
+#: briefly disconnect while Casa still accepts specialist work for it.
+ROUTE_FRESHNESS_S = 60
+#: Maximum time a completed background voice result is retained for delivery.
+#: A specialist may request a shorter privacy expiry; the shorter value wins.
+DELIVERY_TTL_S = 900
+#: Maximum active-or-ready specialist jobs held for one voice route.
+ROUTE_CAP = 5
 
 
 @dataclass(frozen=True)
@@ -17,24 +33,12 @@ class VoiceDeliveryConfig:
     route_cap: int
 
 
-def _bounded_env_int(name: str, default: int, minimum: int, maximum: int) -> int:
-    try:
-        value = int(os.environ.get(name, str(default)))
-    except (TypeError, ValueError):
-        value = default
-    return max(minimum, min(maximum, value))
-
-
 def load_voice_delivery_config() -> VoiceDeliveryConfig:
-    """Read one immutable, defence-in-depth-clamped boot snapshot."""
+    """One immutable boot snapshot of the delivery bounds."""
     config = VoiceDeliveryConfig(
-        route_freshness_s=_bounded_env_int(
-            "VOICE_ROUTE_FRESHNESS_SECONDS", 60, 0, 300,
-        ),
-        delivery_ttl_s=_bounded_env_int(
-            "VOICE_JOB_DELIVERY_TTL_SECONDS", 900, 30, 3600,
-        ),
-        route_cap=_bounded_env_int("VOICE_JOB_ROUTE_CAP", 5, 1, 20),
+        route_freshness_s=ROUTE_FRESHNESS_S,
+        delivery_ttl_s=DELIVERY_TTL_S,
+        route_cap=ROUTE_CAP,
     )
     logger.info(
         "voice_delivery_config route_freshness_s=%d ttl_s=%d route_cap=%d",

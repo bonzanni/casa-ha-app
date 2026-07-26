@@ -27,7 +27,6 @@ Casa runs always-on AI agents inside your Home Assistant instance. The primary a
 | `telegram_bot_token` | Telegram bot token from @BotFather. Enables the Telegram channel. |
 | `telegram_chat_id` | Telegram chat ID to restrict messages to. Leave empty to accept all chats. |
 | `telegram_engagement_supergroup_id` | Chat ID of the dedicated Telegram forum supergroup used for interactive engagements (Tier 2 Specialist interactive mode; Tier 3 Executor types, Plan 3+). Must be a negative integer. Leave at 0 to disable engagements. |
-| `telegram_rich_text` | Render Markdown (bold, italic, inline code, monospace code blocks, and headings) in agent replies, including engagement narration and question prompts. Default: `true`. Set to `false` to send everything as plain text. |
 
 ### Optional -- Memory
 
@@ -58,17 +57,10 @@ setting by hand:
 | Option | Description |
 |--------|-------------|
 | `enable_terminal` | Enable a web terminal accessible via the ingress panel. Default: `false`. |
-| `sdk_client_pool` | Reuse a warm Claude SDK client across resident turns for faster replies. Default: `true`. Disable to fall back to a fresh per-turn session (e.g. while diagnosing an issue). |
-| `tina_ha_facade_enabled` | Keep Tina's role-scoped Home Assistant tools connected and ready instead of rediscovering them during a voice turn. Default: `true`. Disable to use the raw Home Assistant MCP connection while diagnosing compatibility issues. |
-| `webhook_auth_enabled` | Require HMAC authentication for webhook and voice requests. When enabled, Casa uses the optional `webhook_secret` override or generates a secret in `/data/webhook_secret`. Retrieve a generated secret through the web terminal. Default: `false`. |
-| `webhook_secret` | Optional manual override used when `webhook_auth_enabled` is enabled. Leave empty to use the generated secret from `/data/webhook_secret`. |
+| `webhook_secret` | Optional manual override for the HMAC secret that authenticates webhook, invoke and voice requests. Leave empty and Casa generates one in `/data/webhook_secret`, retrievable through the web terminal. Authentication is always on. |
 | `context7_api_key` | API key for the bundled Context7 documentation plugin (plugin-developer toolbox). Optional; an entry in the plugin env store overrides it. |
 | `engagement_reap_days` | Auto-close engagements after this many days without activity (daily sweep cancels them and closes their Telegram topic; the engaging agent is notified). Set `0` to disable. Default: `7`. |
 | `log_level` | Log verbosity: `debug`, `info`, `warning`, or `error`. Default: `info`. Flip to `debug` for verbose troubleshooting without rebuilding the image. |
-| `voice_turn_budget_seconds` | Wall-clock budget for one voice turn, from request ingress to the turn deadline (see [Voice pipeline](#voice-pipeline)). A synchronous specialist hand-off started mid-turn must finish within it, minus a ~5s reserve held back so Casa can still speak a fallback if the specialist runs long. Range 10-27; hard-capped at 27 regardless of this value. Default: `27`. |
-| `voice_route_freshness_seconds` | Grace period in which an authenticated, background-capable Home Assistant route may briefly disconnect while Gary still accepts specialist work. Set `0` to require a currently connected route. Range 0-300. Default: `60`. |
-| `voice_job_delivery_ttl_seconds` | Maximum time a completed background voice result is retained for delivery. A specialist may request a shorter privacy/result expiry; the shorter value wins. Range 30-3600. Default: `900`. |
-| `voice_job_route_cap` | Maximum active or ready specialist jobs held for one authenticated voice route. New work is refused at the cap; older work is never silently dropped. Range 1-20. Default: `5`. |
 | `specialist_max_concurrency` | Max specialist delegations in flight fleet-wide at once (see [Delegation limits](#delegation-limits)). Range 1-20. Default: `2`. |
 | `specialist_cost_alert_threshold` | Cumulative per-specialist USD spend past which Casa logs a warning on further delegations (see [Delegation limits](#delegation-limits)). Default: `5.0`. |
 
@@ -92,9 +84,8 @@ All endpoints are accessible through the ingress proxy.
 | `POST` | `/invoke/{agent}` | Synchronous agent invocation (returns response) |
 
 Webhook and invoke endpoints accept JSON bodies (capped at 64 KiB). Auth is
-**fail-closed**: `/invoke` is rejected with `403` when `webhook_auth_enabled` is
-off, and a webhook trigger whose secret is missing returns `401` rather than
-serving open.
+always on and **fail-closed**: a webhook trigger whose secret is missing
+returns `401` rather than serving open.
 
 **Per-trigger webhook auth.** Each webhook trigger declares an `auth` mode:
 
@@ -159,13 +150,12 @@ bundled plugins (manage those through the specialist's own upgrade/uninstall).
 
 Casa exposes two transports for Home Assistant voice / generic voice clients. The HA-side integration that consumes them ships separately in `casa-ha-integration` (phase 2.4).
 
-> **`webhook_auth_enabled` is required for voice.** Both transports below are
-> fail-closed: with no webhook secret configured, every voice request is
-> rejected with `401` — the same treatment as `/invoke` and `/telegram/update`.
-> This matters because the external API port can be published, and an unsigned
-> voice turn reaches an agent that can drive Home Assistant. The companion
-> integration signs every request and cannot be configured without a secret, so
-> a working voice setup already satisfies this.
+> **Voice is authenticated.** Both transports below are fail-closed: without a
+> webhook secret every voice request is rejected with `401` — the same
+> treatment as `/invoke` and `/telegram/update`. This matters because the
+> external API port can be published, and an unsigned voice turn reaches an
+> agent that can drive Home Assistant. Casa always has a secret, and the
+> companion integration signs every request.
 
 - `POST /api/converse` — Server-Sent Events, per-request. Body:
   `{"prompt", "agent_role", "scope_id", "context"}`. Stream: `event:
@@ -185,16 +175,15 @@ Casa exposes two transports for Home Assistant voice / generic voice clients. Th
 The companion Home Assistant integration discovers enabled residents through
 `GET /api/voice/agents`. The response contains `schema_version` 1 and only each
 enabled `ha_voice` resident's stable role and display name. The request is
-signed over an empty body with `X-Webhook-Signature`. Enable
-`webhook_auth_enabled` before using discovery; Casa then uses the optional
-`webhook_secret` override or the generated secret stored in
-`/data/webhook_secret`. When authentication is disabled, discovery **and both
-voice transports** return the same generic `401` response used for a missing or
-invalid signature — voice is fail-closed, so unsigned turns are never accepted.
+signed over an empty body with `X-Webhook-Signature`. Casa signs with the
+optional `webhook_secret` override or the generated secret stored in
+`/data/webhook_secret`. Discovery **and both voice transports** return the same
+generic `401` response for a missing or invalid signature — voice is
+fail-closed, so unsigned turns are never accepted.
 
 For Supervisor-based setup, Casa also publishes the authenticated endpoint to
 the companion integration through the `casa` discovery service. This requires
-Home Assistant Supervisor support and `webhook_auth_enabled`; Casa obtains its
+Home Assistant Supervisor support; Casa obtains its
 runtime hostname from Supervisor and refreshes the registration if the secret
 changes. The only local registration state is the returned UUID in
 `/data/casa-supervisor-discovery.json`; the webhook secret is never stored in
@@ -219,10 +208,9 @@ Toggle the transports via environment variables on the app:
 | `VOICE_IDLE_TIMEOUT_SECONDS` | (butler.session.idle_timeout, 300) | Session pool eviction timeout |
 
 A synchronous specialist delegation started mid-voice-turn (`delegate_to_agent`
-from the voice butler) is bounded by the `voice_turn_budget_seconds` app
-option (default 27) so it always leaves room for the voice transport's own
-30s timeout — the effective budget is hard-capped at 27 seconds no matter
-how high the option is set.
+from the voice butler) is bounded by a fixed 27-second turn budget, derived
+from the voice transport's own 30s timeout so a turn always has room to return
+before that timeout fires.
 
 ### Background specialist voice jobs
 
@@ -276,14 +264,11 @@ not cryptographically authenticate the server. The Casa-to-Home Assistant link
 is therefore plaintext and must remain on a trusted LAN/private network or
 travel through an encrypted, server-authenticated tunnel or reverse proxy.
 
-Tina normally uses an eager, role-scoped Home Assistant facade: Casa discovers
-the Assist tools at boot, keeps that upstream connection resident, and gives
-only Tina the ready-to-call proxy surface. Set `tina_ha_facade_enabled: false`
-to use the raw Home Assistant MCP server instead. If the eager facade cannot
-initialize, Casa still boots in the same degraded raw-fallback mode; other
-agents' raw Home Assistant access is unchanged. This switch is intended for
-diagnosis and rollback, so direct raw mode may reintroduce per-session tool
-discovery and higher voice latency.
+Tina uses an eager, role-scoped Home Assistant facade: Casa discovers the
+Assist tools at boot, keeps that upstream connection resident, and gives only
+Tina the ready-to-call proxy surface. If the eager facade cannot initialize,
+Casa still boots in a degraded raw-fallback mode; other agents' raw Home
+Assistant access is unchanged.
 
 Per-agent voice config (`butler.yaml`):
 

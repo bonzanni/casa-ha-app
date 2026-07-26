@@ -332,7 +332,17 @@ def test_setup_normalizes_blank_bashio_webhook_secret_before_generation():
     assert 'if [ "$USER_SECRET" = "null" ]; then' in secret_block
     assert 'USER_SECRET=""' in secret_block
     assert '[ "$(cat "$SECRET_FILE" 2>/dev/null)" = "null" ]' in secret_block
-    assert 'CASA_DISCOVERY_AUTH_ENABLED="$DISCOVERY_AUTH_ENABLED"' in script
+    # Sol review: a container killed mid-generation leaves a ZERO-BYTE secret
+    # file. `-f` would accept it forever; since v0.125.0 made auth mandatory
+    # that is an install nothing can authenticate against, so test for
+    # non-empty and stage the write so the real path is never empty.
+    assert '[ ! -s "$SECRET_FILE" ]' in secret_block
+    assert '[ ! -f "$SECRET_FILE" ]' not in secret_block
+    assert 'mv -f "$_secret_tmp" "$SECRET_FILE"' in secret_block
+    # v0.125.0 (#228): auth is mandatory, so the publisher is told "true"
+    # unconditionally rather than through a toggle-derived variable.
+    assert "CASA_DISCOVERY_AUTH_ENABLED=true" in script
+    assert "webhook_auth_enabled" not in secret_block
 
 
 def test_manifest_and_docs_declare_discovery_contract():

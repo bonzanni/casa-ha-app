@@ -538,8 +538,7 @@ def _make_post_inline_keyboard(
         # caps ⇒ entities None ⇒ the pre-v0.109 plain send, byte-identical.
         _text = body.get("text") or ""
         _extra: dict = {}
-        if not body.get("parse_mode") and getattr(
-                telegram_channel, "_rich_text_enabled", False):
+        if not body.get("parse_mode"):
             from channels.tg_richtext import render as _render
             _display, _entities = _render(_text)
             if _entities is not None:

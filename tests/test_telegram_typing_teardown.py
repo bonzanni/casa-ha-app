@@ -20,7 +20,7 @@ pytestmark = [pytest.mark.unit, pytest.mark.asyncio]
 
 async def test_turn_finished_cancels_typing_task():
     ch = TelegramChannel(
-        bot_token="t", chat_id="123", default_agent="a", delivery_mode="block",
+        bot_token="t", chat_id="123", default_agent="a",
     )
     ch._app = type("_App", (), {"bot": AsyncMock()})()
     ch._start_typing("123", "cid-1")
@@ -40,7 +40,7 @@ async def test_turn_finished_falls_back_to_default_chat():
     """A non-numeric context chat_id resolves to the channel default (mirrors
     send()/finalize_stream() via _resolve_chat_id)."""
     ch = TelegramChannel(
-        bot_token="t", chat_id="123", default_agent="a", delivery_mode="block",
+        bot_token="t", chat_id="123", default_agent="a",
     )
     ch._app = type("_App", (), {"bot": AsyncMock()})()
     ch._start_typing("123", "cid-1")

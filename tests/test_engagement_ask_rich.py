@@ -107,19 +107,6 @@ async def test_post_ask_body_rich_forwards_reply_markup_on_both_paths():
     assert "entities" not in bot2.send_message.await_args.kwargs
 
 
-async def test_post_ask_body_rich_killswitch_off_is_plain():
-    ch, bot = _mk_channel_with_fake_bot()
-    ch._rich_text_enabled = False
-    await ch.post_ask_body_rich(42, "**bold**")
-    kw = bot.send_message.await_args.kwargs
-    assert kw["text"] == "**bold**"
-    assert "entities" not in kw
-
-
-# ===========================================================================
-# Part (b) · post_options_keyboard renders the button-ask body rich
-# ===========================================================================
-
 def _fake_registry_with_topic(topic_id: int = 42):
     reg = MagicMock()
     reg.get = MagicMock(return_value=MagicMock(topic_id=topic_id))
@@ -358,16 +345,6 @@ async def test_edit_markup_not_modified_is_success():
     ok = await ch.edit_topic_message_markup(42, 999, "Deploy **prod**?", MARKUP_EMPTY)
     assert ok is True
     assert bot.edit_message_text.await_count == 1  # not-modified ⇒ no plain retry
-
-
-async def test_edit_markup_killswitch_off_is_plain():
-    from channels.output_sequencer import MARKUP_EMPTY
-    ch, bot = _mk_channel_with_fake_bot()
-    ch._rich_text_enabled = False
-    await ch.edit_topic_message_markup(42, 999, "Deploy **prod**?", MARKUP_EMPTY)
-    kw = bot.edit_message_text.await_args.kwargs
-    assert kw["text"] == "Deploy **prod**?"
-    assert "entities" not in kw
 
 
 async def test_multi_settle_via_edit_discrete_renders_rich():

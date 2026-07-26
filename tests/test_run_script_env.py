@@ -26,7 +26,6 @@ def _read_run_script() -> str:
     "TELEGRAM_BOT_TOKEN",
     "TELEGRAM_CHAT_ID",
     "TELEGRAM_TRANSPORT",
-    "TELEGRAM_DELIVERY_MODE",
     "TELEGRAM_ENGAGEMENT_SUPERGROUP_ID",  # v0.18.1 - was missing pre-fix
     "TELEGRAM_BOT_API_BASE",  # was missing pre-fix; option was dead in prod
 ])
@@ -72,60 +71,32 @@ def test_run_script_exports_telegram_bot_api_base_null_normalized():
     )
 
 
-def test_run_script_exports_sdk_client_pool():
-    """Finding 1 (v0.66.0 final-review): sdk_client_pool must be an
-    operator-reachable add-on option, not just an env var — the deploy
-    plan's rollback step depends on flipping it via add-on options. Guard:
-    svc-casa/run must read the option and export SDK_CLIENT_POOL so
-    sdk_client_pool.pool_enabled() sees it."""
+def test_run_script_never_exports_the_null_sentinel_as_webhook_secret():
+    """v0.125.0 (#228): auth is mandatory, so there is no toggle to gate the
+    export on — but the export must still not fire for an UNSET option.
+
+    `bashio::config` returns the literal string "null" for an unset optional,
+    and casa_core.py treats a non-empty WEBHOOK_SECRET as authoritative over
+    /data/webhook_secret. Exporting "null" would therefore make that literal
+    word the HMAC key while every signer used the generated secret file, and
+    nothing would verify. Guard: the export is conditional on a real value.
+    """
     script = _read_run_script()
-    assert "bashio::config 'sdk_client_pool'" in script, (
-        "svc-casa/run must read the sdk_client_pool add-on option"
+    assert "bashio::config.true 'webhook_auth_enabled'" not in script, (
+        "the webhook_auth_enabled toggle was removed in v0.125.0"
     )
-    assert 'export SDK_CLIENT_POOL="$(bashio::config \'sdk_client_pool\')"' in script, (
-        "Missing `export SDK_CLIENT_POOL=...` in svc-casa/run"
-    )
-
-
-def test_run_script_exports_tina_ha_facade_kill_switch_exactly():
-    script = _read_run_script()
-    export = (
-        'export TINA_HA_FACADE_ENABLED="$(bashio::config '
-        "'tina_ha_facade_enabled')\""
-    )
-    assert export in script
-    assert script.count(export) == 1
-
-
-@pytest.mark.parametrize(
-    ("option", "env_var"),
-    [
-        ("voice_route_freshness_seconds", "VOICE_ROUTE_FRESHNESS_SECONDS"),
-        ("voice_job_delivery_ttl_seconds", "VOICE_JOB_DELIVERY_TTL_SECONDS"),
-        ("voice_job_route_cap", "VOICE_JOB_ROUTE_CAP"),
-    ],
-)
-def test_run_script_exports_voice_delivery_options_exactly_once(option, env_var):
-    script = _read_run_script()
-    export = f'export {env_var}="$(bashio::config \'{option}\')"'
-    assert export in script
-    assert script.count(export) == 1
-
-
-def test_run_script_gates_webhook_secret_on_auth_enabled():
-    """webhook_auth_enabled=false must actually disable webhook auth, even
-    when webhook_secret still holds a configured value. Prior to the fix,
-    WEBHOOK_SECRET was exported unconditionally, so the toggle had no
-    effect once a secret was set. Guard: the export must live inside a
-    `webhook_auth_enabled` conditional."""
-    script = _read_run_script()
-    assert "bashio::config.true 'webhook_auth_enabled'" in script, (
-        "svc-casa/run must gate WEBHOOK_SECRET export on webhook_auth_enabled"
-    )
-    start = script.index("bashio::config.true 'webhook_auth_enabled'")
+    assert '_webhook_secret="$(bashio::config \'webhook_secret\')"' in script
+    start = script.index('_webhook_secret="$(bashio::config')
     block = script[start:script.index("\nfi", start)]
-    assert 'export WEBHOOK_SECRET="$(bashio::config \'webhook_secret\')"' in block, (
-        "WEBHOOK_SECRET export must be inside the webhook_auth_enabled conditional"
+    assert '[ "$_webhook_secret" != "null" ]' in block, (
+        'the "null" sentinel must never be exported as the secret'
+    )
+    assert 'export WEBHOOK_SECRET="$_webhook_secret"' in block
+    # Sol review: `with-contenv` imports the container environment, so an
+    # inherited WEBHOOK_SECRET would outrank /data/webhook_secret in casa_core
+    # while every signer still used the file. The option is the only override.
+    assert script.index("unset WEBHOOK_SECRET") < start, (
+        "inherited WEBHOOK_SECRET must be cleared before reading the option"
     )
 
 

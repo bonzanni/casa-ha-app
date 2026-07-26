@@ -18,13 +18,6 @@ pytestmark = pytest.mark.unit
 
 _SYSTEM_SPEAKER = SpeakerProvenance(speaker_kind="system")
 
-_ENV_KEYS = (
-    "VOICE_ROUTE_FRESHNESS_SECONDS",
-    "VOICE_JOB_DELIVERY_TTL_SECONDS",
-    "VOICE_JOB_ROUTE_CAP",
-)
-
-
 def _load_config_module():
     try:
         return importlib.import_module("voice_delivery_config")
@@ -33,13 +26,17 @@ def _load_config_module():
 
 
 def _clear_config(monkeypatch):
-    for key in _ENV_KEYS:
+    """v0.125.0 (#228): kept so the boot-event test still proves the log line
+    carries no operator data — the env vars themselves are gone."""
+    for key in (
+        "VOICE_ROUTE_FRESHNESS_SECONDS",
+        "VOICE_JOB_DELIVERY_TTL_SECONDS",
+        "VOICE_JOB_ROUTE_CAP",
+    ):
         monkeypatch.delenv(key, raising=False)
 
 
-def test_voice_delivery_config_defaults(monkeypatch):
-    _clear_config(monkeypatch)
-
+def test_voice_delivery_config_is_constant():
     config = _load_config_module().load_voice_delivery_config()
 
     assert config.route_freshness_s == 60
@@ -47,33 +44,19 @@ def test_voice_delivery_config_defaults(monkeypatch):
     assert config.route_cap == 5
 
 
-@pytest.mark.parametrize(
-    ("values", "expected"),
-    [
-        (("-1", "29", "0"), (0, 30, 1)),
-        (("301", "3601", "21"), (300, 3600, 20)),
-        (("0", "30", "1"), (0, 30, 1)),
-        (("300", "3600", "20"), (300, 3600, 20)),
-    ],
-)
-def test_voice_delivery_config_clamps_to_operator_rails(
-    monkeypatch, values, expected,
-):
-    for key, value in zip(_ENV_KEYS, values, strict=True):
+def test_env_cannot_override_the_delivery_constants(monkeypatch):
+    """Regression guard for #228: these were operator options read from env.
+
+    A stale env var on an upgraded install must not resurrect them — the
+    clamping rails that used to bound the option values are gone with it, so
+    an honoured override would have nothing bounding it.
+    """
+    for key, value in (
+        ("VOICE_ROUTE_FRESHNESS_SECONDS", "301"),
+        ("VOICE_JOB_DELIVERY_TTL_SECONDS", "3601"),
+        ("VOICE_JOB_ROUTE_CAP", "21"),
+    ):
         monkeypatch.setenv(key, value)
-
-    config = _load_config_module().load_voice_delivery_config()
-
-    assert (
-        config.route_freshness_s,
-        config.delivery_ttl_s,
-        config.route_cap,
-    ) == expected
-
-
-def test_voice_delivery_config_non_numeric_values_use_defaults(monkeypatch):
-    for key in _ENV_KEYS:
-        monkeypatch.setenv(key, "not-a-number")
 
     config = _load_config_module().load_voice_delivery_config()
 
@@ -126,39 +109,49 @@ def test_boot_wires_one_config_snapshot_into_all_voice_delivery_consumers():
     assert "voice_job_route_cap=voice_delivery_config.route_cap" in source
 
 
-def test_addon_declares_exact_voice_delivery_options_and_schema():
-    config_path = (
-        Path(__file__).resolve().parent.parent / "casa-agent" / "config.yaml"
-    )
-    addon = yaml.safe_load(config_path.read_text(encoding="utf-8"))
+def test_addon_no_longer_declares_the_voice_delivery_options():
+    """v0.125.0 (#228): removed from options, schema AND translations.
 
-    assert {
-        "voice_route_freshness_seconds": 60,
-        "voice_job_delivery_ttl_seconds": 900,
-        "voice_job_route_cap": 5,
-    }.items() <= addon["options"].items()
-    assert {
-        "voice_route_freshness_seconds": "int(0,300)?",
-        "voice_job_delivery_ttl_seconds": "int(30,3600)?",
-        "voice_job_route_cap": "int(1,20)?",
-    }.items() <= addon["schema"].items()
-
-
-def test_voice_delivery_options_have_english_translations():
-    translations_path = (
-        Path(__file__).resolve().parent.parent
-        / "casa-agent" / "translations" / "en.yaml"
-    )
-    translations = yaml.safe_load(translations_path.read_text(encoding="utf-8"))
+    Guards all three together because a half-removal is the failure mode: an
+    orphan schema entry makes Home Assistant render a control that changes
+    nothing, and an orphan translation is invisible until someone re-adds the
+    key and gets stale help text.
+    """
+    root = Path(__file__).resolve().parent.parent / "casa-agent"
+    addon = yaml.safe_load((root / "config.yaml").read_text(encoding="utf-8"))
+    translations = yaml.safe_load(
+        (root / "translations" / "en.yaml").read_text(encoding="utf-8"))
 
     for option in (
+        "voice_turn_budget_seconds",
         "voice_route_freshness_seconds",
         "voice_job_delivery_ttl_seconds",
         "voice_job_route_cap",
     ):
-        entry = translations["configuration"][option]
-        assert entry["name"]
-        assert entry["description"]
+        assert option not in addon["options"]
+        assert option not in addon["schema"]
+        assert option not in translations["configuration"]
+
+
+def test_removed_options_are_pruned_from_stored_config_on_boot():
+    """Every key removed here must be pruned, or Home Assistant logs
+    "Option '<key>' does not exist in the schema" on every boot of an
+    upgraded install (the rule stated in config.yaml itself)."""
+    setup = (
+        Path(__file__).resolve().parent.parent / "casa-agent" / "rootfs"
+        / "etc" / "s6-overlay" / "scripts" / "setup-configs.sh"
+    ).read_text(encoding="utf-8")
+    line = next(
+        l for l in setup.splitlines() if l.startswith("DEPRECATED_OPTION_KEYS=")
+    )
+
+    for option in (
+        "telegram_delivery_mode", "telegram_rich_text", "webhook_auth_enabled",
+        "sdk_client_pool", "tina_ha_facade_enabled",
+        "voice_turn_budget_seconds", "voice_route_freshness_seconds",
+        "voice_job_delivery_ttl_seconds", "voice_job_route_cap",
+    ):
+        assert option in line
 
 
 def _accepted_job(

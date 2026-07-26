@@ -234,12 +234,6 @@ def _env_int(name: str, default: int, *, min_value: int = 1) -> int:
     return max(value, min_value)
 
 
-def pool_enabled() -> bool:
-    return os.environ.get("SDK_CLIENT_POOL", "on").strip().lower() not in (
-        "off", "0", "false",
-    )
-
-
 class PoolTurnResult(NamedTuple):
     sid: str | None
     resume_sid: str | None

@@ -396,15 +396,6 @@ async def test_webhook_uuid_turn_bypasses_pool(agent_fixture, scripted_factory):
     assert agent._pool.stats()["entries"] == 0
 
 
-async def test_kill_switch_disables_pool(agent_fixture, scripted_factory,
-                                         monkeypatch):
-    monkeypatch.setenv("SDK_CLIENT_POOL", "off")
-    agent, send_turn = agent_fixture
-    await send_turn("a")
-    await send_turn("b")
-    assert scripted_factory.constructed == 2
-
-
 async def test_new_reset_listener_closes_warm_entry(agent_fixture,
                                                     scripted_factory):
     agent, send_turn = agent_fixture

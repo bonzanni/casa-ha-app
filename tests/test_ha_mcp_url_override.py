@@ -48,26 +48,6 @@ def _run_python_resolver(
     )
 
 
-def test_tina_facade_option_defaults_on_with_optional_bool_schema_and_copy():
-    root = Path(__file__).resolve().parents[1]
-    config = yaml.safe_load(
-        (root / "casa-agent/config.yaml").read_text(encoding="utf-8"),
-    )
-    translation = yaml.safe_load(
-        (root / "casa-agent/translations/en.yaml").read_text(encoding="utf-8"),
-    )
-
-    # Version presence/shape only — pinning a literal here breaks every
-    # release bump (it broke v0.87.0's master QA).
-    import re
-    assert re.fullmatch(r"\d+\.\d+\.\d+", config["version"])
-    assert config["options"]["tina_ha_facade_enabled"] is True
-    assert config["schema"]["tina_ha_facade_enabled"] == "bool?"
-    copy = translation["configuration"]["tina_ha_facade_enabled"]
-    assert copy["name"]
-    assert "fallback" in copy["description"].lower()
-
-
 def test_ha_mock_e2e_pins_eager_facade_contract():
     script = HA_E2E_SCRIPT.read_text(encoding="utf-8")
 
@@ -261,7 +241,6 @@ async def test_start_tina_facade_uses_supervisor_auth_and_butler_override(
         {},
         ha_mcp_url="http://raw",
         supervisor_token="secret-token",
-        env={},
     )
 
     assert facade is recording_facade.instances[0]
@@ -292,7 +271,6 @@ async def test_tina_facade_callback_uses_current_agents_and_refreshed_config(
         agents,
         ha_mcp_url="http://raw",
         supervisor_token="secret-token",
-        env={},
     )
 
     class ObservingAgent:
@@ -322,40 +300,6 @@ async def test_tina_facade_callback_uses_current_agents_and_refreshed_config(
     )["homeassistant"]["url"] == "http://raw"
 
 
-async def test_tina_facade_false_kill_switch_logs_once_without_secrets(
-    recording_facade, caplog,
-):
-    from casa_core import _start_tina_ha_facade
-    from mcp_registry import McpServerRegistry
-
-    registry = McpServerRegistry()
-    registry.register_http("homeassistant", "http://private-ha")
-
-    with caplog.at_level(logging.INFO):
-        facade = await _start_tina_ha_facade(
-            registry,
-            {"butler": SimpleNamespace(channels=["ha_voice"])},
-            {},
-            ha_mcp_url="http://private-ha",
-            supervisor_token="private-token",
-            env={"TINA_HA_FACADE_ENABLED": "false"},
-        )
-
-    assert facade is None
-    assert recording_facade.instances == []
-    assert [
-        record.getMessage() for record in caplog.records
-        if "ha_facade" in record.getMessage()
-    ] == ["ha_facade_disabled"]
-    assert "private-token" not in caplog.text
-    assert "private-ha" not in caplog.text
-    assert "authorization" not in caplog.text.lower()
-    assert "headers" not in caplog.text.lower()
-    assert registry.resolve(
-        ["homeassistant"], role="butler",
-    )["homeassistant"]["url"] == "http://private-ha"
-
-
 @pytest.mark.parametrize(
     ("supervisor_token", "role_configs"),
     [
@@ -380,7 +324,6 @@ async def test_tina_facade_requires_token_and_ha_voice_butler(
         {},
         ha_mcp_url="http://raw",
         supervisor_token=supervisor_token,
-        env={},
     )
 
     assert facade is None
@@ -409,7 +352,6 @@ async def test_tina_facade_initial_discovery_failure_is_sanitized_degraded(
             {},
             ha_mcp_url="http://private-ha",
             supervisor_token="private-token",
-            env={},
         )
 
     assert facade is None

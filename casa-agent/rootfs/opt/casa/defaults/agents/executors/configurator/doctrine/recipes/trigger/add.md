@@ -67,8 +67,9 @@ Five fields: minute hour day month day_of_week. "0 7 * * 1-5" = 7:00 on weekdays
 - **Auth is per-trigger and fail-closed** (spec A1). Pick the mode that fits the
   caller:
   - `hmac_body` (default) — caller sends `X-Webhook-Signature` = HMAC-SHA256 hex
-    of the body, using the global `webhook_secret`. Requires
-    `webhook_auth_enabled` on, else the trigger is refused.
+    of the body, using the global webhook secret. That secret always exists
+    (Casa generates one at `/data/webhook_secret` when the operator sets no
+    override), so this mode is always available.
   - `static_header` — caller sends a shared secret in a header (default
     `X-API-Key`). For services that can only send static headers (many SaaS
     webhooks). The secret is auto-generated at `/data/webhook_secrets/<name>`;
