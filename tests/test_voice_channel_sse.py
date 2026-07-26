@@ -151,7 +151,7 @@ async def agent_error_voice_app(tmp_path):
 
     bus = MessageBus()
 
-    cfg = AgentConfig(role_artifact=STUB_ROLE_ARTIFACT, 
+    cfg = AgentConfig(role_artifact=STUB_ROLE_ARTIFACT,
         role="butler",
         model="claude-haiku-4-5",
         system_prompt="Butler.",

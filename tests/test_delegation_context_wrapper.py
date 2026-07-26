@@ -18,7 +18,7 @@ pytestmark = pytest.mark.asyncio
 
 
 def _make_cfg(role: str, name: str) -> AgentConfig:
-    return AgentConfig(role_artifact=STUB_ROLE_ARTIFACT, 
+    return AgentConfig(role_artifact=STUB_ROLE_ARTIFACT,
         role=role, model="x",
         character=CharacterConfig(name=name),
         system_prompt="x",

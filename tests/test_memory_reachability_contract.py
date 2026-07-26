@@ -113,7 +113,7 @@ class _CaptureClient:
 
 
 def _agent(tmp_path, role: str, *, seed_resumed: str | None = None) -> tuple[Agent, _CaptureSem]:
-    cfg = AgentConfig(role_artifact=STUB_ROLE_ARTIFACT, 
+    cfg = AgentConfig(role_artifact=STUB_ROLE_ARTIFACT,
         role=role,
         model="claude-sonnet-4-6",
         system_prompt=f"You are {role}.",

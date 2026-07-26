@@ -751,7 +751,7 @@ class TestDrainedReanchorUnit:
     # -- (e) accepted-send-then-raises → no second send -----------------------
 
     async def test_accepted_send_then_raises_no_second_send(self, tmp_path):
-        reg, rec, n, wire, drv, seq = await self._setup(tmp_path, )
+        reg, rec, n, wire, drv, seq = await self._setup(tmp_path)
         wire.send_raises = True
 
         ok = await drv._reanchor_pass(rec)

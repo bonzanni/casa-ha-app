@@ -28,7 +28,7 @@ pytestmark = [pytest.mark.unit]
 
 
 def _construct(tmp_path, **cfg_kw) -> None:
-    cfg = AgentConfig(role_artifact=STUB_ROLE_ARTIFACT, 
+    cfg = AgentConfig(role_artifact=STUB_ROLE_ARTIFACT,
         role=cfg_kw.get("role", "assistant"),
         model=cfg_kw.get("model", "claude-sonnet-4-6"),
         enabled=cfg_kw.get("enabled", True),

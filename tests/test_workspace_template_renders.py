@@ -41,7 +41,7 @@ def executor_defaults(tmp_path: Path) -> Path:
 def _defn(exec_type="test-fixture", tools_allowed=("Read",),
           permission_mode="acceptEdits"):
     from config import ExecutorDefinition
-    return ExecutorDefinition(role_artifact=STUB_ROLE_ARTIFACT, 
+    return ExecutorDefinition(role_artifact=STUB_ROLE_ARTIFACT,
         type=exec_type,
         description="test fixture twenty-character description here",
         model="sonnet",
@@ -139,7 +139,7 @@ def test_template_path_handles_bundled_plugin_developer(tmp_path):
     raw_defn = yaml.safe_load((plugin_dev_dir / "definition.yaml").read_text(encoding="utf-8"))
     raw_hooks = yaml.safe_load((plugin_dev_dir / "hooks.yaml").read_text(encoding="utf-8")) or {}
     tools = raw_defn.get("tools") or {}
-    defn = ExecutorDefinition(role_artifact=STUB_ROLE_ARTIFACT, 
+    defn = ExecutorDefinition(role_artifact=STUB_ROLE_ARTIFACT,
         type=raw_defn["type"], description=raw_defn["description"],
         model="sonnet", driver=raw_defn["driver"],
         tools_allowed=list(tools.get("allowed", [])),

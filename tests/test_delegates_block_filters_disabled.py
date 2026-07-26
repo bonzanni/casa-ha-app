@@ -24,7 +24,7 @@ pytestmark = [pytest.mark.unit]
 
 
 def _cfg(role: str, name: str, *, delegates=None) -> AgentConfig:
-    return AgentConfig(role_artifact=STUB_ROLE_ARTIFACT, 
+    return AgentConfig(role_artifact=STUB_ROLE_ARTIFACT,
         role=role,
         model="x",
         character=CharacterConfig(name=name),

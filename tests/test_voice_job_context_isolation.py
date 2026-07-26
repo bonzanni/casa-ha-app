@@ -94,7 +94,7 @@ async def test_voice_job_completion_never_reenters_gary(
     caller.delegates = [
         DelegateEntry(agent="judge", purpose="rules", when="rules question"),
     ]
-    judge = AgentConfig(role_artifact=STUB_ROLE_ARTIFACT, 
+    judge = AgentConfig(role_artifact=STUB_ROLE_ARTIFACT,
         role="judge",
         character=CharacterConfig(name="Judge"),
         model="claude-sonnet-4-6",

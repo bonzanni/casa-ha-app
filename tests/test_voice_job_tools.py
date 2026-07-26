@@ -53,7 +53,7 @@ def _caller_cfg() -> AgentConfig:
 
 
 def _specialist_cfg(role: str, display_name: str) -> AgentConfig:
-    return AgentConfig(role_artifact=STUB_ROLE_ARTIFACT, 
+    return AgentConfig(role_artifact=STUB_ROLE_ARTIFACT,
         role=role,
         character=CharacterConfig(name=display_name),
         model="claude-sonnet-4-6",

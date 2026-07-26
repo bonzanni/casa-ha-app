@@ -110,7 +110,7 @@ def _specialist_cfg(role: str = "finance", token_budget: int = 4000):
     from config import (
         AgentConfig, CharacterConfig, MemoryConfig, SessionConfig, ToolsConfig,
     )
-    return AgentConfig(role_artifact=STUB_ROLE_ARTIFACT, 
+    return AgentConfig(role_artifact=STUB_ROLE_ARTIFACT,
         role=role,
         model="claude-sonnet-4-6",
         system_prompt=f"You are {role}",

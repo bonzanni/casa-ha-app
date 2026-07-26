@@ -452,8 +452,13 @@ class InstalledSpecialistIndex:
                 active, desired = instance_dir.active(), instance_dir.desired()
                 if active is None and desired is None:
                     continue
+                # Two states only: the both-None case `continue`d above, so
+                # there is no third arm to reach here. `InstanceState` keeps its
+                # "error" member — a FAILED upgrade constructs one directly
+                # (specialist_install.py), and that is a transient result state,
+                # not something this directory scan can reconstruct from disk.
                 state: InstanceState = (
-                    "active" if active is not None else "pending-configuration" if desired is not None else "error"
+                    "active" if active is not None else "pending-configuration"
                 )
                 instances[slug] = SpecialistInstance(
                     slug=slug, stable_agent_id=f"specialist:{slug}", state=state,

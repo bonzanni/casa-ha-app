@@ -78,7 +78,7 @@ def test_executor_entry_dataclass_fields():
 
 def test_agent_config_has_executors_field():
     from config import AgentConfig
-    cfg = AgentConfig(role_artifact=STUB_ROLE_ARTIFACT, )
+    cfg = AgentConfig(role_artifact=STUB_ROLE_ARTIFACT)
     assert cfg.executors == []
 
 

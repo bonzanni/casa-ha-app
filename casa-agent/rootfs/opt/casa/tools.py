@@ -21,6 +21,10 @@ from typing import TYPE_CHECKING, Any, Awaitable
 
 if TYPE_CHECKING:
     from trigger_registry import TriggerRegistry
+    # #205: type-only — _recall_surface's return feeds delegated_recall(surface=),
+    # which is typed Surface. Kept behind TYPE_CHECKING so annotating it adds no
+    # runtime import edge (tools.py already reaches recall_renderer lazily).
+    from recall_renderer import Surface
 
 from executor_registry import ExecutorRegistry
 from plugin_env_conf import set_entry as _set_env_entry  # noqa: F401 — available for future use
@@ -4178,7 +4182,7 @@ async def continue_voice_job(args: dict) -> dict:
 # ---------------------------------------------------------------------------
 
 
-def _recall_surface(channel: str, origin: dict) -> str:
+def _recall_surface(channel: str, origin: dict) -> "Surface":
     """Attribution surface for a recall render (Task 11): voice speaks aloud;
     an untrusted webhook_trigger turn is ``restricted_webhook`` (never names a
     person, regardless of clearance); everything else is ``text``."""

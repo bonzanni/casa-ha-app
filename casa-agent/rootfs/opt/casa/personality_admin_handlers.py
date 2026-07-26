@@ -15,7 +15,6 @@ TTY + typed ``SHOW`` gate lives in ``casactl`` itself, one layer up.
 from __future__ import annotations
 
 import asyncio
-from pathlib import Path
 
 from aiohttp import web
 
@@ -54,7 +53,6 @@ def register_personality_admin_routes(
     app: "web.Application",
     *,
     runtime,
-    persona_roots: tuple[Path, ...] = (Path("/config/personas"), Path("/opt/casa/defaults/personas")),
 ) -> None:
     async def _inspect(request: "web.Request") -> "web.Response":
         body = await request.json()

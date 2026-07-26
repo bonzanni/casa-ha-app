@@ -187,7 +187,7 @@ async def test_resident_specialist_and_executor_options_use_verified_cli(
     )
     monkeypatch.setattr(tools_mod, "_mcp_registry", None)
 
-    cfg = AgentConfig(role_artifact=STUB_ROLE_ARTIFACT, 
+    cfg = AgentConfig(role_artifact=STUB_ROLE_ARTIFACT,
         role="butler",
         model="claude-haiku-4-5",
         system_prompt="You are Tina.",

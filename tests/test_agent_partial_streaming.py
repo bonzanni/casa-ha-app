@@ -210,7 +210,7 @@ def patch_retry_sleep():
 
 
 def _make_agent(tmp_path, role: str = "butler") -> Agent:
-    cfg = AgentConfig(role_artifact=STUB_ROLE_ARTIFACT, 
+    cfg = AgentConfig(role_artifact=STUB_ROLE_ARTIFACT,
         role=role,
         model="claude-sonnet-4-6",
         system_prompt="You are helpful.",
