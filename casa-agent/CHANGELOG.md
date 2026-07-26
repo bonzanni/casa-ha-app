@@ -1,5 +1,35 @@
 # Changelog
 
+## [0.126.0] - 2026-07-26
+
+### Fixed
+
+- Clearing the "Primary agent model" or "Voice agent model" field in the add-on
+  configuration no longer stops Casa from starting. Both fields are optional, so
+  emptying one leaves it unset — and Casa was passing the resulting placeholder
+  through as if it were a model name, which every agent then rejected as invalid
+  on startup. A cleared field now falls back to its default (Opus and Haiku
+  respectively), the same way the configuration validator already did. If you
+  ever cleared one of these fields and the add-on would not boot, this was why
+  (#205).
+
+### Added
+
+- Executors (the Configurator and Plugin Developer) now refuse to start if their
+  editable definition file names a different model than Casa's built-in
+  definition for that executor. The definition file is the one an agent can edit
+  on your behalf, and its model setting was the value actually used — so an
+  incorrect edit could quietly run an executor on a model it was never meant to
+  use, at a different cost and capability. Casa already guarded that file's tool
+  permissions this way; the model setting now gets the same treatment. A
+  mismatch disables only the affected executor and is reported in the log (#205).
+
+### Changed
+
+- A specialist's long-term memory lookups are now tracked separately from other
+  memory lookups, so a memory problem affecting one is easier to identify and no
+  longer counts against the others' failure budget (#205).
+
 ## [0.125.2] - 2026-07-26
 
 ### Fixed
