@@ -22,7 +22,7 @@ import pytest
 import pytest_asyncio
 
 # Ensure the Casa package root is importable.
-_casa_root = str(Path(__file__).resolve().parent.parent / "casa-agent" / "rootfs" / "opt" / "casa")
+_casa_root = str(Path(__file__).resolve().parent.parent / "casa" / "rootfs" / "opt" / "casa")
 if _casa_root not in sys.path:
     sys.path.insert(0, _casa_root)
 

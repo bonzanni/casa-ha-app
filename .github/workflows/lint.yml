@@ -9,7 +9,7 @@ on:
 
 jobs:
   addon-linter:
-    name: App lint (casa-agent)
+    name: App lint (casa)
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v7
@@ -17,4 +17,4 @@ jobs:
       - name: Run Home Assistant app lint
         uses: frenck/action-addon-linter@v2.21
         with:
-          path: "./casa-agent"
+          path: "./casa"

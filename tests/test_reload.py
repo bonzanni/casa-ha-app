@@ -385,7 +385,7 @@ class TestReloadAgent:
         adds/evicts path) provisioned the agent-home; the granular
         per-role scope skipped it, and the first ``delegate_to_agent``
         failed with ``Working directory does not exist:
-        /addon_configs/casa-agent/agent-home/<role>``. The fix moves
+        /addon_configs/casa/agent-home/<role>``. The fix moves
         provisioning into ``_construct_agent`` so it fires regardless of
         which scope triggered the construction.
         """

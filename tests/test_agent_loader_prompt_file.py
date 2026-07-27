@@ -12,7 +12,7 @@ import pytest
 
 def _load_schema(name: str) -> dict:
     root = Path(__file__).resolve().parent.parent
-    path = root / "casa-agent/rootfs/opt/casa/defaults/schema" / f"{name}.v1.json"
+    path = root / "casa/rootfs/opt/casa/defaults/schema" / f"{name}.v1.json"
     return json.loads(path.read_text(encoding="utf-8"))
 
 

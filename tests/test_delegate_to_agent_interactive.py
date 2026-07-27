@@ -24,7 +24,7 @@ def _make_assistant_cfg():
     """Caller cfg declaring `finance` as a delegate (spec A1 ACL fixture).
 
     Mirrors the assistant's real `delegates.yaml`, which declares finance —
-    see `casa-agent/rootfs/opt/casa/defaults/agents/assistant/delegates.yaml`.
+    see `casa/rootfs/opt/casa/defaults/agents/assistant/delegates.yaml`.
     """
     cfg = AgentConfig(role_artifact=STUB_ROLE_ARTIFACT, role="assistant")
     cfg.delegates = [DelegateEntry(agent="finance", purpose="p", when="w")]

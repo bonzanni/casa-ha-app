@@ -25,7 +25,7 @@ from verdict_broker import VerdictBroker
 pytestmark = pytest.mark.asyncio
 
 REPO = Path(__file__).resolve().parents[1]
-CASA = REPO / "casa-agent" / "rootfs" / "opt" / "casa"
+CASA = REPO / "casa" / "rootfs" / "opt" / "casa"
 AGENTS = CASA / "defaults" / "agents"
 ASK_TOOL = "mcp__casa-framework__ask_user"
 

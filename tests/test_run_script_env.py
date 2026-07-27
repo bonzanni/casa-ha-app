@@ -16,7 +16,7 @@ pytestmark = pytest.mark.unit
 def _read_run_script() -> str:
     p = (
         Path(__file__).resolve().parent.parent
-        / "casa-agent" / "rootfs" / "etc" / "s6-overlay"
+        / "casa" / "rootfs" / "etc" / "s6-overlay"
         / "s6-rc.d" / "svc-casa" / "run"
     )
     return p.read_text(encoding="utf-8")
@@ -140,7 +140,7 @@ def test_svc_casa_mcp_run_script_execs_venv_python():
     """Symmetric guard for the other long-run Python service."""
     p = (
         Path(__file__).resolve().parent.parent
-        / "casa-agent" / "rootfs" / "etc" / "s6-overlay"
+        / "casa" / "rootfs" / "etc" / "s6-overlay"
         / "s6-rc.d" / "svc-casa-mcp" / "run"
     )
     script = p.read_text(encoding="utf-8")
@@ -192,7 +192,7 @@ def test_setup_configs_and_run_script_agree_on_model_fallbacks():
     """
     setup = (
         Path(__file__).resolve().parent.parent
-        / "casa-agent" / "rootfs" / "etc" / "s6-overlay"
+        / "casa" / "rootfs" / "etc" / "s6-overlay"
         / "scripts" / "setup-configs.sh"
     ).read_text(encoding="utf-8")
     run = _read_run_script()

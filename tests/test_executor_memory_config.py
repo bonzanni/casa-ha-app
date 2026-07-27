@@ -17,7 +17,7 @@ except ImportError:
 
 
 _SCHEMA_PATH = os.path.join(
-    os.path.dirname(__file__), "..", "casa-agent", "rootfs", "opt", "casa",
+    os.path.dirname(__file__), "..", "casa", "rootfs", "opt", "casa",
     "defaults", "schema", "executor.v1.json",
 )
 

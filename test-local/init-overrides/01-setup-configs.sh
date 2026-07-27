@@ -1,6 +1,6 @@
 #!/bin/sh
 # Test override: reads options.json directly instead of bashio.
-# Structurally mirrors casa-agent/rootfs/etc/s6-overlay/scripts/setup-configs.sh.
+# Structurally mirrors casa/rootfs/etc/s6-overlay/scripts/setup-configs.sh.
 CONFIG_DIR="/config"
 DATA_DIR="/data"
 DEFAULTS_DIR="/opt/casa/defaults"
@@ -90,8 +90,8 @@ if ! command -v git >/dev/null 2>&1; then
 elif [ ! -d "$CONFIG_DIR/.git" ]; then
     cd "$CONFIG_DIR"
     git init -q
-    git config user.email "casa-agent@local"
-    git config user.name  "Casa Agent"
+    git config user.email "casa@local"
+    git config user.name  "Casa"
     cat > .gitignore <<'EOF'
 # Track configs only.
 *

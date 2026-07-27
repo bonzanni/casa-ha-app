@@ -17,14 +17,14 @@ import pytest
 def _butler_md_path() -> Path:
     root = Path(__file__).resolve().parent.parent
     return root / (
-        "casa-agent/rootfs/opt/casa/defaults/agents/butler/prompts/system.md"
+        "casa/rootfs/opt/casa/defaults/agents/butler/prompts/system.md"
     )
 
 
 def _resident_ha_doctrine_path() -> Path:
     root = Path(__file__).resolve().parent.parent
     return root / (
-        "casa-agent/rootfs/opt/casa/defaults/agents/executors/"
+        "casa/rootfs/opt/casa/defaults/agents/executors/"
         "configurator/doctrine/recipes/resident/grant_ha_tools.md"
     )
 
@@ -92,7 +92,7 @@ def test_butler_runtime_disallows_subagent_spawn():
     import yaml
 
     root = Path(__file__).resolve().parent.parent
-    rt = root / "casa-agent/rootfs/opt/casa/defaults/agents/butler/runtime.yaml"
+    rt = root / "casa/rootfs/opt/casa/defaults/agents/butler/runtime.yaml"
     data = yaml.safe_load(rt.read_text(encoding="utf-8"))
     disallowed = data["tools"]["disallowed"]
     assert "Agent" in disallowed and "Task" in disallowed

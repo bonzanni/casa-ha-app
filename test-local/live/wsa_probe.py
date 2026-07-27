@@ -2,8 +2,8 @@
 
 Runs INSIDE the casa container (like audit/live_invariant_audit.py):
 
-    docker cp wsa_probe.py addon_<slug>_casa-agent:/tmp/wsa_probe.py
-    docker exec addon_<slug>_casa-agent python3 /tmp/wsa_probe.py <cmd> ...
+    docker cp wsa_probe.py addon_<slug>_casa:/tmp/wsa_probe.py
+    docker exec addon_<slug>_casa python3 /tmp/wsa_probe.py <cmd> ...
 
 Every command takes the agent role / target / scope as PARAMETERS so the same
 probe re-runs unchanged against any future agent (a new voice resident, an MTG

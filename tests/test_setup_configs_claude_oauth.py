@@ -26,7 +26,7 @@ import pytest
 pytestmark = pytest.mark.unit
 
 
-SETUP_CONFIGS = Path("casa-agent/rootfs/etc/s6-overlay/scripts/setup-configs.sh")
+SETUP_CONFIGS = Path("casa/rootfs/etc/s6-overlay/scripts/setup-configs.sh")
 
 
 def _extract_oauth_block() -> str:
@@ -186,7 +186,7 @@ def test_run_template_does_not_unset_claude_oauth_token() -> None:
     in its `unset` list — otherwise K-1 is reintroduced.
     """
     template = Path(
-        "casa-agent/rootfs/opt/casa/scripts/engagement_run_template.sh"
+        "casa/rootfs/opt/casa/scripts/engagement_run_template.sh"
     ).read_text(encoding="utf-8")
     # Find the unset line; assert OAuth token is not on it.
     for line in template.splitlines():

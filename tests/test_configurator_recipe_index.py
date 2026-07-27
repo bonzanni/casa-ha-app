@@ -14,7 +14,7 @@ from pathlib import Path
 REPO_ROOT = Path(__file__).resolve().parents[1]
 CONFIGURATOR = (
     REPO_ROOT
-    / "casa-agent/rootfs/opt/casa/defaults/agents/executors/configurator"
+    / "casa/rootfs/opt/casa/defaults/agents/executors/configurator"
 )
 RECIPES_DIR = CONFIGURATOR / "doctrine/recipes"
 PROMPT = CONFIGURATOR / "prompt.md"

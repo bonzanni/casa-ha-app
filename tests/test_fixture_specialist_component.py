@@ -28,7 +28,7 @@ _COMPONENT = _FIXTURES / "specialist-components" / "mtg-test"
 _PERSONA = _FIXTURES / "personas" / "alt-butler-tina"
 _BUNDLED_COMPONENT = _FIXTURES / "specialist-components" / "bundletest"
 _BUTLER_ROLE_DIR = (
-    _REPO_ROOT / "casa-agent/rootfs/opt/casa/defaults/roles/resident/butler"
+    _REPO_ROOT / "casa/rootfs/opt/casa/defaults/roles/resident/butler"
 )
 
 

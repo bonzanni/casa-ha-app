@@ -317,14 +317,14 @@ async def test_enabled_auth_with_unreadable_secret_retains_discovery_state(paths
 
 
 def test_setup_wires_discovery_after_webhook_secret_selection():
-    script = Path("casa-agent/rootfs/etc/s6-overlay/scripts/setup-configs.sh").read_text()
+    script = Path("casa/rootfs/etc/s6-overlay/scripts/setup-configs.sh").read_text()
     secret_block = script.index('SECRET_FILE="$DATA_DIR/webhook_secret"')
     publisher = script.index("supervisor_discovery.py")
     assert publisher > secret_block
 
 
 def test_setup_normalizes_blank_bashio_webhook_secret_before_generation():
-    script = Path("casa-agent/rootfs/etc/s6-overlay/scripts/setup-configs.sh").read_text()
+    script = Path("casa/rootfs/etc/s6-overlay/scripts/setup-configs.sh").read_text()
     start = script.index('SECRET_FILE="$DATA_DIR/webhook_secret"')
     end = script.index("# Publish Casa's authenticated endpoint", start)
     secret_block = script[start:end]
@@ -346,7 +346,7 @@ def test_setup_normalizes_blank_bashio_webhook_secret_before_generation():
 
 
 def test_manifest_and_docs_declare_discovery_contract():
-    manifest = Path("casa-agent/config.yaml").read_text()
-    docs = Path("casa-agent/DOCS.md").read_text()
+    manifest = Path("casa/config.yaml").read_text()
+    docs = Path("casa/DOCS.md").read_text()
     assert "discovery: [casa]" in manifest
     assert "/data/casa-supervisor-discovery.json" in docs

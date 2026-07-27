@@ -40,7 +40,7 @@ echo "Step 4: Wait for emit_completion + casa_reload_triggers (~5-10s)"
 read -p "    Press enter after you see the completion summary... "
 
 echo "Step 5: Verify trigger landed (SSH to the HA host):"
-echo "  ssh <ha-host> sudo -n docker exec addon_c071ea9c_casa-agent \\"
+echo "  ssh <ha-host> sudo -n docker exec addon_91d4d4c8_casa \\"
 echo "    cat /config/agents/assistant/triggers.yaml"
 read -p "    Press enter after manual verification... "
 
@@ -49,7 +49,7 @@ read -p "    Press enter after confirming narration... "
 
 echo "Step 7: Verify no addon restart (soft reload only):"
 echo "  ssh <ha-host> sudo -n docker exec hassio_cli \\"
-echo "    ha apps info c071ea9c_casa-agent --raw-json | grep -E '^(version|state)'"
+echo "    ha apps info 91d4d4c8_casa --raw-json | grep -E '^(version|state)'"
 echo "  Uptime should be unchanged."
 read -p "    Press enter after manual verification... "
 

@@ -244,7 +244,7 @@ class TestPluginsWhitelist:
         from config_git import _GITIGNORE_CONTENT
 
         sh = (Path(__file__).resolve().parent.parent
-              / "casa-agent" / "rootfs" / "etc" / "s6-overlay" / "scripts"
+              / "casa" / "rootfs" / "etc" / "s6-overlay" / "scripts"
               / "setup-configs.sh").read_text(encoding="utf-8")
         m = re.search(r"cat > \.gitignore <<'EOF'\n(.*?)EOF\n", sh, re.S)
         assert m, "setup-configs.sh .gitignore heredoc not found"

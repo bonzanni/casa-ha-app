@@ -21,10 +21,10 @@ except ImportError:
 pytestmark = [pytest.mark.unit]
 
 REPO = Path(__file__).resolve().parents[1]
-APP_ROOT = REPO / "casa-agent" / "rootfs" / "opt" / "casa"
-DOCKERFILE = REPO / "casa-agent" / "Dockerfile"
+APP_ROOT = REPO / "casa" / "rootfs" / "opt" / "casa"
+DOCKERFILE = REPO / "casa" / "Dockerfile"
 TEST_DOCKERFILE = REPO / "test-local" / "Dockerfile.test"
-REQUIREMENTS = REPO / "casa-agent" / "requirements.txt"
+REQUIREMENTS = REPO / "casa" / "requirements.txt"
 
 SDK_VERSION = "0.2.114"
 
@@ -262,7 +262,7 @@ def test_effective_cli_is_verified_before_any_ingress_listener() -> None:
 
 @pytest.fixture(scope="session")
 def _pin_image_tag() -> str:
-    return "casa-agent:local-clipin"
+    return "casa:local-clipin"
 
 
 @pytest.fixture(scope="session")
@@ -272,7 +272,7 @@ def _build_pin_image(_pin_image_tag: str) -> None:
     subprocess.run(
         ["docker", "build",
          "--build-arg", "BUILD_FROM=ghcr.io/home-assistant/amd64-base-debian:bookworm",
-         "-t", _pin_image_tag, "-f", "casa-agent/Dockerfile", "casa-agent/"],
+         "-t", _pin_image_tag, "-f", "casa/Dockerfile", "casa/"],
         check=True,
     )
 

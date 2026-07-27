@@ -42,7 +42,7 @@ import yaml
 
 CASA_ROOT = (
     Path(__file__).resolve().parent.parent
-    / "casa-agent" / "rootfs" / "opt" / "casa"
+    / "casa" / "rootfs" / "opt" / "casa"
 )
 EXECUTORS_DIR = CASA_ROOT / "defaults" / "agents" / "executors"
 

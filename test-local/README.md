@@ -119,7 +119,7 @@ file is gitignored. Build and run without the mock by using the production
 Dockerfile directly:
 
 ```bash
-docker build -f casa-agent/Dockerfile -t casa-live .
+docker build -f casa/Dockerfile -t casa-live .
 docker run --rm -p 8080:8080 -v $(pwd)/test-local/options.json:/data/options.json casa-live
 ```
 

@@ -11,7 +11,7 @@ class TestCasaConfigGuard:
     async def test_blocks_write_to_data(self):
         from hooks import make_casa_config_guard_hook
         hook = make_casa_config_guard_hook(
-            forbid_write_paths=["/data", "/addon_configs/casa-agent/schema"],
+            forbid_write_paths=["/data", "/addon_configs/casa/schema"],
             forbid_delete_residents=True,
         )
         out = await hook(
@@ -24,11 +24,11 @@ class TestCasaConfigGuard:
     async def test_blocks_write_to_schema(self):
         from hooks import make_casa_config_guard_hook
         hook = make_casa_config_guard_hook(
-            forbid_write_paths=["/addon_configs/casa-agent/schema"],
+            forbid_write_paths=["/addon_configs/casa/schema"],
             forbid_delete_residents=True,
         )
         out = await hook(
-            {"tool_name": "Edit", "tool_input": {"file_path": "/addon_configs/casa-agent/schema/x.json"}},
+            {"tool_name": "Edit", "tool_input": {"file_path": "/addon_configs/casa/schema/x.json"}},
             None, {},
         )
         assert out is not None
@@ -41,7 +41,7 @@ class TestCasaConfigGuard:
             forbid_delete_residents=True,
         )
         out = await hook(
-            {"tool_name": "Write", "tool_input": {"file_path": "/addon_configs/casa-agent/agents/specialists/x/character.yaml"}},
+            {"tool_name": "Write", "tool_input": {"file_path": "/addon_configs/casa/agents/specialists/x/character.yaml"}},
             None, {},
         )
         assert out == {}

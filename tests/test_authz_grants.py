@@ -365,7 +365,7 @@ def test_authz_grant_sweep_is_a_coroutine_function():
 
 _CASA_CORE_SRC = (
     Path(__file__).resolve().parent.parent
-    / "casa-agent"
+    / "casa"
     / "rootfs"
     / "opt"
     / "casa"

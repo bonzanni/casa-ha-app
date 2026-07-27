@@ -9,7 +9,7 @@ directories that don't already exist. Per memory
 pre-existing files.
 
 The migration scans every
-``/addon_configs/casa-agent/agents/executors/<name>/hooks.yaml`` whose
+``/addon_configs/casa/agents/executors/<name>/hooks.yaml`` whose
 sibling ``definition.yaml`` has ``driver: claude_code`` and, if the
 file lacks an ``engagement_permission_relay`` policy entry, appends
 the three-line stanza with ``timeout: 600``. Idempotent — running
@@ -26,7 +26,7 @@ import pytest
 pytestmark = pytest.mark.unit
 
 
-SETUP_CONFIGS = Path("casa-agent/rootfs/etc/s6-overlay/scripts/setup-configs.sh")
+SETUP_CONFIGS = Path("casa/rootfs/etc/s6-overlay/scripts/setup-configs.sh")
 
 
 def _extract_block() -> str:

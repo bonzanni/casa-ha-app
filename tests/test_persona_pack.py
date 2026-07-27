@@ -385,7 +385,7 @@ def test_valid_pack_with_matching_manifest_loads(tmp_path: Path) -> None:
 # ---------------------------------------------------------------------------
 
 _REAL_PERSONAS_DIR = Path(__file__).resolve().parent.parent / (
-    "casa-agent/rootfs/opt/casa/defaults/personas"
+    "casa/rootfs/opt/casa/defaults/personas"
 )
 _REAL_PERSONA_SLUGS = ["alex", "judge", "ellen", "gary", "tina"]
 

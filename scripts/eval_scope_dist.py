@@ -110,7 +110,7 @@ def read_log_file(path: str) -> Iterable[str]:
 
 
 def read_ssh_logs(
-    host: str, since: str, container: str = "addon_c071ea9c_casa-agent",
+    host: str, since: str, container: str = "addon_91d4d4c8_casa",
 ) -> Iterable[str]:
     """Pull recent container logs over SSH. Wraps `ssh <host> sudo -n
     docker logs --since <since> <container>` — `sudo -n` because the HA

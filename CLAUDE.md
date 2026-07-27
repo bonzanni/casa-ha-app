@@ -1,4 +1,4 @@
-# Casa Agent — contributor & AI-assistant guide
+# Casa — contributor & AI-assistant guide
 
 Casa is a **Home Assistant app** (formerly "add-on"): a fleet of Claude-powered agents
 reachable over Telegram and a voice (SSE/WebSocket) channel, packaged as an HA app.
@@ -6,10 +6,10 @@ Python + `aiohttp`, built on the **Claude Agent SDK**, Hindsight memory, the **M
 protocol, and **APScheduler**, all **s6-overlay**–supervised inside the container.
 
 ## Where things are
-- **Application code:** `casa-agent/rootfs/opt/casa/` (~45 modules — this is the deep
+- **Application code:** `casa/rootfs/opt/casa/` (~45 modules — this is the deep
   HA-rootfs path; the add-on copies `rootfs/` into the image root).
-- **App manifest:** `casa-agent/config.yaml` (version lives here). User-facing app
-  docs: `casa-agent/DOCS.md`. App changelog: `casa-agent/CHANGELOG.md`.
+- **App manifest:** `casa/config.yaml` (version lives here). User-facing app
+  docs: `casa/DOCS.md`. App changelog: `casa/CHANGELOG.md`.
 - **Tests:** `tests/` (173 files). Container/e2e harness: `test-local/`. CI: `.github/workflows/qa.yml`.
 - **Internal engineering docs:** `docs/` — see the boundary note below.
 
@@ -43,19 +43,19 @@ The `tests/conftest.py` auto-adds the code root to `sys.path`.
 
 ## Release flow
 1. Branch `feat/vX.Y.Z-<desc>` off `main`.
-2. Bump `version:` in `casa-agent/config.yaml` and prepend a `casa-agent/CHANGELOG.md` entry.
+2. Bump `version:` in `casa/config.yaml` and prepend a `casa/CHANGELOG.md` entry.
 3. Commit `release: vX.Y.Z (<summary>)`, push, open a PR, **squash-merge** once CI is green.
 4. Merging to main auto-publishes the GHCR images and creates the `vX.Y.Z` tag +
    GitHub Release from the changelog entry (`deploy.yml`) — no manual tagging.
 - **Removing an app option?** Also append its key to `DEPRECATED_OPTION_KEYS` in
-  `casa-agent/rootfs/etc/s6-overlay/scripts/setup-configs.sh` (the `deprecated-options-prune`
+  `casa/rootfs/etc/s6-overlay/scripts/setup-configs.sh` (the `deprecated-options-prune`
   block) so the stale stored value is deleted on boot and HA stops warning.
 
 ## Environment (WSL)
 - Develop on **WSL2 on the native ext4 filesystem** (not `/mnt/c`) — needed for perf and
   correct exec bits.
 - **Container-bound files must be LF.** `.gitattributes` enforces `eol=lf` on `*.sh`,
-  `Dockerfile`, and all of `casa-agent/rootfs/**` — CRLF breaks shebangs and s6. Don't
+  `Dockerfile`, and all of `casa/rootfs/**` — CRLF breaks shebangs and s6. Don't
   fight it; new `rootfs/**` or `*.sh` files must be LF.
 - `ls` may show `-rwxr-xr-x` on plain files — that's a WSL mount display artifact; git
   tracks `100644`. Don't "fix" it or commit mode changes.
@@ -89,7 +89,7 @@ mid-2026). Keep it publish-ready at all times:
   can't (see the v0.52–v0.57 red streak).
 - **Branches die on merge.** GitHub auto-deletes the remote head; delete the local
   branch too. No stray branches on origin.
-- **Every release**: bump `casa-agent/config.yaml` version + a user-facing CHANGELOG
+- **Every release**: bump `casa/config.yaml` version + a user-facing CHANGELOG
   entry (keepachangelog tone; deep engineering detail belongs in the PR body) + a
   `translations/en.yaml` entry for any new/changed option + DOCS.md accuracy.
 - **Nothing internal on any pushed ref**: no `docs/` content, no audit/diagnosis

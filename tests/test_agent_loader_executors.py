@@ -168,7 +168,7 @@ def test_assistant_delegates_yaml_has_no_executor_entries():
     plugin-developer, or engagement — those moved to executors.yaml."""
     from agent_loader import _read_yaml
     path = (
-        "casa-agent/rootfs/opt/casa/defaults/agents/assistant/delegates.yaml"
+        "casa/rootfs/opt/casa/defaults/agents/assistant/delegates.yaml"
     )
     data = _read_yaml(path)
     agents = {entry["agent"] for entry in (data.get("delegates") or [])}
@@ -185,7 +185,7 @@ def test_assistant_delegates_yaml_has_no_executor_entries():
 def test_assistant_executors_yaml_seed_loads():
     from agent_loader import _read_yaml, _validate
     path = (
-        "casa-agent/rootfs/opt/casa/defaults/agents/assistant/executors.yaml"
+        "casa/rootfs/opt/casa/defaults/agents/assistant/executors.yaml"
     )
     data = _read_yaml(path)
     _validate(data, "executors", path)

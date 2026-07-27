@@ -18,7 +18,7 @@ BASELINE_TOOLS = [
 
 @pytest.fixture(scope="session")
 def image_tag() -> str:
-    return "casa-agent:local-baseline"
+    return "casa:local-baseline"
 
 
 @pytest.fixture(scope="session", autouse=True)
@@ -28,7 +28,7 @@ def _build_image(image_tag: str) -> None:
     subprocess.run(
         ["docker", "build",
          "--build-arg", "BUILD_FROM=ghcr.io/home-assistant/amd64-base-debian:bookworm",
-         "-t", image_tag, "-f", "casa-agent/Dockerfile", "casa-agent/"],
+         "-t", image_tag, "-f", "casa/Dockerfile", "casa/"],
         check=True,
     )
 

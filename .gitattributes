@@ -2,11 +2,11 @@
 # Windows CRLF breaks shell shebangs and s6-overlay
 *.sh text eol=lf
 Dockerfile text eol=lf
-casa-agent/rootfs/**/* text eol=lf
-casa-agent/apparmor.txt text eol=lf
-casa-agent/config.yaml text eol=lf
-casa-agent/build.yaml text eol=lf
-casa-agent/requirements.txt text eol=lf
+casa/rootfs/**/* text eol=lf
+casa/apparmor.txt text eol=lf
+casa/config.yaml text eol=lf
+casa/build.yaml text eol=lf
+casa/requirements.txt text eol=lf
 
 # Preserve CRLF for legacy-crlf fixture (migration test fixture)
 test-local/fixtures/legacy-crlf/** -text

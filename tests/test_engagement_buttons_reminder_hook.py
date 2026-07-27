@@ -33,7 +33,7 @@ ENG_ID = "b" * 32
 
 _ROOT = Path(__file__).resolve().parent.parent
 _DEV = _ROOT / (
-    "casa-agent/rootfs/opt/casa/defaults/agents/executors/plugin-developer"
+    "casa/rootfs/opt/casa/defaults/agents/executors/plugin-developer"
 )
 
 

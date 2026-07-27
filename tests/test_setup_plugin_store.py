@@ -8,7 +8,7 @@ import pytest
 
 pytestmark = pytest.mark.unit
 
-_ROOT = Path(__file__).resolve().parent.parent / "casa-agent" / "rootfs"
+_ROOT = Path(__file__).resolve().parent.parent / "casa" / "rootfs"
 _S6 = _ROOT / "etc" / "s6-overlay" / "s6-rc.d"
 _SCRIPTS = _ROOT / "etc" / "s6-overlay" / "scripts"
 

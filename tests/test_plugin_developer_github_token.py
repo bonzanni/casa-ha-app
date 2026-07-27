@@ -28,7 +28,7 @@ def test_run_template_no_explicit_github_token_export() -> None:
     """The engagement run template does NOT explicitly export GITHUB_TOKEN.
     s6-overlay's container_environment merges it in automatically."""
     template = Path(
-        "casa-agent/rootfs/opt/casa/scripts/engagement_run_template.sh"
+        "casa/rootfs/opt/casa/scripts/engagement_run_template.sh"
     ).read_text()
     # An explicit `export GITHUB_TOKEN=` would mean v0.14.6's pattern is
     # still alive; assert it isn't.
@@ -40,7 +40,7 @@ def test_run_template_no_explicit_github_token_export() -> None:
 
 def test_etc_gitconfig_credential_helper_present() -> None:
     """github-access goes through the credential helper, not URL embedding."""
-    cfg = Path("casa-agent/rootfs/etc/gitconfig").read_text()
+    cfg = Path("casa/rootfs/etc/gitconfig").read_text()
     assert "git-credential-casa.sh" in cfg
     assert "x-access-token" not in cfg, (
         "Token must come from helper at request time, never be embedded in "

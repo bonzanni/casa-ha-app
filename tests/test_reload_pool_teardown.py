@@ -20,7 +20,7 @@ def _make_runtime():
 
     `from tests.test_reload import _make_runtime` does NOT work under this
     repo's conftest sys.path setup: conftest.py only inserts the
-    casa-agent code root onto sys.path, `tests/` has no `__init__.py`, and
+    casa code root onto sys.path, `tests/` has no `__init__.py`, and
     plain `pytest tests/...` invocation does not add the repo root to
     sys.path either — so `import tests` raises ModuleNotFoundError
     (verified empirically before writing this file). Per the task-9

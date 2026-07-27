@@ -15,7 +15,7 @@ pytestmark = pytest.mark.unit
 
 _SCRIPT = (
     Path(__file__).resolve().parents[1]
-    / "casa-agent/rootfs/etc/s6-overlay/scripts/setup-nginx.sh"
+    / "casa/rootfs/etc/s6-overlay/scripts/setup-nginx.sh"
 )
 
 

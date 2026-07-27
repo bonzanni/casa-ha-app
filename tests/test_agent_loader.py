@@ -810,7 +810,7 @@ def test_butler_runtime_grants_homeassistant_server_level():
 
     runtime_path = (
         Path(__file__).resolve().parents[1]
-        / "casa-agent/rootfs/opt/casa/defaults/agents/butler/runtime.yaml"
+        / "casa/rootfs/opt/casa/defaults/agents/butler/runtime.yaml"
     )
     data = yaml.safe_load(runtime_path.read_text(encoding="utf-8"))
     allowed = data["tools"]["allowed"]
@@ -825,7 +825,7 @@ def test_butler_runtime_sets_minimal_context_surface_policy():
 
     runtime_path = (
         Path(__file__).resolve().parents[1]
-        / "casa-agent/rootfs/opt/casa/defaults/agents/butler/runtime.yaml"
+        / "casa/rootfs/opt/casa/defaults/agents/butler/runtime.yaml"
     )
     data = yaml.safe_load(runtime_path.read_text(encoding="utf-8"))
 
@@ -841,7 +841,7 @@ def test_assistant_runtime_omits_unused_homeassistant_attachment():
 
     runtime_path = (
         Path(__file__).resolve().parents[1]
-        / "casa-agent/rootfs/opt/casa/defaults/agents/assistant/runtime.yaml"
+        / "casa/rootfs/opt/casa/defaults/agents/assistant/runtime.yaml"
     )
     data = yaml.safe_load(runtime_path.read_text(encoding="utf-8"))
 
@@ -858,7 +858,7 @@ def test_assistant_delegates_include_butler():
 
     delegates_path = (
         Path(__file__).resolve().parents[1]
-        / "casa-agent/rootfs/opt/casa/defaults/agents/assistant/delegates.yaml"
+        / "casa/rootfs/opt/casa/defaults/agents/assistant/delegates.yaml"
     )
     data = yaml.safe_load(delegates_path.read_text(encoding="utf-8"))
     delegate_roles = [d["agent"] for d in data["delegates"]]
@@ -912,7 +912,7 @@ class TestValidateConfigRepo:
     def test_clean_repo_returns_empty(self, tmp_path):
         from agent_loader import validate_config_repo
 
-        repo = tmp_path / "addon_configs" / "casa-agent"
+        repo = tmp_path / "addon_configs" / "casa"
         resident_dir = _seed_resident(repo / "agents", "assistant")
         _seed_specialist(repo / "agents", "finance")
         # A genuinely-bootable repo has a policy library (boot's load_policies
@@ -948,7 +948,7 @@ class TestValidateConfigRepo:
         privileged tool path and must not crash on edge filesystems."""
         from agent_loader import validate_config_repo
 
-        repo = tmp_path / "addon_configs" / "casa-agent"
+        repo = tmp_path / "addon_configs" / "casa"
         repo.mkdir(parents=True)
         errors = validate_config_repo(str(repo))
         assert errors == []
@@ -963,7 +963,7 @@ class TestValidateConfigRepo:
         configurator can't ship schema-invalid policy YAML."""
         from agent_loader import validate_config_repo
 
-        repo = tmp_path / "addon_configs" / "casa-agent"
+        repo = tmp_path / "addon_configs" / "casa"
         _seed_resident(repo / "agents", "assistant")
         _w(repo / "policies" / "disclosure.yaml", """\
             schema_version: 1
@@ -990,7 +990,7 @@ class TestValidateConfigRepo:
         policies/."""
         from agent_loader import validate_config_repo
 
-        repo = tmp_path / "addon_configs" / "casa-agent"
+        repo = tmp_path / "addon_configs" / "casa"
         _seed_resident(repo / "agents", "assistant")
         _w(repo / "policies" / "disclosure.yaml", """\
             schema_version: 1
@@ -1016,7 +1016,7 @@ class TestValidateConfigRepo:
         """Exact repro of the v0.30.0 / v0.29.0 P4.2 'TRAIT:' incident."""
         from agent_loader import validate_config_repo
 
-        repo = tmp_path / "addon_configs" / "casa-agent"
+        repo = tmp_path / "addon_configs" / "casa"
         agent_dir = _seed_resident(repo / "agents", "assistant")
         _policies_file(repo / "policies")  # isolate the character.yaml error
 
@@ -1045,7 +1045,7 @@ class TestValidateConfigRepo:
         the gate — they're outside the schema-bearing YAML allowlist."""
         from agent_loader import validate_config_repo
 
-        repo = tmp_path / "addon_configs" / "casa-agent"
+        repo = tmp_path / "addon_configs" / "casa"
         _seed_resident(repo / "agents", "assistant")
         _policies_file(repo / "policies")
         _w(repo / "agents" / "assistant" / "prompts" / "system.md",
@@ -1063,7 +1063,7 @@ class TestValidateConfigRepo:
         copy could land schema-named blobs inside agents/)."""
         from agent_loader import validate_config_repo
 
-        repo = tmp_path / "addon_configs" / "casa-agent"
+        repo = tmp_path / "addon_configs" / "casa"
         _seed_resident(repo / "agents", "assistant")
         _policies_file(repo / "policies")
         # Write a file inside agents/.git that would FAIL validation if visited.
@@ -1077,7 +1077,7 @@ class TestValidateConfigRepo:
         """Multiple bad files all surface — caller sees the full picture."""
         from agent_loader import validate_config_repo
 
-        repo = tmp_path / "addon_configs" / "casa-agent"
+        repo = tmp_path / "addon_configs" / "casa"
         agent_dir = _seed_resident(repo / "agents", "assistant")
         _policies_file(repo / "policies")  # isolate the two character.yaml errors
         _w(agent_dir / "character.yaml", """\

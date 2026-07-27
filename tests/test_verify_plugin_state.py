@@ -285,7 +285,7 @@ def test_bundled_registry_authorized_for_plugin_developer(tmp_path, monkeypatch)
     import agent as agent_mod
     import yaml
 
-    root = Path(__file__).resolve().parent.parent / "casa-agent" / "rootfs" / "opt" / "casa"
+    root = Path(__file__).resolve().parent.parent / "casa" / "rootfs" / "opt" / "casa"
     default_reg_path = root / "defaults" / "plugin-registry.json"
     if not default_reg_path.is_file():
         pytest.skip("default plugin-registry.json lands in Task 18")

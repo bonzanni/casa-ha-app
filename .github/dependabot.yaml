@@ -6,7 +6,7 @@ updates:
       interval: weekly
 
   - package-ecosystem: pip
-    directory: "/casa-agent"
+    directory: "/casa"
     schedule:
       interval: weekly
     open-pull-requests-limit: 3

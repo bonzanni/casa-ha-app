@@ -29,10 +29,10 @@ criteria. Quick start (set your own host/container/chat-id — nothing is baked
 in):
 
 ```bash
-# HOST = ssh alias for the HA host; CONTAINER = casa-agent container name;
+# HOST = ssh alias for the HA host; CONTAINER = casa container name;
 # CASA_PROBE_TG_USER = the operator Telegram chat id for synthetic DMs.
 export HOST=<your-ha-ssh-alias>
-export CONTAINER=addon_<slug>_casa-agent
+export CONTAINER=addon_<slug>_casa
 export CASA_PROBE_TG_USER=<your-telegram-chat-id>
 D="ssh $HOST -- sudo -n docker exec $CONTAINER"
 

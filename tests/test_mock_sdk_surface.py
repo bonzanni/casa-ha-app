@@ -24,7 +24,7 @@ import pytest
 pytestmark = pytest.mark.unit
 
 _REPO = Path(__file__).resolve().parent.parent
-_APP = _REPO / "casa-agent" / "rootfs" / "opt" / "casa"
+_APP = _REPO / "casa" / "rootfs" / "opt" / "casa"
 _MOCK = _REPO / "test-local" / "mock-claude-sdk" / "claude_agent_sdk" / "__init__.py"
 
 

@@ -19,7 +19,7 @@ import pytest
 pytestmark = pytest.mark.unit
 
 
-SETUP_CONFIGS = Path("casa-agent/rootfs/etc/s6-overlay/scripts/setup-configs.sh")
+SETUP_CONFIGS = Path("casa/rootfs/etc/s6-overlay/scripts/setup-configs.sh")
 CC_HOME = "/config/cc-home"
 
 

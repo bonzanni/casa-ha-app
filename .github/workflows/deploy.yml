@@ -1,6 +1,6 @@
 name: Deploy
 
-# Container image pipeline for the Casa Agent app.
+# Container image pipeline for the Casa app.
 #
 # Pull requests touching the app get a validation build (no push). Pushes to
 # main build per-arch images, push them to GHCR (Cosign-signed via the
@@ -12,11 +12,11 @@ on:
   push:
     branches: [main]
     paths:
-      - "casa-agent/**"
+      - "casa/**"
       - ".github/workflows/deploy.yml"
   pull_request:
     paths:
-      - "casa-agent/**"
+      - "casa/**"
       - ".github/workflows/deploy.yml"
 
 permissions:
@@ -42,7 +42,7 @@ jobs:
         id: info
         uses: home-assistant/actions/helpers/info@master
         with:
-          path: "./casa-agent"
+          path: "./casa"
 
       - name: Normalize app information
         id: normalize
@@ -94,7 +94,7 @@ jobs:
         with:
           arch: ${{ matrix.arch }}
           container-registry-password: ${{ secrets.GITHUB_TOKEN }}
-          context: "./casa-agent"
+          context: "./casa"
           image: ${{ matrix.image }}
           image-tags: |
             ${{ needs.prepare.outputs.version }}
@@ -151,9 +151,9 @@ jobs:
             $0 ~ "^## \\[" ver "\\]" {found=1; print; next}
             found && /^## \[/ {exit}
             found {print}
-          ' casa-agent/CHANGELOG.md > /tmp/notes.md
+          ' casa/CHANGELOG.md > /tmp/notes.md
           if [ ! -s /tmp/notes.md ]; then
-            echo "Release v${VERSION}. See casa-agent/CHANGELOG.md." > /tmp/notes.md
+            echo "Release v${VERSION}. See casa/CHANGELOG.md." > /tmp/notes.md
           fi
           gh release create "v${VERSION}" \
             --title "v${VERSION}" \

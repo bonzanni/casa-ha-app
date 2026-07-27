@@ -1,4 +1,4 @@
-"""POSIX-env reader/writer for /addon_configs/casa-agent/plugin-env.conf."""
+"""POSIX-env reader/writer for /addon_configs/casa/plugin-env.conf."""
 from __future__ import annotations
 
 import os

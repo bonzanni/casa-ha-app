@@ -29,7 +29,7 @@ import pytest
 
 _ROOT = Path(__file__).resolve().parent.parent
 _DEV = _ROOT / (
-    "casa-agent/rootfs/opt/casa/defaults/agents/executors/plugin-developer"
+    "casa/rootfs/opt/casa/defaults/agents/executors/plugin-developer"
 )
 
 
@@ -62,7 +62,7 @@ def ask_docstring() -> str:
 
     import sys
 
-    sys.path.insert(0, str(_ROOT / "casa-agent/rootfs/opt/casa"))
+    sys.path.insert(0, str(_ROOT / "casa/rootfs/opt/casa"))
     from channels import casa_engagement_channel as cec
 
     return (inspect.getdoc(cec.ask) or "").lower()

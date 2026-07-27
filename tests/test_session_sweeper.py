@@ -586,8 +586,8 @@ class TestTranscriptReaper:
             calls.append((session_id, directory))
 
         monkeypatch.setattr(session_sweeper, "_sdk_delete_session", fake_delete, raising=False)
-        await session_sweeper._reap_transcript("sid-7", "/addon_configs/casa-agent/agent-home/assistant")
-        assert calls == [("sid-7", "/addon_configs/casa-agent/agent-home/assistant")]
+        await session_sweeper._reap_transcript("sid-7", "/addon_configs/casa/agent-home/assistant")
+        assert calls == [("sid-7", "/addon_configs/casa/agent-home/assistant")]
 
     async def test_freshness_guard_keeps_recent_voice_entry_alive(self, tmp_path):
         """A voice entry that is inside its freshness window must NOT be evicted

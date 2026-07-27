@@ -881,7 +881,7 @@ def test_persona_pin_roots_includes_a_resident_override_binding(tmp_path: Path) 
 
     role_dir = (
         Path(__file__).resolve().parent.parent
-        / "casa-agent/rootfs/opt/casa/defaults/roles/resident/assistant"
+        / "casa/rootfs/opt/casa/defaults/roles/resident/assistant"
     )
     role = materialize_role(source=load_role_artifact(role_dir), options={})
     persona_dir = tmp_path / "ellen-repo"

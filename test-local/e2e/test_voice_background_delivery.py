@@ -35,14 +35,14 @@ def _integration_root() -> Path:
             )
         return candidate.resolve()
     candidates = [
-        parent / "casa-ha-integration"
+        parent / "ha-casa-integration"
         for parent in Path(__file__).resolve().parents
     ]
     for candidate in candidates:
         if (candidate / "custom_components/casa/delivery.py").is_file():
             return candidate.resolve()
     pytest.fail(
-        "casa-ha-integration checkout with background delivery is unavailable",
+        "ha-casa-integration checkout with background delivery is unavailable",
         pytrace=False,
     )
 
@@ -51,7 +51,7 @@ INTEGRATION_ROOT = _integration_root()
 sys.path.insert(0, str(INTEGRATION_ROOT))
 CASA_CODE_ROOT = (
     Path(__file__).resolve().parents[2]
-    / "casa-agent/rootfs/opt/casa"
+    / "casa/rootfs/opt/casa"
 )
 sys.path.insert(0, str(CASA_CODE_ROOT))
 

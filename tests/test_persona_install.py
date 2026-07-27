@@ -270,7 +270,7 @@ def _resident_role():
 
     role_dir = (
         Path(__file__).resolve().parent.parent
-        / "casa-agent/rootfs/opt/casa/defaults/roles/resident/assistant"
+        / "casa/rootfs/opt/casa/defaults/roles/resident/assistant"
     )
     return materialize_role(source=load_role_artifact(role_dir), options={})
 

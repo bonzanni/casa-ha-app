@@ -26,7 +26,7 @@ pyflakes_reporter = pytest.importorskip("pyflakes.reporter")
 
 CODE_ROOT = (
     Path(__file__).resolve().parent.parent
-    / "casa-agent" / "rootfs" / "opt" / "casa"
+    / "casa" / "rootfs" / "opt" / "casa"
 )
 
 # Undefined-name families. `UndefinedLocal` is the read-before-assignment
@@ -87,7 +87,7 @@ class _Collector(pyflakes_reporter.Reporter):
 def test_no_module_references_an_undefined_name():
     """The whole application tree, not just the modules a test imports.
 
-    Scoped to `casa-agent/rootfs/opt/casa` and skips `defaults/` (agent
+    Scoped to `casa/rootfs/opt/casa` and skips `defaults/` (agent
     doctrine and bundled plugin payloads, not Casa's own importable code).
     """
     targets = sorted(

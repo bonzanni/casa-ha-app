@@ -42,7 +42,7 @@ except ImportError:
 
 pytestmark = [pytest.mark.unit]
 
-AGENTS = Path(__file__).resolve().parents[1] / "casa-agent" / "rootfs" / "opt" / "casa" / "defaults" / "agents"
+AGENTS = Path(__file__).resolve().parents[1] / "casa" / "rootfs" / "opt" / "casa" / "defaults" / "agents"
 
 
 def _real_allowed(role: str) -> list[str]:

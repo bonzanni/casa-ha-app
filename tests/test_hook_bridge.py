@@ -64,7 +64,7 @@ class TestHookBridgeTranslate:
 
         here = Path(__file__).resolve().parent.parent
         hooks_path = (
-            here / "casa-agent" / "rootfs" / "opt" / "casa" / "defaults"
+            here / "casa" / "rootfs" / "opt" / "casa" / "defaults"
             / "agents" / "executors" / "plugin-developer" / "hooks.yaml"
         )
         raw = yaml.safe_load(hooks_path.read_text(encoding="utf-8")) or {}
@@ -160,7 +160,7 @@ class TestTimeoutPassthrough:
         here = Path(__file__).resolve().parent.parent
         for executor in ("plugin-developer",):
             hooks_path = (
-                here / "casa-agent" / "rootfs" / "opt" / "casa" / "defaults"
+                here / "casa" / "rootfs" / "opt" / "casa" / "defaults"
                 / "agents" / "executors" / executor / "hooks.yaml"
             )
             raw = yaml.safe_load(hooks_path.read_text(encoding="utf-8")) or {}
@@ -196,7 +196,7 @@ class TestTimeoutPassthrough:
 
         here = Path(__file__).resolve().parent.parent
         hooks_path = (
-            here / "casa-agent" / "rootfs" / "opt" / "casa" / "defaults"
+            here / "casa" / "rootfs" / "opt" / "casa" / "defaults"
             / "agents" / "executors" / "configurator" / "hooks.yaml"
         )
         raw = yaml.safe_load(hooks_path.read_text(encoding="utf-8")) or {}
