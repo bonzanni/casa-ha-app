@@ -41,6 +41,11 @@ _FIELD_LIMITS = {
 }
 
 
+# Ingress surfaces reached with a shared bearer secret rather than by a
+# person: their turns are authored by a machine (#204).
+_AUTOMATION_SURFACES = frozenset({"invoke", "webhook"})
+
+
 class UserProvenance:
     """Trusted factory namespace; not a fifth runtime identity object."""
 
@@ -54,6 +59,21 @@ class UserProvenance:
     ) -> SpeakerProvenance:
         if server_origin.route != surface:
             raise ValueError("trusted origin route does not match surface")
+        if surface in _AUTOMATION_SURFACES:
+            # #204: /invoke and /webhook are reached with a shared bearer
+            # secret. That authorizes the request; it never establishes who
+            # authored the text, so the turn is an ``automation`` — honest
+            # about being externally originated without claiming either a human
+            # author or Casa's own internal authority.
+            if authenticated_user is not None:
+                raise ValueError(
+                    "an automation surface cannot assert an authenticated user")
+            value = SpeakerProvenance(
+                speaker_kind="automation",
+                user_peer=unicodedata.normalize("NFC", user_peer),
+            )
+            validate_speaker_provenance(value)
+            return value
         if surface == "voice" and authenticated_user is None:
             if user_peer != "voice_speaker":
                 raise ValueError("anonymous voice must use voice_speaker")
@@ -125,6 +145,19 @@ def validate_speaker_provenance(value: SpeakerProvenance) -> None:
         if any((value.role_id, value.persona_id,
                 value.persona_version, value.binding_digest)):
             raise ValueError("user agent fields must be null")
+    elif kind == "automation":
+        # A machine author reached through a shared bearer secret (#204). It
+        # gets a peer so the originating trigger stays attributable, but never
+        # a user_id or display_name — those are what promote a provenance to a
+        # NAMED person in recall_renderer.provenance_view, and a shared secret
+        # identifies no human. Agent fields stay null: it is not one of Casa's
+        # own roles either.
+        if not value.user_peer:
+            raise ValueError("user_peer is required for automation provenance")
+        if any((value.role_id, value.persona_id, value.persona_version,
+                value.binding_digest, value.display_name, value.user_id)):
+            raise ValueError(
+                "automation identity cannot name a person or an agent role")
     elif kind == "system":
         if any((value.role_id, value.persona_id, value.persona_version,
                 value.binding_digest, value.user_peer, value.user_id)):

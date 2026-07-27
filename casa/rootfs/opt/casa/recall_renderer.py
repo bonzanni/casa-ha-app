@@ -84,6 +84,16 @@ def render_recall(
         elif allowed.speaker_kind == "user":
             speaker = allowed.display_name or "A prior user"
             entry.append(f"- {speaker} said: {hit.text}")
+        elif allowed.speaker_kind == "automation":
+            # #204: a machine that reached Casa through a shared secret. Named
+            # as neither a person nor Casa itself. The originating trigger is
+            # NOT disclosed — ``user_peer`` is deliberately outside
+            # ``ProvenanceView``, so this line reads the same at every
+            # clearance.
+            entry.extend([
+                f"- An automation reported: {hit.text}",
+                "  [source: an external trigger, not a person or a Casa agent]",
+            ])
         elif allowed.display_name and allowed.role_id:
             source = allowed.role_id
             if allowed.persona_id and allowed.persona_version:

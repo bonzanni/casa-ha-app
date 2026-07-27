@@ -103,6 +103,18 @@ network, plugins, or hooks — only public-clearance memory recall and an
 operator-bound notification), reads memory at a reduced clearance, and writes no
 memory. Operator-signed `/invoke` keeps full trust.
 
+**Who a triggered turn is attributed to (0.129.0).** Both endpoints are opened
+by a shared secret, which proves the caller holds a credential — never that a
+particular person wrote the request. So neither is ever recorded as you. An
+`/invoke` turn is attributed to `invoke_caller`; a webhook turn to
+`webhook:<trigger name>`, so two triggers are never mistaken for each other.
+Both are recorded as **automations** rather than as people, and a recalled
+automation memory is introduced to the assistant as "An automation reported: …"
+— never as something you said, and never as something Casa concluded itself.
+The trigger's own name stays private to Casa. This is separate from the trust
+question above: holding the secret decides what the assistant may *disclose*;
+it says nothing about who *spoke*.
+
 > Webhook trigger `path` is removed in 0.97.0 — triggers are served at
 > `POST /webhook/<name>`.
 

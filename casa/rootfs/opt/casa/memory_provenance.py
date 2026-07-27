@@ -27,7 +27,11 @@ import asyncio
 from typing import Awaitable, Callable, Sequence
 
 from canonical_bytes import canonical_json_bytes
-from hindsight_ids import agent_document_id, content_document_id
+from hindsight_ids import (
+    agent_document_id,
+    automation_document_id,
+    content_document_id,
+)
 from personality_types import RetainedTurn
 from speaker_provenance import (
     RESERVED_SOURCE_NAMESPACE,
@@ -69,11 +73,16 @@ async def build_retain_items(
         text = turn.text.strip()
         if not text:
             continue
-        document_id = (
-            content_document_id(turn.provenance.user_peer or "", text)
-            if turn.provenance.speaker_kind == "user"
-            else agent_document_id(turn.provenance, text)
-        )
+        # Route by KIND: a human peer, an automation's originating trigger, or
+        # an agent's persona identity. Automations are NOT agents — their id
+        # must key on user_peer, which the agent scheme discards (#204).
+        if turn.provenance.speaker_kind == "user":
+            document_id = content_document_id(turn.provenance.user_peer or "", text)
+        elif turn.provenance.speaker_kind == "automation":
+            document_id = automation_document_id(
+                turn.provenance.user_peer or "", text)
+        else:
+            document_id = agent_document_id(turn.provenance, text)
         prior = seen.get(document_id)
         if prior is not None and prior != text:
             raise ValueError("document-id collision maps to different text")

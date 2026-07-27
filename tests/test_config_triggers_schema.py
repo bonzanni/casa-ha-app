@@ -92,3 +92,47 @@ def test_user_trigger_normal_name_still_ok():
                               "auth": {"mode": "static_header"}}), SCHEMA)
     jsonschema.validate(_doc({"name": "my-plg", "type": "webhook",
                               "auth": {"mode": "static_header"}}), SCHEMA)
+
+
+class TestNameFitsTheProvenancePeerBound:
+    """#204 (Sol, review r1): the trigger name becomes the automation peer
+    ``webhook:{name}``, which must fit the ``user_peer`` provenance bound (256
+    scalars). Without a schema cap, a long-but-legal name registered fine,
+    authenticated fine, and then failed identity stamping on EVERY request —
+    turning a config mistake into a permanently broken webhook discovered only
+    in production. The cap belongs at config time, where the operator sees it.
+    """
+
+    def test_a_name_that_would_overflow_the_peer_bound_is_rejected(self):
+        # 249 is the first length that cannot fit: "webhook:" (8) + 249 = 257,
+        # one past the 256-scalar user_peer bound.
+        with pytest.raises(jsonschema.ValidationError):
+            jsonschema.validate(
+                _doc({"name": "n" * 249, "type": "webhook"}), SCHEMA)
+
+    def test_the_cap_is_the_exact_derived_bound_not_a_round_number(self):
+        # Sol, re-review r2: an arbitrarily tighter cap would reject names
+        # that are in fact stampable. The schema cap must BE the constraint.
+        import sys
+
+        sys.path.insert(0, "casa/rootfs/opt/casa")
+        import ingress_identity as ii
+
+        cap = SCHEMA["properties"]["triggers"]["items"][
+            "properties"]["name"]["maxLength"]
+        assert cap == ii._PEER_MAX_SCALARS - len(ii._WEBHOOK_PEER_PREFIX)
+
+    def test_every_schema_legal_name_can_be_stamped(self):
+        # The property that matters: schema-legal implies stampable. Pins the
+        # schema cap and the provenance bound together so they cannot drift
+        # apart silently.
+        import sys
+
+        sys.path.insert(0, "casa/rootfs/opt/casa")
+        from ingress_identity import ingress_identity
+
+        longest = "n" * SCHEMA["properties"]["triggers"]["items"][
+            "properties"]["name"]["maxLength"]
+        jsonschema.validate(_doc({"name": longest, "type": "webhook"}), SCHEMA)
+        origin = ingress_identity("webhook_trigger", webhook_name=longest)
+        assert origin.user_peer == "webhook:" + longest

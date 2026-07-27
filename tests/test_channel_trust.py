@@ -40,11 +40,24 @@ class TestChannelTrustDisplay:
         assert channel_trust_display("mystery") == "unknown"
 
 
-class TestUserPeer:
-    def test_telegram_user_peer_is_nicola(self):
-        from channel_trust import user_peer_for_channel
-        assert user_peer_for_channel("telegram") == "nicola"
+class TestUserPeerMovedOut:
+    """#204: per-turn AUTHOR identity left this module for ingress_identity.
 
-    def test_voice_user_peer_is_voice_speaker(self):
-        from channel_trust import user_peer_for_channel
-        assert user_peer_for_channel("voice") == "voice_speaker"
+    The retired ``user_peer_for_channel`` defaulted to ``"nicola"`` for any
+    channel absent from its map, so /invoke and /webhook would have recorded
+    third-party content as authored by the operator. Peers are now declared per
+    ingress ROUTE, with no default at all — trust (this module) and authorship
+    (ingress_identity) are separate axes.
+    """
+
+    def test_channel_trust_no_longer_owns_peer_identity(self):
+        import channel_trust
+        assert not hasattr(channel_trust, "user_peer_for_channel")
+
+    def test_telegram_peer_now_comes_from_the_ingress_table(self):
+        from ingress_identity import ingress_identity
+        assert ingress_identity("telegram").user_peer == "nicola"
+
+    def test_voice_peer_now_comes_from_the_ingress_table(self):
+        from ingress_identity import ingress_identity
+        assert ingress_identity("voice_sse").user_peer == "voice_speaker"
