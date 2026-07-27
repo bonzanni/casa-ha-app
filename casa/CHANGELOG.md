@@ -1,5 +1,38 @@
 # Changelog
 
+## [0.128.0] - 2026-07-28
+
+### Added
+
+- **Documented that reinstalling Casa changes its container name.** Home
+  Assistant derives the container name and network alias from the repository
+  URL and the slug, so both change on a reinstall from a different repository.
+  Anything reaching Casa by name — most often a reverse proxy in front of the
+  external API port, which is not host-published by default — then returns a
+  bare `502` on every request, while Casa itself is healthy and its logs are
+  clean. DOCS.md now explains the symptom and how to find the current name.
+
+### Fixed
+
+- The local QA harness still referenced three add-on options removed in
+  v0.125.0, and one of them changed its behaviour: since webhook
+  authentication became mandatory, the harness's `webhook_auth_enabled` branch
+  was deleting the webhook secret and booting test containers into a state a
+  real installation can no longer be in. The harness now mirrors the shipped
+  boot script exactly, including regenerating a secret that is missing,
+  zero-byte, or literally `"null"`. No effect on a running installation.
+- Two local-only test failures that read as product regressions: the voice
+  WebSocket smoke test invoked the system Python, which usually lacks
+  `aiohttp`, and the concurrency probe measured elapsed time with a `date`
+  flag that uutils coreutils silently ignores — producing nonsense timings
+  that the failure message blamed on the concurrency semaphore.
+
+### Internal
+
+- A unit test now fails when a harness fixture or the harness env-export still
+  references an option absent from the add-on's schema, so the next option
+  removal cannot leave this behind silently.
+
 ## [0.127.0] - 2026-07-27
 
 ### Changed

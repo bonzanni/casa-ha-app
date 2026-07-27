@@ -7,7 +7,7 @@ HERE="$(cd "$(dirname "$0")" && pwd)"
 # #193 (v0.117.0): the voice routes are fail-CLOSED — no secret means every
 # voice route is OFF. This test runs two containers in SEQUENCE (they share
 # HOST_PORT, so never concurrently):
-#   1. the default no-secret fixture — every voice route must refuse, and
+#   1. a forced no-secret container — every voice route must refuse, and
 #   2. an auth-ON fixture — a correctly SIGNED turn must still stream.
 NAME="casa-voice-sse-$$"
 AUTH_NAME="casa-voice-sse-auth-$$"
@@ -16,8 +16,15 @@ trap 'stop_container $NAME; stop_container $AUTH_NAME' EXIT
 build_image
 
 # ---------------------------------------------------------------- no secret
+# Since #262 the harness init mirrors production and ALWAYS materializes a
+# secret, so the secretless state must now be requested explicitly rather than
+# falling out of a fixture that omitted the removed `webhook_auth_enabled`
+# key. The state is still worth covering: production reaches it whenever
+# secret generation fails, and fail-closed is the only thing protecting that
+# install. The flag is scoped to THIS container — $AUTH_NAME must not inherit
+# it, or V-3 would be testing the wrong thing.
 log "Starting no-secret container $NAME"
-start_container "$NAME" >/dev/null
+start_container "$NAME" -e E2E_FORCE_NO_WEBHOOK_SECRET=1 >/dev/null
 wait_healthy "$NAME"
 
 log "V-1: POST /api/converse fails closed without a secret"

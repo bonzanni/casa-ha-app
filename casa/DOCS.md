@@ -127,6 +127,39 @@ curl -X POST http://homeassistant.local:8080/invoke/ellen \
   -d '{"prompt": "What is the temperature in the living room?"}'
 ```
 
+### Reinstalling Casa changes its container name
+
+Home Assistant derives an installed add-on's container name from **both** the
+repository URL and the slug:
+
+```
+addon_<sha1(repository_url)[:8]>_<slug>
+```
+
+The Docker network alias follows the same pattern (`<hash>-<slug>`). Both
+therefore change whenever either input changes — including a reinstall from a
+different repository URL. In v0.127.0 the rename moved them from
+`addon_c071ea9c_casa-agent` / `c071ea9c-casa-agent` to `addon_91d4d4c8_casa` /
+`91d4d4c8-casa`.
+
+Anything outside Home Assistant that reaches Casa **by container name or IP**
+breaks at that moment. In a typical setup that is a reverse proxy in front of
+the external API port (`18065/tcp`), because that port is not host-published by
+default — the proxy reaches the container directly over the `hassio` Docker
+network.
+
+The symptom is unhelpful: every external request returns a bare `502 Bad
+Gateway` from the proxy. `/healthz`, `/invoke`, the voice endpoints and the
+Telegram webhook all fail together, while Casa itself is healthy and its logs
+are clean — nothing in them indicates the cause.
+
+After any reinstall or repository change, update whatever points at Casa by
+name. To find the current one:
+
+```bash
+docker ps --format '{{.Names}}' | grep casa
+```
+
 ## Agent configuration
 
 Agent YAML files are stored in `/config/agents/`. Default configs are created on first boot and never overwritten. You can edit them freely.

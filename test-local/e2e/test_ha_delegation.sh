@@ -27,15 +27,11 @@ HERE="$(cd "$(dirname "$0")" && pwd)"
 . "$HERE/common.sh"
 
 REPO_ROOT="$(cd "$HERE/../.." && pwd)"
-GIT_COMMON_DIR="$(git -C "$REPO_ROOT" rev-parse --git-common-dir)"
-case "$GIT_COMMON_DIR" in
-    /*) ;;
-    *) GIT_COMMON_DIR="$REPO_ROOT/$GIT_COMMON_DIR" ;;
-esac
-SHARED_REPO_ROOT="$(cd "$(dirname "$GIT_COMMON_DIR")" && pwd)"
-if ! E2E_PYTHON="$(bash "$HERE/resolve_python.sh" "$SHARED_REPO_ROOT")"; then
-    exit 1
-fi
+# The worktree-aware resolver now lives in common.sh as e2e_python (#270), so
+# every host-side driver picks the same venv-first, aiohttp-verified
+# interpreter. E2E_PYTHON remains the operator override, honoured inside
+# resolve_python.sh.
+E2E_PYTHON="$(e2e_python)"
 MOCK_HA_PORT="${MOCK_HA_PORT:-8200}"
 MOCK_HA_PID=""
 NAME="casa-ha-deleg-$$"

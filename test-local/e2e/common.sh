@@ -12,6 +12,29 @@ log()  { printf '[e2e] %s\n' "$*" >&2; }
 fail() { printf '[e2e FAIL] %s\n' "$*" >&2; exit 1; }
 pass() { printf '[e2e PASS] %s\n' "$*" >&2; }
 
+# Milliseconds since the epoch (#271).
+#
+# NOT `date +%s%3N`: the width modifier is a GNU extension. uutils coreutils
+# (the Rust reimplementation, default on some distros and WSL images) silently
+# IGNORES it and emits full nanoseconds — 19 digits where GNU gives 13 — so a
+# subtraction of two such stamps yields garbage. Timing probes then fail their
+# upper bound and blame the product.
+#
+# The digit check is load-bearing, not defensive noise: on BSD/macOS `date`
+# does not support %N at all and emits a literal "N", which makes the
+# arithmetic expansion below abort under `set -euo pipefail` BEFORE any caller
+# can range-check the result — an opaque shell error instead of a clear one.
+now_ms() {
+    local ns
+    ns="$(date +%s%N)" || fail "harness clock: 'date +%s%N' failed"
+    case "$ns" in
+        ''|*[!0-9]*)
+            fail "harness clock: 'date +%s%N' returned '$ns' — this harness needs a date(1) supporting %N (GNU or uutils coreutils)"
+            ;;
+    esac
+    printf '%s\n' "$(( ns / 1000000 ))"
+}
+
 build_image() {
     log "Building $IMAGE from test-local/Dockerfile.test"
     docker build -f test-local/Dockerfile.test -t "$IMAGE" . >/dev/null
@@ -22,6 +45,35 @@ build_image() {
 # override and sign each request. WEBHOOK_SECRET_E2E matches options.auth.json.
 WEBHOOK_SECRET_E2E="e2e-invoke-secret"
 _REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
+
+# e2e_python — path to a HOST-side Python that can import aiohttp (#270).
+#
+# Host-side drivers (the voice WS smoke, the mock Telegram server) import
+# aiohttp, which on a dev box lives in the project venv, not in system python3.
+# resolve_python.sh honours $E2E_PYTHON, else prefers venv_test/, else falls
+# back to python3 — and verifies the choice can actually import aiohttp before
+# returning it. Every host-side driver with third-party imports must go through
+# this.
+#
+# NOT for `docker exec … python3`: that runs the container's interpreter and
+# must stay untouched. Host-side `python3 -c` one-liners that only use stdlib
+# `json` also do not need this — any python3 will do.
+#
+# Assign the result once per script (`PY="$(e2e_python)"`); each call re-runs
+# the aiohttp probe. On failure the resolver's diagnostic is already on stderr
+# and the non-zero return trips `set -e` at the assignment.
+e2e_python() {
+    local git_common_dir shared_repo_root
+    # Worktree-aware: venv_test/ lives in the shared checkout, not in a linked
+    # worktree, so resolve through --git-common-dir rather than $_REPO_ROOT.
+    git_common_dir="$(git -C "$_REPO_ROOT" rev-parse --git-common-dir)"
+    case "$git_common_dir" in
+        /*) ;;
+        *) git_common_dir="$_REPO_ROOT/$git_common_dir" ;;
+    esac
+    shared_repo_root="$(cd "$(dirname "$git_common_dir")" && pwd)"
+    bash "$_REPO_ROOT/test-local/e2e/resolve_python.sh" "$shared_repo_root"
+}
 
 # start_authed_container <name> [extra docker args...]
 # Like start_container but mounts the auth-ON options over /data/options.json.
@@ -170,9 +222,16 @@ assert_file_contains() {
 # Returns 0 on success, 1 on timeout (after which caller should fail loudly).
 start_mock_telegram_server() {
     local port="${1:-${MOCK_TG_PORT:-8081}}"
-    local repo_root
+    local repo_root py
     repo_root="$(cd "$(dirname "$(readlink -f "${BASH_SOURCE[0]}")")/../.." && pwd)"
-    python3 "$repo_root/test-local/e2e/mock_telegram/server.py" \
+    # server.py imports aiohttp — resolve a venv-first interpreter (#270).
+    # Explicit `|| return 1`: the only caller is
+    # `MOCK_PID="$(start_mock_telegram_server …)" || fail …`, and bash disables
+    # errexit for the left side of a `||`, so a resolver failure would sail on,
+    # background an empty command, and surface 3s later as a bogus "mock TG
+    # never started" instead of the real missing-aiohttp diagnostic.
+    py="$(e2e_python)" || return 1
+    "$py" "$repo_root/test-local/e2e/mock_telegram/server.py" \
         >/tmp/mock-tg.log 2>&1 &
     local pid=$!
     local i

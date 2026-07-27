@@ -14,7 +14,9 @@ build_image
 start_authed_container "$NAME" >/dev/null
 wait_healthy "$NAME"
 
-# Invoke the python driver. Requires aiohttp on host (already a Casa dep
-# via the tests/ suite).
+# Invoke the python driver. It imports aiohttp, which on a dev box lives in
+# venv_test/ and not in system python3 — resolve a venv-first interpreter
+# rather than assuming the ambient one has it (#270).
+PY="$(e2e_python)"
 HOST_PORT="$HOST_PORT" WEBHOOK_SECRET_E2E="$WEBHOOK_SECRET_E2E" \
-    python3 "$HERE/test_voice_ws.py"
+    "$PY" "$HERE/test_voice_ws.py"

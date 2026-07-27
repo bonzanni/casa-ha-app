@@ -95,8 +95,14 @@ RUN printf '/bin/sh /etc/s6-overlay/scripts/validate-config-test.sh\n' \
     > /etc/s6-overlay/s6-rc.d/init-validate-config/up
 
 # init-setup-configs
+# Runs under with-contenv so the script sees the CONTAINER environment, i.e.
+# anything passed as `docker run -e`. Without it an s6-rc oneshot `up` gets a
+# near-empty env and E2E_FORCE_NO_WEBHOOK_SECRET (test_voice_sse.sh) silently
+# reads as unset — the secretless container boots WITH a secret and the
+# fail-closed assertions fail. This also restores parity with the real image,
+# whose setup-configs.sh is `#!/command/with-contenv bashio`.
 COPY test-local/init-overrides/01-setup-configs.sh /etc/s6-overlay/scripts/setup-configs-test.sh
-RUN printf '/bin/sh /etc/s6-overlay/scripts/setup-configs-test.sh\n' \
+RUN printf '/command/with-contenv /bin/sh /etc/s6-overlay/scripts/setup-configs-test.sh\n' \
     > /etc/s6-overlay/s6-rc.d/init-setup-configs/up
 
 # init-setup-nginx
