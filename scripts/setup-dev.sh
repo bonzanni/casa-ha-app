@@ -39,7 +39,7 @@ fi
 
 echo "==> 3/4 dependencies"
 venv_test/bin/python -m pip install --quiet --upgrade pip
-venv_test/bin/python -m pip install --quiet -r casa/requirements.txt pytest pytest-asyncio anyio
+venv_test/bin/python -m pip install --quiet -r casa/requirements.txt pytest pytest-asyncio anyio pyflakes
 
 echo "==> 4/4 AI assets (subagents/skills) → .claude/"
 # In a linked git worktree, docs/ (private inner repo, gitignored) exists only in the
