@@ -12,7 +12,7 @@
 # Bumped 0.2.87 -> 0.2.114 (v0.59.1, Dependabot #104): no breaking changes
 # across the range (release-notes reviewed); additive TaskUpdatedMessage typing
 # (0.2.101) and a defensive mcp<2.0.0 pin (0.2.96, matches ours below).
-claude-agent-sdk==0.2.114
+claude-agent-sdk==0.2.128
 python-telegram-bot==22.7
 # Bumped 3.13.5 -> 3.14.1 (v0.59.1): clears 11 security advisories (deserialization,
 # HTTP request-smuggling/pipelining, websocket memory-limit bypass, etc.), all
