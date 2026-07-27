@@ -122,20 +122,50 @@ if [ ! -f "$DATA_DIR/sessions.json" ]; then
     echo '{}' > "$DATA_DIR/sessions.json"
 fi
 
-# Auto-generate webhook secret if auth is enabled.
+# Materialize the webhook secret, mirroring the real
+# rootfs/etc/s6-overlay/scripts/setup-configs.sh (#262).
+#
+# Until v0.125.0 (#228) this branched on a `webhook_auth_enabled` option and
+# `rm -f`'d the secret when it was absent or false. That option is GONE and
+# auth is MANDATORY: the real script always materializes a secret, so the
+# secretless container the old else-branch produced was a state production
+# could not be in. Worse, the default fixture omits the key, so `// false`
+# made that impossible state the DEFAULT for every plain start_container.
 SECRET_FILE="$DATA_DIR/webhook_secret"
-AUTH_ENABLED=$(jq -r '.webhook_auth_enabled // false' /data/options.json)
-if [ "$AUTH_ENABLED" = "true" ]; then
+
+if [ "${E2E_FORCE_NO_WEBHOOK_SECRET:-0}" = "1" ]; then
+    # Test-only escape hatch, opted into per-container via
+    # `docker run -e E2E_FORCE_NO_WEBHOOK_SECRET=1`. Production reaches the
+    # secretless state only when generation FAILS (the real script logs
+    # "Failed to generate webhook secret" and leaves none), and the voice
+    # routes must still fail closed there — test_voice_sse.sh V-1/V-2 cover
+    # exactly that. Skip generation entirely; do not fall through.
+    rm -f "$SECRET_FILE"
+    echo "[WARN] E2E_FORCE_NO_WEBHOOK_SECRET=1 — booting SECRETLESS (test-only; every authenticated route must refuse)"
+else
     USER_SECRET=$(jq -r '.webhook_secret // empty' /data/options.json)
     if [ -n "$USER_SECRET" ]; then
         printf '%s' "$USER_SECRET" > "$SECRET_FILE"
-    elif [ ! -f "$SECRET_FILE" ]; then
-        head -c 32 /dev/urandom | base64 | tr -d '=/+' | head -c 48 > "$SECRET_FILE"
-        echo "[INFO] Auto-generated webhook secret (see /data/webhook_secret)"
+    elif [ ! -s "$SECRET_FILE" ] || \
+         [ "$(cat "$SECRET_FILE" 2>/dev/null)" = "null" ]; then
+        # -s, not -f, matching the real script: the redirection truncates
+        # before the pipeline writes, so a container killed mid-generation
+        # leaves a ZERO-BYTE secret that must regenerate rather than be
+        # trusted. The literal "null" is the other invalid value the real
+        # script rejects — bashio yields that string for an unset optional, so
+        # a boot that persisted it must not have it accepted as a real key.
+        # Temp file + mv so the real path is never transiently empty.
+        _secret_tmp="$SECRET_FILE.tmp.$$"
+        if head -c 32 /dev/urandom | base64 | tr -d '=/+' | head -c 48 \
+                > "$_secret_tmp" && [ -s "$_secret_tmp" ]; then
+            mv -f "$_secret_tmp" "$SECRET_FILE"
+            echo "[INFO] Auto-generated webhook secret (see /data/webhook_secret)"
+        else
+            rm -f "$_secret_tmp"
+            echo "[ERROR] Failed to generate webhook secret"
+        fi
+        unset _secret_tmp
     fi
-    echo "[INFO] Webhook authentication enabled."
-else
-    rm -f "$SECRET_FILE"
 fi
 
 # v0.71.0: no seed-copy in the test override. Plugin materialization is the

@@ -14,13 +14,21 @@ start_authed_container "$NAME" -e MOCK_SDK_LATENCY_SEC=2 >/dev/null
 wait_healthy "$NAME"
 
 log "D-1: firing two /invoke calls in parallel"
-start_ts=$(date +%s%3N)
+start_ts=$(now_ms)
 signed_invoke "$HOST_PORT" assistant '{"prompt":"slow-A","context":{"chat_id":"A"}}' >/dev/null &
 signed_invoke "$HOST_PORT" assistant '{"prompt":"slow-B","context":{"chat_id":"B"}}' >/dev/null &
 wait
-end_ts=$(date +%s%3N)
+end_ts=$(now_ms)
 elapsed=$(( end_ts - start_ts ))
 log "elapsed: ${elapsed}ms"
+
+# Sanity-check the CLOCK before judging the PRODUCT (#271). This must run
+# before the two bounds below: a broken stamp lands far outside them, and the
+# messages there blame the semaphore, so a harness fault would read as a
+# concurrency regression.
+if [ "$elapsed" -lt 0 ] || [ "$elapsed" -gt 600000 ]; then
+    fail "implausible elapsed ${elapsed}ms — the harness clock is wrong, not the app (check date(1) %N support)"
+fi
 
 # Phase 2.1 has no semaphore, so we expect concurrent execution (~2s).
 # If someone adds MAX_CONCURRENT_AGENTS=1 upstream, this test must be

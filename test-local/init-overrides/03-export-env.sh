@@ -7,9 +7,20 @@ S6_ENV="/var/run/s6/container_environment"
 
 mkdir -p "$S6_ENV"
 
-# Export each option as an s6 container env var
-for key in public_url telegram_bot_token telegram_chat_id telegram_transport telegram_delivery_mode \
-           honcho_api_url honcho_api_key webhook_secret enable_terminal \
+# Parity with the real svc-casa/run: the add-on option is the ONLY source of a
+# WEBHOOK_SECRET override. casa_core treats a non-empty WEBHOOK_SECRET as
+# authoritative over /data/webhook_secret, so a value inherited from the
+# container environment (a stray `docker run -e`) would outrank the file that
+# every signer actually uses, and nothing would verify. Clear it first, then
+# let the loop below re-export it only when the option really sets it.
+rm -f "${S6_ENV}/WEBHOOK_SECRET"
+
+# Export each option as an s6 container env var.
+# v0.125.0 (#228) removed telegram_delivery_mode, honcho_api_url and
+# honcho_api_key; they are in DEPRECATED_OPTION_KEYS and no longer in
+# config.yaml's schema, so exporting them was dead weight (#262).
+for key in public_url telegram_bot_token telegram_chat_id telegram_transport \
+           webhook_secret enable_terminal \
            primary_agent_model voice_agent_model; do
     val=$(jq -r ".${key} // empty" "$OPTIONS")
     upper_key=$(echo "$key" | tr '[:lower:]' '[:upper:]')
@@ -25,12 +36,9 @@ if [ -n "$val" ]; then
     printf '%s' "$val" > "${S6_ENV}/CLAUDE_CODE_OAUTH_TOKEN"
 fi
 
-# Map scope_threshold -> CASA_SCOPE_THRESHOLD (casa_core.py reads the
-# CASA_ prefix). Mirrors the real svc-casa/run behaviour.
-val=$(jq -r '.scope_threshold // empty' "$OPTIONS")
-if [ -n "$val" ]; then
-    printf '%s' "$val" > "${S6_ENV}/CASA_SCOPE_THRESHOLD"
-fi
+# scope_threshold -> CASA_SCOPE_THRESHOLD was removed here in #262: the option
+# is gone from config.yaml's schema and listed in DEPRECATED_OPTION_KEYS, and
+# the real svc-casa/run no longer exports it either.
 
 # Engagement supergroup (0 = disabled; always export so consumers can check).
 val=$(jq -r '.telegram_engagement_supergroup_id // 0' "$OPTIONS")
