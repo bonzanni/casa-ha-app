@@ -37,7 +37,7 @@ import yaml
 pytestmark = [pytest.mark.unit]
 
 REPO = Path(__file__).resolve().parents[1]
-CASA = REPO / "casa-agent" / "rootfs" / "opt" / "casa"
+CASA = REPO / "casa" / "rootfs" / "opt" / "casa"
 AGENTS = CASA / "defaults" / "agents"
 sys.path.insert(0, str(CASA))
 
@@ -233,8 +233,8 @@ def test_validate_config_repo_is_env_independent(monkeypatch) -> None:
 def test_every_option_has_a_translation() -> None:
     """Invariant D (options): each add-on schema key has an en.yaml translation,
     so the HA UI never renders a raw key."""
-    cfg = yaml.safe_load((REPO / "casa-agent" / "config.yaml").read_text(encoding="utf-8"))
-    trans = yaml.safe_load((REPO / "casa-agent" / "translations" / "en.yaml").read_text(encoding="utf-8"))
+    cfg = yaml.safe_load((REPO / "casa" / "config.yaml").read_text(encoding="utf-8"))
+    trans = yaml.safe_load((REPO / "casa" / "translations" / "en.yaml").read_text(encoding="utf-8"))
     schema_keys = set((cfg.get("schema") or {}).keys())
     translated = set((trans.get("configuration") or {}).keys())
     missing = schema_keys - translated
@@ -253,7 +253,7 @@ def test_configurator_definition_and_role_allowlists_are_identical() -> None:
         .read_text(encoding="utf-8"))
     role = yaml.safe_load(
         (Path(__file__).resolve().parents[1]
-         / "casa-agent/rootfs/opt/casa/defaults/roles/executor/configurator"
+         / "casa/rootfs/opt/casa/defaults/roles/executor/configurator"
          / "role.yaml").read_text(encoding="utf-8"))
     defn_allowed = set((defn.get("tools") or {}).get("allowed") or [])
     role_allowed = set((role.get("tools") or {}).get("allowed") or [])

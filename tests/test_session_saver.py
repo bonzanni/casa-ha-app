@@ -90,7 +90,7 @@ async def test_save_session_retains_and_finishes(tmp_path, monkeypatch):
     with patch("session_saver.get_session_messages", return_value=msgs):
         ok = await save_session(
             "telegram-r1", reg, sem,
-            directory="/addon_configs/casa-agent/agent-home/assistant",
+            directory="/addon_configs/casa/agent-home/assistant",
             channel="telegram",
         )
     assert ok is True

@@ -653,6 +653,6 @@ async def test_assistant_config_grants_cleanup_tool():
     can tidy the engagement group without delegation."""
     import yaml
     root = Path(__file__).resolve().parent.parent
-    rt = root / "casa-agent/rootfs/opt/casa/defaults/agents/assistant/runtime.yaml"
+    rt = root / "casa/rootfs/opt/casa/defaults/agents/assistant/runtime.yaml"
     allowed = yaml.safe_load(rt.read_text(encoding="utf-8"))["tools"]["allowed"]
     assert "mcp__casa-framework__cleanup_engagement_topics" in allowed

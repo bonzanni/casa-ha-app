@@ -11,8 +11,8 @@ from __future__ import annotations
 
 import pytest
 
-_AGENTS = "casa-agent/rootfs/opt/casa/defaults/agents"
-_POLICIES = "casa-agent/rootfs/opt/casa/defaults/policies/disclosure.yaml"
+_AGENTS = "casa/rootfs/opt/casa/defaults/agents"
+_POLICIES = "casa/rootfs/opt/casa/defaults/policies/disclosure.yaml"
 
 
 def _load(role: str):
@@ -141,9 +141,9 @@ def test_real_concierge_role_stages_a_reset_to_its_own_default(tmp_path) -> None
     role = cfg.role_slot
     boot_digest = cfg.binding_digest
 
-    gary_dir = Path("casa-agent/rootfs/opt/casa/defaults/personas/casa/gary/0.1.0")
+    gary_dir = Path("casa/rootfs/opt/casa/defaults/personas/casa/gary/0.1.0")
     gary = load_persona_pack(gary_dir / "pack", gary_dir / "manifest.json")
-    tina_dir = Path("casa-agent/rootfs/opt/casa/defaults/personas/casa/tina/0.1.0")
+    tina_dir = Path("casa/rootfs/opt/casa/defaults/personas/casa/tina/0.1.0")
     tina = load_persona_pack(tina_dir / "pack", tina_dir / "manifest.json")
 
     # The shipped concierge role only accepts casa/gary — an off-list persona is

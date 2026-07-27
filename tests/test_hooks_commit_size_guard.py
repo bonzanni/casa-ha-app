@@ -15,7 +15,7 @@ class TestCommitSizeGuard:
         hook = make_commit_size_guard_hook(max_files=20)
         with patch("hooks._git_porcelain_count", return_value=5):
             out = await hook(
-                {"tool_name": "Write", "tool_input": {"file_path": "/addon_configs/casa-agent/agents/x.yaml"}},
+                {"tool_name": "Write", "tool_input": {"file_path": "/addon_configs/casa/agents/x.yaml"}},
                 None, {},
             )
         assert out == {}
@@ -25,7 +25,7 @@ class TestCommitSizeGuard:
         hook = make_commit_size_guard_hook(max_files=20)
         with patch("hooks._git_porcelain_count", return_value=25):
             out = await hook(
-                {"tool_name": "Write", "tool_input": {"file_path": "/addon_configs/casa-agent/agents/x.yaml"}},
+                {"tool_name": "Write", "tool_input": {"file_path": "/addon_configs/casa/agents/x.yaml"}},
                 None, {},
             )
         assert out is not None

@@ -61,7 +61,7 @@ else
 </style></head>
 <body><div class="card">
   <h1>Web Terminal is disabled</h1>
-  <p>To enable it, go to <strong>Settings &rarr; Add-ons &rarr; Casa Agent &rarr; Configuration</strong>
+  <p>To enable it, go to <strong>Settings &rarr; Add-ons &rarr; Casa &rarr; Configuration</strong>
      and set <code>Enable Web Terminal</code> to on, then restart the add-on.</p>
 </div></body></html>';
         }

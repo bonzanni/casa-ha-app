@@ -18,7 +18,7 @@ import yaml
 pytestmark = [pytest.mark.unit]
 
 REPO = Path(__file__).resolve().parents[1]
-AGENTS = REPO / "casa-agent" / "rootfs" / "opt" / "casa" / "defaults" / "agents"
+AGENTS = REPO / "casa" / "rootfs" / "opt" / "casa" / "defaults" / "agents"
 RECALL_TOOL = "mcp__casa-framework__recall_memory"
 
 

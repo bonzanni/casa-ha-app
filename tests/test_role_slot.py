@@ -214,7 +214,7 @@ def test_materialize_role_succeeds_on_a_real_deep_frozen_role_artifact() -> None
 
     real_roles_dir = (
         Path(__file__).resolve().parent.parent
-        / "casa-agent/rootfs/opt/casa/defaults/roles"
+        / "casa/rootfs/opt/casa/defaults/roles"
     )
     source = load_role_artifact(real_roles_dir / "resident" / "butler")
 

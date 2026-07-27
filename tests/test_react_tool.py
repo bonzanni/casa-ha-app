@@ -204,7 +204,7 @@ def test_react_doctrine_marks_non_decisional():
     """Doctrine states reactions are non-decisional and never an approval
     shortcut for the verdict broker / ask."""
     doctrine = pathlib.Path(
-        "casa-agent/rootfs/opt/casa/defaults/agents/executors/"
+        "casa/rootfs/opt/casa/defaults/agents/executors/"
         "plugin-developer/doctrine/engagement-conduct.md"
     ).read_text(encoding="utf-8")
     low = doctrine.lower()
@@ -228,7 +228,7 @@ def test_react_granted_in_definition_and_resume_builder():
     engaged-executor resume-options builder (scoped to executors)."""
     import yaml
     defn = yaml.safe_load(pathlib.Path(
-        "casa-agent/rootfs/opt/casa/defaults/agents/executors/"
+        "casa/rootfs/opt/casa/defaults/agents/executors/"
         "plugin-developer/definition.yaml"
     ).read_text(encoding="utf-8"))
     assert "mcp__casa-framework__react" in defn["tools"]["allowed"]

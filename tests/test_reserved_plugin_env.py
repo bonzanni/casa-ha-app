@@ -20,7 +20,7 @@ from plugin_fixtures import entry, mk_artifact, mk_registry
 
 pytestmark = pytest.mark.unit
 
-_ROOTFS = Path(__file__).resolve().parent.parent / "casa-agent" / "rootfs"
+_ROOTFS = Path(__file__).resolve().parent.parent / "casa" / "rootfs"
 _DOCTRINE = (_ROOTFS / "opt" / "casa" / "defaults" / "agents" / "executors"
              / "plugin-developer" / "doctrine")
 

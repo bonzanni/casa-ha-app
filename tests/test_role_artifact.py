@@ -35,10 +35,10 @@ from role_artifact import RoleArtifactSource, load_role_artifact
 # ---------------------------------------------------------------------------
 
 _SCHEMA_PATH = Path(__file__).resolve().parent.parent / (
-    "casa-agent/rootfs/opt/casa/defaults/schema/role.v1.json"
+    "casa/rootfs/opt/casa/defaults/schema/role.v1.json"
 )
 _REAL_ROLES_DIR = Path(__file__).resolve().parent.parent / (
-    "casa-agent/rootfs/opt/casa/defaults/roles"
+    "casa/rootfs/opt/casa/defaults/roles"
 )
 
 _REAL_ROLE_DIRS = [

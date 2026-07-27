@@ -145,7 +145,7 @@ Emit only the structured result contract; no persona voice, no conversational fr
 
 def _build_synthetic_defaults_root(tmp_path: Path) -> Path:
     real_repo_root = Path(__file__).resolve().parents[1]
-    real_defaults_root = real_repo_root / "casa-agent" / "rootfs" / "opt" / "casa" / "defaults"
+    real_defaults_root = real_repo_root / "casa" / "rootfs" / "opt" / "casa" / "defaults"
 
     root = tmp_path / "synthetic-defaults"
     finance_role_dir = root / "roles" / "specialist" / "finance"

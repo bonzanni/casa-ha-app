@@ -9,8 +9,8 @@ import pytest
 pytestmark = pytest.mark.unit
 
 _ROOT = pathlib.Path(__file__).resolve().parents[1]
-SCRIPT = _ROOT / "casa-agent/rootfs/etc/s6-overlay/scripts/setup-configs.sh"
-CASA_CORE = _ROOT / "casa-agent/rootfs/opt/casa/casa_core.py"
+SCRIPT = _ROOT / "casa/rootfs/etc/s6-overlay/scripts/setup-configs.sh"
+CASA_CORE = _ROOT / "casa/rootfs/opt/casa/casa_core.py"
 
 
 def test_script_creates_and_exports_outbox():

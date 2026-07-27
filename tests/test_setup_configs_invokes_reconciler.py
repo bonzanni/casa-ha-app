@@ -11,7 +11,7 @@ import pytest
 
 pytestmark = pytest.mark.unit
 
-SETUP = Path("casa-agent/rootfs/etc/s6-overlay/scripts/setup-configs.sh")
+SETUP = Path("casa/rootfs/etc/s6-overlay/scripts/setup-configs.sh")
 
 
 def test_invokes_reconciler() -> None:

@@ -1,4 +1,4 @@
-"""Boot-time reconciliation of /addon_configs/casa-agent/tools/ (§4.3.4)."""
+"""Boot-time reconciliation of /addon_configs/casa/tools/ (§4.3.4)."""
 from __future__ import annotations
 
 import json
@@ -12,7 +12,7 @@ import yaml
 
 pytestmark = pytest.mark.unit
 
-RECONCILER = Path("casa-agent/rootfs/opt/casa/scripts/reconcile_system_requirements.py")
+RECONCILER = Path("casa/rootfs/opt/casa/scripts/reconcile_system_requirements.py")
 
 
 def _write_manifest(path: Path, entries: list[dict]) -> None:

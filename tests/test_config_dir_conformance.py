@@ -18,6 +18,6 @@ def test_config_dir_is_slash_config():
 def test_no_addon_configs_casa_agent_literal_in_python():
     offenders = []
     for p in _OPT_CASA.rglob("*.py"):
-        if re.search(r"/addon_configs/casa-agent", p.read_text(encoding="utf-8")):
+        if re.search(r"/addon_configs/casa", p.read_text(encoding="utf-8")):
             offenders.append(str(p.relative_to(_OPT_CASA)))
-    assert offenders == [], f"stale /addon_configs/casa-agent literal in: {offenders}"
+    assert offenders == [], f"stale /addon_configs/casa literal in: {offenders}"

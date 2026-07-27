@@ -7,7 +7,7 @@ Casa is pre-1.0: only the latest released version receives fixes.
 ## Reporting a vulnerability
 
 Please report vulnerabilities privately via GitHub's
-[private vulnerability reporting](https://github.com/bonzanni/casa-ha-app/security/advisories/new)
+[private vulnerability reporting](https://github.com/bonzanni/ha-casa-app/security/advisories/new)
 (Security tab → *Report a vulnerability*). Please do not open a public issue
 for security problems.
 

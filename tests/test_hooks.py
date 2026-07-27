@@ -90,19 +90,19 @@ async def test_block_curl_post():
 async def test_v2_writable_allows_write_under_prefix():
     from hooks import make_path_scope_hook_v2
     hook = make_path_scope_hook_v2(
-        writable=["/addon_configs/casa-agent/workspace"],
-        readable=["/addon_configs/casa-agent/workspace"],
+        writable=["/addon_configs/casa/workspace"],
+        readable=["/addon_configs/casa/workspace"],
     )
     data = {"tool_name": "Write",
             "tool_input": {"file_path":
-                "/addon_configs/casa-agent/workspace/note.txt"}}
+                "/addon_configs/casa/workspace/note.txt"}}
     assert await hook(data, "tid-20", CTX) == {}
 
 
 async def test_v2_writable_denies_write_outside():
     from hooks import make_path_scope_hook_v2
     hook = make_path_scope_hook_v2(
-        writable=["/addon_configs/casa-agent/workspace"],
+        writable=["/addon_configs/casa/workspace"],
         readable=[],
     )
     data = {"tool_name": "Write",
@@ -119,7 +119,7 @@ async def test_v2_readable_allows_read():
         readable=["/addon_configs"],
     )
     data = {"tool_name": "Read",
-            "tool_input": {"file_path": "/addon_configs/casa-agent/agents/butler/character.yaml"}}
+            "tool_input": {"file_path": "/addon_configs/casa/agents/butler/character.yaml"}}
     assert await hook(data, "tid-22", CTX) == {}
 
 

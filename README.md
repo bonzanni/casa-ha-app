@@ -1,15 +1,15 @@
 <div align="center">
 
-<img src="casa-agent/logo.png" alt="Casa logo" width="256">
+<img src="casa/logo.png" alt="Casa logo" width="256">
 
 # Casa — Claude-powered agents for Home Assistant
 
 **An always-on fleet of AI agents living inside your Home Assistant: chat with them on Telegram, talk to them through Assist, put your home on a schedule.**
 
-[![Open your Home Assistant instance and show the app store with this repository pre-filled.](https://my.home-assistant.io/badges/supervisor_store.svg)](https://my.home-assistant.io/redirect/supervisor_store/?repository_url=https%3A%2F%2Fgithub.com%2Fbonzanni%2Fcasa-ha-app)
+[![Open your Home Assistant instance and show the app store with this repository pre-filled.](https://my.home-assistant.io/badges/supervisor_store.svg)](https://my.home-assistant.io/redirect/supervisor_store/?repository_url=https%3A%2F%2Fgithub.com%2Fbonzanni%2Fha-casa-app)
 
-[![QA](https://github.com/bonzanni/casa-ha-app/actions/workflows/qa.yml/badge.svg)](https://github.com/bonzanni/casa-ha-app/actions/workflows/qa.yml)
-[![Version](https://img.shields.io/badge/dynamic/yaml?url=https%3A%2F%2Fraw.githubusercontent.com%2Fbonzanni%2Fcasa-ha-app%2Fmain%2Fcasa-agent%2Fconfig.yaml&query=%24.version&label=version&color=blue)](casa-agent/CHANGELOG.md)
+[![QA](https://github.com/bonzanni/ha-casa-app/actions/workflows/qa.yml/badge.svg)](https://github.com/bonzanni/ha-casa-app/actions/workflows/qa.yml)
+[![Version](https://img.shields.io/badge/dynamic/yaml?url=https%3A%2F%2Fraw.githubusercontent.com%2Fbonzanni%2Fha-casa-app%2Fmain%2Fcasa%2Fconfig.yaml&query=%24.version&label=version&color=blue)](casa/CHANGELOG.md)
 [![License: MIT](https://img.shields.io/badge/license-MIT-green.svg)](LICENSE)
 ![Supports aarch64 Architecture](https://img.shields.io/badge/aarch64-yes-green.svg)
 ![Supports amd64 Architecture](https://img.shields.io/badge/amd64-yes-green.svg)
@@ -45,7 +45,7 @@ the Home Assistant APIs at their fingertips.
 
 ## Apps in this repository
 
-### [Casa Agent](./casa-agent)
+### [Casa](./casa)
 
 ![Supports aarch64 Architecture](https://img.shields.io/badge/aarch64-yes-green.svg)
 ![Supports amd64 Architecture](https://img.shields.io/badge/amd64-yes-green.svg)
@@ -57,12 +57,12 @@ _Personal AI agent framework powered by Claude — the main (and currently only)
 1. Click the button above, or add this repository URL manually in
    **Settings → Apps → App Store → ⋮ → Repositories** (on older Home Assistant
    versions: **Settings → Add-ons → Add-on Store**):
-   `https://github.com/bonzanni/casa-ha-app`
-2. Install **Casa Agent** from the store.
+   `https://github.com/bonzanni/ha-casa-app`
+2. Install **Casa** from the store.
 3. Set your Claude OAuth token in the app configuration (run `claude setup-token`
    on your workstation to obtain one), optionally add a Telegram bot token, and
    start the app. The full walkthrough lives in the
-   [documentation](casa-agent/DOCS.md).
+   [documentation](casa/DOCS.md).
 
 > [!NOTE]
 > Installs pull a prebuilt, Cosign-signed container image from GHCR — no
@@ -79,18 +79,18 @@ _Personal AI agent framework powered by Claude — the main (and currently only)
 
 ## Documentation & support
 
-- [Casa Agent documentation](casa-agent/DOCS.md) — setup, configuration reference,
+- [Casa documentation](casa/DOCS.md) — setup, configuration reference,
   channels, memory, troubleshooting.
-- [Changelog](casa-agent/CHANGELOG.md)
+- [Changelog](casa/CHANGELOG.md)
 - Found a bug or have a feature request?
-  [Open an issue](https://github.com/bonzanni/casa-ha-app/issues).
+  [Open an issue](https://github.com/bonzanni/ha-casa-app/issues).
 
 ## Development
 
 Run `make setup` once on a fresh checkout (Linux/WSL2), then `make test-unit` for
 the fast gate and `make test-docker` for the container-backed tiers. Changes land
-via squash-merged pull requests; every release bumps `casa-agent/config.yaml` and
-adds a `casa-agent/CHANGELOG.md` entry.
+via squash-merged pull requests; every release bumps `casa/config.yaml` and
+adds a `casa/CHANGELOG.md` entry.
 
 ### AI-assisted development
 

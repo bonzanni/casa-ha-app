@@ -43,7 +43,7 @@ from personality_types import (
 
 _SCHEMA_PATH = (
     Path(__file__).resolve().parent.parent
-    / "casa-agent" / "rootfs" / "opt" / "casa" / "defaults" / "schema"
+    / "casa" / "rootfs" / "opt" / "casa" / "defaults" / "schema"
     / "speaker-provenance.v1.json"
 )
 

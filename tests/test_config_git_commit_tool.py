@@ -187,7 +187,7 @@ class TestConfigGitCommitSchemaGate:
         with patch(
             "agent_loader.validate_config_repo",
             return_value=[
-                "/addon_configs/casa-agent/agents/assistant/character.yaml: "
+                "/addon_configs/casa/agents/assistant/character.yaml: "
                 "schema violation at (root): Additional properties are not "
                 "allowed ('TRAIT' was unexpected)",
             ],

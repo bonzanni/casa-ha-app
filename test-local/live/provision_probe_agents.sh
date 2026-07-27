@@ -12,13 +12,13 @@
 #   provision_probe_agents.sh remove        [--gw R] [--spec R]
 #
 # Env overrides (REQUIRED — no host/container baked in): HOST is the ssh alias
-# for the HA host, CONTAINER is the casa-agent docker container name. Set them
+# for the HA host, CONTAINER is the casa docker container name. Set them
 # in the environment before running; the placeholder defaults below fail loudly.
 set -euo pipefail
 
 HERE="$(cd "$(dirname "$0")" && pwd)"
 HOST="${HOST:-ha-host}"                 # e.g. an ~/.ssh/config alias
-CONTAINER="${CONTAINER:-addon_casa-agent}"   # e.g. addon_<slug>_casa-agent
+CONTAINER="${CONTAINER:-addon_casa}"   # e.g. addon_<slug>_casa
 GW="probe-gw"
 SPEC="probe-spec"
 GHOST="probe-ghost"

@@ -22,7 +22,7 @@ pytestmark = [pytest.mark.asyncio, pytest.mark.unit]
 
 _EXECUTORS_DIR = (
     Path(__file__).resolve().parents[1]
-    / "casa-agent/rootfs/opt/casa/defaults/agents/executors"
+    / "casa/rootfs/opt/casa/defaults/agents/executors"
 )
 
 

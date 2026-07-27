@@ -10,7 +10,7 @@ import pytest
 
 pytestmark = pytest.mark.unit
 
-CASACTL = Path(__file__).resolve().parent.parent / "casa-agent" / \
+CASACTL = Path(__file__).resolve().parent.parent / "casa" / \
           "rootfs" / "usr" / "local" / "bin" / "casactl"
 
 

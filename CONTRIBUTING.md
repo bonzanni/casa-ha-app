@@ -19,8 +19,8 @@ validation builds for both architectures on every pull request.
 ## Pull requests
 
 - Branch from `master`; PRs are squash-merged.
-- Releases: bump `version:` in `casa-agent/config.yaml` and prepend a
-  user-facing `casa-agent/CHANGELOG.md` entry. Merging to master automatically
+- Releases: bump `version:` in `casa/config.yaml` and prepend a
+  user-facing `casa/CHANGELOG.md` entry. Merging to master automatically
   publishes the container images and creates the `vX.Y.Z` tag + GitHub
   Release — no manual steps.
 - New or changed app options need a `translations/en.yaml` entry and DOCS.md

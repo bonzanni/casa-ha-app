@@ -133,7 +133,7 @@ def test_template_path_handles_bundled_plugin_developer(tmp_path):
 
     here = Path(__file__).resolve().parent.parent
     plugin_dev_dir = (
-        here / "casa-agent" / "rootfs" / "opt" / "casa" / "defaults"
+        here / "casa" / "rootfs" / "opt" / "casa" / "defaults"
         / "agents" / "executors" / "plugin-developer"
     )
     raw_defn = yaml.safe_load((plugin_dev_dir / "definition.yaml").read_text(encoding="utf-8"))
@@ -202,7 +202,7 @@ def test_render_run_script_rejects_relative_or_shell_special_plugin_dir():
 
 
 def test_run_template_has_no_seed_or_cache_env():
-    template = (Path(__file__).resolve().parent.parent / "casa-agent" / "rootfs"
+    template = (Path(__file__).resolve().parent.parent / "casa" / "rootfs"
                 / "opt" / "casa" / "scripts" / "engagement_run_template.sh"
                 ).read_text(encoding="utf-8")
     assert "CLAUDE_CODE_PLUGIN_SEED_DIR" not in template
@@ -247,7 +247,7 @@ _bash_required = pytest.mark.skipif(BASH is None, reason="bash not found on PATH
 # {ID} is already substituted by render_run_script — operate on the result).
 _PROBE_ID = "probe0000"
 _RINGLOG = os.path.abspath(
-    "casa-agent/rootfs/opt/casa/scripts/ringlog.sh")
+    "casa/rootfs/opt/casa/scripts/ringlog.sh")
 
 
 @pytest.fixture
@@ -294,7 +294,7 @@ def test_ringlog_streams_before_eof_via_fifo(tmp_path):
     wfd = os.open(str(fifo), os.O_WRONLY)          # reader exists → won't block
     os.set_blocking(rfd, True)
     proc = subprocess.Popen([BASH, "scripts/ringlog.sh", str(log), "65536"],
-                            stdin=rfd, cwd="casa-agent/rootfs/opt/casa")
+                            stdin=rfd, cwd="casa/rootfs/opt/casa")
     os.close(rfd)                                  # child holds its own copy
     os.write(wfd, b"A" * 3000); time.sleep(0.3)
     assert log.stat().st_size >= 2048              # streamed BEFORE EOF, not buffered
@@ -310,7 +310,7 @@ def test_ringlog_byte_exact_multibyte_not_codepoint(tmp_path):
     log = tmp_path / "e.log"
     r = subprocess.run([BASH, "scripts/ringlog.sh", str(log), "1000000"],
                        input=("é" * 4096).encode("utf-8"),
-                       capture_output=True, cwd="casa-agent/rootfs/opt/casa")
+                       capture_output=True, cwd="casa/rootfs/opt/casa")
     assert r.returncode == 0
     assert log.stat().st_size == 8192          # EXACT bytes, not codepoint-clamped
 
@@ -322,7 +322,7 @@ def test_ringlog_large_no_newline_flood_bounded(tmp_path):
     log = tmp_path / "e.log"
     r = subprocess.run([BASH, "scripts/ringlog.sh", str(log), "65536"],
                        input=b"x" * 1_000_000, capture_output=True,
-                       cwd="casa-agent/rootfs/opt/casa")
+                       cwd="casa/rootfs/opt/casa")
     assert r.returncode == 0
     assert log.stat().st_size <= 65536 + 2048
     if (tmp_path / "e.log.1").exists():
@@ -334,7 +334,7 @@ def test_ringlog_rotates_on_threshold(tmp_path):
     log = tmp_path / "e.log"
     r = subprocess.run([BASH, "scripts/ringlog.sh", str(log), "64"],
                        input=b"y" * 512, capture_output=True,
-                       cwd="casa-agent/rootfs/opt/casa")
+                       cwd="casa/rootfs/opt/casa")
     assert (tmp_path / "e.log.1").exists()
 
 

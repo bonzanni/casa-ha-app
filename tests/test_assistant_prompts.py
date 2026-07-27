@@ -17,7 +17,7 @@ import pytest
 def _system_md_path() -> Path:
     root = Path(__file__).resolve().parent.parent
     return root / (
-        "casa-agent/rootfs/opt/casa/defaults/agents/assistant/prompts/system.md"
+        "casa/rootfs/opt/casa/defaults/agents/assistant/prompts/system.md"
     )
 
 

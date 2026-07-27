@@ -1,4 +1,4 @@
-"""manifest.yaml reader/writer for /addon_configs/casa-agent/system-requirements.yaml."""
+"""manifest.yaml reader/writer for /addon_configs/casa/system-requirements.yaml."""
 from __future__ import annotations
 
 from pathlib import Path

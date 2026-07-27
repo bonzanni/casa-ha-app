@@ -43,10 +43,10 @@ from pathlib import Path
 
 def _ensure_code_root_on_path() -> None:
     """Make the casa code root importable whether run on the host
-    (casa-agent/rootfs/opt/casa relative to this file) or inside the
+    (casa/rootfs/opt/casa relative to this file) or inside the
     container (/opt/casa)."""
     for candidate in (
-        Path(__file__).resolve().parents[3] / "casa-agent" / "rootfs" / "opt" / "casa",
+        Path(__file__).resolve().parents[3] / "casa" / "rootfs" / "opt" / "casa",
         Path("/opt/casa"),
     ):
         if (candidate / "canonical_bytes.py").is_file():

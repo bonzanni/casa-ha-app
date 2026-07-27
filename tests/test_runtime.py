@@ -24,12 +24,12 @@ def test_casa_runtime_holds_all_required_fields():
         engagement_driver=MagicMock(),
         claude_code_driver=MagicMock(),
         policy_lib=MagicMock(),
-        config_dir="/addon_configs/casa-agent",
-        agents_dir="/addon_configs/casa-agent/agents",
-        home_root="/addon_configs/casa-agent/agent-home",
+        config_dir="/addon_configs/casa",
+        agents_dir="/addon_configs/casa/agents",
+        home_root="/addon_configs/casa/agent-home",
         defaults_root="/opt/casa",
     )
-    assert rt.config_dir == "/addon_configs/casa-agent"
+    assert rt.config_dir == "/addon_configs/casa"
     assert rt.agents == {}
 
 

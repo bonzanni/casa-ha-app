@@ -98,7 +98,7 @@ def test_voice_tool_loop_error_has_typed_classification_and_generic_message():
 def test_butler_runtime_has_tina_voice_tool_loop_line():
     runtime_path = (
         Path(__file__).parents[1]
-        / "casa-agent/rootfs/opt/casa/defaults/agents/butler/runtime.yaml"
+        / "casa/rootfs/opt/casa/defaults/agents/butler/runtime.yaml"
     )
     runtime = yaml.safe_load(runtime_path.read_text(encoding="utf-8"))
     assert runtime["voice_errors"]["voice_tool_loop"] == (

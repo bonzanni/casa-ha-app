@@ -19,7 +19,7 @@ import pytest
 pytestmark = [pytest.mark.unit]
 
 REPO = Path(__file__).resolve().parents[1]
-CASA = REPO / "casa-agent" / "rootfs" / "opt" / "casa"
+CASA = REPO / "casa" / "rootfs" / "opt" / "casa"
 
 _SCRIPT = textwrap.dedent(
     """

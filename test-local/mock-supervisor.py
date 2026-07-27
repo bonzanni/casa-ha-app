@@ -30,8 +30,8 @@ async def addon_info(request):
     return web.json_response({
         "result": "ok",
         "data": {
-            "name": "Casa Agent",
-            "slug": "casa-agent",
+            "name": "Casa",
+            "slug": "casa",
             "state": "started",
             "version": "0.1.0",
             "ingress": True,

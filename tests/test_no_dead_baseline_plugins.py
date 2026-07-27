@@ -27,6 +27,6 @@ def test_claude_code_driver_has_no_base_plugins_root_param():
 
 
 def test_dockerfile_does_not_bake_dead_superpowers_clone():
-    text = (REPO_ROOT / "casa-agent" / "Dockerfile").read_text(encoding="utf-8")
+    text = (REPO_ROOT / "casa" / "Dockerfile").read_text(encoding="utf-8")
     assert "claude-plugins/base" not in text
     assert "SUPERPOWERS_REF" not in text

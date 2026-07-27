@@ -8,7 +8,7 @@ import jsonschema
 import pytest
 
 SCHEMA = json.loads(pathlib.Path(
-    "casa-agent/rootfs/opt/casa/defaults/schema/triggers.v1.json").read_text())
+    "casa/rootfs/opt/casa/defaults/schema/triggers.v1.json").read_text())
 
 
 def _doc(trigger: dict, version: int = 2) -> dict:

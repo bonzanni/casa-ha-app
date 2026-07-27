@@ -18,19 +18,19 @@ class TestPathScopeV2:
     async def test_writable_allows_write_under_prefix(self):
         from hooks import make_path_scope_hook_v2
         hook = make_path_scope_hook_v2(
-            writable=["/addon_configs/casa-agent/workspace"],
-            readable=["/addon_configs/casa-agent/workspace"],
+            writable=["/addon_configs/casa/workspace"],
+            readable=["/addon_configs/casa/workspace"],
         )
         data = {"tool_name": "Write",
                 "tool_input": {"file_path":
-                    "/addon_configs/casa-agent/workspace/note.txt"}}
+                    "/addon_configs/casa/workspace/note.txt"}}
         assert await hook(data, "tid", CTX) == {}
 
     async def test_writable_denies_write_outside_prefix(self):
         from hooks import make_path_scope_hook_v2
         hook = make_path_scope_hook_v2(
-            writable=["/addon_configs/casa-agent/workspace"],
-            readable=["/addon_configs/casa-agent/workspace"],
+            writable=["/addon_configs/casa/workspace"],
+            readable=["/addon_configs/casa/workspace"],
         )
         data = {"tool_name": "Write",
                 "tool_input": {"file_path": "/etc/shadow"}}
@@ -221,13 +221,13 @@ class TestHookNoopReturnsEmptyDict:
     async def test_path_scope_allowed_write(self):
         from hooks import make_path_scope_hook_v2
         hook = make_path_scope_hook_v2(
-            writable=["/addon_configs/casa-agent/workspace"],
-            readable=["/addon_configs/casa-agent/workspace"],
+            writable=["/addon_configs/casa/workspace"],
+            readable=["/addon_configs/casa/workspace"],
         )
         result = await hook(
             {"tool_name": "Write",
              "tool_input": {"file_path":
-                 "/addon_configs/casa-agent/workspace/note.txt"}},
+                 "/addon_configs/casa/workspace/note.txt"}},
             None, {},
         )
         assert result == {}, f"expected empty dict, got {result!r}"
@@ -250,7 +250,7 @@ class TestHookNoopReturnsEmptyDict:
         result = await hook(
             {"tool_name": "Write",
              "tool_input": {"file_path":
-                 "/addon_configs/casa-agent/agents/specialists/x/character.yaml"}},
+                 "/addon_configs/casa/agents/specialists/x/character.yaml"}},
             None, {},
         )
         assert result == {}, f"expected empty dict, got {result!r}"
@@ -276,7 +276,7 @@ class TestHookNoopReturnsEmptyDict:
             result = await hook(
                 {"tool_name": "Write",
                  "tool_input": {"file_path":
-                     "/addon_configs/casa-agent/agents/x.yaml"}},
+                     "/addon_configs/casa/agents/x.yaml"}},
                 None, {},
             )
         assert result == {}, f"expected empty dict, got {result!r}"

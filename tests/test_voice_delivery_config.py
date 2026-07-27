@@ -100,7 +100,7 @@ def test_voice_delivery_config_emits_one_static_sanitized_boot_event(
 def test_boot_wires_one_config_snapshot_into_all_voice_delivery_consumers():
     source = (
         Path(__file__).resolve().parent.parent
-        / "casa-agent" / "rootfs" / "opt" / "casa" / "casa_core.py"
+        / "casa" / "rootfs" / "opt" / "casa" / "casa_core.py"
     ).read_text(encoding="utf-8")
 
     assert "voice_delivery_config = load_voice_delivery_config()" in source
@@ -117,7 +117,7 @@ def test_addon_no_longer_declares_the_voice_delivery_options():
     nothing, and an orphan translation is invisible until someone re-adds the
     key and gets stale help text.
     """
-    root = Path(__file__).resolve().parent.parent / "casa-agent"
+    root = Path(__file__).resolve().parent.parent / "casa"
     addon = yaml.safe_load((root / "config.yaml").read_text(encoding="utf-8"))
     translations = yaml.safe_load(
         (root / "translations" / "en.yaml").read_text(encoding="utf-8"))
@@ -138,7 +138,7 @@ def test_removed_options_are_pruned_from_stored_config_on_boot():
     "Option '<key>' does not exist in the schema" on every boot of an
     upgraded install (the rule stated in config.yaml itself)."""
     setup = (
-        Path(__file__).resolve().parent.parent / "casa-agent" / "rootfs"
+        Path(__file__).resolve().parent.parent / "casa" / "rootfs"
         / "etc" / "s6-overlay" / "scripts" / "setup-configs.sh"
     ).read_text(encoding="utf-8")
     line = next(
@@ -333,7 +333,7 @@ async def test_configured_voice_ttl_reaches_voice_terminal_paths(
 
 def test_docs_state_websocket_hmac_security_boundary_exactly():
     docs = " ".join((
-        Path(__file__).resolve().parent.parent / "casa-agent" / "DOCS.md"
+        Path(__file__).resolve().parent.parent / "casa" / "DOCS.md"
     ).read_text(encoding="utf-8").split())
 
     assert "empty HTTP upgrade request body" in docs

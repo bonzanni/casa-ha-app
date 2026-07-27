@@ -13,7 +13,7 @@ from plugin_registry import TARGET_RE, compute_artifact_id
 
 pytestmark = pytest.mark.unit
 
-_PATH = (Path(__file__).resolve().parent.parent / "casa-agent" / "rootfs"
+_PATH = (Path(__file__).resolve().parent.parent / "casa" / "rootfs"
          / "opt" / "casa" / "defaults" / "plugin-registry.json")
 _EXPECTED = {"superpowers", "plugin-dev", "skill-creator", "mcp-server-dev",
              "context7"}

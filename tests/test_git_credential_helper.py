@@ -15,7 +15,7 @@ import pytest
 pytestmark = pytest.mark.unit
 
 HELPER = Path(
-    "casa-agent/rootfs/opt/casa/scripts/git-credential-casa.sh"
+    "casa/rootfs/opt/casa/scripts/git-credential-casa.sh"
 )
 
 

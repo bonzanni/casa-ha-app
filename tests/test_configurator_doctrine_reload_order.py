@@ -27,7 +27,7 @@ import pytest
 
 _DOCTRINE_ROOT = (
     Path(__file__).resolve().parent.parent
-    / "casa-agent"
+    / "casa"
     / "rootfs"
     / "opt"
     / "casa"

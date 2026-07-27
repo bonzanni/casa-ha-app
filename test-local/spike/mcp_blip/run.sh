@@ -1,7 +1,7 @@
 #!/bin/bash
 # Usage: ssh n150 -t 'cd /tmp && bash /path/to/mcp_blip/run.sh'
 #
-# Assumes `claude` CLI is on PATH (it is, inside the casa-agent container's
+# Assumes `claude` CLI is on PATH (it is, inside the casa container's
 # engagement workspaces). Run this OUTSIDE the container to avoid polluting
 # a real engagement. Requires python3 + aiohttp.
 set -euo pipefail

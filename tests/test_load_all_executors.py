@@ -430,7 +430,7 @@ class TestRoleCeilingClamp:
 
         agents_base = (
             Path(__file__).resolve().parents[1]
-            / "casa-agent" / "rootfs" / "opt" / "casa" / "defaults" / "agents"
+            / "casa" / "rootfs" / "opt" / "casa" / "defaults" / "agents"
         )
         with caplog.at_level(logging.ERROR):
             out, failed = load_all_executors(str(agents_base))

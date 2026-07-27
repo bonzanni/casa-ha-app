@@ -937,7 +937,7 @@ def test_freeze_refuses_symlinked_root(tmp_path):
 
 def test_s6_exports_pycache_prefix():
     from pathlib import Path as _P
-    text = (_P(__file__).resolve().parent.parent / "casa-agent" / "rootfs"
+    text = (_P(__file__).resolve().parent.parent / "casa" / "rootfs"
             / "etc" / "s6-overlay" / "scripts"
             / "setup-configs.sh").read_text(encoding="utf-8")
     assert "/run/s6/container_environment/PYTHONPYCACHEPREFIX" in text

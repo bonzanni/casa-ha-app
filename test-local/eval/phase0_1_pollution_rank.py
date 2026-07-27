@@ -91,7 +91,7 @@ TECHNICAL = [
     ("apparmor", "public", _exe("e7","configurator","tighten the AppArmor profile",
         "Added deny rules for /proc and network raw in apparmor.txt; smoke test passed.", ["apparmor.txt"])),
     ("ingress", "public", _eng("e8","frontend","fix ingress 502",
-        "NPM was pointing at a stale container IP; switched the proxy host to c071ea9c-casa-agent:8099.", [])),
+        "NPM was pointing at a stale container IP; switched the proxy host to c071ea9c-casa:8099.", [])),
     ("pytest", "public", _exe("e9","backend","add unit tests",
         "Added test_run_script_env.py asserting MEMORY_BACKEND derivation; 7 tests pass under pytest -m unit.", ["tests/test_run_script_env.py"])),
     ("lovelace2", "public", _eng("e10","frontend","build a chore-chart card",

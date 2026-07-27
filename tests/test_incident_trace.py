@@ -131,7 +131,7 @@ def test_stale_active_binding_is_never_green(monkeypatch, tmp_path):
 
 def test_verify_never_reads_highest_version_dir():
     """Meta-guard: the version-keyed indirection is gone for good."""
-    root = (Path(__file__).resolve().parent.parent / "casa-agent" / "rootfs"
+    root = (Path(__file__).resolve().parent.parent / "casa" / "rootfs"
             / "opt" / "casa")
     assert "highest_version" not in (root / "tools.py").read_text(encoding="utf-8")
     assert "_version_key" not in (root / "plugin_grants.py").read_text(encoding="utf-8")
