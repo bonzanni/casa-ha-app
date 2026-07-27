@@ -74,6 +74,31 @@ def content_document_id(speaker: str, text: str) -> str:
     return f"m-{digest[:24]}"
 
 
+def automation_document_id(user_peer: str, text: str) -> str:
+    """Content-stable ``document_id`` for a turn authored by an AUTOMATION —
+    a machine that reached Casa through a shared bearer secret (``/invoke``, or
+    a ``/webhook/{name}`` trigger). Personality Task 10 / #204.
+
+    Keyed on ``(user_peer, text)`` like :func:`content_document_id`, because the
+    originating trigger is exactly what distinguishes one automation from
+    another: two triggers posting identical text are two facts from two sources,
+    not one. Routing these through :func:`agent_document_id` instead would fold
+    role/persona (both null on an automation) and DISCARD ``user_peer``
+    entirely, collapsing every trigger into a single document.
+
+    The digest is domain-separated by an ``automation`` prefix and the id by an
+    ``m-x-`` prefix (x = eXternal), so the same ``(peer, text)`` can never
+    collide with the user ``m-`` space or the agent ``m-a-`` space — an
+    automation calling itself ``nicola`` still cannot upsert over the operator's
+    own memories."""
+    if not user_peer:
+        raise ValueError("automation_document_id requires a user_peer")
+    digest = hashlib.sha256(
+        f"automation\x00{user_peer}\x00{text}".encode("utf-8")
+    ).hexdigest()
+    return f"m-x-{digest[:24]}"
+
+
 def agent_document_id(provenance: "SpeakerProvenance", text: str) -> str:
     """Content-stable ``document_id`` for a memory turn authored by an AGENT
     (resident / specialist / executor / the unattributed ``system`` identity) —
@@ -97,6 +122,9 @@ def agent_document_id(provenance: "SpeakerProvenance", text: str) -> str:
     validate_speaker_provenance(provenance)
     if provenance.speaker_kind == "user":
         raise ValueError("agent_document_id cannot be used for a user provenance")
+    if provenance.speaker_kind == "automation":
+        raise ValueError(
+            "agent_document_id cannot be used for an automation provenance")
     digest = hashlib.sha256(
         ("agent\0" + provenance.speaker_kind + "\0" + (provenance.role_id or "") + "\0"
          + (provenance.persona_id or "") + "\0" + text).encode("utf-8")

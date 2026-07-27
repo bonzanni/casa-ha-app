@@ -37,12 +37,7 @@ from telegram.ext import (
 )
 
 from bus import BusMessage, MessageBus, MessageType
-from channel_trust import user_peer_for_channel
-from personality_types import (
-    AuthenticatedUser,
-    TrustedOrigin,
-    TrustedUserOriginInput,
-)
+from ingress_identity import ingress_identity
 from channels import Channel
 # v0.79.0 (§2 Primitive A): the per-topic OUTPUT SEQUENCER + relay-mediated
 # discrete-posting intent registry. Implemented in the sibling module and
@@ -1272,18 +1267,12 @@ class TelegramChannel(Channel):
             # Task 9: server-created trusted ingress identity (never decoded
             # from payload) — the sole source Agent._process reads to persist
             # this turn's user provenance for the session-resume identity gate.
-            trusted_user_origin=TrustedUserOriginInput(
-                surface="telegram",
-                server_origin=TrustedOrigin(
-                    route="telegram", is_authenticated=True, clearance="private",
-                ),
-                authenticated_user=(
-                    AuthenticatedUser(
-                        stable_id=str(user.id), configured_display_name=user_name,
-                    )
-                    if user is not None else None
-                ),
-                user_peer=user_peer_for_channel("telegram"),
+            # Resolved through the declarative ingress table (#203) so this
+            # route can never silently lose its identity.
+            trusted_user_origin=ingress_identity(
+                "telegram",
+                sender_id=str(user.id) if user is not None else None,
+                sender_display_name=user_name if user is not None else None,
             ),
         )
         await self._bus.send(msg)

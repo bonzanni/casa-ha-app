@@ -1,5 +1,55 @@
 # Changelog
 
+## [0.129.0] - 2026-07-28
+
+### Added
+
+- **Webhook and invoke turns now say who triggered them.** A turn arriving via
+  `POST /webhook/{name}` or `POST /invoke/{agent}` used to be recorded with the
+  generic, unattributed `system` identity — honest, but it lost which trigger
+  fired. Each now carries its own identity: `/invoke` is recorded as
+  `invoke_caller`, and every webhook trigger as `webhook:<its name>`, so two
+  triggers are never confused for each other or for anything Casa said itself.
+  (#204)
+- **A new `automation` author kind.** Both of those surfaces are reached with a
+  shared secret, which proves the caller holds a credential — never that a
+  particular person wrote the text. Their turns are therefore recorded as
+  automations rather than as people: honest about arriving from outside without
+  claiming a human author or Casa's own authority. Recalled automation memories
+  are introduced as "An automation reported: …" rather than being attributed to
+  a person or to Casa. Neither surface is ever attributed to the operator.
+- **Casa now refuses to start if any of its entry points cannot say who is
+  speaking.** Every external entry point declares its identity in one place,
+  checked at startup; an entry point that could only produce an anonymous or
+  wrong author fails the boot loudly instead of quietly mislabelling months of
+  memories. A single request that cannot be identified is rejected on its own
+  rather than being let through unattributed. (#203)
+
+### Changed
+
+- Webhook trigger names are capped at 248 characters, and rejected with a
+  config error rather than accepted and then failing on every request. Existing
+  names are unaffected — the longest in any shipped configuration is far below
+  the cap, and plugin-declared triggers were already limited to 64.
+
+### Internal
+
+- Per-turn author identity moved out of `channel_trust` into a new declarative
+  `ingress_identity` table keyed by ingress route. The retired helper defaulted
+  to the operator's peer for any channel absent from its map, so `/invoke` and
+  `/webhook` would have inherited Nicola's identity by omission — third-party
+  content permanently recorded as the operator's own words. Peers are now
+  declared per route with no default at all.
+- `automation_document_id` gives automation memories their own content-addressed
+  id space (`m-x-`), domain-separated from the user (`m-`) and agent (`m-a-`)
+  spaces. Without it, the agent id scheme would have folded every trigger into a
+  single document by discarding `user_peer`, and an automation naming itself
+  after the operator could have upserted over the operator's own memories.
+- Downgrading to a build without the `automation` kind is fail-safe, not fatal:
+  the older parser rejects the unknown kind and `_decode_provenance` treats the
+  entry as absent, so such a session is simply treated as legacy and starts
+  fresh. Rollback loses webhook/invoke attribution and nothing else.
+
 ## [0.128.0] - 2026-07-28
 
 ### Added

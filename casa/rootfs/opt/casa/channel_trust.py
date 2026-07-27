@@ -7,16 +7,24 @@ rendering inside the <channel_context> system-prompt block.
 Trust ordering (highest → lowest):
     internal > authenticated > external-authenticated > household-shared > public
 
+Per-turn AUTHOR identity is NOT here — see :mod:`ingress_identity`, which maps
+an ingress ROUTE to the peer that authored its turns. The two are different
+axes: this module answers "how much may the agent disclose on this channel?",
+that one answers "who wrote this?". A shared bearer secret settles the first and
+says nothing about the second (#204).
+
+(A ``user_peer_for_channel`` helper used to live here. It defaulted to
+``"nicola"`` for any channel absent from its map, so /invoke and /webhook would
+have inherited the operator's identity by omission. Peers are now declared per
+route, with no default.)
+
 Future voice-ID upgrade path: a recognised speaker can be promoted
 from ``voice_speaker`` to ``nicola`` at the channel layer before
-``Agent.handle_message`` — no change needed below.
+``Agent.handle_message`` — change the voice entries in
+:mod:`ingress_identity`.
 """
 
 from __future__ import annotations
-
-_USER_PEER_BY_CHANNEL: dict[str, str] = {
-    "voice": "voice_speaker",
-}
 
 _CHANNEL_TRUST_TOKEN: dict[str, str] = {
     "telegram":  "authenticated",
@@ -37,11 +45,6 @@ _CHANNEL_TRUST_DISPLAY: dict[str, str] = {
     "scheduler": "internal (system-initiated)",
     "webhook":   "authenticated (shared secret)",
 }
-
-
-def user_peer_for_channel(channel: str) -> str:
-    """Return the peer name that owns user-text from *channel*."""
-    return _USER_PEER_BY_CHANNEL.get(channel, "nicola")
 
 
 def channel_trust(channel: str) -> str:

@@ -37,6 +37,11 @@ from claude_runtime import (
 from config import AgentConfig
 from config_git import init_repo, snapshot_manual_edits
 from freshness_reaper import FreshnessReaper
+from ingress_identity import (
+    IngressIdentityError,
+    ingress_identity,
+    validate_ingress_identity_table,
+)
 from log_cid import install_logging, new_cid
 from casa_core_middleware import cid_middleware, CasaAccessLogger
 from ha_mcp_facade import HomeAssistantFacade
@@ -1378,12 +1383,31 @@ def _make_webhook_handler(
         except Exception:
             payload = body.decode("utf-8", errors="replace")
 
+        # #204: attribute the turn to the trigger that fired it. Resolved
+        # BEFORE the message is built so an unstampable ingress fails the
+        # request (#203) instead of dispatching under the blind ``system``
+        # identity. The peer is per-trigger and never the operator's.
+        try:
+            trusted_origin = ingress_identity(
+                "webhook_trigger", webhook_name=name,
+                clearance=trigger_registry.get_clearance(name),
+            )
+        except IngressIdentityError:
+            logger.error(
+                "webhook %r could not be given a trusted identity; refusing "
+                "to dispatch it unattributed", name, exc_info=True,
+            )
+            return web.json_response(
+                {"error": "ingress identity unavailable"}, status=500,
+            )
+
         msg = BusMessage(
             type=MessageType.SCHEDULED,
             source="webhook",
             target=target_role,
             content=f"Webhook '{name}' triggered with payload: {payload}",
             channel="webhook",
+            trusted_user_origin=trusted_origin,
             context={
                 "webhook_name": name,
                 "cid": request.get("cid") or new_cid(),
@@ -1564,6 +1588,11 @@ def build_invoke_message(
         content=prompt,
         channel="webhook",
         context=context,
+        # #204: an operator-signed call is still a MACHINE caller — the global
+        # HMAC secret is a bearer credential, so this is an ``invoke_caller``
+        # automation, never the operator himself. Server-created like
+        # ``_origin_route`` above; a caller cannot reach it through the body.
+        trusted_user_origin=ingress_identity("invoke"),
     )
 
 
@@ -1977,6 +2006,19 @@ async def main() -> None:
     from sdk_logging import install_sdk_task_noise_filter
     install_sdk_task_noise_filter(asyncio.get_running_loop())
     logger.info("Casa core starting up")
+
+    # 1b. #203: every external ingress must be able to name the author of its
+    # turns. A deterministic defect in that table (a dropped route, an empty
+    # peer, an unrecognized strategy) is a programming error that would send
+    # the affected ingress silently back to the unattributed ``system``
+    # identity, so it fails startup here rather than degrading in the field.
+    # Unconditional and early ON PURPOSE — v0.125.0 crash-looped production
+    # from a defect inside `if telegram_token:`, a branch no unit test enters.
+    # The validator is pure, narrow (it reads no runtime data) and directly
+    # unit-tested; per-request identity failures are handled at the ingress,
+    # never here.
+    validate_ingress_identity_table()
+
     voice_delivery_config = load_voice_delivery_config()
 
     observed_cli = await asyncio.to_thread(verify_effective_cli)

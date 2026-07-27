@@ -3,7 +3,9 @@ from types import MappingProxyType
 from typing import Literal, Mapping
 
 
-SpeakerKind = Literal["user", "resident", "specialist", "executor", "system"]
+SpeakerKind = Literal[
+    "user", "resident", "specialist", "executor", "system", "automation",
+]
 SensitivityTier = Literal["public", "friends", "family", "private"]
 
 
