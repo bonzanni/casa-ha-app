@@ -5,8 +5,10 @@
 # unrelated would otherwise skip the gate entirely, and a commit that adds private
 # content followed by one that removes it still publishes the object.
 #
-# The gated paths live in .githooks/gated-paths.txt. They are deliberately wider than
-# docs/: the FIRST public push carries no corpus and is still irreversible.
+# EVERY commit is gated, and only refs/heads/* may be published at all. A path-based
+# trigger was tried and was wrong twice over: a narrow list left ordinary source pushes
+# ungated, and even an all-paths list let an EMPTY commit through, whose message and
+# author identity are published all the same.
 #
 # CASA_GATE_OVERRIDE=<reason> bypasses this. It prints the reason; the reason belongs in
 # the PR. This is a local control — see docs/doctrine/publishing.md for what it does and
@@ -14,46 +16,39 @@
 set -euo pipefail
 
 receipt="$(git rev-parse --git-path casa-gate-approved)"   # `.git` is a FILE in a worktree
-gated_file="$(cd "$(dirname "$0")" && pwd)/gated-paths.txt"
 zero="0000000000000000000000000000000000000000"
-
-[ -f "$gated_file" ] || { echo "✋ pre-push: missing $gated_file" >&2; exit 1; }
 
 # git passes the DESTINATION remote as $1. Coverage must be relative to that remote: a
 # commit reachable from some *other* configured remote (a private one, say) is not
-# published at this destination, and `--not --remotes` used to treat it as if it were.
+# published at this destination.
 destination="${1:-origin}"
 
 while read -r local_ref local_sha remote_ref remote_sha; do
-  [ "$local_sha" = "$zero" ] && continue          # branch deletion
+  [ "$local_sha" = "$zero" ] && continue          # deleting a ref publishes nothing
 
-  # TAGS ARE REFUSED OUTRIGHT.
+  # ONLY branch updates are publishable through this hook. Everything else is refused:
   #
-  # A tag publishes its annotation, its tagger identity and its name, none of which is a
-  # commit and none of which any range or message sweep covers. An attestation flow for
-  # them was built and then removed: it produced a fresh publication hole in three
-  # consecutive reviews (headers discarded, scanner never run, object-not-name binding,
-  # regex-injectable name matching, unswept nested tag objects). Patching it further was
-  # buying risk for a capability nothing here uses.
+  #   refs/tags/*  - a tag publishes its annotation, tagger identity and name, none of
+  #                  them a commit and none covered by any sweep. An attestation flow for
+  #                  them produced a fresh hole in three consecutive reviews and was
+  #                  deleted; this repo does not tag locally (deploy.yml cuts the release
+  #                  tag in CI, which does not run this hook).
+  #   anything else - an arbitrary namespace such as refs/archive/* can carry a tag object
+  #                  whose target is already reachable, so it introduces no commits and
+  #                  would slip through the enumeration below entirely.
   #
-  # This repo does not tag locally: deploy.yml cuts the vX.Y.Z tag and the GitHub release
-  # in CI on merge to main, and CLAUDE.md states "no manual tagging". CI does not run this
-  # hook. If a local tag push is ever genuinely needed, CASA_GATE_OVERRIDE takes a reason
-  # and prints it, and that reason belongs in the PR.
-  #
-  # Both sides are checked: `main:refs/tags/x` publishes a tag while the SOURCE ref is a
-  # branch, which a local-ref-only test would have waved through.
-  case "$local_ref$remote_ref" in
-    *refs/tags/*)
+  # CASA_GATE_OVERRIDE takes a reason and prints it; the reason belongs in the PR.
+  case "$remote_ref" in
+    refs/heads/*) ;;
+    *)
       if [ -n "${CASA_GATE_OVERRIDE:-}" ]; then
-        echo "⚠  pre-push: tag push overridden — $CASA_GATE_OVERRIDE" >&2
+        echo "⚠  pre-push: non-branch ref overridden — $CASA_GATE_OVERRIDE" >&2
         continue
       fi
-      echo "✋ pre-push: refusing to push a tag." >&2
-      echo "   A tag publishes its annotation, tagger identity and name — none of them a" >&2
-      echo "   commit, none covered by any sweep. Releases are tagged by CI on merge to" >&2
-      echo "   main; there is no local tagging in this repo." >&2
-      echo "   If you truly need one: CASA_GATE_OVERRIDE='<reason>' git push ..." >&2
+      echo "✋ pre-push: refusing to publish $remote_ref — only refs/heads/* is allowed." >&2
+      echo "   Tags and other namespaces publish annotations, identities and ref names" >&2
+      echo "   that no sweep covers. Releases are tagged by CI on merge to main." >&2
+      echo "   If you truly need this: CASA_GATE_OVERRIDE='<reason>' git push ..." >&2
       exit 1 ;;
   esac
 
@@ -62,30 +57,19 @@ while read -r local_ref local_sha remote_ref remote_sha; do
   else
     commits="$(git rev-list "$remote_sha..$local_sha")"
   fi
-  [ -n "$commits" ] || continue
+  [ -n "$commits" ] || continue                   # nothing new to publish
 
-  touches=""
-  for commit in $commits; do
-    # -m: a merge emits no file list at all without it, so a gated path introduced by
-    # conflict resolution would not require a receipt. deny-sweep already passes -m; the
-    # decision about WHETHER to gate has to agree with it.
-    changed="$(git show --name-only --format= -m "$commit")"
-    while IFS= read -r pattern; do
-      case "$pattern" in ""|\#*) continue ;; esac
-      if printf '%s\n' "$changed" | grep -qE "$pattern"; then
-        touches="$commit"
-        break 2
-      fi
-    done < "$gated_file"
-  done
-  [ -n "$touches" ] || continue                   # nothing gated in this push
-
+  # EVERY introduced commit needs the receipt, whether or not it changes a file. An empty
+  # commit still publishes its message, its author and its committer — a
+  # `git commit --allow-empty -m '<private text>'` used to sail straight through here,
+  # and a test asserted that it should.
   if [ -n "${CASA_GATE_OVERRIDE:-}" ]; then
     echo "⚠  pre-push: gate overridden — $CASA_GATE_OVERRIDE" >&2
     continue
   fi
   if [ ! -f "$receipt" ] || [ "$(head -1 "$receipt")" != "$local_sha" ]; then
-    echo "✋ pre-push: commit $touches touches a gated path and $local_sha is not attested." >&2
+    count="$(printf '%s\n' "$commits" | wc -l | tr -d ' ')"
+    echo "✋ pre-push: $count commit(s) would be published and $local_sha is not attested." >&2
     echo "   Run: scripts/gate.sh" >&2
     echo "        scripts/attest.sh --read-in-full --reviewers \"...\" --findings-applied --re-reviewed" >&2
     echo "   This push is irreversible; objects stay fetchable by SHA afterwards." >&2

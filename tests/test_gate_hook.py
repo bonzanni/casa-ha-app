@@ -19,7 +19,6 @@ def _repo(tmp_path: Path) -> Path:
     subprocess.run(["git", "init", "-q", str(repo)], check=True)
     for key, value in (("user.email", "t@t"), ("user.name", "t")):
         subprocess.run(["git", "-C", str(repo), "config", key, value], check=True)
-    # The hook reads its path list relative to ITSELF, so the project's list is used.
     return repo
 
 
@@ -73,6 +72,43 @@ def test_an_ordinary_source_push_is_gated_too(tmp_path):
     result = _push(repo, sha)
     assert result.returncode == 1
     assert "not attested" in result.stderr
+
+
+def test_an_empty_commit_is_gated(tmp_path):
+    """It changes no file, so a path-based trigger let it through — but its MESSAGE,
+    author and committer are published. A test previously asserted this was allowed."""
+    repo = _repo(tmp_path)
+    subprocess.run(
+        ["git", "-C", str(repo), "commit", "-q", "--allow-empty", "-m", "private text here"],
+        check=True,
+    )
+    sha = subprocess.run(["git", "-C", str(repo), "rev-parse", "HEAD"],
+                         capture_output=True, text=True, check=True).stdout.strip()
+    result = _push(repo, sha)
+    assert result.returncode == 1
+    assert "not attested" in result.stderr
+
+
+def test_an_empty_tip_does_not_hide_an_earlier_commit(tmp_path):
+    """What the removed test was reaching for: the hook enumerates the range, so a push
+    whose TIP is empty is still gated for the commits behind it."""
+    repo = _repo(tmp_path)
+    _commit(repo, "docs/architecture/a.md")
+    subprocess.run(["git", "-C", str(repo), "commit", "-q", "--allow-empty", "-m", "empty tip"],
+                   check=True)
+    tip = subprocess.run(["git", "-C", str(repo), "rev-parse", "HEAD"],
+                         capture_output=True, text=True, check=True).stdout.strip()
+    assert _push(repo, tip).returncode == 1
+
+
+def test_a_non_branch_namespace_is_refused(tmp_path):
+    """An arbitrary namespace can carry a tag object whose target is already reachable, so
+    it introduces no commits and would slip past the enumeration entirely."""
+    repo = _repo(tmp_path)
+    sha = _commit(repo, "docs/architecture/a.md")
+    result = _tag_push(repo, "refs/heads/main", sha, remote_ref="refs/archive/x")
+    assert result.returncode == 1
+    assert "only refs/heads/* is allowed" in result.stderr
 
 
 def test_the_automated_receipt_alone_does_not_authorise_a_push(tmp_path):
@@ -207,7 +243,7 @@ def test_an_annotated_tag_push_is_refused(tmp_path):
                          capture_output=True, text=True, check=True).stdout.strip()
     result = _tag_push(repo, "refs/tags/v1", sha)
     assert result.returncode == 1
-    assert "refusing to push a tag" in result.stderr
+    assert "only refs/heads/* is allowed" in result.stderr
 
 
 def test_a_lightweight_tag_push_is_refused(tmp_path):
@@ -223,7 +259,7 @@ def test_a_branch_source_pushed_to_a_tag_destination_is_refused(tmp_path):
     sha = _commit(repo, "docs/architecture/a.md")
     result = _tag_push(repo, "refs/heads/main", sha, remote_ref="refs/tags/sneaky")
     assert result.returncode == 1
-    assert "refusing to push a tag" in result.stderr
+    assert "only refs/heads/* is allowed" in result.stderr
 
 
 def test_a_tag_name_with_regex_metacharacters_is_still_refused(tmp_path):
@@ -249,22 +285,3 @@ def test_a_tag_push_can_be_overridden_with_a_reason(tmp_path):
                        env={"CASA_GATE_OVERRIDE": "documented exception"})
     assert result.returncode == 0
     assert "overridden" in result.stderr
-
-
-def test_an_empty_commit_is_the_only_ungated_push(tmp_path):
-    """With every path gated, this is what proves the hook enumerates history rather than
-    inspecting the tip: an empty commit touches nothing, so a range whose TIP is empty is
-    still gated when an earlier commit is not."""
-    repo = _repo(tmp_path)
-    subprocess.run(["git", "-C", str(repo), "commit", "-q", "--allow-empty", "-m", "empty"],
-                   check=True)
-    empty_only = subprocess.run(["git", "-C", str(repo), "rev-parse", "HEAD"],
-                                capture_output=True, text=True, check=True).stdout.strip()
-    assert _push(repo, empty_only).returncode == 0, "an empty commit touches no path"
-
-    _commit(repo, "docs/architecture/a.md")
-    subprocess.run(["git", "-C", str(repo), "commit", "-q", "--allow-empty", "-m", "empty tip"],
-                   check=True)
-    tip = subprocess.run(["git", "-C", str(repo), "rev-parse", "HEAD"],
-                         capture_output=True, text=True, check=True).stdout.strip()
-    assert _push(repo, tip).returncode == 1, "a tip-only check would have missed this"
