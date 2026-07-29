@@ -17,6 +17,8 @@ PATTERNS = """
 (^|/)zzforbidden-
 [content]
 ZZ-DENIED-LITERAL-ZZ
+[allow-content]
+ZZ-NEVER-MATCHES-ANYTHING-ZZ
 """
 
 

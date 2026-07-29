@@ -113,6 +113,25 @@ def test_an_allow_rule_cannot_exempt_a_value_it_merely_prefixes(tmp_path):
     assert "notallowed@zztest.zzdomain" in result.stderr
 
 
+def test_a_structurally_invalid_policy_fails_closed(tmp_path):
+    """"Fails closed" has to cover an INVALID policy, not only an unreadable one: a blank
+    file parsed into empty arrays while every check still reported success, and the policy
+    file is itself excluded from the primary content sweep."""
+    repo, deny = _repo(tmp_path)
+    _commit(repo, "README.md", "fine\n")
+    deny.write_text("")
+    result = _sweep(repo, deny, "tree")
+    assert result.returncode == 2
+    assert "malformed policy" in result.stderr or "no path or content rules" in result.stderr
+
+
+def test_a_policy_missing_a_section_fails_closed(tmp_path):
+    repo, deny = _repo(tmp_path)
+    _commit(repo, "README.md", "fine\n")
+    deny.write_text("[content]\nZZ-DENIED-LITERAL-ZZ\n")
+    assert _sweep(repo, deny, "tree").returncode == 2
+
+
 def test_a_missing_pattern_file_fails_closed(tmp_path):
     """It used to load zero rules and exit 0 — so a commit deleting the policy file
     disabled its own guard, and in staged mode the deletion is not even in the ACMR
@@ -143,7 +162,7 @@ def test_an_allow_rule_cannot_blind_the_private_supplement(tmp_path):
     """
     repo, deny = _repo(tmp_path)
     supplement = tmp_path / "supplement.txt"
-    supplement.write_text("[content]\nZZ-DENIED-LITERAL-ZZ-BUT-ALLOWED\n")
+    supplement.write_text("[content]\nZZ-DENIED-LITERAL-ZZ-BUT-ALLOWED\n")  # supplement needs no sections
     _commit(repo, "README.md", "ZZ-DENIED-LITERAL-ZZ-BUT-ALLOWED\n")
     result = _sweep(repo, deny, "tree", supplement=supplement)
     assert result.returncode == 1
@@ -196,7 +215,7 @@ def test_messages_mode_sweeps_commit_messages(tmp_path):
 
 def test_an_invalid_pattern_is_fatal_not_silent(tmp_path):
     repo, deny = _repo(tmp_path)
-    deny.write_text("[content]\n[unclosed\n")
+    deny.write_text("[paths]\nzz-never\n[content]\n[unclosed\n[allow-content]\n")
     _commit(repo, "README.md", "fine\n")
     result = _sweep(repo, deny, "tree")
     assert result.returncode == 2
@@ -207,7 +226,7 @@ def test_a_valid_pattern_is_not_reported_invalid(tmp_path):
     """`status=$?` captured after `!` is always 0, which made every real rule read as
     invalid and the whole sweep fail closed."""
     repo, deny = _repo(tmp_path)
-    deny.write_text("[content]\n^definitely-not-present-anywhere$\n")
+    deny.write_text("[paths]\nzz-never\n[content]\n^definitely-not-present-anywhere$\n[allow-content]\n")
     _commit(repo, "README.md", "fine\n")
     result = _sweep(repo, deny, "tree")
     assert result.returncode == 0, result.stderr
@@ -231,7 +250,7 @@ def test_the_pattern_file_in_use_is_excluded_from_the_content_sweep(tmp_path):
 def test_a_trivially_broad_allow_rule_is_refused(tmp_path):
     """One `.*` under [allow-content] would exempt every finding there is."""
     repo, deny = _repo(tmp_path)
-    deny.write_text("[content]\nZZ-DENIED-LITERAL-ZZ\n[allow-content]\n.*\n")
+    deny.write_text("[paths]\nzz-never\n[content]\nZZ-DENIED-LITERAL-ZZ\n[allow-content]\n.*\n")
     _commit(repo, "README.md", "contact: ZZ-DENIED-LITERAL-ZZ\n")
     result = _sweep(repo, deny, "tree")
     assert result.returncode == 2

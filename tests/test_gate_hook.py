@@ -73,10 +73,15 @@ def test_a_push_touching_only_the_guard_is_gated(tmp_path):
     assert "not attested" in result.stderr
 
 
-def test_a_push_touching_no_gated_path_is_allowed(tmp_path):
+def test_an_ordinary_source_push_is_gated_too(tmp_path):
+    """This used to assert the opposite, which enshrined a real hole: a push adding
+    private prose or an address to casa/ was an ordinary, fully-verified path to a public
+    ref, gated by nothing. Every push to a public repo publishes."""
     repo = _repo(tmp_path)
     sha = _commit(repo, "casa/rootfs/opt/casa/thing.py")
-    assert _push(repo, sha).returncode == 0
+    result = _push(repo, sha)
+    assert result.returncode == 1
+    assert "not attested" in result.stderr
 
 
 def test_the_automated_receipt_alone_does_not_authorise_a_push(tmp_path):
