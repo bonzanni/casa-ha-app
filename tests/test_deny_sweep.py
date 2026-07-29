@@ -45,6 +45,24 @@ def _repo(tmp_path: Path) -> tuple[Path, Path]:
     return repo, deny
 
 
+def _policy(repo: Path) -> None:
+    """Write the policy files the sweep now requires, the way Task 7 generates them.
+
+    Both fail CLOSED when absent, which is the point — so every fixture has to supply
+    them, exactly as a real checkout does.
+    """
+    hooks = repo / ".githooks"
+    hooks.mkdir(exist_ok=True)
+    roots = subprocess.run(
+        ["git", "-C", str(repo), "ls-files"], capture_output=True, text=True, check=True
+    ).stdout.split()
+    (hooks / "root-allowlist.txt").write_text(
+        "".join(f"{r}\n" for r in sorted(roots) if "/" not in r)
+    )
+    if not (hooks / "gitleaks-allow-sites.txt").exists():
+        (hooks / "gitleaks-allow-sites.txt").write_text("")
+
+
 def _commit(repo: Path, rel: str, body: str) -> str:
     target = repo / rel
     target.parent.mkdir(parents=True, exist_ok=True)
@@ -59,6 +77,7 @@ def _commit(repo: Path, rel: str, body: str) -> str:
 
 def _sweep(repo: Path, deny: Path, *args, supplement: Path | None = None):
     """The script must scan the repo it is RUN IN, not the one it lives in."""
+    _policy(repo)
     env = {"PATH": "/usr/bin:/bin", "HOME": str(repo), "CASA_DENY_FILE": str(deny)}
     if supplement is not None:
         env["CASA_DENY_SUPPLEMENT"] = str(supplement)
@@ -195,13 +214,28 @@ def test_a_valid_pattern_is_not_reported_invalid(tmp_path):
 
 
 def test_the_pattern_file_in_use_is_excluded_from_the_content_sweep(tmp_path):
-    """Whichever file CASA_DENY_FILE names, not just the canonical path."""
+    """Whichever file CASA_DENY_FILE names, not just the canonical path.
+
+    The appended literal goes under an explicit [content] header. An earlier version of
+    this test appended after [allow-content], so the literal became an ALLOW rule and the
+    test passed for a reason unrelated to the exclusion it claimed to prove.
+    """
     repo, deny = _repo(tmp_path)
     inside = repo / "patterns.txt"
-    inside.write_text(PATTERNS + "\nZZ-DENIED-LITERAL-ZZ\n")
+    inside.write_text(PATTERNS + "\n[content]\nZZ-DENIED-LITERAL-ZZ\n")
     subprocess.run(["git", "-C", str(repo), "add", "-A"], check=True)
     subprocess.run(["git", "-C", str(repo), "commit", "-qm", "patterns"], check=True)
     assert _sweep(repo, inside, "tree").returncode == 0
+
+
+def test_a_trivially_broad_allow_rule_is_refused(tmp_path):
+    """One `.*` under [allow-content] would exempt every finding there is."""
+    repo, deny = _repo(tmp_path)
+    deny.write_text("[content]\nZZ-DENIED-LITERAL-ZZ\n[allow-content]\n.*\n")
+    _commit(repo, "README.md", "contact: ZZ-DENIED-LITERAL-ZZ\n")
+    result = _sweep(repo, deny, "tree")
+    assert result.returncode == 2
+    assert "broad" in result.stderr
 
 
 def _sections(text: str) -> dict[str, list[str]]:
@@ -236,10 +270,17 @@ def test_every_real_pattern_compiles_under_the_enforcing_engine():
             assert result.returncode <= 1, f"grep -E rejects /{pattern}/: {result.stderr}"
 
 
-def test_allow_patterns_contain_no_slash():
-    """They are applied as sed substitutions with `/` as the delimiter."""
+def test_no_real_allow_rule_is_trivially_broad():
+    """Allow rules are whole-match exemptions now, not sed substitutions, so the old
+    no-slash restriction is obsolete. What matters is that none of them is broad enough
+    to exempt an unrelated finding."""
+    canaries = ["CANARY-9f3c", "nobody@nowhere" + ".invalid", "10.11.12" + ".13"]
     for pattern in _sections(REAL_DENY.read_text()).get("[allow-content]", []):
-        assert "/" not in pattern, pattern
+        for canary in canaries:
+            result = subprocess.run(
+                ["grep", "-qxE", "--", pattern], input=canary, capture_output=True, text=True
+            )
+            assert result.returncode != 0, f"/{pattern}/ whole-matches {canary!r}"
 
 
 def test_the_public_pattern_file_carries_no_address_like_text():

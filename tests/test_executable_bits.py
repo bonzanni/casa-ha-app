@@ -10,13 +10,29 @@ from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[1]
 
+# Both reviewers caught this list omitting three scripts an operator is told to invoke
+# directly — the exact gap the test claims to prevent.
 MUST_BE_EXECUTABLE = [
     ".githooks/pre-commit",
     ".githooks/pre-push",
+    "scripts/attest.sh",
     "scripts/deny-sweep.sh",
+    "scripts/gate.sh",
     "scripts/run-gitleaks.sh",
     "scripts/setup-dev.sh",
+    "scripts/sweep-text.sh",
 ]
+
+
+def test_the_list_covers_every_shipped_shell_script():
+    """A list that silently omits a script proves nothing about that script."""
+    tracked = subprocess.run(
+        ["git", "-C", str(ROOT), "ls-files", "scripts/", ".githooks/"],
+        capture_output=True, text=True, check=True,
+    ).stdout.split()
+    shipped = {p for p in tracked if p.endswith(".sh") or p.startswith(".githooks/pre-")}
+    missing = shipped - set(MUST_BE_EXECUTABLE)
+    assert not missing, f"shell scripts absent from MUST_BE_EXECUTABLE: {sorted(missing)}"
 
 
 def _mode(rel: str) -> str:

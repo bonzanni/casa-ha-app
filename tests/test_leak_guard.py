@@ -38,9 +38,24 @@ def _stage(repo: Path, rel: str, body: str) -> None:
     subprocess.run(["git", "-C", str(repo), "add", "-A"], check=True)
 
 
+def _policy(repo: Path) -> None:
+    """The sweep's policy files fail closed when absent; supply them as a checkout does."""
+    hooks = repo / ".githooks"
+    hooks.mkdir(exist_ok=True)
+    roots = subprocess.run(
+        ["git", "-C", str(repo), "ls-files"], capture_output=True, text=True, check=True
+    ).stdout.split()
+    (hooks / "root-allowlist.txt").write_text(
+        "".join(f"{r}\n" for r in sorted(roots) if "/" not in r)
+    )
+    if not (hooks / "gitleaks-allow-sites.txt").exists():
+        (hooks / "gitleaks-allow-sites.txt").write_text("")
+
+
 def _run_hook(repo: Path, deny: Path, hook: Path = HOOK):
     """The project's hook resolves the project's sweep (relative to the hook), and the
     sweep then scans whichever repo it is run in — here, the throwaway one."""
+    _policy(repo)
     return subprocess.run(
         ["bash", str(hook)], cwd=repo, capture_output=True, text=True,
         env={"PATH": "/usr/bin:/bin", "HOME": str(repo), "CASA_DENY_FILE": str(deny)},
