@@ -1,0 +1,81 @@
+#!/usr/bin/env bash
+# Refuse to push publication-surface content the gate has not approved.
+#
+# It inspects EVERY commit being introduced, not the tip: a push whose last commit is
+# unrelated would otherwise skip the gate entirely, and a commit that adds private
+# content followed by one that removes it still publishes the object.
+#
+# The gated paths live in .githooks/gated-paths.txt. They are deliberately wider than
+# docs/: the FIRST public push carries no corpus and is still irreversible.
+#
+# CASA_GATE_OVERRIDE=<reason> bypasses this. It prints the reason; the reason belongs in
+# the PR. This is a local control — see docs/doctrine/publishing.md for what it does and
+# does not guarantee.
+set -euo pipefail
+
+receipt="$(git rev-parse --git-path casa-gate-approved)"   # `.git` is a FILE in a worktree
+gated_file="$(cd "$(dirname "$0")" && pwd)/gated-paths.txt"
+zero="0000000000000000000000000000000000000000"
+
+[ -f "$gated_file" ] || { echo "✋ pre-push: missing $gated_file" >&2; exit 1; }
+
+# git passes the DESTINATION remote as $1. Coverage must be relative to that remote: a
+# commit reachable from some *other* configured remote (a private one, say) is not
+# published at this destination, and `--not --remotes` used to treat it as if it were.
+destination="${1:-origin}"
+
+while read -r local_ref local_sha _remote_ref remote_sha; do
+  [ "$local_sha" = "$zero" ] && continue          # branch deletion
+
+  # A tag push publishes its annotation, which is not a commit and appears in no range.
+  # Gate every tag rather than try to reason about which are safe.
+  case "$local_ref" in
+    refs/tags/*)
+      if [ -n "${CASA_GATE_OVERRIDE:-}" ]; then
+        echo "⚠  pre-push: gate overridden — $CASA_GATE_OVERRIDE" >&2
+        continue
+      fi
+      if [ ! -f "$receipt" ] || [ "$(head -1 "$receipt")" != "$local_sha" ]; then
+        echo "✋ pre-push: $local_ref is a tag; its annotation is published text that no" >&2
+        echo "   range or commit-message sweep covers. It needs an attestation too." >&2
+        exit 1
+      fi
+      continue ;;
+  esac
+
+  if [ "$remote_sha" = "$zero" ]; then
+    commits="$(git rev-list "$local_sha" --not --remotes="$destination")"
+  else
+    commits="$(git rev-list "$remote_sha..$local_sha")"
+  fi
+  [ -n "$commits" ] || continue
+
+  touches=""
+  for commit in $commits; do
+    # -m: a merge emits no file list at all without it, so a gated path introduced by
+    # conflict resolution would not require a receipt. deny-sweep already passes -m; the
+    # decision about WHETHER to gate has to agree with it.
+    changed="$(git show --name-only --format= -m "$commit")"
+    while IFS= read -r pattern; do
+      case "$pattern" in ""|\#*) continue ;; esac
+      if printf '%s\n' "$changed" | grep -qE "$pattern"; then
+        touches="$commit"
+        break 2
+      fi
+    done < "$gated_file"
+  done
+  [ -n "$touches" ] || continue                   # nothing gated in this push
+
+  if [ -n "${CASA_GATE_OVERRIDE:-}" ]; then
+    echo "⚠  pre-push: gate overridden — $CASA_GATE_OVERRIDE" >&2
+    continue
+  fi
+  if [ ! -f "$receipt" ] || [ "$(head -1 "$receipt")" != "$local_sha" ]; then
+    echo "✋ pre-push: commit $touches touches a gated path and $local_sha is not attested." >&2
+    echo "   Run: scripts/gate.sh" >&2
+    echo "        scripts/attest.sh --read-in-full --reviewers \"...\" --findings-applied --re-reviewed" >&2
+    echo "   This push is irreversible; objects stay fetchable by SHA afterwards." >&2
+    exit 1
+  fi
+done
+exit 0

@@ -1,0 +1,9 @@
+# A push introducing a commit that touches any of these needs an attestation.
+# docs/ is the corpus; the rest is the publication machinery and the boundary prose —
+# the first public push carries no corpus and is still irreversible.
+^docs/
+^\.githooks/
+^scripts/
+^\.gitleaks\.toml$
+^CLAUDE\.md$
+^AGENTS\.md$
