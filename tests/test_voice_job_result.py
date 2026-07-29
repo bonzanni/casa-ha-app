@@ -129,7 +129,7 @@ def test_parser_rejects_non_json_provenance_values():
 
 
 def test_parser_rejects_excessive_provenance_depth_without_payload_echo():
-    private_key = "PRIVATE-DEEP-PROVENANCE-KEY-83f2"
+    private_key = "PRIVATE-DEEP-PROVENANCE-KEY-83f2"  # gitleaks:allow - synthetic fixture; this test exists to prove redaction works
     private_value = "PRIVATE-DEEP-PROVENANCE-VALUE-4ca1"
     provenance = nested_provenance(1000, {private_key: private_value})
 

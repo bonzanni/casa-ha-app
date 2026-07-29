@@ -17,7 +17,7 @@ class TestRedact:
         assert "uvwxyz1234567890" not in result
 
     def test_redacts_ghp_token(self):
-        text = "token: ghp_abcd1234567890abcdef1234567890abcdef"
+        text = "token: ghp_abcd1234567890abcdef1234567890abcdef"  # gitleaks:allow - synthetic fixture; this test exists to prove redaction works
         result = redact(text)
         assert "ghp_abcd" in result
         assert "1234567890abcdef1234567890abcdef" not in result
@@ -29,7 +29,7 @@ class TestRedact:
         assert "eyJhbGci" not in result
 
     def test_redacts_key_value_pattern(self):
-        text = 'api_key: "sk_test_abcdefghijklmnop1234567890"'
+        text = 'api_key: "sk_test_abcdefghijklmnop1234567890"'  # gitleaks:allow - synthetic fixture; this test exists to prove redaction works
         result = redact(text)
         assert "sk_test_" in result
         assert "1234567890" not in result
@@ -159,7 +159,7 @@ class TestRedactingFilterArgs:
 
     def test_no_args_message_redacted(self):
         record = self._record(
-            "token: ghp_abcd1234567890abcdef1234567890abcdef", None)
+            "token: ghp_abcd1234567890abcdef1234567890abcdef", None)  # gitleaks:allow - synthetic fixture; this test exists to prove redaction works
         out = self._emit(record)
         assert "1234567890abcdef1234567890abcdef" not in out
 

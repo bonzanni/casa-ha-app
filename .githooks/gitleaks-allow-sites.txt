@@ -1,0 +1,2 @@
+tests/test_log_redact.py
+tests/test_voice_job_result.py
