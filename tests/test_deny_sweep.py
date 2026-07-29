@@ -414,3 +414,16 @@ def test_a_path_with_a_control_character_is_refused(tmp_path):
     result = _sweep(repo, deny, "tree")
     assert result.returncode == 1
     assert "control characters" in result.stderr
+
+
+def test_an_empty_file_is_not_treated_as_a_binary_blob(tmp_path):
+    """`git grep -Il` does not list an empty file, so it fell into the binary set — every
+    zero-byte s6 marker and any empty __init__.py was reported as unscannable. An empty
+    file carries nothing and can hide nothing."""
+    repo, deny = _repo(tmp_path)
+    (repo / "pkg").mkdir()
+    (repo / "pkg" / "__init__.py").write_text("")
+    _commit(repo, "a.txt", "benign\n")
+    result = _sweep(repo, deny, "tree")
+    assert result.returncode == 0, result.stderr
+    assert "__init__.py" not in result.stderr

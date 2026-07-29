@@ -217,7 +217,14 @@ if [ "$mode" != "messages" ]; then
       # `git grep -Il` exits 1 when NOTHING is textual; under `pipefail` that killed the
       # whole sweep with an empty message — a silent failure in the guard itself.
       { git grep -Il '' HEAD -- . 2>/dev/null || true; } | sed 's|^HEAD:||' | sort > "$work/textual"
-      comm -23 "$work/all" "$work/textual" > "$work/binaries" ;;
+      comm -23 "$work/all" "$work/textual" > "$work/maybe-binary"
+      # An EMPTY file is not textual to `git grep -Il` and not binary either: it carries
+      # nothing and can hide nothing. Without this, every zero-byte marker file — and any
+      # empty __init__.py — is reported as an unscannable blob.
+      : > "$work/binaries"
+      while IFS= read -r candidate; do
+        [ -s "$candidate" ] && printf '%s\n' "$candidate" >> "$work/binaries"
+      done < "$work/maybe-binary" ;;
     range)
       # numstat prints `-	-	<path>` for a binary change.
       { git log --numstat --format= -m "$range" 2>/dev/null || true; } \
