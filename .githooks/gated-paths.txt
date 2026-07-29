@@ -1,9 +1,11 @@
-# A push introducing a commit that touches any of these needs an attestation.
-# docs/ is the corpus; the rest is the publication machinery and the boundary prose —
-# the first public push carries no corpus and is still irreversible.
-^docs/
-^\.githooks/
-^scripts/
-^\.gitleaks\.toml$
-^CLAUDE\.md$
-^AGENTS\.md$
+# Which paths make a push require an attestation.
+#
+# EVERYTHING. This repository is public: every push publishes, and every published object
+# stays fetchable by SHA afterwards. A narrower list was tried and was wrong — a push
+# adding private prose or an address to casa/ or tests/ would have been an ordinary,
+# fully-verified path straight to a public ref, gated by nothing.
+#
+# The cost is real: ordinary development pushes run the gate too. That is the intended
+# trade while the publication migration is in flight. Narrowing it later is a decision to
+# take deliberately, with the reason written down — not a default to drift into.
+.

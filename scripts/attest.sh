@@ -2,6 +2,7 @@
 # Record that the manual gates happened, bound to the exact commit they happened on.
 #
 #   scripts/attest.sh --read-in-full --reviewers "sol,terra" --findings-applied --re-reviewed
+#   scripts/attest.sh ... --object v1.2.3     (attest a TAG; its annotation is swept)
 #
 # Structured on purpose: an earlier draft accepted any string, so `attest.sh x` minted the
 # receipt pre-push honours. Each flag is a distinct claim, and all four are required.
@@ -13,13 +14,17 @@ set -euo pipefail
 # script: `cd $(dirname $0)/..` made the tests read and write the real checkout's receipts.
 cd "$(git rev-parse --show-toplevel)"
 
-read_in_full=0; findings_applied=0; re_reviewed=0; reviewers=""
+read_in_full=0; findings_applied=0; re_reviewed=0; reviewers=""; object=""
 while [ $# -gt 0 ]; do
   case "$1" in
     --read-in-full)     read_in_full=1 ;;
     --findings-applied) findings_applied=1 ;;
     --re-reviewed)      re_reviewed=1 ;;
     --reviewers)        shift; reviewers="${1:-}" ;;
+    # An annotated tag's object sha is never HEAD's commit sha, so a tag push could not be
+    # attested at all through the commit-only flow. The tag ANNOTATION is published text
+    # that no range or message sweep covers, which is why the hook gates tags.
+    --object)           shift; object="${1:-}" ;;
     *) echo "✋ attest: unknown argument $1" >&2; exit 1 ;;
   esac
   shift
@@ -45,10 +50,24 @@ EOF
 fi
 
 [ -z "$(git status --porcelain)" ] || { echo "✋ attest: working tree is dirty." >&2; exit 1; }
-head_sha="$(git rev-parse HEAD)"
+if [ -n "$object" ]; then
+  head_sha="$(git rev-parse --verify "$object^{}" >/dev/null 2>&1 && git rev-parse "$object")" || {
+    echo "✋ attest: --object '$object' does not resolve" >&2; exit 1; }
+  # A tag attests the annotation; sweep it before recording that anyone read it.
+  if [ "$(git cat-file -t "$object" 2>/dev/null)" = "tag" ]; then
+    git cat-file tag "$object" | sed -n '/^$/,$p' > "$(git rev-parse --git-path casa-tag-message)"
+    scripts/sweep-text.sh "$(git rev-parse --git-path casa-tag-message)" || {
+      echo "✋ attest: the tag annotation itself carries denied content." >&2; exit 1; }
+  fi
+else
+  head_sha="$(git rev-parse HEAD)"
+fi
 automated="$(git rev-parse --git-path casa-gate-automated)"
 [ -f "$automated" ] || { echo "✋ attest: run scripts/gate.sh first." >&2; exit 1; }
-[ "$(cat "$automated")" = "$head_sha" ] || {
+# A tag attestation stands on the gate run for the commit it points at.
+expected="$head_sha"
+[ -n "$object" ] && expected="$(git rev-parse "$object^{commit}")"
+[ "$(cat "$automated")" = "$expected" ] || {
   echo "✋ attest: the automated receipt is for a different commit. Re-run scripts/gate.sh." >&2
   exit 1
 }

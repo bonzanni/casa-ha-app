@@ -64,6 +64,22 @@ read_patterns() {                       # $1=file  $2=1 if this is the private s
 read_patterns "$deny_file" 0
 read_patterns "${CASA_DENY_SUPPLEMENT:-}" 1
 
+# "Fails closed" has to cover an INVALID policy, not only an unreadable one. A blank or
+# malformed pattern file used to parse into empty arrays, and the file is itself excluded
+# from the primary content sweep — so a committed blank policy disabled the guard while
+# every check still reported success.
+for required in '[paths]' '[content]' '[allow-content]'; do
+  grep -qxF -- "$required" "$deny_file" || {
+    echo "✋ deny-sweep: $deny_file has no $required section — refusing to run on a" >&2
+    echo "        malformed policy. An empty policy is indistinguishable from no rules." >&2
+    exit 2
+  }
+done
+if [ "${#generic_content_pats[@]}" -eq 0 ] || [ "${#path_pats[@]}" -eq 0 ]; then
+  echo "✋ deny-sweep: $deny_file declares no path or content rules — refusing to run." >&2
+  exit 2
+fi
+
 [ -n "${CASA_SWEEP_LIB:-}" ] && return 0   # sourced as a library: patterns only, no state
 
 work="$(mktemp -d)"
@@ -162,6 +178,15 @@ case "$mode" in
   messages) : > "$work/paths" ;;
   *)      echo "✋ deny-sweep: unknown mode $mode" >&2; exit 2 ;;
 esac
+# A path containing a newline is C-quoted by git, so anchored path rules stop matching and
+# such a commit could evade both gated-path detection and path denial. Refuse the name
+# rather than try to parse it.
+if grep -q '^"' "$work/paths" 2>/dev/null; then
+  echo "✋ deny-sweep: path name(s) containing control characters:" >&2
+  grep '^"' "$work/paths" | head -5 | sed 's/^/   /' >&2
+  echo "   git C-quotes these, which defeats anchored path rules. Rename them." >&2
+  fail=1
+fi
 for pat in ${path_pats[@]+"${path_pats[@]}"}; do
   scan "$pat" "$work/paths" "path" 1
 done
@@ -229,16 +254,34 @@ if [ "$mode" != "messages" ]; then
   # Assembled at runtime: writing the marker literally here would make THIS file a
   # bypass site by its own rule.
   marker="gitleaks"":""allow"
-  # Mode-aware, like every other check: grepping HEAD in staged mode reports the state
-  # being replaced, not the one being committed — which deadlocks any fix.
+  # Mode-aware, and POLICY-VERSION-aware. A marker in commit C is authorised only if C's
+  # own allowlist named it: comparing every commit's markers against the working-tree
+  # policy would let a later commit retroactively authorise an earlier marker.
+  : > "$work/new-allow-sites"
+  check_sites() {                        # $1=file list  $2=policy file
+    grep -vxF -f "$2" "$1" >> "$work/new-allow-sites" || true
+  }
   case "$mode" in
-    staged) { git grep -lI --cached -- "$marker" -- . 2>/dev/null || true; } | sort -u > "$work/allow-sites" ;;
-    range)  { git rev-list "$range" | while read -r c; do
-                git grep -lI -- "$marker" "$c" -- . 2>/dev/null || true
-              done; } | sed 's|^[0-9a-f]*:||' | sort -u > "$work/allow-sites" ;;
-    *)      { git grep -lI -- "$marker" HEAD -- . 2>/dev/null || true; } | sed 's|^HEAD:||' | sort -u > "$work/allow-sites" ;;
+    staged)
+      { git grep -lI --cached -- "$marker" -- . 2>/dev/null || true; } | sort -u > "$work/allow-sites"
+      git show ":.githooks/gitleaks-allow-sites.txt" > "$work/allow-policy" 2>/dev/null \
+        || cp .githooks/gitleaks-allow-sites.txt "$work/allow-policy"
+      check_sites "$work/allow-sites" "$work/allow-policy" ;;
+    range)
+      for commit in $(git rev-list "$range"); do
+        { git grep -lI -- "$marker" "$commit" -- . 2>/dev/null || true; } \
+          | sed 's|^[0-9a-f]*:||' | sort -u > "$work/allow-sites"
+        [ -s "$work/allow-sites" ] || continue
+        git show "$commit:.githooks/gitleaks-allow-sites.txt" > "$work/allow-policy" 2>/dev/null \
+          || : > "$work/allow-policy"
+        check_sites "$work/allow-sites" "$work/allow-policy"
+      done ;;
+    *)
+      { git grep -lI -- "$marker" HEAD -- . 2>/dev/null || true; } | sed 's|^HEAD:||' | sort -u > "$work/allow-sites"
+      cp .githooks/gitleaks-allow-sites.txt "$work/allow-policy"
+      check_sites "$work/allow-sites" "$work/allow-policy" ;;
   esac
-  grep -vxF -f .githooks/gitleaks-allow-sites.txt "$work/allow-sites" > "$work/new-allow-sites" || true
+  sort -u -o "$work/new-allow-sites" "$work/new-allow-sites"
   if [ -s "$work/new-allow-sites" ]; then
     echo "✋ inline scanner allow-marker used in file(s) that are not reviewed sites:" >&2
     sed 's/^/   /' "$work/new-allow-sites" >&2
