@@ -368,3 +368,20 @@ def test_a_push_to_a_different_branch_than_attested_is_refused(tmp_path):
     )
     assert ok.returncode == 1
     assert "published text" in ok.stderr
+
+
+def test_republishing_the_same_objects_under_a_new_branch_name_is_refused(tmp_path):
+    """Introduces NO commits — every objects-based check short-circuits — but the branch
+    name is newly published. A check placed after the commit enumeration never ran here;
+    an end-to-end push proved it silently succeeded."""
+    repo = _repo(tmp_path)
+    sha = _commit(repo, "docs/architecture/a.md")
+    _approve(repo, sha, branch="main")
+    result = subprocess.run(
+        ["bash", str(HOOK)], cwd=repo, capture_output=True, text=True,
+        # remote_sha is zero (new ref) and the objects are already reachable there
+        input=f"refs/heads/main {sha} refs/heads/leaky-client-name {ZERO}\n",
+        env={"PATH": "/usr/bin:/bin", "HOME": str(repo)},
+    )
+    assert result.returncode == 1
+    assert "introduces no commits" in result.stderr

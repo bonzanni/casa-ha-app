@@ -52,6 +52,28 @@ while read -r local_ref local_sha remote_ref remote_sha; do
       exit 1 ;;
   esac
 
+  # The destination BRANCH NAME is published metadata in its own right, so this is checked
+  # BEFORE any commit enumeration: pushing already-published objects under a NEW name
+  # introduces no commits at all, and a check placed after `[ -n "$commits" ] || continue`
+  # never ran for exactly that case. Verified by pushing the same tip to a second branch.
+  #
+  # Exact string comparison — the removed tag binding interpolated the name into a grep
+  # expression, so `v1|.*` matched any receipt line.
+  # Only when a receipt exists: with none at all, the missing attestation is the real
+  # problem and the commit check below reports it accurately.
+  dest_branch="${remote_ref#refs/heads/}"
+  if [ -f "$receipt" ] && [ "$dest_branch" != "$(sed -n 3p "$receipt")" ]; then
+    attested_branch="$(sed -n 3p "$receipt")"
+    if [ -n "${CASA_GATE_OVERRIDE:-}" ]; then
+      echo "⚠  pre-push: branch-name mismatch overridden — $CASA_GATE_OVERRIDE" >&2
+    else
+      echo "✋ pre-push: attested for branch '${attested_branch:-<none>}', pushing to" >&2
+      echo "   '$dest_branch'. A branch name is published text that no sweep covers, and" >&2
+      echo "   republishing existing objects under a new name introduces no commits." >&2
+      exit 1
+    fi
+  fi
+
   if [ "$remote_sha" = "$zero" ]; then
     # ASK THE DESTINATION what it has. `--not --remotes=<name>` reads local tracking refs,
     # which describe this clone, not the remote: repoint origin at a fresh repository and
@@ -100,16 +122,6 @@ while read -r local_ref local_sha remote_ref remote_sha; do
   if [ "$(sha256sum < "$reviewed" | cut -d' ' -f1)" != "$(sed -n 2p "$receipt")" ]; then
     echo "✋ pre-push: the reviewed commit set has changed since it was attested." >&2
     echo "   Re-run scripts/gate.sh, re-read the range, and re-attest." >&2
-    exit 1
-  fi
-
-  # The destination BRANCH NAME is published metadata; the attestation names the one that
-  # was swept. Exact string comparison — the removed tag binding interpolated a name into
-  # a grep expression, so `v1|.*` matched any receipt line.
-  dest_branch="${remote_ref#refs/heads/}"
-  if [ "$dest_branch" != "$(sed -n 3p "$receipt")" ]; then
-    echo "✋ pre-push: attested for branch '$(sed -n 3p "$receipt")', pushing to" >&2
-    echo "   '$dest_branch'. A branch name is published text that no sweep covers." >&2
     exit 1
   fi
 
