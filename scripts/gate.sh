@@ -61,6 +61,11 @@ make test-unit
 
 echo "==> 6/6 automated receipt"
 printf '%s\n' "$head_sha" > "$(git rev-parse --git-path casa-gate-automated)"
+# Record the exact commit SET that was swept, not just its tip. Binding only the tip let
+# a tip gated against origin/main be pushed to a different destination, where the hook
+# found hundreds of additional introduced commits and allowed them because the tip
+# matched. pre-push now requires every introduced commit to be in this set.
+git rev-list "$range" > "$(git rev-parse --git-path casa-gate-commits)"
 cat <<EOF
 
 Automated gate PASSED for $head_sha.

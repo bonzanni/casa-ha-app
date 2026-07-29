@@ -46,6 +46,15 @@ def _receipt(repo: Path, name: str, body: str) -> None:
     (repo / ".git" / name).write_text(body)
 
 
+def _reviewed(repo: Path, sha: str, extra: list[str] | None = None) -> None:
+    """Record the commit SET the gate swept, as scripts/gate.sh does."""
+    shas = subprocess.run(
+        ["git", "-C", str(repo), "rev-list", sha], capture_output=True, text=True, check=True
+    ).stdout.split()
+    keep = shas if extra is None else extra
+    (repo / ".git" / "casa-gate-commits").write_text("".join(f"{c}\n" for c in keep))
+
+
 def test_a_gated_push_without_an_attestation_is_refused(tmp_path):
     repo = _repo(tmp_path)
     sha = _commit(repo, "docs/architecture/a.md")
@@ -98,7 +107,11 @@ def test_an_empty_tip_does_not_hide_an_earlier_commit(tmp_path):
                    check=True)
     tip = subprocess.run(["git", "-C", str(repo), "rev-parse", "HEAD"],
                          capture_output=True, text=True, check=True).stdout.strip()
-    assert _push(repo, tip).returncode == 1
+    result = _push(repo, tip)
+    assert result.returncode == 1
+    # Prove BOTH commits were enumerated: a hook that inspected only the empty tip would
+    # also return 1, so the count is what distinguishes them.
+    assert "2 commit(s)" in result.stderr
 
 
 def test_a_non_branch_namespace_is_refused(tmp_path):
@@ -124,7 +137,31 @@ def test_an_attested_tip_is_allowed(tmp_path):
     repo = _repo(tmp_path)
     sha = _commit(repo, "docs/architecture/a.md")
     _receipt(repo, "casa-gate-approved", f"{sha}\nread-in-full; reviewers=a,b\n")
+    _reviewed(repo, sha)
     assert _push(repo, sha).returncode == 0
+
+
+def test_an_attested_tip_does_not_authorise_unreviewed_commits(tmp_path):
+    """The receipt names a TIP; the gate swept a RANGE. A tip gated against one base,
+    pushed to a destination that has less history, introduces commits the review never
+    covered — and matching the tip alone let them through."""
+    repo = _repo(tmp_path)
+    _commit(repo, "docs/architecture/older.md")
+    sha = _commit(repo, "docs/architecture/a.md")
+    _receipt(repo, "casa-gate-approved", f"{sha}\nread-in-full; reviewers=a,b\n")
+    _reviewed(repo, sha, extra=[sha])          # only the tip was reviewed
+    result = _push(repo, sha)
+    assert result.returncode == 1
+    assert "never in" in result.stderr
+
+
+def test_a_missing_reviewed_set_is_refused(tmp_path):
+    repo = _repo(tmp_path)
+    sha = _commit(repo, "docs/architecture/a.md")
+    _receipt(repo, "casa-gate-approved", f"{sha}\nread-in-full; reviewers=a,b\n")
+    result = _push(repo, sha)
+    assert result.returncode == 1
+    assert "no reviewed commit set" in result.stderr
 
 
 def test_a_stale_attestation_is_refused(tmp_path):
@@ -211,6 +248,7 @@ def test_attest_writes_the_receipt_for_the_repo_it_is_run_in(tmp_path):
     receipt = (repo / ".git" / "casa-gate-approved").read_text()
     assert receipt.splitlines()[0] == sha
     assert "reviewers=a,b" in receipt
+    _reviewed(repo, sha)
     assert _push(repo, sha).returncode == 0
 
 
@@ -274,6 +312,7 @@ def test_an_attested_commit_receipt_does_not_authorise_a_tag(tmp_path):
     repo = _repo(tmp_path)
     sha = _commit(repo, "docs/architecture/a.md")
     _receipt(repo, "casa-gate-approved", f"{sha}\nread-in-full; reviewers=a,b\n")
+    _reviewed(repo, sha)
     assert _push(repo, sha).returncode == 0, "the commit push is fine"
     assert _tag_push(repo, "refs/tags/v1", sha).returncode == 1, "the tag is not"
 

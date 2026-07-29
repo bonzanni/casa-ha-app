@@ -67,12 +67,29 @@ while read -r local_ref local_sha remote_ref remote_sha; do
     echo "⚠  pre-push: gate overridden — $CASA_GATE_OVERRIDE" >&2
     continue
   fi
+  count="$(printf '%s\n' "$commits" | wc -l | tr -d ' ')"
   if [ ! -f "$receipt" ] || [ "$(head -1 "$receipt")" != "$local_sha" ]; then
-    count="$(printf '%s\n' "$commits" | wc -l | tr -d ' ')"
     echo "✋ pre-push: $count commit(s) would be published and $local_sha is not attested." >&2
     echo "   Run: scripts/gate.sh" >&2
     echo "        scripts/attest.sh --read-in-full --reviewers \"...\" --findings-applied --re-reviewed" >&2
     echo "   This push is irreversible; objects stay fetchable by SHA afterwards." >&2
+    exit 1
+  fi
+
+  # The receipt names a tip; the gate swept a RANGE. Those differ per destination: a tip
+  # gated against origin/main, pushed to a different or empty remote, introduces commits
+  # the review never covered — and matching the tip alone let them through.
+  reviewed="$(git rev-parse --git-path casa-gate-commits)"
+  if [ ! -f "$reviewed" ]; then
+    echo "✋ pre-push: no reviewed commit set recorded. Re-run scripts/gate.sh." >&2
+    exit 1
+  fi
+  unreviewed="$(printf '%s\n' "$commits" | grep -vxF -f "$reviewed" || true)"
+  if [ -n "$unreviewed" ]; then
+    echo "✋ pre-push: $count commit(s) would reach $destination, but these were never in" >&2
+    echo "   the reviewed range:" >&2
+    printf '%s\n' "$unreviewed" | head -5 | sed 's/^/     /' >&2
+    echo "   Re-run the gate with CASA_GATE_BASE set to what $destination already has." >&2
     exit 1
   fi
 done
