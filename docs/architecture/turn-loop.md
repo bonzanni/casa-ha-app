@@ -21,15 +21,15 @@ existing conversation or starts a fresh one, assemble a system prompt and a memo
 call the model with retry, stream the output, and record what happened.
 
 The one structural subtlety is that the model client is **usually not created for this
-turn**. Residents reuse a warm, conversation-bound client held in a pool, keyed by channel.
-The pool exists because creating a client per turn dominated latency. Everything awkward in
-this area follows from that reuse: the decision about resume-versus-fresh has to be made
-under the pool's own lock, a cancelled turn has to be drained before its client can be
-handed to anyone else, and an error result must invalidate the entry rather than leave it
-warm.
+turn**. Residents reuse a warm, conversation-bound client held in a pool, keyed by channel —
+so a turn normally begins with a client that has already been connected and has already seen
+this conversation. Everything awkward in this area follows from that reuse: the decision
+about resume-versus-fresh has to be made under the pool's own lock, a cancelled turn has to
+be drained before its client can be handed to anyone else, and an error result must
+invalidate the entry rather than leave it warm.
 
-When the pool cannot serve a turn it raises, and the turn falls back to creating a client
-for itself. That fallback is the pre-pool behaviour, kept deliberately.
+When the pool cannot serve a turn it raises, and the turn creates a client for itself
+instead, using it for that turn only. Both paths exist and both are exercised.
 
 ## Contracts & invariants
 

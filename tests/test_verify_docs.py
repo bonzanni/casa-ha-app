@@ -352,3 +352,47 @@ def test_impacted_docs_honours_a_claim_deleted_in_the_same_change(tmp_path):
     assert verify_docs.impacted_docs(root, ["casa/a.py"], base_manifest=ENTRY) == {
         "architecture/turn-loop.md"
     }
+
+
+# --- round-9 findings ----------------------------------------------------------------
+
+def test_an_anchor_through_a_tracked_symlink_is_rejected(tmp_path):
+    """The lexical path is tracked, so the tracked-set check passes — and then symbol
+    resolution reads the destination, which may not be in the commit at all."""
+    root = _corpus(tmp_path, ENTRY.replace("casa/a.py::A.b", "casa/link.py::A.b"))
+    (root / "casa" / "hidden.py").write_text("class A:\n    def b(self):\n        pass\n")
+    (root / "casa" / "link.py").symlink_to("hidden.py")
+    subprocess.run(["git", "-C", str(root), "add", "-A"], check=True)
+    assert any("is a symlink" in p for p in verify_docs.verify(root))
+
+
+def test_an_invariant_with_no_statement_is_caught(tmp_path):
+    """It renders as a blank row; only the terminal-punctuation heuristic was checked."""
+    manifest = ENTRY.replace("  related: [doctrine/publishing.md]",
+                             "  related: []\n  defines_invariants: [INV-X-001]")
+    root = _corpus(tmp_path, manifest, docs={
+        "architecture/turn-loop.md": "# T\n" + CODE_WINS + "**INV-X-001**:\n" + SOURCEMAP,
+    })
+    assert any("no statement on its definition line" in p for p in verify_docs.verify(root))
+
+
+def test_a_root_level_document_is_rejected(tmp_path):
+    """It verifies cleanly but render_llms emits only the three configured prefixes, so it
+    would be absent from the flat index it is supposed to appear in."""
+    manifest = ENTRY + "\n- doc: stray.md\n  summary: s\n  when_changing: w\n"
+    root = _corpus(tmp_path, manifest,
+                   docs={**DOC, "stray.md": "# Stray\n" + CODE_WINS + SOURCEMAP})
+    assert any("root-level document is omitted" in p for p in verify_docs.verify(root))
+
+
+def test_reversed_routing_markers_are_reported_not_raised(tmp_path):
+    root = _corpus(tmp_path)
+    (root / "docs" / "README.md").write_text(
+        "# Docs\n\n<!-- END ROUTING -->\n<!-- BEGIN ROUTING -->\n"
+    )
+    try:
+        verify_docs.nav_targets(root)
+    except SystemExit as exc:
+        assert "reversed" in str(exc)
+    else:
+        raise AssertionError("reversed markers should be reported")

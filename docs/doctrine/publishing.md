@@ -39,9 +39,14 @@ details, including in commit metadata and branch names.
 
 "Never rebind a module's `asyncio.sleep`" is publishable *with its mechanism* — it replaces
 the shared module attribute, so an unrelated `while True: await asyncio.sleep(...)` loop in
-the same process spins at CPU speed under a mock whose call list grows without bound. The
-outage that taught us is not publishable, and does not need to be: the mechanism is what
-makes the rule checkable, and the mechanism stays true.
+the same process spins at CPU speed under a mock whose call list grows without bound. What
+must not be written down is how anyone came to know that: whether something broke, when, or
+to whom. The mechanism is what makes the rule checkable and the mechanism stays true, so the
+history adds nothing a reader can act on.
+
+This file previously illustrated that point with a sentence asserting an outage had occurred
+— publishing exactly the class of fact it was arguing against. The rule is easier to state
+than to follow.
 
 **INV-PUB-003**: When a claim cannot be checked from the commit, stop and ask. Do not guess, and do not paraphrase around it.
 

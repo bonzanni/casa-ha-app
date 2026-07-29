@@ -59,10 +59,22 @@ while read -r local_ref local_sha remote_ref remote_sha; do
   #
   # Exact string comparison — the removed tag binding interpolated the name into a grep
   # expression, so `v1|.*` matched any receipt line.
-  # Only when a receipt exists: with none at all, the missing attestation is the real
-  # problem and the commit check below reports it accurately.
+  # EVERY branch update needs a receipt, including one that introduces no commits.
+  # `git push <published-sha>:refs/heads/private-client-name` publishes a NAME while adding
+  # no objects: with the check conditional on a receipt existing, no receipt meant the check
+  # was skipped, and no new commits meant the enumeration below `continue`d. Both reviewers
+  # found that; the earlier comment claiming the commit check would report it was wrong.
   dest_branch="${remote_ref#refs/heads/}"
-  if [ -f "$receipt" ] && [ "$dest_branch" != "$(sed -n 3p "$receipt")" ]; then
+  if [ ! -f "$receipt" ]; then
+    if [ -n "${CASA_GATE_OVERRIDE:-}" ]; then
+      echo "⚠  pre-push: unattested branch publication overridden — $CASA_GATE_OVERRIDE" >&2
+    else
+      echo "✋ pre-push: $remote_ref is not attested. A branch name is published text even" >&2
+      echo "   when the push adds no commits." >&2
+      echo "   Run: scripts/gate.sh   then   scripts/attest.sh --read-in-full ..." >&2
+      exit 1
+    fi
+  elif [ "$dest_branch" != "$(sed -n 3p "$receipt")" ]; then
     attested_branch="$(sed -n 3p "$receipt")"
     if [ -n "${CASA_GATE_OVERRIDE:-}" ]; then
       echo "⚠  pre-push: branch-name mismatch overridden — $CASA_GATE_OVERRIDE" >&2

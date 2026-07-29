@@ -28,6 +28,11 @@ ceiling is a hard 25 KB rather than a suggestion.
 
 **INV-DOC-001**: Every document repeats the code-wins line verbatim at the top, under front matter carrying `last_reviewed`.
 
+`last_reviewed` is the one field here that is not a fact about the software. A commit proves
+the string was written, not that anyone read the file that day — it is an author's claim,
+kept because the rotation below needs something to sort on. Treat it as a claim, and do not
+build anything on it that a lie would break.
+
 **INV-DOC-002**: Documents follow one section order: Scope, Mental model, Contracts & invariants, Failure behavior, Extension points, Source & test map. An agent can then skim positionally instead of reading to find out where things are.
 
 **INV-DOC-003**: Present tense only. No changelog voice, no "as of version X", no discrepancy log, no TODOs, no open questions. Those belong in the change that resolves them.

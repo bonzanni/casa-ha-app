@@ -126,6 +126,9 @@ def test_an_empty_tip_does_not_hide_an_earlier_commit(tmp_path):
                    check=True)
     tip = subprocess.run(["git", "-C", str(repo), "rev-parse", "HEAD"],
                          capture_output=True, text=True, check=True).stdout.strip()
+    # A receipt for the right BRANCH but the wrong tip, so the run reaches the enumeration
+    # rather than stopping at the earlier unattested-branch check.
+    _receipt(repo, "casa-gate-approved", "f" * 40 + "\ndigest\nmain\nclaims\n")
     result = _push(repo, tip)
     assert result.returncode == 1
     # Prove BOTH commits were enumerated: a hook that inspected only the empty tip would
@@ -385,3 +388,32 @@ def test_republishing_the_same_objects_under_a_new_branch_name_is_refused(tmp_pa
     )
     assert result.returncode == 1
     assert "introduces no commits" in result.stderr
+
+
+def test_publishing_a_branch_name_with_no_receipt_at_all_is_refused(tmp_path):
+    """`git push <published-sha>:refs/heads/private-client-name` adds no objects, so the
+    commit enumeration `continue`d — and the branch check was conditional on a receipt
+    existing, so with none it never ran. Both reviewers found it; the comment claiming the
+    commit check would report it was wrong."""
+    repo = _repo(tmp_path)
+    sha = _commit(repo, "docs/architecture/a.md")
+    result = subprocess.run(
+        ["bash", str(HOOK)], cwd=repo, capture_output=True, text=True,
+        input=f"refs/heads/main {sha} refs/heads/private-client-name {ZERO}\n",
+        env={"PATH": "/usr/bin:/bin", "HOME": str(repo)},
+    )
+    assert result.returncode == 1
+    assert "published text even" in result.stderr
+
+
+def test_an_unattested_branch_publication_can_be_overridden(tmp_path):
+    repo = _repo(tmp_path)
+    sha = _commit(repo, "docs/architecture/a.md")
+    result = subprocess.run(
+        ["bash", str(HOOK)], cwd=repo, capture_output=True, text=True,
+        input=f"refs/heads/main {sha} refs/heads/other {ZERO}\n",
+        env={"PATH": "/usr/bin:/bin", "HOME": str(repo),
+             "CASA_GATE_OVERRIDE": "documented exception"},
+    )
+    assert result.returncode == 0
+    assert "overridden" in result.stderr

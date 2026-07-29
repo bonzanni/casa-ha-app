@@ -280,6 +280,16 @@ def _check_anchor(repo_root: Path, anchor: str, doc: str, tracked: set[str]) -> 
             f"{doc}: anchor {anchor!r} is not tracked by git — a doc may only anchor to "
             f"what the public commit contains, not to ignored or local files"
         ]
+    # A TRACKED symlink whose destination is untracked would otherwise pass: the lexical
+    # path is in the tree, and symbol resolution then reads the destination's contents.
+    # Same for a gitlink, whose files are not in this commit at all.
+    if target.is_symlink():
+        return [
+            f"{doc}: anchor {anchor!r} is a symlink — it resolves to content that may not "
+            f"be in the public commit; anchor the real path"
+        ]
+    if target.exists() and not target.is_file():
+        return [f"{doc}: anchor {anchor!r} is not a regular file"]
     if not target.exists():
         return [f"{doc}: anchor {anchor!r} names a file that does not exist"]
     if symbol is None:
@@ -342,10 +352,14 @@ def _check_invariants(docs_dir: Path, entries: list[dict]) -> list[str]:
                 f"invariant has exactly one defining file"
             )
         statement = statements.get(inv, "")
+        if not statement:
+            problems.append(f"{inv}: has no statement on its definition line")
         if "|" in statement:
             problems.append(f"{inv}: the statement must be free of `|` — it renders into a table")
         # A wrapped statement renders TRUNCATED into the generated table, because only the
-        # definition line is captured. An unterminated line is the detectable symptom.
+        # definition line is captured. Terminal punctuation is a HEURISTIC for that, not a
+        # proof: a complete first sentence followed by an essential qualification on the next
+        # line still passes here, and only a reviewer catches it.
         if statement and statement[-1] not in ".!?":
             problems.append(
                 f"{inv}: the statement must be complete on ONE line (it ends with "
@@ -394,11 +408,20 @@ def verify(repo_root: Path) -> list[str]:
         problems.extend(_check_entry_shape(entry, seen))
         kind = entry.get("kind", "document")
 
-        top = Path(doc).parts[0] if len(Path(doc).parts) > 1 else ""
+        parts = Path(doc).parts
+        top = parts[0] if len(parts) > 1 else ""
         if top and top not in ALLOWED_TOP_DIRS:
             problems.append(
                 f"{doc}: {top}/ is not an admitted corpus directory "
                 f"({', '.join(sorted(ALLOWED_TOP_DIRS))})"
+            )
+        # A root-level `document` verifies cleanly but render_llms only emits the three
+        # configured prefixes, so it would be absent from the flat index it claims to be in.
+        if not top and kind in DOCUMENT_KINDS:
+            problems.append(
+                f"{doc}: a document must live under one of "
+                f"{', '.join(sorted(ALLOWED_TOP_DIRS))}/ — a root-level document is omitted "
+                f"from the generated index"
             )
 
         target, path_problems = _resolve_doc(docs_dir, doc)
@@ -577,6 +600,8 @@ def render_sourcemap(entry: dict) -> str:
 def _splice(text: str, begin: str, end: str, body: str, where: str) -> str:
     if text.count(begin) != 1 or text.count(end) != 1:
         raise SystemExit(f"{where}: needs exactly one {begin} / {end} pair")
+    if text.index(begin) > text.index(end):
+        raise SystemExit(f"{where}: {begin} / {end} markers are reversed")
     head, rest = text.split(begin, 1)
     _, tail = rest.split(end, 1)
     return f"{head}{begin}\n{body}{end}{tail}"
@@ -679,8 +704,22 @@ def main() -> int:
         changed = [line.strip() for line in sys.stdin.read().splitlines() if line.strip()]
         base_manifest = None
         if "--base-manifest" in args:
+            # Fail CLOSED. Silently dropping a requested base manifest reinstates the exact
+            # bypass impacted_docs() exists to close: delete the claim at head, lose the base,
+            # and the check reports no claimant.
             base_path = Path(args[args.index("--base-manifest") + 1])
-            base_manifest = base_path.read_text() if base_path.exists() else None
+            if not base_path.exists():
+                print(f"✗ --base-manifest {base_path} does not exist")
+                return 1
+            base_manifest = base_path.read_text()
+            try:
+                parsed = yaml.safe_load(base_manifest)
+            except yaml.YAMLError as exc:
+                print(f"✗ --base-manifest {base_path} is not valid YAML: {exc}")
+                return 1
+            if parsed is not None and not isinstance(parsed, list):
+                print(f"✗ --base-manifest {base_path} is not a list of entries")
+                return 1
         for doc in sorted(impacted_docs(root, changed, base_manifest)):
             print(doc)
         return 0
