@@ -1,0 +1,16 @@
+# Casa — Home Assistant app
+
+Canonical current-state documentation for AI agents working on this repository.
+Code is the source of truth; these files are a map.
+
+## Architecture
+
+- [architecture/turn-loop.md](architecture/turn-loop.md): How one inbound message becomes one agent turn, and what bounds it.
+
+## Doctrine
+
+- [doctrine/publishing.md](doctrine/publishing.md): The one rule that decides whether a fact may be written down in this repository.
+
+## Contributing
+
+- [contributing/doc-contract.md](contributing/doc-contract.md): The shape a document takes, and which of its rules CI enforces versus a reviewer.

@@ -1,0 +1,354 @@
+"""The docs-corpus verifier.
+
+Every case here was first a manual probe against the real corpus. A clean pass proves
+nothing on its own — the point of these is that each check demonstrably bites.
+"""
+import importlib.util
+import subprocess
+from pathlib import Path
+
+# Loaded by explicit path, not `from scripts import verify_docs`: tests/conftest.py inserts
+# the application code root at sys.path[0], and that root contains its OWN `scripts/`
+# directory, which shadows the repo-root package. `python -m scripts.verify_docs` from the
+# repo root is unaffected — but a test must not depend on sys.path ordering to import the
+# thing it is testing.
+_spec = importlib.util.spec_from_file_location(
+    "casa_verify_docs", Path(__file__).resolve().parents[1] / "scripts" / "verify_docs.py"
+)
+verify_docs = importlib.util.module_from_spec(_spec)
+_spec.loader.exec_module(verify_docs)
+
+SOURCEMAP = "\n## Source & test map\n\n<!-- BEGIN SOURCEMAP -->\n<!-- END SOURCEMAP -->\n"
+CODE_WINS = "> Code is the source of truth. This file is a map; when it and the code disagree, the code wins.\n"
+
+ENTRY = """
+- doc: architecture/turn-loop.md
+  summary: How one inbound message becomes one agent turn.
+  when_changing: the turn lifecycle or turn timeouts
+  covers: [casa/a.py::A.b]
+  tests: [tests/test_a.py::test_b]
+  related: [doctrine/publishing.md]
+"""
+
+SKELETON_MANIFEST = """
+- doc: manifest.yaml
+  kind: meta
+  summary: The publication allowlist.
+- doc: README.md
+  kind: index
+  summary: Routing map.
+- doc: llms.txt
+  kind: generated
+  summary: Generated index.
+- doc: doctrine/invariants.md
+  kind: generated
+  summary: Generated invariant index.
+- doc: doctrine/publishing.md
+  summary: What may be written down here.
+  when_changing: anything published
+- doc: contributing/doc-contract.md
+  summary: How to keep this corpus true.
+  when_changing: the documentation rules themselves
+"""
+
+SKELETON_FILES = {
+    "README.md": "# Docs\n\n<!-- BEGIN ROUTING -->\n<!-- END ROUTING -->\n",
+    "llms.txt": "",
+    "doctrine/invariants.md": "",
+    "doctrine/publishing.md": CODE_WINS + SOURCEMAP,
+    "contributing/doc-contract.md": CODE_WINS + SOURCEMAP,
+}
+
+DOC = {"architecture/turn-loop.md": "# Turn loop\n" + CODE_WINS + SOURCEMAP}
+
+
+def _corpus(tmp_path: Path, manifest: str = ENTRY, docs: dict[str, str] | None = None,
+            *, skeleton: bool = True, stage: bool = True) -> Path:
+    """A miniature repo. Real git, because the allowlist's ground truth is git ls-files."""
+    subprocess.run(["git", "init", "-q", str(tmp_path)], check=True)
+    for key, value in (("user.email", "t@t"), ("user.name", "t")):
+        subprocess.run(["git", "-C", str(tmp_path), "config", key, value], check=True)
+
+    files = {**(SKELETON_FILES if skeleton else {}), **(DOC if docs is None else docs)}
+    (tmp_path / "docs").mkdir()
+    (tmp_path / "docs" / "manifest.yaml").write_text(
+        manifest + (SKELETON_MANIFEST if skeleton else "")
+    )
+    for rel, body in files.items():
+        target = tmp_path / "docs" / rel
+        target.parent.mkdir(parents=True, exist_ok=True)
+        target.write_text(body)
+
+    (tmp_path / "casa").mkdir()
+    (tmp_path / "casa" / "a.py").write_text("class A:\n    def b(self):\n        pass\n")
+    (tmp_path / "casa" / "conf.yaml").write_text("schema:\n  foo: str\n")
+    (tmp_path / "tests").mkdir()
+    (tmp_path / "tests" / "test_a.py").write_text("def test_b():\n    pass\n")
+    if stage:
+        subprocess.run(["git", "-C", str(tmp_path), "add", "-A"], check=True)
+    return tmp_path
+
+
+# --- anchor primitives ---------------------------------------------------------------
+
+def test_parse_anchor_splits_symbol():
+    assert verify_docs.parse_anchor("casa/a.py::C.d") == ("casa/a.py", "C.d")
+    assert verify_docs.parse_anchor("casa/a.py") == ("casa/a.py", None)
+
+
+def test_symbol_exists_resolves_a_nested_method(tmp_path):
+    src = tmp_path / "m.py"
+    src.write_text("class A:\n    async def b(self):\n        pass\n")
+    assert verify_docs.symbol_exists(src, "A.b") is True
+    assert verify_docs.symbol_exists(src, "A.c") is False
+
+
+def test_yaml_key_exists(tmp_path):
+    cfg = tmp_path / "c.yaml"
+    cfg.write_text("schema:\n  foo: str\n")
+    assert verify_docs.yaml_key_exists(cfg, "schema.foo") is True
+    assert verify_docs.yaml_key_exists(cfg, "schema.bar") is False
+
+
+# --- the corpus is clean, and each check bites ----------------------------------------
+
+def test_a_clean_corpus_verifies(tmp_path):
+    assert verify_docs.verify(_corpus(tmp_path)) == []
+
+
+def test_a_dead_symbol_anchor_is_caught(tmp_path):
+    root = _corpus(tmp_path, ENTRY.replace("A.b", "A.gone"))
+    assert any("A.gone" in p and "does not resolve" in p for p in verify_docs.verify(root))
+
+
+def test_a_line_number_anchor_is_rejected(tmp_path):
+    root = _corpus(tmp_path, ENTRY.replace("casa/a.py::A.b", "casa/a.py:12"))
+    assert any("line-number anchor" in p for p in verify_docs.verify(root))
+
+
+def test_an_anchor_outside_the_repository_is_rejected(tmp_path):
+    root = _corpus(tmp_path, ENTRY.replace("casa/a.py::A.b", "/etc/passwd"))
+    assert any("outside the repository" in p for p in verify_docs.verify(root))
+
+
+def test_an_untracked_anchor_is_rejected(tmp_path):
+    """It would pass locally while being absent from the published commit."""
+    root = _corpus(tmp_path, ENTRY.replace("casa/a.py::A.b", "casa/ignored.py"))
+    (root / "casa" / "ignored.py").write_text("x = 1\n")
+    assert any("not tracked by git" in p for p in verify_docs.verify(root))
+
+
+def test_a_tracked_file_with_no_manifest_entry_is_caught(tmp_path):
+    root = _corpus(tmp_path, docs={**DOC, "architecture/stray.md": "# Stray\n" + SOURCEMAP})
+    assert any("stray.md" in p and "not in the manifest" in p for p in verify_docs.verify(root))
+
+
+def test_a_manifest_entry_git_does_not_track_is_caught(tmp_path):
+    """One-directional exactness lets the verifier see a file the pushed commit lacks."""
+    root = _corpus(tmp_path)
+    ghost = root / "docs" / "architecture" / "ghost.md"
+    ghost.write_text("# Ghost\n" + SOURCEMAP)          # created but never staged
+    manifest = root / "docs" / "manifest.yaml"
+    manifest.write_text(
+        manifest.read_text()
+        + "\n- doc: architecture/ghost.md\n  summary: s\n  when_changing: w\n"
+    )
+    assert any("ghost.md" in p and "does not track it" in p for p in verify_docs.verify(root))
+
+
+def test_a_disallowed_extension_is_rejected(tmp_path):
+    root = _corpus(tmp_path, docs={**DOC, "architecture/diagram.png": "\x89PNG\r\n"})
+    assert any("diagram.png" in p and "not admitted" in p for p in verify_docs.verify(root))
+
+
+def test_a_document_over_the_ceiling_is_rejected(tmp_path):
+    body = "# Turn loop\n" + CODE_WINS + "x" * 26_000 + SOURCEMAP
+    root = _corpus(tmp_path, docs={"architecture/turn-loop.md": body})
+    assert any("exceeds the 25 KB ceiling" in p for p in verify_docs.verify(root))
+
+
+def test_a_generated_index_gets_the_larger_budget(tmp_path):
+    root = _corpus(tmp_path, docs={**DOC, "llms.txt": "x" * 30_000})
+    assert verify_docs.verify(root) == []
+
+
+def test_a_near_ceiling_document_warns_without_failing(tmp_path):
+    body = "# Turn loop\n" + CODE_WINS + "x" * 21_000 + SOURCEMAP
+    root = _corpus(tmp_path, docs={"architecture/turn-loop.md": body})
+    assert verify_docs.verify(root) == []
+    assert any("approaching the ceiling" in w for w in verify_docs.warnings(root))
+
+
+def test_a_missing_sourcemap_marker_is_caught(tmp_path):
+    root = _corpus(tmp_path, docs={"architecture/turn-loop.md": "# Turn loop\n" + CODE_WINS})
+    assert any("SOURCEMAP" in p and "exactly one" in p for p in verify_docs.verify(root))
+
+
+def test_reversed_sourcemap_markers_are_caught(tmp_path):
+    body = "# T\n<!-- END SOURCEMAP -->\n<!-- BEGIN SOURCEMAP -->\n"
+    root = _corpus(tmp_path, docs={"architecture/turn-loop.md": body})
+    assert any("reversed" in p for p in verify_docs.verify(root))
+
+
+def test_a_symlinked_doc_is_rejected(tmp_path):
+    root = _corpus(tmp_path, docs={})
+    target = root / "docs" / "architecture"
+    target.mkdir(parents=True, exist_ok=True)
+    (target / "turn-loop.md").symlink_to("/etc/passwd")
+    subprocess.run(["git", "-C", str(root), "add", "-A"], check=True)
+    assert any("symlink" in p for p in verify_docs.verify(root))
+
+
+def test_path_traversal_in_the_manifest_is_rejected(tmp_path):
+    root = _corpus(tmp_path, ENTRY.replace("architecture/turn-loop.md", "../../etc/passwd"))
+    assert any("outside" in p for p in verify_docs.verify(root))
+
+
+def test_a_duplicate_manifest_entry_is_caught(tmp_path):
+    assert any("listed twice" in p for p in verify_docs.verify(_corpus(tmp_path, ENTRY + ENTRY)))
+
+
+def test_required_fields_are_enforced(tmp_path):
+    manifest = "\n- doc: architecture/turn-loop.md\n  covers: []\n"
+    problems = verify_docs.verify(_corpus(tmp_path, manifest))
+    assert any("`summary` is required" in p for p in problems)
+    assert any("`when_changing` is required" in p for p in problems)
+
+
+def test_a_pipe_in_a_table_rendered_field_is_rejected(tmp_path):
+    root = _corpus(tmp_path, ENTRY.replace("the turn lifecycle or turn timeouts", "a | b"))
+    assert any("free of `|`" in p for p in verify_docs.verify(root))
+
+
+def test_a_malformed_kind_does_not_crash(tmp_path):
+    """`kind: []` is unhashable and verify() builds sets before per-entry validation."""
+    root = _corpus(tmp_path, ENTRY + "  kind: []\n")
+    assert any("`kind` must be a string" in p for p in verify_docs.verify(root))
+
+
+def test_invalid_yaml_is_a_finding_not_a_traceback(tmp_path):
+    root = _corpus(tmp_path, "- doc: [unclosed\n", skeleton=False)
+    assert any("not valid YAML" in p for p in verify_docs.verify(root))
+
+
+def test_a_missing_skeleton_is_caught(tmp_path):
+    """A manifest holding only its own entry would otherwise pass every other check."""
+    root = _corpus(tmp_path, skeleton=False)
+    assert any("required by the corpus contract" in p for p in verify_docs.verify(root))
+
+
+def test_related_must_name_a_document_not_an_index(tmp_path):
+    root = _corpus(tmp_path, ENTRY.replace("related: [doctrine/publishing.md]", "related: [llms.txt]"))
+    assert any("not a manifested document" in p for p in verify_docs.verify(root))
+
+
+# --- invariants ----------------------------------------------------------------------
+
+def test_an_invariant_defined_twice_is_caught(tmp_path):
+    inv = "**INV-X-001**: one statement.\n"
+    manifest = (
+        ENTRY.replace("  related: [doctrine/publishing.md]",
+                      "  related: []\n  defines_invariants: [INV-X-001]")
+        + "\n- doc: architecture/other.md\n  summary: Other.\n  when_changing: else\n"
+        + "  defines_invariants: [INV-X-001]\n"
+    )
+    root = _corpus(tmp_path, manifest, docs={
+        "architecture/turn-loop.md": "# T\n" + CODE_WINS + inv + SOURCEMAP,
+        "architecture/other.md": "# O\n" + CODE_WINS + inv + SOURCEMAP,
+    })
+    assert any("defined 2 times" in p for p in verify_docs.verify(root))
+
+
+def test_an_undefined_invariant_reference_is_caught(tmp_path):
+    root = _corpus(tmp_path, docs={
+        "architecture/turn-loop.md": "# T\n" + CODE_WINS + "See INV-GHOST-009.\n" + SOURCEMAP,
+    })
+    assert any("INV-GHOST-009" in p and "never defined" in p for p in verify_docs.verify(root))
+
+
+def test_a_declaration_mismatch_is_caught_both_ways(tmp_path):
+    manifest = ENTRY.replace("  related: [doctrine/publishing.md]",
+                             "  related: []\n  defines_invariants: [INV-X-002]")
+    root = _corpus(tmp_path, manifest, docs={
+        "architecture/turn-loop.md":
+            "# T\n" + CODE_WINS + "**INV-X-001**: one statement.\n" + SOURCEMAP,
+    })
+    problems = verify_docs.verify(root)
+    assert any("declares INV-X-002" in p for p in problems)
+    assert any("does not declare" in p and "INV-X-001" in p for p in problems)
+
+
+def test_a_wrapped_invariant_statement_is_caught(tmp_path):
+    """It renders TRUNCATED into the generated index — only the definition line is captured.
+    Found by reading the generated table, not by reasoning about it."""
+    manifest = ENTRY.replace("  related: [doctrine/publishing.md]",
+                             "  related: []\n  defines_invariants: [INV-X-001]")
+    wrapped = "**INV-X-001**: this statement continues on\nthe following line.\n"
+    root = _corpus(tmp_path, manifest, docs={
+        "architecture/turn-loop.md": "# T\n" + CODE_WINS + wrapped + SOURCEMAP,
+    })
+    assert any("complete on ONE line" in p for p in verify_docs.verify(root))
+
+
+# --- generated navigation ------------------------------------------------------------
+
+def test_llms_links_resolve_relative_to_the_docs_directory(tmp_path):
+    """Emitting `docs/...` from inside docs/ would resolve to docs/docs/..."""
+    import re as _re
+    root = _corpus(tmp_path)
+    out = verify_docs.render_llms(root)
+    targets = _re.findall(r"\]\(([^)]+)\)", out)
+    assert targets
+    for target in targets:
+        assert not target.startswith("docs/")
+        assert (root / "docs" / target).exists()
+
+
+def test_routing_is_keyed_on_the_task_and_omits_indexes(tmp_path):
+    out = verify_docs.render_routing(_corpus(tmp_path))
+    assert "the turn lifecycle or turn timeouts" in out
+    assert "llms.txt" not in out
+
+
+def test_stale_nav_writes_nothing(tmp_path):
+    root = _corpus(tmp_path)
+    before = {p: p.read_bytes() for p in (root / "docs").rglob("*") if p.is_file()}
+    assert verify_docs.stale_nav(root), "the seeded corpus is stale"
+    after = {p: p.read_bytes() for p in (root / "docs").rglob("*") if p.is_file()}
+    assert before == after, "--check-nav must not mutate what it inspects"
+
+
+def test_write_nav_is_idempotent_and_keeps_handwritten_text(tmp_path):
+    root = _corpus(tmp_path)
+    readme = root / "docs" / "README.md"
+    readme.write_text("# Docs\n\nRead me first.\n\n<!-- BEGIN ROUTING -->\nstale\n<!-- END ROUTING -->\n\nFooter.\n")
+    verify_docs.write_nav(root)
+    assert verify_docs.write_nav(root) == []
+    assert verify_docs.stale_nav(root) == []
+    text = readme.read_text()
+    assert "Read me first." in text and "Footer." in text and "stale" not in text
+
+
+def test_the_sourcemap_is_injected_from_the_manifest(tmp_path):
+    root = _corpus(tmp_path)
+    verify_docs.write_nav(root)
+    text = (root / "docs" / "architecture" / "turn-loop.md").read_text()
+    assert "casa/a.py::A.b" in text
+    assert "tests/test_a.py::test_b" in text
+
+
+# --- docs impact ---------------------------------------------------------------------
+
+def test_impacted_docs_maps_a_changed_path_to_its_claimants(tmp_path):
+    root = _corpus(tmp_path)
+    assert verify_docs.impacted_docs(root, ["casa/a.py"]) == {"architecture/turn-loop.md"}
+    assert verify_docs.impacted_docs(root, ["casa/unclaimed.py"]) == set()
+
+
+def test_impacted_docs_honours_a_claim_deleted_in_the_same_change(tmp_path):
+    """Dropping the covers anchor in the same PR must not drop the obligation."""
+    root = _corpus(tmp_path, ENTRY.replace("  covers: [casa/a.py::A.b]\n", ""))
+    assert verify_docs.impacted_docs(root, ["casa/a.py"]) == set()
+    assert verify_docs.impacted_docs(root, ["casa/a.py"], base_manifest=ENTRY) == {
+        "architecture/turn-loop.md"
+    }

@@ -1,0 +1,60 @@
+# The publication allowlist for this corpus.
+#
+# Nothing under docs/ is published without an entry here, and every entry must name a file
+# git actually tracks — both directions are checked, because an entry naming an untracked
+# file passes locally while the pushed commit does not contain it.
+#
+# `when_changing` is phrased as the TASK an agent is about to do, not the subsystem name:
+# an agent knows what it is about to change before it knows which subsystem owns it, and the
+# generated routing table has to meet it there.
+#
+# Verify with:  python -m scripts.verify_docs .
+# Regenerate:   python -m scripts.verify_docs . --write-nav
+
+- doc: manifest.yaml
+  kind: meta
+  summary: The publication allowlist for this corpus.
+
+- doc: README.md
+  kind: index
+  summary: Routing map — what you are about to change, and what to read for it.
+
+- doc: llms.txt
+  kind: generated
+  summary: Flat index of the corpus, generated from this manifest.
+
+- doc: doctrine/invariants.md
+  kind: generated
+  summary: Every INV-* id, its statement, and the file that defines it.
+
+- doc: doctrine/publishing.md
+  summary: The one rule that decides whether a fact may be written down in this repository.
+  when_changing: anything published — docs, comments, commit messages, PR text, branch names
+  related: [contributing/doc-contract.md]
+  defines_invariants: [INV-PUB-001, INV-PUB-002, INV-PUB-003]
+
+- doc: architecture/turn-loop.md
+  summary: How one inbound message becomes one agent turn, and what bounds it.
+  when_changing: the turn lifecycle, the warm client pool, retry behaviour, or turn teardown
+  covers:
+    - casa/rootfs/opt/casa/agent.py::Agent._process
+    - casa/rootfs/opt/casa/agent.py::Agent._build_options
+    - casa/rootfs/opt/casa/agent.py::Agent.aclose
+    - casa/rootfs/opt/casa/sdk_client_pool.py::SdkClientPool.turn
+    - casa/rootfs/opt/casa/sdk_client_pool.py::ManagedSdkClient
+    - casa/rootfs/opt/casa/sdk_client_pool.py::PoolUnavailable
+    - casa/rootfs/opt/casa/retry.py::retry_sdk_call
+    - casa/rootfs/opt/casa/retry.py::compute_backoff_ms
+  tests:
+    - tests/test_agent_process.py::test_session_id_is_channel_plus_role
+    - tests/test_agent_process.py::test_telegram_channel_autorecalls_on_fresh_session
+    - tests/test_sdk_client_pool_pool.py
+    - tests/test_retry.py
+  related: [doctrine/publishing.md]
+  defines_invariants: [INV-TURN-001, INV-TURN-002, INV-TURN-003, INV-TURN-004, INV-TURN-005]
+
+- doc: contributing/doc-contract.md
+  summary: The shape a document takes, and which of its rules CI enforces versus a reviewer.
+  when_changing: the documentation rules themselves, or adding a document to the corpus
+  related: [doctrine/publishing.md]
+  defines_invariants: [INV-DOC-001, INV-DOC-002, INV-DOC-003, INV-DOC-004, INV-DOC-005, INV-DOC-006]
