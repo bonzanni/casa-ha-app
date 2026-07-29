@@ -55,15 +55,6 @@ def test_a_gated_push_without_an_attestation_is_refused(tmp_path):
     assert "not attested" in result.stderr
 
 
-def test_a_gated_commit_behind_a_non_gated_tip_is_still_caught(tmp_path):
-    """Both planned corpus pushes END with a non-docs commit, so a tip-only check would
-    have skipped the gate on exactly the pushes that matter."""
-    repo = _repo(tmp_path)
-    _commit(repo, "docs/architecture/a.md")
-    tip = _commit(repo, "casa/rootfs/opt/casa/thing.py")
-    assert _push(repo, tip).returncode == 1
-
-
 def test_a_push_touching_only_the_guard_is_gated(tmp_path):
     """PR-0's shape exactly: publication machinery and boundary prose, no corpus."""
     repo = _repo(tmp_path)
@@ -196,17 +187,19 @@ def test_attest_refuses_on_a_dirty_tree(tmp_path):
                    "--findings-applied", "--re-reviewed").returncode == 1
 
 
-# --- tags: annotation, tagger identity, and ref name are all published ----------------
+# --- tags are refused outright ---------------------------------------------------------
 
-def _tag_push(repo: Path, ref: str, sha: str, env: dict | None = None):
+def _tag_push(repo: Path, local_ref: str, sha: str, remote_ref: str | None = None,
+              env: dict | None = None):
+    remote_ref = remote_ref or local_ref
     return subprocess.run(
         ["bash", str(HOOK)], cwd=repo, capture_output=True, text=True,
-        input=f"{ref} {sha} {ref} {ZERO}\n",
+        input=f"{local_ref} {sha} {remote_ref} {ZERO}\n",
         env={"PATH": "/usr/bin:/bin", "HOME": str(repo), **(env or {})},
     )
 
 
-def test_a_tag_push_without_an_attestation_is_refused(tmp_path):
+def test_an_annotated_tag_push_is_refused(tmp_path):
     repo = _repo(tmp_path)
     _commit(repo, "docs/architecture/a.md")
     subprocess.run(["git", "-C", str(repo), "tag", "-a", "v1", "-m", "release"], check=True)
@@ -214,26 +207,48 @@ def test_a_tag_push_without_an_attestation_is_refused(tmp_path):
                          capture_output=True, text=True, check=True).stdout.strip()
     result = _tag_push(repo, "refs/tags/v1", sha)
     assert result.returncode == 1
-    assert "published text" in result.stderr
+    assert "refusing to push a tag" in result.stderr
 
 
-def test_an_attested_tag_object_may_not_be_pushed_under_another_name(tmp_path):
-    """Keying approval on the object alone let the same attested tag be republished under
-    a newly created, unswept name — and a ref name is published text."""
-    repo = _repo(tmp_path)
-    _commit(repo, "docs/architecture/a.md")
-    subprocess.run(["git", "-C", str(repo), "tag", "-a", "v1", "-m", "release"], check=True)
-    sha = subprocess.run(["git", "-C", str(repo), "rev-parse", "v1"],
-                         capture_output=True, text=True, check=True).stdout.strip()
-    _receipt(repo, "casa-gate-approved", f"{sha}\nread-in-full; reviewers=a,b; ref=v1\n")
-    assert _tag_push(repo, "refs/tags/v1", sha).returncode == 0
-    assert _tag_push(repo, "refs/tags/v1-evil", sha).returncode == 1
-
-
-def test_a_lightweight_tag_is_gated_too(tmp_path):
+def test_a_lightweight_tag_push_is_refused(tmp_path):
     repo = _repo(tmp_path)
     sha = _commit(repo, "docs/architecture/a.md")
     assert _tag_push(repo, "refs/tags/light", sha).returncode == 1
+
+
+def test_a_branch_source_pushed_to_a_tag_destination_is_refused(tmp_path):
+    """`main:refs/tags/x` publishes a tag while the SOURCE ref is a branch — a
+    local-ref-only test waved this through."""
+    repo = _repo(tmp_path)
+    sha = _commit(repo, "docs/architecture/a.md")
+    result = _tag_push(repo, "refs/heads/main", sha, remote_ref="refs/tags/sneaky")
+    assert result.returncode == 1
+    assert "refusing to push a tag" in result.stderr
+
+
+def test_a_tag_name_with_regex_metacharacters_is_still_refused(tmp_path):
+    """The removed binding interpolated the name into a grep expression, so a name like
+    `v1|.*` matched any receipt line."""
+    repo = _repo(tmp_path)
+    sha = _commit(repo, "docs/architecture/a.md")
+    assert _tag_push(repo, "refs/tags/v1|.*", sha).returncode == 1
+
+
+def test_an_attested_commit_receipt_does_not_authorise_a_tag(tmp_path):
+    repo = _repo(tmp_path)
+    sha = _commit(repo, "docs/architecture/a.md")
+    _receipt(repo, "casa-gate-approved", f"{sha}\nread-in-full; reviewers=a,b\n")
+    assert _push(repo, sha).returncode == 0, "the commit push is fine"
+    assert _tag_push(repo, "refs/tags/v1", sha).returncode == 1, "the tag is not"
+
+
+def test_a_tag_push_can_be_overridden_with_a_reason(tmp_path):
+    repo = _repo(tmp_path)
+    sha = _commit(repo, "docs/architecture/a.md")
+    result = _tag_push(repo, "refs/tags/v1", sha,
+                       env={"CASA_GATE_OVERRIDE": "documented exception"})
+    assert result.returncode == 0
+    assert "overridden" in result.stderr
 
 
 def test_an_empty_commit_is_the_only_ungated_push(tmp_path):

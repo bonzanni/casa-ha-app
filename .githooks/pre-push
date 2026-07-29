@@ -24,29 +24,37 @@ zero="0000000000000000000000000000000000000000"
 # published at this destination, and `--not --remotes` used to treat it as if it were.
 destination="${1:-origin}"
 
-while read -r local_ref local_sha _remote_ref remote_sha; do
+while read -r local_ref local_sha remote_ref remote_sha; do
   [ "$local_sha" = "$zero" ] && continue          # branch deletion
 
-  # A tag push publishes its annotation, which is not a commit and appears in no range.
-  # Gate every tag rather than try to reason about which are safe.
-  case "$local_ref" in
-    refs/tags/*)
+  # TAGS ARE REFUSED OUTRIGHT.
+  #
+  # A tag publishes its annotation, its tagger identity and its name, none of which is a
+  # commit and none of which any range or message sweep covers. An attestation flow for
+  # them was built and then removed: it produced a fresh publication hole in three
+  # consecutive reviews (headers discarded, scanner never run, object-not-name binding,
+  # regex-injectable name matching, unswept nested tag objects). Patching it further was
+  # buying risk for a capability nothing here uses.
+  #
+  # This repo does not tag locally: deploy.yml cuts the vX.Y.Z tag and the GitHub release
+  # in CI on merge to main, and CLAUDE.md states "no manual tagging". CI does not run this
+  # hook. If a local tag push is ever genuinely needed, CASA_GATE_OVERRIDE takes a reason
+  # and prints it, and that reason belongs in the PR.
+  #
+  # Both sides are checked: `main:refs/tags/x` publishes a tag while the SOURCE ref is a
+  # branch, which a local-ref-only test would have waved through.
+  case "$local_ref$remote_ref" in
+    *refs/tags/*)
       if [ -n "${CASA_GATE_OVERRIDE:-}" ]; then
-        echo "⚠  pre-push: gate overridden — $CASA_GATE_OVERRIDE" >&2
+        echo "⚠  pre-push: tag push overridden — $CASA_GATE_OVERRIDE" >&2
         continue
       fi
-      # Bind the REF NAME as well as the object. Keying on the object alone let the same
-      # attested tag be pushed under a newly created, unswept name.
-      tag_name="${local_ref#refs/tags/}"
-      if [ ! -f "$receipt" ] || [ "$(head -1 "$receipt")" != "$local_sha" ] \
-         || ! grep -q "ref=$tag_name\$" "$receipt"; then
-        echo "✋ pre-push: $local_ref is a tag. Its annotation, its tagger identity and its" >&2
-        echo "   name are all published text that no range or message sweep covers, and the" >&2
-        echo "   attestation must name this exact ref." >&2
-        echo "   Run: scripts/attest.sh ... --object $tag_name" >&2
-        exit 1
-      fi
-      continue ;;
+      echo "✋ pre-push: refusing to push a tag." >&2
+      echo "   A tag publishes its annotation, tagger identity and name — none of them a" >&2
+      echo "   commit, none covered by any sweep. Releases are tagged by CI on merge to" >&2
+      echo "   main; there is no local tagging in this repo." >&2
+      echo "   If you truly need one: CASA_GATE_OVERRIDE='<reason>' git push ..." >&2
+      exit 1 ;;
   esac
 
   if [ "$remote_sha" = "$zero" ]; then
