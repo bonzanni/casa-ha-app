@@ -62,18 +62,29 @@ The `tests/conftest.py` auto-adds the code root to `sys.path`.
 - `venv_test/` must be a **Linux venv** (run `make setup`); any pre-existing Windows-layout
   venv (`Scripts/`, `Activate.ps1`) won't run under WSL.
 
-## The `docs/` boundary — READ THIS
-`docs/` is an **intentionally-private, separate inner git repo** (its own `docs/.git` with
-a private remote). It is **gitignored by this public add-on repo and is NEVER shipped
-here.** It holds internal engineering docs (roadmaps, design specs, the canonical
-current-state spec).
+## The publication boundary — READ THIS
+**Internal engineering material is never committed here.** Design specs, plans, roadmaps,
+reviews and captured transcripts belong outside this repository. The rule for what may go
+in is one line: *a fact belongs in this repo only if it is verifiable from the public
+commit alone* — no operator, no production box, no private repository.
 
-- **Never `git add -f docs/` or otherwise commit `docs/` into this repo.** A
-  `.githooks/pre-commit` guard refuses it; `make setup` installs that guard.
-- Do **not** `git commit` inside `docs/` unless explicitly asked — it has its own history.
-- If you have the private `docs/` tree checked out, the **canonical current-state
-  reference** is `docs/current-state-spec.md` (code is the source of truth — when that doc
-  and the code disagree, the code wins). For internal guidance see `docs/CLAUDE.md`.
+`docs/` is being populated with a public, curated, agent-facing corpus. Until it lands,
+treat the directory as tracked and public: **anything committed there is published.**
+
+Three controls enforce this, and `make setup` installs the hooks:
+
+- `.githooks/pre-commit` refuses staged paths and added lines matching
+  `.githooks/deny-patterns.txt` — generic rules only, since this repo is public and a
+  pattern written here is published by the commit that adds it.
+- `scripts/gate.sh` is the pre-push gate: it evaluates `HEAD` on a clean tree, sweeps the
+  endpoint tree, every unpublished commit and their messages, then runs a pinned secret
+  scanner over both tree and history.
+- `.githooks/pre-push` refuses a push whose commits touch a gated path without an
+  attestation from `scripts/attest.sh`. **The first push of anything is irreversible** —
+  objects stay fetchable by SHA after any branch deletion or force-push.
+
+Contributors with additional local tooling supply an exact-literal supplement through
+`CASA_DENY_SUPPLEMENT`; CI runs the generic rules and the scanner.
 
 ## Working norms
 - **Verify against whole files, not thin grep slices** — read around a symbol before
