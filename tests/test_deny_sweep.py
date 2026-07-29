@@ -379,3 +379,38 @@ def test_a_secret_hidden_in_the_pattern_file_is_caught(tmp_path):
     result = _sweep(repo, hooks / "deny-patterns.txt", "tree")
     assert result.returncode == 1
     assert "pattern-file residue" in result.stderr
+
+
+def test_a_later_commit_cannot_retroactively_authorise_an_earlier_marker(tmp_path):
+    """The allow-site policy is read from the commit being assessed. Comparing every
+    commit's markers against the working-tree policy let a commit added later authorise a
+    scanner-silencing marker introduced earlier in the same pushed range."""
+    repo, deny = _repo(tmp_path)
+    hooks = repo / ".githooks"
+    hooks.mkdir(exist_ok=True)
+    (hooks / "gitleaks-allow-sites.txt").write_text("")
+    base = _commit(repo, "a.txt", "benign\n")
+
+    marker = "gitleaks" ":" "allow"
+    _commit(repo, "sneaky.py", f"token = 'x'  # {marker}\n")     # unauthorised here
+    (hooks / "gitleaks-allow-sites.txt").write_text("sneaky.py\n")
+    subprocess.run(["git", "-C", str(repo), "add", "-A"], check=True)
+    subprocess.run(["git", "-C", str(repo), "commit", "-qm", "authorise it after the fact"],
+                   check=True)
+
+    result = _sweep(repo, deny, "range", f"{base}..HEAD")
+    assert result.returncode == 1, "the marker was unauthorised in the commit that added it"
+    assert "sneaky.py" in result.stderr
+
+
+def test_a_path_with_a_control_character_is_refused(tmp_path):
+    """git C-quotes such a name, which silently defeats anchored path rules."""
+    repo, deny = _repo(tmp_path)
+    _commit(repo, "a.txt", "benign\n")
+    weird = repo / "line\nbreak.txt"
+    weird.write_bytes(b"x\n")
+    subprocess.run(["git", "-C", str(repo), "add", "-A"], check=True)
+    subprocess.run(["git", "-C", str(repo), "commit", "-qm", "weird"], check=True)
+    result = _sweep(repo, deny, "tree")
+    assert result.returncode == 1
+    assert "control characters" in result.stderr

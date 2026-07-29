@@ -35,9 +35,15 @@ while read -r local_ref local_sha _remote_ref remote_sha; do
         echo "⚠  pre-push: gate overridden — $CASA_GATE_OVERRIDE" >&2
         continue
       fi
-      if [ ! -f "$receipt" ] || [ "$(head -1 "$receipt")" != "$local_sha" ]; then
-        echo "✋ pre-push: $local_ref is a tag; its annotation is published text that no" >&2
-        echo "   range or commit-message sweep covers. It needs an attestation too." >&2
+      # Bind the REF NAME as well as the object. Keying on the object alone let the same
+      # attested tag be pushed under a newly created, unswept name.
+      tag_name="${local_ref#refs/tags/}"
+      if [ ! -f "$receipt" ] || [ "$(head -1 "$receipt")" != "$local_sha" ] \
+         || ! grep -q "ref=$tag_name\$" "$receipt"; then
+        echo "✋ pre-push: $local_ref is a tag. Its annotation, its tagger identity and its" >&2
+        echo "   name are all published text that no range or message sweep covers, and the" >&2
+        echo "   attestation must name this exact ref." >&2
+        echo "   Run: scripts/attest.sh ... --object $tag_name" >&2
         exit 1
       fi
       continue ;;

@@ -194,3 +194,62 @@ def test_attest_refuses_on_a_dirty_tree(tmp_path):
     (repo / "docs" / "architecture" / "a.md").write_text("changed\n")
     assert _attest(repo, "--read-in-full", "--reviewers", "a,b",
                    "--findings-applied", "--re-reviewed").returncode == 1
+
+
+# --- tags: annotation, tagger identity, and ref name are all published ----------------
+
+def _tag_push(repo: Path, ref: str, sha: str, env: dict | None = None):
+    return subprocess.run(
+        ["bash", str(HOOK)], cwd=repo, capture_output=True, text=True,
+        input=f"{ref} {sha} {ref} {ZERO}\n",
+        env={"PATH": "/usr/bin:/bin", "HOME": str(repo), **(env or {})},
+    )
+
+
+def test_a_tag_push_without_an_attestation_is_refused(tmp_path):
+    repo = _repo(tmp_path)
+    _commit(repo, "docs/architecture/a.md")
+    subprocess.run(["git", "-C", str(repo), "tag", "-a", "v1", "-m", "release"], check=True)
+    sha = subprocess.run(["git", "-C", str(repo), "rev-parse", "v1"],
+                         capture_output=True, text=True, check=True).stdout.strip()
+    result = _tag_push(repo, "refs/tags/v1", sha)
+    assert result.returncode == 1
+    assert "published text" in result.stderr
+
+
+def test_an_attested_tag_object_may_not_be_pushed_under_another_name(tmp_path):
+    """Keying approval on the object alone let the same attested tag be republished under
+    a newly created, unswept name — and a ref name is published text."""
+    repo = _repo(tmp_path)
+    _commit(repo, "docs/architecture/a.md")
+    subprocess.run(["git", "-C", str(repo), "tag", "-a", "v1", "-m", "release"], check=True)
+    sha = subprocess.run(["git", "-C", str(repo), "rev-parse", "v1"],
+                         capture_output=True, text=True, check=True).stdout.strip()
+    _receipt(repo, "casa-gate-approved", f"{sha}\nread-in-full; reviewers=a,b; ref=v1\n")
+    assert _tag_push(repo, "refs/tags/v1", sha).returncode == 0
+    assert _tag_push(repo, "refs/tags/v1-evil", sha).returncode == 1
+
+
+def test_a_lightweight_tag_is_gated_too(tmp_path):
+    repo = _repo(tmp_path)
+    sha = _commit(repo, "docs/architecture/a.md")
+    assert _tag_push(repo, "refs/tags/light", sha).returncode == 1
+
+
+def test_an_empty_commit_is_the_only_ungated_push(tmp_path):
+    """With every path gated, this is what proves the hook enumerates history rather than
+    inspecting the tip: an empty commit touches nothing, so a range whose TIP is empty is
+    still gated when an earlier commit is not."""
+    repo = _repo(tmp_path)
+    subprocess.run(["git", "-C", str(repo), "commit", "-q", "--allow-empty", "-m", "empty"],
+                   check=True)
+    empty_only = subprocess.run(["git", "-C", str(repo), "rev-parse", "HEAD"],
+                                capture_output=True, text=True, check=True).stdout.strip()
+    assert _push(repo, empty_only).returncode == 0, "an empty commit touches no path"
+
+    _commit(repo, "docs/architecture/a.md")
+    subprocess.run(["git", "-C", str(repo), "commit", "-q", "--allow-empty", "-m", "empty tip"],
+                   check=True)
+    tip = subprocess.run(["git", "-C", str(repo), "rev-parse", "HEAD"],
+                         capture_output=True, text=True, check=True).stdout.strip()
+    assert _push(repo, tip).returncode == 1, "a tip-only check would have missed this"
