@@ -13,6 +13,11 @@
 # Refuses unless the automated gate passed for THIS commit. Applying a review finding
 # creates a new commit, which invalidates both receipts — that is the point.
 set -euo pipefail
+# Resolve siblings BEFORE changing directory: the repo being attested is not necessarily
+# the repo this script lives in, and `scripts/sweep-text.sh` resolved against the wrong
+# one — reporting a MISSING sweeper as "carries denied content", which is a fail-open
+# message dressed as a fail-closed one.
+script_dir="$(cd "$(dirname "$0")" && pwd)"
 # Operate on the repository containing the CURRENT DIRECTORY, not the one containing this
 # script: `cd $(dirname $0)/..` made the tests read and write the real checkout's receipts.
 cd "$(git rev-parse --show-toplevel)"
@@ -52,11 +57,39 @@ fi
 head_sha="$(git rev-parse HEAD)"
 automated="$(git rev-parse --git-path casa-gate-automated)"
 [ -f "$automated" ] || { echo "✋ attest: run scripts/gate.sh first." >&2; exit 1; }
-[ "$(cat "$automated")" = "$head_sha" ] || {
+[ "$(head -1 "$automated")" = "$head_sha" ] || {
   echo "✋ attest: the automated receipt is for a different commit. Re-run scripts/gate.sh." >&2
   exit 1
 }
 
-printf '%s\nread-in-full; reviewers=%s; findings-applied; re-reviewed\n' \
-  "$head_sha" "$reviewers" > "$(git rev-parse --git-path casa-gate-approved)"
+# Bind the reviewed SET, not just its tip. Re-running the gate at the same HEAD with a
+# wider base rewrites the set; without this the older approval would still authorise it.
+commits_file="$(git rev-parse --git-path casa-gate-commits)"
+[ -f "$commits_file" ] || { echo "✋ attest: no reviewed commit set. Re-run scripts/gate.sh." >&2; exit 1; }
+digest="$(sha256sum < "$commits_file" | cut -d' ' -f1)"
+[ "$(sed -n 2p "$automated")" = "$digest" ] || {
+  echo "✋ attest: the reviewed commit set has changed since the gate ran." >&2
+  echo "        Re-run scripts/gate.sh, then read and review the new range." >&2
+  exit 1
+}
+
+# The destination BRANCH NAME is published metadata too, and no sweep covers it.
+branch="$(git rev-parse --abbrev-ref HEAD)"
+sweeper="$script_dir/sweep-text.sh"
+[ -x "$sweeper" ] || { echo "✋ attest: $sweeper is missing — cannot sweep the branch name." >&2; exit 1; }
+printf '%s\n' "$branch" > "$(git rev-parse --git-path casa-branch-name)"
+set +e
+"$sweeper" "$(git rev-parse --git-path casa-branch-name)" >/dev/null 2>&1
+sweep_status=$?
+set -e
+if [ "$sweep_status" -eq 1 ]; then
+  echo "✋ attest: the branch name '$branch' carries denied content. It is published." >&2
+  exit 1
+elif [ "$sweep_status" -ne 0 ]; then
+  echo "✋ attest: the branch-name sweep failed (status $sweep_status)." >&2
+  exit 1
+fi
+
+printf '%s\n%s\n%s\nread-in-full; reviewers=%s; findings-applied; re-reviewed\n' \
+  "$head_sha" "$digest" "$branch" "$reviewers" > "$(git rev-parse --git-path casa-gate-approved)"
 echo "✓ attested $head_sha"

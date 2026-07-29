@@ -53,7 +53,17 @@ while read -r local_ref local_sha remote_ref remote_sha; do
   esac
 
   if [ "$remote_sha" = "$zero" ]; then
-    commits="$(git rev-list "$local_sha" --not --remotes="$destination")"
+    # ASK THE DESTINATION what it has. `--not --remotes=<name>` reads local tracking refs,
+    # which describe this clone, not the remote: repoint origin at a fresh repository and
+    # a stale refs/remotes/origin/main makes whole ancestries look already-published.
+    advertised="$(git ls-remote --heads "$destination" 2>/dev/null | cut -f1)" || advertised=""
+    if [ -n "$advertised" ]; then
+      commits="$(git rev-list "$local_sha" --not $advertised 2>/dev/null)" \
+        || commits="$(git rev-list "$local_sha")"
+    else
+      # An empty or unreachable destination publishes the whole ancestry.
+      commits="$(git rev-list "$local_sha")"
+    fi
   else
     commits="$(git rev-list "$remote_sha..$local_sha")"
   fi
@@ -84,7 +94,36 @@ while read -r local_ref local_sha remote_ref remote_sha; do
     echo "✋ pre-push: no reviewed commit set recorded. Re-run scripts/gate.sh." >&2
     exit 1
   fi
-  unreviewed="$(printf '%s\n' "$commits" | grep -vxF -f "$reviewed" || true)"
+
+  # The receipt carries a digest of the set it approved. Without it, a second gate run at
+  # the same HEAD with a wider base rewrites the set while the old approval still stands.
+  if [ "$(sha256sum < "$reviewed" | cut -d' ' -f1)" != "$(sed -n 2p "$receipt")" ]; then
+    echo "✋ pre-push: the reviewed commit set has changed since it was attested." >&2
+    echo "   Re-run scripts/gate.sh, re-read the range, and re-attest." >&2
+    exit 1
+  fi
+
+  # The destination BRANCH NAME is published metadata; the attestation names the one that
+  # was swept. Exact string comparison — the removed tag binding interpolated a name into
+  # a grep expression, so `v1|.*` matched any receipt line.
+  dest_branch="${remote_ref#refs/heads/}"
+  if [ "$dest_branch" != "$(sed -n 3p "$receipt")" ]; then
+    echo "✋ pre-push: attested for branch '$(sed -n 3p "$receipt")', pushing to" >&2
+    echo "   '$dest_branch'. A branch name is published text that no sweep covers." >&2
+    exit 1
+  fi
+
+  set +e
+  printf '%s\n' "$commits" | grep -vxF -f "$reviewed" > "$(git rev-parse --git-path casa-unreviewed)"
+  grep_status=$?
+  set -e
+  if [ "$grep_status" -ge 2 ]; then
+    echo "✋ pre-push: comparison against the reviewed set failed (grep status $grep_status)." >&2
+    echo "   Refusing rather than assuming everything matched." >&2
+    exit 1
+  fi
+  unreviewed="$(cat "$(git rev-parse --git-path casa-unreviewed)")"
+  rm -f "$(git rev-parse --git-path casa-unreviewed)"
   if [ -n "$unreviewed" ]; then
     echo "✋ pre-push: $count commit(s) would reach $destination, but these were never in" >&2
     echo "   the reviewed range:" >&2

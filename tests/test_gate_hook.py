@@ -4,6 +4,7 @@ These were verified by hand at the shell but had no automated test, which is exa
 kind of gap that rots: the hook is the only thing standing between a local mistake and an
 irreversible publication.
 """
+import hashlib
 import subprocess
 from pathlib import Path
 
@@ -19,6 +20,14 @@ def _repo(tmp_path: Path) -> Path:
     subprocess.run(["git", "init", "-q", str(repo)], check=True)
     for key, value in (("user.email", "t@t"), ("user.name", "t")):
         subprocess.run(["git", "-C", str(repo), "config", key, value], check=True)
+    # attest.sh sweeps the branch name, and every policy file fails closed when absent.
+    hooks = repo / ".githooks"
+    hooks.mkdir()
+    (hooks / "deny-patterns.txt").write_text(
+        "[paths]\n(^|/)zzforbidden-\n[content]\nZZ-DENIED-LITERAL-ZZ\n[allow-content]\nZZ-NEVER-ZZ\n"
+    )
+    (hooks / "root-allowlist.txt").write_text("")
+    (hooks / "gitleaks-allow-sites.txt").write_text("")
     return repo
 
 
@@ -46,13 +55,23 @@ def _receipt(repo: Path, name: str, body: str) -> None:
     (repo / ".git" / name).write_text(body)
 
 
-def _reviewed(repo: Path, sha: str, extra: list[str] | None = None) -> None:
-    """Record the commit SET the gate swept, as scripts/gate.sh does."""
+def _reviewed(repo: Path, sha: str, extra: list[str] | None = None) -> str:
+    """Record the commit SET the gate swept, as scripts/gate.sh does; return its digest."""
     shas = subprocess.run(
         ["git", "-C", str(repo), "rev-list", sha], capture_output=True, text=True, check=True
     ).stdout.split()
     keep = shas if extra is None else extra
-    (repo / ".git" / "casa-gate-commits").write_text("".join(f"{c}\n" for c in keep))
+    body = "".join(f"{c}\n" for c in keep)
+    (repo / ".git" / "casa-gate-commits").write_text(body)
+    return hashlib.sha256(body.encode()).hexdigest()
+
+
+def _approve(repo: Path, sha: str, branch: str = "main",
+             extra: list[str] | None = None) -> None:
+    """A complete approved receipt: tip, set digest, branch, claims."""
+    digest = _reviewed(repo, sha, extra=extra)
+    _receipt(repo, "casa-gate-approved",
+             f"{sha}\n{digest}\n{branch}\nread-in-full; reviewers=a,b\n")
 
 
 def test_a_gated_push_without_an_attestation_is_refused(tmp_path):
@@ -136,8 +155,7 @@ def test_the_automated_receipt_alone_does_not_authorise_a_push(tmp_path):
 def test_an_attested_tip_is_allowed(tmp_path):
     repo = _repo(tmp_path)
     sha = _commit(repo, "docs/architecture/a.md")
-    _receipt(repo, "casa-gate-approved", f"{sha}\nread-in-full; reviewers=a,b\n")
-    _reviewed(repo, sha)
+    _approve(repo, sha)
     assert _push(repo, sha).returncode == 0
 
 
@@ -148,8 +166,7 @@ def test_an_attested_tip_does_not_authorise_unreviewed_commits(tmp_path):
     repo = _repo(tmp_path)
     _commit(repo, "docs/architecture/older.md")
     sha = _commit(repo, "docs/architecture/a.md")
-    _receipt(repo, "casa-gate-approved", f"{sha}\nread-in-full; reviewers=a,b\n")
-    _reviewed(repo, sha, extra=[sha])          # only the tip was reviewed
+    _approve(repo, sha, extra=[sha])           # only the tip was reviewed
     result = _push(repo, sha)
     assert result.returncode == 1
     assert "never in" in result.stderr
@@ -158,7 +175,7 @@ def test_an_attested_tip_does_not_authorise_unreviewed_commits(tmp_path):
 def test_a_missing_reviewed_set_is_refused(tmp_path):
     repo = _repo(tmp_path)
     sha = _commit(repo, "docs/architecture/a.md")
-    _receipt(repo, "casa-gate-approved", f"{sha}\nread-in-full; reviewers=a,b\n")
+    _receipt(repo, "casa-gate-approved", f"{sha}\ndigest\nmain\nread-in-full\n")
     result = _push(repo, sha)
     assert result.returncode == 1
     assert "no reviewed commit set" in result.stderr
@@ -168,7 +185,7 @@ def test_a_stale_attestation_is_refused(tmp_path):
     """Applying a review finding makes a new commit; the old approval must not carry."""
     repo = _repo(tmp_path)
     sha = _commit(repo, "docs/architecture/a.md")
-    _receipt(repo, "casa-gate-approved", "f" * 40 + "\nold\n")
+    _receipt(repo, "casa-gate-approved", "f" * 40 + "\ndigest\nmain\nold\n")
     assert _push(repo, sha).returncode == 1
 
 
@@ -241,15 +258,16 @@ def test_attest_writes_the_receipt_for_the_repo_it_is_run_in(tmp_path):
     """It must touch the throwaway repo's receipt, never the real checkout's."""
     repo = _repo(tmp_path)
     sha = _commit(repo, "docs/architecture/a.md")
-    _receipt(repo, "casa-gate-automated", sha + "\n")
+    digest = _reviewed(repo, sha)
+    _receipt(repo, "casa-gate-automated", f"{sha}\n{digest}\n")
     result = _attest(repo, "--read-in-full", "--reviewers", "a,b",
                      "--findings-applied", "--re-reviewed")
     assert result.returncode == 0, result.stderr
     receipt = (repo / ".git" / "casa-gate-approved").read_text()
     assert receipt.splitlines()[0] == sha
+    assert receipt.splitlines()[1] == digest
     assert "reviewers=a,b" in receipt
-    _reviewed(repo, sha)
-    assert _push(repo, sha).returncode == 0
+    assert _push(repo, sha).returncode == 0, "the receipt it wrote is accepted"
 
 
 def test_attest_refuses_on_a_dirty_tree(tmp_path):
@@ -311,8 +329,7 @@ def test_a_tag_name_with_regex_metacharacters_is_still_refused(tmp_path):
 def test_an_attested_commit_receipt_does_not_authorise_a_tag(tmp_path):
     repo = _repo(tmp_path)
     sha = _commit(repo, "docs/architecture/a.md")
-    _receipt(repo, "casa-gate-approved", f"{sha}\nread-in-full; reviewers=a,b\n")
-    _reviewed(repo, sha)
+    _approve(repo, sha)
     assert _push(repo, sha).returncode == 0, "the commit push is fine"
     assert _tag_push(repo, "refs/tags/v1", sha).returncode == 1, "the tag is not"
 
@@ -324,3 +341,30 @@ def test_a_tag_push_can_be_overridden_with_a_reason(tmp_path):
                        env={"CASA_GATE_OVERRIDE": "documented exception"})
     assert result.returncode == 0
     assert "overridden" in result.stderr
+
+
+def test_a_swapped_reviewed_set_is_refused(tmp_path):
+    """Re-running the gate at the same HEAD with a wider base rewrites the set; the older
+    approval must not still authorise it."""
+    repo = _repo(tmp_path)
+    _commit(repo, "docs/architecture/older.md")
+    sha = _commit(repo, "docs/architecture/a.md")
+    _approve(repo, sha)
+    _reviewed(repo, sha, extra=[sha, "0" * 40])      # set rewritten after approval
+    result = _push(repo, sha)
+    assert result.returncode == 1
+    assert "changed since it was attested" in result.stderr
+
+
+def test_a_push_to_a_different_branch_than_attested_is_refused(tmp_path):
+    """A branch name is published metadata; the attestation names the swept one."""
+    repo = _repo(tmp_path)
+    sha = _commit(repo, "docs/architecture/a.md")
+    _approve(repo, sha, branch="main")
+    ok = subprocess.run(
+        ["bash", str(HOOK)], cwd=repo, capture_output=True, text=True,
+        input=f"refs/heads/main {sha} refs/heads/private-client-name {ZERO}\n",
+        env={"PATH": "/usr/bin:/bin", "HOME": str(repo)},
+    )
+    assert ok.returncode == 1
+    assert "published text" in ok.stderr

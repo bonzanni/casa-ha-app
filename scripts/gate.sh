@@ -18,8 +18,11 @@ if [ -n "$(git status --porcelain)" ]; then
   echo "        commit, and a push publishes commits, not files." >&2
   exit 1
 fi
+# Resolve to immutable shas up front: a concurrent fetch moving `origin/main` between the
+# scans and the final rev-list would otherwise record commits that were never swept.
 head_sha="$(git rev-parse HEAD)"
-range="$base..HEAD"
+base_sha="$(git rev-parse "$base")"
+range="$base_sha..$head_sha"
 echo "    HEAD  = $head_sha"
 echo "    range = $range ($(git rev-list --count "$range") unpublished commit(s))"
 
@@ -60,12 +63,15 @@ echo "==> 5/6 unit gate"
 make test-unit
 
 echo "==> 6/6 automated receipt"
-printf '%s\n' "$head_sha" > "$(git rev-parse --git-path casa-gate-automated)"
-# Record the exact commit SET that was swept, not just its tip. Binding only the tip let
-# a tip gated against origin/main be pushed to a different destination, where the hook
-# found hundreds of additional introduced commits and allowed them because the tip
-# matched. pre-push now requires every introduced commit to be in this set.
-git rev-list "$range" > "$(git rev-parse --git-path casa-gate-commits)"
+# Record the exact commit SET that was swept, not just its tip, and DIGEST it into the
+# receipt. Binding only the tip let a tip gated against origin/main be pushed to a
+# destination with less history, carrying commits the review never covered. Digesting it
+# additionally stops a second gate run at the same HEAD with a wider base from silently
+# swapping the set while an older approval still stands.
+commits_file="$(git rev-parse --git-path casa-gate-commits)"
+git rev-list "$range" > "$commits_file"
+digest="$(sha256sum < "$commits_file" | cut -d" " -f1)"
+printf '%s\n%s\n' "$head_sha" "$digest" > "$(git rev-parse --git-path casa-gate-automated)"
 cat <<EOF
 
 Automated gate PASSED for $head_sha.
