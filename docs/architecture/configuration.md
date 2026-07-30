@@ -51,7 +51,10 @@ typed as passwords that are not in that set are used verbatim.
 
 **INV-CFG-001**: Exactly eight reload scopes exist, and none of them rereads the app manifest options.
 
-Enforced by the registration calls in the reload module — the set is closed and explicit.
+Maintained by the module-level registration calls in the reload module. The set is not
+mechanically closed — the registry is a plain dict and accepts any scope string — so
+"exactly eight" is the current, deliberate count of registrations, held by review and the
+pinning test rather than by an enum.
 
 What it does not cover, and it is the point of stating it: no scope reloads operator options,
 global channel setup, process environment generally, or arbitrary files in the config tree.
@@ -89,8 +92,11 @@ something tries to load what was left broken.
 
 ## Failure behavior
 
-**The required credential option is missing.** Boot stops at validation. This is the one
-configuration failure that is fatal, and every service is gated behind it.
+**The required credential option is missing.** Boot stops at validation — the earliest fatal
+gate, and every service is gated behind it. It is not the only fatal configuration failure:
+later in startup, malformed policies, a malformed agent configuration, and the absence of the
+primary assistant role each raise and stop the process too. "Reconciliation is never
+boot-fatal" (INV-CFG-005) is about the config *tree*, not about validation.
 
 **Reconciliation fails.** Absorbed and logged. A recovery artifact is preserved — a
 pre-reconciliation commit where the repository is usable, and a backup copy otherwise — so an

@@ -49,7 +49,8 @@ Enforced at registration, which raises rather than registering a trigger that wo
 a channel the agent does not have.
 
 What it does not cover: it does not establish that the channel is working, only that it is
-declared.
+declared. And it is genuinely *scheduled-only*: a resident webhook trigger registers and
+dispatches without any channel-declaration check at all.
 
 **INV-TRIG-002**: Webhook trigger names are unique, and the user and plugin namespaces cannot collide.
 
@@ -69,6 +70,11 @@ means only that the declaration is well-formed.
 Enforced by an atomic write, and by a load path that treats anything malformed or
 identity-mismatched as zero approvals rather than trusting it. This is the one approval in
 the system that outlives a restart, so it fails closed on read.
+
+"Exact identity" is a specific tuple: plugin, artifact id, effective name, target, and the
+normalized auth policy. **Clearance is not in it** — a clearance change on a trigger installs
+under the old approval without renewed consent. Everything in the tuple, including any auth
+mode, header or tolerance change, does invalidate the approval.
 
 **INV-TRIG-005**: Reconciliation replaces the entire plugin overlay in a single rebind.
 
@@ -101,13 +107,17 @@ absent rather than opening.
 **A new resident trigger type** touches the schema, the loader, registration and dispatch —
 the current set is exactly three.
 
-**A new resident webhook** needs the trigger declaration, the resident to declare the webhook
-channel, and a name outside the reserved plugin prefix.
+**A new resident webhook** needs the trigger declaration and a name outside the reserved
+plugin prefix. Declaring the webhook channel on the resident is *not* checked for webhooks —
+the channel gate is scheduled-only (see INV-TRIG-001).
 
 **A new plugin trigger** needs the manifest declaration, an assigned target that accepts
 webhooks, secret backing, and operator consent — and reconciliation must then run.
-Reconciliation is hooked at boot, at trigger-affecting reload scopes, at plugin lifecycle
-changes, and at consent and revocation.
+Reconciliation is hooked at boot, at plugin lifecycle changes, at consent and revocation,
+and at exactly four reload scopes: triggers, agent, agents, and full. The policies and
+config-sync reloads refresh agent configuration without reconciling the plugin overlay, so
+a routing-relevant change arriving through those leaves the old overlay live until a
+covered scope runs.
 
 **Anything relying on a missed schedule being caught up** needs a persistent job store first;
 there is none today.

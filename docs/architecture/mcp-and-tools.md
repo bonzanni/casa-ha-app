@@ -22,24 +22,32 @@ tools an agent *sees* therefore depends on which surface it came through.
 important thing on this page. The internal tool-call handler looks a name up in the full
 dispatch map and invokes it; it never consults an agent's declared tool list. That list is
 enforced *upstream*, by the SDK's own permission machinery and by hooks, before a call is
-ever dispatched.
+ever dispatched — and that upstream enforcement has modes: an executor engagement running in
+an autonomous permission mode short-circuits the relay to allow *before* the declared list is
+consulted, so for those only the disallowed list is an enforced prohibition.
 
 The consequence is worth stating plainly: **the allowlist is a constraint on the agent, not a
-boundary at the tool.** Anything able to reach the internal endpoint directly is not
-constrained by it. That endpoint is loopback-only and its socket is permission-restricted, so
-the boundary is the container, not the tool name — but a reader who assumes the allowlist is
-checked at execution will misjudge what a compromised or misbehaving in-container caller can
-do.
+boundary at the tool.** Anything able to reach full-map dispatch directly is not constrained
+by it. There are two such reaching points, not one: the internal endpoint (a
+permission-restricted Unix socket), and fallback MCP and hook-resolution routes on the main
+loopback application for in-container workspace subprocesses. The second is where "the
+boundary is the container" needs care: the external nginx listener refuses those paths, but
+the Home Assistant ingress listener proxies them — so an HA-authenticated ingress caller
+outside the container can reach full-map dispatch. The boundary around it is HA's own
+authentication, not the container wall.
 
 Individual tools may still refuse individual operations. Those are tool-local gates, not a
 universal authorization check.
 
-**The bridge runs as its own supervised service** so that hook resolution survives a restart
-of the main application. Its own client is a thin shell shim, and that shim **fails open**:
-on any transport error it returns an allow decision rather than blocking. The code says why —
-an unreachable Casa should not wedge a running engagement. That is a deliberate choice of
-availability over strictness, and it means hook policy is enforced only while the bridge is
-reachable. Anything that must hold regardless belongs in a tool, not in a hook.
+**The bridge runs as its own supervised service** so that the bridge *connection* survives a
+restart of the main application. Its own client is a thin shell shim, and the failure
+semantics are two-layered and opposite: the shim **fails open** — when its own HTTP call to
+the bridge fails, it returns an allow decision rather than blocking (an unreachable Casa
+should not wedge a running engagement) — but the bridge itself **fails closed**: when it is
+up and the main application's socket is not, it answers with an explicit deny, and the shim
+relays that deny. So hook policy is unenforced only when the *bridge* is unreachable; a
+main-application restart denies rather than allows. Anything that must hold regardless
+belongs in a tool, not in a hook.
 
 ## Contracts & invariants
 
@@ -56,6 +64,11 @@ treated specially.
 This is the boundary that actually contains the property above. If reasoning about who can
 call a tool, reason about who can reach that socket.
 
+What it does not cover: the *fallback* full-map routes on the main loopback application.
+Those are refused by the external nginx listener but proxied by the HA ingress listener, so
+they are contained by Home Assistant's authentication rather than by this socket boundary
+(see the mental model).
+
 **INV-MCP-003**: The two surfaces expose different tool sets — role-filtered on the SDK side, the full static set over HTTP.
 
 What it does not cover: being advertised is not being permitted. The HTTP advertisement
@@ -68,6 +81,10 @@ describes what the bridge can route, not what any particular agent may invoke.
 **The bridge service is unreachable.** The shim returns an allow decision. A hook that would
 have denied the call does not run, so the call proceeds. This is why a hook is not the right
 place for a constraint that must never be bypassed.
+
+**The bridge is up but the main application is not.** The opposite of the case above: the
+bridge answers hook resolution with an explicit deny, and the shim relays it. Hook-gated
+calls fail closed for the duration of a main-application restart.
 
 **A tool raises.** The failure is returned in the response envelope rather than propagating
 as a transport error, so a failing tool is a result, not a broken connection.
