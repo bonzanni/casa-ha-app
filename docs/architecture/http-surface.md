@@ -48,13 +48,28 @@ mode before reasoning about what protects it.
 Fail-closed on a missing secret is the part worth remembering: there is no unauthenticated
 path that runs when configuration is incomplete.
 
-**INV-HTTP-003**: The timestamped mode rejects a signature outside its tolerance window, so a captured request does not stay replayable.
+**INV-HTTP-003**: Only the timestamped mode has a replay window. The body-HMAC and static-header modes accept a valid credential indefinitely.
+
+This asymmetry is the thing to carry away, and it is easy to read past. A captured
+body-HMAC signature replays for as long as the secret lives, and a static header is a
+bearer token — no body binding, no nonce, no expiry. Only the timestamped mode compares
+against a tolerance and refuses what falls outside it. Choosing a mode is therefore
+choosing whether replay is in the threat model, and the default tolerance is a
+configuration value, not a constant.
 
 **INV-HTTP-004**: External context arriving on a request cannot set provenance fields; the ingress supplies them.
 
 A payload that could name its own origin could claim any origin, and provenance is what
-later decides what a turn may do — see `provenance.py` and `ingress_identity.py` for what
-is sanitised and what assigns identity.
+later decides what a turn may do — see `provenance.py` for what is stripped.
+
+**INV-HTTP-005**: Every external entry point must be able to say who spoke. The ingress-identity table is validated at boot against an independently-written contract, and a route that cannot name its speaker is a boot failure.
+
+The check is deliberately redundant: the table and the contract are separate declarations,
+so adding a route in one place without the other fails rather than silently inheriting a
+default. Per request the same function raises instead of returning anything a caller could
+mistake for "no identity" — there is no quiet fallback to an anonymous or system speaker.
+Automation ingresses are additionally prevented from resolving to an operator's identity,
+which is what stops an unattended trigger from being recorded as a person.
 
 ## Failure behavior
 

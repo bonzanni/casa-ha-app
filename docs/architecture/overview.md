@@ -66,9 +66,22 @@ collision.
 **Validation fails.** Boot stops at the `init-validate-config` one-shot. Nothing later runs,
 so the app does not come up in a partly-configured state.
 
+**The one-shots are not equally fatal, and only one of them is.** Config validation gates
+everything transitively and is the only one that stops boot by failing. The other three end
+on a log statement or an explicit success exit — the plugin store says so in a comment,
+because a non-zero exit there *would* block the main service. Their failures surface as
+degraded state and health issues rather than as a container that will not start. Do not
+read "one-shot" as "must succeed".
+
 **A service fails.** Each longrun is supervised separately, so their lifetimes are
-independent. What the supervisor does on failure is set by the service definition; read it
-there rather than assuming a policy.
+independent, and what happens on failure differs per service — one stops the whole app, the
+others log and respawn. That is set by the service definition; read it there rather than
+assuming a policy.
+
+**Boot refuses for a reason not in the manifest.** Configuration is not the only fatal
+class. The application also refuses to start when its ingress-identity table cannot account
+for every external entry point, and that check runs before almost anything else — see
+`architecture/http-surface.md`.
 
 **An option is removed from the manifest.** Removing the schema key is not sufficient on its
 own — the pruning path in the config-materialisation script is what discards a stored value.

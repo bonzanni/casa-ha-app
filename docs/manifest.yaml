@@ -91,7 +91,7 @@
     - tests/test_webhook_origin_containment.py
     - tests/test_setup_nginx_ingress.py
   related: [architecture/overview.md]
-  defines_invariants: [INV-HTTP-001, INV-HTTP-002, INV-HTTP-003, INV-HTTP-004]
+  defines_invariants: [INV-HTTP-001, INV-HTTP-002, INV-HTTP-003, INV-HTTP-004, INV-HTTP-005]
 
 - doc: architecture/turn-loop.md
   summary: How one inbound message becomes one agent turn, and what bounds it.

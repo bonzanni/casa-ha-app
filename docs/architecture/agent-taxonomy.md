@@ -56,6 +56,17 @@ skipped, so a stray save does not become a half-parsed agent.
 Stated as the asymmetry it is. `validate_config_repo` additionally skips the
 pipeline-managed specialists subtree, so it is not a whole-repository gate either.
 
+Two qualifiers, both of which invert the naive reading:
+
+The loader's own docstring says collection-level errors still raise — but the registries
+above it catch those, so nothing reaches boot. Reading the loader alone tells you the
+opposite of what happens. Follow the call up before concluding a raise is fatal.
+
+The resident path fails closed on a bad directory, but an *absent* agents directory is
+not a bad one: the walk returns empty before any drift check runs, and a system with no
+residents boots clean. "Fails closed both ways" holds for what is there, not for what is
+missing entirely.
+
 **INV-AGENT-004**: The registry performs no filesystem access; it is an index built from already-loaded configuration.
 
 Nothing resolves a role by touching disk at request time.
