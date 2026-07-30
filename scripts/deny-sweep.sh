@@ -299,10 +299,15 @@ if [ "$mode" != "messages" ]; then
 fi
 
 # --- content ---
+# The leading `+` of a diff line is stripped before matching. It is a legal e-mail
+# local-part character, so an added line beginning with a Python decorator matched the
+# address rule: the diff marker, not the code, made it look like one.
 case "$mode" in
-  staged)   git diff --cached -U0 -- . ":!$deny_rel" | grep -E '^\+' | grep -vE '^\+\+\+' > "$work/body" || true ;;
+  staged)   git diff --cached -U0 -- . ":!$deny_rel" | grep -E '^\+' | grep -vE '^\+\+\+' \
+              | sed 's/^+//' > "$work/body" || true ;;
   tree)     git grep -I --no-color -n '' HEAD -- . ":!$deny_rel" > "$work/body" || true ;;
-  range)    git log -p -m --no-color "$range" -- . ":!$deny_rel" | grep -E '^\+' | grep -vE '^\+\+\+' > "$work/body" || true ;;
+  range)    git log -p -m --no-color "$range" -- . ":!$deny_rel" | grep -E '^\+' | grep -vE '^\+\+\+' \
+              | sed 's/^+//' > "$work/body" || true ;;
   messages) git log --format='%B' "$range" > "$work/body" || true ;;
 esac
 # Generic rules honour [allow-content]; the private supplement never does — an allow entry

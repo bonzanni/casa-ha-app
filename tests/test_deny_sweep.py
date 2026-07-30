@@ -427,3 +427,16 @@ def test_an_empty_file_is_not_treated_as_a_binary_blob(tmp_path):
     result = _sweep(repo, deny, "tree")
     assert result.returncode == 0, result.stderr
     assert "__init__.py" not in result.stderr
+
+
+def test_a_diff_marker_does_not_manufacture_a_match(tmp_path):
+    """`+` is a legal e-mail local-part character, so an added line beginning with a Python
+    decorator matched the address rule: diff-marker plus decorator reads as local-part plus
+    domain. The marker made it look like an address; the code never did."""
+    repo, deny = _repo(tmp_path)
+    email_rule = "[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\\.[A-Za-z]{2,}"
+    deny.write_text(f"[paths]\nzz-never\n[content]\n{email_rule}\n[allow-content]\nzz-never\n")
+    (repo / "t.py").write_text('@pytest.mark.parametrize("p", X, ids=lambda p: p.name)\ndef f(): ...\n')
+    subprocess.run(["git", "-C", str(repo), "add", "-A"], check=True)
+    result = _sweep(repo, deny, "staged")
+    assert result.returncode == 0, result.stderr
