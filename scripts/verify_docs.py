@@ -365,6 +365,16 @@ def _defined_symbols(repo_root: Path, tracked: set[str]) -> tuple[set[str], set[
                 for sub in node.body:
                     if isinstance(sub, (ast.FunctionDef, ast.AsyncFunctionDef)):
                         names.add(f"{node.name}.{sub.name}")
+                    # Class-level attributes are as citable as methods, and most of this
+                    # codebase's data types are dataclasses whose fields are bare
+                    # annotations. Collecting only callables flagged `GrantKey.artifact_id`
+                    # and `VoiceJob.delivery_modality`, both of which plainly exist.
+                    elif isinstance(sub, ast.AnnAssign) and isinstance(sub.target, ast.Name):
+                        names.add(f"{node.name}.{sub.target.id}")
+                    elif isinstance(sub, ast.Assign):
+                        for target in sub.targets:
+                            if isinstance(target, ast.Name):
+                                names.add(f"{node.name}.{target.id}")
     return modules, names
 
 
