@@ -323,6 +323,91 @@ def _check_anchor(repo_root: Path, anchor: str, doc: str, tracked: set[str]) -> 
     return [] if ok else [f"{doc}: anchor {anchor!r} does not resolve"]
 
 
+# Tokens that look like code but are prose or well-known non-source names. Anything added
+# here is a deliberate exemption and should be rare.
+PROSE_TOKENS = {
+    "CLAUDE.md", "AGENTS.md", "DOCS.md", "README.md", "SKILL.md", "config.yaml",
+    "manifest.yaml", "llms.txt", "Dockerfile", "dependencies.d", "s6-rc.d", "type",
+}
+# `foo.py`, `Thing.method`, `func()` — the shapes that assert a code identifier exists.
+PROSE_CODE = re.compile(
+    r"`("
+    r"[a-z_][a-z0-9_]*\.py"                     # a module
+    r"|[A-Z][A-Za-z0-9_]*\.[a-z_][a-z0-9_]*"    # Class.method
+    r"|_?[a-z][a-z0-9_]{3,}\(\)"               # func()
+    r")`"
+)
+
+
+def _code_identifiers(text: str) -> set[str]:
+    return {m.group(1) for m in PROSE_CODE.finditer(text)} - PROSE_TOKENS
+
+
+def _defined_symbols(repo_root: Path, tracked: set[str]) -> tuple[set[str], set[str]]:
+    """Every module basename and every def/class name git tracks. Built once per run."""
+    modules: set[str] = set()
+    names: set[str] = set()
+    for rel in tracked:
+        if not rel.endswith(".py"):
+            continue
+        modules.add(Path(rel).name)
+        try:
+            tree = ast.parse((repo_root / rel).read_text())
+        except (OSError, SyntaxError, ValueError):
+            continue
+        for node in ast.walk(tree):
+            if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)):
+                names.add(node.name)
+        # Every class anywhere, not only top-level ones: a method of a nested class is still
+        # a method, and treating it as unqualified would flag honest prose.
+        for node in ast.walk(tree):
+            if isinstance(node, ast.ClassDef):
+                for sub in node.body:
+                    if isinstance(sub, (ast.FunctionDef, ast.AsyncFunctionDef)):
+                        names.add(f"{node.name}.{sub.name}")
+    return modules, names
+
+
+def _check_prose_code(text: str, doc: str, modules: set[str], names: set[str]) -> list[str]:
+    """A document must not name code that does not exist.
+
+    Review found this exact failure: prose citing a method that had been deleted, and a
+    private spec asserting ten modules that are gone. Anchors were already checked; the
+    PROSE was not, and prose is what a reader acts on.
+    """
+    problems = []
+    for token in sorted(_code_identifiers(text)):
+        if token.endswith(".py"):
+            ok = token in modules
+        elif token.endswith("()"):
+            bare = token[:-2]
+            ok = bare in names or any(n.endswith(f".{bare}") for n in names)
+        else:
+            # `Class.method`. An exact hit is fine, and so is a method the class inherits —
+            # the qualified set only records where a method is *defined*. What is refused is
+            # a bare function or a closure dressed up as a method: `Agent._attempt_bypass_turn`
+            # reads as an attribute of Agent, and a reader who greps the class will not find
+            # it. That sentence was written, published and wrong; this is the check for it.
+            bare = token.split(".")[-1]
+            methods = {n.split(".")[-1] for n in names if "." in n}
+            if token in names or bare in methods:
+                ok = True
+            elif bare in names:
+                problems.append(
+                    f"{doc}: names `{token}` in prose, but `{bare}` is not a method of any "
+                    f"class — it is a plain function or a nested closure. Name it without "
+                    f"the class prefix, or say where it actually lives."
+                )
+                continue
+            else:
+                ok = False
+        if not ok:
+            problems.append(
+                f"{doc}: names `{token}` in prose, which does not exist in the tracked code"
+            )
+    return problems
+
+
 def _check_sourcemap(target: Path, doc: str) -> list[str]:
     """A document without exactly one ordered marker pair gets no generated map at all."""
     text = target.read_text(errors="replace")
@@ -414,6 +499,7 @@ def verify(repo_root: Path) -> list[str]:
         return problems
 
     manifested = {entry["doc"] for entry in entries}
+    modules, names = _defined_symbols(repo_root, tracked_files(repo_root))
     # `related` must name a real DOCUMENT: the manifest, the README and the generated
     # indexes are all manifested but are not things to go read next.
     related_targets = {
@@ -461,6 +547,9 @@ def verify(repo_root: Path) -> list[str]:
 
         if kind in DOCUMENT_KINDS:
             problems.extend(_check_sourcemap(target, doc))
+            problems.extend(
+                _check_prose_code(target.read_text(errors="replace"), doc, modules, names)
+            )
             # An invariant is a claim about what the code maintains, so the document must
             # name where it is maintained. Review found invariants asserted with the anchor
             # pointing at a nearby representative symbol instead of the enforcement point;

@@ -396,3 +396,71 @@ def test_reversed_routing_markers_are_reported_not_raised(tmp_path):
         assert "reversed" in str(exc)
     else:
         raise AssertionError("reversed markers should be reported")
+
+
+# --- prose must not name code that does not exist ---------------------------------------
+#
+# These exist because the check was added AFTER the failure it prevents had already been
+# committed: a published sentence named `Agent._attempt_bypass_turn`, which is a closure
+# nested inside `Agent._process` and not an attribute of Agent at all. The claim survived
+# symbol-anchor verification, because the anchors were right and only the prose was wrong.
+
+MODULES = {"agent.py", "agent_registry.py"}
+NAMES = {
+    "Agent",
+    "Agent._process",              # a real method
+    "_process",
+    "_attempt_bypass_turn",        # a closure: defined, but not a method of anything
+    "AgentRegistry",
+    "AgentRegistry.tier_for_role",
+    "tier_for_role",
+    "build",                       # a method of some other class, i.e. inheritable
+    "Base.build",
+}
+
+
+def _prose(text):
+    return verify_docs._check_prose_code(text, "d.md", MODULES, NAMES)
+
+
+def test_a_closure_named_as_a_method_is_refused():
+    """The exact sentence that shipped wrong."""
+    problems = _prose("see `Agent._attempt_bypass_turn` for the bypass")
+    assert problems, "a closure dressed up as a method must not pass"
+    assert "not a method of any class" in problems[0]
+
+
+def test_a_real_method_passes():
+    assert not _prose("`Agent._process` drives the turn")
+
+
+def test_an_inherited_method_passes():
+    """Only definition sites are recorded, so a subclass reference must not be refused."""
+    assert not _prose("`AgentRegistry.build` assembles the index")
+
+
+def test_a_retired_module_is_refused():
+    problems = _prose("configured in `marketplace_ops.py`")
+    assert problems and "does not exist" in problems[0]
+
+
+def test_a_live_module_passes():
+    assert not _prose("configured in `agent_registry.py`")
+
+
+def test_an_invented_function_is_refused():
+    problems = _prose("call `totally_made_up_thing()` first")
+    assert problems and "does not exist" in problems[0]
+
+
+def test_a_method_of_a_nested_class_is_not_flagged_as_a_closure():
+    """`ast.walk` collects nested classes; if it did not, honest prose would be refused."""
+    import ast as _ast
+    tree = _ast.parse("class Outer:\n    class Inner:\n        def go(self): pass\n")
+    found = set()
+    for node in _ast.walk(tree):
+        if isinstance(node, _ast.ClassDef):
+            for sub in node.body:
+                if isinstance(sub, (_ast.FunctionDef, _ast.AsyncFunctionDef)):
+                    found.add(f"{node.name}.{sub.name}")
+    assert "Inner.go" in found
