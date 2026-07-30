@@ -40,12 +40,17 @@ belongs to, what it is called, and whether it exists at all.
 
 ## Contracts & invariants
 
-**INV-AGENT-001**: A role claimed by both a resident and a specialist is refused when the role registry is built.
+**INV-AGENT-001**: A role claimed by both a resident and a specialist is refused at boot, when the role registry is built.
 
 Enforced in `_build_role_registry`, which raises naming the duplicated role. This check is
 load-bearing precisely because `AgentRegistry.build` is not: it assigns residents and then
 specialists into one mapping, so a collision that got past the check would silently resolve
 to the specialist rather than raise.
+
+What it does not cover: reload. The reload paths rebuild through `AgentRegistry.build` and
+the delegation role map directly, and both *tolerate* a collision — with opposite winners:
+the registry mapping resolves to the specialist, the delegation map warns and keeps the
+resident. A collision introduced after boot degrades inconsistently instead of failing.
 
 **INV-AGENT-002**: For residents and specialists, `_check_file_set` refuses a missing required file, a forbidden file, or an unrecognised one. The executor path implements its own weaker check and does not refuse unrecognised files.
 
@@ -61,6 +66,12 @@ skipped, so a stray save does not become a half-parsed agent.
 
 Stated as the asymmetry it is. `validate_config_repo` additionally skips the
 pipeline-managed specialists subtree, so it is not a whole-repository gate either.
+
+What it does not cover: the isolation catches the loader's own typed error and nothing else.
+An exception of a different type escaping a specialist's load — role materialisation raises
+plain `ValueError` subclasses, for instance — is not confined to that specialist and is
+boot-fatal after all. "Non-fatal" is a property of failures the loader converts, not of the
+tier.
 
 Two qualifiers, both of which invert the naive reading:
 

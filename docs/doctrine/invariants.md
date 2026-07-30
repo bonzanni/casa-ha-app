@@ -8,7 +8,7 @@ Every invariant is defined in exactly one file and referenced by id elsewhere.
 
 | Id | Statement | Defined in |
 |---|---|---|
-| `INV-AGENT-001` | A role claimed by both a resident and a specialist is refused when the role registry is built. | [`architecture/agent-taxonomy.md`](../architecture/agent-taxonomy.md) |
+| `INV-AGENT-001` | A role claimed by both a resident and a specialist is refused at boot, when the role registry is built. | [`architecture/agent-taxonomy.md`](../architecture/agent-taxonomy.md) |
 | `INV-AGENT-002` | For residents and specialists, `_check_file_set` refuses a missing required file, a forbidden file, or an unrecognised one. The executor path implements its own weaker check and does not refuse unrecognised files. | [`architecture/agent-taxonomy.md`](../architecture/agent-taxonomy.md) |
 | `INV-AGENT-003` | Specialist and executor loading is isolated per agent and boot-non-fatal; resident loading is not. | [`architecture/agent-taxonomy.md`](../architecture/agent-taxonomy.md) |
 | `INV-AGENT-004` | The registry performs no filesystem access; it is an index built from already-loaded configuration. | [`architecture/agent-taxonomy.md`](../architecture/agent-taxonomy.md) |
@@ -79,10 +79,10 @@ Every invariant is defined in exactly one file and referenced by id elsewhere.
 | `INV-TRIG-004` | A trigger approval is persisted and bound to an exact identity, and an unreadable or mismatched approval store yields no approvals. | [`architecture/triggers.md`](../architecture/triggers.md) |
 | `INV-TRIG-005` | Reconciliation replaces the entire plugin overlay in a single rebind. | [`architecture/triggers.md`](../architecture/triggers.md) |
 | `INV-TURN-001` | The resume-versus-fresh decision is re-derived from a fresh session read while holding the pool entry's lock, and a cached client is reused only when its session id matches that decision exactly. | [`architecture/turn-loop.md`](../architecture/turn-loop.md) |
-| `INV-TURN-002` | An error result invalidates the pool entry before anything else happens. | [`architecture/turn-loop.md`](../architecture/turn-loop.md) |
-| `INV-TURN-003` | A cancelled turn interrupts, then drains its own buffered messages through the terminal result before the entry may return to warm. Any failure in that window — including a second cancellation — invalidates the entry instead. | [`architecture/turn-loop.md`](../architecture/turn-loop.md) |
+| `INV-TURN-002` | An error result invalidates the pool entry before the client can return to warm; an entry is never left warm after an error. | [`architecture/turn-loop.md`](../architecture/turn-loop.md) |
+| `INV-TURN-003` | A cancelled turn interrupts, then drains its buffered messages until the terminal result or stream end before the entry may return to warm; any failure in that window — including a second cancellation — invalidates the entry instead. | [`architecture/turn-loop.md`](../architecture/turn-loop.md) |
 | `INV-TURN-004` | A memory read that raises does not fail the turn. It is logged and the turn proceeds with an empty memory block. | [`architecture/turn-loop.md`](../architecture/turn-loop.md) |
-| `INV-TURN-005` | Cancellation propagates immediately and is never retried. Everything else transient — timeouts, rate limits, generic model errors — is retried with exponential backoff, honouring a server-supplied retry hint when present. | [`architecture/turn-loop.md`](../architecture/turn-loop.md) |
+| `INV-TURN-005` | Cancellation is never retried and is re-raised after a bounded interrupt-and-drain cleanup; retry covers exactly the three classified transient kinds — timeout, rate limit, and SDK error — with exponential backoff, honouring a server-supplied retry hint when present. | [`architecture/turn-loop.md`](../architecture/turn-loop.md) |
 | `INV-VOICE-001` | Every voice route refuses a request when no secret is configured or the signature does not match. | [`architecture/voice.md`](../architecture/voice.md) |
 | `INV-VOICE-002` | An agent is reachable over voice only if its configuration declares the voice capability. | [`architecture/voice.md`](../architecture/voice.md) |
 | `INV-VOICE-003` | The agent catalog is complete or it fails; it never returns a partial list. | [`architecture/voice.md`](../architecture/voice.md) |

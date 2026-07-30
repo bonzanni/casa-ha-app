@@ -25,7 +25,7 @@ Four services run under s6, each with a single job:
 |---|---|
 | `svc-casa` | the main async application — channels, agents, HTTP surface |
 | `svc-casa-mcp` | an MCP bridge, supervised as its own service with its own lifetime |
-| `svc-nginx` | the ingress front door, including the Home Assistant source restriction |
+| `svc-nginx` | the front door — two listeners: HA ingress (Supervisor-source-restricted) and the published external API port, which has no source restriction and relies on route-level refusals |
 | `svc-ttyd` | an optional terminal, off unless enabled |
 
 Four `init-*` one-shots exist — config validation, config materialisation, nginx setup and
@@ -42,7 +42,7 @@ do:
 | Tier | Lifetime | Reach |
 |---|---|---|
 | **Resident** | long-lived, a fixed set of slots | memory, delegation, channel reach |
-| **Specialist** | ephemeral, role-keyed | no channel of its own |
+| **Specialist** | ephemeral per delegated invocation, role-keyed | no channel of its own |
 | **Executor** | ephemeral, task-bounded | outside the role registry entirely |
 
 One boundary matters more than the table: **the role registry models residents and
@@ -87,9 +87,10 @@ that suppresses restart when it is disabled. That is set by the service definiti
 there rather than assuming a policy.
 
 **Boot refuses for a reason not in the manifest.** Configuration is not the only fatal
-class. The application also refuses to start when its ingress-identity table cannot account
-for every external entry point, and that check runs before almost anything else — see
-`architecture/http-surface.md`.
+class. The application also refuses to start when its declared ingress-identity table and
+its independently hand-written route contract disagree — a coherence check between two
+declared tables, not an audit of the routes actually registered — and that check runs
+before almost anything else. See `architecture/http-surface.md`.
 
 **An option is removed from the manifest.** Removing the schema key is not sufficient on its
 own — the pruning path in the config-materialisation script is what discards a stored value.

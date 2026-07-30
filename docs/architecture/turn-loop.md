@@ -21,9 +21,10 @@ existing conversation or starts a fresh one, assemble a system prompt and a memo
 call the model with retry, stream the output, and record what happened.
 
 The one structural subtlety is that the model client is **usually not created for this
-turn**. Residents reuse a warm, conversation-bound client held in a pool, keyed by channel —
-so a turn normally begins with a client that has already been connected and has already seen
-this conversation. Everything awkward in this area follows from that reuse: the decision
+turn**. Residents reuse a warm, conversation-bound client held in a pool, keyed by a scoped
+session key — channel, resident role, and conversation scope together, so one channel can
+carry several conversations and roles without sharing a client. A turn normally begins with
+a client that has already been connected and has already seen this conversation. Everything awkward in this area follows from that reuse: the decision
 about resume-versus-fresh has to be made under the pool's own lock, a cancelled turn has to
 be drained before its client can be handed to anyone else, and an error result must
 invalidate the entry rather than leave it warm.
@@ -39,37 +40,55 @@ Without the lock, a `/new`, a freshness expiry and an interleaved turn on the sa
 can fork a conversation or hand a turn a stale client. A mismatched entry is closed and
 rebuilt rather than reused.
 
-**INV-TURN-002**: An error result invalidates the pool entry before anything else happens.
-An entry is never left warm after an error.
+"That decision" is more than a timestamp: resume requires a decodable stored entry, an exact
+role-identity match, an exact personality-binding digest, a parseable last-active time, and
+channel-specific freshness — failing any one of them means fresh, not resume.
 
+**INV-TURN-002**: An error result invalidates the pool entry before the client can return to warm; an entry is never left warm after an error.
+
+The sequencing is looser than "before anything else": the error result is still forwarded to
+the turn's message handler like any other message, and invalidation happens after the receive
+loop — what is guaranteed is that the entry is invalid by the time the call returns.
 Retryable errors are re-raised so the retry wrapper sees them; non-retryable ones return
 with the entry marked invalid for the pool to drop.
 
-**INV-TURN-003**: A cancelled turn interrupts, then drains its own buffered messages through the terminal result before the entry may return to warm. Any failure in that window — including a second cancellation — invalidates the entry instead.
+**INV-TURN-003**: A cancelled turn interrupts, then drains its buffered messages until the terminal result or stream end before the entry may return to warm; any failure in that window — including a second cancellation — invalidates the entry instead.
 
 This is what makes voice barge-in safe: the next turn on that channel must not inherit a
-half-consumed stream.
+half-consumed stream. Note the "or stream end": a drain whose stream ends *without* a
+terminal result still returns the entry to warm — the guarantee is a fully-consumed stream,
+not a witnessed terminal result.
 
 **INV-TURN-004**: A memory read that raises does not fail the turn. It is logged and the turn proceeds with an empty memory block.
 
-**INV-TURN-005**: Cancellation propagates immediately and is never retried. Everything else transient — timeouts, rate limits, generic model errors — is retried with exponential backoff, honouring a server-supplied retry hint when present.
+What it does not cover: nothing downstream is told. The unavailable-versus-empty distinction
+is flattened to omission at this point — observable in logs and the recall breaker, not in
+the prompt — and a successfully-read profile overlay may still be present beside the missing
+recall block.
+
+**INV-TURN-005**: Cancellation is never retried and is re-raised after a bounded interrupt-and-drain cleanup; retry covers exactly the three classified transient kinds — timeout, rate limit, and SDK error — with exponential backoff, honouring a server-supplied retry hint when present.
+
+"Generic model errors" are *not* a retried category: a failure that classifies to none of the
+three kinds is raised immediately.
 
 ## Failure behavior
 
 **The model call fails transiently.** Retried with exponential backoff up to a small attempt
 limit. A retry hint from the server overrides the computed delay.
 
-**The session id is stale.** The session is cleared and the turn retried fresh once.
+**The session id is stale.** The stored session is cleared and the turn re-enters the normal
+fresh retry policy — up to the standard attempt limit, not a single extra try.
 
 **The pool cannot serve the turn.** It raises, and the turn creates its own client for this
 turn only.
 
 **Memory is unavailable.** The turn proceeds without it, with a warning. An unavailable
-memory is not an empty memory, and the distinction is preserved for the caller rather than
-flattened here.
+memory is not an empty memory — but at this point the distinction lives only in the logs and
+the recall breaker. The model and the turn's caller see the same thing either way: no recall
+block (see INV-TURN-004).
 
-**The turn is cancelled.** The cancellation passes through untouched. The pool entry is
-interrupted and drained, or invalidated.
+**The turn is cancelled.** The cancellation is re-raised after a bounded, shielded
+interrupt-and-drain cleanup of the pool entry — drained back to warm, or invalidated.
 
 What the loop does *not* do: it does not save long-term memory per turn. Saving happens at
 session granularity, in the background, elsewhere.
