@@ -17,12 +17,18 @@ explains, is where the actual limits live.
 **Casa is not the authorization boundary for what an agent may control.** This is the single
 most important thing here, and it is the opposite of what the architecture suggests. No code
 in this application reads Home Assistant's entity registry or refuses an action because of
-the entity or domain it names. Action arguments are forwarded unchanged.
+the entity or domain it names. Action arguments are forwarded unchanged for ordinary tools —
+the one exception is the live-context tool, whose arguments the facade replaces and whose
+response it filters when a domain was asked for.
 
-What limits an agent is **Home Assistant's own exposure configuration** — which entities are
-exposed to its assistant surface. That is upstream, operator-controlled, and outside this
-repository. If you need an agent not to be able to touch something, that is where to do it;
-adding a check here would be adding the first one.
+Two different limits apply, and they answer different questions. *Which agents can talk to
+Home Assistant at all* is Casa configuration: an agent reaches these tools only if its
+configuration names the Home Assistant MCP server — in the shipped fleet that is the butler
+alone. *What a connected agent may touch* is **Home Assistant's own exposure configuration**
+— which entities are exposed to its assistant surface. That is upstream,
+operator-controlled, and outside this repository. If you need a connected agent not to be
+able to touch something, that is where to do it; adding a per-entity check here would be
+adding the first one.
 
 **A facade wraps the underlying tool surface**, curating what is offered and doing some
 filtering of what comes *back*. Read filtering and write authorization are different things,

@@ -47,10 +47,14 @@ closed inventory of what appears there.
 
 ## Contracts & invariants
 
-**INV-STATE-001**: Only an explicit whitelist of the mapped configuration root is version-controlled.
+**INV-STATE-001**: Only an explicit whitelist of the mapped configuration root is admitted into version control.
 
-Enforced by the ignore file written at boot. Being under that root implies visibility, not
-history.
+Enforced by the ignore file written and reconciled at boot. Being under that root implies
+visibility, not history.
+
+What it does not cover: ignore rules gate *admission*, not eviction. A path that is already
+tracked — from before a whitelist change, or force-added — stays tracked and keeps recording
+history until something removes it from the index; nothing here does.
 
 **INV-STATE-002**: A missing state file is a valid empty state for most loaders; a corrupt one is handled per-loader and inconsistently.
 
@@ -65,7 +69,12 @@ without the same protection.
 **INV-STATE-004**: Where a registry commits to disk before publishing in memory, the on-disk state leads.
 
 This is the pattern that keeps a process from believing something that was never persisted —
-the same discipline the engagement terminal transition follows.
+the discipline the engagement registry's *strict* terminal transition follows.
+
+What it does not cover: the pattern is opt-in per write path, and the engagement registry's
+legacy direct status mutators write their tombstone non-strictly — a failed write there is
+swallowed with a warning, leaving memory terminal while disk is not. Where disk-leads
+matters, check that the path you are on is a strict one.
 
 ## Failure behavior
 

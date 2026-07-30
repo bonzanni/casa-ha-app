@@ -19,7 +19,9 @@ it may do. The persona decides how it sounds. They are versioned and validated s
 and a binding is what associates them.
 
 **The compiled bundle replaces the composed prompt — it does not layer onto it.** This is the
-easiest thing to get wrong here. A prompt is composed from role artifacts, and separately a
+easiest thing to get wrong here. The composed prompt is built from the agent's own
+configuration — character prompt, voice, response shape, delegates, disclosure policy; it
+reads no role artifact. Role artifacts feed the *compiled bundle* path instead, and separately a
 bundle is compiled when a binding activates. At turn time, if a bundle exists, its projection
 *is* the base prompt; the composed one is used only when there is no bundle. So text present
 in the composed prompt is not automatically carried into an activated compiled prompt — it is
@@ -61,8 +63,11 @@ which is boot-fatal. Persona problems on a resident are not a degraded mode.
 
 ## Failure behavior
 
-**A persona fails validation on a resident.** Loading fails, and because resident loading is
-boot-fatal, so does boot.
+**A persona fails validation on a resident.** It depends on what exists already. On a fresh
+install — no active binding tuple — loading fails, and because resident loading is
+boot-fatal, so does boot. With an existing active binding, a failing *candidate* is
+discarded with a diagnostic and boot proceeds on the retained last-known-good binding;
+reconciliation raises only when there is nothing good to retain.
 
 **A persona fails validation on a specialist.** Absorbed by that tier's isolated loading; the
 specialist is unavailable and the system continues.

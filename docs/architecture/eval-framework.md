@@ -22,11 +22,11 @@ assumption that behaviour is being evaluated somewhere. It is not. Test coverage
 repository comes from the ordinary test suite, and that is where a behavioural guarantee
 should be pinned today.
 
-**Separate from the framework, some model-backed checks do exist**, and they are not wired
-through it. Where they run a real model against a real composed prompt, they typically
-substitute a fake for the expensive or irreversible tool — so they assert what an agent
-*attempted*, not what happened. That distinction is worth carrying: passing means the model
-asked for the right thing, not that the thing worked.
+**Separate from the framework, one model-backed check exists today**, and it is not wired
+through it: an opt-in, credential-gated accuracy test for the sensitivity classifier, which
+sends the classifier prompt directly with no tools at all. It does not exercise an agent's
+composed prompt and substitutes nothing — there is currently no fake-tool harness. What it
+asserts is classifier accuracy against a labelled set, nothing about what an agent would do.
 
 **Anything touching live memory uses a caller-supplied bank name.** Keeping evaluation away
 from real memory is therefore a convention the caller must honour, not a guard the code
@@ -36,8 +36,11 @@ enforces. There is nothing that will stop a probe pointed at the wrong bank.
 
 **INV-EVAL-001**: The tester registry is empty; no evaluator is registered or invoked.
 
-Enforced by the fact that nothing calls the registration path. The contract tests assert
-lookups fail, which is the current intended state.
+Enforced by the fact that nothing calls the registration path. Note what the existing
+contract test checks: it *clears* the registry, asserts empty-state API behavior, and
+restores it — it would pass even if production registered a tester. Emptiness of the shipped
+registry is established by code search, and pinned only if a test asserts the unmodified
+registry.
 
 **INV-EVAL-002**: Bank selection for any live-memory check comes from the caller; the code does not confine it.
 
