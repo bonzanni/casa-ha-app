@@ -97,7 +97,9 @@ Nothing resolves a role by touching disk at request time.
 
 **A required file is missing, forbidden, or unrecognised.** `_check_file_set` raises naming
 the role and the files. For a resident this stops boot; for a specialist or executor the
-isolated path absorbs it and the rest of the system continues.
+isolated path absorbs it and the rest of the system continues — noting that the executor
+check never refuses an unrecognised file in the first place (INV-AGENT-002), so for
+executors only missing-required and forbidden files reach this failure at all.
 
 **A resident and a specialist claim one role.** Registry construction raises, naming the
 role. The check is cross-tier because each directory looks fine on its own.

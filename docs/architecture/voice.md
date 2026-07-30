@@ -41,8 +41,8 @@ can therefore still fail later, at the endpoint rather than at the decision.
 **The turn is bounded by an absolute deadline anchored at true ingress.** On the request path
 it is captured in the handler's first statements — *before* the body is read and before
 authentication — so that slow I/O counts against the budget rather than hiding from it. On
-the socket path it is captured when the utterance frame arrives, so the handshake is outside
-the budget. Deferred jobs deliberately outlive it.
+the socket path it is captured when a decoded frame is dispatched as an utterance — so the
+handshake, frame receipt and JSON parsing are all outside the budget there. Deferred jobs deliberately outlive it.
 
 **Sessions are keyed by role and scope together**, so the same speaker talking to two agents
 gets two sessions rather than one shared context.
@@ -72,7 +72,8 @@ agent that still declares voice remains reachable by a caller that knows its rol
 
 **INV-VOICE-003**: The agent catalog is complete or it fails; it never returns a partial list.
 
-Enforced when the catalog is built — a malformed entry or too many entries raises, and the
+Enforced when the catalog is built — a malformed *enabled, voice-capable* entry or too many
+entries raises (disabled and non-voice configs are skipped before validation), and the
 handler turns that into a service error. The reasoning is that a silently short catalog would
 present a missing agent as a nonexistent one.
 

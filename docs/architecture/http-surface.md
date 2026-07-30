@@ -34,7 +34,9 @@ setup before assuming reachability either way.
 **nginx runs two listeners with different security postures, and conflating them is the
 easiest way to be badly wrong here.** The Home Assistant ingress listener carries a
 server-scope source restriction to the supervisor address. The second listener is published
-by the app manifest as an external API port and carries **no source restriction at all** —
+by the app manifest as an external API port — declared with host publication *disabled* by
+default, so it is host-reachable only where the operator maps it — and carries **no source
+restriction at all** —
 it proxies to the same backend application. So "reachable through the host" is true of one
 listener and not the other, and a route's exposure depends on which listener you arrive on.
 
@@ -65,7 +67,8 @@ mode before reasoning about what protects it.
 
 Scope matters as much as the modes. **`verify` is the webhook-trigger verifier, not the
 application's authentication layer.** Agent invocation, the voice transports and the
-Telegram update sink each perform their own check against their own secret. Do not read
+Telegram update sink each perform their own route-specific check against the one shared
+configured webhook secret. Do not read
 this invariant as describing what protects any route other than a webhook trigger.
 
 **INV-HTTP-002**: Every secret comparison inside `verify` uses a constant-time primitive, and an absent or empty secret returns false rather than passing.

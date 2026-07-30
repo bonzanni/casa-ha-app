@@ -39,7 +39,9 @@ every resolve, and the resolved paths hand the live artifact tree to the SDK wit
 revalidation. So a *registry* edit is invisible until a reload — deliberate, because
 validation is expensive and a long-lived agent should not see a half-written registry — while
 a mutation *inside a stored artifact* can become visible immediately and evades the cached
-checksum until an explicit verification or the next snapshot reload.
+checksum until an explicit verification, the next snapshot reload — or an interactive
+specialist resume, which deep-validates its recorded artifacts automatically. Executor
+resume checks only that the recorded directories still exist.
 
 **Plugin failures degrade; they do not stop the container.** The boot path writes health data
 and exits successfully whatever it finds. One broken plugin costs that plugin.
@@ -97,7 +99,10 @@ grant binds operator, chat, tier-stripped role, artifact, full tool name, and a 
 canonical arguments — so an approval authorises one action with one argument set, not a
 capability.
 
-What it does not cover: unprotected plugin tools, and the executor path entirely.
+What it does not cover: unprotected plugin tools, and the executor path entirely. And
+"proceeds by consuming" applies to direct resident calls and ephemerally delegated
+specialists — a call whose provenance is an interactive *engagement* is denied outright,
+before any grant lookup: protected tools are not available inside engagements at all.
 
 **INV-PLUG-005**: Grants exist only in process memory; a restart revokes every one of them.
 
