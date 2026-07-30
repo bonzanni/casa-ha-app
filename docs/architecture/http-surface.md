@@ -28,45 +28,82 @@ admin reload, personality and specialist endpoints, and a family of internal cha
 Its listener configuration, not its route table, is what makes it internal; check the runner
 setup before assuming reachability either way.
 
-nginx restricts ingress on the app's port to the Home Assistant supervisor address, so
-"public" here means reachable through the host, not from the internet.
+**nginx runs two listeners with different security postures, and conflating them is the
+easiest way to be badly wrong here.** The Home Assistant ingress listener carries a
+server-scope source restriction to the supervisor address. The second listener is published
+by the app manifest as an external API port and carries **no source restriction at all** —
+it proxies to the same backend application. So "reachable through the host" is true of one
+listener and not the other, and a route's exposure depends on which listener you arrive on.
+
+What separates them is not authentication but a set of explicit 404s: the external listener
+refuses a handful of path prefixes that the ingress listener passes through. Those refusals
+are the boundary. Read the server blocks before reasoning about who can reach what.
 
 Authentication is **per route**, not ambient. There is no boundary that authenticates
 everything arriving on the public app, so the question for any route is which check *it*
-performs.
+performs — and several routes perform none.
+
+**The routes with no application-layer check are the ones to understand first.** An MCP
+endpoint and a hook-resolution endpoint are unauthenticated at the backend and are protected
+only by being 404'd on the external listener. They remain reachable over ingress and from
+loopback. A new route registered near them inherits no protection from that arrangement; it
+inherits only its own absence of a check.
 
 ## Contracts & invariants
 
-**INV-HTTP-001**: `verify` authenticates under one of three named modes — a body HMAC, a static header, or a timestamped HMAC — and returns a single boolean.
+**INV-HTTP-001**: `verify` authenticates webhook-trigger requests under one of three named modes — a body HMAC, a static header, or a timestamped HMAC — and returns a single boolean.
 
 Not "webhooks use HMAC": a static-header trigger is authenticated by comparing a shared
 value, with no HMAC involved. Which mode applies is configuration, so read the trigger's
 mode before reasoning about what protects it.
 
+Scope matters as much as the modes. **`verify` is the webhook-trigger verifier, not the
+application's authentication layer.** Agent invocation, the voice transports and the
+Telegram update sink each perform their own check against their own secret. Do not read
+this invariant as describing what protects any route other than a webhook trigger.
+
 **INV-HTTP-002**: Every secret comparison inside `verify` uses a constant-time primitive, and an absent or empty secret returns false rather than passing.
 
-Fail-closed on a missing secret is the part worth remembering: there is no unauthenticated
-path that runs when configuration is incomplete.
+Fail-closed on a missing secret is the part worth remembering: within this verifier there
+is no path that passes when configuration is incomplete. That is a statement about
+`verify`, not about the application — routes that never call it are unaffected by it.
 
-**INV-HTTP-003**: Only the timestamped mode has a replay window. The body-HMAC and static-header modes accept a valid credential indefinitely.
+**INV-HTTP-003**: No mode prevents replay. The timestamped mode *bounds* it to a tolerance window; the other two accept a valid credential indefinitely.
 
-This asymmetry is the thing to carry away, and it is easy to read past. A captured
-body-HMAC signature replays for as long as the secret lives, and a static header is a
-bearer token — no body binding, no nonce, no expiry. Only the timestamped mode compares
-against a tolerance and refuses what falls outside it. Choosing a mode is therefore
-choosing whether replay is in the threat model, and the default tolerance is a
-configuration value, not a constant.
+This is the correction most worth reading carefully, because the intuitive reading of
+"timestamped" is wrong. Nothing tracks nonces or spent signatures, so a captured
+timestamped request can be replayed **repeatedly within its window**, and a timestamp
+modestly in the future is accepted — the comparison is on absolute difference. Bounded
+replay is a materially weaker property than replay prevention.
+
+The other two modes have no bound at all. A captured body-HMAC signature authenticates its
+own exact body for as long as the secret is accepted; it cannot authenticate a modified
+body, which is a real but narrow protection. A static header is a bearer token: no body
+binding, no nonce, no expiry.
+
+The tolerance default is a literal in the code, not an absent value the operator must
+supply, and configured values are constrained to a bounded range. Replay is in the threat
+model for every mode; choosing a mode chooses how long the window stays open.
 
 **INV-HTTP-004**: External context arriving on a request cannot set provenance fields; the ingress supplies them.
 
 A payload that could name its own origin could claim any origin, and provenance is what
 later decides what a turn may do — see `provenance.py` for what is stripped.
 
-**INV-HTTP-005**: Every external entry point must be able to say who spoke. The ingress-identity table is validated at boot against an independently-written contract, and a route that cannot name its speaker is a boot failure.
+**INV-HTTP-005**: The ingress-identity table is validated at boot against an independently-written route contract, and any disagreement between the two is a boot failure.
 
-The check is deliberately redundant: the table and the contract are separate declarations,
-so adding a route in one place without the other fails rather than silently inheriting a
-default. Per request the same function raises instead of returning anything a caller could
+Read the scope precisely, because the useful-sounding version of this is false. **The check
+compares two hand-maintained declarations with each other. It does not inspect the
+registered HTTP routes.** Adding a turn-producing route without touching either declaration
+therefore produces no boot failure — the guarantee is that the two declarations cannot
+drift apart, not that they cover the application. Keeping a new ingress honest is still a
+matter of remembering to declare it.
+
+What the check does enforce is worth having: both directions of set equality, so neither
+declaration can gain or lose a route alone, plus per-route agreement on surface,
+authentication flag and peer strategy.
+
+Per request the identity function raises instead of returning anything a caller could
 mistake for "no identity" — there is no quiet fallback to an anonymous or system speaker.
 Automation ingresses are additionally prevented from resolving to an operator's identity,
 which is what stops an unattended trigger from being recorded as a person.
@@ -85,8 +122,15 @@ health signal reads more into it than it carries.
 
 ## Extension points
 
-A new public route means choosing its authentication explicitly. Nothing authenticates it
-for you, so a route with no check is callable by whatever can reach the app.
+A new public route means choosing its authentication explicitly **and** knowing which
+listeners will carry it. Nothing authenticates it for you, so a route with no check is
+callable by whatever can reach the app — which, on the external listener, is whatever can
+reach the published port. If the route should not be externally reachable, the 404 list on
+that listener is what excludes it, and adding the route alone does not add the exclusion.
+
+A route that produces a turn also needs an entry in both ingress-identity declarations.
+Nothing detects its absence at boot, so this is a step to remember rather than one the
+system enforces.
 
 A new internal route belongs on the internal application, and is worth writing as though it
 were reachable from outside — a later change to the listener is all it would take.
@@ -104,8 +148,11 @@ this document establishes; check the call sites for the one you care about.
 - `casa/rootfs/opt/casa/webhook_auth.py::verify`
 - `casa/rootfs/opt/casa/webhook_auth.py::read_secret`
 - `casa/rootfs/opt/casa/casa_core.py::healthz`
-- `casa/rootfs/opt/casa/ingress_identity.py`
-- `casa/rootfs/opt/casa/provenance.py`
+- `casa/rootfs/opt/casa/ingress_identity.py::validate_ingress_identity_table`
+- `casa/rootfs/opt/casa/ingress_identity.py::ingress_identity`
+- `casa/rootfs/opt/casa/provenance.py::sanitize_external_context`
+- `casa/rootfs/etc/s6-overlay/scripts/setup-nginx.sh`
+- `casa/config.yaml::ports`
 
 **Tests**
 - `tests/test_webhook_auth.py::test_hmac_body_valid`

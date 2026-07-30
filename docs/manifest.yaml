@@ -82,8 +82,11 @@
     - casa/rootfs/opt/casa/webhook_auth.py::verify
     - casa/rootfs/opt/casa/webhook_auth.py::read_secret
     - casa/rootfs/opt/casa/casa_core.py::healthz
-    - casa/rootfs/opt/casa/ingress_identity.py
-    - casa/rootfs/opt/casa/provenance.py
+    - casa/rootfs/opt/casa/ingress_identity.py::validate_ingress_identity_table
+    - casa/rootfs/opt/casa/ingress_identity.py::ingress_identity
+    - casa/rootfs/opt/casa/provenance.py::sanitize_external_context
+    - casa/rootfs/etc/s6-overlay/scripts/setup-nginx.sh
+    - casa/config.yaml::ports
   tests:
     - tests/test_webhook_auth.py::test_hmac_body_valid
     - tests/test_webhook_auth.py::test_hmac_body_wrong_secret_fails

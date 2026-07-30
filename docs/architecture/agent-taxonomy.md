@@ -24,8 +24,10 @@ in this area.
 
 Two names exist for a registered agent and they are not interchangeable. The **role** is the
 stable identifier the system routes on. The **name** is what a person sees. Code resolves by
-role and translates to a name at the edge, because a name can change without anything
-breaking while a role cannot.
+role and translates to a name at the edge, so routing survives a rename — but nothing
+enforces that names are unique, and reverse lookup from a name is first-wins, so
+name-keyed behaviour is not guaranteed to survive one. Routing is what a rename is safe
+for; not everything is routing.
 
 Failure is **not uniform across tiers**, and that is the second thing to internalise.
 Residents are gating: a bad one stops boot. Specialists and executors load on isolated paths
@@ -45,10 +47,14 @@ load-bearing precisely because `AgentRegistry.build` is not: it assigns resident
 specialists into one mapping, so a collision that got past the check would silently resolve
 to the specialist rather than raise.
 
-**INV-AGENT-002**: Every tier declares an exact file set, and `_check_file_set` refuses a missing required file, a forbidden file, or an unrecognised one.
+**INV-AGENT-002**: For residents and specialists, `_check_file_set` refuses a missing required file, a forbidden file, or an unrecognised one. The executor path implements its own weaker check and does not refuse unrecognised files.
 
-All three directions, not just the missing case: an unexpected file in an agent directory is
-as much a failure as an absent one. Directories, dotfiles and recognised editor backups are
+All three directions apply only on the first path, and that asymmetry is easy to miss
+because both paths talk about required and forbidden files. `_check_file_set` has a single
+caller; executors are loaded elsewhere and are checked only for missing-required and
+present-forbidden. An unexpected file in an executor directory is not an error.
+
+Where the strict check does run, directories, dotfiles and recognised editor backups are
 skipped, so a stray save does not become a half-parsed agent.
 
 **INV-AGENT-003**: Specialist and executor loading is isolated per agent and boot-non-fatal; resident loading is not.
@@ -62,10 +68,15 @@ The loader's own docstring says collection-level errors still raise — but the 
 above it catch those, so nothing reaches boot. Reading the loader alone tells you the
 opposite of what happens. Follow the call up before concluding a raise is fatal.
 
-The resident path fails closed on a bad directory, but an *absent* agents directory is
-not a bad one: the walk returns empty before any drift check runs, and a system with no
-residents boots clean. "Fails closed both ways" holds for what is there, not for what is
-missing entirely.
+The resident path fails closed, and it does so in more than one place. An absent agents
+directory makes the loader's own walk return empty before its fixed-slot check runs — but
+that is one early return, not a clean boot: startup separately refuses to continue without
+a primary assistant role. An empty-but-present directory fails the fixed-slot check
+directly. There is no arrangement in which a system with no residents comes up.
+
+That distinction is worth stating because reading the loader alone suggests otherwise, and
+a correction based on the loader alone was published here and was wrong. Follow the call
+chain past the function that returns before concluding what boot does.
 
 **INV-AGENT-004**: The registry performs no filesystem access; it is an index built from already-loaded configuration.
 
@@ -86,15 +97,26 @@ what that means — read the call site rather than assuming it errors.
 
 ## Extension points
 
-A new agent: a directory under its tier, the file set that tier requires, and an unclaimed
-role.
+"A new agent" is not one operation, and the tier decides how much freedom you have.
 
-A new tier is a much larger change than a new agent: the file set, the loading path and the
-registry's tier type all move together. Note that the registry's type currently admits two
-tiers, so anything registry-visible is a change to that type and everything reading it.
+**Residents are a fixed set.** The slots are enumerated in code and the loader refuses a
+resident set that is not exactly those slots — so there is no such thing as adding a fourth
+resident without changing that enumeration and everything that assumes it. A new resident is
+a design change, not a directory.
+
+**A new specialist** is closer to the simple story: a directory under its tier, the file set
+that tier requires, and a role no resident or specialist already claims.
+
+**A new executor** needs the file set, but is outside the cross-tier uniqueness check, since
+that check spans residents and specialists only. Do not look to the role registry to tell
+you whether an executor's role is free; it does not model executors at all.
+
+A new tier is larger still: the file set, the loading path and the registry's tier type all
+move together, and the type currently admits two tiers.
 
 A new required artifact means updating the tier's file set and every agent of that tier in
-the same change, since the check is exact and a missing file is a boot failure.
+the same change. What a missing file costs depends on the tier — boot for a resident, that
+one agent for a specialist or executor.
 
 ## Source & test map
 

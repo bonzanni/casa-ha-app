@@ -30,17 +30,20 @@ Four services run under s6, each with a single job:
 
 Four `init-*` one-shots exist — config validation, config materialisation, nginx setup and
 the plugin store — but they do **not** all precede every service. Each service names only
-the one-shots it needs: the nginx setup gates `svc-nginx` alone, and the terminal depends
-only on config materialisation. Read the ordering in the `dependencies.d` directories, not
-here and not in a log statement; it is data, and it is what is actually true.
+the one-shots it needs: the nginx setup gates `svc-nginx` alone, the plugin store gates both
+the main application and the MCP service, and the terminal depends only on config
+materialisation. Read the ordering in the `dependencies.d` directories, not here and not in
+a log statement; it is data, and it is what is actually true.
 
-Agents come in three tiers, and the tier decides lifetime and reach rather than capability:
+Agents come in three tiers. Tier is the main axis along which lifetime, reach, validation
+strictness and failure isolation all vary together — it is not only about what an agent can
+do:
 
 | Tier | Lifetime | Reach |
 |---|---|---|
-| **Resident** | long-lived, owns a channel | memory, delegation, its own channel |
+| **Resident** | long-lived, a fixed set of slots | memory, delegation, channel reach |
 | **Specialist** | ephemeral, role-keyed | no channel of its own |
-| **Executor** | ephemeral, task-bounded | loaded on its own isolated path |
+| **Executor** | ephemeral, task-bounded | outside the role registry entirely |
 
 One boundary matters more than the table: **the role registry models residents and
 specialists only.** Its tier type admits those two, and executors load separately. Reasoning
@@ -66,17 +69,22 @@ collision.
 **Validation fails.** Boot stops at the `init-validate-config` one-shot. Nothing later runs,
 so the app does not come up in a partly-configured state.
 
-**The one-shots are not equally fatal, and only one of them is.** Config validation gates
-everything transitively and is the only one that stops boot by failing. The other three end
-on a log statement or an explicit success exit — the plugin store says so in a comment,
-because a non-zero exit there *would* block the main service. Their failures surface as
-degraded state and health issues rather than as a container that will not start. Do not
-read "one-shot" as "must succeed".
+**The one-shots do not treat failure alike.** All four sit in dependency chains, so any of
+them failing blocks what depends on it — that part is uniform. What differs is how hard each
+one tries to fail. Config validation is the only one that reports an ordinary configuration
+defect as a non-zero exit; that is its job. The others mask most of what goes wrong
+internally, degrading rather than stopping — the plugin store forces a success exit outright,
+because a non-zero exit there would block the services that depend on it.
+
+That is a statement about intent, not a guarantee. A shell parse error or an unexecutable
+script still fails a one-shot that "cannot fail" by design. Read "one-shot" as "gates what
+follows", never as "must succeed" or as "will report a problem".
 
 **A service fails.** Each longrun is supervised separately, so their lifetimes are
-independent, and what happens on failure differs per service — one stops the whole app, the
-others log and respawn. That is set by the service definition; read it there rather than
-assuming a policy.
+independent, and what happens on failure differs per service — one stops the whole app,
+others log and let the supervisor restart them, and the terminal deliberately exits in a way
+that suppresses restart when it is disabled. That is set by the service definition; read it
+there rather than assuming a policy.
 
 **Boot refuses for a reason not in the manifest.** Configuration is not the only fatal
 class. The application also refuses to start when its ingress-identity table cannot account
@@ -92,9 +100,10 @@ Both edits belong in the same change.
 A new service means a new `s6-rc.d` directory and the dependency files that place it in the
 ordering; nothing in Python decides startup order.
 
-A new agent means a directory of configuration artifacts under the tier it belongs to, plus
-a role no other agent claims. The exact file set is checked per tier by `_check_file_set`,
-which is the authority on what is required, optional and forbidden.
+A new agent means a directory of configuration artifacts under the tier it belongs to — but
+what else it requires depends heavily on the tier, and the resident slots are a fixed set
+that cannot simply be extended. `architecture/agent-taxonomy.md` sets out what each tier
+actually allows; treating them alike is the common mistake.
 
 A new option means the app manifest, the translations file, and whatever reads it. An
 option that is only read by shell during boot still belongs in the manifest, because that
