@@ -41,7 +41,9 @@ jobs:
       - run: pip install --quiet pyyaml
 
       - name: Verify manifest, anchors, budget and invariants
-        run: python -m scripts.verify_docs .
+        run: |
+          python -m scripts.verify_docs .
+          python3 scripts/coverage_ledger.py check .
 
       - name: Generated navigation is current
         run: python -m scripts.verify_docs . --check-nav

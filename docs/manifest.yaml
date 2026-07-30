@@ -15,6 +15,10 @@
   kind: meta
   summary: The publication allowlist for this corpus.
 
+- doc: coverage.yaml
+  kind: meta
+  summary: Code-derived coverage ledger — every enumerated surface maps to a document or an explicit exclusion.
+
 - doc: README.md
   kind: index
   summary: Routing map — what you are about to change, and what to read for it.

@@ -1,0 +1,411 @@
+# Code-derived coverage ledger — every enumerated surface maps to the document
+# that covers it, or is excluded with a reason. Verified by
+# scripts/coverage_ledger.py check (run by scripts/verify_docs.py and CI).
+# Regenerate the enumeration with: python3 scripts/coverage_ledger.py enumerate .
+
+- item: casa/rootfs/opt/casa/agent.py
+  doc: architecture/turn-loop.md
+- item: casa/rootfs/opt/casa/agent_loader.py
+  doc: architecture/agent-taxonomy.md
+- item: casa/rootfs/opt/casa/authz_grants.py
+  doc: architecture/plugins.md
+- item: casa/rootfs/opt/casa/bus.py
+  excluded: "PHASE-3: architecture/concurrency-model.md"
+- item: casa/rootfs/opt/casa/canonical_bytes.py
+  doc: architecture/personality.md
+- item: casa/rootfs/opt/casa/casa_core.py
+  doc: architecture/overview.md
+- item: casa/rootfs/opt/casa/casa_core_middleware.py
+  doc: architecture/observability.md
+- item: casa/rootfs/opt/casa/casa_eval/base.py
+  doc: architecture/eval-framework.md
+- item: casa/rootfs/opt/casa/channels/casa_engagement_channel.py
+  doc: architecture/engagements.md
+- item: casa/rootfs/opt/casa/channels/channel_handlers.py
+  doc: architecture/http-surface.md
+- item: casa/rootfs/opt/casa/channels/output_sequencer.py
+  doc: architecture/engagements.md
+- item: casa/rootfs/opt/casa/channels/state_emoji.py
+  doc: architecture/telegram.md
+- item: casa/rootfs/opt/casa/channels/telegram.py
+  doc: architecture/telegram.md
+- item: casa/rootfs/opt/casa/channels/telegram_supervisor.py
+  doc: architecture/telegram.md
+- item: casa/rootfs/opt/casa/channels/tg_richtext.py
+  doc: architecture/telegram.md
+- item: casa/rootfs/opt/casa/channels/voice/channel.py
+  doc: architecture/voice.md
+- item: casa/rootfs/opt/casa/channels/voice/delivery.py
+  excluded: "PHASE-3: architecture/jobs-and-delivery.md"
+- item: casa/rootfs/opt/casa/channels/voice/prosodic.py
+  doc: architecture/voice.md
+- item: casa/rootfs/opt/casa/channels/voice/routes.py
+  doc: architecture/voice.md
+- item: casa/rootfs/opt/casa/channels/voice/session.py
+  doc: architecture/voice.md
+- item: casa/rootfs/opt/casa/config.py
+  doc: architecture/configuration.md
+- item: casa/rootfs/opt/casa/config_git.py
+  doc: architecture/configuration.md
+- item: casa/rootfs/opt/casa/config_sync.py
+  doc: architecture/configuration.md
+- item: casa/rootfs/opt/casa/delegated_memory.py
+  doc: architecture/memory.md
+- item: casa/rootfs/opt/casa/drivers/brief.py
+  doc: architecture/engagements.md
+- item: casa/rootfs/opt/casa/drivers/claude_code_driver.py
+  doc: architecture/engagements.md
+- item: casa/rootfs/opt/casa/drivers/in_casa_driver.py
+  doc: architecture/engagements.md
+- item: casa/rootfs/opt/casa/drivers/s6_rc.py
+  doc: architecture/overview.md
+- item: casa/rootfs/opt/casa/drivers/summary_controller.py
+  doc: architecture/engagements.md
+- item: casa/rootfs/opt/casa/drivers/topic_stream.py
+  doc: architecture/engagements.md
+- item: casa/rootfs/opt/casa/drivers/workspace.py
+  doc: architecture/engagements.md
+- item: casa/rootfs/opt/casa/engagement_registry.py
+  doc: architecture/engagements.md
+- item: casa/rootfs/opt/casa/executor_registry.py
+  doc: architecture/agent-taxonomy.md
+- item: casa/rootfs/opt/casa/explanation_store.py
+  doc: architecture/persistent-state.md
+- item: casa/rootfs/opt/casa/freshness_reaper.py
+  doc: architecture/memory.md
+- item: casa/rootfs/opt/casa/ha_mcp_facade.py
+  doc: architecture/home-assistant-control.md
+- item: casa/rootfs/opt/casa/hindsight_ids.py
+  doc: architecture/memory.md
+- item: casa/rootfs/opt/casa/hindsight_memory.py
+  doc: architecture/memory.md
+- item: casa/rootfs/opt/casa/hindsight_provenance_contract.py
+  doc: architecture/memory.md
+- item: casa/rootfs/opt/casa/hooks.py
+  doc: architecture/mcp-and-tools.md
+- item: casa/rootfs/opt/casa/ingress_identity.py
+  doc: architecture/http-surface.md
+- item: casa/rootfs/opt/casa/internal_handlers.py
+  doc: architecture/mcp-and-tools.md
+- item: casa/rootfs/opt/casa/job_registry.py
+  excluded: "PHASE-3: architecture/jobs-and-delivery.md"
+- item: casa/rootfs/opt/casa/log_cid.py
+  doc: architecture/observability.md
+- item: casa/rootfs/opt/casa/log_redact.py
+  doc: architecture/observability.md
+- item: casa/rootfs/opt/casa/mcp_envelope.py
+  doc: architecture/mcp-and-tools.md
+- item: casa/rootfs/opt/casa/memory_provenance.py
+  doc: architecture/memory.md
+- item: casa/rootfs/opt/casa/observer.py
+  doc: architecture/engagements.md
+- item: casa/rootfs/opt/casa/persona_install.py
+  doc: architecture/personality.md
+- item: casa/rootfs/opt/casa/persona_pack.py
+  doc: architecture/personality.md
+- item: casa/rootfs/opt/casa/personality_admin_handlers.py
+  doc: architecture/personality.md
+- item: casa/rootfs/opt/casa/personality_binding.py
+  doc: architecture/personality.md
+- item: casa/rootfs/opt/casa/plugin_boot.py
+  doc: architecture/plugins.md
+- item: casa/rootfs/opt/casa/plugin_completion_guard.py
+  doc: architecture/plugins.md
+- item: casa/rootfs/opt/casa/plugin_env_conf.py
+  doc: architecture/plugins.md
+- item: casa/rootfs/opt/casa/plugin_grants.py
+  doc: architecture/plugins.md
+- item: casa/rootfs/opt/casa/plugin_health.py
+  doc: architecture/plugins.md
+- item: casa/rootfs/opt/casa/plugin_outbox.py
+  doc: architecture/plugins.md
+- item: casa/rootfs/opt/casa/plugin_registry.py
+  doc: architecture/plugins.md
+- item: casa/rootfs/opt/casa/plugin_setup_episodes.py
+  doc: architecture/plugins.md
+- item: casa/rootfs/opt/casa/plugin_store.py
+  doc: architecture/plugins.md
+- item: casa/rootfs/opt/casa/plugin_triggers.py
+  doc: architecture/triggers.md
+- item: casa/rootfs/opt/casa/policies.py
+  doc: architecture/personality.md
+- item: casa/rootfs/opt/casa/prompt_compiler.py
+  doc: architecture/personality.md
+- item: casa/rootfs/opt/casa/provenance.py
+  doc: architecture/http-surface.md
+- item: casa/rootfs/opt/casa/rate_limit.py
+  doc: architecture/http-surface.md
+- item: casa/rootfs/opt/casa/recall_health.py
+  doc: architecture/memory.md
+- item: casa/rootfs/opt/casa/recall_renderer.py
+  doc: architecture/memory.md
+- item: casa/rootfs/opt/casa/reload.py
+  doc: architecture/configuration.md
+- item: casa/rootfs/opt/casa/retry.py
+  doc: architecture/turn-loop.md
+- item: casa/rootfs/opt/casa/role_artifact.py
+  doc: architecture/personality.md
+- item: casa/rootfs/opt/casa/role_slot.py
+  doc: architecture/personality.md
+- item: casa/rootfs/opt/casa/runtime.py
+  doc: architecture/overview.md
+- item: casa/rootfs/opt/casa/sdk_client_pool.py
+  doc: architecture/turn-loop.md
+- item: casa/rootfs/opt/casa/sdk_logging.py
+  doc: architecture/observability.md
+- item: casa/rootfs/opt/casa/semantic_memory.py
+  doc: architecture/memory.md
+- item: casa/rootfs/opt/casa/sensitivity.py
+  doc: architecture/memory.md
+- item: casa/rootfs/opt/casa/session_registry.py
+  doc: architecture/persistent-state.md
+- item: casa/rootfs/opt/casa/session_saver.py
+  doc: architecture/memory.md
+- item: casa/rootfs/opt/casa/session_sweeper.py
+  doc: architecture/persistent-state.md
+- item: casa/rootfs/opt/casa/speaker_provenance.py
+  doc: architecture/memory.md
+- item: casa/rootfs/opt/casa/specialist_bundle_journal.py
+  excluded: "PHASE-3: architecture/specialist-lifecycle.md"
+- item: casa/rootfs/opt/casa/specialist_component.py
+  excluded: "PHASE-3: architecture/specialist-lifecycle.md"
+- item: casa/rootfs/opt/casa/specialist_export.py
+  excluded: "PHASE-3: architecture/specialist-lifecycle.md"
+- item: casa/rootfs/opt/casa/specialist_install.py
+  excluded: "PHASE-3: architecture/specialist-lifecycle.md"
+- item: casa/rootfs/opt/casa/specialist_install_consent.py
+  excluded: "PHASE-3: architecture/specialist-lifecycle.md"
+- item: casa/rootfs/opt/casa/specialist_limits.py
+  excluded: "PHASE-3: architecture/specialist-lifecycle.md"
+- item: casa/rootfs/opt/casa/specialist_materialize.py
+  excluded: "PHASE-3: architecture/specialist-lifecycle.md"
+- item: casa/rootfs/opt/casa/specialist_receipt.py
+  excluded: "PHASE-3: architecture/specialist-lifecycle.md"
+- item: casa/rootfs/opt/casa/specialist_registry.py
+  doc: architecture/agent-taxonomy.md
+- item: casa/rootfs/opt/casa/supervisor_discovery.py
+  doc: architecture/home-assistant-control.md
+- item: casa/rootfs/opt/casa/svc_casa_mcp.py
+  doc: architecture/mcp-and-tools.md
+- item: casa/rootfs/opt/casa/system_requirements/orchestrator.py
+  excluded: "PHASE-3: architecture/specialist-lifecycle.md"
+- item: casa/rootfs/opt/casa/system_requirements/tarball.py
+  excluded: "PHASE-3: architecture/specialist-lifecycle.md"
+- item: casa/rootfs/opt/casa/text_util.py
+  doc: architecture/telegram.md
+- item: casa/rootfs/opt/casa/tokens.py
+  doc: architecture/observability.md
+- item: casa/rootfs/opt/casa/tools.py
+  doc: architecture/mcp-and-tools.md
+- item: casa/rootfs/opt/casa/topic_ledger.py
+  doc: architecture/persistent-state.md
+- item: casa/rootfs/opt/casa/trigger_acks.py
+  doc: architecture/triggers.md
+- item: casa/rootfs/opt/casa/trigger_consent.py
+  doc: architecture/triggers.md
+- item: casa/rootfs/opt/casa/trigger_reconcile.py
+  doc: architecture/triggers.md
+- item: casa/rootfs/opt/casa/trigger_registry.py
+  doc: architecture/triggers.md
+- item: casa/rootfs/opt/casa/verdict_broker.py
+  doc: architecture/telegram.md
+- item: casa/rootfs/opt/casa/voice_job_result.py
+  excluded: "PHASE-3: architecture/jobs-and-delivery.md"
+- item: casa/rootfs/opt/casa/webhook_auth.py
+  doc: architecture/http-surface.md
+- item: option:casa_tz
+  excluded: "PHASE-3: reference/operator-options.md"
+- item: option:claude_oauth_token
+  excluded: "PHASE-3: reference/operator-options.md"
+- item: option:context7_api_key
+  excluded: "PHASE-3: reference/operator-options.md"
+- item: option:enable_terminal
+  excluded: "PHASE-3: reference/operator-options.md"
+- item: option:engagement_reap_days
+  excluded: "PHASE-3: reference/operator-options.md"
+- item: option:hindsight_api_url
+  excluded: "PHASE-3: reference/operator-options.md"
+- item: option:log_level
+  excluded: "PHASE-3: reference/operator-options.md"
+- item: option:onepassword_default_vault
+  excluded: "PHASE-3: reference/operator-options.md"
+- item: option:onepassword_service_account_token
+  excluded: "PHASE-3: reference/operator-options.md"
+- item: option:primary_agent_model
+  excluded: "PHASE-3: reference/operator-options.md"
+- item: option:public_url
+  excluded: "PHASE-3: reference/operator-options.md"
+- item: option:specialist_cost_alert_threshold
+  excluded: "PHASE-3: reference/operator-options.md"
+- item: option:specialist_max_concurrency
+  excluded: "PHASE-3: reference/operator-options.md"
+- item: option:telegram_bot_api_base
+  excluded: "PHASE-3: reference/operator-options.md"
+- item: option:telegram_bot_token
+  excluded: "PHASE-3: reference/operator-options.md"
+- item: option:telegram_chat_id
+  excluded: "PHASE-3: reference/operator-options.md"
+- item: option:telegram_engagement_supergroup_id
+  excluded: "PHASE-3: reference/operator-options.md"
+- item: option:telegram_transport
+  excluded: "PHASE-3: reference/operator-options.md"
+- item: option:voice_agent_model
+  excluded: "PHASE-3: reference/operator-options.md"
+- item: option:webhook_secret
+  excluded: "PHASE-3: reference/operator-options.md"
+- item: s6:init-plugin-store
+  doc: architecture/overview.md
+- item: s6:init-setup-configs
+  doc: architecture/overview.md
+- item: s6:init-setup-nginx
+  doc: architecture/overview.md
+- item: s6:init-validate-config
+  doc: architecture/overview.md
+- item: s6:svc-casa
+  doc: architecture/overview.md
+- item: s6:svc-casa-mcp
+  doc: architecture/overview.md
+- item: s6:svc-nginx
+  doc: architecture/overview.md
+- item: s6:svc-ttyd
+  doc: architecture/overview.md
+- item: s6:user
+  doc: architecture/overview.md
+- item: tool:ask_user
+  excluded: "PHASE-3: architecture/tools-interface.md"
+- item: tool:cancel_engagement
+  excluded: "PHASE-3: architecture/tools-interface.md"
+- item: tool:cancel_voice_job
+  excluded: "PHASE-3: architecture/tools-interface.md"
+- item: tool:casa_reload
+  excluded: "PHASE-3: architecture/tools-interface.md"
+- item: tool:casa_reload_triggers
+  excluded: "PHASE-3: architecture/tools-interface.md"
+- item: tool:casa_restart_supervised
+  excluded: "PHASE-3: architecture/tools-interface.md"
+- item: tool:cleanup_engagement_topics
+  excluded: "PHASE-3: architecture/tools-interface.md"
+- item: tool:config_git_commit
+  excluded: "PHASE-3: architecture/tools-interface.md"
+- item: tool:continue_voice_job
+  excluded: "PHASE-3: architecture/tools-interface.md"
+- item: tool:delegate_to_agent
+  excluded: "PHASE-3: architecture/tools-interface.md"
+- item: tool:delete_engagement_workspace
+  excluded: "PHASE-3: architecture/tools-interface.md"
+- item: tool:emit_completion
+  excluded: "PHASE-3: architecture/tools-interface.md"
+- item: tool:engage_executor
+  excluded: "PHASE-3: architecture/tools-interface.md"
+- item: tool:get_item_fields
+  excluded: "PHASE-3: architecture/tools-interface.md"
+- item: tool:get_schedule
+  excluded: "PHASE-3: architecture/tools-interface.md"
+- item: tool:list_engagement_workspaces
+  excluded: "PHASE-3: architecture/tools-interface.md"
+- item: tool:list_vault_items
+  excluded: "PHASE-3: architecture/tools-interface.md"
+- item: tool:peek_engagement_workspace
+  excluded: "PHASE-3: architecture/tools-interface.md"
+- item: tool:persona_apply
+  excluded: "PHASE-3: architecture/tools-interface.md"
+- item: tool:persona_install_commit
+  excluded: "PHASE-3: architecture/tools-interface.md"
+- item: tool:persona_install_inspect
+  excluded: "PHASE-3: architecture/tools-interface.md"
+- item: tool:plugin_add
+  excluded: "PHASE-3: architecture/tools-interface.md"
+- item: tool:plugin_assign
+  excluded: "PHASE-3: architecture/tools-interface.md"
+- item: tool:plugin_list
+  excluded: "PHASE-3: architecture/tools-interface.md"
+- item: tool:plugin_remove
+  excluded: "PHASE-3: architecture/tools-interface.md"
+- item: tool:plugin_unassign
+  excluded: "PHASE-3: architecture/tools-interface.md"
+- item: tool:plugin_update
+  excluded: "PHASE-3: architecture/tools-interface.md"
+- item: tool:query_engager
+  excluded: "PHASE-3: architecture/tools-interface.md"
+- item: tool:react
+  excluded: "PHASE-3: architecture/tools-interface.md"
+- item: tool:recall_memory
+  excluded: "PHASE-3: architecture/tools-interface.md"
+- item: tool:remove_plugin_env_reference
+  excluded: "PHASE-3: architecture/tools-interface.md"
+- item: tool:resident_persona_reset
+  excluded: "PHASE-3: architecture/tools-interface.md"
+- item: tool:resident_persona_swap
+  excluded: "PHASE-3: architecture/tools-interface.md"
+- item: tool:send_media
+  excluded: "PHASE-3: architecture/tools-interface.md"
+- item: tool:send_message
+  excluded: "PHASE-3: architecture/tools-interface.md"
+- item: tool:set_plugin_env_reference
+  excluded: "PHASE-3: architecture/tools-interface.md"
+- item: tool:specialist_install_commit
+  excluded: "PHASE-3: architecture/tools-interface.md"
+- item: tool:specialist_install_inspect
+  excluded: "PHASE-3: architecture/tools-interface.md"
+- item: tool:specialist_rollback
+  excluded: "PHASE-3: architecture/tools-interface.md"
+- item: tool:specialist_uninstall
+  excluded: "PHASE-3: architecture/tools-interface.md"
+- item: tool:specialist_upgrade
+  excluded: "PHASE-3: architecture/tools-interface.md"
+- item: tool:trigger_ack_revoke
+  excluded: "PHASE-3: architecture/tools-interface.md"
+- item: tool:verify_plugin_secrets
+  excluded: "PHASE-3: architecture/tools-interface.md"
+- item: tool:verify_plugin_state
+  excluded: "PHASE-3: architecture/tools-interface.md"
+- item: tool:voice_job_status
+  excluded: "PHASE-3: architecture/tools-interface.md"
+- item: route:casa/rootfs/opt/casa/casa_core.py:GET:/
+  doc: architecture/http-surface.md
+- item: route:casa/rootfs/opt/casa/casa_core.py:GET:/healthz
+  doc: architecture/observability.md
+- item: route:casa/rootfs/opt/casa/casa_core.py:GET:/mcp/casa-framework
+  doc: architecture/mcp-and-tools.md
+- item: route:casa/rootfs/opt/casa/casa_core.py:GET:path
+  doc: architecture/mcp-and-tools.md
+- item: route:casa/rootfs/opt/casa/casa_core.py:POST:/admin/reload
+  doc: architecture/configuration.md
+- item: route:casa/rootfs/opt/casa/casa_core.py:POST:/hooks/resolve
+  doc: architecture/mcp-and-tools.md
+- item: route:casa/rootfs/opt/casa/casa_core.py:POST:/internal/hooks/resolve
+  doc: architecture/mcp-and-tools.md
+- item: route:casa/rootfs/opt/casa/casa_core.py:POST:/internal/tools/call
+  doc: architecture/mcp-and-tools.md
+- item: route:casa/rootfs/opt/casa/casa_core.py:POST:/invoke/{agent}
+  doc: architecture/http-surface.md
+- item: route:casa/rootfs/opt/casa/casa_core.py:POST:/mcp/casa-framework
+  doc: architecture/mcp-and-tools.md
+- item: route:casa/rootfs/opt/casa/casa_core.py:POST:/telegram/update
+  doc: architecture/telegram.md
+- item: route:casa/rootfs/opt/casa/casa_core.py:POST:/webhook/{name}
+  doc: architecture/triggers.md
+- item: route:casa/rootfs/opt/casa/casa_core.py:POST:path
+  doc: architecture/mcp-and-tools.md
+- item: route:casa/rootfs/opt/casa/channels/voice/channel.py:GET:VOICE_AGENT_CATALOG_PATH
+  doc: architecture/voice.md
+- item: route:casa/rootfs/opt/casa/channels/voice/channel.py:GET:self._ws_path
+  doc: architecture/voice.md
+- item: route:casa/rootfs/opt/casa/channels/voice/channel.py:POST:self._sse_path
+  doc: architecture/voice.md
+- item: route:casa/rootfs/opt/casa/personality_admin_handlers.py:POST:/admin/explain
+  doc: architecture/personality.md
+- item: route:casa/rootfs/opt/casa/personality_admin_handlers.py:POST:/admin/personality/diff
+  doc: architecture/personality.md
+- item: route:casa/rootfs/opt/casa/personality_admin_handlers.py:POST:/admin/personality/inspect
+  doc: architecture/personality.md
+- item: route:casa/rootfs/opt/casa/personality_admin_handlers.py:POST:/admin/personality/render
+  doc: architecture/personality.md
+- item: route:casa/rootfs/opt/casa/personality_admin_handlers.py:POST:/admin/specialist/status
+  doc: architecture/personality.md
+- item: route:casa/rootfs/opt/casa/svc_casa_mcp.py:GET:/mcp/casa-framework
+  doc: architecture/mcp-and-tools.md
+- item: route:casa/rootfs/opt/casa/svc_casa_mcp.py:POST:/hooks/resolve
+  doc: architecture/mcp-and-tools.md
+- item: route:casa/rootfs/opt/casa/svc_casa_mcp.py:POST:/mcp/casa-framework
+  doc: architecture/mcp-and-tools.md

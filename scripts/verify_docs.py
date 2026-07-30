@@ -957,6 +957,20 @@ def main() -> int:
         print(f"! {warning}")
 
     problems = verify(root)
+    # The coverage ledger is part of the corpus contract: a surface the code grows that
+    # no document claims is the same defect as a document claiming code that is gone.
+    ledger_script = Path(__file__).resolve().parent / "coverage_ledger.py"
+    if ledger_script.exists() and (root / "docs" / "coverage.yaml").exists():
+        result = subprocess.run(
+            [sys.executable, str(ledger_script), "check", str(root)],
+            capture_output=True, text=True,
+        )
+        if result.returncode != 0:
+            problems.extend(
+                line.lstrip("✗ ").rstrip()
+                for line in result.stdout.splitlines()
+                if line.startswith("✗")
+            )
     for problem in problems:
         print(f"✗ {problem}")
     if problems:
