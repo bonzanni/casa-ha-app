@@ -25,6 +25,7 @@ which is keyed on what you are about to do rather than on subsystem names.
 | adding an evaluator, or before assuming behaviour is evaluated somewhere | [`architecture/eval-framework.md`](architecture/eval-framework.md) |
 | adding durable state, changing a corrupt-file policy, or anything about what survives | [`architecture/persistent-state.md`](architecture/persistent-state.md) |
 | adding or removing an option, the reload scopes, the config repo, or secret resolution | [`architecture/configuration.md`](architecture/configuration.md) |
+| agent prompts, refusal text, or anything shaping how an agent acts at runtime | [`doctrine/operating-casa.md`](doctrine/operating-casa.md) |
 | anything published — docs, comments, commit messages, PR text, branch names | [`doctrine/publishing.md`](doctrine/publishing.md) |
 | anything structural, or when you need to find which document owns an area | [`architecture/overview.md`](architecture/overview.md) |
 | delegation, engagement lifecycle, terminal transitions, drivers, or engagement output ordering | [`architecture/engagements.md`](architecture/engagements.md) |
@@ -33,6 +34,7 @@ which is keyed on what you are about to do rather than on subsystem names.
 | plugin installation, artifact identity, protected tools, or authorization grants | [`architecture/plugins.md`](architecture/plugins.md) |
 | recall behaviour, sensitivity tiers, provenance on a stored fact, or session persistence | [`architecture/memory.md`](architecture/memory.md) |
 | the HA facade, HA tool exposure, or anything about what an agent may control | [`architecture/home-assistant-control.md`](architecture/home-assistant-control.md) |
+| the contribution rules, the verification discipline, or how documentation is kept honest | [`doctrine/working-on-casa.md`](doctrine/working-on-casa.md) |
 | the documentation rules themselves, or adding a document to the corpus | [`contributing/doc-contract.md`](contributing/doc-contract.md) |
 | the turn lifecycle, the warm client pool, retry behaviour, or turn teardown | [`architecture/turn-loop.md`](architecture/turn-loop.md) |
 | trigger types, webhook trigger routing, plugin trigger consent, or scheduling | [`architecture/triggers.md`](architecture/triggers.md) |

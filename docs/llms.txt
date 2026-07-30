@@ -25,7 +25,9 @@ Code is the source of truth; these files are a map.
 
 ## Doctrine
 
+- [doctrine/operating-casa.md](doctrine/operating-casa.md): How an agent running inside Casa should behave, and which property of the system each rule follows from.
 - [doctrine/publishing.md](doctrine/publishing.md): The one rule that decides whether a fact may be written down in this repository.
+- [doctrine/working-on-casa.md](doctrine/working-on-casa.md): How to change this repository without breaking it, and how to establish that a claim about it is true.
 
 ## Contributing
 

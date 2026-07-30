@@ -44,6 +44,28 @@
   related: [contributing/doc-contract.md]
   defines_invariants: [INV-PUB-001, INV-PUB-002, INV-PUB-003]
 
+- doc: doctrine/operating-casa.md
+  summary: How an agent running inside Casa should behave, and which property of the system each rule follows from.
+  when_changing: agent prompts, refusal text, or anything shaping how an agent acts at runtime
+  covers:
+    - casa/rootfs/opt/casa/semantic_memory.py::RecallUnavailable
+    - casa/rootfs/opt/casa/authz_grants.py::GrantKey
+    - casa/rootfs/opt/casa/tools.py::emit_completion
+  tests:
+    - tests/test_recall_absence_invariant.py
+    - tests/test_authz_grants.py
+  related: [architecture/memory.md, architecture/engagements.md, architecture/voice.md]
+
+- doc: doctrine/working-on-casa.md
+  summary: How to change this repository without breaking it, and how to establish that a claim about it is true.
+  when_changing: the contribution rules, the verification discipline, or how documentation is kept honest
+  covers:
+    - scripts/verify_docs.py::verify
+    - casa/config.yaml::schema
+  tests:
+    - tests/test_verify_docs.py
+  related: [doctrine/publishing.md, contributing/doc-contract.md, architecture/persistent-state.md]
+
 - doc: architecture/overview.md
   summary: What Casa is made of — supervised services, the three agent tiers, and where configuration enters.
   when_changing: anything structural, or when you need to find which document owns an area
