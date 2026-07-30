@@ -43,6 +43,10 @@
     - tests/test_gate_hook.py
   related: [contributing/doc-contract.md]
   defines_invariants: [INV-PUB-001, INV-PUB-002, INV-PUB-003]
+  invariant_tests:
+    INV-PUB-001: [tests/PINNING-TEST-MISSING]
+    INV-PUB-002: [tests/PINNING-TEST-MISSING]
+    INV-PUB-003: [tests/PINNING-TEST-MISSING]
 
 - doc: doctrine/operating-casa.md
   summary: How an agent running inside Casa should behave, and which property of the system each rule follows from.
@@ -78,6 +82,9 @@
     - tests/test_setup_nginx_ingress.py
   related: [architecture/agent-taxonomy.md, architecture/turn-loop.md]
   defines_invariants: [INV-SYS-001, INV-SYS-002]
+  invariant_tests:
+    INV-SYS-001: [tests/PINNING-TEST-MISSING]
+    INV-SYS-002: [tests/PINNING-TEST-MISSING]
 
 - doc: architecture/agent-taxonomy.md
   summary: How an agent is declared, validated and looked up — tiers, required artifacts, and the registry.
@@ -96,6 +103,11 @@
     - tests/test_agent_loader.py::test_duplicate_role_across_residents_and_specialists_fails
   related: [architecture/overview.md, architecture/turn-loop.md]
   defines_invariants: [INV-AGENT-001, INV-AGENT-002, INV-AGENT-003, INV-AGENT-004]
+  invariant_tests:
+    INV-AGENT-001: [tests/PINNING-TEST-MISSING]
+    INV-AGENT-002: [tests/PINNING-TEST-MISSING]
+    INV-AGENT-003: [tests/PINNING-TEST-MISSING]
+    INV-AGENT-004: [tests/PINNING-TEST-MISSING]
 
 - doc: architecture/http-surface.md
   summary: The two HTTP servers, what each exposes, and how an inbound request is authenticated.
@@ -117,6 +129,12 @@
     - tests/test_setup_nginx_ingress.py
   related: [architecture/overview.md]
   defines_invariants: [INV-HTTP-001, INV-HTTP-002, INV-HTTP-003, INV-HTTP-004, INV-HTTP-005]
+  invariant_tests:
+    INV-HTTP-001: [tests/PINNING-TEST-MISSING]
+    INV-HTTP-002: [tests/PINNING-TEST-MISSING]
+    INV-HTTP-003: [tests/PINNING-TEST-MISSING]
+    INV-HTTP-004: [tests/PINNING-TEST-MISSING]
+    INV-HTTP-005: [tests/PINNING-TEST-MISSING]
 
 - doc: architecture/memory.md
   summary: Long-term memory — how a fact is written, who may read it back, and what a caller is told when the store cannot answer.
@@ -143,6 +161,12 @@
     - tests/test_agent_auto_recall_unavailable.py
   related: [architecture/overview.md, architecture/turn-loop.md]
   defines_invariants: [INV-MEM-001, INV-MEM-002, INV-MEM-003, INV-MEM-004, INV-MEM-005]
+  invariant_tests:
+    INV-MEM-001: [tests/PINNING-TEST-MISSING]
+    INV-MEM-002: [tests/PINNING-TEST-MISSING]
+    INV-MEM-003: [tests/PINNING-TEST-MISSING]
+    INV-MEM-004: [tests/PINNING-TEST-MISSING]
+    INV-MEM-005: [tests/PINNING-TEST-MISSING]
 
 - doc: architecture/plugins.md
   summary: How a plugin becomes usable — registry, content-addressed store, artifact identity, and per-call authorization.
@@ -166,6 +190,13 @@
     - tests/test_plugin_boot.py
   related: [architecture/overview.md, architecture/agent-taxonomy.md]
   defines_invariants: [INV-PLUG-001, INV-PLUG-002, INV-PLUG-003, INV-PLUG-004, INV-PLUG-005, INV-PLUG-006]
+  invariant_tests:
+    INV-PLUG-001: [tests/PINNING-TEST-MISSING]
+    INV-PLUG-002: [tests/PINNING-TEST-MISSING]
+    INV-PLUG-003: [tests/PINNING-TEST-MISSING]
+    INV-PLUG-004: [tests/PINNING-TEST-MISSING]
+    INV-PLUG-005: [tests/PINNING-TEST-MISSING]
+    INV-PLUG-006: [tests/PINNING-TEST-MISSING]
 
 - doc: architecture/engagements.md
   summary: Work one agent hands to another — ephemeral delegation, durable engagements, how they end, and what survives a restart.
@@ -185,6 +216,12 @@
     - tests/test_cancel_engagement_tool.py
   related: [architecture/overview.md, architecture/turn-loop.md, architecture/agent-taxonomy.md]
   defines_invariants: [INV-ENG-001, INV-ENG-002, INV-ENG-003, INV-ENG-004, INV-ENG-005]
+  invariant_tests:
+    INV-ENG-001: [tests/PINNING-TEST-MISSING]
+    INV-ENG-002: [tests/PINNING-TEST-MISSING]
+    INV-ENG-003: [tests/PINNING-TEST-MISSING]
+    INV-ENG-004: [tests/PINNING-TEST-MISSING]
+    INV-ENG-005: [tests/PINNING-TEST-MISSING]
 
 - doc: architecture/voice.md
   summary: How spoken input becomes a turn and how the answer gets back — transports, authentication, the turn budget, and deferred delivery.
@@ -205,6 +242,13 @@
     - tests/test_voice_context_sanitize.py
   related: [architecture/overview.md, architecture/http-surface.md, architecture/turn-loop.md]
   defines_invariants: [INV-VOICE-001, INV-VOICE-002, INV-VOICE-003, INV-VOICE-004, INV-VOICE-005, INV-VOICE-006]
+  invariant_tests:
+    INV-VOICE-001: [tests/PINNING-TEST-MISSING]
+    INV-VOICE-002: [tests/PINNING-TEST-MISSING]
+    INV-VOICE-003: [tests/PINNING-TEST-MISSING]
+    INV-VOICE-004: [tests/PINNING-TEST-MISSING]
+    INV-VOICE-005: [tests/PINNING-TEST-MISSING]
+    INV-VOICE-006: [tests/PINNING-TEST-MISSING]
 
 - doc: architecture/telegram.md
   summary: How Telegram messages become turns — transports, authentication, the per-topic causal log, keyboards, and rendering.
@@ -223,6 +267,12 @@
     - tests/test_verdict_broker.py
   related: [architecture/overview.md, architecture/engagements.md, architecture/http-surface.md]
   defines_invariants: [INV-TG-001, INV-TG-002, INV-TG-003, INV-TG-004, INV-TG-005]
+  invariant_tests:
+    INV-TG-001: [tests/PINNING-TEST-MISSING]
+    INV-TG-002: [tests/PINNING-TEST-MISSING]
+    INV-TG-003: [tests/PINNING-TEST-MISSING]
+    INV-TG-004: [tests/PINNING-TEST-MISSING]
+    INV-TG-005: [tests/PINNING-TEST-MISSING]
 
 - doc: architecture/configuration.md
   summary: Where configuration comes from, what is version-controlled, what reload can pick up without a restart, and how secrets resolve.
@@ -243,6 +293,12 @@
     - tests/test_admin_reload_route.py
   related: [architecture/overview.md, architecture/plugins.md, architecture/agent-taxonomy.md]
   defines_invariants: [INV-CFG-001, INV-CFG-002, INV-CFG-003, INV-CFG-004, INV-CFG-005]
+  invariant_tests:
+    INV-CFG-001: [tests/PINNING-TEST-MISSING]
+    INV-CFG-002: [tests/PINNING-TEST-MISSING]
+    INV-CFG-003: [tests/PINNING-TEST-MISSING]
+    INV-CFG-004: [tests/PINNING-TEST-MISSING]
+    INV-CFG-005: [tests/PINNING-TEST-MISSING]
 
 - doc: architecture/triggers.md
   summary: What makes an agent act without a person speaking — scheduled and webhook triggers, and the consent a plugin trigger needs.
@@ -261,6 +317,12 @@
     - tests/test_casa_reload_triggers_resident.py
   related: [architecture/plugins.md, architecture/http-surface.md, architecture/overview.md]
   defines_invariants: [INV-TRIG-001, INV-TRIG-002, INV-TRIG-003, INV-TRIG-004, INV-TRIG-005]
+  invariant_tests:
+    INV-TRIG-001: [tests/PINNING-TEST-MISSING]
+    INV-TRIG-002: [tests/PINNING-TEST-MISSING]
+    INV-TRIG-003: [tests/PINNING-TEST-MISSING]
+    INV-TRIG-004: [tests/PINNING-TEST-MISSING]
+    INV-TRIG-005: [tests/PINNING-TEST-MISSING]
 
 - doc: architecture/mcp-and-tools.md
   summary: How tools reach an agent, and where authorization for a tool call actually happens.
@@ -275,6 +337,10 @@
     - tests/test_mcp_envelope.py
   related: [architecture/plugins.md, architecture/agent-taxonomy.md, architecture/http-surface.md]
   defines_invariants: [INV-MCP-001, INV-MCP-002, INV-MCP-003]
+  invariant_tests:
+    INV-MCP-001: [tests/PINNING-TEST-MISSING]
+    INV-MCP-002: [tests/PINNING-TEST-MISSING]
+    INV-MCP-003: [tests/PINNING-TEST-MISSING]
 
 - doc: architecture/personality.md
   summary: What an agent is versus how it presents — role artifacts, personas, bindings, and which prompt is actually served.
@@ -290,6 +356,11 @@
     - tests/test_personality_admin_handlers.py
   related: [architecture/agent-taxonomy.md, architecture/turn-loop.md]
   defines_invariants: [INV-PERS-001, INV-PERS-002, INV-PERS-003, INV-PERS-004]
+  invariant_tests:
+    INV-PERS-001: [tests/PINNING-TEST-MISSING]
+    INV-PERS-002: [tests/PINNING-TEST-MISSING]
+    INV-PERS-003: [tests/PINNING-TEST-MISSING]
+    INV-PERS-004: [tests/PINNING-TEST-MISSING]
 
 - doc: architecture/home-assistant-control.md
   summary: How an agent reads and changes the state of the house — and why the limits on that live in Home Assistant, not here.
@@ -303,6 +374,10 @@
     - tests/test_mock_ha_mcp.py
   related: [architecture/mcp-and-tools.md, architecture/overview.md]
   defines_invariants: [INV-HA-001, INV-HA-002, INV-HA-003]
+  invariant_tests:
+    INV-HA-001: [tests/PINNING-TEST-MISSING]
+    INV-HA-002: [tests/PINNING-TEST-MISSING]
+    INV-HA-003: [tests/PINNING-TEST-MISSING]
 
 - doc: architecture/observability.md
   summary: How work is traced across components, what reaches a log, and what the health surfaces actually assert.
@@ -318,6 +393,10 @@
     - tests/test_log_cid.py
   related: [architecture/http-surface.md, architecture/overview.md]
   defines_invariants: [INV-OBS-001, INV-OBS-002, INV-OBS-003]
+  invariant_tests:
+    INV-OBS-001: [tests/PINNING-TEST-MISSING]
+    INV-OBS-002: [tests/PINNING-TEST-MISSING]
+    INV-OBS-003: [tests/PINNING-TEST-MISSING]
 
 - doc: architecture/persistent-state.md
   summary: What the application writes to disk, how it treats a missing or corrupt file, and what that means for recovery.
@@ -335,6 +414,11 @@
     - tests/test_explanation_store_concurrency.py
   related: [architecture/configuration.md, architecture/engagements.md, architecture/memory.md]
   defines_invariants: [INV-STATE-001, INV-STATE-002, INV-STATE-003, INV-STATE-004]
+  invariant_tests:
+    INV-STATE-001: [tests/PINNING-TEST-MISSING]
+    INV-STATE-002: [tests/PINNING-TEST-MISSING]
+    INV-STATE-003: [tests/PINNING-TEST-MISSING]
+    INV-STATE-004: [tests/PINNING-TEST-MISSING]
 
 - doc: architecture/eval-framework.md
   summary: The evaluation scaffolding — and the fact that its registry ships empty.
@@ -346,6 +430,9 @@
     - tests/test_eval_framework.py
   related: [contributing/doc-contract.md]
   defines_invariants: [INV-EVAL-001, INV-EVAL-002]
+  invariant_tests:
+    INV-EVAL-001: [tests/PINNING-TEST-MISSING]
+    INV-EVAL-002: [tests/PINNING-TEST-MISSING]
 
 - doc: architecture/turn-loop.md
   summary: How one inbound message becomes one agent turn, and what bounds it.
@@ -366,6 +453,12 @@
     - tests/test_retry.py
   related: [architecture/overview.md, architecture/agent-taxonomy.md]
   defines_invariants: [INV-TURN-001, INV-TURN-002, INV-TURN-003, INV-TURN-004, INV-TURN-005]
+  invariant_tests:
+    INV-TURN-001: [tests/PINNING-TEST-MISSING]
+    INV-TURN-002: [tests/PINNING-TEST-MISSING]
+    INV-TURN-003: [tests/PINNING-TEST-MISSING]
+    INV-TURN-004: [tests/PINNING-TEST-MISSING]
+    INV-TURN-005: [tests/PINNING-TEST-MISSING]
 
 - doc: contributing/doc-contract.md
   summary: The shape a document takes, and which of its rules CI enforces versus a reviewer.
@@ -379,3 +472,10 @@
     - tests/test_verify_docs.py
   related: [doctrine/publishing.md]
   defines_invariants: [INV-DOC-001, INV-DOC-002, INV-DOC-003, INV-DOC-004, INV-DOC-005, INV-DOC-006]
+  invariant_tests:
+    INV-DOC-001: [tests/PINNING-TEST-MISSING]
+    INV-DOC-002: [tests/PINNING-TEST-MISSING]
+    INV-DOC-003: [tests/PINNING-TEST-MISSING]
+    INV-DOC-004: [tests/PINNING-TEST-MISSING]
+    INV-DOC-005: [tests/PINNING-TEST-MISSING]
+    INV-DOC-006: [tests/PINNING-TEST-MISSING]

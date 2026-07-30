@@ -55,6 +55,11 @@ ALLOWED_TOP_DIRS = {"architecture", "doctrine", "contributing"}
 TABLE_SAFE_FIELDS = ("summary", "when_changing")
 LIST_FIELDS = ("covers", "tests", "related", "defines_invariants")
 
+# An invariant bound to this literal has NO pinning test yet. The sentinel exists so the
+# backlog is mechanical: the verifier is red until every sentinel is replaced by a real
+# test that has been demonstrated to fail when the invariant is false.
+PINNING_SENTINEL = "tests/PINNING-TEST-MISSING"
+
 REQUIRED_SKELETON = {
     "README.md",
     "llms.txt",
@@ -207,6 +212,21 @@ def _load_entries(docs_dir: Path) -> tuple[list[dict], list[str]]:
             ):
                 problems.append(f"{entry['doc']}: `{field}` must be a list of strings")
                 entry[field] = []
+        bindings = entry.get("invariant_tests")
+        if bindings is not None and not (
+            isinstance(bindings, dict)
+            and all(
+                isinstance(inv, str)
+                and isinstance(tests, list)
+                and all(isinstance(t, str) for t in tests)
+                for inv, tests in bindings.items()
+            )
+        ):
+            problems.append(
+                f"{entry['doc']}: `invariant_tests` must be a mapping of invariant id to "
+                f"a list of test references"
+            )
+            entry["invariant_tests"] = {}
         entries.append(entry)
     return entries, problems
 
@@ -418,6 +438,61 @@ def _check_prose_code(text: str, doc: str, modules: set[str], names: set[str]) -
     return problems
 
 
+def _check_invariant_tests(entry: dict, repo_root: Path, tracked: set[str]) -> list[str]:
+    """Every invariant must name a test that fails if the invariant is false.
+
+    Without this an invariant is an assertion, not a contract: the corpus stays green
+    while the property it states quietly stops being true. The binding is checked both
+    ways — a declared invariant with no test is refused, and so is a binding for an
+    invariant the entry no longer declares, which would keep a dead test looking
+    load-bearing.
+    """
+    doc = entry["doc"]
+    declared = entry.get("defines_invariants") or []
+    bindings = entry.get("invariant_tests") or {}
+    problems: list[str] = []
+    for inv in declared:
+        refs = bindings.get(inv) or []
+        if not refs:
+            problems.append(
+                f"{doc}: {inv} has no pinning test — bind one in `invariant_tests`, or "
+                f"the sentinel {PINNING_SENTINEL} to record the debt visibly"
+            )
+            continue
+        for ref in refs:
+            if ref == PINNING_SENTINEL:
+                problems.append(
+                    f"{doc}: {inv} is bound to {PINNING_SENTINEL} — the invariant has no "
+                    f"pinning test yet; write one and demonstrate its red case"
+                )
+                continue
+            rel, node = parse_anchor(ref)
+            if rel not in tracked:
+                problems.append(
+                    f"{doc}: {inv} names {ref!r} but git does not track {rel!r} — a "
+                    f"pinning test must be in the published commit"
+                )
+                continue
+            if node is None:
+                continue
+            # A plain string search, not pytest collection: cheap, dependency-free, and
+            # enough to catch a renamed or deleted test function.
+            try:
+                text = (repo_root / rel).read_text(errors="replace")
+            except OSError:
+                text = ""
+            if node not in text:
+                problems.append(
+                    f"{doc}: {inv} names {ref!r} but {node!r} does not appear in {rel}"
+                )
+    for inv in sorted(set(bindings) - set(declared)):
+        problems.append(
+            f"{doc}: invariant_tests binds {inv}, which the entry does not declare in "
+            f"defines_invariants"
+        )
+    return problems
+
+
 def _check_sourcemap(target: Path, doc: str) -> list[str]:
     """A document without exactly one ordered marker pair gets no generated map at all."""
     text = target.read_text(errors="replace")
@@ -570,6 +645,7 @@ def verify(repo_root: Path) -> list[str]:
                     f"{doc}: declares invariants but anchors no source — name the code that "
                     f"maintains them in `covers`"
                 )
+            problems.extend(_check_invariant_tests(entry, repo_root, tracked))
 
         for anchor in list(entry.get("covers") or []) + list(entry.get("tests") or []):
             problems.extend(_check_anchor(repo_root, anchor, doc, tracked))

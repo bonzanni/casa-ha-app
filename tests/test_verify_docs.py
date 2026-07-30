@@ -290,6 +290,82 @@ def test_a_wrapped_invariant_statement_is_caught(tmp_path):
     assert any("complete on ONE line" in p for p in verify_docs.verify(root))
 
 
+# --- invariant → pinning-test binding -------------------------------------------------
+
+INV_DOC = {"architecture/turn-loop.md":
+           "# T\n" + CODE_WINS + "**INV-X-001**: one statement.\n" + SOURCEMAP}
+
+
+def _inv_manifest(binding: str = "") -> str:
+    return ENTRY.replace(
+        "  related: [doctrine/publishing.md]",
+        "  related: []\n  defines_invariants: [INV-X-001]" + binding,
+    )
+
+
+def test_an_invariant_without_a_pinning_test_binding_is_refused(tmp_path):
+    root = _corpus(tmp_path, _inv_manifest(), docs=INV_DOC)
+    assert any(
+        "INV-X-001" in p and "no pinning test" in p for p in verify_docs.verify(root)
+    )
+
+
+def test_a_binding_naming_an_untracked_test_file_is_refused(tmp_path):
+    manifest = _inv_manifest("\n  invariant_tests:\n    INV-X-001: [tests/test_ghost.py]")
+    root = _corpus(tmp_path, manifest, docs=INV_DOC)
+    assert any(
+        "INV-X-001" in p and "does not track" in p for p in verify_docs.verify(root)
+    )
+
+
+def test_a_binding_node_absent_from_the_file_is_refused(tmp_path):
+    manifest = _inv_manifest(
+        "\n  invariant_tests:\n    INV-X-001: [tests/test_a.py::test_vanished]"
+    )
+    root = _corpus(tmp_path, manifest, docs=INV_DOC)
+    assert any(
+        "test_vanished" in p and "does not appear" in p for p in verify_docs.verify(root)
+    )
+
+
+def test_a_correct_binding_passes(tmp_path):
+    manifest = _inv_manifest("\n  invariant_tests:\n    INV-X-001: [tests/test_a.py::test_b]")
+    root = _corpus(tmp_path, manifest, docs=INV_DOC)
+    assert verify_docs.verify(root) == []
+
+
+def test_the_pinning_sentinel_is_a_failure_naming_the_invariant(tmp_path):
+    """The sentinel makes the missing-test backlog mechanical: the corpus is RED until
+    every sentinel is replaced by a real, demonstrated-red pinning test."""
+    manifest = _inv_manifest(
+        "\n  invariant_tests:\n    INV-X-001: [tests/PINNING-TEST-MISSING]"
+    )
+    root = _corpus(tmp_path, manifest, docs=INV_DOC)
+    assert any(
+        "INV-X-001" in p and "PINNING-TEST-MISSING" in p for p in verify_docs.verify(root)
+    )
+
+
+def test_a_binding_for_an_undeclared_invariant_is_refused(tmp_path):
+    """Bidirectional, like every other manifest check: a binding surviving its invariant's
+    removal would keep a dead test looking load-bearing."""
+    manifest = _inv_manifest(
+        "\n  invariant_tests:\n"
+        "    INV-X-001: [tests/test_a.py::test_b]\n"
+        "    INV-X-009: [tests/test_a.py::test_b]"
+    )
+    root = _corpus(tmp_path, manifest, docs=INV_DOC)
+    assert any(
+        "INV-X-009" in p and "does not declare" in p for p in verify_docs.verify(root)
+    )
+
+
+def test_a_malformed_invariant_tests_field_is_a_finding_not_a_traceback(tmp_path):
+    manifest = _inv_manifest("\n  invariant_tests: [not, a, mapping]")
+    root = _corpus(tmp_path, manifest, docs=INV_DOC)
+    assert any("invariant_tests" in p and "mapping" in p for p in verify_docs.verify(root))
+
+
 # --- generated navigation ------------------------------------------------------------
 
 def test_llms_links_resolve_relative_to_the_docs_directory(tmp_path):
