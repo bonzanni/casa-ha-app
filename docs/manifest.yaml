@@ -62,6 +62,22 @@
   related: [architecture/overview.md, architecture/turn-loop.md]
   defines_invariants: [INV-AGENT-001, INV-AGENT-002, INV-AGENT-003, INV-AGENT-004]
 
+- doc: architecture/http-surface.md
+  summary: The two HTTP servers, what each exposes, and how an inbound request is authenticated.
+  when_changing: adding a route, changing webhook authentication, or anything crossing the container boundary
+  covers:
+    - casa/rootfs/opt/casa/webhook_auth.py::verify
+    - casa/rootfs/opt/casa/webhook_auth.py::read_secret
+    - casa/rootfs/opt/casa/casa_core.py::healthz
+  tests:
+    - tests/test_webhook_auth.py::test_hmac_body_valid
+    - tests/test_webhook_auth.py::test_hmac_body_wrong_secret_fails
+    - tests/test_webhook_auth.py::test_hmac_body_missing_header_fails
+    - tests/test_webhook_origin_containment.py
+    - tests/test_setup_nginx_ingress.py
+  related: [architecture/overview.md]
+  defines_invariants: [INV-HTTP-001, INV-HTTP-002, INV-HTTP-003, INV-HTTP-004]
+
 - doc: architecture/turn-loop.md
   summary: How one inbound message becomes one agent turn, and what bounds it.
   when_changing: the turn lifecycle, the warm client pool, retry behaviour, or turn teardown

@@ -18,6 +18,7 @@ which is keyed on what you are about to do rather than on subsystem names.
 
 | When you are changing… | Read |
 |---|---|
+| adding a route, changing webhook authentication, or anything crossing the container boundary | [`architecture/http-surface.md`](architecture/http-surface.md) |
 | adding an agent or a tier, the required file set, or role resolution | [`architecture/agent-taxonomy.md`](architecture/agent-taxonomy.md) |
 | anything published — docs, comments, commit messages, PR text, branch names | [`doctrine/publishing.md`](doctrine/publishing.md) |
 | anything structural, or when you need to find which document owns an area | [`architecture/overview.md`](architecture/overview.md) |
