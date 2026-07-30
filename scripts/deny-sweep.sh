@@ -299,15 +299,27 @@ if [ "$mode" != "messages" ]; then
 fi
 
 # --- content ---
-# The leading `+` of a diff line is stripped before matching. It is a legal e-mail
-# local-part character, so an added line beginning with a Python decorator matched the
-# address rule: the diff marker, not the code, made it look like one.
+# Added lines are extracted with a STATE MACHINE, not by pattern-matching the diff text.
+#
+# `grep -vE '^\+\+\+'` was meant to drop the `+++ b/path` header, but a real added line
+# whose content begins `++` renders as `+++content` and was dropped with it — so a denied
+# value could be added in one commit, removed in the next, and evade the range sweep while
+# the endpoint tree stayed clean. Demonstrated against this script before it was fixed.
+#
+# A `+++` line is a header only when it sits between `diff --git` and the first `@@`. That
+# is structural and cannot be spoofed by content. The leading `+` is then stripped, because
+# it is a legal e-mail local-part character and would otherwise turn an added line starting
+# with a decorator into an apparent address.
+added_lines() { awk '
+  /^diff --git /   { inheader = 1; next }
+  /^@@/            { inheader = 0; next }
+  inheader         { next }
+  /^\+/           { print substr($0, 2) }
+'; }
 case "$mode" in
-  staged)   git diff --cached -U0 -- . ":!$deny_rel" | grep -E '^\+' | grep -vE '^\+\+\+' \
-              | sed 's/^+//' > "$work/body" || true ;;
+  staged)   git diff --cached -U0 -- . ":!$deny_rel" | added_lines > "$work/body" || true ;;
   tree)     git grep -I --no-color -n '' HEAD -- . ":!$deny_rel" > "$work/body" || true ;;
-  range)    git log -p -m --no-color "$range" -- . ":!$deny_rel" | grep -E '^\+' | grep -vE '^\+\+\+' \
-              | sed 's/^+//' > "$work/body" || true ;;
+  range)    git log -p -m --no-color "$range" -- . ":!$deny_rel" | added_lines > "$work/body" || true ;;
   messages) git log --format='%B' "$range" > "$work/body" || true ;;
 esac
 # Generic rules honour [allow-content]; the private supplement never does — an allow entry

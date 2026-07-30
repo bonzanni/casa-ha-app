@@ -9,6 +9,14 @@ name: Docs
 #
 # CI deliberately has NO private supplement: the exact-literal layer lives with the operator
 # and is applied by the hook and the gate. CI runs the generic patterns and the scanner.
+#
+# READ THIS BEFORE TRUSTING A GREEN RESULT. Every script and policy file this job runs comes
+# from the pull request's own checkout, so a PR can weaken its own guard — replace a scanner
+# with a no-op, relax the deny patterns, delete a step. `pull_request` is still the right
+# event (it keeps secrets and a write token away from PR-controlled code), and this is an
+# accepted property rather than a defect, because the mandatory control is the local gate.
+# The consequence is concrete: a PR touching .github/workflows/, scripts/, .githooks/ or
+# tests/ needs privileged human review, and its green check proves nothing on its own.
 
 on:
   push:
@@ -100,8 +108,17 @@ jobs:
 
           # The claim map is editable in the same PR, so consult the BASE manifest too:
           # deleting a covers anchor must not delete the obligation.
-          git show "$base:docs/manifest.yaml" > "$RUNNER_TEMP/base-manifest.yaml" 2>/dev/null \
-            || : > "$RUNNER_TEMP/base-manifest.yaml"
+          #
+          # FAIL CLOSED. Substituting an empty manifest on any error silently drops every
+          # base-side claim — the exact obligations this step exists to preserve. An empty
+          # one is accepted only when the base genuinely has no manifest, which is true
+          # until the corpus first lands and false forever after.
+          if git cat-file -e "$base:docs/manifest.yaml" 2>/dev/null; then
+            git show "$base:docs/manifest.yaml" > "$RUNNER_TEMP/base-manifest.yaml"
+          else
+            echo "note: $base has no docs/manifest.yaml yet — no base-side claims to carry"
+            : > "$RUNNER_TEMP/base-manifest.yaml"
+          fi
           impacted="$(printf '%s\n' "$changed" \
             | python -m scripts.verify_docs . --impact --base-manifest "$RUNNER_TEMP/base-manifest.yaml")"
           [ -n "$impacted" ] || exit 0
@@ -109,16 +126,24 @@ jobs:
           # A DELETED doc is not an updated doc.
           touched="$(git diff --name-only --diff-filter=d "$base"...HEAD | grep '^docs/' | sed 's|^docs/||' || true)"
           deleted="$(git diff --name-only --diff-filter=D "$base"...HEAD | grep '^docs/' | sed 's|^docs/||' || true)"
-          missing=""
-          for doc in $impacted; do
-            if printf '%s\n' "$deleted" | grep -qxF "$doc"; then
+          # One path per line, never `for doc in $impacted`: word splitting would break a
+          # path containing a space into fragments, and matching those fragments against
+          # `touched` could satisfy the check while the real claiming document is untouched.
+          # The verifier separately forbids whitespace in manifest paths; this does not rely
+          # on that holding.
+          : > "$RUNNER_TEMP/missing.txt"
+          while IFS= read -r doc; do
+            [ -n "$doc" ] || continue
+            if printf '%s\n' "$deleted" | grep -qxF -- "$doc"; then
               echo "::error::$doc claimed a changed surface and was deleted in the same PR."
               echo "::error::Retire a claimed document in its own PR, not alongside the change."
               exit 1
             fi
-            printf '%s\n' "$touched" | grep -qxF "$doc" || missing="$missing $doc"
-          done
-          if [ -n "$missing" ]; then
-            echo "::error::changed a claimed surface; these docs claim it but did not change:$missing"
+            printf '%s\n' "$touched" | grep -qxF -- "$doc" \
+              || printf '%s\n' "$doc" >> "$RUNNER_TEMP/missing.txt"
+          done <<< "$impacted"
+          if [ -s "$RUNNER_TEMP/missing.txt" ]; then
+            echo "::error::changed a claimed surface; these docs claim it but did not change:"
+            sed 's/^/::error::  /' "$RUNNER_TEMP/missing.txt"
             exit 1
           fi

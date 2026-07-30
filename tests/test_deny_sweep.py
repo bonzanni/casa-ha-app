@@ -440,3 +440,30 @@ def test_a_diff_marker_does_not_manufacture_a_match(tmp_path):
     subprocess.run(["git", "-C", str(repo), "add", "-A"], check=True)
     result = _sweep(repo, deny, "staged")
     assert result.returncode == 0, result.stderr
+
+
+def test_an_added_line_beginning_with_plus_plus_is_not_mistaken_for_a_header(tmp_path):
+    """`grep -vE '^\\+\\+\\+'` dropped it as a file header, so a denied value could be added
+    in one commit, removed in the next, and evade the range sweep while the endpoint tree
+    stayed clean. Demonstrated against the real script before the state machine replaced it.
+    """
+    repo, deny = _repo(tmp_path)
+    base = _commit(repo, "src/a.txt", "benign\n")
+    _commit(repo, "src/leak.txt", "++ZZ-DENIED-LITERAL-ZZ\n")
+    (repo / "src" / "leak.txt").unlink()
+    subprocess.run(["git", "-C", str(repo), "add", "-A"], check=True)
+    subprocess.run(["git", "-C", str(repo), "commit", "-qm", "remove"], check=True)
+
+    assert _sweep(repo, deny, "tree").returncode == 0, "the endpoint really is clean"
+    result = _sweep(repo, deny, "range", f"{base}..HEAD")
+    assert result.returncode == 1, "the transient ++ line must still be caught"
+    assert "ZZ-DENIED-LITERAL-ZZ" in result.stderr
+
+
+def test_a_real_diff_header_is_still_ignored(tmp_path):
+    """The state machine must not start reporting `+++ b/path` as content."""
+    repo, deny = _repo(tmp_path)
+    base = _commit(repo, "src/a.txt", "benign\n")
+    _commit(repo, "src/b.txt", "harmless\n")
+    result = _sweep(repo, deny, "range", f"{base}..HEAD")
+    assert result.returncode == 0, result.stderr
