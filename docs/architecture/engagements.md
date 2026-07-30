@@ -74,8 +74,10 @@ so this guarantee belongs to the finalize path specifically.
 Enforced both as a pre-check and again as a hook inside the transition itself, so the
 condition is re-evaluated at the moment the state changes rather than only before it.
 
-What it does not cover: failed and cancelled outcomes intentionally skip the gate. And the
-gate exists only where the driver implements the inbound accessors — today that is the
+What it does not cover: failed and cancelled outcomes intentionally skip the gate, and so
+does the operator's own complete command — only the completion *tool* arms the gate, so an
+operator marking an engagement complete finalizes past unread input deliberately. The gate
+also exists only where the driver implements the inbound accessors — today that is the
 claude-code driver alone, so an interactive in-casa specialist completion has no unread-input
 gate. Accessor failures fail open with a warning rather than wedging termination.
 
@@ -109,9 +111,12 @@ engagement stays live and the caller sees a tool error.
 and the caller gets a retryable outcome naming the condition. This is a precondition failure,
 not an error state.
 
-**The terminal write fails.** The record is rolled back to live, no side effects run, and the
-caller gets a distinct retryable outcome. Distinguishing this from the precondition failure
-matters: one says "read your messages", the other says "try again".
+**The terminal write fails.** The record is rolled back to live and no side effects run.
+Only the completion tool surfaces this as its distinct retryable outcome; the cancellation
+tool does not inspect the result and reports success either way, leaving the still-live
+record for a later retry or reap. Distinguishing the retryable outcome from the precondition
+failure matters where it is surfaced: one says "read your messages", the other says "try
+again".
 
 **Two callers race.** The loser is absorbed as already-terminal. No duplicate topic closure
 and no duplicate notification.
