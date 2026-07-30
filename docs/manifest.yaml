@@ -145,6 +145,25 @@
   related: [architecture/overview.md, architecture/agent-taxonomy.md]
   defines_invariants: [INV-PLUG-001, INV-PLUG-002, INV-PLUG-003, INV-PLUG-004, INV-PLUG-005, INV-PLUG-006]
 
+- doc: architecture/engagements.md
+  summary: Work one agent hands to another — ephemeral delegation, durable engagements, how they end, and what survives a restart.
+  when_changing: delegation, engagement lifecycle, terminal transitions, drivers, or engagement output ordering
+  covers:
+    - casa/rootfs/opt/casa/engagement_registry.py::EngagementRecord
+    - casa/rootfs/opt/casa/engagement_registry.py::EngagementRegistry.try_transition_terminal
+    - casa/rootfs/opt/casa/engagement_registry.py::TerminalPreconditionFailed
+    - casa/rootfs/opt/casa/drivers/driver_protocol.py::DriverProtocol
+    - casa/rootfs/opt/casa/drivers/claude_code_driver.py::ClaudeCodeDriver
+    - casa/rootfs/opt/casa/channels/output_sequencer.py::OutputSequencer
+    - casa/rootfs/opt/casa/casa_core.py::replay_undergoing_engagements
+  tests:
+    - tests/test_delegate_to_agent.py
+    - tests/test_delegate_to_agent_interactive.py
+    - tests/test_claude_code_driver.py
+    - tests/test_cancel_engagement_tool.py
+  related: [architecture/overview.md, architecture/turn-loop.md, architecture/agent-taxonomy.md]
+  defines_invariants: [INV-ENG-001, INV-ENG-002, INV-ENG-003, INV-ENG-004, INV-ENG-005]
+
 - doc: architecture/turn-loop.md
   summary: How one inbound message becomes one agent turn, and what bounds it.
   when_changing: the turn lifecycle, the warm client pool, retry behaviour, or turn teardown

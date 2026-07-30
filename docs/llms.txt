@@ -6,6 +6,7 @@ Code is the source of truth; these files are a map.
 ## Architecture
 
 - [architecture/agent-taxonomy.md](architecture/agent-taxonomy.md): How an agent is declared, validated and looked up — tiers, required artifacts, and the registry.
+- [architecture/engagements.md](architecture/engagements.md): Work one agent hands to another — ephemeral delegation, durable engagements, how they end, and what survives a restart.
 - [architecture/http-surface.md](architecture/http-surface.md): The two HTTP servers, what each exposes, and how an inbound request is authenticated.
 - [architecture/memory.md](architecture/memory.md): Long-term memory — how a fact is written, who may read it back, and what a caller is told when the store cannot answer.
 - [architecture/overview.md](architecture/overview.md): What Casa is made of — supervised services, the three agent tiers, and where configuration enters.
