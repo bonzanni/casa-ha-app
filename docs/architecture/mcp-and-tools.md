@@ -24,7 +24,9 @@ dispatch map and invokes it; it never consults an agent's declared tool list. Th
 enforced *upstream*, by the SDK's own permission machinery and by hooks, before a call is
 ever dispatched — and that upstream enforcement has modes: an executor engagement running in
 an autonomous permission mode short-circuits the relay to allow *before* the declared list is
-consulted, so for those only the disallowed list is an enforced prohibition.
+consulted, so of the two declared lists only the disallowed one still prohibits there. The
+code-mandatory guard hooks and tool-local gates are separate from both lists and keep
+denying regardless of mode.
 
 The consequence is worth stating plainly: **the allowlist is a constraint on the agent, not a
 boundary at the tool.** Anything able to reach full-map dispatch directly is not constrained

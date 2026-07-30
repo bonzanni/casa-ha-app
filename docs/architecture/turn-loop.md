@@ -95,8 +95,11 @@ session granularity, in the background, elsewhere.
 
 ## Extension points
 
-Anything that must be true for every turn belongs in the options assembly, which is the one
-place that sees the fully-resolved per-turn context.
+Know where "every turn" actually runs: options assembly happens when a client generation is
+*built* — a warm reuse skips it entirely, prompt, memory block and all. Anything that must
+be true for literally every turn belongs on the message-processing path around the query,
+not in the options assembly; anything that only needs to hold per client generation belongs
+in the options assembly, which is the one place that sees the fully-resolved context.
 
 The pool is bounded three ways — a per-agent cap, a fleet-wide cap shared across agents, and
 an idle/age sweeper — and all three are environment-tunable. A new bound belongs alongside

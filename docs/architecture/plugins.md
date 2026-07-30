@@ -161,7 +161,9 @@ uniqueness, **not that the named tool exists**; a typo produces a declaration th
 nothing. And it applies only to the resident and specialist paths.
 
 **Adding a webhook trigger** requires intrinsic validation plus a durable operator consent
-bound to the exact trigger identity. This is the one approval that outlives a restart.
+bound to the exact trigger identity. This approval outlives a restart — one of the durable
+approval ledgers (specialist and persona install acknowledgements are others), in contrast
+to the in-memory tool-call grants above.
 
 **Reloading** refreshes the snapshot before agents and executors are rebuilt, and purges
 role-scoped grants and pending challenges before a role is replaced or removed.

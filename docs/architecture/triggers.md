@@ -68,8 +68,9 @@ means only that the declaration is well-formed.
 **INV-TRIG-004**: A trigger approval is persisted and bound to an exact identity, and an unreadable or mismatched approval store yields no approvals.
 
 Enforced by an atomic write, and by a load path that treats anything malformed or
-identity-mismatched as zero approvals rather than trusting it. This is the one approval in
-the system that outlives a restart, so it fails closed on read.
+identity-mismatched as zero approvals rather than trusting it. This approval outlives a
+restart — as do the specialist and persona install acknowledgements, which keep their own
+stores — so it fails closed on read.
 
 "Exact identity" is a specific tuple: plugin, artifact id, effective name, target, and the
 normalized auth policy. **Clearance is not in it** — a clearance change on a trigger installs
