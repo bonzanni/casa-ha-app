@@ -24,59 +24,64 @@ Four services run under s6, each with a single job:
 | Service | Job |
 |---|---|
 | `svc-casa` | the main async application — channels, agents, HTTP surface |
-| `svc-casa-mcp` | a standalone MCP bridge, so tool access survives a restart of the app |
+| `svc-casa-mcp` | an MCP bridge, supervised as its own service with its own lifetime |
 | `svc-nginx` | the ingress front door, including the Home Assistant source restriction |
 | `svc-ttyd` | an optional terminal, off unless enabled |
 
-Four `init-*` one-shots run before them and must succeed first: config validation, config
-materialisation, nginx setup, and the plugin store. The ordering is expressed as s6
-dependency files rather than in code, which is why boot problems are read there and not in
-a log statement.
+Four `init-*` one-shots exist — config validation, config materialisation, nginx setup and
+the plugin store — but they do **not** all precede every service. Each service names only
+the one-shots it needs: the nginx setup gates `svc-nginx` alone, and the terminal depends
+only on config materialisation. Read the ordering in the `dependencies.d` directories, not
+here and not in a log statement; it is data, and it is what is actually true.
 
 Agents come in three tiers, and the tier decides lifetime and reach rather than capability:
 
 | Tier | Lifetime | Reach |
 |---|---|---|
 | **Resident** | long-lived, owns a channel | memory, delegation, its own channel |
-| **Specialist** | ephemeral, role-keyed | no channel; inherits the caller's clearance |
-| **Executor** | ephemeral, task-bounded | a dedicated conversation for one task |
+| **Specialist** | ephemeral, role-keyed | no channel of its own |
+| **Executor** | ephemeral, task-bounded | loaded on its own isolated path |
 
-The distinction that matters when reading the code: a resident is addressed by *channel*, a
-specialist by *role*, and an executor by *task*. Everything else about them — prompts,
-personas, tools — is configuration.
+One boundary matters more than the table: **the role registry models residents and
+specialists only.** Its tier type admits those two, and executors load separately. Reasoning
+about executors through the registry is the likeliest way to be wrong here;
+`architecture/agent-taxonomy.md` sets that boundary out.
 
 ## Contracts & invariants
 
-**INV-SYS-001**: Configuration is validated before it is materialised, and a failure stops boot rather than degrading it.
+**INV-SYS-001**: Config materialisation depends on config validation, so the validating one-shot runs first and a failure there stops what depends on it.
 
-An app whose configuration is half-applied is harder to diagnose than one that refused to
-start, and a partly-configured agent can act on a policy nobody wrote.
+The dependency is declared in `init-setup-configs/dependencies.d` — check it there rather
+than taking this sentence's word for it.
 
-**INV-SYS-002**: A role is unique across every tier; two agents cannot answer to the same role.
+**INV-SYS-002**: A role claimed by both a resident and a specialist is a boot failure, raised when the role registry is built.
 
-Resolution is by role throughout, so a collision would make routing ambiguous and the
-ambiguity would surface as a wrong agent replying rather than as an error.
+Scoped deliberately to those two tiers, because that is what the registry models. It is
+enforced in `_build_role_registry`; `AgentRegistry.build` itself assigns residents and then
+specialists, so it is last-write-wins and depends on that earlier check having refused the
+collision.
 
 ## Failure behavior
 
 **Validation fails.** Boot stops at the `init-validate-config` one-shot. Nothing later runs,
 so the app does not come up in a partly-configured state.
 
-**A service dies.** s6 restarts it. The MCP bridge is deliberately a separate service so
-that a restart there does not take the app with it, and vice versa.
+**A service fails.** Each longrun is supervised separately, so their lifetimes are
+independent. What the supervisor does on failure is set by the service definition; read it
+there rather than assuming a policy.
 
-**An option is removed from the schema.** The stored value survives in the host's own
-configuration until it is explicitly pruned, so removing an option is two edits, not one —
-see the release rules in the contributor guide.
+**An option is removed from the manifest.** Removing the schema key is not sufficient on its
+own — the pruning path in the config-materialisation script is what discards a stored value.
+Both edits belong in the same change.
 
 ## Extension points
 
 A new service means a new `s6-rc.d` directory and the dependency files that place it in the
 ordering; nothing in Python decides startup order.
 
-A new agent means a directory of configuration artifacts under the tier it belongs to —
-character, prompts, delegates, triggers, response shape and so on — plus a role that no
-other agent claims. Adding one requires no code change, which is the point of the loader.
+A new agent means a directory of configuration artifacts under the tier it belongs to, plus
+a role no other agent claims. The exact file set is checked per tier by `_check_file_set`,
+which is the authority on what is required, optional and forbidden.
 
 A new option means the app manifest, the translations file, and whatever reads it. An
 option that is only read by shell during boot still belongs in the manifest, because that

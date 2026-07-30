@@ -15,64 +15,70 @@ turn.
 
 ## Mental model
 
-There are **two** servers, and confusing them is the most common way to reason wrongly about
-this area.
+Routes are registered on **two separate applications**, and which one a route lands on
+decides who can call it.
 
-The **public app** sits behind nginx and is what the outside world can reach: a dashboard, a
-health endpoint, inbound webhooks, direct agent invocation, and the Telegram update sink.
-Requests arriving here are untrusted until proven otherwise.
+The **public app** carries the externally-reachable routes: a dashboard, a health endpoint,
+inbound webhooks, agent invocation, the Telegram update sink, a hook-resolution endpoint, an
+MCP endpoint, and conditionally-registered voice and per-agent trigger routes. This document
+does not enumerate them; the registration block is the authority and it changes.
 
-The **internal app** is not exposed. It exists so that other processes in the container —
-notably per-engagement subprocesses — can hand work back without going out through the front
-door and back in. Its routes are registered separately from the public ones, and that
-separation is the boundary: a route registered on the wrong app changes who can call it.
+The **internal app** carries routes intended for other processes in the container to call —
+admin reload, personality and specialist endpoints, and a family of internal channel routes.
+Its listener configuration, not its route table, is what makes it internal; check the runner
+setup before assuming reachability either way.
 
-nginx additionally restricts ingress to the Home Assistant supervisor, so the public app is
-public relative to the container, not to the internet.
+nginx restricts ingress on the app's port to the Home Assistant supervisor address, so
+"public" here means reachable through the host, not from the internet.
+
+Authentication is **per route**, not ambient. There is no boundary that authenticates
+everything arriving on the public app, so the question for any route is which check *it*
+performs.
 
 ## Contracts & invariants
 
-**INV-HTTP-001**: An inbound webhook is authenticated by HMAC over the request, compared in constant time, before any routing decision is made.
+**INV-HTTP-001**: `verify` authenticates under one of three named modes — a body HMAC, a static header, or a timestamped HMAC — and returns a single boolean.
 
-Authentication precedes dispatch, not the reverse. A handler that decides what to do and
-then checks whether it was allowed leaks the decision through timing and through whatever
-work it did first.
+Not "webhooks use HMAC": a static-header trigger is authenticated by comparing a shared
+value, with no HMAC involved. Which mode applies is configuration, so read the trigger's
+mode before reasoning about what protects it.
 
-**INV-HTTP-002**: A comparison of secret material uses a constant-time primitive, never `==`.
+**INV-HTTP-002**: Every secret comparison inside `verify` uses a constant-time primitive, and an absent or empty secret returns false rather than passing.
 
-**INV-HTTP-003**: Every inbound request is attributed to a named ingress, and an unnamed one fails loudly rather than defaulting.
+Fail-closed on a missing secret is the part worth remembering: there is no unauthenticated
+path that runs when configuration is incomplete.
 
-Provenance is what later decides what a turn may do. An unnamed ingress that quietly becomes
-a default is an unauthenticated caller wearing someone else's permissions.
+**INV-HTTP-003**: The timestamped mode rejects a signature outside its tolerance window, so a captured request does not stay replayable.
 
-**INV-HTTP-004**: Routes on the internal app are unreachable from outside the container, and nothing registers a route there because it is convenient.
+**INV-HTTP-004**: External context arriving on a request cannot set provenance fields; the ingress supplies them.
+
+A payload that could name its own origin could claim any origin, and provenance is what
+later decides what a turn may do — see `provenance.py` and `ingress_identity.py` for what
+is sanitised and what assigns identity.
 
 ## Failure behavior
 
-**A webhook arrives with no signature, a malformed one, or one that does not verify.** It is
-rejected. The failure does not distinguish the cases to the caller.
+**A signature is absent, malformed, out of tolerance, or wrong.** `verify` returns false in
+every case. What the caller sees is the handler's decision, not this function's — read the
+handler for the response.
 
-**A secret is missing or unreadable.** Verification fails closed. There is no unauthenticated
-path that runs when the secret is absent.
+**A secret is missing or empty.** `verify` returns false before doing anything else.
 
-**An agent named in a request does not exist.** The request is refused rather than routed to
-a default agent — the same reasoning as unknown roles in the registry.
-
-**The health endpoint** answers without touching agents or memory, so it stays truthful when
-the parts it does not touch are broken. It reports that the process is serving, not that the
-system is healthy in a broader sense, and reading more into it than that is a mistake.
+**The health endpoint** returns a fixed ok response without consulting agents or memory. It
+reports that the process is serving requests and nothing more; treating it as a system
+health signal reads more into it than it carries.
 
 ## Extension points
 
-A new public route means deciding, explicitly, what authenticates it. There is no ambient
-authentication: a route that does not check is a route anyone inside the container can call.
+A new public route means choosing its authentication explicitly. Nothing authenticates it
+for you, so a route with no check is callable by whatever can reach the app.
 
-A new internal route belongs on the internal app, and the test that matters is whether it
-would be safe if it were reachable from outside — because a later refactor is exactly how
-that happens.
+A new internal route belongs on the internal application, and is worth writing as though it
+were reachable from outside — a later change to the listener is all it would take.
 
-Secret material is read through the secrets helper rather than from the environment at the
-point of use, so that publication, rotation and orphan-sweeping stay in one place.
+`read_secret` is the read path for webhook secret material, with validation and orphan
+sweeping alongside it. Whether every secret in the system flows through it is not something
+this document establishes; check the call sites for the one you care about.
 
 ## Source & test map
 
@@ -83,6 +89,8 @@ point of use, so that publication, rotation and orphan-sweeping stay in one plac
 - `casa/rootfs/opt/casa/webhook_auth.py::verify`
 - `casa/rootfs/opt/casa/webhook_auth.py::read_secret`
 - `casa/rootfs/opt/casa/casa_core.py::healthz`
+- `casa/rootfs/opt/casa/ingress_identity.py`
+- `casa/rootfs/opt/casa/provenance.py`
 
 **Tests**
 - `tests/test_webhook_auth.py::test_hmac_body_valid`

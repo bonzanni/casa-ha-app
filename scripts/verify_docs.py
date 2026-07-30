@@ -155,6 +155,26 @@ def tracked_docs(repo_root: Path) -> set[str]:
 
 # --- manifest ------------------------------------------------------------------------
 
+class _DuplicateKeyLoader(yaml.SafeLoader):
+    """PyYAML silently keeps the LAST of a duplicate key, so a manifest entry can carry two
+    `covers` blocks and quietly publish only one. Reject them instead."""
+
+
+def _no_duplicate_keys(loader, node, deep=False):
+    seen, dupes = set(), []
+    for key_node, _ in node.value:
+        key = loader.construct_object(key_node, deep=True)
+        if key in seen:
+            dupes.append(key)
+        seen.add(key)
+    if dupes:
+        raise yaml.YAMLError(f"duplicate key(s) in a manifest entry: {sorted(dupes)}")
+    return yaml.SafeLoader.construct_mapping(loader, node, deep)
+
+
+_DuplicateKeyLoader.construct_mapping = _no_duplicate_keys
+
+
 def _load_entries(docs_dir: Path) -> tuple[list[dict], list[str]]:
     """Parse the manifest, normalising anything a later caller would trip over.
 
@@ -162,7 +182,7 @@ def _load_entries(docs_dir: Path) -> tuple[list[dict], list[str]]:
     these values before per-entry validation runs, and `kind: []` is unhashable.
     """
     try:
-        raw = yaml.safe_load((docs_dir / "manifest.yaml").read_text())
+        raw = yaml.load((docs_dir / "manifest.yaml").read_text(), _DuplicateKeyLoader)
     except yaml.YAMLError as exc:
         return [], [f"docs/manifest.yaml is not valid YAML: {exc}"]
     except OSError as exc:
@@ -441,6 +461,16 @@ def verify(repo_root: Path) -> list[str]:
 
         if kind in DOCUMENT_KINDS:
             problems.extend(_check_sourcemap(target, doc))
+            # An invariant is a claim about what the code maintains, so the document must
+            # name where it is maintained. Review found invariants asserted with the anchor
+            # pointing at a nearby representative symbol instead of the enforcement point;
+            # this cannot prove the anchor is the RIGHT one, but an invariant with nothing
+            # to check it against is an assertion, not a contract.
+            if (entry.get("defines_invariants") or []) and not (entry.get("covers") or []):
+                problems.append(
+                    f"{doc}: declares invariants but anchors no source — name the code that "
+                    f"maintains them in `covers`"
+                )
 
         for anchor in list(entry.get("covers") or []) + list(entry.get("tests") or []):
             problems.extend(_check_anchor(repo_root, anchor, doc, tracked))

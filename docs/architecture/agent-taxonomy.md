@@ -14,69 +14,73 @@ inside a turn once an agent is chosen, nor how personas dress an agent up.
 
 ## Mental model
 
-An agent is a **directory of configuration**, not a class. Adding one is adding a directory
-and a role; no code changes. That single decision explains most of the shape here.
+An agent is a **directory of configuration**, not a class: the loader checks a per-tier file
+set rather than importing anything. That decision explains most of the shape here.
 
-Two names exist for every agent and they are not interchangeable. The **role** is the
+**The role registry models residents and specialists only** — its tier type admits exactly
+those two, and executors load on their own isolated path. Every registry claim below is
+scoped to that boundary, and reasoning about executors through it is the likeliest mistake
+in this area.
+
+Two names exist for a registered agent and they are not interchangeable. The **role** is the
 stable identifier the system routes on. The **name** is what a person sees. Code resolves by
 role and translates to a name at the edge, because a name can change without anything
 breaking while a role cannot.
 
-Loading happens in two phases with a hard boundary between them. First the whole
-configuration repository is **validated** — schemas, required file sets, role uniqueness.
-Only then is anything built. A validation failure is a boot failure, so an agent is never
-half-loaded and never runs under a policy that failed to parse.
+Failure is **not uniform across tiers**, and that is the second thing to internalise.
+Residents are gating: a bad one stops boot. Specialists and executors load on isolated paths
+whose failures are deliberately boot-non-fatal — one broken specialist does not take the
+system down, and the code says so at the loader's walk. A document claiming "a validation
+failure is a boot failure" would be wrong for two of the three tiers.
 
 The registry is the read side: a small, already-validated index answering what tier a role
 belongs to, what it is called, and whether it exists at all.
 
 ## Contracts & invariants
 
-**INV-AGENT-001**: A role is unique across every tier, and a duplicate is a load failure rather than a last-one-wins.
+**INV-AGENT-001**: A role claimed by both a resident and a specialist is refused when the role registry is built.
 
-Routing is by role, so a collision does not raise — it silently sends work to whichever
-agent happened to load second. Refusing at load is the only place the ambiguity is visible.
+Enforced in `_build_role_registry`, which raises naming the duplicated role. This check is
+load-bearing precisely because `AgentRegistry.build` is not: it assigns residents and then
+specialists into one mapping, so a collision that got past the check would silently resolve
+to the specialist rather than raise.
 
-**INV-AGENT-002**: Every tier declares the exact file set it requires, and a missing artifact fails the load.
+**INV-AGENT-002**: Every tier declares an exact file set, and `_check_file_set` refuses a missing required file, a forbidden file, or an unrecognised one.
 
-An agent with no response shape or no prompts would start and behave arbitrarily. The file
-set is checked per tier because the tiers genuinely differ — an executor needs no channel
-configuration, a resident does.
+All three directions, not just the missing case: an unexpected file in an agent directory is
+as much a failure as an absent one. Directories, dotfiles and recognised editor backups are
+skipped, so a stray save does not become a half-parsed agent.
 
-**INV-AGENT-003**: Validation completes for the whole repository before anything is built.
+**INV-AGENT-003**: Specialist and executor loading is isolated per agent and boot-non-fatal; resident loading is not.
 
-Otherwise the first valid agents are live while a later one is still failing, which is a
-partly-configured system presenting as a working one.
+Stated as the asymmetry it is. `validate_config_repo` additionally skips the
+pipeline-managed specialists subtree, so it is not a whole-repository gate either.
 
-**INV-AGENT-004**: The registry answers only about agents that already validated; it is an index, not a loader.
+**INV-AGENT-004**: The registry performs no filesystem access; it is an index built from already-loaded configuration.
 
-Nothing resolves a role by touching the filesystem at request time.
+Nothing resolves a role by touching disk at request time.
 
 ## Failure behavior
 
-**An artifact is missing or malformed.** The load raises with the role and the file named.
-Boot stops.
+**A required file is missing, forbidden, or unrecognised.** `_check_file_set` raises naming
+the role and the files. For a resident this stops boot; for a specialist or executor the
+isolated path absorbs it and the rest of the system continues.
 
-**Two agents claim one role.** The load fails, naming both. This is checked across tiers,
-not within them, because the cross-tier case is the one that looks fine in any single
-directory.
+**A resident and a specialist claim one role.** Registry construction raises, naming the
+role. The check is cross-tier because each directory looks fine on its own.
 
-**A role is unknown at runtime.** The registry reports it as unknown rather than inventing a
-default. A wrong-but-plausible agent answering is worse than no answer.
-
-**An editor backup file appears in an agent directory.** It is ignored rather than treated
-as an artifact — the loader recognises the shapes editors leave behind, so a stray save does
-not become a half-parsed agent.
+**A role is unknown at runtime.** The registry does not raise: `name_to_role` returns `None`,
+`is_known` returns `False`, and `role_to_name` returns the role unchanged. Callers decide
+what that means — read the call site rather than assuming it errors.
 
 ## Extension points
 
 A new agent: a directory under its tier, the file set that tier requires, and an unclaimed
 role.
 
-A new tier is a much larger change than a new agent — the required file set, the validation
-path, and the registry's notion of tier all move together. The three that exist differ in
-lifetime and reach rather than in capability, so a genuinely new tier needs a reason in one
-of those two dimensions.
+A new tier is a much larger change than a new agent: the file set, the loading path and the
+registry's tier type all move together. Note that the registry's type currently admits two
+tiers, so anything registry-visible is a change to that type and everything reading it.
 
 A new required artifact means updating the tier's file set and every agent of that tier in
 the same change, since the check is exact and a missing file is a boot failure.
@@ -92,6 +96,8 @@ the same change, since the check is exact and a missing file is a boot failure.
 - `casa/rootfs/opt/casa/agent_registry.py::AgentRegistry.tier_for_role`
 - `casa/rootfs/opt/casa/agent_loader.py::validate_config_repo`
 - `casa/rootfs/opt/casa/agent_loader.py::LoadError`
+- `casa/rootfs/opt/casa/agent_loader.py::_check_file_set`
+- `casa/rootfs/opt/casa/casa_core.py::_build_role_registry`
 
 **Tests**
 - `tests/test_agent_registry.py::test_role_to_name_basic`

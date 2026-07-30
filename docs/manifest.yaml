@@ -30,6 +30,17 @@
 - doc: doctrine/publishing.md
   summary: The one rule that decides whether a fact may be written down in this repository.
   when_changing: anything published — docs, comments, commit messages, PR text, branch names
+  covers:
+    - .githooks/pre-commit
+    - .githooks/deny-patterns.txt
+    - scripts/deny-sweep.sh
+    - scripts/gate.sh
+    - scripts/attest.sh
+    - .githooks/pre-push
+  tests:
+    - tests/test_deny_sweep.py
+    - tests/test_leak_guard.py
+    - tests/test_gate_hook.py
   related: [contributing/doc-contract.md]
   defines_invariants: [INV-PUB-001, INV-PUB-002, INV-PUB-003]
 
@@ -55,6 +66,8 @@
     - casa/rootfs/opt/casa/agent_registry.py::AgentRegistry.tier_for_role
     - casa/rootfs/opt/casa/agent_loader.py::validate_config_repo
     - casa/rootfs/opt/casa/agent_loader.py::LoadError
+    - casa/rootfs/opt/casa/agent_loader.py::_check_file_set
+    - casa/rootfs/opt/casa/casa_core.py::_build_role_registry
   tests:
     - tests/test_agent_registry.py::test_role_to_name_basic
     - tests/test_agent_registry.py::test_name_to_role_unknown_returns_none
@@ -69,6 +82,8 @@
     - casa/rootfs/opt/casa/webhook_auth.py::verify
     - casa/rootfs/opt/casa/webhook_auth.py::read_secret
     - casa/rootfs/opt/casa/casa_core.py::healthz
+    - casa/rootfs/opt/casa/ingress_identity.py
+    - casa/rootfs/opt/casa/provenance.py
   tests:
     - tests/test_webhook_auth.py::test_hmac_body_valid
     - tests/test_webhook_auth.py::test_hmac_body_wrong_secret_fails
@@ -101,5 +116,12 @@
 - doc: contributing/doc-contract.md
   summary: The shape a document takes, and which of its rules CI enforces versus a reviewer.
   when_changing: the documentation rules themselves, or adding a document to the corpus
+  covers:
+    - scripts/verify_docs.py::verify
+    - scripts/verify_docs.py::_check_sourcemap
+    - scripts/verify_docs.py::_check_invariants
+    - scripts/verify_docs.py::write_nav
+  tests:
+    - tests/test_verify_docs.py
   related: [doctrine/publishing.md]
   defines_invariants: [INV-DOC-001, INV-DOC-002, INV-DOC-003, INV-DOC-004, INV-DOC-005, INV-DOC-006]

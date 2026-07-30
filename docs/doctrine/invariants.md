@@ -8,25 +8,25 @@ Every invariant is defined in exactly one file and referenced by id elsewhere.
 
 | Id | Statement | Defined in |
 |---|---|---|
-| `INV-AGENT-001` | A role is unique across every tier, and a duplicate is a load failure rather than a last-one-wins. | [`architecture/agent-taxonomy.md`](../architecture/agent-taxonomy.md) |
-| `INV-AGENT-002` | Every tier declares the exact file set it requires, and a missing artifact fails the load. | [`architecture/agent-taxonomy.md`](../architecture/agent-taxonomy.md) |
-| `INV-AGENT-003` | Validation completes for the whole repository before anything is built. | [`architecture/agent-taxonomy.md`](../architecture/agent-taxonomy.md) |
-| `INV-AGENT-004` | The registry answers only about agents that already validated; it is an index, not a loader. | [`architecture/agent-taxonomy.md`](../architecture/agent-taxonomy.md) |
+| `INV-AGENT-001` | A role claimed by both a resident and a specialist is refused when the role registry is built. | [`architecture/agent-taxonomy.md`](../architecture/agent-taxonomy.md) |
+| `INV-AGENT-002` | Every tier declares an exact file set, and `_check_file_set` refuses a missing required file, a forbidden file, or an unrecognised one. | [`architecture/agent-taxonomy.md`](../architecture/agent-taxonomy.md) |
+| `INV-AGENT-003` | Specialist and executor loading is isolated per agent and boot-non-fatal; resident loading is not. | [`architecture/agent-taxonomy.md`](../architecture/agent-taxonomy.md) |
+| `INV-AGENT-004` | The registry performs no filesystem access; it is an index built from already-loaded configuration. | [`architecture/agent-taxonomy.md`](../architecture/agent-taxonomy.md) |
 | `INV-DOC-001` | Every document repeats the code-wins line verbatim at the top, under front matter carrying `last_reviewed`. | [`contributing/doc-contract.md`](../contributing/doc-contract.md) |
 | `INV-DOC-002` | Documents follow one section order: Scope, Mental model, Contracts & invariants, Failure behavior, Extension points, Source & test map. An agent can then skim positionally instead of reading to find out where things are. | [`contributing/doc-contract.md`](../contributing/doc-contract.md) |
 | `INV-DOC-003` | Present tense only. No changelog voice, no "as of version X", no discrepancy log, no TODOs, no open questions. Those belong in the change that resolves them. | [`contributing/doc-contract.md`](../contributing/doc-contract.md) |
 | `INV-DOC-004` | A cross-cutting rule is defined exactly once, as `**INV-AREA-NNN**: <single-line statement>`, and referenced by id everywhere else. Ids are issued only for rules referenced from more than one file — an id per local rule is bureaucracy, and the define-once check makes over-issuing visibly expensive. | [`contributing/doc-contract.md`](../contributing/doc-contract.md) |
 | `INV-DOC-005` | Anchors are typed symbols — `path/to/file.py::Class.method`, `config.yaml::schema.key`, `tests/test_x.py::test_name`. Never `file:line`, which rots silently on the next edit. | [`contributing/doc-contract.md`](../contributing/doc-contract.md) |
 | `INV-DOC-006` | Growth splits, it never appends. A document that reaches the ceiling is divided and both halves manifested. The ceiling is not raised, and nothing shards on its own. | [`contributing/doc-contract.md`](../contributing/doc-contract.md) |
-| `INV-HTTP-001` | An inbound webhook is authenticated by HMAC over the request, compared in constant time, before any routing decision is made. | [`architecture/http-surface.md`](../architecture/http-surface.md) |
-| `INV-HTTP-002` | A comparison of secret material uses a constant-time primitive, never `==`. | [`architecture/http-surface.md`](../architecture/http-surface.md) |
-| `INV-HTTP-003` | Every inbound request is attributed to a named ingress, and an unnamed one fails loudly rather than defaulting. | [`architecture/http-surface.md`](../architecture/http-surface.md) |
-| `INV-HTTP-004` | Routes on the internal app are unreachable from outside the container, and nothing registers a route there because it is convenient. | [`architecture/http-surface.md`](../architecture/http-surface.md) |
+| `INV-HTTP-001` | `verify` authenticates under one of three named modes — a body HMAC, a static header, or a timestamped HMAC — and returns a single boolean. | [`architecture/http-surface.md`](../architecture/http-surface.md) |
+| `INV-HTTP-002` | Every secret comparison inside `verify` uses a constant-time primitive, and an absent or empty secret returns false rather than passing. | [`architecture/http-surface.md`](../architecture/http-surface.md) |
+| `INV-HTTP-003` | The timestamped mode rejects a signature outside its tolerance window, so a captured request does not stay replayable. | [`architecture/http-surface.md`](../architecture/http-surface.md) |
+| `INV-HTTP-004` | External context arriving on a request cannot set provenance fields; the ingress supplies them. | [`architecture/http-surface.md`](../architecture/http-surface.md) |
 | `INV-PUB-001` | A fact belongs in this repository only if it is verifiable from the public commit alone — with no operator, no production system, and no private repository. | [`doctrine/publishing.md`](../doctrine/publishing.md) |
 | `INV-PUB-002` | Doctrine states the mechanism, never the incident. | [`doctrine/publishing.md`](../doctrine/publishing.md) |
 | `INV-PUB-003` | When a claim cannot be checked from the commit, stop and ask. Do not guess, and do not paraphrase around it. | [`doctrine/publishing.md`](../doctrine/publishing.md) |
-| `INV-SYS-001` | Configuration is validated before it is materialised, and a failure stops boot rather than degrading it. | [`architecture/overview.md`](../architecture/overview.md) |
-| `INV-SYS-002` | A role is unique across every tier; two agents cannot answer to the same role. | [`architecture/overview.md`](../architecture/overview.md) |
+| `INV-SYS-001` | Config materialisation depends on config validation, so the validating one-shot runs first and a failure there stops what depends on it. | [`architecture/overview.md`](../architecture/overview.md) |
+| `INV-SYS-002` | A role claimed by both a resident and a specialist is a boot failure, raised when the role registry is built. | [`architecture/overview.md`](../architecture/overview.md) |
 | `INV-TURN-001` | The resume-versus-fresh decision is re-derived from a fresh session read while holding the pool entry's lock, and a cached client is reused only when its session id matches that decision exactly. | [`architecture/turn-loop.md`](../architecture/turn-loop.md) |
 | `INV-TURN-002` | An error result invalidates the pool entry before anything else happens. | [`architecture/turn-loop.md`](../architecture/turn-loop.md) |
 | `INV-TURN-003` | A cancelled turn interrupts, then drains its own buffered messages through the terminal result before the entry may return to warm. Any failure in that window — including a second cancellation — invalidates the entry instead. | [`architecture/turn-loop.md`](../architecture/turn-loop.md) |
