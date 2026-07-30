@@ -18,8 +18,10 @@ which is keyed on what you are about to do rather than on subsystem names.
 
 | When you are changing… | Read |
 |---|---|
+| Telegram transport, callback namespaces, topic output ordering, or message rendering | [`architecture/telegram.md`](architecture/telegram.md) |
 | adding a route, changing webhook authentication, or anything crossing the container boundary | [`architecture/http-surface.md`](architecture/http-surface.md) |
 | adding an agent or a tier, the required file set, or role resolution | [`architecture/agent-taxonomy.md`](architecture/agent-taxonomy.md) |
+| adding or removing an option, the reload scopes, the config repo, or secret resolution | [`architecture/configuration.md`](architecture/configuration.md) |
 | anything published — docs, comments, commit messages, PR text, branch names | [`doctrine/publishing.md`](doctrine/publishing.md) |
 | anything structural, or when you need to find which document owns an area | [`architecture/overview.md`](architecture/overview.md) |
 | delegation, engagement lifecycle, terminal transitions, drivers, or engagement output ordering | [`architecture/engagements.md`](architecture/engagements.md) |
@@ -27,6 +29,7 @@ which is keyed on what you are about to do rather than on subsystem names.
 | recall behaviour, sensitivity tiers, provenance on a stored fact, or session persistence | [`architecture/memory.md`](architecture/memory.md) |
 | the documentation rules themselves, or adding a document to the corpus | [`contributing/doc-contract.md`](contributing/doc-contract.md) |
 | the turn lifecycle, the warm client pool, retry behaviour, or turn teardown | [`architecture/turn-loop.md`](architecture/turn-loop.md) |
+| voice transports, voice authentication, the turn budget, specialist handoff, or deferred delivery | [`architecture/voice.md`](architecture/voice.md) |
 <!-- END ROUTING -->
 
 Every document is ≤ 25 KB by design, so one fits in context beside the code it describes.

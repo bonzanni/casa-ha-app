@@ -1,0 +1,161 @@
+---
+last_reviewed: 2026-07-30
+---
+
+# The voice channel
+
+> Code is the source of truth. This file is a map; when it and the code disagree, the code wins.
+
+## Scope
+
+How spoken input becomes a turn and how the answer gets back: the two transports, what
+authenticates them, the turn budget, and the deferred-delivery path that lets an answer
+arrive after the turn is over. It does not cover speech recognition or synthesis, which
+happen outside this application, nor the companion integration's own internals.
+
+## Mental model
+
+**Two transports, and they are not equivalent.** A request-shaped path streams one answer
+back. A socket path additionally carries route binding, specialist handoff, and deferred
+delivery. Anything about background work applies only to the socket path — the request path
+can never qualify for it.
+
+**Authentication is at the door, not on each message.** Every voice route fails closed
+without a configured secret. The request path signs its body; the socket upgrade and the
+agent catalog both sign empty bytes, which means one signature authenticates both of those
+and there is no per-frame signature after an upgrade succeeds. Once a socket is open, its
+frames are trusted because the connection was.
+
+**The critical trust boundary: a route's declared capabilities describe the client's
+transport, not the device.** Registration checks that a client speaks the expected protocol
+and claims the full capability set — but nothing in it establishes that any particular
+speaker or screen can actually play or show an answer. This application cannot inspect the
+home's device registry to find out.
+
+What actually decides delivery is the **per-utterance offer** carried on the frame, naming a
+device and a modality. An authenticated client can overclaim there, and the code accepts that
+knowingly: the trust boundary is the authenticated connection, and a dishonest client is out
+of scope. Delivery can therefore still fail later, at the endpoint rather than at the
+decision.
+
+**The turn is bounded by an absolute deadline anchored at true ingress.** On the request path
+it is captured in the handler's first statements — *before* the body is read and before
+authentication — so that slow I/O counts against the budget rather than hiding from it. On
+the socket path it is captured when the utterance frame arrives, so the handshake is outside
+the budget. Deferred jobs deliberately outlive it.
+
+**Sessions are keyed by role and scope together**, so the same speaker talking to two agents
+gets two sessions rather than one shared context.
+
+## Contracts & invariants
+
+**INV-VOICE-001**: Every voice route refuses a request when no secret is configured or the signature does not match.
+
+Enforced by the channel's verification helper, called by the request handler, the socket
+upgrade and the catalog alike. A missing secret returns false before any comparison.
+
+What it does not cover: there is no per-frame signature, nonce, timestamp, or binding to
+method or path. The empty-body signature that authenticates the catalog also authenticates a
+socket upgrade.
+
+**INV-VOICE-002**: An agent is reachable over voice only if its configuration declares the voice capability.
+
+Enforced at dispatch on both transports. Unknown agents and agents that exist but are not
+voice-enabled are deliberately indistinguishable to the caller.
+
+**INV-VOICE-003**: The agent catalog is complete or it fails; it never returns a partial list.
+
+Enforced when the catalog is built — a malformed entry or too many entries raises, and the
+handler turns that into a service error. The reasoning is that a silently short catalog would
+present a missing agent as a nonexistent one.
+
+What it does not cover: appearing in the catalog says nothing about whether that agent will
+handle a turn successfully.
+
+**INV-VOICE-004**: A route registers only with the expected protocol version and exactly the full capability set.
+
+Enforced by the route registry, which checks containment in both directions — so a client
+offering extra capabilities or missing one is refused, and a refusal is acknowledged with an
+empty accepted set rather than silently ignored.
+
+What it does not cover: it cannot prove the client implements what it claims.
+
+**INV-VOICE-005**: Caller-supplied context cannot mint trusted route, device, job-control, handoff or delivery values.
+
+Enforced by sanitising external context and then overwriting the trusted keys from the
+connection and the frame. This is why a payload cannot promise itself a delivery route.
+
+What it does not cover, and the distinction is easy to lose: the *frame itself* legitimately
+supplies a device id and a delivery offer. Those are trusted because the connection is
+authenticated, not because they were verified.
+
+**INV-VOICE-006**: Deferred delivery sends only the modality recorded on the job; an unrecognised or absent modality is never guessed.
+
+Enforced in the delivery coordinator's offer path. A job whose modality is unknown waits and
+expires rather than being sent as speech on the assumption that speech is what was wanted.
+
+## Failure behavior
+
+**No secret, or a bad signature.** All voice routes return unauthorised. This is a
+configuration failure that presents as an authentication failure.
+
+**A malformed request or an unknown agent.** The request path returns a client error or a
+generic not-found; the socket path emits a typed error frame before dispatching anything to
+an agent.
+
+**Malformed socket frames.** Unrecognised or non-conforming frames are skipped rather than
+closing the connection. A socket does not die because one frame was bad.
+
+**Rate limiting.** Both transports report the refusal in their own idiom, and neither reaches
+an agent.
+
+**The turn exceeds its budget.** Waits are computed from the remaining budget and refused
+when there is not enough left, rather than being started and abandoned.
+
+**Delivery fails at the endpoint.** Send failures are absorbed and logged, and the sweeper
+survives them. Endpoint failure is reported by the client rather than discovered here — so
+"delivered" means "handed over", not "heard".
+
+## Extension points
+
+**A new voice agent** must be enabled, declare the voice capability, and have a
+well-formed role and display name. Note the blast radius: because the catalog is
+complete-or-fail, one malformed agent takes the catalog down for every caller.
+
+**A new capability** means changing the exact set on both sides. Registration enforces
+equality against a fixed set, so a one-sided change refuses every route rather than
+degrading.
+
+**A new delivery modality** touches several places that nothing centrally ties together —
+the offer sanitiser, the modality selection, the deliverable set, and the spoken phrasing. No
+single check will tell you one was missed.
+
+**Anything that reasons about where an answer can go** should read the per-utterance offer,
+not the route's capabilities. Those answer different questions.
+
+## Source & test map
+
+<!-- BEGIN SOURCEMAP -->
+<!-- generated by scripts/verify_docs.py --write-nav; do not hand-edit -->
+
+**Source**
+- `casa/rootfs/opt/casa/channels/voice/channel.py::VoiceChannel`
+- `casa/rootfs/opt/casa/channels/voice/channel.py::sanitize_delivery_offer`
+- `casa/rootfs/opt/casa/channels/voice/catalog.py::build_voice_agent_catalog`
+- `casa/rootfs/opt/casa/channels/voice/routes.py::VoiceRouteRegistry`
+- `casa/rootfs/opt/casa/channels/voice/delivery.py::VoiceDeliveryCoordinator`
+- `casa/rootfs/opt/casa/channels/voice/session.py::VoiceSessionPool`
+- `casa/rootfs/opt/casa/channel_authz.py::agent_allowed_on`
+
+**Tests**
+- `tests/test_voice_auth_failclosed.py`
+- `tests/test_voice_agent_catalog.py`
+- `tests/test_voice_channel_sse.py`
+- `tests/test_voice_channel_ws.py`
+- `tests/test_voice_context_sanitize.py`
+
+**Related**
+- [`architecture/overview.md`](../architecture/overview.md)
+- [`architecture/http-surface.md`](../architecture/http-surface.md)
+- [`architecture/turn-loop.md`](../architecture/turn-loop.md)
+<!-- END SOURCEMAP -->

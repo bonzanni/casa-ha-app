@@ -12,6 +12,11 @@ Every invariant is defined in exactly one file and referenced by id elsewhere.
 | `INV-AGENT-002` | For residents and specialists, `_check_file_set` refuses a missing required file, a forbidden file, or an unrecognised one. The executor path implements its own weaker check and does not refuse unrecognised files. | [`architecture/agent-taxonomy.md`](../architecture/agent-taxonomy.md) |
 | `INV-AGENT-003` | Specialist and executor loading is isolated per agent and boot-non-fatal; resident loading is not. | [`architecture/agent-taxonomy.md`](../architecture/agent-taxonomy.md) |
 | `INV-AGENT-004` | The registry performs no filesystem access; it is an index built from already-loaded configuration. | [`architecture/agent-taxonomy.md`](../architecture/agent-taxonomy.md) |
+| `INV-CFG-001` | Exactly eight reload scopes exist, and none of them rereads the app manifest options. | [`architecture/configuration.md`](../architecture/configuration.md) |
+| `INV-CFG-002` | A full reload excludes every other dispatched reload for its duration. | [`architecture/configuration.md`](../architecture/configuration.md) |
+| `INV-CFG-003` | A resident identity change is refused as restart-required rather than hot-swapped. | [`architecture/configuration.md`](../architecture/configuration.md) |
+| `INV-CFG-004` | Only an explicit whitelist of the config tree is version-controlled. | [`architecture/configuration.md`](../architecture/configuration.md) |
+| `INV-CFG-005` | Reconciliation of the config tree is never boot-fatal. | [`architecture/configuration.md`](../architecture/configuration.md) |
 | `INV-DOC-001` | Every document repeats the code-wins line verbatim at the top, under front matter carrying `last_reviewed`. | [`contributing/doc-contract.md`](../contributing/doc-contract.md) |
 | `INV-DOC-002` | Documents follow one section order: Scope, Mental model, Contracts & invariants, Failure behavior, Extension points, Source & test map. An agent can then skim positionally instead of reading to find out where things are. | [`contributing/doc-contract.md`](../contributing/doc-contract.md) |
 | `INV-DOC-003` | Present tense only. No changelog voice, no "as of version X", no discrepancy log, no TODOs, no open questions. Those belong in the change that resolves them. | [`contributing/doc-contract.md`](../contributing/doc-contract.md) |
@@ -44,8 +49,19 @@ Every invariant is defined in exactly one file and referenced by id elsewhere.
 | `INV-PUB-003` | When a claim cannot be checked from the commit, stop and ask. Do not guess, and do not paraphrase around it. | [`doctrine/publishing.md`](../doctrine/publishing.md) |
 | `INV-SYS-001` | Config materialisation depends on config validation, so the validating one-shot runs first and a failure there stops what depends on it. | [`architecture/overview.md`](../architecture/overview.md) |
 | `INV-SYS-002` | A role claimed by both a resident and a specialist is a boot failure, raised when the role registry is built. | [`architecture/overview.md`](../architecture/overview.md) |
+| `INV-TG-001` | A webhook update is accepted only when a secret is configured and the request's secret-token header matches it exactly. | [`architecture/telegram.md`](../architecture/telegram.md) |
+| `INV-TG-002` | A callback can resolve a request only from the operator that request is bound to. | [`architecture/telegram.md`](../architecture/telegram.md) |
+| `INV-TG-003` | A live request is resolved exactly once. | [`architecture/telegram.md`](../architecture/telegram.md) |
+| `INV-TG-004` | Writer operations on a sequenced topic are serialized under one lock. | [`architecture/telegram.md`](../architecture/telegram.md) |
+| `INV-TG-005` | A rich response is paginated to Telegram's message-length and entity budgets. | [`architecture/telegram.md`](../architecture/telegram.md) |
 | `INV-TURN-001` | The resume-versus-fresh decision is re-derived from a fresh session read while holding the pool entry's lock, and a cached client is reused only when its session id matches that decision exactly. | [`architecture/turn-loop.md`](../architecture/turn-loop.md) |
 | `INV-TURN-002` | An error result invalidates the pool entry before anything else happens. | [`architecture/turn-loop.md`](../architecture/turn-loop.md) |
 | `INV-TURN-003` | A cancelled turn interrupts, then drains its own buffered messages through the terminal result before the entry may return to warm. Any failure in that window — including a second cancellation — invalidates the entry instead. | [`architecture/turn-loop.md`](../architecture/turn-loop.md) |
 | `INV-TURN-004` | A memory read that raises does not fail the turn. It is logged and the turn proceeds with an empty memory block. | [`architecture/turn-loop.md`](../architecture/turn-loop.md) |
 | `INV-TURN-005` | Cancellation propagates immediately and is never retried. Everything else transient — timeouts, rate limits, generic model errors — is retried with exponential backoff, honouring a server-supplied retry hint when present. | [`architecture/turn-loop.md`](../architecture/turn-loop.md) |
+| `INV-VOICE-001` | Every voice route refuses a request when no secret is configured or the signature does not match. | [`architecture/voice.md`](../architecture/voice.md) |
+| `INV-VOICE-002` | An agent is reachable over voice only if its configuration declares the voice capability. | [`architecture/voice.md`](../architecture/voice.md) |
+| `INV-VOICE-003` | The agent catalog is complete or it fails; it never returns a partial list. | [`architecture/voice.md`](../architecture/voice.md) |
+| `INV-VOICE-004` | A route registers only with the expected protocol version and exactly the full capability set. | [`architecture/voice.md`](../architecture/voice.md) |
+| `INV-VOICE-005` | Caller-supplied context cannot mint trusted route, device, job-control, handoff or delivery values. | [`architecture/voice.md`](../architecture/voice.md) |
+| `INV-VOICE-006` | Deferred delivery sends only the modality recorded on the job; an unrecognised or absent modality is never guessed. | [`architecture/voice.md`](../architecture/voice.md) |
