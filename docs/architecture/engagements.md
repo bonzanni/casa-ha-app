@@ -43,10 +43,10 @@ concurrency permits, live drivers, output sequencers, inbound reservations and v
 in-flight maps do not. A record found `active` at startup is rewritten to `idle`, because no
 live driver survived to make `active` true.
 
-**The depth cap is narrower than it sounds.** It stops an ephemeral delegated specialist from
-delegating onwards. It is read in one place and stamped in one place, and the executor launch
-path touches neither — so it is not a general limit on agents creating long-running work. See
-the invariant below for exactly what it covers.
+**The depth cap is narrower than it sounds.** It stops an ephemerally delegated agent —
+resident or specialist alike — from delegating onwards. It is read in one place and stamped
+in one place, and the executor launch path touches neither — so it is not a general limit on
+agents creating long-running work. See the invariant below for exactly what it covers.
 
 ## Contracts & invariants
 
@@ -58,29 +58,38 @@ notification only on success.
 
 What it does not cover: the direct status mutators do not check for a prior terminal state.
 Code that sets a terminal status directly bypasses this protocol and its side-effect
-ordering.
+ordering. And exclusivity covers the *post-transition* side effects only: the pre-close
+inbound spool drain runs before the win/lose transition, so a caller that goes on to lose the
+race may already have flushed pending receipts and eviction notices externally. The drain is
+idempotent, which is why running it ahead of the gate is tolerated — but "does nothing" is
+not what a losing finalizer does.
 
 **INV-ENG-002**: A strict terminal transition never leaves the persisted and in-memory records disagreeing; on a write failure it restores the prior state and raises.
 
 What it does not cover: non-strict registry mutations warn and continue if their write fails,
 so this guarantee belongs to the finalize path specifically.
 
-**INV-ENG-003**: A successful completion is refused while unread inbound messages or inbound reservations exist.
+**INV-ENG-003**: A successful completion is refused while unread inbound messages or inbound reservations exist, when the driver exposes its inbound state.
 
 Enforced both as a pre-check and again as a hook inside the transition itself, so the
 condition is re-evaluated at the moment the state changes rather than only before it.
 
-What it does not cover: failed and cancelled outcomes intentionally skip the gate.
+What it does not cover: failed and cancelled outcomes intentionally skip the gate. And the
+gate exists only where the driver implements the inbound accessors — today that is the
+claude-code driver alone, so an interactive in-casa specialist completion has no unread-input
+gate. Accessor failures fail open with a warning rather than wedging termination.
 
-**INV-ENG-004**: Ephemeral specialist delegation stops at depth one.
+**INV-ENG-004**: Ephemeral delegation stops at depth one.
 
-Enforced in the pre-launch check for the delegation tool, against a depth stamped when a
-delegated child's origin is built.
+Enforced in the pre-launch check for the delegation tool, against a depth stamped when an
+ephemeral delegated child's origin is built — stamped for every delegated target, resident
+and specialist alike, and checked without regard to the caller's tier.
 
 What it does not cover, and this is the scope worth reading twice: the executor launch path
 neither reads nor stamps the depth, and the interactive branch that creates a specialist
-engagement does not go through the stamping path either. The guarantee is "a delegated
-specialist cannot delegate onwards", not "agent-created work cannot chain".
+engagement copies the caller's origin without stamping — an interactively-engaged specialist
+runs at the caller's depth and can delegate onwards. The guarantee is "an agent reached
+through ephemeral delegation cannot delegate again", not "agent-created work cannot chain".
 
 **INV-ENG-005**: Once the output sequencer is terminalized, ordinary narration and unresolved sends cannot post below the completion.
 

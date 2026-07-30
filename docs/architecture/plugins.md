@@ -25,13 +25,21 @@ different byte trees fetched for the same coordinates produce the *same* artifac
 are pinned separately, by a checksum recorded in the artifact's own metadata and verified
 when the artifact is validated. Reasoning about integrity from the artifact id alone is the
 most common way to be wrong here: identity answers "which plugin is this", and a separate
-checksum answers "are these the expected bytes".
+checksum answers "are these the expected bytes". Know the checksum's trust boundary, though:
+its expected value lives in the artifact's own metadata file — which is excluded from the
+hash and recorded nowhere else, not in the registry and not signed. It detects drift of the
+tree relative to the artifact's internal metadata, not tampering: a writer able to change the
+store can change bytes and recorded checksum together, and nothing recomputes a digest from
+the source.
 
-**Resolution is snapshot-based.** Registry parsing and deep artifact validation happen when a
-snapshot is built; afterwards, resolution reads cached verdicts. **An edit on disk is
-invisible until a reload.** This is deliberate — validation is expensive and a long-lived
-agent should not see a half-written registry — but it means "I changed the file" and "the
-system changed" are different events.
+**Resolution is snapshot-based, but not everything is cached.** Registry parsing and deep
+artifact validation happen when a snapshot is built; the checksum verdict is cached and never
+recomputed by resolution. Resolution does, however, re-read the artifact's `plugin.json` on
+every resolve, and the resolved paths hand the live artifact tree to the SDK without
+revalidation. So a *registry* edit is invisible until a reload — deliberate, because
+validation is expensive and a long-lived agent should not see a half-written registry — while
+a mutation *inside a stored artifact* can become visible immediately and evades the cached
+checksum until an explicit verification or the next snapshot reload.
 
 **Plugin failures degrade; they do not stop the container.** The boot path writes health data
 and exits successfully whatever it finds. One broken plugin costs that plugin.
@@ -43,10 +51,14 @@ memory only.
 
 **Tiers are not gated alike, and this is the asymmetry to carry away.** Residents and
 specialists get plugin grants merged into their allowed tools, a fail-closed tool gate, and
-the protected-tool approval hook. **Executors get none of those** — they receive plugin paths
-and are constrained by their own declared tool list instead. A plugin declaring protected
-tools protects resident and specialist calls; it creates no equivalent protection on the
-executor path.
+the protected-tool approval hook. **Executors get none of those** — they receive plugin
+paths, and their declared tool list is passed to the SDK as *auto-approved* tools, which is
+a convenience rather than an enforcement boundary: sub-agent spawning bypasses an
+allowed-tools list, and only the disallowed list is CLI-enforced. What actually constrains an
+executor is the code-mandatory clamps merged into every options build — sub-agent spawn tools
+are hard-denied, Bash is hard-denied unless the declaration allows it, and guard hooks
+protect managed components and agent-home settings. A plugin declaring protected tools
+protects resident and specialist calls; it creates no equivalent gate on the executor path.
 
 ## Contracts & invariants
 
@@ -63,9 +75,13 @@ the bytes in the store.
 Enforced by the artifact verdict computed when a snapshot is built; a failing verdict means
 the plugin is not resolved and the reason is recorded.
 
-What it does not cover: the verdict is not recomputed after the snapshot is published, so a
-change underneath a live snapshot is caught later and by a different path. Internal
-non-escaping symlinks inside an artifact are permitted.
+What it does not cover: the verdict is not recomputed after the snapshot is published.
+Resolution meanwhile re-reads the artifact's manifest and hands out live paths, so a change
+underneath a live snapshot is detected only by an explicit verification or the next snapshot
+reload — nothing catches it on its own. The recorded checksum itself lives in the artifact's
+metadata (see the mental model): it pins the tree against that metadata, not against an
+independently authenticated content identity. Internal non-escaping symlinks inside an
+artifact are permitted.
 
 **INV-PLUG-003**: Archive extraction refuses traversal, absolute paths, links out of the tree, and special files.
 
@@ -95,9 +111,10 @@ and re-validated from disk at startup, because it authorises a route rather than
 **INV-PLUG-006**: Executor options receive plugin paths without a grant merge and without a tool gate.
 
 Stated as an invariant because it is a security-relevant asymmetry that reads like an
-oversight and is not one — the executor path is constrained by its own declared tool list and
-relay instead. Verification will report an executor whose declaration lacks a needed
-authorisation, but nothing merges it automatically.
+oversight and is not one — the executor path is constrained by its code-mandatory disallow
+clamps, guard hooks and relay instead; its declared tool list is auto-approval, not a gate.
+Verification will report an executor whose declaration lacks a needed authorisation, but
+nothing merges it automatically.
 
 ## Failure behavior
 

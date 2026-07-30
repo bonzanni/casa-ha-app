@@ -65,8 +65,11 @@ malformed envelopes, and the no-op implementation raises rather than returning e
 backend is configured.
 
 What it does not cover: **individual call sites may still collapse the distinction after the
-fact**, and at least one deliberately does. The invariant holds at the seam, not at every
-consumer. Check the call site you care about rather than assuming it propagates.
+fact**, and at least one does. `query_engager()` reports an empty rendered digest as "searched
+and found nothing relevant" — and because rendering emits nothing when the first hit exceeds
+the token budget, hits that exist but did not fit are reported as absence. The invariant holds
+at the seam, for typed recall, not at every consumer. Check the call site you care about
+rather than assuming it propagates.
 
 **INV-MEM-002**: A typed hit is readable only when its tags carry exactly one recognised tier at or below the caller's clearance; if every hit is dropped, the result is unavailable rather than empty.
 
@@ -82,8 +85,11 @@ backend returned — the request's own tag filter is not treated as the access c
 Enforced by the channel-clearance lookup's default. The direction matters: an unknown surface
 sees less, not more.
 
-What it does not cover: origin-stamped requests are resolved separately, so a webhook turn's
-clearance depends on its declared origin rather than on the channel default alone.
+What it does not cover: origin-aware resolution is narrower than it sounds. Resident
+auto-recall and the recall tool resolve clearance from the stamped origin (`clearance_for_origin()`),
+so a webhook turn's clearance there depends on its declared origin. Delegated recall
+(`delegated_recall()`) resolves from the origin *channel* alone and discards any
+origin-stamped route or clearance override.
 
 **INV-MEM-004**: A caller cannot inject a sensitivity tier or a provenance tag through ordinary application tags.
 

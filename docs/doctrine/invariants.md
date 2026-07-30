@@ -25,8 +25,8 @@ Every invariant is defined in exactly one file and referenced by id elsewhere.
 | `INV-DOC-006` | Growth splits, it never appends. A document that reaches the ceiling is divided and both halves manifested. The ceiling is not raised, and nothing shards on its own. | [`contributing/doc-contract.md`](../contributing/doc-contract.md) |
 | `INV-ENG-001` | A terminal transition has exactly one winner, and only the winner performs the finalization side effects. | [`architecture/engagements.md`](../architecture/engagements.md) |
 | `INV-ENG-002` | A strict terminal transition never leaves the persisted and in-memory records disagreeing; on a write failure it restores the prior state and raises. | [`architecture/engagements.md`](../architecture/engagements.md) |
-| `INV-ENG-003` | A successful completion is refused while unread inbound messages or inbound reservations exist. | [`architecture/engagements.md`](../architecture/engagements.md) |
-| `INV-ENG-004` | Ephemeral specialist delegation stops at depth one. | [`architecture/engagements.md`](../architecture/engagements.md) |
+| `INV-ENG-003` | A successful completion is refused while unread inbound messages or inbound reservations exist, when the driver exposes its inbound state. | [`architecture/engagements.md`](../architecture/engagements.md) |
+| `INV-ENG-004` | Ephemeral delegation stops at depth one. | [`architecture/engagements.md`](../architecture/engagements.md) |
 | `INV-ENG-005` | Once the output sequencer is terminalized, ordinary narration and unresolved sends cannot post below the completion. | [`architecture/engagements.md`](../architecture/engagements.md) |
 | `INV-EVAL-001` | The tester registry is empty; no evaluator is registered or invoked. | [`architecture/eval-framework.md`](../architecture/eval-framework.md) |
 | `INV-EVAL-002` | Bank selection for any live-memory check comes from the caller; the code does not confine it. | [`architecture/eval-framework.md`](../architecture/eval-framework.md) |
