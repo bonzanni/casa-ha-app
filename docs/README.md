@@ -18,7 +18,9 @@ which is keyed on what you are about to do rather than on subsystem names.
 
 | When you are changing… | Read |
 |---|---|
+| adding an agent or a tier, the required file set, or role resolution | [`architecture/agent-taxonomy.md`](architecture/agent-taxonomy.md) |
 | anything published — docs, comments, commit messages, PR text, branch names | [`doctrine/publishing.md`](doctrine/publishing.md) |
+| anything structural, or when you need to find which document owns an area | [`architecture/overview.md`](architecture/overview.md) |
 | the documentation rules themselves, or adding a document to the corpus | [`contributing/doc-contract.md`](contributing/doc-contract.md) |
 | the turn lifecycle, the warm client pool, retry behaviour, or turn teardown | [`architecture/turn-loop.md`](architecture/turn-loop.md) |
 <!-- END ROUTING -->

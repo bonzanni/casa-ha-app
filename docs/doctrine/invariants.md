@@ -8,6 +8,10 @@ Every invariant is defined in exactly one file and referenced by id elsewhere.
 
 | Id | Statement | Defined in |
 |---|---|---|
+| `INV-AGENT-001` | A role is unique across every tier, and a duplicate is a load failure rather than a last-one-wins. | [`architecture/agent-taxonomy.md`](../architecture/agent-taxonomy.md) |
+| `INV-AGENT-002` | Every tier declares the exact file set it requires, and a missing artifact fails the load. | [`architecture/agent-taxonomy.md`](../architecture/agent-taxonomy.md) |
+| `INV-AGENT-003` | Validation completes for the whole repository before anything is built. | [`architecture/agent-taxonomy.md`](../architecture/agent-taxonomy.md) |
+| `INV-AGENT-004` | The registry answers only about agents that already validated; it is an index, not a loader. | [`architecture/agent-taxonomy.md`](../architecture/agent-taxonomy.md) |
 | `INV-DOC-001` | Every document repeats the code-wins line verbatim at the top, under front matter carrying `last_reviewed`. | [`contributing/doc-contract.md`](../contributing/doc-contract.md) |
 | `INV-DOC-002` | Documents follow one section order: Scope, Mental model, Contracts & invariants, Failure behavior, Extension points, Source & test map. An agent can then skim positionally instead of reading to find out where things are. | [`contributing/doc-contract.md`](../contributing/doc-contract.md) |
 | `INV-DOC-003` | Present tense only. No changelog voice, no "as of version X", no discrepancy log, no TODOs, no open questions. Those belong in the change that resolves them. | [`contributing/doc-contract.md`](../contributing/doc-contract.md) |
@@ -17,6 +21,8 @@ Every invariant is defined in exactly one file and referenced by id elsewhere.
 | `INV-PUB-001` | A fact belongs in this repository only if it is verifiable from the public commit alone — with no operator, no production system, and no private repository. | [`doctrine/publishing.md`](../doctrine/publishing.md) |
 | `INV-PUB-002` | Doctrine states the mechanism, never the incident. | [`doctrine/publishing.md`](../doctrine/publishing.md) |
 | `INV-PUB-003` | When a claim cannot be checked from the commit, stop and ask. Do not guess, and do not paraphrase around it. | [`doctrine/publishing.md`](../doctrine/publishing.md) |
+| `INV-SYS-001` | Configuration is validated before it is materialised, and a failure stops boot rather than degrading it. | [`architecture/overview.md`](../architecture/overview.md) |
+| `INV-SYS-002` | A role is unique across every tier; two agents cannot answer to the same role. | [`architecture/overview.md`](../architecture/overview.md) |
 | `INV-TURN-001` | The resume-versus-fresh decision is re-derived from a fresh session read while holding the pool entry's lock, and a cached client is reused only when its session id matches that decision exactly. | [`architecture/turn-loop.md`](../architecture/turn-loop.md) |
 | `INV-TURN-002` | An error result invalidates the pool entry before anything else happens. | [`architecture/turn-loop.md`](../architecture/turn-loop.md) |
 | `INV-TURN-003` | A cancelled turn interrupts, then drains its own buffered messages through the terminal result before the entry may return to warm. Any failure in that window — including a second cancellation — invalidates the entry instead. | [`architecture/turn-loop.md`](../architecture/turn-loop.md) |

@@ -33,6 +33,35 @@
   related: [contributing/doc-contract.md]
   defines_invariants: [INV-PUB-001, INV-PUB-002, INV-PUB-003]
 
+- doc: architecture/overview.md
+  summary: What Casa is made of — supervised services, the three agent tiers, and where configuration enters.
+  when_changing: anything structural, or when you need to find which document owns an area
+  covers:
+    - casa/rootfs/opt/casa/casa_core.py::main
+    - casa/rootfs/opt/casa/runtime.py::CasaRuntime
+    - casa/config.yaml::options
+  tests:
+    - tests/test_casa_core_agent_loading.py
+    - tests/test_setup_nginx_ingress.py
+  related: [architecture/agent-taxonomy.md, architecture/turn-loop.md]
+  defines_invariants: [INV-SYS-001, INV-SYS-002]
+
+- doc: architecture/agent-taxonomy.md
+  summary: How an agent is declared, validated and looked up — tiers, required artifacts, and the registry.
+  when_changing: adding an agent or a tier, the required file set, or role resolution
+  covers:
+    - casa/rootfs/opt/casa/agent_registry.py::AgentRegistry
+    - casa/rootfs/opt/casa/agent_registry.py::KnownAgent
+    - casa/rootfs/opt/casa/agent_registry.py::AgentRegistry.tier_for_role
+    - casa/rootfs/opt/casa/agent_loader.py::validate_config_repo
+    - casa/rootfs/opt/casa/agent_loader.py::LoadError
+  tests:
+    - tests/test_agent_registry.py::test_role_to_name_basic
+    - tests/test_agent_registry.py::test_name_to_role_unknown_returns_none
+    - tests/test_agent_loader.py::test_duplicate_role_across_residents_and_specialists_fails
+  related: [architecture/overview.md, architecture/turn-loop.md]
+  defines_invariants: [INV-AGENT-001, INV-AGENT-002, INV-AGENT-003, INV-AGENT-004]
+
 - doc: architecture/turn-loop.md
   summary: How one inbound message becomes one agent turn, and what bounds it.
   when_changing: the turn lifecycle, the warm client pool, retry behaviour, or turn teardown
@@ -50,7 +79,7 @@
     - tests/test_agent_process.py::test_telegram_channel_autorecalls_on_fresh_session
     - tests/test_sdk_client_pool_pool.py
     - tests/test_retry.py
-  related: [doctrine/publishing.md]
+  related: [architecture/overview.md, architecture/agent-taxonomy.md]
   defines_invariants: [INV-TURN-001, INV-TURN-002, INV-TURN-003, INV-TURN-004, INV-TURN-005]
 
 - doc: contributing/doc-contract.md

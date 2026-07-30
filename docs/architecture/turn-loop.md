@@ -113,5 +113,6 @@ the same way.
 - `tests/test_retry.py`
 
 **Related**
-- [`doctrine/publishing.md`](../doctrine/publishing.md)
+- [`architecture/overview.md`](../architecture/overview.md)
+- [`architecture/agent-taxonomy.md`](../architecture/agent-taxonomy.md)
 <!-- END SOURCEMAP -->
