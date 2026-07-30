@@ -260,6 +260,7 @@ async def test_error_result_retryable_raises_sdkturnerror_and_invalidates():
 
 
 async def test_error_result_nonretryable_returns_but_invalidates():
+    """Pins INV-TURN-002. Red case demonstrated: leaving the non-retryable error path warm instead of invalid fails this test."""
     c = _client()
     await c.open()
     c._client.script = [[_mk_assistant("partial"),
@@ -275,7 +276,10 @@ async def test_error_result_nonretryable_returns_but_invalidates():
 
 async def test_cancel_interrupts_drains_and_stays_warm():
     """AR-1: the aborted turn's buffered tail (incl. its ResultMessage) is
-    consumed during cleanup, so the NEXT turn cannot go off-by-one."""
+    consumed during cleanup, so the NEXT turn cannot go off-by-one.
+
+    Pins INV-TURN-003. Red case demonstrated: skipping _cleanup_after_cancel in the CancelledError handler fails this test.
+    """
     c = _client()
     await c.open()
     hang = asyncio.Event()

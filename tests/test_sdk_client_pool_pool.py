@@ -485,6 +485,7 @@ async def test_decision_new_closes_old_awaits_disconnect_then_stale_cb():
 
 
 async def test_sid_mismatch_reconnects_on_registry_sid():
+    """Pins INV-TURN-001. Red case demonstrated: dropping the entry.sid == resume_sid half of the reusable check fails this test."""
     reg = FakeRegistry()
     reg.data["tg-1"] = {"sdk_session_id": "sid-A", "last_active": "x"}
     pool = _mk_pool(reg)

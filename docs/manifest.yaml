@@ -87,8 +87,8 @@
   related: [architecture/agent-taxonomy.md, architecture/turn-loop.md]
   defines_invariants: [INV-SYS-001, INV-SYS-002]
   invariant_tests:
-    INV-SYS-001: [tests/PINNING-TEST-MISSING]
-    INV-SYS-002: [tests/PINNING-TEST-MISSING]
+    INV-SYS-001: [tests/test_pin_g1_invariants.py::test_pin_inv_sys_001_materialisation_depends_on_validation]
+    INV-SYS-002: [tests/test_agent_loader.py::test_duplicate_role_across_residents_and_specialists_fails]
 
 - doc: architecture/agent-taxonomy.md
   summary: How an agent is declared, validated and looked up — tiers, required artifacts, and the registry.
@@ -108,10 +108,10 @@
   related: [architecture/overview.md, architecture/turn-loop.md]
   defines_invariants: [INV-AGENT-001, INV-AGENT-002, INV-AGENT-003, INV-AGENT-004]
   invariant_tests:
-    INV-AGENT-001: [tests/PINNING-TEST-MISSING]
-    INV-AGENT-002: [tests/PINNING-TEST-MISSING]
-    INV-AGENT-003: [tests/PINNING-TEST-MISSING]
-    INV-AGENT-004: [tests/PINNING-TEST-MISSING]
+    INV-AGENT-001: [tests/test_agent_loader.py::test_duplicate_role_across_residents_and_specialists_fails]
+    INV-AGENT-002: [tests/test_pin_g1_invariants.py::test_pin_inv_agent_002_strict_file_set_for_residents_and_specialists]
+    INV-AGENT-003: [tests/test_agent_loader.py::test_per_specialist_isolation]
+    INV-AGENT-004: [tests/test_pin_g1_invariants.py::test_pin_inv_agent_004_registry_performs_no_filesystem_access]
 
 - doc: architecture/http-surface.md
   summary: The two HTTP servers, what each exposes, and how an inbound request is authenticated.
@@ -458,11 +458,11 @@
   related: [architecture/overview.md, architecture/agent-taxonomy.md]
   defines_invariants: [INV-TURN-001, INV-TURN-002, INV-TURN-003, INV-TURN-004, INV-TURN-005]
   invariant_tests:
-    INV-TURN-001: [tests/PINNING-TEST-MISSING]
-    INV-TURN-002: [tests/PINNING-TEST-MISSING]
-    INV-TURN-003: [tests/PINNING-TEST-MISSING]
-    INV-TURN-004: [tests/PINNING-TEST-MISSING]
-    INV-TURN-005: [tests/PINNING-TEST-MISSING]
+    INV-TURN-001: [tests/test_sdk_client_pool_pool.py::test_sid_mismatch_reconnects_on_registry_sid]
+    INV-TURN-002: [tests/test_sdk_client_pool_client.py::test_error_result_nonretryable_returns_but_invalidates]
+    INV-TURN-003: [tests/test_sdk_client_pool_client.py::test_cancel_interrupts_drains_and_stays_warm]
+    INV-TURN-004: [tests/test_agent_process.py::test_memory_failure_does_not_break_response]
+    INV-TURN-005: [tests/test_retry.py::test_cancelled_error_propagates_immediately, tests/test_retry.py]
 
 - doc: contributing/doc-contract.md
   summary: The shape a document takes, and which of its rules CI enforces versus a reviewer.
