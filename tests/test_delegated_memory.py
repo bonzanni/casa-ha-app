@@ -154,6 +154,8 @@ async def test_retain_delegated_classifies_each_item(monkeypatch):
 
 
 async def test_retain_delegated_voice_writes_nothing():
+    """Pins INV-MEM-005. Red case demonstrated: adding "voice" to
+    channel_policy._WRITABLE_CHANNELS fails this test."""
     sem = _Sem()
     await delegated_memory.retain_delegated(
         sem, origin_channel="voice",

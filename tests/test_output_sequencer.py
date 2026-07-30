@@ -1035,6 +1035,8 @@ async def test_register_intent_rejected_after_terminalize():
 
 
 async def test_post_intent_locked_discards_under_terminal_latch():
+    """Pins INV-ENG-005. Red case demonstrated: disabling _post_intent_locked's
+    terminal-latch fail-closed branch (`if False:`) fails this test."""
     from channels.output_sequencer import SendIntent
     rec, clock = Recorder(), Clock()
     seq = _make_seq(rec, clock)

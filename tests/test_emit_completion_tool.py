@@ -169,6 +169,9 @@ class TestConcurrentCancelVsEmit:
     async def test_cancel_during_g2_reload_window_finalizes_once(
         self, tmp_path, monkeypatch,
     ):
+        """Pins INV-ENG-001. Red case demonstrated: reducing
+        try_transition_terminal's already-terminal refusal to `rec is None`
+        lets the loser finalize too and fails this test."""
         import tools
         from engagement_registry import EngagementRegistry
         from tools import emit_completion, engagement_var, init_tools, _finalize_engagement
@@ -589,6 +592,36 @@ class TestCompletionInboundGate:
             agent_mod.active_claude_code_driver = None
         assert payload["status"] == "acknowledged"
         assert rec.status == "completed"
+
+    async def test_inbound_racing_past_precheck_is_vetoed_by_terminal_hook(
+            self, tmp_path):
+        """Pins INV-ENG-003's second enforcement layer: the gate re-evaluates
+        INSIDE the terminal transition, so input that arrives after
+        emit_completion's pre-check but before the flip still vetoes.
+
+        Red case demonstrated: neutering the terminal hook's veto
+        (`if inbound_gate and (texts or resv):` → `if False:`) completes this
+        engagement and fails the test. Breaking emit_completion's pre-check
+        alone fails nothing — the hook backstops it and the refusal is
+        recorded on the veto path too — so the hook is where the invariant is
+        actually pinned; the pre-check is an optimisation that spares
+        sequencer debt.
+        """
+        import agent as agent_mod
+        drv = _FakeInboundDriver()
+        reg, rec, _ = await self._setup(tmp_path, drv)
+
+        async def _inbound_arrives_during_drain(engagement):
+            drv._depth = 1
+            drv._texts = ["arrived during completion"]
+
+        drv.drain_inbound_spool = _inbound_arrives_during_drain
+        try:
+            payload = await self._emit(rec)
+        finally:
+            agent_mod.active_claude_code_driver = None
+        assert payload["kind"] == "unread_inbound"
+        assert rec.status not in ("completed", "error", "cancelled")
 
     async def test_error_status_not_gated_but_annotated(self, tmp_path):
         """A broken engagement must be able to die even with unread input;

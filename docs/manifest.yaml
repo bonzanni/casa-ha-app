@@ -166,11 +166,11 @@
   related: [architecture/overview.md, architecture/turn-loop.md]
   defines_invariants: [INV-MEM-001, INV-MEM-002, INV-MEM-003, INV-MEM-004, INV-MEM-005]
   invariant_tests:
-    INV-MEM-001: [tests/PINNING-TEST-MISSING]
-    INV-MEM-002: [tests/PINNING-TEST-MISSING]
-    INV-MEM-003: [tests/PINNING-TEST-MISSING]
-    INV-MEM-004: [tests/PINNING-TEST-MISSING]
-    INV-MEM-005: [tests/PINNING-TEST-MISSING]
+    INV-MEM-001: [tests/test_pin_memory_invariants.py::test_pin_inv_mem_001_failures_raise_never_return_empty, tests/test_hindsight_memory.py::test_recall_unrenderable_results_are_unavailable_not_zero_hits]
+    INV-MEM-002: [tests/test_pin_memory_invariants.py::test_pin_inv_mem_002_exactly_one_readable_tier]
+    INV-MEM-003: [tests/test_sensitivity.py::test_unknown_channel_fails_closed_to_public]
+    INV-MEM-004: [tests/test_pin_memory_invariants.py::test_pin_inv_mem_004_reserved_tags_refused_before_io]
+    INV-MEM-005: [tests/test_delegated_memory.py::test_retain_delegated_voice_writes_nothing]
 
 - doc: architecture/plugins.md
   summary: How a plugin becomes usable — registry, content-addressed store, artifact identity, and per-call authorization.
@@ -195,12 +195,12 @@
   related: [architecture/overview.md, architecture/agent-taxonomy.md]
   defines_invariants: [INV-PLUG-001, INV-PLUG-002, INV-PLUG-003, INV-PLUG-004, INV-PLUG-005, INV-PLUG-006]
   invariant_tests:
-    INV-PLUG-001: [tests/PINNING-TEST-MISSING]
-    INV-PLUG-002: [tests/PINNING-TEST-MISSING]
-    INV-PLUG-003: [tests/PINNING-TEST-MISSING]
-    INV-PLUG-004: [tests/PINNING-TEST-MISSING]
-    INV-PLUG-005: [tests/PINNING-TEST-MISSING]
-    INV-PLUG-006: [tests/PINNING-TEST-MISSING]
+    INV-PLUG-001: [tests/test_plugin_registry.py::test_artifact_id_mismatch_is_per_entry_skip]
+    INV-PLUG-002: [tests/test_pin_plugin_invariants.py::test_pin_inv_plug_002_checksum_drift_and_symlinked_locations]
+    INV-PLUG-003: [tests/test_plugin_store.py::test_safe_extract_rejects]
+    INV-PLUG-004: [tests/test_authz_hook.py::test_third_call_rechallenges_single_use, tests/test_authz_hook.py::test_args_drift_rechallenges, tests/test_authz_grants.py::test_exactly_one_thread_consumes]
+    INV-PLUG-005: [tests/test_authz_hook.py::test_restart_loses_grants_fresh_store_rechallenges]
+    INV-PLUG-006: [tests/test_agent_plugin_binding.py::test_executor_options_have_plugins_but_no_grants_no_callback]
 
 - doc: architecture/engagements.md
   summary: Work one agent hands to another — ephemeral delegation, durable engagements, how they end, and what survives a restart.
@@ -221,11 +221,11 @@
   related: [architecture/overview.md, architecture/turn-loop.md, architecture/agent-taxonomy.md]
   defines_invariants: [INV-ENG-001, INV-ENG-002, INV-ENG-003, INV-ENG-004, INV-ENG-005]
   invariant_tests:
-    INV-ENG-001: [tests/PINNING-TEST-MISSING]
-    INV-ENG-002: [tests/PINNING-TEST-MISSING]
-    INV-ENG-003: [tests/PINNING-TEST-MISSING]
-    INV-ENG-004: [tests/PINNING-TEST-MISSING]
-    INV-ENG-005: [tests/PINNING-TEST-MISSING]
+    INV-ENG-001: [tests/test_emit_completion_tool.py::test_cancel_during_g2_reload_window_finalizes_once]
+    INV-ENG-002: [tests/test_engagement_registry.py::test_strict_transition_rolls_back_full_field_on_persist_failure]
+    INV-ENG-003: [tests/test_emit_completion_tool.py::test_unread_queued_message_refuses_completion, tests/test_emit_completion_tool.py::test_pending_ingress_reservation_refuses_completion, tests/test_emit_completion_tool.py::test_inbound_racing_past_precheck_is_vetoed_by_terminal_hook]
+    INV-ENG-004: [tests/test_delegation_context_wrapper.py::test_child_origin_extends_parent_with_execution_role, tests/test_delegate_to_agent.py::test_delegate_to_agent_depth_cap]
+    INV-ENG-005: [tests/test_anchor_narration_buffer.py::test_terminal_latch_discards_via_sequencer_writers, tests/test_output_sequencer.py::test_post_intent_locked_discards_under_terminal_latch]
 
 - doc: architecture/voice.md
   summary: How spoken input becomes a turn and how the answer gets back — transports, authentication, the turn budget, and deferred delivery.
