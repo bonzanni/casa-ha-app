@@ -183,6 +183,7 @@ async def test_any_unknown_capability_fails_the_whole_registration_closed():
 
 
 async def test_missing_voice_handoff_capability_fails_registration_closed():
+    """Pins INV-VOICE-004 (subset direction). Red case demonstrated: deleting the full-set-required containment check in register() fails this file's tests."""
     raw = _RawSocket()
     connection = VoiceWsConnection(raw)
     routes = VoiceRouteRegistry(

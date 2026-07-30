@@ -134,11 +134,11 @@
   related: [architecture/overview.md]
   defines_invariants: [INV-HTTP-001, INV-HTTP-002, INV-HTTP-003, INV-HTTP-004, INV-HTTP-005]
   invariant_tests:
-    INV-HTTP-001: [tests/PINNING-TEST-MISSING]
-    INV-HTTP-002: [tests/PINNING-TEST-MISSING]
-    INV-HTTP-003: [tests/PINNING-TEST-MISSING]
-    INV-HTTP-004: [tests/PINNING-TEST-MISSING]
-    INV-HTTP-005: [tests/PINNING-TEST-MISSING]
+    INV-HTTP-001: [tests/test_webhook_auth.py::test_hmac_body_valid, tests/test_webhook_auth.py::test_static_header_valid_and_missing, tests/test_webhook_auth.py::test_timestamped_hmac_valid_within_tolerance, tests/test_webhook_auth.py::test_unknown_mode_fails]
+    INV-HTTP-002: [tests/test_pin_http_invariants.py::test_pin_inv_http_002_constant_time_everywhere_and_no_empty_secret, tests/test_webhook_auth.py::test_empty_secret_fails_closed]
+    INV-HTTP-003: [tests/test_pin_http_invariants.py::test_pin_inv_http_003_replay_unbounded_except_timestamped, tests/test_webhook_auth.py::test_timestamped_hmac_stale_rejected]
+    INV-HTTP-004: [tests/test_origin_stamping.py::test_invoke_route_is_unspoofable, tests/test_webhook_handler.py::test_payload_context_never_enters_bus_message_context]
+    INV-HTTP-005: [tests/test_pin_http_invariants.py::test_pin_inv_http_005_table_contract_disagreement_refused, tests/test_ingress_identity_boot_check.py::test_main_validates_the_table_before_doing_anything_else]
 
 - doc: architecture/memory.md
   summary: Long-term memory — how a fact is written, who may read it back, and what a caller is told when the store cannot answer.
@@ -247,12 +247,12 @@
   related: [architecture/overview.md, architecture/http-surface.md, architecture/turn-loop.md]
   defines_invariants: [INV-VOICE-001, INV-VOICE-002, INV-VOICE-003, INV-VOICE-004, INV-VOICE-005, INV-VOICE-006]
   invariant_tests:
-    INV-VOICE-001: [tests/PINNING-TEST-MISSING]
-    INV-VOICE-002: [tests/PINNING-TEST-MISSING]
-    INV-VOICE-003: [tests/PINNING-TEST-MISSING]
-    INV-VOICE-004: [tests/PINNING-TEST-MISSING]
-    INV-VOICE-005: [tests/PINNING-TEST-MISSING]
-    INV-VOICE-006: [tests/PINNING-TEST-MISSING]
+    INV-VOICE-001: [tests/test_voice_auth_failclosed.py::test_sse_turn_rejected_and_never_dispatched, tests/test_voice_auth_failclosed.py::test_ws_upgrade_rejected, tests/test_voice_auth_failclosed.py::test_catalog_rejected, tests/test_voice_auth_failclosed.py::test_mis_signed_turn_rejected]
+    INV-VOICE-002: [tests/test_voice_channel_ws.py::test_pin_inv_voice_002_text_only_agent_refused_on_every_voice_path, tests/test_voice_channel_ws.py::test_invalid_stt_start_is_a_noop]
+    INV-VOICE-003: [tests/test_voice_agent_catalog.py::test_catalog_rejects_overflow_without_truncating]
+    INV-VOICE-004: [tests/test_voice_routes.py::test_missing_voice_handoff_capability_fails_registration_closed, tests/test_voice_routes.py::test_any_unknown_capability_fails_the_whole_registration_closed, tests/test_voice_routes.py::test_protocol_requires_exact_json_integer_two]
+    INV-VOICE-005: [tests/test_voice_context_sanitize.py::test_the_delivery_offer_comes_only_from_the_frame, tests/test_voice_context_sanitize.py::test_route_capability_comes_only_from_server_connection]
+    INV-VOICE-006: [tests/test_voice_delivery.py::test_an_unknown_modality_is_treated_as_no_endpoint, tests/test_voice_delivery.py::test_a_job_with_no_recorded_endpoint_is_never_offered]
 
 - doc: architecture/telegram.md
   summary: How Telegram messages become turns — transports, authentication, the per-topic causal log, keyboards, and rendering.
@@ -272,11 +272,11 @@
   related: [architecture/overview.md, architecture/engagements.md, architecture/http-surface.md]
   defines_invariants: [INV-TG-001, INV-TG-002, INV-TG-003, INV-TG-004, INV-TG-005]
   invariant_tests:
-    INV-TG-001: [tests/PINNING-TEST-MISSING]
-    INV-TG-002: [tests/PINNING-TEST-MISSING]
-    INV-TG-003: [tests/PINNING-TEST-MISSING]
-    INV-TG-004: [tests/PINNING-TEST-MISSING]
-    INV-TG-005: [tests/PINNING-TEST-MISSING]
+    INV-TG-001: [tests/test_telegram_update_handler.py::test_no_secret_configured_rejects, tests/test_telegram_update_handler.py::test_wrong_token_403_and_not_processed, tests/test_telegram_update_handler.py::test_correct_token_200]
+    INV-TG-002: [tests/test_telegram_inline_callback.py::test_wrong_user_refused_without_claiming]
+    INV-TG-003: [tests/test_verdict_broker.py::test_claim_does_not_resolve_until_commit_and_stale_after_retire]
+    INV-TG-004: [tests/test_output_sequencer.py::test_serialized_still_mutually_exclusive_across_tasks]
+    INV-TG-005: [tests/test_tg_richtext.py::test_pin_inv_tg_005_render_paged_enforces_length_and_entity_budgets]
 
 - doc: architecture/configuration.md
   summary: Where configuration comes from, what is version-controlled, what reload can pick up without a restart, and how secrets resolve.

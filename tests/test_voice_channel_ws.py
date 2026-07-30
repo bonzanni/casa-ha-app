@@ -1139,3 +1139,47 @@ class TestARCTimeCapWS:
         assert block_texts, "expected the time-cap to force a block mid-turn"
         assert block_texts[0].rstrip() == "word,", block_texts
         assert "more text" in "".join(block_texts)
+
+
+async def test_pin_inv_voice_002_text_only_agent_refused_on_every_voice_path(
+    signed_ws_app,
+):
+    """Pins INV-VOICE-002: an agent without the voice capability is
+    unreachable over voice — SSE dispatch, WS route registration, and WS
+    utterance dispatch all refuse it.
+
+    Red case demonstrated: dropping the `agent_allowed_on("voice", cfg)` half
+    of _sse_handler's gate lets the SSE turn through and fails the 404
+    assertion.
+    """
+    client, channel, _, headers = signed_ws_app
+    body = json.dumps({
+        "prompt": "hi", "agent_role": "text-only", "scope_id": "s",
+    }).encode()
+    sse_headers = {
+        "Content-Type": "application/json",
+        "X-Webhook-Signature": hmac.new(
+            channel._webhook_secret.encode(), body, hashlib.sha256,
+        ).hexdigest(),
+    }
+    response = await client.post("/api/converse", data=body, headers=sse_headers)
+    assert response.status == 404
+    response.close()
+
+    async with client.ws_connect("/api/converse/ws", headers=headers) as ws:
+        await ws.send_json({
+            "type": "voice_route_register", "protocol": 2,
+            "route_id": "entry-text", "agent_role": "text-only",
+            "capabilities": [
+                "background_jobs", "endpoint_delivery", "voice_handoff",
+            ],
+        })
+        assert (await ws.receive_json())["accepted_capabilities"] == []
+        assert channel.routes.get_connected("entry-text") is None
+
+        await ws.send_json({
+            "type": "utterance", "utterance_id": "u-text",
+            "text": "hi", "agent_role": "text-only", "scope_id": "s",
+        })
+        reply = await ws.receive_json()
+        assert reply["kind"] == "unknown_agent"

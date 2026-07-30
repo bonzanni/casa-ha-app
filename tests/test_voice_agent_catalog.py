@@ -117,6 +117,7 @@ def test_catalog_accepts_exactly_twenty_entries():
 
 
 def test_catalog_rejects_overflow_without_truncating():
+    """Pins INV-VOICE-003. Red case demonstrated: truncating to the cap instead of raising fails this test."""
     configs = {
         f"role_{index}": _cfg(
             f"role_{index}", f"Agent {index}", ["ha_voice"],

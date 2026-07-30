@@ -10,6 +10,7 @@ def test_invoke_stamps_origin_route_invoke():
 
 
 def test_invoke_route_is_unspoofable():
+    """Pins INV-HTTP-004. Red case demonstrated: bypassing sanitize_external_context in the invoke ingress fails this test."""
     # A caller passing _origin_route in the external context is stripped by
     # sanitization; the server stamps "invoke" regardless.
     msg = casa_core.build_invoke_message(

@@ -72,6 +72,7 @@ async def test_non_ascii_token_is_403_not_500():
 
 
 async def test_no_secret_configured_rejects():
+    """Pins INV-TG-001 (with the sibling tests here). Red case demonstrated: neutering the no-secret rejection in _make_telegram_update_handler fails this test."""
     # #193: with no webhook secret the route is fail-CLOSED — an unsigned
     # (potentially forged) update must NOT reach the assistant. 403 signals the
     # route is disabled, not merely mis-signed (mirrors /invoke). In polling

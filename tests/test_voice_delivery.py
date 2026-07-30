@@ -1110,6 +1110,7 @@ async def test_a_job_with_no_recorded_endpoint_is_never_offered(delivery):
 
 @pytest.mark.asyncio
 async def test_an_unknown_modality_is_treated_as_no_endpoint(delivery):
+    """Pins INV-VOICE-006. Red case demonstrated: narrowing the modality check to `is None` offers the unknown modality and fails this test."""
     registry, _, route, coordinator, _ = delivery
     await registry.create(_ready_job(
         "weird-1", sequence=1, device="kitchen", delivery_modality="telepathy"))

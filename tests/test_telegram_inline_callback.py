@@ -154,6 +154,7 @@ class TestFailClosedActorBinding:
     async def test_wrong_user_refused_without_claiming(
         self, fake_telegram_bot, engagement_fixture, _fresh_broker,
     ):
+        """Pins INV-TG-002. Red case demonstrated: dropping the actor-mismatch half of _on_inline_callback's check lets the wrong user claim and fails this test."""
         ch = _mk_channel(fake_telegram_bot, engagement_fixture)
         rec = engagement_fixture.active_record
         _seed(_fresh_broker, scope=rec.id, rid="rid-wu",

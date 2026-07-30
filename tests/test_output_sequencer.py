@@ -847,7 +847,10 @@ async def test_serialized_still_mutually_exclusive_across_tasks():
     """Owner-tracking must NOT relax exclusion for a DIFFERENT task: while one
     task holds the writer lock (inside a poster await), another task's locked
     op BLOCKS until release. Guards against the reentrant conversion turning the
-    single-writer lock into a no-op for concurrent tasks."""
+    single-writer lock into a no-op for concurrent tasks.
+
+    Pins INV-TG-004. Red case demonstrated: making _serialized treat every task as the lock owner fails this test.
+    """
     rec, clock = Recorder(), Clock()
     seq = _make_seq(rec, clock)
     entered = asyncio.Event()

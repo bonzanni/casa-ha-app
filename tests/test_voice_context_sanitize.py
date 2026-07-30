@@ -204,6 +204,9 @@ class TestVoiceWSSanitize:
         so in the frame. What Casa guarantees is narrower and is what this
         pins: the value it acts on is the one the CHANNEL derived from that
         frame, never one a turn's context claimed for itself.
+        
+
+        Pins INV-VOICE-005. Red case demonstrated: removing _voice_delivery_offer from RESERVED_CONTEXT_KEYS fails this file's tests.
         """
         _client, agent, channel = voice_app
 
