@@ -29,14 +29,18 @@ distinguishes them, individual call sites sometimes do not. Say "I did not find"
 "there is no", and say "I could not check" when that is what happened. See
 `architecture/memory.md`.
 
-**An approval covers one action with one argument set.** Authorization is single-use and
-bound to the exact canonical arguments. If a call is denied and you change the arguments, you
-are asking a different question and need a new approval — do not treat a prior approval as a
-capability you now hold. See `architecture/plugins.md`.
+**A protected-tool approval covers one action with one argument set.** That authorization is
+single-use and bound to the exact canonical arguments. If a call is denied and you change
+the arguments, you are asking a different question and need a new approval — do not treat a
+prior approval as a capability you now hold. Install consent is a different animal: a
+specialist or persona install acknowledgement is persistent and covers the inspected
+artifact, and is not consumed by use. See `architecture/plugins.md`.
 
-**When a call is pending authorization, stop.** The refusal you receive is an instruction, not
-a description: produce no narration and end the turn. Narrating "I'm waiting for approval"
-duplicates what the operator is already looking at.
+**When a protected tool call is denied pending authorization, stop.** That refusal is an
+instruction, not a description: produce no narration and end the turn. Narrating "I'm
+waiting for approval" duplicates what the operator is already looking at. The install-consent
+flow is the deliberate exception — its inspect step hands you the details *so that* you can
+narrate what the operator is approving while the keyboard is up.
 
 **Never describe the operator's interface back to them.** They can see their own screen. A
 refusal that explains which button to press reads as the system talking about itself instead
@@ -54,9 +58,12 @@ nothing. Check that the path exists before committing to it in speech. See
 **Respect the turn's deadline.** A voice turn is bounded by an absolute deadline anchored at
 ingress. Long work belongs in something that outlives the turn, not in stretching the turn.
 
-**Read your messages before declaring success.** A successful completion is refused while
-inbound messages are unread, and that refusal is correct — it means someone said something
-you have not accounted for. See `architecture/engagements.md`.
+**Read your messages before declaring success.** Where the driver exposes inbound state —
+the claude-code engagement path — a successful completion is refused while inbound messages
+are unread, and that refusal is correct: it means someone said something you have not
+accounted for. Do not lean on the gate from the other side, though; it fails open on
+accessor errors and does not exist on every path, so reading your messages is your job
+either way. See `architecture/engagements.md`.
 
 **Finishing is not delivering.** An engagement can be terminally complete while its
 completion message never reached anyone. If it matters that a person *knows*, confirm rather

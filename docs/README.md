@@ -10,7 +10,9 @@ Canonical current-state reference for AI agents working on this repository. Writ
 agent that has just arrived and is about to change something.
 
 Read [`doctrine/publishing.md`](doctrine/publishing.md) before writing anything here — this
-repository is public, and everything published stays published. Then use the table below,
+repository is public, and everything published must be treated as staying published —
+pushed objects remain fetchable by hash whatever happens to branches, so assume
+irreversibility rather than counting on retraction. Then use the table below,
 which is keyed on what you are about to do rather than on subsystem names.
 
 <!-- BEGIN ROUTING -->

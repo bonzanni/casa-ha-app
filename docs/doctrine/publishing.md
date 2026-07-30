@@ -28,12 +28,15 @@ So the question is never "can this be removed later". It is "may this exist at a
 
 That is the whole rule. Everything below is it, applied.
 
-**What the rule excludes.** Hostnames, IP addresses and network topology. Credentials of
-every kind, and references that name where a credential lives. Chat, group and channel
-identifiers. Reverse-proxy and deployment configuration. Anything describing one specific
-installation rather than the software. Roadmaps, plans, design specifications, review
-notes, incident write-ups and captured agent transcripts. Personal addresses and contact
-details, including in commit metadata and branch names.
+**What the rule excludes.** Anything describing one specific installation rather than the
+software: an installation's hostnames, addresses and network layout, credentials of every
+kind and references that name where a credential lives, chat, group and channel identifiers,
+and an operator's deployment arrangements. The software's *own* topology is different — the
+ports the manifest publishes, the listeners the shipped nginx config defines, a loopback
+bind in the source — all of that is already in the public commit and is exactly what these
+documents describe. Also excluded: roadmaps, plans, design specifications, review notes,
+incident write-ups and captured agent transcripts. Personal addresses and contact details,
+including in commit metadata and branch names.
 
 **INV-PUB-002**: Doctrine states the mechanism, never the incident.
 
@@ -44,9 +47,9 @@ must not be written down is how anyone came to know that: whether something brok
 to whom. The mechanism is what makes the rule checkable and the mechanism stays true, so the
 history adds nothing a reader can act on.
 
-This file previously illustrated that point with a sentence asserting an outage had occurred
-— publishing exactly the class of fact it was arguing against. The rule is easier to state
-than to follow.
+A sentence asserting that a failure once happened publishes exactly the class of fact this
+rule argues against — and it is the easiest sentence to write while arguing it. The rule is
+easier to state than to follow.
 
 **INV-PUB-003**: When a claim cannot be checked from the commit, stop and ask. Do not guess, and do not paraphrase around it.
 
@@ -68,6 +71,14 @@ What they cannot do is recognise a paragraph that is confidential without contai
 secret. Patterns match shapes; prose has none. That gap is why the gate also requires a
 human to read every introduced file before anything is pushed, and why an attestation
 recording that read is what the push hook actually checks.
+
+Know the layers' limits as layers, too: the hooks run only where they are installed and git
+lets a determined pusher bypass them; the pre-push gate honours an explicit override
+variable for emergencies; and CI runs from the pull request's own checkout, so a PR can
+weaken CI's copy of the guard. They are defence in depth around a human rule, not a
+guarantee. And the rule's reach is the *commit*: pull-request titles and bodies are GitHub
+metadata the gate never sees, so applying the rule there is a review habit, not a swept
+surface.
 
 A guard that refuses your change is not an obstacle to route around. Loosening a pattern to
 make a commit succeed inverts the control: the pattern existed because someone decided that

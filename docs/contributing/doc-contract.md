@@ -33,13 +33,13 @@ the string was written, not that anyone read the file that day — it is an auth
 kept because the rotation below needs something to sort on. Treat it as a claim, and do not
 build anything on it that a lie would break.
 
-**INV-DOC-002**: Documents follow one section order: Scope, Mental model, Contracts & invariants, Failure behavior, Extension points, Source & test map. An agent can then skim positionally instead of reading to find out where things are.
+**INV-DOC-002**: An architecture document follows one section order — Scope, Mental model, Contracts & invariants, Failure behavior, Extension points, Source & test map — so an agent can skim positionally; doctrine and contributing documents keep the code-wins line and the source map but shape their own sections.
 
-**INV-DOC-003**: Present tense only. No changelog voice, no "as of version X", no discrepancy log, no TODOs, no open questions. Those belong in the change that resolves them.
+**INV-DOC-003**: A document describes the present system — no changelog voice, no "as of version X", no discrepancy log, no TODOs, no open questions; past tense may explain a mechanism, never track the document's own history.
 
-**INV-DOC-004**: A cross-cutting rule is defined exactly once, as `**INV-AREA-NNN**: <single-line statement>`, and referenced by id everywhere else. Ids are issued only for rules referenced from more than one file — an id per local rule is bureaucracy, and the define-once check makes over-issuing visibly expensive.
+**INV-DOC-004**: A cross-cutting rule is defined exactly once, as `**INV-AREA-NNN**: <single-line statement>`, and referenced by id rather than restated. Issue ids sparingly — an id per local rule is bureaucracy, and the define-once check makes over-issuing visibly expensive; nothing mechanical enforces a minimum reference count.
 
-**INV-DOC-005**: Anchors are typed symbols — `path/to/file.py::Class.method`, `config.yaml::schema.key`, `tests/test_x.py::test_name`. Never `file:line`, which rots silently on the next edit.
+**INV-DOC-005**: Anchors are typed symbols (`path/to/file.py::Class.method`, `config.yaml::schema.key`, `tests/test_x.py::test_name`) or tracked bare paths; never `file:line`, which rots silently on the next edit.
 
 **INV-DOC-006**: Growth splits, it never appends. A document that reaches the ceiling is divided and both halves manifested. The ceiling is not raised, and nothing shards on its own.
 
@@ -51,8 +51,11 @@ how a corpus rots while passing.
 **CI enforces**: the size budget; allowlist exactness in both directions against
 `git ls-files`; admitted extensions; manifest schema and required fields; anchor resolution
 and containment; the marker pair in every document; invariant define-once, reference
-resolution, and declaration accuracy; the required skeleton; and that all generated
-navigation is current.
+resolution, and declaration accuracy; that every declared invariant binds at least one
+tracked pinning test (the `invariant_tests` map — a binding to the missing-test sentinel is
+itself a failure); the code-derived coverage ledger in both directions (every enumerated
+surface assigned to a document or excluded with a reason, no stale entries); the required
+skeleton; and that all generated navigation is current.
 
 **A reviewer enforces**: front matter and the code-wins line; the section order; present
 tense; whether a document is one-hop sufficient; whether the same rule has been restated in
@@ -60,8 +63,8 @@ different words somewhere else; and whether any of it is true. No script can tel
 rule from a plausible one.
 
 Those reviewer obligations are the periodic sweep's job, per release, oldest `last_reviewed`
-first. A document that has gone four releases unswept blocks the release rather than
-silently ageing.
+first. That rotation is a convention: nothing mechanical blocks a release on an unswept
+document, so the sort on `last_reviewed` is what keeps ageing visible.
 
 ## Extension points
 
