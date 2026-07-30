@@ -23,6 +23,17 @@ Every invariant is defined in exactly one file and referenced by id elsewhere.
 | `INV-HTTP-003` | No mode prevents replay. The timestamped mode *bounds* it to a tolerance window; the other two accept a valid credential indefinitely. | [`architecture/http-surface.md`](../architecture/http-surface.md) |
 | `INV-HTTP-004` | External context arriving on a request cannot set provenance fields; the ingress supplies them. | [`architecture/http-surface.md`](../architecture/http-surface.md) |
 | `INV-HTTP-005` | The ingress-identity table is validated at boot against an independently-written route contract, and any disagreement between the two is a boot failure. | [`architecture/http-surface.md`](../architecture/http-surface.md) |
+| `INV-MEM-001` | Recall reports unavailability by raising; it never represents a failure as a successful empty result. | [`architecture/memory.md`](../architecture/memory.md) |
+| `INV-MEM-002` | A typed hit is readable only when its tags carry exactly one recognised tier at or below the caller's clearance; if every hit is dropped, the result is unavailable rather than empty. | [`architecture/memory.md`](../architecture/memory.md) |
+| `INV-MEM-003` | An unrecognised channel reads at the least-sensitive tier. | [`architecture/memory.md`](../architecture/memory.md) |
+| `INV-MEM-004` | A caller cannot inject a sensitivity tier or a provenance tag through ordinary application tags. | [`architecture/memory.md`](../architecture/memory.md) |
+| `INV-MEM-005` | Only write-trusted channels retain to the shared bank. | [`architecture/memory.md`](../architecture/memory.md) |
+| `INV-PLUG-001` | A registry entry is usable only when its recorded artifact id equals the id computed from its own source coordinates. | [`architecture/plugins.md`](../architecture/plugins.md) |
+| `INV-PLUG-002` | A resolved artifact must match its recorded content checksum, and the artifact path and its parent must not be symlinks. | [`architecture/plugins.md`](../architecture/plugins.md) |
+| `INV-PLUG-003` | Archive extraction refuses traversal, absolute paths, links out of the tree, and special files. | [`architecture/plugins.md`](../architecture/plugins.md) |
+| `INV-PLUG-004` | A protected tool call from a resident or specialist proceeds only by consuming an exact, single-use grant. | [`architecture/plugins.md`](../architecture/plugins.md) |
+| `INV-PLUG-005` | Grants exist only in process memory; a restart revokes every one of them. | [`architecture/plugins.md`](../architecture/plugins.md) |
+| `INV-PLUG-006` | Executor options receive plugin paths without a grant merge and without a tool gate. | [`architecture/plugins.md`](../architecture/plugins.md) |
 | `INV-PUB-001` | A fact belongs in this repository only if it is verifiable from the public commit alone — with no operator, no production system, and no private repository. | [`doctrine/publishing.md`](../doctrine/publishing.md) |
 | `INV-PUB-002` | Doctrine states the mechanism, never the incident. | [`doctrine/publishing.md`](../doctrine/publishing.md) |
 | `INV-PUB-003` | When a claim cannot be checked from the commit, stop and ask. Do not guess, and do not paraphrase around it. | [`doctrine/publishing.md`](../doctrine/publishing.md) |

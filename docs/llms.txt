@@ -7,7 +7,9 @@ Code is the source of truth; these files are a map.
 
 - [architecture/agent-taxonomy.md](architecture/agent-taxonomy.md): How an agent is declared, validated and looked up — tiers, required artifacts, and the registry.
 - [architecture/http-surface.md](architecture/http-surface.md): The two HTTP servers, what each exposes, and how an inbound request is authenticated.
+- [architecture/memory.md](architecture/memory.md): Long-term memory — how a fact is written, who may read it back, and what a caller is told when the store cannot answer.
 - [architecture/overview.md](architecture/overview.md): What Casa is made of — supervised services, the three agent tiers, and where configuration enters.
+- [architecture/plugins.md](architecture/plugins.md): How a plugin becomes usable — registry, content-addressed store, artifact identity, and per-call authorization.
 - [architecture/turn-loop.md](architecture/turn-loop.md): How one inbound message becomes one agent turn, and what bounds it.
 
 ## Doctrine

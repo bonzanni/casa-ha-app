@@ -96,6 +96,55 @@
   related: [architecture/overview.md]
   defines_invariants: [INV-HTTP-001, INV-HTTP-002, INV-HTTP-003, INV-HTTP-004, INV-HTTP-005]
 
+- doc: architecture/memory.md
+  summary: Long-term memory — how a fact is written, who may read it back, and what a caller is told when the store cannot answer.
+  when_changing: recall behaviour, sensitivity tiers, provenance on a stored fact, or session persistence
+  covers:
+    - casa/rootfs/opt/casa/semantic_memory.py::SemanticMemory
+    - casa/rootfs/opt/casa/semantic_memory.py::RecallUnavailable
+    - casa/rootfs/opt/casa/semantic_memory.py::RecallProtocolError
+    - casa/rootfs/opt/casa/semantic_memory.py::NoOpSemanticMemory
+    - casa/rootfs/opt/casa/hindsight_memory.py::HindsightSemanticMemory.recall_items
+    - casa/rootfs/opt/casa/sensitivity.py::clearance_for_channel
+    - casa/rootfs/opt/casa/sensitivity.py::clearance_for_origin
+    - casa/rootfs/opt/casa/channel_policy.py::writes_to_bank
+    - casa/rootfs/opt/casa/memory_provenance.py::build_retain_items
+    - casa/rootfs/opt/casa/recall_renderer.py::render_recall
+    - casa/rootfs/opt/casa/recall_health.py::observed_recall
+    - casa/rootfs/opt/casa/session_saver.py::save_session
+  tests:
+    - tests/test_recall_absence_invariant.py
+    - tests/test_recall_health.py::test_breaker_opens_after_threshold_failures
+    - tests/test_sensitivity.py::test_readable_tiers_is_clearance_and_below
+    - tests/test_channel_policy.py
+    - tests/test_memory_provenance.py
+    - tests/test_agent_auto_recall_unavailable.py
+  related: [architecture/overview.md, architecture/turn-loop.md]
+  defines_invariants: [INV-MEM-001, INV-MEM-002, INV-MEM-003, INV-MEM-004, INV-MEM-005]
+
+- doc: architecture/plugins.md
+  summary: How a plugin becomes usable — registry, content-addressed store, artifact identity, and per-call authorization.
+  when_changing: plugin installation, artifact identity, protected tools, or authorization grants
+  covers:
+    - casa/rootfs/opt/casa/plugin_registry.py::compute_artifact_id
+    - casa/rootfs/opt/casa/plugin_registry.py::reload_snapshot
+    - casa/rootfs/opt/casa/plugin_store.py::safe_extract_tar
+    - casa/rootfs/opt/casa/plugin_store.py::artifact_verdict
+    - casa/rootfs/opt/casa/plugin_store.py::manifest_protected_tools
+    - casa/rootfs/opt/casa/plugin_grants.py::protected_map
+    - casa/rootfs/opt/casa/authz_grants.py::GrantKey
+    - casa/rootfs/opt/casa/authz_grants.py::GrantStore
+    - casa/rootfs/opt/casa/plugin_boot.py::main
+  tests:
+    - tests/test_plugin_registry.py
+    - tests/test_plugin_store_publish.py
+    - tests/test_plugin_grants.py
+    - tests/test_authz_grants.py
+    - tests/test_authz_hook.py
+    - tests/test_plugin_boot.py
+  related: [architecture/overview.md, architecture/agent-taxonomy.md]
+  defines_invariants: [INV-PLUG-001, INV-PLUG-002, INV-PLUG-003, INV-PLUG-004, INV-PLUG-005, INV-PLUG-006]
+
 - doc: architecture/turn-loop.md
   summary: How one inbound message becomes one agent turn, and what bounds it.
   when_changing: the turn lifecycle, the warm client pool, retry behaviour, or turn teardown
