@@ -33,11 +33,18 @@ Every invariant is defined in exactly one file and referenced by id elsewhere.
 | `INV-HTTP-003` | No mode prevents replay. The timestamped mode *bounds* it to a tolerance window; the other two accept a valid credential indefinitely. | [`architecture/http-surface.md`](../architecture/http-surface.md) |
 | `INV-HTTP-004` | External context arriving on a request cannot set provenance fields; the ingress supplies them. | [`architecture/http-surface.md`](../architecture/http-surface.md) |
 | `INV-HTTP-005` | The ingress-identity table is validated at boot against an independently-written route contract, and any disagreement between the two is a boot failure. | [`architecture/http-surface.md`](../architecture/http-surface.md) |
+| `INV-MCP-001` | The internal tool dispatch path resolves a call by name against the full tool map and does not consult any per-agent allowlist. | [`architecture/mcp-and-tools.md`](../architecture/mcp-and-tools.md) |
+| `INV-MCP-002` | The internal endpoint is reachable only from inside the container, over a Unix socket with restricted permissions. | [`architecture/mcp-and-tools.md`](../architecture/mcp-and-tools.md) |
+| `INV-MCP-003` | The two surfaces expose different tool sets — role-filtered on the SDK side, the full static set over HTTP. | [`architecture/mcp-and-tools.md`](../architecture/mcp-and-tools.md) |
 | `INV-MEM-001` | Recall reports unavailability by raising; it never represents a failure as a successful empty result. | [`architecture/memory.md`](../architecture/memory.md) |
 | `INV-MEM-002` | A typed hit is readable only when its tags carry exactly one recognised tier at or below the caller's clearance; if every hit is dropped, the result is unavailable rather than empty. | [`architecture/memory.md`](../architecture/memory.md) |
 | `INV-MEM-003` | An unrecognised channel reads at the least-sensitive tier. | [`architecture/memory.md`](../architecture/memory.md) |
 | `INV-MEM-004` | A caller cannot inject a sensitivity tier or a provenance tag through ordinary application tags. | [`architecture/memory.md`](../architecture/memory.md) |
 | `INV-MEM-005` | Only write-trusted channels retain to the shared bank. | [`architecture/memory.md`](../architecture/memory.md) |
+| `INV-PERS-001` | When a resident has an activated compiled bundle, that bundle's projection is the base prompt; the composed prompt is a fallback for when there is none. | [`architecture/personality.md`](../architecture/personality.md) |
+| `INV-PERS-002` | Persona validation is structural; it does not verify that a persona's claims about capability are true. | [`architecture/personality.md`](../architecture/personality.md) |
+| `INV-PERS-003` | A resident's binding reconciliation runs as part of loading and is not isolated from it. | [`architecture/personality.md`](../architecture/personality.md) |
+| `INV-PERS-004` | The restricted-origin prompt omits the persona section. | [`architecture/personality.md`](../architecture/personality.md) |
 | `INV-PLUG-001` | A registry entry is usable only when its recorded artifact id equals the id computed from its own source coordinates. | [`architecture/plugins.md`](../architecture/plugins.md) |
 | `INV-PLUG-002` | A resolved artifact must match its recorded content checksum, and the artifact path and its parent must not be symlinks. | [`architecture/plugins.md`](../architecture/plugins.md) |
 | `INV-PLUG-003` | Archive extraction refuses traversal, absolute paths, links out of the tree, and special files. | [`architecture/plugins.md`](../architecture/plugins.md) |
@@ -54,6 +61,11 @@ Every invariant is defined in exactly one file and referenced by id elsewhere.
 | `INV-TG-003` | A live request is resolved exactly once. | [`architecture/telegram.md`](../architecture/telegram.md) |
 | `INV-TG-004` | Writer operations on a sequenced topic are serialized under one lock. | [`architecture/telegram.md`](../architecture/telegram.md) |
 | `INV-TG-005` | A rich response is paginated to Telegram's message-length and entity budgets. | [`architecture/telegram.md`](../architecture/telegram.md) |
+| `INV-TRIG-001` | A resident's scheduled trigger registers only if the resident declares the channel it names. | [`architecture/triggers.md`](../architecture/triggers.md) |
+| `INV-TRIG-002` | Webhook trigger names are unique, and the user and plugin namespaces cannot collide. | [`architecture/triggers.md`](../architecture/triggers.md) |
+| `INV-TRIG-003` | A plugin's triggers route only as a complete set, and only when target, assignment, secret backing and a persisted operator approval all hold. | [`architecture/triggers.md`](../architecture/triggers.md) |
+| `INV-TRIG-004` | A trigger approval is persisted and bound to an exact identity, and an unreadable or mismatched approval store yields no approvals. | [`architecture/triggers.md`](../architecture/triggers.md) |
+| `INV-TRIG-005` | Reconciliation replaces the entire plugin overlay in a single rebind. | [`architecture/triggers.md`](../architecture/triggers.md) |
 | `INV-TURN-001` | The resume-versus-fresh decision is re-derived from a fresh session read while holding the pool entry's lock, and a cached client is reused only when its session id matches that decision exactly. | [`architecture/turn-loop.md`](../architecture/turn-loop.md) |
 | `INV-TURN-002` | An error result invalidates the pool entry before anything else happens. | [`architecture/turn-loop.md`](../architecture/turn-loop.md) |
 | `INV-TURN-003` | A cancelled turn interrupts, then drains its own buffered messages through the terminal result before the entry may return to warm. Any failure in that window — including a second cancellation — invalidates the entry instead. | [`architecture/turn-loop.md`](../architecture/turn-loop.md) |

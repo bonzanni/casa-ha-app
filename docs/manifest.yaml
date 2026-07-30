@@ -222,6 +222,53 @@
   related: [architecture/overview.md, architecture/plugins.md, architecture/agent-taxonomy.md]
   defines_invariants: [INV-CFG-001, INV-CFG-002, INV-CFG-003, INV-CFG-004, INV-CFG-005]
 
+- doc: architecture/triggers.md
+  summary: What makes an agent act without a person speaking — scheduled and webhook triggers, and the consent a plugin trigger needs.
+  when_changing: trigger types, webhook trigger routing, plugin trigger consent, or scheduling
+  covers:
+    - casa/rootfs/opt/casa/trigger_registry.py::TriggerRegistry
+    - casa/rootfs/opt/casa/trigger_registry.py::TriggerRegistry.replace_plugin_overlay
+    - casa/rootfs/opt/casa/trigger_reconcile.py::compute_desired
+    - casa/rootfs/opt/casa/trigger_acks.py::TriggerAckStore
+    - casa/rootfs/opt/casa/plugin_triggers.py::parse_and_validate
+    - casa/rootfs/opt/casa/casa_core.py::_make_webhook_handler
+  tests:
+    - tests/test_config_triggers_schema.py
+    - tests/test_trigger_consent.py
+    - tests/test_agent_loader_trigger_auth.py
+    - tests/test_casa_reload_triggers_resident.py
+  related: [architecture/plugins.md, architecture/http-surface.md, architecture/overview.md]
+  defines_invariants: [INV-TRIG-001, INV-TRIG-002, INV-TRIG-003, INV-TRIG-004, INV-TRIG-005]
+
+- doc: architecture/mcp-and-tools.md
+  summary: How tools reach an agent, and where authorization for a tool call actually happens.
+  when_changing: adding a tool, changing tool dispatch, or anything about tool authorization
+  covers:
+    - casa/rootfs/opt/casa/internal_handlers.py::_make_internal_tools_call_handler
+    - casa/rootfs/opt/casa/svc_casa_mcp.py
+    - casa/rootfs/opt/casa/tools.py::init_tools
+  tests:
+    - tests/test_internal_handlers.py
+    - tests/test_svc_casa_mcp.py
+    - tests/test_mcp_envelope.py
+  related: [architecture/plugins.md, architecture/agent-taxonomy.md, architecture/http-surface.md]
+  defines_invariants: [INV-MCP-001, INV-MCP-002, INV-MCP-003]
+
+- doc: architecture/personality.md
+  summary: What an agent is versus how it presents — role artifacts, personas, bindings, and which prompt is actually served.
+  when_changing: personas, bindings, prompt composition, or the binding digest
+  covers:
+    - casa/rootfs/opt/casa/personality_binding.py
+    - casa/rootfs/opt/casa/personality_types.py
+    - casa/rootfs/opt/casa/agent_loader.py::_compose_prompt
+    - casa/rootfs/opt/casa/role_slot.py
+  tests:
+    - tests/test_personality_binding.py
+    - tests/test_persona_install.py
+    - tests/test_personality_admin_handlers.py
+  related: [architecture/agent-taxonomy.md, architecture/turn-loop.md]
+  defines_invariants: [INV-PERS-001, INV-PERS-002, INV-PERS-003, INV-PERS-004]
+
 - doc: architecture/turn-loop.md
   summary: How one inbound message becomes one agent turn, and what bounds it.
   when_changing: the turn lifecycle, the warm client pool, retry behaviour, or turn teardown
