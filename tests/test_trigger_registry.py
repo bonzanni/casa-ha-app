@@ -391,6 +391,7 @@ class TestValidation:
                                channels=["telegram"])
 
     async def test_interval_channel_must_be_registered_on_agent(self):
+        """Pins INV-TRIG-001. Red case demonstrated: neutering register_agent's scheduled-channel membership check fails this test."""
         from trigger_registry import TriggerRegistry, TriggerError
 
         sched = _make_scheduler()

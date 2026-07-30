@@ -92,6 +92,7 @@ def test_sdk_factory_receives_role_and_frozen_grants():
 
 
 def test_casa_framework_factory_exposes_only_granted_tools():
+    """Pins INV-MCP-003 (SDK half; the HTTP half is test_svc_tools_list_uses_static_snapshot). Red case demonstrated: neutering select_casa_tools' allowed_tools filter fails this test."""
     from tools import create_casa_tools, select_casa_tools
 
     grants = frozenset({

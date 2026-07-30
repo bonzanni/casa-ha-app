@@ -298,11 +298,11 @@
   related: [architecture/overview.md, architecture/plugins.md, architecture/agent-taxonomy.md]
   defines_invariants: [INV-CFG-001, INV-CFG-002, INV-CFG-003, INV-CFG-004, INV-CFG-005]
   invariant_tests:
-    INV-CFG-001: [tests/PINNING-TEST-MISSING]
-    INV-CFG-002: [tests/PINNING-TEST-MISSING]
-    INV-CFG-003: [tests/PINNING-TEST-MISSING]
-    INV-CFG-004: [tests/PINNING-TEST-MISSING]
-    INV-CFG-005: [tests/PINNING-TEST-MISSING]
+    INV-CFG-001: [tests/test_pin_g4_invariants.py::test_pin_inv_cfg_001_exactly_eight_scopes_none_reading_options]
+    INV-CFG-002: [tests/test_reload.py::test_full_excludes_other_scopes]
+    INV-CFG-003: [tests/test_phase_a_compiler_integration.py::test_reload_refuses_hot_swap_across_identity_change, tests/test_reload.py::test_reload_triggers_two_step_laundering_is_blocked]
+    INV-CFG-004: [tests/test_config_git.py::test_store_and_staging_stay_untracked]
+    INV-CFG-005: [tests/test_config_sync_main.py::test_run_is_non_fatal_on_error]
 
 - doc: architecture/triggers.md
   summary: What makes an agent act without a person speaking — scheduled and webhook triggers, and the consent a plugin trigger needs.
@@ -322,11 +322,11 @@
   related: [architecture/plugins.md, architecture/http-surface.md, architecture/overview.md]
   defines_invariants: [INV-TRIG-001, INV-TRIG-002, INV-TRIG-003, INV-TRIG-004, INV-TRIG-005]
   invariant_tests:
-    INV-TRIG-001: [tests/PINNING-TEST-MISSING]
-    INV-TRIG-002: [tests/PINNING-TEST-MISSING]
-    INV-TRIG-003: [tests/PINNING-TEST-MISSING]
-    INV-TRIG-004: [tests/PINNING-TEST-MISSING]
-    INV-TRIG-005: [tests/PINNING-TEST-MISSING]
+    INV-TRIG-001: [tests/test_trigger_registry.py::test_interval_channel_must_be_registered_on_agent]
+    INV-TRIG-002: [tests/test_pin_g4_invariants.py::test_pin_inv_trig_002_plugin_namespace_reserved_in_user_schema, tests/test_trigger_registry.py::test_duplicate_trigger_name_same_agent_rejected, tests/test_trigger_registry.py::test_cross_role_webhook_name_collision_rejected]
+    INV-TRIG-003: [tests/test_plugin_triggers_reconcile.py::test_per_plugin_all_or_nothing]
+    INV-TRIG-004: [tests/test_plugin_triggers_consent.py::test_tampered_identity_fails_whole_store_closed]
+    INV-TRIG-005: [tests/test_plugin_triggers_overlay.py::test_replace_is_atomic_full_swap_stale_swept]
 
 - doc: architecture/mcp-and-tools.md
   summary: How tools reach an agent, and where authorization for a tool call actually happens.
@@ -342,9 +342,9 @@
   related: [architecture/plugins.md, architecture/agent-taxonomy.md, architecture/http-surface.md]
   defines_invariants: [INV-MCP-001, INV-MCP-002, INV-MCP-003]
   invariant_tests:
-    INV-MCP-001: [tests/PINNING-TEST-MISSING]
-    INV-MCP-002: [tests/PINNING-TEST-MISSING]
-    INV-MCP-003: [tests/PINNING-TEST-MISSING]
+    INV-MCP-001: [tests/test_pin_g4_invariants.py::test_pin_inv_mcp_001_internal_dispatch_ignores_agent_allowlist]
+    INV-MCP-002: [tests/test_unix_socket_runner.py::test_unix_runner_creates_socket_with_mode_0600]
+    INV-MCP-003: [tests/test_role_scoped_mcp.py::test_casa_framework_factory_exposes_only_granted_tools, tests/test_svc_casa_mcp.py::test_svc_tools_list_uses_static_snapshot]
 
 - doc: architecture/personality.md
   summary: What an agent is versus how it presents — role artifacts, personas, bindings, and which prompt is actually served.

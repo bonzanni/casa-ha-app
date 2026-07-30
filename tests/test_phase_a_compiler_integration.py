@@ -69,7 +69,10 @@ def test_projection_selects_surface_by_channel_and_route() -> None:
 async def test_reload_refuses_hot_swap_across_identity_change(tmp_path, monkeypatch) -> None:
     """A resident reload whose new_cfg.role_checksum differs from the live cfg
     raises ReloadError(kind='restart_required') BEFORE any construction, leaving
-    the live compiled bundle object-identical."""
+    the live compiled bundle object-identical.
+
+    Pins INV-CFG-003. Red case demonstrated: neutering reload_agent's _resident_identity_changed guard fails this test.
+    """
     from types import SimpleNamespace
 
     import reload as reload_mod

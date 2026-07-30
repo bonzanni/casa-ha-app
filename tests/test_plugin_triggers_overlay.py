@@ -34,6 +34,7 @@ def test_replace_overlay_registers_reads():
 
 
 def test_replace_is_atomic_full_swap_stale_swept():
+    """Pins INV-TRIG-005. Red case demonstrated: replacing the overlay rebind with an update() merge fails this test."""
     reg = _mk_registry()
     reg.replace_plugin_overlay({"plg-a--x": _overlay_entry()})
     reg.replace_plugin_overlay({"plg-b--y": _overlay_entry()})

@@ -38,6 +38,7 @@ class _FakeReg:
 
 
 async def test_unix_runner_creates_socket_with_mode_0600() -> None:
+    """Pins INV-MCP-002. Red case demonstrated: chmodding the socket 0o644 instead of 0o600 fails this test."""
     from casa_core import start_internal_unix_runner
     with tempfile.TemporaryDirectory() as td:
         sock = os.path.join(td, "internal.sock")
