@@ -22,13 +22,17 @@ which is keyed on what you are about to do rather than on subsystem names.
 | adding a route, changing webhook authentication, or anything crossing the container boundary | [`architecture/http-surface.md`](architecture/http-surface.md) |
 | adding a tool, changing tool dispatch, or anything about tool authorization | [`architecture/mcp-and-tools.md`](architecture/mcp-and-tools.md) |
 | adding an agent or a tier, the required file set, or role resolution | [`architecture/agent-taxonomy.md`](architecture/agent-taxonomy.md) |
+| adding an evaluator, or before assuming behaviour is evaluated somewhere | [`architecture/eval-framework.md`](architecture/eval-framework.md) |
+| adding durable state, changing a corrupt-file policy, or anything about what survives | [`architecture/persistent-state.md`](architecture/persistent-state.md) |
 | adding or removing an option, the reload scopes, the config repo, or secret resolution | [`architecture/configuration.md`](architecture/configuration.md) |
 | anything published — docs, comments, commit messages, PR text, branch names | [`doctrine/publishing.md`](doctrine/publishing.md) |
 | anything structural, or when you need to find which document owns an area | [`architecture/overview.md`](architecture/overview.md) |
 | delegation, engagement lifecycle, terminal transitions, drivers, or engagement output ordering | [`architecture/engagements.md`](architecture/engagements.md) |
+| logging, correlation ids, redaction, or a health surface | [`architecture/observability.md`](architecture/observability.md) |
 | personas, bindings, prompt composition, or the binding digest | [`architecture/personality.md`](architecture/personality.md) |
 | plugin installation, artifact identity, protected tools, or authorization grants | [`architecture/plugins.md`](architecture/plugins.md) |
 | recall behaviour, sensitivity tiers, provenance on a stored fact, or session persistence | [`architecture/memory.md`](architecture/memory.md) |
+| the HA facade, HA tool exposure, or anything about what an agent may control | [`architecture/home-assistant-control.md`](architecture/home-assistant-control.md) |
 | the documentation rules themselves, or adding a document to the corpus | [`contributing/doc-contract.md`](contributing/doc-contract.md) |
 | the turn lifecycle, the warm client pool, retry behaviour, or turn teardown | [`architecture/turn-loop.md`](architecture/turn-loop.md) |
 | trigger types, webhook trigger routing, plugin trigger consent, or scheduling | [`architecture/triggers.md`](architecture/triggers.md) |

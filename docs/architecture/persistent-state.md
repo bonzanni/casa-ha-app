@@ -1,0 +1,121 @@
+---
+last_reviewed: 2026-07-31
+---
+
+# Persistent state
+
+> Code is the source of truth. This file is a map; when it and the code disagree, the code wins.
+
+## Scope
+
+What this application writes to disk, how it treats a file that is missing or corrupt, and
+what that means for recovery. It deliberately does not enumerate every file — that list
+changes faster than a document can track, and the modules that own each artifact are the
+authority. What is stable, and what this document is for, is the *pattern*.
+
+## Mental model
+
+**Two roots with different meanings.** One is mapped and operator-visible, holding
+configuration and installed content. The other is application-private runtime state:
+registries, ledgers, secrets, workspaces, queues and reports.
+
+**Operator-visible does not mean version-controlled.** Only a whitelist of the mapped root is
+tracked — agents, policies, bindings, schema, and specific registry files. Personas,
+receipts, installed stores, staging areas, agent homes and the environment file are all
+present, all operator-visible, and none of them tracked. If you are relying on git history to
+recover something there, check the whitelist first.
+
+**A missing file is usually a valid empty state, not an error.** Most loaders treat absence
+as "nothing yet" and carry on. That is why a fresh install and a wiped state directory both
+boot cleanly.
+
+**Corrupt-file policy is not uniform, and that inconsistency is the thing to know.** Across
+the state files there are at least four different behaviours: rename the bad file aside and
+start empty; back it up under a different suffix and start empty; **overwrite it in place
+with an empty value, preserving no copy**; and **raise, with no recovery at all**. Two of
+those lose data, and one of them stops the load. Before assuming a corrupt file is
+recoverable, read that specific loader — the neighbouring one probably does something else.
+
+**Atomicity is a property of individual writers, not of the system.** There are helpers that
+write to a temporary file, flush, and replace. Writers that use them are atomic; writers that
+do not are not, and several ordinary paths do a direct write. Some repair paths — including
+one that rewrites a corrupt file — are themselves non-atomic.
+
+**Some state is produced by things this application does not control.** Engagement workspaces
+and plugin outbox directories receive content from child processes and plugins. There is no
+closed inventory of what appears there.
+
+## Contracts & invariants
+
+**INV-STATE-001**: Only an explicit whitelist of the mapped configuration root is version-controlled.
+
+Enforced by the ignore file written at boot. Being under that root implies visibility, not
+history.
+
+**INV-STATE-002**: A missing state file is a valid empty state for most loaders; a corrupt one is handled per-loader and inconsistently.
+
+Stated as an invariant because the *inconsistency* is what a reader must carry. There is no
+single policy to rely on.
+
+**INV-STATE-003**: Atomic replacement is applied by specific writers that opt into it, not by a storage layer.
+
+What it does not cover: direct writes elsewhere, and repair paths that rewrite a damaged file
+without the same protection.
+
+**INV-STATE-004**: Where a registry commits to disk before publishing in memory, the on-disk state leads.
+
+This is the pattern that keeps a process from believing something that was never persisted —
+the same discipline the engagement terminal transition follows.
+
+## Failure behavior
+
+**A state file is absent.** Almost always treated as empty, and often created on first write.
+
+**A state file is corrupt.** Depends entirely on which file. Some are preserved under a
+different name before being replaced; at least one is overwritten with no copy retained; at
+least one raises rather than recovering. Check the loader.
+
+**A write fails in an atomic writer.** It raises to its caller rather than leaving a partial
+file. The temporary file is what absorbs the failure.
+
+**A write fails in a direct writer.** There is no general guarantee. A partially written file
+is possible, and it becomes the next run's corrupt-file case.
+
+## Extension points
+
+**A new state file** needs five decisions made explicitly, because none is inherited: where
+it is created, what a missing file means, what a corrupt one means, whether the write is
+atomic, and — if it is under the mapped root — whether it should be tracked. Adding a file
+there does not make it version-controlled.
+
+**Anything that must not be lost** should use the atomic helpers and should decide its
+corrupt-file policy deliberately. Preserving the damaged copy costs a rename and is the
+difference between a diagnosable failure and a silent one.
+
+**What survives an uninstall** is decided by the host from the volume mapping, not by
+application code. This repository does not determine it, so do not infer retention from what
+the code writes.
+
+## Source & test map
+
+<!-- BEGIN SOURCEMAP -->
+<!-- generated by scripts/verify_docs.py --write-nav; do not hand-edit -->
+
+**Source**
+- `casa/rootfs/opt/casa/atomic_io.py::atomic_write_json`
+- `casa/rootfs/opt/casa/atomic_io.py::atomic_write_text`
+- `casa/rootfs/opt/casa/session_registry.py::SessionRegistry`
+- `casa/rootfs/opt/casa/topic_ledger.py`
+- `casa/rootfs/opt/casa/explanation_store.py`
+- `casa/rootfs/opt/casa/config_git.py::init_repo`
+
+**Tests**
+- `tests/test_atomic_io.py`
+- `tests/test_session_registry.py`
+- `tests/test_explanation_store_concurrency.py`
+
+**Related**
+- [`architecture/configuration.md`](../architecture/configuration.md)
+- [`architecture/engagements.md`](../architecture/engagements.md)
+- [`architecture/memory.md`](../architecture/memory.md)
+<!-- END SOURCEMAP -->

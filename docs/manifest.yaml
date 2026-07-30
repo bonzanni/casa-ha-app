@@ -269,6 +269,62 @@
   related: [architecture/agent-taxonomy.md, architecture/turn-loop.md]
   defines_invariants: [INV-PERS-001, INV-PERS-002, INV-PERS-003, INV-PERS-004]
 
+- doc: architecture/home-assistant-control.md
+  summary: How an agent reads and changes the state of the house — and why the limits on that live in Home Assistant, not here.
+  when_changing: the HA facade, HA tool exposure, or anything about what an agent may control
+  covers:
+    - casa/rootfs/opt/casa/ha_mcp_facade.py::HomeAssistantFacade
+    - casa/rootfs/opt/casa/mcp_registry.py::McpServerRegistry
+  tests:
+    - tests/test_ha_mcp_facade.py
+    - tests/test_ha_mcp_url_override.py
+    - tests/test_mock_ha_mcp.py
+  related: [architecture/mcp-and-tools.md, architecture/overview.md]
+  defines_invariants: [INV-HA-001, INV-HA-002, INV-HA-003]
+
+- doc: architecture/observability.md
+  summary: How work is traced across components, what reaches a log, and what the health surfaces actually assert.
+  when_changing: logging, correlation ids, redaction, or a health surface
+  covers:
+    - casa/rootfs/opt/casa/log_cid.py::install_logging
+    - casa/rootfs/opt/casa/log_cid.py::new_cid
+    - casa/rootfs/opt/casa/log_redact.py::RedactingFilter
+    - casa/rootfs/opt/casa/log_redact.py::redact
+    - casa/rootfs/opt/casa/casa_core.py::healthz
+  tests:
+    - tests/test_log_redact.py
+    - tests/test_log_cid.py
+  related: [architecture/http-surface.md, architecture/overview.md]
+  defines_invariants: [INV-OBS-001, INV-OBS-002, INV-OBS-003]
+
+- doc: architecture/persistent-state.md
+  summary: What the application writes to disk, how it treats a missing or corrupt file, and what that means for recovery.
+  when_changing: adding durable state, changing a corrupt-file policy, or anything about what survives
+  covers:
+    - casa/rootfs/opt/casa/atomic_io.py::atomic_write_json
+    - casa/rootfs/opt/casa/atomic_io.py::atomic_write_text
+    - casa/rootfs/opt/casa/session_registry.py::SessionRegistry
+    - casa/rootfs/opt/casa/topic_ledger.py
+    - casa/rootfs/opt/casa/explanation_store.py
+    - casa/rootfs/opt/casa/config_git.py::init_repo
+  tests:
+    - tests/test_atomic_io.py
+    - tests/test_session_registry.py
+    - tests/test_explanation_store_concurrency.py
+  related: [architecture/configuration.md, architecture/engagements.md, architecture/memory.md]
+  defines_invariants: [INV-STATE-001, INV-STATE-002, INV-STATE-003, INV-STATE-004]
+
+- doc: architecture/eval-framework.md
+  summary: The evaluation scaffolding — and the fact that its registry ships empty.
+  when_changing: adding an evaluator, or before assuming behaviour is evaluated somewhere
+  covers:
+    - casa/rootfs/opt/casa/casa_eval/base.py::Tester
+    - casa/rootfs/opt/casa/casa_eval/__init__.py::get_tester
+  tests:
+    - tests/test_eval_framework.py
+  related: [contributing/doc-contract.md]
+  defines_invariants: [INV-EVAL-001, INV-EVAL-002]
+
 - doc: architecture/turn-loop.md
   summary: How one inbound message becomes one agent turn, and what bounds it.
   when_changing: the turn lifecycle, the warm client pool, retry behaviour, or turn teardown

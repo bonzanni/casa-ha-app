@@ -28,6 +28,11 @@ Every invariant is defined in exactly one file and referenced by id elsewhere.
 | `INV-ENG-003` | A successful completion is refused while unread inbound messages or inbound reservations exist. | [`architecture/engagements.md`](../architecture/engagements.md) |
 | `INV-ENG-004` | Ephemeral specialist delegation stops at depth one. | [`architecture/engagements.md`](../architecture/engagements.md) |
 | `INV-ENG-005` | Once the output sequencer is terminalized, ordinary narration and unresolved sends cannot post below the completion. | [`architecture/engagements.md`](../architecture/engagements.md) |
+| `INV-EVAL-001` | The tester registry is empty; no evaluator is registered or invoked. | [`architecture/eval-framework.md`](../architecture/eval-framework.md) |
+| `INV-EVAL-002` | Bank selection for any live-memory check comes from the caller; the code does not confine it. | [`architecture/eval-framework.md`](../architecture/eval-framework.md) |
+| `INV-HA-001` | No code in this application restricts a control action by entity or domain. | [`architecture/home-assistant-control.md`](../architecture/home-assistant-control.md) |
+| `INV-HA-002` | A failed or inapplicable facade leaves the raw tool surface registered. | [`architecture/home-assistant-control.md`](../architecture/home-assistant-control.md) |
+| `INV-HA-003` | The facade's cached tool surface has no time-based expiry. | [`architecture/home-assistant-control.md`](../architecture/home-assistant-control.md) |
 | `INV-HTTP-001` | `verify` authenticates webhook-trigger requests under one of three named modes — a body HMAC, a static header, or a timestamped HMAC — and returns a single boolean. | [`architecture/http-surface.md`](../architecture/http-surface.md) |
 | `INV-HTTP-002` | Every secret comparison inside `verify` uses a constant-time primitive, and an absent or empty secret returns false rather than passing. | [`architecture/http-surface.md`](../architecture/http-surface.md) |
 | `INV-HTTP-003` | No mode prevents replay. The timestamped mode *bounds* it to a tolerance window; the other two accept a valid credential indefinitely. | [`architecture/http-surface.md`](../architecture/http-surface.md) |
@@ -41,6 +46,9 @@ Every invariant is defined in exactly one file and referenced by id elsewhere.
 | `INV-MEM-003` | An unrecognised channel reads at the least-sensitive tier. | [`architecture/memory.md`](../architecture/memory.md) |
 | `INV-MEM-004` | A caller cannot inject a sensitivity tier or a provenance tag through ordinary application tags. | [`architecture/memory.md`](../architecture/memory.md) |
 | `INV-MEM-005` | Only write-trusted channels retain to the shared bank. | [`architecture/memory.md`](../architecture/memory.md) |
+| `INV-OBS-001` | A correlation id arriving on the request header is validated to a fixed shape; one supplied inside an invocation payload is not. | [`architecture/observability.md`](../architecture/observability.md) |
+| `INV-OBS-002` | Redaction operates on a log record's message and arguments only. | [`architecture/observability.md`](../architecture/observability.md) |
+| `INV-OBS-003` | The health endpoint returns a fixed success response without consulting any subsystem. | [`architecture/observability.md`](../architecture/observability.md) |
 | `INV-PERS-001` | When a resident has an activated compiled bundle, that bundle's projection is the base prompt; the composed prompt is a fallback for when there is none. | [`architecture/personality.md`](../architecture/personality.md) |
 | `INV-PERS-002` | Persona validation is structural; it does not verify that a persona's claims about capability are true. | [`architecture/personality.md`](../architecture/personality.md) |
 | `INV-PERS-003` | A resident's binding reconciliation runs as part of loading and is not isolated from it. | [`architecture/personality.md`](../architecture/personality.md) |
@@ -54,6 +62,10 @@ Every invariant is defined in exactly one file and referenced by id elsewhere.
 | `INV-PUB-001` | A fact belongs in this repository only if it is verifiable from the public commit alone — with no operator, no production system, and no private repository. | [`doctrine/publishing.md`](../doctrine/publishing.md) |
 | `INV-PUB-002` | Doctrine states the mechanism, never the incident. | [`doctrine/publishing.md`](../doctrine/publishing.md) |
 | `INV-PUB-003` | When a claim cannot be checked from the commit, stop and ask. Do not guess, and do not paraphrase around it. | [`doctrine/publishing.md`](../doctrine/publishing.md) |
+| `INV-STATE-001` | Only an explicit whitelist of the mapped configuration root is version-controlled. | [`architecture/persistent-state.md`](../architecture/persistent-state.md) |
+| `INV-STATE-002` | A missing state file is a valid empty state for most loaders; a corrupt one is handled per-loader and inconsistently. | [`architecture/persistent-state.md`](../architecture/persistent-state.md) |
+| `INV-STATE-003` | Atomic replacement is applied by specific writers that opt into it, not by a storage layer. | [`architecture/persistent-state.md`](../architecture/persistent-state.md) |
+| `INV-STATE-004` | Where a registry commits to disk before publishing in memory, the on-disk state leads. | [`architecture/persistent-state.md`](../architecture/persistent-state.md) |
 | `INV-SYS-001` | Config materialisation depends on config validation, so the validating one-shot runs first and a failure there stops what depends on it. | [`architecture/overview.md`](../architecture/overview.md) |
 | `INV-SYS-002` | A role claimed by both a resident and a specialist is a boot failure, raised when the role registry is built. | [`architecture/overview.md`](../architecture/overview.md) |
 | `INV-TG-001` | A webhook update is accepted only when a secret is configured and the request's secret-token header matches it exactly. | [`architecture/telegram.md`](../architecture/telegram.md) |
