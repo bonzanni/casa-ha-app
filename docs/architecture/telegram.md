@@ -32,8 +32,11 @@ instead — it is input to running work, not a new conversation.
 **Ordering in a topic is a property of the sequencer, not of Telegram sends.** An engagement
 topic is a causal log: a single serialized writer keeps narration, discrete posts and edits
 in an order that matches what actually happened. That guarantee belongs to the sequencer
-seam. **A direct send bypasses it, and nothing mechanically prevents one** — fallback paths
-exist for when no driver seam is present, and they are outside the ordering guarantee.
+seam, and **only claude-code engagement topics have one** — platform notices for other
+engagements post directly to the topic, so an in-casa specialist topic sits outside the
+ordering guarantee entirely. **A direct send bypasses it, and nothing mechanically prevents
+one** — fallback paths exist for when no driver seam is present, and they are outside the
+ordering guarantee.
 
 **A tap is authorised against the request it answers.** Callback data is versioned and
 carries the namespace and request id; resolution is bound to the operator the request was
@@ -50,7 +53,8 @@ emoji, most notably — those two numbers differ, and only the first matches the
 **INV-TG-001**: A webhook update is accepted only when a secret is configured and the request's secret-token header matches it exactly.
 
 Enforced in the update route before the payload is parsed or enqueued, using a constant-time
-comparison. A non-ASCII configured secret yields a refusal rather than an error.
+comparison over the encoded bytes of both header and secret — so a non-ASCII value is
+handled without an error, and a matching non-ASCII secret is accepted.
 
 What it does not cover: polling updates do not pass through this route at all, and the header
 establishes only that the sender knows the shared secret.
@@ -96,7 +100,9 @@ reaches the channel.
 **Webhook transport selected without a public URL.** Boot does not fail; the system logs and
 uses polling.
 
-**A duplicate update arrives.** Absorbed by a bounded recent-update cache.
+**A duplicate update arrives.** A webhook redelivery is absorbed by a bounded, process-local
+recent-update cache consulted on the webhook path only. Polling updates never pass that
+cache, and no equivalent deduplication is established for them here.
 
 **A message arrives from an unconfigured chat.** Logged and dropped. Note that leaving the
 chat id empty accepts other chats — the check is only as narrow as the configuration.

@@ -8,10 +8,11 @@ last_reviewed: 2026-07-30
 
 ## Scope
 
-The two HTTP servers Casa runs, what each exposes, and how a request from outside is
-authenticated before it can reach an agent. It does not cover what an agent does once
-reached, nor the voice transport's own protocol beyond the point where a request becomes a
-turn.
+The two HTTP applications the main Casa process runs, what each exposes, and how a request
+from outside is authenticated before it can reach an agent. It does not cover what an agent
+does once reached, nor the voice transport's own protocol beyond the point where a request
+becomes a turn. The container also ships a third, separately supervised loopback HTTP
+service — the MCP bridge — which belongs to `architecture/mcp-and-tools.md`, not here.
 
 ## Mental model
 
@@ -19,9 +20,11 @@ Routes are registered on **two separate applications**, and which one a route la
 decides who can call it.
 
 The **public app** carries the externally-reachable routes: a dashboard, a health endpoint,
-inbound webhooks, agent invocation, the Telegram update sink, a hook-resolution endpoint, an
-MCP endpoint, and conditionally-registered voice and per-agent trigger routes. This document
-does not enumerate them; the registration block is the authority and it changes.
+agent invocation, the Telegram update sink, a hook-resolution endpoint, an MCP endpoint,
+conditionally-registered voice routes, and inbound webhooks — which are a *single wildcard
+route* backed by a dynamically-maintained trigger allowlist, not per-trigger route
+registrations. This document does not enumerate the routes; the registration block is the
+authority and it changes.
 
 The **internal app** carries routes intended for other processes in the container to call —
 admin reload, personality and specialist endpoints, and a family of internal channel routes.
@@ -35,9 +38,12 @@ by the app manifest as an external API port and carries **no source restriction 
 it proxies to the same backend application. So "reachable through the host" is true of one
 listener and not the other, and a route's exposure depends on which listener you arrive on.
 
-What separates them is not authentication but a set of explicit 404s: the external listener
-refuses a handful of path prefixes that the ingress listener passes through. Those refusals
-are the boundary. Read the server blocks before reasoning about who can reach what.
+The listeners differ in two ways, and both matter: the ingress listener carries the
+source restriction above (and sits behind Home Assistant's own authentication), while the
+external listener carries neither — and a set of explicit 404s on the external listener
+refuses a handful of path prefixes that the ingress listener passes through. For deciding
+*which backend routes the external listener proxies*, the 404 set is the boundary. Read the
+server blocks before reasoning about who can reach what.
 
 Authentication is **per route**, not ambient. There is no boundary that authenticates
 everything arriving on the public app, so the question for any route is which check *it*

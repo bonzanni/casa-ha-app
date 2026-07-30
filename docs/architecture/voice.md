@@ -32,11 +32,11 @@ and claims the full capability set — but nothing in it establishes that any pa
 speaker or screen can actually play or show an answer. This application cannot inspect the
 home's device registry to find out.
 
-What actually decides delivery is the **per-utterance offer** carried on the frame, naming a
-device and a modality. An authenticated client can overclaim there, and the code accepts that
-knowingly: the trust boundary is the authenticated connection, and a dishonest client is out
-of scope. Delivery can therefore still fail later, at the endpoint rather than at the
-decision.
+What actually decides delivery is **per-utterance**: the utterance frame supplies the device
+id, and the frame's delivery offer supplies the modality and receipt strength. An
+authenticated client can overclaim there, and the code accepts that knowingly: the trust
+boundary is the authenticated connection, and a dishonest client is out of scope. Delivery
+can therefore still fail later, at the endpoint rather than at the decision.
 
 **The turn is bounded by an absolute deadline anchored at true ingress.** On the request path
 it is captured in the handler's first statements — *before* the body is read and before
@@ -56,12 +56,19 @@ upgrade and the catalog alike. A missing secret returns false before any compari
 
 What it does not cover: there is no per-frame signature, nonce, timestamp, or binding to
 method or path. The empty-body signature that authenticates the catalog also authenticates a
-socket upgrade.
+socket upgrade. And "refuses" means an ordinary mismatch: only the catalog handler pre-checks
+that the signature header is ASCII — on the request and socket paths a non-ASCII header
+reaches the comparison primitive, which raises, so those return a server error rather than
+unauthorised.
 
 **INV-VOICE-002**: An agent is reachable over voice only if its configuration declares the voice capability.
 
 Enforced at dispatch on both transports. Unknown agents and agents that exist but are not
-voice-enabled are deliberately indistinguishable to the caller.
+voice-capable are deliberately indistinguishable to the caller.
+
+What it does not cover: the *enabled* flag. Being disabled removes an agent from the catalog
+but not from dispatch — dispatch authorises on the declared capability alone, so a disabled
+agent that still declares voice remains reachable by a caller that knows its role.
 
 **INV-VOICE-003**: The agent catalog is complete or it fails; it never returns a partial list.
 
@@ -96,15 +103,22 @@ expires rather than being sent as speech on the assumption that speech is what w
 
 ## Failure behavior
 
-**No secret, or a bad signature.** All voice routes return unauthorised. This is a
-configuration failure that presents as an authentication failure.
+**No secret, or a bad signature.** All voice routes return unauthorised for a missing or
+ordinarily mismatched signature. This is a configuration failure that presents as an
+authentication failure. A *non-ASCII* signature header is the exception noted under
+INV-VOICE-001: outside the catalog it raises and returns a server error.
 
-**A malformed request or an unknown agent.** The request path returns a client error or a
-generic not-found; the socket path emits a typed error frame before dispatching anything to
-an agent.
+**A malformed request or an unknown agent.** Invalid JSON and a missing prompt return client
+errors, and an unknown agent a generic not-found — but the request path validates no further
+than that: valid JSON whose top level is not an object reaches field access and produces a
+server error. The socket path emits a typed error frame before dispatching anything to an
+agent.
 
-**Malformed socket frames.** Unrecognised or non-conforming frames are skipped rather than
-closing the connection. A socket does not die because one frame was bad.
+**Malformed socket frames.** Frames that fail to parse, are not objects, or carry an
+unrecognised type are skipped rather than closing the connection. This is narrower than "any
+bad frame": a registration frame whose capability list contains a non-hashable element raises
+while the set is built, and nothing per-frame catches it, so that one frame closes the
+socket.
 
 **Rate limiting.** Both transports report the refusal in their own idiom, and neither reaches
 an agent.
@@ -118,9 +132,10 @@ survives them. Endpoint failure is reported by the client rather than discovered
 
 ## Extension points
 
-**A new voice agent** must be enabled, declare the voice capability, and have a
-well-formed role and display name. Note the blast radius: because the catalog is
-complete-or-fail, one malformed agent takes the catalog down for every caller.
+**A new voice agent** must declare the voice capability and have a well-formed role and
+display name; being enabled additionally puts it in the catalog (see INV-VOICE-002 for why
+those differ). Note the blast radius: because the catalog is complete-or-fail, one malformed
+agent takes the catalog down for every caller.
 
 **A new capability** means changing the exact set on both sides. Registration enforces
 equality against a fixed set, so a one-sided change refuses every route rather than
