@@ -600,6 +600,16 @@ class TelegramChannel(Channel):
         # in_casa_driver._locks. Entries are not pruned — bounded growth,
         # cleared on add-on restart.
         self._engagement_handler_locks: dict[int, asyncio.Lock] = {}
+        # #317: per-chat serialization for the DM path (_handle). Handlers run
+        # with block=False (H5), so /new and an immediately-following message
+        # dispatch concurrently — the follow-up could resume the mid-reset
+        # session or have its fresh session erased by the reset's trailing
+        # remove. Serializing /new (which awaits the whole reset) against
+        # same-chat message ENQUEUE restores the ordering M29 assumed from
+        # PTB's default serialized dispatch; other chats keep flowing. Keyed
+        # by chat_id; entries are not pruned — bounded growth (DM chats),
+        # cleared on add-on restart, mirroring _engagement_handler_locks.
+        self._chat_serial_locks: dict[str, asyncio.Lock] = {}
         # R5 (v0.89.0): NON-PERSISTENT current-inbound target for the `react`
         # framework tool. Maps engagement_id -> (chat_id, topic_id, message_id)
         # of the LATEST operator message seen in that engagement's topic.
@@ -1148,12 +1158,23 @@ class TelegramChannel(Channel):
         update: Update,
         context: ContextTypes.DEFAULT_TYPE,
     ) -> None:
-        """Handle an incoming Telegram text message."""
+        """Handle an incoming Telegram text message.
+
+        #317: the body runs under the per-chat serialization lock — /new
+        awaits its whole reset in here, so a follow-up message for the SAME
+        chat cannot be enqueued (and thus cannot have its turn processed)
+        until the reset finished. Normal messages hold the lock only for the
+        brief enqueue; distinct chats never contend."""
         if update.message is None or update.message.text is None:
             return
 
         chat_id = str(update.effective_chat.id) if update.effective_chat else self.chat_id
+        lock = self._chat_serial_locks.setdefault(chat_id, asyncio.Lock())
+        async with lock:
+            await self._handle_serialized(update, chat_id)
 
+    async def _handle_serialized(self, update: Update, chat_id: str) -> None:
+        """Body of ``_handle``, run under ``_chat_serial_locks[chat_id]`` (#317)."""
         # /new reset — intercept before rate-limiting or bus dispatch (spec §4.2 #2, C2).
         text = (update.message.text or "").strip()
         # M10 (v0.52.0): tolerate a "/new@botname" mention suffix (defensive —
@@ -1183,9 +1204,10 @@ class TelegramChannel(Channel):
             # M29: ack BEFORE the (potentially multi-second) save so the user
             # gets instant feedback. reset_channel stays awaited (NOT
             # backgrounded) — the registry entry must survive until the retain
-            # succeeds so the reaper can retry; in default polling mode PTB
-            # serializes updates so no follow-up can resume the old session
-            # mid-reset.
+            # succeeds so the reaper can retry. Handlers dispatch with
+            # block=False (H5), so PTB no longer serializes updates; the
+            # per-chat lock held by _handle (#317) is what now guarantees no
+            # same-chat follow-up can resume the old session mid-reset.
             if self._app is not None:
                 try:
                     await self._app.bot.send_message(
@@ -1686,16 +1708,33 @@ class TelegramChannel(Channel):
                 fail_count = rec.origin.get("_resume_fail_count", 0)
                 try:
                     await drv.resume(rec, rec.sdk_session_id)
-                    rec.origin["_resume_fail_count"] = 0
+                    # #326: persist the reset so a pre-restart strike cannot
+                    # combine with a later one across reboots. Skip the write
+                    # when the counter was already clean (the common path).
+                    if fail_count and reg is not None:
+                        await reg.set_resume_fail_count(rec.id, 0)
+                    else:
+                        rec.origin["_resume_fail_count"] = 0
                 except Exception as exc:  # noqa: BLE001
                     fail_count += 1
-                    rec.origin["_resume_fail_count"] = fail_count
+                    # #326: durable two-strike counter — without persistence a
+                    # restart reset it and an unrecoverable engagement dodged
+                    # the error transition forever.
+                    if reg is not None:
+                        await reg.set_resume_fail_count(rec.id, fail_count)
+                    else:
+                        rec.origin["_resume_fail_count"] = fail_count
                     logger.warning(
                         "resume failed (%d/2) for engagement %s: %s",
                         fail_count, rec.id[:8], exc,
                     )
+                    won_error = reg is None
                     if fail_count >= 2 and reg is not None:
-                        await reg.mark_error(
+                        # #326: mark_error reports whether THIS call won the
+                        # terminal transition — a /cancel that finalized during
+                        # the resume await keeps its status, and the loser must
+                        # not run duplicate topic cleanup.
+                        won_error = await reg.mark_error(
                             rec.id, kind="resume_failed", message=str(exc),
                         )
                     await self.send_to_topic(
@@ -1703,7 +1742,7 @@ class TelegramChannel(Channel):
                         f"Could not resume this engagement: {exc}. "
                         f"Start a fresh one if needed.",
                     )
-                    if fail_count >= 2:
+                    if fail_count >= 2 and won_error:
                         # [AR-1] (v0.65.0): this terminal path bypasses finalize
                         # — title-mark, close + ledger the topic here
                         # (best-effort, never raises). After the notice: posting

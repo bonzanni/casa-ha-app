@@ -14,11 +14,20 @@ from __future__ import annotations
 import hashlib
 import json
 import logging
+import threading
 from pathlib import Path
 
 logger = logging.getLogger(__name__)
 
 HEALTH_PATH = Path("/data/plugin-health.json")
+
+# #353: write_report often runs in a worker thread (asyncio.to_thread via
+# tools._regenerate_plugin_health) while mark_notified runs on the event
+# loop — both read-modify-write the same report file. A threading.Lock (not
+# asyncio) serializes the critical sections across threads so a mid-flight
+# regeneration can never overwrite a just-delivered notification marker
+# (which would re-DM the same issue).
+_REPORT_LOCK = threading.Lock()
 
 
 def fingerprint(issue) -> str:
@@ -129,22 +138,27 @@ def write_report(*, issues: list, warnings: list,
     state); each owned entry's issue/warning row gains an `owner` field
     alongside its already-scoped `name`. `registry_path` defaults to
     `plugin_registry.REGISTRY_PATH` (production) — tests may override it."""
-    prev = load_report(path) or {}
-    prev_notified = set(prev.get("notified_fingerprints") or [])
     quarantined_bundles, owners = _registry_state(registry_path)
     issue_dicts = [_issue_dict(i, owners) for i in issues]
     warning_dicts = [_issue_dict(w, owners) for w in warnings]
     current_fps = {d["fingerprint"] for d in issue_dicts}
     current_fps |= {d["fingerprint"] for d in warning_dicts}
-    report = {
-        "schema_version": 1,
-        "issues": issue_dicts,
-        "warnings": warning_dicts,
-        "notified_fingerprints": sorted(prev_notified & current_fps),
-        "quarantined_bundles": quarantined_bundles,
-        "boot_reconcile_actions": _boot_reconcile_actions(),
-    }
-    _atomic_write(path, report)
+    boot_actions = _boot_reconcile_actions()
+    # #353: the previous report is read INSIDE the critical section — reading
+    # it earlier lets a concurrent mark_notified land between read and write
+    # and be silently erased by this regeneration.
+    with _REPORT_LOCK:
+        prev = load_report(path) or {}
+        prev_notified = set(prev.get("notified_fingerprints") or [])
+        report = {
+            "schema_version": 1,
+            "issues": issue_dicts,
+            "warnings": warning_dicts,
+            "notified_fingerprints": sorted(prev_notified & current_fps),
+            "quarantined_bundles": quarantined_bundles,
+            "boot_reconcile_actions": boot_actions,
+        }
+        _atomic_write(path, report)
     return report
 
 
@@ -165,15 +179,16 @@ def new_fingerprints(report: dict) -> list[str]:
 
 
 def mark_notified(fps: list[str], path: Path = HEALTH_PATH) -> None:
-    report = load_report(path)
-    if report is None:
-        return
-    notified = list(report.get("notified_fingerprints") or [])
-    for fp in fps:
-        if fp not in notified:
-            notified.append(fp)
-    report["notified_fingerprints"] = notified
-    _atomic_write(path, report)
+    with _REPORT_LOCK:
+        report = load_report(path)
+        if report is None:
+            return
+        notified = list(report.get("notified_fingerprints") or [])
+        for fp in fps:
+            if fp not in notified:
+                notified.append(fp)
+        report["notified_fingerprints"] = notified
+        _atomic_write(path, report)
 
 
 def first_contact_notice(role: str, path: Path = HEALTH_PATH) -> str | None:

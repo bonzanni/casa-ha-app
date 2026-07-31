@@ -193,6 +193,8 @@
     - casa/rootfs/opt/casa/recall_renderer.py::render_recall
     - casa/rootfs/opt/casa/recall_health.py::observed_recall
     - casa/rootfs/opt/casa/session_saver.py::save_session
+    - casa/rootfs/opt/casa/session_saver.py::reset_channel
+    - casa/rootfs/opt/casa/freshness_reaper.py::FreshnessReaper.sweep_once
   tests:
     - tests/test_recall_absence_invariant.py
     - tests/test_recall_health.py::test_breaker_opens_after_threshold_failures
@@ -201,14 +203,17 @@
     - tests/test_channel_policy.py
     - tests/test_memory_provenance.py
     - tests/test_agent_auto_recall_unavailable.py
+    - tests/test_session_saver.py
+    - tests/test_freshness_reaper.py
   related: [architecture/overview.md, architecture/turn-loop.md]
-  defines_invariants: [INV-MEM-001, INV-MEM-002, INV-MEM-003, INV-MEM-004, INV-MEM-005]
+  defines_invariants: [INV-MEM-001, INV-MEM-002, INV-MEM-003, INV-MEM-004, INV-MEM-005, INV-MEM-006]
   invariant_tests:
     INV-MEM-001: [tests/test_pin_memory_invariants.py::test_pin_inv_mem_001_failures_raise_never_return_empty, tests/test_hindsight_memory.py::test_recall_unrenderable_results_are_unavailable_not_zero_hits]
     INV-MEM-002: [tests/test_pin_memory_invariants.py::test_pin_inv_mem_002_exactly_one_readable_tier]
     INV-MEM-003: [tests/test_sensitivity.py::test_unknown_channel_fails_closed_to_public]
     INV-MEM-004: [tests/test_pin_memory_invariants.py::test_pin_inv_mem_004_reserved_tags_refused_before_io]
     INV-MEM-005: [tests/test_delegated_memory.py::test_retain_delegated_voice_writes_nothing]
+    INV-MEM-006: [tests/test_session_saver.py::test_save_session_expected_sid_mismatch_releases_claim, tests/test_session_saver.py::test_reset_channel_trailing_remove_spares_follow_up_session, tests/test_session_registry.py::test_remove_with_stale_expected_sid_spares_newer_session, tests/test_freshness_reaper.py::test_sweep_passes_cold_snapshot_sid_to_save]
 
 - doc: architecture/plugins.md
   summary: How a plugin becomes usable — registry, content-addressed store, artifact identity, and per-call authorization.
@@ -259,11 +264,13 @@
     - tests/test_delegate_to_agent_interactive.py
     - tests/test_claude_code_driver.py
     - tests/test_cancel_engagement_tool.py
+    - tests/test_engagement_registry.py
+    - tests/test_observer.py
   related: [architecture/overview.md, architecture/turn-loop.md, architecture/agent-taxonomy.md]
   defines_invariants: [INV-ENG-001, INV-ENG-002, INV-ENG-003, INV-ENG-004, INV-ENG-005]
   invariant_tests:
-    INV-ENG-001: [tests/test_emit_completion_tool.py::test_cancel_during_g2_reload_window_finalizes_once]
-    INV-ENG-002: [tests/test_engagement_registry.py::test_strict_transition_rolls_back_full_field_on_persist_failure]
+    INV-ENG-001: [tests/test_emit_completion_tool.py::test_cancel_during_g2_reload_window_finalizes_once, tests/test_engagement_registry.py::test_mark_idle_never_overwrites_terminal, tests/test_engagement_registry.py::test_mark_error_loses_to_terminal_winner, tests/test_engagement_registry.py::test_sweep_does_not_resurrect_concurrently_finalized]
+    INV-ENG-002: [tests/test_engagement_registry.py::test_strict_transition_rolls_back_full_field_on_persist_failure, tests/test_engagement_registry.py::test_create_persist_failure_raises_and_rolls_back]
     INV-ENG-003: [tests/test_emit_completion_tool.py::test_unread_queued_message_refuses_completion, tests/test_emit_completion_tool.py::test_pending_ingress_reservation_refuses_completion, tests/test_emit_completion_tool.py::test_inbound_racing_past_precheck_is_vetoed_by_terminal_hook]
     INV-ENG-004: [tests/test_delegation_context_wrapper.py::test_child_origin_extends_parent_with_execution_role, tests/test_delegate_to_agent.py::test_delegate_to_agent_depth_cap]
     INV-ENG-005: [tests/test_anchor_narration_buffer.py::test_terminal_latch_discards_via_sequencer_writers, tests/test_output_sequencer.py::test_post_intent_locked_discards_under_terminal_latch]
@@ -336,6 +343,8 @@
     - tests/test_telegram_update_handler.py
     - tests/test_tg_richtext_remnants.py
     - tests/test_verdict_broker.py
+    - tests/test_telegram_new_reset.py
+    - tests/test_telegram_supervisor.py
   related: [architecture/overview.md, architecture/engagements.md, architecture/http-surface.md]
   defines_invariants: [INV-TG-001, INV-TG-002, INV-TG-003, INV-TG-004, INV-TG-005]
   invariant_tests:
@@ -559,6 +568,7 @@
     - casa/rootfs/opt/casa/agent.py::Agent._build_options
     - casa/rootfs/opt/casa/agent.py::Agent.aclose
     - casa/rootfs/opt/casa/sdk_client_pool.py::SdkClientPool.turn
+    - casa/rootfs/opt/casa/sdk_client_pool.py::SdkClientPool.close_key
     - casa/rootfs/opt/casa/sdk_client_pool.py::ManagedSdkClient
     - casa/rootfs/opt/casa/sdk_client_pool.py::PoolUnavailable
     - casa/rootfs/opt/casa/retry.py::retry_sdk_call
@@ -569,13 +579,14 @@
     - tests/test_sdk_client_pool_pool.py
     - tests/test_retry.py
   related: [architecture/overview.md, architecture/agent-taxonomy.md]
-  defines_invariants: [INV-TURN-001, INV-TURN-002, INV-TURN-003, INV-TURN-004, INV-TURN-005]
+  defines_invariants: [INV-TURN-001, INV-TURN-002, INV-TURN-003, INV-TURN-004, INV-TURN-005, INV-TURN-006]
   invariant_tests:
     INV-TURN-001: [tests/test_sdk_client_pool_pool.py::test_sid_mismatch_reconnects_on_registry_sid]
     INV-TURN-002: [tests/test_sdk_client_pool_client.py::test_error_result_nonretryable_returns_but_invalidates]
     INV-TURN-003: [tests/test_sdk_client_pool_client.py::test_cancel_interrupts_drains_and_stays_warm]
     INV-TURN-004: [tests/test_agent_process.py::test_memory_failure_does_not_break_response]
     INV-TURN-005: [tests/test_retry.py::test_cancelled_error_propagates_immediately, tests/test_retry.py]
+    INV-TURN-006: [tests/test_sdk_client_pool_pool.py::test_close_key_joins_inflight_invalidation_flush]
 
 - doc: contributing/doc-contract.md
   summary: The shape a document takes, and which of its rules CI enforces versus a reviewer.

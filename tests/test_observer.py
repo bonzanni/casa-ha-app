@@ -232,3 +232,116 @@ class TestBudgetCountsOnlyPostedInterjections:
         obs.forget("e1")
         assert "e1" not in obs._interjection_counts
         assert obs.is_silenced("e1") is False
+
+
+class TestConcurrentInterjectionCap:
+    """#353: the bus dispatches each event as an independent task, so several
+    trigger events can be in flight at once. The 3-interjection cap must hold
+    under that concurrency: the budget slot is reserved BEFORE the LLM await,
+    and released only when nothing was posted."""
+
+    async def test_concurrent_triggers_cannot_exceed_cap(self, monkeypatch):
+        import asyncio
+
+        from observer import Observer
+
+        bus = MagicMock(); bus.notify = AsyncMock()
+        registry = MagicMock()
+        registry.get.return_value = MagicMock(
+            id="e1", task="t",
+            origin={"role": "assistant", "channel": "telegram", "chat_id": "c1"},
+            role_or_type="finance",
+        )
+        obs = Observer(bus=bus, engagement_registry=registry, model_name="haiku")
+
+        release = asyncio.Event()
+
+        async def _gated_decide(event_type, payload, rec):
+            await release.wait()
+            return {"interject": True, "text": "alert"}
+
+        monkeypatch.setattr(obs, "_decide_interjection", _gated_decide)
+
+        events = []
+        for _ in range(5):
+            m = MagicMock()
+            m.content = {"event": "warn", "engagement_id": "e1"}
+            events.append(m)
+        tasks = [asyncio.ensure_future(obs._handle_event(m)) for m in events]
+        await asyncio.sleep(0)
+        release.set()
+        await asyncio.gather(*tasks)
+
+        assert bus.notify.await_count == 3, (
+            "concurrent trigger events must never exceed the 3-interjection cap"
+        )
+        assert obs._interjection_counts.get("e1") == 3
+
+    async def test_declined_concurrent_evaluation_releases_slot(self, monkeypatch):
+        """A reserved slot whose evaluation declines must be handed back so a
+        later genuine alert still fits in the budget (L68/L17 preserved)."""
+        import asyncio
+
+        from observer import Observer
+
+        bus = MagicMock(); bus.notify = AsyncMock()
+        registry = MagicMock()
+        registry.get.return_value = MagicMock(
+            id="e1", task="t",
+            origin={"role": "assistant", "channel": "telegram", "chat_id": "c1"},
+            role_or_type="finance",
+        )
+        obs = Observer(bus=bus, engagement_registry=registry, model_name="haiku")
+
+        monkeypatch.setattr(
+            obs, "_decide_interjection",
+            AsyncMock(return_value={"interject": False, "text": ""}),
+        )
+        m = MagicMock()
+        m.content = {"event": "warn", "engagement_id": "e1"}
+        for _ in range(3):
+            await obs._handle_event(m)
+        # Declines must not have burned the budget.
+        monkeypatch.setattr(
+            obs, "_decide_interjection",
+            AsyncMock(return_value={"interject": True, "text": "real alert"}),
+        )
+        await obs._handle_event(m)
+        bus.notify.assert_awaited_once()
+        assert obs._interjection_counts.get("e1", 0) == 1
+
+    async def test_cancelled_evaluation_never_refunds_the_slot(self, monkeypatch):
+        """An exception — cancellation included — is an ambiguous outcome: the
+        notification may already be enqueued, so the reservation must NOT be
+        refunded (the cap is the hard contract; budget loss is the safe
+        direction)."""
+        import asyncio
+
+        from observer import Observer
+
+        bus = MagicMock(); bus.notify = AsyncMock()
+        registry = MagicMock()
+        registry.get.return_value = MagicMock(
+            id="e1", task="t",
+            origin={"role": "assistant", "channel": "telegram", "chat_id": "c1"},
+            role_or_type="finance",
+        )
+        obs = Observer(bus=bus, engagement_registry=registry, model_name="haiku")
+
+        entered = asyncio.Event()
+
+        async def _hanging_decide(event_type, payload, rec):
+            entered.set()
+            await asyncio.Event().wait()
+
+        monkeypatch.setattr(obs, "_decide_interjection", _hanging_decide)
+        m = MagicMock()
+        m.content = {"event": "warn", "engagement_id": "e1"}
+        task = asyncio.ensure_future(obs._handle_event(m))
+        await asyncio.wait_for(entered.wait(), timeout=1)
+        task.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await task
+        assert obs._interjection_counts.get("e1") == 1, (
+            "an ambiguous (cancelled) evaluation must keep its reservation"
+        )

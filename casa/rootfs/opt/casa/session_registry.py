@@ -22,6 +22,11 @@ logger = logging.getLogger(__name__)
 _SESSION_KEY_RE = re.compile(r"^[A-Za-z0-9_-]+$")
 _SESSION_KEY_MAX = 100  # mirrors the server-side max_length from the former upstream dependency
 
+# Sentinel distinguishing "remove unconditionally" (argument omitted) from
+# "remove only while the entry still has NO session id" (explicit None) —
+# needed because a guarded caller's snapshot may itself lack a sid (#353).
+_UNCONDITIONAL = object()
+
 # v2 scoped-key schema (spec A2): channel-role-scope identity, collision-safe
 # across residents sharing a device/channel. See build_scoped_session_key.
 SESSION_KEY_SCHEMA_V2 = "v2"
@@ -257,9 +262,23 @@ class SessionRegistry:
                 entry["last_active"] = datetime.now(timezone.utc).isoformat()
                 await self._save_locked()
 
-    async def remove(self, channel_key: str) -> None:
-        """Remove an entry and persist."""
+    async def remove(
+        self, channel_key: str, expected_sid: object = _UNCONDITIONAL,
+    ) -> None:
+        """Remove an entry and persist.
+
+        With ``expected_sid``, remove only while the entry still carries that
+        session id — like ``finish_save``/``clear_save_claim``, a newer
+        registration (a turn that landed between the caller's snapshot and
+        this call) is left intact instead of being silently deleted (#317,
+        #353). ``expected_sid=None`` means the snapshotted entry had NO
+        session id, so the removal declines once any real session registers.
+        Omitting the argument keeps the unconditional behavior."""
         async with self._lock:
+            if expected_sid is not _UNCONDITIONAL:
+                entry = self._data.get(channel_key)
+                if entry is None or entry.get("sdk_session_id") != expected_sid:
+                    return  # re-registered by a newer session; leave it alone
             self._data.pop(channel_key, None)
             await self._save_locked()
 

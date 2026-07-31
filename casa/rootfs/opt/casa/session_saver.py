@@ -96,6 +96,7 @@ async def transcript_to_items(
 
 async def save_session(
     channel_key: str, registry, semantic_memory, *, directory: str, channel: str,
+    expected_sid: str | None = None,
 ) -> bool:
     """Idempotently retain an ended session to long-term memory (design §4.2; tier
     model §2.4; personality Task 10). Channels that fail write-trust (voice —
@@ -104,7 +105,14 @@ async def save_session(
     a caller-passed role/user_peer), so a legacy or corrupt entry with no usable
     provenance releases the claim rather than retaining with invented authorship.
     On success retains the per-item tier+provenance-tagged transcript to the
-    shared ``casa`` bank and removes the entry."""
+    shared ``casa`` bank and removes the entry.
+
+    ``expected_sid`` (#353): callers that decided WHICH session to save at a
+    suspension point before this call (the freshness reaper's cold check, a
+    reset's snapshot) pass the sid they judged. If a new turn re-registered the
+    key in that window, the claim just placed on the NEW session is released
+    and nothing is retained — otherwise the save would snapshot the active
+    session and ``finish_save`` would remove its live resume pointer."""
     from agent import snapshot_session_entry
 
     if not writes_to_bank(channel):
@@ -115,6 +123,13 @@ async def save_session(
     if snapshot is None or snapshot.speaker_provenance is None or snapshot.user_provenance is None:
         logger.debug(
             "save_session: %s has no usable provenance snapshot — releasing claim",
+            channel_key,
+        )
+        await registry.clear_save_claim(channel_key)
+        return False
+    if expected_sid is not None and snapshot.sdk_session_id != expected_sid:
+        logger.debug(
+            "save_session: %s re-registered under a newer session — releasing claim",
             channel_key,
         )
         await registry.clear_save_claim(channel_key)
@@ -203,9 +218,12 @@ async def reset_channel(
     # entry snapshot itself — no role=/user_peer= to pass here.
     # save_session is idempotent and removes the entry on a successful retain;
     # remove() afterwards guarantees the pointer is cleared even when the save
-    # was a no-op (nothing to retain).
+    # was a no-op (nothing to retain). Both carry the snapshot's sid (#317):
+    # a follow-up turn that re-registered this key mid-save keeps its fresh
+    # session instead of having it retained or its pointer deleted.
     await save_session(
         channel_key, registry, semantic_memory,
         directory=directory, channel=channel,
+        expected_sid=snapshot.sdk_session_id,
     )
-    await registry.remove(channel_key)
+    await registry.remove(channel_key, expected_sid=snapshot.sdk_session_id)

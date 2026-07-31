@@ -49,7 +49,10 @@ a specialist, seven for an executor, refiring weekly); terminal tombstones age o
 thirty days, which bounds duplicate-task protection. Separately, an observer watches
 engagement events and may post a bounded LLM interjection into the resident chat — capped
 at three per engagement and suppressible with `/silent` — so engagement work can surface in
-the main conversation through a path outside the lifecycle above.
+the main conversation through a path outside the lifecycle above. The cap holds under the
+bus's concurrent dispatch: a budget slot is reserved before the interjection is evaluated
+and handed back if nothing is posted, so simultaneous events can neither overshoot the cap
+nor burn budget on declined evaluations.
 
 **The depth cap is narrower than it sounds.** It stops an ephemerally delegated agent —
 resident or specialist alike — from delegating onwards. It is read in one place and stamped
@@ -64,9 +67,13 @@ Enforced by the registry's terminal transition, which refuses a missing or alrea
 record and returns failure; the finalize path performs topic closure, driver teardown and
 notification only on success.
 
-What it does not cover: the direct status mutators do not check for a prior terminal state.
-Code that sets a terminal status directly bypasses this protocol and its side-effect
-ordering. And exclusivity covers the *post-transition* side effects only: the pre-close
+The direct status mutators honour the same boundary: each re-checks for a prior terminal
+state under the registry lock and declines to overwrite one — the idle sweep cannot flip a
+concurrently-cancelled engagement back to resumable, and a failed resume that loses the
+race to a cancel neither overwrites the status nor runs its duplicate topic cleanup (the
+error mutator reports whether it won, and only a winner cleans up).
+
+What it does not cover: exclusivity covers the *post-transition* side effects only: the pre-close
 inbound spool drain runs before the win/lose transition, so a caller that goes on to lose the
 race may already have flushed pending receipts and eviction notices externally. The drain is
 idempotent, which is why running it ahead of the gate is tolerated — but "does nothing" is
@@ -74,8 +81,19 @@ not what a losing finalizer does.
 
 **INV-ENG-002**: A strict terminal transition never leaves the persisted and in-memory records disagreeing; on a write failure it restores the prior state and raises.
 
-What it does not cover: non-strict registry mutations warn and continue if their write fails,
-so this guarantee belongs to the finalize path specifically.
+Record *creation* holds the same strictness: a create whose tombstone write fails rolls the
+in-memory insert back and raises, rather than handing the caller a running engagement whose
+crash-recovery record never reached disk.
+
+Creation also compensates for a *cancelled* creator: a caller cancelled after the persist
+committed never receives the record, so the insert is rolled back and its removal persisted
+before the cancellation propagates — no durable active record whose driver never started.
+
+What it does not cover: the other non-strict registry mutations (status touches, channel
+state, counters) warn and continue if their write fails, so the no-disagreement guarantee
+belongs to creation and the finalize path specifically. And the cancellation compensation is
+itself best-effort on the disk side — if the compensating write fails, the on-disk ghost row
+remains until the boot reconcile and reap TTL retire it.
 
 **INV-ENG-003**: A successful completion is refused while unread inbound messages or inbound reservations exist, when the driver exposes its inbound state.
 
@@ -185,6 +203,8 @@ cap to cover it.
 - `tests/test_delegate_to_agent_interactive.py`
 - `tests/test_claude_code_driver.py`
 - `tests/test_cancel_engagement_tool.py`
+- `tests/test_engagement_registry.py`
+- `tests/test_observer.py`
 
 **Related**
 - [`architecture/overview.md`](../architecture/overview.md)

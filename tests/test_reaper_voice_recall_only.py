@@ -27,7 +27,7 @@ class _Reg:
     def all_entries(self):
         return dict(self._e)
 
-    async def remove(self, key):
+    async def remove(self, key, expected_sid=None):
         self.removed.append(key)
         self._e.pop(key, None)
 
@@ -36,7 +36,7 @@ class _Reg:
         self._e.get(key, {}).pop("consolidated_at", None)
 
 
-async def _save_fn(key, reg, sem, *, directory, channel):
+async def _save_fn(key, reg, sem, *, directory, channel, expected_sid=None):
     reg.saved.append((key, channel))
     return True
 

@@ -229,3 +229,47 @@ class TestLifecycle:
             assert rebuild.await_count == 1
         finally:
             await sup.stop()
+
+
+class TestTriggerCoalescing:
+    async def test_trigger_during_inflight_rebuild_coalesces(self):
+        """#353: a trigger() arriving while a rebuild is already running is
+        satisfied by that rebuild — it must not tear down and rebuild the
+        now-healthy transport a second time."""
+        started = asyncio.Event()
+        release = asyncio.Event()
+        calls = []
+
+        async def rebuild():
+            calls.append(1)
+            started.set()
+            await release.wait()
+
+        sup = ReconnectSupervisor(
+            rebuild_fn=rebuild, logger=logging.getLogger("t"),
+            initial_ms=1, cap_ms=4,
+        )
+        sup.start()
+        try:
+            sup.trigger("probe_failed")
+            await asyncio.wait_for(started.wait(), timeout=1)
+            # A second trigger lands while the rebuild is in flight.
+            sup.trigger("probe_failed_again")
+            release.set()
+            # Give the supervisor loop ample cycles to (wrongly) start a
+            # second rebuild if the stale trigger survived.
+            deadline = asyncio.get_running_loop().time() + 0.5
+            while asyncio.get_running_loop().time() < deadline and len(calls) < 2:
+                await asyncio.sleep(0.001)
+            assert len(calls) == 1, (
+                "a trigger absorbed by an in-flight rebuild must not re-run it"
+            )
+
+            # A genuinely NEW trigger after recovery still rebuilds.
+            started.clear()
+            sup.trigger("new_outage")
+            await asyncio.wait_for(started.wait(), timeout=1)
+            assert len(calls) == 2
+        finally:
+            release.set()
+            await sup.stop()

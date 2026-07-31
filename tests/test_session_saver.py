@@ -205,3 +205,75 @@ async def test_reset_channel_no_entry_is_noop(tmp_path):
     await reset_channel("telegram-99", reg, sem, channel="telegram")
     sem.retain.assert_not_awaited()         # nothing to save
     assert reg.get("telegram-99") is None
+
+
+async def test_save_session_expected_sid_mismatch_releases_claim(tmp_path):
+    """#353: the reaper decides an entry is cold, then a new turn replaces it
+    before the save claim lands. save_session must notice the sid changed,
+    release the claim it just placed on the NEW session, and retain nothing."""
+    from session_registry import SessionRegistry
+    reg = SessionRegistry(str(tmp_path / "s.json"))
+    # The registry now holds the NEW session (registered after the reaper's
+    # cold snapshot of sid-old).
+    await reg.register("telegram-r1", "assistant", "sid-new", binding_digest=STUB_BINDING_DIGEST, speaker_provenance=STUB_SPEAKER_PROV, user_provenance=STUB_USER_PROV)
+    sem = AsyncMock()
+    ok = await save_session(
+        "telegram-r1", reg, sem, directory="/d", channel="telegram",
+        expected_sid="sid-old",
+    )
+    assert ok is False
+    sem.retain.assert_not_awaited()
+    entry = reg.get("telegram-r1")
+    assert entry is not None                        # new session untouched
+    assert entry["sdk_session_id"] == "sid-new"
+    assert not entry.get("consolidated_at")         # claim released
+
+
+async def test_save_session_expected_sid_match_proceeds(tmp_path, monkeypatch):
+    async def fake_classify(content: str) -> str:
+        return "public"
+    monkeypatch.setattr(session_saver, "classify_tier", fake_classify)
+    from session_registry import SessionRegistry
+    reg = SessionRegistry(str(tmp_path / "s.json"))
+    await reg.register("telegram-r1", "assistant", "sid-9", binding_digest=STUB_BINDING_DIGEST, speaker_provenance=STUB_SPEAKER_PROV, user_provenance=STUB_USER_PROV)
+    sem = AsyncMock()
+    msgs = [type("M", (), {"type": "user", "message": {"content": "hi"}})()]
+    with patch("session_saver.get_session_messages", return_value=msgs):
+        ok = await save_session(
+            "telegram-r1", reg, sem, directory="/d", channel="telegram",
+            expected_sid="sid-9",
+        )
+    assert ok is True
+    assert reg.get("telegram-r1") is None
+
+
+async def test_reset_channel_trailing_remove_spares_follow_up_session(tmp_path, monkeypatch):
+    """#317: a follow-up message that registers a NEW session while /new's
+    save is in flight must not have its fresh session erased by the reset's
+    trailing remove()."""
+    from session_registry import SessionRegistry
+    reg = SessionRegistry(str(tmp_path / "s.json"))
+    await reg.register("telegram-42", "assistant", "sid-old", binding_digest=STUB_BINDING_DIGEST, speaker_provenance=STUB_SPEAKER_PROV, user_provenance=STUB_USER_PROV)
+    sem = AsyncMock()
+
+    captured_kwargs = {}
+
+    async def racing_save(channel_key, registry, semantic_memory, **kwargs):
+        captured_kwargs.update(kwargs)
+        # Simulate a follow-up turn landing mid-save: it re-registers the
+        # channel with a fresh session, then the save is a no-op (claim lost).
+        await registry.register(
+            channel_key, "assistant", "sid-follow-up",
+            binding_digest=STUB_BINDING_DIGEST,
+            speaker_provenance=STUB_SPEAKER_PROV, user_provenance=STUB_USER_PROV,
+        )
+        return False
+
+    monkeypatch.setattr(session_saver, "save_session", racing_save)
+    await reset_channel("telegram-42", reg, sem, channel="telegram")
+
+    # The reset's own snapshot sid must flow into the save's sid guard.
+    assert captured_kwargs.get("expected_sid") == "sid-old"
+    entry = reg.get("telegram-42")
+    assert entry is not None, "follow-up's fresh session must survive the reset"
+    assert entry["sdk_session_id"] == "sid-follow-up"

@@ -52,6 +52,12 @@ _FIELD_MISSING = object()
 
 _STALE_KIND_DEFAULT = "plain"
 
+# #326: the statuses no direct mutator may overwrite. try_transition_terminal
+# is the single authoritative gate INTO this set; mark_idle/mark_error/
+# mark_completed/mark_cancelled re-check membership under the lock so a
+# finalizer that won during one of their callers' awaits is never overwritten.
+_TERMINAL_STATUSES = ("completed", "cancelled", "error")
+
 
 # Personality Task 10: origin dicts are snapshotted off ``agent.origin_var``,
 # which — like every ContextVar-carried origin — may hold LIVE, non-JSON objects
@@ -526,7 +532,69 @@ class EngagementRegistry:
             self._records[engagement_id] = rec
             if topic_id is not None:
                 self._topic_index[topic_id] = engagement_id
-            await self._write_tombstone_locked()
+
+            # #326: STRICT persistence — the record's whole point is crash
+            # recovery, so reporting success after a swallowed write failure
+            # hands the caller a running topic/workspace that a restart will
+            # neither recover nor reap. On failure the in-memory insert is
+            # rolled back and the error propagates (the engage/delegate call
+            # sites already surface launch-path failures as tool errors).
+            # Shield-and-await like the sibling strict mutators so a caller
+            # cancelled mid-``to_thread`` cannot tear memory from disk.
+            def _rollback() -> None:
+                self._records.pop(engagement_id, None)
+                if (topic_id is not None
+                        and self._topic_index.get(topic_id) == engagement_id):
+                    del self._topic_index[topic_id]
+
+            async def _persist() -> None:
+                try:
+                    await self._write_tombstone_locked(strict=True)
+                except Exception:
+                    _rollback()
+                    raise
+
+            async def _settle_despite_cancel(fut: "asyncio.Future") -> None:
+                """Wait for *fut* to finish, absorbing ANY number of caller
+                cancellations (a to_thread write cannot be interrupted, only
+                abandoned — and an abandoned commit is exactly the ghost this
+                path exists to prevent). Retrieves the result so a failure is
+                never left 'never retrieved'; the caller re-raises its own
+                cancellation afterwards."""
+                while not fut.done():
+                    try:
+                        await asyncio.shield(fut)
+                    except asyncio.CancelledError:
+                        continue          # cancelled again — keep waiting
+                    except Exception:  # noqa: BLE001 — retrieved below
+                        break
+                if not fut.cancelled():
+                    fut.exception()
+
+            task = asyncio.ensure_future(_persist())
+            try:
+                await asyncio.shield(task)
+            except asyncio.CancelledError:
+                # Terra r2-1/r3-1: a cancelled caller never receives this
+                # record, so a COMMITTED persist would strand a durable
+                # active engagement with no driver. The persist must first
+                # SETTLE — through repeated cancellation — before we can
+                # know whether to compensate; then the rollback + removal
+                # persist runs to completion the same way, all under the
+                # lock. A failed undo write leaves only an on-disk ghost
+                # row, which boot reconcile + the reap TTL already retire.
+                await _settle_despite_cancel(task)
+                if not task.cancelled() and task.exception() is None:
+                    _rollback()
+                    undo = asyncio.ensure_future(self._write_tombstone_locked())
+                    await _settle_despite_cancel(undo)
+                    if not undo.cancelled() and undo.exception() is not None:
+                        logger.warning(
+                            "engagement create: compensating tombstone write "
+                            "failed after cancellation — on-disk ghost row "
+                            "until boot reconcile/reap",
+                        )
+                raise
         logger.info(
             "Engagement %s created (kind=%s role_or_type=%s topic_id=%s)",
             engagement_id[:8], kind, role_or_type, topic_id,
@@ -555,8 +623,8 @@ class EngagementRegistry:
     async def mark_completed(self, engagement_id: str, completed_at: float) -> None:
         async with self._lock:
             rec = self._records.get(engagement_id)
-            if rec is None:
-                return
+            if rec is None or rec.status in _TERMINAL_STATUSES:
+                return  # #326: never overwrite a terminal winner
             rec.status = "completed"
             rec.completed_at = completed_at
             self._release_permit(rec)
@@ -565,24 +633,31 @@ class EngagementRegistry:
     async def mark_cancelled(self, engagement_id: str) -> None:
         async with self._lock:
             rec = self._records.get(engagement_id)
-            if rec is None:
-                return
+            if rec is None or rec.status in _TERMINAL_STATUSES:
+                return  # #326: never overwrite a terminal winner
             rec.status = "cancelled"
             rec.completed_at = time.time()
             self._release_permit(rec)
             await self._write_tombstone_locked()
 
-    async def mark_error(self, engagement_id: str, kind: str, message: str) -> None:
+    async def mark_error(self, engagement_id: str, kind: str, message: str) -> bool:
+        """Returns True when THIS call flipped the record to ``error`` — like
+        ``try_transition_terminal``, only the winner may run terminal side
+        effects (topic cleanup). False for an unknown record or one a
+        concurrent finalizer already committed terminal (#326): a failed
+        resume racing a /cancel must not overwrite ``cancelled`` with
+        ``error`` and run duplicate cleanup."""
         async with self._lock:
             rec = self._records.get(engagement_id)
-            if rec is None:
-                return
+            if rec is None or rec.status in _TERMINAL_STATUSES:
+                return False
             rec.status = "error"
             rec.completed_at = time.time()
             rec.origin["error_kind"] = kind
             rec.origin["error_message"] = message
             self._release_permit(rec)
             await self._write_tombstone_locked()
+            return True
 
     async def try_transition_terminal(
         self,
@@ -707,7 +782,11 @@ class EngagementRegistry:
     async def mark_idle(self, engagement_id: str) -> None:
         async with self._lock:
             rec = self._records.get(engagement_id)
-            if rec is None:
+            if rec is None or rec.status in _TERMINAL_STATUSES:
+                # #326: the idle sweep calls this after awaiting
+                # driver.cancel(); a finalizer that committed
+                # completed/cancelled/error during that await must not be
+                # flipped back to a resumable idle (resurrection).
                 return
             rec.status = "idle"
             await self._write_tombstone_locked()
@@ -734,6 +813,20 @@ class EngagementRegistry:
             if rec is None:
                 return
             rec.last_idle_reminder_ts = ts
+            await self._write_tombstone_locked()
+
+    async def set_resume_fail_count(self, engagement_id: str, count: int) -> None:
+        """#326 (low): persist the two-strike resume-failure counter into the
+        record's origin. Before this, the counter lived only on the in-memory
+        origin dict, so a restart reset it and an unrecoverable engagement
+        could dodge the error transition indefinitely. Best-effort (non-strict)
+        persistence: a write failure degrades to in-memory-only counting for
+        this process lifetime — exactly the pre-fix behavior."""
+        async with self._lock:
+            rec = self._records.get(engagement_id)
+            if rec is None:
+                return
+            rec.origin["_resume_fail_count"] = count
             await self._write_tombstone_locked()
 
     async def persist_session_id(self, engagement_id: str, session_id: str) -> None:

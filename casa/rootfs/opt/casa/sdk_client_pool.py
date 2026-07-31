@@ -269,6 +269,12 @@ class SdkClientPool:
             str, asyncio.Future[None]
         ] = {}
         self._invalidation_groups: set[asyncio.Future[Any]] = set()
+        # #319: per-key in-flight invalidation close workers. close_key (the
+        # /new reset hook) awaits these so a reset joins the old generation's
+        # FULL close — the disconnect is what flushes the transcript (AR-4) —
+        # not just its turn-lock handoff barrier. A set per key tolerates
+        # overlapping invalidate_all() generations.
+        self._invalidation_closes: dict[str, set[asyncio.Task]] = {}
         self._pool_lock = asyncio.Lock()
         self._closing = False
         self._sweeper: asyncio.Task | None = None
@@ -489,10 +495,43 @@ class SdkClientPool:
         async with entry.lock:
             await entry.aclose()
 
+    def _discard_invalidation_close(self, key: str, task: asyncio.Task) -> None:
+        tasks = self._invalidation_closes.get(key)
+        if tasks is not None:
+            tasks.discard(task)
+            if not tasks:
+                del self._invalidation_closes[key]
+
     async def close_key(self, channel_key: str) -> None:
-        """AR-4 reset-hook target: close (flush) the key's warm client."""
-        async with self._pool_lock:
-            entry = self._entries.pop(channel_key, None)
+        """AR-4 reset-hook target: close (flush) the key's warm client.
+
+        #319: joins any in-flight ``invalidate_all()`` generation for this key
+        before returning. The old contract popped the entry and returned
+        instantly when invalidation had already removed it — so a /new reset
+        could save/remove the session BEFORE the old client's turn ended and
+        its transport closed (the disconnect is what flushes the transcript,
+        AR-4), letting the finishing turn resurrect the just-reset session.
+        Unlike a replacement turn (which only waits for the lock-handoff
+        barrier), a reset waits for the old generation's close to COMPLETE."""
+        while True:
+            closing = tuple(self._invalidation_closes.get(channel_key) or ())
+            if closing:
+                # wait() never cancels the shared close workers, and the
+                # shield keeps a cancelled caller's CancelledError from
+                # propagating into them. It does NOT make a cancelled caller
+                # wait out the flush — cancellation aborts close_key
+                # immediately, which aborts the whole reset (reset_channel
+                # reads the transcript only after this returns), so an
+                # unflushed transcript is never read on that path.
+                await asyncio.shield(asyncio.wait(closing))
+                continue
+            async with self._pool_lock:
+                if self._invalidation_barriers.get(channel_key) is None:
+                    entry = self._entries.pop(channel_key, None)
+                    break
+            # A barrier without a close worker is only the synchronous window
+            # inside invalidate_all(); loop back and pick up its close task.
+            await asyncio.sleep(0)
         if entry is not None:
             async with entry.lock:
                 await entry.aclose()
@@ -532,13 +571,19 @@ class SdkClientPool:
                     self._release_invalidation_barrier(key, barrier)
                 )
 
-        close_group = asyncio.gather(
-            *(
-                _close(key, entry, barriers[key])
-                for key, entry in entries.items()
-            ),
-            return_exceptions=True,
-        )
+        # #319: register each close worker per key so close_key can join the
+        # full flush. Created synchronously after the barrier install above
+        # (no suspension between), so a reset that saw the barrier always
+        # finds the close task on its next loop iteration.
+        close_tasks = []
+        for key, entry in entries.items():
+            task = asyncio.create_task(_close(key, entry, barriers[key]))
+            self._invalidation_closes.setdefault(key, set()).add(task)
+            task.add_done_callback(
+                lambda t, _key=key: self._discard_invalidation_close(_key, t)
+            )
+            close_tasks.append(task)
+        close_group = asyncio.gather(*close_tasks, return_exceptions=True)
         # Caller cancellation must not cancel the lock-handoff workers: doing
         # so would either strand the barrier or release it while the old turn
         # still owns the lock. Keep the shielded group strongly referenced

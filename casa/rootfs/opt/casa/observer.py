@@ -89,11 +89,23 @@ class Observer:
         # trigger
         if self.is_silenced(engagement_id):
             return
-        if not self._rate_limit_ok(engagement_id):
+        # #353: the bus dispatches each event as an independent task, so the
+        # budget slot must be RESERVED before the LLM await — checking first
+        # and counting after the post lets N concurrent events all see the
+        # same under-limit count and blow past the cap. A reservation whose
+        # evaluation declines (or fails) is handed back, preserving the
+        # L68/L17 "declined evaluations must not burn budget" contract.
+        if not self._try_reserve_interjection(engagement_id):
             return
+        # The slot is refunded ONLY on a KNOWN not-posted outcome (a normal
+        # False return). An exception — cancellation included — is an
+        # ambiguous outcome: the NOTIFICATION may already sit on the bus
+        # queue, and refunding then could let a fourth interjection through.
+        # The cap is the hard contract; losing a budget unit to ambiguity is
+        # the safe direction.
         posted = await self._interject(engagement_id, event_type, content)
-        if posted:
-            self._count_interjection(engagement_id)
+        if not posted:
+            self._release_interjection(engagement_id)
 
     # -- classifier -------------------------------------------------------
 
@@ -121,6 +133,21 @@ class Observer:
         self._interjection_counts[engagement_id] = (
             self._interjection_counts.get(engagement_id, 0) + 1
         )
+
+    def _try_reserve_interjection(self, engagement_id: str) -> bool:
+        """Atomic check-and-increment (#353): no suspension point between the
+        cap check and the count, so concurrent trigger events can never
+        collectively exceed ``_INTERJECTION_RATE_LIMIT``."""
+        if not self._rate_limit_ok(engagement_id):
+            return False
+        self._count_interjection(engagement_id)
+        return True
+
+    def _release_interjection(self, engagement_id: str) -> None:
+        """Hand back a reserved slot whose evaluation posted nothing."""
+        count = self._interjection_counts.get(engagement_id)
+        if count is not None and count > 0:
+            self._interjection_counts[engagement_id] = count - 1
 
     # -- interjection -----------------------------------------------------
 

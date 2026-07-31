@@ -97,24 +97,38 @@ class FreshnessReaper:
                 # cases rather than handing it to a save that can't succeed.
                 from agent import snapshot_session_entry
                 snapshot = snapshot_session_entry(entry)
+                # #353 (Sol r2): both direct-removal branches below are
+                # sid-guarded against the SNAPSHOTTED entry — the sweep
+                # iterates a stale all_entries() copy across awaits, so a new
+                # turn can re-register the key at any point; an unconditional
+                # remove would delete that fresh live session. A snapshot
+                # without a sid guards on None (declines once any real
+                # session registers).
                 if (
                     snapshot is None
                     or snapshot.speaker_provenance is None
                     or snapshot.user_provenance is None
                 ):
-                    await self._reg.remove(key)
+                    await self._reg.remove(
+                        key, expected_sid=entry.get("sdk_session_id"),
+                    )
                     continue
                 if not writes_to_bank(channel):
                     # Recall-only channel (voice): nothing to persist; drop the cold
                     # pointer so the registry does not accumulate dead voice entries.
-                    await self._reg.remove(key)
+                    await self._reg.remove(
+                        key, expected_sid=snapshot.sdk_session_id,
+                    )
                     continue
                 # The reduced save_session reads speaker/user provenance from the
                 # entry snapshot itself; only the transcript directory (routed
                 # through the injected role→home resolver) and channel are passed.
+                # expected_sid (#353) pins the save to the session THIS sweep
+                # judged cold — a new turn racing the claim keeps its session.
                 await self._save(
                     key, self._reg, self._sem,
                     directory=self._dir_for(snapshot.agent), channel=channel,
+                    expected_sid=snapshot.sdk_session_id,
                 )
             except asyncio.CancelledError:
                 raise

@@ -29,6 +29,18 @@ unaffected, because it does not use that route.
 turn on the bus. A message in an engagement topic is delivered to that engagement's driver
 instead — it is input to running work, not a new conversation.
 
+**Update dispatch is concurrent; ordering is re-imposed per scope, not globally.** Handlers
+run non-blocking, so nothing about arrival order survives dispatch on its own. Engagement
+topics re-serialize under a per-topic handler lock, and direct messages re-serialize per
+chat: `/new` holds its chat's lock across the whole reset (retain, then pointer removal),
+so once the reset holds the lock, no same-chat follow-up can be enqueued — let alone resume
+the dying session — until it finished. Distinct chats never contend. Two boundaries to keep
+in view: the lock serializes in *acquisition* order, which matches arrival order except in
+the brief window between handler dispatch and the acquire, where near-simultaneous updates
+can in principle swap; and a message dispatched *before* the `/new` is not ordered by the
+lock at all — an already-in-flight turn races the reset and is handled by the session
+registry's session-id checks instead (INV-MEM-006).
+
 **Ordering in a topic is a property of the sequencer, not of Telegram sends.** An engagement
 topic is a causal log: a single serialized writer keeps narration, discrete posts and edits
 in an order that matches what actually happened. That guarantee belongs to the sequencer
@@ -77,7 +89,9 @@ same-key registration inside that window *reattaches to the prior outcome* inste
 creating a fresh request — so an HTTP retry sees the original verdict rather than posting
 a duplicate keyboard. Transport failures are handled separately by a reconnect supervisor
 (a periodic probe with bounded timeout, then unbounded jittered-backoff rebuilds), which is
-why a Telegram outage recovers without operator action.
+why a Telegram outage recovers without operator action. Rebuild triggers coalesce: one
+arriving while a rebuild is already running is satisfied by that rebuild rather than
+tearing the fresh transport down again.
 
 Enforced by a claim-then-commit protocol in the broker: claiming marks the request, commit
 validates the claim token, and finishing removes it and resolves its waiter.
@@ -158,6 +172,8 @@ what Telegram measures.
 - `tests/test_telegram_update_handler.py`
 - `tests/test_tg_richtext_remnants.py`
 - `tests/test_verdict_broker.py`
+- `tests/test_telegram_new_reset.py`
+- `tests/test_telegram_supervisor.py`
 
 **Related**
 - [`architecture/overview.md`](../architecture/overview.md)
