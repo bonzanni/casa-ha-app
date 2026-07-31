@@ -6,6 +6,7 @@ Code is the source of truth; these files are a map.
 ## Architecture
 
 - [architecture/agent-taxonomy.md](architecture/agent-taxonomy.md): How an agent is declared, validated and looked up — tiers, required artifacts, and the registry.
+- [architecture/concurrency-model.md](architecture/concurrency-model.md): What runs concurrently — bus dequeue vs execution, session-key serialization, the lock inventory, and threaded vs loop work.
 - [architecture/configuration.md](architecture/configuration.md): Where configuration comes from, what is version-controlled, what reload can pick up without a restart, and how secrets resolve.
 - [architecture/engagements.md](architecture/engagements.md): Work one agent hands to another — ephemeral delegation, durable engagements, how they end, and what survives a restart.
 - [architecture/eval-framework.md](architecture/eval-framework.md): The evaluation scaffolding — and the fact that its registry ships empty.

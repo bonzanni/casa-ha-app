@@ -581,6 +581,9 @@ async def test_invalidation_serializes_same_key_until_active_turn_releases():
     """A cleared generation remains a same-key handoff barrier until its
     active turn releases the entry lock, but neither unrelated keys nor the
     replacement generation wait for the old transport to finish closing.
+    
+
+    Pins INV-CONC-003 (with the single-connect sibling). Red case demonstrated: a turn-path mutation that breaks the locked decision (reuse regardless of sid) fails these tests.
     """
     reg = FakeRegistry()
     reg.data["voice-same"] = {

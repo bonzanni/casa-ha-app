@@ -326,6 +326,25 @@
     INV-TG-004: [tests/test_output_sequencer.py::test_serialized_still_mutually_exclusive_across_tasks]
     INV-TG-005: [tests/test_tg_richtext.py::test_pin_inv_tg_005_render_paged_enforces_length_and_entity_budgets]
 
+- doc: architecture/concurrency-model.md
+  summary: What runs concurrently — bus dequeue vs execution, session-key serialization, the lock inventory, and threaded vs loop work.
+  when_changing: anything that must serialize, a new lock, bus dispatch, or blocking I/O placement
+  covers:
+    - casa/rootfs/opt/casa/bus.py::MessageBus.run_agent_loop
+    - casa/rootfs/opt/casa/bus.py::MessageBus.register
+    - casa/rootfs/opt/casa/bus.py::MessageBus.start_agent_loop
+    - casa/rootfs/opt/casa/sdk_client_pool.py::SdkClientPool.turn
+    - casa/rootfs/opt/casa/reload.py::_RWLock
+  tests:
+    - tests/test_bus.py
+    - tests/test_sdk_client_pool_pool.py
+  related: [architecture/turn-loop.md, architecture/configuration.md, architecture/engagements.md]
+  defines_invariants: [INV-CONC-001, INV-CONC-002, INV-CONC-003]
+  invariant_tests:
+    INV-CONC-001: [tests/test_bus.py::test_handlers_dispatch_concurrently, tests/test_bus.py::test_priority_ordering]
+    INV-CONC-002: [tests/test_bus.py::test_reregister_preserves_queue_and_rebinds_handler, tests/test_bus.py::test_start_agent_loop_spawns_tracked_consumer]
+    INV-CONC-003: [tests/test_sdk_client_pool_pool.py::test_invalidation_serializes_same_key_until_active_turn_releases, tests/test_sdk_client_pool_pool.py::test_concurrent_first_turns_single_connect]
+
 - doc: architecture/configuration.md
   summary: Where configuration comes from, what is version-controlled, what reload can pick up without a restart, and how secrets resolve.
   when_changing: adding or removing an option, the reload scopes, the config repo, or secret resolution

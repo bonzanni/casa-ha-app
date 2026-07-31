@@ -240,6 +240,9 @@ async def test_handlers_dispatch_concurrently():
     inline, serialising messages on the same agent. The fix wraps each
     handler in `asyncio.create_task`. With two 200ms handlers, concurrent
     dispatch completes in ~200ms; a serialised dispatch would take ~400ms.
+    
+
+    Pins INV-CONC-001. Red case demonstrated: awaiting each dispatch instead of spawning a task fails this test.
     """
     import time
 
@@ -462,6 +465,7 @@ class TestRegisterIdempotent:
     """
 
     async def test_reregister_preserves_queue_and_rebinds_handler(self):
+        """Pins INV-CONC-002. Red case demonstrated: recreating the queue on re-registration fails this test."""
         bus = MessageBus()
         first_calls: list[str] = []
         second_calls: list[str] = []
