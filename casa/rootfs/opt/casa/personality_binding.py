@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import json
+import logging
 import os
 import re
 import threading
@@ -24,6 +25,8 @@ from role_slot import (  # noqa: F401 — re-exported for existing callers (Task
 from trait_renderer import RENDERER_VERSION
 
 _SCHEMA_DIR = Path(__file__).parent / "defaults" / "schema"
+
+logger = logging.getLogger(__name__)
 
 # THE PERSONALITY-INSTANCE MUTATION LOCK (whole-branch review round 6, F1).
 # Defined HERE — its true home — because it guards the InstanceDir state whose
@@ -344,10 +347,25 @@ class InstanceDir:
             # that would overwrite the true pre-commit rollback target with a
             # duplicate of the new active. #339: under the write-active-first
             # order below, the interrupted step may ALSO be the pending
-            # tmp -> prior rotation (the copied OLD active) — finish it.
+            # tmp -> prior rotation (the copied OLD active) — finish it, but
+            # only after PROVING the tmp is a genuine pre-commit generation
+            # (Sol review): a bundle-journal rollback restores active/prior
+            # without knowing about this tmp, so a stale tmp can survive
+            # holding the SAME tuple as the restored active — rotating that
+            # duplicate over prior is exactly the clobber this branch exists
+            # to prevent. A tmp that fails to load (corrupt/tampered) must
+            # never reach prior either. Unlink in both cases.
             pending = active_path.with_suffix(active_path.suffix + ".rollback-tmp")
             if pending.exists():
-                os.replace(pending, prior_path)
+                try:
+                    pending_tuple = load_instance_tuple(pending)
+                except (ValueError, OSError, yaml.YAMLError,
+                        jsonschema.ValidationError):
+                    pending_tuple = None
+                if pending_tuple is not None and pending_tuple != candidate:
+                    os.replace(pending, prior_path)
+                else:
+                    pending.unlink(missing_ok=True)
             desired_path.unlink(missing_ok=True)
             return candidate
         # #339 (rollback-generation safety): durably write the NEW active
@@ -372,7 +390,22 @@ class InstanceDir:
                 pending_prior.unlink(missing_ok=True)
             raise
         if pending_prior is not None:
-            os.replace(pending_prior, prior_path)
+            try:
+                os.replace(pending_prior, prior_path)
+            except OSError:
+                # Terra review: the commit has already SUCCEEDED — the new
+                # active is durably written. Failing here would make the
+                # caller run the pre-commit tuple while disk says otherwise
+                # (reconcile catches OSError and returns the retained
+                # active). Keep the tmp as the pending-rotation journal —
+                # the no-op recommit branch above completes it, and any
+                # later real commit overwrites it — and log the degraded
+                # prior instead of failing a committed transition.
+                logger.warning(
+                    "%s: new active committed but prior rotation failed; "
+                    "rollback target is one generation stale until the "
+                    "pending rotation completes", self._dir, exc_info=True,
+                )
         desired_path.unlink(missing_ok=True)
         return candidate
 

@@ -444,3 +444,108 @@ def test_owned_plugins_noop_recommit_does_not_rotate_prior(tmp_path: Path) -> No
     assert read_owned_plugins(owned_plugins_path(tmp_path / "mtg")) == gen2
     assert read_owned_plugins(owned_plugins_prior_path(tmp_path / "mtg")) == gen1
     assert not owned_plugins_desired_path(tmp_path / "mtg").exists()
+
+
+def test_stale_rollback_tmp_left_by_journal_rollback_is_never_rotated_over_prior(
+        tmp_path: Path) -> None:
+    """Sol review (#339/#346): the specialist bundle journal restores
+    active/prior on rollback but knows nothing about active.yaml.rollback-tmp.
+    After a rollback, a stale tmp can hold the SAME tuple as the restored
+    active; a later byte-identical recommit taking the no-op branch must
+    detect that (parse-and-compare, not blind os.replace) and discard the
+    tmp instead of clobbering the true prior with a duplicate."""
+    from personality_binding import atomic_write_instance_tuple, load_instance_tuple
+
+    d = InstanceDir(tmp_path / "mtg")
+    gen1 = _tuple(_binding(persona_version="0.1.0"))
+    d.stage_desired(gen1)
+    d.commit_desired_to_active()
+    gen2 = _tuple(_binding(persona_version="0.2.0"))
+    d.stage_desired(gen2)
+    d.commit_desired_to_active()
+
+    base = tmp_path / "mtg"
+    prior_path = base / "active.prior.yaml"
+    assert load_instance_tuple(prior_path) == gen1
+
+    # Journal-rollback aftermath: a gen3 upgrade crashed mid-commit (tmp holds
+    # the then-active gen2), then the journal restored active back to gen2 —
+    # so tmp now DUPLICATES active.
+    atomic_write_instance_tuple(base / "active.yaml.rollback-tmp", gen2)
+
+    # Byte-identical recommit of gen2 (crash-retry / duplicate bundle).
+    d.stage_desired(gen2)
+    d.commit_desired_to_active()
+
+    assert d.active() == gen2
+    assert load_instance_tuple(prior_path) == gen1  # true prior survives
+    assert not (base / "active.yaml.rollback-tmp").exists()
+
+
+def test_corrupt_rollback_tmp_is_discarded_not_rotated(tmp_path: Path) -> None:
+    """A tmp that fails to load (corrupt/tampered) must never become prior."""
+    from personality_binding import load_instance_tuple
+
+    d = InstanceDir(tmp_path / "mtg")
+    gen1 = _tuple(_binding(persona_version="0.1.0"))
+    d.stage_desired(gen1)
+    d.commit_desired_to_active()
+    gen2 = _tuple(_binding(persona_version="0.2.0"))
+    d.stage_desired(gen2)
+    d.commit_desired_to_active()
+
+    base = tmp_path / "mtg"
+    (base / "active.yaml.rollback-tmp").write_text("{{{ garbage", encoding="utf-8")
+    d.stage_desired(gen2)
+    d.commit_desired_to_active()
+
+    assert load_instance_tuple(base / "active.prior.yaml") == gen1
+    assert not (base / "active.yaml.rollback-tmp").exists()
+
+
+def test_a_failed_prior_rotation_does_not_fail_the_committed_transition(
+        tmp_path: Path, monkeypatch) -> None:
+    """Terra review (#339): once the new active is durably written the commit
+    has succeeded — a failure rotating tmp -> prior must not raise (the
+    caller would then run the pre-commit tuple while disk says otherwise).
+    The tmp stays behind as the pending-rotation journal and a later
+    recommit completes it."""
+    import personality_binding
+    from personality_binding import load_instance_tuple
+
+    d = InstanceDir(tmp_path / "mtg")
+    gen1 = _tuple(_binding(persona_version="0.1.0"))
+    d.stage_desired(gen1)
+    d.commit_desired_to_active()
+    gen2 = _tuple(_binding(persona_version="0.2.0"))
+    d.stage_desired(gen2)
+    d.commit_desired_to_active()
+
+    base = tmp_path / "mtg"
+    prior_path = base / "active.prior.yaml"
+    gen3 = _tuple(_binding(persona_version="0.3.0"))
+    d.stage_desired(gen3)
+
+    real_replace = personality_binding.os.replace
+
+    def _fail_prior_rotation(src, dst):
+        if str(dst) == str(prior_path):
+            raise OSError("EIO on prior rotation")
+        return real_replace(src, dst)
+
+    monkeypatch.setattr(personality_binding.os, "replace", _fail_prior_rotation)
+    committed = d.commit_desired_to_active()  # must NOT raise
+    monkeypatch.undo()
+
+    assert committed == gen3
+    assert d.active() == gen3                      # disk agrees with the caller
+    assert d.desired() is None
+    assert load_instance_tuple(prior_path) == gen1  # stale but intact (never clobbered)
+    pending = base / "active.yaml.rollback-tmp"
+    assert pending.exists()                        # the pending-rotation journal
+
+    # A later recommit of the same tuple completes the interrupted rotation.
+    d.stage_desired(gen3)
+    d.commit_desired_to_active()
+    assert load_instance_tuple(prior_path) == gen2
+    assert not pending.exists()

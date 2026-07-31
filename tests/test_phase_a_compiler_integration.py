@@ -352,3 +352,48 @@ async def test_persona_swap_tool_structured_errors(monkeypatch) -> None:
         {"role": "resident:concierge", "persona_ref": "casa/gary@0.1.0"},
     )
     assert _payload(no_runtime)["kind"] == "runtime_unavailable"
+
+
+def test_changed_bytes_under_an_active_override_fail_the_load_as_load_error(
+        tmp_path) -> None:
+    """Terra review (#339): with an ACTIVE override whose on-disk bytes
+    changed under the pinned version, reconcile refuses to rematerialize
+    (checksum pin) and retains the active tuple — and the loader's compile
+    integrity check then REFUSES the changed pack against the retained
+    binding. The altered bytes are never served; the resident fails to load
+    with a typed LoadError (boot-fatal per INV-PERS-003)."""
+    import dataclasses
+    from pathlib import Path
+
+    from personality_binding import InstanceDir, InstanceTuple, materialize_override_binding
+    from persona_pack import load_persona_pack
+    from agent_loader import LoadError, load_agent_from_dir
+    from policies import load_policies
+
+    cfg = _load("concierge")
+    role = cfg.role_slot
+    gary_dir = Path("casa/rootfs/opt/casa/defaults/personas/casa/gary/0.1.0")
+    gary = load_persona_pack(gary_dir / "pack", gary_dir / "manifest.json")
+
+    # The ACTIVE binding pins a checksum that does not match the bytes the
+    # loader will find on disk — the "restore changed the bytes under a
+    # pinned version" state.
+    approved_elsewhere = dataclasses.replace(gary, checksum="sha256:" + "e" * 64)
+    binding = materialize_override_binding(
+        role=role, persona=approved_elsewhere, override_source="operator:casa/gary@0.1.0",
+    )
+    bindings_root = tmp_path / "bindings-root"
+    instance_dir = InstanceDir(bindings_root / "resident-concierge")
+    instance_dir.stage_desired(InstanceTuple(
+        root="operator:casa/gary@0.1.0", binding=binding,
+        config_snapshot={}, config_digest=binding.effective_config_digest,
+    ))
+    instance_dir.commit_desired_to_active()
+
+    policies = load_policies(_POLICIES)
+    with pytest.raises(LoadError):
+        load_agent_from_dir(
+            f"{_AGENTS}/concierge", policies=policies, bindings_dir=str(bindings_root),
+        )
+    # The altered on-disk pack was never accepted into the binding.
+    assert instance_dir.active().binding.persona_checksum == "sha256:" + "e" * 64

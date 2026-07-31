@@ -1359,10 +1359,23 @@ def _activate_resident_binding(
             f"{active_tuple.binding.persona_id}@{active_tuple.binding.persona_version} "
             f"failed to reload after reconciliation: {exc}"
         ) from exc
-    bundle = compile_prompt_bundle(
-        role=cfg.role_slot, persona=bound_persona, binding=active_tuple.binding,
-        platform_frame=platform_frame, safety_kernel=safety_kernel,
-    )
+    try:
+        bundle = compile_prompt_bundle(
+            role=cfg.role_slot, persona=bound_persona, binding=active_tuple.binding,
+            platform_frame=platform_frame, safety_kernel=safety_kernel,
+        )
+    except ValueError as exc:
+        # Terra review (#339): reachable — e.g. an ACTIVE override whose
+        # on-disk bytes changed under the pinned version. Reconcile refuses
+        # to rematerialize (checksum pin) and retains the active tuple; the
+        # reload above then returns the CHANGED pack and this compile's
+        # integrity check (binding.persona_checksum vs persona.checksum)
+        # refuses it. The altered bytes are never served; the failure is the
+        # documented boot-fatal resident load (INV-PERS-003) — typed as
+        # LoadError like every other load failure, not a raw ValueError.
+        raise LoadError(
+            f"agent {role_from_path!r}: compiled binding rejected: {exc}"
+        ) from exc
     cfg.persona_pack = bound_persona
     cfg.binding = active_tuple.binding
     cfg.compiled_prompt_bundle = bundle

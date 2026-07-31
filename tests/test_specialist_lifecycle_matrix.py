@@ -327,3 +327,20 @@ def test_second_fresh_install_cannot_replace_a_different_pending_candidate(
         acks=acks, specialists_dir=tmp_path / "specialists",
         agents_specialists_dir=tmp_path / "agents-specialists")
     assert satisfied.state == "active"
+
+
+def test_fresh_install_refuses_an_unreadable_pending_candidate(tmp_path: Path) -> None:
+    """#346: a desired.yaml the guard cannot LOAD (bad YAML) is an occupant it
+    cannot prove is ours — refuse structurally (concurrent_mutation), never
+    raise a raw parser error or silently replace it."""
+    slug_dir = tmp_path / "specialists" / "mtg"
+    slug_dir.mkdir(parents=True)
+    (slug_dir / "desired.yaml").write_text("{{{ not yaml", encoding="utf-8")
+
+    inspection, acks = _approved_inspection(tmp_path)
+    with pytest.raises(SpecialistInstallError) as excinfo:
+        commit_specialist_install(
+            inspection=inspection, config={}, secret_names_provided=frozenset(),
+            acks=acks, specialists_dir=tmp_path / "specialists",
+            agents_specialists_dir=tmp_path / "agents-specialists")
+    assert excinfo.value.kind == "concurrent_mutation"

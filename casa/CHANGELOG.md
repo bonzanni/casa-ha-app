@@ -1,5 +1,43 @@
 # Changelog
 
+## [0.134.0] - 2026-07-31
+
+### Fixed
+
+Boot-safety batch — four issues (#325, #338, #339, #346) closing paths where
+an ordinary configuration edit, a damaged file or a race could stop the app
+from starting or corrupt its rollback state:
+
+- **Clearing an optional Telegram option no longer crash-loops the add-on**
+  (#325). An unset optional yields the literal string "null" from the
+  Supervisor config layer; the boot script now normalizes the bot token, chat
+  id and engagement supergroup id like every other optional, and the
+  supergroup id parse tolerates garbage (real, negative Telegram IDs are
+  preserved).
+- **A persona that fails prompt-admission ceilings can no longer be activated
+  and brick every later boot** (#339). A resident binding candidate is now
+  fully validated — compatibility, the pinned persona checksum, and the full
+  compile pass — *before* it is promoted to active; a failing candidate is
+  discarded and the last-known-good binding keeps running. Persona bytes that
+  changed under a pinned version are refused instead of silently adopted, and
+  the active/prior rotation can no longer lose the rollback generation on a
+  failed write.
+- **The pre-commit configuration gate now predicts boot** (#338). It replays
+  trigger registration (duplicate names, undeclared channels, invalid cron
+  fields are refused at commit instead of crash-looping the next boot), one
+  inconsistent specialist no longer kills the whole specialist scan, and
+  validating a commit can no longer activate a staged persona swap as a side
+  effect.
+- **Specialist install/upgrade robustness** (#346). Consent receipts are
+  re-checked under the mutation lock (a concurrent duplicate bundle fails
+  closed instead of desyncing rollback generations); a damaged installed
+  specialist is isolated at boot as an error-state instance instead of
+  aborting startup; a second fresh install can no longer silently replace a
+  different pending install of the same slug; malformed fetched manifests
+  surface as structured errors; the component-store path is containment-pinned
+  against tampered tuple roots; and component export refuses corpus symlinks
+  that would produce an uninstallable bundle.
+
 ## [0.133.0] - 2026-07-31
 
 ### Security

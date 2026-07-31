@@ -11,6 +11,7 @@ from pathlib import Path
 from typing import TYPE_CHECKING, Literal, Mapping
 
 import jsonschema
+import yaml
 
 from authored_markers import contains_forbidden_marker
 from canonical_bytes import reject_forbidden_markers, to_plain_json
@@ -150,7 +151,12 @@ def _refuse_if_active_present(instance_dir, *, slug: str, root: str) -> None:
             f"and retry")
     try:
         pending = instance_dir.desired()
-    except (ValueError, OSError) as exc:
+    except (ValueError, OSError, yaml.YAMLError,
+            jsonschema.ValidationError) as exc:
+        # load_instance_tuple wraps only its own ValueError path; a bad-YAML
+        # or schema-invalid desired.yaml raises the raw parser/validator
+        # error. All of them mean the same thing here: an occupant we cannot
+        # prove is ours — fail closed.
         raise SpecialistInstallError(
             "concurrent_mutation",
             f"{slug!r}: an unreadable pending candidate already exists "
