@@ -17,7 +17,12 @@ ZERO = "0" * 40
 def _repo(tmp_path: Path) -> Path:
     repo = tmp_path / "repo"
     repo.mkdir()
-    subprocess.run(["git", "init", "-q", str(repo)], check=True)
+    # -b main: attest.sh records the CURRENT branch into the receipt and
+    # pre-push compares it to the pushed ref. The tests push refs/heads/main,
+    # so the fixture must be on main regardless of the host's
+    # init.defaultBranch — CI runners default to master, which made the
+    # attest-then-push test fail only in CI.
+    subprocess.run(["git", "init", "-q", "-b", "main", str(repo)], check=True)
     for key, value in (("user.email", "t@t"), ("user.name", "t")):
         subprocess.run(["git", "-C", str(repo), "config", key, value], check=True)
     # attest.sh sweeps the branch name, and every policy file fails closed when absent.
