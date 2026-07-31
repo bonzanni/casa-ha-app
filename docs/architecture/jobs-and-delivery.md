@@ -68,9 +68,11 @@ fresh lease instead of being orphaned, precisely so a mid-playback device is not
 
 **INV-JOB-003**: Every delivery transition is a compare-and-set against both the expected durable state and the recorded attempt id; a stale or mismatched frame is denied without mutation.
 
-Enforced by the registry's delivery CAS helper, consulted by claim, renew, authorize,
-mark-playing, mark-delivered and nack — each of which has exactly one production caller,
-the delivery coordinator's frame handler.
+Enforced in the registry's transition methods — some through the shared CAS helper, some
+(renew, mark-delivered, nack) with their own equivalent state-and-attempt checks; the
+semantics are uniform even where the helper is not. The delivery coordinator is the only
+production caller, through its frame handler — plus one extra nack site for a revoked
+acknowledgement.
 
 What it does not cover: endpoint authenticity. Route and connection matching happen in the
 coordinator before the CAS; the CAS itself trusts the coordinator's identification.

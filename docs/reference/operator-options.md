@@ -27,10 +27,15 @@ generic placeholder substitution, and model options enter through the role-slot 
 (INV-CFG-001); values are read once by boot scripts and process initialization. The reload
 system covers repository and plugin configuration, not the manifest.
 
-**Empty optional strings are mostly not exported** — an unset option usually means the
-variable is absent rather than empty, and only the webhook secret is explicitly unset
-before its export decision, so a variable inherited from the environment can survive an
-empty option elsewhere.
+**Export handling is option-specific, not uniform.** One group exports conditionally with
+"null" normalization — the public URL, the Hindsight URL, the Telegram API base, the
+webhook secret, the Context7 key, the timezone, the log level and the reap TTL are exported
+only when set to a real value. Another group exports *unconditionally* — the Telegram
+token, chat id and supergroup id, the 1Password token and vault among them — relying on the
+shipped `options:` defaults to keep the value an empty string; a key deleted from the
+stored options would surface as the literal string "null" there, which downstream truthy
+checks would accept. Only the webhook secret is explicitly unset before its export
+decision, so an inherited container variable can survive an empty option elsewhere.
 
 ## The options
 
@@ -53,7 +58,7 @@ empty option elsewhere.
 | `enable_terminal` | `ENABLE_TERMINAL` | nginx setup, ttyd service, dashboard | false | restart |
 | `casa_tz` | `CASA_TZ` | timekeeping resolution | Europe/Amsterdam | restart |
 | `engagement_reap_days` | `ENGAGEMENT_REAP_DAYS` | engagement reaper | 7 (0 disables) | restart |
-| `log_level` | `LOG_LEVEL` | main startup logging | INFO | restart |
+| `log_level` | `LOG_LEVEL` | main startup logging | schema-only (absent from `options:`); runtime falls back to INFO | restart |
 | `specialist_max_concurrency` | `SPECIALIST_MAX_CONCURRENCY` | specialist limiter (clamped 1–20) | 2 | restart |
 | `specialist_cost_alert_threshold` | `SPECIALIST_COST_ALERT_THRESHOLD` | specialist telemetry (malformed → default) | 5.0 | restart |
 
@@ -65,8 +70,9 @@ supergroup id** fails startup — that conversion is unguarded. **A failed `op:/
 resolution** warns and leaves the raw reference in place, so the downstream credential is
 rejected rather than the boot. **An invalid timezone** warns and falls back to the
 default. **An invalid reap value** falls back to seven days. **The specialist rails** are
-the exception to schema-only validation: concurrency is clamped and the cost threshold
-rejects malformed values — the other options trust the schema and the operator.
+the exception to schema-only validation: concurrency is clamped to its range and a
+malformed cost threshold falls back to the default at runtime (the schema rejects it at
+input time) — the other options trust the schema and the operator.
 
 ## Extension points
 

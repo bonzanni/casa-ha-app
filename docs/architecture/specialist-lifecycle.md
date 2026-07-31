@@ -102,8 +102,10 @@ itself fails, the journal stays in progress for boot to finish.
 corrupt or unrollbackable ones quarantined — a filename that cannot be parsed quarantines
 every owned entry rather than guessing.
 
-**Two mutations race.** The loser refuses as a concurrent mutation; nothing is overwritten
-or resurrected.
+**Two mutations race.** Where an active tuple exists, the loser refuses as a concurrent
+mutation; nothing is overwritten or resurrected. The refusal checks the *active* tuple
+specifically — a second stale fresh-install racing a pending (desired-only) instance sees
+no active tuple and restages the desired one rather than refusing.
 
 ## Extension points
 
