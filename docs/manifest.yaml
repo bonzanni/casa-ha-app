@@ -48,9 +48,9 @@
   related: [contributing/doc-contract.md]
   defines_invariants: [INV-PUB-001, INV-PUB-002, INV-PUB-003]
   invariant_tests:
-    INV-PUB-001: [tests/PINNING-TEST-MISSING]
-    INV-PUB-002: [tests/PINNING-TEST-MISSING]
-    INV-PUB-003: [tests/PINNING-TEST-MISSING]
+    INV-PUB-001: [tests/test_deny_sweep.py::test_a_denied_literal_is_caught, tests/test_leak_guard.py::test_a_denied_path_is_rejected]
+    INV-PUB-002: [tests/test_pin_doc_corpus_shape.py::test_pin_inv_pub_002_doctrine_carries_no_dated_history]
+    INV-PUB-003: [tests/test_gate_hook.py::test_a_gated_push_without_an_attestation_is_refused, tests/test_gate_hook.py::test_the_automated_receipt_alone_does_not_authorise_a_push]
 
 - doc: doctrine/operating-casa.md
   summary: How an agent running inside Casa should behave, and which property of the system each rule follows from.
@@ -477,9 +477,9 @@
   related: [doctrine/publishing.md]
   defines_invariants: [INV-DOC-001, INV-DOC-002, INV-DOC-003, INV-DOC-004, INV-DOC-005, INV-DOC-006]
   invariant_tests:
-    INV-DOC-001: [tests/PINNING-TEST-MISSING]
-    INV-DOC-002: [tests/PINNING-TEST-MISSING]
-    INV-DOC-003: [tests/PINNING-TEST-MISSING]
-    INV-DOC-004: [tests/PINNING-TEST-MISSING]
-    INV-DOC-005: [tests/PINNING-TEST-MISSING]
-    INV-DOC-006: [tests/PINNING-TEST-MISSING]
+    INV-DOC-001: [tests/test_pin_doc_corpus_shape.py::test_pin_inv_doc_001_front_matter_and_code_wins_line]
+    INV-DOC-002: [tests/test_pin_doc_corpus_shape.py::test_pin_inv_doc_002_architecture_documents_follow_the_section_order]
+    INV-DOC-003: [tests/test_pin_doc_corpus_shape.py::test_pin_inv_doc_003_no_changelog_voice_markers]
+    INV-DOC-004: [tests/test_verify_docs.py::test_an_invariant_defined_twice_is_caught]
+    INV-DOC-005: [tests/test_verify_docs.py::test_a_line_number_anchor_is_rejected]
+    INV-DOC-006: [tests/test_verify_docs.py::test_a_document_over_the_ceiling_is_rejected]

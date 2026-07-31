@@ -122,6 +122,7 @@ def test_a_dead_symbol_anchor_is_caught(tmp_path):
 
 
 def test_a_line_number_anchor_is_rejected(tmp_path):
+    """Pins INV-DOC-005's enforced core. Red case demonstrated: disabling the line-anchor rejection fails this test."""
     root = _corpus(tmp_path, ENTRY.replace("casa/a.py::A.b", "casa/a.py:12"))
     assert any("line-number anchor" in p for p in verify_docs.verify(root))
 
@@ -162,6 +163,7 @@ def test_a_disallowed_extension_is_rejected(tmp_path):
 
 
 def test_a_document_over_the_ceiling_is_rejected(tmp_path):
+    """Pins INV-DOC-006's enforced core. Red case demonstrated: disabling the size-budget check fails this test."""
     body = "# Turn loop\n" + CODE_WINS + "x" * 26_000 + SOURCEMAP
     root = _corpus(tmp_path, docs={"architecture/turn-loop.md": body})
     assert any("exceeds the 25 KB ceiling" in p for p in verify_docs.verify(root))
@@ -245,6 +247,7 @@ def test_related_must_name_a_document_not_an_index(tmp_path):
 # --- invariants ----------------------------------------------------------------------
 
 def test_an_invariant_defined_twice_is_caught(tmp_path):
+    """Pins INV-DOC-004's enforced core (define-once). Red case demonstrated: disabling the duplicate-definition check fails this test."""
     inv = "**INV-X-001**: one statement.\n"
     manifest = (
         ENTRY.replace("  related: [doctrine/publishing.md]",

@@ -151,6 +151,7 @@ def test_a_missing_supplement_fails_closed_when_one_is_named(tmp_path):
 
 
 def test_a_denied_literal_is_caught(tmp_path):
+    """Pins INV-PUB-001 (the mechanical layer). Red case demonstrated: emptying the sweep's per-file match collection fails this test."""
     repo, deny = _repo(tmp_path)
     _commit(repo, "README.md", "contact: ZZ-DENIED-LITERAL-ZZ\n")
     assert _sweep(repo, deny, "tree").returncode == 1

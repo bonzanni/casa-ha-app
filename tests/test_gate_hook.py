@@ -75,6 +75,7 @@ def _approve(repo: Path, sha: str, branch: str = "main",
 
 
 def test_a_gated_push_without_an_attestation_is_refused(tmp_path):
+    """Pins INV-PUB-003 (the mechanism: nothing publishes without an attested human read). Red case demonstrated: skipping the pre-push receipt check fails this test."""
     repo = _repo(tmp_path)
     sha = _commit(repo, "docs/architecture/a.md")
     result = _push(repo, sha)
