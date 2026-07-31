@@ -197,6 +197,7 @@
     - tests/test_recall_absence_invariant.py
     - tests/test_recall_health.py::test_breaker_opens_after_threshold_failures
     - tests/test_sensitivity.py::test_readable_tiers_is_clearance_and_below
+    - tests/test_sensitivity.py::test_clearance_docstring_states_the_fail_closed_direction
     - tests/test_channel_policy.py
     - tests/test_memory_provenance.py
     - tests/test_agent_auto_recall_unavailable.py
@@ -246,6 +247,9 @@
     - casa/rootfs/opt/casa/engagement_registry.py::EngagementRecord
     - casa/rootfs/opt/casa/engagement_registry.py::EngagementRegistry.try_transition_terminal
     - casa/rootfs/opt/casa/engagement_registry.py::TerminalPreconditionFailed
+    - casa/rootfs/opt/casa/tools.py::_finalize_engagement
+    - casa/rootfs/opt/casa/tools.py::FinalizeResult
+    - casa/rootfs/opt/casa/tools.py::cancel_engagement
     - casa/rootfs/opt/casa/drivers/driver_protocol.py::DriverProtocol
     - casa/rootfs/opt/casa/drivers/claude_code_driver.py::ClaudeCodeDriver
     - casa/rootfs/opt/casa/channels/output_sequencer.py::OutputSequencer
@@ -277,6 +281,7 @@
     - casa/rootfs/opt/casa/channel_authz.py::agent_allowed_on
   tests:
     - tests/test_voice_auth_failclosed.py
+    - tests/test_voice_malformed_input.py
     - tests/test_voice_agent_catalog.py
     - tests/test_voice_channel_sse.py
     - tests/test_voice_channel_ws.py
@@ -284,7 +289,7 @@
   related: [architecture/overview.md, architecture/http-surface.md, architecture/turn-loop.md]
   defines_invariants: [INV-VOICE-001, INV-VOICE-002, INV-VOICE-003, INV-VOICE-004, INV-VOICE-005, INV-VOICE-006]
   invariant_tests:
-    INV-VOICE-001: [tests/test_voice_auth_failclosed.py::test_sse_turn_rejected_and_never_dispatched, tests/test_voice_auth_failclosed.py::test_ws_upgrade_rejected, tests/test_voice_auth_failclosed.py::test_catalog_rejected, tests/test_voice_auth_failclosed.py::test_mis_signed_turn_rejected]
+    INV-VOICE-001: [tests/test_voice_auth_failclosed.py::test_sse_turn_rejected_and_never_dispatched, tests/test_voice_auth_failclosed.py::test_ws_upgrade_rejected, tests/test_voice_auth_failclosed.py::test_catalog_rejected, tests/test_voice_auth_failclosed.py::test_mis_signed_turn_rejected, tests/test_voice_malformed_input.py::test_sse_non_ascii_signature_is_401, tests/test_voice_malformed_input.py::test_ws_non_ascii_signature_is_401]
     INV-VOICE-002: [tests/test_voice_channel_ws.py::test_pin_inv_voice_002_text_only_agent_refused_on_every_voice_path, tests/test_voice_channel_ws.py::test_invalid_stt_start_is_a_noop]
     INV-VOICE-003: [tests/test_voice_agent_catalog.py::test_catalog_rejects_overflow_without_truncating]
     INV-VOICE-004: [tests/test_voice_routes.py::test_missing_voice_handoff_capability_fails_registration_closed, tests/test_voice_routes.py::test_any_unknown_capability_fails_the_whole_registration_closed, tests/test_voice_routes.py::test_protocol_requires_exact_json_integer_two]
@@ -493,8 +498,12 @@
   covers:
     - casa/rootfs/opt/casa/log_cid.py::install_logging
     - casa/rootfs/opt/casa/log_cid.py::new_cid
+    - casa/rootfs/opt/casa/log_cid.py::HumanFormatter
+    - casa/rootfs/opt/casa/log_cid.py::JsonFormatter
+    - casa/rootfs/opt/casa/log_cid.py::_RedactingRenderMixin
     - casa/rootfs/opt/casa/log_redact.py::RedactingFilter
     - casa/rootfs/opt/casa/log_redact.py::redact
+    - casa/rootfs/opt/casa/log_redact.py::redact_extras
     - casa/rootfs/opt/casa/casa_core.py::healthz
   tests:
     - tests/test_log_redact.py
@@ -503,7 +512,7 @@
   defines_invariants: [INV-OBS-001, INV-OBS-002, INV-OBS-003]
   invariant_tests:
     INV-OBS-001: [tests/test_pin_g5_invariants.py::test_pin_inv_obs_001_header_cid_validated_payload_cid_not]
-    INV-OBS-002: [tests/test_pin_g5_invariants.py::test_pin_inv_obs_002_redaction_covers_message_and_args_only]
+    INV-OBS-002: [tests/test_pin_g5_invariants.py::test_pin_inv_obs_002_rendered_output_redacts_exceptions_and_extras]
     INV-OBS-003: [tests/test_pin_g5_invariants.py::test_pin_inv_obs_003_healthz_is_fixed_and_reads_nothing]
 
 - doc: architecture/persistent-state.md

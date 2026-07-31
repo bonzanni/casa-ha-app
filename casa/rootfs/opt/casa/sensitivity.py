@@ -58,7 +58,8 @@ def apply_ceiling(tier: str, ceiling: str) -> str:
 
 
 def clearance_for_channel(channel: str) -> str:
-    """Clearance for a channel (defaults to the most-trusted tier for private surfaces)."""
+    """Clearance for a channel. FAIL-CLOSED: an unmapped channel reads at the
+    LEAST-sensitive tier (public) — see _DEFAULT_CLEARANCE (X2, 2026-07-10)."""
     return CLEARANCE_BY_CHANNEL.get(channel, _DEFAULT_CLEARANCE)
 
 

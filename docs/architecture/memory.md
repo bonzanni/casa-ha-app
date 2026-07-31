@@ -1,5 +1,5 @@
 ---
-last_reviewed: 2026-07-30
+last_reviewed: 2026-07-31
 ---
 
 # Memory and recall
@@ -43,10 +43,9 @@ auto-recalls. Both can still recall explicitly through the tool. "The agent reme
 automatically" is true of a narrower set of turns than it sounds.
 
 **Read clearance is per channel and fails closed.** Known channels are mapped explicitly; an
-unrecognised one gets the *least* sensitive clearance. Note that `clearance_for_channel`'s own
-docstring says the opposite — it claims the default is the most-trusted tier. The code is
-right and the sentence is wrong; this is a live example of why the corpus rule is that code
-wins.
+unrecognised one gets the *least* sensitive clearance. The fail direction is the security
+control here: an unknown surface must read less, never more, and a test pins the function's
+docstring to that direction so prose and behaviour cannot drift apart again.
 
 **Writing is narrower than reading.** Only write-trusted channels retain to the shared bank.
 A channel that can recall is not thereby able to store.
@@ -198,6 +197,7 @@ once.
 - `tests/test_recall_absence_invariant.py`
 - `tests/test_recall_health.py::test_breaker_opens_after_threshold_failures`
 - `tests/test_sensitivity.py::test_readable_tiers_is_clearance_and_below`
+- `tests/test_sensitivity.py::test_clearance_docstring_states_the_fail_closed_direction`
 - `tests/test_channel_policy.py`
 - `tests/test_memory_provenance.py`
 - `tests/test_agent_auto_recall_unavailable.py`

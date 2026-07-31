@@ -58,6 +58,21 @@ def test_unknown_channel_fails_closed_to_public():
     assert clearance_for_channel("") == "public"            # boot-replay edge
 
 
+def test_clearance_docstring_states_the_fail_closed_direction():
+    """#282: the docstring used to claim the default was the MOST-trusted
+    tier while the code fails closed to the least-sensitive one — exactly
+    the sentence someone reasons from without re-reading the constant. Pin
+    prose and behaviour together so the pair cannot drift apart again.
+
+    Red case demonstrated: restoring the pre-#282 docstring ("defaults to
+    the most-trusted tier for private surfaces") fails this test.
+    """
+    doc = clearance_for_channel.__doc__ or ""
+    assert "FAIL-CLOSED" in doc
+    assert "LEAST-sensitive" in doc
+    assert "most-trusted" not in doc
+
+
 def test_real_ingress_channels_explicitly_mapped():
     """X2 (2026-07-09): every real ingress channel is an EXPLICIT clearance
     decision, not an accident of the fallback."""

@@ -6393,10 +6393,25 @@ async def cancel_engagement(args: dict) -> dict:
     except Exception:
         pass
 
-    await _finalize_engagement(
+    fin = await _finalize_engagement(
         rec, outcome="cancelled", text="Engagement cancelled.",
         artifacts=[], next_steps=[], driver=driver,
     )
+    # #289: mirror emit_completion's contract instead of acking
+    # unconditionally — a persist rollback leaves the record LIVE, and a
+    # lost race means something else already finalized it.
+    if fin is FinalizeResult.ALREADY_TERMINAL:
+        return _result({"status": "acknowledged", "kind": "already_terminal",
+                        "message": "engagement was already terminal"})
+    if not fin:  # PERSIST_FAILED (no other non-won outcome is reachable
+        #          here: the inbound gate only arms for outcome="completed")
+        return _result({
+            "status": "error", "kind": "finalize_persist_failed",
+            "retryable": True,
+            "message": ("cancellation could not be persisted; the "
+                        "engagement is still active — call "
+                        "cancel_engagement again"),
+        })
     return _result({"status": "ok", "engagement_id": engagement_id})
 
 

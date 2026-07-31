@@ -502,12 +502,9 @@ class VoiceChannel(Channel):
         self,
         request: web.Request,
     ) -> web.Response:
-        signature = request.headers.get("X-Webhook-Signature", "")
-        if (
-            not self._webhook_secret
-            or not signature.isascii()
-            or not self._verify(request, b"")
-        ):
+        # _verify is fail-closed on a missing secret and a non-ASCII
+        # signature header (#287) — one mechanism for all three routes.
+        if not self._verify(request, b""):
             return web.json_response(
                 {"error": "invalid signature"}, status=401,
             )
@@ -548,6 +545,10 @@ class VoiceChannel(Channel):
         if not self._webhook_secret:
             return False
         sig = request.headers.get("X-Webhook-Signature", "")
+        # #287: compare_digest raises TypeError on a non-ASCII str — a
+        # malformed header must be a 401, not a 500, on every route.
+        if not sig.isascii():
+            return False
         expected = hmac.new(
             self._webhook_secret.encode(), body, hashlib.sha256,
         ).hexdigest()
@@ -571,12 +572,21 @@ class VoiceChannel(Channel):
             payload = json.loads(body.decode("utf-8"))
         except Exception:
             return web.json_response({"error": "invalid JSON"}, status=400)
+        # #287: valid JSON with a non-object top level (array/string/number)
+        # would raise AttributeError on .get below — refuse it as a 400.
+        if not isinstance(payload, dict):
+            return web.json_response({"error": "invalid JSON"}, status=400)
 
-        prompt = payload.get("prompt") or ""
-        if not prompt:
+        # #287 r2: field-level shape checks — a non-str prompt/agent_role from
+        # an authenticated caller raised (unhashable dict key, str ops) → 500.
+        prompt = payload.get("prompt")
+        if not isinstance(prompt, str) or not prompt:
             return web.json_response({"error": "missing 'prompt'"}, status=400)
 
         agent_role = payload.get("agent_role", self.default_agent)
+        if not isinstance(agent_role, str):
+            # Same body as an unknown role — no shape oracle.
+            return web.json_response({"error": "unknown agent_role"}, status=404)
         cfg = self._agent_configs.get(agent_role)
         # Fail-closed channel-capability gate (spec A3): unknown role and a
         # role that never declared ha_voice get the SAME 404 body — no
@@ -827,15 +837,21 @@ class VoiceChannel(Channel):
 
     @staticmethod
     def _resolve_scope_id(payload: dict) -> str:
-        if payload.get("scope_id"):
-            return payload["scope_id"]
-        ctx = payload.get("context") or {}
-        return (
-            ctx.get("user_id")
-            or ctx.get("device_id")
-            or ctx.get("conversation_id")
-            or "anon"
-        )
+        # #287 r2: only a non-empty str may become a scope id — a list/dict
+        # here raised later as an unhashable session key (500 on SSE), and a
+        # non-dict ``context`` raised on ``.get``. Malformed values fall
+        # through to the next candidate / "anon" instead.
+        sid = payload.get("scope_id")
+        if isinstance(sid, str) and sid:
+            return sid
+        ctx = payload.get("context")
+        if not isinstance(ctx, dict):
+            ctx = {}
+        for key in ("user_id", "device_id", "conversation_id"):
+            value = ctx.get(key)
+            if isinstance(value, str) and value:
+                return value
+        return "anon"
 
     @staticmethod
     def _error_line(cfg: Any, exc: Exception) -> str:
@@ -945,14 +961,21 @@ class VoiceChannel(Channel):
                     continue
 
                 if t == "cancel":
+                    # #287 r2: a non-str utterance_id raised as an unhashable
+                    # dict key and closed the socket — skip the frame instead.
                     uid = frame.get("utterance_id")
-                    task = tasks.get(uid) if uid else None
+                    task = (tasks.get(uid)
+                            if isinstance(uid, str) and uid else None)
                     if task is not None and not task.done():
                         task.cancel()
                     continue
 
                 if t == "utterance":
-                    uid = frame.get("utterance_id") or str(uuid.uuid4())
+                    uid = frame.get("utterance_id")
+                    if not isinstance(uid, str) or not uid:
+                        # #287 r2: non-str ids (unhashable → closed socket)
+                        # get a server-minted id like absent ones.
+                        uid = str(uuid.uuid4())
                     # Server-owned anchor: overwrite any identically named client
                     # field before handing the frame to the scheduled task.
                     frame["_casa_ingress_started_ms"] = self._monotonic() * 1000
@@ -1020,6 +1043,10 @@ class VoiceChannel(Channel):
         # between receipt and this task actually running is counted against
         # the budget rather than silently extending it.
         agent_role = frame.get("agent_role", self.default_agent)
+        if not isinstance(agent_role, str):
+            # #287 r2: a non-str role raised on the config lookup; treat it
+            # as unknown so the client gets the error frame below.
+            agent_role = ""
         cfg = self._agent_configs.get(agent_role)
         # Fail-closed channel-capability gate (spec A3): a 404 can't follow
         # the WS upgrade, so an unknown role AND a role that never declared

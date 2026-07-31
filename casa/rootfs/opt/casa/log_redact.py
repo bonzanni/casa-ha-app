@@ -3,7 +3,9 @@
 from __future__ import annotations
 
 import logging
+import numbers
 import re
+from collections.abc import Mapping
 
 # Patterns that match common secret/token formats
 _REDACT_PATTERNS: list[tuple[re.Pattern[str], str]] = [
@@ -19,11 +21,18 @@ _REDACT_PATTERNS: list[tuple[re.Pattern[str], str]] = [
     (re.compile(r"(xox[bpsa]-[a-zA-Z0-9]{4})[a-zA-Z0-9-]+"), r"\1***"),
     # Bearer tokens in headers
     (re.compile(r"(Bearer\s+)[^\s'\"]+", re.IGNORECASE), r"\1***"),
-    # Generic password/token/key/secret value patterns in key=value or key: value
+    # Generic password/token/key/secret value patterns in key=value or key: value.
+    # The lookahead keeps %-format PLACEHOLDERS intact: redacting record.msg
+    # happens before args are merged, and eating "%(api_key)s" down to
+    # "%(api_ke***" turns the format string invalid (ValueError at
+    # getMessage) — the mapping VALUE is masked separately by the args walk.
+    # It requires a COMPLETE placeholder (name, optional flags/width, a
+    # conversion letter), so an opaque value merely starting with "%(" is
+    # still redacted (Terra r3).
     (
         re.compile(
             r"((?:token|key|secret|password|authorization)['\"]?\s*[:=]\s*['\"]?)"
-            r"([^\s'\"]{8})[^\s'\"]*",
+            r"((?!%\([^)]*\)[-#0+ ]*[\d.*]*[a-zA-Z])[^\s'\"]{8})[^\s'\"]*",
             re.IGNORECASE,
         ),
         r"\1\2***",
@@ -49,6 +58,17 @@ _REDACTED = "«redacted»"
 _SENSITIVE_KEY_RE = re.compile(
     r"secret|password|passwd|token|authorization|"
     r"api[_-]?key|private[_-]?key|access[_-]?token|client[_-]?secret",
+    re.IGNORECASE,
+)
+
+# The one place _SENSITIVE_KEY_RE is deliberately overridden: "token" is both
+# a credential word AND the unit of the per-turn cost telemetry. A NUMERIC
+# value under one of these count-shaped keys (input_tokens, token_count,
+# token_budget, …) stays legible; a numeric value under any other
+# credential-named key (password=123456, secret_pin=9999) is masked — a
+# numeric PIN is a real credential (Sol r2 + Terra r3, reconciled).
+_NUMERIC_TELEMETRY_KEY_RE = re.compile(
+    r"(?:^|[_-])tokens(?:$|[_-])|tokens?[_-](?:count|budget|total|used|remaining)",
     re.IGNORECASE,
 )
 
@@ -104,8 +124,18 @@ def _redact_arg(value: object, _depth: int = 0) -> object:
     if isinstance(value, dict):
         out: dict = {}
         for k, v in value.items():
-            if isinstance(k, str) and isinstance(v, str) and _SENSITIVE_KEY_RE.search(k):
-                out[k] = _REDACTED
+            # #285 r2 (Sol+Terra): mask a credential-named key WHOLESALE for
+            # ANY value type — a bytes/list/object value under ``api_key``
+            # was previously returned unchanged and stringified only later,
+            # at render time, where redaction can no longer see it. The sole
+            # exemption is numeric token-count telemetry (see
+            # _NUMERIC_TELEMETRY_KEY_RE above).
+            if isinstance(k, str) and _SENSITIVE_KEY_RE.search(k):
+                if (isinstance(v, numbers.Number)
+                        and _NUMERIC_TELEMETRY_KEY_RE.search(k)):
+                    out[k] = v
+                else:
+                    out[k] = _REDACTED
             else:
                 out[k] = _redact_arg(v, _depth + 1)
         return out
@@ -115,7 +145,38 @@ def _redact_arg(value: object, _depth: int = 0) -> object:
             return type(value)(redacted)
         except Exception:  # noqa: BLE001 — exotic subclass: fail closed to a list
             return redacted
-    return value
+    if value is None or isinstance(value, numbers.Number):
+        # numbers.Number (not just int/float) so Decimal/Fraction/numpy
+        # scalars keep working under %d/%.2f — stringifying them made
+        # %-formatting raise (Sol r2). A number is never a secret.
+        return value
+    # #285 r2: any other object (an exception instance is the common case —
+    # ``logger.error("x: %s", exc)``) is stringified only at render time, by
+    # %-formatting, ``json.dumps(default=str)`` or an f-string — after every
+    # redaction pass has run. Stringify it HERE so redaction sees the text.
+    # ``%s`` renders identically; the rare ``%r`` arg gains string quoting.
+    try:
+        return redact(str(value))
+    except Exception:  # noqa: BLE001 — hostile __str__: fail closed
+        return _REDACTED
+
+
+def redact_extras(extras: dict) -> dict:
+    """Redact a flat dict of structured log extras (#285).
+
+    Extras never pass through :class:`RedactingFilter` — the formatters
+    flatten them into the payload after the filter has run — so the
+    formatters call this at render time. Same rules as a dict log arg:
+    credential-named keys are masked wholesale, string values get pattern
+    and exact-registration redaction, containers are walked.
+    """
+    out = _redact_arg(extras)
+    if not isinstance(out, dict):
+        return {}
+    # Terra r3: the field NAMES are rendered too (JSON keys / key=val
+    # labels) — a registered secret used as an extras key must not survive.
+    return {(redact(k) if isinstance(k, str) else k): v
+            for k, v in out.items()}
 
 
 class RedactingFilter(logging.Filter):
@@ -135,11 +196,41 @@ class RedactingFilter(logging.Filter):
         try:
             if isinstance(record.msg, str):
                 record.msg = redact(record.msg)
+            elif not (record.msg is None
+                      or isinstance(record.msg, numbers.Number)):
+                # #285 r3 (Sol): logger.error(RuntimeError(secret)) — a
+                # non-str msg OBJECT is stringified by getMessage() only
+                # after this filter has run. getMessage() does str(msg)
+                # (then %-merges args if any), so pre-stringifying here
+                # renders identically — but redacted.
+                record.msg = redact(str(record.msg))
             if record.args:
-                if isinstance(record.args, dict):
-                    record.args = {
-                        k: _redact_arg(v) for k, v in record.args.items()
-                    }
+                if isinstance(record.args, Mapping):
+                    # #285 r3 (Sol+Terra): LogRecord unwraps ANY single
+                    # Mapping (dict, UserDict, mappingproxy) into
+                    # record.args. Walk it FIRST — wholesale masking of
+                    # credential-named keys is what a rendered repr cannot
+                    # guarantee (b'…' quoting defeats the generic pattern).
+                    walked = _redact_arg(dict(record.args))
+                    if not isinstance(walked, dict):
+                        walked = dict(record.args)
+                    if "%(" in str(record.msg):
+                        # Genuinely mapping-STYLE format ("%(key)s"): also
+                        # pre-render and redact the MERGED text — separate
+                        # walks cannot catch "password=%(value)s" whose
+                        # secret rides under a benign key name (Sol r3).
+                        try:
+                            rendered = str(record.msg) % walked
+                        except Exception:  # noqa: BLE001 — broken format:
+                            record.args = walked  # render raises as before
+                        else:
+                            record.msg = redact(rendered)
+                            record.args = None
+                    else:
+                        # Positional "%s" with one dict arg (the PTB shape):
+                        # per-value walk only, so benign labels like
+                        # key=voice-latency stay legible (#214).
+                        record.args = walked
                 elif isinstance(record.args, tuple):
                     record.args = tuple(_redact_arg(a) for a in record.args)
         except Exception:  # noqa: BLE001 — never let redaction break logging

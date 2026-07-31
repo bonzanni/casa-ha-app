@@ -1,2 +1,3 @@
 tests/test_log_redact.py
 tests/test_voice_job_result.py
+tests/test_pin_g5_invariants.py

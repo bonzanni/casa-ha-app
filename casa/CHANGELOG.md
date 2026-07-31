@@ -1,5 +1,36 @@
 # Changelog
 
+## [0.130.0] - 2026-07-31
+
+### Fixed
+
+- **Secrets inside exception tracebacks no longer reach the logs.** Redaction
+  used to inspect only a log line's message and arguments; a secret that ended
+  up inside an exception message or traceback was written out verbatim at any
+  log level. Casa's log formatters now redact exception text, stack text and
+  structured log fields with the same rules as ordinary messages, so a
+  credential passing through an error is masked wherever Casa writes its own
+  logs. (#285)
+- **Voice endpoints no longer crash on malformed input from an authenticated
+  caller.** A family of edge cases turned a malformed request into a server
+  error (or a dropped connection) instead of a clean refusal: a non-ASCII
+  signature header, valid JSON whose top level is not an object, a voice
+  route registration whose capability list contains a non-string entry, and
+  request fields (prompt, agent role, scope, context) carrying the wrong
+  type. All now get the proper "no" — 401, 400, a not-found, or a refused
+  registration that leaves the connection open — and a malformed `context`
+  no longer aborts `/invoke` turns either. (#287)
+- **Cancelling an engagement now tells the truth when the cancellation could
+  not be saved.** If writing the terminal state failed, the cancel tool still
+  reported success while the engagement quietly stayed active. It now reports
+  a retryable error — the same contract completion already had — so the caller
+  knows to try again. (#289)
+- **A memory-clearance docstring said the opposite of what the code does.**
+  Unknown channels read at the *least* sensitive memory tier (fail-closed);
+  the docstring claimed they defaulted to the most-trusted tier. The code was
+  right, the sentence was wrong; the pair is now pinned by a test so they
+  cannot drift apart again. (#282)
+
 ## [0.129.0] - 2026-07-28
 
 ### Added

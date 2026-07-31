@@ -1,5 +1,5 @@
 ---
-last_reviewed: 2026-07-30
+last_reviewed: 2026-07-31
 ---
 
 # The voice channel
@@ -67,10 +67,9 @@ upgrade and the catalog alike. A missing secret returns false before any compari
 
 What it does not cover: there is no per-frame signature, nonce, timestamp, or binding to
 method or path. The empty-body signature that authenticates the catalog also authenticates a
-socket upgrade. And "refuses" means an ordinary mismatch: only the catalog handler pre-checks
-that the signature header is ASCII — on the request and socket paths a non-ASCII header
-reaches the comparison primitive, which raises, so those return a server error rather than
-unauthorised.
+socket upgrade. "Refuses" includes a malformed header: the verification helper rejects a
+non-ASCII signature before the comparison primitive sees it, so all three routes return
+unauthorised rather than a server error.
 
 **INV-VOICE-002**: An agent is reachable over voice only if its configuration declares the voice capability.
 
@@ -115,22 +114,25 @@ expires rather than being sent as speech on the assumption that speech is what w
 
 ## Failure behavior
 
-**No secret, or a bad signature.** All voice routes return unauthorised for a missing or
-ordinarily mismatched signature. This is a configuration failure that presents as an
-authentication failure. A *non-ASCII* signature header is the exception noted under
-INV-VOICE-001: outside the catalog it raises and returns a server error.
+**No secret, or a bad signature.** All voice routes return unauthorised for a missing,
+mismatched or non-ASCII signature. This is a configuration failure that presents as an
+authentication failure.
 
-**A malformed request or an unknown agent.** Invalid JSON and a missing prompt return client
-errors, and an unknown agent a generic not-found — but the request path validates no further
-than that: valid JSON whose top level is not an object reaches field access and produces a
-server error. The socket path emits a typed error frame before dispatching anything to an
-agent.
+**A malformed request or an unknown agent.** Invalid JSON — including valid JSON whose top
+level is not an object — and a missing or non-string prompt return client errors; an
+unknown agent, and a role field that is not a string at all, get the same generic
+not-found. A malformed scope or context field falls back to the anonymous scope rather than
+failing the request. The socket path emits a typed error frame before dispatching anything
+to an agent.
 
 **Malformed socket frames.** Frames that fail to parse, are not objects, or carry an
-unrecognised type are skipped rather than closing the connection. This is narrower than "any
-bad frame": a registration frame whose capability list contains a non-hashable element raises
-while the set is built, and nothing per-frame catches it, so that one frame closes the
-socket.
+unrecognised type are skipped rather than closing the connection. A registration frame
+whose capability list is malformed — wrong container, non-string or non-hashable elements,
+or the wrong capability set — is refused with an empty accepted set while the socket stays
+open, and a non-string utterance or cancel id is treated as absent. This is an *input*
+guarantee, not a blanket one: an internal failure while handling a well-formed frame still
+aborts the reader and closes the socket, deliberately, so the client reconnects to a clean
+connection rather than talking to a wedged one.
 
 **Rate limiting.** Both transports report the refusal in their own idiom, and neither reaches
 an agent.
@@ -176,6 +178,7 @@ not the route's capabilities. Those answer different questions.
 
 **Tests**
 - `tests/test_voice_auth_failclosed.py`
+- `tests/test_voice_malformed_input.py`
 - `tests/test_voice_agent_catalog.py`
 - `tests/test_voice_channel_sse.py`
 - `tests/test_voice_channel_ws.py`
