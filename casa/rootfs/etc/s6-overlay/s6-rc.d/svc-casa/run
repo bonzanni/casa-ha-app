@@ -30,11 +30,21 @@ if [ "$_hindsight_url" != "null" ] && [ -n "$_hindsight_url" ]; then
     # nothing else sets it, so derive it here. Respect an explicit override.
     export MEMORY_BACKEND="${MEMORY_BACKEND:-hindsight}"
 fi
-export TELEGRAM_BOT_TOKEN="$(bashio::config 'telegram_bot_token')"
-export TELEGRAM_CHAT_ID="$(bashio::config 'telegram_chat_id')"
+# #325: all three are optional (password?/str?/int?) — a cleared field makes
+# bashio yield the literal "null". Unnormalized, that is truthy for the token
+# gate in casa_core and boot-fatal for the supergroup id (int("null")).
+_tg_token="$(bashio::config 'telegram_bot_token')"
+[ "$_tg_token" = "null" ] && _tg_token=""
+export TELEGRAM_BOT_TOKEN="$_tg_token"
+_tg_chat_id="$(bashio::config 'telegram_chat_id')"
+[ "$_tg_chat_id" = "null" ] && _tg_chat_id=""
+export TELEGRAM_CHAT_ID="$_tg_chat_id"
 _tg_transport="$(bashio::config 'telegram_transport')"
 export TELEGRAM_TRANSPORT="${_tg_transport:-polling}"
-export TELEGRAM_ENGAGEMENT_SUPERGROUP_ID="$(bashio::config 'telegram_engagement_supergroup_id')"
+_tg_supergroup="$(bashio::config 'telegram_engagement_supergroup_id')"
+[ "$_tg_supergroup" = "null" ] && _tg_supergroup=""
+export TELEGRAM_ENGAGEMENT_SUPERGROUP_ID="$_tg_supergroup"
+unset _tg_token _tg_chat_id _tg_supergroup
 # telegram_bot_api_base is optional (schema str?); bashio returns "null" when unset.
 _tg_api_base="$(bashio::config 'telegram_bot_api_base')"
 if [ "$_tg_api_base" != "null" ] && [ -n "$_tg_api_base" ]; then

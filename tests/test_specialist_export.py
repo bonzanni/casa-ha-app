@@ -13,6 +13,8 @@ the finance/mtg role directories (and finance's legacy agent directory).
 """
 import json
 import shutil
+
+import pytest
 from pathlib import Path
 
 from specialist_export import (
@@ -299,3 +301,26 @@ def test_clean_image_install_of_the_exported_finance_bundle_succeeds(tmp_path: P
         receipts_dir=tmp_path / "receipts",
     )
     assert result.slug == "finance"  # no SpecialistInstallError("slug_collision", ...) raised
+
+
+def test_export_refuses_a_corpus_containing_symlinks(tmp_path: Path) -> None:
+    """#346: the corpus digest is computed over the SOURCE tree, where
+    content_checksum records a symlink as a symlink entry — but the bundle
+    writes every is_file() path (symlinks dereferenced) as regular bytes, so
+    installation recomputes a DIFFERENT digest over the extracted tree and
+    rejects the bundle. There is no consistent way to represent a symlink in
+    a bytes-mapped bundle; refuse at export time with an actionable error."""
+    from specialist_export import export_mtg_component
+
+    corpus = tmp_path / "corpus-source"
+    corpus.mkdir()
+    (corpus / "cr.txt").write_text("702.1 Some rule text.\n", encoding="utf-8")
+    (corpus / "alias.txt").symlink_to(corpus / "cr.txt")
+    plugin_root = _build_mtg_plugin_root(tmp_path)
+    defaults_root = _build_synthetic_defaults_root(tmp_path)
+
+    with pytest.raises(ValueError, match="symlink"):
+        export_mtg_component(
+            defaults_root=defaults_root, corpus_source=corpus,
+            mtg_plugin_root=plugin_root,
+        )

@@ -120,6 +120,22 @@ def export_mtg_component(
     pack = load_persona_pack(persona_dir / "pack", persona_dir / "manifest.json")
     config_schema = json.dumps({"required": [], "secret_names": []}).encode("utf-8")
     persona_ref = f"{pack.persona_id}@{pack.version}"
+    # #346: content_checksum records a symlink as a symlink ENTRY (lstat),
+    # but the bundle below writes every is_file() path — symlinks
+    # dereferenced — as regular bytes, so installation would recompute a
+    # DIFFERENT digest over the extracted tree and reject the bundle. A
+    # bytes-mapped bundle has no way to carry a symlink; refuse at export
+    # time with the offending paths named.
+    corpus_symlinks = sorted(
+        p.relative_to(corpus_source).as_posix()
+        for p in corpus_source.rglob("*") if p.is_symlink()
+    )
+    if corpus_symlinks:
+        raise ValueError(
+            f"corpus_source contains symlink(s) {corpus_symlinks} — the tree "
+            f"digest records symlinks but a bundle stores only bytes; "
+            f"dereference or remove them and re-export"
+        )
     # content_checksum() is bare hex; every digest field in the manifest
     # schema requires the sha256: prefix (matches the same normalization
     # resolve_dependency_closure's corpus branch applies on the read side —

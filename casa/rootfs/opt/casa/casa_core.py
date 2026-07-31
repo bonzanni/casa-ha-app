@@ -1143,6 +1143,27 @@ def _env_int_or(name: str, default: int, *, min_value: int = 0,
     return value
 
 
+def _telegram_supergroup_id_from_env(
+        env: dict[str, str] | None = None) -> int:
+    """Parse TELEGRAM_ENGAGEMENT_SUPERGROUP_ID; garbage → 0 (disabled).
+
+    Not :func:`_env_int_or`: real Telegram supergroup IDs are negative
+    (-100xxxxxxxxxx) and that helper's ``min_value`` clamp would silently
+    zero them. #325 defence-in-depth behind svc-casa/run's "null"
+    normalization — a stray "null" here must not be boot-fatal.
+    """
+    env = env if env is not None else os.environ
+    raw = env.get("TELEGRAM_ENGAGEMENT_SUPERGROUP_ID", "")
+    try:
+        return int(raw or "0")
+    except ValueError:
+        logger.warning(
+            "Invalid TELEGRAM_ENGAGEMENT_SUPERGROUP_ID=%r; "
+            "engagement supergroup disabled", raw,
+        )
+        return 0
+
+
 def _env_float_or(name: str, default: float, *, min_value: float = 0.0,
                    env: dict[str, str] | None = None) -> float:
     """Read a non-negative float from env; fall back to *default* on bad
@@ -2481,9 +2502,7 @@ async def main() -> None:
         from channels.telegram import TelegramChannel
 
         telegram_chat_id = os.environ.get("TELEGRAM_CHAT_ID", "")
-        telegram_engagement_supergroup_id = int(os.environ.get(
-            "TELEGRAM_ENGAGEMENT_SUPERGROUP_ID", "0",
-        ) or "0")
+        telegram_engagement_supergroup_id = _telegram_supergroup_id_from_env()
 
         # Derive transport: webhook only possible when public_url is set
         telegram_transport = os.environ.get("TELEGRAM_TRANSPORT", "polling")

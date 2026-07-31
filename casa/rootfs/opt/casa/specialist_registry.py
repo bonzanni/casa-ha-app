@@ -19,6 +19,7 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
 
+import jsonschema
 import yaml
 
 from config import AgentConfig
@@ -449,7 +450,26 @@ class InstalledSpecialistIndex:
                     continue
                 slug = entry.name
                 instance_dir = InstanceDir(entry)
-                active, desired = instance_dir.active(), instance_dir.desired()
+                try:
+                    active, desired = instance_dir.active(), instance_dir.desired()
+                except (ValueError, OSError, yaml.YAMLError,
+                        jsonschema.ValidationError) as exc:
+                    # #346: a single damaged tuple file (bad YAML, schema
+                    # violation, tampered digest) must not abort the whole
+                    # boot-time scan. Isolate the slug as state="error" —
+                    # keeping it in the index reserves the slug (a fresh
+                    # install cannot silently overwrite a damaged one) and
+                    # surfaces the error to admin/inspection paths.
+                    logger.error(
+                        "installed specialist %r: unreadable instance tuple "
+                        "(%s); isolated as state=error", slug, exc,
+                    )
+                    instances[slug] = SpecialistInstance(
+                        slug=slug, stable_agent_id=f"specialist:{slug}",
+                        state="error", active=None, desired=None,
+                        last_activation_error=str(exc),
+                    )
+                    continue
                 if active is None and desired is None:
                     continue
                 # Two states only: the both-None case `continue`d above, so

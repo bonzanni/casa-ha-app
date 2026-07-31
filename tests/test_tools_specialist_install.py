@@ -1020,8 +1020,9 @@ async def test_inspect_receipt_id_round_trips_into_commit(monkeypatch, tmp_path)
 
     # The receipt loaded is the EXACT id the inspect payload carried — the
     # round trip works — and the commit reaches success, never dead-ending
-    # at receipt_required.
-    assert load_calls == [real_receipt_id]
+    # at receipt_required. Two loads since #346: the pre-lock load plus the
+    # in-lock re-check (a concurrent bundle may prune it while we wait).
+    assert load_calls == [real_receipt_id, real_receipt_id]
     assert commit_payload["ok"] is True
     assert commit_payload["slug"] == "mtg"
 
@@ -1293,3 +1294,57 @@ async def test_second_commit_on_an_active_slug_is_a_clean_typed_error(
     }))
     assert payload["ok"] is False
     assert payload["kind"] == "concurrent_mutation"
+
+
+@pytest.mark.asyncio
+async def test_specialist_upgrade_rechecks_the_receipt_under_the_lock(
+    monkeypatch, tmp_path,
+) -> None:
+    """#346: the receipt is loaded BEFORE _PLUGIN_TOOLS_LOCK is acquired. A
+    concurrent same-receipt bundle completing while this call waits on the
+    lock PRUNES the receipt; proceeding anyway made the second upgrade treat
+    the tuple commit as a no-op yet still rotate the owned-plugins sidecar —
+    desyncing active.prior (V1) from owned-plugins.prior (V2), so a later
+    rollback activates one generation's tuple with another's plugins. The
+    tool must re-check the receipt under the lock and refuse."""
+    from test_specialist_install import _write_component
+    from specialist_component import load_specialist_component
+    from specialist_install import compute_install_root_digest, resolve_dependency_closure
+    import specialist_install
+    import specialist_receipt
+    from tools import specialist_upgrade
+
+    staged = _write_component(tmp_path / "staged", slug="mtg")
+    component = load_specialist_component(staged, staged / "manifest.json")
+    deps = resolve_dependency_closure(component, staged)
+    root_digest = compute_install_root_digest(
+        component, deps, manifest_bytes=(staged / "manifest.json").read_bytes())
+
+    from types import SimpleNamespace
+    fake = SimpleNamespace(receipt_id="a" * 32, receipt_digest="", slug="mtg", plugins=())
+    calls = {"n": 0}
+
+    def _load(rid, *a, **k):
+        calls["n"] += 1
+        # First (pre-lock) load sees the receipt; by the in-lock re-check a
+        # concurrent bundle has pruned it.
+        return fake if calls["n"] == 1 else None
+
+    monkeypatch.setattr(specialist_receipt, "load", _load)
+
+    def _must_not_be_called(*args, **kwargs):
+        raise AssertionError(
+            "upgrade_specialist must not run once the receipt was pruned by a "
+            "concurrent bundle")
+
+    monkeypatch.setattr(specialist_install, "upgrade_specialist", _must_not_be_called)
+
+    result = await specialist_upgrade.handler({
+        "slug": "mtg", "component_id": component.component_id,
+        "version": component.version, "root_digest": root_digest,
+        "staged_dir": str(staged), "receipt_id": "a" * 32,
+    })
+    payload = _payload(result)
+    assert payload["ok"] is False
+    assert payload["kind"] == "receipt_required"
+    assert calls["n"] >= 2, "the receipt must be re-loaded under the lock"

@@ -234,6 +234,101 @@ def test_missing_override_persona_blob_at_reload_raises_load_error(tmp_path) -> 
         )
 
 
+def test_a_staged_override_with_a_wrong_checksum_is_discarded_and_boot_retains_default(
+        tmp_path) -> None:
+    """#339: end-to-end through the REAL loader. A stale/tampered staged
+    desired tuple pins a persona_checksum that does not match the bytes on
+    disk for casa/gary@0.1.0. Reconcile must refuse it (checksum pin),
+    discard the candidate, and the concierge must boot on its image-default
+    binding — before the fix the loader committed a rematerialized binding
+    for whatever bytes were present."""
+    import dataclasses
+    from pathlib import Path
+
+    from personality_binding import InstanceDir, InstanceTuple, materialize_override_binding
+    from persona_pack import load_persona_pack
+    from agent_loader import load_agent_from_dir
+    from policies import load_policies
+
+    cfg = _load("concierge")
+    role = cfg.role_slot
+    gary_dir = Path("casa/rootfs/opt/casa/defaults/personas/casa/gary/0.1.0")
+    gary = load_persona_pack(gary_dir / "pack", gary_dir / "manifest.json")
+    tampered = dataclasses.replace(gary, checksum="sha256:" + "f" * 64)
+
+    binding = materialize_override_binding(
+        role=role, persona=tampered, override_source="operator:casa/gary@0.1.0",
+    )
+    bindings_root = tmp_path / "bindings-root"
+    policies = load_policies(_POLICIES)
+    # First boot establishes the image-default active tuple (the
+    # last-known-good the second boot must retain).
+    load_agent_from_dir(
+        f"{_AGENTS}/concierge", policies=policies, bindings_dir=str(bindings_root),
+    )
+    instance_dir = InstanceDir(bindings_root / "resident-concierge")
+    instance_dir.stage_desired(InstanceTuple(
+        root="operator:casa/gary@0.1.0", binding=binding,
+        config_snapshot={}, config_digest=binding.effective_config_digest,
+    ))
+
+    loaded = load_agent_from_dir(
+        f"{_AGENTS}/concierge", policies=policies, bindings_dir=str(bindings_root),
+    )
+    assert loaded.binding.mode == "image-default"
+    assert loaded.binding.persona_checksum == gary.checksum
+    assert (bindings_root / "resident-concierge" / "desired.error.yaml").exists()
+
+
+def test_loader_wires_a_candidate_validator_that_enforces_compile_ceilings(
+        tmp_path, monkeypatch) -> None:
+    """#339 (high): _activate_resident_binding must hand reconcile a
+    candidate_validator that runs the REAL compile admission — so an
+    over-ceiling persona fails as a *candidate* (discarded, active retained)
+    instead of after commit (boot-fatal forever). Captures the validator the
+    loader passes and proves it rejects an over-ceiling persona for the
+    shipped concierge role."""
+    from pathlib import Path
+
+    import personality_binding
+    from persona_pack import load_persona_pack, PersonaManifest, PersonaPack
+
+    captured: dict = {}
+    real = personality_binding.reconcile_resident_binding
+
+    def spy(**kwargs):
+        captured.update(kwargs)
+        return real(**kwargs)
+
+    monkeypatch.setattr(personality_binding, "reconcile_resident_binding", spy)
+    monkeypatch.setenv("CASA_BINDINGS_DIR", str(tmp_path / "bindings-root"))
+    cfg = _load("concierge")
+    validator = captured.get("candidate_validator")
+    assert validator is not None, (
+        "loader must pass a compile-admission candidate_validator to reconcile"
+    )
+
+    gary_dir = Path("casa/rootfs/opt/casa/defaults/personas/casa/gary/0.1.0")
+    gary = load_persona_pack(gary_dir / "pack", gary_dir / "manifest.json")
+    # The shipped persona compiles — the validator accepts it.
+    ok_binding = personality_binding.materialize_override_binding(
+        role=cfg.role_slot, persona=gary, override_source="operator:casa/gary@0.1.0",
+    )
+    validator(gary, ok_binding)
+
+    # An over-ceiling variant (same structure, bloated core prose) is refused.
+    import dataclasses
+    huge = dataclasses.replace(
+        gary,
+        markdown="# Core\n\n" + ("Verbose prose. " * 4000) + "\n",
+    )
+    huge_binding = personality_binding.materialize_override_binding(
+        role=cfg.role_slot, persona=huge, override_source="operator:casa/gary@0.1.0",
+    )
+    with pytest.raises(ValueError, match="ceiling"):
+        validator(huge, huge_binding)
+
+
 @pytest.mark.asyncio
 async def test_persona_swap_tool_structured_errors(monkeypatch) -> None:
     """The persona-swap tool returns structured errors before any staging:

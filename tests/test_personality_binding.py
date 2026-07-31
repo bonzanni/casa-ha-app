@@ -154,6 +154,82 @@ def test_commit_is_crash_retry_idempotent_and_preserves_true_prior(tmp_path: Pat
     assert d.desired() is None
 
 
+def test_a_failed_active_write_never_destroys_the_prior_rollback_generation(
+        tmp_path: Path, monkeypatch) -> None:
+    """#339 (low): the old commit order rotated active -> active.prior.yaml
+    BEFORE durably writing the new active. A write failure (disk full, crash)
+    in between left prior == active — the previous rollback generation was
+    destroyed with nothing gained. The new active must be written first; only
+    then is the old active rotated into prior."""
+    import personality_binding
+    from personality_binding import load_instance_tuple
+
+    d = InstanceDir(tmp_path / "resident-butler")
+    gen1 = _tuple(_binding(persona_version="0.1.0"))
+    d.stage_desired(gen1)
+    d.commit_desired_to_active()
+    gen2 = _tuple(_binding(persona_version="0.2.0"))
+    d.stage_desired(gen2)
+    d.commit_desired_to_active()
+
+    prior_path = tmp_path / "resident-butler" / "active.prior.yaml"
+    assert load_instance_tuple(prior_path) == gen1
+
+    gen3 = _tuple(_binding(persona_version="0.3.0"))
+    d.stage_desired(gen3)
+
+    def _fail_write(path, tuple_):
+        raise OSError("disk full")
+
+    monkeypatch.setattr(
+        personality_binding, "atomic_write_instance_tuple", _fail_write)
+    with pytest.raises(OSError):
+        d.commit_desired_to_active()
+    monkeypatch.undo()
+
+    # The failed commit changed NOTHING durable: active is still gen2 and —
+    # the point of the fix — prior still holds gen1, not a copy of gen2.
+    assert d.active() == gen2
+    assert load_instance_tuple(prior_path) == gen1
+
+
+def test_crash_between_active_write_and_prior_rotation_completes_on_retry(
+        tmp_path: Path) -> None:
+    """#339 (low), the other half of the reordering: with the new order
+    (write active, THEN rotate prior) a crash in between leaves the new
+    active in place, desired.yaml still staged, and the copied old active in
+    the .rollback-tmp file. The crash-retry recommit must FINISH the
+    interrupted rotation (tmp -> prior) instead of leaving prior a
+    generation stale."""
+    from personality_binding import atomic_write_instance_tuple, load_instance_tuple
+
+    d = InstanceDir(tmp_path / "resident-butler")
+    gen1 = _tuple(_binding(persona_version="0.1.0"))
+    d.stage_desired(gen1)
+    d.commit_desired_to_active()
+    gen2 = _tuple(_binding(persona_version="0.2.0"))
+    d.stage_desired(gen2)
+    d.commit_desired_to_active()
+
+    base = tmp_path / "resident-butler"
+    prior_path = base / "active.prior.yaml"
+    assert load_instance_tuple(prior_path) == gen1
+
+    # Hand-build the mid-commit crash state for gen3: desired staged, active
+    # already rewritten to gen3, the old active (gen2) copied to the
+    # rollback-tmp but not yet rotated over prior.
+    gen3 = _tuple(_binding(persona_version="0.3.0"))
+    d.stage_desired(gen3)
+    atomic_write_instance_tuple(base / "active.yaml", gen3)
+    atomic_write_instance_tuple(base / "active.yaml.rollback-tmp", gen2)
+
+    committed = d.commit_desired_to_active()
+    assert committed == gen3
+    assert d.desired() is None
+    assert load_instance_tuple(prior_path) == gen2  # rotation completed
+    assert not (base / "active.yaml.rollback-tmp").exists()
+
+
 def test_tampered_nested_binding_missing_field_raises_value_error(tmp_path: Path) -> None:
     """Regression for defect #3: a tampered instance tuple whose nested
     binding drops a required field must raise a path-prefixed ValueError,
@@ -338,3 +414,33 @@ def test_load_binding_still_rejects_a_tampered_digest(tmp_path: Path) -> None:
 
     with pytest.raises(ValueError, match="binding_digest"):
         load_binding(path)
+
+
+def test_owned_plugins_noop_recommit_does_not_rotate_prior(tmp_path: Path) -> None:
+    """#346: a crash-retry / concurrent-duplicate bundle commit whose staged
+    sidecar is byte-identical to the active one must NOT rotate
+    owned-plugins.yaml -> owned-plugins.prior.yaml — that clobbers the true
+    prior generation with a duplicate of the new active, so a later rollback
+    would activate one generation's tuple while registering another's
+    plugins. Mirrors commit_desired_to_active's tuple no-op semantics."""
+    from personality_binding import (
+        owned_plugins_desired_path, owned_plugins_path, owned_plugins_prior_path,
+        read_owned_plugins, write_owned_plugins,
+    )
+
+    d = InstanceDir(tmp_path / "mtg")
+    gen1 = {"schema_version": 1, "component_source": {"gen": "one"}, "plugins": []}
+    gen2 = {"schema_version": 1, "component_source": {"gen": "two"}, "plugins": []}
+    d.stage_desired_owned_plugins(gen1)
+    d.commit_owned_plugins_desired_to_active()
+    d.stage_desired_owned_plugins(gen2)
+    d.commit_owned_plugins_desired_to_active()
+    assert read_owned_plugins(owned_plugins_prior_path(tmp_path / "mtg")) == gen1
+
+    # Re-stage the ALREADY-ACTIVE doc (crash-retry) and recommit.
+    d.stage_desired_owned_plugins(gen2)
+    d.commit_owned_plugins_desired_to_active()
+
+    assert read_owned_plugins(owned_plugins_path(tmp_path / "mtg")) == gen2
+    assert read_owned_plugins(owned_plugins_prior_path(tmp_path / "mtg")) == gen1
+    assert not owned_plugins_desired_path(tmp_path / "mtg").exists()

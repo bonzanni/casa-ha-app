@@ -1,5 +1,5 @@
 ---
-last_reviewed: 2026-07-30
+last_reviewed: 2026-07-31
 ---
 
 # Triggers and scheduling
@@ -101,8 +101,11 @@ propagates, so a failure removes plugin routing rather than leaving a stale set.
 some comments elsewhere describe the opposite; the swap is what happens.
 
 **A resident's trigger registration fails at boot.** It is not caught, so it stops boot.
-Re-registration later behaves differently: the old entries are removed first, so a failure
-partway can leave that role with fewer triggers than it started with.
+The pre-commit config gate replays the same registration into a throwaway registry, so a
+trigger set that passes the schema but cannot register — duplicate names, an undeclared
+channel, an out-of-range cron field — is refused at commit time rather than discovered as
+a boot loop. Re-registration later behaves differently: the old entries are removed first,
+so a failure partway can leave that role with fewer triggers than it started with.
 
 **The approval store is missing or corrupt.** Treated as no approvals. Pending routes stay
 absent rather than opening.

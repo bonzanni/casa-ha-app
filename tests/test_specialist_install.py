@@ -1134,3 +1134,57 @@ def test_selfheal_reads_the_active_tuple_inside_the_lock_not_the_stale_snapshot(
     marker = specialist_materialize._read_binding_marker(agents_specialists_dir / "mtg")
     assert marker is not None
     assert marker["binding_digest"] == binding_b.binding_digest  # B won, not the stale A
+
+
+def test_inspect_maps_a_schema_invalid_manifest_to_manifest_invalid(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """#346: load_specialist_component raises jsonschema.ValidationError (its
+    pinned type for a schema-violating manifest), but inspection caught only
+    ValueError — a malformed FETCHED manifest escaped the structured error
+    contract as a raw ValidationError instead of kind='manifest_invalid'."""
+    import json as _json
+
+    component_root = _write_component(tmp_path / "component", slug="fresh-specialist")
+    manifest_path = component_root / "manifest.json"
+    manifest = _json.loads(manifest_path.read_text(encoding="utf-8"))
+    del manifest["component_id"]  # schema-required field
+    manifest_path.write_text(_json.dumps(manifest), encoding="utf-8")
+    monkeypatch.setattr(
+        specialist_install, "resolve_and_fetch", _stub_resolve_and_fetch(component_root))
+
+    index = InstalledSpecialistIndex(specialists_dir=str(tmp_path / "specialists"))
+    index.load()
+    with pytest.raises(SpecialistInstallError) as exc_info:
+        specialist_install.inspect_specialist_repo(
+            "org/repo", "main",
+            staging_root=tmp_path / "staging",
+            installed_index=index,
+            receipts_dir=tmp_path / "receipts",
+        )
+    assert exc_info.value.kind == "manifest_invalid"
+
+
+def test_parse_component_root_rejects_a_non_hex_checksum_suffix(tmp_path: Path) -> None:
+    """#346: parse_component_root accepted ANY 'sha256:'-prefixed suffix and
+    cas_store_dir joins it straight into the store path — a tampered tuple
+    root like '...#sha256:../../outside' resolved OUTSIDE the CAS store. The
+    checksum segment must be exactly 64 hex chars."""
+    from specialist_install import cas_store_dir, parse_component_root
+
+    good = "casa/mtg@0.1.0#sha256:" + "a" * 64
+    assert parse_component_root(good)[2] == "sha256:" + "a" * 64
+
+    for evil in (
+        "casa/mtg@0.1.0#sha256:../../outside",
+        "casa/mtg@0.1.0#sha256:" + "a" * 63,
+        "casa/mtg@0.1.0#sha256:" + "A" * 64,   # canonical form is lower-hex
+        "casa/mtg@0.1.0#sha256:a/b" + "a" * 60,
+    ):
+        with pytest.raises(ValueError, match="component_root"):
+            parse_component_root(evil)
+
+    # Containment: whatever parse accepts, the store join stays in the store.
+    store = tmp_path / "store"
+    resolved = cas_store_dir(parse_component_root(good)[2], store_root=store)
+    assert store in resolved.parents

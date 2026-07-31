@@ -1,5 +1,5 @@
 ---
-last_reviewed: 2026-07-30
+last_reviewed: 2026-07-31
 ---
 
 # Personality: roles, personas and bindings
@@ -52,7 +52,10 @@ behavior written only outside the core never reaches the voice surface.
 **A published persona version is immutable, and installing one is consent-bound.** A bare
 persona repo installs through checksum-bound durable operator consent; re-publishing the
 same `persona_id@version` with different bytes is refused rather than replaced, and
-applying an override to a specialist preserves its component root and configuration.
+applying an override to a specialist preserves its component root and configuration. Boot
+reconciliation holds the same line: an override is reloaded by `persona_id@version` and the
+bytes found on disk must match the binding's pinned checksum — changed bytes under a pinned
+version are refused, never silently re-materialized into a fresh binding.
 
 **The observer and secondary passes run on their own model.** `SECONDARY_AGENT_MODEL`
 (default *haiku*) selects the model for engagement observation and engager-query synthesis
@@ -89,7 +92,12 @@ which is boot-fatal. Persona problems on a resident are not a degraded mode.
 install — no active binding tuple — loading fails, and because resident loading is
 boot-fatal, so does boot. With an existing active binding, a failing *candidate* is
 discarded with a diagnostic and boot proceeds on the retained last-known-good binding;
-reconciliation raises only when there is nothing good to retain.
+reconciliation raises only when there is nothing good to retain. Candidate validation is
+complete before promotion: requirements, the pinned-checksum match, and the full
+compile/admission pass all run on the candidate — a persona that would fail an admission
+ceiling is discarded as a candidate, never committed active to fail every later boot. The
+pre-commit config gate replays this reconciliation in a validation-only mode that writes no
+binding state, so validating a commit can never activate a staged persona swap.
 
 **A persona fails validation on a specialist.** Absorbed by that tier's isolated loading; the
 specialist is unavailable and the system continues.

@@ -251,3 +251,79 @@ def test_uninstall_then_reinstall_at_the_same_digest_is_allowed(tmp_path: Path) 
         inspection=inspection, config={}, secret_names_provided=frozenset(), acks=second_acks,
         specialists_dir=specialists_dir, agents_specialists_dir=agents_specialists_dir)
     assert reinstalled.state == "active"
+
+
+# --- #346: fresh-install guard must also refuse a conflicting pending -------
+
+
+def test_second_fresh_install_cannot_replace_a_different_pending_candidate(
+    tmp_path: Path,
+) -> None:
+    """#346: the fresh-install guard rejected an existing active.yaml but not
+    an existing desired.yaml — two inspections of the same free slug both
+    passed uniqueness, and the second commit silently replaced the first
+    pending candidate (and its config/owned-plugin sidecar). A DIFFERENT
+    pending candidate must be refused; only the same component's own
+    re-commit (the configure step) may replace its desired tuple."""
+    # First install: v0.1.0, pending-configuration (required secret missing).
+    root = tmp_path / "component-mtg-a"
+    _write_component(root, slug="mtg")
+    (root / "config-schema.json").write_text(
+        json.dumps({"required": ["api_key"], "secret_names": ["api_key"]}), encoding="utf-8")
+    files = {
+        "role/role.yaml": (root / "role" / "role.yaml").read_bytes(),
+        "role/doctrine.md": (root / "role" / "doctrine.md").read_bytes(),
+        "config-schema.json": (root / "config-schema.json").read_bytes(),
+    }
+    manifest_path = root / "manifest.json"
+    manifest = json.loads(manifest_path.read_text())
+    manifest["checksum"] = compute_component_checksum(files)
+    manifest_path.write_text(json.dumps(manifest), encoding="utf-8")
+    component = load_specialist_component(root, manifest_path)
+    from specialist_install import InspectionResult, compute_install_root_digest
+    deps = resolve_dependency_closure(component, root)
+    root_digest = compute_install_root_digest(
+        component, deps, manifest_bytes=manifest_path.read_bytes())
+    inspection_a = InspectionResult(
+        component_id=component.component_id, version=component.version, slug=component.slug,
+        component_checksum=component.checksum, root_digest=root_digest, mission="x",
+        default_persona_ref=component.default_persona_ref,
+        default_persona_checksum=component.default_persona_checksum,
+        required_config_names=(), required_secret_names=("api_key",),
+        dependencies=deps, staged_dir=root,
+    )
+    acks = SpecialistInstallAckStore(path=tmp_path / "acks-a.json")
+    identity = install_consent_identity(
+        component_id=inspection_a.component_id, version=inspection_a.version,
+        root_digest=inspection_a.root_digest, slug=inspection_a.slug)
+    acks.record(identity=identity, component_id=inspection_a.component_id,
+                version=inspection_a.version, component_checksum=inspection_a.root_digest,
+                slug=inspection_a.slug)
+    pending = commit_specialist_install(
+        inspection=inspection_a, config={}, secret_names_provided=frozenset(), acks=acks,
+        specialists_dir=tmp_path / "specialists",
+        agents_specialists_dir=tmp_path / "agents-specialists")
+    assert pending.state == "pending-configuration"
+
+    # Second, DIFFERENT component (same slug, bumped version) fully satisfied
+    # — before the fix this silently replaced A's pending candidate.
+    inspection_b, acks_b = _approved_inspection(
+        tmp_path, slug="mtg", version_suffix="-b", version_override="0.2.0")
+    with pytest.raises(SpecialistInstallError) as excinfo:
+        commit_specialist_install(
+            inspection=inspection_b, config={}, secret_names_provided=frozenset(),
+            acks=acks_b, specialists_dir=tmp_path / "specialists",
+            agents_specialists_dir=tmp_path / "agents-specialists")
+    assert excinfo.value.kind == "concurrent_mutation"
+
+    # A's own pending candidate survives untouched...
+    from personality_binding import InstanceDir
+    desired = InstanceDir(tmp_path / "specialists" / "mtg").desired()
+    assert desired is not None and "@0.1.0#" in desired.root  # still A's candidate
+
+    # ...and A's own configure re-commit (same component) still works.
+    satisfied = commit_specialist_install(
+        inspection=inspection_a, config={}, secret_names_provided=frozenset({"api_key"}),
+        acks=acks, specialists_dir=tmp_path / "specialists",
+        agents_specialists_dir=tmp_path / "agents-specialists")
+    assert satisfied.state == "active"

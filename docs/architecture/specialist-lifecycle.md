@@ -110,10 +110,18 @@ itself fails, the journal stays in progress for boot to finish.
 corrupt or unrollbackable ones quarantined — a filename that cannot be parsed quarantines
 every owned entry rather than guessing.
 
-**Two mutations race.** Where an active tuple exists, the loser refuses as a concurrent
-mutation; nothing is overwritten or resurrected. The refusal checks the *active* tuple
-specifically — a second stale fresh-install racing a pending (desired-only) instance sees
-no active tuple and restages the desired one rather than refusing.
+**Two mutations race.** The loser refuses as a concurrent mutation; nothing is overwritten
+or resurrected. The in-lock re-check covers both generations: an active tuple that appeared
+while waiting refuses outright, and a pending (desired-only) candidate with a *different*
+component root refuses too — only the same component's own configure re-commit may replace
+its pending tuple. The commit and upgrade tools additionally re-load the consent receipt
+inside the mutation lock, so a receipt consumed by a concurrent bundle fails closed as
+receipt-required instead of rotating sidecar generations for a no-op; the sidecar commit
+itself treats a byte-identical restage as a no-op rather than rotating the prior away.
+
+**A damaged instance tuple is found at boot.** The installed index isolates that slug as an
+error-state instance — its slug stays reserved against reinstall-overwrite and the error is
+surfaced for inspection — instead of aborting the whole scan and with it the app start.
 
 ## Extension points
 

@@ -395,8 +395,13 @@ def validate_config_repo(
             # "no assistant" onto it.
             resident_dir_names.add(entry)
             try:
+                # binding_commit=False (#338): this is a VALIDATION replay —
+                # the resident binding reconciliation must not commit a
+                # staged desired -> active (activating a pending persona
+                # swap) as a side effect of validating an unrelated commit.
                 cfg = load_agent_from_dir(
                     path, policies=policy_lib, roles_dir=roles_dir,
+                    binding_commit=False,
                 )
             except Exception as exc:
                 # Broad by design (mandate: 'a validation error must be
@@ -463,6 +468,43 @@ def validate_config_repo(
                 "no enabled resident with role 'assistant' — Casa cannot boot "
                 "without a primary assistant (agents/assistant/ must exist and "
                 "declare role: assistant in runtime.yaml)"
+            )
+
+        # #338: boot registers every resident's triggers UNCAUGHT
+        # (casa_core step 13b) — TriggerRegistry.register_agent raises
+        # TriggerError on a duplicate name / unregistered channel, and
+        # APScheduler's add_job raises on out-of-range cron field values;
+        # the triggers schema alone catches none of that (no uniqueItems,
+        # channel and schedule are free-ish strings). Replay the SAME
+        # registration into a throwaway registry backed by an unstarted
+        # scheduler: add_job validates trigger construction identically
+        # while nothing is started and nothing can fire (bus/app unused
+        # until a job actually runs). Defensive wrapper: the gate's mandate
+        # is report-never-crash.
+        try:
+            from apscheduler.schedulers.background import BackgroundScheduler
+            from trigger_registry import TriggerError, TriggerRegistry
+
+            replay_registry = TriggerRegistry(
+                scheduler=BackgroundScheduler(), app=None, bus=None,
+            )
+            for role, cfg in resident_configs.items():
+                if not cfg.triggers:
+                    continue
+                try:
+                    replay_registry.register_agent(
+                        role=role, triggers=cfg.triggers, channels=cfg.channels,
+                    )
+                except TriggerError as exc:
+                    errors.append(str(exc))
+                except Exception as exc:  # noqa: BLE001 — apscheduler ValueError etc.
+                    errors.append(
+                        f"agent {role!r}: trigger registration failed: {exc}"
+                    )
+        except Exception:  # noqa: BLE001 — replay harness itself must never crash the gate
+            logger.warning(
+                "trigger-registration replay unavailable; gate ran without it",
+                exc_info=True,
             )
 
         # Cross-tier role-registry parity. After load_all_agents, casa_core.main
@@ -1043,6 +1085,7 @@ def _resident_bindings_root(bindings_dir: str | None) -> Path:
 def load_agent_from_dir(
     agent_dir: str, *, policies: PolicyLibrary | None,
     roles_dir: str | None = None, bindings_dir: str | None = None,
+    binding_commit: bool = True,
 ) -> AgentConfig:
     """Load one agent directory. Strict: every error raises LoadError.
 
@@ -1057,6 +1100,11 @@ def load_agent_from_dir(
 
     ``bindings_dir`` overrides the resident instance-tuple root (Task 8)
     used by boot-time binding reconciliation; see ``_resident_bindings_root``.
+
+    ``binding_commit=False`` (#338) makes the resident binding reconciliation
+    validation-only: the full candidate validation runs, but no InstanceDir
+    state is written — ``validate_config_repo``'s boot-parity replay must
+    never activate a staged persona swap as a side effect of validating.
     """
     if not os.path.isdir(agent_dir):
         raise LoadError(f"not a directory: {agent_dir}")
@@ -1174,7 +1222,9 @@ def load_agent_from_dir(
     # executors never). A resident fails to load ONLY when reconciliation itself
     # raises (no active tuple exists AND the fresh attempt failed).
     if cfg.kind == "resident":
-        _activate_resident_binding(cfg, role_from_path, bindings_dir)
+        _activate_resident_binding(
+            cfg, role_from_path, bindings_dir, binding_commit=binding_commit,
+        )
     elif cfg.kind == "specialist":
         # Personality Phase A, Task N1b Step 19: the specialist counterpart
         # to the resident block above — activates the INSTALLED component's
@@ -1211,8 +1261,13 @@ def load_agent_from_dir(
 
 def _activate_resident_binding(
     cfg: AgentConfig, role_from_path: str, bindings_dir: str | None,
+    *, binding_commit: bool = True,
 ) -> None:
-    """Reconcile + compile the resident binding onto *cfg* (Task 8, Step 8)."""
+    """Reconcile + compile the resident binding onto *cfg* (Task 8, Step 8).
+
+    ``binding_commit=False`` — see ``load_agent_from_dir``: full validation,
+    no InstanceDir writes (the validate_config_repo replay).
+    """
     from persona_pack import load_persona_pack
     from personality_binding import (
         IMAGE_DEFAULT_PERSONA_BY_SLOT,
@@ -1254,10 +1309,28 @@ def _activate_resident_binding(
     instance_dir = InstanceDir(
         _resident_bindings_root(bindings_dir) / f"resident-{cfg.role_slot.slot}"
     )
+    # #339: read the compile inputs BEFORE reconcile so the candidate can be
+    # proven compilable pre-commit. A missing/unreadable frame or kernel file
+    # is a broken image — the same hard failure it always was, just earlier.
+    platform_frame = (Path(SCHEMA_DIR).parent / "personality" / "platform-frame.md").read_text(encoding="utf-8")
+    safety_kernel = (Path(SCHEMA_DIR).parent / "personality" / "safety-kernel.md").read_text(encoding="utf-8")
+
+    def _prove_candidate_compiles(persona, binding) -> None:
+        # #339 (the poisoned-active fix): the same admission-ceiling compile
+        # the loader runs after reconcile, applied to the CANDIDATE before
+        # desired -> active promotion. A candidate that cannot compile is
+        # discarded by reconcile and the retained active keeps running,
+        # instead of being committed and failing every subsequent boot.
+        compile_prompt_bundle(
+            role=cfg.role_slot, persona=persona, binding=binding,
+            platform_frame=platform_frame, safety_kernel=safety_kernel,
+        )
+
     try:
         active_tuple = reconcile_resident_binding(
             role=cfg.role_slot, image_default_persona_loader=_load_default,
             override_persona_loader=_load_override, instance_dir=instance_dir,
+            candidate_validator=_prove_candidate_compiles, commit=binding_commit,
         )
     except ValueError as exc:
         raise LoadError(
@@ -1286,8 +1359,6 @@ def _activate_resident_binding(
             f"{active_tuple.binding.persona_id}@{active_tuple.binding.persona_version} "
             f"failed to reload after reconciliation: {exc}"
         ) from exc
-    platform_frame = (Path(SCHEMA_DIR).parent / "personality" / "platform-frame.md").read_text(encoding="utf-8")
-    safety_kernel = (Path(SCHEMA_DIR).parent / "personality" / "safety-kernel.md").read_text(encoding="utf-8")
     bundle = compile_prompt_bundle(
         role=cfg.role_slot, persona=bound_persona, binding=active_tuple.binding,
         platform_frame=platform_frame, safety_kernel=safety_kernel,
@@ -1400,7 +1471,14 @@ def load_all_specialists(
             )
         try:
             cfg = load_agent_from_dir(path, policies=None, roles_dir=roles_dir)
-        except LoadError as exc:
+        except (LoadError, ValueError, OSError) as exc:
+            # #338: broader than LoadError by necessity — load_agent_from_dir
+            # raises raw ValueError subclasses on schema-valid input too
+            # (role_slot.materialize_role's RoleValidationError for an
+            # ha_option role whose allowed list excludes the operator's
+            # current option value). One inconsistent specialist must land in
+            # `failed` and keep its siblings (and boot) alive, not kill the
+            # whole scan.
             failed.append((entry, str(exc)))
             continue
         found[cfg.role] = cfg

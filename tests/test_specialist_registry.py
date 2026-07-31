@@ -747,3 +747,41 @@ class TestInstalledSpecialistIndexCollisionSet:
             role_dir.mkdir(parents=True)
             (role_dir / "role.yaml").write_text(f"slot: {slot}\n", encoding="utf-8")
         assert _discover_image_role_slots(str(tmp_path)) == {"assistant", "configurator", "finance"}
+
+
+async def test_one_malformed_installed_tuple_does_not_abort_the_index_load(tmp_path):
+    """#346: InstalledSpecialistIndex.load() ran InstanceDir.active()/
+    .desired() unguarded — a single damaged active.yaml (bad YAML, schema
+    violation, tampered digest) raised out of the boot-time scan and aborted
+    the whole app start. The damaged slug must be isolated as state="error"
+    (keeping its slug reserved against reinstall-overwrite) while healthy
+    siblings load normally."""
+    from personality_binding import InstanceDir, InstanceTuple
+    from specialist_registry import InstalledSpecialistIndex
+    from test_specialist_install import _specialist_binding
+
+    root = tmp_path / "specialists"
+    # Healthy installed specialist: a real, verifiable active tuple.
+    binding = _specialist_binding("healthy", mode="component-default",
+                                  component_root="casa/healthy@0.1.0#sha256:" + "a" * 64)
+    good = InstanceDir(root / "healthy")
+    good.stage_desired(InstanceTuple(
+        root="casa/healthy@0.1.0#sha256:" + "a" * 64, binding=binding,
+        config_snapshot={}, config_digest=binding.effective_config_digest,
+    ))
+    good.commit_desired_to_active()
+    # Damaged sibling: active.yaml present but unparseable.
+    (root / "damaged").mkdir(parents=True)
+    (root / "damaged" / "active.yaml").write_text("{{{ not yaml", encoding="utf-8")
+
+    index = InstalledSpecialistIndex(specialists_dir=str(root))
+    index.load()  # must NOT raise
+
+    assert "healthy" in index.installed_slugs()
+    damaged = index.get_instance("damaged")
+    assert damaged is not None
+    assert damaged.state == "error"
+    assert damaged.active is None and damaged.desired is None
+    assert damaged.last_activation_error
+    # The slug stays reserved: a fresh install cannot silently overwrite it.
+    assert "damaged" in index.all_collision_slugs()
