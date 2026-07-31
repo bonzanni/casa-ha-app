@@ -60,10 +60,13 @@ RESERVED_CONTEXT_KEYS = frozenset({
 def sanitize_external_context(ctx: dict | None) -> dict:
     """Return a copy of *ctx* with every reserved provenance key removed.
 
-    ``None`` (or any falsy value) normalizes to ``{}``. The input dict is
-    never mutated — callers may still hold a reference to it.
+    ``None``, any falsy value, or a non-dict normalizes to ``{}`` — the
+    value under ``"context"`` is caller-controlled on every ingress that
+    passes it here (SSE body, WS utterance frame, /invoke payload), and a
+    truthy non-dict used to crash the handler on ``.items()`` (#287). The
+    input dict is never mutated — callers may still hold a reference to it.
     """
-    if not ctx:
+    if not isinstance(ctx, dict) or not ctx:
         return {}
     return {k: v for k, v in ctx.items() if k not in RESERVED_CONTEXT_KEYS}
 

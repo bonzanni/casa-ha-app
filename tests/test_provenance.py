@@ -54,6 +54,14 @@ class TestSanitizeExternalContext:
     def test_empty_dict_stays_empty(self):
         assert sanitize_external_context({}) == {}
 
+    def test_non_dict_normalizes_to_empty_dict(self):
+        # #287 r3 (Terra): "context" is caller-controlled on the SSE body,
+        # the WS utterance frame AND the /invoke payload; a truthy non-dict
+        # ([1], "x", 42) reached .items() and crashed the handler after the
+        # stream was already prepared.
+        for bad in ([1], "x", 42, [["nested"]]):
+            assert sanitize_external_context(bad) == {}
+
     def test_strips_exactly_the_reserved_keys(self):
         ctx = {
             "chat_id": "1", "cid": "abc",

@@ -38,17 +38,24 @@ identifier through, and only a missing or empty one is replaced. The consequence
 knowing: the value bound for the turn can be arbitrary caller text, and it may differ from
 the one on the HTTP access line for the same request.
 
-**Redaction is a partial measure, not a guarantee.** It is attached to the application's own
-handler rather than to the root logger, and it inspects the message and its arguments. That
-covers the ordinary case of a secret interpolated into a log line.
+**Redaction is layered where each piece of a record becomes text.** The filter on the
+application's own handler inspects the message and its arguments — the ordinary case of a
+secret interpolated into a log line. Exception text and structured extras only become
+strings later, inside the formatters, so the application's formatters redact them at render
+time: formatted tracebacks pass through the same redaction as messages, and extras get the
+same per-value walk as dict arguments (credential-named keys masked wholesale, benign
+labels preserved). One deliberate exemption: numeric values under token-*count* keys —
+per-turn token telemetry — stay legible, while a numeric value under any other
+credential-named key is masked like everything else. Stack text differs by format: the
+human formatter renders it redacted; the JSON formatter does not emit stack text at all.
 
-**It does not cover exception information.** Nothing walks the traceback or the exception
-message, and formatting happens after the filter has run. A secret inside an exception
-reaches the log at any level. This is the gap to know about before logging an exception near
-credential-handling code.
-
-Also outside its reach: structured extras attached to a record, output from subprocesses, and
-any handler that is not the application's own.
+**It is still not a guarantee.** Outside its reach: output from subprocesses, and any
+handler that is not the application's own — a foreign handler is *not guaranteed* to be
+covered. It may incidentally see redacted values (the filter mutates the record's message
+and arguments in place, and the human formatter caches redacted exception text on the
+record), but nothing promises it, and a foreign handler that formats first sees raw text.
+The filter is deliberately on the handler rather than the root logger, because root-logger
+filters do not run for records propagated from descendants.
 
 **Health surfaces assert less than their names suggest.** The health endpoint returns a fixed
 success response — it says the process is answering requests, and nothing about agents,
@@ -63,11 +70,11 @@ operational health check, and treating either as one reads in something that is 
 The asymmetry is intentional — external systems thread their own ids — but it means one of
 the two paths accepts arbitrary text.
 
-**INV-OBS-002**: Redaction operates on a log record's message and arguments only.
+**INV-OBS-002**: Everything the application's own formatters render — message, arguments, exception text, stack text and structured extras — is redacted before it is emitted.
 
-What it does not cover, and this is the operative part: exception information is not
-inspected, structured extras are not inspected, and the filter is installed on the
-application's handler rather than globally.
+What it does not cover, and this is the operative part: the pipeline is installed on the
+application's handler rather than globally, so a record reaching any other handler has no
+redaction guarantee, and subprocess output never passes through it at all.
 
 **INV-OBS-003**: The health endpoint returns a fixed success response without consulting any subsystem.
 
@@ -76,8 +83,10 @@ signal for the system.
 
 ## Failure behavior
 
-**A secret appears in an exception.** It is logged. Nothing catches this today, so treat
-exception logging near secret material as a place to redact by hand.
+**A secret appears in an exception.** The formatter redacts it on the application's own
+handler — if the value matches a known pattern or was registered at load. An unregistered,
+pattern-less secret still passes through, so exception logging near secret material remains
+a place to be deliberate.
 
 **A caller supplies an unusual correlation id.** It is used. Downstream consumers that
 validate identifiers more strictly may then reject it, so the failure surfaces late and away
@@ -88,11 +97,13 @@ of its own.
 
 ## Extension points
 
-**A new log call near secret material** should redact at the call site rather than relying on
-the filter, and must not pass the value through an exception.
+**A new log call near secret material** should still redact at the call site rather than
+relying on the pipeline: pattern and exact-value redaction only catch what they recognise,
+and registering the value at load is what makes an opaque secret recognisable.
 
-**Widening redaction** means deciding deliberately between covering exception text — the
-known gap — and the cost of walking every traceback.
+**Widening redaction** now means extending the pattern list or registering values — the
+formatter already covers exception text and extras. What cannot be widened from here is
+coverage of handlers the application does not own.
 
 **A real readiness check** would be a new surface. Neither existing one can be extended into
 it without changing what it means, and other things depend on the current behaviour.
@@ -105,8 +116,12 @@ it without changing what it means, and other things depend on the current behavi
 **Source**
 - `casa/rootfs/opt/casa/log_cid.py::install_logging`
 - `casa/rootfs/opt/casa/log_cid.py::new_cid`
+- `casa/rootfs/opt/casa/log_cid.py::HumanFormatter`
+- `casa/rootfs/opt/casa/log_cid.py::JsonFormatter`
+- `casa/rootfs/opt/casa/log_cid.py::_RedactingRenderMixin`
 - `casa/rootfs/opt/casa/log_redact.py::RedactingFilter`
 - `casa/rootfs/opt/casa/log_redact.py::redact`
+- `casa/rootfs/opt/casa/log_redact.py::redact_extras`
 - `casa/rootfs/opt/casa/casa_core.py::healthz`
 
 **Tests**

@@ -113,10 +113,14 @@ class VoiceRouteRegistry:
             valid_requested = all(
                 isinstance(capability, str) for capability in requested
             )
+        # #287: build the frozenset only once every element is known to be a
+        # str — an unhashable entry (e.g. capabilities: [{}]) raised
+        # TypeError here, and with no per-frame catch in _ws_handler that
+        # closed the socket instead of refusing the registration.
+        if valid_requested:
             requested_set = frozenset(requested)
             valid_requested = (
-                valid_requested
-                and requested_set <= _BACKGROUND_CAPABILITIES
+                requested_set <= _BACKGROUND_CAPABILITIES
                 and _BACKGROUND_CAPABILITIES <= requested_set
             )
 

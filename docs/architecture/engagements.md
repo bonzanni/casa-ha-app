@@ -1,5 +1,5 @@
 ---
-last_reviewed: 2026-07-30
+last_reviewed: 2026-07-31
 ---
 
 # Engagements and delegation
@@ -120,11 +120,11 @@ and the caller gets a retryable outcome naming the condition. This is a precondi
 not an error state.
 
 **The terminal write fails.** The record is rolled back to live and no side effects run.
-Only the completion tool surfaces this as its distinct retryable outcome; the cancellation
-tool does not inspect the result and reports success either way, leaving the still-live
-record for a later retry or reap. Distinguishing the retryable outcome from the precondition
-failure matters where it is surfaced: one says "read your messages", the other says "try
-again".
+Both the completion tool and the cancellation tool surface this as the same distinct
+retryable outcome — the caller is told the record is still live and to call again, rather
+than being handed a success for a transition that did not happen. Distinguishing the
+retryable outcome from the precondition failure matters where it is surfaced: one says
+"read your messages", the other says "try again".
 
 **Two callers race.** The loser is absorbed as already-terminal. No duplicate topic closure
 and no duplicate notification.
@@ -172,6 +172,9 @@ cap to cover it.
 - `casa/rootfs/opt/casa/engagement_registry.py::EngagementRecord`
 - `casa/rootfs/opt/casa/engagement_registry.py::EngagementRegistry.try_transition_terminal`
 - `casa/rootfs/opt/casa/engagement_registry.py::TerminalPreconditionFailed`
+- `casa/rootfs/opt/casa/tools.py::_finalize_engagement`
+- `casa/rootfs/opt/casa/tools.py::FinalizeResult`
+- `casa/rootfs/opt/casa/tools.py::cancel_engagement`
 - `casa/rootfs/opt/casa/drivers/driver_protocol.py::DriverProtocol`
 - `casa/rootfs/opt/casa/drivers/claude_code_driver.py::ClaudeCodeDriver`
 - `casa/rootfs/opt/casa/channels/output_sequencer.py::OutputSequencer`

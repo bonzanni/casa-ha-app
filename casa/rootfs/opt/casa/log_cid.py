@@ -23,7 +23,7 @@ import uuid
 from contextvars import ContextVar
 from typing import IO
 
-from log_redact import RedactingFilter
+from log_redact import RedactingFilter, redact, redact_extras
 
 # Module-level constant — Python's stock LogRecord attributes. Anything
 # else attached to a record (via logger.*("msg", extra={...}) or by a
@@ -88,15 +88,39 @@ _HUMAN_FORMAT = "%(asctime)s [%(levelname)s] %(name)s cid=%(cid)s: %(message)s"
 _ISO_UTC_DATEFMT = "%Y-%m-%dT%H:%M:%SZ"
 
 
-class HumanFormatter(logging.Formatter):
+class _RedactingRenderMixin:
+    """Redact exception/stack text at the point it becomes a string (#285).
+
+    The :class:`~log_redact.RedactingFilter` runs before formatting and
+    only sees ``record.msg``/``record.args`` — a secret inside an
+    exception message or traceback would otherwise reach the log at any
+    level. Redacting here, in the formatter, covers both formatters with
+    one mechanism and keeps the filter's per-value arg walk (which must
+    not see rendered ``key=value`` text) unchanged.
+    """
+
+    def formatException(self, ei) -> str:
+        return redact(super().formatException(ei))
+
+    def formatStack(self, stack_info: str) -> str:
+        return redact(super().formatStack(stack_info))
+
+
+class HumanFormatter(_RedactingRenderMixin, logging.Formatter):
     """Human-readable formatter that appends LogRecord extras as
     `key=val` suffix. Mirrors `JsonFormatter`'s extras-merging so a
     single `logger.info("evt", extra={...})` call renders coherently
     in both modes."""
 
     def format(self, record: logging.LogRecord) -> str:
+        # A foreign formatter (another handler running first) may have
+        # cached unredacted exception text on the record; the base class
+        # reuses that cache instead of calling formatException, so scrub
+        # it here. Idempotent — re-redacting redacted text is a no-op.
+        if record.exc_text:
+            record.exc_text = redact(record.exc_text)
         base = super().format(record)
-        extras = _record_extras(record)
+        extras = redact_extras(_record_extras(record))
         if not extras:
             return base
         suffix = " ".join(f"{k}={v}" for k, v in extras.items())
@@ -110,7 +134,7 @@ def _human_formatter() -> HumanFormatter:
     return fmt
 
 
-class JsonFormatter(logging.Formatter):
+class JsonFormatter(_RedactingRenderMixin, logging.Formatter):
     """One-line JSON with fields ``ts, level, logger, cid, msg[, exc]``."""
 
     def __init__(self) -> None:
@@ -129,7 +153,7 @@ class JsonFormatter(logging.Formatter):
         if record.exc_info:
             payload["exc"] = self.formatException(record.exc_info)
         # Flatten any extras (e.g. logger.info("evt", extra={"channel": "x"})).
-        payload.update(_record_extras(record))
+        payload.update(redact_extras(_record_extras(record)))
         return json.dumps(payload, default=str)
 
 

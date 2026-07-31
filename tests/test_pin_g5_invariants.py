@@ -50,14 +50,21 @@ async def test_pin_inv_obs_001_header_cid_validated_payload_cid_not():
     assert message.context["cid"] == payload_cid
 
 
-def test_pin_inv_obs_002_redaction_covers_message_and_args_only():
-    """INV-OBS-002: redaction operates on a log record's message and
-    arguments only — exception info is untouched.
+def test_pin_inv_obs_002_rendered_output_redacts_exceptions_and_extras():
+    """INV-OBS-002: what Casa's own formatters render is redacted end to
+    end — message and args at the filter, exception text and structured
+    extras at the formatter (#285). A handler that is not Casa's own is
+    still uncovered.
 
-    Red case demonstrated: extending RedactingFilter.filter to scrub
-    exc_info makes the secret disappear and fails this test.
+    Red case demonstrated: dropping _RedactingRenderMixin from
+    JsonFormatter (or reverting redact_extras in JsonFormatter.format)
+    puts the secret back in the rendered line and fails this test.
     """
-    secret = "exception-secret-value"
+    from log_cid import JsonFormatter
+    from log_redact import register_secret
+
+    secret = "pin-obs2-exception-secret"  # gitleaks:allow - synthetic fixture; this test exists to prove redaction works
+    register_secret(secret)
     try:
         raise RuntimeError(secret)
     except RuntimeError:
@@ -65,7 +72,14 @@ def test_pin_inv_obs_002_redaction_covers_message_and_args_only():
             name="test", level=logging.ERROR, pathname=__file__, lineno=1,
             msg="safe message", args=(), exc_info=sys.exc_info(),
         )
+    record.api_key = "pin-obs2-extra"
     RedactingFilter().filter(record)
+    rendered = JsonFormatter().format(record)
+    assert secret not in rendered
+    assert "pin-obs2-extra" not in rendered
+    assert "RuntimeError" in rendered  # traceback context survives
+    # The boundary that remains: a foreign handler formatting the same
+    # record without Casa's formatter still sees the raw exception.
     assert secret in logging.Formatter().formatException(record.exc_info)
 
 
