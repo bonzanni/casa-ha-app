@@ -1422,6 +1422,20 @@ class TelegramChannel(Channel):
                     await self.send_to_topic(thread_id, "No active engagement in this topic.")
                     return
 
+                # #336 (Terra, review r4): an engagement reads at the
+                # clearance of the turn that CREATED it — but any member of
+                # the engagement supergroup can steer it by messaging its
+                # topic, and answering a steering turn at the creator's
+                # clearance would hand a non-operator the operator's private
+                # memory through the engagement. Clamp the engagement's
+                # read-clearance DOWN to this sender's before their turn is
+                # delivered, so it never reads above the least-privileged
+                # person who has steered it. Monotonic: it only ever lowers,
+                # so it is safe under concurrent steerers and idempotent for
+                # the ordinary operator-only case (where it no-ops).
+                await self._engagement_registry.lower_origin_clearance(
+                    rec.id, self._origin_clearance_for_user_id(user_id))
+
                 # R5 (v0.89.0): record this operator message as the react
                 # target — SYNCHRONOUSLY, from the TRUSTED msg.message_id and
                 # the authoritative topic/chat identity, BEFORE the first await

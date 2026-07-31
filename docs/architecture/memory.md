@@ -65,11 +65,15 @@ specialist can query, and a nested engagement it spawns, which inherits rather t
 re-deriving. An engagement whose record predates this (or came from an origin that stamps no
 route) keeps the channel-keyed behaviour.
 
-The rule is *inheritance at creation*, and that is also its limit: an engagement carries the
-clearance of whoever started it for its whole life. A second person messaging into an
-existing engagement's topic is answered at the creator's clearance, not their own — engagement
-topics live in an invite-only supergroup, so this is a narrower surface than the DM, but it
-is not per-turn identity.
+Inheritance at creation is only half the rule, because an engagement is *steerable*: anyone
+in the engagement supergroup can direct it by messaging its topic. So the recorded clearance
+is also a **monotonic floor** — a steering turn clamps it down to that sender's clearance and
+never raises it back, which makes the property "an engagement never reads above the
+least-privileged person who has taken part in it". The clamp is deliberately one-way: two
+people steering concurrently can only drive it further down, and the operator returning to
+their own engagement does not restore what a lower-clearance participant has already seen.
+Note what this is not: within a turn it is still record-level, not per-turn — the engagement
+does not read at a *higher* clearance for the operator after being lowered.
 
 **Writing is narrower than reading.** Only write-trusted channels retain to the shared bank.
 A channel that can recall is not thereby able to store.
@@ -163,15 +167,20 @@ behavior; and a turn still running on the *same* session when a reset saves it c
 tail exchanges miss retention — the reset drops the pointer (its contract) and nothing
 saves that session again.
 
-**INV-MEM-008**: An engagement's recall resolves clearance from the origin markers its own record carries, not from the ambient turn origin or the channel default.
+**INV-MEM-008**: An engagement's reads resolve clearance from the origin markers its own record carries, and a steering turn from a lower-clearance sender clamps those markers down permanently.
 
-Enforced where the markers are resolved for an access-control decision: the ambient origin
-wins when it has a route of its own (an in-process delegated turn), otherwise the bound
-engagement record supplies them.
+Enforced in two places that have to agree: where the markers are resolved for an
+access-control decision — the ambient origin wins when it has a route of its own (an
+in-process delegated turn), otherwise the bound engagement record supplies them — and at the
+engagement-topic ingress, which lowers the record's stamped clearance to each steering
+sender's before their turn is delivered. Every read an engagement can perform resolves
+through the first: its own recall, the executor archive injected at launch, the engager-side
+context, and a nested engagement it spawns.
 
 What it does not cover: a record carrying no markers falls back to channel-keyed clearance,
 which on Telegram is private — so this tightens what a *newly* stamped origin can reach, and
-does not retroactively downgrade engagements created before the markers existed.
+does not retroactively downgrade engagements created before the markers existed. The clamp
+also cannot un-share what was already disclosed before a lower-clearance sender arrived.
 
 **INV-MEM-007**: A tier-classifier reply parses only when it is exactly one tier token; any reply containing other words yields no tier and the item falls to the private default.
 

@@ -8,8 +8,12 @@ clearance/write-trust INHERITED from their originating context (the resident
 turn / engagement that spawned them — its channel is on ``origin_var`` /
 ``engagement.origin``).
 
-- Read  → ``delegated_recall`` : a single ``recall`` at the originating channel's
-  read-clearance (``readable_tiers(clearance_for_channel(origin_channel))``).
+- Read  → ``delegated_recall`` : a single ``recall`` at the originating context's
+  read-clearance. When the caller names the originating ROUTE the clearance comes
+  from that server-stamped marker (``clearance_for_origin``) — necessary since
+  #336, because a telegram turn's clearance is PER SENDER and a channel-keyed
+  lookup would hand a non-operator's delegation the operator's private tier. A
+  caller that names no route keeps the channel-keyed lookup.
 - Write → ``retain_delegated`` : an EXPLICIT, write-trust-gated, per-item
   tier-classified ``retain`` (the reaper can't catch ephemeral turns). Voice
   (recall-only) writes nothing. Both are best-effort — they never crash a

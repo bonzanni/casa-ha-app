@@ -27,6 +27,7 @@ from dataclasses import dataclass, field
 from typing import Any
 
 from atomic_io import atomic_write_json
+from sensitivity import TIERS
 
 logger = logging.getLogger(__name__)
 
@@ -851,6 +852,44 @@ class EngagementRegistry:
             if rec.status == "idle":
                 rec.status = "active"
             await self._write_tombstone_locked()
+
+    async def lower_origin_clearance(
+        self, engagement_id: str, clearance: str,
+    ) -> bool:
+        """#336: clamp an engagement's read-clearance DOWN to *clearance*.
+
+        An engagement reads at the clearance of the turn that created it. But
+        anyone in the engagement supergroup can send into its topic, and that
+        message steers the engagement — so an engagement answering a steering
+        turn must not read above the person steering it. This lowers the
+        record's stamped clearance to the floor of everyone who has steered
+        it; it NEVER raises one (a monotonic clamp is race-free: two
+        concurrent steerers can only drive it further down, and re-applying
+        is a no-op).
+
+        Returns True when the record actually moved. A record carrying no
+        stamped clearance is left alone — it resolves channel-keyed, which is
+        the pre-existing behaviour for engagements created before the markers
+        existed, and inventing a marker here would silently change it.
+        """
+        if clearance not in TIERS:
+            return False
+        async with self._lock:
+            rec = self._records.get(engagement_id)
+            if rec is None:
+                return False
+            current = rec.origin.get("_origin_clearance")
+            if current not in TIERS:
+                return False
+            if TIERS.index(clearance) >= TIERS.index(current):
+                return False          # already at or below this floor
+            rec.origin["_origin_clearance"] = clearance
+            logger.info(
+                "engagement %s read-clearance lowered %s→%s (steered by a "
+                "lower-clearance sender)", engagement_id[:8], current, clearance,
+            )
+            await self._write_tombstone_locked()
+            return True
 
     async def update_last_idle_reminder(self, engagement_id: str, ts: float) -> None:
         async with self._lock:

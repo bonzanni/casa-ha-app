@@ -684,19 +684,28 @@ async def replay_undergoing_engagements(
                         # the helper's own mark then no-ops against the #326
                         # terminal guard while still running the checked
                         # teardown and adding the id to ``refused_ids``.
+                        # STRICT: the mark must reach DISK before we move on
+                        # (Terra, review r4). ``mark_error`` persists
+                        # best-effort, so a swallowed tombstone-write failure
+                        # would leave the next boot reloading the record as
+                        # active/idle — and it would then see the on-disk
+                        # token matching, skip the cycle, and resume the very
+                        # engagement this refusal exists to retire.
                         try:
-                            await registry.mark_error(
-                                rec.id, kind="refuse_credential_cycle_failed",
-                                message=(
+                            await registry.try_transition_terminal(
+                                rec.id, "error", strict=True,
+                                error_kind="refuse_credential_cycle_failed",
+                                error_message=(
                                     "engagement could not be confirmed down "
                                     "after a credential refresh"
                                 ),
                             )
                         except Exception:  # noqa: BLE001 — teardown still runs
                             logger.warning(
-                                "boot replay: mark_error("
-                                "refuse_credential_cycle_failed) failed for "
-                                "%s", rec.id[:8], exc_info=True,
+                                "boot replay: durable terminal mark after a "
+                                "credential-cycle failure did not persist for "
+                                "%s — the engagement may be reloaded as live "
+                                "on the next boot", rec.id[:8], exc_info=True,
                             )
                         await _refuse_brief_resume(
                             rec,

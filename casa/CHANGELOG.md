@@ -25,8 +25,8 @@ trusted for *who it claimed to be* rather than *who it proved to be*:
   one container, so a shell-capable engagement can still read a sibling's
   credential file (#365), and hook resolution still identifies an engagement
   by working directory (#366).
-- **Telegram senders are attributed individually, and only the operator
-  reads private memory** (#336). Previously every accepted Telegram sender —
+- **Telegram senders are attributed individually, and private memory is
+  reached only through the operator** (#336). Previously every accepted Telegram sender —
   including strangers, when `telegram_chat_id` is left empty ("accept all
   chats") — was recorded as the operator and recalled memory at the
   operator's private clearance. Now only the sender whose id matches the
@@ -39,10 +39,12 @@ trusted for *who it claimed to be* rather than *who it proved to be*:
   into an executor's prompt all read at that same lower clearance instead of
   the operator's private tier. With the option empty, no sender is treated
   as the operator — set your chat id to keep operator attribution.
-  Two limits worth knowing: an engagement carries the clearance of whoever
-  *started* it, so a second person messaging into an existing engagement's
-  topic is answered at the creator's clearance; and a non-operator can still
-  answer their own protected-tool confirmation prompt (#368).
+  An engagement carries the clearance of whoever started it — and if anyone
+  with a lower clearance later steers it by messaging its topic, the
+  engagement drops to *their* clearance for good, so it never reads above
+  the least-privileged person taking part. One limit worth knowing: a
+  non-operator can still answer their own protected-tool confirmation prompt
+  (#368).
 - **A chatty memory-sensitivity classification can no longer leak a fact
   downward** (#350). The tier classifier's reply parser used to accept the
   first tier word found anywhere in the reply — so "this is not public; it

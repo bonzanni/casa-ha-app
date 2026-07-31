@@ -399,3 +399,58 @@ async def test_specialist_recall_records_specialist_archive_path(monkeypatch):
         "'delegated' breaker"
     )
     reset_recall_breakers()
+
+
+# ---------------------------------------------------------------------------
+# #336 — a delegated specialist reads at the DELEGATING TURN's clearance
+# ---------------------------------------------------------------------------
+
+
+async def test_non_operator_delegation_reads_public_only(monkeypatch):
+    """Sol r3/r4: a non-operator Telegram sender must not reach private memory
+    by having a specialist fetch it. End-to-end through _run_delegated_agent,
+    asserting what the recall actually received.
+
+    Red case demonstrated: dropping origin_route/origin_clearance from the
+    specialist's delegated_recall call restores channel-keyed private
+    clearance and this test fails."""
+    import agent as agent_mod
+    cfg = _specialist_cfg(role="finance", token_budget=4000)
+    fake_sem = _FakeSem(recall_ret="## Summary\nnothing sensitive\n")
+    monkeypatch.setattr(agent_mod, "active_semantic_memory", fake_sem, raising=False)
+    agent_mod.origin_var.set({
+        "role": "assistant", "channel": "telegram", "chat_id": "abc",
+        "cid": "cid42", "scope": "personal", "delegation_depth": 0,
+        # The stamped markers of a stranger's turn.
+        "_origin_route": "telegram", "_origin_clearance": "public",
+    })
+    _FakeSDKClient.reset()
+
+    with patch.object(tools, "ClaudeSDKClient", _FakeSDKClient):
+        await tools._run_delegated_agent(
+            cfg, task_text="what is the alarm code?", context_text="")
+
+    c = fake_sem.recall_calls[0]
+    assert c["clearance"] == "public"
+    assert c["tags"] == ["public"]
+
+
+async def test_operator_delegation_still_reads_every_tier(monkeypatch):
+    import agent as agent_mod
+    cfg = _specialist_cfg(role="finance", token_budget=4000)
+    fake_sem = _FakeSem(recall_ret="## Summary\nQ1 spend: 1200\n")
+    monkeypatch.setattr(agent_mod, "active_semantic_memory", fake_sem, raising=False)
+    agent_mod.origin_var.set({
+        "role": "assistant", "channel": "telegram", "chat_id": "abc",
+        "cid": "cid42", "scope": "personal", "delegation_depth": 0,
+        "_origin_route": "telegram", "_origin_clearance": "private",
+    })
+    _FakeSDKClient.reset()
+
+    with patch.object(tools, "ClaudeSDKClient", _FakeSDKClient):
+        await tools._run_delegated_agent(
+            cfg, task_text="how is Q1 cashflow?", context_text="")
+
+    c = fake_sem.recall_calls[0]
+    assert c["clearance"] == "private"
+    assert c["tags"] == ["family", "friends", "private", "public"]

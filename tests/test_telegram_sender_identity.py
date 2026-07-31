@@ -216,3 +216,144 @@ class TestEngagementInheritsItsOriginClearance:
             {"_origin_route": "telegram", "_origin_clearance": "public"},
             ambient={"_origin_route": "telegram", "_origin_clearance": "private"},
         ) == "private"
+
+
+class TestEngagementClearanceClampOnSteering:
+    """Terra r4: an engagement reads at its CREATOR's clearance, but anyone in
+    the engagement supergroup can steer it by messaging its topic. Answering a
+    steering turn at the creator's clearance would hand a non-operator the
+    operator's private memory through the engagement, so the record's
+    clearance is clamped DOWN to each steerer's."""
+
+    async def _registry(self, tmp_path, creator_clearance):
+        from engagement_registry import EngagementRegistry
+        reg = EngagementRegistry(
+            tombstone_path=str(tmp_path / "e.json"), bus=None)
+        rec = await reg.create(
+            kind="executor", role_or_type="configurator", driver="claude_code",
+            task="t",
+            origin={"channel": "telegram", "_origin_route": "telegram",
+                    "_origin_clearance": creator_clearance},
+            topic_id=99)
+        return reg, rec
+
+    async def test_non_operator_steering_lowers_the_clearance(self, tmp_path):
+        reg, rec = await self._registry(tmp_path, "private")
+        assert await reg.lower_origin_clearance(rec.id, "public") is True
+        assert rec.origin["_origin_clearance"] == "public"
+
+    async def test_clamp_never_raises_a_clearance(self, tmp_path):
+        # The operator messaging into an already-lowered engagement must NOT
+        # restore private — the low-clearance steerer is still party to it.
+        reg, rec = await self._registry(tmp_path, "public")
+        assert await reg.lower_origin_clearance(rec.id, "private") is False
+        assert rec.origin["_origin_clearance"] == "public"
+
+    async def test_clamp_is_idempotent_for_the_operator_only_case(self, tmp_path):
+        reg, rec = await self._registry(tmp_path, "private")
+        assert await reg.lower_origin_clearance(rec.id, "private") is False
+        assert rec.origin["_origin_clearance"] == "private"
+
+    async def test_record_without_a_stamped_clearance_is_left_alone(self, tmp_path):
+        # Pre-#336 records resolve channel-keyed; inventing a marker here
+        # would silently change their behaviour.
+        from engagement_registry import EngagementRegistry
+        reg = EngagementRegistry(
+            tombstone_path=str(tmp_path / "e.json"), bus=None)
+        rec = await reg.create(
+            kind="executor", role_or_type="configurator", driver="claude_code",
+            task="t", origin={"channel": "telegram"}, topic_id=99)
+        assert await reg.lower_origin_clearance(rec.id, "public") is False
+        assert "_origin_clearance" not in rec.origin
+
+    async def test_the_lowered_clearance_is_durable(self, tmp_path):
+        from engagement_registry import EngagementRegistry
+        path = str(tmp_path / "e.json")
+        reg, rec = await self._registry(tmp_path, "private")
+        await reg.lower_origin_clearance(rec.id, "public")
+        reloaded = EngagementRegistry(tombstone_path=path, bus=None)
+        await reloaded.load()
+        assert reloaded.get(rec.id).origin["_origin_clearance"] == "public"
+
+    async def test_a_lowered_engagement_recalls_at_the_lower_tier(self, tmp_path, monkeypatch):
+        """End-to-end: the clamp is what the recall path actually reads."""
+        import agent as agent_mod
+        import tools as tools_mod
+        from personality_types import RecallHit
+
+        calls = []
+
+        class _Sem:
+            async def recall_items(self, bank, query, *, tags, max_tokens,
+                                   clearance, types=(), tags_match="any",
+                                   budget="mid"):
+                calls.append({"tags": sorted(tags), "clearance": clearance})
+                return (RecallHit(
+                    text="x", memory_type="world", sensitivity="public",
+                    application_tags=(), provenance=None, backend_id="b",
+                    document_id=None, chunk_id=None, source_fact_ids=None,
+                    metadata=None, context=None, score=None),)
+
+        monkeypatch.setattr(
+            agent_mod, "active_semantic_memory", _Sem(), raising=False)
+        reg, rec = await self._registry(tmp_path, "private")
+        await reg.lower_origin_clearance(rec.id, "public")
+        token = tools_mod.engagement_var.set(rec)
+        try:
+            await tools_mod.recall_memory.handler({"query": "alarm code"})
+        finally:
+            tools_mod.engagement_var.reset(token)
+        assert calls[0]["clearance"] == "public"
+        assert calls[0]["tags"] == ["public"]
+
+
+class TestNestedEngagementInheritsMarkers:
+    """Terra r3 / Sol r4: an engagement that spawns a NESTED engagement calls
+    engage_executor over the internal socket, where the ambient origin carries
+    no route — so without inheritance the child record would persist no
+    markers and its own reads would fall back to the channel default
+    (private), laundering a low-clearance parent into a high-clearance
+    child."""
+
+    def _inherited(self, parent_origin, ambient):
+        """The marker pair engage_executor would stamp onto a child record."""
+        import tools as tools_mod
+
+        class _Rec:
+            def __init__(self, origin):
+                self.origin = origin
+
+        token = tools_mod.engagement_var.set(_Rec(parent_origin))
+        try:
+            origin = dict(ambient)
+            route, clearance = tools_mod._origin_clearance_markers(origin)
+            if route is not None and "_origin_route" not in origin:
+                origin["_origin_route"] = route
+                origin["_origin_clearance"] = clearance
+            return origin.get("_origin_route"), origin.get("_origin_clearance")
+        finally:
+            tools_mod.engagement_var.reset(token)
+
+    def test_child_inherits_a_low_clearance_parent(self):
+        assert self._inherited(
+            {"_origin_route": "telegram", "_origin_clearance": "public"},
+            ambient={"role": "configurator", "channel": "telegram"},
+        ) == ("telegram", "public")
+
+    def test_child_inherits_a_private_parent_unchanged(self):
+        assert self._inherited(
+            {"_origin_route": "telegram", "_origin_clearance": "private"},
+            ambient={"role": "configurator", "channel": "telegram"},
+        ) == ("telegram", "private")
+
+    def test_an_ambient_route_is_not_overwritten(self):
+        # A resident turn creating an engagement carries its own markers.
+        assert self._inherited(
+            {"_origin_route": "telegram", "_origin_clearance": "public"},
+            ambient={"_origin_route": "telegram", "_origin_clearance": "private"},
+        ) == ("telegram", "private")
+
+    def test_marker_less_parent_stamps_nothing(self):
+        assert self._inherited(
+            {}, ambient={"role": "assistant", "channel": "telegram"},
+        ) == (None, None)

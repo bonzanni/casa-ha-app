@@ -205,7 +205,7 @@
     INV-MEM-005: [tests/test_delegated_memory.py::test_retain_delegated_voice_writes_nothing]
     INV-MEM-006: [tests/test_session_saver.py::test_save_session_expected_sid_mismatch_releases_claim, tests/test_session_saver.py::test_reset_channel_trailing_remove_spares_follow_up_session, tests/test_session_registry.py::test_remove_with_stale_expected_sid_spares_newer_session, tests/test_freshness_reaper.py::test_sweep_passes_cold_snapshot_sid_to_save]
     INV-MEM-007: [tests/test_sensitivity.py::test_parse_tier_rejects_a_tier_word_inside_a_chatty_reply, tests/test_tier_classifier.py::test_classify_chatty_reply_with_tier_words_defaults_private]
-    INV-MEM-008: [tests/test_telegram_sender_identity.py::test_engagement_started_by_a_non_operator_reads_public]
+    INV-MEM-008: [tests/test_recall_memory_tool_tiers.py::test_engagement_started_by_a_non_operator_recalls_public_only, tests/test_telegram_sender_identity.py::test_a_lowered_engagement_recalls_at_the_lower_tier]
 
 - doc: architecture/plugins.md
   summary: How a plugin becomes usable — registry, content-addressed store, artifact identity, and per-call authorization.
@@ -268,7 +268,7 @@
     INV-ENG-005: [tests/test_anchor_narration_buffer.py::test_terminal_latch_discards_via_sequencer_writers, tests/test_output_sequencer.py::test_post_intent_locked_discards_under_terminal_latch]
 
 - doc: architecture/voice.md
-  summary: How spoken input becomes a turn and how the answer gets back — transports, authentication, the turn budget, and deferred delivery.
+  summary: How speech becomes a turn and the answer gets back — transports, auth, turn budget, deferred delivery.
   when_changing: voice transports, voice authentication, the turn budget, specialist handoff, or deferred delivery
   covers:
     - casa/rootfs/opt/casa/channels/voice/channel.py::VoiceChannel
@@ -296,7 +296,7 @@
     INV-VOICE-006: [tests/test_voice_delivery.py::test_an_unknown_modality_is_treated_as_no_endpoint, tests/test_voice_delivery.py::test_a_job_with_no_recorded_endpoint_is_never_offered]
 
 - doc: architecture/specialist-lifecycle.md
-  summary: Specialist install/upgrade/rollback — instance tuples, the content-addressed store, consent receipts, materialization, and the crash journal.
+  summary: Specialist install/upgrade/rollback — instance tuples, the store, consent receipts, materialization, the crash journal.
   when_changing: specialist install identity, consent, materialization, or bundle-transaction recovery
   covers:
     - casa/rootfs/opt/casa/specialist_install.py::commit_specialist_install
