@@ -55,8 +55,11 @@ and a real endpoint offer; without them the promise is undeliverable and the per
 nothing. Check that the path exists before committing to it in speech. See
 `architecture/voice.md`.
 
-**Respect the turn's deadline.** A voice turn is bounded by an absolute deadline anchored at
-ingress. Long work belongs in something that outlives the turn, not in stretching the turn.
+**Respect the turn's deadline.** A voice turn carries an absolute deadline anchored at
+ingress, and the operations that wait — synchronous voice delegation above all — compute
+their budgets from it and refuse when too little remains; the transport's own coarser
+timeout is what ultimately ends a turn that ignores it. Long work belongs in something that
+outlives the turn, not in stretching the turn.
 
 **Read your messages before declaring success.** Where the driver exposes inbound state —
 the claude-code engagement path — a successful completion is refused while inbound messages

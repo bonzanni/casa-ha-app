@@ -19,7 +19,10 @@ lines from the same work can be tied together.
 
 **Two different ids can describe one request, and a caller can supply one of them.** The
 inbound header is validated to a strict shape. A correlation id supplied inside an invocation
-payload is *not* — it is deliberately preserved so an external system can thread its own
+payload is *not* validated — though note that on the HTTP invoke route the ingress
+*overwrites* the payload's id with the request's, so turn and access log share one id there;
+the payload id survives only for callers that build an invocation message off the HTTP
+path. Where it survives, it is deliberately preserved so an external system can thread its own
 identifier through, and only a missing or empty one is replaced. The consequence is worth
 knowing: the value bound for the turn can be arbitrary caller text, and it may differ from
 the one on the HTTP access line for the same request.

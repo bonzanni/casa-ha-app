@@ -84,8 +84,9 @@ wrong.
 **A new persona** must satisfy the structural contract — markers, sections, size — and be
 bound to a role. Getting it *accurate* is not something validation will help with.
 
-**A new role artifact** changes what the composed prompt can contain, and separately what the
-compilation must carry, since the two are not automatically in step.
+**A new role artifact** changes what the compilation must carry — and only that: the
+composed fallback prompt never reads role artifacts (see the mental model), so an artifact
+change lands solely on the compiled-bundle path.
 
 **Changing what the binding digest covers** changes what counts as drift, and therefore what
 forces a re-activation. Widening it is safe; narrowing it silently stops detecting something.

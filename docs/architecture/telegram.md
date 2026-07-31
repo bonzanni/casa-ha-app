@@ -41,7 +41,9 @@ ordering guarantee.
 **A tap is authorised against the request it answers.** Callback data is versioned and
 carries the namespace and request id; resolution is bound to the operator the request was
 posted for. A tap from someone else is refused. Note that the parser still accepts a legacy
-permission format, so keyboards posted before an upgrade remain actionable.
+permission format — but actionability is bounded by process memory: a callback resolves only
+while its request lives in the current process's broker, so buttons from before a restart
+are rejected as expired however well their format parses.
 
 **Two rendering paths count length differently, and only one of them counts what Telegram
 counts.** The rich path paginates against Telegram's limits, adjusting for UTF-16. The plain
