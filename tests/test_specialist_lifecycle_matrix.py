@@ -86,6 +86,7 @@ def test_fresh_install_with_no_required_config_goes_straight_to_active(tmp_path:
 def test_fresh_install_missing_config_is_pending_configuration_with_no_active_tuple(
     tmp_path: Path,
 ) -> None:
+    """Pins INV-SPEC-002. Red case demonstrated: treating unsatisfied config as satisfied fails this test."""
     root = tmp_path / "component-mtg-cfg"
     _write_component(root, slug="mtg")
     (root / "config-schema.json").write_text(
@@ -134,6 +135,7 @@ def test_fresh_install_missing_config_is_pending_configuration_with_no_active_tu
 
 
 def test_install_never_writes_cas_without_a_recorded_consent(tmp_path: Path) -> None:
+    """Pins INV-SPEC-001. Red case demonstrated: skipping the consent check before staging fails this test."""
     inspection, _acks = _approved_inspection(tmp_path)
     unacked = SpecialistInstallAckStore(path=tmp_path / "no-acks.json")
     with pytest.raises(SpecialistInstallError) as raised:

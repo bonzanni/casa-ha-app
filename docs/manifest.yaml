@@ -277,6 +277,31 @@
     INV-VOICE-005: [tests/test_voice_context_sanitize.py::test_the_delivery_offer_comes_only_from_the_frame, tests/test_voice_context_sanitize.py::test_route_capability_comes_only_from_server_connection]
     INV-VOICE-006: [tests/test_voice_delivery.py::test_an_unknown_modality_is_treated_as_no_endpoint, tests/test_voice_delivery.py::test_a_job_with_no_recorded_endpoint_is_never_offered]
 
+- doc: architecture/specialist-lifecycle.md
+  summary: Specialist install/upgrade/rollback — instance tuples, the content-addressed store, consent receipts, materialization, and the crash journal.
+  when_changing: specialist install identity, consent, materialization, or bundle-transaction recovery
+  covers:
+    - casa/rootfs/opt/casa/specialist_install.py::commit_specialist_install
+    - casa/rootfs/opt/casa/specialist_install.py::compute_install_root_digest
+    - casa/rootfs/opt/casa/specialist_materialize.py::current_specialist_roles_dir
+    - casa/rootfs/opt/casa/specialist_materialize.py::materialize_specialist_operational_files
+    - casa/rootfs/opt/casa/specialist_receipt.py::compute_receipt_digest
+    - casa/rootfs/opt/casa/specialist_bundle_journal.py::reconcile_boot
+    - casa/rootfs/opt/casa/specialist_registry.py::InstalledSpecialistIndex
+  tests:
+    - tests/test_specialist_install.py
+    - tests/test_specialist_lifecycle_matrix.py
+    - tests/test_specialist_materialize.py
+    - tests/test_specialist_bundle_journal.py
+  related: [architecture/agent-taxonomy.md, architecture/personality.md, architecture/plugins.md]
+  defines_invariants: [INV-SPEC-001, INV-SPEC-002, INV-SPEC-003, INV-SPEC-004, INV-SPEC-005]
+  invariant_tests:
+    INV-SPEC-001: [tests/test_specialist_lifecycle_matrix.py::test_install_never_writes_cas_without_a_recorded_consent]
+    INV-SPEC-002: [tests/test_specialist_lifecycle_matrix.py::test_fresh_install_missing_config_is_pending_configuration_with_no_active_tuple]
+    INV-SPEC-003: [tests/test_specialist_lifecycle_matrix.py::test_upgrade_failure_leaves_the_complete_active_tuple_running, tests/test_specialist_install.py::test_rollback_restores_the_prior_tuple]
+    INV-SPEC-004: [tests/test_specialist_materialize.py::test_materialize_operational_files_repeat_call_swaps_atomically_and_gcs_old_version]
+    INV-SPEC-005: [tests/test_specialist_consent_receipt.py::test_pin_inv_spec_005_tampered_receipt_loads_as_none]
+
 - doc: architecture/telegram.md
   summary: How Telegram messages become turns — transports, authentication, the per-topic causal log, keyboards, and rendering.
   when_changing: Telegram transport, callback namespaces, topic output ordering, or message rendering

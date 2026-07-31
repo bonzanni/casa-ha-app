@@ -166,21 +166,21 @@
 - item: casa/rootfs/opt/casa/speaker_provenance.py
   doc: architecture/memory.md
 - item: casa/rootfs/opt/casa/specialist_bundle_journal.py
-  excluded: "PHASE-3: architecture/specialist-lifecycle.md"
+  doc: architecture/specialist-lifecycle.md
 - item: casa/rootfs/opt/casa/specialist_component.py
-  excluded: "PHASE-3: architecture/specialist-lifecycle.md"
+  doc: architecture/specialist-lifecycle.md
 - item: casa/rootfs/opt/casa/specialist_export.py
-  excluded: "PHASE-3: architecture/specialist-lifecycle.md"
+  doc: architecture/specialist-lifecycle.md
 - item: casa/rootfs/opt/casa/specialist_install.py
-  excluded: "PHASE-3: architecture/specialist-lifecycle.md"
+  doc: architecture/specialist-lifecycle.md
 - item: casa/rootfs/opt/casa/specialist_install_consent.py
-  excluded: "PHASE-3: architecture/specialist-lifecycle.md"
+  doc: architecture/specialist-lifecycle.md
 - item: casa/rootfs/opt/casa/specialist_limits.py
-  excluded: "PHASE-3: architecture/specialist-lifecycle.md"
+  doc: architecture/specialist-lifecycle.md
 - item: casa/rootfs/opt/casa/specialist_materialize.py
-  excluded: "PHASE-3: architecture/specialist-lifecycle.md"
+  doc: architecture/specialist-lifecycle.md
 - item: casa/rootfs/opt/casa/specialist_receipt.py
-  excluded: "PHASE-3: architecture/specialist-lifecycle.md"
+  doc: architecture/specialist-lifecycle.md
 - item: casa/rootfs/opt/casa/specialist_registry.py
   doc: architecture/agent-taxonomy.md
 - item: casa/rootfs/opt/casa/supervisor_discovery.py
@@ -188,9 +188,9 @@
 - item: casa/rootfs/opt/casa/svc_casa_mcp.py
   doc: architecture/mcp-and-tools.md
 - item: casa/rootfs/opt/casa/system_requirements/orchestrator.py
-  excluded: "PHASE-3: architecture/specialist-lifecycle.md"
+  doc: architecture/specialist-lifecycle.md
 - item: casa/rootfs/opt/casa/system_requirements/tarball.py
-  excluded: "PHASE-3: architecture/specialist-lifecycle.md"
+  doc: architecture/specialist-lifecycle.md
 - item: casa/rootfs/opt/casa/text_util.py
   doc: architecture/telegram.md
 - item: casa/rootfs/opt/casa/tokens.py

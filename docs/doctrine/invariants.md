@@ -67,6 +67,11 @@ Every invariant is defined in exactly one file and referenced by id elsewhere.
 | `INV-PUB-001` | A fact belongs in this repository only if it is verifiable from the public commit alone — with no operator, no production system, and no private repository. | [`doctrine/publishing.md`](../doctrine/publishing.md) |
 | `INV-PUB-002` | Doctrine states the mechanism, never the incident. | [`doctrine/publishing.md`](../doctrine/publishing.md) |
 | `INV-PUB-003` | When a claim cannot be checked from the commit, stop and ask. Do not guess, and do not paraphrase around it. | [`doctrine/publishing.md`](../doctrine/publishing.md) |
+| `INV-SPEC-001` | No durable component-store write happens without a recorded consent for the exact install identity. | [`architecture/specialist-lifecycle.md`](../architecture/specialist-lifecycle.md) |
+| `INV-SPEC-002` | An install whose required configuration is missing becomes a pending instance — a desired tuple only, never an active one. | [`architecture/specialist-lifecycle.md`](../architecture/specialist-lifecycle.md) |
+| `INV-SPEC-003` | An upgrade failure retains the complete prior active tuple; a rollback restores it. | [`architecture/specialist-lifecycle.md`](../architecture/specialist-lifecycle.md) |
+| `INV-SPEC-004` | Operational materialization writes a fresh content directory and atomically retargets the slug symlink, with deletion containment-gated. | [`architecture/specialist-lifecycle.md`](../architecture/specialist-lifecycle.md) |
+| `INV-SPEC-005` | A receipt is integrity-checked on load — a malformed or tampered receipt reads as absent, never as attested. | [`architecture/specialist-lifecycle.md`](../architecture/specialist-lifecycle.md) |
 | `INV-STATE-001` | Only an explicit whitelist of the mapped configuration root is admitted into version control. | [`architecture/persistent-state.md`](../architecture/persistent-state.md) |
 | `INV-STATE-002` | A missing state file is a valid empty state for most loaders; a corrupt one is handled per-loader and inconsistently. | [`architecture/persistent-state.md`](../architecture/persistent-state.md) |
 | `INV-STATE-003` | Atomic replacement is applied by specific writers that opt into it, not by a storage layer. | [`architecture/persistent-state.md`](../architecture/persistent-state.md) |
