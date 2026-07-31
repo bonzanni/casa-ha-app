@@ -31,9 +31,14 @@ import yaml
 
 CODE_ROOT = "casa/rootfs/opt/casa"
 S6_ROOT = "casa/rootfs/etc/s6-overlay/s6-rc.d"
+SCRIPTS_ROOT = "casa/rootfs/etc/s6-overlay/scripts"
+SCHEMA_ROOT = "casa/rootfs/opt/casa/defaults/schema"
+DOCKERFILE = "casa/Dockerfile"
 CONFIG_YAML = "casa/config.yaml"
 TOOLS_MODULE = "tools.py"
-MIN_MODULE_LINES = 100
+# Every module counts — a size floor made ~40 small modules invisible to the
+# ledger, and small is not the same as uninteresting (webhook_auth.py is tiny).
+MIN_MODULE_LINES = 0
 
 # aiohttp registration spellings. ``add_route(method, path)`` carries its method as the
 # first argument; ``add_routes([web.get(path, h), …])`` nests them in a list.
@@ -151,6 +156,65 @@ def enumerate_routes(repo_root: Path) -> list[str]:
     return sorted(found)
 
 
+def enumerate_env_reads(repo_root: Path) -> list[str]:
+    """Every environment variable the code reads by literal name, by AST —
+    ``os.environ.get("X")``, ``os.environ["X"]`` and ``os.getenv("X")``. Env
+    vars are the classic undocumented surface: a tunable nobody wrote down."""
+    root = repo_root / CODE_ROOT
+    names: set[str] = set()
+    for path in sorted(root.rglob("*.py")):
+        try:
+            tree = ast.parse(path.read_text(errors="replace"))
+        except (OSError, SyntaxError, ValueError):
+            continue
+        for node in ast.walk(tree):
+            if isinstance(node, ast.Call) and isinstance(node.func, ast.Attribute):
+                func = node.func
+                base = func.value
+                is_env_get = (
+                    func.attr == "get"
+                    and isinstance(base, ast.Attribute) and base.attr == "environ"
+                )
+                is_getenv = (
+                    func.attr == "getenv"
+                    and isinstance(base, ast.Name) and base.id == "os"
+                )
+                if (
+                    (is_env_get or is_getenv)
+                    and node.args
+                    and isinstance(node.args[0], ast.Constant)
+                    and isinstance(node.args[0].value, str)
+                ):
+                    names.add(node.args[0].value)
+            elif isinstance(node, ast.Subscript):
+                value = node.value
+                if (
+                    isinstance(value, ast.Attribute) and value.attr == "environ"
+                    and isinstance(node.slice, ast.Constant)
+                    and isinstance(node.slice.value, str)
+                ):
+                    names.add(node.slice.value)
+    return [f"env:{name}" for name in sorted(names)]
+
+
+def enumerate_scripts(repo_root: Path) -> list[str]:
+    root = repo_root / SCRIPTS_ROOT
+    if not root.is_dir():
+        return []
+    return [f"script:{p.name}" for p in sorted(root.iterdir()) if p.is_file()]
+
+
+def enumerate_schemas(repo_root: Path) -> list[str]:
+    root = repo_root / SCHEMA_ROOT
+    if not root.is_dir():
+        return []
+    return [f"schema:{p.name}" for p in sorted(root.iterdir()) if p.is_file()]
+
+
+def enumerate_dockerfile(repo_root: Path) -> list[str]:
+    return [DOCKERFILE] if (repo_root / DOCKERFILE).is_file() else []
+
+
 def enumerate_items(repo_root: Path) -> list[str]:
     return (
         enumerate_modules(repo_root)
@@ -158,6 +222,10 @@ def enumerate_items(repo_root: Path) -> list[str]:
         + enumerate_s6(repo_root)
         + enumerate_tools(repo_root)
         + enumerate_routes(repo_root)
+        + enumerate_env_reads(repo_root)
+        + enumerate_scripts(repo_root)
+        + enumerate_schemas(repo_root)
+        + enumerate_dockerfile(repo_root)
     )
 
 

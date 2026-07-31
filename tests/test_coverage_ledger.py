@@ -81,14 +81,44 @@ def _full_ledger_for(root: Path) -> str:
 
 def test_enumeration_covers_every_surface_kind(tmp_path):
     items = coverage_ledger.enumerate_items(_repo(tmp_path))
-    assert "casa/rootfs/opt/casa/big.py" in items          # >=100-line module
-    assert "casa/rootfs/opt/casa/small.py" not in items    # under the floor
+    assert "casa/rootfs/opt/casa/big.py" in items          # every module —
+    assert "casa/rootfs/opt/casa/small.py" in items        # no size floor
     assert "option:log_level" in items                     # options: key
     assert "option:new_key" in items                       # schema:-only key still counts
     assert "s6:svc-casa" in items and "s6:init-setup" in items
     assert "tool:send_message" in items and "tool:react" in items
     assert "route:casa/rootfs/opt/casa/routes_mod.py:GET:/healthz" in items
     assert "route:casa/rootfs/opt/casa/routes_mod.py:POST:/invoke/{agent}" in items
+
+
+def test_enumeration_covers_env_scripts_schemas_and_dockerfile(tmp_path):
+    """Env reads are AST-enumerated (a commented read does not count), boot
+    scripts, schema files and the Dockerfile are surfaces too."""
+    root = _repo(tmp_path)
+    code = root / "casa" / "rootfs" / "opt" / "casa"
+    (code / "envuser.py").write_text(
+        "import os\n"
+        'A = os.environ.get("CASA_PROBE_A")\n'
+        'B = os.environ["CASA_PROBE_B"]\n'
+        'C = os.getenv("CASA_PROBE_C")\n'
+        '# os.environ.get("CASA_PROBE_COMMENTED")\n'
+    )
+    scripts = root / "casa" / "rootfs" / "etc" / "s6-overlay" / "scripts"
+    scripts.mkdir(parents=True)
+    (scripts / "setup-probe.sh").write_text("#!/bin/sh\n")
+    schema = code / "defaults" / "schema"
+    schema.mkdir(parents=True)
+    (schema / "probe.v1.json").write_text("{}")
+    (root / "casa" / "Dockerfile").write_text("FROM scratch\n")
+
+    items = coverage_ledger.enumerate_items(root)
+    assert "env:CASA_PROBE_A" in items
+    assert "env:CASA_PROBE_B" in items
+    assert "env:CASA_PROBE_C" in items
+    assert "env:CASA_PROBE_COMMENTED" not in items
+    assert "script:setup-probe.sh" in items
+    assert "schema:probe.v1.json" in items
+    assert "casa/Dockerfile" in items
 
 
 def test_a_dynamic_route_path_is_enumerated_not_skipped(tmp_path):
