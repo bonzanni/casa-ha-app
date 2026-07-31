@@ -14,10 +14,17 @@ trusted for *who it claimed to be* rather than *who it proved to be*:
   Previously, any in-container process that knew another engagement's id
   (ids appear in logs and configuration) could call privileged tools as that
   engagement — including configurator-only config commits. A known id with a
-  missing or wrong credential is now rejected outright. In-flight
+  missing or wrong credential is now rejected outright, the workspace
+  inspection tool refuses to hand out the credential file, and both files
+  that store a credential are no longer world-readable. In-flight
   engagements survive the upgrade: the credential is minted for existing
-  records at boot and their workspaces are refreshed before the CLI
-  respawns.
+  records at boot, their workspaces are refreshed, and an engagement whose
+  credential changed is restarted so it picks the new one up.
+  Scope, stated plainly: this raises the bar from "know an id" to "hold a
+  secret". It is not isolation between engagements — they all run as root in
+  one container, so a shell-capable engagement can still read a sibling's
+  credential file (#365), and hook resolution still identifies an engagement
+  by working directory (#366).
 - **Telegram senders are attributed individually, and only the operator
   reads private memory** (#336). Previously every accepted Telegram sender —
   including strangers, when `telegram_chat_id` is left empty ("accept all

@@ -77,6 +77,16 @@ _NON_PERSISTABLE_ORIGIN_KEYS = frozenset({
 })
 
 
+def _valid_token_or_blank(value: Any) -> str:
+    """#335: a persisted ``auth_token`` is usable only as a non-empty ASCII
+    string — anything else (a JSON number, null, a non-ASCII string) becomes
+    ``""`` so ``load()``'s backfill mints a fresh one. Keeping an unusable
+    value would leave the record permanently unbindable."""
+    if isinstance(value, str) and value and value.isascii():
+        return value
+    return ""
+
+
 def _persistable_origin(origin: dict[str, Any]) -> dict[str, Any]:
     """A JSON-safe copy of *origin* for tombstone persistence: drops the known
     live/non-serializable ContextVar-carried keys (see
@@ -331,7 +341,11 @@ class EngagementRegistry:
                     sdk_session_id=row.get("sdk_session_id"),
                     origin=dict(row.get("origin") or {}),
                     task=row.get("task", ""),
-                    auth_token=row.get("auth_token") or "",
+                    # #335: a corrupt/hand-edited row can carry a non-string
+                    # (or non-ASCII) token; normalize to "" so the backfill
+                    # below re-mints a usable one rather than leaving a value
+                    # every auth check must refuse (Terra, review r1).
+                    auth_token=_valid_token_or_blank(row.get("auth_token")),
                     pinned_message_id=row.get("pinned_message_id"),
                     progress_message_id=row.get("progress_message_id"),
                     current_state_emoji=row.get("current_state_emoji"),
@@ -508,7 +522,14 @@ class EngagementRegistry:
     def _write_tombstone(self, snapshot: list[dict[str, Any]]) -> None:
         # Atomic (temp-file + fsync + os.replace): a crash mid-write must not
         # lose all in-flight engagement state to a truncated tombstone (M15).
-        atomic_write_json(self._tombstone_path, snapshot, indent=2)
+        # #335: 0600 — every row carries that engagement's ``auth_token``, so
+        # this file is secret-bearing and must not stay world-readable. This
+        # is defense in depth, NOT isolation: engagement subprocesses run as
+        # root in this container and can still read it. Passing the mode
+        # explicitly also MIGRATES a pre-#335 0644 file on the first write
+        # after upgrade.
+        atomic_write_json(
+            self._tombstone_path, snapshot, indent=2, mode=0o600)
 
     # -- Mutators ---------------------------------------------------------
 

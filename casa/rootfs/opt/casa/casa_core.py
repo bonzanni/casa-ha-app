@@ -444,7 +444,7 @@ async def replay_undergoing_engagements(
     from drivers import s6_rc
     from drivers.workspace import (
         refresh_claude_md, render_log_run_script, render_run_script,
-        write_workspace_mcp_json,
+        workspace_mcp_token, write_workspace_mcp_json,
     )
 
     undergoing = [
@@ -575,33 +575,6 @@ async def replay_undergoing_engagements(
         # compile/start below.
         for rec in undergoing:
             try:
-                # #335: re-write the workspace .mcp.json from the RECORD's
-                # auth token before anything else — placed, like the CLAUDE.md
-                # refresh below, BEFORE the service_pair_complete fast-path
-                # continue (an ordinary restart takes that continue). This is
-                # what keeps a pre-upgrade workspace resumable: load()
-                # backfilled a token onto its record, and the respawned CLI
-                # reads the refreshed credential from disk. Fail-closed on a
-                # write failure — a CLI running with a stale/absent token
-                # would have every tool call rejected (a zombie engagement).
-                _ws_dir = os.path.join(engagements_root, rec.id)
-                if os.path.isdir(_ws_dir):
-                    try:
-                        write_workspace_mcp_json(
-                            _ws_dir,
-                            engagement_id=rec.id,
-                            engagement_auth_token=rec.auth_token,
-                            casa_framework_mcp_url=getattr(
-                                driver, "_casa_framework_mcp_url",
-                                "http://127.0.0.1:8100/mcp/casa-framework",
-                            ),
-                        )
-                    except Exception as exc:  # noqa: BLE001 — fail-closed
-                        await _refuse_brief_resume(
-                            rec, f".mcp.json refresh failed: {exc}",
-                        )
-                        continue
-
                 # W3 (r8-B5/r9-B5): re-render the workspace CLAUDE.md from the
                 # VERBATIM origin["brief"] for EVERY resumed brief-bearing
                 # engagement — placed at the TOP of the loop, BEFORE the
@@ -635,6 +608,67 @@ async def replay_undergoing_engagements(
                             rec, f"CLAUDE.md refresh failed: {exc}",
                         )
                         continue
+
+                # #335: refresh the workspace credential from the RECORD's
+                # auth token. Placed, like the CLAUDE.md refresh above, BEFORE
+                # the service_pair_complete fast-path continue — an ordinary
+                # restart takes that continue, so a refresh after it would
+                # never run — but AFTER the refusal checks, so a record we are
+                # about to tear down is not cycled first. This is what keeps a
+                # pre-upgrade workspace resumable: load() backfilled a token
+                # onto its record, and the CLI reads the refreshed credential
+                # from disk when it respawns.
+                #
+                # Only rewrite when the credential actually CHANGED, and then
+                # force the engagement's CLI to respawn (Terra + Sol, review
+                # r1): engagement services are supervised independently of
+                # casa-main, so one can already be running — with the OLD
+                # ``.mcp.json`` cached at its spawn — while this boot mints a
+                # token for it. ``start_service`` below is idempotent and would
+                # NOT respawn it, leaving an engagement whose every call
+                # authenticates against a credential it does not have. Bring it
+                # down here, once the new file is durable, so that start brings
+                # it back up reading the new one. The unchanged case (every
+                # ordinary restart) writes nothing and cycles nothing.
+                _ws_dir = os.path.join(engagements_root, rec.id)
+                if (os.path.isdir(_ws_dir)
+                        and workspace_mcp_token(_ws_dir) != rec.auth_token):
+                    try:
+                        write_workspace_mcp_json(
+                            _ws_dir,
+                            engagement_id=rec.id,
+                            engagement_auth_token=rec.auth_token,
+                            casa_framework_mcp_url=getattr(
+                                driver, "_casa_framework_mcp_url",
+                                "http://127.0.0.1:8100/mcp/casa-framework",
+                            ),
+                        )
+                    except Exception as exc:  # noqa: BLE001 — fail-closed
+                        await _refuse_brief_resume(
+                            rec, f".mcp.json refresh failed: {exc}",
+                            kind="refuse_credential_refresh_failed",
+                        )
+                        continue
+                    logger.info(
+                        "boot replay: engagement %s workspace credential "
+                        "refreshed — cycling its service so the CLI reloads",
+                        rec.id[:8],
+                    )
+                    try:
+                        if await s6_rc.ensure_service_down(
+                                engagement_id=rec.id) is False:
+                            logger.warning(
+                                "boot replay: engagement %s could not be "
+                                "confirmed down after a credential refresh — "
+                                "a surviving CLI still holds the old token "
+                                "and its calls will be rejected until it is "
+                                "restarted", rec.id[:8],
+                            )
+                    except Exception:  # noqa: BLE001 — start below still runs
+                        logger.warning(
+                            "boot replay: service cycle after credential "
+                            "refresh failed for %s", rec.id[:8], exc_info=True,
+                        )
 
                 if s6_rc.service_pair_complete(
                     svc_root=s6_rc.ENGAGEMENT_SOURCES_ROOT,

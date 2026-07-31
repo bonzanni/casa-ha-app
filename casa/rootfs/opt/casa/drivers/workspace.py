@@ -13,6 +13,7 @@ from pathlib import Path
 
 import yaml
 
+from atomic_io import atomic_write_json
 from drivers.hook_bridge import translate_hooks_to_settings
 
 logger = logging.getLogger(__name__)
@@ -198,6 +199,27 @@ def render_log_run_script(*, engagement_id: str) -> str:
     )
 
 
+def workspace_mcp_token(ws_dir: str) -> str | None:
+    """The engagement token currently baked into ``<ws>/.mcp.json``.
+
+    ``None`` when the file is absent, unreadable, malformed, or predates
+    #335 (no token header). Boot replay compares this against the record's
+    token to decide whether the workspace credential actually CHANGED — a
+    running CLI caches ``.mcp.json`` at spawn, so a changed credential means
+    that CLI must be respawned or every one of its calls is rejected.
+    """
+    try:
+        cfg = json.loads(
+            (Path(ws_dir) / ".mcp.json").read_text(encoding="utf-8"))
+        token = (
+            cfg["mcpServers"]["casa-framework"]["headers"]
+            ["X-Casa-Engagement-Token"]
+        )
+    except (OSError, ValueError, KeyError, TypeError):
+        return None
+    return token if isinstance(token, str) and token else None
+
+
 def write_workspace_mcp_json(
     ws_dir: str,
     *,
@@ -238,8 +260,15 @@ def write_workspace_mcp_json(
             },
         },
     }}
-    (Path(ws_dir) / ".mcp.json").write_text(
-        json.dumps(mcp_config, indent=2), encoding="utf-8")
+    # 0600 — this file carries the engagement's credential. Written through
+    # the atomic helper with an explicit mode so the secret is never briefly
+    # world-readable AND so a pre-#335 0644 file is migrated on the boot-replay
+    # rewrite. Defense in depth only: engagement subprocesses run as root in
+    # this container and can still read a sibling's file (Terra, review r1) —
+    # real containment needs per-engagement process identity, which this
+    # release does not attempt.
+    atomic_write_json(
+        str(Path(ws_dir) / ".mcp.json"), mcp_config, indent=2, mode=0o600)
 
 
 async def provision_workspace(

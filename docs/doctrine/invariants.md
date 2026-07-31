@@ -51,6 +51,7 @@ Every invariant is defined in exactly one file and referenced by id elsewhere.
 | `INV-MCP-002` | The internal endpoint is reachable only from inside the container, over a Unix socket with restricted permissions. | [`architecture/mcp-and-tools.md`](../architecture/mcp-and-tools.md) |
 | `INV-MCP-003` | The two surfaces expose different tool sets — role-filtered on the SDK side, the full static set over HTTP. | [`architecture/mcp-and-tools.md`](../architecture/mcp-and-tools.md) |
 | `INV-MCP-004` | An engagement-id claim binds an engagement record only together with that record's per-engagement auth token; a known id with a missing or mismatched token is rejected without invoking the tool. | [`architecture/mcp-and-tools.md`](../architecture/mcp-and-tools.md) |
+| `INV-MCP-005` | The workspace-inspection tool never returns the contents of a credential-bearing workspace file. | [`architecture/mcp-and-tools.md`](../architecture/mcp-and-tools.md) |
 | `INV-MEM-001` | Recall reports unavailability by raising; it never represents a failure as a successful empty result. | [`architecture/memory.md`](../architecture/memory.md) |
 | `INV-MEM-002` | A typed hit is readable only when its tags carry exactly one recognised tier at or below the caller's clearance; if every hit is dropped, the result is unavailable rather than empty. | [`architecture/memory.md`](../architecture/memory.md) |
 | `INV-MEM-003` | An unrecognised channel reads at the least-sensitive tier. | [`architecture/memory.md`](../architecture/memory.md) |

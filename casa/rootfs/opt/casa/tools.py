@@ -6671,6 +6671,16 @@ async def delete_engagement_workspace(args: dict) -> dict:
 _PEEK_MAX_DEFAULT = 65_536
 _PEEK_MAX_HARD = 524_288
 
+# #335 (Sol, review r1): workspace files that carry an engagement's
+# credential are NEVER returned through the inspection tool. Without this the
+# whole engagement-token boundary is decorative: any caller — including one
+# with no engagement identity at all, since an unbound tools/call dispatches
+# normally — could read a victim's ``.mcp.json`` and then authenticate as
+# that engagement. Matched on basename anywhere in the workspace, so a copy
+# in a subdirectory is refused too. The tree listing still shows the name;
+# only the CONTENTS are withheld.
+_PEEK_CREDENTIAL_BASENAMES = frozenset({".mcp.json"})
+
 
 @tool(
     "peek_engagement_workspace",
@@ -6723,6 +6733,17 @@ async def peek_engagement_workspace(args: dict) -> dict:
     if not full.is_file():
         return _result({"status": "error", "kind": "not_a_file",
                         "message": f"{path_arg!r} is not a regular file"})
+
+    # #335: refuse credential-bearing files outright (checked on the RESOLVED
+    # path, so a symlink or alternate spelling cannot smuggle one out).
+    if full.name in _PEEK_CREDENTIAL_BASENAMES:
+        return _result({
+            "status": "error", "kind": "credential_file",
+            "message": (
+                f"{full.name} carries this engagement's authentication "
+                "credential and is never readable through this tool"
+            ),
+        })
 
     max_bytes = int(args.get("max_bytes") or _PEEK_MAX_DEFAULT)
     if max_bytes > _PEEK_MAX_HARD:

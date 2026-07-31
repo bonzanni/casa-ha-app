@@ -1,5 +1,4 @@
-# Publication allowlist: docs/ publishes only git-tracked entries listed here.
-# `when_changing` = the TASK at hand. Verify: python -m scripts.verify_docs .
+# Publication allowlist (git-tracked only). Verify: python -m scripts.verify_docs .
 
 - doc: manifest.yaml
   kind: meta
@@ -450,12 +449,13 @@
     - tests/test_svc_casa_mcp.py
     - tests/test_mcp_envelope.py
   related: [architecture/plugins.md, architecture/agent-taxonomy.md, architecture/http-surface.md]
-  defines_invariants: [INV-MCP-001, INV-MCP-002, INV-MCP-003, INV-MCP-004]
+  defines_invariants: [INV-MCP-001, INV-MCP-002, INV-MCP-003, INV-MCP-004, INV-MCP-005]
   invariant_tests:
     INV-MCP-001: [tests/test_pin_g4_invariants.py::test_pin_inv_mcp_001_internal_dispatch_ignores_agent_allowlist]
     INV-MCP-002: [tests/test_unix_socket_runner.py::test_unix_runner_creates_socket_with_mode_0600]
     INV-MCP-003: [tests/test_role_scoped_mcp.py::test_casa_framework_factory_exposes_only_granted_tools, tests/test_svc_casa_mcp.py::test_svc_tools_list_uses_static_snapshot]
     INV-MCP-004: [tests/test_engagement_auth_token.py::test_forged_id_without_token_is_rejected_and_tool_never_runs, tests/test_engagement_auth_token.py::test_terminal_binding_allowlist_still_requires_the_token]
+    INV-MCP-005: [tests/test_engagement_auth_token.py::test_peek_refuses_to_return_mcp_json_contents]
 
 - doc: architecture/personality.md
   summary: What an agent is versus how it presents — role artifacts, personas, bindings, and which prompt is actually served.

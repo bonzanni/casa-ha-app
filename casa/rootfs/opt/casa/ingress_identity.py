@@ -92,8 +92,14 @@ _TELEGRAM_PEER_PREFIX = "telegram:"
 
 # Read-clearance for a non-operator Telegram sender. Fail-closed: accept-all
 # mode is reachable by anyone who finds the bot, so an unrecognized sender
-# reads at the least-sensitive tier only.
-_TELEGRAM_NON_OPERATOR_CLEARANCE = "public"
+# reads at the least-sensitive tier only. Exported (with the operator's own
+# clearance) because a turn can also begin at a BUTTON TAP, which does not
+# pass through :func:`ingress_identity` — the channel stamps the same
+# per-sender clearance there, and both entry points must read it from here
+# rather than each spelling the tier out.
+TELEGRAM_NON_OPERATOR_CLEARANCE = "public"
+TELEGRAM_OPERATOR_CLEARANCE = "private"
+_TELEGRAM_NON_OPERATOR_CLEARANCE = TELEGRAM_NON_OPERATOR_CLEARANCE
 
 
 class IngressIdentityError(RuntimeError):

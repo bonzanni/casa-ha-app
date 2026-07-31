@@ -117,8 +117,12 @@ def clearance_for_origin(
 # that a single-word answer still legitimately carries (a "Tier:" label,
 # punctuation, markdown emphasis, whitespace) is tolerated; ANY other word in
 # the reply makes it ambiguous, and ambiguity must fall to DEFAULT_TIER.
+# The optional "Tier" label must be followed by a REAL separator (Sol, review
+# r1): with a zero-width one, "tierpublic" parsed as public — a malformed
+# reply silently classified at the least-sensitive tier instead of taking the
+# private default.
 _TIER_REPLY_RE = re.compile(
-    r"^[\W_]*(?:tier[\W_]*)?(private|family|friends|public)[\W_]*$",
+    r"^[\W_]*(?:tier[\W_]+)?(private|family|friends|public)[\W_]*$",
     re.IGNORECASE,
 )
 

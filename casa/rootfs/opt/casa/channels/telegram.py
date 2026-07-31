@@ -37,7 +37,11 @@ from telegram.ext import (
 )
 
 from bus import BusMessage, MessageBus, MessageType
-from ingress_identity import ingress_identity
+from ingress_identity import (
+    TELEGRAM_NON_OPERATOR_CLEARANCE,
+    TELEGRAM_OPERATOR_CLEARANCE,
+    ingress_identity,
+)
 from channels import Channel
 # v0.79.0 (§2 Primitive A): the per-topic OUTPUT SEQUENCER + relay-mediated
 # discrete-posting intent registry. Implemented in the sibling module and
@@ -1153,8 +1157,8 @@ class TelegramChannel(Channel):
                 "rate-limit reply to chat_id=%s failed: %s", chat_id, exc,
             )
 
-    def _sender_is_operator(self, user) -> bool:
-        """#336: is this Telegram sender the configured operator?
+    def _user_id_is_operator(self, user_id) -> bool:
+        """#336: does this Telegram user id belong to the configured operator?
 
         The only operator identity Casa is configured with is
         ``telegram_chat_id`` — in the standard DM setup the chat id IS the
@@ -1167,9 +1171,25 @@ class TelegramChannel(Channel):
         operator attribution). A group-id configuration (negative id) can
         never match a user id, which is correct: group members are not the
         operator.
+
+        The single home of this rule: both the message ingress and the
+        button-tap continuation resolve identity through it, so the two
+        entry points into a turn can never disagree about who the operator
+        is.
         """
         configured = str(self.chat_id or "").strip()
-        return bool(configured) and user is not None and str(user.id) == configured
+        return bool(configured) and user_id is not None and str(user_id) == configured
+
+    def _sender_is_operator(self, user) -> bool:
+        """``_user_id_is_operator`` for a Telegram ``User`` object."""
+        return user is not None and self._user_id_is_operator(user.id)
+
+    def _origin_clearance_for_user_id(self, user_id) -> str:
+        """The per-sender read clearance stamped on a telegram turn (#336)."""
+        return (
+            TELEGRAM_OPERATOR_CLEARANCE if self._user_id_is_operator(user_id)
+            else TELEGRAM_NON_OPERATOR_CLEARANCE
+        )
 
     async def _handle(
         self,
@@ -1278,11 +1298,6 @@ class TelegramChannel(Channel):
         inherited = cid_var.get()
         cid = inherited if inherited != "-" else new_cid()
 
-        # r1-1: start this organic turn's typing lease keyed by its cid — the
-        # SAME cid placed in the delivery context below, so send()/streaming
-        # first-token/turn_finished release exactly this lease.
-        self._start_typing(chat_id, cid)
-
         # Task 9: server-created trusted ingress identity (never decoded
         # from payload) — the sole source Agent._process reads to persist
         # this turn's user provenance for the session-resume identity gate.
@@ -1293,12 +1308,21 @@ class TelegramChannel(Channel):
         # channel post, only reachable in accept-all mode) raises rather
         # than borrowing the operator's identity, and that failure kills
         # the turn loudly per #203.
+        #
+        # Resolved BEFORE the typing lease starts (Terra, review r1): that
+        # raise produces no bus turn, so a lease taken first would never be
+        # released and the chat would show "typing…" forever.
         trusted_origin = ingress_identity(
             "telegram",
             sender_id=str(user.id) if user is not None else None,
             sender_display_name=user_name if user is not None else None,
             sender_is_operator=self._sender_is_operator(user),
         )
+
+        # r1-1: start this organic turn's typing lease keyed by its cid — the
+        # SAME cid placed in the delivery context below, so send()/streaming
+        # first-token/turn_finished release exactly this lease.
+        self._start_typing(chat_id, cid)
 
         # This context dict is entirely Casa-owned (built from the Telegram
         # `Update`, not caller-supplied) — routed through
@@ -2892,6 +2916,14 @@ class TelegramChannel(Channel):
         # releases it. Compute the cid ONCE and reuse it across retries — a
         # per-attempt new_cid() would desync the lease from the accepted turn.
         cid = new_cid()
+        # #336: a tap is a TURN, and it must run at the tapper's clearance.
+        # Without these markers the continuation fell through to the
+        # channel-wide telegram clearance (private) — so a non-operator whose
+        # question produced buttons got private recall on the follow-up turn,
+        # re-opening through the button path exactly what the per-sender
+        # identity closed on the message path. The broker already pins a tap
+        # to the user the request was bound to, which is who ``user_id`` is.
+        _clearance = self._origin_clearance_for_user_id(user_id)
         for attempt in range(3):
             msg = BusMessage(
                 type=MessageType.CHANNEL_IN,
@@ -2905,6 +2937,8 @@ class TelegramChannel(Channel):
                     "cid": cid,
                     "synthetic": "button",
                     "button_answer": request_id,
+                    "_origin_route": "telegram",
+                    "_origin_clearance": _clearance,
                 },
             )
             try:

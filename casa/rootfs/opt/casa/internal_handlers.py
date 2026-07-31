@@ -58,9 +58,17 @@ def engagement_auth_ok(rec: Any, presented: Any) -> bool:
     ``load()`` backfills — but reachable with a hand-built record) matches
     nothing, and a missing/non-string presented token matches nothing.
     Constant-time compare so the token is not oracle-recoverable.
+
+    Both sides are type- and ASCII-checked BEFORE the compare: a corrupt
+    tombstone row (``"auth_token": 123``) or a non-ASCII value would make
+    ``hmac.compare_digest`` raise ``TypeError``, turning a fail-closed
+    rejection into a 500 — an authentication check must refuse, never crash
+    (Terra, review r1).
     """
     expected = getattr(rec, "auth_token", "") or ""
-    if not expected or not isinstance(presented, str) or not presented:
+    if not isinstance(expected, str) or not expected.isascii() or not expected:
+        return False
+    if not isinstance(presented, str) or not presented.isascii() or not presented:
         return False
     return hmac.compare_digest(expected, presented)
 

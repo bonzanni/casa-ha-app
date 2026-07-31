@@ -122,6 +122,16 @@ def test_parse_tier_rejects_a_tier_word_inside_a_chatty_reply():
     assert parse_tier("family\npublic") is None
 
 
+def test_parse_tier_requires_a_real_separator_after_the_tier_label():
+    # Sol r1: the label's separator class allowed ZERO characters, so the
+    # non-word "tierpublic" parsed as public — a malformed reply landing at
+    # the LEAST sensitive tier is exactly the leak the default prevents.
+    assert parse_tier("tierpublic") is None
+    assert parse_tier("tierfamily") is None
+    assert parse_tier("Tier: public") == "public"
+    assert parse_tier("tier family") == "family"
+
+
 def test_parse_tier_accepts_decorated_single_token_replies():
     # The single-word contract still tolerates minimal decoration: a
     # "Tier:" label, punctuation, markdown emphasis, surrounding whitespace.

@@ -329,6 +329,93 @@ class TestWorkspaceCredential:
         assert ch["env"]["CASA_ENGAGEMENT_TOKEN"] == "tok-ws"
         assert ch["env"]["CASA_INTERNAL_SOCKET"] == "/run/casa/internal.sock"
 
+    def test_credential_files_are_not_world_readable(self, tmp_path):
+        # Terra r1: both files that carry a token were written 0644. Defense
+        # in depth (engagements run as root and can still read a sibling's
+        # file) — but a secret should not be world-readable regardless.
+        import os
+        import stat
+        from drivers.workspace import write_workspace_mcp_json
+        write_workspace_mcp_json(
+            str(tmp_path), engagement_id="e" * 32,
+            engagement_auth_token="tok-ws",
+            casa_framework_mcp_url="http://127.0.0.1:8100/mcp/casa-framework",
+        )
+        mode = stat.S_IMODE(os.stat(tmp_path / ".mcp.json").st_mode)
+        assert mode == 0o600, f".mcp.json is {oct(mode)}"
+
+    async def test_tombstone_is_not_world_readable(self, tmp_path):
+        import os
+        import stat
+        from engagement_registry import EngagementRegistry
+        path = str(tmp_path / "engagements.json")
+        registry = EngagementRegistry(tombstone_path=path, bus=None)
+        await registry.create(
+            kind="executor", role_or_type="t", driver="claude_code",
+            task="x", origin={}, topic_id=None)
+        assert stat.S_IMODE(os.stat(path).st_mode) == 0o600
+
+    def test_reads_back_the_token_it_wrote(self, tmp_path):
+        from drivers.workspace import (
+            workspace_mcp_token, write_workspace_mcp_json,
+        )
+        assert workspace_mcp_token(str(tmp_path)) is None  # no file yet
+        write_workspace_mcp_json(
+            str(tmp_path), engagement_id="e" * 32,
+            engagement_auth_token="tok-ws",
+            casa_framework_mcp_url="http://127.0.0.1:8100/mcp/casa-framework",
+        )
+        assert workspace_mcp_token(str(tmp_path)) == "tok-ws"
+
+    def test_pre_335_workspace_reports_no_token(self, tmp_path):
+        # The migration trigger: an old workspace has the id header only, so
+        # boot replay must see a MISMATCH and refresh + cycle the service.
+        (tmp_path / ".mcp.json").write_text(json.dumps({"mcpServers": {
+            "casa-framework": {"headers": {"X-Casa-Engagement-Id": "e" * 32}},
+        }}), encoding="utf-8")
+        from drivers.workspace import workspace_mcp_token
+        assert workspace_mcp_token(str(tmp_path)) is None
+
+    def test_malformed_workspace_config_reports_no_token(self, tmp_path):
+        (tmp_path / ".mcp.json").write_text("{not json", encoding="utf-8")
+        from drivers.workspace import workspace_mcp_token
+        assert workspace_mcp_token(str(tmp_path)) is None
+
+
+class TestCredentialIsNotReadableThroughTheToolSurface:
+    """Sol r1: the token boundary is decorative if any caller can simply READ
+    a victim's .mcp.json through the workspace-inspection tool — it needs no
+    engagement identity at all, since an unbound tools/call dispatches
+    normally."""
+
+    async def test_peek_refuses_to_return_mcp_json_contents(self, tmp_path, monkeypatch):
+        import tools as tools_mod
+        eng = "f" * 32
+        ws = tmp_path / eng
+        ws.mkdir()
+        from drivers.workspace import write_workspace_mcp_json
+        write_workspace_mcp_json(
+            str(ws), engagement_id=eng, engagement_auth_token="tok-victim",
+            casa_framework_mcp_url="http://127.0.0.1:8100/mcp/casa-framework",
+        )
+        monkeypatch.setattr(tools_mod, "_ENGAGEMENTS_ROOT", str(tmp_path))
+        out = await tools_mod.peek_engagement_workspace.handler(
+            {"engagement_id": eng, "path": ".mcp.json"})
+        text = out["content"][0]["text"]
+        assert "tok-victim" not in text
+        assert "credential_file" in text
+
+    async def test_peek_still_reads_ordinary_workspace_files(self, tmp_path, monkeypatch):
+        import tools as tools_mod
+        eng = "f" * 32
+        ws = tmp_path / eng
+        ws.mkdir()
+        (ws / "NOTES.md").write_text("ordinary content", encoding="utf-8")
+        monkeypatch.setattr(tools_mod, "_ENGAGEMENTS_ROOT", str(tmp_path))
+        out = await tools_mod.peek_engagement_workspace.handler(
+            {"engagement_id": eng, "path": "NOTES.md"})
+        assert "ordinary content" in out["content"][0]["text"]
+
 
 # ---------------------------------------------------------------------------
 # /internal/channel/* — sibling arms of the same id-claim authority
