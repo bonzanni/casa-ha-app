@@ -202,7 +202,7 @@ def _body(resp: web.Response) -> dict:
     return json.loads(resp.text)
 
 
-async def _await_registered(broker, key, *, max_turns: int = 1000) -> None:
+async def _await_registered(broker, key, *, timeout_s: float = 5.0) -> None:
     """Yield the event loop until the ask task has REGISTERED its waiter.
 
     Replaces a fixed ``asyncio.sleep(0.02)``. The tap below can only be
@@ -213,10 +213,11 @@ async def _await_registered(broker, key, *, max_turns: int = 1000) -> None:
     the actual precondition is correct at any speed. (Same flake class as the
     v0.124.1 engagement ask-gate deflake.)
     """
-    for _ in range(max_turns):
+    deadline = asyncio.get_running_loop().time() + timeout_s
+    while asyncio.get_running_loop().time() < deadline:
         if key in broker._live:
             return
-        await asyncio.sleep(0)
+        await asyncio.sleep(0.001)
     raise AssertionError(f"ask never registered {key!r} with the broker")
 
 
