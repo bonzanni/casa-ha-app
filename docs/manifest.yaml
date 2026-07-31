@@ -331,7 +331,7 @@
   summary: The mutation interface — the one tool registry, result envelopes, and which failures roll back versus report.
   when_changing: adding a tool, a tool's result contract, plugin mutation sequencing, or completion semantics
   covers:
-    - casa/rootfs/opt/casa/tools.py::CASA_TOOLS
+    - casa/rootfs/opt/casa/tools.py::create_casa_tools
     - casa/rootfs/opt/casa/tools.py::_result
     - casa/rootfs/opt/casa/tools.py::select_casa_tools
     - casa/rootfs/opt/casa/tools.py::emit_completion
