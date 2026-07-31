@@ -282,7 +282,10 @@ async def test_claim_does_not_resolve_until_commit_and_stale_after_retire(monkey
     """r5-B1: claim reserves the LIVE winner WITHOUT resolving the future; only
     commit resolves it. A second claim while claimed → 'duplicate'. A claim on a
     retired (timed-out) request → 'stale' with NO effect (so the callback never
-    advances interaction_state on a late tap)."""
+    advances interaction_state on a late tap).
+
+    Pins INV-TG-003. Red case demonstrated: removing claim()'s duplicate guard fails this test.
+    """
     monkeypatch.setattr(verdict_broker, "_RETIRE_S", 5)
     b = VerdictBroker()
     req, _ = b.register(namespace="engagement_ask", scope="e1",

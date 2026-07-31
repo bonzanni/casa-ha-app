@@ -327,7 +327,11 @@ async def test_recall_wellformed_empty_is_zero_hits() -> None:
 ])
 async def test_recall_unrenderable_results_are_unavailable_not_zero_hits(results) -> None:
     """Non-empty results that render to nothing are NOT a genuine zero-hit —
-    hits exist but cannot be read, so the recall is UNAVAILABLE."""
+    hits exist but cannot be read, so the recall is UNAVAILABLE.
+
+    Pins INV-MEM-001. Red case demonstrated: replacing the unrenderable-results
+    raise in HindsightSemanticMemory.recall with `return ""` fails this test.
+    """
     mem = HindsightSemanticMemory(base_url="http://hs:8888")
     mem._request = AsyncMock(return_value={"results": results})
     with pytest.raises(RecallUnavailable) as ei:

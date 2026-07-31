@@ -918,3 +918,52 @@ async def test_stale_generation_failure_does_not_replace_recovered_session():
     finally:
         failed.release_slow.set()
         await facade.aclose()
+
+
+async def test_pin_inv_ha_001_action_arguments_pass_through_unchanged():
+    """Pins INV-HA-001: no code here restricts a control action by entity or
+    domain — ordinary action arguments reach the upstream unchanged.
+
+    Red case demonstrated: filtering entity_id/domain out of non-live-context
+    arguments in HomeAssistantFacade._call fails this test.
+    """
+    upstream = FakeHaSession(tools=[Tool(
+        name="HassTurnOff",
+        description="action",
+        inputSchema={"type": "object", "properties": {
+            "entity_id": {"type": "string"}, "domain": {"type": "string"},
+        }},
+    )])
+    facade = make_facade(upstream)
+    await facade.start()
+    try:
+        arguments = {"entity_id": "switch.security_system", "domain": "switch"}
+        await invoke_sdk_tool(facade.server_config, "HassTurnOff", arguments)
+        assert upstream.calls == [("HassTurnOff", arguments)]
+    finally:
+        await facade.aclose()
+
+
+async def test_pin_inv_ha_003_tool_cache_has_no_time_expiry():
+    """Pins INV-HA-003: the facade's cached tool surface never expires by
+    time — only explicit refresh or transport recovery rediscovers.
+
+    Red case demonstrated: adding a TTL-based refresh to _call fails this
+    test (the second session would be opened and the surface would change).
+    """
+    clock = [0.0]
+    sessions = SessionSequence(
+        FakeHaSession(tools=[action_tool("HassTurnOn")]),
+        FakeHaSession(tools=[action_tool("HassLightSet")]),
+    )
+    facade = make_facade(sessions, monotonic=lambda: clock[0])
+    await facade.start()
+    try:
+        clock[0] = 10**12
+        await invoke_sdk_tool(
+            facade.server_config, "HassTurnOn", {"name": "kitchen"},
+        )
+        assert facade.tool_names == ("HassTurnOn",)
+        assert sessions.open_count == 1
+    finally:
+        await facade.aclose()

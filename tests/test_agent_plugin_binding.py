@@ -167,6 +167,8 @@ def _exec_defn():
 
 def test_executor_options_have_plugins_but_no_grants_no_callback(tmp_path,
                                                                  monkeypatch):
+    """Pins INV-PLUG-006. Red case demonstrated: appending a plugin-grant tool
+    name to _build_executor_options' allowed_tools fails this test."""
     import tools as tools_mod
     store = tmp_path / "store"
     e = entry("execplug", ["executor:probe-exec"])

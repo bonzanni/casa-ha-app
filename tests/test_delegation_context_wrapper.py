@@ -113,6 +113,8 @@ async def test_delegation_context_voice_channel_yields_voice_register(monkeypatc
 
 
 async def test_child_origin_extends_parent_with_execution_role(monkeypatch):
+    """Pins INV-ENG-004 (the stamp). Red case demonstrated: stamping the
+    child origin with depth 0 instead of parent+1 fails this test."""
     """A:§1/r1-B5: child_origin must EXTEND the parent dict (delegation_depth
     stays parent+1) while adding execution_role == the DELEGATE's role,
     distinct from the inherited (unchanged) "role" == the CALLER's role.

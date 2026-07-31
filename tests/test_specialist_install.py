@@ -723,6 +723,7 @@ def test_upgrade_with_missing_new_required_config_leaves_the_active_tuple_runnin
 
 
 def test_rollback_restores_the_prior_tuple(tmp_path: Path) -> None:
+    """Pins INV-SPEC-003 (rollback half). Red case demonstrated: reading the current active instead of active.prior.yaml fails this test."""
     from specialist_install import parse_component_root, rollback_specialist, upgrade_specialist
     from specialist_install_consent import SpecialistInstallAckStore, install_consent_identity
 

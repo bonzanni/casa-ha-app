@@ -147,6 +147,8 @@ def test_duplicate_name_skips_both(tmp_path):
 
 
 def test_artifact_id_mismatch_is_per_entry_skip(tmp_path):
+    """Pins INV-PLUG-001. Red case demonstrated: neutering _entry_error's
+    artifact-id mismatch check (`if False:`) fails this test."""
     bad = _entry(artifact_id="0" * 64)
     p = _write(tmp_path, {"schema_version": 1, "plugins": [bad]})
     data = load_registry(p)

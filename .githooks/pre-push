@@ -1,0 +1,159 @@
+#!/usr/bin/env bash
+# Refuse to push publication-surface content the gate has not approved.
+#
+# It inspects EVERY commit being introduced, not the tip: a push whose last commit is
+# unrelated would otherwise skip the gate entirely, and a commit that adds private
+# content followed by one that removes it still publishes the object.
+#
+# EVERY commit is gated, and only refs/heads/* may be published at all. A path-based
+# trigger was tried and was wrong twice over: a narrow list left ordinary source pushes
+# ungated, and even an all-paths list let an EMPTY commit through, whose message and
+# author identity are published all the same.
+#
+# CASA_GATE_OVERRIDE=<reason> bypasses this. It prints the reason; the reason belongs in
+# the PR. This is a local control — see docs/doctrine/publishing.md for what it does and
+# does not guarantee.
+set -euo pipefail
+
+receipt="$(git rev-parse --git-path casa-gate-approved)"   # `.git` is a FILE in a worktree
+zero="0000000000000000000000000000000000000000"
+
+# git passes the DESTINATION remote as $1. Coverage must be relative to that remote: a
+# commit reachable from some *other* configured remote (a private one, say) is not
+# published at this destination.
+destination="${1:-origin}"
+
+while read -r local_ref local_sha remote_ref remote_sha; do
+  [ "$local_sha" = "$zero" ] && continue          # deleting a ref publishes nothing
+
+  # ONLY branch updates are publishable through this hook. Everything else is refused:
+  #
+  #   refs/tags/*  - a tag publishes its annotation, tagger identity and name, none of
+  #                  them a commit and none covered by any sweep. An attestation flow for
+  #                  them produced a fresh hole in three consecutive reviews and was
+  #                  deleted; this repo does not tag locally (deploy.yml cuts the release
+  #                  tag in CI, which does not run this hook).
+  #   anything else - an arbitrary namespace such as refs/archive/* can carry a tag object
+  #                  whose target is already reachable, so it introduces no commits and
+  #                  would slip through the enumeration below entirely.
+  #
+  # CASA_GATE_OVERRIDE takes a reason and prints it; the reason belongs in the PR.
+  case "$remote_ref" in
+    refs/heads/*) ;;
+    *)
+      if [ -n "${CASA_GATE_OVERRIDE:-}" ]; then
+        echo "⚠  pre-push: non-branch ref overridden — $CASA_GATE_OVERRIDE" >&2
+        continue
+      fi
+      echo "✋ pre-push: refusing to publish $remote_ref — only refs/heads/* is allowed." >&2
+      echo "   Tags and other namespaces publish annotations, identities and ref names" >&2
+      echo "   that no sweep covers. Releases are tagged by CI on merge to main." >&2
+      echo "   If you truly need this: CASA_GATE_OVERRIDE='<reason>' git push ..." >&2
+      exit 1 ;;
+  esac
+
+  # The destination BRANCH NAME is published metadata in its own right, so this is checked
+  # BEFORE any commit enumeration: pushing already-published objects under a NEW name
+  # introduces no commits at all, and a check placed after `[ -n "$commits" ] || continue`
+  # never ran for exactly that case. Verified by pushing the same tip to a second branch.
+  #
+  # Exact string comparison — the removed tag binding interpolated the name into a grep
+  # expression, so `v1|.*` matched any receipt line.
+  # EVERY branch update needs a receipt, including one that introduces no commits.
+  # `git push <published-sha>:refs/heads/private-client-name` publishes a NAME while adding
+  # no objects: with the check conditional on a receipt existing, no receipt meant the check
+  # was skipped, and no new commits meant the enumeration below `continue`d. Both reviewers
+  # found that; the earlier comment claiming the commit check would report it was wrong.
+  dest_branch="${remote_ref#refs/heads/}"
+  if [ ! -f "$receipt" ]; then
+    if [ -n "${CASA_GATE_OVERRIDE:-}" ]; then
+      echo "⚠  pre-push: unattested branch publication overridden — $CASA_GATE_OVERRIDE" >&2
+    else
+      echo "✋ pre-push: $remote_ref is not attested. A branch name is published text even" >&2
+      echo "   when the push adds no commits." >&2
+      echo "   Run: scripts/gate.sh   then   scripts/attest.sh --read-in-full ..." >&2
+      exit 1
+    fi
+  elif [ "$dest_branch" != "$(sed -n 3p "$receipt")" ]; then
+    attested_branch="$(sed -n 3p "$receipt")"
+    if [ -n "${CASA_GATE_OVERRIDE:-}" ]; then
+      echo "⚠  pre-push: branch-name mismatch overridden — $CASA_GATE_OVERRIDE" >&2
+    else
+      echo "✋ pre-push: attested for branch '${attested_branch:-<none>}', pushing to" >&2
+      echo "   '$dest_branch'. A branch name is published text that no sweep covers, and" >&2
+      echo "   republishing existing objects under a new name introduces no commits." >&2
+      exit 1
+    fi
+  fi
+
+  if [ "$remote_sha" = "$zero" ]; then
+    # ASK THE DESTINATION what it has. `--not --remotes=<name>` reads local tracking refs,
+    # which describe this clone, not the remote: repoint origin at a fresh repository and
+    # a stale refs/remotes/origin/main makes whole ancestries look already-published.
+    advertised="$(git ls-remote --heads "$destination" 2>/dev/null | cut -f1)" || advertised=""
+    if [ -n "$advertised" ]; then
+      commits="$(git rev-list "$local_sha" --not $advertised 2>/dev/null)" \
+        || commits="$(git rev-list "$local_sha")"
+    else
+      # An empty or unreachable destination publishes the whole ancestry.
+      commits="$(git rev-list "$local_sha")"
+    fi
+  else
+    commits="$(git rev-list "$remote_sha..$local_sha")"
+  fi
+  [ -n "$commits" ] || continue                   # nothing new to publish
+
+  # EVERY introduced commit needs the receipt, whether or not it changes a file. An empty
+  # commit still publishes its message, its author and its committer — a
+  # `git commit --allow-empty -m '<private text>'` used to sail straight through here,
+  # and a test asserted that it should.
+  if [ -n "${CASA_GATE_OVERRIDE:-}" ]; then
+    echo "⚠  pre-push: gate overridden — $CASA_GATE_OVERRIDE" >&2
+    continue
+  fi
+  count="$(printf '%s\n' "$commits" | wc -l | tr -d ' ')"
+  if [ ! -f "$receipt" ] || [ "$(head -1 "$receipt")" != "$local_sha" ]; then
+    echo "✋ pre-push: $count commit(s) would be published and $local_sha is not attested." >&2
+    echo "   Run: scripts/gate.sh" >&2
+    echo "        scripts/attest.sh --read-in-full --reviewers \"...\" --findings-applied --re-reviewed" >&2
+    echo "   This push is irreversible; objects stay fetchable by SHA afterwards." >&2
+    exit 1
+  fi
+
+  # The receipt names a tip; the gate swept a RANGE. Those differ per destination: a tip
+  # gated against origin/main, pushed to a different or empty remote, introduces commits
+  # the review never covered — and matching the tip alone let them through.
+  reviewed="$(git rev-parse --git-path casa-gate-commits)"
+  if [ ! -f "$reviewed" ]; then
+    echo "✋ pre-push: no reviewed commit set recorded. Re-run scripts/gate.sh." >&2
+    exit 1
+  fi
+
+  # The receipt carries a digest of the set it approved. Without it, a second gate run at
+  # the same HEAD with a wider base rewrites the set while the old approval still stands.
+  if [ "$(sha256sum < "$reviewed" | cut -d' ' -f1)" != "$(sed -n 2p "$receipt")" ]; then
+    echo "✋ pre-push: the reviewed commit set has changed since it was attested." >&2
+    echo "   Re-run scripts/gate.sh, re-read the range, and re-attest." >&2
+    exit 1
+  fi
+
+  set +e
+  printf '%s\n' "$commits" | grep -vxF -f "$reviewed" > "$(git rev-parse --git-path casa-unreviewed)"
+  grep_status=$?
+  set -e
+  if [ "$grep_status" -ge 2 ]; then
+    echo "✋ pre-push: comparison against the reviewed set failed (grep status $grep_status)." >&2
+    echo "   Refusing rather than assuming everything matched." >&2
+    exit 1
+  fi
+  unreviewed="$(cat "$(git rev-parse --git-path casa-unreviewed)")"
+  rm -f "$(git rev-parse --git-path casa-unreviewed)"
+  if [ -n "$unreviewed" ]; then
+    echo "✋ pre-push: $count commit(s) would reach $destination, but these were never in" >&2
+    echo "   the reviewed range:" >&2
+    printf '%s\n' "$unreviewed" | head -5 | sed 's/^/     /' >&2
+    echo "   Re-run the gate with CASA_GATE_BASE set to what $destination already has." >&2
+    exit 1
+  fi
+done
+exit 0

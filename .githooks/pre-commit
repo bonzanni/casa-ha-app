@@ -1,19 +1,30 @@
 #!/usr/bin/env bash
-# Leak guard: never let the private docs/ tree be committed into this PUBLIC add-on repo.
+# Leak guard for this PUBLIC repo — a thin wrapper over scripts/deny-sweep.sh.
 #
-# docs/ is an intentionally-private, separate inner git repo (its own remote) and is
-# gitignored here. The only ways it could leak into a public commit are `git add -f docs/`
-# or removing the .gitignore line. This hook refuses any commit that stages docs/.
+# Internal engineering material is never committed here. This hook refuses to stage
+# private-only paths, or added lines carrying content that must never appear on a public
+# ref. It does not reimplement the pattern grammar: three divergent copies disagreed once,
+# and one of them would have failed CI on the project's own public identity.
+#
+# DEFENCE IN DEPTH, not the control. The control is scripts/gate.sh plus the attestation
+# it requires — see docs/doctrine/publishing.md, including what a local hook cannot
+# guarantee.
+#
+#   CASA_DENY_FILE        overrides the pattern file (tests use a synthetic one)
+#   CASA_DENY_SUPPLEMENT  optional private pattern file with exact literals
 #
 # Installed by `make setup` (which sets `git config core.hooksPath .githooks`).
 set -euo pipefail
 
-staged="$(git diff --cached --name-only)"
-# Match both files under docs/ (^docs/) and docs staged as a submodule gitlink (^docs$).
-if printf '%s\n' "$staged" | grep -qE '^docs(/|$)'; then
-  echo "✋ pre-commit: refusing to commit docs/ into this PUBLIC add-on repo." >&2
-  echo "   docs/ is a PRIVATE inner repo, intentionally excluded from this public repo." >&2
-  echo "   You likely ran 'git add -f docs'. Unstage it with:  git reset HEAD -- docs" >&2
+sweep="$(cd "$(dirname "$0")/../scripts" && pwd)/deny-sweep.sh"
+if [ ! -x "$sweep" ]; then
+  echo "✋ pre-commit: $sweep is missing or not executable — run ./scripts/setup-dev.sh" >&2
+  exit 1
+fi
+
+if ! "$sweep" staged; then
+  echo "   Redaction is not the fix — this content does not belong on a public ref." >&2
+  echo "   Internal engineering material belongs in the private repo, not here." >&2
   exit 1
 fi
 exit 0

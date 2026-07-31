@@ -49,6 +49,8 @@ def test_voice_identity_ignores_user_or_model_clearance_claims():
 
 
 def test_unknown_channel_fails_closed_to_public():
+    """Pins INV-MEM-003. Red case demonstrated: changing sensitivity.py's
+    _DEFAULT_CLEARANCE from "public" to "private" fails this test."""
     # 2026-07-10: unmapped channels now fail CLOSED (least-sensitive). Real
     # channels are explicitly mapped; only unknown/future channels hit this.
     assert clearance_for_channel("telegram") == "private"   # explicit

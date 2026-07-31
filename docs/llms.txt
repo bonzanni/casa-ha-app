@@ -1,0 +1,42 @@
+# Casa — Home Assistant app
+
+Canonical current-state documentation for AI agents working on this repository.
+Code is the source of truth; these files are a map.
+
+## Architecture
+
+- [architecture/agent-taxonomy.md](architecture/agent-taxonomy.md): How an agent is declared, validated and looked up — tiers, required artifacts, and the registry.
+- [architecture/concurrency-model.md](architecture/concurrency-model.md): What runs concurrently — bus dequeue vs execution, session-key serialization, the lock inventory, and threaded vs loop work.
+- [architecture/configuration.md](architecture/configuration.md): Where configuration comes from, what is version-controlled, what reload can pick up without a restart, and how secrets resolve.
+- [architecture/engagements.md](architecture/engagements.md): Work one agent hands to another — ephemeral delegation, durable engagements, how they end, and what survives a restart.
+- [architecture/eval-framework.md](architecture/eval-framework.md): The evaluation scaffolding — and the fact that its registry ships empty.
+- [architecture/home-assistant-control.md](architecture/home-assistant-control.md): How an agent reads and changes the state of the house — and why the limits on that live in Home Assistant, not here.
+- [architecture/http-surface.md](architecture/http-surface.md): The two HTTP servers, what each exposes, and how an inbound request is authenticated.
+- [architecture/jobs-and-delivery.md](architecture/jobs-and-delivery.md): Durable background jobs — execution vs delivery state, restart reconciliation, and the leased claim/ack protocol.
+- [architecture/mcp-and-tools.md](architecture/mcp-and-tools.md): How tools reach an agent, and where authorization for a tool call actually happens.
+- [architecture/memory.md](architecture/memory.md): Long-term memory — how a fact is written, who may read it back, and what a caller is told when the store cannot answer.
+- [architecture/observability.md](architecture/observability.md): How work is traced across components, what reaches a log, and what the health surfaces actually assert.
+- [architecture/overview.md](architecture/overview.md): What Casa is made of — supervised services, the three agent tiers, and where configuration enters.
+- [architecture/persistent-state.md](architecture/persistent-state.md): What the application writes to disk, how it treats a missing or corrupt file, and what that means for recovery.
+- [architecture/personality.md](architecture/personality.md): What an agent is versus how it presents — role artifacts, personas, bindings, and which prompt is actually served.
+- [architecture/plugins.md](architecture/plugins.md): How a plugin becomes usable — registry, content-addressed store, artifact identity, and per-call authorization.
+- [architecture/specialist-lifecycle.md](architecture/specialist-lifecycle.md): Specialist install/upgrade/rollback — instance tuples, the content-addressed store, consent receipts, materialization, and the crash journal.
+- [architecture/telegram.md](architecture/telegram.md): How Telegram messages become turns — transports, authentication, the per-topic causal log, keyboards, and rendering.
+- [architecture/tools-interface.md](architecture/tools-interface.md): The mutation interface — the one tool registry, result envelopes, and which failures roll back versus report.
+- [architecture/triggers.md](architecture/triggers.md): What makes an agent act without a person speaking — scheduled and webhook triggers, and the consent a plugin trigger needs.
+- [architecture/turn-loop.md](architecture/turn-loop.md): How one inbound message becomes one agent turn, and what bounds it.
+- [architecture/voice.md](architecture/voice.md): How spoken input becomes a turn and how the answer gets back — transports, authentication, the turn budget, and deferred delivery.
+
+## Reference
+
+- [reference/operator-options.md](reference/operator-options.md): The option-by-option operator contract — key, env var, consumer, default, restart-vs-reload.
+
+## Doctrine
+
+- [doctrine/operating-casa.md](doctrine/operating-casa.md): How an agent running inside Casa should behave, and which property of the system each rule follows from.
+- [doctrine/publishing.md](doctrine/publishing.md): The one rule that decides whether a fact may be written down in this repository.
+- [doctrine/working-on-casa.md](doctrine/working-on-casa.md): How to change this repository without breaking it, and how to establish that a claim about it is true.
+
+## Contributing
+
+- [contributing/doc-contract.md](contributing/doc-contract.md): The shape a document takes, and which of its rules CI enforces versus a reviewer.

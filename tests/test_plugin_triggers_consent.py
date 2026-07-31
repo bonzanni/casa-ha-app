@@ -155,7 +155,10 @@ def test_wrong_shape_store_fails_closed(tmp_path):
 def test_tampered_identity_fails_whole_store_closed(tmp_path):
     """Terra shipB-r1 P1-3a: a parseable store whose key does not equal the
     RECOMPUTED identity of its own record must grant nothing — a truncated /
-    merged / hand-edited store can never manufacture consent."""
+    merged / hand-edited store can never manufacture consent.
+
+    Pins INV-TRIG-004. Red case demonstrated: dropping the load path's identity-mismatch rejection fails this test.
+    """
     path = tmp_path / "acks.json"
     store = TriggerAckStore(path=path)
     good = _record(store)

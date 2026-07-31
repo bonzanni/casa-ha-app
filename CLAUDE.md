@@ -11,7 +11,9 @@ protocol, and **APScheduler**, all **s6-overlay**–supervised inside the contai
 - **App manifest:** `casa/config.yaml` (version lives here). User-facing app
   docs: `casa/DOCS.md`. App changelog: `casa/CHANGELOG.md`.
 - **Tests:** `tests/` (173 files). Container/e2e harness: `test-local/`. CI: `.github/workflows/qa.yml`.
-- **Internal engineering docs:** `docs/` — see the boundary note below.
+- **Agent-facing docs corpus:** `docs/` — the canonical, CI-enforced current-state
+  documentation. **Before changing a subsystem, read the document that
+  `docs/README.md`'s routing table names for it.** See the boundary note below.
 
 ## Build & test
 Run once on a fresh checkout:
@@ -62,18 +64,37 @@ The `tests/conftest.py` auto-adds the code root to `sys.path`.
 - `venv_test/` must be a **Linux venv** (run `make setup`); any pre-existing Windows-layout
   venv (`Scripts/`, `Activate.ps1`) won't run under WSL.
 
-## The `docs/` boundary — READ THIS
-`docs/` is an **intentionally-private, separate inner git repo** (its own `docs/.git` with
-a private remote). It is **gitignored by this public add-on repo and is NEVER shipped
-here.** It holds internal engineering docs (roadmaps, design specs, the canonical
-current-state spec).
+## The publication boundary — READ THIS
+**Internal engineering material is never committed here.** Design specs, plans, roadmaps,
+reviews and captured transcripts belong outside this repository. The rule for what may go
+in is one line: *a fact belongs in this repo only if it is verifiable from the public
+commit alone* — no operator, no production box, no private repository.
 
-- **Never `git add -f docs/` or otherwise commit `docs/` into this repo.** A
-  `.githooks/pre-commit` guard refuses it; `make setup` installs that guard.
-- Do **not** `git commit` inside `docs/` unless explicitly asked — it has its own history.
-- If you have the private `docs/` tree checked out, the **canonical current-state
-  reference** is `docs/current-state-spec.md` (code is the source of truth — when that doc
-  and the code disagree, the code wins). For internal guidance see `docs/CLAUDE.md`.
+`docs/` holds the public, curated, agent-facing corpus — **anything committed there is
+published.** It is canonical and CI-enforced: every anchor must resolve against tracked
+code, every declared invariant must carry a tracked test binding (the red-case discipline
+in `docs/contributing/doc-contract.md` is what makes it a genuine pinning test), and a
+code-derived coverage ledger (`docs/coverage.yaml`) fails the build when a substantial
+module (≥100 lines), an option, a tool, a route or an s6 unit is neither assigned to a
+document nor excluded with a reason. Consult `docs/README.md`'s routing table before
+changing a subsystem, and update the corpus in the same change — the verifier
+(`python -m scripts.verify_docs .`) and `scripts/coverage_ledger.py check .` must stay
+green.
+
+Three controls enforce this, and `make setup` installs the hooks:
+
+- `.githooks/pre-commit` refuses staged paths and added lines matching
+  `.githooks/deny-patterns.txt` — generic rules only, since this repo is public and a
+  pattern written here is published by the commit that adds it.
+- `scripts/gate.sh` is the pre-push gate: it evaluates `HEAD` on a clean tree, sweeps the
+  endpoint tree, every unpublished commit and their messages, then runs a pinned secret
+  scanner over both tree and history.
+- `.githooks/pre-push` refuses a push whose commits touch a gated path without an
+  attestation from `scripts/attest.sh`. **The first push of anything is irreversible** —
+  objects stay fetchable by SHA after any branch deletion or force-push.
+
+Contributors with additional local tooling supply an exact-literal supplement through
+`CASA_DENY_SUPPLEMENT`; CI runs the generic rules and the scanner.
 
 ## Working norms
 - **Verify against whole files, not thin grep slices** — read around a symbol before
@@ -92,15 +113,16 @@ mid-2026). Keep it publish-ready at all times:
 - **Every release**: bump `casa/config.yaml` version + a user-facing CHANGELOG
   entry (keepachangelog tone; deep engineering detail belongs in the PR body) + a
   `translations/en.yaml` entry for any new/changed option + DOCS.md accuracy.
-- **Nothing internal on any pushed ref**: no `docs/` content, no audit/diagnosis
-  ledgers, no `.claude/`. Internal artifacts live in `docs/` (the private inner repo).
-  Force-pushed-away commits stay fetchable by SHA on GitHub — prevention is the only
-  cure.
+- **Nothing internal on any pushed ref**: no design specs, plans, reviews, audit or
+  diagnosis ledgers, no `.claude/`. Internal artifacts live in a private repository
+  outside this checkout; the public `docs/` corpus carries only what passes the
+  publication rule. Force-pushed-away commits stay fetchable by SHA on GitHub —
+  prevention is the only cure.
 - **Public identity**: commits AND public-facing files (repository.yaml maintainer,
   README) use `3899230+bonzanni@users.noreply.github.com`, never a personal address.
 - **Clean tree between sessions**: commit or revert stragglers. New files have a home
-  (eval scripts → `test-local/eval/`, e2e → `test-local/e2e/`, internal specs →
-  `docs/`); nothing parked at the repo root.
+  (eval scripts → `test-local/eval/`, e2e → `test-local/e2e/`, internal specs → the
+  private repository outside this checkout); nothing parked at the repo root.
 - **AI attribution**: commits end with `Assisted-by: Claude Code` (kernel/Fedora-style
   disclosure — not `Co-Authored-By`, which implies authorship and suffers GitHub
   email-squatting); PR bodies carry no vendor footer. Configured in

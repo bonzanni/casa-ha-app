@@ -302,7 +302,10 @@ async def test_remove_drops_named_ids_and_ignores_unknown(tmp_path):
 async def test_append_writes_through_atomic_write_json(tmp_path, monkeypatch):
     """Crash-safety pin: ledger persistence must route through
     atomic_io.atomic_write_json — a plain open("w") regression could leave
-    a truncated ledger after a power loss."""
+    a truncated ledger after a power loss.
+
+    Pins INV-STATE-003. Red case demonstrated: replacing the ledger's atomic_write_json call with a direct write fails this test.
+    """
     real = topic_ledger.atomic_write_json
     calls: list[str] = []
 

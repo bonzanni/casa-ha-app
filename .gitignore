@@ -7,7 +7,6 @@ dist/
 build/
 .eggs/
 .claude/
-docs/
 .worktrees/
 .env
 .env.smoke

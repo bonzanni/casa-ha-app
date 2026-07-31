@@ -1,0 +1,153 @@
+name: Docs
+
+# The corpus in docs/ is published, so these checks run on every pull request and on main.
+#
+# CI is DEFENCE IN DEPTH, not the control. `main` has no branch protection and merges use
+# --admin, so CI is not guaranteed to run before a merge; the mandatory control is the local
+# pre-push gate (scripts/gate.sh plus the attestation it requires). What CI adds is a second
+# pair of eyes on every PR, and a check that runs in a clone nobody has configured.
+#
+# CI deliberately has NO private supplement: the exact-literal layer lives with the operator
+# and is applied by the hook and the gate. CI runs the generic patterns and the scanner.
+#
+# READ THIS BEFORE TRUSTING A GREEN RESULT. Every script and policy file this job runs comes
+# from the pull request's own checkout, so a PR can weaken its own guard — replace a scanner
+# with a no-op, relax the deny patterns, delete a step. `pull_request` is still the right
+# event (it keeps secrets and a write token away from PR-controlled code), and this is an
+# accepted property rather than a defect, because the mandatory control is the local gate.
+# The consequence is concrete: a PR touching .github/workflows/, scripts/, .githooks/ or
+# tests/ needs privileged human review, and its green check proves nothing on its own.
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+jobs:
+  docs-verify:
+    name: Corpus + publication guard
+    runs-on: ubuntu-latest
+    env:
+      CASA_ALLOW_NO_SUPPLEMENT: "1" # CI has no private supplement, by design
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          fetch-depth: 0 # the range sweeps need history, not just the tip
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - run: pip install --quiet pyyaml
+
+      - name: Verify manifest, anchors, budget and invariants
+        run: |
+          python -m scripts.verify_docs .
+          python3 scripts/coverage_ledger.py check .
+
+      - name: Generated navigation is current
+        run: python -m scripts.verify_docs . --check-nav
+
+      - name: Size report (growth pressure, informational)
+        run: python -m scripts.verify_docs . --report
+
+      - name: Operating cards point at the doctrine
+        run: |
+          set -euo pipefail
+          for card in CLAUDE.md AGENTS.md; do
+            grep -q 'verifiable from the public commit alone' "$card" || {
+              echo "::error::$card no longer states the publication rule"; exit 1; }
+            grep -Eq "docs/README\.md.{0,20}routing table" "$card" || {
+              echo "::error::$card no longer routes agents into the docs corpus (needs the docs/README.md routing-table directive)"; exit 1; }
+          done
+
+      - name: Deny sweep — tracked tree
+        run: scripts/deny-sweep.sh tree
+
+      - name: Deny sweep — the commits this PR would publish
+        if: github.event_name == 'pull_request'
+        run: |
+          set -euo pipefail
+          base="origin/${{ github.base_ref }}"
+          # merge-base..HEAD, not base...HEAD: `git rev-list A...B` is the SYMMETRIC
+          # difference, so it would sweep commits that are on the base and not in this PR.
+          # Three dots is right for `git diff`, wrong for enumerating what this PR adds.
+          range="$(git merge-base "$base" HEAD)..HEAD"
+          scripts/deny-sweep.sh range "$range"
+          scripts/deny-sweep.sh messages "$range"
+
+      - name: Secret scan
+        run: |
+          set -euo pipefail
+          # The runner cannot write to root-owned /usr/local/bin.
+          mkdir -p "$RUNNER_TEMP/bin"
+          curl -sSfL "https://github.com/gitleaks/gitleaks/releases/download/v8.28.0/gitleaks_8.28.0_linux_x64.tar.gz" \
+            | tar -xz -C "$RUNNER_TEMP/bin" gitleaks
+          chmod +x "$RUNNER_TEMP/bin/gitleaks"
+          export PATH="$RUNNER_TEMP/bin:$PATH"
+          scripts/run-gitleaks.sh tree
+          if [ "${{ github.event_name }}" = "pull_request" ]; then
+            base="origin/${{ github.base_ref }}"
+            scripts/run-gitleaks.sh range "$(git merge-base "$base" HEAD)..HEAD"
+          fi
+
+      - name: Docs impact on claimed surfaces
+        if: github.event_name == 'pull_request'
+        run: |
+          set -euo pipefail
+          base="origin/${{ github.base_ref }}"
+          changed="$(git diff --name-only "$base"...HEAD)"
+
+          # A version-only bump to the app manifest is not a schema change. BOTH added and
+          # removed lines are inspected: deleting an option produces no added schema line,
+          # and treating that as version-only would skip the check on an option removal —
+          # the change most likely to invalidate a document.
+          if printf '%s\n' "$changed" | grep -qx 'casa/config\.yaml'; then
+            substantive="$(git diff -U0 "$base"...HEAD -- casa/config.yaml \
+              | grep -E '^[+-]' | grep -vE '^(\+\+\+|---)' | grep -vE '^[+-]version:' || true)"
+            if [ -z "$substantive" ]; then
+              changed="$(printf '%s\n' "$changed" | grep -vx 'casa/config\.yaml' || true)"
+            fi
+          fi
+
+          # The claim map is editable in the same PR, so consult the BASE manifest too:
+          # deleting a covers anchor must not delete the obligation.
+          #
+          # FAIL CLOSED. Substituting an empty manifest on any error silently drops every
+          # base-side claim — the exact obligations this step exists to preserve. An empty
+          # one is accepted only when the base genuinely has no manifest, which is true
+          # until the corpus first lands and false forever after.
+          if git cat-file -e "$base:docs/manifest.yaml" 2>/dev/null; then
+            git show "$base:docs/manifest.yaml" > "$RUNNER_TEMP/base-manifest.yaml"
+          else
+            echo "note: $base has no docs/manifest.yaml yet — no base-side claims to carry"
+            : > "$RUNNER_TEMP/base-manifest.yaml"
+          fi
+          impacted="$(printf '%s\n' "$changed" \
+            | python -m scripts.verify_docs . --impact --base-manifest "$RUNNER_TEMP/base-manifest.yaml")"
+          [ -n "$impacted" ] || exit 0
+
+          # A DELETED doc is not an updated doc.
+          touched="$(git diff --name-only --diff-filter=d "$base"...HEAD | grep '^docs/' | sed 's|^docs/||' || true)"
+          deleted="$(git diff --name-only --diff-filter=D "$base"...HEAD | grep '^docs/' | sed 's|^docs/||' || true)"
+          # One path per line, never `for doc in $impacted`: word splitting would break a
+          # path containing a space into fragments, and matching those fragments against
+          # `touched` could satisfy the check while the real claiming document is untouched.
+          # The verifier separately forbids whitespace in manifest paths; this does not rely
+          # on that holding.
+          : > "$RUNNER_TEMP/missing.txt"
+          while IFS= read -r doc; do
+            [ -n "$doc" ] || continue
+            if printf '%s\n' "$deleted" | grep -qxF -- "$doc"; then
+              echo "::error::$doc claimed a changed surface and was deleted in the same PR."
+              echo "::error::Retire a claimed document in its own PR, not alongside the change."
+              exit 1
+            fi
+            printf '%s\n' "$touched" | grep -qxF -- "$doc" \
+              || printf '%s\n' "$doc" >> "$RUNNER_TEMP/missing.txt"
+          done <<< "$impacted"
+          if [ -s "$RUNNER_TEMP/missing.txt" ]; then
+            echo "::error::changed a claimed surface; these docs claim it but did not change:"
+            sed 's/^/::error::  /' "$RUNNER_TEMP/missing.txt"
+            exit 1
+          fi

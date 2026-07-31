@@ -485,6 +485,7 @@ async def test_decision_new_closes_old_awaits_disconnect_then_stale_cb():
 
 
 async def test_sid_mismatch_reconnects_on_registry_sid():
+    """Pins INV-TURN-001. Red case demonstrated: dropping the entry.sid == resume_sid half of the reusable check fails this test."""
     reg = FakeRegistry()
     reg.data["tg-1"] = {"sdk_session_id": "sid-A", "last_active": "x"}
     pool = _mk_pool(reg)
@@ -580,6 +581,9 @@ async def test_invalidation_serializes_same_key_until_active_turn_releases():
     """A cleared generation remains a same-key handoff barrier until its
     active turn releases the entry lock, but neither unrelated keys nor the
     replacement generation wait for the old transport to finish closing.
+    
+
+    Pins INV-CONC-003 (with the single-connect sibling). Red case demonstrated: a turn-path mutation that breaks the locked decision (reuse regardless of sid) fails these tests.
     """
     reg = FakeRegistry()
     reg.data["voice-same"] = {

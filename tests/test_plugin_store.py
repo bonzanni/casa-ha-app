@@ -154,6 +154,9 @@ def test_safe_extract_falls_back_without_filter_kwarg(tmp_path, monkeypatch):
     ("lnk2", None, {"type": tarfile.SYMTYPE, "linkname": "../../outside"}),
 ])
 def test_safe_extract_rejects(tmp_path, member):
+    """Pins INV-PLUG-003. Red case demonstrated: dropping the `".." in
+    name.parts` traversal refusal in safe_extract_tar fails the traversal
+    parametrization."""
     tar = _write_tar(tmp_path, [member])
     with pytest.raises(StoreError) as ei:
         safe_extract_tar(tar, tmp_path / "out")

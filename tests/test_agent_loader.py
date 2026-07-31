@@ -761,7 +761,10 @@ class TestLoadAllSpecialists:
     def test_per_specialist_isolation(self, tmp_path):
         """O-2b (v0.37.9): one malformed specialist does NOT prevent its
         siblings from loading; the bad one is recorded in ``failed``.
-        Mirrors the v0.37.1 B-1b ``load_all_executors`` pattern."""
+        Mirrors the v0.37.1 B-1b ``load_all_executors`` pattern.
+
+        Pins INV-AGENT-003. Red case demonstrated: narrowing load_all_specialists' except so LoadError escapes fails this test.
+        """
         from agent_loader import load_all_specialists
 
         specialists_root = tmp_path / "specialists"
@@ -789,7 +792,10 @@ class TestLoadAllSpecialists:
 
 def test_duplicate_role_across_residents_and_specialists_fails(tmp_path):
     """A role present in BOTH residents/<role>/ and specialists/<role>/
-    must fail boot — both registries cannot share a role."""
+    must fail boot — both registries cannot share a role.
+
+    Pins INV-SYS-002 and INV-AGENT-001. Red case demonstrated: neutering _build_role_registry's overlap raise fails this test.
+    """
     from casa_core import _build_role_registry  # introduced by Task 5
     residents = {"finance": object()}      # placeholder configs
     specialists = {"finance": object()}    # collision on `finance`

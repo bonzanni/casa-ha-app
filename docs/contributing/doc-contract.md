@@ -1,0 +1,104 @@
+---
+last_reviewed: 2026-07-29
+---
+
+# How to keep this corpus true and readable
+
+> Code is the source of truth. This file is a map; when it and the code disagree, the code wins.
+
+## Scope
+
+The rules a document in this corpus follows, and which of them a machine checks. It does
+not decide what may be published at all — that is
+[`../doctrine/publishing.md`](../doctrine/publishing.md).
+
+## Mental model
+
+The audience is an AI agent that has just arrived, has no history with this codebase, and
+is about to change something. It will read one or two files, act, and move on. Everything
+below follows from that: a document is a working surface for a stranger under time
+pressure, not a reference work.
+
+Two consequences do most of the work. **Front-load**, so an agent that stops reading after
+two sections has still got the load-bearing part. And **stay small**, so a document fits in
+context *beside* the code it describes — which is the actual working set, and the reason the
+ceiling is a hard 25 KB rather than a suggestion.
+
+## Contracts & invariants
+
+**INV-DOC-001**: Every document repeats the code-wins line verbatim at the top, under front matter carrying `last_reviewed`.
+
+`last_reviewed` is the one field here that is not a fact about the software. A commit proves
+the string was written, not that anyone read the file that day — it is an author's claim,
+kept because the rotation below needs something to sort on. Treat it as a claim, and do not
+build anything on it that a lie would break.
+
+**INV-DOC-002**: An architecture document follows one section order — Scope, Mental model, Contracts & invariants, Failure behavior, Extension points, Source & test map — so an agent can skim positionally; documents in the other directories keep the code-wins line and the source map but shape their own sections.
+
+**INV-DOC-003**: A document describes the present system — no changelog voice, no "as of version X", no discrepancy log, no TODOs, no open questions; past tense may explain a mechanism, never track the document's own history.
+
+**INV-DOC-004**: A cross-cutting rule is defined exactly once, as `**INV-AREA-NNN**: <single-line statement>`, and referenced by id rather than restated. Issue ids sparingly — an id per local rule is bureaucracy, and the define-once check makes over-issuing visibly expensive; nothing mechanical enforces a minimum reference count.
+
+**INV-DOC-005**: Anchors are typed symbols (`path/to/file.py::Class.method`, `config.yaml::schema.key`, `tests/test_x.py::test_name`) or tracked bare paths; never `file:line`, which rots silently on the next edit.
+
+**INV-DOC-006**: Growth splits, it never appends. A document that reaches the ceiling is divided and both halves manifested. The ceiling is not raised, and nothing shards on its own.
+
+## Failure behavior
+
+Knowing which rules a machine enforces matters, because claiming a convention is enforced is
+how a corpus rots while passing.
+
+**CI enforces**: the size budget; allowlist exactness in both directions against
+`git ls-files`; admitted extensions; manifest schema and required fields; anchor resolution
+and containment; the marker pair in every document; invariant define-once, reference
+resolution, and declaration accuracy; that every declared invariant carries at least one
+`invariant_tests` binding to a tracked file that is not the missing-test sentinel, with any
+named test function checked by string search (that the reference *is* a genuine, collected
+pinning test is established by the red-case discipline, not by CI); the code-derived
+coverage ledger in both directions (every enumerated
+surface assigned to a document or excluded with a reason, no stale entries); the required
+skeleton; and that all generated navigation is current.
+
+**A reviewer enforces**: front matter and the code-wins line; the section order; present
+tense; whether a document is one-hop sufficient; whether the same rule has been restated in
+different words somewhere else; and whether any of it is true. No script can tell a correct
+rule from a plausible one.
+
+Those reviewer obligations are the periodic sweep's job, per release, oldest `last_reviewed`
+first. That rotation is a convention: nothing mechanical blocks a release on an unswept
+document, so the sort on `last_reviewed` is what keeps ageing visible.
+
+## Extension points
+
+Adding a document means adding a manifest entry — `doc`, `summary`, `when_changing`, and the
+`covers`, `tests`, `related` and `defines_invariants` it actually has. The verifier, gate
+and CI refuse an unmanifested tracked document wherever they run; like every layer in
+`doctrine/publishing.md`, that is enforced defence, not an absolute guarantee against a
+deliberate bypass.
+
+`when_changing` is phrased as the *task* an agent is about to do, not the subsystem name.
+An agent knows what it is about to change before it knows which subsystem owns it, and the
+routing table has to meet it where it is.
+
+Never hand-edit a generated block or file: `llms.txt`, `doctrine/invariants.md`, the routing
+table between the README's markers, and each document's Source & test map are all rendered
+from `manifest.yaml`. Hand-kept indexes rot behind the corpus they index; generated ones
+cannot. Regenerate with `python -m scripts.verify_docs . --write-nav`.
+
+## Source & test map
+
+<!-- BEGIN SOURCEMAP -->
+<!-- generated by scripts/verify_docs.py --write-nav; do not hand-edit -->
+
+**Source**
+- `scripts/verify_docs.py::verify`
+- `scripts/verify_docs.py::_check_sourcemap`
+- `scripts/verify_docs.py::_check_invariants`
+- `scripts/verify_docs.py::write_nav`
+
+**Tests**
+- `tests/test_verify_docs.py`
+
+**Related**
+- [`doctrine/publishing.md`](../doctrine/publishing.md)
+<!-- END SOURCEMAP -->

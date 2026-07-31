@@ -327,7 +327,11 @@ class TestConsumeAndChallenge:
 
     async def test_third_call_rechallenges_single_use(self, monkeypatch):
         """mint → 1st identical call allows; 2nd identical call (grant spent) →
-        re-challenge (single-use)."""
+        re-challenge (single-use).
+
+        Pins INV-PLUG-004. Red case demonstrated: dropping the `grant.used`
+        half of GrantStore.consume's check fails this test.
+        """
         broker, coord, channel = _fresh_coord(monkeypatch)
         store = GrantStore()
         ti = {"amount": 10}
@@ -384,6 +388,9 @@ class TestConsumeAndChallenge:
     async def test_restart_loses_grants_fresh_store_rechallenges(
         self, monkeypatch,
     ):
+        """Pins INV-PLUG-005. Red case demonstrated: backing GrantStore._grants
+        with a module-level dict shared across instances (persistence stand-in)
+        fails this test."""
         broker, coord, channel = _fresh_coord(monkeypatch)
         old_store = GrantStore()
         ti = {"amount": 10}

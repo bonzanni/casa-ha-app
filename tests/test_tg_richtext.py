@@ -156,3 +156,34 @@ def test_render_unpaired_surrogate_degrades_to_none():
     # degrade to plain (never raise).
     display, ents = render("\ud800 **x**")
     assert ents is None
+
+
+def test_pin_inv_tg_005_render_paged_enforces_length_and_entity_budgets():
+    """Pins INV-TG-005: a rich response is paginated to Telegram's UTF-16
+    message-length and entity budgets.
+
+    Red case demonstrated: short-circuiting _paginate's initial budget check
+    to always return a single page fails both over-budget cases here.
+    """
+    from channels.tg_richtext import (
+        MAX_ENTITIES,
+        MAX_LEN,
+        parse_markdown,
+        render_paged,
+    )
+
+    long_source = "```\n" + ("x" * 9000) + "\n```"
+    long_display, _ = parse_markdown(long_source)
+    long_pages = render_paged(long_source)
+    assert len(long_pages) > 1
+    assert "".join(text for text, _ in long_pages) == long_display
+    assert all(
+        len(text.encode("utf-16-le")) // 2 <= MAX_LEN for text, _ in long_pages
+    )
+
+    entity_source = " ".join(["**x**"] * (MAX_ENTITIES + 1))
+    entity_pages = render_paged(entity_source)
+    assert len(entity_pages) > 1
+    assert all(
+        len(entities or ()) <= MAX_ENTITIES for _, entities in entity_pages
+    )

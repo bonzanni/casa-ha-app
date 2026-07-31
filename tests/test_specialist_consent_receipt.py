@@ -177,3 +177,29 @@ def test_sweep_aged_removes_only_old_receipts(tmp_path):
     assert removed == 1
     assert not old_path.exists()
     assert (tmp_path / f"{fresh.receipt_id}.json").exists()
+
+
+def test_pin_inv_spec_005_tampered_receipt_loads_as_none(tmp_path):
+    """Pins INV-SPEC-005: a receipt whose attested fields no longer match its
+    recorded digest reads as absent, never as attested.
+
+    Red case demonstrated: disabling the loader's digest-recompute comparison
+    makes the tampered receipt load and fails this test.
+    """
+    import json
+
+    import specialist_receipt as sr
+
+    receipt = sr.build_receipt(
+        slug="x", component_repo="o/r", component_ref="v1",
+        component_revision="rev", component_subdir="", component_staged_path="/s",
+        plugins=(),
+    )
+    sr.persist(receipt, receipts_dir=tmp_path)
+    assert sr.load(receipt.receipt_id, receipts_dir=tmp_path) is not None
+
+    path = tmp_path / f"{receipt.receipt_id}.json"
+    raw = json.loads(path.read_text())
+    raw["component_ref"] = "v2-tampered"
+    path.write_text(json.dumps(raw))
+    assert sr.load(receipt.receipt_id, receipts_dir=tmp_path) is None

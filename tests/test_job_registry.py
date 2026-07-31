@@ -346,6 +346,7 @@ async def test_cancel_after_replace_waits_for_memory_publication_under_lock(
 
 
 async def test_invalid_compare_and_set_does_not_mutate(tmp_path):
+    """Pins INV-JOB-003 (registry layer; the coordinator layer is test_stale_claim_is_denied_without_mutation). Red case demonstrated: neutering BOTH the state and attempt-id comparisons in _require_delivery_cas fails this test — each alone is backstopped by the other."""
     registry = await loaded_registry(tmp_path, make_job())
     with pytest.raises(JobTransitionError):
         await registry.mark_playing("job-1", "attempt-1")
@@ -501,6 +502,7 @@ async def test_nack_without_cancel_requeues_with_fresh_attempt_required(tmp_path
 
 
 async def test_playing_lease_lapse_requeues_for_at_least_once_delivery(tmp_path):
+    """Pins INV-JOB-004. Red case demonstrated: expiring a lapsed lease to DELIVERED instead of READY fails this test."""
     registry = await loaded_registry(
         tmp_path,
         make_job(
@@ -523,6 +525,7 @@ async def test_playing_lease_lapse_requeues_for_at_least_once_delivery(tmp_path)
 async def test_failed_snapshot_write_does_not_publish_memory_mutation(
     tmp_path, monkeypatch,
 ):
+    """Pins INV-STATE-004. Red case demonstrated: publishing the in-memory jobs before the snapshot write fails this test. Also pins INV-JOB-001 (same property, stated from the jobs doc's side)."""
     import job_registry as job_registry_module
 
     registry = await loaded_registry(tmp_path, make_job())
@@ -787,6 +790,7 @@ async def test_atomic_replace_failure_preserves_prior_snapshot_and_memory(
 
 
 async def test_restart_orphans_running_job_and_queues_voice_failure(tmp_path):
+    """Pins INV-JOB-002. Red case demonstrated: recovering live jobs to RUNNING instead of ORPHANED fails this test."""
     registry = await loaded_registry(
         tmp_path,
         make_job(

@@ -774,7 +774,10 @@ async def test_resolver_taxonomy_maps_to_envelope_kinds(monkeypatch, tmp_path):
 
 async def test_envelope_pre_activation_failure_is_pinned_shape(
         monkeypatch, tmp_path):
-    """Guard failure: pin never moved; kind/verify still present (spec §E)."""
+    """Guard failure: pin never moved; kind/verify still present (spec §E).
+
+    Pins INV-TOOL-003 (envelope half; the lock is structural). Red case demonstrated: defaulting activation_committed to True on plugin_update's failure path fails this test.
+    """
     import plugin_store
     st = _State()
     st.raw["plugins"].append(_entry())
@@ -794,7 +797,10 @@ async def test_envelope_pre_activation_failure_is_pinned_shape(
 
 async def test_envelope_committed_but_not_ready(monkeypatch, tmp_path):
     """activation_committed:true + runtime_ready:false = 'pin moved, runtime
-    not caught up' — callers retry the RELOAD, never the activation."""
+    not caught up' — callers retry the RELOAD, never the activation.
+
+    Pins INV-TOOL-004. Red case demonstrated: reporting activation_committed False after the registry save fails this test.
+    """
     st = _State()
     st.raw["plugins"].append(_entry())
     tools_mod = _wire(monkeypatch, tmp_path, st, publish=_pr(),

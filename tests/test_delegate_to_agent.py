@@ -1859,7 +1859,10 @@ class TestMergedRoleMap:
             agent_mod.origin_var.reset(token)
 
     async def test_delegate_to_agent_depth_cap(self, tmp_path, monkeypatch):
-        """A nested delegate_to_agent (depth >= 1) returns delegation_depth_exceeded."""
+        """A nested delegate_to_agent (depth >= 1) returns delegation_depth_exceeded.
+
+        Pins INV-ENG-004 (the check). Red case demonstrated: neutering
+        _prelaunch's depth comparison (`if False:`) fails this test."""
         import tools, agent as agent_mod
 
         resident_cfg = _specialist_cfg(role="butler")

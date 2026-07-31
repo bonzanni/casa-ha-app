@@ -152,7 +152,10 @@ def test_materialize_operational_files_repeat_call_swaps_atomically_and_gcs_old_
     """Round-4 fix (finding #1): a second materialize call for the SAME slug
     retargets the slug_dir symlink in one os.replace — never leaves slug_dir
     absent, never leaves the old content directory behind, and the new
-    content fully replaces (not merges with) the old."""
+    content fully replaces (not merges with) the old.
+
+    Pins INV-SPEC-004. Red case demonstrated: skipping the prior-content GC after the atomic retarget fails this test.
+    """
     from role_slot import RoleSlot, ResolvedModel
     from persona_pack import PersonaPack, PersonaManifest
 

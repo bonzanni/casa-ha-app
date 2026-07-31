@@ -1,0 +1,15 @@
+.dockerignore
+.gitattributes
+.gitignore
+.gitleaks.toml
+.worktreeinclude
+AGENTS.md
+CLAUDE.md
+CODE_OF_CONDUCT.md
+CONTRIBUTING.md
+LICENSE
+Makefile
+README.md
+SECURITY.md
+pytest.ini
+repository.yaml

@@ -68,6 +68,7 @@ def test_run_writes_report_and_reconciles(tmp_path: Path, monkeypatch) -> None:
 
 
 def test_run_is_non_fatal_on_error(tmp_path: Path, monkeypatch) -> None:
+    """Pins INV-CFG-005. Red case demonstrated: re-raising from run()'s broad except fails this test."""
     # Force reconcile to raise; run() must swallow and return 0.
     monkeypatch.setattr(config_sync, "reconcile",
                         lambda **k: (_ for _ in ()).throw(RuntimeError("boom")))

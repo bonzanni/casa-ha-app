@@ -1173,7 +1173,10 @@ async def test_terminal_finalize_discards_unposted_suffix(tmp_path):
 async def test_terminal_latch_discards_via_sequencer_writers(tmp_path):
     """The latch is the ONE truth source consulted inside the locked writers:
     once terminalized, ``open_narration`` / ``edit_narration_if_latest`` return
-    DISCARDED and ``post_unless_anchor_open`` holds — directly, with no relay."""
+    DISCARDED and ``post_unless_anchor_open`` holds — directly, with no relay.
+
+    Pins INV-ENG-005. Red case demonstrated: disabling _post_intent_locked's
+    terminal-latch fail-closed branch (`if False:`) fails this test."""
     from channels.output_sequencer import DISCARDED
     rec, _clock = Recorder(), None
     seq, _clock = _fast_sequencer(rec)

@@ -388,7 +388,10 @@ async def test_stale_plugin_overlay_is_swept(tmp_path):
 
 async def test_per_plugin_all_or_nothing(tmp_path):
     """One bad trigger (channel missing) sinks the plugin's WHOLE set — the
-    acked+valid sibling must not route either."""
+    acked+valid sibling must not route either.
+
+    Pins INV-TRIG-003. Red case demonstrated: making compute_desired route the overlay unconditionally fails this test.
+    """
     registry = _registry()
     acks = TriggerAckStore(path=tmp_path / "acks.json")
     _ack(acks)

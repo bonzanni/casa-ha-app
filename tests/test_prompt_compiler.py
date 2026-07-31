@@ -75,6 +75,7 @@ def binding_factory():
 
 
 def test_compiler_order_and_restricted_projection(role_factory, persona_factory, binding_factory) -> None:
+    """Pins INV-PERS-004. Red case demonstrated: disabling the restricted_webhook persona omission fails this test."""
     role, persona = role_factory(), persona_factory()
     binding = binding_factory(role, persona)
     bundle = compile_prompt_bundle(

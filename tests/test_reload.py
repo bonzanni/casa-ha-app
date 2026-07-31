@@ -1250,7 +1250,10 @@ class TestFullScopeExclusion:
     async def test_full_excludes_other_scopes(self, monkeypatch):
         """A reader arriving while the writer is active must wait for
         release_write. Pre-fix ordering was
-        ["full:start", "agent:start", "agent:end", "full:end"]."""
+        ["full:start", "agent:start", "agent:end", "full:end"].
+
+        Pins INV-CFG-002. Red case demonstrated: dropping _RWLock.acquire_write's writer flag fails this test.
+        """
         import reload as reload_mod
         from reload import dispatch
 

@@ -197,6 +197,7 @@ class TestPluginsWhitelist:
         assert "plugin-env.conf" not in tracked
 
     def test_store_and_staging_stay_untracked(self, tmp_path):
+        """Pins INV-CFG-004. Red case demonstrated: widening the whitelist to !plugins/** and dropping the store/.staging excludes fails this test."""
         from config_git import commit_config, init_repo
 
         _seed(tmp_path)

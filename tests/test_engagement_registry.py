@@ -332,6 +332,9 @@ class TestRegistryStateTransitions:
     async def test_strict_transition_rolls_back_full_field_on_persist_failure(
         self, tmp_path,
     ):
+        """Pins INV-ENG-002. Red case demonstrated: removing _restore() from
+        the tombstone-write exception handler leaves the in-memory record
+        terminal after the raise and fails this test."""
         """v0.79.0 (§3, Sol r7-2): the STRICT terminal transition snapshots
         EVERY mutated field (status, completed_at, error metadata) and, on a
         tombstone-write failure, restores the FULL snapshot and re-raises — no

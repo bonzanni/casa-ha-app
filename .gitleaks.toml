@@ -1,0 +1,19 @@
+# gitleaks configuration for the public Casa repo.
+#
+# NO PATH IS ALLOWLISTED. Exempting a tracked file from the scanner turns it into an
+# unreviewed channel: private prose placed there would pass every automated layer. The
+# leak guard's fixtures are synthetic and its pattern file holds only generic regexes, so
+# neither needs an exemption — and the pattern file is swept by the private supplement's
+# exact literals, which is the one residue it cannot check on itself.
+#
+# There is deliberately NO baseline file either — measured both ways, it cannot work here:
+# stored verbatim it carries the secrets and trips the scan itself; stored redacted it
+# suppresses nothing. Accepted findings carry an inline gitleaks allow-marker at the site, and
+# the SITES ARE ALLOWLISTED in .githooks/gitleaks-allow-sites.txt so the marker cannot be
+# sprinkled anywhere: the deny sweep refuses it in any unlisted file.
+#
+# The global allowlist table is [[allowlists]] (plural) — verified against gitleaks
+# 8.28.0, which rejects the singular form with
+#   "1 error(s) decoding: * 'AllowList' expected a map, got 'slice'"
+[extend]
+useDefault = true

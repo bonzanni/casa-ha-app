@@ -80,6 +80,7 @@ async def _client(secret: str):
 
 class TestNoSecretIsFailClosed:
     async def test_sse_turn_rejected_and_never_dispatched(self):
+        """Pins INV-VOICE-001. Red case demonstrated: making _verify return True on a missing secret fails this class's tests."""
         client, dispatched = await _client("")
         try:
             resp = await client.post("/api/converse", json=_TURN)

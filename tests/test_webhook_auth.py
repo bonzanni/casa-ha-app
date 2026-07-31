@@ -40,6 +40,7 @@ def test_hmac_body_missing_header_fails():
 
 
 def test_static_header_valid_and_missing():
+    """Pins INV-HTTP-001 (with the sibling mode tests). Red case demonstrated: renaming the static_header mode branch fails this test."""
     assert verify(
         "static_header", body=b"", headers={"X-API-Key": "s3cr3t-bytes"},
         secret=SEC, header_name="X-API-Key", tolerance_secs=0, now=0,

@@ -253,6 +253,7 @@ class TestRetrySdkCall:
         assert 250 <= delay_ms <= 500
 
     async def test_cancelled_error_propagates_immediately(self):
+        """Pins INV-TURN-005 (cancellation half; RETRY_KINDS membership is pinned by the sibling kind tests). Red case demonstrated: replacing the CancelledError re-raise with a retry continue fails this test."""
         attempts = {"n": 0}
 
         async def fn():

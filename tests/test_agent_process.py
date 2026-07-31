@@ -615,6 +615,7 @@ async def test_auto_recall_injects_attributed_memory_context(tmp_path):
 
 
 async def test_memory_failure_does_not_break_response(tmp_path, caplog):
+    """Pins INV-TURN-004. Red case demonstrated: re-raising from _build_options' broad recall-failure handler fails this test."""
     import logging
 
     class BrokenSemanticMemory(FakeSemanticMemory):
