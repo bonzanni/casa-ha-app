@@ -223,16 +223,30 @@ def _ask_payload(**over) -> dict:
 # ---------------------------------------------------------------------------
 
 
+async def _until(cond, *, tries: int = 2000):
+    """Deterministic wait: yield to the loop until *cond* holds. A fixed
+    sleep(0.02) races the scheduler under CI load (the documented ask-gates
+    flake shape); yielding until the observable condition is true does not."""
+    for _ in range(tries):
+        if cond():
+            return
+        await asyncio.sleep(0)
+    raise AssertionError("condition never became true")
+
+
 async def test_answered_settles_with_check_and_clears_keyboard(env):
     eid = env["rec"].id
     task = asyncio.ensure_future(env["ask"](
         _FakeRequest(_ask_payload(engagement_id=eid, request_id="a1"))))
-    await asyncio.sleep(0.02)
+    await _until(lambda: (env["broker"].get_meta(
+        namespace="engagement_ask", scope=eid, request_id="a1") or {}).get(
+        "message_id") is not None)
     assert env["broker"].deliver(
         namespace="engagement_ask", scope=eid, request_id="a1",
         option_index=1, actor_id=555) == "delivered"
     resp = await asyncio.wait_for(task, timeout=1.0)
     await env["broker"].drain_hooks()
+    await _until(lambda: env["ch"].edits)
 
     assert _body(resp) == {
         "ok": True, "outcome": "answered", "option": "B", "option_index": 1}
@@ -622,14 +636,21 @@ async def test_button_ask_reattach_race_preserves_static_metadata(env, monkeypat
     first = asyncio.ensure_future(env["ask"](_FakeRequest(p)))
     await asyncio.wait_for(parked.wait(), timeout=1.0)
 
-    # The RETRY (same request_id) reattaches and, in the race, CREATES the
-    # broker request. It must seed the complete static metadata.
+    # The RETRY (same request_id) reattaches while the first attempt is still
+    # parked. Whichever path ends up creating the broker request, the request
+    # must carry the complete static metadata.
     second = asyncio.ensure_future(env["ask"](_FakeRequest(p)))
-    await asyncio.sleep(0.02)   # let the retry register the broker request
+    # The retry parks on the owner-first gate; give it bounded bare yields to
+    # get there (reaching a wait needs scheduler turns, not wall time).
+    for _ in range(50):
+        await asyncio.sleep(0)
 
-    # Let the first attempt resume: its main-path register now sees created=False.
+    # Let the first attempt resume; registration and meta seeding follow on
+    # the owner path. Wait on the observable outcome instead of a fixed sleep
+    # — the fixed 0.02s raced the scheduler under CI load.
     resume.set()
-    await asyncio.sleep(0.02)
+    await _until(lambda: env["broker"].get_meta(
+        namespace="engagement_ask", scope=eid, request_id="race-1") is not None)
 
     meta = env["broker"].get_meta(
         namespace="engagement_ask", scope=eid, request_id="race-1")
