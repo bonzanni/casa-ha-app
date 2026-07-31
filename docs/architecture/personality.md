@@ -14,9 +14,12 @@ does not cover agent declaration and loading, which belong to the taxonomy docum
 
 ## Mental model
 
-**A role is identity; a persona is presentation.** The role decides what an agent is and what
-it may do. The persona decides how it sounds. They are versioned and validated separately,
-and a binding is what associates them.
+**A role is identity; a persona is presentation.** The role decides what an agent *is* —
+identity, model, doctrine, and the role-based checks. What a resident or specialist *may do*
+— its tool lists, permission mode and MCP servers — comes from its own runtime
+configuration, not from the role artifact; only the executor path applies a role-artifact
+capability ceiling. The persona decides how the agent sounds. Roles and personas are
+versioned and validated separately, and a binding is what associates them.
 
 **The compiled bundle replaces the composed prompt — it does not layer onto it.** This is the
 easiest thing to get wrong here. The composed prompt is built from the agent's own

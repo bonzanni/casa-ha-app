@@ -18,8 +18,10 @@ explains, is where the actual limits live.
 most important thing here, and it is the opposite of what the architecture suggests. No code
 in this application reads Home Assistant's entity registry or refuses an action because of
 the entity or domain it names. Action arguments are forwarded unchanged for ordinary tools —
-the one exception is the live-context tool, whose arguments the facade replaces and whose
-response it filters when a domain was asked for.
+the one exception is the live-context tool, whose upstream arguments the facade replaces
+outright (a requested domain never leaves the facade) and whose response it domain-filters
+only when the upstream answers in the legacy mapping shape — the current curated
+success/result shape passes through unfiltered.
 
 Two different limits apply, and they answer different questions. *Which agents can talk to
 Home Assistant at all* is Casa configuration: an agent reaches these tools only if its

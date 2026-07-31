@@ -51,9 +51,11 @@ how a corpus rots while passing.
 **CI enforces**: the size budget; allowlist exactness in both directions against
 `git ls-files`; admitted extensions; manifest schema and required fields; anchor resolution
 and containment; the marker pair in every document; invariant define-once, reference
-resolution, and declaration accuracy; that every declared invariant binds at least one
-tracked pinning test (the `invariant_tests` map — a binding to the missing-test sentinel is
-itself a failure); the code-derived coverage ledger in both directions (every enumerated
+resolution, and declaration accuracy; that every declared invariant carries at least one
+`invariant_tests` binding to a tracked file that is not the missing-test sentinel, with any
+named test function checked by string search (that the reference *is* a genuine, collected
+pinning test is established by the red-case discipline, not by CI); the code-derived
+coverage ledger in both directions (every enumerated
 surface assigned to a document or excluded with a reason, no stale entries); the required
 skeleton; and that all generated navigation is current.
 
