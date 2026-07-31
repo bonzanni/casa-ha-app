@@ -827,6 +827,31 @@ def _origin_clearance_markers(origin: dict) -> tuple[str | None, str | None]:
     )
 
 
+def inherit_origin_markers(origin: dict) -> dict:
+    """Stamp the effective origin markers onto an engagement's origin dict.
+
+    #336 (Terra, review r3): an engagement that spawns a NESTED engagement
+    calls ``engage_executor`` over the internal socket, where the ambient
+    origin carries no route — so the child record would persist no markers and
+    its own reads would fall back to the channel default (private on
+    telegram), laundering a low-clearance parent into a high-clearance child.
+    Inheriting the parent's effective markers means clearance cannot be gained
+    by nesting.
+
+    Returns *origin* (mutated in place — it is already a per-call snapshot
+    copy, never the shared ContextVar holder). An origin that carries its own
+    route is left untouched: a resident turn creating an engagement is the
+    authority on its own clearance.
+    """
+    if "_origin_route" in origin:
+        return origin
+    route, clearance = _origin_clearance_markers(origin)
+    if route is not None:
+        origin["_origin_route"] = route
+        origin["_origin_clearance"] = clearance
+    return origin
+
+
 def _result(payload: dict, *, is_error: bool | None = None) -> dict:
     """Wrap a JSON-serializable payload as the tool's MCP content.
 
@@ -4822,16 +4847,7 @@ async def engage_executor(args: dict) -> dict:
             "status": "error", "kind": "no_origin",
             "message": "engage_executor called outside a turn",
         })
-    # #336 (Terra, review r3): an engagement that spawns a NESTED engagement
-    # calls this over the internal socket, where the ambient origin carries no
-    # route — so the child record would persist no markers and its own recall
-    # would fall back to the channel default (private on telegram), laundering
-    # a low-clearance parent into a high-clearance child. Inherit the parent's
-    # effective markers so clearance cannot be gained by nesting.
-    _inherit_route, _inherit_clearance = _origin_clearance_markers(origin)
-    if _inherit_route is not None and "_origin_route" not in origin:
-        origin["_origin_route"] = _inherit_route
-        origin["_origin_clearance"] = _inherit_clearance
+    origin = inherit_origin_markers(origin)
 
     executor_type = args.get("executor_type", "")
     task_text = args.get("task", "") or ""

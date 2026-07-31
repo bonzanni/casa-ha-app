@@ -888,7 +888,21 @@ class EngagementRegistry:
                 "engagement %s read-clearance lowered %s→%s (steered by a "
                 "lower-clearance sender)", engagement_id[:8], current, clearance,
             )
-            await self._write_tombstone_locked()
+            # The IN-MEMORY clamp is what gates every read from here on, and it
+            # is applied above regardless of what disk does — a persistence
+            # failure must never leave this process reading at the higher tier.
+            # The write is what makes it survive a restart, so a failure is
+            # security-relevant and says so; it is deliberately NOT rolled back
+            # (rolling back would RAISE the clearance, the one direction this
+            # clamp must never move).
+            try:
+                await self._write_tombstone_locked(strict=True)
+            except Exception as exc:  # noqa: BLE001 — in-memory clamp stands
+                logger.warning(
+                    "engagement %s read-clearance lowered to %s in memory but "
+                    "the write failed (%s) — a restart would restore %s",
+                    engagement_id[:8], clearance, exc, current,
+                )
             return True
 
     async def update_last_idle_reminder(self, engagement_id: str, ts: float) -> None:

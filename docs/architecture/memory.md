@@ -72,8 +72,16 @@ never raises it back, which makes the property "an engagement never reads above 
 least-privileged person who has taken part in it". The clamp is deliberately one-way: two
 people steering concurrently can only drive it further down, and the operator returning to
 their own engagement does not restore what a lower-clearance participant has already seen.
-Note what this is not: within a turn it is still record-level, not per-turn — the engagement
-does not read at a *higher* clearance for the operator after being lowered.
+
+Read the clamp's scope precisely, because three things it does not do are easy to assume.
+It gates *future* reads: content already recalled into a live session's transcript stays
+there, and a tool call that resolved its clearance before the clamp landed completes at the
+old tier — so a steering turn does not retroactively censor an answer already in flight for
+someone else's question. It is applied in memory first and persisted best-effort, so a failed
+write leaves this process correctly clamped while a restart would restore the higher tier
+(the failure is logged as security-relevant). And it only moves a record that carries a
+stamped clearance: an engagement that was already running before per-sender markers existed
+has none, so it keeps channel-keyed clearance — on Telegram, private — until it finishes.
 
 **Writing is narrower than reading.** Only write-trusted channels retain to the shared bank.
 A channel that can recall is not thereby able to store.

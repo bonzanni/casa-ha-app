@@ -316,7 +316,9 @@ class TestNestedEngagementInheritsMarkers:
     child."""
 
     def _inherited(self, parent_origin, ambient):
-        """The marker pair engage_executor would stamp onto a child record."""
+        """The markers PRODUCTION stamps onto a child record — this calls
+        ``tools.inherit_origin_markers``, the function ``engage_executor``
+        itself uses, rather than reimplementing the rule (Terra, review r5)."""
         import tools as tools_mod
 
         class _Rec:
@@ -325,14 +327,10 @@ class TestNestedEngagementInheritsMarkers:
 
         token = tools_mod.engagement_var.set(_Rec(parent_origin))
         try:
-            origin = dict(ambient)
-            route, clearance = tools_mod._origin_clearance_markers(origin)
-            if route is not None and "_origin_route" not in origin:
-                origin["_origin_route"] = route
-                origin["_origin_clearance"] = clearance
-            return origin.get("_origin_route"), origin.get("_origin_clearance")
+            out = tools_mod.inherit_origin_markers(dict(ambient))
         finally:
             tools_mod.engagement_var.reset(token)
+        return out.get("_origin_route"), out.get("_origin_clearance")
 
     def test_child_inherits_a_low_clearance_parent(self):
         assert self._inherited(
