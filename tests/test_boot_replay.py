@@ -16,6 +16,18 @@ except ImportError:
 pytestmark = [pytest.mark.asyncio, pytest.mark.unit]
 
 
+@pytest.fixture(autouse=True)
+def _confirmed_service_stop(monkeypatch):
+    """#335: these workspaces carry no ``.mcp.json``, so every record looks
+    like a credential migration and replay cycles its service — which shells
+    out to ``s6-rc``, absent in the test image. Default the stop to CONFIRMED
+    so the cycle behaves as it does in production; the tests that exercise a
+    teardown failure re-patch this themselves (a later monkeypatch wins)."""
+    from drivers import s6_rc
+    monkeypatch.setattr(
+        s6_rc, "ensure_service_down", AsyncMock(return_value=True))
+
+
 def _boot_driver():
     """A driver fake for boot-replay tests.
 
@@ -28,6 +40,10 @@ def _boot_driver():
     overridden by each caller.)"""
     driver = AsyncMock()
     driver.schedule_boot_reconcile = lambda *a, **k: None
+    # #335: the replay loop reads this URL for the .mcp.json refresh; an
+    # AsyncMock auto-attribute is not JSON-serializable and would make every
+    # heal refuse resume with ".mcp.json refresh failed".
+    driver._casa_framework_mcp_url = "http://127.0.0.1:8100/mcp/casa-framework"
     return driver
 
 
@@ -643,6 +659,18 @@ def _exec_reg_any(defn, *, enabled=True):
     return Reg()
 
 
+def _seed_current_credential(ws_dir, rec):
+    """#335: make a test workspace look like an ORDINARY restart — its
+    ``.mcp.json`` already carries the record's credential — so replay's
+    credential-migration cycle does not fire."""
+    from drivers.workspace import write_workspace_mcp_json
+    rec.auth_token = rec.auth_token or "tok-seeded"
+    write_workspace_mcp_json(
+        str(ws_dir), engagement_id=rec.id,
+        engagement_auth_token=rec.auth_token,
+        casa_framework_mcp_url="http://127.0.0.1:8100/mcp/casa-framework")
+
+
 def _brief_rec(eid, brief, *, role="hello-driver", topic_id=1):
     from engagement_registry import EngagementRecord
     return EngagementRecord(
@@ -1005,6 +1033,11 @@ async def test_replay_b2_stale_migration_removal_fails_refuses_closed(
 
     reg = EngagementRegistry(tombstone_path=str(tmp_path / "tomb.json"), bus=None)
     reg._records["keep1"] = _brief_rec("keep1", _BRIEF)
+    # #335: this test is about the STALE-PAIR migration refusal, so give the
+    # workspace an already-current credential — otherwise the (also
+    # unconfirmable) credential cycle refuses first and the assertion below
+    # would be testing that refusal instead of this one.
+    _seed_current_credential(ws_root / "keep1", reg._records["keep1"])
     driver = _boot_driver(); bg = MagicMock(); driver._spawn_background_tasks = bg
 
     await replay_undergoing_engagements(
@@ -1226,3 +1259,151 @@ async def test_replay_adopts_summary_before_start(monkeypatch, tmp_path):
     await replay_undergoing_engagements(registry=reg, driver=driver)
 
     assert order == [("adopt", "keep1"), ("start", "keep1")]
+
+
+# ---------------------------------------------------------------------------
+# #335 — credential migration cycle (Sol, review r2)
+# ---------------------------------------------------------------------------
+
+
+async def test_credential_migration_rewrites_and_cycles_the_service(
+    monkeypatch, tmp_path,
+):
+    """A pre-#335 workspace (no token in .mcp.json) is refreshed from the
+    record AND its service cycled, because a running CLI caches .mcp.json at
+    spawn and would otherwise authenticate with a credential it does not
+    hold."""
+    from casa_core import replay_undergoing_engagements
+    from drivers import s6_rc
+    from drivers.workspace import workspace_mcp_token
+    from engagement_registry import EngagementRegistry
+
+    monkeypatch.setattr(s6_rc, "sweep_orphan_service_dirs", lambda **kw: [])
+    monkeypatch.setattr(s6_rc, "sweep_orphan_compiled_dbs", lambda: None)
+    monkeypatch.setattr(s6_rc, "service_pair_complete", lambda **kw: True)
+    monkeypatch.setattr(s6_rc, "run_script_is_stale", lambda **kw: False)
+    monkeypatch.setattr(s6_rc, "_compile_and_update_locked", AsyncMock())
+    started: list[str] = []
+    async def fake_start(*, engagement_id): started.append(engagement_id)
+    monkeypatch.setattr(s6_rc, "start_service", fake_start)
+    down = AsyncMock(return_value=True)
+    monkeypatch.setattr(s6_rc, "ensure_service_down", down)
+
+    ws_root = tmp_path / "eng"
+    (ws_root / "keep1").mkdir(parents=True)
+    reg = EngagementRegistry(tombstone_path=str(tmp_path / "tomb.json"), bus=None)
+    rec = _brief_rec("keep1", _BRIEF)
+    rec.origin = {}                      # brief-less: pure credential path
+    rec.auth_token = "tok-fresh"
+    reg._records["keep1"] = rec
+    driver = _boot_driver()
+    driver._spawn_background_tasks = lambda rec: None
+
+    await replay_undergoing_engagements(
+        registry=reg, driver=driver, engagements_root=str(ws_root))
+
+    assert workspace_mcp_token(str(ws_root / "keep1")) == "tok-fresh"
+    down.assert_awaited_once()           # cycled so the CLI reloads it
+    assert started == ["keep1"]          # and brought back up
+    assert reg._records["keep1"].status != "error"
+
+
+async def test_unchanged_credential_neither_rewrites_nor_cycles(
+    monkeypatch, tmp_path,
+):
+    """The ordinary restart: the on-disk credential already matches, so replay
+    touches nothing and no engagement is disturbed."""
+    from casa_core import replay_undergoing_engagements
+    from drivers import s6_rc
+    from engagement_registry import EngagementRegistry
+
+    monkeypatch.setattr(s6_rc, "sweep_orphan_service_dirs", lambda **kw: [])
+    monkeypatch.setattr(s6_rc, "sweep_orphan_compiled_dbs", lambda: None)
+    monkeypatch.setattr(s6_rc, "service_pair_complete", lambda **kw: True)
+    monkeypatch.setattr(s6_rc, "run_script_is_stale", lambda **kw: False)
+    monkeypatch.setattr(s6_rc, "_compile_and_update_locked", AsyncMock())
+    monkeypatch.setattr(s6_rc, "start_service", AsyncMock())
+    down = AsyncMock(return_value=True)
+    monkeypatch.setattr(s6_rc, "ensure_service_down", down)
+
+    ws_root = tmp_path / "eng"
+    (ws_root / "keep1").mkdir(parents=True)
+    reg = EngagementRegistry(tombstone_path=str(tmp_path / "tomb.json"), bus=None)
+    rec = _brief_rec("keep1", _BRIEF)
+    rec.origin = {}
+    rec.auth_token = "tok-same"
+    reg._records["keep1"] = rec
+    _seed_current_credential(ws_root / "keep1", rec)
+    mtime_before = (ws_root / "keep1" / ".mcp.json").stat().st_mtime_ns
+    driver = _boot_driver()
+    driver._spawn_background_tasks = lambda rec: None
+
+    await replay_undergoing_engagements(
+        registry=reg, driver=driver, engagements_root=str(ws_root))
+
+    down.assert_not_awaited()
+    assert (ws_root / "keep1" / ".mcp.json").stat().st_mtime_ns == mtime_before
+
+
+@pytest.mark.parametrize(
+    "stop_outcome", ["returns_false", "raises", "raises_persistently"])
+async def test_unconfirmed_stop_after_credential_refresh_refuses_resume(
+    monkeypatch, tmp_path, stop_outcome,
+):
+    """Sol r2: if the stop cannot be CONFIRMED after the credential is already
+    on disk, a surviving CLI holds one that authenticates nowhere — and the
+    next boot would see the on-disk token matching the record and never retry
+    the cycle. So the resume is refused (terminal mark + excluded from the
+    start and background loops) rather than left as a mute zombie."""
+    from unittest.mock import MagicMock
+    from casa_core import replay_undergoing_engagements
+    from drivers import s6_rc
+    from engagement_registry import EngagementRegistry
+
+    monkeypatch.setattr(s6_rc, "sweep_orphan_service_dirs", lambda **kw: [])
+    monkeypatch.setattr(s6_rc, "sweep_orphan_compiled_dbs", lambda: None)
+    monkeypatch.setattr(s6_rc, "service_pair_complete", lambda **kw: True)
+    monkeypatch.setattr(s6_rc, "run_script_is_stale", lambda **kw: False)
+    monkeypatch.setattr(s6_rc, "_compile_and_update_locked", AsyncMock())
+    monkeypatch.setattr(
+        s6_rc, "remove_service_dir",
+        lambda *, svc_root, engagement_id: None)
+    started: list[str] = []
+    async def fake_start(*, engagement_id): started.append(engagement_id)
+    monkeypatch.setattr(s6_rc, "start_service", fake_start)
+    if stop_outcome == "returns_false":
+        monkeypatch.setattr(
+            s6_rc, "ensure_service_down", AsyncMock(return_value=False))
+    elif stop_outcome == "raises":
+        # The cycle attempt itself raises; the refusal helper's own checked
+        # teardown then runs and cannot confirm the stop either.
+        monkeypatch.setattr(
+            s6_rc, "ensure_service_down",
+            AsyncMock(side_effect=[OSError("s6-rc missing"), False]))
+    else:
+        # Sol r3: EVERY stop raises, including the refusal helper's own — the
+        # helper then returns before marking anything, so the terminal mark
+        # has to be landed by the caller that chose to refuse.
+        monkeypatch.setattr(
+            s6_rc, "ensure_service_down",
+            AsyncMock(side_effect=OSError("s6-rc missing")))
+
+    ws_root = tmp_path / "eng"
+    (ws_root / "keep1").mkdir(parents=True)
+    reg = EngagementRegistry(tombstone_path=str(tmp_path / "tomb.json"), bus=None)
+    rec = _brief_rec("keep1", _BRIEF)
+    rec.origin = {}
+    rec.auth_token = "tok-fresh"
+    reg._records["keep1"] = rec
+    driver = _boot_driver()
+    bg = MagicMock()
+    driver._spawn_background_tasks = bg
+
+    await replay_undergoing_engagements(
+        registry=reg, driver=driver, engagements_root=str(ws_root))
+
+    assert reg._records["keep1"].status == "error"
+    assert reg._records["keep1"].origin["error_kind"] == (
+        "refuse_credential_cycle_failed")
+    assert started == []        # never resumed
+    assert bg.call_count == 0   # and no background tasks attached

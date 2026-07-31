@@ -248,6 +248,7 @@ async def test_oversized_ask_refused_with_self_explaining_detail(
         {"user_id": 555}, topic_id=42)
     payload = {
         "engagement_id": rec.id, "request_id": "r1",
+        "engagement_token": rec.auth_token,
         "question": question, "options": options, "timeout_s": 60,
     }
     resp = await ask(_FakeRequest(payload))
@@ -279,6 +280,7 @@ async def test_oversized_multi_ask_all_selected_worst_case_refused(
         {"user_id": 555}, topic_id=42)
     payload = {
         "engagement_id": rec.id, "request_id": "r2",
+        "engagement_token": rec.auth_token,
         "question": question, "options": options, "multi": True,
         "timeout_s": 60,
     }
@@ -306,6 +308,7 @@ async def test_near_boundary_single_select_body_passes(
         {"user_id": 555}, topic_id=42)
     payload = {
         "engagement_id": rec.id, "request_id": "r3",
+        "engagement_token": rec.auth_token,
         "question": question, "options": options, "timeout_s": 60,
     }
     task = asyncio.ensure_future(ask(_FakeRequest(payload)))

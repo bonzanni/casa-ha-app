@@ -1,5 +1,64 @@
 # Changelog
 
+## [0.136.0] - 2026-08-01
+
+### Fixed / Security
+
+Identity-family batch — three issues (#335, #336, #350) where something was
+trusted for *who it claimed to be* rather than *who it proved to be*:
+
+- **Engagement identity is now authenticated, not just claimed** (#335).
+  Every engagement gets a per-engagement secret credential, provisioned only
+  into its own workspace; the internal tool bridge and the engagement
+  channel routes now verify it before acting with an engagement's authority.
+  Previously, any in-container process that knew another engagement's id
+  (ids appear in logs and configuration) could call privileged tools as that
+  engagement — including configurator-only config commits. A known id with a
+  missing or wrong credential is now rejected outright, the workspace
+  inspection tool refuses to hand out the credential file, and both files
+  that store a credential are no longer world-readable. In-flight
+  engagements survive the upgrade: the credential is minted for existing
+  records at boot, their workspaces are refreshed, and an engagement whose
+  credential changed is restarted so it picks the new one up.
+  Scope, stated plainly: this raises the bar from "know an id" to "hold a
+  secret". It is not isolation between engagements — they all run as root in
+  one container, so a shell-capable engagement can still read a sibling's
+  credential file (#365), and hook resolution still identifies an engagement
+  by working directory (#366).
+- **Telegram senders are attributed individually, and private memory is
+  reached only through the operator** (#336). Previously every accepted Telegram sender —
+  including strangers, when `telegram_chat_id` is left empty ("accept all
+  chats") — was recorded as the operator and recalled memory at the
+  operator's private clearance. Now only the sender whose id matches the
+  configured `telegram_chat_id` is the operator; any other sender is
+  recorded under its own `telegram:<id>` identity, reads at public clearance
+  only, and the agent is told the sender is not the operator. This holds for
+  both ways a turn starts — a message and a button tap — and it follows the
+  turn outward: a specialist it delegates to, an engagement it starts (and
+  any engagement that one spawns), and the prior-engagement memory injected
+  into an executor's prompt all read at that same lower clearance instead of
+  the operator's private tier. With the option empty, no sender is treated
+  as the operator — set your chat id to keep operator attribution.
+  An engagement started after this release carries the clearance of whoever
+  started it — and if anyone with a lower clearance later steers it by
+  messaging its topic, it drops to *their* clearance and never climbs back,
+  so it does not read above the least-privileged person taking part. Four
+  limits worth knowing: engagements that were **already running** before this
+  upgrade carry no such stamp, so they keep the old channel-wide clearance
+  until you finish them (start a new engagement if that matters to you);
+  lowering an engagement's clearance stops *new* private reads but does not
+  erase what it already knows from earlier in the same engagement (#369); the
+  drop is recorded on a best-effort write, so in the rare case that write
+  fails, a restart restores the earlier clearance (the failure is logged);
+  and a non-operator can still answer their own protected-tool confirmation
+  prompt (#368).
+- **A chatty memory-sensitivity classification can no longer leak a fact
+  downward** (#350). The tier classifier's reply parser used to accept the
+  first tier word found anywhere in the reply — so "this is not public; it
+  is family" tagged a family fact *public* and made it recallable on
+  public-clearance surfaces. The parser now accepts only a clean single-word
+  answer; anything ambiguous falls back to the leak-safe private default.
+
 ## [0.135.0] - 2026-07-31
 
 ### Fixed

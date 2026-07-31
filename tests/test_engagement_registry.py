@@ -236,6 +236,9 @@ class TestRegistryStateTransitions:
             "driver": "in_casa", "status": "idle", "topic_id": 2,
             "started_at": 1000.0, "last_user_turn_ts": 1000.0,
             "origin": {}, "task": "t",
+            # #335: a row WITHOUT auth_token triggers the load() backfill
+            # rewrite — carry one so no-reconcile really means no rewrite.
+            "auth_token": "tok-e-idle",
         }]))
         before = tombstone.read_text()
         reg = EngagementRegistry(tombstone_path=str(tombstone), bus=None)

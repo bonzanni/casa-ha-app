@@ -83,6 +83,7 @@ async def test_workspace_legacy_path_substitutes_executor_memory(tmp_path):
     await provision_workspace(
         engagements_root=str(eng_root),
         engagement_id="abc12345",
+        engagement_auth_token="tok-ws-test",
         defn=_Defn(),
         task="dotask",
         context="(none)",

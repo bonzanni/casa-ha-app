@@ -293,6 +293,7 @@ async def test_body_identical_across_post_persist_and_settle(
     options = ["Personal Gmail", "Work Outlook"]
     payload = {
         "engagement_id": eid, "request_id": "a1",
+        "engagement_token": rec.auth_token,
         "question": "Which account?", "options": options, "timeout_s": 60,
     }
     task = asyncio.ensure_future(ask(_FakeRequest(payload)))

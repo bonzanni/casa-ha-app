@@ -239,8 +239,9 @@ async def _until(cond, *, tries: int = 2000):
 
 async def test_answered_settles_with_check_and_clears_keyboard(env):
     eid = env["rec"].id
+    tok = env["rec"].auth_token
     task = asyncio.ensure_future(env["ask"](
-        _FakeRequest(_ask_payload(engagement_id=eid, request_id="a1"))))
+        _FakeRequest(_ask_payload(engagement_id=eid, engagement_token=tok, request_id="a1"))))
     await _until(lambda: (env["broker"].get_meta(
         namespace="engagement_ask", scope=eid, request_id="a1") or {}).get(
         "message_id") is not None)
@@ -265,9 +266,10 @@ async def test_answered_settles_with_check_and_clears_keyboard(env):
 async def test_expired_settles_with_hourglass_and_clears_keyboard(env, monkeypatch):
     import channels.channel_handlers  # noqa: F401
     eid = env["rec"].id
+    tok = env["rec"].auth_token
     # Fire the timeout immediately.
     task = asyncio.ensure_future(env["ask"](
-        _FakeRequest(_ask_payload(engagement_id=eid, request_id="e1", timeout_s=30))))
+        _FakeRequest(_ask_payload(engagement_id=eid, engagement_token=tok, request_id="e1", timeout_s=30))))
     await asyncio.sleep(0.02)
     env["broker"]._on_timeout(("engagement_ask", eid, "e1"))
     resp = await asyncio.wait_for(task, timeout=1.0)
@@ -283,11 +285,12 @@ async def test_expired_settles_with_hourglass_and_clears_keyboard(env, monkeypat
 
 async def test_canonical_qnumber_prepends_verbatim(env):
     eid = env["rec"].id
+    tok = env["rec"].auth_token
     # v0.85.0 (round 4, D4): the agent's own "Q7:" prefix is preserved
     # VERBATIM — Casa only PREPENDS the allocated durable number, it no
     # longer strips an agent-authored leading "Q<digits>:".
     task = asyncio.ensure_future(env["ask"](_FakeRequest(_ask_payload(
-        engagement_id=eid, request_id="c1", question="Q7: Which DB?"))))
+        engagement_id=eid, engagement_token=tok, request_id="c1", question="Q7: Which DB?"))))
     await asyncio.sleep(0.02)
     posted_q = env["ch"].options_keyboards[-1]["question"]
     assert posted_q == "Q1: Q7: Which DB?\n\n1. A\n2. B"
@@ -309,8 +312,9 @@ async def test_canonical_qnumber_prepends_verbatim(env):
 
 async def test_free_text_anchor_posts_numbered_and_registers(env):
     eid = env["rec"].id
+    tok = env["rec"].auth_token
     resp = await env["ask"](_FakeRequest(_ask_payload(
-        engagement_id=eid, request_id="ft1",
+        engagement_id=eid, engagement_token=tok, request_id="ft1",
         question="What's the DB name?", options=[])))
     body = _body(resp)
     assert body["ok"] is True and body["outcome"] == "anchored"
@@ -331,9 +335,10 @@ async def test_free_text_anchor_posts_numbered_and_registers(env):
 
 async def test_unread_inbound_refuses_without_registering(env):
     eid = env["rec"].id
+    tok = env["rec"].auth_token
     env["driver"].depth = 1  # operator message waiting, unseen
     resp = await env["ask"](_FakeRequest(_ask_payload(
-        engagement_id=eid, request_id="g1")))
+        engagement_id=eid, engagement_token=tok, request_id="g1")))
     body = _body(resp)
     assert body["ok"] is False and body["error"] == "unread_inbound"
     assert "end your turn now" in body["message"]
@@ -346,9 +351,10 @@ async def test_unread_inbound_refuses_without_registering(env):
 
 async def test_free_text_anchor_also_gated_on_unread(env):
     eid = env["rec"].id
+    tok = env["rec"].auth_token
     env["driver"].depth = 1
     resp = await env["ask"](_FakeRequest(_ask_payload(
-        engagement_id=eid, request_id="ga1", question="DB name?", options=[])))
+        engagement_id=eid, engagement_token=tok, request_id="ga1", question="DB name?", options=[])))
     body = _body(resp)
     assert body["ok"] is False and body["error"] == "unread_inbound"
     # No anchor posted, nothing registered.
@@ -358,11 +364,12 @@ async def test_free_text_anchor_also_gated_on_unread(env):
 
 async def test_refusal_escalates_at_third(env):
     eid = env["rec"].id
+    tok = env["rec"].auth_token
     env["driver"].depth = 1
     msgs = []
     for i in range(3):
         resp = await env["ask"](_FakeRequest(_ask_payload(
-            engagement_id=eid, request_id=f"r{i}")))
+            engagement_id=eid, engagement_token=tok, request_id=f"r{i}")))
         msgs.append(_body(resp)["message"])
     assert msgs[0] == msgs[1]
     assert msgs[2] != msgs[0]
@@ -376,6 +383,7 @@ async def test_refusal_escalates_at_third(env):
 
 async def test_generation_recheck_supersedes(env):
     eid = env["rec"].id
+    tok = env["rec"].auth_token
     ch = env["ch"]
     driver = env["driver"]
 
@@ -392,7 +400,7 @@ async def test_generation_recheck_supersedes(env):
     ch.post_options_keyboard = _post
 
     resp = await env["ask"](_FakeRequest(_ask_payload(
-        engagement_id=eid, request_id="s1")))
+        engagement_id=eid, engagement_token=tok, request_id="s1")))
     body = _body(resp)
     assert body["ok"] is False and body["error"] == "superseded"
     await env["broker"].drain_hooks()
@@ -410,7 +418,8 @@ async def test_generation_recheck_supersedes(env):
 
 async def test_reply_retry_reattaches_no_double_post(env):
     eid = env["rec"].id
-    p = {"engagement_id": eid, "text": "hello operator",
+    tok = env["rec"].auth_token
+    p = {"engagement_id": eid, "engagement_token": tok, "text": "hello operator",
          "request_id": "rep-1", "projection_hash": "rh"}
     r1 = await env["send"](_FakeRequest(p))
     b1 = _body(r1)
@@ -473,8 +482,9 @@ async def test_reply_poster_failure_returns_ok_false(failing_env):
     """F3: the deferred reply poster fails → the handler AWAITS the outcome and
     returns ok:false. An ok:true response with a failed post is impossible."""
     eid = failing_env["rec"].id
+    tok = failing_env["rec"].auth_token
     r = await failing_env["send"](_FakeRequest({
-        "engagement_id": eid, "text": "shipped it",
+        "engagement_id": eid, "engagement_token": tok, "text": "shipped it",
         "request_id": "rf-1", "projection_hash": "rh"}))
     assert _body(r)["ok"] is False
     # The intent recorded an ok:false outcome (surfaced, not swallowed).
@@ -485,8 +495,9 @@ async def test_reply_poster_failure_returns_ok_false(failing_env):
 async def test_anchor_poster_failure_returns_ok_false(failing_env):
     """F3: the free-text anchor poster fails → ok:false, never ok:true."""
     eid = failing_env["rec"].id
+    tok = failing_env["rec"].auth_token
     r = await failing_env["ask"](_FakeRequest(_ask_payload(
-        engagement_id=eid, request_id="af-1",
+        engagement_id=eid, engagement_token=tok, request_id="af-1",
         question="Which DB?", options=[])))
     assert _body(r)["ok"] is False
 
@@ -545,8 +556,10 @@ async def test_reply_retry_unresolved_awaits_and_fails_closed(env, monkeypatch):
     driver = _UnresolvedDriver(created=False)
     monkeypatch.setattr(agent_mod, "active_claude_code_driver", driver)
     eid = env["rec"].id
+    tok = env["rec"].auth_token
     r = await env["send"](_FakeRequest({
-        "engagement_id": eid, "text": "hi", "request_id": "rep-u",
+        "engagement_id": eid, "engagement_token": tok, "text": "hi",
+        "request_id": "rep-u",
         "projection_hash": "rh"}))
     b = _body(r)
     assert b["ok"] is False and b["error"] == "send_failed"
@@ -559,8 +572,10 @@ async def test_reply_first_attempt_unresolved_fails_closed(env, monkeypatch):
     driver = _UnresolvedDriver(created=True)
     monkeypatch.setattr(agent_mod, "active_claude_code_driver", driver)
     eid = env["rec"].id
+    tok = env["rec"].auth_token
     r = await env["send"](_FakeRequest({
-        "engagement_id": eid, "text": "hi", "request_id": "rep-f",
+        "engagement_id": eid, "engagement_token": tok, "text": "hi",
+        "request_id": "rep-f",
         "projection_hash": "rh"}))
     assert _body(r)["ok"] is False
 
@@ -572,9 +587,10 @@ async def test_anchor_retry_unresolved_fails_closed_no_number(env, monkeypatch):
     driver = _UnresolvedDriver(created=False)
     monkeypatch.setattr(agent_mod, "active_claude_code_driver", driver)
     eid = env["rec"].id
+    tok = env["rec"].auth_token
     before = env["reg"].get(eid).next_question_number
     r = await env["ask"](_FakeRequest(_ask_payload(
-        engagement_id=eid, request_id="fu", question="DB?", options=[])))
+        engagement_id=eid, engagement_token=tok, request_id="fu", question="DB?", options=[])))
     b = _body(r)
     assert b["ok"] is False and b["error"] == "delivery_failed"
     assert env["reg"].get(eid).next_question_number == before  # no number burned
@@ -586,7 +602,8 @@ async def test_anchor_retry_reattaches_without_new_qnumber(env):
     second anchor, single open-question entry (parity with the button reattach).
     """
     eid = env["rec"].id
-    p = _ask_payload(engagement_id=eid, request_id="ftr",
+    tok = env["rec"].auth_token
+    p = _ask_payload(engagement_id=eid, engagement_token=tok, request_id="ftr",
                      question="DB?", options=[])
     r1 = await env["ask"](_FakeRequest(p))
     assert _body(r1)["question_number"] == 1
@@ -620,6 +637,7 @@ async def test_button_ask_reattach_race_preserves_static_metadata(env, monkeypat
     {"message_id": ...} only ⇒ every tap rejected.
     """
     eid = env["rec"].id
+    tok = env["rec"].auth_token
     reg = env["reg"]
 
     parked = asyncio.Event()   # set once the first attempt is inside allocation
@@ -651,7 +669,7 @@ async def test_button_ask_reattach_race_preserves_static_metadata(env, monkeypat
 
     monkeypatch.setattr(gate.event, "wait", _observed_wait)
 
-    p = _ask_payload(engagement_id=eid, request_id="race-1")
+    p = _ask_payload(engagement_id=eid, engagement_token=tok, request_id="race-1")
     first = asyncio.ensure_future(env["ask"](_FakeRequest(p)))
     await asyncio.wait_for(parked.wait(), timeout=1.0)
 
@@ -708,6 +726,7 @@ async def test_reattach_without_local_owner_creates_request_with_full_metadata(e
     from channels.output_sequencer import ASK_TOOL
 
     eid = env["rec"].id
+    tok = env["rec"].auth_token
 
     async def _vanished_owner_poster():
         return None
@@ -721,7 +740,7 @@ async def test_reattach_without_local_owner_creates_request_with_full_metadata(e
         projection_hash="hash-abc", poster=_vanished_owner_poster)
 
     task = asyncio.ensure_future(env["ask"](_FakeRequest(
-        _ask_payload(engagement_id=eid, request_id="orphan-1"))))
+        _ask_payload(engagement_id=eid, engagement_token=tok, request_id="orphan-1"))))
     await _until(lambda: env["broker"].get_meta(
         namespace="engagement_ask", scope=eid, request_id="orphan-1") is not None)
 

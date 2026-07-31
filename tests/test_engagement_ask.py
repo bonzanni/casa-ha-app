@@ -52,6 +52,9 @@ class _FakeRecord:
         self.topic_id = topic_id
         self.status = status
         self.origin = origin if origin is not None else {"user_id": 999}
+        # #335: per-engagement secret; bodies must present it as
+        # ``engagement_token`` to act with this engagement's authority.
+        self.auth_token = f"tok-{eng_id}"
 
 
 class _FakeRegistry:
@@ -181,6 +184,7 @@ def ask_handler_direct(_fresh_broker):
 def _payload(**overrides) -> dict:
     base = {
         "engagement_id": "eng-1", "request_id": "rid-default",
+        "engagement_token": "tok-eng-1",
         "question": "Proceed?", "options": ["A", "B"], "timeout_s": 60,
     }
     base.update(overrides)
@@ -490,7 +494,8 @@ async def test_ask_cancel_route_is_explicit_cancellation(app_with_ask) -> None:
         await asyncio.sleep(0.05)
         resp_cancel = await client.post(
             "/internal/channel/ask_cancel",
-            json={"engagement_id": "eng-1", "request_id": "rid-ec"},
+            json={"engagement_id": "eng-1", "request_id": "rid-ec",
+                  "engagement_token": "tok-eng-1"},
         )
         assert (await resp_cancel.json()) == {"ok": True}
 
@@ -643,7 +648,8 @@ async def test_ask_cancel_no_live_request_is_still_ok(app_with_ask) -> None:
     async with TestClient(TestServer(app)) as client:
         resp = await client.post(
             "/internal/channel/ask_cancel",
-            json={"engagement_id": "eng-1", "request_id": "no-such-rid"},
+            json={"engagement_id": "eng-1", "request_id": "no-such-rid",
+                  "engagement_token": "tok-eng-1"},
         )
         assert (await resp.json()) == {"ok": True}
 

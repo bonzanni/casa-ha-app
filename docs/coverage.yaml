@@ -503,6 +503,8 @@
   doc: architecture/overview.md
 - item: env:CASA_DISCOVERY_AUTH_ENABLED
   doc: architecture/home-assistant-control.md
+- item: env:CASA_ENGAGEMENT_TOKEN
+  doc: architecture/mcp-and-tools.md
 - item: env:CASA_FRAMEWORK_MCP_URL
   doc: architecture/mcp-and-tools.md
 - item: env:CASA_HA_MCP_URL

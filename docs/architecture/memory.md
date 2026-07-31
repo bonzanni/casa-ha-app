@@ -1,5 +1,5 @@
 ---
-last_reviewed: 2026-07-31
+last_reviewed: 2026-08-01
 ---
 
 # Memory and recall
@@ -42,10 +42,46 @@ fresh non-voice session only — a warm reused client skips that path entirely, 
 auto-recalls. Both can still recall explicitly through the tool. "The agent remembers
 automatically" is true of a narrower set of turns than it sounds.
 
-**Read clearance is per channel and fails closed.** Known channels are mapped explicitly; an
-unrecognised one gets the *least* sensitive clearance. The fail direction is the security
-control here: an unknown surface must read less, never more, and a test pins the function's
-docstring to that direction so prose and behaviour cannot drift apart again.
+**Read clearance is per channel and fails closed** — and on Telegram, per *sender*. Known
+channels are mapped explicitly; an unrecognised one gets the *least* sensitive clearance.
+The fail direction is the security control here: an unknown surface must read less, never
+more, and a test pins the function's docstring to that direction so prose and behaviour
+cannot drift apart again. The Telegram channel's mapped clearance (private) is not
+route-wide: the ingress stamps a per-sender origin clearance — private only for the sender
+whose id matches the configured operator chat id, public for anyone else the accept-all
+mode lets in — and origin-aware resolution honors that stamp, failing closed to public
+when a telegram-marked turn carries a missing or malformed one. Both ways into a Telegram
+turn stamp it: a message and a button tap.
+
+**An engagement reads at the clearance of the turn that created it.** This needs stating
+because the mechanism is not the obvious one: an engagement's own tool calls arrive over the
+internal socket, which binds the engagement record but no ambient turn origin — so a
+clearance resolved from the ambient origin alone would find nothing and fall through to the
+channel default, handing an engagement started by a low-clearance sender the operator's
+private tier. The engagement's recorded origin carries the markers its creating turn was
+stamped with, and that is what its reads resolve against: its own recall, the prior-
+engagement archive injected into an executor's prompt at launch, the engager-side context a
+specialist can query, and a nested engagement it spawns, which inherits rather than
+re-deriving. An engagement whose record predates this (or came from an origin that stamps no
+route) keeps the channel-keyed behaviour.
+
+Inheritance at creation is only half the rule, because an engagement is *steerable*: anyone
+in the engagement supergroup can direct it by messaging its topic. So the recorded clearance
+is also a **monotonic floor** — a steering turn clamps it down to that sender's clearance and
+never raises it back, which makes the property "an engagement never reads above the
+least-privileged person who has taken part in it". The clamp is deliberately one-way: two
+people steering concurrently can only drive it further down, and the operator returning to
+their own engagement does not restore what a lower-clearance participant has already seen.
+
+Read the clamp's scope precisely, because three things it does not do are easy to assume.
+It gates *future* reads: content already recalled into a live session's transcript stays
+there, and a tool call that resolved its clearance before the clamp landed completes at the
+old tier — so a steering turn does not retroactively censor an answer already in flight for
+someone else's question. It is applied in memory first and persisted best-effort, so a failed
+write leaves this process correctly clamped while a restart would restore the higher tier
+(the failure is logged as security-relevant). And it only moves a record that carries a
+stamped clearance: an engagement that was already running before per-sender markers existed
+has none, so it keeps channel-keyed clearance — on Telegram, private — until it finishes.
 
 **Writing is narrower than reading.** Only write-trusted channels retain to the shared bank.
 A channel that can recall is not thereby able to store.
@@ -92,10 +128,11 @@ Enforced by the channel-clearance lookup's default. The direction matters: an un
 sees less, not more.
 
 What it does not cover: origin-aware resolution is narrower than it sounds. Resident
-auto-recall and the recall tool resolve clearance from the stamped origin (`clearance_for_origin()`),
-so a webhook turn's clearance there depends on its declared origin. Delegated recall
-(`delegated_recall()`) resolves from the origin *channel* alone and discards any
-origin-stamped route or clearance override.
+auto-recall and the recall tool resolve clearance from the stamped origin
+(`clearance_for_origin()`), so a webhook turn's clearance there depends on its declared
+origin. Delegated recall honours a route its caller passes, but falls back to channel-keyed
+clearance for every caller that passes none — check the call site before assuming a
+delegated read is origin-filtered.
 
 **INV-MEM-004**: A caller cannot inject a sensitivity tier or a provenance tag through ordinary application tags.
 
@@ -138,6 +175,30 @@ behavior; and a turn still running on the *same* session when a reset saves it c
 tail exchanges miss retention — the reset drops the pointer (its contract) and nothing
 saves that session again.
 
+**INV-MEM-008**: An engagement's reads resolve clearance from the origin markers its own record carries, and a steering turn from a lower-clearance sender clamps those markers down permanently.
+
+Enforced in two places that have to agree: where the markers are resolved for an
+access-control decision — the ambient origin wins when it has a route of its own (an
+in-process delegated turn), otherwise the bound engagement record supplies them — and at the
+engagement-topic ingress, which lowers the record's stamped clearance to each steering
+sender's before their turn is delivered. Every read an engagement can perform resolves
+through the first: its own recall, the executor archive injected at launch, the engager-side
+context, and a nested engagement it spawns.
+
+What it does not cover: a record carrying no markers falls back to channel-keyed clearance,
+which on Telegram is private — so this tightens what a *newly* stamped origin can reach, and
+does not retroactively downgrade engagements created before the markers existed. The clamp
+also cannot un-share what was already disclosed before a lower-clearance sender arrived.
+
+**INV-MEM-007**: A tier-classifier reply parses only when it is exactly one tier token; any reply containing other words yields no tier and the item falls to the private default.
+
+Enforced in the reply parser (`parse_tier`), which full-matches a single decorated token
+instead of searching for the leftmost tier word — the search behaviour is what let a chatty
+reply mis-tag a family fact as public.
+
+What it does not cover: a classifier that *confidently answers the wrong single word* is
+believed. This is a parser contract, not an accuracy guarantee — the eval set owns accuracy.
+
 ## Failure behavior
 
 **The backend is slow, unreachable, or returns an error.** The seam raises `RecallUnavailable`
@@ -164,7 +225,11 @@ and reset it; only unavailability counts as failure.
 
 **Tier classification fails.** Retention classifies each item's sensitivity with a bounded
 LLM pass; a failed or unparseable classification retries once and then assigns *private*,
-with only a log warning to show for it. The write is not lost — but the fact becomes invisible below the highest
+with only a log warning to show for it. "Unparseable" is strict: the classifier is prompted
+for a single tier word, and only a reply that *is* exactly one tier token (modulo a label,
+punctuation, or emphasis) parses — a tier word inside a longer sentence ("this is not
+public; it is family") is ambiguity, not an answer, and falls to the private default
+rather than having its leftmost tier word extracted. The write is not lost — but the fact becomes invisible below the highest
 clearance, which reads as absence on voice and friends surfaces.
 
 **Saving a session fails.** The save is abandoned, its claim is released, and the entry stays

@@ -110,17 +110,20 @@ async def test_svc_tools_call_forwards_to_internal_with_engagement_id() -> None:
                 "jsonrpc": "2.0", "id": 5, "method": "tools/call",
                 "params": {"name": "ok", "arguments": {"x": 1}},
             },
-            headers={"X-Casa-Engagement-Id": "eng-9"},
+            headers={"X-Casa-Engagement-Id": "eng-9",
+                     "X-Casa-Engagement-Token": "tok-eng-9"},
         )
         body = await resp.json()
         assert body["result"] == {"content": [{"type": "text", "text": "ok"}]}
-        # forward_call called with internal-shape body.
+        # forward_call called with internal-shape body (#335: the engagement
+        # auth token header rides along as body key engagement_token).
         call_args = fwd.call_args
         assert call_args.kwargs["path"] == "/internal/tools/call"
         assert call_args.kwargs["body"] == {
             "name": "ok",
             "arguments": {"x": 1},
             "engagement_id": "eng-9",
+            "engagement_token": "tok-eng-9",
         }
 
 

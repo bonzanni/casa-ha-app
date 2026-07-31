@@ -77,7 +77,10 @@ async def test_pin_inv_mcp_001_internal_dispatch_ignores_agent_allowlist():
     async def privileged(_arguments):
         return {"content": [{"type": "text", "text": "ran"}]}
 
-    record = type("Record", (), {"status": "active", "allowed_tools": []})()
+    record = type("Record", (), {
+        "status": "active", "allowed_tools": [],
+        "auth_token": "tok-e1",  # #335: id claims bind only with the token
+    })()
     registry = type("Registry", (), {"get": lambda self, _id: record})()
     app = web.Application()
     app.router.add_post(
@@ -90,6 +93,7 @@ async def test_pin_inv_mcp_001_internal_dispatch_ignores_agent_allowlist():
     async with TestClient(TestServer(app)) as client:
         response = await client.post("/internal/tools/call", json={
             "name": "privileged", "arguments": {}, "engagement_id": "e1",
+            "engagement_token": "tok-e1",
         })
         payload = await response.json()
     assert payload["content"] == [{"type": "text", "text": "ran"}]

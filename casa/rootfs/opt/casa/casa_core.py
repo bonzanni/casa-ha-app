@@ -283,8 +283,10 @@ def _make_public_mcp_fallback_handler(
             return _jsonrpc_ok(req_id, {})
 
         if method == "tools/call":
-            # Translate JSON-RPC params + X-Casa-Engagement-Id header into the
-            # internal-handler body shape, then dispatch in-process.
+            # Translate JSON-RPC params + X-Casa-Engagement-Id/-Token headers
+            # into the internal-handler body shape, then dispatch in-process.
+            # #335: the token header is what actually authenticates the id
+            # claim (verified against the record in the dispatcher).
             name = params.get("name")
             arguments = params.get("arguments") or {}
             eng_id = request.headers.get("X-Casa-Engagement-Id")
@@ -292,6 +294,8 @@ def _make_public_mcp_fallback_handler(
                 "name": name,
                 "arguments": arguments,
                 "engagement_id": eng_id,
+                "engagement_token": request.headers.get(
+                    "X-Casa-Engagement-Token"),
             }
             result = await _dispatch_internal_tools_call(
                 body=inner_body,
@@ -368,17 +372,29 @@ async def _dispatch_internal_tools_call(
 
     # v0.74.2: terminal binding for the emit_completion idempotency path —
     # mirrors internal_handlers (see _TERMINAL_BINDING_TOOLS there).
-    from internal_handlers import _TERMINAL_BINDING_TOOLS
+    # #335: same token gate as the internal handler — an id claim without the
+    # record's auth token is an explicit reject, never an unauthenticated
+    # fallthrough.
+    from internal_handlers import _TERMINAL_BINDING_TOOLS, engagement_auth_ok
     engagement = None
     if eng_id:
         try:
             rec = engagement_registry.get(eng_id)
         except Exception:  # noqa: BLE001
             rec = None
-        if rec is not None and (
-                getattr(rec, "status", None) == "active"
-                or name in _TERMINAL_BINDING_TOOLS):
-            engagement = rec
+        if rec is not None:
+            if not engagement_auth_ok(rec, body.get("engagement_token")):
+                logger.warning(
+                    "public /mcp/casa-framework fallback: rejected engagement "
+                    "id claim for %s (tool=%r): missing/invalid engagement "
+                    "token", str(eng_id)[:8], name,
+                )
+                return {"error": {"code": -32003,
+                                  "message": "engagement_auth_failed: "
+                                             "invalid engagement token"}}
+            if (getattr(rec, "status", None) == "active"
+                    or name in _TERMINAL_BINDING_TOOLS):
+                engagement = rec
 
     from tools import engagement_var
     token = engagement_var.set(engagement)
@@ -428,6 +444,7 @@ async def replay_undergoing_engagements(
     from drivers import s6_rc
     from drivers.workspace import (
         refresh_claude_md, render_log_run_script, render_run_script,
+        workspace_mcp_token, write_workspace_mcp_json,
     )
 
     undergoing = [
@@ -589,6 +606,113 @@ async def replay_undergoing_engagements(
                     except Exception as exc:  # noqa: BLE001 — fail-closed
                         await _refuse_brief_resume(
                             rec, f"CLAUDE.md refresh failed: {exc}",
+                        )
+                        continue
+
+                # #335: refresh the workspace credential from the RECORD's
+                # auth token. Placed, like the CLAUDE.md refresh above, BEFORE
+                # the service_pair_complete fast-path continue — an ordinary
+                # restart takes that continue, so a refresh after it would
+                # never run — but AFTER the refusal checks, so a record we are
+                # about to tear down is not cycled first. This is what keeps a
+                # pre-upgrade workspace resumable: load() backfilled a token
+                # onto its record, and the CLI reads the refreshed credential
+                # from disk when it respawns.
+                #
+                # Only rewrite when the credential actually CHANGED, and then
+                # force the engagement's CLI to respawn (Terra + Sol, review
+                # r1): engagement services are supervised independently of
+                # casa-main, so one can already be running — with the OLD
+                # ``.mcp.json`` cached at its spawn — while this boot mints a
+                # token for it. ``start_service`` below is idempotent and would
+                # NOT respawn it, leaving an engagement whose every call
+                # authenticates against a credential it does not have. Bring it
+                # down here, once the new file is durable, so that start brings
+                # it back up reading the new one. The unchanged case (every
+                # ordinary restart) writes nothing and cycles nothing.
+                _ws_dir = os.path.join(engagements_root, rec.id)
+                if (os.path.isdir(_ws_dir)
+                        and workspace_mcp_token(_ws_dir) != rec.auth_token):
+                    try:
+                        write_workspace_mcp_json(
+                            _ws_dir,
+                            engagement_id=rec.id,
+                            engagement_auth_token=rec.auth_token,
+                            casa_framework_mcp_url=getattr(
+                                driver, "_casa_framework_mcp_url",
+                                "http://127.0.0.1:8100/mcp/casa-framework",
+                            ),
+                        )
+                    except Exception as exc:  # noqa: BLE001 — fail-closed
+                        await _refuse_brief_resume(
+                            rec, f".mcp.json refresh failed: {exc}",
+                            kind="refuse_credential_refresh_failed",
+                        )
+                        continue
+                    logger.info(
+                        "boot replay: engagement %s workspace credential "
+                        "refreshed — cycling its service so the CLI reloads",
+                        rec.id[:8],
+                    )
+                    # An unconfirmed stop is FATAL to the resume, not a
+                    # warning (Sol, review r2): the new credential is already
+                    # on disk, so a surviving CLI holds one that authenticates
+                    # nowhere — and the NEXT boot would see the on-disk token
+                    # matching the record and never retry the cycle, leaving a
+                    # permanently mute engagement that still looks live. Refuse
+                    # it instead: the shared helper runs the checked teardown
+                    # ladder, lands a terminal mark, and adds it to
+                    # ``refused_ids`` so the start and background-task loops
+                    # skip it.
+                    try:
+                        _down = await s6_rc.ensure_service_down(
+                            engagement_id=rec.id)
+                    except Exception as exc:  # noqa: BLE001
+                        _down = False
+                        logger.warning(
+                            "boot replay: service cycle after credential "
+                            "refresh raised for %s: %s", rec.id[:8], exc,
+                        )
+                    if _down is False:
+                        # Mark TERMINAL unconditionally, not via the helper's
+                        # own teardown outcome (Terra, review r3): the helper
+                        # only marks when ITS stop also fails, so a
+                        # fail-then-succeed pair would leave the record
+                        # active/idle with its service dir removed — dormant
+                        # this boot, silently resurrected the next one. The
+                        # decision was already made here, so record it here;
+                        # the helper's own mark then no-ops against the #326
+                        # terminal guard while still running the checked
+                        # teardown and adding the id to ``refused_ids``.
+                        # STRICT: the mark must reach DISK before we move on
+                        # (Terra, review r4). ``mark_error`` persists
+                        # best-effort, so a swallowed tombstone-write failure
+                        # would leave the next boot reloading the record as
+                        # active/idle — and it would then see the on-disk
+                        # token matching, skip the cycle, and resume the very
+                        # engagement this refusal exists to retire.
+                        try:
+                            await registry.try_transition_terminal(
+                                rec.id, "error", strict=True,
+                                error_kind="refuse_credential_cycle_failed",
+                                error_message=(
+                                    "engagement could not be confirmed down "
+                                    "after a credential refresh"
+                                ),
+                            )
+                        except Exception:  # noqa: BLE001 — teardown still runs
+                            logger.warning(
+                                "boot replay: durable terminal mark after a "
+                                "credential-cycle failure did not persist for "
+                                "%s — the engagement may be reloaded as live "
+                                "on the next boot", rec.id[:8], exc_info=True,
+                            )
+                        await _refuse_brief_resume(
+                            rec,
+                            "engagement could not be confirmed down after a "
+                            "credential refresh, so a surviving CLI would run "
+                            "with a credential that no longer authenticates",
+                            kind="refuse_credential_cycle_failed",
                         )
                         continue
 

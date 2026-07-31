@@ -146,3 +146,46 @@ async def test_voice_clearance_uses_friends_tags(monkeypatch):
 
     assert len(fake.recall_calls) == 1
     assert fake.recall_calls[0]["tags"] == ["friends", "public"]
+
+
+# ---------------------------------------------------------------------------
+# #336 — the archive is filtered at the LAUNCHING TURN's clearance
+# ---------------------------------------------------------------------------
+
+
+async def test_non_operator_launch_gets_public_tags_only(monkeypatch):
+    """Terra/Sol r3: the archive block is injected into the executor's prompt,
+    so a non-operator-launched executor must not be handed private lessons.
+    Red case: dropping origin_route/origin_clearance from the call restores
+    channel-keyed private clearance and fails this test."""
+    fake = _Sem("prior lesson")
+    monkeypatch.setattr(agent_mod, "active_semantic_memory", fake, raising=False)
+
+    await _fetch_executor_archive(
+        task="build the invoice",
+        origin_channel="telegram",
+        token_budget=3000,
+        origin_route="telegram",
+        origin_clearance="public",
+    )
+
+    c = fake.recall_calls[0]
+    assert c["clearance"] == "public"
+    assert c["tags"] == ["public"]
+
+
+async def test_operator_launch_still_reads_every_tier(monkeypatch):
+    fake = _Sem("prior lesson")
+    monkeypatch.setattr(agent_mod, "active_semantic_memory", fake, raising=False)
+
+    await _fetch_executor_archive(
+        task="build the invoice",
+        origin_channel="telegram",
+        token_budget=3000,
+        origin_route="telegram",
+        origin_clearance="private",
+    )
+
+    c = fake.recall_calls[0]
+    assert c["clearance"] == "private"
+    assert c["tags"] == ["family", "friends", "private", "public"]

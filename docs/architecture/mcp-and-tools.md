@@ -1,5 +1,5 @@
 ---
-last_reviewed: 2026-07-30
+last_reviewed: 2026-08-01
 ---
 
 # The MCP surface and the tool boundary
@@ -41,6 +41,31 @@ authentication, not the container wall.
 Individual tools may still refuse individual operations. Those are tool-local gates, not a
 universal authorization check.
 
+**An engagement identity is authenticated, not merely claimed.** A tool call that names an
+engagement id binds that engagement's record — and with it the record-derived role that
+tool-local gates authorize against — only when it also presents the per-engagement secret
+token minted at record creation and provisioned into that engagement's own workspace. The id
+alone is deliberately treated as public information (it appears in the workspace MCP
+configuration, in logs, and on shared loopback endpoints): a known id with a missing or
+mismatched token is rejected outright rather than downgraded to an unauthenticated call, on
+the paths that resolve the record for tool authority — the internal socket handler, the
+in-process fallback twin, and the engagement-channel routes that act on a record's topic and
+questions. An id the registry does not know still dispatches unbound, so a stale workspace
+gets an honest `not_in_engagement` from the tool rather than an authentication error.
+
+**What the token does not contain, stated plainly.** It raises the bar from "know an id" to
+"hold a secret", and it is not process isolation. Engagement subprocesses run as root in one
+container, so a shell-capable engagement can still read a sibling workspace's credential
+file directly; the credential files are `0600` as defense in depth, which is not a boundary
+against a co-resident root process. The inspection tool refuses to return the credential
+file's contents precisely because that surface *is* reachable without any identity at all.
+Hook resolution is a separate, still-unauthenticated identity path: it derives an engagement
+from the caller-supplied working directory, so it can select another engagement's hook
+parameters and post a permission prompt into that engagement's topic. It grants no tool
+authority — that path is token-gated — but it is not covered by this rule. Treat the token
+as removing identity forgery from *knowing an id*, not as containment of a hostile
+in-container process.
+
 **The bridge runs as its own supervised service** so that the bridge *connection* survives a
 restart of the main application. Its own client is a thin shell shim, and the failure
 semantics are two-layered and opposite: the shim **fails open** — when its own HTTP call to
@@ -75,6 +100,27 @@ they are contained by Home Assistant's authentication rather than by this socket
 
 What it does not cover: being advertised is not being permitted. The HTTP advertisement
 describes what the bridge can route, not what any particular agent may invoke.
+
+**INV-MCP-004**: An engagement-id claim binds an engagement record only together with that record's per-engagement auth token; a known id with a missing or mismatched token is rejected without invoking the tool.
+
+The terminal-binding allowlist is inside this rule, not an exception to it: a terminal
+record still binds for a completion retry only when the token matches.
+
+What it does not cover: an id the registry does not know — that call dispatches with no
+engagement bound (unchanged), and the tool answers for itself. It also does not cover the
+hook-resolution path, which still identifies an engagement by the caller-supplied working
+directory, nor a co-resident root process reading another workspace's credential file (see
+the mental model).
+
+**INV-MCP-005**: The workspace-inspection tool never returns the contents of a credential-bearing workspace file.
+
+The inspection tool needs no engagement identity to run, so returning `.mcp.json` would hand
+any caller the credential that INV-MCP-004 exists to require. The refusal is on the resolved
+path's basename, so a symlink or a copy in a subdirectory is refused too; directory listings
+still show the name.
+
+What it does not cover: a caller with shell access reads the file directly — this closes the
+*tool* surface, not the filesystem.
 
 ## Failure behavior
 

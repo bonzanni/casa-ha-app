@@ -20,12 +20,14 @@ import asyncio
 import json
 import logging
 import os
+import secrets
 import time
 import uuid
 from dataclasses import dataclass, field
 from typing import Any
 
 from atomic_io import atomic_write_json
+from sensitivity import TIERS
 
 logger = logging.getLogger(__name__)
 
@@ -74,6 +76,16 @@ _NON_PERSISTABLE_ORIGIN_KEYS = frozenset({
     "voice_route_capabilities",
     "voice_deadline",
 })
+
+
+def _valid_token_or_blank(value: Any) -> str:
+    """#335: a persisted ``auth_token`` is usable only as a non-empty ASCII
+    string — anything else (a JSON number, null, a non-ASCII string) becomes
+    ``""`` so ``load()``'s backfill mints a fresh one. Keeping an unusable
+    value would leave the record permanently unbindable."""
+    if isinstance(value, str) and value and value.isascii():
+        return value
+    return ""
 
 
 def _persistable_origin(origin: dict[str, Any]) -> dict[str, Any]:
@@ -174,6 +186,13 @@ class EngagementRecord:
     sdk_session_id: str | None
     origin: dict[str, Any]
     task: str
+    # #335: per-engagement secret authenticating this engagement's id on the
+    # internal surfaces (MCP tools/call + /internal/channel/*). Generated at
+    # ``create()``, backfilled at ``load()`` for pre-upgrade rows, provisioned
+    # ONLY into this engagement's own workspace ``.mcp.json`` — the id alone
+    # is endpoint-visible and must never confer authority. Persisted so a
+    # restart-resumed engagement's existing workspace credential stays valid.
+    auth_token: str = ""
     # E-12 (v0.37.0): channel-side state for in-place edits across restarts.
     pinned_message_id: int | None = None
     progress_message_id: int | None = None
@@ -323,6 +342,11 @@ class EngagementRegistry:
                     sdk_session_id=row.get("sdk_session_id"),
                     origin=dict(row.get("origin") or {}),
                     task=row.get("task", ""),
+                    # #335: a corrupt/hand-edited row can carry a non-string
+                    # (or non-ASCII) token; normalize to "" so the backfill
+                    # below re-mints a usable one rather than leaving a value
+                    # every auth check must refuse (Terra, review r1).
+                    auth_token=_valid_token_or_blank(row.get("auth_token")),
                     pinned_message_id=row.get("pinned_message_id"),
                     progress_message_id=row.get("progress_message_id"),
                     current_state_emoji=row.get("current_state_emoji"),
@@ -353,6 +377,16 @@ class EngagementRegistry:
                     "boot reconcile: engagement %s active→idle "
                     "(no driver survives a restart)", rec.id[:8],
                 )
+            # #335 boot backfill: a pre-upgrade row has no auth token. Every
+            # in-memory record must carry one (the internal surfaces fail
+            # CLOSED on a token-less record), so mint it here; boot replay
+            # then rewrites the workspace .mcp.json from the record before
+            # the engagement's CLI is respawned, keeping resumed engagements
+            # working. Uniform for terminal tombstones too — cheap, and no
+            # record class is left permanently unbindable.
+            if not rec.auth_token:
+                rec.auth_token = secrets.token_urlsafe(32)
+                reconciled_any = True
             self._records[rec.id] = rec
             if rec.topic_id is not None:
                 self._topic_index[rec.topic_id] = rec.id
@@ -465,6 +499,7 @@ class EngagementRegistry:
                 "sdk_session_id": rec.sdk_session_id,
                 "origin": _persistable_origin(rec.origin),
                 "task": rec.task,
+                "auth_token": rec.auth_token,
                 "pinned_message_id": rec.pinned_message_id,
                 "progress_message_id": rec.progress_message_id,
                 "current_state_emoji": rec.current_state_emoji,
@@ -488,7 +523,14 @@ class EngagementRegistry:
     def _write_tombstone(self, snapshot: list[dict[str, Any]]) -> None:
         # Atomic (temp-file + fsync + os.replace): a crash mid-write must not
         # lose all in-flight engagement state to a truncated tombstone (M15).
-        atomic_write_json(self._tombstone_path, snapshot, indent=2)
+        # #335: 0600 — every row carries that engagement's ``auth_token``, so
+        # this file is secret-bearing and must not stay world-readable. This
+        # is defense in depth, NOT isolation: engagement subprocesses run as
+        # root in this container and can still read it. Passing the mode
+        # explicitly also MIGRATES a pre-#335 0644 file on the first write
+        # after upgrade.
+        atomic_write_json(
+            self._tombstone_path, snapshot, indent=2, mode=0o600)
 
     # -- Mutators ---------------------------------------------------------
 
@@ -522,6 +564,10 @@ class EngagementRegistry:
             sdk_session_id=None,
             origin=dict(origin),
             task=task,
+            # #335: minted here, before first persist, so the workspace
+            # provisioner can bake it into .mcp.json and every internal
+            # surface can verify id claims against it.
+            auth_token=secrets.token_urlsafe(32),
             tools_allowed=tuple(tools_allowed),
             permission_mode=permission_mode or "acceptEdits",
             plugin_artifacts=tuple(dict(pa) for pa in plugin_artifacts),
@@ -806,6 +852,58 @@ class EngagementRegistry:
             if rec.status == "idle":
                 rec.status = "active"
             await self._write_tombstone_locked()
+
+    async def lower_origin_clearance(
+        self, engagement_id: str, clearance: str,
+    ) -> bool:
+        """#336: clamp an engagement's read-clearance DOWN to *clearance*.
+
+        An engagement reads at the clearance of the turn that created it. But
+        anyone in the engagement supergroup can send into its topic, and that
+        message steers the engagement — so an engagement answering a steering
+        turn must not read above the person steering it. This lowers the
+        record's stamped clearance to the floor of everyone who has steered
+        it; it NEVER raises one (a monotonic clamp is race-free: two
+        concurrent steerers can only drive it further down, and re-applying
+        is a no-op).
+
+        Returns True when the record actually moved. A record carrying no
+        stamped clearance is left alone — it resolves channel-keyed, which is
+        the pre-existing behaviour for engagements created before the markers
+        existed, and inventing a marker here would silently change it.
+        """
+        if clearance not in TIERS:
+            return False
+        async with self._lock:
+            rec = self._records.get(engagement_id)
+            if rec is None:
+                return False
+            current = rec.origin.get("_origin_clearance")
+            if current not in TIERS:
+                return False
+            if TIERS.index(clearance) >= TIERS.index(current):
+                return False          # already at or below this floor
+            rec.origin["_origin_clearance"] = clearance
+            logger.info(
+                "engagement %s read-clearance lowered %s→%s (steered by a "
+                "lower-clearance sender)", engagement_id[:8], current, clearance,
+            )
+            # The IN-MEMORY clamp is what gates every read from here on, and it
+            # is applied above regardless of what disk does — a persistence
+            # failure must never leave this process reading at the higher tier.
+            # The write is what makes it survive a restart, so a failure is
+            # security-relevant and says so; it is deliberately NOT rolled back
+            # (rolling back would RAISE the clearance, the one direction this
+            # clamp must never move).
+            try:
+                await self._write_tombstone_locked(strict=True)
+            except Exception as exc:  # noqa: BLE001 — in-memory clamp stands
+                logger.warning(
+                    "engagement %s read-clearance lowered to %s in memory but "
+                    "the write failed (%s) — a restart would restore %s",
+                    engagement_id[:8], clearance, exc, current,
+                )
+            return True
 
     async def update_last_idle_reminder(self, engagement_id: str, ts: float) -> None:
         async with self._lock:

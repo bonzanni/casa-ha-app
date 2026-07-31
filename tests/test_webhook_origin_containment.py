@@ -48,3 +48,22 @@ def test_webhook_channel_fail_closed_without_invoke():
     assert clearance_for_origin(None, None, "webhook") == "public"
     assert clearance_for_origin("bogus-route", None, "webhook") == "public"
     assert clearance_for_origin("invoke", None, "webhook") == "private"
+
+
+# ---------------------------------------------------------------------------
+# #336: telegram-origin clearance is per-SENDER (stamped at ingress), not the
+# channel-wide private constant.
+# ---------------------------------------------------------------------------
+
+
+def test_telegram_origin_reads_at_its_stamped_clearance():
+    # Operator turn: the ingress stamps private; non-operator: public.
+    assert clearance_for_origin("telegram", "private", "telegram") == "private"
+    assert clearance_for_origin("telegram", "public", "telegram") == "public"
+
+
+def test_telegram_origin_fails_closed_on_missing_or_bad_clearance():
+    # A telegram-marked turn with a missing/malformed stamped clearance is a
+    # bug, and it fails CLOSED — never through to the channel's private.
+    assert clearance_for_origin("telegram", None, "telegram") == "public"
+    assert clearance_for_origin("telegram", "bogus", "telegram") == "public"

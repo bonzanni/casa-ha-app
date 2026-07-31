@@ -109,6 +109,37 @@ def test_parse_tier_returns_none_on_unparseable():
     assert parse_tier(None) is None  # type: ignore[arg-type]
 
 
+def test_parse_tier_rejects_a_tier_word_inside_a_chatty_reply():
+    # #350: the classifier is prompted for ONE word. A tier token embedded in
+    # a longer reply (negation, hedging, multiple tiers) must NOT be
+    # extracted — returning None here is what routes the caller to the
+    # leak-safe DEFAULT_TIER fallback instead of the leftmost tier word.
+    assert parse_tier("This is not public; it is family") is None
+    assert parse_tier("private or family") is None
+    assert parse_tier("The tier is family") is None
+    assert parse_tier(
+        "I would say public, since a brand name is not personal") is None
+    assert parse_tier("family\npublic") is None
+
+
+def test_parse_tier_requires_a_real_separator_after_the_tier_label():
+    # Sol r1: the label's separator class allowed ZERO characters, so the
+    # non-word "tierpublic" parsed as public — a malformed reply landing at
+    # the LEAST sensitive tier is exactly the leak the default prevents.
+    assert parse_tier("tierpublic") is None
+    assert parse_tier("tierfamily") is None
+    assert parse_tier("Tier: public") == "public"
+    assert parse_tier("tier family") == "family"
+
+
+def test_parse_tier_accepts_decorated_single_token_replies():
+    # The single-word contract still tolerates minimal decoration: a
+    # "Tier:" label, punctuation, markdown emphasis, surrounding whitespace.
+    assert parse_tier("**family**") == "family"
+    assert parse_tier("Tier: private.") == "private"
+    assert parse_tier("`friends`") == "friends"
+
+
 def test_prompt_names_all_four_tiers():
     for tier in ("public", "friends", "family", "private"):
         assert tier in SENSITIVITY_PROMPT

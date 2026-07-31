@@ -224,7 +224,8 @@ def test_template_path_fires_without_plugins_yaml(tmp_path, executor_defaults):
     defn.mcp_server_names = []
     ws = asyncio.run(provision_workspace(
         engagements_root=str(tmp_path / "engagements"),
-        engagement_id="f" * 32, defn=defn, task="t", context="c",
+        engagement_id="f" * 32, engagement_auth_token="tok-ws-test",
+        defn=defn, task="t", context="c",
         casa_framework_mcp_url="http://x",
         workspace_template_root=exec_dir / "workspace-template",
     ))

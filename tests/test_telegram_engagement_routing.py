@@ -923,3 +923,57 @@ class TestResumeFailureRaces:
         assert reg.get(rec.id).status == "cancelled"          # winner stands
         assert "error_kind" not in reg.get(rec.id).origin
         ch._cleanup_error_topic.assert_not_awaited()          # no duplicate cleanup
+
+
+class TestSteeringClampsEngagementClearance:
+    """#336 (review r4): an engagement reads at its creator's clearance, but
+    any supergroup member can steer it by messaging its topic. The ingress
+    clamps the record's clearance DOWN to the steering sender's BEFORE the
+    turn is delivered, so the engagement never reads above the
+    least-privileged person taking part.
+
+    Red case: removing the ``lower_origin_clearance`` call from the topic
+    ingress leaves the record at ``private`` and fails this test."""
+
+    async def test_non_operator_topic_message_lowers_the_record(
+        self, fake_telegram_bot, engagement_fixture,
+    ):
+        from channels.telegram import TelegramChannel
+
+        ch = TelegramChannel(bot=fake_telegram_bot, chat_id=100,
+                             engagement_supergroup_id=-1001)
+        ch._driver_send_user_turn = AsyncMock()
+        ch._engagement_registry = engagement_fixture.registry
+        rec = engagement_fixture.active_record
+        rec.origin["_origin_route"] = "telegram"
+        rec.origin["_origin_clearance"] = "private"   # operator-created
+
+        # user_id 77 != configured chat_id 100 ⇒ not the operator.
+        await ch.handle_update(
+            _mk_update(chat_id=-1001, text="what's the alarm code?",
+                       thread_id=555, user_id=77))
+        await _drain_turns(ch)
+
+        assert rec.origin["_origin_clearance"] == "public"
+        ch._driver_send_user_turn.assert_awaited_once()
+
+    async def test_operator_topic_message_leaves_it_private(
+        self, fake_telegram_bot, engagement_fixture,
+    ):
+        from channels.telegram import TelegramChannel
+
+        ch = TelegramChannel(bot=fake_telegram_bot, chat_id=100,
+                             engagement_supergroup_id=-1001)
+        ch._driver_send_user_turn = AsyncMock()
+        ch._engagement_registry = engagement_fixture.registry
+        rec = engagement_fixture.active_record
+        rec.origin["_origin_route"] = "telegram"
+        rec.origin["_origin_clearance"] = "private"
+
+        # user_id 100 == configured chat_id ⇒ the operator.
+        await ch.handle_update(
+            _mk_update(chat_id=-1001, text="carry on", thread_id=555,
+                       user_id=100))
+        await _drain_turns(ch)
+
+        assert rec.origin["_origin_clearance"] == "private"

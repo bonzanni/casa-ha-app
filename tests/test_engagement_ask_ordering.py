@@ -135,12 +135,14 @@ async def test_ask_keyboard_posts_after_preceding_narration(wired):
     """§2: narration text block precedes the ask tool_use block in one frame; the
     keyboard must post AFTER the narration (higher message id), not before it."""
     eid = wired["rec"].id
+    tok = wired["rec"].auth_token
     seq, chan = wired["seq"], wired["chan"]
     h = projection_hash(
         ASK_TOOL, {"question": "Proceed?", "options": ["A", "B"], "timeout_s": 60})
 
     task = asyncio.ensure_future(wired["ask"](_FakeRequest({
-        "engagement_id": eid, "request_id": "a1", "question": "Proceed?",
+        "engagement_id": eid, "engagement_token": tok,
+        "request_id": "a1", "question": "Proceed?",
         "options": ["A", "B"], "timeout_s": 60, "projection_hash": h})))
     # Let the handler reach its post/await point (eager model posts HERE).
     await asyncio.sleep(0.02)
@@ -172,11 +174,13 @@ async def test_button_ask_retry_reattaches_no_second_keyboard(wired):
     Q1 with both ledger entries surviving; here exactly one keyboard + one open
     question survive and both handlers resolve to the same answer."""
     eid = wired["rec"].id
+    tok = wired["rec"].auth_token
     seq, reg = wired["seq"], wired["reg"]
     h = projection_hash(
         ASK_TOOL, {"question": "Proceed?", "options": ["A", "B"], "timeout_s": 60})
     payload = {
-        "engagement_id": eid, "request_id": "dup", "question": "Proceed?",
+        "engagement_id": eid, "engagement_token": tok,
+        "request_id": "dup", "question": "Proceed?",
         "options": ["A", "B"], "timeout_s": 60, "projection_hash": h}
 
     # First attempt: registers + arms the intent, then parks awaiting the tap
@@ -208,11 +212,13 @@ async def test_reply_posts_after_preceding_narration(wired):
     """§2 reply-ingress variant: a reply within a frame posts at its tool_use
     block position, AFTER the preceding narration text."""
     eid = wired["rec"].id
+    tok = wired["rec"].auth_token
     seq, chan = wired["seq"], wired["chan"]
     h = projection_hash(REPLY_TOOL, {"text": "done — shipped it"})
 
     task = asyncio.ensure_future(wired["send"](_FakeRequest({
-        "engagement_id": eid, "text": "done — shipped it",
+        "engagement_id": eid, "engagement_token": tok,
+        "text": "done — shipped it",
         "request_id": "r1", "projection_hash": h})))
     await asyncio.sleep(0.02)
 

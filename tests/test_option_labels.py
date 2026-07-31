@@ -245,6 +245,7 @@ class TestDictOptionsEndToEnd:
         ]
         payload = {
             "engagement_id": wired["rec"].id, "request_id": "d1",
+            "engagement_token": wired["rec"].auth_token,
             "question": "Which account?", "options": options, "timeout_s": 60,
         }
         body = await _drive_answer(wired, payload, option_index=0)
@@ -278,6 +279,7 @@ class TestDictOptionsEndToEnd:
         ]
         payload = {
             "engagement_id": wired["rec"].id, "request_id": "d2",
+            "engagement_token": wired["rec"].auth_token,
             "question": "Which?", "options": options, "timeout_s": 60,
         }
         body = await _drive_answer(wired, payload, option_index=1)
@@ -293,6 +295,7 @@ class TestDictOptionsEndToEnd:
         # (backward-compatible call shape); the fake records None.
         payload = {
             "engagement_id": wired["rec"].id, "request_id": "d3",
+            "engagement_token": wired["rec"].auth_token,
             "question": "Which?", "options": ["A", "B"], "timeout_s": 60,
         }
         await _drive_answer(wired, payload, option_index=0)

@@ -527,10 +527,11 @@ pass "D-8 restart-survival: engagement PID unchanged across svc-casa restart"
 # ---------------------------------------------------------------------------
 # D-9 — MCP HTTP bridge round-trip: direct curl to /mcp/casa-framework
 # ---------------------------------------------------------------------------
-# We construct an engagement with the engage_executor tool (mock path),
-# then POST a tools/call for emit_completion with X-Casa-Engagement-Id set.
-# The bridge must dispatch, bind engagement_var, finalize the engagement,
-# and return a JSON-RPC result envelope.
+# POSTs initialize/tools/list/tools/call round-trips against the 8099
+# fallback bridge. The tools/call probe carries NO engagement identity —
+# since #335 an id claim additionally needs the per-engagement
+# X-Casa-Engagement-Token (read from the workspace .mcp.json), so the
+# unauthenticated probe pins the not_in_engagement path only.
 run_harness "D-9 mcp-bridge" "$(cat <<'PY'
 import json, os, subprocess, time, urllib.request, urllib.error
 

@@ -90,5 +90,12 @@ class TestTelegramHandleRoutesThroughSanitize:
         assert ctx["user_name"] == "User"
         assert ctx["message_id"] == "42"
         assert "cid" in ctx
-        # No reserved keys ever entered (nothing external supplied them).
-        assert not (provenance.RESERVED_CONTEXT_KEYS & ctx.keys())
+        # #336: the ONLY reserved keys present are the two origin markers
+        # Casa itself stamps AFTER the sanitize pass (server-side, so an
+        # external payload still cannot supply them) — nothing else reserved
+        # ever entered.
+        assert provenance.RESERVED_CONTEXT_KEYS & ctx.keys() == {
+            "_origin_route", "_origin_clearance",
+        }
+        assert ctx["_origin_route"] == "telegram"
+        assert ctx["_origin_clearance"] in ("private", "public")

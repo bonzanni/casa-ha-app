@@ -1,5 +1,5 @@
 ---
-last_reviewed: 2026-07-30
+last_reviewed: 2026-08-01
 ---
 
 # The HTTP surface
@@ -132,6 +132,19 @@ Per request the identity function raises instead of returning anything a caller 
 mistake for "no identity" — there is no quiet fallback to an anonymous or system speaker.
 Automation ingresses are additionally prevented from resolving to an operator's identity,
 which is what stops an unattended trigger from being recorded as a person.
+
+**INV-HTTP-006**: The operator peer and private clearance on the Telegram ingress are granted per sender — only the sender whose id matches the configured operator chat id resolves to them; any other sender resolves to a namespaced per-sender peer at public clearance, and a sender-less Telegram turn raises rather than borrowing an identity.
+
+The route used to fix the operator peer as a constant, so with the accept-all
+configuration any Telegram user's turns were recorded under the operator's identity and
+ran at the operator's private recall clearance. The namespaced dynamic peers
+(`telegram:<id>`, like `webhook:<name>`) get the same boot-checked guarantee that no
+operator peer can live inside a caller-derived namespace.
+
+What it does not cover: it names the *configured* operator. With `telegram_chat_id` empty
+there is no configured operator identity, so no sender — the operator included — receives
+operator attribution; and a group-id configuration names no sender at all. Sender identity
+is Telegram's authentication of its user ids, not an additional Casa-side proof.
 
 ## Failure behavior
 

@@ -19,6 +19,9 @@ configuration:
     name: Telegram Chat ID
     description: >-
       Restrict Telegram messages to this chat ID. Leave empty to accept all.
+      Also names the operator: only this sender gets operator attribution
+      and private-memory clearance; other accepted senders read at public
+      clearance under their own identity.
   telegram_transport:
     name: Telegram Transport
     description: >-
