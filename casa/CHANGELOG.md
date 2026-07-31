@@ -1,5 +1,19 @@
 # Changelog
 
+## [0.132.1] - 2026-07-31
+
+### Fixed
+
+- **An engagement turn no longer disappears from its Telegram topic after a
+  restart that lands exactly on a log-segment rotation.** When a turn closed
+  on the last frame of a log segment that then rotated to an archive, restart
+  recovery opened the archive at its exact end, found nothing left to read
+  there, and treated the entire next segment — the whole in-progress turn —
+  as already-seen replay: nothing was posted to the topic, and resumption
+  then skipped past the suppressed frames permanently. Recovery now
+  recognizes that a scan starting at (or past) the checkpoint is already
+  beyond it, and delivers the successor segment's turn normally.
+
 ## [0.132.0] - 2026-07-31
 
 ### Fixed
