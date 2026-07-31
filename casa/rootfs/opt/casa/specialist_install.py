@@ -142,7 +142,16 @@ def _refuse_if_active_present(instance_dir, *, slug: str, root: str) -> None:
     placeholder. ``root`` is the caller's component_root string
     (component_id@version#checksum). A pending tuple that fails to LOAD is
     treated as a conflict too (cannot prove it is ours — fail closed; the
-    boot-time index isolates it as state="error" for inspection)."""
+    boot-time index isolates it as state="error" for inspection).
+
+    Deliberately NOT keyed on receipt/operation identity (Terra round-3):
+    a same-root restage with different config is last-writer-wins pending
+    activation. An operator resuming configuration later re-inspects and
+    holds a NEW receipt for the same root, so demanding receipt equality
+    would refuse the legitimate resume flow; and both writers necessarily
+    hold consent for this exact install identity with byte-identical
+    content, so no consent or integrity boundary is crossed — only the
+    not-yet-activated config of one consented component."""
     if instance_dir.active() is not None:
         raise SpecialistInstallError(
             "concurrent_mutation",
