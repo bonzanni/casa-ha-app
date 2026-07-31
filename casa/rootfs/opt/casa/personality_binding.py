@@ -356,17 +356,28 @@ class InstanceDir:
             # to prevent. A tmp that fails to load (corrupt/tampered) must
             # never reach prior either. Unlink in both cases.
             pending = active_path.with_suffix(active_path.suffix + ".rollback-tmp")
-            if pending.exists():
-                try:
-                    pending_tuple = load_instance_tuple(pending)
-                except (ValueError, OSError, yaml.YAMLError,
-                        jsonschema.ValidationError):
-                    pending_tuple = None
-                if pending_tuple is not None and pending_tuple != candidate:
-                    os.replace(pending, prior_path)
-                else:
-                    pending.unlink(missing_ok=True)
-            desired_path.unlink(missing_ok=True)
+            try:
+                if pending.exists():
+                    try:
+                        pending_tuple = load_instance_tuple(pending)
+                    except (ValueError, OSError, yaml.YAMLError,
+                            jsonschema.ValidationError):
+                        pending_tuple = None
+                    if pending_tuple is not None and pending_tuple != candidate:
+                        os.replace(pending, prior_path)
+                    else:
+                        pending.unlink(missing_ok=True)
+                desired_path.unlink(missing_ok=True)
+            except OSError:
+                # Sol round-2: active.yaml already IS the candidate — the
+                # commit is durable, so every remaining step is best-effort
+                # cleanup and must not make the caller believe the commit
+                # failed (it would run the pre-commit tuple while disk holds
+                # the new active). The next recommit retries.
+                logger.warning(
+                    "%s: post-commit cleanup failed; retried on the next "
+                    "recommit", self._dir, exc_info=True,
+                )
             return candidate
         # #339 (rollback-generation safety): durably write the NEW active
         # before anything touches active.prior.yaml. The old order rotated
@@ -406,7 +417,16 @@ class InstanceDir:
                     "rollback target is one generation stale until the "
                     "pending rotation completes", self._dir, exc_info=True,
                 )
-        desired_path.unlink(missing_ok=True)
+        try:
+            desired_path.unlink(missing_ok=True)
+        except OSError:
+            # Sol round-2: same post-commit rule as above — the new active is
+            # durable, so a failed desired unlink must not fail the commit;
+            # the stale desired is cleared by the next no-op recommit.
+            logger.warning(
+                "%s: new active committed but desired.yaml unlink failed; "
+                "cleared on the next recommit", self._dir, exc_info=True,
+            )
         return candidate
 
     def _copy_to_temp(self, path: Path) -> Path:

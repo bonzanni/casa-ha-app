@@ -35,7 +35,7 @@ The store is append-only in practice: roots are pinned, unreferenced blobs are n
 collected.
 
 **A sourced-plugin install is a journalled bundle transaction.** The pre-state of the
-owned registry entries, the six tuple/sidecar files and the slug's acknowledgements is
+owned registry entries, the journalled tuple/sidecar files (the pending prior-rotation temporary included) and the slug's acknowledgements is
 journalled before the visible swap; a sync-phase failure rolls that recorded state back,
 and boot reconciliation replays or quarantines whatever a crash left. The journal's reach
 is exactly what it records — component-store and plugin-store artifacts published earlier

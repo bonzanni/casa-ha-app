@@ -1272,7 +1272,7 @@ def _owned_sidecar_doc(
 
 
 def _tuple_files_snapshot(slug_dir: Path) -> "dict[str, str | None]":
-    """Read the six journalled tuple/sidecar files' bytes (or None when absent)
+    """Read the journalled tuple/sidecar files' bytes (or None when absent)
     for the bundle-op journal's before-state."""
     from specialist_bundle_journal import TUPLE_FILENAMES
 

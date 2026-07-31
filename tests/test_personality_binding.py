@@ -549,3 +549,37 @@ def test_a_failed_prior_rotation_does_not_fail_the_committed_transition(
     d.commit_desired_to_active()
     assert load_instance_tuple(prior_path) == gen2
     assert not pending.exists()
+
+
+def test_a_failed_desired_unlink_does_not_fail_the_committed_transition(
+        tmp_path: Path, monkeypatch) -> None:
+    """Sol round-2 (#339): once the new active is durably written, EVERY
+    post-commit cleanup step is best-effort — a failing desired.yaml unlink
+    must not raise (the caller would run the pre-commit tuple while disk
+    holds the new active). The stale desired is retried by the next no-op
+    recommit."""
+    d = InstanceDir(tmp_path / "mtg")
+    gen1 = _tuple(_binding(persona_version="0.1.0"))
+    d.stage_desired(gen1)
+    d.commit_desired_to_active()
+    gen2 = _tuple(_binding(persona_version="0.2.0"))
+    d.stage_desired(gen2)
+
+    import personality_binding
+    real_unlink = Path.unlink
+    desired = tmp_path / "mtg" / "desired.yaml"
+
+    def _fail_desired_unlink(self, *a, **k):
+        if str(self) == str(desired):
+            raise OSError("EIO on unlink")
+        return real_unlink(self, *a, **k)
+
+    monkeypatch.setattr(Path, "unlink", _fail_desired_unlink)
+    committed = d.commit_desired_to_active()  # must NOT raise
+    monkeypatch.undo()
+
+    assert committed == gen2
+    assert d.active() == gen2
+    assert d.desired() == gen2               # stale, retried later
+    d.commit_desired_to_active()             # no-op recommit clears it
+    assert d.desired() is None
