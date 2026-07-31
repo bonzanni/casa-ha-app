@@ -5,6 +5,7 @@ nothing on its own — the point of these is that each check demonstrably bites.
 """
 import importlib.util
 import subprocess
+import sys
 from pathlib import Path
 
 # Loaded by explicit path, not `from scripts import verify_docs`: tests/conftest.py inserts
@@ -552,3 +553,20 @@ def test_a_reference_document_is_admitted(tmp_path):
     root = _corpus(tmp_path, manifest, docs={"reference/ops.md": "# O\n" + CODE_WINS + SOURCEMAP})
     assert verify_docs.verify(root) == []
     assert "reference/ops.md" in verify_docs.render_llms(root)
+
+
+def test_default_invocation_fails_on_stale_nav(tmp_path, monkeypatch, capsys):
+    """The documented keep-me-green command is the BARE invocation; it must
+    fail on stale generated navigation exactly like the gate does (which
+    passes --check-nav). Pre-fix, the bare run printed a green corpus verdict
+    over a stale routing table and the mismatch surfaced only at push time.
+
+    Red case demonstrated: restoring the `if "--check-nav" in args:` guard
+    around the staleness check fails this test.
+    """
+    root = _corpus(tmp_path)
+    assert verify_docs.stale_nav(root), "the seeded corpus must start stale"
+    monkeypatch.setattr(sys, "argv", ["verify_docs", str(root)])
+    assert verify_docs.main() == 1
+    out = capsys.readouterr().out
+    assert "generated navigation is stale" in out

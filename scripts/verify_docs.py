@@ -947,12 +947,18 @@ def main() -> int:
     if "--write-nav" in args:
         for rel in write_nav(root):
             print(f"✓ regenerated docs/{rel}")
-    if "--check-nav" in args:
-        stale = stale_nav(root)
-        if stale:
-            print("✗ generated navigation is stale: " + ", ".join(stale))
-            print("  run: python -m scripts.verify_docs . --write-nav")
-            return 1
+    # Nav staleness is checked UNCONDITIONALLY (v0.130.0 follow-up): the gate
+    # always ran --check-nav, but the documented keep-me-green invocation is
+    # the bare `python -m scripts.verify_docs .` — which used to pass on a
+    # stale routing table or source map and let the mismatch surface only at
+    # push time. A local green must mean gate green. `--check-nav` remains
+    # accepted for existing callers; after --write-nav the check is trivially
+    # fresh.
+    stale = stale_nav(root)
+    if stale:
+        print("✗ generated navigation is stale: " + ", ".join(stale))
+        print("  run: python -m scripts.verify_docs . --write-nav")
+        return 1
 
     for warning in warnings(root):
         print(f"! {warning}")

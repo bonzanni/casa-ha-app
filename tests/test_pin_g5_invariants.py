@@ -50,8 +50,9 @@ async def test_pin_inv_obs_001_header_cid_validated_payload_cid_not():
     assert message.context["cid"] == payload_cid
 
 
-def test_pin_inv_obs_002_rendered_output_redacts_exceptions_and_extras():
-    """INV-OBS-002: what Casa's own formatters render is redacted end to
+def test_pin_inv_obs_004_rendered_output_redacts_exceptions_and_extras():
+    """INV-OBS-004 (replaces the retired INV-OBS-002, whose statement pinned
+    the pre-#285 gap): what Casa's own formatters render is redacted end to
     end — message and args at the filter, exception text and structured
     extras at the formatter (#285). A handler that is not Casa's own is
     still uncovered.

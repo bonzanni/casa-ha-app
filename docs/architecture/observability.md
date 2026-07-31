@@ -70,11 +70,17 @@ operational health check, and treating either as one reads in something that is 
 The asymmetry is intentional — external systems thread their own ids — but it means one of
 the two paths accepts arbitrary text.
 
-**INV-OBS-002**: Everything the application's own formatters render — message, arguments, exception text, stack text and structured extras — is redacted before it is emitted.
+**INV-OBS-004**: Redaction runs at every point the application's own logging pipeline turns record content into text — the filter for message and arguments, the formatters for exception text, stack text and structured extras.
+
+The id replaces a retired predecessor (OBS 002) whose meaning inverted: the old statement
+pinned the *absence* of exception coverage as if it were the contract, and the fix
+flipped what the sentence asserted. A flipped assertion gets a fresh id.
 
 What it does not cover, and this is the operative part: the pipeline is installed on the
 application's handler rather than globally, so a record reaching any other handler has no
-redaction guarantee, and subprocess output never passes through it at all.
+redaction guarantee, and subprocess output never passes through it at all. Within the
+pipeline, redaction recognises patterns, registered exact values and credential-named
+keys — an unregistered, pattern-less secret under a benign key still passes.
 
 **INV-OBS-003**: The health endpoint returns a fixed success response without consulting any subsystem.
 

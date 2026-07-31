@@ -55,8 +55,8 @@ Every invariant is defined in exactly one file and referenced by id elsewhere.
 | `INV-MEM-004` | A caller cannot inject a sensitivity tier or a provenance tag through ordinary application tags. | [`architecture/memory.md`](../architecture/memory.md) |
 | `INV-MEM-005` | Only write-trusted channels retain to the shared bank. | [`architecture/memory.md`](../architecture/memory.md) |
 | `INV-OBS-001` | A correlation id arriving on the request header is validated to a fixed shape; one supplied inside an invocation payload is not. | [`architecture/observability.md`](../architecture/observability.md) |
-| `INV-OBS-002` | Everything the application's own formatters render — message, arguments, exception text, stack text and structured extras — is redacted before it is emitted. | [`architecture/observability.md`](../architecture/observability.md) |
 | `INV-OBS-003` | The health endpoint returns a fixed success response without consulting any subsystem. | [`architecture/observability.md`](../architecture/observability.md) |
+| `INV-OBS-004` | Redaction runs at every point the application's own logging pipeline turns record content into text — the filter for message and arguments, the formatters for exception text, stack text and structured extras. | [`architecture/observability.md`](../architecture/observability.md) |
 | `INV-PERS-001` | When a resident has an activated compiled bundle, that bundle's projection is the base prompt; the composed prompt is a fallback for when there is none. | [`architecture/personality.md`](../architecture/personality.md) |
 | `INV-PERS-002` | Persona validation is structural; it does not verify that a persona's claims about capability are true. | [`architecture/personality.md`](../architecture/personality.md) |
 | `INV-PERS-003` | A resident's binding reconciliation runs as part of loading and is not isolated from it. | [`architecture/personality.md`](../architecture/personality.md) |
