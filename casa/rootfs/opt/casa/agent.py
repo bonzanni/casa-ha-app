@@ -710,7 +710,13 @@ class Agent:
         # cost of operator-visible literal `<silent/>` is real-but-small.
         if text:
             stripped = text.strip()
-            if not stripped or stripped == "<silent/>":
+            # A turn is silence when it strips to nothing, or to nothing but
+            # one-or-more `<silent/>` sentinels and surrounding whitespace
+            # (so a buffered model that emits the sentinel on its own line, or
+            # repeats it, is still suppressed). Residual PROSE after a sentinel
+            # is still sent — the G-3 recant contract: a model that emits
+            # `<silent/>` and then a real message must not have it swallowed.
+            if not stripped or not stripped.replace("<silent/>", "").strip():
                 text = ""
 
         # §3.10 first-contact notice: while plugin-health holds a blocking

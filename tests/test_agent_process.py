@@ -1811,6 +1811,59 @@ class TestScheduledSilence:
         assert stub.finalize_stream.call_count == 0
         assert result is None
 
+    async def test_sentinel_with_whitespace_suppresses_send(self, tmp_path):
+        """A buffered model that emits the sentinel on its own line (or with
+        leading/trailing whitespace) must still be suppressed — the gate
+        strips surrounding whitespace around the sentinel."""
+        agent = _make_agent(tmp_path, role="assistant")
+        stub = _StubChannel()
+        agent._channel_manager.register(stub)
+
+        with patch.object(
+            agent, "_process", AsyncMock(return_value="\n  <silent/>  \n"),
+        ):
+            result = await agent.handle_message(_scheduled_msg())
+
+        assert stub.send.call_count == 0
+        assert stub.send_response.call_count == 0
+        assert stub.finalize_stream.call_count == 0
+        assert result is None
+
+    async def test_repeated_sentinel_suppresses_send(self, tmp_path):
+        """Output that is nothing but repeated sentinels + whitespace is
+        silence, not a message."""
+        agent = _make_agent(tmp_path, role="assistant")
+        stub = _StubChannel()
+        agent._channel_manager.register(stub)
+
+        with patch.object(
+            agent, "_process", AsyncMock(return_value="<silent/>\n<silent/>"),
+        ):
+            result = await agent.handle_message(_scheduled_msg())
+
+        assert stub.send.call_count == 0
+        assert stub.send_response.call_count == 0
+        assert result is None
+
+    async def test_recant_after_sentinel_is_still_sent(self, tmp_path):
+        """G-3 recant contract preserved: a `<silent/>` followed by real prose
+        is NOT swallowed — the residual message is delivered."""
+        agent = _make_agent(tmp_path, role="assistant")
+        stub = _StubChannel()
+        agent._channel_manager.register(stub)
+
+        with patch.object(
+            agent, "_process",
+            AsyncMock(return_value="<silent/> actually, meeting at 3pm."),
+        ):
+            result = await agent.handle_message(_scheduled_msg())
+
+        assert stub.send_response.call_count == 1
+        assert stub.send_response.call_args.args[0] == (
+            "<silent/> actually, meeting at 3pm."
+        )
+        assert result is not None
+
     async def test_real_text_passes_through(self, tmp_path):
         """Spec §3.2 B.2: any non-sentinel, non-empty text reaches the
         channel and emits a RESPONSE BusMessage with the same body."""

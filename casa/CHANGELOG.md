@@ -1,5 +1,25 @@
 # Changelog
 
+## [0.132.0] - 2026-07-31
+
+### Fixed
+
+- **The 8:00 weekday morning briefing no longer sends an "all quiet" message
+  when there is nothing to report.** The briefing prompt told the assistant to
+  "stay silent," but a scheduled turn is only actually suppressed when its
+  whole output is empty or the literal `<silent/>` sentinel — so a model that
+  wrote a short "nothing to report" line (or even a sentence *saying* it was
+  staying silent) had that prose delivered. The briefing prompt now teaches the
+  sentinel explicitly, matching the hourly heartbeat trigger.
+- **The silence gate tolerates whitespace and repeated sentinels.** A buffered
+  turn whose output strips to nothing but one or more `<silent/>` sentinels
+  (e.g. on its own line) is now suppressed, while any real text after a
+  sentinel is still delivered (the recant contract is preserved).
+
+Existing installs pick up the corrected briefing prompt automatically on
+update via the config-sync reconciler (the file is an unmodified shipped
+default).
+
 ## [0.131.0] - 2026-07-31
 
 ### Changed
