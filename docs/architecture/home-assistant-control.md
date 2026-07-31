@@ -102,8 +102,9 @@ payload rather than assuming a Casa-side check ran.
 Casa-side restriction is genuinely wanted, it would be new — there is no existing hook to
 extend, and it would need to sit where action arguments are forwarded.
 
-**Adding a tool to the curated surface** means the facade's mapping. Remember the cache: an
-addition is invisible until a refresh.
+**Adding a tool to the curated surface** happens upstream: the facade mirrors whatever Home
+Assistant offers with a valid schema, so a new upstream tool appears on its own — after a
+refresh. Remember the cache: an addition is invisible until one runs.
 
 **Anything relying on cache freshness** needs an explicit refresh, since none happens on a
 timer.

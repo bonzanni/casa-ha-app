@@ -25,9 +25,9 @@ is reconciled against image defaults at boot and can be reloaded in-process afte
 
 **Reload is scope-specific, and it is not a restart.** The registered scopes — triggers,
 agent, agents, policies, plugin_env, executors, config_sync, and full (the set INV-CFG-001
-pins) — each
-rebuilding a defined slice (executors rebuilds the executor registry with a resident
-cascade; config_sync reruns reconciliation then cascades agents and policies). There is no
+pins) — each rebuild a defined slice: executors rebuilds the executor registry with a
+resident cascade, and config_sync reruns reconciliation then cascades agents and policies.
+There is no
 scope that rereads manifest options, reconstructs channels, or re-reads arbitrary files. If
 your change is an operator option, reload will not help you, and this is the single most
 common wrong expectation in this area.
@@ -49,7 +49,6 @@ it. An operator-edited file that conflicts with a changed default, or that fails
 schema, is *overwritten by the image* with the prior content preserved as a recovery
 artifact. A live file the image does not know is adopted, not deleted. Predicting which of
 your edits survive means knowing which of the three cases each file is in.
-
 
 **Some identity changes cannot be hot-swapped at all.** If a resident's identity changes, the
 reload path returns a restart-required outcome *before* mutating live state rather than

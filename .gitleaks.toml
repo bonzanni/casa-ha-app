@@ -8,7 +8,7 @@
 #
 # There is deliberately NO baseline file either — measured both ways, it cannot work here:
 # stored verbatim it carries the secrets and trips the scan itself; stored redacted it
-# suppresses nothing. Accepted findings carry an inline an inline gitleaks allow-marker at the site, and
+# suppresses nothing. Accepted findings carry an inline gitleaks allow-marker at the site, and
 # the SITES ARE ALLOWLISTED in .githooks/gitleaks-allow-sites.txt so the marker cannot be
 # sprinkled anywhere: the deny sweep refuses it in any unlisted file.
 #
