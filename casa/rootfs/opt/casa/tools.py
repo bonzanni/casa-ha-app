@@ -795,6 +795,38 @@ def _snapshot_origin() -> dict:
     return dict(agent_mod.origin_var.get(None) or {})
 
 
+def _origin_clearance_markers(origin: dict) -> tuple[str | None, str | None]:
+    """The ``(route, clearance)`` pair an access-control decision must use.
+
+    #336 (Terra, review r2): an engagement's tool call arrives over the
+    internal socket, which binds ``engagement_var`` but NOT ``origin_var`` —
+    so the ambient origin is empty and a clearance keyed off it fell through
+    to the channel default, which on telegram is ``private``. An engagement
+    started or steered by a NON-OPERATOR sender could therefore recall the
+    operator's private memory through its own tools, going around the
+    per-sender clearance the ingress had just established.
+
+    An engagement inherits the clearance of the turn that created it, read
+    from the markers its record persisted (the ingress stamps them
+    server-side and the tombstone preserves them). Only consulted when the
+    ambient origin carries no route of its own, so a delegated in-process
+    turn — which does carry one — is unaffected; a record with no markers
+    (created before this release, or from an origin that stamps none) yields
+    ``(None, None)`` and keeps today's channel-keyed behavior.
+    """
+    route = origin.get("_origin_route")
+    if route is not None:
+        return route, origin.get("_origin_clearance")
+    eng = engagement_var.get(None)
+    if eng is None:
+        return None, None
+    eng_origin = getattr(eng, "origin", None) or {}
+    return (
+        eng_origin.get("_origin_route"),
+        eng_origin.get("_origin_clearance"),
+    )
+
+
 def _result(payload: dict, *, is_error: bool | None = None) -> dict:
     """Wrap a JSON-serializable payload as the tool's MCP content.
 
@@ -4253,9 +4285,12 @@ async def recall_memory(args: dict) -> dict:
     # channel fails closed to public.
     from personality_types import SpeakerProvenance
     from sensitivity import clearance_for_origin, readable_tiers
-    clearance = clearance_for_origin(
-        origin.get("_origin_route"), origin.get("_origin_clearance"), channel,
-    )
+    # #336 (Terra r2): inside an engagement the ambient origin is empty, so
+    # the markers come from the engagement's own record — an engagement reads
+    # at the clearance of the turn that started it, not at the channel
+    # default (which on telegram is private).
+    _route, _stamped_clearance = _origin_clearance_markers(origin)
+    clearance = clearance_for_origin(_route, _stamped_clearance, channel)
     tags = readable_tiers(clearance)
 
     budget = "low" if channel == "voice" else "mid"
@@ -4674,6 +4709,7 @@ def _jaccard_task_similarity(a: str, b: str) -> float:
 
 async def _fetch_executor_archive(
     *, task: str, origin_channel: str, token_budget: int,
+    origin_route: str | None = None, origin_clearance: str | None = None,
 ) -> str:
     """Read prior-engagement "lessons" as a SEMANTIC recall against the shared
     ``casa`` bank, keyed on the current ``task`` and filtered to the originating
@@ -4711,6 +4747,11 @@ async def _fetch_executor_archive(
         digest = await delegated_recall(
             sem, query=task, origin_channel=origin_channel, max_tokens=token_budget,
             path="executor_archive",
+            # #336 (Terra r2): the archive block is injected into the
+            # executor's prompt at launch, so it must be filtered at the
+            # ORIGINATING turn's clearance — a non-operator-launched executor
+            # must not be handed private lessons in its system prompt.
+            origin_route=origin_route, origin_clearance=origin_clearance,
         )
     except RecallUnavailable:
         return ""
@@ -5112,6 +5153,8 @@ async def engage_executor(args: dict) -> dict:
             task=task_text,
             origin_channel=origin.get("channel", "telegram"),
             token_budget=defn.memory.token_budget,
+            origin_route=origin.get("_origin_route"),
+            origin_clearance=origin.get("_origin_clearance"),
         )
 
     # W3/Sol r5-B8: the {task} value reaches BOTH driver paths through this ONE

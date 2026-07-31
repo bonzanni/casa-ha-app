@@ -129,3 +129,90 @@ class TestOperatorDetermination:
         assert channel._sender_is_operator(types.SimpleNamespace(id=7))
         assert not channel._sender_is_operator(types.SimpleNamespace(id=77))
         assert not channel._sender_is_operator(None)
+
+
+class TestButtonTapIdentity:
+    """Sol r2: a tap is a turn — it must carry the tapper's identity, not just
+    their clearance. Without ``trusted_user_origin`` the continuation was
+    persisted as the unattributed ``system`` speaker."""
+
+    async def test_non_operator_tap_is_attributed_to_that_sender(self):
+        channel, bus = _channel("")
+        await channel._dispatch_button_continuation(
+            chat_id=999, user_id=999, target_role="assistant",
+            request_id="r1", text="yes")
+        (msg,) = await _drain(bus)
+        assert msg.trusted_user_origin is not None
+        assert msg.trusted_user_origin.user_peer == "telegram:999"
+        assert msg.trusted_user_origin.server_origin.clearance == "public"
+        assert msg.context["_origin_clearance"] == "public"
+
+    async def test_operator_tap_keeps_the_operator_identity(self):
+        channel, bus = _channel("7")
+        await channel._dispatch_button_continuation(
+            chat_id=7, user_id=7, target_role="assistant",
+            request_id="r1", text="yes")
+        (msg,) = await _drain(bus)
+        assert msg.trusted_user_origin.user_peer == "nicola"
+        assert msg.context["_origin_clearance"] == "private"
+
+    async def test_tap_provenance_is_a_user_not_the_system_speaker(self):
+        from speaker_provenance import UserProvenance
+        channel, bus = _channel("")
+        await channel._dispatch_button_continuation(
+            chat_id=999, user_id=999, target_role="assistant",
+            request_id="r1", text="yes")
+        (msg,) = await _drain(bus)
+        o = msg.trusted_user_origin
+        prov = UserProvenance.from_origin(
+            surface=o.surface, server_origin=o.server_origin,
+            authenticated_user=o.authenticated_user, user_peer=o.user_peer)
+        assert prov.speaker_kind == "user"
+        assert prov.user_peer == "telegram:999"
+
+
+class TestEngagementInheritsItsOriginClearance:
+    """Terra r2: an engagement's tool calls bind ``engagement_var`` but no
+    ambient origin, so a clearance keyed off the ambient origin fell through
+    to the telegram channel default (private) — letting an engagement started
+    by a non-operator recall the operator's private memory."""
+
+    def _clearance(self, eng_origin, ambient=None):
+        import tools as tools_mod
+        from sensitivity import clearance_for_origin
+
+        class _Rec:
+            def __init__(self, origin):
+                self.origin = origin
+
+        token = tools_mod.engagement_var.set(
+            _Rec(eng_origin) if eng_origin is not None else None)
+        try:
+            route, clearance = tools_mod._origin_clearance_markers(ambient or {})
+        finally:
+            tools_mod.engagement_var.reset(token)
+        return clearance_for_origin(route, clearance, "telegram")
+
+    def test_engagement_started_by_a_non_operator_reads_public(self):
+        assert self._clearance(
+            {"_origin_route": "telegram", "_origin_clearance": "public"}
+        ) == "public"
+
+    def test_engagement_started_by_the_operator_still_reads_private(self):
+        assert self._clearance(
+            {"_origin_route": "telegram", "_origin_clearance": "private"}
+        ) == "private"
+
+    def test_record_without_markers_keeps_channel_behaviour(self):
+        # Non-regressive: engagements created before this release, and origins
+        # that stamp no route, resolve exactly as they did.
+        assert self._clearance({}) == "private"
+        assert self._clearance(None) == "private"
+
+    def test_an_ambient_origin_is_never_overridden_by_the_record(self):
+        # A delegated IN-PROCESS turn carries its own origin; the engagement
+        # record must not displace it.
+        assert self._clearance(
+            {"_origin_route": "telegram", "_origin_clearance": "public"},
+            ambient={"_origin_route": "telegram", "_origin_clearance": "private"},
+        ) == "private"

@@ -27,7 +27,9 @@ from personality_types import RetainedTurn, SpeakerProvenance
 from recall_health import RecallPath, default_telemetry, observed_recall
 from recall_renderer import Surface, render_recall
 from semantic_memory import RecallUnavailable
-from sensitivity import clearance_for_channel, readable_tiers
+from sensitivity import (
+    clearance_for_channel, clearance_for_origin, readable_tiers,
+)
 from tier_classifier import classify_tier
 
 logger = logging.getLogger(__name__)
@@ -37,6 +39,7 @@ async def delegated_recall(
     semantic_memory: Any, *, query: str, origin_channel: str, max_tokens: int,
     budget: str = "mid", surface: Surface = "text",
     path: RecallPath = "delegated", current_speaker: SpeakerProvenance | None = None,
+    origin_route: str | None = None, origin_clearance: str | None = None,
 ) -> str:
     """Recall the shared bank at the ORIGINATING context's read-clearance,
     returning an ATTRIBUTED digest (personality Task 11).
@@ -83,7 +86,17 @@ async def delegated_recall(
             "delegated_recall requires a non-blank query; a blank one performs "
             "no search and must not be reported as a zero-hit result (#201)"
         )
-    clearance = clearance_for_channel(origin_channel)
+    # #336 (Terra, review r2): when the caller can name the originating
+    # ROUTE, clearance resolves off that server-stamped marker rather than the
+    # channel alone — a telegram turn's clearance is per sender, so a
+    # channel-keyed lookup would hand an engagement created by a non-operator
+    # the operator's private tier. Callers that pass no route keep the exact
+    # channel-keyed behavior they had.
+    clearance = (
+        clearance_for_origin(origin_route, origin_clearance, origin_channel)
+        if origin_route is not None
+        else clearance_for_channel(origin_channel)
+    )
     tags = readable_tiers(clearance)
     if current_speaker is None:
         current_speaker = SpeakerProvenance(speaker_kind="system")

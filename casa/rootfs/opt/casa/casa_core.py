@@ -654,21 +654,34 @@ async def replay_undergoing_engagements(
                         "refreshed — cycling its service so the CLI reloads",
                         rec.id[:8],
                     )
+                    # An unconfirmed stop is FATAL to the resume, not a
+                    # warning (Sol, review r2): the new credential is already
+                    # on disk, so a surviving CLI holds one that authenticates
+                    # nowhere — and the NEXT boot would see the on-disk token
+                    # matching the record and never retry the cycle, leaving a
+                    # permanently mute engagement that still looks live. Refuse
+                    # it instead: the shared helper runs the checked teardown
+                    # ladder, lands a terminal mark, and adds it to
+                    # ``refused_ids`` so the start and background-task loops
+                    # skip it.
                     try:
-                        if await s6_rc.ensure_service_down(
-                                engagement_id=rec.id) is False:
-                            logger.warning(
-                                "boot replay: engagement %s could not be "
-                                "confirmed down after a credential refresh — "
-                                "a surviving CLI still holds the old token "
-                                "and its calls will be rejected until it is "
-                                "restarted", rec.id[:8],
-                            )
-                    except Exception:  # noqa: BLE001 — start below still runs
+                        _down = await s6_rc.ensure_service_down(
+                            engagement_id=rec.id)
+                    except Exception as exc:  # noqa: BLE001
+                        _down = False
                         logger.warning(
                             "boot replay: service cycle after credential "
-                            "refresh failed for %s", rec.id[:8], exc_info=True,
+                            "refresh raised for %s: %s", rec.id[:8], exc,
                         )
+                    if _down is False:
+                        await _refuse_brief_resume(
+                            rec,
+                            "engagement could not be confirmed down after a "
+                            "credential refresh, so a surviving CLI would run "
+                            "with a credential that no longer authenticates",
+                            kind="refuse_credential_cycle_failed",
+                        )
+                        continue
 
                 if s6_rc.service_pair_complete(
                     svc_root=s6_rc.ENGAGEMENT_SOURCES_ROOT,

@@ -142,7 +142,7 @@
     INV-HTTP-003: [tests/test_pin_http_invariants.py::test_pin_inv_http_003_replay_unbounded_except_timestamped, tests/test_webhook_auth.py::test_timestamped_hmac_stale_rejected]
     INV-HTTP-004: [tests/test_origin_stamping.py::test_invoke_route_is_unspoofable, tests/test_webhook_handler.py::test_payload_context_never_enters_bus_message_context]
     INV-HTTP-005: [tests/test_pin_http_invariants.py::test_pin_inv_http_005_table_contract_disagreement_refused, tests/test_ingress_identity_boot_check.py::test_main_validates_the_table_before_doing_anything_else]
-    INV-HTTP-006: [tests/test_ingress_identity.py::test_non_operator_sender_gets_its_own_peer_not_the_operators, tests/test_ingress_identity.py::test_a_telegram_turn_without_a_sender_fails_loudly]
+    INV-HTTP-006: [tests/test_ingress_identity.py::test_non_operator_sender_gets_its_own_peer_not_the_operators]
 
 - doc: architecture/jobs-and-delivery.md
   summary: Durable background jobs — execution vs delivery state, restart reconciliation, and the leased claim/ack protocol.
@@ -196,7 +196,7 @@
     - tests/test_session_saver.py
     - tests/test_freshness_reaper.py
   related: [architecture/overview.md, architecture/turn-loop.md]
-  defines_invariants: [INV-MEM-001, INV-MEM-002, INV-MEM-003, INV-MEM-004, INV-MEM-005, INV-MEM-006, INV-MEM-007]
+  defines_invariants: [INV-MEM-001, INV-MEM-002, INV-MEM-003, INV-MEM-004, INV-MEM-005, INV-MEM-006, INV-MEM-007, INV-MEM-008]
   invariant_tests:
     INV-MEM-001: [tests/test_pin_memory_invariants.py::test_pin_inv_mem_001_failures_raise_never_return_empty, tests/test_hindsight_memory.py::test_recall_unrenderable_results_are_unavailable_not_zero_hits]
     INV-MEM-002: [tests/test_pin_memory_invariants.py::test_pin_inv_mem_002_exactly_one_readable_tier]
@@ -205,6 +205,7 @@
     INV-MEM-005: [tests/test_delegated_memory.py::test_retain_delegated_voice_writes_nothing]
     INV-MEM-006: [tests/test_session_saver.py::test_save_session_expected_sid_mismatch_releases_claim, tests/test_session_saver.py::test_reset_channel_trailing_remove_spares_follow_up_session, tests/test_session_registry.py::test_remove_with_stale_expected_sid_spares_newer_session, tests/test_freshness_reaper.py::test_sweep_passes_cold_snapshot_sid_to_save]
     INV-MEM-007: [tests/test_sensitivity.py::test_parse_tier_rejects_a_tier_word_inside_a_chatty_reply, tests/test_tier_classifier.py::test_classify_chatty_reply_with_tier_words_defaults_private]
+    INV-MEM-008: [tests/test_telegram_sender_identity.py::test_engagement_started_by_a_non_operator_reads_public]
 
 - doc: architecture/plugins.md
   summary: How a plugin becomes usable — registry, content-addressed store, artifact identity, and per-call authorization.
@@ -454,7 +455,7 @@
     INV-MCP-001: [tests/test_pin_g4_invariants.py::test_pin_inv_mcp_001_internal_dispatch_ignores_agent_allowlist]
     INV-MCP-002: [tests/test_unix_socket_runner.py::test_unix_runner_creates_socket_with_mode_0600]
     INV-MCP-003: [tests/test_role_scoped_mcp.py::test_casa_framework_factory_exposes_only_granted_tools, tests/test_svc_casa_mcp.py::test_svc_tools_list_uses_static_snapshot]
-    INV-MCP-004: [tests/test_engagement_auth_token.py::test_forged_id_without_token_is_rejected_and_tool_never_runs, tests/test_engagement_auth_token.py::test_terminal_binding_allowlist_still_requires_the_token]
+    INV-MCP-004: [tests/test_engagement_auth_token.py::test_forged_id_without_token_is_rejected_and_tool_never_runs]
     INV-MCP-005: [tests/test_engagement_auth_token.py::test_peek_refuses_to_return_mcp_json_contents]
 
 - doc: architecture/personality.md

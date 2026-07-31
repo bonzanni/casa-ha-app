@@ -2916,14 +2916,22 @@ class TelegramChannel(Channel):
         # releases it. Compute the cid ONCE and reuse it across retries — a
         # per-attempt new_cid() would desync the lease from the accepted turn.
         cid = new_cid()
-        # #336: a tap is a TURN, and it must run at the tapper's clearance.
-        # Without these markers the continuation fell through to the
-        # channel-wide telegram clearance (private) — so a non-operator whose
-        # question produced buttons got private recall on the follow-up turn,
-        # re-opening through the button path exactly what the per-sender
-        # identity closed on the message path. The broker already pins a tap
-        # to the user the request was bound to, which is who ``user_id`` is.
+        # #336: a tap is a TURN, and it must both RUN at the tapper's
+        # clearance and be ATTRIBUTED to the tapper. Without the markers the
+        # continuation fell through to the channel-wide telegram clearance
+        # (private), and without the trusted origin it was persisted as the
+        # unattributed ``system`` speaker — so a non-operator whose question
+        # produced buttons got private recall AND anonymous attribution on the
+        # follow-up turn, re-opening through the button path exactly what the
+        # per-sender identity closed on the message path (Sol, review r2). The
+        # broker already pins a tap to the user the request was bound to,
+        # which is who ``user_id`` is.
         _clearance = self._origin_clearance_for_user_id(user_id)
+        _trusted_origin = ingress_identity(
+            "telegram",
+            sender_id=str(user_id),
+            sender_is_operator=self._user_id_is_operator(user_id),
+        )
         for attempt in range(3):
             msg = BusMessage(
                 type=MessageType.CHANNEL_IN,
@@ -2940,6 +2948,7 @@ class TelegramChannel(Channel):
                     "_origin_route": "telegram",
                     "_origin_clearance": _clearance,
                 },
+                trusted_user_origin=_trusted_origin,
             )
             try:
                 if await self._bus.send_checked(msg) == "accepted":
