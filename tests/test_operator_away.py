@@ -278,7 +278,7 @@ async def _run_until_timeout(env, payload, key_rid):
 async def test_no_answer_enters_operator_away_and_returns_paused(env):
     eid = env["rec"].id
     resp = await _run_until_timeout(
-        env, _payload(eid, request_id="e1"), "e1")
+        env, _payload(eid, engagement_token=env["rec"].auth_token, request_id="e1"), "e1")
 
     body = _body(resp)
     assert body["ok"] is True
@@ -300,7 +300,7 @@ async def test_racing_inbound_suppresses_away_entry(env):
     driver = env["driver"]
 
     task = asyncio.ensure_future(env["ask"](
-        _FakeRequest(_payload(eid, request_id="e2"))))
+        _FakeRequest(_payload(eid, engagement_token=env["rec"].auth_token, request_id="e2"))))
     await _await_registered(env["broker"], ("engagement_ask", eid, "e2"))
     # A REAL inbound envelope lands (generation 0 → 1) in the race window
     # BEFORE the timeout finishes — the meta still carries gen 0.
@@ -328,7 +328,7 @@ async def test_reattach_tombstone_uses_original_gen_no_rewedge(env):
 
     # First ask expires → away set at generation 0; a tombstone retains its meta
     # (inbound_gen == 0).
-    resp1 = await _run_until_timeout(env, _payload(eid, request_id="r1"), "r1")
+    resp1 = await _run_until_timeout(env, _payload(eid, engagement_token=env["rec"].auth_token, request_id="r1"), "r1")
     assert _body(resp1)["engagement_paused"] is True
     assert driver.operator_away_active(eid) is True
 
@@ -340,7 +340,7 @@ async def test_reattach_tombstone_uses_original_gen_no_rewedge(env):
     # A same-request_id retry reattaches to the retired no_answer tombstone. The
     # tombstone meta carries the ORIGINAL gen (0), so the CAS (current gen 1 !=
     # 0) FAILS — the retry cannot re-wedge the cleared away state.
-    resp2 = await env["ask"](_FakeRequest(_payload(eid, request_id="r1")))
+    resp2 = await env["ask"](_FakeRequest(_payload(eid, engagement_token=env["rec"].auth_token, request_id="r1")))
     body2 = _body(resp2)
     assert body2["outcome"] == "no_answer"
     assert body2["engagement_paused"] is True
@@ -357,7 +357,7 @@ async def test_button_ask_refused_while_away_no_broker(env):
     driver = env["driver"]
     driver._operator_away[eid] = True
 
-    resp = await env["ask"](_FakeRequest(_payload(eid, request_id="b1")))
+    resp = await env["ask"](_FakeRequest(_payload(eid, engagement_token=env["rec"].auth_token, request_id="b1")))
     body = _body(resp)
     assert body["ok"] is False
     assert body["error"] == "operator_away"
@@ -376,7 +376,7 @@ async def test_anchor_ask_refused_while_away_no_broker(env):
     driver._operator_away[eid] = True
 
     resp = await env["ask"](_FakeRequest(
-        _payload(eid, request_id="a1", options=[])))
+        _payload(eid, engagement_token=env["rec"].auth_token, request_id="a1", options=[])))
     body = _body(resp)
     assert body["ok"] is False
     assert body["error"] == "operator_away"
@@ -599,13 +599,13 @@ async def test_button_away_refusal_retry_short_circuits_no_broker(env):
     driver._operator_away[eid] = True
 
     # First away-refused button ask records the refusal outcome on the intent.
-    resp1 = await env["ask"](_FakeRequest(_payload(eid, request_id="b1")))
+    resp1 = await env["ask"](_FakeRequest(_payload(eid, engagement_token=env["rec"].auth_token, request_id="b1")))
     assert _body(resp1)["error"] == "operator_away"
     assert driver._away_refusals.get(eid) == 1
 
     # Same-request_id transport retry: reattaches to the recorded refusal
     # WITHOUT touching the broker and WITHOUT re-bumping the away counter.
-    resp2 = await env["ask"](_FakeRequest(_payload(eid, request_id="b1")))
+    resp2 = await env["ask"](_FakeRequest(_payload(eid, engagement_token=env["rec"].auth_token, request_id="b1")))
     body2 = _body(resp2)
     assert body2["ok"] is False
     assert body2["error"] == "operator_away"
@@ -622,12 +622,12 @@ async def test_anchor_away_refusal_retry_short_circuits_no_delivery_failed(env):
     driver._operator_away[eid] = True
 
     resp1 = await env["ask"](_FakeRequest(
-        _payload(eid, request_id="a1", options=[])))
+        _payload(eid, engagement_token=env["rec"].auth_token, request_id="a1", options=[])))
     assert _body(resp1)["error"] == "operator_away"
 
     # Retry reattaches to the recorded operator_away refusal — NOT delivery_failed.
     resp2 = await env["ask"](_FakeRequest(
-        _payload(eid, request_id="a1", options=[])))
+        _payload(eid, engagement_token=env["rec"].auth_token, request_id="a1", options=[])))
     body2 = _body(resp2)
     assert body2["ok"] is False
     assert body2["error"] == "operator_away"
@@ -685,7 +685,7 @@ async def test_anchor_away_retry_returns_recorded_outcome_not_unread(env):
     # First anchor ask is refused operator_away and records the outcome on the
     # intent (created_intent True → _record_intent_refusal).
     resp1 = await env["ask"](_FakeRequest(
-        _payload(eid, request_id="a4", options=[])))
+        _payload(eid, engagement_token=env["rec"].auth_token, request_id="a4", options=[])))
     assert _body(resp1)["error"] == "operator_away"
 
     # The operator returns: an inbound lands (clears away) but is still UNREAD
@@ -698,7 +698,7 @@ async def test_anchor_away_retry_returns_recorded_outcome_not_unread(env):
     # Same-request_id transport retry: reattach-first returns the RECORDED
     # operator_away outcome, NOT unread_inbound (the pre-fix ordering bug).
     resp2 = await env["ask"](_FakeRequest(
-        _payload(eid, request_id="a4", options=[])))
+        _payload(eid, engagement_token=env["rec"].auth_token, request_id="a4", options=[])))
     body2 = _body(resp2)
     assert body2["ok"] is False
     assert body2["error"] == "operator_away"
@@ -724,14 +724,14 @@ async def test_button_unread_refusal_retry_short_circuits_no_delivery_failed(env
     await driver.spool.enqueue("operator message")
     assert driver.inbound_unread_depth(eid) > 0
 
-    resp1 = await env["ask"](_FakeRequest(_payload(eid, request_id="u1")))
+    resp1 = await env["ask"](_FakeRequest(_payload(eid, engagement_token=env["rec"].auth_token, request_id="u1")))
     body1 = _body(resp1)
     assert body1["error"] == "unread_inbound"
     assert driver.ask_refusals == 1
 
     # Same-request_id transport retry: reattaches to the RECORDED refusal and
     # returns unread_inbound immediately — NOT delivery_failed.
-    resp2 = await env["ask"](_FakeRequest(_payload(eid, request_id="u1")))
+    resp2 = await env["ask"](_FakeRequest(_payload(eid, engagement_token=env["rec"].auth_token, request_id="u1")))
     body2 = _body(resp2)
     assert body2["ok"] is False
     assert body2["error"] == "unread_inbound"
@@ -749,11 +749,11 @@ async def test_anchor_unread_refusal_retry_short_circuits_no_delivery_failed(env
     assert driver.inbound_unread_depth(eid) > 0
 
     resp1 = await env["ask"](_FakeRequest(
-        _payload(eid, request_id="u2", options=[])))
+        _payload(eid, engagement_token=env["rec"].auth_token, request_id="u2", options=[])))
     assert _body(resp1)["error"] == "unread_inbound"
 
     resp2 = await env["ask"](_FakeRequest(
-        _payload(eid, request_id="u2", options=[])))
+        _payload(eid, engagement_token=env["rec"].auth_token, request_id="u2", options=[])))
     body2 = _body(resp2)
     assert body2["ok"] is False
     assert body2["error"] == "unread_inbound"       # NOT delivery_failed

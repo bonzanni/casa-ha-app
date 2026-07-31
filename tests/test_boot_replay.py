@@ -28,6 +28,10 @@ def _boot_driver():
     overridden by each caller.)"""
     driver = AsyncMock()
     driver.schedule_boot_reconcile = lambda *a, **k: None
+    # #335: the replay loop reads this URL for the .mcp.json refresh; an
+    # AsyncMock auto-attribute is not JSON-serializable and would make every
+    # heal refuse resume with ".mcp.json refresh failed".
+    driver._casa_framework_mcp_url = "http://127.0.0.1:8100/mcp/casa-framework"
     return driver
 
 

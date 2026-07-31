@@ -622,6 +622,7 @@ class TestHandlerEndToEnd:
     async def test_multi_keyboard_posted_and_submit_settles(self, wired):
         payload = {
             "engagement_id": wired.rec.id, "request_id": "h1",
+            "engagement_token": wired.rec.auth_token,
             "question": "Which apply?", "options": ["Alpha", "Beta", "Gamma"],
             "timeout_s": 60, "multi": True,
         }
@@ -654,6 +655,7 @@ class TestHandlerEndToEnd:
     async def test_multi_supersession_settles(self, wired):
         payload = {
             "engagement_id": wired.rec.id, "request_id": "h2",
+            "engagement_token": wired.rec.auth_token,
             "question": "Which apply?", "options": ["Alpha", "Beta"],
             "timeout_s": 60, "multi": True,
         }
@@ -673,6 +675,7 @@ class TestHandlerEndToEnd:
     async def test_multi_timeout_no_answer(self, wired):
         payload = {
             "engagement_id": wired.rec.id, "request_id": "h3",
+            "engagement_token": wired.rec.auth_token,
             "question": "Which apply?", "options": ["Alpha", "Beta"],
             "timeout_s": 60, "multi": True,
         }
@@ -697,6 +700,7 @@ class TestHandlerEndToEnd:
     async def test_multi_anchor_refused_invalid_args(self, wired):
         payload = {
             "engagement_id": wired.rec.id, "request_id": "h4",
+            "engagement_token": wired.rec.auth_token,
             "question": "Which apply?", "options": [], "multi": True,
         }
         resp = await asyncio.wait_for(

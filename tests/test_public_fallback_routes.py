@@ -33,6 +33,8 @@ class _FakeRec:
     def __init__(self, id, status="active"):
         self.id = id
         self.status = status
+        # #335: per-engagement secret; the body must present it to bind.
+        self.auth_token = f"tok-{id}"
 
 
 def _build_app() -> web.Application:
@@ -102,6 +104,7 @@ async def test_public_mcp_tools_list() -> None:
 
 
 async def test_public_mcp_tools_call_known_tool() -> None:
+    """#335: the id claim rides with the matching engagement token header."""
     async with TestClient(TestServer(_build_app())) as client:
         resp = await client.post(
             "/mcp/casa-framework",
@@ -109,7 +112,8 @@ async def test_public_mcp_tools_call_known_tool() -> None:
                 "jsonrpc": "2.0", "id": 3, "method": "tools/call",
                 "params": {"name": "ok", "arguments": {"x": 7}},
             },
-            headers={"X-Casa-Engagement-Id": "eng-active"},
+            headers={"X-Casa-Engagement-Id": "eng-active",
+                     "X-Casa-Engagement-Token": "tok-eng-active"},
         )
         body = await resp.json()
         assert body["jsonrpc"] == "2.0"

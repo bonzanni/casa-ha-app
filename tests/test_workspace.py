@@ -393,6 +393,7 @@ class TestProvisionWorkspace:
         path = await provision_workspace(
             engagements_root=str(ws),
             engagement_id="eng1",
+            engagement_auth_token="tok-ws-test",
             defn=defn,
             task="do a thing",
             context="because",
@@ -437,6 +438,7 @@ class TestProvisionWorkspace:
         path = await provision_workspace(
             engagements_root=str(ws),
             engagement_id="eng2",
+            engagement_auth_token="tok-ws-test",
             defn=defn, task="t", context="c",
             casa_framework_mcp_url="http://x",
         )
@@ -448,8 +450,9 @@ class TestProvisionWorkspace:
 
     @pytest.mark.skipif(sys.platform == "win32", reason="mkfifo/symlink not meaningful on Windows")
     async def test_mcp_json_carries_engagement_id_header(self, tmp_path):
-        """Plan 4a.1: .mcp.json.mcpServers.casa-framework.headers contains
-        X-Casa-Engagement-Id so the HTTP bridge can bind engagement_var."""
+        """Plan 4a.1 + #335: .mcp.json.mcpServers.casa-framework.headers
+        carries X-Casa-Engagement-Id AND X-Casa-Engagement-Token so the HTTP
+        bridge can authenticate + bind engagement_var."""
         from pathlib import Path
         from drivers.workspace import provision_workspace
 
@@ -461,6 +464,7 @@ class TestProvisionWorkspace:
         await provision_workspace(
             engagements_root=str(ws),
             engagement_id="eng-hdr-test",
+            engagement_auth_token="tok-ws-test",
             defn=defn,
             task="t", context="c",
             casa_framework_mcp_url="http://127.0.0.1:8099/mcp/casa-framework",
@@ -468,7 +472,10 @@ class TestProvisionWorkspace:
 
         mcp = json.loads((Path(ws) / "eng-hdr-test" / ".mcp.json").read_text())
         server_cfg = mcp["mcpServers"]["casa-framework"]
-        assert server_cfg["headers"] == {"X-Casa-Engagement-Id": "eng-hdr-test"}
+        assert server_cfg["headers"] == {
+            "X-Casa-Engagement-Id": "eng-hdr-test",
+            "X-Casa-Engagement-Token": "tok-ws-test",
+        }
 
     @pytest.mark.skipif(sys.platform == "win32", reason="mkfifo not meaningful on Windows")
     async def test_legacy_path_writes_permissions_allow_filtered(self, tmp_path):
@@ -489,6 +496,7 @@ class TestProvisionWorkspace:
         path = await provision_workspace(
             engagements_root=str(ws),
             engagement_id="eng-perm",
+            engagement_auth_token="tok-ws-test",
             defn=defn, task="t", context="c",
             casa_framework_mcp_url="http://x",
         )
@@ -517,6 +525,7 @@ class TestProvisionWorkspace:
         path = await provision_workspace(
             engagements_root=str(ws),
             engagement_id="eng-perm-mode",
+            engagement_auth_token="tok-ws-test",
             defn=defn, task="t", context="c",
             casa_framework_mcp_url="http://x",
         )
@@ -548,6 +557,7 @@ class TestProvisionWorkspace:
         path = await provision_workspace(
             engagements_root=str(ws),
             engagement_id="eng-both",
+            engagement_auth_token="tok-ws-test",
             defn=defn, task="t", context="c",
             casa_framework_mcp_url="http://x",
         )
@@ -579,6 +589,7 @@ class TestProvisionWorkspace:
         path = await provision_workspace(
             engagements_root=str(ws),
             engagement_id="eng-tpl-home",
+            engagement_auth_token="tok-ws-test",
             defn=defn, task="t", context="c",
             casa_framework_mcp_url="http://x",
             workspace_template_root=tpl_root,
@@ -601,6 +612,7 @@ class TestProvisionWorkspace:
         path = await provision_workspace(
             engagements_root=str(ws),
             engagement_id=eng_id,
+            engagement_auth_token="tok-ws-test",
             defn=defn, task="t", context="c",
             casa_framework_mcp_url="http://127.0.0.1:8100/mcp/casa-framework",
         )
@@ -614,6 +626,8 @@ class TestProvisionWorkspace:
             "--engagement-id", eng_id,
         ]
         assert entry["env"]["CASA_INTERNAL_SOCKET"] == "/run/casa/internal.sock"
+        # #335: the per-engagement auth token rides into the stdio channel env.
+        assert entry["env"]["CASA_ENGAGEMENT_TOKEN"] == "tok-ws-test"
 
 
 class TestCasaMeta:
@@ -674,6 +688,7 @@ class TestProvisionWithHooks:
         path = await provision_workspace(
             engagements_root=str(tmp_path / "eng"),
             engagement_id="e42",
+            engagement_auth_token="tok-ws-test",
             defn=defn, task="t", context="c",
             casa_framework_mcp_url="x",
         )
@@ -790,6 +805,7 @@ class TestDoctrineProvisioning:
         ws.mkdir()
         path = await provision_workspace(
             engagements_root=str(ws), engagement_id="engd", defn=defn,
+            engagement_auth_token="tok-ws-test",
             task="t", context="c",
             casa_framework_mcp_url="http://127.0.0.1:8080/mcp/casa-framework")
         p = Path(path)
@@ -819,6 +835,7 @@ class TestDoctrineProvisioning:
         with pytest.raises(FileNotFoundError):
             await provision_workspace(
                 engagements_root=str(ws), engagement_id="engm", defn=defn,
+                engagement_auth_token="tok-ws-test",
                 task="t", context="c",
                 casa_framework_mcp_url="http://127.0.0.1:8080/mcp/casa-framework")
 
@@ -842,6 +859,7 @@ class TestDoctrineProvisioning:
         ws.mkdir()
         path = await provision_workspace(
             engagements_root=str(ws), engagement_id="engo", defn=defn,
+            engagement_auth_token="tok-ws-test",
             task="t", context="c",
             casa_framework_mcp_url="http://127.0.0.1:8080/mcp/casa-framework")
         assert not (__import__("pathlib").Path(path) / "doctrine").exists()
@@ -912,6 +930,7 @@ class TestRefreshClaudeMd:
         ws.mkdir()
         path = await provision_workspace(
             engagements_root=str(ws), engagement_id=rec.id, defn=defn,
+            engagement_auth_token="tok-ws-test",
             task=brief_task_for(rec, defn), context="",
             casa_framework_mcp_url="http://x",
         )
@@ -942,6 +961,7 @@ class TestRefreshClaudeMd:
         ws.mkdir()
         path = await provision_workspace(
             engagements_root=str(ws), engagement_id=rec.id, defn=defn,
+            engagement_auth_token="tok-ws-test",
             task=brief_task_for(rec, defn), context="ctx-marker",
             world_state_summary="world-marker", executor_memory="mem-marker",
             casa_framework_mcp_url="http://x",
@@ -975,6 +995,7 @@ class TestRefreshClaudeMd:
         ws.mkdir()
         path = await provision_workspace(
             engagements_root=str(ws), engagement_id=rec.id, defn=defn,
+            engagement_auth_token="tok-ws-test",
             task=rec.task, context="c1", executor_memory="",
             casa_framework_mcp_url="http://x",
         )

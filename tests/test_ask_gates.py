@@ -23,6 +23,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+from types import SimpleNamespace
 
 import pytest
 from aiohttp import web
@@ -179,18 +180,20 @@ async def wired(tmp_path, fresh_broker, monkeypatch):
     }
 
 
-def _btn_payload(eid, rid="b1", *, hash=_BTN_HASH, **over):
+def _btn_payload(rec, rid="b1", *, hash=_BTN_HASH, **over):
     base = {
-        "engagement_id": eid, "request_id": rid, "question": "Proceed?",
+        "engagement_id": rec.id, "request_id": rid, "question": "Proceed?",
+        "engagement_token": rec.auth_token,
         "options": ["A", "B"], "timeout_s": 60, "projection_hash": hash,
     }
     base.update(over)
     return base
 
 
-def _anchor_payload(eid, rid="a1", *, hash=_ANCHOR_HASH, **over):
+def _anchor_payload(rec, rid="a1", *, hash=_ANCHOR_HASH, **over):
     base = {
-        "engagement_id": eid, "request_id": rid, "question": "DB name?",
+        "engagement_id": rec.id, "request_id": rid, "question": "DB name?",
+        "engagement_token": rec.auth_token,
         "options": [], "timeout_s": 60, "projection_hash": hash,
     }
     base.update(over)
@@ -312,7 +315,8 @@ class TestReplyGate:
             namespace="engagement_ask", scope=eid, request_id="q1",
             timeout_s=60, meta={})
         resp = await wired["send"](_FakeRequest(
-            {"engagement_id": eid, "text": "meanwhile..."}))
+            {"engagement_id": eid,
+             "engagement_token": wired["rec"].auth_token, "text": "meanwhile..."}))
         body = _body(resp)
         assert body["ok"] is False
         assert body["error"] == "question_pending"
@@ -323,7 +327,8 @@ class TestReplyGate:
         n = await reg.allocate_question_number(eid)
         await reg.add_open_question(eid, n, 7001, text="Q1: DB?", kind="anchor")
         resp = await wired["send"](_FakeRequest(
-            {"engagement_id": eid, "text": "meanwhile..."}))
+            {"engagement_id": eid,
+             "engagement_token": wired["rec"].auth_token, "text": "meanwhile..."}))
         assert _body(resp)["error"] == "question_pending"
 
     async def test_reply_refused_while_marker_set_no_gap(self, wired):
@@ -332,7 +337,8 @@ class TestReplyGate:
         eid = wired["rec"].id
         wired["drv"].set_ask_inflight(eid, "pending-q")
         resp = await wired["send"](_FakeRequest(
-            {"engagement_id": eid, "text": "meanwhile..."}))
+            {"engagement_id": eid,
+             "engagement_token": wired["rec"].auth_token, "text": "meanwhile..."}))
         assert _body(resp)["error"] == "question_pending"
 
     async def test_reply_allowed_after_tap_answer(self, wired):
@@ -345,7 +351,8 @@ class TestReplyGate:
             namespace="engagement_ask", scope=eid, request_id="q1",
             option_index=0, actor_id=555)
         resp = await wired["send"](_FakeRequest(
-            {"engagement_id": eid, "text": "carry on"}))
+            {"engagement_id": eid,
+             "engagement_token": wired["rec"].auth_token, "text": "carry on"}))
         assert _body(resp)["ok"] is True  # eager post (no projection_hash)
         assert wired["chan"].replies
 
@@ -353,7 +360,8 @@ class TestReplyGate:
         """An EXPIRED ask (no live broker request, no anchor) → reply allowed."""
         eid = wired["rec"].id
         resp = await wired["send"](_FakeRequest(
-            {"engagement_id": eid, "text": "wrap up"}))
+            {"engagement_id": eid,
+             "engagement_token": wired["rec"].auth_token, "text": "wrap up"}))
         assert _body(resp)["ok"] is True
 
     async def test_reply_allowed_for_answered_but_unconfirmed_anchor(self, wired):
@@ -364,7 +372,8 @@ class TestReplyGate:
         await reg.add_open_question(eid, n, 7002, text="Q1: DB?", kind="anchor")
         await reg.mark_question_answered(eid, n)  # answered, entry still present
         resp = await wired["send"](_FakeRequest(
-            {"engagement_id": eid, "text": "the answer is casa"}))
+            {"engagement_id": eid,
+             "engagement_token": wired["rec"].auth_token, "text": "the answer is casa"}))
         assert _body(resp)["ok"] is True
 
     async def test_reply_allowed_for_reserved_anchor(self, wired):
@@ -374,7 +383,8 @@ class TestReplyGate:
         await reg.add_open_question(eid, n, 7003, text="Q1: DB?", kind="anchor")
         assert wired["drv"].reserve_answer(eid) is not None
         resp = await wired["send"](_FakeRequest(
-            {"engagement_id": eid, "text": "reserved answer"}))
+            {"engagement_id": eid,
+             "engagement_token": wired["rec"].auth_token, "text": "reserved answer"}))
         assert _body(resp)["ok"] is True
 
 
@@ -387,9 +397,9 @@ class TestStackingGate:
     async def test_concurrent_button_button_one_wins(self, wired):
         eid = wired["rec"].id
         t1 = asyncio.ensure_future(wired["ask"](_FakeRequest(
-            _btn_payload(eid, "ba"))))
+            _btn_payload(wired["rec"], "ba"))))
         t2 = asyncio.ensure_future(wired["ask"](_FakeRequest(
-            _btn_payload(eid, "bb"))))
+            _btn_payload(wired["rec"], "bb"))))
         done, pending = await asyncio.wait(
             {t1, t2}, timeout=0.3, return_when=asyncio.ALL_COMPLETED)
         # Exactly one refused (fast), one still awaiting the tap.
@@ -402,7 +412,7 @@ class TestStackingGate:
         winner_rid = live[0]
         # A same-request_id reattach of the WINNER still passes (no refusal).
         t3 = asyncio.ensure_future(wired["ask"](_FakeRequest(
-            _btn_payload(eid, winner_rid))))
+            _btn_payload(wired["rec"], winner_rid))))
         await asyncio.sleep(0.02)
         # Drive the winner's relay-deferred keyboard post, then tap.
         await wired["seq"].post_for_block(ASK_TOOL, _BTN_HASH)
@@ -420,9 +430,9 @@ class TestStackingGate:
     async def test_concurrent_anchor_anchor_one_wins(self, wired):
         eid = wired["rec"].id
         t1 = asyncio.ensure_future(wired["ask"](_FakeRequest(
-            _anchor_payload(eid, "aa"))))
+            _anchor_payload(wired["rec"], "aa"))))
         t2 = asyncio.ensure_future(wired["ask"](_FakeRequest(
-            _anchor_payload(eid, "ab"))))
+            _anchor_payload(wired["rec"], "ab"))))
         done, pending = await asyncio.wait({t1, t2}, timeout=0.3)
         assert len(done) == 1 and len(pending) == 1
         assert _body(done.pop().result())["error"] == "question_pending"
@@ -437,9 +447,9 @@ class TestStackingGate:
     async def test_concurrent_cross_kind_one_wins(self, wired):
         eid = wired["rec"].id
         t_btn = asyncio.ensure_future(wired["ask"](_FakeRequest(
-            _btn_payload(eid, "bx"))))
+            _btn_payload(wired["rec"], "bx"))))
         t_anc = asyncio.ensure_future(wired["ask"](_FakeRequest(
-            _anchor_payload(eid, "ax"))))
+            _anchor_payload(wired["rec"], "ax"))))
         done, pending = await asyncio.wait({t_btn, t_anc}, timeout=0.3)
         assert len(done) == 1 and len(pending) == 1
         assert _body(done.pop().result())["error"] == "question_pending"
@@ -457,7 +467,7 @@ class TestMarkerLifecycle:
         eid = wired["rec"].id
         wired["chan"].send_returns_none = True  # wire post returns None
         task = asyncio.ensure_future(wired["ask"](_FakeRequest(
-            _anchor_payload(eid, "af"))))
+            _anchor_payload(wired["rec"], "af"))))
         resp = await _drive_anchor(wired, task, "af")
         assert _body(resp)["error"] == "delivery_failed"
         assert wired["drv"].ask_inflight(eid) is None
@@ -465,7 +475,7 @@ class TestMarkerLifecycle:
     async def test_marker_cleared_on_success_anchor(self, wired):
         eid = wired["rec"].id
         task = asyncio.ensure_future(wired["ask"](_FakeRequest(
-            _anchor_payload(eid, "as"))))
+            _anchor_payload(wired["rec"], "as"))))
         resp = await _drive_anchor(wired, task, "as")
         assert _body(resp)["outcome"] == "anchored"
         assert wired["drv"].ask_inflight(eid) is None
@@ -486,13 +496,13 @@ class TestAllocationFailure:
             raise RuntimeError("registry down")
 
         monkeypatch.setattr(wired["reg"], "allocate_question_number", _boom)
-        resp = await wired["ask"](_FakeRequest(_anchor_payload(eid, "ar")))
+        resp = await wired["ask"](_FakeRequest(_anchor_payload(wired["rec"], "ar")))
         body = _body(resp)
         assert body["ok"] is False and body["error"] == "internal_error"
         assert wired["chan"].anchors == []       # ZERO wire posts
         assert wired["drv"].ask_inflight(eid) is None
         # Retry short-circuits (reattaches to the tombstoned refusal); still zero.
-        resp2 = await wired["ask"](_FakeRequest(_anchor_payload(eid, "ar")))
+        resp2 = await wired["ask"](_FakeRequest(_anchor_payload(wired["rec"], "ar")))
         assert _body(resp2)["ok"] is False
         assert wired["chan"].anchors == []
 
@@ -505,7 +515,7 @@ class TestAllocationFailure:
             raise RuntimeError("registry down")
 
         monkeypatch.setattr(wired["reg"], "allocate_question_number", _boom)
-        resp = await wired["ask"](_FakeRequest(_btn_payload(eid, "br")))
+        resp = await wired["ask"](_FakeRequest(_btn_payload(wired["rec"], "br")))
         body = _body(resp)
         assert body["ok"] is False and body["error"] == "internal_error"
         assert wired["chan"].keyboards == []
@@ -519,7 +529,7 @@ class TestAllocationFailure:
         eid = wired["rec"].id
         monkeypatch.setattr(wired["reg"], "allocate_question_number", None)
         task = asyncio.ensure_future(wired["ask"](_FakeRequest(
-            _anchor_payload(eid, "al"))))
+            _anchor_payload(wired["rec"], "al"))))
         resp = await _drive_anchor(wired, task, "al")
         body = _body(resp)
         assert body["outcome"] == "anchored"
@@ -543,7 +553,7 @@ class TestAddFailureCompensation:
 
         monkeypatch.setattr(wired["reg"], "add_open_question", _boom)
         task = asyncio.ensure_future(wired["ask"](_FakeRequest(
-            _anchor_payload(eid, "ac"))))
+            _anchor_payload(wired["rec"], "ac"))))
         resp = await _drive_anchor(wired, task, "ac")
         body = _body(resp)
         # The handler maps the compensated outcome to ok:false internal_error.
@@ -581,12 +591,12 @@ class TestAddFailureCompensation:
 
         monkeypatch.setattr(wired["reg"], "add_open_question", _boom_once)
         t1 = asyncio.ensure_future(wired["ask"](_FakeRequest(
-            _anchor_payload(eid, "c1"))))
+            _anchor_payload(wired["rec"], "c1"))))
         await _drive_anchor(wired, t1, "c1")
         orphan_mid = wired["chan"].anchors[0][0]
         # A subsequent ask posts BELOW the compensated orphan (higher id).
         t2 = asyncio.ensure_future(wired["ask"](_FakeRequest(
-            _anchor_payload(eid, "c2"))))
+            _anchor_payload(wired["rec"], "c2"))))
         await _drive_anchor(wired, t2, "c2")
         second_mid = wired["chan"].anchors[1][0]
         assert second_mid > orphan_mid
@@ -615,7 +625,7 @@ class TestMarkerCancellationWedge:
 
         monkeypatch.setattr(wired["reg"], "allocate_question_number", _slow)
         task = asyncio.ensure_future(wired["ask"](_FakeRequest(
-            _anchor_payload(eid, "cx"))))
+            _anchor_payload(wired["rec"], "cx"))))
         await _wait_inflight(wired, eid, "cx")
         # Marker claimed, coroutine parked in the awaited allocation.
         assert wired["drv"].ask_inflight(eid) == "cx"
@@ -629,7 +639,7 @@ class TestMarkerCancellationWedge:
         # separate block).
         gate.set()
         t2 = asyncio.ensure_future(wired["ask"](_FakeRequest(
-            _anchor_payload(eid, "cy", hash="anchor-hash-2"))))
+            _anchor_payload(wired["rec"], "cy", hash="anchor-hash-2"))))
         resp2 = await _drive_anchor(wired, t2, "cy", hash="anchor-hash-2")
         assert _body(resp2)["outcome"] == "anchored"
 
@@ -645,7 +655,7 @@ class TestMarkerCancellationWedge:
 
         monkeypatch.setattr(wired["reg"], "allocate_question_number", _slow)
         task = asyncio.ensure_future(wired["ask"](_FakeRequest(
-            _btn_payload(eid, "cx"))))
+            _btn_payload(wired["rec"], "cx"))))
         await _wait_inflight(wired, eid, "cx")
         assert wired["drv"].ask_inflight(eid) == "cx"
         task.cancel()
@@ -656,7 +666,7 @@ class TestMarkerCancellationWedge:
         # not refused question_pending.
         gate.set()
         t2 = asyncio.ensure_future(wired["ask"](_FakeRequest(
-            _btn_payload(eid, "cy"))))
+            _btn_payload(wired["rec"], "cy"))))
         await asyncio.sleep(0.02)
         await wired["seq"].post_for_block(ASK_TOOL, _BTN_HASH)
         assert wired["broker"].pending(
@@ -684,7 +694,7 @@ class TestCancelledIntentTombstone:
         # has NOT reached the block — ``post_for_block`` not called yet).
         eid, drv = wired["rec"].id, wired["drv"]
         t1 = asyncio.ensure_future(wired["ask"](_FakeRequest(
-            _anchor_payload(eid, "a1"))))
+            _anchor_payload(wired["rec"], "a1"))))
         await _wait_inflight(wired, eid, "a1")
         assert drv.ask_inflight(eid) == "a1"            # marker armed
         assert wired["chan"].anchors == []              # nothing posted yet
@@ -700,13 +710,13 @@ class TestCancelledIntentTombstone:
         assert wired["chan"].anchors == []
         # A second, DIFFERENT ask posts EXACTLY once.
         t2 = asyncio.ensure_future(wired["ask"](_FakeRequest(
-            _anchor_payload(eid, "a2", hash="anchor-hash-2"))))
+            _anchor_payload(wired["rec"], "a2", hash="anchor-hash-2"))))
         resp2 = await _drive_anchor(wired, t2, "a2", hash="anchor-hash-2")
         assert _body(resp2)["outcome"] == "anchored"
         assert len(wired["chan"].anchors) == 1
         # A same-id retry gets the recorded cancelled outcome verbatim (no hang).
         resp_retry = await asyncio.wait_for(
-            wired["ask"](_FakeRequest(_anchor_payload(eid, "a1"))), timeout=1.0)
+            wired["ask"](_FakeRequest(_anchor_payload(wired["rec"], "a1"))), timeout=1.0)
         assert _body(resp_retry) == {"ok": False, "error": "cancelled"}
 
     async def test_cancel_during_inflight_post_loses_the_post_wins_anchor(
@@ -739,7 +749,7 @@ class TestCancelledIntentTombstone:
 
         # a1 registers, arms, and parks awaiting the relay-deferred post.
         t1 = asyncio.ensure_future(wired["ask"](_FakeRequest(
-            _anchor_payload(eid, "a1"))))
+            _anchor_payload(wired["rec"], "a1"))))
         await _wait_inflight(wired, eid, "a1")
         assert drv.ask_inflight(eid) == "a1"
 
@@ -771,7 +781,7 @@ class TestCancelledIntentTombstone:
         # SECOND, different ask is refused question_pending (one-question intact).
         assert drv.ask_inflight(eid) == "a1"
         resp2 = await asyncio.wait_for(wired["ask"](_FakeRequest(
-            _anchor_payload(eid, "a2", hash="anchor-hash-2"))), timeout=1.0)
+            _anchor_payload(wired["rec"], "a2", hash="anchor-hash-2"))), timeout=1.0)
         assert _body(resp2)["error"] == "question_pending"
 
         # Release the poster → it finishes durable ownership (clears the marker)
@@ -792,7 +802,7 @@ class TestCancelledIntentTombstone:
         # The cancelled handler's same-request_id retry reattaches to the POSTED
         # outcome — no second post, no hang.
         resp_retry = await asyncio.wait_for(wired["ask"](_FakeRequest(
-            _anchor_payload(eid, "a1"))), timeout=1.0)
+            _anchor_payload(wired["rec"], "a1"))), timeout=1.0)
         body_retry = _body(resp_retry)
         assert body_retry["outcome"] == "anchored"
         assert body_retry["message_id"] == outcome["message_id"]
@@ -813,7 +823,7 @@ class TestCancelledIntentTombstone:
 
         monkeypatch.setattr(wired["reg"], "allocate_question_number", _slow)
         task = asyncio.ensure_future(wired["ask"](_FakeRequest(
-            _anchor_payload(eid, "cx"))))
+            _anchor_payload(wired["rec"], "cx"))))
         await _wait_inflight(wired, eid, "cx")
         assert drv.ask_inflight(eid) == "cx"
         task.cancel()
@@ -826,7 +836,7 @@ class TestCancelledIntentTombstone:
         # no fresh post.
         gate.set()
         resp = await asyncio.wait_for(
-            wired["ask"](_FakeRequest(_anchor_payload(eid, "cx"))), timeout=1.0)
+            wired["ask"](_FakeRequest(_anchor_payload(wired["rec"], "cx"))), timeout=1.0)
         assert _body(resp) == {"ok": False, "error": "cancelled"}
         assert wired["chan"].anchors == []
 
@@ -844,7 +854,7 @@ class TestCancelledIntentTombstone:
 
         monkeypatch.setattr(wired["reg"], "allocate_question_number", _slow)
         task = asyncio.ensure_future(wired["ask"](_FakeRequest(
-            _btn_payload(eid, "cx"))))
+            _btn_payload(wired["rec"], "cx"))))
         await _wait_inflight(wired, eid, "cx")
         assert drv.ask_inflight(eid) == "cx"
         task.cancel()
@@ -855,7 +865,7 @@ class TestCancelledIntentTombstone:
             "ok": False, "error": "cancelled"}
         gate.set()
         resp = await asyncio.wait_for(
-            wired["ask"](_FakeRequest(_btn_payload(eid, "cx"))), timeout=1.0)
+            wired["ask"](_FakeRequest(_btn_payload(wired["rec"], "cx"))), timeout=1.0)
         assert _body(resp) == {"ok": False, "error": "cancelled"}
         # No broker request was created — no timeout burn, no keyboard.
         assert wired["broker"].pending(
@@ -894,7 +904,7 @@ class TestDoubleCancelWave4:
         monkeypatch.setattr(wired["reg"], "add_open_question", _gated_add)
 
         t1 = asyncio.ensure_future(wired["ask"](_FakeRequest(
-            _anchor_payload(eid, "a1"))))
+            _anchor_payload(wired["rec"], "a1"))))
         await _wait_inflight(wired, eid, "a1")
         assert drv.ask_inflight(eid) == "a1"
 
@@ -926,7 +936,7 @@ class TestDoubleCancelWave4:
         # would be admitted, giving two live questions).
         assert drv.ask_inflight(eid) == "a1"
         resp2 = await asyncio.wait_for(wired["ask"](_FakeRequest(
-            _anchor_payload(eid, "a2", hash="anchor-hash-2"))), timeout=1.0)
+            _anchor_payload(wired["rec"], "a2", hash="anchor-hash-2"))), timeout=1.0)
         assert _body(resp2)["error"] == "question_pending"
 
         # Release the poster → durable ownership clears the marker, the post
@@ -942,7 +952,7 @@ class TestDoubleCancelWave4:
         # The cancelled handler's same-request_id retry reattaches to the POSTED
         # outcome — no second post, no hang.
         resp_retry = await asyncio.wait_for(wired["ask"](_FakeRequest(
-            _anchor_payload(eid, "a1"))), timeout=1.0)
+            _anchor_payload(wired["rec"], "a1"))), timeout=1.0)
         body_retry = _body(resp_retry)
         assert body_retry["outcome"] == "anchored"
         assert body_retry["message_id"] == outcome["message_id"]
@@ -964,7 +974,7 @@ class TestDoubleCancelWave4:
 
         monkeypatch.setattr(wired["reg"], "allocate_question_number", _slow)
         t1 = asyncio.ensure_future(wired["ask"](_FakeRequest(
-            _anchor_payload(eid, "a1"))))
+            _anchor_payload(wired["rec"], "a1"))))
         await _wait_inflight(wired, eid, "a1")
         assert drv.ask_inflight(eid) == "a1"
         intent = wired["seq"].registry.by_request_id("a1")
@@ -987,7 +997,7 @@ class TestDoubleCancelWave4:
         await wired["seq"].post_for_block(ASK_TOOL, _ANCHOR_HASH)
         assert wired["chan"].anchors == []
         t2 = asyncio.ensure_future(wired["ask"](_FakeRequest(
-            _anchor_payload(eid, "a2", hash="anchor-hash-2"))))
+            _anchor_payload(wired["rec"], "a2", hash="anchor-hash-2"))))
         resp2 = await _drive_anchor(wired, t2, "a2", hash="anchor-hash-2")
         assert _body(resp2)["outcome"] == "anchored"
         assert len(wired["chan"].anchors) == 1
@@ -1022,7 +1032,7 @@ class TestAskCancelRoutePostWins:
         monkeypatch.setattr(wired["reg"], "add_open_question", _gated_add)
 
         t1 = asyncio.ensure_future(wired["ask"](_FakeRequest(
-            _anchor_payload(eid, "a1"))))
+            _anchor_payload(wired["rec"], "a1"))))
         await _wait_inflight(wired, eid, "a1")
         assert drv.ask_inflight(eid) == "a1"
 
@@ -1039,7 +1049,8 @@ class TestAskCancelRoutePostWins:
 
         # Fire the SEPARATE ``/ask_cancel`` HTTP route while the post is winning.
         resp_cancel = await asyncio.wait_for(wired["ask_cancel"](_FakeRequest(
-            {"engagement_id": eid, "request_id": "a1"})), timeout=1.0)
+            {"engagement_id": eid, "request_id": "a1",
+             "engagement_token": wired["rec"].auth_token})), timeout=1.0)
         assert _body(resp_cancel)["ok"] is True
 
         # The marker STILL stands (the post is winning → poster owns the clear).
@@ -1047,7 +1058,7 @@ class TestAskCancelRoutePostWins:
         # was cleared unconditionally → this ask would be admitted → two live Qs.
         assert drv.ask_inflight(eid) == "a1"
         resp2 = await asyncio.wait_for(wired["ask"](_FakeRequest(
-            _anchor_payload(eid, "a2", hash="anchor-hash-2"))), timeout=1.0)
+            _anchor_payload(wired["rec"], "a2", hash="anchor-hash-2"))), timeout=1.0)
         assert _body(resp2)["error"] == "question_pending"
 
         # Release the poster → durable ownership clears the marker; the anchor
@@ -1096,7 +1107,7 @@ class TestPosterOwnsClearWave5:
         monkeypatch.setattr(chan, "send_to_topic", _gated_raising_send)
 
         t1 = asyncio.ensure_future(wired["ask"](_FakeRequest(
-            _anchor_payload(eid, "a1"))))
+            _anchor_payload(wired["rec"], "a1"))))
         await _wait_until(lambda: drv.ask_inflight(eid) == "a1")
 
         relay = asyncio.ensure_future(seq.post_for_block(ASK_TOOL, _ANCHOR_HASH))
@@ -1141,14 +1152,14 @@ class TestPosterOwnsClearWave5:
         # A next, DIFFERENT ask is NOT wedged question_pending — it posts cleanly.
         monkeypatch.setattr(chan, "send_to_topic", real_send)
         t2 = asyncio.ensure_future(wired["ask"](_FakeRequest(
-            _anchor_payload(eid, "a2", hash="anchor-hash-2"))))
+            _anchor_payload(wired["rec"], "a2", hash="anchor-hash-2"))))
         resp2 = await _drive_anchor(wired, t2, "a2", hash="anchor-hash-2")
         assert _body(resp2)["outcome"] == "anchored"
 
         # The cancelled handler's same-request_id retry short-circuits to the
         # recorded failure outcome — no second post, no hang.
         resp_retry = await asyncio.wait_for(wired["ask"](_FakeRequest(
-            _anchor_payload(eid, "a1"))), timeout=1.0)
+            _anchor_payload(wired["rec"], "a1"))), timeout=1.0)
         assert _body(resp_retry)["ok"] is False
         assert len(chan.anchors) == 1      # only a2 posted
 
@@ -1168,7 +1179,7 @@ class TestPosterOwnsClearWave5:
         monkeypatch.setattr(chan, "send_to_topic", _gated_none_send)
 
         t1 = asyncio.ensure_future(wired["ask"](_FakeRequest(
-            _anchor_payload(eid, "a1"))))
+            _anchor_payload(wired["rec"], "a1"))))
         await _wait_until(lambda: drv.ask_inflight(eid) == "a1")
 
         relay = asyncio.ensure_future(seq.post_for_block(ASK_TOOL, _ANCHOR_HASH))
@@ -1213,7 +1224,7 @@ class TestPosterOwnsClearWave5:
 
         monkeypatch.setattr(chan, "post_options_keyboard", _boom)
         t1 = asyncio.ensure_future(wired["ask"](_FakeRequest(
-            _btn_payload(eid, "b1"))))
+            _btn_payload(wired["rec"], "b1"))))
         await asyncio.sleep(0.02)
         await wired["seq"].post_for_block(ASK_TOOL, _BTN_HASH)
         resp1 = await asyncio.wait_for(t1, timeout=1.0)
@@ -1225,7 +1236,7 @@ class TestPosterOwnsClearWave5:
         # to an answered resolution.
         monkeypatch.setattr(chan, "post_options_keyboard", real_kbd)
         t2 = asyncio.ensure_future(wired["ask"](_FakeRequest(
-            _btn_payload(eid, "b2", hash="btn-hash-2"))))
+            _btn_payload(wired["rec"], "b2", hash="btn-hash-2"))))
         resp2 = await _drive_button(wired, t2, "b2", hash="btn-hash-2")
         assert _body(resp2)["outcome"] == "answered"
 
@@ -1256,7 +1267,7 @@ class TestCompensationCancelInterleaving:
         monkeypatch.setattr(wired["reg"], "add_open_question", _gated_boom_add)
 
         t1 = asyncio.ensure_future(wired["ask"](_FakeRequest(
-            _anchor_payload(eid, "a1"))))
+            _anchor_payload(wired["rec"], "a1"))))
         await _wait_inflight(wired, eid, "a1")
         assert drv.ask_inflight(eid) == "a1"
 
@@ -1304,7 +1315,7 @@ class TestCompensationCancelInterleaving:
         # the compensated orphan (higher id) and resolves cleanly.
         monkeypatch.setattr(wired["reg"], "add_open_question", orig_add)
         t2 = asyncio.ensure_future(wired["ask"](_FakeRequest(
-            _anchor_payload(eid, "a2", hash="anchor-hash-2"))))
+            _anchor_payload(wired["rec"], "a2", hash="anchor-hash-2"))))
         resp2 = await _drive_anchor(wired, t2, "a2", hash="anchor-hash-2")
         assert _body(resp2)["outcome"] == "anchored"
         assert chan.anchors[1][0] > orphan_mid
@@ -1318,7 +1329,7 @@ class TestPostAddGenRecheck:
         holder = {"gen": 0}
         monkeypatch.setattr(drv, "inbound_generation", lambda _e: holder["gen"])
         task = asyncio.ensure_future(wired["ask"](_FakeRequest(
-            _anchor_payload(eid, "g1"))))
+            _anchor_payload(wired["rec"], "g1"))))
         await asyncio.sleep(0.02)
         # An operator envelope arrives between reserve and the relay post.
         holder["gen"] = 1
@@ -1364,7 +1375,7 @@ class TestAnchorLatchedSend:
         monkeypatch.setattr(drv, "arm_send_intent", _arm_and_cancel)
 
         task = asyncio.ensure_future(wired["ask"](_FakeRequest(
-            _anchor_payload(eid, "a1"))))
+            _anchor_payload(wired["rec"], "a1"))))
         await asyncio.sleep(0.02)
         # The relay reaches the (armed, but latch-cancelled) block.
         await wired["seq"].post_for_block(ASK_TOOL, _ANCHOR_HASH)
@@ -1399,7 +1410,7 @@ class TestAnchorLatchedSend:
         monkeypatch.setattr(chan, "send_to_topic", _blocking_send)
 
         task = asyncio.ensure_future(wired["ask"](_FakeRequest(
-            _anchor_payload(eid, "a1"))))
+            _anchor_payload(wired["rec"], "a1"))))
         await _wait_inflight(wired, eid, "a1")
         assert drv.ask_inflight(eid) == "a1"          # armed, awaiting the post
         # Cancel lands between ARM and the wire.
@@ -1433,6 +1444,7 @@ class TestAnchorLatchedSend:
         # No ``projection_hash`` => created_intent is None => eager fallback.
         resp = await wired["ask"](_FakeRequest(
             {"engagement_id": eid, "request_id": "c1",
+             "engagement_token": wired["rec"].auth_token,
              "question": "DB name?", "options": [], "timeout_s": 60}))
         assert _body(resp)["ok"] is False
         assert chan.anchors == []                     # eager path posted nothing
@@ -1443,7 +1455,7 @@ class TestAnchorLatchedSend:
         # ``send_to_topic`` — the rich two-send path is never taken.
         eid, chan = wired["rec"].id, wired["chan"]
         task = asyncio.ensure_future(wired["ask"](_FakeRequest(
-            _anchor_payload(eid, "d1"))))
+            _anchor_payload(wired["rec"], "d1"))))
         resp = await _drive_anchor(wired, task, "d1")
         assert _body(resp)["outcome"] == "anchored"
         assert len(chan.anchors) == 1                 # exactly ONE physical send
@@ -1465,7 +1477,7 @@ class TestInlineEnumeratedAnchorsAccepted:
         eid = wired["rec"].id
         q = "Which stack?\nA — Python MCP + MCPB\nB — Rust bridge"
         task = asyncio.ensure_future(wired["ask"](_FakeRequest(
-            _anchor_payload(eid, "e1", question=q))))
+            _anchor_payload(wired["rec"], "e1", question=q))))
         resp = await _drive_anchor(wired, task, "e1")
         body = _body(resp)
         assert body["ok"] is True
@@ -1477,7 +1489,7 @@ class TestInlineEnumeratedAnchorsAccepted:
         eid = wired["rec"].id
         q = "Pick:\n1. one\n2. two"
         task = asyncio.ensure_future(wired["ask"](_FakeRequest(
-            _anchor_payload(eid, "e2", question=q))))
+            _anchor_payload(wired["rec"], "e2", question=q))))
         resp = await _drive_anchor(wired, task, "e2")
         assert _body(resp)["ok"] is True
         assert _body(resp)["outcome"] == "anchored"
@@ -1489,7 +1501,7 @@ class TestInlineEnumeratedAnchorsAccepted:
         eid = wired["rec"].id
         q = "Which do you want: (a) the fast path or (b) the safe path?"
         task = asyncio.ensure_future(wired["ask"](_FakeRequest(
-            _anchor_payload(eid, "e3", question=q))))
+            _anchor_payload(wired["rec"], "e3", question=q))))
         resp = await _drive_anchor(wired, task, "e3")
         body = _body(resp)
         assert body["ok"] is True
@@ -1500,7 +1512,7 @@ class TestInlineEnumeratedAnchorsAccepted:
         eid = wired["rec"].id
         q = "Which?\nA — Python MCP\njust prose, no second option"
         task = asyncio.ensure_future(wired["ask"](_FakeRequest(
-            _anchor_payload(eid, "ok1", question=q))))
+            _anchor_payload(wired["rec"], "ok1", question=q))))
         resp = await _drive_anchor(wired, task, "ok1")
         assert _body(resp)["ok"] is True
         assert _body(resp)["outcome"] == "anchored"
@@ -1508,7 +1520,7 @@ class TestInlineEnumeratedAnchorsAccepted:
     async def test_plain_prose_anchor_allowed(self, wired):
         eid = wired["rec"].id
         task = asyncio.ensure_future(wired["ask"](_FakeRequest(
-            _anchor_payload(eid, "ok2", question="What DB name do you want?"))))
+            _anchor_payload(wired["rec"], "ok2", question="What DB name do you want?"))))
         resp = await _drive_anchor(wired, task, "ok2")
         assert _body(resp)["ok"] is True
 
@@ -1518,7 +1530,7 @@ class TestInlineEnumeratedAnchorsAccepted:
         eid = wired["rec"].id
         q = "Which?\n1. one\n2. two"
         task = asyncio.ensure_future(wired["ask"](_FakeRequest(
-            _btn_payload(eid, "b7", question=q))))
+            _btn_payload(wired["rec"], "b7", question=q))))
         resp = await _drive_button(wired, task, "b7")
         assert _body(resp)["outcome"] == "answered"
 
@@ -1539,7 +1551,7 @@ class TestCapsRemovedEndToEnd:
         long_label = base + "x" * (139 - len(base))
         assert len(long_label) == 139
         task = asyncio.ensure_future(wired["ask"](_FakeRequest(
-            _btn_payload(eid, "cap1", options=[long_label, "B"]))))
+            _btn_payload(wired["rec"], "cap1", options=[long_label, "B"]))))
         resp = await _drive_button(wired, task, "cap1")
         body = _body(resp)
         assert body["ok"] is True
@@ -1551,7 +1563,7 @@ class TestCapsRemovedEndToEnd:
     async def test_2000_char_question_accepted(self, wired):
         long_question = "x" * 2000
         task = asyncio.ensure_future(wired["ask"](_FakeRequest(
-            _btn_payload(eid=wired["rec"].id, rid="cap2", question=long_question))))
+            _btn_payload(wired["rec"], rid="cap2", question=long_question))))
         resp = await _drive_button(wired, task, "cap2")
         assert _body(resp)["ok"] is True
 
@@ -1560,13 +1572,13 @@ class TestCapsRemovedEndToEnd:
         by D1) still refuses — this is never about label/question length."""
         eid = wired["rec"].id
         resp = await wired["ask"](_FakeRequest(_btn_payload(
-            eid, "cap3", options=[f"o{i}" for i in range(9)])))
+            wired["rec"], "cap3", options=[f"o{i}" for i in range(9)])))
         assert _body(resp) == {"ok": False, "error": "invalid_args"}
 
     async def test_duplicate_full_labels_still_rejected(self, wired):
         eid = wired["rec"].id
         resp = await wired["ask"](_FakeRequest(_btn_payload(
-            eid, "cap4", options=["Same", "Same"])))
+            wired["rec"], "cap4", options=["Same", "Same"])))
         assert _body(resp) == {"ok": False, "error": "invalid_args"}
 
     async def test_blank_and_non_string_short_never_reject(self, wired):
@@ -1578,7 +1590,7 @@ class TestCapsRemovedEndToEnd:
             {"label": "Work Outlook", "short": 7},
         ]
         task = asyncio.ensure_future(wired["ask"](_FakeRequest(
-            _btn_payload(eid, "cap5", options=options))))
+            _btn_payload(wired["rec"], "cap5", options=options))))
         resp = await _drive_button(wired, task, "cap5")
         assert _body(resp)["ok"] is True
         assert len(wired["chan"].keyboards) == 1
@@ -1617,10 +1629,10 @@ class TestGateWiring:
         """Owner registers first (created intent), blocks in the allocator;
         the reattacher then registers (created=False) and blocks on the gate."""
         owner = asyncio.ensure_future(wired["ask"](_FakeRequest(
-            _btn_payload(wired["rec"].id, rid, **over))))
+            _btn_payload(wired["rec"], rid, **over))))
         await asyncio.wait_for(entered.wait(), timeout=1.0)
         reattach = asyncio.ensure_future(wired["ask"](_FakeRequest(
-            _btn_payload(wired["rec"].id, rid, **over))))
+            _btn_payload(wired["rec"], rid, **over))))
         await asyncio.sleep(0.02)  # let the reattacher reach the gate wait
         assert not reattach.done()  # truly blocked on the PENDING gate
         return owner, reattach
@@ -1668,7 +1680,8 @@ class TestGateWiring:
         owner, reattach = await self._launch_owner_reattacher(wired, "gw3", entered)
         # Cancel lands WHILE the owner is suspended in allocation.
         await wired["ask_cancel"](_FakeRequest(
-            {"engagement_id": wired["rec"].id, "request_id": "gw3"}))
+            {"engagement_id": wired["rec"].id, "request_id": "gw3",
+             "engagement_token": wired["rec"].auth_token}))
         release.set()
         r_owner = _body(await asyncio.wait_for(owner, 1.0))
         r_re = _body(await asyncio.wait_for(reattach, 1.0))
@@ -1686,9 +1699,10 @@ class TestGateWiring:
         with no broker, no keyboard."""
         eid = wired["rec"].id
         await wired["ask_cancel"](_FakeRequest(
-            {"engagement_id": eid, "request_id": "gw4"}))
+            {"engagement_id": eid, "request_id": "gw4",
+             "engagement_token": wired["rec"].auth_token}))
         resp = await asyncio.wait_for(
-            wired["ask"](_FakeRequest(_btn_payload(eid, "gw4"))), 1.0)
+            wired["ask"](_FakeRequest(_btn_payload(wired["rec"], "gw4"))), 1.0)
         assert _body(resp) == {"ok": False, "error": "cancelled"}
         assert wired["broker"].pending(
             namespace="engagement_ask", scope=eid) == []
@@ -1699,8 +1713,8 @@ class TestGateWiring:
         same-request_id reattacher byte-identically, with no broker/post."""
         eid = wired["rec"].id
         wired["drv"]._operator_away[eid] = True  # SUSPEND (F-EXPIRE gate reads it)
-        r_owner = _body(await wired["ask"](_FakeRequest(_btn_payload(eid, "gw5"))))
-        r_re = _body(await wired["ask"](_FakeRequest(_btn_payload(eid, "gw5"))))
+        r_owner = _body(await wired["ask"](_FakeRequest(_btn_payload(wired["rec"], "gw5"))))
+        r_re = _body(await wired["ask"](_FakeRequest(_btn_payload(wired["rec"], "gw5"))))
         assert r_owner["error"] == "operator_away"
         assert r_re["error"] == "operator_away"
         assert r_owner["message"] == r_re["message"]
@@ -1719,8 +1733,8 @@ class TestGateWiring:
         wired["broker"].register(
             namespace="engagement_ask", scope=eid, request_id="live",
             timeout_s=60, meta={})
-        r_owner = _body(await wired["ask"](_FakeRequest(_btn_payload(eid, "gw6"))))
-        r_re = _body(await wired["ask"](_FakeRequest(_btn_payload(eid, "gw6"))))
+        r_owner = _body(await wired["ask"](_FakeRequest(_btn_payload(wired["rec"], "gw6"))))
+        r_re = _body(await wired["ask"](_FakeRequest(_btn_payload(wired["rec"], "gw6"))))
         assert r_owner["error"] == "question_pending"
         assert r_re["error"] == "question_pending"
         assert r_owner == r_re
@@ -2113,7 +2127,7 @@ class TestIntentLifecycleGatePin:
         monkeypatch.setattr(_verdict_broker_mod, "_RETIRE_S", 0.0)
         eid = wired["rec"].id
         task = asyncio.ensure_future(
-            wired["ask"](_FakeRequest(_anchor_payload(eid, "a1"))))
+            wired["ask"](_FakeRequest(_anchor_payload(wired["rec"], "a1"))))
         # Drive the relay-deferred anchor post: gate PASSED, intent LIVE (posted,
         # not yet pruned), handler returned (its OWN gate pin already released).
         await _drive_anchor(wired, task, "a1")
@@ -2240,7 +2254,7 @@ class TestAskEntrySweepsPriorLeakedGates:
         resolution — nowhere near the retention bound."""
         eid = wired["rec"].id
         task = asyncio.ensure_future(
-            wired["ask"](_FakeRequest(_btn_payload(eid, "leak1"))))
+            wired["ask"](_FakeRequest(_btn_payload(wired["rec"], "leak1"))))
         resp = await _drive_button(wired, task, "leak1")
         assert _body(resp)["ok"] is True
 
@@ -2261,7 +2275,7 @@ class TestAskEntrySweepsPriorLeakedGates:
     ):
         eid = wired["rec"].id
         task1 = asyncio.ensure_future(
-            wired["ask"](_FakeRequest(_btn_payload(eid, "leak2"))))
+            wired["ask"](_FakeRequest(_btn_payload(wired["rec"], "leak2"))))
         await _drive_button(wired, task1, "leak2")
         assert "leak2" in ASK_GATES
         # wb2-4: leak2's gate is pinned by its live send-intent — the turn must
@@ -2282,7 +2296,7 @@ class TestAskEntrySweepsPriorLeakedGates:
         ASK_GATES["leak2"]._resolved_at -= 61.0
 
         task2 = asyncio.ensure_future(
-            wired["ask"](_FakeRequest(_btn_payload(eid, "leak3"))))
+            wired["ask"](_FakeRequest(_btn_payload(wired["rec"], "leak3"))))
         await _drive_button(wired, task2, "leak3")
 
         assert "leak2" not in ASK_GATES  # swept at leak3's entry
@@ -2318,13 +2332,13 @@ class TestUnreadRefusalReattachIsCountFree:
         eid = wired["rec"].id
         monkeypatch.setattr(wired["drv"], "inbound_unread_depth", lambda e: 1)
 
-        r_owner = _body(await wired["ask"](_FakeRequest(_btn_payload(eid, "gwU"))))
+        r_owner = _body(await wired["ask"](_FakeRequest(_btn_payload(wired["rec"], "gwU"))))
         assert r_owner["ok"] is False
         assert r_owner["error"] == "unread_inbound"
         assert r_owner["refusal_count"] == 1
 
         r_reattach = _body(
-            await wired["ask"](_FakeRequest(_btn_payload(eid, "gwU"))))
+            await wired["ask"](_FakeRequest(_btn_payload(wired["rec"], "gwU"))))
         # The reattacher's payload is the byte-identical COUNT-FREE form
         # recorded on the intent — never a fresh bump of ``refusal_count``.
         assert "refusal_count" not in r_reattach
@@ -2354,7 +2368,7 @@ class TestTerminalIntentAbort:
             wired["rec"].id, wired["drv"], wired["seq"], wired["chan"])
         rec = wired["rec"]
         t1 = asyncio.ensure_future(wired["ask"](_FakeRequest(
-            _anchor_payload(eid, "a1"))))
+            _anchor_payload(wired["rec"], "a1"))))
         await _wait_armed(wired, "a1")
         intent = seq.registry.by_request_id("a1")
         assert intent is not None and intent.state == "armed"   # PASSED+ARMED
@@ -2387,7 +2401,7 @@ class TestTerminalIntentAbort:
         monkeypatch.setattr(wired["reg"], "add_open_question", _gated_add)
 
         t1 = asyncio.ensure_future(wired["ask"](_FakeRequest(
-            _anchor_payload(eid, "a1"))))
+            _anchor_payload(wired["rec"], "a1"))))
         # Registration barrier: the relay must not start before the ask has
         # armed, or the causal setup under test is a different one (Terra).
         await _wait_armed(wired, "a1")
@@ -2425,7 +2439,7 @@ class TestTerminalGatePinRelease:
         eid, drv, seq = wired["rec"].id, wired["drv"], wired["seq"]
         rec = wired["rec"]
         t1 = asyncio.ensure_future(wired["ask"](_FakeRequest(
-            _anchor_payload(eid, "gp1"))))
+            _anchor_payload(wired["rec"], "gp1"))))
         await _wait_armed(wired, "gp1")
         assert seq.registry.by_request_id("gp1").state == "armed"
         assert "gp1" in _INTENT_GATE_PINS      # gate pinned to the intent (wb2-4)
@@ -2459,7 +2473,7 @@ class TestFloorTelemetry:
         import logging
         eid = wired["rec"].id
         payload = _btn_payload(
-            eid, "flr1",
+            wired["rec"], "flr1",
             question="SecretQuestionZZZ?",
             options=["ApproveZZZ", "RejectZZZ"],   # bare labels ⇒ no shorts ⇒ floor
         )
@@ -2486,7 +2500,7 @@ class TestFloorTelemetry:
         import logging
         eid = wired["rec"].id
         payload = _btn_payload(
-            eid, "nf1",
+            wired["rec"], "nf1",
             options=[
                 {"label": "ApproveZZZ", "short": "Approve"},
                 {"label": "RejectZZZ", "short": "Reject"},
@@ -2548,6 +2562,7 @@ class TestLateReplyAfterTerminalize:
         h = projection_hash(REPLY_TOOL, {"text": "late reply"})
         resp = await wired["send"](_FakeRequest({
             "engagement_id": eid, "text": "late reply",
+            "engagement_token": wired["rec"].auth_token,
             "request_id": "lr1", "projection_hash": h,
         }))
         body = _body(resp)
@@ -2577,14 +2592,14 @@ class TestTerminalExitsPublishGate:
 
         payload = {"ok": False, "error": "unknown_engagement"}
         resp = await wired["ask"](_FakeRequest(
-            _anchor_payload("no-such-engagement", rid="wb7-unknown")))
+            _anchor_payload(SimpleNamespace(id="no-such-engagement", auth_token="tok-none"), rid="wb7-unknown")))
         assert _body(resp) == payload
         gate = ASK_GATES.get("wb7-unknown")
         assert gate is not None                       # RETAINED (not PENDING-deleted)
         assert gate.effective() == ("FAILED", payload)  # RESOLVED with exact payload
         # Same-request retry reads the byte-identical outcome.
         resp2 = await wired["ask"](_FakeRequest(
-            _anchor_payload("no-such-engagement", rid="wb7-unknown")))
+            _anchor_payload(SimpleNamespace(id="no-such-engagement", auth_token="tok-none"), rid="wb7-unknown")))
         assert _body(resp2) == payload
 
     async def test_engagement_terminal_status_publishes_and_retains_gate(self, wired):
@@ -2595,12 +2610,12 @@ class TestTerminalExitsPublishGate:
         eid = wired["rec"].id
         await wired["reg"].mark_completed(eid, time.time())   # status → terminal
         payload = {"ok": False, "error": "engagement_terminal"}
-        resp = await wired["ask"](_FakeRequest(_anchor_payload(eid, rid="wb7-term")))
+        resp = await wired["ask"](_FakeRequest(_anchor_payload(wired["rec"], rid="wb7-term")))
         assert _body(resp) == payload
         gate = ASK_GATES.get("wb7-term")
         assert gate is not None
         assert gate.effective() == ("FAILED", payload)
-        resp2 = await wired["ask"](_FakeRequest(_anchor_payload(eid, rid="wb7-term")))
+        resp2 = await wired["ask"](_FakeRequest(_anchor_payload(wired["rec"], rid="wb7-term")))
         assert _body(resp2) == payload
 
     async def test_anchor_terminal_registration_publishes_and_retains_gate(self, wired):
@@ -2609,12 +2624,12 @@ class TestTerminalExitsPublishGate:
         eid, seq = wired["rec"].id, wired["seq"]
         await seq.terminalize()   # rec status stays active; register_intent REFUSES
         payload = {"ok": False, "error": "engagement_terminal"}
-        resp = await wired["ask"](_FakeRequest(_anchor_payload(eid, rid="wb7-areg")))
+        resp = await wired["ask"](_FakeRequest(_anchor_payload(wired["rec"], rid="wb7-areg")))
         assert _body(resp) == payload
         gate = ASK_GATES.get("wb7-areg")
         assert gate is not None
         assert gate.effective() == ("FAILED", payload)
-        resp2 = await wired["ask"](_FakeRequest(_anchor_payload(eid, rid="wb7-areg")))
+        resp2 = await wired["ask"](_FakeRequest(_anchor_payload(wired["rec"], rid="wb7-areg")))
         assert _body(resp2) == payload
 
     async def test_button_terminal_registration_publishes_and_retains_gate(self, wired):
@@ -2623,10 +2638,10 @@ class TestTerminalExitsPublishGate:
         eid, seq = wired["rec"].id, wired["seq"]
         await seq.terminalize()
         payload = {"ok": False, "error": "engagement_terminal"}
-        resp = await wired["ask"](_FakeRequest(_btn_payload(eid, rid="wb7-breg")))
+        resp = await wired["ask"](_FakeRequest(_btn_payload(wired["rec"], rid="wb7-breg")))
         assert _body(resp) == payload
         gate = ASK_GATES.get("wb7-breg")
         assert gate is not None
         assert gate.effective() == ("FAILED", payload)
-        resp2 = await wired["ask"](_FakeRequest(_btn_payload(eid, rid="wb7-breg")))
+        resp2 = await wired["ask"](_FakeRequest(_btn_payload(wired["rec"], rid="wb7-breg")))
         assert _body(resp2) == payload

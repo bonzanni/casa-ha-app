@@ -112,7 +112,8 @@ async def wired(tmp_path):
                 resp = await client.post(
                     "/internal/tools/call",
                     json={"name": "react", "arguments": {"emoji": emoji},
-                          "engagement_id": eng_id},
+                          "engagement_id": eng_id,
+                          "engagement_token": rec.auth_token},
                 )
                 body = await resp.json()
                 return json.loads(body["content"][0]["text"])

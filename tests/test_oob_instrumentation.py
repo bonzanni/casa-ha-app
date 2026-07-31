@@ -142,6 +142,7 @@ class TestSlotMissedTiming:
 
         task = asyncio.ensure_future(ask(_FakeRequest(
             {"engagement_id": rec.id, "request_id": "s1",
+             "engagement_token": rec.auth_token,
              "question": "DB name?", "options": [], "timeout_s": 60,
              "projection_hash": _ANCHOR_HASH})))
         await asyncio.sleep(0.02)

@@ -162,7 +162,8 @@ async def test_unix_runner_serves_channel_send_to_topic() -> None:
     class _Reg:
         def get(self, eid):
             if eid == "eng-1":
-                return SimpleNamespace(id=eid, topic_id=42, status="active")
+                return SimpleNamespace(id=eid, topic_id=42, status="active",
+                                       auth_token="tok-eng-1")
             return None
 
     with tempfile.TemporaryDirectory() as td:
@@ -179,7 +180,8 @@ async def test_unix_runner_serves_channel_send_to_topic() -> None:
             async with aiohttp.ClientSession(connector=connector) as sess:
                 async with sess.post(
                     "http://unix/internal/channel/send_to_topic",
-                    json={"engagement_id": "eng-1", "text": "hello operator"},
+                    json={"engagement_id": "eng-1", "text": "hello operator",
+                          "engagement_token": "tok-eng-1"},
                 ) as resp:
                     assert resp.status == 200
                     body = await resp.json()

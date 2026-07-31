@@ -64,6 +64,9 @@ class _FakeRecord:
         self.id = eng_id
         self.topic_id = topic_id
         self.status = status
+        # #335: per-engagement secret; bodies must present it as
+        # ``engagement_token`` to act with this engagement's authority.
+        self.auth_token = f"tok-{eng_id}"
 
 
 class _FakeRegistry:
@@ -130,7 +133,8 @@ async def test_send_to_topic_routes_by_engagement_id(app_factory) -> None:
     async with TestClient(TestServer(app)) as client:
         resp = await client.post(
             "/internal/channel/send_to_topic",
-            json={"engagement_id": "eng-1", "text": "hello operator"},
+            json={"engagement_id": "eng-1", "text": "hello operator",
+                  "engagement_token": "tok-eng-1"},
         )
         assert resp.status == 200
         body = await resp.json()
@@ -174,7 +178,8 @@ async def test_send_to_topic_missing_topic_id_returns_error(
     async with TestClient(TestServer(app)) as client:
         resp = await client.post(
             "/internal/channel/send_to_topic",
-            json={"engagement_id": "eng-1", "text": "hi"},
+            json={"engagement_id": "eng-1", "text": "hi",
+                  "engagement_token": "tok-eng-1"},
         )
         assert resp.status == 200
         body = await resp.json()
@@ -192,7 +197,8 @@ async def test_send_to_topic_advances_interaction_state_first_contact(
     async with TestClient(TestServer(app)) as client:
         resp = await client.post(
             "/internal/channel/send_to_topic",
-            json={"engagement_id": "eng-1", "text": "hello operator"},
+            json={"engagement_id": "eng-1", "text": "hello operator",
+                  "engagement_token": "tok-eng-1"},
         )
         assert resp.status == 200
     assert reg.advances == [("eng-1", "first_contact")]
@@ -212,6 +218,7 @@ async def test_post_inline_keyboard_routes_to_topic(app_factory) -> None:
             "/internal/channel/post_inline_keyboard",
             json={
                 "engagement_id": "eng-1",
+                "engagement_token": "tok-eng-1",
                 "text": "approve?",
                 "buttons": [[
                     {"text": "✅ Allow", "callback_data": "perm:allow:rid"},
@@ -248,6 +255,7 @@ async def test_post_inline_keyboard_supports_url_buttons(app_factory) -> None:
             "/internal/channel/post_inline_keyboard",
             json={
                 "engagement_id": "eng-1",
+                "engagement_token": "tok-eng-1",
                 "text": "open remote",
                 "buttons": [[
                     {"text": "🌐 Open Remote Control",
@@ -290,6 +298,7 @@ async def test_post_inline_keyboard_send_failure_returns_error(
         resp = await client.post(
             "/internal/channel/post_inline_keyboard",
             json={"engagement_id": "eng-1", "text": "x",
+                  "engagement_token": "tok-eng-1",
                   "buttons": [[{"text": "a", "callback_data": "b"}]]},
         )
         body = await resp.json()
@@ -376,6 +385,7 @@ async def test_permission_verdict_allow_delivers_to_broker(
         resp = await client.post(
             "/internal/channel/permission_verdict",
             json={"engagement_id": "eng-1", "request_id": "rid-001",
+                  "engagement_token": "tok-eng-1",
                   "verdict": "allow", "operator_id": 999},
         )
         body = await resp.json()
@@ -402,6 +412,7 @@ async def test_permission_verdict_deny_delivers_to_broker(
         resp = await client.post(
             "/internal/channel/permission_verdict",
             json={"engagement_id": "eng-1", "request_id": "rid-002",
+                  "engagement_token": "tok-eng-1",
                   "verdict": "deny", "operator_id": 7},
         )
         body = await resp.json()
@@ -424,6 +435,7 @@ async def test_permission_verdict_no_live_request_returns_stale(
         resp = await client.post(
             "/internal/channel/permission_verdict",
             json={"engagement_id": "eng-1", "request_id": "no-such-rid",
+                  "engagement_token": "tok-eng-1",
                   "verdict": "allow", "operator_id": 999},
         )
         body = await resp.json()
@@ -440,6 +452,7 @@ async def test_permission_verdict_unknown_engagement_returns_error(
         resp = await client.post(
             "/internal/channel/permission_verdict",
             json={"engagement_id": "eng-1", "request_id": "rid-001",
+                  "engagement_token": "tok-eng-1",
                   "verdict": "allow", "operator_id": 999},
         )
         assert (await resp.json()) == {
@@ -467,6 +480,7 @@ async def test_permission_verdict_terminal_engagement_returns_error(
         resp = await client.post(
             "/internal/channel/permission_verdict",
             json={"engagement_id": "eng-1", "request_id": "rid-001",
+                  "engagement_token": "tok-eng-1",
                   "verdict": "allow", "operator_id": 999},
         )
         assert (await resp.json()) == {
@@ -516,7 +530,8 @@ async def test_update_state_calls_telegram_helper(app_factory) -> None:
     async with TestClient(TestServer(app)) as client:
         resp = await client.post(
             "/internal/channel/update_state",
-            json={"engagement_id": "eng-1", "new_state": "awaiting"},
+            json={"engagement_id": "eng-1", "new_state": "awaiting",
+                  "engagement_token": "tok-eng-1"},
         )
         assert (await resp.json()) == {"ok": True}
 
@@ -537,7 +552,8 @@ async def test_update_state_unknown_state_is_dropped_gracefully(
     async with TestClient(TestServer(app)) as client:
         resp = await client.post(
             "/internal/channel/update_state",
-            json={"engagement_id": "eng-1", "new_state": "made-up"},
+            json={"engagement_id": "eng-1", "new_state": "made-up",
+                  "engagement_token": "tok-eng-1"},
         )
         # The handler is forgiving — the channel decides what's a valid state.
         assert (await resp.json()) == {"ok": True}
@@ -562,6 +578,7 @@ async def test_update_state_channel_failure_returns_error(app_factory) -> None:
     async with TestClient(TestServer(app)) as client:
         resp = await client.post(
             "/internal/channel/update_state",
-            json={"engagement_id": "eng-1", "new_state": "awaiting"},
+            json={"engagement_id": "eng-1", "new_state": "awaiting",
+                  "engagement_token": "tok-eng-1"},
         )
         assert (await resp.json()) == {"ok": False, "error": "update_failed"}

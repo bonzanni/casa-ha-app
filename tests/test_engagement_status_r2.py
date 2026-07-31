@@ -314,6 +314,7 @@ async def test_fast_tap_during_registration_never_stuck_waiting(
 
     payload = {
         "engagement_id": eid, "request_id": "fast-1",
+        "engagement_token": rec.auth_token,
         "question": "Proceed?", "options": ["A", "B"], "timeout_s": 60,
         "projection_hash": "hash-abc",
     }

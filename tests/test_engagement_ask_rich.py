@@ -206,7 +206,8 @@ async def test_anchor_rich_body_single_physical_send(real_env):
     carrying entities (markers rendered, not literal)."""
     eid = real_env["rec"].id
     resp = await real_env["ask"](_FakeRequest(_payload(
-        engagement_id=eid, request_id="ft1",
+        engagement_id=eid, engagement_token=real_env["rec"].auth_token,
+        request_id="ft1",
         question="Pick the **prod** DB?", options=[])))
     assert _body(resp)["ok"] is True
     await asyncio.sleep(0.01)  # drive the simulated relay-deferred post
@@ -224,7 +225,8 @@ async def test_anchor_rich_badrequest_fails_closed_single_send(real_env):
     real_env["bot"].send_message.side_effect = BadRequest("bad entity")
     eid = real_env["rec"].id
     resp = await real_env["ask"](_FakeRequest(_payload(
-        engagement_id=eid, request_id="ft2",
+        engagement_id=eid, engagement_token=real_env["rec"].auth_token,
+        request_id="ft2",
         question="Pick the **prod** DB?", options=[])))
     await asyncio.sleep(0.01)
     assert real_env["bot"].send_message.await_count == 1  # NO second send
@@ -238,7 +240,8 @@ async def test_single_select_settle_edit_renders_rich(real_env):
     routes through the RICH edit primitive — no literal ``**`` after answer."""
     eid = real_env["rec"].id
     task = asyncio.ensure_future(real_env["ask"](_FakeRequest(_payload(
-        engagement_id=eid, request_id="s1",
+        engagement_id=eid, engagement_token=real_env["rec"].auth_token,
+        request_id="s1",
         question="Deploy **prod**?", options=["Yes", "No"]))))
     # Await the actual posted-and-live boundary (keyboard physically sent AND
     # the request live+unclaimed in the broker) instead of a fixed real-time

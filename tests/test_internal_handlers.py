@@ -19,6 +19,8 @@ class _FakeRecord:
     def __init__(self, eng_id: str, status: str = "active") -> None:
         self.id = eng_id
         self.status = status
+        # #335: per-engagement secret; the body must present it to bind.
+        self.auth_token = f"tok-{eng_id}"
 
 
 class _FakeRegistry:
@@ -112,6 +114,8 @@ async def test_tools_call_missing_name_returns_error_object() -> None:
 
 
 async def test_tools_call_engagement_id_binds_contextvar() -> None:
+    """#335: the engagement id binds only together with the record's
+    auth token (the id alone is no longer an authenticator)."""
     reg = _FakeRegistry()
     rec = _FakeRecord(eng_id="abc-123", status="active")
     reg.add(rec)
@@ -119,7 +123,8 @@ async def test_tools_call_engagement_id_binds_contextvar() -> None:
     async with TestClient(TestServer(app)) as client:
         resp = await client.post(
             "/internal/tools/call",
-            json={"name": "eng", "arguments": {}, "engagement_id": "abc-123"},
+            json={"name": "eng", "arguments": {}, "engagement_id": "abc-123",
+                  "engagement_token": rec.auth_token},
         )
         body = await resp.json()
         text = json.loads(body["content"][0]["text"])
@@ -136,7 +141,8 @@ async def test_tools_call_inactive_engagement_binds_none() -> None:
     async with TestClient(TestServer(app)) as client:
         resp = await client.post(
             "/internal/tools/call",
-            json={"name": "eng", "arguments": {}, "engagement_id": "fin-1"},
+            json={"name": "eng", "arguments": {}, "engagement_id": "fin-1",
+                  "engagement_token": rec.auth_token},
         )
         body = await resp.json()
         text = json.loads(body["content"][0]["text"])
@@ -341,7 +347,8 @@ async def test_tools_call_terminal_engagement_binds_for_emit_completion() -> Non
         resp = await client.post(
             "/internal/tools/call",
             json={"name": "emit_completion", "arguments": {},
-                  "engagement_id": "fin-2"},
+                  "engagement_id": "fin-2",
+                  "engagement_token": rec.auth_token},
         )
         body = await resp.json()
         text = json.loads(body["content"][0]["text"])
@@ -353,17 +360,20 @@ async def test_public_fallback_terminal_binding_matches_internal() -> None:
     terminal binding for emit_completion only."""
     from casa_core import _dispatch_internal_tools_call
     reg = _FakeRegistry()
-    reg.add(_FakeRecord(eng_id="fin-3", status="completed"))
+    rec = _FakeRecord(eng_id="fin-3", status="completed")
+    reg.add(rec)
     out = await _dispatch_internal_tools_call(
         body={"name": "emit_completion", "arguments": {},
-              "engagement_id": "fin-3"},
+              "engagement_id": "fin-3",
+              "engagement_token": rec.auth_token},
         tool_dispatch={"emit_completion": _engagement_aware_tool,
                        "eng": _engagement_aware_tool},
         engagement_registry=reg,
     )
     assert json.loads(out["content"][0]["text"]) == {"eng": "fin-3"}
     out2 = await _dispatch_internal_tools_call(
-        body={"name": "eng", "arguments": {}, "engagement_id": "fin-3"},
+        body={"name": "eng", "arguments": {}, "engagement_id": "fin-3",
+              "engagement_token": rec.auth_token},
         tool_dispatch={"emit_completion": _engagement_aware_tool,
                        "eng": _engagement_aware_tool},
         engagement_registry=reg,

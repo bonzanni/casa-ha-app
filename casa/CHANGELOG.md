@@ -1,5 +1,40 @@
 # Changelog
 
+## [0.136.0] - 2026-08-01
+
+### Fixed / Security
+
+Identity-family batch — three issues (#335, #336, #350) where something was
+trusted for *who it claimed to be* rather than *who it proved to be*:
+
+- **Engagement identity is now authenticated, not just claimed** (#335).
+  Every engagement gets a per-engagement secret credential, provisioned only
+  into its own workspace; the internal tool bridge and the engagement
+  channel routes now verify it before acting with an engagement's authority.
+  Previously, any in-container process that knew another engagement's id
+  (ids appear in logs and configuration) could call privileged tools as that
+  engagement — including configurator-only config commits. A known id with a
+  missing or wrong credential is now rejected outright. In-flight
+  engagements survive the upgrade: the credential is minted for existing
+  records at boot and their workspaces are refreshed before the CLI
+  respawns.
+- **Telegram senders are attributed individually, and only the operator
+  reads private memory** (#336). Previously every accepted Telegram sender —
+  including strangers, when `telegram_chat_id` is left empty ("accept all
+  chats") — was recorded as the operator and recalled memory at the
+  operator's private clearance. Now only the sender whose id matches the
+  configured `telegram_chat_id` is the operator; any other sender is
+  recorded under its own `telegram:<id>` identity, reads at public clearance
+  only, and the agent is told the sender is not the operator. With the
+  option empty, no sender is treated as the operator — configure your chat
+  id to keep operator attribution.
+- **A chatty memory-sensitivity classification can no longer leak a fact
+  downward** (#350). The tier classifier's reply parser used to accept the
+  first tier word found anywhere in the reply — so "this is not public; it
+  is family" tagged a family fact *public* and made it recallable on
+  public-clearance surfaces. The parser now accepts only a clean single-word
+  answer; anything ambiguous falls back to the leak-safe private default.
+
 ## [0.135.0] - 2026-07-31
 
 ### Fixed
