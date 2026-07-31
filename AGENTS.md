@@ -24,8 +24,11 @@ transcripts — is never committed here. The rule for what may go in is one line
 > A fact belongs in this repo only if it is verifiable from the public commit alone: no
 > operator, no production box, no private repository.
 
-An agent-facing corpus is being published under `docs/`. Until it lands, treat that
-directory as tracked and public: anything committed there is published.
+The agent-facing corpus lives under `docs/` and is canonical: consult
+`docs/README.md`'s routing table before changing a subsystem, keep
+`python -m scripts.verify_docs .` and `python3 scripts/coverage_ledger.py check .`
+green, and update the corpus in the same change that alters what it describes.
+Anything committed there is published.
 
 A pre-commit guard, a pre-push gate and a CI sweep enforce this; `make setup` installs the
 hooks. **The first push of anything is irreversible** — objects stay fetchable by SHA

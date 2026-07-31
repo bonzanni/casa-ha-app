@@ -24,3 +24,22 @@ def test_pin_docs_workflow_runs_verifier_ledger_and_impact():
     assert "--check-nav" in text
     # The docs-impact declaration on changed paths.
     assert "--impact" in text
+    # The operating cards must keep routing agents into the corpus — pinned as
+    # the substantive directive pattern, not a bare filename an unrelated
+    # sentence could satisfy.
+    assert 'docs/README\\.md.{0,20}routing table' in text
+
+
+def test_pin_operating_cards_carry_the_routing_directive():
+    """The property the workflow's card-check enforces, asserted directly:
+    both public cards route agents into the corpus via the routing table.
+
+    Red case demonstrated: removing the routing sentence from either card
+    fails this test.
+    """
+    import re
+
+    root = WORKFLOW.parents[2]
+    for card in ("CLAUDE.md", "AGENTS.md"):
+        text = (root / card).read_text()
+        assert re.search(r"docs/README\.md.{0,20}routing table", text), card

@@ -57,6 +57,8 @@ jobs:
           for card in CLAUDE.md AGENTS.md; do
             grep -q 'verifiable from the public commit alone' "$card" || {
               echo "::error::$card no longer states the publication rule"; exit 1; }
+            grep -Eq "docs/README\.md.{0,20}routing table" "$card" || {
+              echo "::error::$card no longer routes agents into the docs corpus (needs the docs/README.md routing-table directive)"; exit 1; }
           done
 
       - name: Deny sweep — tracked tree

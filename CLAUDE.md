@@ -11,7 +11,9 @@ protocol, and **APScheduler**, all **s6-overlay**–supervised inside the contai
 - **App manifest:** `casa/config.yaml` (version lives here). User-facing app
   docs: `casa/DOCS.md`. App changelog: `casa/CHANGELOG.md`.
 - **Tests:** `tests/` (173 files). Container/e2e harness: `test-local/`. CI: `.github/workflows/qa.yml`.
-- **Internal engineering docs:** `docs/` — see the boundary note below.
+- **Agent-facing docs corpus:** `docs/` — the canonical, CI-enforced current-state
+  documentation. **Before changing a subsystem, read the document that
+  `docs/README.md`'s routing table names for it.** See the boundary note below.
 
 ## Build & test
 Run once on a fresh checkout:
@@ -68,8 +70,16 @@ reviews and captured transcripts belong outside this repository. The rule for wh
 in is one line: *a fact belongs in this repo only if it is verifiable from the public
 commit alone* — no operator, no production box, no private repository.
 
-`docs/` is being populated with a public, curated, agent-facing corpus. Until it lands,
-treat the directory as tracked and public: **anything committed there is published.**
+`docs/` holds the public, curated, agent-facing corpus — **anything committed there is
+published.** It is canonical and CI-enforced: every anchor must resolve against tracked
+code, every declared invariant must carry a tracked test binding (the red-case discipline
+in `docs/contributing/doc-contract.md` is what makes it a genuine pinning test), and a
+code-derived coverage ledger (`docs/coverage.yaml`) fails the build when a substantial
+module (≥100 lines), an option, a tool, a route or an s6 unit is neither assigned to a
+document nor excluded with a reason. Consult `docs/README.md`'s routing table before
+changing a subsystem, and update the corpus in the same change — the verifier
+(`python -m scripts.verify_docs .`) and `scripts/coverage_ledger.py check .` must stay
+green.
 
 Three controls enforce this, and `make setup` installs the hooks:
 
@@ -103,15 +113,16 @@ mid-2026). Keep it publish-ready at all times:
 - **Every release**: bump `casa/config.yaml` version + a user-facing CHANGELOG
   entry (keepachangelog tone; deep engineering detail belongs in the PR body) + a
   `translations/en.yaml` entry for any new/changed option + DOCS.md accuracy.
-- **Nothing internal on any pushed ref**: no `docs/` content, no audit/diagnosis
-  ledgers, no `.claude/`. Internal artifacts live in `docs/` (the private inner repo).
-  Force-pushed-away commits stay fetchable by SHA on GitHub — prevention is the only
-  cure.
+- **Nothing internal on any pushed ref**: no design specs, plans, reviews, audit or
+  diagnosis ledgers, no `.claude/`. Internal artifacts live in a private repository
+  outside this checkout; the public `docs/` corpus carries only what passes the
+  publication rule. Force-pushed-away commits stay fetchable by SHA on GitHub —
+  prevention is the only cure.
 - **Public identity**: commits AND public-facing files (repository.yaml maintainer,
   README) use `3899230+bonzanni@users.noreply.github.com`, never a personal address.
 - **Clean tree between sessions**: commit or revert stragglers. New files have a home
-  (eval scripts → `test-local/eval/`, e2e → `test-local/e2e/`, internal specs →
-  `docs/`); nothing parked at the repo root.
+  (eval scripts → `test-local/eval/`, e2e → `test-local/e2e/`, internal specs → the
+  private repository outside this checkout); nothing parked at the repo root.
 - **AI attribution**: commits end with `Assisted-by: Claude Code` (kernel/Fedora-style
   disclosure — not `Co-Authored-By`, which implies authorship and suffers GitHub
   email-squatting); PR bodies carry no vendor footer. Configured in
