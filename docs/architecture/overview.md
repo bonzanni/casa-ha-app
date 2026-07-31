@@ -31,8 +31,8 @@ Four services run under s6, each with a single job:
 The static service table is not the whole process story: executor engagements compile and
 supervise *dynamic* s6 service/logger pairs of their own — created, recovered and forcibly
 terminated per engagement, outside the four services above. And two environment switches
-shape the process family broadly: `LOG_FORMAT=human` swaps the default one-line-JSON
-logging for human-readable text, and the `CASA_*` path/version variables
+shape the process family broadly: `LOG_FORMAT` selects the log output shape (the format
+itself belongs to `architecture/observability.md`), and the `CASA_*` path/version variables
 (`CASA_CONFIG_DIR`, `CASA_DATA_DIR`, `CASA_DEFAULTS_DIR`, `CASA_BINDINGS_DIR`,
 `CASA_VERSION`, `CASA_IMAGE_VERSION`) redirect *specific loaders and reports*, not the
 application uniformly — treating them as global root overrides silently splits reads from

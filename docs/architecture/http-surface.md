@@ -105,7 +105,10 @@ The invoke route's concrete contract is easy to guess wrong: the global rate lim
 agents declaring the webhook capability are reachable; and the payload's `chat_id` decides
 session reuse — two invocations with the same chat id share a conversation. That rate
 limiter is one shared token bucket across the invoke *and* webhook surfaces, answering 429
-with a Retry-After — a noisy webhook source throttles direct invocations too.
+with a Retry-After — a noisy webhook source throttles direct invocations too. The
+per-minute caps are environment-tunable per ingress class: `WEBHOOK_RATE_PER_MIN`
+(default 60), `TELEGRAM_RATE_PER_MIN` (30) and `VOICE_RATE_PER_MIN` (20), with zero
+disabling that limiter.
 
 **INV-HTTP-004**: External context arriving on a request cannot set provenance fields; the ingress supplies them.
 

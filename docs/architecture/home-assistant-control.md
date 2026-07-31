@@ -41,11 +41,13 @@ mapping to add a tool to.
 
 **Two environment switches shape the integration itself.** `CASA_HA_MCP_URL` redirects the
 Home Assistant MCP endpoint that both the raw registration and the facade connect to — the
-first place to look when control fails against the wrong upstream. And
-`CASA_DISCOVERY_AUTH_ENABLED` governs Supervisor discovery: when on, Casa publishes an
-authenticated discovery record — its external-port endpoint *carrying the webhook secret*
-— to Home Assistant, persists only the discovery UUID locally, and withdraws the record
-when turned off. That publication is how the companion integration finds Casa, and it is
+first place to look when control fails against the wrong upstream. And Supervisor
+discovery: Casa publishes an authenticated discovery record — its external-port endpoint
+*carrying the webhook secret* — to Home Assistant, persisting only the discovery UUID
+locally. `CASA_DISCOVERY_AUTH_ENABLED` is the publisher module's own switch, but
+production boot invokes the publisher with it *forced on*, so an operator cannot withdraw
+discovery by setting the variable — it is an input for standalone invocations, not an
+operating control. The publication is how the companion integration finds Casa, and it is
 also a credential leaving the container.
 
 **The facade is conditional, and its absence is not a closed door.** It applies only when its

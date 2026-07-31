@@ -412,7 +412,7 @@
 - item: casa/Dockerfile
   doc: architecture/overview.md
 - item: casa/rootfs/opt/casa/agent_home.py
-  doc: architecture/engagements.md
+  doc: architecture/agent-taxonomy.md
 - item: casa/rootfs/opt/casa/agent_registry.py
   doc: architecture/agent-taxonomy.md
 - item: casa/rootfs/opt/casa/atomic_io.py
@@ -607,3 +607,31 @@
   doc: architecture/plugins.md
 - item: script:validate-config.sh
   doc: architecture/configuration.md
+- item: env:SDK_POOL_FLEET_CAP
+  doc: architecture/turn-loop.md
+- item: env:SDK_POOL_IDLE_SECONDS
+  doc: architecture/turn-loop.md
+- item: env:SDK_POOL_MAX_AGE_SECONDS
+  doc: architecture/turn-loop.md
+- item: env:SDK_POOL_MAX_PER_AGENT
+  doc: architecture/turn-loop.md
+- item: env:SDK_RETRY_CAP_MS
+  doc: architecture/turn-loop.md
+- item: env:SDK_RETRY_INITIAL_MS
+  doc: architecture/turn-loop.md
+- item: env:SDK_RETRY_MAX_ATTEMPTS
+  doc: architecture/turn-loop.md
+- item: env:SESSION_TTL_DAYS
+  doc: architecture/persistent-state.md
+- item: env:SPECIALIST_COST_ALERT_THRESHOLD
+  doc: reference/operator-options.md
+- item: env:SPECIALIST_MAX_CONCURRENCY
+  doc: reference/operator-options.md
+- item: env:TELEGRAM_RATE_PER_MIN
+  doc: architecture/http-surface.md
+- item: env:VOICE_RATE_PER_MIN
+  doc: architecture/http-surface.md
+- item: env:WEBHOOK_RATE_PER_MIN
+  doc: architecture/http-surface.md
+- item: env:WEBHOOK_SESSION_TTL_DAYS
+  doc: architecture/persistent-state.md

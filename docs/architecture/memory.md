@@ -141,8 +141,8 @@ dedicated reason rather than calling the backend. Genuine zero-hit results count
 and reset it; only unavailability counts as failure.
 
 **Tier classification fails.** Retention classifies each item's sensitivity with a bounded
-LLM pass; a failed or unparseable classification retries once and then silently assigns
-*private*. The write is not lost — but the fact becomes invisible below the highest
+LLM pass; a failed or unparseable classification retries once and then assigns *private*,
+with only a log warning to show for it. The write is not lost — but the fact becomes invisible below the highest
 clearance, which reads as absence on voice and friends surfaces.
 
 **Saving a session fails.** The save is abandoned, its claim is released, and the entry stays

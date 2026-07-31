@@ -5,7 +5,7 @@ The corpus can only claim completeness against a surface list that comes from th
 itself — a hand-maintained list rots the day after it is written. This script enumerates,
 mechanically:
 
-* every ``.py`` of ≥100 lines under ``casa/rootfs/opt/casa/`` (the substantial modules),
+* every ``.py`` under ``casa/rootfs/opt/casa/`` (no size floor),
 * every ``options:`` / ``schema:`` key in ``casa/config.yaml``,
 * every s6 unit directory under ``casa/rootfs/etc/s6-overlay/s6-rc.d/``,
 * every tool in ``tools.py``'s ``CASA_TOOLS`` tuple,
@@ -156,10 +156,23 @@ def enumerate_routes(repo_root: Path) -> list[str]:
     return sorted(found)
 
 
+def _is_os_environ(node: ast.AST) -> bool:
+    """Exactly the ``os.environ`` attribute chain — a decoy object whose
+    attribute happens to be named ``environ`` must not enumerate."""
+    return (
+        isinstance(node, ast.Attribute)
+        and node.attr == "environ"
+        and isinstance(node.value, ast.Name)
+        and node.value.id == "os"
+    )
+
+
 def enumerate_env_reads(repo_root: Path) -> list[str]:
     """Every environment variable the code reads by literal name, by AST —
-    ``os.environ.get("X")``, ``os.environ["X"]`` and ``os.getenv("X")``. Env
-    vars are the classic undocumented surface: a tunable nobody wrote down."""
+    ``os.environ.get("X")``, ``os.environ["X"]``, ``os.getenv("X")``, and the
+    project's ``_env_*`` wrapper helpers called with a literal first argument.
+    Env vars are the classic undocumented surface: a tunable nobody wrote
+    down."""
     root = repo_root / CODE_ROOT
     names: set[str] = set()
     for path in sorted(root.rglob("*.py")):
@@ -168,28 +181,31 @@ def enumerate_env_reads(repo_root: Path) -> list[str]:
         except (OSError, SyntaxError, ValueError):
             continue
         for node in ast.walk(tree):
-            if isinstance(node, ast.Call) and isinstance(node.func, ast.Attribute):
-                func = node.func
-                base = func.value
-                is_env_get = (
-                    func.attr == "get"
-                    and isinstance(base, ast.Attribute) and base.attr == "environ"
-                )
-                is_getenv = (
-                    func.attr == "getenv"
-                    and isinstance(base, ast.Name) and base.id == "os"
-                )
-                if (
-                    (is_env_get or is_getenv)
-                    and node.args
+            if isinstance(node, ast.Call):
+                literal = (
+                    node.args
                     and isinstance(node.args[0], ast.Constant)
                     and isinstance(node.args[0].value, str)
-                ):
+                )
+                if not literal:
+                    continue
+                func = node.func
+                if isinstance(func, ast.Attribute):
+                    is_env_get = func.attr == "get" and _is_os_environ(func.value)
+                    is_getenv = (
+                        func.attr == "getenv"
+                        and isinstance(func.value, ast.Name)
+                        and func.value.id == "os"
+                    )
+                    if is_env_get or is_getenv:
+                        names.add(node.args[0].value)
+                elif isinstance(func, ast.Name) and func.id.startswith("_env_"):
+                    # Local wrappers (_env_int, _env_int_or, _env_float_or, …)
+                    # take the variable name as their literal first argument.
                     names.add(node.args[0].value)
             elif isinstance(node, ast.Subscript):
-                value = node.value
                 if (
-                    isinstance(value, ast.Attribute) and value.attr == "environ"
+                    _is_os_environ(node.value)
                     and isinstance(node.slice, ast.Constant)
                     and isinstance(node.slice.value, str)
                 ):

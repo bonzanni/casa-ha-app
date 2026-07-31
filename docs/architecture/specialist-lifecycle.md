@@ -91,9 +91,9 @@ declare system requirements or triggers of their own, or when a required environ
 collides with another installed plugin's — otherwise-valid bundles fail with dedicated
 error kinds the dependency model alone would not predict.
 
-**A component declares system requirements.** They install through an ordered fallback of
-strategies — verified tarball, virtualenv, npm; OS packages are refused — and the winning
-strategy is recorded durably. Boot reconciliation then only *reports* a missing binary as
+**A component declares system requirements.** Each installs by its declared strategy —
+verified tarball, virtualenv or npm, processed in declaration order; OS packages are
+refused — and the winning strategy is recorded durably. Boot reconciliation then only *reports* a missing binary as
 degraded; nothing reinstalls tooling automatically.
 
 **Consent missing or the inspection disagrees with the receipt.** Refused before tuple

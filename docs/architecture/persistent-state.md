@@ -88,7 +88,8 @@ matters, check which of the three shapes the path you are on actually has.
 **Session pointers are actively reaped, and webhook sessions never survive a boot.** A
 six-hour sweep removes expired entries and any with malformed or missing activity
 timestamps, hard-deleting their SDK transcripts best-effort — a stored pointer is not
-indefinitely durable. And boot migration purges *every* webhook-scoped session
+indefinitely durable. The TTLs are environment-tunable: `SESSION_TTL_DAYS` (default 30)
+and the much shorter `WEBHOOK_SESSION_TTL_DAYS` (default 1). And boot migration purges *every* webhook-scoped session
 unconditionally, so webhook conversation continuity deliberately does not survive a
 restart even though the registry file does.
 

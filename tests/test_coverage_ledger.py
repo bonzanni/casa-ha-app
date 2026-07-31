@@ -102,6 +102,13 @@ def test_enumeration_covers_env_scripts_schemas_and_dockerfile(tmp_path):
         'B = os.environ["CASA_PROBE_B"]\n'
         'C = os.getenv("CASA_PROBE_C")\n'
         '# os.environ.get("CASA_PROBE_COMMENTED")\n'
+        "def _env_int(name, default):\n"
+        "    return int(os.environ.get(name, default))\n"
+        'D = _env_int("CASA_PROBE_HELPER", 3)\n'
+        "class settings:\n"
+        "    environ = {}\n"
+        'E = settings.environ.get("CASA_PROBE_DECOY")\n'
+        'F = settings.environ["CASA_PROBE_DECOY2"]\n'
     )
     scripts = root / "casa" / "rootfs" / "etc" / "s6-overlay" / "scripts"
     scripts.mkdir(parents=True)
@@ -116,6 +123,9 @@ def test_enumeration_covers_env_scripts_schemas_and_dockerfile(tmp_path):
     assert "env:CASA_PROBE_B" in items
     assert "env:CASA_PROBE_C" in items
     assert "env:CASA_PROBE_COMMENTED" not in items
+    assert "env:CASA_PROBE_HELPER" in items       # read via an _env_* helper
+    assert "env:CASA_PROBE_DECOY" not in items    # not os.environ
+    assert "env:CASA_PROBE_DECOY2" not in items
     assert "script:setup-probe.sh" in items
     assert "schema:probe.v1.json" in items
     assert "casa/Dockerfile" in items

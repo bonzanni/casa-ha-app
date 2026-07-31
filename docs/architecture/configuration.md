@@ -23,8 +23,9 @@ startup. **Changing one requires a restart.** Nothing reloads them.
 The second is the **config tree on disk** — agents, policies, bindings, specialists — which
 is reconciled against image defaults at boot and can be reloaded in-process afterwards.
 
-**Reload is scope-specific, and it is not a restart.** Eight scopes are registered —
-triggers, agent, agents, policies, plugin_env, executors, config_sync, and full — each
+**Reload is scope-specific, and it is not a restart.** The registered scopes — triggers,
+agent, agents, policies, plugin_env, executors, config_sync, and full (the set INV-CFG-001
+pins) — each
 rebuilding a defined slice (executors rebuilds the executor registry with a resident
 cascade; config_sync reruns reconciliation then cascades agents and policies). There is no
 scope that rereads manifest options, reconstructs channels, or re-reads arbitrary files. If
@@ -49,17 +50,16 @@ schema, is *overwritten by the image* with the prior content preserved as a reco
 artifact. A live file the image does not know is adopted, not deleted. Predicting which of
 your edits survive means knowing which of the three cases each file is in.
 
-**Startup `op://` resolution covers exactly three options** — the Claude OAuth token, the
-Telegram bot token and the webhook secret. Any other password-typed option holding an
-`op://` reference reaches its consumer as the literal string and fails there, not at boot.
 
 **Some identity changes cannot be hot-swapped at all.** If a resident's identity changes, the
 reload path returns a restart-required outcome *before* mutating live state rather than
 attempting a swap.
 
-**Secret indirection is narrower than the option types suggest.** A small, explicit set of
-environment variables is resolved through the external secret reference at startup. Options
-typed as passwords that are not in that set are used verbatim.
+**Secret indirection is narrower than the option types suggest.** Exactly three options
+resolve an external `op://` secret reference at startup — the Claude OAuth token, the
+Telegram bot token and the webhook secret. Options typed as passwords that are not in that
+set are used verbatim: a valid-looking reference reaches its consumer as the literal
+string and fails there, not at boot.
 
 ## Contracts & invariants
 
