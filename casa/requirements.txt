@@ -1,18 +1,24 @@
-# claude-agent-sdk pin. Bumped 0.1.72 -> 0.2.87 (spec §6) for the v0.2.82
-# stderr-callback exception-isolation fix (sdk_logging.with_stderr_callback
-# relies on the SDK swallowing callback exceptions). The pip pin also pins
-# the SDK-bundled CLI used by residents + the in_casa driver; the global npm
-# claude CLI is pinned to the matching version in Dockerfile.
-# G-1 ('NoneType has no attribute items' from hook_0..3 on Edit) is NOT an
-# upstream fix: verified 0.2.87 still does hook_output.items() with no None
-# guard (_internal/query.py:_convert_hook_output_for_cli, call site ~:452).
-# It is mitigated Casa-side by H-2 (v0.36.1) — every hook callback returns
-# {} / _deny(...), never None (hooks.py:187-192). So this bump neither fixes
-# nor regresses G-1; Casa is immune across this range.
-# Bumped 0.2.87 -> 0.2.114 (v0.59.1, Dependabot #104): no breaking changes
-# across the range (release-notes reviewed); additive TaskUpdatedMessage typing
-# (0.2.101) and a defensive mcp<2.0.0 pin (0.2.96, matches ours below).
-claude-agent-sdk==0.2.114
+# claude-agent-sdk pin. History: 0.1.72 -> 0.2.87 (v0.38.0, stderr-callback
+# exception isolation); 0.2.87 -> 0.2.114 (v0.59.1, Dependabot #104);
+# 0.2.114 -> 0.2.128 (v0.131.0, supersedes Dependabot #268). Per the upstream
+# release notes (github.com/anthropics/claude-agent-sdk-python/releases):
+# 0.2.121 passes --resume/--session-id as single =-joined argv tokens
+# (flag-injection hardening); 0.2.127 keeps stdin open while background tasks
+# are in flight (fixes SDK-MCP "Stream closed" failures that also silently
+# bypassed PreToolUse hooks); 0.2.126 adds ResultMessage.terminal_reason +
+# typed model_usage (additive).
+# NOTE (v0.131.0): Casa does NOT run the SDK-bundled CLI — every production
+# ClaudeAgentOptions passes cli_path=/usr/local/bin/claude
+# (claude_runtime.CLAUDE_CLI_PATH), installed by the Dockerfile npm pin and
+# boot-verified against claude_runtime.CLAUDE_CLI_VERSION. Keep the pip pin,
+# the npm pin, and CLAUDE_CLI_VERSION in lockstep;
+# tests/test_cli_sdk_pin_assert.py enforces the npm pins (both Dockerfiles)
+# against CLAUDE_CLI_VERSION, and this pip pin against the test's own
+# SDK_VERSION constant — bump that constant with this line.
+# G-1 ('NoneType has no attribute items' from hook_0..3 on Edit) is mitigated
+# Casa-side by H-2 (v0.36.1): every hook callback returns {} / _deny(...),
+# never None (hooks.py) — Casa is immune regardless of the upstream guard.
+claude-agent-sdk==0.2.128
 python-telegram-bot==22.7
 # Bumped 3.13.5 -> 3.14.1 (v0.59.1): clears 11 security advisories (deserialization,
 # HTTP request-smuggling/pipelining, websocket memory-limit bypass, etc.), all

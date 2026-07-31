@@ -8,7 +8,8 @@ names"): ``mcp__plugin_<plugin>_<server>__<tool>``, segments sanitized so any
 char outside ``A-Za-z0-9_-`` becomes ``_``. A SERVER-LEVEL grant is that
 string without the ``__<tool>`` suffix — covers every tool the server exposes
 (same prefix rule as ``mcp__homeassistant``; proven live for the plugin form
-on CC 2.1.150). Derivation never raises into a turn: missing/corrupt files
+on CC 2.1.150 — the ``mcp__<server>__<tool>`` naming scheme is unchanged
+through the 2.1.220 pin). Derivation never raises into a turn: missing/corrupt files
 degrade to no grants at DEBUG.
 
 The resident/specialist/executor OPTION-BUILDER integration tests live in

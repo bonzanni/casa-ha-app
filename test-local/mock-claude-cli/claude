@@ -2,13 +2,16 @@
 """Mock `claude` CLI for CI. See §9.1 of the plan-4a design spec.
 
 Usage (exactly mimics real claude):
-    claude [--resume <sid>] --permission-mode <mode> --add-dir <dir>...
+    claude [--resume=<sid>] --permission-mode <mode> --add-dir <dir>...
+
+(argparse also accepts the two-token `--resume <sid>` form, but Casa's run
+script only ever emits the =-joined single token — v0.131.0 hardening.)
 
 Reads user turns line-by-line from stdin. For each turn, appends JSONL
 entries for `user` and `assistant` messages to
 $HOME/.claude/projects/<slug>/sessions/<sid>.jsonl. On
 `/mock emit_completion`, prints a synthetic MCP tool-call JSON line and
-exits 0. On `/mock cancel`, exits 0. On `--resume <sid>`, reads the prior
+exits 0. On `/mock cancel`, exits 0. On `--resume=<sid>`, reads the prior
 transcript and prints "Resumed session <sid> with N prior turns" before
 entering the main loop.
 
@@ -108,7 +111,10 @@ def main() -> int:
                         prior += 1
         print(f"Resumed session {sid} with {prior} prior turns", flush=True)
     else:
-        sid = uuid.uuid4().hex
+        # Dashed form — matches the real CLI's session ids AND the run
+        # script's v0.131.0 UUID validation (an undashed .hex value would be
+        # rejected there, silently breaking every mock resume).
+        sid = str(uuid.uuid4())
         # Persist session_id to .session_id so a subsequent respawn can resume.
         pathlib.Path("./.session_id").write_text(sid, encoding="utf-8")
         path = _session_path(home, cwd, sid)

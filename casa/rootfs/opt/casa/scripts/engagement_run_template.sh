@@ -9,8 +9,31 @@ unset TELEGRAM_BOT_TOKEN WEBHOOK_SECRET SUPERVISOR_TOKEN HASSIO_TOKEN \
 export HOME="/data/engagements/{ID}/.home"
 export CLAUDE_CODE_DISABLE_BACKGROUND_TASKS=1
 export MCP_TOOL_TIMEOUT=660000     # [D:§W5] must exceed the 585s ask client bound
+# v0.131.0: CLI 2.1.219 changed the default nested-subagent spawn depth from
+# 1 to 3. Engagements already deny Agent/Task outright (workspace.py settings
+# guard); this pin preserves the pre-2.1.219 contract against config drift.
+export CLAUDE_CODE_MAX_SUBAGENT_SPAWN_DEPTH=1
 {EXTRA_EXPORT}
 cd "/data/engagements/{ID}"
+
+# v0.131.0: .session_id lives inside the engagement workspace, which the
+# engagement's own CLI can write. Accept only an exact UUID and pass it as a
+# single =-joined argv token so a crafted value can never expand into extra
+# CLI flags (mirrors claude-agent-sdk 0.2.121's resume hardening; the old
+# idiom word-split the file's content unquoted into argv). Runs BEFORE the
+# ringlog stderr redirect below so a rejection notice reaches the container
+# log, not just the per-epoch stderr file. The `cat` guard keeps a
+# check-then-read race (file deleted in between) from aborting the spawn
+# under `set -e`.
+RESUME_ARGS=()
+if [ -f "/data/engagements/{ID}/.session_id" ]; then
+  SID="$(cat "/data/engagements/{ID}/.session_id" 2>/dev/null || true)"
+  if [[ "$SID" =~ ^[0-9a-fA-F]{8}(-[0-9a-fA-F]{4}){3}-[0-9a-fA-F]{12}$ ]]; then
+    RESUME_ARGS=("--resume=$SID")
+  else
+    echo "casa: engagement {ID_SHORT}: ignoring malformed .session_id; starting a fresh session" >&2
+  fi
+fi
 
 # Per-spawn bounded stderr + stream-correlated epoch. UNIQUE file per epoch —
 # NOT a mod-4 slot (Sol r5-B2): bash does not wait for the process-substitution
@@ -34,14 +57,9 @@ printf '{"casa_control": "spawn", "epoch": %s}\n' "$EPOCH"   # NDJSON, pre-exec
 
 exec </data/engagements/{ID}/stdin.fifo
 
-RESUME_FLAG=""
-if [ -f "/data/engagements/{ID}/.session_id" ]; then
-  RESUME_FLAG="--resume $(cat /data/engagements/{ID}/.session_id)"
-fi
-
 exec claude --channels server:casa-engagement-channel \
             --print --verbose --output-format stream-json \
-            $RESUME_FLAG \
+            "${RESUME_ARGS[@]}" \
             --permission-mode {PERMISSION_MODE} \
             {ADD_DIR_FLAGS} \
             {PLUGIN_DIR_FLAGS}

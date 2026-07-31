@@ -697,7 +697,9 @@ def test_claude_agent_options_fields_all_classified():
         # connect-time, derived from `channel` — True only for voice.
         "include_partial_messages",
         # defaults Casa does not set — audited 2026-07-11 against SDK
-        # 0.2.114 (spec §Q6): none is turn-variable in Casa's usage.
+        # 0.2.114 (spec §Q6); the 0.2.128 field set is identical, and the
+        # `actual` assertion below re-checks it against the installed SDK
+        # on every run: none is turn-variable in Casa's usage.
         "add_dirs", "agents", "betas", "can_use_tool", "cli_path",
         "continue_conversation", "debug_stderr", "effort",
         "enable_file_checkpointing", "env", "extra_args", "fallback_model",

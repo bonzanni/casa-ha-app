@@ -9,11 +9,11 @@ before `delegate_to_agent` could even be called (cids ef8c68bb/8fff87ef/
 
 Fix under test: the casa-framework SDK MCP server config carries
 ``alwaysLoad: True`` — the CLI's per-server eager-load knob (shipped
-v2.1.121 < our 2.1.150 pin; the Python SDK 0.2.114 transport forwards every
-non-``instance`` key of an sdk-type server config to ``--mcp-config``
-verbatim, `subprocess_cli.py:374-378`). The framework toolset is the small
-always-needed core surface; plugin/HA/n8n servers deliberately keep
-deferral.
+v2.1.121, present in every pin since, incl. 2.1.220. The Python SDK
+transport forwards every non-``instance`` key of an sdk-type server config
+to ``--mcp-config`` verbatim — same code path in 0.2.114 and 0.2.128,
+`subprocess_cli.py`). The framework toolset is the small always-needed
+core surface; plugin/HA/n8n servers deliberately keep deferral.
 """
 
 from __future__ import annotations
