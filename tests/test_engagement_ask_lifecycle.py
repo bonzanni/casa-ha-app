@@ -226,7 +226,10 @@ def _ask_payload(**over) -> dict:
 async def _until(cond, *, tries: int = 2000):
     """Deterministic wait: yield to the loop until *cond* holds. A fixed
     sleep(0.02) races the scheduler under CI load (the documented ask-gates
-    flake shape); yielding until the observable condition is true does not."""
+    flake shape); yielding until the observable condition is true does not.
+    Scheduler-only coordination: bare yields never advance wall time, so this
+    suits conditions reached without real timers, and the bounded ``tries``
+    fails loudly (rather than hanging) if the condition never holds."""
     for _ in range(tries):
         if cond():
             return
@@ -245,8 +248,10 @@ async def test_answered_settles_with_check_and_clears_keyboard(env):
         namespace="engagement_ask", scope=eid, request_id="a1",
         option_index=1, actor_id=555) == "delivered"
     resp = await asyncio.wait_for(task, timeout=1.0)
+    # drain_hooks contractually returns only after the finish hooks (and thus
+    # the settle edit) have run — asserting directly after it keeps that
+    # contract pinned instead of papering over a premature return.
     await env["broker"].drain_hooks()
-    await _until(lambda: env["ch"].edits)
 
     assert _body(resp) == {
         "ok": True, "outcome": "answered", "option": "B", "option_index": 1}
@@ -632,21 +637,34 @@ async def test_button_ask_reattach_race_preserves_static_metadata(env, monkeypat
 
     monkeypatch.setattr(reg, "allocate_question_number", _slow_alloc)
 
+    # Observe the retry actually reaching the owner-first gate: wrap the
+    # gate's event.wait so the test proceeds only once the retry is parked on
+    # it (a blind yield loop cannot prove that — it is still a race).
+    from channels.channel_handlers import get_or_create_gate
+    gate = get_or_create_gate("race-1")
+    reached_gate = asyncio.Event()
+    orig_wait = gate.event.wait
+
+    async def _observed_wait():
+        reached_gate.set()
+        return await orig_wait()
+
+    monkeypatch.setattr(gate.event, "wait", _observed_wait)
+
     p = _ask_payload(engagement_id=eid, request_id="race-1")
     first = asyncio.ensure_future(env["ask"](_FakeRequest(p)))
     await asyncio.wait_for(parked.wait(), timeout=1.0)
 
     # The RETRY (same request_id) reattaches while the first attempt is still
-    # parked. Whichever path ends up creating the broker request, the request
-    # must carry the complete static metadata.
+    # parked; the owner-first gate blocks it until the owner registers the
+    # broker request and marks the gate PASSED, so the OWNER creates the
+    # request — the reattach-created branch is pinned by the no-local-owner
+    # test below.
     second = asyncio.ensure_future(env["ask"](_FakeRequest(p)))
-    # The retry parks on the owner-first gate; give it bounded bare yields to
-    # get there (reaching a wait needs scheduler turns, not wall time).
-    for _ in range(50):
-        await asyncio.sleep(0)
+    await asyncio.wait_for(reached_gate.wait(), timeout=1.0)
 
     # Let the first attempt resume; registration and meta seeding follow on
-    # the owner path. Wait on the observable outcome instead of a fixed sleep
+    # the owner path. Wait on the registered request instead of a fixed sleep
     # — the fixed 0.02s raced the scheduler under CI load.
     resume.set()
     await _until(lambda: env["broker"].get_meta(
@@ -668,6 +686,49 @@ async def test_button_ask_reattach_race_preserves_static_metadata(env, monkeypat
     resp = await asyncio.wait_for(first, timeout=1.0)
     assert _body(resp)["outcome"] == "answered"
     await asyncio.gather(second, return_exceptions=True)
+    await env["broker"].drain_hooks()
+
+
+async def test_reattach_without_local_owner_creates_request_with_full_metadata(env):
+    """F1, reattach-path create branch: when the intent already exists but no
+    LOCAL validation owner is present (a retry after the owning handler died
+    mid-flight), the retry itself creates the broker request and must seed the
+    complete static metadata. The owner-first gate means the parked-owner race
+    above can no longer reach this branch — the owner always wins creation
+    there — so this scenario pins it directly. Red case demonstrated: dropping
+    ``meta=_ask_static_meta()`` from the reattach-path ``BROKER.register`` in
+    channel_handlers.py fails this test (and only this test)."""
+    from channels.output_sequencer import ASK_TOOL
+
+    eid = env["rec"].id
+
+    async def _vanished_owner_poster():
+        return None
+
+    # The intent exists — registered by an owner that vanished before creating
+    # the broker request or resolving its gate. The handler's own registration
+    # then sees created=False, a PENDING gate, and no local owner, and falls
+    # through to the broker reattach that CREATES the request.
+    env["driver"].register_send_intent(
+        engagement_id=eid, request_id="orphan-1", tool_name=ASK_TOOL,
+        projection_hash="hash-abc", poster=_vanished_owner_poster)
+
+    task = asyncio.ensure_future(env["ask"](_FakeRequest(
+        _ask_payload(engagement_id=eid, request_id="orphan-1"))))
+    await _until(lambda: env["broker"].get_meta(
+        namespace="engagement_ask", scope=eid, request_id="orphan-1") is not None)
+
+    meta = env["broker"].get_meta(
+        namespace="engagement_ask", scope=eid, request_id="orphan-1")
+    assert meta.get("topic_id") == 42
+    assert meta.get("operator_id") == 555
+    assert meta.get("options") == ["A", "B"]
+
+    assert env["broker"].deliver(
+        namespace="engagement_ask", scope=eid, request_id="orphan-1",
+        option_index=0, actor_id=555) == "delivered"
+    resp = await asyncio.wait_for(task, timeout=1.0)
+    assert _body(resp)["outcome"] == "answered"
     await env["broker"].drain_hooks()
 
 
