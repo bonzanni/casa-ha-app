@@ -159,6 +159,23 @@ def enumerate_routes(repo_root: Path) -> list[str]:
     return sorted(found)
 
 
+def _walk_scope(scope: ast.AST):
+    """Walk a scope's own statements WITHOUT descending into nested function
+    definitions — each function is analysed as its own scope, so an inner
+    binding must not leak outward and an inner read must not be judged by an
+    outer scope's bindings."""
+    stack = list(getattr(scope, "body", []))
+    while stack:
+        node = stack.pop()
+        if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)):
+            # A nested function is its own scope: yield the definition node
+            # itself but never its interior.
+            yield node
+            continue
+        yield node
+        stack.extend(ast.iter_child_nodes(node))
+
+
 def _is_os_environ(node: ast.AST) -> bool:
     """Exactly the ``os.environ`` attribute chain — a decoy object whose
     attribute happens to be named ``environ`` must not enumerate."""
@@ -183,83 +200,103 @@ def enumerate_env_reads(repo_root: Path) -> list[str]:
             tree = ast.parse(path.read_text(errors="replace"))
         except (OSError, SyntaxError, ValueError):
             continue
-        # Names bound (anywhere in the module) to an expression that contains
-        # os.environ — a parameter defaulted to it, or `env = env or
-        # os.environ`. Literal .get()/[] reads through such a name are env
-        # reads too. Reads through a further indirection (a closure argument)
-        # are not traced; for option-derived variables the option-key
-        # enumeration is the backstop.
-        env_names: set[str] = set()
-        for node in ast.walk(tree):
-            if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)):
-                args = node.args
+        # Names bound to os.environ, tracked PER FUNCTION SCOPE — a parameter
+        # defaulted to it, a direct alias (`env = os.environ`), or the
+        # self-referential rebind (`env = env if … else os.environ`). Literal
+        # .get()/[] reads through such a name are env reads too. `raw =
+        # os.environ.get(…)` binds a VALUE, not the mapping, and is not
+        # tracked; nor does one function's `env` contaminate another's. Reads
+        # through further indirection — a closure argument, or a mapping passed
+        # in at the call site — are not traced; the option-key enumeration
+        # backstops option-derived variables.
+        def _scope_env_names(scope: ast.AST) -> set[str]:
+            found: set[str] = set()
+            if isinstance(scope, (ast.FunctionDef, ast.AsyncFunctionDef)):
+                args = scope.args
                 positional = args.posonlyargs + args.args
                 for arg, default in zip(
                     positional[len(positional) - len(args.defaults):],
                     args.defaults,
                 ):
                     if any(_is_os_environ(n) for n in ast.walk(default)):
-                        env_names.add(arg.arg)
+                        found.add(arg.arg)
                 for arg, default in zip(args.kwonlyargs, args.kw_defaults):
                     if default is not None and any(
                         _is_os_environ(n) for n in ast.walk(default)
                     ):
-                        env_names.add(arg.arg)
-            elif isinstance(node, ast.Assign):
-                # Track only a direct alias (`env = os.environ`) or the
-                # self-referential rebind (`env = env if … else os.environ`).
-                # `raw = os.environ.get(…)` binds a VALUE, not the mapping —
-                # tracking its name module-wide produced a false positive when
-                # an unrelated dict reused it.
-                value_names = {
-                    n.id for n in ast.walk(node.value) if isinstance(n, ast.Name)
-                }
-                is_alias = _is_os_environ(node.value)
-                for target in node.targets:
-                    if isinstance(target, ast.Name) and (
-                        is_alias
-                        or (
-                            target.id in value_names
-                            and any(_is_os_environ(n) for n in ast.walk(node.value))
-                        )
-                    ):
-                        env_names.add(target.id)
+                        found.add(arg.arg)
+            for node in _walk_scope(scope):
+                if True:
+                    if isinstance(node, ast.Assign):
+                        value_names = {
+                            n.id for n in ast.walk(node.value)
+                            if isinstance(n, ast.Name)
+                        }
+                        is_alias = _is_os_environ(node.value)
+                        for target in node.targets:
+                            if isinstance(target, ast.Name) and (
+                                is_alias
+                                or (
+                                    target.id in value_names
+                                    and any(
+                                        _is_os_environ(n)
+                                        for n in ast.walk(node.value)
+                                    )
+                                )
+                            ):
+                                found.add(target.id)
+            return found
 
-        def _is_env_base(base: ast.AST) -> bool:
-            return _is_os_environ(base) or (
-                isinstance(base, ast.Name) and base.id in env_names
+        scopes = [tree] + [
+            n for n in ast.walk(tree)
+            if isinstance(n, (ast.FunctionDef, ast.AsyncFunctionDef))
+        ]
+        module_env = _scope_env_names(tree)
+
+        for scope in scopes:
+            env_names = (
+                module_env if scope is tree
+                else module_env | _scope_env_names(scope)
             )
 
-        for node in ast.walk(tree):
-            if isinstance(node, ast.Call):
-                literal = (
-                    node.args
-                    and isinstance(node.args[0], ast.Constant)
-                    and isinstance(node.args[0].value, str)
+            def _is_env_base(base: ast.AST) -> bool:
+                return _is_os_environ(base) or (
+                    isinstance(base, ast.Name) and base.id in env_names
                 )
-                if not literal:
-                    continue
-                func = node.func
-                if isinstance(func, ast.Attribute):
-                    is_env_get = func.attr == "get" and _is_env_base(func.value)
-                    is_getenv = (
-                        func.attr == "getenv"
-                        and isinstance(func.value, ast.Name)
-                        and func.value.id == "os"
+
+            for node in _walk_scope(scope):
+                if isinstance(node, ast.Call):
+                    literal = (
+                        node.args
+                        and isinstance(node.args[0], ast.Constant)
+                        and isinstance(node.args[0].value, str)
                     )
-                    if is_env_get or is_getenv:
+                    if not literal:
+                        continue
+                    func = node.func
+                    if isinstance(func, ast.Attribute):
+                        is_env_get = (
+                            func.attr == "get" and _is_env_base(func.value)
+                        )
+                        is_getenv = (
+                            func.attr == "getenv"
+                            and isinstance(func.value, ast.Name)
+                            and func.value.id == "os"
+                        )
+                        if is_env_get or is_getenv:
+                            names.add(node.args[0].value)
+                    elif isinstance(func, ast.Name) and func.id.startswith("_env_"):
+                        # Local wrappers (_env_int, _env_int_or, _env_float_or,
+                        # …) take the variable name as their literal first
+                        # argument.
                         names.add(node.args[0].value)
-                elif isinstance(func, ast.Name) and func.id.startswith("_env_"):
-                    # Local wrappers (_env_int, _env_int_or, _env_float_or, …)
-                    # take the variable name as their literal first argument.
-                    names.add(node.args[0].value)
-            elif isinstance(node, ast.Subscript):
-                if (
-                    _is_env_base(node.value)
-                    and isinstance(node.slice, ast.Constant)
-                    and isinstance(node.slice.value, str)
-                ):
-                    names.add(node.slice.value)
+                elif isinstance(node, ast.Subscript):
+                    if (
+                        _is_env_base(node.value)
+                        and isinstance(node.slice, ast.Constant)
+                        and isinstance(node.slice.value, str)
+                    ):
+                        names.add(node.slice.value)
     return [f"env:{name}" for name in sorted(names)]
 
 

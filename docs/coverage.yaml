@@ -635,10 +635,6 @@
   doc: architecture/http-surface.md
 - item: env:WEBHOOK_SESSION_TTL_DAYS
   doc: architecture/persistent-state.md
-- item: env:HINDSIGHT_API_URL
-  doc: reference/operator-options.md
-- item: env:MEMORY_BACKEND
-  doc: reference/operator-options.md
 - item: env:N8N_API_KEY
   doc: architecture/mcp-and-tools.md
 - item: env:N8N_URL

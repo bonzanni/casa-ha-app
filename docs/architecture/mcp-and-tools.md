@@ -98,7 +98,7 @@ instead.
 
 A wholly optional MCP server rides on the environment too: setting `N8N_URL` registers an
 n8n workflow server (bearer-authenticated when `N8N_API_KEY` is set); unset, nothing is
-registered and no document or option mentions it — the variables are its only switch.
+registered. No manifest option exposes it — these variables are its only switch.
 
 Two environment variables move pieces of this topology, unevenly:
 `CASA_FRAMEWORK_MCP_URL` redirects newly provisioned engagement workspaces to a different

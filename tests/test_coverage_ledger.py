@@ -119,6 +119,8 @@ def test_enumeration_covers_env_scripts_schemas_and_dockerfile(tmp_path):
         'raw = os.environ.get("CASA_PROBE_A")\n'
         "raw = {}\n"
         'G = raw.get("CASA_PROBE_REUSED_NAME")\n'
+        "def crossed(env={}):\n"
+        '    return env.get("CASA_PROBE_CROSS_SCOPE")\n'
     )
     scripts = root / "casa" / "rootfs" / "etc" / "s6-overlay" / "scripts"
     scripts.mkdir(parents=True)
@@ -140,6 +142,8 @@ def test_enumeration_covers_env_scripts_schemas_and_dockerfile(tmp_path):
     assert "env:CASA_PROBE_BOUND" in items        # name bound from os.environ
     assert "env:CASA_PROBE_NOT_ENV" not in items  # unrelated mapping
     assert "env:CASA_PROBE_REUSED_NAME" not in items  # value-bind, name reused
+    # `reader(env=os.environ)` must not contaminate `crossed(env={})`:
+    assert "env:CASA_PROBE_CROSS_SCOPE" not in items
     assert "script:setup-probe.sh" in items
     assert "schema:probe.v1.json" in items
     assert "casa/Dockerfile" in items
