@@ -22,6 +22,7 @@ which is keyed on what you are about to do rather than on subsystem names.
 |---|---|
 | Telegram transport, callback namespaces, topic output ordering, or message rendering | [`architecture/telegram.md`](architecture/telegram.md) |
 | adding a route, changing webhook authentication, or anything crossing the container boundary | [`architecture/http-surface.md`](architecture/http-surface.md) |
+| adding a tool, a tool's result contract, plugin mutation sequencing, or completion semantics | [`architecture/tools-interface.md`](architecture/tools-interface.md) |
 | adding a tool, changing tool dispatch, or anything about tool authorization | [`architecture/mcp-and-tools.md`](architecture/mcp-and-tools.md) |
 | adding an agent or a tier, the required file set, or role resolution | [`architecture/agent-taxonomy.md`](architecture/agent-taxonomy.md) |
 | adding an evaluator, or before assuming behaviour is evaluated somewhere | [`architecture/eval-framework.md`](architecture/eval-framework.md) |

@@ -196,7 +196,7 @@
 - item: casa/rootfs/opt/casa/tokens.py
   doc: architecture/observability.md
 - item: casa/rootfs/opt/casa/tools.py
-  doc: architecture/mcp-and-tools.md
+  doc: architecture/tools-interface.md
 - item: casa/rootfs/opt/casa/topic_ledger.py
   doc: architecture/persistent-state.md
 - item: casa/rootfs/opt/casa/trigger_acks.py
@@ -272,95 +272,95 @@
 - item: s6:user
   doc: architecture/overview.md
 - item: tool:ask_user
-  excluded: "PHASE-3: architecture/tools-interface.md"
+  doc: architecture/tools-interface.md
 - item: tool:cancel_engagement
-  excluded: "PHASE-3: architecture/tools-interface.md"
+  doc: architecture/tools-interface.md
 - item: tool:cancel_voice_job
-  excluded: "PHASE-3: architecture/tools-interface.md"
+  doc: architecture/tools-interface.md
 - item: tool:casa_reload
-  excluded: "PHASE-3: architecture/tools-interface.md"
+  doc: architecture/tools-interface.md
 - item: tool:casa_reload_triggers
-  excluded: "PHASE-3: architecture/tools-interface.md"
+  doc: architecture/tools-interface.md
 - item: tool:casa_restart_supervised
-  excluded: "PHASE-3: architecture/tools-interface.md"
+  doc: architecture/tools-interface.md
 - item: tool:cleanup_engagement_topics
-  excluded: "PHASE-3: architecture/tools-interface.md"
+  doc: architecture/tools-interface.md
 - item: tool:config_git_commit
-  excluded: "PHASE-3: architecture/tools-interface.md"
+  doc: architecture/tools-interface.md
 - item: tool:continue_voice_job
-  excluded: "PHASE-3: architecture/tools-interface.md"
+  doc: architecture/tools-interface.md
 - item: tool:delegate_to_agent
-  excluded: "PHASE-3: architecture/tools-interface.md"
+  doc: architecture/tools-interface.md
 - item: tool:delete_engagement_workspace
-  excluded: "PHASE-3: architecture/tools-interface.md"
+  doc: architecture/tools-interface.md
 - item: tool:emit_completion
-  excluded: "PHASE-3: architecture/tools-interface.md"
+  doc: architecture/tools-interface.md
 - item: tool:engage_executor
-  excluded: "PHASE-3: architecture/tools-interface.md"
+  doc: architecture/tools-interface.md
 - item: tool:get_item_fields
-  excluded: "PHASE-3: architecture/tools-interface.md"
+  doc: architecture/tools-interface.md
 - item: tool:get_schedule
-  excluded: "PHASE-3: architecture/tools-interface.md"
+  doc: architecture/tools-interface.md
 - item: tool:list_engagement_workspaces
-  excluded: "PHASE-3: architecture/tools-interface.md"
+  doc: architecture/tools-interface.md
 - item: tool:list_vault_items
-  excluded: "PHASE-3: architecture/tools-interface.md"
+  doc: architecture/tools-interface.md
 - item: tool:peek_engagement_workspace
-  excluded: "PHASE-3: architecture/tools-interface.md"
+  doc: architecture/tools-interface.md
 - item: tool:persona_apply
-  excluded: "PHASE-3: architecture/tools-interface.md"
+  doc: architecture/tools-interface.md
 - item: tool:persona_install_commit
-  excluded: "PHASE-3: architecture/tools-interface.md"
+  doc: architecture/tools-interface.md
 - item: tool:persona_install_inspect
-  excluded: "PHASE-3: architecture/tools-interface.md"
+  doc: architecture/tools-interface.md
 - item: tool:plugin_add
-  excluded: "PHASE-3: architecture/tools-interface.md"
+  doc: architecture/tools-interface.md
 - item: tool:plugin_assign
-  excluded: "PHASE-3: architecture/tools-interface.md"
+  doc: architecture/tools-interface.md
 - item: tool:plugin_list
-  excluded: "PHASE-3: architecture/tools-interface.md"
+  doc: architecture/tools-interface.md
 - item: tool:plugin_remove
-  excluded: "PHASE-3: architecture/tools-interface.md"
+  doc: architecture/tools-interface.md
 - item: tool:plugin_unassign
-  excluded: "PHASE-3: architecture/tools-interface.md"
+  doc: architecture/tools-interface.md
 - item: tool:plugin_update
-  excluded: "PHASE-3: architecture/tools-interface.md"
+  doc: architecture/tools-interface.md
 - item: tool:query_engager
-  excluded: "PHASE-3: architecture/tools-interface.md"
+  doc: architecture/tools-interface.md
 - item: tool:react
-  excluded: "PHASE-3: architecture/tools-interface.md"
+  doc: architecture/tools-interface.md
 - item: tool:recall_memory
-  excluded: "PHASE-3: architecture/tools-interface.md"
+  doc: architecture/tools-interface.md
 - item: tool:remove_plugin_env_reference
-  excluded: "PHASE-3: architecture/tools-interface.md"
+  doc: architecture/tools-interface.md
 - item: tool:resident_persona_reset
-  excluded: "PHASE-3: architecture/tools-interface.md"
+  doc: architecture/tools-interface.md
 - item: tool:resident_persona_swap
-  excluded: "PHASE-3: architecture/tools-interface.md"
+  doc: architecture/tools-interface.md
 - item: tool:send_media
-  excluded: "PHASE-3: architecture/tools-interface.md"
+  doc: architecture/tools-interface.md
 - item: tool:send_message
-  excluded: "PHASE-3: architecture/tools-interface.md"
+  doc: architecture/tools-interface.md
 - item: tool:set_plugin_env_reference
-  excluded: "PHASE-3: architecture/tools-interface.md"
+  doc: architecture/tools-interface.md
 - item: tool:specialist_install_commit
-  excluded: "PHASE-3: architecture/tools-interface.md"
+  doc: architecture/tools-interface.md
 - item: tool:specialist_install_inspect
-  excluded: "PHASE-3: architecture/tools-interface.md"
+  doc: architecture/tools-interface.md
 - item: tool:specialist_rollback
-  excluded: "PHASE-3: architecture/tools-interface.md"
+  doc: architecture/tools-interface.md
 - item: tool:specialist_uninstall
-  excluded: "PHASE-3: architecture/tools-interface.md"
+  doc: architecture/tools-interface.md
 - item: tool:specialist_upgrade
-  excluded: "PHASE-3: architecture/tools-interface.md"
+  doc: architecture/tools-interface.md
 - item: tool:trigger_ack_revoke
-  excluded: "PHASE-3: architecture/tools-interface.md"
+  doc: architecture/tools-interface.md
 - item: tool:verify_plugin_secrets
-  excluded: "PHASE-3: architecture/tools-interface.md"
+  doc: architecture/tools-interface.md
 - item: tool:verify_plugin_state
-  excluded: "PHASE-3: architecture/tools-interface.md"
+  doc: architecture/tools-interface.md
 - item: tool:voice_job_status
-  excluded: "PHASE-3: architecture/tools-interface.md"
+  doc: architecture/tools-interface.md
 - item: route:casa/rootfs/opt/casa/casa_core.py:GET:/
   doc: architecture/http-surface.md
 - item: route:casa/rootfs/opt/casa/casa_core.py:GET:/healthz

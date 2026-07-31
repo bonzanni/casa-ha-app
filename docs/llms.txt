@@ -20,6 +20,7 @@ Code is the source of truth; these files are a map.
 - [architecture/personality.md](architecture/personality.md): What an agent is versus how it presents — role artifacts, personas, bindings, and which prompt is actually served.
 - [architecture/plugins.md](architecture/plugins.md): How a plugin becomes usable — registry, content-addressed store, artifact identity, and per-call authorization.
 - [architecture/telegram.md](architecture/telegram.md): How Telegram messages become turns — transports, authentication, the per-topic causal log, keyboards, and rendering.
+- [architecture/tools-interface.md](architecture/tools-interface.md): The mutation interface — the one tool registry, result envelopes, and which failures roll back versus report.
 - [architecture/triggers.md](architecture/triggers.md): What makes an agent act without a person speaking — scheduled and webhook triggers, and the consent a plugin trigger needs.
 - [architecture/turn-loop.md](architecture/turn-loop.md): How one inbound message becomes one agent turn, and what bounds it.
 - [architecture/voice.md](architecture/voice.md): How spoken input becomes a turn and how the answer gets back — transports, authentication, the turn budget, and deferred delivery.

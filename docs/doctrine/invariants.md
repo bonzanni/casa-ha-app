@@ -78,6 +78,10 @@ Every invariant is defined in exactly one file and referenced by id elsewhere.
 | `INV-TG-003` | A live request is resolved exactly once. | [`architecture/telegram.md`](../architecture/telegram.md) |
 | `INV-TG-004` | Writer operations on a sequenced topic are serialized under one lock. | [`architecture/telegram.md`](../architecture/telegram.md) |
 | `INV-TG-005` | A rich response is paginated to Telegram's message-length and entity budgets. | [`architecture/telegram.md`](../architecture/telegram.md) |
+| `INV-TOOL-001` | The result wrapper marks an outer error only for a payload with status "error" or ok false; every other status is a successful outcome. | [`architecture/tools-interface.md`](../architecture/tools-interface.md) |
+| `INV-TOOL-002` | Internal tool calls bind engagement authority only for an active record; completion alone may bind a terminal record, so a duplicate completion gets its truthful already-terminal answer. | [`architecture/tools-interface.md`](../architecture/tools-interface.md) |
+| `INV-TOOL-003` | Plugin mutations serialize under one lock, and a failure before registry activation leaves the registry unchanged, reported in a pinned envelope shape. | [`architecture/tools-interface.md`](../architecture/tools-interface.md) |
+| `INV-TOOL-004` | A reload or verification failure after the registry commit yields committed-but-not-ready; nothing rolls the registry back. | [`architecture/tools-interface.md`](../architecture/tools-interface.md) |
 | `INV-TRIG-001` | A resident's scheduled trigger registers only if the resident declares the channel it names. | [`architecture/triggers.md`](../architecture/triggers.md) |
 | `INV-TRIG-002` | Webhook trigger names are unique, and the user and plugin namespaces cannot collide. | [`architecture/triggers.md`](../architecture/triggers.md) |
 | `INV-TRIG-003` | A plugin's triggers route only as a complete set, and only when target, assignment, secret backing and a persisted operator approval all hold. | [`architecture/triggers.md`](../architecture/triggers.md) |

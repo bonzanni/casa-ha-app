@@ -328,7 +328,10 @@ async def test_tools_call_terminal_engagement_binds_for_emit_completion() -> Non
     tool's own idempotency check answers already_terminal — the active-only
     gate returned a lying not_in_engagement to the agent. ONLY
     emit_completion gets terminal binding (privileged tools keep the
-    defense-in-depth active-only rule)."""
+    defense-in-depth active-only rule).
+
+    Pins INV-TOOL-002 (with the inactive-binds-none sibling). Red case demonstrated: emptying _TERMINAL_BINDING_TOOLS fails this test.
+    """
     reg = _FakeRegistry()
     rec = _FakeRecord(eng_id="fin-2", status="completed")
     reg.add(rec)
@@ -366,3 +369,17 @@ async def test_public_fallback_terminal_binding_matches_internal() -> None:
         engagement_registry=reg,
     )
     assert json.loads(out2["content"][0]["text"]) == {"eng": None}
+def test_pin_inv_tool_001_result_marks_errors_only_for_error_status():
+    """Pins INV-TOOL-001: _result infers the outer MCP error only from
+    status=="error" or ok is False; other statuses ride as successes.
+
+    Red case demonstrated: widening the inference to treat "unavailable" as
+    an error fails this test.
+    """
+    from tools import _result
+
+    assert _result({"status": "error"})["is_error"] is True
+    assert _result({"ok": False})["is_error"] is True
+    for payload in ({"status": "unavailable"}, {"status": "pending"},
+                    {"status": "acknowledged"}, {"ok": True}):
+        assert _result(payload).get("is_error") is not True

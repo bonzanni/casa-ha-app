@@ -327,6 +327,29 @@
     INV-CFG-004: [tests/test_config_git.py::test_store_and_staging_stay_untracked]
     INV-CFG-005: [tests/test_config_sync_main.py::test_run_is_non_fatal_on_error]
 
+- doc: architecture/tools-interface.md
+  summary: The mutation interface — the one tool registry, result envelopes, and which failures roll back versus report.
+  when_changing: adding a tool, a tool's result contract, plugin mutation sequencing, or completion semantics
+  covers:
+    - casa/rootfs/opt/casa/tools.py::CASA_TOOLS
+    - casa/rootfs/opt/casa/tools.py::_result
+    - casa/rootfs/opt/casa/tools.py::select_casa_tools
+    - casa/rootfs/opt/casa/tools.py::emit_completion
+    - casa/rootfs/opt/casa/tools.py::plugin_add
+    - casa/rootfs/opt/casa/internal_handlers.py::_make_internal_tools_call_handler
+    - casa/rootfs/opt/casa/mcp_envelope.py::_tool_schema
+  tests:
+    - tests/test_internal_handlers.py
+    - tests/test_plugin_tools.py
+    - tests/test_emit_completion_tool.py
+  related: [architecture/mcp-and-tools.md, architecture/engagements.md, architecture/plugins.md]
+  defines_invariants: [INV-TOOL-001, INV-TOOL-002, INV-TOOL-003, INV-TOOL-004]
+  invariant_tests:
+    INV-TOOL-001: [tests/test_internal_handlers.py::test_pin_inv_tool_001_result_marks_errors_only_for_error_status]
+    INV-TOOL-002: [tests/test_internal_handlers.py::test_tools_call_inactive_engagement_binds_none, tests/test_internal_handlers.py::test_tools_call_terminal_engagement_binds_for_emit_completion]
+    INV-TOOL-003: [tests/test_plugin_tools.py::test_envelope_pre_activation_failure_is_pinned_shape]
+    INV-TOOL-004: [tests/test_plugin_tools.py::test_envelope_committed_but_not_ready]
+
 - doc: architecture/triggers.md
   summary: What makes an agent act without a person speaking — scheduled and webhook triggers, and the consent a plugin trigger needs.
   when_changing: trigger types, webhook trigger routing, plugin trigger consent, or scheduling
