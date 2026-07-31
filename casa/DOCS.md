@@ -25,7 +25,7 @@ Casa runs always-on AI agents inside your Home Assistant instance. The primary a
 | Option | Description |
 |--------|-------------|
 | `telegram_bot_token` | Telegram bot token from @BotFather. Enables the Telegram channel. |
-| `telegram_chat_id` | Telegram chat ID to restrict messages to. Leave empty to accept all chats. |
+| `telegram_chat_id` | Telegram chat ID to restrict messages to. Leave empty to accept all chats. This id is also the **operator identity**: only the sender whose Telegram user id matches it is attributed as the operator and reads memory at private clearance — any other accepted sender is recorded under its own `telegram:<id>` identity and reads at public clearance only. With the option empty (accept-all) no sender is the operator. |
 | `telegram_engagement_supergroup_id` | Chat ID of the dedicated Telegram forum supergroup used for interactive engagements (Tier 2 Specialist interactive mode; Tier 3 Executor types, Plan 3+). Must be a negative integer. Leave at 0 to disable engagements. |
 
 ### Optional -- Memory
@@ -874,12 +874,17 @@ a `claude_code` executor with a prompt from an untrusted source.
 Real `claude` CLI subprocesses reach Casa's MCP tools via
 `POST /mcp/casa-framework` — stateless JSON-RPC 2.0 over HTTP, no SSE.
 Engagement identity propagates through the `X-Casa-Engagement-Id` header
-(written into `.mcp.json` by `provision_workspace`) and the bridge binds
-`tools.engagement_var` for the tool call's duration. Missing / unknown
-header → bound to `None` and engagement-gated tools return
-`not_in_engagement`. GET returns 405. The same `CASA_TOOLS` tuple backs
-both the SDK path and the HTTP path, so every in-process tool is
-automatically reachable from real CLI engagements.
+plus the per-engagement secret `X-Casa-Engagement-Token` (both written
+into `.mcp.json` by `provision_workspace`); the id claim is honored only
+when the token matches the engagement record's credential, and then the
+bridge binds `tools.engagement_var` for the tool call's duration. A known
+id with a missing/wrong token is rejected outright
+(`engagement_auth_failed`) — the id alone is endpoint-visible and must
+never confer authority. Missing / unknown header → bound to `None` and
+engagement-gated tools return `not_in_engagement`. GET returns 405. The
+same `CASA_TOOLS` tuple backs both the SDK path and the HTTP path, so
+every in-process tool is automatically reachable from real CLI
+engagements.
 
 ### Hook enforcement (v0.13.1)
 
@@ -976,7 +981,9 @@ model can handle), not a connection drop.
   casa-main; svc-casa-mcp connects to it for every forwarded tool call.
 - New engagement workspaces' `.mcp.json` points at
   `http://127.0.0.1:8100/mcp/casa-framework` and includes the
-  `X-Casa-Engagement-Id` header binding.
+  `X-Casa-Engagement-Id` + `X-Casa-Engagement-Token` header binding
+  (the token authenticates the id claim; boot replay refreshes the file
+  from the engagement record before the CLI respawns).
 - New engagement workspaces' hook proxy script POSTs to
   `http://127.0.0.1:8100/hooks/resolve`.
 

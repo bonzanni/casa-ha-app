@@ -1,5 +1,5 @@
 ---
-last_reviewed: 2026-07-31
+last_reviewed: 2026-08-01
 ---
 
 # Memory and recall
@@ -42,10 +42,15 @@ fresh non-voice session only — a warm reused client skips that path entirely, 
 auto-recalls. Both can still recall explicitly through the tool. "The agent remembers
 automatically" is true of a narrower set of turns than it sounds.
 
-**Read clearance is per channel and fails closed.** Known channels are mapped explicitly; an
-unrecognised one gets the *least* sensitive clearance. The fail direction is the security
-control here: an unknown surface must read less, never more, and a test pins the function's
-docstring to that direction so prose and behaviour cannot drift apart again.
+**Read clearance is per channel and fails closed** — and on Telegram, per *sender*. Known
+channels are mapped explicitly; an unrecognised one gets the *least* sensitive clearance.
+The fail direction is the security control here: an unknown surface must read less, never
+more, and a test pins the function's docstring to that direction so prose and behaviour
+cannot drift apart again. The Telegram channel's mapped clearance (private) is not
+route-wide: the ingress stamps a per-sender origin clearance — private only for the sender
+whose id matches the configured operator chat id, public for anyone else the accept-all
+mode lets in — and origin-aware resolution honors that stamp, failing closed to public
+when a telegram-marked turn carries a missing or malformed one.
 
 **Writing is narrower than reading.** Only write-trusted channels retain to the shared bank.
 A channel that can recall is not thereby able to store.
@@ -138,6 +143,15 @@ behavior; and a turn still running on the *same* session when a reset saves it c
 tail exchanges miss retention — the reset drops the pointer (its contract) and nothing
 saves that session again.
 
+**INV-MEM-007**: A tier-classifier reply parses only when it is exactly one tier token; any reply containing other words yields no tier and the item falls to the private default.
+
+Enforced in the reply parser (`parse_tier`), which full-matches a single decorated token
+instead of searching for the leftmost tier word — the search behaviour is what let a chatty
+reply mis-tag a family fact as public.
+
+What it does not cover: a classifier that *confidently answers the wrong single word* is
+believed. This is a parser contract, not an accuracy guarantee — the eval set owns accuracy.
+
 ## Failure behavior
 
 **The backend is slow, unreachable, or returns an error.** The seam raises `RecallUnavailable`
@@ -164,7 +178,11 @@ and reset it; only unavailability counts as failure.
 
 **Tier classification fails.** Retention classifies each item's sensitivity with a bounded
 LLM pass; a failed or unparseable classification retries once and then assigns *private*,
-with only a log warning to show for it. The write is not lost — but the fact becomes invisible below the highest
+with only a log warning to show for it. "Unparseable" is strict: the classifier is prompted
+for a single tier word, and only a reply that *is* exactly one tier token (modulo a label,
+punctuation, or emphasis) parses — a tier word inside a longer sentence ("this is not
+public; it is family") is ambiguity, not an answer, and falls to the private default
+rather than having its leftmost tier word extracted. The write is not lost — but the fact becomes invisible below the highest
 clearance, which reads as absence on voice and friends surfaces.
 
 **Saving a session fails.** The save is abandoned, its claim is released, and the entry stays

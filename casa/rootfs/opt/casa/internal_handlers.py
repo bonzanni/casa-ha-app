@@ -32,6 +32,7 @@ The hook responses are pass-through (CC's hook protocol is already body-only).
 
 from __future__ import annotations
 
+import hmac
 import logging
 import re as _re
 from typing import Any, Awaitable, Callable
@@ -39,6 +40,29 @@ from typing import Any, Awaitable, Callable
 from aiohttp import web
 
 logger = logging.getLogger(__name__)
+
+
+def engagement_auth_ok(rec: Any, presented: Any) -> bool:
+    """#335: does ``presented`` prove authority over engagement record ``rec``?
+
+    The engagement id alone is NOT an authenticator — it is baked into the
+    workspace ``.mcp.json``, appears in logs/topic metadata, and the MCP
+    endpoint plus the internal socket are reachable from any in-container
+    process, so a lower-privileged engagement could present another
+    engagement's id and inherit its role authority. Authority therefore
+    requires the per-engagement secret ``auth_token`` generated at record
+    creation and provisioned ONLY into that engagement's own workspace.
+
+    Fail-closed on every edge: a record without a token (impossible for
+    registry-created/loaded records — ``create()`` generates one and
+    ``load()`` backfills — but reachable with a hand-built record) matches
+    nothing, and a missing/non-string presented token matches nothing.
+    Constant-time compare so the token is not oracle-recoverable.
+    """
+    expected = getattr(rec, "auth_token", "") or ""
+    if not expected or not isinstance(presented, str) or not presented:
+        return False
+    return hmac.compare_digest(expected, presented)
 
 ToolHandler = Callable[[dict[str, Any]], Awaitable[dict[str, Any]]]
 HookCallback = Callable[[dict[str, Any], Any, dict], Awaitable[dict | None]]
@@ -104,21 +128,36 @@ def _make_internal_tools_call_handler(
                 {"error": {"code": -32602, "message": f"Unknown tool: {name}"}}
             )
 
-        # Resolve engagement record. Defense-in-depth: only bind when status
-        # is still active (mirrors v0.13.1 mcp_bridge._dispatch_tool_call) —
-        # EXCEPT the _TERMINAL_BINDING_TOOLS allowlist (v0.74.2), so a
-        # duplicate/racing emit_completion delivery gets the honest
-        # `already_terminal` from the tool's idempotency check.
+        # Resolve engagement record. #335: an id claim binds ONLY with the
+        # matching per-engagement auth token — the id alone is client-supplied
+        # and shared-endpoint-visible, so a mismatch is an explicit REJECT
+        # (never a silent unauthenticated fallthrough that would let a forger
+        # keep probing tools as "not in engagement"). Then defense-in-depth:
+        # only bind when status is still active (mirrors v0.13.1
+        # mcp_bridge._dispatch_tool_call) — EXCEPT the _TERMINAL_BINDING_TOOLS
+        # allowlist (v0.74.2), so a duplicate/racing emit_completion delivery
+        # gets the honest `already_terminal` from the tool's idempotency check.
         engagement = None
         if eng_id:
             try:
                 rec = engagement_registry.get(eng_id)
             except Exception:  # noqa: BLE001
                 rec = None
-            if rec is not None and (
-                    getattr(rec, "status", None) == "active"
-                    or name in _TERMINAL_BINDING_TOOLS):
-                engagement = rec
+            if rec is not None:
+                if not engagement_auth_ok(rec, body.get("engagement_token")):
+                    logger.warning(
+                        "internal /tools/call: rejected engagement id claim "
+                        "for %s (tool=%r): missing/invalid engagement token",
+                        str(eng_id)[:8], name,
+                    )
+                    return web.json_response(
+                        {"error": {"code": -32003,
+                                   "message": "engagement_auth_failed: "
+                                              "invalid engagement token"}}
+                    )
+                if (getattr(rec, "status", None) == "active"
+                        or name in _TERMINAL_BINDING_TOOLS):
+                    engagement = rec
 
         # Lazy import so monkeypatching `tools.engagement_var` in tests works.
         from tools import engagement_var

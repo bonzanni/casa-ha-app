@@ -329,21 +329,61 @@ def _sweep_retirable_gates() -> None:
 # ---------------------------------------------------------------------------
 
 
+def _engagement_auth_error(
+    engagement_registry: Any, engagement_id: str | None, body: dict,
+) -> str | None:
+    """#335: verify the body's ``engagement_token`` against the record.
+
+    Every /internal/channel/* route acts with the named engagement's
+    authority (posts to its topic, answers/cancels its questions, delivers
+    verdicts into its broker scope), and the internal socket is reachable
+    from any in-container process — so the client-supplied id alone must
+    never be honored. Returns ``"engagement_auth_failed"`` when a record
+    exists and the token is missing/mismatched (fail-closed, including for
+    a token-less record); ``None`` when the claim is authenticated OR the
+    record is unknown (the caller's own ``unknown_engagement`` handling
+    stays authoritative for that case).
+    """
+    if not engagement_id:
+        return None
+    try:
+        rec = engagement_registry.get(engagement_id)
+    except Exception:  # noqa: BLE001
+        rec = None
+    if rec is None:
+        return None
+    from internal_handlers import engagement_auth_ok
+    if not engagement_auth_ok(rec, body.get("engagement_token")):
+        logger.warning(
+            "/internal/channel/*: rejected engagement id claim for %s: "
+            "missing/invalid engagement token", str(engagement_id)[:8],
+        )
+        return "engagement_auth_failed"
+    return None
+
+
 def _resolve_topic(
     engagement_registry: Any, engagement_id: str | None,
+    body: dict | None = None,
 ) -> tuple[int | None, str | None]:
     """Resolve ``engagement_id`` → ``topic_id`` via the registry.
 
     Returns ``(topic_id, None)`` on success or ``(None, error_code)`` on
     failure. Error codes: ``missing_engagement_id`` (missing/falsy id),
     ``unknown_engagement`` (registry.get returned None),
-    ``no_topic_bound`` (record had no ``topic_id``).
+    ``no_topic_bound`` (record had no ``topic_id``),
+    ``engagement_auth_failed`` (#335 — ``body`` supplied and its
+    ``engagement_token`` does not authenticate the record).
     """
     if not engagement_id:
         return None, "missing_engagement_id"
     rec = engagement_registry.get(engagement_id)
     if rec is None:
         return None, "unknown_engagement"
+    if body is not None:
+        err = _engagement_auth_error(engagement_registry, engagement_id, body)
+        if err is not None:
+            return None, err
     topic_id = getattr(rec, "topic_id", None)
     if topic_id is None:
         return None, "no_topic_bound"
@@ -377,7 +417,7 @@ def _make_send_to_topic(
             return web.json_response({"ok": False, "error": "bad_json"})
 
         engagement_id = body.get("engagement_id")
-        topic_id, err = _resolve_topic(engagement_registry, engagement_id)
+        topic_id, err = _resolve_topic(engagement_registry, engagement_id, body)
         if err is not None:
             return web.json_response({"ok": False, "error": err})
 
@@ -514,7 +554,7 @@ def _make_post_inline_keyboard(
             return web.json_response({"ok": False, "error": "bad_json"})
 
         engagement_id = body.get("engagement_id")
-        topic_id, err = _resolve_topic(engagement_registry, engagement_id)
+        topic_id, err = _resolve_topic(engagement_registry, engagement_id, body)
         if err is not None:
             return web.json_response({"ok": False, "error": err})
 
@@ -627,6 +667,11 @@ def _make_permission_verdict(engagement_registry: Any) -> Handler:
             return web.json_response(
                 {"ok": False, "error": "unknown_engagement"},
             )
+        # #335: a verdict delivered into another engagement's broker scope is
+        # an approval forgery — the id claim must be authenticated.
+        auth_err = _engagement_auth_error(engagement_registry, eng_id, body)
+        if auth_err is not None:
+            return web.json_response({"ok": False, "error": auth_err})
 
         option_index = 0 if verdict == "allow" else 1
         result = BROKER.deliver(
@@ -1472,6 +1517,13 @@ def _make_ask(
         request_id = body.get("request_id")
         if not eng_id or not request_id:
             return web.json_response({"ok": False, "error": "invalid_args"})
+
+        # #335: an ask posted under another engagement's identity phishes the
+        # operator in that engagement's topic AND routes the answer to the
+        # forger — authenticate the id claim before any broker/keyboard work.
+        auth_err = _engagement_auth_error(engagement_registry, eng_id, body)
+        if auth_err is not None:
+            return web.json_response({"ok": False, "error": auth_err})
 
         validated = _validate_ask_args(body)
         if validated is None:
@@ -2602,7 +2654,7 @@ def _ask_outcome_response(outcome: dict, options: list) -> web.Response:
     return web.json_response({"ok": False, "error": "delivery_failed"})
 
 
-def _make_ask_cancel() -> Handler:
+def _make_ask_cancel(engagement_registry: Any) -> Handler:
     """POST /internal/channel/ask_cancel — explicit caller cancellation.
 
     v0.75.0 (W5): the `ask` MCP tool's ``finally`` calls this on genuine
@@ -2640,6 +2692,12 @@ def _make_ask_cancel() -> Handler:
         request_id = body.get("request_id")
         if not eng_id or not request_id:
             return web.json_response({"ok": False, "error": "invalid_args"})
+
+        # #335: cancelling another engagement's live question kills a
+        # legitimate operator interaction — authenticate the id claim first.
+        auth_err = _engagement_auth_error(engagement_registry, eng_id, body)
+        if auth_err is not None:
+            return web.json_response({"ok": False, "error": auth_err})
 
         # A5 review, Finding 1: sweep prior asks' currently-retirable gates
         # here too — ``ask_cancel`` is the other entry point that calls
@@ -2679,7 +2737,7 @@ def _make_ask_cancel() -> Handler:
     return handler
 
 
-def _make_update_state(telegram_channel: Any) -> Handler:
+def _make_update_state(telegram_channel: Any, engagement_registry: Any) -> Handler:
     """POST /internal/channel/update_state — channel server → casa-main.
 
     Phase 2 (Task 23): the per-engagement channel server flips the topic
@@ -2706,6 +2764,12 @@ def _make_update_state(telegram_channel: Any) -> Handler:
         new_state = body.get("new_state")
         if not eng_id or not new_state:
             return web.json_response({"ok": False, "error": "bad_params"})
+
+        # #335: flipping another engagement's topic state is a (mild) spoof —
+        # same authenticated-id rule as every other route here.
+        auth_err = _engagement_auth_error(engagement_registry, eng_id, body)
+        if auth_err is not None:
+            return web.json_response({"ok": False, "error": auth_err})
 
         try:
             await telegram_channel.update_topic_state(
@@ -2752,12 +2816,15 @@ def _make_channel_handlers(
         ),
         "/internal/channel/update_state": _make_update_state(
             telegram_channel=telegram_channel,
+            engagement_registry=engagement_registry,
         ),
         "/internal/channel/ask": _make_ask(
             telegram_channel=telegram_channel,
             engagement_registry=engagement_registry,
         ),
-        "/internal/channel/ask_cancel": _make_ask_cancel(),
+        "/internal/channel/ask_cancel": _make_ask_cancel(
+            engagement_registry=engagement_registry,
+        ),
     }
 
 

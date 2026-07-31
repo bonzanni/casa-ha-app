@@ -44,6 +44,12 @@ logger = logging.getLogger(__name__)
 
 ENGAGEMENT_ID: str | None = None
 INTERNAL_SOCKET: str = os.environ.get("CASA_INTERNAL_SOCKET", "/run/casa/internal.sock")
+# #335: per-engagement secret, injected via the workspace .mcp.json "env"
+# block. Sent alongside engagement_id in every internal POST — casa-main
+# verifies it against the record before acting with the engagement's
+# authority. Absent (None) only in pre-upgrade workspaces, whose bodies the
+# handlers then reject fail-closed.
+ENGAGEMENT_TOKEN: str | None = os.environ.get("CASA_ENGAGEMENT_TOKEN")
 
 INSTRUCTIONS = (
     "Casa engagement channel (Phase 1 skeleton). The full operator-facing "
@@ -150,6 +156,9 @@ async def _internal_post(
     body = dict(payload)
     if "engagement_id" not in body and ENGAGEMENT_ID is not None:
         body["engagement_id"] = ENGAGEMENT_ID
+    # #335: the id claim is only honored with the matching workspace secret.
+    if "engagement_token" not in body and ENGAGEMENT_TOKEN is not None:
+        body["engagement_token"] = ENGAGEMENT_TOKEN
 
     connector = UnixConnector(path=INTERNAL_SOCKET)
     session_kwargs: dict[str, Any] = {"connector": connector}
@@ -395,16 +404,21 @@ def main(argv: list[str] | None = None) -> None:
 # Test-only seam: populate module state directly without entering run loop.
 # ---------------------------------------------------------------------------
 
-def _configure_for_test(engagement_id: str, *, internal_socket: str | None = None) -> None:
+def _configure_for_test(
+    engagement_id: str, *, internal_socket: str | None = None,
+    engagement_token: str | None = None,
+) -> None:
     """Test-only seam — populate module state directly without entering run-loop.
 
     Production code never calls this; tests use it after re-importing the module
     with a fresh argv patch.
     """
-    global ENGAGEMENT_ID, INTERNAL_SOCKET
+    global ENGAGEMENT_ID, INTERNAL_SOCKET, ENGAGEMENT_TOKEN
     ENGAGEMENT_ID = engagement_id
     if internal_socket is not None:
         INTERNAL_SOCKET = internal_socket
+    if engagement_token is not None:
+        ENGAGEMENT_TOKEN = engagement_token
 
 
 if __name__ == "__main__":  # pragma: no cover

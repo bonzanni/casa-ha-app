@@ -198,10 +198,55 @@ def render_log_run_script(*, engagement_id: str) -> str:
     )
 
 
+def write_workspace_mcp_json(
+    ws_dir: str,
+    *,
+    engagement_id: str,
+    engagement_auth_token: str,
+    casa_framework_mcp_url: str,
+) -> None:
+    """Write ``<ws>/.mcp.json`` from the engagement's identity + credential.
+
+    #335: the id header alone must never confer authority, so every entry
+    carries the per-engagement ``auth_token`` — as an HTTP header for the
+    casa-framework bridge, and as an env var for the stdio channel server
+    (which posts it in each /internal/channel/* body). Called at provisioning
+    AND at boot replay (before the CLI is respawned), so a pre-upgrade
+    workspace picks up the token the registry backfilled onto its record.
+
+    E-12 (v0.37.0): casa-engagement-channel is the per-engagement stdio
+    channel server for operator UX (reply, ask, permission relay).
+    """
+    mcp_config = {"mcpServers": {
+        "casa-framework": {
+            "type": "http",
+            "url": casa_framework_mcp_url,
+            "headers": {
+                "X-Casa-Engagement-Id": engagement_id,
+                "X-Casa-Engagement-Token": engagement_auth_token,
+            },
+        },
+        "casa-engagement-channel": {
+            "command": "/opt/casa/venv/bin/python",
+            "args": [
+                "/opt/casa/channels/casa_engagement_channel.py",
+                "--engagement-id", engagement_id,
+            ],
+            "env": {
+                "CASA_INTERNAL_SOCKET": "/run/casa/internal.sock",
+                "CASA_ENGAGEMENT_TOKEN": engagement_auth_token,
+            },
+        },
+    }}
+    (Path(ws_dir) / ".mcp.json").write_text(
+        json.dumps(mcp_config, indent=2), encoding="utf-8")
+
+
 async def provision_workspace(
     *,
     engagements_root: str,
     engagement_id: str,
+    engagement_auth_token: str,
     defn,                                    # ExecutorDefinition
     task: str,
     context: str,
@@ -313,28 +358,15 @@ async def provision_workspace(
     # L-1 (v0.34.2): hoisted outside the if/else so template path also gets it.
     (ws / ".home" / ".claude" / "plugins").mkdir(parents=True)
 
-    # 2. .mcp.json — point at Casa's MCP HTTP bridge with engagement id header.
-    mcp_config = {"mcpServers": {
-        "casa-framework": {
-            "type": "http",
-            "url": casa_framework_mcp_url,
-            "headers": {"X-Casa-Engagement-Id": engagement_id},
-        },
-        # E-12 (v0.37.0): per-engagement stdio channel server for
-        # operator UX (reply, ask, set_progress, permission relay).
-        # Spec: docs/superpowers/specs/2026-05-12-e12-claude_code-channels.md.
-        "casa-engagement-channel": {
-            "command": "/opt/casa/venv/bin/python",
-            "args": [
-                "/opt/casa/channels/casa_engagement_channel.py",
-                "--engagement-id", engagement_id,
-            ],
-            "env": {
-                "CASA_INTERNAL_SOCKET": "/run/casa/internal.sock",
-            },
-        },
-    }}
-    (ws / ".mcp.json").write_text(json.dumps(mcp_config, indent=2), encoding="utf-8")
+    # 2. .mcp.json — point at Casa's MCP HTTP bridge with the engagement id
+    # + per-engagement auth token (#335). Written via the same renderer boot
+    # replay uses to refresh a resumed workspace's credential.
+    write_workspace_mcp_json(
+        str(ws),
+        engagement_id=engagement_id,
+        engagement_auth_token=engagement_auth_token,
+        casa_framework_mcp_url=casa_framework_mcp_url,
+    )
 
     # 3. Named FIFO for stdin.
     fifo_path = ws / "stdin.fifo"

@@ -20,6 +20,7 @@ import asyncio
 import json
 import logging
 import os
+import secrets
 import time
 import uuid
 from dataclasses import dataclass, field
@@ -174,6 +175,13 @@ class EngagementRecord:
     sdk_session_id: str | None
     origin: dict[str, Any]
     task: str
+    # #335: per-engagement secret authenticating this engagement's id on the
+    # internal surfaces (MCP tools/call + /internal/channel/*). Generated at
+    # ``create()``, backfilled at ``load()`` for pre-upgrade rows, provisioned
+    # ONLY into this engagement's own workspace ``.mcp.json`` — the id alone
+    # is endpoint-visible and must never confer authority. Persisted so a
+    # restart-resumed engagement's existing workspace credential stays valid.
+    auth_token: str = ""
     # E-12 (v0.37.0): channel-side state for in-place edits across restarts.
     pinned_message_id: int | None = None
     progress_message_id: int | None = None
@@ -323,6 +331,7 @@ class EngagementRegistry:
                     sdk_session_id=row.get("sdk_session_id"),
                     origin=dict(row.get("origin") or {}),
                     task=row.get("task", ""),
+                    auth_token=row.get("auth_token") or "",
                     pinned_message_id=row.get("pinned_message_id"),
                     progress_message_id=row.get("progress_message_id"),
                     current_state_emoji=row.get("current_state_emoji"),
@@ -353,6 +362,16 @@ class EngagementRegistry:
                     "boot reconcile: engagement %s active→idle "
                     "(no driver survives a restart)", rec.id[:8],
                 )
+            # #335 boot backfill: a pre-upgrade row has no auth token. Every
+            # in-memory record must carry one (the internal surfaces fail
+            # CLOSED on a token-less record), so mint it here; boot replay
+            # then rewrites the workspace .mcp.json from the record before
+            # the engagement's CLI is respawned, keeping resumed engagements
+            # working. Uniform for terminal tombstones too — cheap, and no
+            # record class is left permanently unbindable.
+            if not rec.auth_token:
+                rec.auth_token = secrets.token_urlsafe(32)
+                reconciled_any = True
             self._records[rec.id] = rec
             if rec.topic_id is not None:
                 self._topic_index[rec.topic_id] = rec.id
@@ -465,6 +484,7 @@ class EngagementRegistry:
                 "sdk_session_id": rec.sdk_session_id,
                 "origin": _persistable_origin(rec.origin),
                 "task": rec.task,
+                "auth_token": rec.auth_token,
                 "pinned_message_id": rec.pinned_message_id,
                 "progress_message_id": rec.progress_message_id,
                 "current_state_emoji": rec.current_state_emoji,
@@ -522,6 +542,10 @@ class EngagementRegistry:
             sdk_session_id=None,
             origin=dict(origin),
             task=task,
+            # #335: minted here, before first persist, so the workspace
+            # provisioner can bake it into .mcp.json and every internal
+            # surface can verify id claims against it.
+            auth_token=secrets.token_urlsafe(32),
             tools_allowed=tuple(tools_allowed),
             permission_mode=permission_mode or "acceptEdits",
             plugin_artifacts=tuple(dict(pa) for pa in plugin_artifacts),

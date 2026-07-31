@@ -1,5 +1,5 @@
 ---
-last_reviewed: 2026-07-30
+last_reviewed: 2026-08-01
 ---
 
 # The MCP surface and the tool boundary
@@ -41,6 +41,21 @@ authentication, not the container wall.
 Individual tools may still refuse individual operations. Those are tool-local gates, not a
 universal authorization check.
 
+**An engagement identity is authenticated, not merely claimed.** A tool call that names an
+engagement id binds that engagement's record — and with it the record-derived role that
+tool-local gates authorize against — only when it also presents the per-engagement secret
+token minted at record creation and provisioned into that engagement's own workspace. The id
+alone is deliberately treated as public information (it appears in the workspace MCP
+configuration, in logs, and on shared loopback endpoints): a known id with a missing or
+mismatched token is rejected outright rather than downgraded to an unauthenticated call, on
+every path that resolves the record — the internal socket handler, the in-process fallback
+twin, and the engagement-channel routes that act on a record's topic and questions. An id
+the registry does not know still dispatches unbound, so a stale workspace gets an honest
+`not_in_engagement` from the tool rather than an authentication error. The token is a
+same-container secret, not hard process isolation — a root process that can read another
+workspace's files can still steal it; what it removes is identity forgery from knowing an
+id alone.
+
 **The bridge runs as its own supervised service** so that the bridge *connection* survives a
 restart of the main application. Its own client is a thin shell shim, and the failure
 semantics are two-layered and opposite: the shim **fails open** — when its own HTTP call to
@@ -75,6 +90,14 @@ they are contained by Home Assistant's authentication rather than by this socket
 
 What it does not cover: being advertised is not being permitted. The HTTP advertisement
 describes what the bridge can route, not what any particular agent may invoke.
+
+**INV-MCP-004**: An engagement-id claim binds an engagement record only together with that record's per-engagement auth token; a known id with a missing or mismatched token is rejected without invoking the tool.
+
+The terminal-binding allowlist is inside this rule, not an exception to it: a terminal
+record still binds for a completion retry only when the token matches.
+
+What it does not cover: an id the registry does not know — that call dispatches with no
+engagement bound (unchanged), and the tool answers for itself.
 
 ## Failure behavior
 

@@ -156,6 +156,11 @@ def _build_mcp_handler(
                 "name": name,
                 "arguments": arguments,
                 "engagement_id": eng_id,
+                # #335: the per-engagement secret provisioned into the
+                # workspace .mcp.json alongside the id — casa-main verifies
+                # it against the record before binding any authority.
+                "engagement_token": request.headers.get(
+                    "X-Casa-Engagement-Token"),
             }
             try:
                 _status, result = await forward_to_internal(

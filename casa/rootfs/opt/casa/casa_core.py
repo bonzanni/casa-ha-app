@@ -283,8 +283,10 @@ def _make_public_mcp_fallback_handler(
             return _jsonrpc_ok(req_id, {})
 
         if method == "tools/call":
-            # Translate JSON-RPC params + X-Casa-Engagement-Id header into the
-            # internal-handler body shape, then dispatch in-process.
+            # Translate JSON-RPC params + X-Casa-Engagement-Id/-Token headers
+            # into the internal-handler body shape, then dispatch in-process.
+            # #335: the token header is what actually authenticates the id
+            # claim (verified against the record in the dispatcher).
             name = params.get("name")
             arguments = params.get("arguments") or {}
             eng_id = request.headers.get("X-Casa-Engagement-Id")
@@ -292,6 +294,8 @@ def _make_public_mcp_fallback_handler(
                 "name": name,
                 "arguments": arguments,
                 "engagement_id": eng_id,
+                "engagement_token": request.headers.get(
+                    "X-Casa-Engagement-Token"),
             }
             result = await _dispatch_internal_tools_call(
                 body=inner_body,
@@ -368,17 +372,29 @@ async def _dispatch_internal_tools_call(
 
     # v0.74.2: terminal binding for the emit_completion idempotency path —
     # mirrors internal_handlers (see _TERMINAL_BINDING_TOOLS there).
-    from internal_handlers import _TERMINAL_BINDING_TOOLS
+    # #335: same token gate as the internal handler — an id claim without the
+    # record's auth token is an explicit reject, never an unauthenticated
+    # fallthrough.
+    from internal_handlers import _TERMINAL_BINDING_TOOLS, engagement_auth_ok
     engagement = None
     if eng_id:
         try:
             rec = engagement_registry.get(eng_id)
         except Exception:  # noqa: BLE001
             rec = None
-        if rec is not None and (
-                getattr(rec, "status", None) == "active"
-                or name in _TERMINAL_BINDING_TOOLS):
-            engagement = rec
+        if rec is not None:
+            if not engagement_auth_ok(rec, body.get("engagement_token")):
+                logger.warning(
+                    "public /mcp/casa-framework fallback: rejected engagement "
+                    "id claim for %s (tool=%r): missing/invalid engagement "
+                    "token", str(eng_id)[:8], name,
+                )
+                return {"error": {"code": -32003,
+                                  "message": "engagement_auth_failed: "
+                                             "invalid engagement token"}}
+            if (getattr(rec, "status", None) == "active"
+                    or name in _TERMINAL_BINDING_TOOLS):
+                engagement = rec
 
     from tools import engagement_var
     token = engagement_var.set(engagement)
@@ -428,6 +444,7 @@ async def replay_undergoing_engagements(
     from drivers import s6_rc
     from drivers.workspace import (
         refresh_claude_md, render_log_run_script, render_run_script,
+        write_workspace_mcp_json,
     )
 
     undergoing = [
@@ -558,6 +575,33 @@ async def replay_undergoing_engagements(
         # compile/start below.
         for rec in undergoing:
             try:
+                # #335: re-write the workspace .mcp.json from the RECORD's
+                # auth token before anything else — placed, like the CLAUDE.md
+                # refresh below, BEFORE the service_pair_complete fast-path
+                # continue (an ordinary restart takes that continue). This is
+                # what keeps a pre-upgrade workspace resumable: load()
+                # backfilled a token onto its record, and the respawned CLI
+                # reads the refreshed credential from disk. Fail-closed on a
+                # write failure — a CLI running with a stale/absent token
+                # would have every tool call rejected (a zombie engagement).
+                _ws_dir = os.path.join(engagements_root, rec.id)
+                if os.path.isdir(_ws_dir):
+                    try:
+                        write_workspace_mcp_json(
+                            _ws_dir,
+                            engagement_id=rec.id,
+                            engagement_auth_token=rec.auth_token,
+                            casa_framework_mcp_url=getattr(
+                                driver, "_casa_framework_mcp_url",
+                                "http://127.0.0.1:8100/mcp/casa-framework",
+                            ),
+                        )
+                    except Exception as exc:  # noqa: BLE001 — fail-closed
+                        await _refuse_brief_resume(
+                            rec, f".mcp.json refresh failed: {exc}",
+                        )
+                        continue
+
                 # W3 (r8-B5/r9-B5): re-render the workspace CLAUDE.md from the
                 # VERBATIM origin["brief"] for EVERY resumed brief-bearing
                 # engagement — placed at the TOP of the loop, BEFORE the

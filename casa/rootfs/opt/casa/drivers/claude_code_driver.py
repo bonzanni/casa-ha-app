@@ -1026,6 +1026,9 @@ class ClaudeCodeDriver(DriverProtocol):
                 ws = await provision_workspace(
                     engagements_root=self._engagements_root,
                     engagement_id=engagement.id,
+                    # #335: bake the record's secret into .mcp.json — the id
+                    # header alone no longer binds any authority.
+                    engagement_auth_token=engagement.auth_token,
                     defn=defn,
                     # W3 (Task 8): the CLAUDE.md {task} carries the full brief
                     # envelope (acceptance criteria + verbatim process
