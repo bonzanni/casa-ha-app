@@ -361,10 +361,10 @@
   related: [architecture/agent-taxonomy.md, architecture/turn-loop.md]
   defines_invariants: [INV-PERS-001, INV-PERS-002, INV-PERS-003, INV-PERS-004]
   invariant_tests:
-    INV-PERS-001: [tests/PINNING-TEST-MISSING]
-    INV-PERS-002: [tests/PINNING-TEST-MISSING]
-    INV-PERS-003: [tests/PINNING-TEST-MISSING]
-    INV-PERS-004: [tests/PINNING-TEST-MISSING]
+    INV-PERS-001: [tests/test_tools_specialist_options.py::test_build_specialist_options_prefers_compiled_bundle_when_present]
+    INV-PERS-002: [tests/test_persona_pack.py::test_pin_inv_pers_002_capability_claims_are_not_semantically_validated]
+    INV-PERS-003: [tests/test_phase_a_compiler_integration.py::test_missing_override_persona_blob_at_reload_raises_load_error]
+    INV-PERS-004: [tests/test_prompt_compiler.py::test_compiler_order_and_restricted_projection]
 
 - doc: architecture/home-assistant-control.md
   summary: How an agent reads and changes the state of the house — and why the limits on that live in Home Assistant, not here.
@@ -379,9 +379,9 @@
   related: [architecture/mcp-and-tools.md, architecture/overview.md]
   defines_invariants: [INV-HA-001, INV-HA-002, INV-HA-003]
   invariant_tests:
-    INV-HA-001: [tests/PINNING-TEST-MISSING]
-    INV-HA-002: [tests/PINNING-TEST-MISSING]
-    INV-HA-003: [tests/PINNING-TEST-MISSING]
+    INV-HA-001: [tests/test_ha_mcp_facade.py::test_pin_inv_ha_001_action_arguments_pass_through_unchanged]
+    INV-HA-002: [tests/test_ha_mcp_url_override.py::test_tina_facade_initial_discovery_failure_is_sanitized_degraded]
+    INV-HA-003: [tests/test_ha_mcp_facade.py::test_pin_inv_ha_003_tool_cache_has_no_time_expiry]
 
 - doc: architecture/observability.md
   summary: How work is traced across components, what reaches a log, and what the health surfaces actually assert.
@@ -398,9 +398,9 @@
   related: [architecture/http-surface.md, architecture/overview.md]
   defines_invariants: [INV-OBS-001, INV-OBS-002, INV-OBS-003]
   invariant_tests:
-    INV-OBS-001: [tests/PINNING-TEST-MISSING]
-    INV-OBS-002: [tests/PINNING-TEST-MISSING]
-    INV-OBS-003: [tests/PINNING-TEST-MISSING]
+    INV-OBS-001: [tests/test_pin_g5_invariants.py::test_pin_inv_obs_001_header_cid_validated_payload_cid_not]
+    INV-OBS-002: [tests/test_pin_g5_invariants.py::test_pin_inv_obs_002_redaction_covers_message_and_args_only]
+    INV-OBS-003: [tests/test_pin_g5_invariants.py::test_pin_inv_obs_003_healthz_is_fixed_and_reads_nothing]
 
 - doc: architecture/persistent-state.md
   summary: What the application writes to disk, how it treats a missing or corrupt file, and what that means for recovery.
@@ -419,10 +419,10 @@
   related: [architecture/configuration.md, architecture/engagements.md, architecture/memory.md]
   defines_invariants: [INV-STATE-001, INV-STATE-002, INV-STATE-003, INV-STATE-004]
   invariant_tests:
-    INV-STATE-001: [tests/PINNING-TEST-MISSING]
-    INV-STATE-002: [tests/PINNING-TEST-MISSING]
-    INV-STATE-003: [tests/PINNING-TEST-MISSING]
-    INV-STATE-004: [tests/PINNING-TEST-MISSING]
+    INV-STATE-001: [tests/test_pin_g5_invariants.py::test_pin_inv_state_001_only_whitelist_admitted]
+    INV-STATE-002: [tests/test_pin_g5_invariants.py::test_pin_inv_state_002_missing_is_empty_corrupt_is_per_loader]
+    INV-STATE-003: [tests/test_topic_ledger.py::test_append_writes_through_atomic_write_json]
+    INV-STATE-004: [tests/test_job_registry.py::test_failed_snapshot_write_does_not_publish_memory_mutation]
 
 - doc: architecture/eval-framework.md
   summary: The evaluation scaffolding — and the fact that its registry ships empty.
@@ -435,8 +435,8 @@
   related: [contributing/doc-contract.md]
   defines_invariants: [INV-EVAL-001, INV-EVAL-002]
   invariant_tests:
-    INV-EVAL-001: [tests/PINNING-TEST-MISSING]
-    INV-EVAL-002: [tests/PINNING-TEST-MISSING]
+    INV-EVAL-001: [tests/test_pin_g5_invariants.py::test_pin_inv_eval_001_shipped_registry_is_empty]
+    INV-EVAL-002: [tests/test_pin_g5_invariants.py::test_pin_inv_eval_002_sweep_forwards_caller_selected_value]
 
 - doc: architecture/turn-loop.md
   summary: How one inbound message becomes one agent turn, and what bounds it.

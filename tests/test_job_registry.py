@@ -523,6 +523,7 @@ async def test_playing_lease_lapse_requeues_for_at_least_once_delivery(tmp_path)
 async def test_failed_snapshot_write_does_not_publish_memory_mutation(
     tmp_path, monkeypatch,
 ):
+    """Pins INV-STATE-004. Red case demonstrated: publishing the in-memory jobs before the snapshot write fails this test."""
     import job_registry as job_registry_module
 
     registry = await loaded_registry(tmp_path, make_job())

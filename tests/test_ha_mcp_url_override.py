@@ -336,6 +336,7 @@ async def test_tina_facade_requires_token_and_ha_voice_butler(
 async def test_tina_facade_initial_discovery_failure_is_sanitized_degraded(
     recording_facade, caplog,
 ):
+    """Pins INV-HA-002. Red case demonstrated: unregistering the raw homeassistant entry in the facade-failure handler fails this test."""
     from casa_core import _start_tina_ha_facade
     from mcp_registry import McpServerRegistry
 

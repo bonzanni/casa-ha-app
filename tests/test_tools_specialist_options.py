@@ -6,6 +6,7 @@ legacy cfg.system_prompt (_compose_prompt's output)."""
 
 
 def test_build_specialist_options_prefers_compiled_bundle_when_present() -> None:
+    """Pins INV-PERS-001. Red case demonstrated: forcing the no-bundle branch (compiled_bundle -> None) fails this test."""
     from tools import _build_specialist_options
     from prompt_compiler import CompiledPromptBundle, CompiledProjection
 

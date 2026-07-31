@@ -1243,3 +1243,23 @@ def test_select_markdown_sections_omits_unselected_sections() -> None:
     assert "First section body text." in result
     assert "Second section body text." not in result
     assert "Third section body text." not in result
+
+
+def test_pin_inv_pers_002_capability_claims_are_not_semantically_validated(tmp_path):
+    """Pins INV-PERS-002: persona validation is structural; a prose claim
+    about capability is not checked against what the role can do.
+
+    Red case demonstrated: adding a capability-claim rejection after the
+    schema validation in load_persona_pack fails this test.
+    """
+    pack = write_pack(tmp_path)
+    claim = "I can invoke the imaginary privileged tool."
+    (pack / "persona.md").write_text(
+        core().replace("No fake intimacy or authority.", claim),
+        encoding="utf-8",
+    )
+    manifest_path = tmp_path / "manifest.json"
+    write_valid_manifest(pack, manifest_path)
+
+    loaded = load_persona_pack(pack, manifest_path)
+    assert claim in loaded.markdown

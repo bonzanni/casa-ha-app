@@ -190,7 +190,10 @@ def test_missing_override_persona_blob_at_reload_raises_load_error(tmp_path) -> 
     active is returned unchanged. agent_loader._activate_resident_binding then
     reloads that SAME now-missing persona a second time, outside reconcile's
     try/except ValueError -> LoadError translation. Before the fix that second
-    load escaped as a raw ValueError; it must be a LoadError instead."""
+    load escaped as a raw ValueError; it must be a LoadError instead.
+
+    Pins INV-PERS-003. Red case demonstrated: skipping _activate_resident_binding in resident loading fails this test.
+    """
     from persona_pack import PersonaManifest, PersonaPack
     from personality_binding import InstanceDir, InstanceTuple, materialize_override_binding
     from agent_loader import LoadError, load_agent_from_dir
