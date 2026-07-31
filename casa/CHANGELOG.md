@@ -33,11 +33,16 @@ trusted for *who it claimed to be* rather than *who it proved to be*:
   configured `telegram_chat_id` is the operator; any other sender is
   recorded under its own `telegram:<id>` identity, reads at public clearance
   only, and the agent is told the sender is not the operator. This holds for
-  both ways a turn starts — a message and a button tap — and an engagement
-  started by a non-operator inherits that lower clearance instead of reading
-  the operator's private memory through its own tools. With the option
-  empty, no sender is treated as the operator — configure your chat id to
-  keep operator attribution.
+  both ways a turn starts — a message and a button tap — and it follows the
+  turn outward: a specialist it delegates to, an engagement it starts (and
+  any engagement that one spawns), and the prior-engagement memory injected
+  into an executor's prompt all read at that same lower clearance instead of
+  the operator's private tier. With the option empty, no sender is treated
+  as the operator — set your chat id to keep operator attribution.
+  Two limits worth knowing: an engagement carries the clearance of whoever
+  *started* it, so a second person messaging into an existing engagement's
+  topic is answered at the creator's clearance; and a non-operator can still
+  answer their own protected-tool confirmation prompt (#368).
 - **A chatty memory-sensitivity classification can no longer leak a fact
   downward** (#350). The tier classifier's reply parser used to accept the
   first tier word found anywhere in the reply — so "this is not public; it

@@ -155,3 +155,36 @@ async def test_unavailable_recall_returns_unavailable_not_unknown(tmp_path, monk
     # The tool description enumerates all three statuses.
     for status in ("status=ok", "status=unknown", "status=unavailable"):
         assert status in query_engager.description
+
+
+async def test_non_operator_engagement_queries_at_public_only(tmp_path, monkeypatch):
+    """#336 (Sol, review r3): query_engager reads the engager-side context on
+    behalf of THIS engagement, so it is filtered at the clearance of the turn
+    that created it. Red case: dropping origin_route/origin_clearance from the
+    delegated_recall call restores channel-keyed private clearance and every
+    tier becomes readable to a non-operator's engagement."""
+    from engagement_registry import EngagementRegistry
+    from tools import query_engager, engagement_var
+
+    reg = EngagementRegistry(tombstone_path=str(tmp_path / "e.json"), bus=None)
+    rec = await reg.create(
+        kind="specialist", role_or_type="finance", driver="in_casa",
+        task="t", origin={"role": "assistant", "channel": "telegram",
+                          "chat_id": "c1",
+                          "_origin_route": "telegram",
+                          "_origin_clearance": "public"},
+        topic_id=42,
+    )
+    sem = _Sem()
+    await _setup(reg, sem, monkeypatch)
+
+    token = engagement_var.set(rec)
+    try:
+        await query_engager.handler(
+            {"question": "what is the alarm code?", "max_tokens": 500})
+    finally:
+        engagement_var.reset(token)
+
+    c = sem.recall_calls[0]
+    assert c["clearance"] == "public"
+    assert c["tags"] == ["public"]

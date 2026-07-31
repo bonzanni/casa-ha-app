@@ -25,7 +25,7 @@ Casa runs always-on AI agents inside your Home Assistant instance. The primary a
 | Option | Description |
 |--------|-------------|
 | `telegram_bot_token` | Telegram bot token from @BotFather. Enables the Telegram channel. |
-| `telegram_chat_id` | Telegram chat ID to restrict messages to. Leave empty to accept all chats. This id is also the **operator identity**: only the sender whose Telegram user id matches it is attributed as the operator and reads memory at private clearance — any other accepted sender is recorded under its own `telegram:<id>` identity and reads at public clearance only. With the option empty (accept-all) no sender is the operator. |
+| `telegram_chat_id` | Telegram chat ID to restrict messages to. Leave empty to accept all chats. **Setting it is a security control**, not just a filter: this id is the operator identity, so only the sender whose Telegram user id matches it is attributed as the operator and reads memory at private clearance — any other accepted sender is recorded under its own `telegram:<id>` identity and reads at public clearance only, as does any engagement they start. With the option empty (accept-all) no sender is the operator, and note that a non-operator sender can still answer their own protected-tool confirmation prompt. Set this id unless you specifically want an open bot. |
 | `telegram_engagement_supergroup_id` | Chat ID of the dedicated Telegram forum supergroup used for interactive engagements (Tier 2 Specialist interactive mode; Tier 3 Executor types, Plan 3+). Must be a negative integer. Leave at 0 to disable engagements. |
 
 ### Optional -- Memory

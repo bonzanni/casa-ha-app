@@ -1,5 +1,5 @@
 ---
-last_reviewed: 2026-07-30
+last_reviewed: 2026-08-01
 ---
 
 # Plugins
@@ -107,6 +107,14 @@ What it does not cover: unprotected plugin tools, and the executor path entirely
 "proceeds by consuming" applies to direct resident calls and ephemerally delegated
 specialists — a call whose provenance is an interactive *engagement* is denied outright,
 before any grant lookup: protected tools are not available inside engagements at all.
+
+It also does not establish *who* approved. The grant binds the operator id taken from the
+requesting turn, and the confirmation keyboard is answerable only by that same person — so
+on a Telegram deployment configured with an operator chat id, the approver is the operator.
+With that option left empty ("accept all chats") the requesting sender can be anyone, and
+they answer their own challenge: the gate confirms a human decided, not that the *household
+operator* decided. Read this invariant as "one approval authorises one action", not as
+operator authentication.
 
 **INV-PLUG-005**: Grants exist only in process memory; a restart revokes every one of them.
 

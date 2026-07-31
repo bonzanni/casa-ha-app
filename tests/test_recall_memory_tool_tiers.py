@@ -230,3 +230,76 @@ async def test_restricted_webhook_recall_strips_identity(monkeypatch):
     assert "Tina" not in payload["memory"]
     assert "resident:butler" not in payload["memory"]
     assert "casa-source-" not in json.dumps(payload)
+
+
+# ---------------------------------------------------------------------------
+# #336 — per-sender clearance reaches the actual recall, including inside an
+# engagement (Sol/Terra r3: the earlier pin only exercised the marker helper).
+# ---------------------------------------------------------------------------
+
+
+class _Rec:
+    def __init__(self, origin, eid="e" * 32):
+        self.id = eid
+        self.origin = origin
+        self.status = "active"
+
+
+async def test_non_operator_turn_recalls_public_only(monkeypatch):
+    """A stranger's own turn: the stamped markers gate the real recall call."""
+    sem = _RecordingSem()
+    monkeypatch.setattr(agent_mod, "active_semantic_memory", sem, raising=False)
+    token = agent_mod.origin_var.set({
+        "role": "assistant", "channel": "telegram",
+        "_origin_route": "telegram", "_origin_clearance": "public"})
+    try:
+        await tools.recall_memory.handler({"query": "salary"})
+    finally:
+        agent_mod.origin_var.reset(token)
+    assert sem.calls[0]["clearance"] == "public"
+    assert sem.calls[0]["tags"] == ["public"]
+
+
+async def test_engagement_started_by_a_non_operator_recalls_public_only(monkeypatch):
+    """The engagement path: tool calls arrive with NO ambient origin, so the
+    clearance must come from the engagement's own record. Red case: reverting
+    the record fallback in ``_origin_clearance_markers`` yields the telegram
+    channel default (private) and every tier becomes readable."""
+    sem = _RecordingSem()
+    monkeypatch.setattr(agent_mod, "active_semantic_memory", sem, raising=False)
+    eng = tools.engagement_var.set(_Rec(
+        {"channel": "telegram", "_origin_route": "telegram",
+         "_origin_clearance": "public"}))
+    try:
+        await tools.recall_memory.handler({"query": "salary"})
+    finally:
+        tools.engagement_var.reset(eng)
+    assert sem.calls[0]["clearance"] == "public"
+    assert sem.calls[0]["tags"] == ["public"]
+
+
+async def test_engagement_started_by_the_operator_still_recalls_every_tier(monkeypatch):
+    sem = _RecordingSem()
+    monkeypatch.setattr(agent_mod, "active_semantic_memory", sem, raising=False)
+    eng = tools.engagement_var.set(_Rec(
+        {"channel": "telegram", "_origin_route": "telegram",
+         "_origin_clearance": "private"}))
+    try:
+        await tools.recall_memory.handler({"query": "salary"})
+    finally:
+        tools.engagement_var.reset(eng)
+    assert sem.calls[0]["clearance"] == "private"
+    assert sem.calls[0]["tags"] == ["family", "friends", "private", "public"]
+
+
+async def test_engagement_without_markers_keeps_channel_behaviour(monkeypatch):
+    """Non-regressive: a record created before this release resolves exactly
+    as it did — no retroactive downgrade of existing engagements."""
+    sem = _RecordingSem()
+    monkeypatch.setattr(agent_mod, "active_semantic_memory", sem, raising=False)
+    eng = tools.engagement_var.set(_Rec({"channel": "telegram"}))
+    try:
+        await tools.recall_memory.handler({"query": "salary"})
+    finally:
+        tools.engagement_var.reset(eng)
+    assert sem.calls[0]["clearance"] == "private"

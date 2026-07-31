@@ -59,10 +59,17 @@ internal socket, which binds the engagement record but no ambient turn origin â€
 clearance resolved from the ambient origin alone would find nothing and fall through to the
 channel default, handing an engagement started by a low-clearance sender the operator's
 private tier. The engagement's recorded origin carries the markers its creating turn was
-stamped with, and that is what its recall resolves against. The same applies to the prior-
-engagement archive injected into an executor's prompt at launch. An engagement whose record
-predates this (or came from an origin that stamps no route) keeps the channel-keyed
-behaviour.
+stamped with, and that is what its reads resolve against: its own recall, the prior-
+engagement archive injected into an executor's prompt at launch, the engager-side context a
+specialist can query, and a nested engagement it spawns, which inherits rather than
+re-deriving. An engagement whose record predates this (or came from an origin that stamps no
+route) keeps the channel-keyed behaviour.
+
+The rule is *inheritance at creation*, and that is also its limit: an engagement carries the
+clearance of whoever started it for its whole life. A second person messaging into an
+existing engagement's topic is answered at the creator's clearance, not their own â€” engagement
+topics live in an invite-only supergroup, so this is a narrower surface than the DM, but it
+is not per-turn identity.
 
 **Writing is narrower than reading.** Only write-trusted channels retain to the shared bank.
 A channel that can recall is not thereby able to store.

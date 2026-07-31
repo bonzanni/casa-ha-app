@@ -1345,7 +1345,8 @@ async def test_unchanged_credential_neither_rewrites_nor_cycles(
     assert (ws_root / "keep1" / ".mcp.json").stat().st_mtime_ns == mtime_before
 
 
-@pytest.mark.parametrize("stop_outcome", ["returns_false", "raises"])
+@pytest.mark.parametrize(
+    "stop_outcome", ["returns_false", "raises", "raises_persistently"])
 async def test_unconfirmed_stop_after_credential_refresh_refuses_resume(
     monkeypatch, tmp_path, stop_outcome,
 ):
@@ -1373,12 +1374,19 @@ async def test_unconfirmed_stop_after_credential_refresh_refuses_resume(
     if stop_outcome == "returns_false":
         monkeypatch.setattr(
             s6_rc, "ensure_service_down", AsyncMock(return_value=False))
-    else:
+    elif stop_outcome == "raises":
         # The cycle attempt itself raises; the refusal helper's own checked
         # teardown then runs and cannot confirm the stop either.
         monkeypatch.setattr(
             s6_rc, "ensure_service_down",
             AsyncMock(side_effect=[OSError("s6-rc missing"), False]))
+    else:
+        # Sol r3: EVERY stop raises, including the refusal helper's own — the
+        # helper then returns before marking anything, so the terminal mark
+        # has to be landed by the caller that chose to refuse.
+        monkeypatch.setattr(
+            s6_rc, "ensure_service_down",
+            AsyncMock(side_effect=OSError("s6-rc missing")))
 
     ws_root = tmp_path / "eng"
     (ws_root / "keep1").mkdir(parents=True)

@@ -1932,6 +1932,7 @@ async def _run_delegated_agent(
             "</memory_context>\n\n"
         )
         sem = getattr(agent_mod, "active_semantic_memory", None)
+        _parent_route, _parent_clearance = _origin_clearance_markers(parent)
         if not (task_text or "").strip():
             # #201: nothing to search FOR, which is not the same as a memory
             # that could not be checked. Stay silent — no note, no recall.
@@ -1955,6 +1956,15 @@ async def _run_delegated_agent(
                     # indistinguishable in telemetry from any other delegated
                     # recall and shared that path's breaker.
                     path="specialist_archive",
+                    # #336 (Sol, review r3): a delegated specialist reads at
+                    # the DELEGATING turn's clearance, not the channel's — a
+                    # non-operator sender must not reach private memory by
+                    # having a specialist fetch it. Resolved through the
+                    # shared helper so a delegation issued from INSIDE an
+                    # engagement (no ambient origin) inherits that
+                    # engagement's clearance rather than the channel default.
+                    origin_route=_parent_route,
+                    origin_clearance=_parent_clearance,
                 )
             except RecallUnavailable:
                 # Delegated turn proceeds cold, but the specialist is TOLD the
@@ -4812,6 +4822,16 @@ async def engage_executor(args: dict) -> dict:
             "status": "error", "kind": "no_origin",
             "message": "engage_executor called outside a turn",
         })
+    # #336 (Terra, review r3): an engagement that spawns a NESTED engagement
+    # calls this over the internal socket, where the ambient origin carries no
+    # route — so the child record would persist no markers and its own recall
+    # would fall back to the channel default (private on telegram), laundering
+    # a low-clearance parent into a high-clearance child. Inherit the parent's
+    # effective markers so clearance cannot be gained by nesting.
+    _inherit_route, _inherit_clearance = _origin_clearance_markers(origin)
+    if _inherit_route is not None and "_origin_route" not in origin:
+        origin["_origin_route"] = _inherit_route
+        origin["_origin_clearance"] = _inherit_clearance
 
     executor_type = args.get("executor_type", "")
     task_text = args.get("task", "") or ""
@@ -6415,6 +6435,12 @@ async def query_engager(args: dict) -> dict:
                 sem, query=question,
                 origin_channel=str(engagement.origin.get("channel", "")),
                 max_tokens=2000, path="query_engager",
+                # #336 (Sol, review r3): the engager-side context is read on
+                # behalf of THIS engagement, so it is filtered at the
+                # clearance of the turn that created it — the record's own
+                # persisted markers, exactly like its recall_memory calls.
+                origin_route=engagement.origin.get("_origin_route"),
+                origin_clearance=engagement.origin.get("_origin_clearance"),
             )
         except RecallUnavailable:
             # Distinct from status=unknown (a genuine zero-hit): the engager's

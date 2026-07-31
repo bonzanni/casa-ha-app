@@ -674,6 +674,30 @@ async def replay_undergoing_engagements(
                             "refresh raised for %s: %s", rec.id[:8], exc,
                         )
                     if _down is False:
+                        # Mark TERMINAL unconditionally, not via the helper's
+                        # own teardown outcome (Terra, review r3): the helper
+                        # only marks when ITS stop also fails, so a
+                        # fail-then-succeed pair would leave the record
+                        # active/idle with its service dir removed — dormant
+                        # this boot, silently resurrected the next one. The
+                        # decision was already made here, so record it here;
+                        # the helper's own mark then no-ops against the #326
+                        # terminal guard while still running the checked
+                        # teardown and adding the id to ``refused_ids``.
+                        try:
+                            await registry.mark_error(
+                                rec.id, kind="refuse_credential_cycle_failed",
+                                message=(
+                                    "engagement could not be confirmed down "
+                                    "after a credential refresh"
+                                ),
+                            )
+                        except Exception:  # noqa: BLE001 — teardown still runs
+                            logger.warning(
+                                "boot replay: mark_error("
+                                "refuse_credential_cycle_failed) failed for "
+                                "%s", rec.id[:8], exc_info=True,
+                            )
                         await _refuse_brief_resume(
                             rec,
                             "engagement could not be confirmed down after a "
