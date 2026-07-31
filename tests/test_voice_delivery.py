@@ -316,6 +316,7 @@ async def test_shared_writer_interleaves_utterances_and_delivery_protocol(
 
 
 async def test_only_device_queue_head_is_offered(delivery):
+    """Pins INV-JOB-005. Red case demonstrated: removing the per-device occupancy check from the offer pass fails this test."""
     registry, _, route, coordinator, _ = delivery
     await registry.create(_ready_job("job-1", sequence=1, device="kitchen"))
     await registry.create(_ready_job("job-2", sequence=2, device="kitchen"))

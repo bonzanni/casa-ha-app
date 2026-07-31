@@ -36,7 +36,7 @@
 - item: casa/rootfs/opt/casa/channels/voice/channel.py
   doc: architecture/voice.md
 - item: casa/rootfs/opt/casa/channels/voice/delivery.py
-  excluded: "PHASE-3: architecture/jobs-and-delivery.md"
+  doc: architecture/jobs-and-delivery.md
 - item: casa/rootfs/opt/casa/channels/voice/prosodic.py
   doc: architecture/voice.md
 - item: casa/rootfs/opt/casa/channels/voice/routes.py
@@ -88,7 +88,7 @@
 - item: casa/rootfs/opt/casa/internal_handlers.py
   doc: architecture/mcp-and-tools.md
 - item: casa/rootfs/opt/casa/job_registry.py
-  excluded: "PHASE-3: architecture/jobs-and-delivery.md"
+  doc: architecture/jobs-and-delivery.md
 - item: casa/rootfs/opt/casa/log_cid.py
   doc: architecture/observability.md
 - item: casa/rootfs/opt/casa/log_redact.py
@@ -210,7 +210,7 @@
 - item: casa/rootfs/opt/casa/verdict_broker.py
   doc: architecture/telegram.md
 - item: casa/rootfs/opt/casa/voice_job_result.py
-  excluded: "PHASE-3: architecture/jobs-and-delivery.md"
+  doc: architecture/jobs-and-delivery.md
 - item: casa/rootfs/opt/casa/webhook_auth.py
   doc: architecture/http-surface.md
 - item: option:casa_tz

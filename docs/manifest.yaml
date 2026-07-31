@@ -140,6 +140,29 @@
     INV-HTTP-004: [tests/test_origin_stamping.py::test_invoke_route_is_unspoofable, tests/test_webhook_handler.py::test_payload_context_never_enters_bus_message_context]
     INV-HTTP-005: [tests/test_pin_http_invariants.py::test_pin_inv_http_005_table_contract_disagreement_refused, tests/test_ingress_identity_boot_check.py::test_main_validates_the_table_before_doing_anything_else]
 
+- doc: architecture/jobs-and-delivery.md
+  summary: Durable background jobs — execution vs delivery state, restart reconciliation, and the leased claim/ack protocol.
+  when_changing: job persistence, restart recovery, or how a deferred answer reaches a device
+  covers:
+    - casa/rootfs/opt/casa/job_registry.py::JobRegistry
+    - casa/rootfs/opt/casa/job_registry.py::VoiceJob
+    - casa/rootfs/opt/casa/job_registry.py::JobRegistry.recover_after_restart
+    - casa/rootfs/opt/casa/channels/voice/delivery.py::VoiceDeliveryCoordinator
+    - casa/rootfs/opt/casa/voice_job_result.py::parse_voice_job_result
+    - casa/rootfs/opt/casa/voice_job_result.py::spoken_text_for
+  tests:
+    - tests/test_job_registry.py
+    - tests/test_voice_delivery.py
+    - tests/test_voice_job_result.py
+  related: [architecture/voice.md, architecture/persistent-state.md, architecture/turn-loop.md]
+  defines_invariants: [INV-JOB-001, INV-JOB-002, INV-JOB-003, INV-JOB-004, INV-JOB-005]
+  invariant_tests:
+    INV-JOB-001: [tests/test_job_registry.py::test_failed_snapshot_write_does_not_publish_memory_mutation]
+    INV-JOB-002: [tests/test_job_registry.py::test_restart_orphans_running_job_and_queues_voice_failure]
+    INV-JOB-003: [tests/test_job_registry.py::test_invalid_compare_and_set_does_not_mutate, tests/test_voice_delivery.py::test_stale_claim_is_denied_without_mutation]
+    INV-JOB-004: [tests/test_job_registry.py::test_playing_lease_lapse_requeues_for_at_least_once_delivery]
+    INV-JOB-005: [tests/test_voice_delivery.py::test_only_device_queue_head_is_offered, tests/test_voice_delivery.py::test_device_fifo_is_stable_across_route_ids]
+
 - doc: architecture/memory.md
   summary: Long-term memory — how a fact is written, who may read it back, and what a caller is told when the store cannot answer.
   when_changing: recall behaviour, sensitivity tiers, provenance on a stored fact, or session persistence
