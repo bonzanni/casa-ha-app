@@ -80,13 +80,21 @@ def clearance_for_origin(
     ``webhook_trigger`` turns read at their declared ``origin_clearance``
     (default-deny: a missing/malformed/``private`` value ⇒ ``public``).
     ``invoke`` turns are operator-signed and read at ``private`` (the
-    documented authenticated exception). Any other origin falls through to
-    today's channel-keyed clearance so existing surfaces are unchanged.
+    documented authenticated exception). ``telegram`` turns (#336) read at
+    the per-sender clearance the ingress stamped — private only for the
+    configured operator; a missing/malformed stamp on a telegram-marked turn
+    fails CLOSED to ``public``, never through to the channel's private. Any
+    other origin falls through to today's channel-keyed clearance so
+    existing surfaces are unchanged.
     """
     if origin_route == "invoke":
         return "private"
     if origin_route == "webhook_trigger":
         if origin_clearance in _WEBHOOK_TRIGGER_TIERS:
+            return origin_clearance
+        return "public"
+    if origin_route == "telegram":
+        if origin_clearance in TIERS:
             return origin_clearance
         return "public"
     # No trusted origin marker. Fail closed on the webhook channel (Sol r4):
@@ -102,15 +110,28 @@ def clearance_for_origin(
 # LLM output parsing (design §2.4)
 # ---------------------------------------------------------------------------
 
-_TIER_RE = re.compile(r"\b(private|family|friends|public)\b", re.IGNORECASE)
+# #350: the reply must be EXACTLY ONE tier token. The classifier prompt asks
+# for a single word; a leftmost-match search would extract "public" out of
+# "This is not public; it is family" and tag a family fact public — silently
+# defeating the leak-safe default the module contract promises. Decoration
+# that a single-word answer still legitimately carries (a "Tier:" label,
+# punctuation, markdown emphasis, whitespace) is tolerated; ANY other word in
+# the reply makes it ambiguous, and ambiguity must fall to DEFAULT_TIER.
+_TIER_REPLY_RE = re.compile(
+    r"^[\W_]*(?:tier[\W_]*)?(private|family|friends|public)[\W_]*$",
+    re.IGNORECASE,
+)
 
 
 def parse_tier(text: str | None) -> str | None:
-    """Extract a tier token from an LLM/agent emission. Returns the lowercased tier,
-    or None if no known tier is present. The caller applies DEFAULT_TIER on None."""
+    """Parse an LLM/agent reply that should be a single tier word. Returns the
+    lowercased tier only when the reply is exactly one tier token (modulo an
+    optional "Tier:" label and surrounding punctuation/whitespace); None
+    otherwise — including when tier words appear inside a longer sentence
+    (#350). The caller applies DEFAULT_TIER on None."""
     if not isinstance(text, str):
         return None
-    m = _TIER_RE.search(text)
+    m = _TIER_REPLY_RE.match(text)
     return m.group(1).lower() if m else None
 
 

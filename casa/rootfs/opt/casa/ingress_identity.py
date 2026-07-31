@@ -82,6 +82,19 @@ _PEER_MAX_BYTES = 512
 
 _WEBHOOK_PEER_PREFIX = "webhook:"
 
+# #336: peer namespace for a Telegram sender who is NOT the configured
+# operator. With ``telegram_chat_id`` empty ("accept all chats"), any Telegram
+# user can reach the telegram route, so the operator peer + private clearance
+# must be granted per-SENDER — a fixed route-wide peer recorded every
+# stranger's turns under the operator's identity and ran them at the
+# operator's recall clearance.
+_TELEGRAM_PEER_PREFIX = "telegram:"
+
+# Read-clearance for a non-operator Telegram sender. Fail-closed: accept-all
+# mode is reachable by anyone who finds the bot, so an unrecognized sender
+# reads at the least-sensitive tier only.
+_TELEGRAM_NON_OPERATOR_CLEARANCE = "public"
+
 
 class IngressIdentityError(RuntimeError):
     """An ingress could not be given a trusted identity. Always fatal to the
@@ -169,6 +182,7 @@ def ingress_identity(
     clearance: str | None = None,
     sender_id: str | None = None,
     sender_display_name: str | None = None,
+    sender_is_operator: bool = False,
 ) -> TrustedUserOriginInput:
     """Build the server-created trusted ingress identity for *route*.
 
@@ -177,6 +191,14 @@ def ingress_identity(
     to make impossible. ``clearance`` overrides the table default (used by
     ``/webhook/{name}`` to carry the trigger's declared read-clearance);
     ``sender_id``/``sender_display_name`` supply Telegram's authenticated user.
+
+    ``sender_is_operator`` (#336) is the CHANNEL's server-side determination
+    that this Telegram sender is the configured operator (sender id matches
+    ``telegram_chat_id``). Only an operator sender resolves to the operator
+    peer and the table's private clearance; any other sender gets a
+    per-sender ``telegram:<id>`` peer at public clearance, and a sender-less
+    telegram turn (anonymous group/channel post) fails loudly rather than
+    borrowing the operator's identity.
     """
     policy = _INGRESS_IDENTITY.get(route)
     if policy is None:
@@ -206,11 +228,23 @@ def ingress_identity(
                 f"form; two spellings of one name would share an identity")
         peer = _check_peer(route, _WEBHOOK_PEER_PREFIX + webhook_name)
     elif policy.peer_strategy == "telegram_sender":
-        peer = _check_peer(route, policy.peer or "")
-        if sender_id:
-            authenticated_user = AuthenticatedUser(
-                stable_id=sender_id, configured_display_name=sender_display_name,
-            )
+        # #336: identity is per-SENDER. No sender ⇒ no author ⇒ fail the
+        # turn (#203) — the pre-#336 fallback silently attributed anonymous
+        # group/channel posts to the operator.
+        if not sender_id:
+            raise IngressIdentityError(
+                f"ingress route {route!r} requires an authenticated sender id")
+        authenticated_user = AuthenticatedUser(
+            stable_id=sender_id, configured_display_name=sender_display_name,
+        )
+        if sender_is_operator:
+            peer = _check_peer(route, policy.peer or "")
+        else:
+            peer = _check_peer(route, _TELEGRAM_PEER_PREFIX + sender_id)
+            # Forced, not defaulted: the ``clearance`` override parameter
+            # exists for webhook triggers and must never lift a non-operator
+            # Telegram sender above the fail-closed floor.
+            effective_clearance = _TELEGRAM_NON_OPERATOR_CLEARANCE
     elif policy.peer_strategy == "fixed":
         peer = _check_peer(route, policy.peer or "")
     else:
@@ -262,11 +296,20 @@ def validate_ingress_identity_table() -> None:
         raise IngressIdentityError(
             "the webhook peer namespace prefix must be non-empty, or a "
             "trigger name could impersonate another peer")
+    # #336: same namespace discipline for per-sender Telegram peers — with an
+    # empty prefix, a Telegram sender id could collide with (or, degenerately,
+    # BE) another peer's name.
+    if not _TELEGRAM_PEER_PREFIX:
+        raise IngressIdentityError(
+            "the telegram peer namespace prefix must be non-empty, or a "
+            "sender id could impersonate another peer")
     for operator_peer in _OPERATOR_PEERS:
-        if operator_peer.startswith(_WEBHOOK_PEER_PREFIX):
-            raise IngressIdentityError(
-                f"operator peer {operator_peer!r} lives inside the webhook "
-                f"namespace {_WEBHOOK_PEER_PREFIX!r}; a trigger could claim it")
+        for prefix in (_WEBHOOK_PEER_PREFIX, _TELEGRAM_PEER_PREFIX):
+            if operator_peer.startswith(prefix):
+                raise IngressIdentityError(
+                    f"operator peer {operator_peer!r} lives inside the "
+                    f"dynamic peer namespace {prefix!r}; a caller-derived "
+                    f"name could claim it")
 
     for route, policy in _INGRESS_IDENTITY.items():
         if policy.clearance not in _CLEARANCES:

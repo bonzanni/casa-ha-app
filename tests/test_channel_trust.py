@@ -55,8 +55,12 @@ class TestUserPeerMovedOut:
         assert not hasattr(channel_trust, "user_peer_for_channel")
 
     def test_telegram_peer_now_comes_from_the_ingress_table(self):
+        # #336: the operator peer requires the channel's server-side
+        # operator determination; a non-operator sender gets its own peer.
         from ingress_identity import ingress_identity
-        assert ingress_identity("telegram").user_peer == "nicola"
+        assert ingress_identity(
+            "telegram", sender_id="7", sender_is_operator=True,
+        ).user_peer == "nicola"
 
     def test_voice_peer_now_comes_from_the_ingress_table(self):
         from ingress_identity import ingress_identity

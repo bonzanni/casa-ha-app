@@ -98,23 +98,72 @@ class TestStampedOrigins:
             assert value.speaker_kind == "automation"
 
 
-class TestExistingRoutesUnchanged:
-    def test_telegram_still_names_the_operator_peer(self):
+class TestTelegramSenderIdentity:
+    """#336: the operator peer + private clearance are granted per-SENDER,
+    never as a route-wide constant — with telegram_chat_id empty ("accept
+    all"), any Telegram user can reach this route."""
+
+    def test_operator_sender_keeps_the_operator_peer_and_clearance(self):
         from ingress_identity import ingress_identity
 
         origin = ingress_identity(
-            "telegram", sender_id="42", sender_display_name="Nicola")
+            "telegram", sender_id="42", sender_display_name="Nicola",
+            sender_is_operator=True)
         assert origin.user_peer == "nicola"
         assert origin.surface == "telegram"
         assert origin.server_origin.clearance == "private"
         assert origin.authenticated_user.stable_id == "42"
 
-    def test_telegram_without_a_sender_carries_no_authenticated_user(self):
+    def test_non_operator_sender_gets_its_own_peer_not_the_operators(self):
+        # The pre-#336 behavior: sender 42 resolved to user_peer "nicola"
+        # with private clearance regardless of who sent the message.
         from ingress_identity import ingress_identity
 
-        origin = ingress_identity("telegram")
-        assert origin.authenticated_user is None
-        assert origin.user_peer == "nicola"
+        origin = ingress_identity(
+            "telegram", sender_id="42", sender_display_name="Mallory")
+        assert origin.user_peer == "telegram:42"
+        assert origin.user_peer != "nicola"
+        assert origin.authenticated_user.stable_id == "42"
+
+    def test_non_operator_sender_reads_at_public_clearance(self):
+        from ingress_identity import ingress_identity
+
+        origin = ingress_identity("telegram", sender_id="42")
+        assert origin.server_origin.clearance == "public"
+
+    def test_non_operator_clearance_cannot_be_escalated_by_the_caller(self):
+        # The clearance override parameter exists for webhook triggers; a
+        # telegram non-operator turn must not be liftable through it.
+        from ingress_identity import ingress_identity
+
+        origin = ingress_identity(
+            "telegram", sender_id="42", clearance="private")
+        assert origin.server_origin.clearance == "public"
+
+    def test_two_senders_resolve_to_distinct_peers(self):
+        from ingress_identity import ingress_identity
+
+        a = ingress_identity("telegram", sender_id="42")
+        b = ingress_identity("telegram", sender_id="43")
+        assert a.user_peer != b.user_peer
+
+    def test_a_telegram_turn_without_a_sender_fails_loudly(self):
+        # #203 doctrine: an ingress that cannot resolve an author raises —
+        # it must never silently borrow the operator's identity (the
+        # pre-#336 behavior for anonymous group/channel posts).
+        from ingress_identity import IngressIdentityError, ingress_identity
+
+        with pytest.raises(IngressIdentityError):
+            ingress_identity("telegram")
+
+    def test_operator_flag_without_a_sender_still_fails(self):
+        from ingress_identity import IngressIdentityError, ingress_identity
+
+        with pytest.raises(IngressIdentityError):
+            ingress_identity("telegram", sender_is_operator=True)
+
+
+class TestExistingRoutesUnchanged:
 
     def test_voice_sse_is_the_anonymous_trusted_speaker(self):
         from ingress_identity import ingress_identity
@@ -217,8 +266,12 @@ class TestBootValidator:
         for route, policy in _INGRESS_IDENTITY.items():
             if not policy.authenticated:
                 continue
-            kwargs = {"webhook_name": "probe"} if policy.peer_strategy == (
-                "webhook_name") else {}
+            kwargs = {}
+            if policy.peer_strategy == "webhook_name":
+                kwargs["webhook_name"] = "probe"
+            elif policy.peer_strategy == "telegram_sender":
+                # #336: a telegram turn now REQUIRES a sender identity.
+                kwargs["sender_id"] = "424242"
             origin = ingress_identity(route, **kwargs)
             assert origin.user_peer
             validate_speaker_provenance(UserProvenance.from_origin(

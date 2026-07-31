@@ -63,6 +63,14 @@ async def test_classify_defaults_private_on_unparseable(monkeypatch):
     assert await tier_classifier.classify_tier("ambiguous") == DEFAULT_TIER
 
 
+async def test_classify_chatty_reply_with_tier_words_defaults_private(monkeypatch):
+    # #350 end-to-end: a reply that violates the single-word contract must NOT
+    # have a tier word plucked out of it (the leftmost token here is "public",
+    # for a fact that belongs at family) — it falls to the leak-safe default.
+    _install_fake_sdk(monkeypatch, reply="This is not public; it is family")
+    assert await tier_classifier.classify_tier("the home alarm code is 4712") == DEFAULT_TIER
+
+
 async def test_classify_defaults_private_on_error(monkeypatch):
     monkeypatch.setattr(tier_classifier, "_RETRY_BACKOFF_S", 0)  # D-5 retry path
     _install_fake_sdk(monkeypatch, raise_exc=RuntimeError("sdk boom"))

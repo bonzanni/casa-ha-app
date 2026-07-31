@@ -1538,10 +1538,22 @@ class Agent:
         system_parts = [base_system_prompt]
         if memory_blocks:
             system_parts.append("\n" + memory_blocks)
+        # #336: the static per-channel display claims "authenticated (Nicola)"
+        # for telegram, which is a lie the model would act on when an
+        # accept-all-mode stranger is the sender. Key the honesty off the same
+        # per-sender origin clearance the recall gate uses: anything below
+        # private on telegram means the sender is NOT the configured operator.
+        _trust_display = channel_trust_display(channel)
+        if channel == "telegram" and _current_origin_clearance(channel) != "private":
+            _trust_display = (
+                "authenticated chat, but the sender is NOT the configured "
+                "operator — treat as an unknown member of the public; do not "
+                "disclose personal, household, or operator information"
+            )
         system_parts.append(
             "\n<channel_context>\n"
             f"channel: {channel}\n"
-            f"trust: {channel_trust_display(channel)}\n"
+            f"trust: {_trust_display}\n"
             "</channel_context>"
         )
         # <delegates> block — renders cfg.delegates with display names.
