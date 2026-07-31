@@ -54,10 +54,13 @@ jobs:
       - name: Operating cards point at the doctrine
         run: |
           set -euo pipefail
+          # Cards are prose and wrap at ~95 columns, so both required phrases can
+          # legitimately span a line break — normalise newlines before matching.
           for card in CLAUDE.md AGENTS.md; do
-            grep -q 'verifiable from the public commit alone' "$card" || {
+            flat="$(tr '\n' ' ' < "$card" | tr -s ' ')"
+            printf '%s' "$flat" | grep -q 'verifiable from the public commit alone' || {
               echo "::error::$card no longer states the publication rule"; exit 1; }
-            grep -Eq "docs/README\.md.{0,20}routing table" "$card" || {
+            printf '%s' "$flat" | grep -Eq "docs/README\.md.{0,20}routing table" || {
               echo "::error::$card no longer routes agents into the docs corpus (needs the docs/README.md routing-table directive)"; exit 1; }
           done
 

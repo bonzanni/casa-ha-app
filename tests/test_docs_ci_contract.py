@@ -31,15 +31,17 @@ def test_pin_docs_workflow_runs_verifier_ledger_and_impact():
 
 
 def test_pin_operating_cards_carry_the_routing_directive():
-    """The property the workflow's card-check enforces, asserted directly:
-    both public cards route agents into the corpus via the routing table.
+    """The properties the workflow's card-check enforces, asserted directly
+    over newline-normalised text — cards are wrapped prose, and the first CI
+    execution of the unnormalised grep failed on a phrase spanning a line
+    break (a check never seen red, failing wrong).
 
-    Red case demonstrated: removing the routing sentence from either card
-    fails this test.
+    Red case demonstrated: rewording either phrase in a card fails this test.
     """
     import re
 
     root = WORKFLOW.parents[2]
     for card in ("CLAUDE.md", "AGENTS.md"):
-        text = (root / card).read_text()
-        assert re.search(r"docs/README\.md.{0,20}routing table", text), card
+        flat = " ".join((root / card).read_text().split())
+        assert "verifiable from the public commit alone" in flat, card
+        assert re.search(r"docs/README\.md.{0,20}routing table", flat), card
