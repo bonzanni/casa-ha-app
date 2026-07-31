@@ -109,6 +109,16 @@ def test_enumeration_covers_env_scripts_schemas_and_dockerfile(tmp_path):
         "    environ = {}\n"
         'E = settings.environ.get("CASA_PROBE_DECOY")\n'
         'F = settings.environ["CASA_PROBE_DECOY2"]\n'
+        "def reader(env=os.environ):\n"
+        '    return env.get("CASA_PROBE_PARAM")\n'
+        "def cond_reader(env=None):\n"
+        "    env = env if env is not None else os.environ\n"
+        '    return env["CASA_PROBE_BOUND"]\n'
+        "def other(mapping={}):\n"
+        '    return mapping.get("CASA_PROBE_NOT_ENV")\n'
+        'raw = os.environ.get("CASA_PROBE_A")\n'
+        "raw = {}\n"
+        'G = raw.get("CASA_PROBE_REUSED_NAME")\n'
     )
     scripts = root / "casa" / "rootfs" / "etc" / "s6-overlay" / "scripts"
     scripts.mkdir(parents=True)
@@ -126,6 +136,10 @@ def test_enumeration_covers_env_scripts_schemas_and_dockerfile(tmp_path):
     assert "env:CASA_PROBE_HELPER" in items       # read via an _env_* helper
     assert "env:CASA_PROBE_DECOY" not in items    # not os.environ
     assert "env:CASA_PROBE_DECOY2" not in items
+    assert "env:CASA_PROBE_PARAM" in items        # param defaulted to os.environ
+    assert "env:CASA_PROBE_BOUND" in items        # name bound from os.environ
+    assert "env:CASA_PROBE_NOT_ENV" not in items  # unrelated mapping
+    assert "env:CASA_PROBE_REUSED_NAME" not in items  # value-bind, name reused
     assert "script:setup-probe.sh" in items
     assert "schema:probe.v1.json" in items
     assert "casa/Dockerfile" in items

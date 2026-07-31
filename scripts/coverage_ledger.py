@@ -10,7 +10,10 @@ mechanically:
 * every s6 unit directory under ``casa/rootfs/etc/s6-overlay/s6-rc.d/``,
 * every tool in ``tools.py``'s ``CASA_TOOLS`` tuple,
 * every HTTP route registration (``add_get``/``add_post``/``add_route``/``add_routes``
-  call sites, by AST, so comments and docstrings cannot fake one).
+  call sites, by AST, so comments and docstrings cannot fake one),
+* every environment variable read by literal name (direct ``os.environ``/``os.getenv``,
+  ``_env_*`` wrapper helpers, and names bound from ``os.environ``),
+* every s6 boot script, every ``defaults/schema/*.json`` file, and the Dockerfile.
 
 ``docs/coverage.yaml`` must map every enumerated item to the corpus document that covers
 it, or exclude it with a one-line reason. The check is bidirectional, like the manifest:
@@ -180,6 +183,53 @@ def enumerate_env_reads(repo_root: Path) -> list[str]:
             tree = ast.parse(path.read_text(errors="replace"))
         except (OSError, SyntaxError, ValueError):
             continue
+        # Names bound (anywhere in the module) to an expression that contains
+        # os.environ — a parameter defaulted to it, or `env = env or
+        # os.environ`. Literal .get()/[] reads through such a name are env
+        # reads too. Reads through a further indirection (a closure argument)
+        # are not traced; for option-derived variables the option-key
+        # enumeration is the backstop.
+        env_names: set[str] = set()
+        for node in ast.walk(tree):
+            if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)):
+                args = node.args
+                positional = args.posonlyargs + args.args
+                for arg, default in zip(
+                    positional[len(positional) - len(args.defaults):],
+                    args.defaults,
+                ):
+                    if any(_is_os_environ(n) for n in ast.walk(default)):
+                        env_names.add(arg.arg)
+                for arg, default in zip(args.kwonlyargs, args.kw_defaults):
+                    if default is not None and any(
+                        _is_os_environ(n) for n in ast.walk(default)
+                    ):
+                        env_names.add(arg.arg)
+            elif isinstance(node, ast.Assign):
+                # Track only a direct alias (`env = os.environ`) or the
+                # self-referential rebind (`env = env if … else os.environ`).
+                # `raw = os.environ.get(…)` binds a VALUE, not the mapping —
+                # tracking its name module-wide produced a false positive when
+                # an unrelated dict reused it.
+                value_names = {
+                    n.id for n in ast.walk(node.value) if isinstance(n, ast.Name)
+                }
+                is_alias = _is_os_environ(node.value)
+                for target in node.targets:
+                    if isinstance(target, ast.Name) and (
+                        is_alias
+                        or (
+                            target.id in value_names
+                            and any(_is_os_environ(n) for n in ast.walk(node.value))
+                        )
+                    ):
+                        env_names.add(target.id)
+
+        def _is_env_base(base: ast.AST) -> bool:
+            return _is_os_environ(base) or (
+                isinstance(base, ast.Name) and base.id in env_names
+            )
+
         for node in ast.walk(tree):
             if isinstance(node, ast.Call):
                 literal = (
@@ -191,7 +241,7 @@ def enumerate_env_reads(repo_root: Path) -> list[str]:
                     continue
                 func = node.func
                 if isinstance(func, ast.Attribute):
-                    is_env_get = func.attr == "get" and _is_os_environ(func.value)
+                    is_env_get = func.attr == "get" and _is_env_base(func.value)
                     is_getenv = (
                         func.attr == "getenv"
                         and isinstance(func.value, ast.Name)
@@ -205,7 +255,7 @@ def enumerate_env_reads(repo_root: Path) -> list[str]:
                     names.add(node.args[0].value)
             elif isinstance(node, ast.Subscript):
                 if (
-                    _is_os_environ(node.value)
+                    _is_env_base(node.value)
                     and isinstance(node.slice, ast.Constant)
                     and isinstance(node.slice.value, str)
                 ):
