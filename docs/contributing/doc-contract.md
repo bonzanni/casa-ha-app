@@ -39,6 +39,18 @@ build anything on it that a lie would break.
 
 **INV-DOC-004**: A cross-cutting rule is defined exactly once, as `**INV-AREA-NNN**: <single-line statement>`, and referenced by id rather than restated. Issue ids sparingly — an id per local rule is bureaucracy, and the define-once check makes over-issuing visibly expensive; nothing mechanical enforces a minimum reference count.
 
+Three conventions about what an invariant *says*, learned the expensive way and
+reviewer-enforced. An invariant states a **guarantee**; a known limitation belongs in the
+"what it does not cover" prose under it — with its tracking issue — never red-pinned as
+the invariant's own substance, because a pin on the gap makes the eventual fix arrive as
+"breaking an invariant", inverted. A change that flips what an invariant asserts
+**retires the id and mints a new one**: the ids exist to be referenced, and an id whose
+meaning silently reverses between releases poisons every reference made under the old
+meaning. And the one-line statement should be a bounded claim about a mechanism, not an
+absolute — an absolute ("everything is X") invites an unbounded hunt for exceptions,
+while the enforced boundary plus an honest not-covered clause is checkable and stays
+true.
+
 **INV-DOC-005**: Anchors are typed symbols (`path/to/file.py::Class.method`, `config.yaml::schema.key`, `tests/test_x.py::test_name`) or tracked bare paths; never `file:line`, which rots silently on the next edit.
 
 **INV-DOC-006**: Growth splits, it never appends. A document that reaches the ceiling is divided and both halves manifested. The ceiling is not raised, and nothing shards on its own.

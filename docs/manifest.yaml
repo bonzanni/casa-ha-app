@@ -509,10 +509,10 @@
     - tests/test_log_redact.py
     - tests/test_log_cid.py
   related: [architecture/http-surface.md, architecture/overview.md]
-  defines_invariants: [INV-OBS-001, INV-OBS-002, INV-OBS-003]
+  defines_invariants: [INV-OBS-001, INV-OBS-003, INV-OBS-004]
   invariant_tests:
     INV-OBS-001: [tests/test_pin_g5_invariants.py::test_pin_inv_obs_001_header_cid_validated_payload_cid_not]
-    INV-OBS-002: [tests/test_pin_g5_invariants.py::test_pin_inv_obs_002_rendered_output_redacts_exceptions_and_extras]
+    INV-OBS-004: [tests/test_pin_g5_invariants.py::test_pin_inv_obs_004_rendered_output_redacts_exceptions_and_extras]
     INV-OBS-003: [tests/test_pin_g5_invariants.py::test_pin_inv_obs_003_healthz_is_fixed_and_reads_nothing]
 
 - doc: architecture/persistent-state.md
