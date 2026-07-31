@@ -214,45 +214,45 @@
 - item: casa/rootfs/opt/casa/webhook_auth.py
   doc: architecture/http-surface.md
 - item: option:casa_tz
-  excluded: "PHASE-3: reference/operator-options.md"
+  doc: reference/operator-options.md
 - item: option:claude_oauth_token
-  excluded: "PHASE-3: reference/operator-options.md"
+  doc: reference/operator-options.md
 - item: option:context7_api_key
-  excluded: "PHASE-3: reference/operator-options.md"
+  doc: reference/operator-options.md
 - item: option:enable_terminal
-  excluded: "PHASE-3: reference/operator-options.md"
+  doc: reference/operator-options.md
 - item: option:engagement_reap_days
-  excluded: "PHASE-3: reference/operator-options.md"
+  doc: reference/operator-options.md
 - item: option:hindsight_api_url
-  excluded: "PHASE-3: reference/operator-options.md"
+  doc: reference/operator-options.md
 - item: option:log_level
-  excluded: "PHASE-3: reference/operator-options.md"
+  doc: reference/operator-options.md
 - item: option:onepassword_default_vault
-  excluded: "PHASE-3: reference/operator-options.md"
+  doc: reference/operator-options.md
 - item: option:onepassword_service_account_token
-  excluded: "PHASE-3: reference/operator-options.md"
+  doc: reference/operator-options.md
 - item: option:primary_agent_model
-  excluded: "PHASE-3: reference/operator-options.md"
+  doc: reference/operator-options.md
 - item: option:public_url
-  excluded: "PHASE-3: reference/operator-options.md"
+  doc: reference/operator-options.md
 - item: option:specialist_cost_alert_threshold
-  excluded: "PHASE-3: reference/operator-options.md"
+  doc: reference/operator-options.md
 - item: option:specialist_max_concurrency
-  excluded: "PHASE-3: reference/operator-options.md"
+  doc: reference/operator-options.md
 - item: option:telegram_bot_api_base
-  excluded: "PHASE-3: reference/operator-options.md"
+  doc: reference/operator-options.md
 - item: option:telegram_bot_token
-  excluded: "PHASE-3: reference/operator-options.md"
+  doc: reference/operator-options.md
 - item: option:telegram_chat_id
-  excluded: "PHASE-3: reference/operator-options.md"
+  doc: reference/operator-options.md
 - item: option:telegram_engagement_supergroup_id
-  excluded: "PHASE-3: reference/operator-options.md"
+  doc: reference/operator-options.md
 - item: option:telegram_transport
-  excluded: "PHASE-3: reference/operator-options.md"
+  doc: reference/operator-options.md
 - item: option:voice_agent_model
-  excluded: "PHASE-3: reference/operator-options.md"
+  doc: reference/operator-options.md
 - item: option:webhook_secret
-  excluded: "PHASE-3: reference/operator-options.md"
+  doc: reference/operator-options.md
 - item: s6:init-plugin-store
   doc: architecture/overview.md
 - item: s6:init-setup-configs

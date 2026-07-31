@@ -543,3 +543,12 @@ def test_a_method_of_a_nested_class_is_not_flagged_as_a_closure():
                 if isinstance(sub, (_ast.FunctionDef, _ast.AsyncFunctionDef)):
                     found.add(f"{node.name}.{sub.name}")
     assert "Inner.go" in found
+
+
+def test_a_reference_document_is_admitted(tmp_path):
+    """reference/ is a corpus directory (operator reference docs); it renders
+    into its own llms.txt section and passes the top-dir check."""
+    manifest = ENTRY.replace("architecture/turn-loop.md", "reference/ops.md")
+    root = _corpus(tmp_path, manifest, docs={"reference/ops.md": "# O\n" + CODE_WINS + SOURCEMAP})
+    assert verify_docs.verify(root) == []
+    assert "reference/ops.md" in verify_docs.render_llms(root)

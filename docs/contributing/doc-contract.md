@@ -33,7 +33,7 @@ the string was written, not that anyone read the file that day — it is an auth
 kept because the rotation below needs something to sort on. Treat it as a claim, and do not
 build anything on it that a lie would break.
 
-**INV-DOC-002**: An architecture document follows one section order — Scope, Mental model, Contracts & invariants, Failure behavior, Extension points, Source & test map — so an agent can skim positionally; doctrine and contributing documents keep the code-wins line and the source map but shape their own sections.
+**INV-DOC-002**: An architecture document follows one section order — Scope, Mental model, Contracts & invariants, Failure behavior, Extension points, Source & test map — so an agent can skim positionally; documents in the other directories keep the code-wins line and the source map but shape their own sections.
 
 **INV-DOC-003**: A document describes the present system — no changelog voice, no "as of version X", no discrepancy log, no TODOs, no open questions; past tense may explain a mechanism, never track the document's own history.
 

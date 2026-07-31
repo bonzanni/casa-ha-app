@@ -31,6 +31,20 @@
   kind: generated
   summary: Every INV-* id, its statement, and the file that defines it.
 
+- doc: reference/operator-options.md
+  summary: The option-by-option operator contract — key, env var, consumer, default, restart-vs-reload.
+  when_changing: adding or removing an app option, or changing what consumes one
+  covers:
+    - casa/config.yaml::options
+    - casa/config.yaml::schema
+    - casa/rootfs/etc/s6-overlay/scripts/setup-configs.sh
+    - casa/rootfs/opt/casa/timekeeping.py::resolve_tz
+    - casa/rootfs/opt/casa/specialist_limits.py::SpecialistLimiter
+  tests:
+    - tests/test_run_script_env.py
+    - tests/test_setup_configs_deprecated_options_prune.py
+  related: [architecture/configuration.md, architecture/overview.md]
+
 - doc: doctrine/publishing.md
   summary: The one rule that decides whether a fact may be written down in this repository.
   when_changing: anything published — docs, comments, commit messages, PR text, branch names

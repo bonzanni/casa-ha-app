@@ -51,7 +51,7 @@ DOCUMENT_KINDS = {"document"}
 INDEX_KINDS = {"index", "generated", "meta"}
 ALL_KINDS = DOCUMENT_KINDS | INDEX_KINDS
 ALLOWED_SUFFIXES = {".md", ".txt", ".yaml"}
-ALLOWED_TOP_DIRS = {"architecture", "doctrine", "contributing"}
+ALLOWED_TOP_DIRS = {"architecture", "doctrine", "contributing", "reference"}
 TABLE_SAFE_FIELDS = ("summary", "when_changing")
 LIST_FIELDS = ("covers", "tests", "related", "defines_invariants")
 
@@ -79,6 +79,7 @@ CODE_WINS = (
 
 SECTIONS = (
     ("Architecture", "architecture/"),
+    ("Reference", "reference/"),
     ("Doctrine", "doctrine/"),
     ("Contributing", "contributing/"),
 )

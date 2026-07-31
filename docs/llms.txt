@@ -27,6 +27,10 @@ Code is the source of truth; these files are a map.
 - [architecture/turn-loop.md](architecture/turn-loop.md): How one inbound message becomes one agent turn, and what bounds it.
 - [architecture/voice.md](architecture/voice.md): How spoken input becomes a turn and how the answer gets back — transports, authentication, the turn budget, and deferred delivery.
 
+## Reference
+
+- [reference/operator-options.md](reference/operator-options.md): The option-by-option operator contract — key, env var, consumer, default, restart-vs-reload.
+
 ## Doctrine
 
 - [doctrine/operating-casa.md](doctrine/operating-casa.md): How an agent running inside Casa should behave, and which property of the system each rule follows from.

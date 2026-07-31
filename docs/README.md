@@ -27,6 +27,7 @@ which is keyed on what you are about to do rather than on subsystem names.
 | adding an agent or a tier, the required file set, or role resolution | [`architecture/agent-taxonomy.md`](architecture/agent-taxonomy.md) |
 | adding an evaluator, or before assuming behaviour is evaluated somewhere | [`architecture/eval-framework.md`](architecture/eval-framework.md) |
 | adding durable state, changing a corrupt-file policy, or anything about what survives | [`architecture/persistent-state.md`](architecture/persistent-state.md) |
+| adding or removing an app option, or changing what consumes one | [`reference/operator-options.md`](reference/operator-options.md) |
 | adding or removing an option, the reload scopes, the config repo, or secret resolution | [`architecture/configuration.md`](architecture/configuration.md) |
 | agent prompts, refusal text, or anything shaping how an agent acts at runtime | [`doctrine/operating-casa.md`](doctrine/operating-casa.md) |
 | anything published — docs, comments, commit messages, PR text, branch names | [`doctrine/publishing.md`](doctrine/publishing.md) |
