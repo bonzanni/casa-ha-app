@@ -690,12 +690,19 @@ async def test_button_ask_reattach_race_preserves_static_metadata(env, monkeypat
 
 
 async def test_reattach_without_local_owner_creates_request_with_full_metadata(env):
-    """F1, reattach-path create branch: when the intent already exists but no
-    LOCAL validation owner is present (a retry after the owning handler died
-    mid-flight), the retry itself creates the broker request and must seed the
-    complete static metadata. The owner-first gate means the parked-owner race
-    above can no longer reach this branch — the owner always wins creation
-    there — so this scenario pins it directly. Red case demonstrated: dropping
+    """F1, reattach-path create branch: a reattacher that finds a PENDING
+    gate with no local validation owner falls through to the broker reattach,
+    creates the request itself, and must seed the complete static metadata.
+
+    The setup is deliberately synthetic — the owner safety net in the
+    handler's ``finally`` resolves the gate before dropping ownership, so
+    normal in-process flow does not produce this state. It is the code's own
+    documented fail-safe contract, though: the reattach register seeds meta
+    "if THIS reattach wins the create race", and the gate-cleanup path names
+    "a reattacher that found a PENDING gate with no local owner" as a handled
+    case. The owner-first gate means the parked-owner race above can no
+    longer reach this branch — the owner always wins creation there — so
+    this test pins the branch directly. Red case demonstrated: dropping
     ``meta=_ask_static_meta()`` from the reattach-path ``BROKER.register`` in
     channel_handlers.py fails this test (and only this test)."""
     from channels.output_sequencer import ASK_TOOL
