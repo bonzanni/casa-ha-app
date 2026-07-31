@@ -8075,6 +8075,14 @@ async def specialist_install_commit(args: dict) -> dict:
         plugin_resolutions=receipt.plugins,
     )
     async with _PLUGIN_TOOLS_LOCK:
+        # #346: same in-lock receipt re-check as specialist_upgrade — a
+        # concurrent same-receipt bundle that completed while we waited has
+        # pruned it; fail closed instead of double-consuming.
+        if specialist_receipt.load(receipt.receipt_id) is None:
+            return _result({"ok": False, "kind": "receipt_required",
+                            "detail": "the receipt was consumed by a concurrent "
+                                      "bundle while waiting for the mutation lock "
+                                      "— re-run specialist_install_inspect"})
         try:
             instance, txn = await asyncio.to_thread(
                 commit_specialist_install, inspection=inspection, receipt=receipt,
@@ -8166,6 +8174,16 @@ async def specialist_upgrade(args: dict) -> dict:
         plugin_resolutions=receipt.plugins,
     )
     async with _PLUGIN_TOOLS_LOCK:
+        # #346: the receipt was loaded BEFORE this lock; a concurrent bundle
+        # holding the same receipt may have completed (and pruned it) while
+        # we waited. Re-check under the lock — proceeding would treat the
+        # tuple commit as a no-op yet still rotate the owned-plugins sidecar,
+        # desyncing active.prior from owned-plugins.prior for rollback.
+        if specialist_receipt.load(receipt.receipt_id) is None:
+            return _result({"ok": False, "kind": "receipt_required",
+                            "detail": "the receipt was consumed by a concurrent "
+                                      "bundle while waiting for the mutation lock "
+                                      "— re-run specialist_install_inspect"})
         try:
             instance, txn = await asyncio.to_thread(
                 upgrade_specialist, slug=args["slug"], inspection=inspection, receipt=receipt,

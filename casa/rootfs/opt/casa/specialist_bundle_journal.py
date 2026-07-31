@@ -59,6 +59,12 @@ TUPLE_FILENAMES = frozenset({
     "active.yaml", "desired.yaml", "active.prior.yaml",
     "owned-plugins.yaml", "owned-plugins.desired.yaml",
     "owned-plugins.prior.yaml",
+    # #339/#346 (Sol round-2): the pending prior-rotation journal
+    # InstanceDir.commit_desired_to_active leaves behind when a rotation
+    # fails or crashes. A bundle commit's copy step overwrites it, so
+    # compensation must restore (or re-remove) it with the rest of the
+    # tuple state or a compensated crash discards the pending rotation.
+    "active.yaml.rollback-tmp",
 })
 
 # Task 11 reads this after every boot to surface reconciliation results in
@@ -293,7 +299,7 @@ def quarantine_all(*,
 def _valid_payload(payload: Any, slug: str) -> bool:
     """Strict, jsonschema-shaped structural validation (spec §3.1): schema
     shape, `payload["slug"] == filename slug`, and tuple-path containment —
-    every `before.tuple_files` key must be one of the fixed six filenames.
+    every `before.tuple_files` key must be one of the fixed journalled filenames (TUPLE_FILENAMES).
     Never raises — any unexpected shape is simply invalid."""
     try:
         if not isinstance(payload, dict):

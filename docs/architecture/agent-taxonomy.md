@@ -1,5 +1,5 @@
 ---
-last_reviewed: 2026-07-30
+last_reviewed: 2026-07-31
 ---
 
 # Agent taxonomy and the registry
@@ -67,11 +67,11 @@ skipped, so a stray save does not become a half-parsed agent.
 Stated as the asymmetry it is. `validate_config_repo` additionally skips the
 pipeline-managed specialists subtree, so it is not a whole-repository gate either.
 
-What it does not cover: the isolation catches the loader's own typed error and nothing else.
-An exception of a different type escaping a specialist's load — role materialisation raises
-plain `ValueError` subclasses, for instance — is not confined to that specialist and is
-boot-fatal after all. "Non-fatal" is a property of failures the loader converts, not of the
-tier.
+What it does not cover: the isolation catches the loader's typed error plus plain
+`ValueError` and `OSError` — the set the load path actually raises on malformed input
+(role materialisation raises `ValueError` subclasses, for instance). An exception outside
+that set escaping a specialist's load is not confined to that specialist and is boot-fatal
+after all. "Non-fatal" is a property of failures the loader converts, not of the tier.
 
 Two qualifiers, both of which invert the naive reading:
 

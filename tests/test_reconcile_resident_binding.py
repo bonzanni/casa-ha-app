@@ -210,6 +210,204 @@ def test_a_staged_candidate_identical_to_active_is_a_no_op_and_clears_the_stale_
 
 
 # ---------------------------------------------------------------------------
+# #339 — commit-before-validate. A candidate binding must PROVE it loads
+# (persona requirements + the caller-supplied compile/admission check) BEFORE
+# desired -> active promotion, and an override reconcile must verify the
+# persona bytes on disk still match the binding's pinned persona_checksum.
+# ---------------------------------------------------------------------------
+
+
+def test_a_staged_candidate_that_fails_candidate_validation_is_not_committed(tmp_path) -> None:
+    """#339 (high): prompt admission used to run only AFTER reconcile had
+    already committed desired -> active, so a schema-valid persona that
+    exceeds a compile ceiling was made active and every later boot failed on
+    it. The caller-supplied candidate_validator (agent_loader wires the real
+    compile) must run BEFORE the commit; on failure the staged candidate is
+    discarded and the retained active keeps running."""
+    role = _role()
+    default = _persona("casa/tina", "0.1.0")
+    override = _persona("casa/gary", "0.2.0")
+    instance_dir = InstanceDir(tmp_path / "resident-butler")
+
+    first = reconcile_resident_binding(
+        role=role, image_default_persona_loader=_loaders({"casa/tina@0.1.0": default}),
+        override_persona_loader=_loaders({}), instance_dir=instance_dir,
+    )
+
+    override_binding = materialize_override_binding(
+        role=role, persona=override, override_source="operator:casa/gary@0.2.0",
+    )
+    instance_dir.stage_desired(InstanceTuple(
+        root="operator:casa/gary@0.2.0", binding=override_binding,
+        config_snapshot={}, config_digest=override_binding.effective_config_digest,
+    ))
+
+    def _reject_gary(persona, binding):
+        if persona.persona_id == "casa/gary":
+            raise ValueError("text prompt exceeds admission ceiling")
+
+    second = reconcile_resident_binding(
+        role=role, image_default_persona_loader=_loaders({"casa/tina@0.1.0": default}),
+        override_persona_loader=_loaders({"casa/gary@0.2.0": override}),
+        instance_dir=instance_dir, candidate_validator=_reject_gary,
+    )
+    assert second == first  # retained last-known-good, NOT the bad candidate
+    assert instance_dir.active() == first  # nothing was committed to disk
+    assert instance_dir.desired() is None
+    assert (tmp_path / "resident-butler" / "desired.error.yaml").exists()
+
+
+def test_reconcile_verifies_the_pinned_persona_checksum_before_activating(tmp_path) -> None:
+    """#339 (medium): a staged override pins persona_checksum; if the bytes at
+    the (mutable) persona path have changed while the version string stayed
+    the same, reconcile used to silently rematerialize + commit a binding for
+    whatever bytes were present — bypassing the checksum-bound consent
+    contract. Changed bytes must be refused; the retained active keeps
+    running."""
+    import dataclasses
+
+    role = _role()
+    default = _persona("casa/tina", "0.1.0")
+    approved = _persona("casa/gary", "0.2.0")
+    tampered = dataclasses.replace(approved, checksum="sha256:" + "4" * 64)
+    instance_dir = InstanceDir(tmp_path / "resident-butler")
+
+    first = reconcile_resident_binding(
+        role=role, image_default_persona_loader=_loaders({"casa/tina@0.1.0": default}),
+        override_persona_loader=_loaders({}), instance_dir=instance_dir,
+    )
+
+    # The binding was staged against the APPROVED bytes...
+    override_binding = materialize_override_binding(
+        role=role, persona=approved, override_source="operator:casa/gary@0.2.0",
+    )
+    instance_dir.stage_desired(InstanceTuple(
+        root="operator:casa/gary@0.2.0", binding=override_binding,
+        config_snapshot={}, config_digest=override_binding.effective_config_digest,
+    ))
+    # ...but the loader now returns DIFFERENT bytes for the same id@version.
+    second = reconcile_resident_binding(
+        role=role, image_default_persona_loader=_loaders({"casa/tina@0.1.0": default}),
+        override_persona_loader=_loaders({"casa/gary@0.2.0": tampered}),
+        instance_dir=instance_dir,
+    )
+    assert second == first
+    assert instance_dir.active().binding.mode == "image-default"
+    assert instance_dir.desired() is None
+    error_file = tmp_path / "resident-butler" / "desired.error.yaml"
+    assert "checksum" in error_file.read_text(encoding="utf-8")
+
+
+def test_changed_bytes_under_an_active_override_are_never_reactivated(tmp_path) -> None:
+    """#339 (medium), the nothing-staged variant: an ACTIVE override is
+    re-reconciled on every boot by persona_id@version. If the bytes changed
+    (e.g. a restore over /config), the old code committed a fresh binding for
+    the new bytes — same silent consent bypass. The changed bytes must not be
+    activated; the pinned active tuple is retained unchanged (its own
+    load-time fate is the loader's, per INV-PERS-003)."""
+    import dataclasses
+
+    role = _role()
+    default = _persona("casa/tina", "0.1.0")
+    approved = _persona("casa/gary", "0.2.0")
+    instance_dir = InstanceDir(tmp_path / "resident-butler")
+
+    reconcile_resident_binding(
+        role=role, image_default_persona_loader=_loaders({"casa/tina@0.1.0": default}),
+        override_persona_loader=_loaders({}), instance_dir=instance_dir,
+    )
+    override_binding = materialize_override_binding(
+        role=role, persona=approved, override_source="operator:casa/gary@0.2.0",
+    )
+    instance_dir.stage_desired(InstanceTuple(
+        root="operator:casa/gary@0.2.0", binding=override_binding,
+        config_snapshot={}, config_digest=override_binding.effective_config_digest,
+    ))
+    active = reconcile_resident_binding(
+        role=role, image_default_persona_loader=_loaders({"casa/tina@0.1.0": default}),
+        override_persona_loader=_loaders({"casa/gary@0.2.0": approved}),
+        instance_dir=instance_dir,
+    )
+    assert active.binding.mode == "override"
+    approved_checksum = active.binding.persona_checksum
+
+    tampered = dataclasses.replace(approved, checksum="sha256:" + "4" * 64)
+    third = reconcile_resident_binding(
+        role=role, image_default_persona_loader=_loaders({"casa/tina@0.1.0": default}),
+        override_persona_loader=_loaders({"casa/gary@0.2.0": tampered}),
+        instance_dir=instance_dir,
+    )
+    assert third.binding.persona_checksum == approved_checksum
+    assert instance_dir.active().binding.persona_checksum == approved_checksum
+
+
+def test_dry_run_reconcile_validates_without_any_instance_dir_write(tmp_path) -> None:
+    """#338 (medium): tools.validate_config_repo replays the boot loader for
+    validation ONLY, but reconcile used to commit a staged desired -> active
+    as a side effect — a validation-only config_git_commit could flip the
+    live persona binding before the required restart. commit=False must
+    perform the full validation and return the would-be tuple while leaving
+    every on-disk file untouched."""
+    role = _role()
+    default = _persona("casa/tina", "0.1.0")
+    override = _persona("casa/gary", "0.2.0")
+    instance_dir = InstanceDir(tmp_path / "resident-butler")
+
+    first = reconcile_resident_binding(
+        role=role, image_default_persona_loader=_loaders({"casa/tina@0.1.0": default}),
+        override_persona_loader=_loaders({}), instance_dir=instance_dir,
+    )
+    override_binding = materialize_override_binding(
+        role=role, persona=override, override_source="operator:casa/gary@0.2.0",
+    )
+    staged = InstanceTuple(
+        root="operator:casa/gary@0.2.0", binding=override_binding,
+        config_snapshot={}, config_digest=override_binding.effective_config_digest,
+    )
+    instance_dir.stage_desired(staged)
+
+    result = reconcile_resident_binding(
+        role=role, image_default_persona_loader=_loaders({"casa/tina@0.1.0": default}),
+        override_persona_loader=_loaders({"casa/gary@0.2.0": override}),
+        instance_dir=instance_dir, commit=False,
+    )
+    assert result.binding.mode == "override"          # the would-be active
+    assert instance_dir.active() == first             # ...but nothing moved
+    assert instance_dir.desired() == staged           # staged file untouched
+
+
+def test_dry_run_reconcile_leaves_a_failing_staged_candidate_in_place(tmp_path) -> None:
+    """commit=False must not even write desired.error.yaml — a validation
+    pass is read-only, and boot must still see (and then discard) the staged
+    candidate itself."""
+    role = _role()
+    default = _persona("casa/tina", "0.1.0")
+    instance_dir = InstanceDir(tmp_path / "resident-butler")
+    first = reconcile_resident_binding(
+        role=role, image_default_persona_loader=_loaders({"casa/tina@0.1.0": default}),
+        override_persona_loader=_loaders({}), instance_dir=instance_dir,
+    )
+    ghost_binding = materialize_override_binding(
+        role=role, persona=_persona("casa/ghost", "0.9.0"),
+        override_source="operator:casa/ghost@0.9.0",
+    )
+    staged = InstanceTuple(
+        root="operator:casa/ghost@0.9.0", binding=ghost_binding,
+        config_snapshot={}, config_digest=ghost_binding.effective_config_digest,
+    )
+    instance_dir.stage_desired(staged)
+
+    result = reconcile_resident_binding(
+        role=role, image_default_persona_loader=_loaders({"casa/tina@0.1.0": default}),
+        override_persona_loader=_loaders({}),  # staged persona unresolvable
+        instance_dir=instance_dir, commit=False,
+    )
+    assert result == first                            # boot outcome: retained active
+    assert instance_dir.desired() == staged           # nothing discarded
+    assert not (tmp_path / "resident-butler" / "desired.error.yaml").exists()
+
+
+# ---------------------------------------------------------------------------
 # Whole-branch review round 6, F1 — reconcile_resident_binding must stage/commit
 # under MATERIALIZE_LOCK. It runs on the boot AND reload load paths, concurrently
 # with the now-locked persona-swap tools; off-lock it could overwrite/discard a

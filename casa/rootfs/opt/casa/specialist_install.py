@@ -10,6 +10,9 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import TYPE_CHECKING, Literal, Mapping
 
+import jsonschema
+import yaml
+
 from authored_markers import contains_forbidden_marker
 from canonical_bytes import reject_forbidden_markers, to_plain_json
 from specialist_component import SpecialistComponent, is_valid_slug, load_specialist_component
@@ -116,7 +119,7 @@ def _require_active_unchanged(instance_dir, active_before, *, slug: str) -> None
             f"refusing to overwrite it — retry the operation")
 
 
-def _refuse_if_active_present(instance_dir, *, slug: str) -> None:
+def _refuse_if_active_present(instance_dir, *, slug: str, root: str) -> None:
     """F2: a fresh `commit_specialist_install` (both the activating and the
     pending-configuration placeholder paths) presumes the slug is NOT yet
     active — inspect's `check_slug_uniqueness` rejected an already-installed
@@ -127,13 +130,52 @@ def _refuse_if_active_present(instance_dir, *, slug: str) -> None:
     `commit_desired_to_active` would rotate the winner's active into prior and
     write ours over it — a silent double-activate demoting the winner. Re-read
     under the lock and refuse if an active tuple already exists (fail closed),
-    rather than clobber a concurrent winner."""
+    rather than clobber a concurrent winner.
+
+    #346 extends the same guard to a PENDING candidate: uniqueness at inspect
+    time sees neither tuple for a free slug, so two fresh installs of the same
+    slug could both pass and the second would silently replace the first's
+    desired.yaml (and its config/owned-plugin sidecar). A pending candidate
+    with a DIFFERENT component root is refused; the SAME root may restage —
+    that is the pending-configuration slug's own configure re-commit (the
+    documented pending -> active step), which legitimately replaces its own
+    placeholder. ``root`` is the caller's component_root string
+    (component_id@version#checksum). A pending tuple that fails to LOAD is
+    treated as a conflict too (cannot prove it is ours — fail closed; the
+    boot-time index isolates it as state="error" for inspection).
+
+    Deliberately NOT keyed on receipt/operation identity (Terra round-3):
+    a same-root restage with different config is last-writer-wins pending
+    activation. An operator resuming configuration later re-inspects and
+    holds a NEW receipt for the same root, so demanding receipt equality
+    would refuse the legitimate resume flow; and both writers necessarily
+    hold consent for this exact install identity with byte-identical
+    content, so no consent or integrity boundary is crossed — only the
+    not-yet-activated config of one consented component."""
     if instance_dir.active() is not None:
         raise SpecialistInstallError(
             "concurrent_mutation",
             f"{slug!r}: an active install appeared under a concurrent install "
             f"while acquiring the lock; refusing to double-activate — re-inspect "
             f"and retry")
+    try:
+        pending = instance_dir.desired()
+    except (ValueError, OSError, yaml.YAMLError,
+            jsonschema.ValidationError) as exc:
+        # load_instance_tuple wraps only its own ValueError path; a bad-YAML
+        # or schema-invalid desired.yaml raises the raw parser/validator
+        # error. All of them mean the same thing here: an occupant we cannot
+        # prove is ours — fail closed.
+        raise SpecialistInstallError(
+            "concurrent_mutation",
+            f"{slug!r}: an unreadable pending candidate already exists "
+            f"({exc}); refusing to replace it — uninstall or repair first")
+    if pending is not None and pending.root != root:
+        raise SpecialistInstallError(
+            "concurrent_mutation",
+            f"{slug!r}: a different pending install ({pending.root}) already "
+            f"occupies this slug; refusing to replace it — complete or "
+            f"uninstall it first")
 
 
 @dataclass(frozen=True, slots=True)
@@ -873,7 +915,10 @@ def inspect_specialist_repo(
         raise SpecialistInstallError("manifest_missing", f"{repo}@{ref}: manifest.json not found")
     try:
         component = load_specialist_component(component_dir, manifest_path)
-    except ValueError as exc:
+    except (ValueError, jsonschema.ValidationError) as exc:
+        # #346: load_specialist_component pins jsonschema.ValidationError —
+        # NOT a ValueError subclass — for a schema-violating manifest; both
+        # must land in the structured manifest_invalid envelope.
         raise SpecialistInstallError("manifest_invalid", str(exc)) from exc
 
     _validate_untrusted_bytes(component)
@@ -1036,12 +1081,20 @@ def component_root_string(*, component_id: str, version: str, component_checksum
     return f"{component_id}@{version}#{component_checksum}"
 
 
+_COMPONENT_CHECKSUM_RE = re.compile(r"^sha256:[0-9a-f]{64}$")
+
+
 def parse_component_root(component_root: str) -> tuple[str, str, str]:
     """Inverse of component_root_string. Raises ValueError on a malformed root
     (never silently returns a partial tuple — a corrupt InstanceTuple's root
-    must fail closed, not resolve to a guessed CAS path)."""
+    must fail closed, not resolve to a guessed CAS path).
+
+    #346: the checksum segment is pinned to exactly ``sha256:`` + 64 lower-hex
+    — ``cas_store_dir`` joins it (prefix-stripped) straight into the store
+    root, so a tampered tuple root like ``...#sha256:../../outside`` must
+    never parse."""
     head, sep, checksum = component_root.rpartition("#")
-    if not sep or not checksum.startswith("sha256:"):
+    if not sep or not _COMPONENT_CHECKSUM_RE.match(checksum):
         raise ValueError(f"malformed component_root: {component_root!r}")
     component_id, sep2, version = head.rpartition("@")
     if not sep2:
@@ -1228,7 +1281,7 @@ def _owned_sidecar_doc(
 
 
 def _tuple_files_snapshot(slug_dir: Path) -> "dict[str, str | None]":
-    """Read the six journalled tuple/sidecar files' bytes (or None when absent)
+    """Read the journalled tuple/sidecar files' bytes (or None when absent)
     for the bundle-op journal's before-state."""
     from specialist_bundle_journal import TUPLE_FILENAMES
 
@@ -1548,7 +1601,7 @@ def commit_specialist_install(
                     dependency_digests=dependency_digests,
                 )
                 with specialist_materialize.MATERIALIZE_LOCK:
-                    _refuse_if_active_present(instance_dir, slug=inspection.slug)
+                    _refuse_if_active_present(instance_dir, slug=inspection.slug, root=root)
                     instance_dir.stage_desired(InstanceTuple(
                         root=root, binding=placeholder_binding, config_snapshot=dict(config),
                         config_digest=placeholder_binding.effective_config_digest,
@@ -1562,7 +1615,7 @@ def commit_specialist_install(
                 )
             last_activation_error: str | None = None
             with specialist_materialize.MATERIALIZE_LOCK:
-                _refuse_if_active_present(instance_dir, slug=inspection.slug)
+                _refuse_if_active_present(instance_dir, slug=inspection.slug, root=root)
                 instance_dir.stage_desired(InstanceTuple(
                     root=root, binding=binding, config_snapshot=dict(config),
                     config_digest=effective_config_digest,

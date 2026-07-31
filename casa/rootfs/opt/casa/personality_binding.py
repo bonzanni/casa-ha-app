@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import json
+import logging
 import os
 import re
 import threading
@@ -24,6 +25,8 @@ from role_slot import (  # noqa: F401 — re-exported for existing callers (Task
 from trait_renderer import RENDERER_VERSION
 
 _SCHEMA_DIR = Path(__file__).parent / "defaults" / "schema"
+
+logger = logging.getLogger(__name__)
 
 # THE PERSONALITY-INSTANCE MUTATION LOCK (whole-branch review round 6, F1).
 # Defined HERE — its true home — because it guards the InstanceDir state whose
@@ -339,16 +342,91 @@ class InstanceDir:
         # preserves_true_prior).
         if current_active is not None and current_active == candidate:
             # Crash-retry / no-op recommit (§4.1): a previous run already wrote
-            # `candidate` to active.yaml but died before unlinking desired.yaml.
-            # active.yaml already IS the candidate, so do NOT rotate prior again
-            # — that would overwrite the true pre-commit rollback target with a
-            # duplicate of the new active. Just finish the interrupted step.
-            desired_path.unlink(missing_ok=True)
+            # `candidate` to active.yaml but died before finishing. active.yaml
+            # already IS the candidate, so do NOT re-copy it toward prior —
+            # that would overwrite the true pre-commit rollback target with a
+            # duplicate of the new active. #339: under the write-active-first
+            # order below, the interrupted step may ALSO be the pending
+            # tmp -> prior rotation (the copied OLD active) — finish it, but
+            # only after PROVING the tmp is a genuine pre-commit generation
+            # (Sol review): a bundle-journal rollback restores active/prior
+            # without knowing about this tmp, so a stale tmp can survive
+            # holding the SAME tuple as the restored active — rotating that
+            # duplicate over prior is exactly the clobber this branch exists
+            # to prevent. A tmp that fails to load (corrupt/tampered) must
+            # never reach prior either. Unlink in both cases.
+            pending = active_path.with_suffix(active_path.suffix + ".rollback-tmp")
+            try:
+                if pending.exists():
+                    try:
+                        pending_tuple = load_instance_tuple(pending)
+                    except (ValueError, OSError, yaml.YAMLError,
+                            jsonschema.ValidationError):
+                        pending_tuple = None
+                    if pending_tuple is not None and pending_tuple != candidate:
+                        os.replace(pending, prior_path)
+                    else:
+                        pending.unlink(missing_ok=True)
+                desired_path.unlink(missing_ok=True)
+            except OSError:
+                # Sol round-2: active.yaml already IS the candidate — the
+                # commit is durable, so every remaining step is best-effort
+                # cleanup and must not make the caller believe the commit
+                # failed (it would run the pre-commit tuple while disk holds
+                # the new active). The next recommit retries.
+                logger.warning(
+                    "%s: post-commit cleanup failed; retried on the next "
+                    "recommit", self._dir, exc_info=True,
+                )
             return candidate
-        if active_path.exists():
-            os.replace(self._copy_to_temp(active_path), prior_path)
-        atomic_write_instance_tuple(active_path, candidate)  # write new active LAST-safe
-        desired_path.unlink(missing_ok=True)
+        # #339 (rollback-generation safety): durably write the NEW active
+        # before anything touches active.prior.yaml. The old order rotated
+        # prior first, so an active-write failure in between left
+        # prior == active — the previous rollback generation destroyed with
+        # nothing gained. Now a failure at any point leaves prior intact,
+        # and a crash after the active write is completed by the
+        # crash-retry branch above (the .rollback-tmp copy IS the journal).
+        pending_prior = (
+            self._copy_to_temp(active_path) if active_path.exists() else None
+        )
+        try:
+            atomic_write_instance_tuple(active_path, candidate)
+        except BaseException:
+            # A FAILED (not crashed) write must not leave the copied tmp
+            # behind: a later commit of a tuple identical to active would
+            # take the crash-retry branch and rotate this stale copy over
+            # the true prior. (A hard crash here is safe without cleanup —
+            # active != candidate still, so retry recreates the copy.)
+            if pending_prior is not None:
+                pending_prior.unlink(missing_ok=True)
+            raise
+        if pending_prior is not None:
+            try:
+                os.replace(pending_prior, prior_path)
+            except OSError:
+                # Terra review: the commit has already SUCCEEDED — the new
+                # active is durably written. Failing here would make the
+                # caller run the pre-commit tuple while disk says otherwise
+                # (reconcile catches OSError and returns the retained
+                # active). Keep the tmp as the pending-rotation journal —
+                # the no-op recommit branch above completes it, and any
+                # later real commit overwrites it — and log the degraded
+                # prior instead of failing a committed transition.
+                logger.warning(
+                    "%s: new active committed but prior rotation failed; "
+                    "rollback target is one generation stale until the "
+                    "pending rotation completes", self._dir, exc_info=True,
+                )
+        try:
+            desired_path.unlink(missing_ok=True)
+        except OSError:
+            # Sol round-2: same post-commit rule as above — the new active is
+            # durable, so a failed desired unlink must not fail the commit;
+            # the stale desired is cleared by the next no-op recommit.
+            logger.warning(
+                "%s: new active committed but desired.yaml unlink failed; "
+                "cleared on the next recommit", self._dir, exc_info=True,
+            )
         return candidate
 
     def _copy_to_temp(self, path: Path) -> Path:
@@ -389,6 +467,15 @@ class InstanceDir:
         active = owned_plugins_path(self._dir)
         prior = owned_plugins_prior_path(self._dir)
         if not desired.exists():
+            return
+        if active.exists() and desired.read_bytes() == active.read_bytes():
+            # #346: no-op recommit (crash-retry, or a duplicate bundle that
+            # lost a race) — the staged sidecar IS the active one. Rotating
+            # would clobber the true prior generation with a duplicate of
+            # the new active, desyncing owned-plugins.prior from
+            # active.prior.yaml for rollback. Mirrors
+            # commit_desired_to_active's tuple no-op semantics.
+            desired.unlink()
             return
         if active.exists():
             # Copy-then-replace (mirrors commit_desired_to_active's
@@ -593,6 +680,8 @@ def check_persona_requirements(role: Mapping[str, object], persona: PersonaPack)
 def reconcile_resident_binding(
     *, role: RoleSlot, image_default_persona_loader: Callable[[str], PersonaPack],
     override_persona_loader: Callable[[str], PersonaPack], instance_dir: InstanceDir,
+    candidate_validator: "Callable[[PersonaPack, BindingRecord], None] | None" = None,
+    commit: bool = True,
 ) -> InstanceTuple:
     """Boot-time reconciliation of a resident's binding (spec §4.1, §4.2, §4.4).
 
@@ -659,6 +748,20 @@ def reconcile_resident_binding(
             if source_binding is not None and source_binding.mode == "override":
                 persona_ref = f"{source_binding.persona_id}@{source_binding.persona_version}"
                 persona = override_persona_loader(persona_ref)
+                # #339: a published persona version is immutable and its
+                # activation is checksum-bound consent. The binding pins the
+                # approved bytes; if the (mutable) path now holds DIFFERENT
+                # bytes for the same id@version, refuse to rematerialize —
+                # silently committing whatever is present would bypass the
+                # consent contract.
+                if persona.checksum != source_binding.persona_checksum:
+                    raise ValueError(
+                        f"persona {persona_ref} on disk has checksum "
+                        f"{persona.checksum} but the binding pins "
+                        f"{source_binding.persona_checksum} — bytes changed "
+                        f"under a pinned version; re-run resident_persona_swap "
+                        f"to re-approve, or resident_persona_reset to recover"
+                    )
                 candidate_binding = materialize_override_binding(
                     role=role, persona=persona, override_source=source_binding.override_source,
                 )
@@ -672,7 +775,7 @@ def reconcile_resident_binding(
                 root = candidate_binding.image_default_root
 
             if active is not None and active.binding.binding_digest == candidate_binding.binding_digest:
-                if staged is not None:
+                if staged is not None and commit:
                     instance_dir.discard_desired(reason="no-op: candidate matches the already-active binding")
                 return active
 
@@ -681,12 +784,26 @@ def reconcile_resident_binding(
                 config_digest=candidate_binding.effective_config_digest,
             )
             check_persona_requirements(role.normalized, persona)
+            # #339: the candidate must PROVE it loads before promotion. The
+            # caller supplies the same compile/admission check the loader
+            # runs after reconcile (agent_loader wires compile_prompt_bundle
+            # — not imported here, which would cycle). Without this, a
+            # schema-valid persona that fails a compile ceiling was committed
+            # active and every subsequent boot failed on it with no
+            # last-known-good left to retain.
+            if candidate_validator is not None:
+                candidate_validator(persona, candidate_binding)
+            if not commit:
+                # Validation-only replay (#338): report what boot WOULD
+                # activate without writing any InstanceDir state.
+                return candidate_tuple
             instance_dir.stage_desired(candidate_tuple)
             return instance_dir.commit_desired_to_active()
         except (ValueError, OSError) as exc:
             # discard_desired() is a no-op when nothing was ever staged (e.g. the
             # persona loader itself raised before stage_desired ran).
-            instance_dir.discard_desired(reason=str(exc))
+            if commit:
+                instance_dir.discard_desired(reason=str(exc))
             if active is None:
                 raise ValueError(
                     f"resident {role.role_id}: no prior active binding exists and the "

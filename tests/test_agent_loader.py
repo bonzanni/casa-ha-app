@@ -1800,3 +1800,202 @@ class TestSpecialistBindingActivation:
         cfg.compiled_prompt_bundle = None
         activate_binding_for_config(cfg, specialists_root=tmp_path / "specialists")  # no InstanceDir written
         assert cfg.compiled_prompt_bundle is None  # legacy fallback path stays intact
+
+
+# ---------------------------------------------------------------------------
+# #338 — validate_config_repo boot-parity: trigger registration, specialist
+# isolation, and no binding side effects from a validation-only pass.
+# ---------------------------------------------------------------------------
+
+
+class TestValidateConfigRepoIssue338:
+    """The gate must replay what boot actually runs — and ONLY validate."""
+
+    def _repo(self, tmp_path):
+        """A bootable single-resident repo on a synthetic roles_dir."""
+        repo = tmp_path / "addon_configs" / "casa"
+        resident_dir = _seed_resident(repo / "agents", "assistant")
+        _policies_file(repo / "policies")
+        roles_dir = tmp_path / "roles"
+        _seed_role_artifact(roles_dir, "resident", "assistant")
+        _w(resident_dir / "runtime.yaml", """\
+            schema_version: 1
+            kind: resident
+            model: {source: fixed, value: sonnet}
+            tools:
+              allowed: [Read, Write]
+            channels: [telegram]
+        """)
+        return repo, resident_dir, roles_dir
+
+    def test_duplicate_trigger_names_are_refused_by_the_gate(self, tmp_path):
+        """Boot registers resident triggers UNCAUGHT (casa_core step 13b);
+        TriggerRegistry.register_agent raises TriggerError on a duplicate
+        name, and the triggers schema has no uniqueItems — so this commit
+        used to pass the gate and crash-loop the add-on."""
+        from agent_loader import validate_config_repo
+
+        repo, resident_dir, roles_dir = self._repo(tmp_path)
+        _w(resident_dir / "triggers.yaml", """\
+            schema_version: 1
+            triggers:
+              - {name: dup, type: interval, minutes: 5, channel: telegram, prompt: tick}
+              - {name: dup, type: interval, minutes: 10, channel: telegram, prompt: tock}
+        """)
+        errors = validate_config_repo(str(repo), roles_dir=str(roles_dir))
+        assert any("duplicate trigger name" in e for e in errors), errors
+
+    def test_scheduled_trigger_on_an_unregistered_channel_is_refused(self, tmp_path):
+        from agent_loader import validate_config_repo
+
+        repo, resident_dir, roles_dir = self._repo(tmp_path)
+        _w(resident_dir / "triggers.yaml", """\
+            schema_version: 1
+            triggers:
+              - {name: tick, type: interval, minutes: 5, channel: voice, prompt: hi}
+        """)
+        errors = validate_config_repo(str(repo), roles_dir=str(roles_dir))
+        assert any("not registered on this agent" in e for e in errors), errors
+
+    def test_cron_field_out_of_range_is_refused(self, tmp_path):
+        """A 5-field cron string with an out-of-range value passes the
+        schema (any non-empty string) and the field-count check, but
+        APScheduler's add_job raises at boot registration."""
+        from agent_loader import validate_config_repo
+
+        repo, resident_dir, roles_dir = self._repo(tmp_path)
+        _w(resident_dir / "triggers.yaml", """\
+            schema_version: 1
+            triggers:
+              - {name: nightly, type: cron, schedule: "99 3 * * *", channel: telegram, prompt: go}
+        """)
+        errors = validate_config_repo(str(repo), roles_dir=str(roles_dir))
+        # APScheduler's message names the offending expression, not the
+        # trigger; the replay wrapper adds the agent.
+        assert any("trigger registration failed" in e and "99" in e
+                   for e in errors), errors
+
+    def test_a_clean_repo_with_valid_triggers_still_passes(self, tmp_path):
+        """The replay must not false-flag a registrable trigger set."""
+        from agent_loader import validate_config_repo
+
+        repo, resident_dir, roles_dir = self._repo(tmp_path)
+        _w(resident_dir / "triggers.yaml", """\
+            schema_version: 1
+            triggers:
+              - {name: morning, type: cron, schedule: "0 8 * * *", channel: telegram, prompt: brief}
+              - {name: tick, type: interval, minutes: 30, channel: telegram, prompt: check}
+        """)
+        errors = validate_config_repo(str(repo), roles_dir=str(roles_dir))
+        assert errors == []
+
+    def test_one_inconsistent_specialist_is_isolated_not_scan_fatal(
+            self, tmp_path, monkeypatch):
+        """#338: materialize_role raises raw RoleValidationError (a
+        ValueError) for a schema-valid but inconsistent role artifact — e.g.
+        an ha_option role whose allowed list excludes the operator's current
+        option value. load_all_specialists caught only LoadError, so ONE such
+        specialist killed the whole scan (and with it boot). It must land in
+        `failed` like every other per-specialist error."""
+        from agent_loader import load_all_specialists
+
+        base = tmp_path / "agents" / "specialists"
+        _seed_specialist(base, "finance")
+        _seed_specialist(base, "broken")
+        roles_dir = tmp_path / "roles"
+        _seed_role_artifact(roles_dir, "specialist", "finance")
+        _seed_role_artifact(roles_dir, "specialist", "broken")
+
+        ha_model = ("model: {source: ha_option, option: voice_agent_model, "
+                    "default: haiku, allowed: [haiku]}")
+        role_yaml = roles_dir / "specialist" / "broken" / "role.yaml"
+        role_yaml.write_text(role_yaml.read_text(encoding="utf-8").replace(
+            "model: {source: fixed, value: sonnet}", ha_model), encoding="utf-8")
+        _w(base / "broken" / "runtime.yaml", f"""\
+            schema_version: 1
+            kind: specialist
+            {ha_model}
+            enabled: true
+            memory:
+              token_budget: 0
+            session:
+              strategy: ephemeral
+        """)
+        monkeypatch.setenv("VOICE_AGENT_MODEL", "opus")  # permitted by config.yaml
+
+        found, failed = load_all_specialists(str(base), roles_dir=str(roles_dir))
+        assert "finance" in found
+        assert any(name == "broken" for name, _ in failed), failed
+
+    def test_gate_survives_an_inconsistent_specialist(self, tmp_path, monkeypatch):
+        """Same repo through validate_config_repo: per-specialist failures
+        are boot-non-fatal (isolated) and deliberately not gate errors — but
+        before the fix the raw RoleValidationError CRASHED the gate itself."""
+        from agent_loader import validate_config_repo
+
+        repo, _resident_dir, roles_dir = self._repo(tmp_path)
+        base = repo / "agents" / "specialists"
+        _seed_specialist(base, "broken")
+        _seed_role_artifact(roles_dir, "specialist", "broken")
+        ha_model = ("model: {source: ha_option, option: voice_agent_model, "
+                    "default: haiku, allowed: [haiku]}")
+        role_yaml = roles_dir / "specialist" / "broken" / "role.yaml"
+        role_yaml.write_text(role_yaml.read_text(encoding="utf-8").replace(
+            "model: {source: fixed, value: sonnet}", ha_model), encoding="utf-8")
+        _w(base / "broken" / "runtime.yaml", f"""\
+            schema_version: 1
+            kind: specialist
+            {ha_model}
+            enabled: true
+            memory:
+              token_budget: 0
+            session:
+              strategy: ephemeral
+        """)
+        monkeypatch.setenv("VOICE_AGENT_MODEL", "opus")
+
+        errors = validate_config_repo(str(repo), roles_dir=str(roles_dir))
+        assert errors == []
+
+    def test_validation_never_activates_a_staged_persona_swap(self, tmp_path):
+        """#338 (medium): validate_config_repo replays the resident loader,
+        whose binding reconciliation used to COMMIT a staged desired ->
+        active as a side effect — a validation-only config_git_commit could
+        flip the live persona binding before the required restart. After the
+        fix the staged swap must survive validation untouched."""
+        import os as _os
+        from pathlib import Path as _P
+
+        from agent_loader import load_agent_from_dir, validate_config_repo
+        from personality_binding import (
+            InstanceDir, InstanceTuple, materialize_override_binding,
+        )
+        from persona_pack import load_persona_pack
+        from policies import load_policies
+
+        repo, resident_dir, roles_dir = self._repo(tmp_path)
+        policies = load_policies(str(repo / "policies" / "disclosure.yaml"))
+        # Boot once: establishes the image-default active tuple under the
+        # test-scoped CASA_BINDINGS_DIR (conftest).
+        cfg = load_agent_from_dir(
+            str(resident_dir), policies=policies, roles_dir=str(roles_dir),
+        )
+
+        tina_dir = _P("casa/rootfs/opt/casa/defaults/personas/casa/tina/0.1.0")
+        tina = load_persona_pack(tina_dir / "pack", tina_dir / "manifest.json")
+        binding = materialize_override_binding(
+            role=cfg.role_slot, persona=tina, override_source="operator:casa/tina@0.1.0",
+        )
+        instance_dir = InstanceDir(
+            _P(_os.environ["CASA_BINDINGS_DIR"]) / "resident-assistant"
+        )
+        staged = InstanceTuple(
+            root="operator:casa/tina@0.1.0", binding=binding,
+            config_snapshot={}, config_digest=binding.effective_config_digest,
+        )
+        instance_dir.stage_desired(staged)
+
+        errors = validate_config_repo(str(repo), roles_dir=str(roles_dir))
+        assert errors == []
+        assert instance_dir.desired() == staged          # swap NOT consumed
+        assert instance_dir.active().binding.mode == "image-default"

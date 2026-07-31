@@ -607,3 +607,54 @@ def test_fsync_write_completes_under_short_writes(tmp_path, monkeypatch):
     journal._fsync_write(target, payload)
 
     assert target.read_text(encoding="utf-8") == payload
+
+
+def test_journal_snapshots_and_restores_the_rollback_tmp(tmp_path):
+    """Sol round-2 (#339/#346): active.yaml.rollback-tmp is the pending
+    prior-rotation journal InstanceDir.commit_desired_to_active leaves behind
+    when a rotation fails or a crash interrupts it. A bundle transaction that
+    later mutates the slug dir overwrites it, so bundle compensation must
+    restore (or re-remove) it like every other tuple/sidecar file — otherwise
+    a compensated crash silently discards the pending rotation and the
+    rollback generation it carried."""
+    import specialist_bundle_journal as journal
+    from specialist_install import _tuple_files_snapshot
+
+    assert "active.yaml.rollback-tmp" in journal.TUPLE_FILENAMES
+
+    slug_dir = tmp_path / "specialists" / "mtg"
+    slug_dir.mkdir(parents=True)
+    (slug_dir / "active.yaml").write_text("active: current\n", encoding="utf-8")
+    (slug_dir / "active.yaml.rollback-tmp").write_text(
+        "pending: rotation\n", encoding="utf-8")
+
+    snap = _tuple_files_snapshot(slug_dir)
+    assert snap["active.yaml.rollback-tmp"] == "pending: rotation\n"
+
+    txn = journal.BundleTxn(
+        slug="mtg", journal_path=tmp_path / "j.json",
+        registry_path=tmp_path / "registry.json",
+        specialists_dir=tmp_path / "specialists",
+        acks_path=tmp_path / "acks.json",
+        before_entries=[], before_tuple_files=snap, ack_records=[],
+        new_artifact_ids=(), removed_artifact_ids=(),
+    )
+    # The transaction clobbers the tmp (a later commit's copy step would).
+    (slug_dir / "active.yaml.rollback-tmp").write_text(
+        "clobbered: yes\n", encoding="utf-8")
+    txn.rollback_disk()
+    assert (slug_dir / "active.yaml.rollback-tmp").read_text(
+        encoding="utf-8") == "pending: rotation\n"
+
+    # And a tmp recorded ABSENT is removed on rollback.
+    snap_absent = dict(snap, **{"active.yaml.rollback-tmp": None})
+    txn2 = journal.BundleTxn(
+        slug="mtg", journal_path=tmp_path / "j2.json",
+        registry_path=tmp_path / "registry.json",
+        specialists_dir=tmp_path / "specialists",
+        acks_path=tmp_path / "acks.json",
+        before_entries=[], before_tuple_files=snap_absent, ack_records=[],
+        new_artifact_ids=(), removed_artifact_ids=(),
+    )
+    txn2.rollback_disk()
+    assert not (slug_dir / "active.yaml.rollback-tmp").exists()
