@@ -23,10 +23,13 @@ startup. **Changing one requires a restart.** Nothing reloads them.
 The second is the **config tree on disk** — agents, policies, bindings, specialists — which
 is reconciled against image defaults at boot and can be reloaded in-process afterwards.
 
-**Reload is scope-specific, and it is not a restart.** Eight scopes are registered, each
-rebuilding a defined slice. There is no scope that rereads manifest options, reconstructs
-channels, or re-reads arbitrary files. If your change is an operator option, reload will not
-help you, and this is the single most common wrong expectation in this area.
+**Reload is scope-specific, and it is not a restart.** Eight scopes are registered —
+triggers, agent, agents, policies, plugin_env, executors, config_sync, and full — each
+rebuilding a defined slice (executors rebuilds the executor registry with a resident
+cascade; config_sync reruns reconciliation then cascades agents and policies). There is no
+scope that rereads manifest options, reconstructs channels, or re-reads arbitrary files. If
+your change is an operator option, reload will not help you, and this is the single most
+common wrong expectation in this area.
 
 **A full reload is exclusive but not atomic.** It takes a writer lock that excludes every
 other reload, then runs its steps in order — and there is no rollback across them. A failure
@@ -38,6 +41,17 @@ unless explicitly asked.
 bindings, schema, and specific registry files are versioned; plugin stores, staging areas,
 the environment file and general working state are not. The whitelist is the authority, and
 it is duplicated in the boot script — both must agree.
+
+**Reconciliation has ownership rules that decide what survives an upgrade.** A default the
+operator never touched follows the image — updated in place, deleted if upstream removed
+it. An operator-edited file that conflicts with a changed default, or that fails its
+schema, is *overwritten by the image* with the prior content preserved as a recovery
+artifact. A live file the image does not know is adopted, not deleted. Predicting which of
+your edits survive means knowing which of the three cases each file is in.
+
+**Startup `op://` resolution covers exactly three options** — the Claude OAuth token, the
+Telegram bot token and the webhook secret. Any other password-typed option holding an
+`op://` reference reaches its consumer as the literal string and fails there, not at boot.
 
 **Some identity changes cannot be hot-swapped at all.** If a resident's identity changes, the
 reload path returns a restart-required outcome *before* mutating live state rather than

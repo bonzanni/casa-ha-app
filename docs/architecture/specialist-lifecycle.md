@@ -86,7 +86,15 @@ inspected; the commit separately re-checks that what it fetched still matches.
 
 **Resolution, fetch, manifest or dependency problems.** Typed refusals before anything
 durable — reference not found, fetch failure, invalid manifest, slug collision, dependency
-unavailable.
+unavailable. Sourced plugin dependencies are additionally refused categorically when they
+declare system requirements or triggers of their own, or when a required environment name
+collides with another installed plugin's — otherwise-valid bundles fail with dedicated
+error kinds the dependency model alone would not predict.
+
+**A component declares system requirements.** They install through an ordered fallback of
+strategies — verified tarball, virtualenv, npm; OS packages are refused — and the winning
+strategy is recorded durably. Boot reconciliation then only *reports* a missing binary as
+degraded; nothing reinstalls tooling automatically.
 
 **Consent missing or the inspection disagrees with the receipt.** Refused before tuple
 activation; a changed closure means a changed identity means new consent.

@@ -43,6 +43,14 @@ concurrency permits, live drivers, output sequencers, inbound reservations and v
 in-flight maps do not. A record found `active` at startup is rewritten to `idle`, because no
 live driver survived to make `active` true.
 
+**Durable is not indefinite, and engagements can speak up unprompted.** A daily sweep
+suspends a live session after a day idle and posts recurring idle reminders (three days for
+a specialist, seven for an executor, refiring weekly); terminal tombstones age out after
+thirty days, which bounds duplicate-task protection. Separately, an observer watches
+engagement events and may post a bounded LLM interjection into the resident chat — capped
+at three per engagement and suppressible with `/silent` — so engagement work can surface in
+the main conversation through a path outside the lifecycle above.
+
 **The depth cap is narrower than it sounds.** It stops an ephemerally delegated agent —
 resident or specialist alike — from delegating onwards. It is read in one place and stamped
 in one place, and the executor launch path touches neither — so it is not a general limit on

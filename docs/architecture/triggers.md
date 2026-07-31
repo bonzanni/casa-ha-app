@@ -84,6 +84,10 @@ routing immediately.
 
 ## Failure behavior
 
+**A webhook body is too large.** Requests are hard-capped at 64 KiB — chunked or not — and
+refused with 413 *before* authentication or dispatch, so an oversized producer never
+reaches its trigger.
+
 **An unknown webhook name.** Not-found, with no turn dispatched — and the name check happens
 *after* the body has been read and size-capped, so an unknown name still consumes the
 request.
@@ -113,7 +117,16 @@ plugin prefix. Declaring the webhook channel on the resident is *not* checked fo
 the channel gate is scheduled-only (see INV-TRIG-001).
 
 **A new plugin trigger** needs the manifest declaration, an assigned target that accepts
-webhooks, secret backing, and operator consent — and reconciliation must then run.
+webhooks, secret backing, and operator consent — and reconciliation must then run. The
+declaration itself has hard rails a plugin author cannot discover from the routing model:
+at most eight triggers per plugin, effective names capped at 64 characters, and
+provider-owned secrets rejected outright. Secret backing is mode-specific: static-header
+and timestamped modes get a per-trigger secret minted eagerly after consent into the
+webhook-secrets state directory, while body-HMAC rides the one global webhook secret —
+provisioning the wrong kind leaves the plugin unroutable. Resident trigger files have
+their own schema rails: v2 forbids a webhook `path` (the wildcard route provides it),
+while legacy v1 required one, and a scheduled trigger takes exactly one of an inline
+prompt or a prompt file.
 Reconciliation is hooked at boot, at plugin lifecycle changes, at consent and revocation,
 and at exactly four reload scopes: triggers, agent, agents, and full. The policies and
 config-sync reloads refresh agent configuration without reconciling the plugin overlay, so

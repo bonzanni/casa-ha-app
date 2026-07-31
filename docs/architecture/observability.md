@@ -17,6 +17,16 @@ metrics, of which there are none to speak of.
 **A correlation id threads a request across components**, bound into context so that log
 lines from the same work can be tied together.
 
+**The emitted records are structured, and JSON is the default.** Output is one-line JSON
+unless `LOG_FORMAT=human` selects UTC human-readable text; structured extras are flattened
+into the record, and the access line carries method, path with query, status, duration and
+bytes. A log consumer configured from guesswork parses production output wrong.
+
+**Per-turn token telemetry is the cost signal.** Every SDK turn emits a token summary
+(input, output, cache counters), and a budget tracker warns — once per session — after
+three consecutive turns land above 110% of the memory-envelope budget. Those lines are the
+principal evidence for cost, cache and context regressions; nothing else reports them.
+
 **Two different ids can describe one request, and a caller can supply one of them.** The
 inbound header is validated to a strict shape. A correlation id supplied inside an invocation
 payload is *not* validated — though note that on the HTTP invoke route the ingress

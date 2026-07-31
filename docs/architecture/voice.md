@@ -47,6 +47,17 @@ handshake, frame receipt and JSON parsing are all outside the budget there. Defe
 **Sessions are keyed by role and scope together**, so the same speaker talking to two agents
 gets two sessions rather than one shared context.
 
+**The transports themselves are environment-configured.** `VOICE_SSE_ENABLED` /
+`VOICE_WS_ENABLED` decide which routes exist at all (both off removes the channel),
+`VOICE_SSE_PATH` / `VOICE_WS_PATH` set the public paths, and
+`VOICE_IDLE_TIMEOUT_SECONDS` bounds session-pool idle eviction. A proxy or integration
+pointed at the default paths breaks silently if these move.
+
+**Direct HA voice turns run under a tool-loop guard.** On the `ha_direct` attempt shape, a
+second successful live-context call — or a second validation-correction failure —
+terminates the turn rather than looping. A prompt or tool change can trip this on
+otherwise valid turns; other voice roles do not carry the guard.
+
 ## Contracts & invariants
 
 **INV-VOICE-001**: Every voice route refuses a request when no secret is configured or the signature does not match.

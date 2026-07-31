@@ -28,6 +28,16 @@ Four services run under s6, each with a single job:
 | `svc-nginx` | the front door — two listeners: HA ingress (Supervisor-source-restricted) and the published external API port, which has no source restriction and relies on route-level refusals |
 | `svc-ttyd` | an optional terminal, off unless enabled |
 
+The static service table is not the whole process story: executor engagements compile and
+supervise *dynamic* s6 service/logger pairs of their own — created, recovered and forcibly
+terminated per engagement, outside the four services above. And two environment switches
+shape the process family broadly: `LOG_FORMAT=human` swaps the default one-line-JSON
+logging for human-readable text, and the `CASA_*` path/version variables
+(`CASA_CONFIG_DIR`, `CASA_DATA_DIR`, `CASA_DEFAULTS_DIR`, `CASA_BINDINGS_DIR`,
+`CASA_VERSION`, `CASA_IMAGE_VERSION`) redirect *specific loaders and reports*, not the
+application uniformly — treating them as global root overrides silently splits reads from
+writes.
+
 Four `init-*` one-shots exist — config validation, config materialisation, nginx setup and
 the plugin store — but they do **not** all precede every service. Each service names only
 the one-shots it needs: the nginx setup gates `svc-nginx` alone, the plugin store gates both

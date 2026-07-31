@@ -49,6 +49,16 @@ durable delivery order is offered, and a non-deliverable head blocks that device
 until it expires. Different devices progress independently, and the same device stays
 serialized even across route reconnects.
 
+**The bounds are fixed and small.** A disconnected route stays fresh for sixty seconds; a
+completed result is retained at most fifteen minutes (a specialist's shorter privacy
+expiry wins); a route holds at most five live-or-ready jobs; a claim leases for fifteen
+seconds with five-second renewals, and a nacked endpoint parks re-offers for thirty. These
+decide admission, expiry and redelivery latency — none is operator-configurable.
+
+**Cancellation has a physical boundary.** Ready or claimed work cancels; authorized work
+enters a stopping/revocation handshake; playing or delivered is too late — a cancellation
+request does not promise an already-authorized answer goes unheard.
+
 ## Contracts & invariants
 
 **INV-JOB-001**: Every job mutation writes the complete snapshot to disk before publishing it in memory; a failed write publishes nothing.

@@ -85,6 +85,13 @@ matters, check which of the three shapes the path you are on actually has.
 
 **A state file is absent.** Almost always treated as empty, and often created on first write.
 
+**Session pointers are actively reaped, and webhook sessions never survive a boot.** A
+six-hour sweep removes expired entries and any with malformed or missing activity
+timestamps, hard-deleting their SDK transcripts best-effort — a stored pointer is not
+indefinitely durable. And boot migration purges *every* webhook-scoped session
+unconditionally, so webhook conversation continuity deliberately does not survive a
+restart even though the registry file does.
+
 **A state file is corrupt.** Depends entirely on which file. Some are preserved under a
 different name before being replaced; at least one is overwritten with no copy retained; at
 least one raises rather than recovering. Check the loader.

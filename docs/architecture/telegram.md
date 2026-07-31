@@ -72,6 +72,13 @@ this invariant to commands.
 
 **INV-TG-003**: A live request is resolved exactly once.
 
+"Once" has a short afterlife: a finished request keeps a sixty-second tombstone, and a
+same-key registration inside that window *reattaches to the prior outcome* instead of
+creating a fresh request — so an HTTP retry sees the original verdict rather than posting
+a duplicate keyboard. Transport failures are handled separately by a reconnect supervisor
+(a periodic probe with bounded timeout, then unbounded jittered-backoff rebuilds), which is
+why a Telegram outage recovers without operator action.
+
 Enforced by a claim-then-commit protocol in the broker: claiming marks the request, commit
 validates the claim token, and finishing removes it and resolves its waiter.
 

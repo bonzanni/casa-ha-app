@@ -42,6 +42,10 @@ restores it — it would pass even if production registered a tester. Emptiness 
 registry is established by code search, and pinned only if a test asserts the unmodified
 registry.
 
+The declared `optimization_bounds` are metadata only — a sweep validates the axis *name*
+and never checks values against the bounds, so the framework does not prevent an unsafe
+configuration probe an evaluator author might assume it refuses.
+
 **INV-EVAL-002**: Bank selection for any live-memory check comes from the caller; the code does not confine it.
 
 Stated as an invariant because its absence is a real hazard: a mistyped or defaulted bank

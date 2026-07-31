@@ -86,6 +86,11 @@ fresh retry policy — up to the standard attempt limit, not a single extra try.
 **The pool cannot serve the turn.** It raises, and the turn creates its own client for this
 turn only.
 
+**The CLI does not match its pin.** Boot verifies the effective Claude CLI against a pinned
+path and exact pinned version, and a mismatch is *fatal at startup* — replacing or
+upgrading the CLI without moving the pin prevents Casa from starting rather than merely
+degrading turns.
+
 **Memory is unavailable.** The turn proceeds without it, with a warning. An unavailable
 memory is not an empty memory — but at this point the distinction lives only in the logs and
 the recall breaker. The model and the turn's caller see the same thing either way: no recall
@@ -106,8 +111,13 @@ not in the options assembly; anything that only needs to hold per client generat
 in the options assembly, which is the one place that sees the fully-resolved context.
 
 The pool is bounded three ways — a per-agent cap, a fleet-wide cap shared across agents, and
-an idle/age sweeper — and all three are environment-tunable. A new bound belongs alongside
-them rather than in the turn body, so that eviction stays in one place.
+an idle/age sweeper — and all three are environment-tunable: `SDK_POOL_MAX_PER_AGENT`
+(default 4), `SDK_POOL_FLEET_CAP` (8), `SDK_POOL_IDLE_SECONDS` (1800) and
+`SDK_POOL_MAX_AGE_SECONDS` (43200). Retry is tunable the same way —
+`SDK_RETRY_MAX_ATTEMPTS` (3), `SDK_RETRY_INITIAL_MS` (500), `SDK_RETRY_CAP_MS` (8000) —
+and a server-supplied retry hint is honoured only up to ten times the backoff cap, never
+unboundedly. A new bound belongs alongside these rather than in the turn body, so that
+eviction stays in one place.
 
 Turn types that must never reuse a client are excluded by the eligibility gate. Scheduled
 work and one-shot webhook scopes are excluded there today; that gate is the place to add

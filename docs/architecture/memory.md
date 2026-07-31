@@ -51,6 +51,13 @@ wins.
 **Writing is narrower than reading.** Only write-trusted channels retain to the shared bank.
 A channel that can recall is not thereby able to store.
 
+**When a session goes cold is tunable, and retention deduplicates.** The freshness windows
+that decide when a session stops being resumable and becomes save-eligible are
+environment-tunable (`FRESHNESS_VOICE_MINUTES`, default 30; `FRESHNESS_TELEGRAM_HOURS`,
+default 12). Retained facts are content-addressed, so the same speaker saying the same
+thing across sessions collapses to one stored document — and agent-side deduplication
+ignores persona version, so a persona upgrade does not mint duplicate memories.
+
 **Mental-model overlays cannot be tier-filtered at all**, because they are bank-wide
 summaries rather than individually tagged facts. That is why they are exposed only at the
 highest clearance — there is no way to redact part of one.
@@ -132,6 +139,11 @@ absence from silence.
 **A recall path fails repeatedly.** A circuit breaker fast-fails subsequent calls with a
 dedicated reason rather than calling the backend. Genuine zero-hit results count as successes
 and reset it; only unavailability counts as failure.
+
+**Tier classification fails.** Retention classifies each item's sensitivity with a bounded
+LLM pass; a failed or unparseable classification retries once and then silently assigns
+*private*. The write is not lost — but the fact becomes invisible below the highest
+clearance, which reads as absence on voice and friends surfaces.
 
 **Saving a session fails.** The save is abandoned, its claim is released, and the entry stays
 for a later sweep to retry. An explicit reset is the exception — it drops the pointer whether

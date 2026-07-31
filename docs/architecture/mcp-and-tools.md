@@ -91,6 +91,18 @@ calls fail closed for the duration of a main-application restart.
 **A tool raises.** The failure is returned in the response envelope rather than propagating
 as a transport error, so a failing tool is a result, not a broken connection.
 
+**A tool runs long.** Bridge tool forwarding carries a hard three-minute timeout and
+answers temporarily-unavailable past it — the server side may still be executing. Hook
+forwarding is deliberately unbounded at the transport, governed by per-policy timeouts
+instead.
+
+Two environment variables move pieces of this topology, unevenly:
+`CASA_FRAMEWORK_MCP_URL` redirects newly provisioned engagement workspaces to a different
+framework endpoint, and `CASA_INTERNAL_SOCKET` relocates the socket for the
+engagement-channel client *only* — the main application, the bridge and generated
+production workspaces hard-code the standard path, so treating it as a system-wide knob
+splits the topology.
+
 ## Extension points
 
 **A new tool** is added to the tool table, which is what both surfaces are built from. Adding

@@ -121,6 +121,16 @@ clamps, guard hooks and relay instead; its declared tool list is auto-approval, 
 Verification will report an executor whose declaration lacks a needed authorisation, but
 nothing merges it automatically.
 
+Three runtime integration paths sit beside the install model and are easy to miss. **A
+plugin's declared setup tool is dispatched automatically — but only after its entire
+trigger-consent round approves**: the dispatch is a durable, retrying, crash-recovered
+episode, and a single denied trigger withholds it, so consent is not merely route
+authorization. **Plugin environment values live in a mode-0600 conf file** re-sourced into
+the process only by the plugin-env reload scope — deleting an entry from the file changes
+nothing until that reload runs. **Plugin media flows through a shared outbox directory**
+(operator-relocatable by environment variable) with atomic claim semantics, size and type
+gates, and periodic orphan reaping — consumption is destructive by design.
+
 ## Failure behavior
 
 **The registry document is malformed.** It loads as invalid, no plugins resolve, and the

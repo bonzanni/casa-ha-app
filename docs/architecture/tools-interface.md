@@ -19,7 +19,11 @@ themselves guarantee.
 
 **One registry is the whole surface.** A single module-level tuple of handlers drives both
 the SDK server an agent sees and the bridge's dispatch map. Adding a tool there exposes it
-on both transports; grant filtering is a separate, later cut against fully-qualified names.
+on both transports; grant filtering is a separate, later cut against fully-qualified names —
+with one coarse escape: a *server-level* `mcp__casa-framework` grant exposes every tool at
+once, and only its absence makes filtering per-tool. The SDK server also loads eagerly
+(`alwaysLoad`), so every added tool's schema lands in every SDK session's up-front context
+— adding a tool is a prompt-cost decision, not just a dispatch one.
 
 **A result has two layers, and the outer one is inferred.** A tool returns a payload
 serialized into one text content block; the wrapper marks the outer result as an error only

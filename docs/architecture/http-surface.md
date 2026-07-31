@@ -94,6 +94,19 @@ The tolerance default is a literal in the code, not an absent value the operator
 supply, and configured values are constrained to a bounded range. Replay is in the threat
 model for every mode; choosing a mode chooses how long the window stays open.
 
+The secrets themselves have a lifecycle worth knowing: webhook-trigger secrets are minted
+*per trigger identity* — bound to the plugin artifact, so a plugin update means a new
+identity and a fresh secret — with retirement for identities that disappear and a
+dual-accept window during rotation so in-flight callers keep verifying. Credentials do not
+silently survive an identity change.
+
+The invoke route's concrete contract is easy to guess wrong: the global rate limit runs
+*before* authentication; no configured secret is a 403 and a failed body-HMAC a 401; only
+agents declaring the webhook capability are reachable; and the payload's `chat_id` decides
+session reuse — two invocations with the same chat id share a conversation. That rate
+limiter is one shared token bucket across the invoke *and* webhook surfaces, answering 429
+with a Retry-After — a noisy webhook source throttles direct invocations too.
+
 **INV-HTTP-004**: External context arriving on a request cannot set provenance fields; the ingress supplies them.
 
 A payload that could name its own origin could claim any origin, and provenance is what

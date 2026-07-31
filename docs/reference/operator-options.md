@@ -43,7 +43,7 @@ decision, so an inherited container variable can survive an empty option elsewhe
 | Key | Env | Consumer | Default | Change needs |
 |---|---|---|---|---|
 | `public_url` | `PUBLIC_URL` | main startup (webhook transport base) | empty | restart |
-| `claude_oauth_token` | `CLAUDE_CODE_OAUTH_TOKEN` | main startup secret resolution; inherited by CLI children | empty | restart |
+| `claude_oauth_token` | `CLAUDE_CODE_OAUTH_TOKEN` | main startup secret resolution; inherited by CLI children | empty — but **boot-required**: validation refuses to start without a value | restart |
 | `telegram_bot_token` | `TELEGRAM_BOT_TOKEN` | main startup (channel construction) | empty | restart |
 | `telegram_chat_id` | `TELEGRAM_CHAT_ID` | main startup → Telegram channel | empty | restart |
 | `telegram_engagement_supergroup_id` | `TELEGRAM_ENGAGEMENT_SUPERGROUP_ID` | main startup; engagement configuration check | 0 | restart |
@@ -57,11 +57,11 @@ decision, so an inherited container variable can survive an empty option elsewhe
 | `primary_agent_model` | `PRIMARY_AGENT_MODEL` | role-slot model options → role model resolution | opus | restart |
 | `voice_agent_model` | `VOICE_AGENT_MODEL` | role-slot model options → role model resolution | haiku | restart |
 | `enable_terminal` | `ENABLE_TERMINAL` | nginx setup, ttyd service, dashboard | false | restart |
-| `casa_tz` | `CASA_TZ` | timekeeping resolution | Europe/Amsterdam | restart |
+| `casa_tz` | `CASA_TZ` | timekeeping — both scheduler wall-clock and the current-time block every agent turn sees | Europe/Amsterdam | restart |
 | `engagement_reap_days` | `ENGAGEMENT_REAP_DAYS` | engagement reaper | 7 (0 disables) | restart |
 | `log_level` | `LOG_LEVEL` | main startup logging; the standalone MCP service's logging | schema-only (absent from `options:`); runtime falls back to INFO | restart |
-| `specialist_max_concurrency` | `SPECIALIST_MAX_CONCURRENCY` | specialist limiter (clamped 1–20) | 2 | restart |
-| `specialist_cost_alert_threshold` | `SPECIALIST_COST_ALERT_THRESHOLD` | specialist telemetry (malformed → default) | 5.0 | restart |
+| `specialist_max_concurrency` | `SPECIALIST_MAX_CONCURRENCY` | specialist limiter (clamped 1–20) — the *fleet-wide* cap; a separate hard-coded rule allows exactly one active delegation per scope regardless | 2 | restart |
+| `specialist_cost_alert_threshold` | `SPECIALIST_COST_ALERT_THRESHOLD` | specialist telemetry (malformed → default) — a cumulative per-role USD threshold that only *logs* on every result once exceeded; it caps and cancels nothing | 5.0 | restart |
 
 ## Failure behavior
 

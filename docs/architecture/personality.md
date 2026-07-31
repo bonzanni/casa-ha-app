@@ -36,12 +36,31 @@ what the persona *says* about its capabilities is true. A persona cannot grant a
 claim one it does not have. Capability comes from the role and the tool layer, never from
 prose.
 
-**The binding digest does not cover everything about a binding.** It detects the drift it was
-designed to detect, and some binding attributes can change without moving it. Before relying
-on the digest to notice a change, check whether that change is one it covers.
+**The binding digest does not cover everything about a binding.** It covers the role and
+persona checksums, the compiler version, dependency digests and the effective config
+digest; it excludes the binding mode, the image-default and component roots, and the
+override source — those can change without moving it. Before relying on the digest to
+notice a change, check which side of that boundary the change is on.
 
-**Restricted contexts compile a different prompt.** The persona section is removed entirely
-for the restricted webhook path — an untrusted-origin turn does not get a personality.
+**Projections differ per surface, and admission has ceilings.** Text, voice and
+restricted-webhook prompts have materially different contents — voice carries only the
+persona core plus two quirks, and the restricted path no persona at all — and each surface
+enforces hard persona/total token ceilings (2k/12k text, 400/6k voice, 0/4k restricted).
+A persona that validates structurally can still fail *activation* on a ceiling, and voice
+behavior written only outside the core never reaches the voice surface.
+
+**A published persona version is immutable, and installing one is consent-bound.** A bare
+persona repo installs through checksum-bound durable operator consent; re-publishing the
+same `persona_id@version` with different bytes is refused rather than replaced, and
+applying an override to a specialist preserves its component root and configuration.
+
+**The observer and secondary passes run on their own model.** `SECONDARY_AGENT_MODEL`
+(default *haiku*) selects the model for engagement observation and engager-query synthesis
+— a cost/latency/judgment tunable documented nowhere else.
+
+**The admin surface is internal-only and redacts by default.** The personality admin
+routes exist only on the internal Unix socket, and the explain route withholds sensitive
+prompt and memory fields unless the request both asks for them and confirms.
 
 ## Contracts & invariants
 

@@ -34,7 +34,19 @@ adding the first one.
 
 **A facade wraps the underlying tool surface**, curating what is offered and doing some
 filtering of what comes *back*. Read filtering and write authorization are different things,
-and only the first is happening.
+and only the first is happening. The curation is dynamic, not an allowlist: the facade
+mirrors every upstream tool that carries a valid object schema, skipping malformed ones
+individually and substituting only the live-context tool's schema — there is no manual
+mapping to add a tool to.
+
+**Two environment switches shape the integration itself.** `CASA_HA_MCP_URL` redirects the
+Home Assistant MCP endpoint that both the raw registration and the facade connect to — the
+first place to look when control fails against the wrong upstream. And
+`CASA_DISCOVERY_AUTH_ENABLED` governs Supervisor discovery: when on, Casa publishes an
+authenticated discovery record — its external-port endpoint *carrying the webhook secret*
+— to Home Assistant, persists only the discovery UUID locally, and withdraws the record
+when turned off. That publication is how the companion integration finds Casa, and it is
+also a credential leaving the container.
 
 **The facade is conditional, and its absence is not a closed door.** It applies only when its
 preconditions hold, and it absorbs its own startup failure. The raw tool surface is
