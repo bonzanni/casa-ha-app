@@ -71,8 +71,10 @@ document, so the sort on `last_reviewed` is what keeps ageing visible.
 ## Extension points
 
 Adding a document means adding a manifest entry — `doc`, `summary`, `when_changing`, and the
-`covers`, `tests`, `related` and `defines_invariants` it actually has. Nothing is published
-without one; the allowlist is the mechanism, not a formality.
+`covers`, `tests`, `related` and `defines_invariants` it actually has. The verifier, gate
+and CI refuse an unmanifested tracked document wherever they run; like every layer in
+`doctrine/publishing.md`, that is enforced defence, not an absolute guarantee against a
+deliberate bypass.
 
 `when_changing` is phrased as the *task* an agent is about to do, not the subsystem name.
 An agent knows what it is about to change before it knows which subsystem owns it, and the

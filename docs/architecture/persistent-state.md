@@ -68,13 +68,18 @@ without the same protection.
 
 **INV-STATE-004**: Where a registry commits to disk before publishing in memory, the on-disk state leads.
 
-This is the pattern that keeps a process from believing something that was never persisted —
-the discipline the engagement registry's *strict* terminal transition follows.
+This is the pattern that keeps a process from believing something that was never persisted.
+The job registry is the genuine example: it builds a detached candidate snapshot, writes it,
+and only then assigns it to live memory. The engagement registry's *strict* terminal
+transition achieves a related guarantee by the opposite means — it mutates the shared record
+provisionally, writes, and rolls the mutation back on failure — so a lock-free reader can
+observe the provisional state during the write there; what is guaranteed is restoration, not
+disk-first visibility.
 
 What it does not cover: the pattern is opt-in per write path, and the engagement registry's
 legacy direct status mutators write their tombstone non-strictly — a failed write there is
 swallowed with a warning, leaving memory terminal while disk is not. Where disk-leads
-matters, check that the path you are on is a strict one.
+matters, check which of the three shapes the path you are on actually has.
 
 ## Failure behavior
 

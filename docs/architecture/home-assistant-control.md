@@ -61,7 +61,9 @@ settings there are the real constraint.
 
 What it does not cover: the raw surface is less curated, so the failure mode is a different
 tool surface rather than an unavailable one. Code that assumes "no facade means no HA access"
-is wrong.
+is wrong — with one precondition: the raw surface itself registers only when the supervisor
+token is present, so in a tokenless environment facade and raw path are absent together and
+there genuinely is no HA access.
 
 **INV-HA-003**: The facade's cached tool surface has no time-based expiry.
 
