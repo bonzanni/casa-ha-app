@@ -1931,6 +1931,25 @@ def resolve_hooks(
     return {"PreToolUse": matchers}
 
 
+def _compose_hook_callbacks(
+    callbacks: list["HookCallback"],
+) -> "HookCallback":
+    """#313: one callback running every duplicate declaration of a policy.
+
+    Runs each callback in declaration order and returns the FIRST non-allow
+    result (allow is ``None``/``{}``; the shipped non-allow shapes are
+    ``_deny`` and the relay's ask). Matches the SDK path, where every
+    declaration is its own matcher and any deny blocks the call.
+    """
+    async def _composed(input_data, tool_use_id, context):
+        for cb in callbacks:
+            result = await cb(input_data, tool_use_id, context)
+            if result:
+                return result
+        return {}
+    return _composed
+
+
 def build_policy_callbacks_from_hooks_yaml(
     hooks_yaml_data: dict,
 ) -> dict[str, tuple[str, "HookCallback"]]:
@@ -1950,17 +1969,56 @@ def build_policy_callbacks_from_hooks_yaml(
     per-entry ``matcher``/``timeout`` keys are consumed by other paths and are
     not factory parameters, so they are stripped before the factory call.
     """
-    out: dict[str, tuple[str, "HookCallback"]] = {}
+    grouped: dict[str, tuple[str, list["HookCallback"]]] = {}
+    declared_matchers: dict[str, Any] = {}
     for entry in (hooks_yaml_data.get("pre_tool_use") or []):
         name = entry.get("policy")
         policy = HOOK_POLICIES.get(name)
         if policy is None:
             continue  # e.g. engagement_permission_relay — wired separately
+        # Sol r2-1: duplicate declarations of one policy must agree on their
+        # declared ``matcher`` (including all leaving it absent). The server
+        # cannot tell declarations apart on the wire (the request names only
+        # the POLICY), and the SDK path deliberately ignores declared
+        # matchers (they are config-editable; HOOK_POLICIES matchers are the
+        # trust anchor) — so per-declaration matcher scoping of duplicates
+        # is unenforceable and the composite would surprise (intersection
+        # under the canonical matcher). Refuse the config loudly instead:
+        # with #312's load-time constructibility check this fail-closes the
+        # executor at load/commit, not silently at enforcement time.
+        if name in declared_matchers:
+            if declared_matchers[name] != entry.get("matcher"):
+                raise UnknownPolicyError(
+                    f"policy {name!r} is declared more than once with "
+                    f"differing matchers ({declared_matchers[name]!r} vs "
+                    f"{entry.get('matcher')!r}); duplicate declarations "
+                    f"must agree on their matcher"
+                )
+        else:
+            declared_matchers[name] = entry.get("matcher")
         params = {
             k: v for k, v in entry.items()
             if k not in ("policy", "matcher", "timeout")
         }
-        out[name] = (policy["matcher"], policy["factory"](**params))
+        _matcher, callbacks = grouped.setdefault(
+            name, (policy["matcher"], []))
+        callbacks.append(policy["factory"](**params))
+    # #313: a policy declared MORE THAN ONCE must enforce every declaration.
+    # The SDK path registers one HookMatcher per declaration and runs all of
+    # them (any deny blocks); this dict is keyed by policy name, so the old
+    # ``out[name] = ...`` was last-writer-wins — a write refused by an earlier
+    # declaration but permitted by the last one passed the HTTP path.
+    # Duplicates now compose into ONE callback that runs each declaration in
+    # order and returns the first non-allow result (deny/ask), restoring the
+    # SDK's intersection semantics.
+    out: dict[str, tuple[str, "HookCallback"]] = {
+        name: (
+            matcher,
+            callbacks[0] if len(callbacks) == 1
+            else _compose_hook_callbacks(callbacks),
+        )
+        for name, (matcher, callbacks) in grouped.items()
+    }
     # Round-4 (Terra P0): managed_component_guard is CODE-MANDATORY for
     # executor sessions — the resolved set always carries it regardless of
     # what the (config-editable, pointer-redirectable) hooks.yaml declares.

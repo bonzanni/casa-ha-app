@@ -1,5 +1,35 @@
 # Changelog
 
+## [0.133.0] - 2026-07-31
+
+### Security
+
+Four fixes hardening executor hook enforcement (the containment layer around
+`claude_code` engagements such as the plugin developer and configurator):
+
+- **An executor's `hooks_file:` pointer must now resolve to a valid hooks
+  document.** Previously any present file satisfied the pointer — pointing it
+  at a non-hooks file silently removed the executor's Bash-command and
+  file-path containment policies with no error. The resolved file is now
+  validated against the hooks schema when executors load, and a declared
+  pointer whose target is missing is a load failure (the default `hooks.yaml`
+  remains optional). A failing executor is reported and skipped; its siblings
+  load normally.
+- **Declaring the same hook policy twice now enforces both declarations on
+  the HTTP enforcement path.** The SDK-side path already ran every
+  declaration; the HTTP path kept only the last one, so a restriction
+  declared earlier could be silently widened. Duplicate declarations now
+  compose, and any declaration's refusal blocks the call on both paths.
+- **Engagements of a disabled executor resumed after a restart keep their
+  configured file-path scope.** They previously fell back to an empty default
+  scope that denied every workspace read and write, bricking a legitimately
+  resumed engagement.
+- **Reloading executors now refreshes HTTP hook enforcement immediately.**
+  The enforcement map was previously built once at boot: an executor added or
+  edited via reload ran against stale (or deny-all default) policies until
+  the add-on was restarted, and a tightened policy did not take effect until
+  restart.
+
 ## [0.132.1] - 2026-07-31
 
 ### Fixed
