@@ -36,9 +36,13 @@ instead, using it for that turn only. Both paths exist and both are exercised.
 
 **INV-TURN-001**: The resume-versus-fresh decision is re-derived from a fresh session read while holding the pool entry's lock, and a cached client is reused only when its session id matches that decision exactly.
 
-Without the lock, a `/new`, a freshness expiry and an interleaved turn on the same channel
-can fork a conversation or hand a turn a stale client. A mismatched entry is closed and
-rebuilt rather than reused.
+Without the lock, a freshness expiry and an interleaved turn on the same channel can fork a
+conversation or hand a turn a stale client. A mismatched entry is closed and rebuilt rather
+than reused. Know the lock's reach, though: it serializes the *decision* against the
+registry's current contents, not a multi-step mutation of them — a `/new` reset retains the
+old session and only afterwards removes the pointer, none of it under a pool entry lock, so
+a turn racing into that window can still read the old session id fresh and resume it once
+more.
 
 "That decision" is more than a timestamp: resume requires a decodable stored entry, an exact
 role-identity match, an exact personality-binding digest, a parseable last-active time, and
