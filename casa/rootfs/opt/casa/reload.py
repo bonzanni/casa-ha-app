@@ -1275,6 +1275,55 @@ async def reload_executors(
         raise ReloadError("load_error", f"executors: {exc}") from exc
     actions: list[str] = ["rebuild_executor_registry"]
 
+    # #340: the /hooks/resolve handlers captured the executor hook-policy map
+    # instance at boot (runtime.executor_cc_policies). Rebuild it from the
+    # freshly loaded registry and swap the CONTENTS in place, so a new/edited
+    # executor's parameters take effect and a tightened policy stops enforcing
+    # its stale broader callbacks. Build-then-swap: a builder failure keeps
+    # the old map intact (stale but consistent) rather than half-clearing it.
+    shared_map = getattr(runtime, "executor_cc_policies", None)
+    if shared_map is not None:
+        try:
+            from casa_core import _build_executor_cc_hook_policies
+            registry = runtime.executor_registry
+            fresh = await asyncio.to_thread(
+                _build_executor_cc_hook_policies, registry)
+            # Sol r1-1: an executor ABSENT from the fresh map is either
+            # genuinely removed (drop its entry) or a load/build FAILURE —
+            # and a failed executor's live engagements must keep their old
+            # (possibly tighter) callbacks, not fall back to the broader
+            # defaults (commit_size_guard default 20 vs a configured 5).
+            # Failure = the registry reported the type failed, or its loaded
+            # definition says the builder should have produced an entry
+            # (claude_code + hooks_path) but none arrived (builder skip).
+            failed = set(getattr(registry, "failed_types", set()) or set())
+            for t, entry in list(shared_map.items()):
+                if t in fresh:
+                    continue
+                defn = registry.definition_any(t)
+                build_expected = (
+                    defn is not None
+                    and getattr(defn, "driver", "") == "claude_code"
+                    and getattr(defn, "hooks_path", None)
+                )
+                if t in failed or build_expected:
+                    fresh[t] = entry
+                    logger.warning(
+                        "executors reload: executor %r failed to reload its "
+                        "hook policies — keeping the pre-reload callbacks "
+                        "for its live engagements", t,
+                    )
+                    actions.append(f"executor_hook_policies_kept_stale:{t}")
+            shared_map.clear()
+            shared_map.update(fresh)
+            actions.append("rebuild_executor_hook_policies")
+        except Exception as exc:  # noqa: BLE001
+            logger.warning(
+                "executors reload: hook-policy map rebuild failed — HTTP "
+                "hook enforcement keeps the pre-reload policies: %s", exc,
+            )
+            actions.append(f"rebuild_executor_hook_policies_failed:{exc}")
+
     for r in list(runtime.role_configs.keys()):
         try:
             sub = await _HANDLERS["agent"](runtime, role=r)

@@ -1105,12 +1105,15 @@ def _build_executor_options(
     """
     from config import HooksConfig
     from hooks import resolve_hooks
-    import yaml
 
     hooks_cfg = HooksConfig()
     if defn.hooks_path and os.path.isfile(defn.hooks_path):
-        with open(defn.hooks_path, "r", encoding="utf-8") as fh:
-            raw = yaml.safe_load(fh) or {}
+        # Terra r3-1: the SAME env-substituting reader load-time validation
+        # used (agent_loader.read_hooks_document) — a raw safe_load here made
+        # a ${VAR}-bearing document that validated at load blow up in
+        # resolve_hooks when the executor actually started.
+        from agent_loader import read_hooks_document
+        raw = read_hooks_document(defn.hooks_path)
         hooks_cfg = HooksConfig(pre_tool_use=list(raw.get("pre_tool_use") or []))
 
     resolved_hooks = resolve_hooks(hooks_cfg, default_cwd="/config")

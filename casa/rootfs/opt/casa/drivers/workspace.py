@@ -236,8 +236,12 @@ async def provision_workspace(
     # Load once here; render_workspace_template + legacy branch share it.
     hooks_yaml_data: dict = {}
     if getattr(defn, "hooks_path", None) and os.path.isfile(defn.hooks_path):
-        with open(defn.hooks_path, "r", encoding="utf-8") as fh:
-            hooks_yaml_data = yaml.safe_load(fh) or {}
+        # Sol r1-2: the SAME env-substituting reader load-time validation
+        # used (see agent_loader.read_hooks_document) — a raw safe_load here
+        # rendered settings from a DIFFERENT document for any ${VAR}
+        # reference than the one that was validated.
+        from agent_loader import read_hooks_document
+        hooks_yaml_data = read_hooks_document(defn.hooks_path)
 
     # Plan 4b §16.3: if a workspace-template exists for this executor, render it
     # into the workspace root. This subsumes the old symlink-loop behavior.

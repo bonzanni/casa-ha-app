@@ -237,20 +237,83 @@ def validate_config_repo(
             # validation authority (per-specialist failures are
             # boot-non-fatal and deliberately not gate errors). Walking it
             # here double-validates the materialized files and false-flags
-            # them. executors/ deliberately STAYS in the walk: nothing else
-            # schema-validates an executor's hooks.yaml (load_all_executors
-            # validates only definition.yaml).
+            # them. executors/ deliberately STAYS in the walk: it schema-
+            # validates default-named executor hooks.yaml files by basename
+            # (custom-named ``hooks_file:`` targets are covered by the #312
+            # pointer pass below; load_all_executors validates both at boot
+            # via the same _resolve_executor_hooks).
             if root == agents_root and "specialists" in dirs:
                 dirs.remove("specialists")
             for name in files:
                 schema_name = _SCHEMA_BY_FILENAME.get(name)
                 if schema_name is None:
                     continue
+                # #312 (Terra r2-P1): executor hooks documents are owned by
+                # the pointer pass below, which runs the FULL boot-parity
+                # resolver (schema + factory constructibility) for default
+                # and custom names alike. Validating them here too would
+                # double-report every schema failure.
+                if name == "hooks.yaml" and (
+                    root == os.path.join(agents_root, "executors")
+                    or root.startswith(
+                        os.path.join(agents_root, "executors") + os.sep)
+                ):
+                    continue
                 path = os.path.join(root, name)
                 try:
                     _validate(_read_yaml(path), schema_name, path)
                 except LoadError as exc:
                     errors.append(str(exc))
+
+    # #312 gate parity (Terra r1-P2 / r2-P1): boot fail-closes on a hooks
+    # pointer whose target is absent, schema-invalid, or non-constructible
+    # (factory-refused params), so the gate must refuse those commits too
+    # (the recurring validate-weaker-than-boot family). This pass runs the
+    # SAME resolver boot uses, for default and custom names alike — the
+    # basename walk above skips executor hooks.yaml files so nothing
+    # double-reports. Broad except (Terra r2-P2): the gate's mandate is
+    # report-never-crash.
+    executors_root = os.path.join(agents_root, "executors")
+    try:
+        executor_entries = (
+            sorted(os.listdir(executors_root))
+            if os.path.isdir(executors_root) else []
+        )
+    except OSError as exc:  # Sol r2-3: report, never crash
+        executor_entries = []
+        errors.append(f"agents/executors unreadable: {exc}")
+    if executor_entries:
+        for entry in executor_entries:
+            exec_dir = os.path.join(executors_root, entry)
+            defn_path = os.path.join(exec_dir, "definition.yaml")
+            if not os.path.isdir(exec_dir):
+                continue
+            defn: dict = {}
+            if os.path.isfile(defn_path):
+                try:
+                    defn = _read_yaml(defn_path)
+                except LoadError:
+                    continue  # malformed definition — surfaced by the walk
+                if not isinstance(defn, dict):
+                    continue
+            # A dir WITHOUT definition.yaml fails to load as an executor at
+            # boot anyway, but a present default-named hooks.yaml still gets
+            # schema-gated here (defn = {} resolves the default pointer) —
+            # the walk skips executor hooks.yaml, so this pass is their sole
+            # gate.
+            try:
+                present = {
+                    f for f in os.listdir(exec_dir)
+                    if os.path.isfile(os.path.join(exec_dir, f))
+                }
+                _resolve_executor_hooks(exec_dir, entry, defn, present)
+            except LoadError as exc:
+                errors.append(str(exc))
+            except Exception as exc:  # noqa: BLE001 — report, never crash
+                errors.append(
+                    f"executor {entry!r}: hooks pointer validation failed: "
+                    f"{exc}"
+                )
 
     policies_root = os.path.join(config_dir, "policies")
     if os.path.isdir(policies_root):
@@ -1344,6 +1407,79 @@ def load_all_specialists(
     return found, failed
 
 
+def read_hooks_document(path: str) -> dict[str, Any]:
+    """THE reader for executor hooks documents (#312 / Sol r1-2).
+
+    Env-substituting (``_read_yaml``), shared by load-time validation, the
+    HTTP policy-map builder (``casa_core._build_executor_cc_hook_policies``)
+    and the workspace settings bridge (``drivers.workspace``). Pre-fix those
+    consumers re-read the file with a raw ``yaml.safe_load`` while validation
+    substituted ``${VAR}`` references — a document could validate yet break
+    (or silently change) at enforcement time. One reader, one document.
+    """
+    return _read_yaml(path)
+
+
+def _resolve_executor_hooks(
+    exec_dir: str, entry: str, defn: dict, present: set[str],
+) -> str | None:
+    """#312: resolve ``definition.yaml``'s ``hooks_file`` pointer, fail closed.
+
+    Pre-fix, ANY present file satisfied the pointer — ``hooks_file:
+    definition.yaml`` silently shed every declared containment policy (only
+    the code-mandatory managed_component_guard survived) — and a
+    declared-but-absent pointer silently dropped hooks entirely. Now: a
+    present target must validate against the hooks schema; an absent target
+    is a LoadError unless the resolved NAME is the default ``hooks.yaml``
+    (which stays optional — an explicit ``hooks_file: hooks.yaml`` is the
+    default spelled out, not a stricter declaration, Terra r1-P1). Shared by
+    ``load_all_executors`` (boot/reload) and ``validate_config_repo`` (the
+    pre-commit gate) so the two cannot diverge (Terra r1-P2).
+    """
+    hooks_name = defn.get("hooks_file", "hooks.yaml")
+    if not isinstance(hooks_name, str) or not hooks_name:
+        # Terra r2-P2: the executor schema pins hooks_file to a string, but
+        # this helper is also reached by the pre-commit gate BEFORE schema
+        # validation — an unhashable value (list/dict) would raise TypeError
+        # out of the ``in present`` test below. Report, never crash.
+        raise LoadError(
+            f"executor {entry!r}: hooks_file must be a non-empty string, "
+            f"got {hooks_name!r}"
+        )
+    if hooks_name in present:
+        hooks_abs = os.path.join(exec_dir, hooks_name)
+        try:
+            hooks_data = read_hooks_document(hooks_abs)
+            _validate(hooks_data, "hooks", hooks_abs)
+            # Sol r1-1/r1-2: schema validity is not constructibility — the
+            # hooks schema deliberately allows arbitrary per-policy params
+            # (additionalProperties), so `max_files: notanumber` or an
+            # unknown parameter validates yet raises in the policy factory.
+            # Pre-fix that raise happened inside the policy-map builder,
+            # which SKIPS the executor — enforcement silently fell back to
+            # the broader defaults (commit_size_guard 20 vs a configured 5).
+            # Build the callbacks once here so a non-constructible document
+            # fail-closes the whole executor at load instead.
+            from hooks import build_policy_callbacks_from_hooks_yaml
+            build_policy_callbacks_from_hooks_yaml(hooks_data)
+        except LoadError as exc:
+            raise LoadError(
+                f"executor {entry!r}: hooks_file {hooks_name!r} is "
+                f"not a valid hooks document: {exc}"
+            ) from exc
+        except Exception as exc:  # noqa: BLE001 — factory param errors
+            raise LoadError(
+                f"executor {entry!r}: hooks_file {hooks_name!r} declares "
+                f"a policy the hook factories refuse: {exc}"
+            ) from exc
+        return hooks_abs
+    if hooks_name != "hooks.yaml":
+        raise LoadError(
+            f"executor {entry!r}: hooks_file {hooks_name!r} not found"
+        )
+    return None
+
+
 def load_all_executors(
     base_dir: str, *, roles_dir: str | None = None,
 ) -> tuple[dict[str, "ExecutorDefinition"], list[tuple[str, str]]]:
@@ -1414,9 +1550,10 @@ def load_all_executors(
             doctrine_abs = (os.path.join(exec_dir, doctrine_name)
                             if doctrine_name else "")
 
-            hooks_name = defn.get("hooks_file", "hooks.yaml")
-            hooks_abs = (os.path.join(exec_dir, hooks_name)
-                         if hooks_name in present else None)
+            # #312: the hooks pointer must resolve to a schema-valid hooks
+            # document — see _resolve_executor_hooks (shared with the
+            # pre-commit gate so the two cannot diverge).
+            hooks_abs = _resolve_executor_hooks(exec_dir, entry, defn, present)
 
             observer_name = defn.get("observer_policy_file", "observer.yaml")
             observer_abs = (os.path.join(exec_dir, observer_name)

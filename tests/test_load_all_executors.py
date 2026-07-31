@@ -146,6 +146,260 @@ class TestLoadAllExecutors:
         assert failed[0][0] == "x"
 
 
+class TestHooksFileValidation:
+    """#312: ``hooks_file`` must resolve to a schema-valid hooks document.
+
+    Pre-fix, any present file satisfied the pointer (``hooks_name in
+    present``) — ``hooks_file: definition.yaml`` silently shed every declared
+    safety policy — and a declared-but-absent pointer silently dropped hooks
+    entirely."""
+
+    def _seed(self, tmp_path, extra_defn="", hooks=None):
+        ex_dir = tmp_path / "executors" / "myx"
+        ex_dir.mkdir(parents=True)
+        (ex_dir / "definition.yaml").write_text(
+            "schema_version: 1\n"
+            "type: myx\n"
+            "description: A test executor with a minimum of twenty characters.\n"
+            "model: sonnet\n"
+            "driver: claude_code\n" + extra_defn
+        )
+        (ex_dir / "prompt.md").write_text("hi")
+        if hooks is not None:
+            (ex_dir / "hooks.yaml").write_text(hooks)
+        roles_dir = tmp_path / "roles"
+        _seed_executor_role_artifact(str(roles_dir), "myx")
+        return str(roles_dir)
+
+    def test_hooks_file_pointing_at_non_hooks_document_fails_closed(
+        self, tmp_path,
+    ):
+        from agent_loader import load_all_executors
+        roles_dir = self._seed(
+            tmp_path, extra_defn="hooks_file: definition.yaml\n",
+        )
+        out, failed = load_all_executors(str(tmp_path), roles_dir=roles_dir)
+        assert out == {}
+        assert len(failed) == 1 and failed[0][0] == "myx"
+        assert "hooks" in failed[0][1]
+
+    def test_declared_hooks_file_absent_fails_closed(self, tmp_path):
+        from agent_loader import load_all_executors
+        roles_dir = self._seed(
+            tmp_path, extra_defn="hooks_file: custom-hooks.yaml\n",
+        )
+        out, failed = load_all_executors(str(tmp_path), roles_dir=roles_dir)
+        assert out == {}
+        assert len(failed) == 1 and failed[0][0] == "myx"
+        assert "custom-hooks.yaml" in failed[0][1]
+
+    def test_invalid_default_hooks_yaml_fails_closed(self, tmp_path):
+        from agent_loader import load_all_executors
+        roles_dir = self._seed(tmp_path, hooks="just: nonsense\n")
+        out, failed = load_all_executors(str(tmp_path), roles_dir=roles_dir)
+        assert out == {}
+        assert len(failed) == 1 and failed[0][0] == "myx"
+
+    def test_valid_hooks_yaml_still_loads(self, tmp_path):
+        from agent_loader import load_all_executors
+        roles_dir = self._seed(
+            tmp_path,
+            hooks=(
+                "schema_version: 1\n"
+                "pre_tool_use:\n"
+                "  - policy: path_scope\n"
+                "    writable: [/data/engagements/]\n"
+                "    readable: [/data/engagements/]\n"
+            ),
+        )
+        out, failed = load_all_executors(str(tmp_path), roles_dir=roles_dir)
+        assert failed == []
+        assert out["myx"].hooks_path.endswith("hooks.yaml")
+
+    def test_absent_default_hooks_yaml_stays_optional(self, tmp_path):
+        from agent_loader import load_all_executors
+        roles_dir = self._seed(tmp_path)
+        out, failed = load_all_executors(str(tmp_path), roles_dir=roles_dir)
+        assert failed == []
+        assert out["myx"].hooks_path is None
+
+    def test_explicit_default_hooks_file_absent_stays_optional(self, tmp_path):
+        """Terra r1-P1: ``hooks_file: hooks.yaml`` spelled out is the default,
+        not a stricter declaration — absence stays optional."""
+        from agent_loader import load_all_executors
+        roles_dir = self._seed(
+            tmp_path, extra_defn="hooks_file: hooks.yaml\n",
+        )
+        out, failed = load_all_executors(str(tmp_path), roles_dir=roles_dir)
+        assert failed == []
+        assert out["myx"].hooks_path is None
+
+    def test_non_constructible_policy_params_fail_closed(self, tmp_path):
+        """Sol r1-1/r1-2: the hooks schema allows arbitrary per-policy params,
+        so a schema-valid document can still raise in the policy factory —
+        pre-fix that raise happened in the policy-map builder, which skipped
+        the executor and silently fell back to broader defaults. Load must
+        refuse it instead."""
+        from agent_loader import load_all_executors
+        roles_dir = self._seed(
+            tmp_path,
+            hooks=(
+                "schema_version: 1\n"
+                "pre_tool_use:\n"
+                "  - policy: commit_size_guard\n"
+                "    max_files: notanumber\n"
+            ),
+        )
+        out, failed = load_all_executors(str(tmp_path), roles_dir=roles_dir)
+        assert out == {}
+        assert len(failed) == 1 and failed[0][0] == "myx"
+
+    def test_env_substituted_params_reach_sdk_options(self, tmp_path, monkeypatch):
+        """Terra r3-1: the in_casa/SDK options builder must parse the SAME
+        substituted document validation saw — pre-fix its raw safe_load made
+        ``int("${VAR}")`` raise when the executor actually started, after the
+        document had validated cleanly at load."""
+        import tools as tools_mod
+        from agent_loader import load_all_executors
+        monkeypatch.setenv("CASA_TEST_MAX_FILES", "5")
+        roles_dir = self._seed(
+            tmp_path,
+            hooks=(
+                "schema_version: 1\n"
+                "pre_tool_use:\n"
+                "  - policy: commit_size_guard\n"
+                "    max_files: ${CASA_TEST_MAX_FILES}\n"
+            ),
+        )
+        out, failed = load_all_executors(str(tmp_path), roles_dir=roles_dir)
+        assert failed == []
+        # Pre-fix this raised inside resolve_hooks (int on the raw literal).
+        opts = tools_mod._build_executor_options(
+            out["myx"], executor_type="myx", plugin_paths=[])
+        assert opts.hooks and "PreToolUse" in opts.hooks
+
+    def test_env_substituted_params_load_and_build(self, tmp_path, monkeypatch):
+        """Sol r1-2: validation reads through the env-substituting reader, so
+        the enforcement builders must parse the SAME substituted document —
+        pre-fix they re-read raw and ``int("${VAR}")`` blew up the policy-map
+        entry after validation had passed."""
+        from agent_loader import load_all_executors, read_hooks_document
+        monkeypatch.setenv("CASA_TEST_MAX_FILES", "5")
+        roles_dir = self._seed(
+            tmp_path,
+            hooks=(
+                "schema_version: 1\n"
+                "pre_tool_use:\n"
+                "  - policy: commit_size_guard\n"
+                "    max_files: ${CASA_TEST_MAX_FILES}\n"
+            ),
+        )
+        out, failed = load_all_executors(str(tmp_path), roles_dir=roles_dir)
+        assert failed == []
+        data = read_hooks_document(out["myx"].hooks_path)
+        assert data["pre_tool_use"][0]["max_files"] == 5
+
+
+class TestGateHooksPointerParity:
+    """#312 gate parity (Terra r1-P2 / Sol r1-3): validate_config_repo must
+    refuse the same hooks-pointer commits boot refuses."""
+
+    def _seed_config(self, tmp_path, extra_defn="", custom=None):
+        exec_dir = tmp_path / "agents" / "executors" / "myx"
+        exec_dir.mkdir(parents=True)
+        (exec_dir / "definition.yaml").write_text(
+            "schema_version: 1\n"
+            "type: myx\n"
+            "description: A test executor with a minimum of twenty characters.\n"
+            "model: sonnet\n"
+            "driver: claude_code\n" + extra_defn
+        )
+        (exec_dir / "prompt.md").write_text("hi")
+        if custom is not None:
+            name, body = custom
+            (exec_dir / name).write_text(body)
+        return str(tmp_path)
+
+    def test_gate_flags_pointer_at_non_hooks_document(self, tmp_path):
+        from agent_loader import validate_config_repo
+        cfg = self._seed_config(
+            tmp_path, extra_defn="hooks_file: definition.yaml\n",
+        )
+        errors = validate_config_repo(cfg)
+        assert any("hooks_file" in e and "myx" in e for e in errors)
+
+    def test_gate_flags_absent_custom_pointer(self, tmp_path):
+        from agent_loader import validate_config_repo
+        cfg = self._seed_config(
+            tmp_path, extra_defn="hooks_file: custom-hooks.yaml\n",
+        )
+        errors = validate_config_repo(cfg)
+        assert any("custom-hooks.yaml" in e for e in errors)
+
+    def test_gate_accepts_valid_custom_pointer(self, tmp_path):
+        from agent_loader import validate_config_repo
+        cfg = self._seed_config(
+            tmp_path,
+            extra_defn="hooks_file: custom-hooks.yaml\n",
+            custom=("custom-hooks.yaml",
+                    "schema_version: 1\n"
+                    "pre_tool_use:\n"
+                    "  - policy: block_dangerous_bash\n"),
+        )
+        errors = validate_config_repo(cfg)
+        assert not any("hooks" in e for e in errors)
+
+    def test_gate_does_not_double_report_invalid_default_hooks(self, tmp_path):
+        """An invalid default-named executor hooks.yaml is reported EXACTLY
+        once — the pointer pass owns executor hooks validation and the
+        basename walk skips those files (Terra r2-P1)."""
+        from agent_loader import validate_config_repo
+        cfg = self._seed_config(
+            tmp_path, custom=("hooks.yaml", "just: nonsense\n"),
+        )
+        errors = validate_config_repo(cfg)
+        assert len([e for e in errors if "hooks.yaml" in e]) == 1
+
+    def test_gate_flags_factory_invalid_default_hooks(self, tmp_path):
+        """Terra r2-P1: a schema-valid but factory-refused DEFAULT hooks.yaml
+        (``max_files: notanumber``) must fail the gate exactly as it fails
+        boot — the earlier default-name skip re-opened gate-weaker-than-boot
+        for the default pointer."""
+        from agent_loader import validate_config_repo
+        cfg = self._seed_config(
+            tmp_path,
+            custom=("hooks.yaml",
+                    "schema_version: 1\n"
+                    "pre_tool_use:\n"
+                    "  - policy: commit_size_guard\n"
+                    "    max_files: notanumber\n"),
+        )
+        errors = validate_config_repo(cfg)
+        assert any("myx" in e and "hooks" in e for e in errors)
+
+    def test_gate_reports_unhashable_hooks_file_without_crashing(self, tmp_path):
+        """Terra r2-P2: ``hooks_file: []`` must be REPORTED (the gate's
+        mandate is report-never-crash), not raise TypeError out of the
+        pointer pass."""
+        from agent_loader import validate_config_repo
+        cfg = self._seed_config(tmp_path, extra_defn="hooks_file: []\n")
+        errors = validate_config_repo(cfg)  # must not raise
+        assert any("hooks_file" in e and "myx" in e for e in errors)
+
+    def test_gate_accepts_shipped_default_hooks(self, tmp_path):
+        """A valid default-named hooks.yaml stays clean through the gate."""
+        from agent_loader import validate_config_repo
+        cfg = self._seed_config(
+            tmp_path,
+            custom=("hooks.yaml",
+                    "schema_version: 1\n"
+                    "pre_tool_use:\n"
+                    "  - policy: block_dangerous_bash\n"),
+        )
+        errors = validate_config_repo(cfg)
+        assert not any("hooks" in e for e in errors)
+
+
 class TestExecutorDefinitionPlan4aFields:
     def test_populates_plan4a_fields_with_defaults(self, tmp_path):
         from agent_loader import load_all_executors

@@ -1697,11 +1697,11 @@ class TestValidateConfigRepoWalkScope:
         ), errors
 
     def test_executor_hooks_yaml_still_schema_gated(self, tmp_path):
-        """#213 executor-coverage decision: executors/ deliberately STAYS in
-        the walk. load_all_executors schema-validates only definition.yaml;
-        an executor's hooks.yaml is consumed unvalidated (workspace /
-        hook_bridge / casa_core read it straight off disk), so this walk is
-        its sole schema gate — pruning executors/ would silently drop it."""
+        """#213 executor-coverage decision, ownership moved by #312: the
+        gate's POINTER PASS (not the basename walk, which now skips executor
+        hooks.yaml) schema-gates executor hooks documents — including a
+        default-named hooks.yaml in a dir with no definition.yaml. Dropping
+        the pass would silently un-gate them."""
         from agent_loader import validate_config_repo
 
         repo = tmp_path / "cfg"

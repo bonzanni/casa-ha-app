@@ -908,22 +908,31 @@ def _build_executor_cc_hook_policies(executor_registry) -> dict:
     ``path_scope`` prefixes / ``commit_size_guard`` limit instead of the
     deny-all factory defaults.
 
-    Boot-time snapshot: an operator edit to an executor ``hooks.yaml`` needs an
-    add-on restart to affect the HTTP path (same freshness as the boot-built
-    default policies). A per-executor parse failure is logged and skipped so
-    that executor simply falls back to the default callbacks.
+    Built at boot AND rebuilt in place by ``reload.reload_executors`` (#340 —
+    the resolve handlers capture the dict instance stashed on
+    ``runtime.executor_cc_policies``, so reload mutates that same object).
+    A per-executor parse failure is logged and skipped so that executor simply
+    falls back to the default callbacks.
+
+    #315: iterates ``list_types_any()``/``definition_any()`` — boot replay
+    resumes existing brief-bearing engagements of DISABLED executors, and
+    those must resolve their declared hook parameters too, not the deny-all
+    defaults (default ``path_scope`` has empty prefix lists, denying every
+    workspace Read/Write/Edit).
     """
-    import yaml
+    from agent_loader import read_hooks_document
     from hooks import build_policy_callbacks_from_hooks_yaml
 
     out: dict = {}
-    for t in executor_registry.list_types():
-        defn = executor_registry.get(t)
+    for t in executor_registry.list_types_any():
+        defn = executor_registry.definition_any(t)
         if defn is None or defn.driver != "claude_code" or not defn.hooks_path:
             continue
         try:
-            with open(defn.hooks_path, "r", encoding="utf-8") as fh:
-                data = yaml.safe_load(fh) or {}
+            # Sol r1-2: the SAME env-substituting reader load-time validation
+            # used — a raw safe_load here parsed a DIFFERENT document for any
+            # ${VAR} reference (validated substituted, enforced raw).
+            data = read_hooks_document(defn.hooks_path)
             out[t] = build_policy_callbacks_from_hooks_yaml(data)
         except Exception as exc:  # noqa: BLE001
             logger.warning(
@@ -3029,6 +3038,12 @@ async def main() -> None:
     )
     # H3 (v0.53.0): per-executor hooks.yaml params for the HTTP hook path.
     _executor_cc_policies = _build_executor_cc_hook_policies(executor_registry)
+    # #340: stash the SAME instance both resolve handlers capture on the
+    # runtime, so reload_executors can refresh it in place (clear+update) —
+    # without this, the map stays frozen at boot: a reloaded-in executor
+    # falls back to deny-all defaults and a tightened policy keeps enforcing
+    # the old broader callbacks until restart.
+    runtime.executor_cc_policies = _executor_cc_policies
     app.router.add_post(
         "/hooks/resolve",
         _make_public_hooks_fallback_handler(

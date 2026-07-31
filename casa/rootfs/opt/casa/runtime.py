@@ -113,3 +113,13 @@ class CasaRuntime:
     # narrow CasaRuntime(...) test constructor keeps compiling unchanged —
     # MUST stay the final field (dataclass-ordering rule).
     explanation_store: "ExplanationStore | None" = None
+
+    # #340: the per-executor HTTP hook-policy map
+    # (``{executor_type: {policy_name: (matcher, callback)}}``) built by
+    # ``casa_core._build_executor_cc_hook_policies`` and captured by the
+    # /hooks/resolve handlers at boot. ``reload.reload_executors`` MUTATES it
+    # in place (clear+update) so the captured references see fresh policies —
+    # never rebind this attr. Defaulted (None) so narrow test stand-ins keep
+    # compiling; a None map means "no boot map to refresh" and reload skips
+    # the rebuild. MUST stay the final field (dataclass-ordering rule).
+    executor_cc_policies: dict | None = None

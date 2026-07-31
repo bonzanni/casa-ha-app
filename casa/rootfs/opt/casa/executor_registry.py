@@ -21,6 +21,12 @@ class ExecutorRegistry:
         self._dir = executors_dir
         self._defs: dict[str, ExecutorDefinition] = {}
         self._disabled: set[str] = set()
+        # #340 (Sol r1-1): types whose LOAD failed on the most recent load()
+        # — kept so reload can tell "failed to load" apart from "genuinely
+        # removed" when refreshing the HTTP hook-policy map: a failed
+        # executor's live engagements must keep their old (possibly tighter)
+        # callbacks rather than fall back to the broader defaults.
+        self._failed_types: set[str] = set()
         # Disabled executors' definitions, kept so verify/health can validate a
         # plugin assigned to a currently-disabled executor (the executor being
         # off by config is not a plugin-health failure). NEVER exposed via get()
@@ -46,6 +52,7 @@ class ExecutorRegistry:
         self._defs.clear()
         self._disabled.clear()
         self._disabled_defs.clear()
+        self._failed_types.clear()
 
         base = os.path.dirname(self._dir)
         try:
@@ -57,6 +64,7 @@ class ExecutorRegistry:
 
         # v0.37.1 B-1b: per-file failures don't poison siblings.
         for name, err in failed:
+            self._failed_types.add(name)
             logger.error(
                 "Executor %r failed to load: %s; other executors continue",
                 name, err,
@@ -101,3 +109,17 @@ class ExecutorRegistry:
 
     def list_types(self) -> list[str]:
         return sorted(self._defs.keys())
+
+    @property
+    def failed_types(self) -> set[str]:
+        """Types whose most recent load() failed (copy — see __init__ note)."""
+        return set(self._failed_types)
+
+    def list_types_any(self) -> list[str]:
+        """Every loaded type, ENABLED or DISABLED — the iteration counterpart
+        of :meth:`definition_any`. #315: the HTTP hook-policy map must cover
+        disabled-but-resumable executors (boot replay resumes their existing
+        brief-bearing engagements), so its builder iterates this, not
+        ``list_types()``. Engagement LAUNCH keeps using ``list_types()``/
+        ``get()`` to refuse a disabled type."""
+        return sorted(set(self._defs) | set(self._disabled_defs))

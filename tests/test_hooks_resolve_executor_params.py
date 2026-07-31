@@ -116,3 +116,119 @@ async def test_commit_size_guard_uses_declared_max_files(monkeypatch):
                             "file_path": f"/data/engagements/{ENG_ID}/f"}}})
         # 30 < declared max_files=50 -> allow; default max=20 would deny.
         assert await resp.json() == {}
+
+
+# ---------------------------------------------------------------------------
+# #313: duplicate policy declarations must ALL run on the HTTP path.
+# ---------------------------------------------------------------------------
+
+
+async def test_duplicate_policy_declarations_all_enforced():
+    """#313: the SDK path registers one matcher per declaration and runs all
+    of them, so duplicate declarations enforce their INTERSECTION. Pre-fix,
+    the HTTP builder stored ``out[name] = ...`` — last-writer-wins — so a
+    write refused by the first declaration but permitted by the last was
+    allowed on the HTTP path."""
+    from hooks import build_policy_callbacks_from_hooks_yaml
+    built = build_policy_callbacks_from_hooks_yaml({"pre_tool_use": [
+        {"policy": "path_scope",
+         "writable": ["/data/engagements/"],
+         "readable": ["/data/engagements/"]},
+        {"policy": "path_scope",
+         "writable": ["/config/"],
+         "readable": ["/config/"]},
+    ]})
+    _matcher, cb = built["path_scope"]
+    # Permitted by the LAST declaration alone, refused by the first: the
+    # composite must deny (SDK parity).
+    result = await cb(
+        {"tool_name": "Write", "tool_input": {"file_path": "/config/x"}},
+        None, {},
+    )
+    assert result["hookSpecificOutput"]["permissionDecision"] == "deny"
+
+
+async def test_duplicate_declarations_intersection_still_allows():
+    """A path inside EVERY duplicate declaration's scope stays allowed."""
+    from hooks import build_policy_callbacks_from_hooks_yaml
+    built = build_policy_callbacks_from_hooks_yaml({"pre_tool_use": [
+        {"policy": "path_scope",
+         "writable": ["/data/"], "readable": ["/data/"]},
+        {"policy": "path_scope",
+         "writable": ["/data/engagements/"],
+         "readable": ["/data/engagements/"]},
+    ]})
+    _matcher, cb = built["path_scope"]
+    result = await cb(
+        {"tool_name": "Write",
+         "tool_input": {"file_path": "/data/engagements/e/f"}},
+        None, {},
+    )
+    assert not result
+
+
+# ---------------------------------------------------------------------------
+# #315: disabled-but-resumable executors keep their configured hook params.
+# ---------------------------------------------------------------------------
+
+
+async def test_disabled_executor_hook_params_still_built(tmp_path):
+    """#315: boot replay resumes brief-bearing engagements of DISABLED
+    executors via definition_any(); the HTTP hook-policy map must carry their
+    declared parameters too. Pre-fix it iterated list_types()/get() (enabled
+    only), so a resumed engagement fell back to the default empty path_scope
+    — every workspace Read/Write/Edit denied."""
+    from types import SimpleNamespace
+    from casa_core import _build_executor_cc_hook_policies
+    from executor_registry import ExecutorRegistry
+
+    hooks_path = tmp_path / "hooks.yaml"
+    hooks_path.write_text(
+        "schema_version: 1\n"
+        "pre_tool_use:\n"
+        "  - policy: path_scope\n"
+        "    writable: [/data/engagements/]\n"
+        "    readable: [/data/engagements/]\n"
+    )
+    reg = ExecutorRegistry(str(tmp_path / "executors"))
+    reg._disabled.add("plugin-developer")
+    reg._disabled_defs["plugin-developer"] = SimpleNamespace(
+        driver="claude_code", hooks_path=str(hooks_path),
+    )
+    built = _build_executor_cc_hook_policies(reg)
+    assert "plugin-developer" in built
+    assert "path_scope" in built["plugin-developer"]
+    _matcher, cb = built["plugin-developer"]["path_scope"]
+    result = await cb(
+        {"tool_name": "Write",
+         "tool_input": {"file_path": "/data/engagements/e/f"}},
+        None, {},
+    )
+    assert not result  # declared scope applies — not the deny-all default
+
+
+async def test_duplicate_declarations_with_differing_matchers_refused():
+    """Sol r2-1: the wire names only the POLICY, so per-declaration matcher
+    scoping of duplicates is unenforceable server-side — refuse the config
+    loudly (which #312's load-time constructibility check turns into a
+    fail-closed executor load/commit failure)."""
+    import pytest as _pytest
+    from hooks import UnknownPolicyError, build_policy_callbacks_from_hooks_yaml
+    with _pytest.raises(UnknownPolicyError, match="differing matchers"):
+        build_policy_callbacks_from_hooks_yaml({"pre_tool_use": [
+            {"policy": "path_scope", "matcher": "Read",
+             "readable": ["/a/"]},
+            {"policy": "path_scope", "matcher": "Write",
+             "writable": ["/b/"]},
+        ]})
+
+
+async def test_duplicate_declarations_same_matcher_still_compose():
+    from hooks import build_policy_callbacks_from_hooks_yaml
+    built = build_policy_callbacks_from_hooks_yaml({"pre_tool_use": [
+        {"policy": "path_scope", "writable": ["/data/"],
+         "readable": ["/data/"]},
+        {"policy": "path_scope", "writable": ["/data/engagements/"],
+         "readable": ["/data/engagements/"]},
+    ]})
+    assert "path_scope" in built
