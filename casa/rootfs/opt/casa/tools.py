@@ -3403,12 +3403,26 @@ async def delegate_to_agent(args: dict) -> dict:
                  # runtime identity via _resolution_from_recorded (above).
                  "manifest_name": rp.manifest_name}
                 for rp in _spec_res.plugins)
-            # Create record
-            rec = await _engagement_registry.create(
-                kind="specialist", role_or_type=agent_name, driver="in_casa",
-                task=task_text, origin=dict(origin), topic_id=topic_id,
-                plugin_artifacts=_spec_arts,
-            )
+            # Create record. #326: create() persists STRICTLY — a tombstone
+            # write failure raises (no ghost record). Abort the just-created
+            # topic before surfacing the error; the permit is released by the
+            # outer finally (`owned` is still set here).
+            try:
+                rec = await _engagement_registry.create(
+                    kind="specialist", role_or_type=agent_name, driver="in_casa",
+                    task=task_text, origin=dict(origin), topic_id=topic_id,
+                    plugin_artifacts=_spec_arts,
+                )
+            except asyncio.CancelledError:
+                # create() already compensated the record; close the topic in
+                # the background (a cancelled task cannot await network RTs).
+                _abort_topic_on_cancel(channel, "delegate-abort", topic_id)
+                raise
+            except Exception as exc:  # noqa: BLE001
+                await _abort_engagement_topic(channel, "delegate-abort", topic_id)
+                return _result({
+                    "status": "error", "kind": "record_persist_failed",
+                    "message": str(exc)})
             # Task 6 (spec §4.6): stash the permit on the engagement record so
             # EVERY registry terminal transition (mark_error, mark_cancelled,
             # mark_completed, try_transition_terminal) releases it — including
@@ -5024,17 +5038,31 @@ async def engage_executor(args: dict) -> dict:
             and normalized_brief["interaction_required"]
         )
 
-        rec = await _engagement_registry.create(
-            kind="executor", role_or_type=executor_type, driver=defn.driver,
-            task=task_text,
-            origin={**origin, **_origin_extra},
-            topic_id=topic_id,
-            tools_allowed=tuple(defn.tools_allowed or ()),
-            permission_mode=getattr(defn, "permission_mode", "acceptEdits"),
-            plugin_artifacts=plugin_artifacts,      # §3.8 recorded binding
-            interaction_state="first_contact_required" if _two_phase else "",
-            topic_title=persisted_title,            # W-R6 durable short title
-        )
+        # #326: create() persists STRICTLY — a tombstone write failure raises
+        # (no ghost record). Abort the just-created topic before surfacing
+        # the error, mirroring the _gate_err path above.
+        try:
+            rec = await _engagement_registry.create(
+                kind="executor", role_or_type=executor_type, driver=defn.driver,
+                task=task_text,
+                origin={**origin, **_origin_extra},
+                topic_id=topic_id,
+                tools_allowed=tuple(defn.tools_allowed or ()),
+                permission_mode=getattr(defn, "permission_mode", "acceptEdits"),
+                plugin_artifacts=plugin_artifacts,      # §3.8 recorded binding
+                interaction_state="first_contact_required" if _two_phase else "",
+                topic_title=persisted_title,            # W-R6 durable short title
+            )
+        except asyncio.CancelledError:
+            # create() already compensated the record; close the topic in the
+            # background (a cancelled task cannot await network RTs).
+            _abort_topic_on_cancel(channel, "engage-abort", topic_id)
+            raise
+        except Exception as exc:  # noqa: BLE001
+            await _abort_engagement_topic(channel, "engage-abort", topic_id)
+            return _result({
+                "status": "error", "kind": "record_persist_failed",
+                "message": str(exc)})
 
     # Sol round-4: the manual-edit seam `casa_reload(scope="full")` bumps the
     # snapshot generation WITHOUT the plugin-tools lock, so it can move the
@@ -5195,6 +5223,24 @@ def _engagement_supergroup_chat_id(channel: Any | None) -> int | None:
         ) or None
     except (TypeError, ValueError):
         return None
+
+
+# #326 (review r3): strong refs for topic aborts scheduled from a CANCELLED
+# launch — the caller re-raises immediately, so without a registry the task
+# would be garbage-collectible mid-flight. _abort_engagement_topic never
+# raises, so these settle quietly.
+_ABORT_BG_TASKS: set = set()
+
+
+def _abort_topic_on_cancel(channel: Any, engagement_id: str,
+                           topic_id: int | None) -> None:
+    """Schedule a best-effort topic abort that survives the caller's
+    cancellation (fire-and-forget, strong-ref'd until done)."""
+    task = asyncio.ensure_future(
+        _abort_engagement_topic(channel, engagement_id, topic_id),
+    )
+    _ABORT_BG_TASKS.add(task)
+    task.add_done_callback(_ABORT_BG_TASKS.discard)
 
 
 async def _abort_engagement_topic(

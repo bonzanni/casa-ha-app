@@ -35,7 +35,11 @@ client itself. The engagement registry mutates and persists under one registry l
 a full reload is the writer excluding every other scope (INV-CFG-002). Plugin mutations
 share one tool-level lock (INV-TOOL-003). The specialist lifecycle serializes under the
 materialize lock. Agents keep a small first-publication lock for their plugin-resolution
-snapshot — it does not serialize turns.
+snapshot — it does not serialize turns. The Telegram channel re-imposes ordering per scope
+above the bus: a per-topic handler lock for engagement topics and a per-chat lock
+serializing `/new` with same-chat enqueue (both documented in the Telegram map). The one
+cross-*thread* lock is plugin health's report lock — a `threading.Lock`, because its
+writers run both on the loop and in the thread offload.
 
 **Blocking work goes to threads; coordination stays on the loop.** Filesystem and config
 I/O is pushed through the thread offload helper (well over a hundred call sites);

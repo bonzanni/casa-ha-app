@@ -240,3 +240,48 @@ def test_fingerprint_unaffected_by_owner_and_top_level_keys(tmp_path):
     assert (rep_bare["issues"][0]["fingerprint"]
             == rep_owned["issues"][0]["fingerprint"]
             == plugin_health.fingerprint(issue))
+
+
+def test_concurrent_regeneration_keeps_just_marked_fingerprint(tmp_path, monkeypatch):
+    """#353 (low): write_report runs in a thread (asyncio.to_thread) while
+    mark_notified runs on the loop. A regeneration that read the previous
+    report BEFORE a concurrent mark_notified landed must not overwrite the
+    file without the just-delivered marker — that would re-DM the same issue.
+    The read-merge-write must be serialized (and the previous report read
+    inside the critical section)."""
+    import threading
+
+    p = tmp_path / "health.json"
+    x = _issue()
+    fp_x = plugin_health.fingerprint(x)
+    plugin_health.write_report(issues=[x], warnings=[], path=p)
+
+    in_registry_state = threading.Event()
+    release = threading.Event()
+    real_registry_state = plugin_health._registry_state
+
+    def gated_registry_state(registry_path=None):
+        in_registry_state.set()
+        release.wait(timeout=5)
+        return real_registry_state(registry_path)
+
+    monkeypatch.setattr(plugin_health, "_registry_state", gated_registry_state)
+
+    t = threading.Thread(
+        target=plugin_health.write_report,
+        kwargs={"issues": [x], "warnings": [], "path": p},
+    )
+    t.start()
+    try:
+        assert in_registry_state.wait(timeout=5)
+        # The notification lands while the regeneration is mid-flight.
+        plugin_health.mark_notified([fp_x], path=p)
+    finally:
+        release.set()
+        t.join(timeout=5)
+    assert not t.is_alive()
+
+    final = plugin_health.load_report(p)
+    assert fp_x in (final.get("notified_fingerprints") or []), (
+        "a concurrent regeneration must not erase a delivered-notification marker"
+    )

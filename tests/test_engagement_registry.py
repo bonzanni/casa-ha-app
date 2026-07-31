@@ -1106,3 +1106,206 @@ class TestF6StrictLedgerPersistence:
             with pytest.raises(OSError):
                 await reg.set_summary_message_id(rec.id, 777)
         assert rec.summary_message_id is None
+
+
+class TestTerminalGuards:
+    """#326: non-atomic status writes — mark_idle/mark_error (and the other
+    direct mark_* mutators) must never overwrite a concurrently committed
+    terminal status, and create() must not report success after a failed
+    durable write."""
+
+    async def test_mark_idle_never_overwrites_terminal(self, registry):
+        rec = await registry.create(
+            kind="executor", role_or_type="configurator", driver="claude_code",
+            task="t", origin={}, topic_id=1,
+        )
+        assert await registry.try_transition_terminal(rec.id, "cancelled")
+        await registry.mark_idle(rec.id)
+        assert registry.get(rec.id).status == "cancelled"
+
+    async def test_mark_error_loses_to_terminal_winner(self, registry):
+        rec = await registry.create(
+            kind="executor", role_or_type="configurator", driver="claude_code",
+            task="t", origin={}, topic_id=1,
+        )
+        assert await registry.try_transition_terminal(rec.id, "cancelled")
+        won = await registry.mark_error(rec.id, kind="resume_failed", message="x")
+        assert won is False
+        assert registry.get(rec.id).status == "cancelled"
+        assert "error_kind" not in registry.get(rec.id).origin
+
+    async def test_mark_error_wins_on_live_record(self, registry):
+        rec = await registry.create(
+            kind="executor", role_or_type="configurator", driver="claude_code",
+            task="t", origin={}, topic_id=1,
+        )
+        won = await registry.mark_error(rec.id, kind="boom", message="m")
+        assert won is True
+        assert registry.get(rec.id).status == "error"
+        assert registry.get(rec.id).origin["error_kind"] == "boom"
+
+    async def test_mark_completed_and_cancelled_respect_terminal(self, registry):
+        rec = await registry.create(
+            kind="executor", role_or_type="configurator", driver="claude_code",
+            task="t", origin={}, topic_id=1,
+        )
+        assert await registry.try_transition_terminal(rec.id, "cancelled")
+        await registry.mark_completed(rec.id, completed_at=123.0)
+        assert registry.get(rec.id).status == "cancelled"
+        rec2 = await registry.create(
+            kind="executor", role_or_type="configurator", driver="claude_code",
+            task="t", origin={}, topic_id=2,
+        )
+        assert await registry.try_transition_terminal(rec2.id, "completed")
+        await registry.mark_cancelled(rec2.id)
+        assert registry.get(rec2.id).status == "completed"
+
+    async def test_create_persist_failure_raises_and_rolls_back(
+        self, registry, monkeypatch,
+    ):
+        """create() used the best-effort tombstone writer, so a disk failure
+        produced a running engagement with no crash-recovery record. It must
+        now propagate the failure and leave no ghost record behind."""
+        import engagement_registry as er
+
+        def _boom(*_a, **_k):
+            raise OSError("disk full")
+
+        monkeypatch.setattr(er, "atomic_write_json", _boom)
+        with pytest.raises(OSError):
+            await registry.create(
+                kind="executor", role_or_type="configurator", driver="claude_code",
+                task="t", origin={}, topic_id=99,
+            )
+        assert registry.active_and_idle() == []
+        assert registry.by_topic_id(99) is None
+
+    async def test_sweep_does_not_resurrect_concurrently_finalized(self, registry):
+        """#326: the idle sweep awaits driver.cancel(); a finalizer that commits
+        a terminal status during that await must not be flipped back to idle."""
+        rec = await registry.create(
+            kind="executor", role_or_type="configurator", driver="in_casa",
+            task="t", origin={}, topic_id=5,
+        )
+        now = time.time()
+        rec.last_user_turn_ts = now - 90000  # > _SESSION_SUSPEND_IDLE_S
+        # v0.79.0: silence the idle-reminder branch for this test.
+        rec.last_idle_reminder_ts = now
+
+        class Driver:
+            def is_alive(self, r):
+                return True
+
+            def get_session_id(self, r):
+                return "sid-1"
+
+            async def cancel(self, r):
+                # Concurrent finalizer wins while the sweep awaits us.
+                assert await registry.try_transition_terminal(rec.id, "cancelled")
+
+        await registry.sweep_idle_and_suspend(driver=Driver(), now_override=now)
+        assert registry.get(rec.id).status == "cancelled"
+
+
+class TestResumeFailCountPersistence:
+    async def test_set_resume_fail_count_persists_across_reload(self, tmp_path):
+        """#326 (low): the two-strike resume counter must survive a restart —
+        an unrecoverable engagement must not dodge the error transition by
+        resetting its counter on every boot."""
+        from engagement_registry import EngagementRegistry
+
+        path = str(tmp_path / "e.json")
+        reg = EngagementRegistry(tombstone_path=path, bus=None)
+        rec = await reg.create(
+            kind="specialist", role_or_type="finance", driver="in_casa",
+            task="t", origin={}, topic_id=3,
+        )
+        await reg.set_resume_fail_count(rec.id, 1)
+        assert reg.get(rec.id).origin["_resume_fail_count"] == 1
+
+        reg2 = EngagementRegistry(tombstone_path=path, bus=None)
+        await reg2.load()
+        assert reg2.get(rec.id).origin.get("_resume_fail_count") == 1
+
+    async def test_create_cancelled_mid_persist_leaves_no_ghost(
+        self, registry, monkeypatch,
+    ):
+        """Terra r2-1: a caller cancelled while create()'s persist commits must
+        not strand a durable active record with no driver — the insert is
+        compensated (memory rolled back, removal persisted) under the lock."""
+        import threading
+
+        import engagement_registry as er
+
+        write_entered = threading.Event()
+        release_write = threading.Event()
+        real_write = er.atomic_write_json
+        calls = []
+
+        def gated_write(path, data, **kw):
+            calls.append(1)
+            if len(calls) == 1:
+                write_entered.set()
+                release_write.wait(timeout=5)
+            return real_write(path, data, **kw)
+
+        monkeypatch.setattr(er, "atomic_write_json", gated_write)
+
+        create_task = asyncio.ensure_future(registry.create(
+            kind="executor", role_or_type="configurator", driver="claude_code",
+            task="t", origin={}, topic_id=44,
+        ))
+        await asyncio.to_thread(write_entered.wait, 5)
+        create_task.cancel()
+        release_write.set()
+        with pytest.raises(asyncio.CancelledError):
+            await create_task
+
+        assert registry.active_and_idle() == []
+        assert registry.by_topic_id(44) is None
+        # The compensating write persisted the removal: no row on disk.
+        rows = json.loads(Path(registry._tombstone_path).read_text())
+        assert rows == []
+
+    async def test_create_double_cancellation_still_compensates(
+        self, registry, monkeypatch,
+    ):
+        """Terra/Sol r3: a SECOND cancellation arriving while the first one is
+        waiting for the in-flight persist to settle must not abandon the
+        commit — the persist and the compensation both run to completion
+        before the cancellation propagates."""
+        import threading
+
+        import engagement_registry as er
+
+        write_entered = threading.Event()
+        release_write = threading.Event()
+        real_write = er.atomic_write_json
+        calls = []
+
+        def gated_write(path, data, **kw):
+            calls.append(1)
+            if len(calls) == 1:
+                write_entered.set()
+                release_write.wait(timeout=5)
+            return real_write(path, data, **kw)
+
+        monkeypatch.setattr(er, "atomic_write_json", gated_write)
+
+        create_task = asyncio.ensure_future(registry.create(
+            kind="executor", role_or_type="configurator", driver="claude_code",
+            task="t", origin={}, topic_id=45,
+        ))
+        await asyncio.to_thread(write_entered.wait, 5)
+        create_task.cancel()
+        await asyncio.sleep(0)   # now blocked settling the in-flight persist
+        create_task.cancel()     # second cancellation mid-settle
+        await asyncio.sleep(0)
+        release_write.set()
+        with pytest.raises(asyncio.CancelledError):
+            await create_task
+
+        assert registry.active_and_idle() == []
+        assert registry.by_topic_id(45) is None
+        rows = json.loads(Path(registry._tombstone_path).read_text())
+        assert rows == []

@@ -242,3 +242,40 @@ class TestCrashSafety:
         assert on_disk["tg:1"]["sdk_session_id"] == "sdk-OLD"
         # No orphaned temp sidecar.
         assert [f for f in os.listdir(tmp_path) if f != "sessions.json"] == []
+
+
+class TestSidGuardedRemove:
+    """#317: reset_channel's trailing remove() must not erase a session a
+    concurrent follow-up turn registered after the reset snapshot was taken."""
+
+    async def test_remove_with_matching_expected_sid_removes(self, tmp_path):
+        reg = SessionRegistry(str(tmp_path / "s.json"))
+        await reg.register("telegram-r1", "assistant", "sid-old", binding_digest=STUB_BINDING_DIGEST, speaker_provenance=STUB_SPEAKER_PROV, user_provenance=STUB_USER_PROV)
+        await reg.remove("telegram-r1", expected_sid="sid-old")
+        assert reg.get("telegram-r1") is None
+
+    async def test_remove_with_stale_expected_sid_spares_newer_session(self, tmp_path):
+        reg = SessionRegistry(str(tmp_path / "s.json"))
+        await reg.register("telegram-r1", "assistant", "sid-new", binding_digest=STUB_BINDING_DIGEST, speaker_provenance=STUB_SPEAKER_PROV, user_provenance=STUB_USER_PROV)
+        # A reset that snapshotted sid-old must leave the newer registration.
+        await reg.remove("telegram-r1", expected_sid="sid-old")
+        assert reg.get("telegram-r1") is not None
+        assert reg.get("telegram-r1")["sdk_session_id"] == "sid-new"
+
+    async def test_remove_without_expected_sid_stays_unconditional(self, tmp_path):
+        reg = SessionRegistry(str(tmp_path / "s.json"))
+        await reg.register("telegram-r1", "assistant", "sid-x", binding_digest=STUB_BINDING_DIGEST, speaker_provenance=STUB_SPEAKER_PROV, user_provenance=STUB_USER_PROV)
+        await reg.remove("telegram-r1")
+        assert reg.get("telegram-r1") is None
+
+    async def test_remove_with_expected_none_guards_on_sidless_entry(self, tmp_path):
+        """#353: expected_sid=None means the caller snapshotted a SID-LESS
+        entry — the removal declines once any real session registers."""
+        reg = SessionRegistry(str(tmp_path / "s.json"))
+        reg._data["telegram-r1"] = {"agent": "assistant"}  # malformed: no sid
+        await reg.remove("telegram-r1", expected_sid=None)
+        assert reg.get("telegram-r1") is None  # sid-less snapshot matches
+
+        await reg.register("telegram-r2", "assistant", "sid-live", binding_digest=STUB_BINDING_DIGEST, speaker_provenance=STUB_SPEAKER_PROV, user_provenance=STUB_USER_PROV)
+        await reg.remove("telegram-r2", expected_sid=None)
+        assert reg.get("telegram-r2") is not None  # real session spared

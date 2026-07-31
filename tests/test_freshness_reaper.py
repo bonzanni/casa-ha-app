@@ -110,3 +110,55 @@ def test_is_stale_claim_handles_bad_input():
     now = datetime(2026, 6, 2, 12, 0, tzinfo=timezone.utc)
     assert reaper._is_stale_claim(None, now) is True          # non-str → reclaim
     assert reaper._is_stale_claim("not-a-date", now) is True  # bad ISO → reclaim
+
+
+async def test_sweep_passes_cold_snapshot_sid_to_save(tmp_path):
+    """#353: the reaper must pin the save to the session it judged cold, so a
+    new turn racing the claim can never have its live session retained+removed."""
+    reg = SessionRegistry(str(tmp_path / "s.json"))
+    now = datetime(2026, 6, 2, 12, 0, tzinfo=timezone.utc)
+    await reg.register("telegram-r2", "assistant", "sid-cold", binding_digest=STUB_BINDING_DIGEST, speaker_provenance=STUB_SPEAKER_PROV, user_provenance=STUB_USER_PROV)
+    reg._data["telegram-r2"]["last_active"] = (now - timedelta(hours=13)).isoformat()
+
+    seen = {}
+    async def fake_save(key, *a, **k):
+        seen[key] = k
+        return True
+
+    reaper = FreshnessReaper(
+        registry=reg, semantic_memory=AsyncMock(),
+        directory_for=lambda role: f"/home/{role}", now=lambda: now, save_fn=fake_save,
+    )
+    await reaper.sweep_once()
+    assert seen["telegram-r2"].get("expected_sid") == "sid-cold"
+
+
+async def test_sweep_direct_removals_spare_a_racing_fresh_registration(tmp_path):
+    """#353 (Sol r2): the sweep iterates a STALE all_entries() snapshot across
+    awaits. A cold voice entry replaced by a new live registration mid-sweep
+    must not have its fresh session deleted by the recall-only removal branch."""
+    reg = SessionRegistry(str(tmp_path / "s.json"))
+    now = datetime(2026, 6, 2, 12, 0, tzinfo=timezone.utc)
+    await reg.register("telegram-a", "assistant", "sid-a", binding_digest=STUB_BINDING_DIGEST, speaker_provenance=STUB_SPEAKER_PROV, user_provenance=STUB_USER_PROV)
+    reg._data["telegram-a"]["last_active"] = (now - timedelta(hours=13)).isoformat()
+    await reg.register("voice-b", "butler", "sid-cold", binding_digest=STUB_BINDING_DIGEST, speaker_provenance=STUB_SPEAKER_PROV, user_provenance=STUB_USER_PROV)
+    reg._data["voice-b"]["last_active"] = (now - timedelta(hours=1)).isoformat()
+
+    async def racing_save(key, *a, **k):
+        # While the sweep saves the telegram entry, a live voice turn
+        # re-registers the voice key the sweep judged cold.
+        await reg.register(
+            "voice-b", "butler", "sid-live",
+            binding_digest=STUB_BINDING_DIGEST,
+            speaker_provenance=STUB_SPEAKER_PROV, user_provenance=STUB_USER_PROV,
+        )
+        return True
+
+    reaper = FreshnessReaper(
+        registry=reg, semantic_memory=AsyncMock(),
+        directory_for=lambda role: "/h", now=lambda: now, save_fn=racing_save,
+    )
+    await reaper.sweep_once()
+    entry = reg.get("voice-b")
+    assert entry is not None, "the racing fresh voice session must survive the sweep"
+    assert entry["sdk_session_id"] == "sid-live"

@@ -40,9 +40,10 @@ Without the lock, a freshness expiry and an interleaved turn on the same channel
 conversation or hand a turn a stale client. A mismatched entry is closed and rebuilt rather
 than reused. Know the lock's reach, though: it serializes the *decision* against the
 registry's current contents, not a multi-step mutation of them — a `/new` reset retains the
-old session and only afterwards removes the pointer, none of it under a pool entry lock, so
-a turn racing into that window can still read the old session id fresh and resume it once
-more.
+old session and only afterwards removes the pointer, none of it under a pool entry lock.
+The Telegram channel serializes `/new` against same-chat message *enqueue*, and the reset's
+save and removal are generation-checked (INV-MEM-006) — but a turn already dispatched
+before the reset began can still read the old session id fresh and resume it once more.
 
 "That decision" is more than a timestamp: resume requires a decodable stored entry, an exact
 role-identity match, an exact personality-binding digest, a parseable last-active time, and
@@ -74,6 +75,18 @@ recall block.
 
 "Generic model errors" are *not* a retried category: a failure that classifies to none of the
 three kinds is raised immediately.
+
+**INV-TURN-006**: A key reset joins any in-flight pool invalidation for that key — the reset-hook close returns only after the displaced generation has fully closed, not merely after its lock handed off.
+
+The distinction from an ordinary replacement turn is deliberate and asymmetric: a
+replacement turn waits only for the invalidation's lock-handoff barrier (a slow disconnect
+stays off its path), while a reset waits for the whole close, because the disconnect is
+what flushes the CLI transcript the reset's save is about to read — and because a still-
+finishing old turn could otherwise re-register the session the reset just removed.
+
+What it does not cover: it joins *invalidation* generations only. A reset has no ordering
+relationship with a turn dispatched after it on the same key beyond what the entry lock and
+the channel's own serialization provide.
 
 ## Failure behavior
 
@@ -137,6 +150,7 @@ the same way.
 - `casa/rootfs/opt/casa/agent.py::Agent._build_options`
 - `casa/rootfs/opt/casa/agent.py::Agent.aclose`
 - `casa/rootfs/opt/casa/sdk_client_pool.py::SdkClientPool.turn`
+- `casa/rootfs/opt/casa/sdk_client_pool.py::SdkClientPool.close_key`
 - `casa/rootfs/opt/casa/sdk_client_pool.py::ManagedSdkClient`
 - `casa/rootfs/opt/casa/sdk_client_pool.py::PoolUnavailable`
 - `casa/rootfs/opt/casa/retry.py::retry_sdk_call`

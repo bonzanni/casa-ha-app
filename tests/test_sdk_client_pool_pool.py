@@ -1022,3 +1022,82 @@ async def test_evict_waits_for_entry_lock():
     await evict
     assert made[0].disconnected
     assert pool.stats()["entries"] == 0
+
+
+async def test_close_key_joins_inflight_invalidation_flush():
+    """#319: close_key (the /new reset hook) must not return while an
+    invalidate_all() generation for the same key is still draining — the reset's
+    save may otherwise read a transcript the old client has not flushed, and the
+    finishing old turn can resurrect the just-reset session."""
+    reg = FakeRegistry()
+    reg.data["voice-same"] = {"sdk_session_id": "sid-same", "last_active": "x"}
+    pool = _mk_pool(reg)
+    first_turn_started = asyncio.Event()
+    release_first_turn = asyncio.Event()
+    old_disconnect_started = asyncio.Event()
+    release_old_disconnect = asyncio.Event()
+
+    class GatedClient(ScriptedClient):
+        async def query(self, prompt, session_id="default"):
+            self.queries.append(prompt)
+            if prompt == "first":
+                first_turn_started.set()
+
+        async def receive_response(self):
+            if self.queries[-1] == "first":
+                await release_first_turn.wait()
+            yield _mk_result("sid-same")
+
+        async def disconnect(self):
+            self.disconnected = True
+            old_disconnect_started.set()
+            await release_old_disconnect.wait()
+
+    pool._make_client = GatedClient
+
+    async def go(prompt):
+        async def build_options(is_fresh, resume_sid):
+            return {"resume": resume_sid}
+
+        async def on_message(_message):
+            return None
+
+        return await pool.turn(
+            channel_key="voice-same", channel="voice", prompt=prompt,
+            origin={}, cid="c", build_options=build_options,
+            on_stale_old=lambda _sid: None, on_message=on_message,
+        )
+
+    first = asyncio.create_task(go("first"))
+    invalidation = None
+    closer = None
+    try:
+        await asyncio.wait_for(first_turn_started.wait(), timeout=1)
+        invalidation = asyncio.create_task(pool.invalidate_all())
+        await asyncio.sleep(0)  # invalidation snapshots + blocks on entry lock
+
+        closer = asyncio.create_task(pool.close_key("voice-same"))
+        for _ in range(5):
+            await asyncio.sleep(0)
+        # Old turn still owns the entry lock — the reset must be waiting.
+        assert not closer.done(), "close_key returned before the old turn ended"
+
+        release_first_turn.set()
+        assert (await asyncio.wait_for(first, timeout=1)).sid == "sid-same"
+        await asyncio.wait_for(old_disconnect_started.wait(), timeout=1)
+        for _ in range(5):
+            await asyncio.sleep(0)
+        # The old generation's transport close (= transcript flush, AR-4) is
+        # still in flight — the reset must keep waiting for it.
+        assert not closer.done(), "close_key returned before the old client flushed"
+
+        release_old_disconnect.set()
+        await asyncio.wait_for(closer, timeout=1)
+        await asyncio.wait_for(invalidation, timeout=1)
+    finally:
+        release_first_turn.set()
+        release_old_disconnect.set()
+        tasks = [t for t in (first, invalidation, closer) if t is not None]
+        if tasks:
+            await asyncio.gather(*tasks, return_exceptions=True)
+        await pool.aclose()

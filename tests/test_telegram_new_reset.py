@@ -194,3 +194,57 @@ class TestTelegramNewReset:
         assert len(queued) == 1
         assert queued[0].content == "hello"
         assert app.bot.sent == []
+
+
+class TestNewSerializesWithFollowUps:
+    async def test_follow_up_waits_for_reset_same_chat_other_chats_flow(self, tmp_path):
+        """#317: handlers run with block=False, so a message sent right after
+        /new used to race the reset (resuming the dying session, or having its
+        fresh session erased). The channel must serialize /new with same-chat
+        follow-ups while other chats keep flowing."""
+        import asyncio
+
+        import session_saver
+        from session_registry import SessionRegistry
+
+        reg = SessionRegistry(str(tmp_path / "s.json"))
+        sem = AsyncMock()
+        ch, bus, app = _make_channel(session_registry=reg, semantic_memory=sem)
+
+        reset_started = asyncio.Event()
+        release_reset = asyncio.Event()
+
+        async def gated_reset(channel_key, registry, semantic_memory, *, channel):
+            reset_started.set()
+            await release_reset.wait()
+
+        with patch("session_saver.reset_channel", gated_reset):
+            new_task = asyncio.ensure_future(
+                ch._handle(_fake_update("42", "/new"), None)
+            )
+            await asyncio.wait_for(reset_started.wait(), timeout=1)
+
+            follow_up = asyncio.ensure_future(
+                ch._handle(_fake_update("42", "hello"), None)
+            )
+            for _ in range(10):
+                await asyncio.sleep(0)
+            assert await _drain_bus(bus) == [], (
+                "a same-chat follow-up must not reach the bus mid-reset"
+            )
+
+            # An unrelated chat is not blocked by 42's reset.
+            await asyncio.wait_for(
+                ch._handle(_fake_update("43", "other chat"), None), timeout=1,
+            )
+            other = await _drain_bus(bus)
+            assert [m.content for m in other] == ["other chat"]
+
+            release_reset.set()
+            await asyncio.wait_for(new_task, timeout=1)
+            await asyncio.wait_for(follow_up, timeout=1)
+
+        queued = await _drain_bus(bus)
+        assert [m.content for m in queued] == ["hello"], (
+            "the follow-up must flow to the bus once the reset completes"
+        )

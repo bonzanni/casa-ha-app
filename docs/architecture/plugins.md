@@ -44,7 +44,11 @@ specialist resume, which deep-validates its recorded artifacts automatically. Ex
 resume checks only that the recorded directories still exist.
 
 **Plugin failures degrade; they do not stop the container.** The boot path writes health data
-and exits successfully whatever it finds. One broken plugin costs that plugin.
+and exits successfully whatever it finds. One broken plugin costs that plugin. The health
+report's operator-DM dedup (fingerprints already notified) is a read-merge-write over one
+file from both the event loop and worker threads; a process-wide lock serializes it, and the
+regeneration reads the previous report inside that critical section, so a regeneration
+racing a just-delivered notification cannot erase its marker and re-alert.
 
 **Approval is per call, not per install, and it does not survive a restart.** A protected
 tool call by a resident or specialist consumes a single-use grant bound to a specific

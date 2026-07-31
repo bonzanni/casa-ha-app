@@ -858,3 +858,68 @@ def test_inbound_message_without_message_id_is_tolerated():
         "engagement inbound reads of msg.message_id must be getattr-guarded "
         "(harness/e2e messages may omit it)")
     assert "msg.message_id))" not in src
+
+
+class TestResumeFailureRaces:
+    async def test_resume_fail_count_persists_to_tombstone(
+        self, fake_telegram_bot, engagement_fixture, tmp_path,
+    ):
+        """#326 (low): the two-strike counter must survive a restart — a failed
+        resume writes it through the registry, not just onto the in-memory
+        origin dict."""
+        import json
+
+        from channels.telegram import TelegramChannel
+
+        ch = TelegramChannel(bot=fake_telegram_bot, chat_id=100,
+                             engagement_supergroup_id=-1001)
+        ch._engagement_registry = engagement_fixture.registry
+        ch._driver_send_user_turn = AsyncMock()
+        driver = MagicMock()
+        driver.is_alive = MagicMock(return_value=False)
+        driver.resume = AsyncMock(side_effect=RuntimeError("rotated"))
+        ch._engagement_driver = driver
+        rec = engagement_fixture.active_record
+        await rec_with_session(engagement_fixture.registry, rec, "sess-xyz")
+
+        u = _mk_update(chat_id=-1001, text="turn1", thread_id=rec.topic_id)
+        await ch.handle_update(u)
+
+        rows = json.loads((tmp_path / "e.json").read_text())
+        row = next(r for r in rows if r["id"] == rec.id)
+        assert row["origin"].get("_resume_fail_count") == 1
+
+    async def test_second_strike_lost_to_concurrent_finalize_skips_cleanup(
+        self, fake_telegram_bot, engagement_fixture,
+    ):
+        """#326: a failed resume must not overwrite a concurrently committed
+        terminal status with `error`, nor run its duplicate topic cleanup."""
+        from channels.telegram import TelegramChannel
+
+        ch = TelegramChannel(bot=fake_telegram_bot, chat_id=100,
+                             engagement_supergroup_id=-1001)
+        reg = engagement_fixture.registry
+        ch._engagement_registry = reg
+        ch._driver_send_user_turn = AsyncMock()
+        ch._cleanup_error_topic = AsyncMock()
+        rec = engagement_fixture.active_record
+        await rec_with_session(reg, rec, "sess-xyz")
+        await reg.set_resume_fail_count(rec.id, 1)   # one strike already
+
+        driver = MagicMock()
+        driver.is_alive = MagicMock(return_value=False)
+
+        async def _cancel_races_resume(*_a, **_k):
+            # A /cancel finalizer commits terminal while resume() is awaited.
+            assert await reg.try_transition_terminal(rec.id, "cancelled")
+            raise RuntimeError("rotated")
+
+        driver.resume = AsyncMock(side_effect=_cancel_races_resume)
+        ch._engagement_driver = driver
+
+        u = _mk_update(chat_id=-1001, text="turn2", thread_id=rec.topic_id)
+        await ch.handle_update(u)
+
+        assert reg.get(rec.id).status == "cancelled"          # winner stands
+        assert "error_kind" not in reg.get(rec.id).origin
+        ch._cleanup_error_topic.assert_not_awaited()          # no duplicate cleanup

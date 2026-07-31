@@ -122,4 +122,12 @@ class ReconnectSupervisor:
                     "Telegram transport recovered after %d attempt(s)", attempt + 1,
                 )
                 self._outage_active = False
+            # Triggers that arrived while this rebuild (or its retries) ran
+            # are satisfied by it — the whole transport was just rebuilt.
+            # Without this clear, a trigger landing mid-rebuild survives a
+            # successful cycle and immediately tears down the now-healthy
+            # app, breaking trigger()'s coalescing promise. No suspension
+            # point separates the successful rebuild_fn from this clear, so
+            # a genuinely NEW trigger (post-success) cannot be lost.
+            self._trigger_event.clear()
             return

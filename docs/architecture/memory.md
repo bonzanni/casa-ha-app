@@ -115,6 +115,29 @@ Enforced by the channel write-policy check, consulted by every production retain
 What it does not cover: the seam's retain method itself enforces nothing. A future caller that
 skips the builder and the policy check would bypass both.
 
+**INV-MEM-006**: A session save or removal keyed by channel acts only on the session id its caller snapshotted — a registration carrying a different id in that window is released, not retained or deleted; an explicit reset deliberately removes its snapshotted session even when re-registered.
+
+The registry key names a *conversation slot*, not a session — a new turn can re-register the
+slot at any suspension point. Every step of the save protocol therefore carries the session
+id its caller judged (the reaper's cold snapshot, a reset's own snapshot): the save entry
+point releases a claim that landed on a different session, `finish_save` and
+`clear_save_claim` decline when the stored id moved, and an explicit reset's trailing
+removal declines the same way — as do the reaper's direct removals of unusable and
+recall-only entries (a snapshot without a session id guards on that absence).
+
+The guard is deliberately session-scoped, not registration-scoped, and each path has its own
+reason that suffices. A *reset* that removes a same-id re-registration is executing its
+contract: the id names exactly the conversation the user asked to reset, whoever refreshed
+the pointer meanwhile. The *reaper* cannot meet a same-id re-registration from a racing
+turn at all: resuming stamps `last_active` before the turn runs and a past-freshness
+session is never resumed, so any turn racing a cold sweep registers a *fresh* id — which
+this guard catches.
+
+What it does not cover: a caller that passes no expected id gets the unconditional
+behavior; and a turn still running on the *same* session when a reset saves it can have its
+tail exchanges miss retention — the reset drops the pointer (its contract) and nothing
+saves that session again.
+
 ## Failure behavior
 
 **The backend is slow, unreachable, or returns an error.** The seam raises `RecallUnavailable`
@@ -146,7 +169,8 @@ clearance, which reads as absence on voice and friends surfaces.
 
 **Saving a session fails.** The save is abandoned, its claim is released, and the entry stays
 for a later sweep to retry. An explicit reset is the exception — it drops the pointer whether
-or not the save succeeded.
+or not the save succeeded, unless a newer session registered meanwhile (INV-MEM-006), in
+which case the newer registration stands.
 
 **The session registry file is corrupt at boot.** It is renamed aside and the process starts
 with an empty registry. Session pointers are lost; the app comes up.
@@ -192,6 +216,8 @@ once.
 - `casa/rootfs/opt/casa/recall_renderer.py::render_recall`
 - `casa/rootfs/opt/casa/recall_health.py::observed_recall`
 - `casa/rootfs/opt/casa/session_saver.py::save_session`
+- `casa/rootfs/opt/casa/session_saver.py::reset_channel`
+- `casa/rootfs/opt/casa/freshness_reaper.py::FreshnessReaper.sweep_once`
 
 **Tests**
 - `tests/test_recall_absence_invariant.py`
@@ -201,6 +227,8 @@ once.
 - `tests/test_channel_policy.py`
 - `tests/test_memory_provenance.py`
 - `tests/test_agent_auto_recall_unavailable.py`
+- `tests/test_session_saver.py`
+- `tests/test_freshness_reaper.py`
 
 **Related**
 - [`architecture/overview.md`](../architecture/overview.md)

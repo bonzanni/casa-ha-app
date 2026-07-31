@@ -1,5 +1,39 @@
 # Changelog
 
+## [0.135.0] - 2026-07-31
+
+### Fixed
+
+Race-family batch — four issues (#317, #319, #326, #353) closing
+check-then-act windows where two things happening at once could lose a
+session, resurrect finished work, or spam the operator:
+
+- **A message sent right after `/new` no longer races the reset** (#317).
+  The channel serializes `/new` with same-chat messages: once the reset is
+  underway, a follow-up waits for it — it can neither resume the session
+  being reset nor have its fresh session deleted by the reset's cleanup —
+  and the reset's save and removal are additionally pinned to the exact
+  session they snapshotted. Other chats are unaffected. (Two updates
+  delivered near-simultaneously can still be ordered either way before the
+  serialization applies.)
+- **A `/new` reset now waits for an in-flight pool invalidation to finish
+  flushing** (#319), so the saved transcript is complete and a finishing old
+  turn can no longer re-register the session the reset just removed.
+- **Finished engagements stay finished** (#326). The idle sweep and the
+  resume-failure path can no longer overwrite a concurrently completed or
+  cancelled engagement (no more resumable "zombie" topics or duplicate
+  cleanup); creating an engagement now fails loudly if its crash-recovery
+  record cannot be written, instead of running without one; and the
+  two-strike resume-failure counter survives restarts.
+- **Background sweeps no longer race live sessions** (#353). The hourly
+  freshness reaper can no longer retain-and-delete a session that a new turn
+  just replaced; the engagement observer's three-interjection cap holds even
+  when several events fire at once (and declined evaluations still cost
+  nothing); a Telegram reconnect triggered during an in-flight rebuild no
+  longer tears the recovered transport down a second time; and a plugin
+  health refresh can no longer erase the "already notified" marker and
+  re-send the same alert.
+
 ## [0.134.0] - 2026-07-31
 
 ### Fixed
