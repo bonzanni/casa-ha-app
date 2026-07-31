@@ -278,6 +278,13 @@ def test_rendered_run_script_contract(rendered_run_script):
     assert "--print --verbose --output-format stream-json" in s
     assert '"casa_control": "spawn"' in s
     assert "MCP_TOOL_TIMEOUT=660000" in s
+    # v0.131.0: preserve pre-CLI-2.1.219 nesting (default became 3) — the
+    # CHANGELOG claims this pin for engagements; keep the claim honest.
+    assert "export CLAUDE_CODE_MAX_SUBAGENT_SPAWN_DEPTH=1" in s
+    # v0.131.0: the resume-rejection notice must fire BEFORE the ringlog
+    # stderr redirect so it reaches the container log, not just the
+    # per-epoch stderr file.
+    assert s.index("RESUME_ARGS=()") < s.index("ringlog.sh")
     assert "exec 2>&1" not in s
     assert 'exec claude ' in s and s.index('exec claude') > s.index('ringlog.sh')
 

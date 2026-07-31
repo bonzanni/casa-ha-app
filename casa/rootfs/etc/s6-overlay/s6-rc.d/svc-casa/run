@@ -11,6 +11,15 @@ else
     export PUBLIC_URL="$_public_url"
 fi
 export CLAUDE_CODE_OAUTH_TOKEN="$(bashio::config 'claude_oauth_token')"
+# v0.131.0: CLI 2.1.219 changed the default nested-subagent spawn depth from
+# 1 to 3. This pin is LOAD-BEARING for the assistant resident, whose role
+# config ships `disallowed: []` (defaults/roles/resident/assistant/role.yaml)
+# — Agent/Task spawns bypass allowed_tools (tools.py Q-1 note), so without
+# the pin it would inherit depth-3 nesting. Roles that deny Agent/Task keep
+# denying; for them this is a drift guard. Inherited by every in-process SDK
+# agent's CLI subprocess (all use cli_path=/usr/local/bin/claude —
+# see claude_runtime.py).
+export CLAUDE_CODE_MAX_SUBAGENT_SPAWN_DEPTH=1
 export OP_SERVICE_ACCOUNT_TOKEN="$(bashio::config 'onepassword_service_account_token')"
 export ONEPASSWORD_DEFAULT_VAULT="$(bashio::config 'onepassword_default_vault')"
 _hindsight_url="$(bashio::config 'hindsight_api_url')"

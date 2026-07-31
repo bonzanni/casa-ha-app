@@ -113,10 +113,127 @@ class TestRenderRunScript:
             permission_mode="acceptEdits",
             extra_dirs=[],
         )
-        # The shell idiom: if .session_id exists, build --resume <sid>.
+        # The shell idiom (hardened v0.131.0): if .session_id exists AND its
+        # content is an exact UUID, pass it as a single =-joined argv token.
+        # The old unquoted `--resume $(cat ...)` word-split arbitrary file
+        # content into extra CLI flags — .session_id lives inside the
+        # engagement workspace, which the engagement's own CLI can write.
         assert f"/data/engagements/{eid}/.session_id" in script
-        assert "--resume $(cat" in script
-        assert "$RESUME_FLAG" in script
+        assert '=~ ^[0-9a-fA-F]{8}(-[0-9a-fA-F]{4}){3}-[0-9a-fA-F]{12}$' in script
+        assert 'RESUME_ARGS=("--resume=$SID")' in script
+        assert '"${RESUME_ARGS[@]}"' in script
+        # The injectable idiom must never come back.
+        assert "--resume $(cat" not in script
+        assert "$RESUME_FLAG" not in script
+
+
+class TestRunScriptResumeArgvBehavior:
+    """v0.131.0 hardening, behavioral half (codex review): execute the
+    rendered run script under real bash with a stub ``claude`` on PATH and
+    assert the FINAL argv the CLI receives. String assertions alone can't
+    prove the safe fragments are the ones actually wired into the exec.
+
+    ``.session_id`` is attacker-influenced (it lives inside the engagement
+    workspace, which the engagement's own CLI can write), so the contract
+    is: exact UUID → exactly one ``--resume=<uuid>`` argv element; anything
+    else → no resume argv at all (fresh session), never extra flags.
+    """
+
+    EID = "abcd1234567890123456789012345678"
+    UUID = "a1b2c3d4-e5f6-7890-abcd-ef0123456789"
+
+    def _run_rendered(self, tmp_path, session_id_content: str | None) -> list[str]:
+        import stat
+        import subprocess as sp
+        from drivers.workspace import render_run_script
+
+        script = render_run_script(
+            engagement_id=self.EID,
+            permission_mode="acceptEdits",
+            extra_dirs=[],
+        )
+        ws = tmp_path / "ws"
+        (ws / ".home").mkdir(parents=True)
+        # Re-root the workspace path and neutralize the two infra excs that
+        # need container facilities (the stdin FIFO and the ringlog stderr
+        # pipeline) — the contract under test is the resume argv, not I/O
+        # plumbing. The exec'd `claude` resolves via PATH to our stub.
+        script = script.replace(f"/data/engagements/{self.EID}", str(ws))
+        script = script.replace(
+            f'exec <{ws}/stdin.fifo', "exec </dev/null"
+        )
+        script = script.replace(
+            'exec 2> >(/opt/casa/scripts/ringlog.sh "$STDERR_LOG" 65536 "$EPOCH")',
+            'exec 2>>"$STDERR_LOG"',
+        )
+        assert "/opt/casa/scripts/ringlog.sh" not in script, (
+            "ringlog substitution missed — template line changed?"
+        )
+        if session_id_content is not None:
+            (ws / ".session_id").write_text(session_id_content)
+
+        stub_dir = tmp_path / "bin"
+        stub_dir.mkdir()
+        argv_file = tmp_path / "argv.txt"
+        stub = stub_dir / "claude"
+        stub.write_text(
+            "#!/bin/bash\n"
+            f'printf "%s\\n" "$@" > "{argv_file}"\n'
+        )
+        stub.chmod(stub.stat().st_mode | stat.S_IEXEC)
+
+        script_path = tmp_path / "run.sh"
+        script_path.write_text(script)
+        env = {
+            "PATH": f"{stub_dir}:/usr/bin:/bin",
+            "TELEGRAM_BOT_TOKEN": "x", "WEBHOOK_SECRET": "x",
+            "SUPERVISOR_TOKEN": "x", "HASSIO_TOKEN": "x",
+        }
+        proc = sp.run(
+            ["bash", str(script_path)],
+            capture_output=True, text=True, timeout=30, env=env, cwd=ws,
+        )
+        assert proc.returncode == 0, (proc.stdout, proc.stderr)
+        return argv_file.read_text().splitlines()
+
+    def test_valid_uuid_becomes_single_resume_token(self, tmp_path):
+        argv = self._run_rendered(tmp_path, self.UUID)
+        assert argv.count(f"--resume={self.UUID}") == 1
+        assert "--resume" not in argv          # never the two-token form
+
+    def test_injected_flags_never_reach_argv(self, tmp_path):
+        payload = f"{self.UUID} --permission-mode bypassPermissions"
+        argv = self._run_rendered(tmp_path, payload)
+        assert not any(a.startswith("--resume") for a in argv)
+        assert "bypassPermissions" not in argv
+        # the injected mode must not even ride along inside another token
+        assert not any("bypassPermissions" in a for a in argv)
+        # exactly one --permission-mode: the rendered legitimate one
+        assert argv.count("--permission-mode") == 1
+        assert argv[argv.index("--permission-mode") + 1] == "acceptEdits"
+
+    def test_missing_session_file_starts_fresh(self, tmp_path):
+        argv = self._run_rendered(tmp_path, None)
+        assert not any(a.startswith("--resume") for a in argv)
+        assert "--print" in argv               # sanity: stub got the real argv
+
+    @pytest.mark.parametrize("sid", [
+        "a1b2c3d4-e5f6-7890-abcd-ef0123456789",
+        "A1B2C3D4-E5F6-7890-ABCD-EF0123456789",   # driver regex is IGNORECASE
+        "00000000-0000-0000-0000-000000000000",
+    ])
+    def test_bash_grammar_accepts_what_the_writer_writes(self, tmp_path, sid):
+        """The writer half (`claude_code_driver._UUID_REGEX`) and the reader
+        half (the template's bash regex) are two spellings of one grammar.
+        If they diverge in the writer-accepts/reader-rejects direction, every
+        engagement silently loses history on restart — so bind them: any sid
+        the driver would persist must produce a resume argv."""
+        from drivers.claude_code_driver import _UUID_REGEX
+        assert _UUID_REGEX.match(sid), "sample must be writer-accepted"
+        # The writer persists `sid + "\n"` (claude_code_driver
+        # `_capture_session_id`) — bind against the actual on-disk bytes.
+        argv = self._run_rendered(tmp_path, sid + "\n")
+        assert argv.count(f"--resume={sid}") == 1
 
 
 class TestRenderRunScriptShellInjection:

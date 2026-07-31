@@ -1464,8 +1464,8 @@ class ClaudeCodeDriver(DriverProtocol):
             # P31 (v0.37.10): capture the SDK session_id by watching the
             # claude CLI's own session-storage directory. Persists the
             # UUID to ``<workspace>/.session_id`` so the run script's
-            # ``--resume $(cat .session_id)`` plumbing picks up after a
-            # Casa restart.
+            # resume plumbing (UUID-validated single ``--resume=<uuid>``
+            # token since v0.131.0) picks up after a Casa restart.
             asyncio.create_task(self._capture_session_id(engagement)),
             # W1: the LIVE topic-stream relay is spawned ALWAYS, regardless of
             # LOG_LEVEL — it is the operator's live window on the engagement,
@@ -4254,9 +4254,10 @@ class ClaudeCodeDriver(DriverProtocol):
         """P31 (v0.37.10): watch the claude CLI's own session-storage
         directory for the first ``<uuid>.jsonl`` file. The filename
         (minus extension) IS the SDK session UUID. Persist to
-        ``<workspace>/.session_id`` so a boot-replay's
-        ``--resume $(cat .session_id)`` flag carries the conversation
-        forward.
+        ``<workspace>/.session_id`` so a boot-replay resumes the
+        conversation (the run script validates the file's content as an
+        exact UUID and passes a single ``--resume=<uuid>`` argv token —
+        v0.131.0 hardening).
 
         Replaces v0.37.9's s6-log tailing approach, which was
         non-functional at the time: until v0.64.0 the s6-rc log pipeline

@@ -41,6 +41,17 @@ def test_run_script_exports_telegram_env_var(var):
     ), f"Missing `export {var}=...` in svc-casa/run"
 
 
+def test_run_script_pins_subagent_spawn_depth():
+    """v0.131.0: CLI 2.1.219 changed the default nested-subagent spawn depth
+    from 1 to 3. The pin is load-bearing for the assistant resident (its role
+    ships `disallowed: []`, and Agent/Task spawns bypass allowed_tools), and
+    the CHANGELOG claims it for all agents — keep the claim honest."""
+    script = _read_run_script()
+    assert "export CLAUDE_CODE_MAX_SUBAGENT_SPAWN_DEPTH=1" in script, (
+        "Missing subagent spawn-depth pin in svc-casa/run"
+    )
+
+
 def test_run_script_exports_log_level():
     """v0.18.1: operator-facing log_level addon option must export to env.
 

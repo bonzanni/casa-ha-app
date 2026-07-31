@@ -1,5 +1,35 @@
 # Changelog
 
+## [0.131.0] - 2026-07-31
+
+### Changed
+
+- **Claude Agent SDK 0.2.114 → 0.2.128 and Claude Code CLI 2.1.150 → 2.1.220**
+  (supersedes Dependabot #268; both pins move together — the in-process
+  agents and `claude_code` engagements all run the same pinned CLI).
+  Highlights from the range that matter for a long-running Casa install:
+  memory-leak and performance fixes for long-lived sessions with many MCP
+  tools; a hook timeout is no longer misreported as a user rejection (which
+  could stall unattended agents); a batch of Bash permission-check bypasses
+  was closed upstream; and the SDK now passes `--resume`/`--session-id`
+  values injection-safe.
+- **Subagent spawn depth is pinned to 1 for all agents.** The new CLI
+  defaults to letting subagents spawn nested subagents up to depth 3.
+  Casa roles that already deny subagent spawning are unaffected; the
+  primary assistant does not deny it, so this pin keeps its pre-upgrade
+  behavior (no nested spawning) rather than silently adopting the new
+  default.
+
+### Fixed
+
+- **Engagement respawns validate the stored session id before resuming.**
+  The respawn script used to word-split the `.session_id` file's content
+  into the CLI's argument list; a corrupted or crafted file could inject
+  extra CLI flags into the engagement's next spawn. The id is now accepted
+  only as an exact UUID and passed as a single argument; anything else is
+  ignored and the engagement starts a fresh session (with a notice in the
+  app log).
+
 ## [0.130.0] - 2026-07-31
 
 ### Fixed

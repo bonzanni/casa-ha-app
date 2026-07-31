@@ -9490,8 +9490,8 @@ def create_casa_tools(
     # schemas are deferred by default (allow-listing does not exempt them);
     # cold voice sessions burned 1-4 ToolSearch model round-trips (4.7→27.5s,
     # escalating) resolving delegate_to_agent before they could call it —
-    # eating the 27s voice budget. `alwaysLoad` (CLI ≥2.1.121; our pin
-    # 2.1.150) eager-loads every tool of THIS server at session start; the
+    # eating the 27s voice budget. `alwaysLoad` (CLI ≥2.1.121, incl. the
+    # 2.1.220 pin) eager-loads every tool of THIS server at start; the
     # SDK transport forwards all non-`instance` keys of an sdk-type server
     # config to --mcp-config verbatim. Plugin/HA/n8n servers deliberately
     # keep deferral — this is the small always-needed core surface only.

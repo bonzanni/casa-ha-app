@@ -100,9 +100,10 @@ class InCasaDriver(DriverProtocol):
         self._locks: dict[str, asyncio.Lock] = {}
         # v0.69.11: the CLI's session id, captured from the MESSAGE STREAM
         # (SystemMessage init `data["session_id"]` / ResultMessage.session_id) —
-        # ClaudeSDKClient has NO `session_id` attribute on the pinned Agent SDK
-        # (0.2.114), so the old getattr(client, "session_id") was always None
-        # and persistence silently never fired. Same source the warm pool uses.
+        # ClaudeSDKClient has NO `session_id` attribute on the pinned Agent
+        # SDK (0.2.114; still true on 0.2.128), so getattr(client,
+        # "session_id") was always None and persistence silently never
+        # fired. Same source the warm pool uses.
         self._session_ids: dict[str, str] = {}
 
     # -- lifecycle --------------------------------------------------------
