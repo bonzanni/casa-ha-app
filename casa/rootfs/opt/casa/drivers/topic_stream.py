@@ -1954,6 +1954,26 @@ class TopicStreamRelay:
         self._live = not recovering
         self._reconciled = False
         self._passed_cur_seg = False
+        # #300: when the scan's start coordinate is already at-or-past
+        # ``current`` (a closed-turn cursor has ``turn_start == current``; the
+        # checkpoint may sit at the exact EOF of a since-rotated archive), the
+        # cursor's segment can yield ZERO frames — recovery drains straight
+        # into the successor and ``_update_live``'s per-frame latch would
+        # never fire, replay-muting the entire next segment. Pre-latch
+        # ``_passed_cur_seg``: the scan starts positioned past the checkpoint,
+        # so any frame from a DIFFERENT segment is genuinely post-checkpoint
+        # (frames from the cursor segment itself still latch via the
+        # ``off_after > cur_off`` branch). A zero ``current`` (never
+        # checkpointed but recovering via message_ids/hold_pending/
+        # dropped_through) means NOTHING was consumed — same pre-latch, every
+        # frame is post-checkpoint.
+        ts_seg = tuple(self.cursor.turn_start.get("segment", (0, 0)))
+        if cur_seg == _ZERO_SEG or (
+            ts_seg == cur_seg
+            and int(self.cursor.turn_start.get("offset", 0))
+            >= int(self.cursor.current.get("offset", 0))
+        ):
+            self._passed_cur_seg = True
         self._reset_turn_state()
         self._read_coord = None
         # §D5 C3 (Sol r4-3): cold start with the held-frames marker set ⇒ DISARM

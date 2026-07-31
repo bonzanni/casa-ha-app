@@ -583,6 +583,40 @@ async def test_restart_turn_spans_archive_then_current(tmp_path):
     assert rec.edits[-1][2] == "part-one part-two"
 
 
+async def test_cold_recovery_at_rotated_segment_eof_delivers_next_turn(tmp_path):
+    # #300: the previous turn closed on the LAST frame of a segment that then
+    # rotated — the closed-turn cursor (turn_start == current) sits at the
+    # exact EOF of the archive. The next turn already began in the new
+    # ``current`` before the restart. Recovery opens the archive at EOF, reads
+    # zero frames from the cursor's own segment, and must STILL latch live for
+    # the successor segment — not replay-mute the entire next turn.
+    log_dir = str(tmp_path)
+    archive = os.path.join(log_dir, "@a.s")
+    with open(archive, "wb") as fh:
+        for fr in (_spawn(1), _init(), _text("old turn"), _result()):
+            fh.write(json.dumps(fr).encode("utf-8") + b"\n")
+        eof = fh.tell()
+    seg_arch = _ident(archive)
+    _write_current(
+        tmp_path, [_spawn(2), _init("sid-2"), _text("new turn"), _result()]
+    )
+
+    rec, events = Recorder(), []
+    cur_path = tmp_path / ".stream_cursor.json"
+    StreamCursor(
+        turn_start={"segment": seg_arch, "offset": eof},
+        current={"segment": seg_arch, "offset": eof},
+        message_ids=[],
+    ).save(cur_path)
+
+    await _make_relay(tmp_path, cur_path, rec, events).run()
+
+    # The successor segment's whole turn is LIVE: spawn side effect fires and
+    # the narration posts.
+    assert ("spawn", {"epoch": 2}) in events
+    assert rec.sends and rec.sends[0][1] == "new turn"
+
+
 async def test_rollover_plus_restart_recovers_editing_final_id(tmp_path):
     rec, events = Recorder(), []
     # A >3900 turn spanning two messages (ids 7 and 9), persisted mid-turn.
