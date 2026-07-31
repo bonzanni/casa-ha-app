@@ -28,9 +28,10 @@ generic placeholder substitution, and model options enter through the role-slot 
 system covers repository and plugin configuration, not the manifest.
 
 **Export handling is option-specific, not uniform.** One group exports conditionally with
-"null" normalization — the public URL, the Hindsight URL, the Telegram API base, the
-webhook secret, the Context7 key, the timezone, the log level and the reap TTL are exported
-only when set to a real value. Another group exports *unconditionally* — the Telegram
+"null" normalization — the Hindsight URL, the Telegram API base, the webhook secret, the
+Context7 key, the timezone, the log level and the reap TTL are exported only when set to a
+real value; the public URL is normalized the same way but always exported, empty when
+unset. Another group exports *unconditionally* — the Telegram
 token, chat id and supergroup id, the 1Password token and vault among them — relying on the
 shipped `options:` defaults to keep the value an empty string; a key deleted from the
 stored options would surface as the literal string "null" there, which downstream truthy
@@ -58,7 +59,7 @@ decision, so an inherited container variable can survive an empty option elsewhe
 | `enable_terminal` | `ENABLE_TERMINAL` | nginx setup, ttyd service, dashboard | false | restart |
 | `casa_tz` | `CASA_TZ` | timekeeping resolution | Europe/Amsterdam | restart |
 | `engagement_reap_days` | `ENGAGEMENT_REAP_DAYS` | engagement reaper | 7 (0 disables) | restart |
-| `log_level` | `LOG_LEVEL` | main startup logging | schema-only (absent from `options:`); runtime falls back to INFO | restart |
+| `log_level` | `LOG_LEVEL` | main startup logging; the standalone MCP service's logging | schema-only (absent from `options:`); runtime falls back to INFO | restart |
 | `specialist_max_concurrency` | `SPECIALIST_MAX_CONCURRENCY` | specialist limiter (clamped 1–20) | 2 | restart |
 | `specialist_cost_alert_threshold` | `SPECIALIST_COST_ALERT_THRESHOLD` | specialist telemetry (malformed → default) | 5.0 | restart |
 

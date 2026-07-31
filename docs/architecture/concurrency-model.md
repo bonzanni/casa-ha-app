@@ -58,8 +58,11 @@ pooled turns on one session key.
 Enforced by the loop tracker returning the existing task and by registration rebinding in
 place — a live consumer is never orphaned by a reload.
 
-What it does not cover: a handler captured by an already-running dispatch. Replacement is
-prospective; in-flight dispatches finish on the handler they started with.
+What it does not cover: a handler captured by an already-running dispatch (replacement is
+prospective; in-flight dispatches finish on the handler they started with), and the
+unregister path — unregister cancels the consumer without awaiting it and hands the task
+back, so an unregister-then-re-register that does not await it can briefly overlap the old
+loop with the new one.
 
 **INV-CONC-003**: Turns sharing a session key serialize under the pool entry's lock, decision through publication; distinct keys are concurrent.
 
@@ -73,9 +76,11 @@ What it does not cover: unpooled turn types, and the bus layer above (INV-CONC-0
 **A message targets an unknown role.** The checked send reports no-target; the plain send
 drops silently. Nothing queues.
 
-**A request gets no answer.** The caller times out and its pending future and dispatch
-task are cleaned up; a handler returning nothing produces an empty response rather than a
-hang, and a handler that raises produces an error response.
+**A request gets no answer.** The caller times out and its pending future is removed —
+but a slow handler is *not* cancelled by the timeout and runs to completion; only the
+caller's own cancellation cancels the dispatch task. A handler returning nothing produces
+an empty response rather than a hang, and a handler that raises produces an error
+response.
 
 **The pool cannot serve.** The turn raises pool-unavailable and the agent falls back to a
 one-shot client (the turn loop's contract); a failure mid-publication drops that pool

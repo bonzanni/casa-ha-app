@@ -28,9 +28,11 @@ when the payload says `status: "error"` or `ok: false`. Statuses like *unavailab
 failures. And the wrapper is a convention, not a law: at least one tool returns raw
 envelopes without it, so "every error becomes `is_error`" is not a property of the surface.
 
-**Nothing validates a tool's argument schema at the boundary.** The internal route checks
-that the name is known and passes the arguments through; the advertised schema is
-documentation for the model, and any argument validation a tool needs lives in the tool.
+**Argument-schema validation depends on the transport.** The SDK path registers the
+decorated tools with their schemas, and MCP validation there rejects a missing required
+argument or a bad enum before the handler runs — code and tests rely on it. The internal
+bridge route checks only that the name is known and passes the arguments through, so a
+tool reachable both ways must carry its own validation for the bridge side.
 
 **Engagement mutation is a funnel, not parallel paths.** Completion and cancellation
 converge on one finalize path whose strict registry transition picks a single winner

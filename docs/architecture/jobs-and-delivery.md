@@ -39,9 +39,10 @@ not stolen from.
 **Delivery is leased, attempt-scoped, at-least-once.** An offer is process-local until the
 client claims it; a claim durably records an attempt id and a lease before anything is
 authorized to play. Every subsequent transition must present the same attempt id against
-the expected durable state. "Ready" was offered; only a matching delivered acknowledgement
-retires the obligation — a lapsed playing lease requeues, so audible playback may repeat.
-Exactly-once is deliberately not the contract.
+the expected durable state. "Ready" was offered; among *successful* endings only a matching
+delivered acknowledgement retires the obligation — a lapsed playing lease requeues, so
+audible playback may repeat. Cancellation and TTL expiry also end a delivery obligation,
+as their own terminal states. Exactly-once is deliberately not the contract.
 
 **Ordering is per device, not global.** For each origin device, only the head of the
 durable delivery order is offered, and a non-deliverable head blocks that device's queue
@@ -105,8 +106,9 @@ row stays restart-recoverable. Runtime ownership (the permit) is released either
 re-offered. A failed revocation stays locally pending for a later sweep.
 
 **A frame is malformed, stale, or races a CAS.** Old-protocol and unknown frames are
-ignored; current-protocol frames that fail validation or the CAS receive a revoke denial
-and mutate nothing.
+ignored; current-protocol frames that fail validation or the CAS receive a revoke denial,
+and the *requested* transition mutates nothing — though the handler's pre-validation
+reconciliation pass may independently expire or requeue jobs that were already due.
 
 **The result outlives its TTL.** Delivery becomes expired, the attempt and lease are
 cleared, and the audit row is preserved — expiry deletes nothing.
