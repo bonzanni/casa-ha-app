@@ -41,15 +41,17 @@ trusted for *who it claimed to be* rather than *who it proved to be*:
   as the operator — set your chat id to keep operator attribution.
   An engagement started after this release carries the clearance of whoever
   started it — and if anyone with a lower clearance later steers it by
-  messaging its topic, it drops to *their* clearance for good, so it never
-  reads above the least-privileged person taking part. Three limits worth
-  knowing: engagements that were **already running** before this upgrade
-  carry no such stamp, so they keep the old channel-wide clearance until you
-  finish them (start a new engagement if that matters to you); lowering an
-  engagement's clearance stops *new* private reads but does not erase what it
-  already knows from earlier in the same engagement (#369); and a
-  non-operator can still answer their own protected-tool confirmation prompt
-  (#368).
+  messaging its topic, it drops to *their* clearance and never climbs back,
+  so it does not read above the least-privileged person taking part. Four
+  limits worth knowing: engagements that were **already running** before this
+  upgrade carry no such stamp, so they keep the old channel-wide clearance
+  until you finish them (start a new engagement if that matters to you);
+  lowering an engagement's clearance stops *new* private reads but does not
+  erase what it already knows from earlier in the same engagement (#369); the
+  drop is recorded on a best-effort write, so in the rare case that write
+  fails, a restart restores the earlier clearance (the failure is logged);
+  and a non-operator can still answer their own protected-tool confirmation
+  prompt (#368).
 - **A chatty memory-sensitivity classification can no longer leak a fact
   downward** (#350). The tier classifier's reply parser used to accept the
   first tier word found anywhere in the reply — so "this is not public; it
