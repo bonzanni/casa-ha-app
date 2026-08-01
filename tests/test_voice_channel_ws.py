@@ -685,6 +685,59 @@ class TestWSTurn:
             if route.route_id == "entry-1"
         ] == ["entry-1"]
 
+    async def test_failed_ack_reports_route_displaced_from_another_socket(
+        self, signed_ws_app, monkeypatch,
+    ):
+        """#304 (review round 4): sibling arm — socket B claiming a route
+        id held by socket A displaces A's binding inside register(); if
+        B's ack write fails, B's `previous` is None, so A's displaced
+        binding must be captured separately or its offers stay pinned."""
+        client, channel, delivery, headers = signed_ws_app
+        fail_ack = {"armed": False}
+        orig_send = VoiceWsConnection.send_json
+
+        async def failing_send(self, frame, **kw):
+            if (
+                fail_ack["armed"]
+                and frame.get("type") == "voice_route_registered"
+            ):
+                raise ConnectionResetError("ack write failed")
+            return await orig_send(self, frame, **kw)
+
+        monkeypatch.setattr(VoiceWsConnection, "send_json", failing_send)
+
+        register = {
+            "type": "voice_route_register", "protocol": 3,
+            "route_id": "entry-1", "agent_role": "concierge",
+            "capabilities": [
+                "background_jobs", "endpoint_delivery", "voice_handoff",
+            ],
+        }
+        async with client.ws_connect(
+            "/api/converse/ws", headers=headers,
+        ) as ws_a:
+            await ws_a.send_json(register)
+            await ws_a.receive_json()
+            a_binding = channel.routes.get_connected("entry-1")
+
+            fail_ack["armed"] = True
+            async with client.ws_connect(
+                "/api/converse/ws", headers=headers,
+            ) as ws_b:
+                await ws_b.send_json(register)
+                while True:
+                    msg = await ws_b.receive()
+                    if msg.type.name in (
+                        "CLOSE", "CLOSED", "CLOSING", "ERROR",
+                    ):
+                        break
+
+            for _ in range(100):
+                if a_binding in getattr(delivery, "disconnected", []):
+                    break
+                await asyncio.sleep(0.01)
+            assert a_binding in getattr(delivery, "disconnected", [])
+
     async def test_invalid_reregistration_keeps_binding_and_stays_offerable(
         self, signed_ws_app,
     ):

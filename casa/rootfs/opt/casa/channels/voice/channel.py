@@ -932,6 +932,10 @@ class VoiceChannel(Channel):
                 self.routes.touch(connection)
 
                 if t == "voice_route_register":
+                    # Bindings this frame may displace: this connection's
+                    # own current binding, and another socket's binding for
+                    # the requested route id (#304, review round 4).
+                    displaceable: list[Any] = []
                     previous = None
                     if connection.voice_route_id is not None:
                         candidate = self.routes.get_connected(
@@ -942,24 +946,39 @@ class VoiceChannel(Channel):
                             and candidate.connection is connection
                         ):
                             previous = candidate
+                            displaceable.append(candidate)
+                    requested_id = _nonempty_identifier(
+                        frame.get("route_id"),
+                    )
+                    if requested_id is not None:
+                        holder = self.routes.get_connected(requested_id)
+                        if (
+                            holder is not None
+                            and holder.connection is not connection
+                        ):
+                            displaceable.append(holder)
                     try:
                         bound = await self.routes.register(connection, frame)
                     except BaseException:
-                        # #304: register() mutates the binding before its
-                        # ack write. If that write fails, teardown will
-                        # report only the connection's CURRENT binding — a
-                        # binding this frame displaced must be reported
-                        # here or its offered attempts stay pinned to it.
-                        # A refused frame mutates nothing (previous is
-                        # still the registry's current), so this fires only
-                        # when displacement actually happened.
-                        if (
-                            previous is not None
-                            and self._delivery is not None
-                            and self.routes.get_connected(previous.route_id)
-                            is not previous
-                        ):
-                            await self._delivery.route_disconnected(previous)
+                        # #304: register() mutates bindings before its ack
+                        # write. If that write fails, teardown reports only
+                        # this connection's CURRENT binding — any binding
+                        # this frame displaced must be reported here or its
+                        # offered attempts stay pinned to it. A refused
+                        # frame mutates nothing (each candidate is still
+                        # the registry's current), so this fires only when
+                        # displacement actually happened.
+                        if self._delivery is not None:
+                            for displaced in displaceable:
+                                if (
+                                    self.routes.get_connected(
+                                        displaced.route_id,
+                                    )
+                                    is not displaced
+                                ):
+                                    await self._delivery.route_disconnected(
+                                        displaced,
+                                    )
                         raise
                     if bound is not None and self._delivery is not None:
                         if (
