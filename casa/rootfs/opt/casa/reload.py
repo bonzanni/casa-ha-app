@@ -800,6 +800,13 @@ async def reload_agent(runtime: Any, *, role: str | None = None) -> list[str]:
             agent_registry=fresh_registry,
         )
     except Exception as exc:  # noqa: BLE001
+        # Sol r1-6: for a specialist, specialist_registry was already
+        # refreshed above — publish the matching agent_registry so the pair
+        # stays coherent (registry-known specialist without an Agent object
+        # is boot's own direct-load state; the agents-sweep backfill covers
+        # it). A resident touched no registry, so nothing is published.
+        if tier == "specialist":
+            runtime.agent_registry = fresh_registry
         raise ReloadError("construct_failed", str(exc)) from exc
     actions.append("construct_agent")
 

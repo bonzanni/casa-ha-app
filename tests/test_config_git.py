@@ -374,3 +374,98 @@ class TestCommitConfigChecked:
             str(tmp_path), "noop", lambda tree: calls.append(tree) or [])
         assert (sha, errors) == ("", [])
         assert calls == []
+
+
+class TestCommitConfigCheckedPreservesStaging:
+    def test_refusal_leaves_prior_manual_staging_intact(self, tmp_path):
+        """Terra r1-1: the gate must not corrupt index state it did not
+        create. An operator's intentionally staged (uncommitted) edit must
+        survive a refused checked commit byte-for-byte."""
+        from config_git import commit_config_checked, init_repo
+
+        _seed(tmp_path)
+        init_repo(str(tmp_path))
+        staged = tmp_path / "agents" / "staged.txt"
+        staged.write_text("operator staged this", encoding="utf-8")
+        subprocess.check_call(
+            ["git", "-C", str(tmp_path), "add", "agents/staged.txt"])
+
+        (tmp_path / "agents" / "marker.txt").write_text(
+            "invalid", encoding="utf-8")
+
+        sha, errors = commit_config_checked(
+            str(tmp_path), "refused", lambda tree: ["no"])
+        assert sha == "" and errors == ["no"]
+        cached = subprocess.check_output(
+            ["git", "-C", str(tmp_path), "diff", "--cached", "--name-only"],
+        ).decode().splitlines()
+        assert "agents/staged.txt" in cached, (
+            "refusal wiped the operator's pre-existing staging")
+
+    def test_unexpected_validator_exception_leaves_repo_untouched(
+        self, tmp_path,
+    ):
+        """Sol r1-1: an exception mid-gate must not leave the real index
+        holding an unvalidated staged snapshot."""
+        from config_git import commit_config_checked, init_repo
+
+        _seed(tmp_path)
+        init_repo(str(tmp_path))
+        (tmp_path / "agents" / "marker.txt").write_text(
+            "edited", encoding="utf-8")
+
+        def validator(tree):
+            raise OSError("filesystem hiccup")
+
+        with pytest.raises(OSError):
+            commit_config_checked(str(tmp_path), "boom", validator)
+        # Real index untouched: nothing staged.
+        cached = subprocess.check_output(
+            ["git", "-C", str(tmp_path), "diff", "--cached", "--name-only"],
+        ).decode().strip()
+        assert cached == ""
+
+    def test_concurrent_external_staging_cannot_enter_the_commit(
+        self, tmp_path,
+    ):
+        """Sol r1-2: content added to the SHARED index while validation runs
+        (boot snapshot, an SSH operator's `git add`) must not ride into the
+        checked commit — the commit is built from the private validated
+        tree."""
+        from config_git import commit_config_checked, init_repo
+
+        _seed(tmp_path)
+        init_repo(str(tmp_path))
+        (tmp_path / "agents" / "marker.txt").write_text(
+            "validated", encoding="utf-8")
+        sneaky = tmp_path / "agents" / "sneaky.txt"
+
+        def validator(tree):
+            sneaky.write_text("injected mid-window", encoding="utf-8")
+            subprocess.check_call(
+                ["git", "-C", str(tmp_path), "add", "agents/sneaky.txt"])
+            return []
+
+        sha, errors = commit_config_checked(
+            str(tmp_path), "checked", validator)
+        assert errors == [] and sha
+        committed = subprocess.check_output(
+            ["git", "-C", str(tmp_path), "ls-tree", "-r", "--name-only", sha],
+        ).decode().splitlines()
+        assert "agents/sneaky.txt" not in committed
+
+
+class TestRestoreFileBadSha:
+    def test_malformed_sha_raises_instead_of_deleting(self, tmp_path):
+        """Sol r1-4: a bogus target sha must raise — pre-fix the failed
+        cat-file probe was read as 'path absent at target' and the LIVE file
+        was deleted and the deletion committed."""
+        from config_git import init_repo, restore_file
+
+        _seed(tmp_path)
+        init_repo(str(tmp_path))
+        target = tmp_path / "agents" / "marker.txt"
+        assert target.exists()
+        with pytest.raises(subprocess.CalledProcessError):
+            restore_file(str(tmp_path), "not-a-sha", "agents/marker.txt")
+        assert target.exists()

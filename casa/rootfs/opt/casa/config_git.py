@@ -74,11 +74,12 @@ TRACKED_PATHS_SUMMARY = (
 )
 
 
-def _run(cwd: str, args: Sequence[str], *, check: bool = True) -> str:
+def _run(cwd: str, args: Sequence[str], *, check: bool = True,
+         env: dict | None = None) -> str:
     """Run ``git`` under *cwd*. Returns stripped stdout."""
     completed = subprocess.run(
         ["git", *args], cwd=cwd, check=check,
-        capture_output=True, text=True,
+        capture_output=True, text=True, env=env,
     )
     return completed.stdout.strip()
 
@@ -164,25 +165,49 @@ def commit_config_checked(
     export path rewritten to *config_dir* so refusals read as real paths.
 
     No-op (clean tree) returns ``("", [])`` without calling ``validate``.
+
+    Sol r1-1/2/3 + Terra r1-1: the whole sequence runs against a PRIVATE
+    temporary index (``GIT_INDEX_FILE``), never the repository's real one.
+    Consequences, each previously a finding: a refusal or an unexpected
+    exception leaves the real index byte-for-byte untouched (an operator's
+    intentional manual staging survives); a concurrent ``git add`` by
+    another process (boot's snapshot, an SSH operator) cannot inject
+    content into this commit, because the commit is built with
+    ``commit-tree`` from the validated private tree, not from the shared
+    index. After a successful commit the real index is refreshed to the new
+    HEAD (exactly what a normal ``git commit`` leaves behind).
     """
     with _COMMIT_LOCK:
         status = _run(config_dir, ["status", "--porcelain"])
         if not status:
             return "", []
-        _run(config_dir, ["add", "-A"])
         with tempfile.TemporaryDirectory(prefix="casa-commit-gate-") as tmp:
+            env = {**os.environ, "GIT_INDEX_FILE": os.path.join(tmp, "index")}
+            # Private index := HEAD, then stage the worktree into it.
+            _run(config_dir, ["read-tree", "HEAD"], env=env)
+            _run(config_dir, ["add", "-A"], env=env)
+            export = os.path.join(tmp, "export")
+            os.makedirs(export)
             # Trailing separator is required: checkout-index treats the
             # prefix as a literal string prepended to each path.
             _run(config_dir, ["checkout-index", "-a", "-f",
-                              f"--prefix={tmp}{os.sep}"])
+                              f"--prefix={export}{os.sep}"], env=env)
             errors = [
-                e.replace(tmp, config_dir) for e in (validate(tmp) or [])
+                e.replace(export, config_dir)
+                for e in (validate(export) or [])
             ]
-        if errors:
-            _run(config_dir, ["reset", "-q"], check=False)
-            return "", errors
-        _run(config_dir, ["commit", "-qm", message])
-        return _run(config_dir, ["rev-parse", "HEAD"]), []
+            if errors:
+                return "", errors     # private index discarded; repo untouched
+            tree = _run(config_dir, ["write-tree"], env=env)
+            if tree == _run(config_dir, ["rev-parse", "HEAD^{tree}"]):
+                return "", []         # staged snapshot identical to HEAD
+            sha = _run(config_dir,
+                       ["commit-tree", tree, "-p", "HEAD", "-m", message])
+            _run(config_dir, ["update-ref", "HEAD", sha])
+        # Refresh the real index to the new HEAD — the state an ordinary
+        # `git commit` leaves. Worktree untouched.
+        _run(config_dir, ["reset", "-q"], check=False)
+        return sha, []
 
 
 def changed_paths(config_dir: str, sha: str) -> list[str]:
@@ -223,8 +248,11 @@ def restore_file(config_dir: str, sha: str, relpath: str) -> None:
     #351 (low): a path that did not exist at *sha* (a file ADDED after the
     target commit) cannot be checked out from it — ``git checkout`` errors
     and the rollback failed. Restoring to "absent" means removing the file,
-    so that case becomes ``git rm`` + commit.
+    so that case becomes ``git rm`` + commit. Sol r1-4: that branch is taken
+    only for a VERIFIED target commit — a malformed/unknown *sha* must
+    raise, not silently delete the live file.
     """
+    _run(config_dir, ["rev-parse", "--verify", "--quiet", f"{sha}^{{commit}}"])
     probe = subprocess.run(
         ["git", "cat-file", "-e", f"{sha}:{relpath}"],
         cwd=config_dir, capture_output=True, text=True,

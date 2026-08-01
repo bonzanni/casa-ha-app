@@ -2847,3 +2847,40 @@ class TestReloadIssue327:
         result = await task
         assert result["status"] == "ok"
         assert cascaded == ["ellen"]
+
+    async def test_specialist_construct_failure_keeps_registries_coherent(
+        self, tmp_path, monkeypatch,
+    ):
+        """Sol r1-6: specialist_registry is refreshed before construction;
+        if construction then fails, the agent_registry must be published to
+        match (registry-known specialist without an Agent object — boot's
+        own direct-load state), not left torn at the pre-reload view."""
+        from reload import dispatch, register_handler, reload_agent
+        register_handler("agent", reload_agent)
+
+        agents_dir = tmp_path / "agents"
+        (agents_dir / "specialists" / "newspec").mkdir(parents=True)
+
+        new_cfg = self._resident_cfg("newspec", channels=[])
+        monkeypatch.setattr("agent_loader.load_agent_from_dir",
+                            lambda *a, **kw: new_cfg)
+        monkeypatch.setattr("policies.load_policies", lambda *a, **kw: MagicMock())
+
+        import reload as reload_mod
+
+        def boom(**kw):
+            raise RuntimeError("construction failed")
+
+        monkeypatch.setattr(reload_mod, "_construct_agent", boom)
+
+        runtime = _make_runtime()
+        runtime.config_dir = str(tmp_path)
+        runtime.agents_dir = str(agents_dir)
+        runtime.role_configs = {}
+        runtime.specialist_registry.load = MagicMock()
+        runtime.specialist_registry.all_configs = lambda: {"newspec": new_cfg}
+
+        result = await dispatch("agent", runtime=runtime, role="newspec")
+        assert result["status"] == "error"
+        assert result["kind"] == "construct_failed"
+        assert runtime.agent_registry.tier_for_role("newspec") == "specialist"

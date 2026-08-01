@@ -112,3 +112,50 @@ class TestReregisterFor:
         )
         reg.reregister_for("assistant", [t], channels=["telegram"])
         assert "assistant:t" in reg._seen_job_ids
+
+    def test_stuck_job_removal_refuses_reregistration(self):
+        """Terra r1-2: a remove_job failure must NOT be forgotten — dropping
+        the id from tracking while the job stays scheduled creates a zombie
+        that keeps firing (and collides with a same-id replacement). The
+        unwind keeps the stuck job tracked and reregister_for refuses."""
+        from config import TriggerSpec
+        from trigger_registry import TriggerError
+        reg, scheduler, _app = self._make_registry()
+        t0 = TriggerSpec(
+            name="t0", type="interval", minutes=5,
+            channel="telegram", prompt="p",
+        )
+        reg.register_agent("assistant", [t0], channels=["telegram"])
+        scheduler.remove_job.side_effect = RuntimeError("store hiccup")
+
+        t1 = TriggerSpec(
+            name="t1", type="interval", minutes=10,
+            channel="telegram", prompt="p",
+        )
+        with pytest.raises(TriggerError):
+            reg.reregister_for("assistant", [t1], channels=["telegram"])
+        # The stuck job stays TRACKED (the registry must not lie about it)…
+        assert "assistant:t0" in reg._seen_job_ids
+        # …and no replacement was installed.
+        assert "assistant:t1" not in reg._seen_job_ids
+
+    def test_job_already_absent_counts_as_removed(self):
+        """A JobLookupError means the job is genuinely gone — tracking
+        removal is correct and re-registration proceeds."""
+        from apscheduler.jobstores.base import JobLookupError
+        from config import TriggerSpec
+        reg, scheduler, _app = self._make_registry()
+        t0 = TriggerSpec(
+            name="t0", type="interval", minutes=5,
+            channel="telegram", prompt="p",
+        )
+        reg.register_agent("assistant", [t0], channels=["telegram"])
+        scheduler.remove_job.side_effect = JobLookupError("assistant:t0")
+
+        t1 = TriggerSpec(
+            name="t1", type="interval", minutes=10,
+            channel="telegram", prompt="p",
+        )
+        reg.reregister_for("assistant", [t1], channels=["telegram"])
+        assert "assistant:t0" not in reg._seen_job_ids
+        assert "assistant:t1" in reg._seen_job_ids
