@@ -609,6 +609,54 @@ async def replay_undergoing_engagements(
                         )
                         continue
 
+                # #314: the M7 (missing workspace) and §3.8 (missing recorded
+                # artifact) validations must gate EVERY resume — they used to
+                # sit below the service_pair_complete fast path, so an intact
+                # pair skipped both: replay started a service whose run script
+                # does `set -e; cd <workspace>` (instant exit, s6 respawn
+                # loop) or resumed a CLI with a missing --plugin-dir target.
+                # Placed BEFORE the #335 credential refresh so a record we
+                # refuse is not pointlessly cycled first.
+                #
+                # M7: missing workspace ⇒ REFUSED (was warn-and-skip, which
+                # the start loop ignored — it filters on refused_ids alone,
+                # so the service started regardless, #314(3)). The record
+                # stays UNDERGOING (no terminal mark): /data is the workspace
+                # home, so this state is unrecoverable-but-diagnosable and
+                # re-warns each boot rather than silently retiring.
+                _ws_dir = os.path.join(engagements_root, rec.id)
+                if not os.path.isdir(_ws_dir):
+                    logger.warning(
+                        "boot replay: workspace dir %s missing for "
+                        "engagement %s — refusing resume (M7, #314)",
+                        _ws_dir, rec.id[:8],
+                    )
+                    refused_ids.add(rec.id)
+                    continue
+
+                # §3.8: replay renders --plugin-dir flags from the RECORDED
+                # artifacts, never a re-resolution of current assignments. A
+                # missing recorded artifact refuses resume (fail-closed) —
+                # start/background loops skip it via refused_ids.
+                missing = [pa for pa in rec.plugin_artifacts
+                           if not os.path.isdir(pa.get("path", ""))]
+                if missing:
+                    names = ", ".join(pa.get("name", "?") for pa in missing)
+                    logger.warning(
+                        "boot replay: engagement %s refuses resume — plugin "
+                        "artifact(s) missing: %s", rec.id[:8], names)
+                    if rec.topic_id is not None:
+                        try:
+                            await driver._send_to_topic(
+                                rec.topic_id,
+                                "⚠️ This engagement can't resume: its pinned "
+                                f"plugin artifact(s) are missing ({names}). "
+                                "Start a new engagement.")
+                        except Exception:  # noqa: BLE001 — best-effort notice
+                            pass
+                    refused_ids.add(rec.id)
+                    continue
+
                 # #335: refresh the workspace credential from the RECORD's
                 # auth token. Placed, like the CLAUDE.md refresh above, BEFORE
                 # the service_pair_complete fast-path continue — an ordinary
@@ -761,19 +809,9 @@ async def replay_undergoing_engagements(
                         )
                         continue
 
-                # M7: never plant a service for an engagement whose workspace
-                # is gone. The generated run script does `set -e;
-                # cd <workspace>`, so a missing workspace makes the longrun
-                # exit immediately and s6 respawns it forever. Warn-and-skip
-                # (4a.1 §7.3) instead.
+                # M7 already validated above (#314) — the workspace exists
+                # from here on.
                 ws_dir = os.path.join(engagements_root, rec.id)
-                if not os.path.isdir(ws_dir):
-                    logger.warning(
-                        "boot replay: workspace dir %s missing for engagement "
-                        "%s — leaving UNDERGOING (warn-and-skip, 4a.1 §7.3)",
-                        ws_dir, rec.id[:8],
-                    )
-                    continue
 
                 if executor_registry is None:
                     logger.warning(
@@ -798,28 +836,8 @@ async def replay_undergoing_engagements(
                     )
                     continue
 
-                # §3.8: replay renders --plugin-dir flags from the engagement's
-                # RECORDED artifacts, never a re-resolution of current
-                # assignments. A missing recorded artifact refuses resume
-                # (fail-closed) — start/background loops skip it via refused_ids.
-                missing = [pa for pa in rec.plugin_artifacts
-                           if not os.path.isdir(pa.get("path", ""))]
-                if missing:
-                    names = ", ".join(pa.get("name", "?") for pa in missing)
-                    logger.warning(
-                        "boot replay: engagement %s refuses resume — plugin "
-                        "artifact(s) missing: %s", rec.id[:8], names)
-                    if rec.topic_id is not None:
-                        try:
-                            await driver._send_to_topic(
-                                rec.topic_id,
-                                "⚠️ This engagement can't resume: its pinned "
-                                f"plugin artifact(s) are missing ({names}). "
-                                "Start a new engagement.")
-                        except Exception:  # noqa: BLE001 — best-effort notice
-                            pass
-                    refused_ids.add(rec.id)
-                    continue
+                # §3.8 (missing recorded artifacts) already validated above
+                # (#314) — every recorded --plugin-dir target exists.
 
                 # Clear stale/legacy/torn dirs first — write_service_dir
                 # mkdirs with exist_ok=False (a surviving -log sibling would

@@ -91,8 +91,13 @@ async def test_replay_sweeps_orphans_and_replants_missing(monkeypatch, tmp_path)
     driver = _boot_driver()
     driver._spawn_background_tasks = lambda rec: None
 
+    # #314: a resumable record needs its workspace — a missing one is now
+    # refused (this test's subject is the orphan sweep, not the M7 guard).
+    ws_root = tmp_path / "eng"
+    (ws_root / "keep1").mkdir(parents=True)
+
     await replay_undergoing_engagements(
-        registry=reg, driver=driver,
+        registry=reg, driver=driver, engagements_root=str(ws_root),
     )
 
     # Orphan gone, keep1 still there
@@ -1216,12 +1221,20 @@ async def test_replay_aborts_resume_when_summary_adopt_fails(monkeypatch, tmp_pa
     driver._spawn_background_tasks = lambda rec: None
     driver.adopt_summary_if_missing = _adopt_boom
 
-    await replay_undergoing_engagements(registry=reg, driver=driver)
+    # #314: provision the workspace — a missing one is now refused BEFORE
+    # adoption, and this test's subject is the adoption-failure abort.
+    ws_root = tmp_path / "eng"
+    (ws_root / "keep1").mkdir(parents=True)
+
+    await replay_undergoing_engagements(
+        registry=reg, driver=driver, engagements_root=str(ws_root))
 
     # Adoption was ATTEMPTED, and its failure aborted the resume:
     assert adopt_calls == ["keep1"]
     assert start_calls == []                       # NOT started summary-less
-    assert down_calls == ["keep1"]                 # confirmed down
+    # Two downs are expected: the #335 credential-migration cycle (the fresh
+    # workspace has no .mcp.json) plus the adoption-failure abort itself.
+    assert down_calls and set(down_calls) == {"keep1"}   # confirmed down
     assert reg.get("keep1").status == "error"      # marked error
 
 
@@ -1256,7 +1269,12 @@ async def test_replay_adopts_summary_before_start(monkeypatch, tmp_path):
     driver._spawn_background_tasks = lambda rec: None
     driver.adopt_summary_if_missing = _adopt
 
-    await replay_undergoing_engagements(registry=reg, driver=driver)
+    # #314: provision the workspace — a missing one is now refused.
+    ws_root = tmp_path / "eng"
+    (ws_root / "keep1").mkdir(parents=True)
+
+    await replay_undergoing_engagements(
+        registry=reg, driver=driver, engagements_root=str(ws_root))
 
     assert order == [("adopt", "keep1"), ("start", "keep1")]
 
@@ -1407,3 +1425,105 @@ async def test_unconfirmed_stop_after_credential_refresh_refuses_resume(
         "refuse_credential_cycle_failed")
     assert started == []        # never resumed
     assert bg.call_count == 0   # and no background tasks attached
+
+
+# ---------------------------------------------------------------------------
+# #314 — the complete-pair fast path must not skip the missing-workspace /
+# missing-artifact guards, and a missing workspace refuses the start.
+# ---------------------------------------------------------------------------
+
+
+def _fast_path_env(monkeypatch, tmp_path, *, pair_complete=True):
+    """Wire s6_rc so `keep1` has a COMPLETE, CURRENT service pair (the
+    ordinary-restart fast path) without fabricating real s6 sources."""
+    from drivers import s6_rc
+
+    svc_root = tmp_path / "svc"
+    svc_root.mkdir()
+    (svc_root / "engagement-keep1").mkdir()
+    (svc_root / "engagement-keep1" / "type").write_text("longrun\n")
+    monkeypatch.setattr(s6_rc, "ENGAGEMENT_SOURCES_ROOT", str(svc_root))
+    monkeypatch.setattr(
+        s6_rc, "service_pair_complete", lambda **kw: pair_complete)
+    monkeypatch.setattr(s6_rc, "run_script_is_stale", lambda **kw: False)
+
+    start_calls: list[str] = []
+
+    async def fake_cau():
+        return None
+
+    async def fake_start(*, engagement_id):
+        start_calls.append(engagement_id)
+
+    monkeypatch.setattr(s6_rc, "_compile_and_update_locked", fake_cau)
+    monkeypatch.setattr(s6_rc, "start_service", fake_start)
+    return start_calls
+
+
+async def test_complete_pair_missing_workspace_refuses_start(
+    monkeypatch, tmp_path,
+):
+    """#314 (1+3): an intact pair with a DELETED workspace used to take the
+    early continue and start anyway — the run script's `set -e; cd` then
+    exits and s6 respawns it forever (exactly the loop M7 exists to
+    prevent). The record must be refused, not started."""
+    from casa_core import replay_undergoing_engagements
+
+    start_calls = _fast_path_env(monkeypatch, tmp_path)
+    reg = await _make_registry([_rec("keep1")])
+    driver = _boot_driver()
+    driver._spawn_background_tasks = lambda rec: None
+
+    await replay_undergoing_engagements(
+        registry=reg, driver=driver,
+        engagements_root=str(tmp_path / "eng"),   # keep1 workspace ABSENT
+    )
+    assert start_calls == []
+
+
+async def test_complete_pair_missing_artifact_refuses_start(
+    monkeypatch, tmp_path,
+):
+    """#314 (2): the §3.8 recorded-artifact check only ran on the heal path —
+    an intact pair resumed the CLI with a missing --plugin-dir target instead
+    of the documented fail-closed refusal."""
+    from casa_core import replay_undergoing_engagements
+
+    start_calls = _fast_path_env(monkeypatch, tmp_path)
+    ws_root = tmp_path / "eng"
+    (ws_root / "keep1").mkdir(parents=True)
+
+    rec = _rec("keep1")
+    rec.plugin_artifacts = (
+        {"name": "ghost", "path": str(tmp_path / "gone-artifact")},
+    )
+    reg = await _make_registry([rec])
+    driver = _boot_driver()
+    driver._spawn_background_tasks = lambda rec: None
+
+    await replay_undergoing_engagements(
+        registry=reg, driver=driver, engagements_root=str(ws_root),
+    )
+    assert start_calls == []
+    # The operator notice about the unresumable engagement is still owed.
+    driver._send_to_topic.assert_awaited()
+
+
+async def test_heal_path_missing_workspace_refuses_start(
+    monkeypatch, tmp_path,
+):
+    """#314 (3): even when the workspace guard WAS reached (incomplete pair),
+    it only warned — the start loop filtered on refused_ids alone, so the
+    service was started regardless. Missing workspace ⇒ refused."""
+    from casa_core import replay_undergoing_engagements
+
+    start_calls = _fast_path_env(monkeypatch, tmp_path, pair_complete=False)
+    reg = await _make_registry([_rec("keep1")])
+    driver = _boot_driver()
+    driver._spawn_background_tasks = lambda rec: None
+
+    await replay_undergoing_engagements(
+        registry=reg, driver=driver,
+        engagements_root=str(tmp_path / "eng"),   # workspace ABSENT
+    )
+    assert start_calls == []
