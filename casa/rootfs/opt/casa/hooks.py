@@ -1810,6 +1810,44 @@ _GIT_PUSH_RE = r"\bgit((\s+-\S+(\s+(\"[^\"]*\"|'[^']*'|[^-\s]\S*))?)*)\s+push\b"
 _SEPARATOR_CHARS = frozenset(";&|()")
 
 
+def _cd_operand_words(words: list[str]) -> list[str]:
+    """The real OPERANDS among a `cd` command's words — options, redirection
+    operators, the words those operators consume, and the fd prefixes that
+    introduce them are all removed.
+
+    Terra r13: this replaced a "first word that doesn't look like an option"
+    heuristic which picked the redirection TARGET (`cd 2> /dev/null /repo`
+    → `/dev/null`) and therefore seeded a following relative `cd` from the
+    wrong base. The token stream makes the redirections explicit, so the
+    operands can be computed rather than guessed. Everything after `--` is
+    an operand, however it is spelled."""
+    consumed: set[int] = set()
+    for i, w in enumerate(words):
+        if not w or not all(ch in "<>&|" for ch in w):
+            continue
+        if "<" not in w and ">" not in w:
+            continue  # not a redirection operator
+        consumed.add(i)
+        if i + 1 < len(words):
+            consumed.add(i + 1)          # the redirection target word
+        if i and (words[i - 1].isdigit()
+                  or (words[i - 1].startswith("{")
+                      and words[i - 1].endswith("}"))):
+            consumed.add(i - 1)          # its fd prefix (`2>`, `{fd}>`)
+    operands: list[str] = []
+    seen_ddash = False
+    for i, w in enumerate(words):
+        if i in consumed:
+            continue
+        if not seen_ddash and w == "--":
+            seen_ddash = True
+            continue
+        if not seen_ddash and w.startswith("-"):
+            continue                     # an option word
+        operands.append(w)
+    return operands
+
+
 def _cd_command_words(text: str) -> list[list[str]]:
     """Every `cd` invocation in *text*, as its list of argument WORDS.
 
@@ -1881,7 +1919,11 @@ def _cd_command_words(text: str) -> list[list[str]]:
             continue
         if tok == "cd":
             if collecting is not None:
-                out.append(collecting)   # `cd a; cd b` without a separator
+                # Sol r13: a directory can be NAMED `cd` (`cd cd`) — the
+                # token is both a possible operand of the cd being collected
+                # AND the start of another one. Record it as both.
+                collecting.append(tok)
+                out.append(collecting)
             collecting = []
             continue
         if collecting is not None:
@@ -1973,29 +2015,16 @@ def make_self_containment_guard() -> HookCallback:
         # before the real cd. Collecting cds from the entire string is the
         # same fail-closed over-approximation used everywhere else here.
         for words in _cd_command_words(cmd):
-            # The PRIMARY word (the one bash most likely resolves to) also
-            # propagates into ``bases`` so a relative cd CHAIN keeps working:
-            # skip options, redirection operators and bare fd numbers.
-            # Terra r12: after `--` every word is an OPERAND, so a directory
-            # whose name starts with `-` (`cd -- -weird-dir`) still becomes
-            # the base for a following relative cd.
-            if "--" in words:
-                rest = words[words.index("--") + 1:]
-                primary = next(
-                    (w for w in rest if not _REDIR_SHAPED.search(w)), None)
-            else:
-                primary = next(
-                    (w for w in words
-                     if not w.startswith("-") and not w.isdigit()
-                     and not _REDIR_SHAPED.search(w)),
-                    None)
+            # EVERY word is scanned (fail-closed over-approximation); the
+            # computed OPERANDS additionally propagate into ``bases`` so a
+            # following RELATIVE cd resolves from the right place.
+            operands = _cd_operand_words(words)
             new_bases = set()
             for b in bases:
                 for w in words:
                     candidates.append(Path(w) if os.path.isabs(w) else b / w)
-                if primary is not None:
-                    new_bases.add(Path(primary) if os.path.isabs(primary)
-                                  else b / primary)
+                for w in operands:
+                    new_bases.add(Path(w) if os.path.isabs(w) else b / w)
             bases |= new_bases
             if len(bases) > 64:
                 # Terra/Sol r3: stopping silently would leave every LATER cd

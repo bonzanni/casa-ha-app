@@ -554,6 +554,34 @@ class TestGuardArmingAndOracle:
         assert await self._denied(
             clean, f"echo git push; cd {bad_repo}; git push origin main")
 
+    async def test_directory_literally_named_cd_is_scanned(
+            self, tmp_path: Path, bad_repo: Path):
+        """Sol r13 (#348): `cd cd` — a directory NAMED `cd` is a legitimate
+        operand; the token must count as both operand and (harmlessly) the
+        start of another cd."""
+        holder = tmp_path / "cd-holder"
+        holder.mkdir()
+        (holder / "cd").symlink_to(bad_repo, target_is_directory=True)
+        assert await self._denied(holder, "cd cd; git push origin main")
+
+    async def test_redirect_operand_is_not_the_chain_base(
+            self, tmp_path: Path, bad_repo: Path):
+        """Terra r13 (#348): `cd 2> /dev/null <dir>` — the redirection TARGET
+        must not seed the base for a following relative cd, or the chain's
+        real destination is never scanned."""
+        import shutil
+        # The bad repo is reachable ONLY as a sibling of the first cd's
+        # target — never from the hook cwd — so the scan can only find it
+        # when that target (not the redirection operand) seeded the base.
+        chain = tmp_path / "chain"
+        (chain / "x").mkdir(parents=True)
+        shutil.copytree(bad_repo, chain / "badsib", symlinks=True)
+        clean = tmp_path / "clean-redirbase"
+        clean.mkdir()
+        assert await self._denied(
+            clean,
+            f"cd 2> /dev/null {chain}/x; cd ../badsib; git push origin main")
+
     async def test_cd_chain_overflow_fails_closed(
             self, tmp_path: Path, git_plugin_repo: Path):
         """Terra/Sol r3 (#348): once the feasible-base set overflows, later
