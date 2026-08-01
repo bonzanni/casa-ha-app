@@ -20,9 +20,19 @@ from typing import Callable, Sequence
 
 logger = logging.getLogger(__name__)
 
-# #351: serialize stage→validate→commit sequences. Two concurrent checked
-# commits would otherwise race each other's `git add -A` / `git reset`.
-# A threading (not asyncio) lock: every caller runs in a worker thread.
+# #351: serialize EVERY in-process git mutation in this module (checked
+# commits, plain commits, boot snapshots, rollbacks) — Terra/Sol v0.142.0
+# r6: the shared-index read-decide-write sequences are only safe against
+# writers that share this lock. A threading (not asyncio) lock: every
+# caller runs in a worker thread.
+#
+# Cross-PROCESS writers (an SSH operator's own git commands) cannot share
+# it; there the guarantee is bounded deliberately: each individual git
+# command serializes on git's index.lock, and the residual lost-update
+# window between two adjacent commands here is the same semantics plain
+# git gives any two concurrent processes — stock git has no per-entry
+# compare-and-swap (verified: `read-tree -m` refuses whenever worktree
+# differs from index, i.e. always in the gate's success state).
 _COMMIT_LOCK = threading.Lock()
 
 
@@ -135,13 +145,14 @@ def commit_config(config_dir: str, message: str) -> str:
     """Stage + commit any tracked-file changes. Returns the new sha, or
     an empty string if there were no changes to commit.
     """
-    status = _run(config_dir, ["status", "--porcelain"])
-    if not status:
-        return ""
+    with _COMMIT_LOCK:
+        status = _run(config_dir, ["status", "--porcelain"])
+        if not status:
+            return ""
 
-    _run(config_dir, ["add", "-A"])
-    _run(config_dir, ["commit", "-qm", message])
-    return _run(config_dir, ["rev-parse", "HEAD"])
+        _run(config_dir, ["add", "-A"])
+        _run(config_dir, ["commit", "-qm", message])
+        return _run(config_dir, ["rev-parse", "HEAD"])
 
 
 def commit_config_checked(
@@ -331,12 +342,13 @@ def snapshot_manual_edits(config_dir: str) -> str | None:
     Runs at Casa boot so human edits via SSH land as proper commits
     before the builder agent can race against them.
     """
-    status = _run(config_dir, ["status", "--porcelain"])
-    if not status:
-        return None
-    _run(config_dir, ["add", "-A"])
-    _run(config_dir, ["commit", "-qm", "manual edit (boot-time snapshot)"])
-    return _run(config_dir, ["rev-parse", "HEAD"])
+    with _COMMIT_LOCK:
+        status = _run(config_dir, ["status", "--porcelain"])
+        if not status:
+            return None
+        _run(config_dir, ["add", "-A"])
+        _run(config_dir, ["commit", "-qm", "manual edit (boot-time snapshot)"])
+        return _run(config_dir, ["rev-parse", "HEAD"])
 
 
 def restore_file(config_dir: str, sha: str, relpath: str) -> None:
@@ -349,16 +361,19 @@ def restore_file(config_dir: str, sha: str, relpath: str) -> None:
     only for a VERIFIED target commit — a malformed/unknown *sha* must
     raise, not silently delete the live file.
     """
-    _run(config_dir, ["rev-parse", "--verify", "--quiet", f"{sha}^{{commit}}"])
-    probe = subprocess.run(
-        ["git", "cat-file", "-e", f"{sha}:{relpath}"],
-        cwd=config_dir, capture_output=True, text=True,
-    )
-    if probe.returncode == 0:
-        _run(config_dir, ["checkout", sha, "--", relpath])
-        _run(config_dir, ["add", relpath])
-        _run(config_dir, ["commit", "-qm", f"restore {relpath} to {sha[:8]}"])
-    else:
-        _run(config_dir, ["rm", "-f", "--ignore-unmatch", "--", relpath])
-        _run(config_dir, ["commit", "-qm",
-                          f"remove {relpath} (absent at {sha[:8]})"])
+    with _COMMIT_LOCK:
+        _run(config_dir,
+             ["rev-parse", "--verify", "--quiet", f"{sha}^{{commit}}"])
+        probe = subprocess.run(
+            ["git", "cat-file", "-e", f"{sha}:{relpath}"],
+            cwd=config_dir, capture_output=True, text=True,
+        )
+        if probe.returncode == 0:
+            _run(config_dir, ["checkout", sha, "--", relpath])
+            _run(config_dir, ["add", relpath])
+            _run(config_dir, ["commit", "-qm",
+                              f"restore {relpath} to {sha[:8]}"])
+        else:
+            _run(config_dir, ["rm", "-f", "--ignore-unmatch", "--", relpath])
+            _run(config_dir, ["commit", "-qm",
+                              f"remove {relpath} (absent at {sha[:8]})"])
