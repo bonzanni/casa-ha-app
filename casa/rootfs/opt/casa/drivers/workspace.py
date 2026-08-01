@@ -607,45 +607,63 @@ async def _sweep_workspaces(
     for entry in os.scandir(engagements_root):
         if not entry.is_dir():
             continue
-        meta = load_casa_meta(entry.path)
-        if meta is None:
-            continue
-        status = meta.get("status")
-        if status == "UNDERGOING":
-            continue
-        retention_until = meta.get("retention_until")
-        if retention_until is None:
-            logger.warning(
-                "workspace sweep: engagement %s has terminal status %r "
-                "but retention_until is null; skipping",
-                entry.name, status,
-            )
-            continue
-        if retention_until > now_iso:
-            continue
         try:
-            shutil.rmtree(entry.path)
-        except OSError as exc:
+            _sweep_one_workspace(entry, now_iso=now_iso, log_root=log_root)
+        except Exception:  # noqa: BLE001 — Sol r6-1: per-workspace boundary
             logger.warning(
-                "workspace sweep: rmtree %s failed: %s",
-                entry.path, exc,
+                "workspace sweep: entry %s failed; continuing with the "
+                "remaining workspaces", entry.name, exc_info=True,
             )
-        else:
-            logger.info(
-                "workspace sweep: removed %s (status=%s, past retention)",
-                entry.name, status,
+
+
+def _sweep_one_workspace(
+    entry: os.DirEntry, *, now_iso: str, log_root: str | None,
+) -> None:
+    """One workspace's retention decision + deletion — isolated so a
+    surprising per-entry failure cannot abort the whole sweep (Sol r6-1)."""
+    meta = load_casa_meta(entry.path)
+    if meta is None:
+        return
+    status = meta.get("status")
+    if status == "UNDERGOING":
+        return
+    retention_until = meta.get("retention_until")
+    # Sol r6-1: a non-string retention_until (e.g. a number) would
+    # TypeError against the ISO string comparison below — same
+    # abort-the-sweep class as non-object metadata (#344). Treat any
+    # non-string the way null is treated: warn + skip.
+    if not isinstance(retention_until, str):
+        logger.warning(
+            "workspace sweep: engagement %s has terminal status %r "
+            "but retention_until is %r (expected ISO string); skipping",
+            entry.name, status, retention_until,
+        )
+        return
+    if retention_until > now_iso:
+        return
+    try:
+        shutil.rmtree(entry.path)
+    except OSError as exc:
+        logger.warning(
+            "workspace sweep: rmtree %s failed: %s",
+            entry.path, exc,
+        )
+    else:
+        logger.info(
+            "workspace sweep: removed %s (status=%s, past retention)",
+            entry.name, status,
+        )
+        log_dir = engagement_log_dir(entry.name, root=log_root)
+        try:
+            if os.path.isdir(log_dir):
+                shutil.rmtree(log_dir)
+        except OSError as exc:
+            # The workspace is already gone, so no future sweep can map
+            # to this log dir again — warn, it's the only signal left.
+            logger.warning(
+                "workspace sweep: log dir rmtree %s failed: %s",
+                log_dir, exc,
             )
-            log_dir = engagement_log_dir(entry.name, root=log_root)
-            try:
-                if os.path.isdir(log_dir):
-                    shutil.rmtree(log_dir)
-            except OSError as exc:
-                # The workspace is already gone, so no future sweep can map
-                # to this log dir again — warn, it's the only signal left.
-                logger.warning(
-                    "workspace sweep: log dir rmtree %s failed: %s",
-                    log_dir, exc,
-                )
 
 
 # ---------------------------------------------------------------------------

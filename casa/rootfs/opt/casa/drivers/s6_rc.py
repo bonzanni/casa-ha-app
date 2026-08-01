@@ -237,7 +237,7 @@ _compile_lock = asyncio.Lock()
 _compile_worker_lock = threading.Lock()
 
 
-def _compile_swap_reap_sync(new_db: str) -> None:
+def _compile_swap_reap_sync(new_db: str, abandoned: threading.Event) -> None:
     """The full compile → swap → reap sequence, run in ONE worker thread.
 
     #344: cleanup decisions live HERE, beside the outcome they depend on.
@@ -248,6 +248,14 @@ def _compile_swap_reap_sync(new_db: str) -> None:
     deleted the newly-LIVE compiled db out from under /run/s6-rc.
     A cancelled awaiter now simply abandons this thread, which completes
     and cleans up according to what actually happened.
+
+    ``abandoned`` (Terra r6-1): set by the awaiter's CancelledError path
+    BEFORE its caller releases ``_compile_lock``. Once set, a successor
+    holding that lock may be mutating the source tree this compile read —
+    so a superseded compile DISCARDS its output instead of swapping a
+    possibly-torn snapshot live (the successor compiles the authoritative
+    db itself, queued behind ``_compile_worker_lock``). Failures after
+    abandonment are logged, not raised — nobody awaits this thread.
     """
     with _compile_worker_lock:
         # Terra r1-4: snapshot the live db INSIDE the worker lock — a
@@ -266,10 +274,22 @@ def _compile_swap_reap_sync(new_db: str) -> None:
                 ],
                 check=True,
             )
+            if abandoned.is_set():
+                shutil.rmtree(new_db, ignore_errors=True)
+                logger.info(
+                    "abandoned s6 compile discarded without swap (%s)",
+                    new_db,
+                )
+                return
             subprocess.run(["s6-rc-update", new_db], check=True)
         except BaseException:
             # Failed swap: the fresh compile is the orphan.
             shutil.rmtree(new_db, ignore_errors=True)
+            if abandoned.is_set():
+                logger.warning(
+                    "abandoned s6 compile failed; discarded", exc_info=True,
+                )
+                return
             raise
         # Successful swap: the previous db is unused now. Only reap dirs we
         # created (basename prefix guard keeps a foreign/boot db safe).
@@ -293,7 +313,17 @@ async def _compile_and_update_locked() -> None:
     _prune_broken_pairs(svc_root=ENGAGEMENT_SOURCES_ROOT)
 
     new_db = f"/tmp/s6-casa-db-{uuid.uuid4().hex}"
-    await asyncio.to_thread(_compile_swap_reap_sync, new_db)
+    abandoned = threading.Event()
+    try:
+        await asyncio.to_thread(_compile_swap_reap_sync, new_db, abandoned)
+    except asyncio.CancelledError:
+        # Terra r6-1: mark the worker superseded BEFORE our caller's
+        # ``async with _compile_lock`` releases on this unwind — any
+        # successor's source-tree mutation therefore happens-after this
+        # set, and the worker refuses to swap a snapshot it may have
+        # read torn.
+        abandoned.set()
+        raise
 
 
 async def compile_and_update() -> None:
