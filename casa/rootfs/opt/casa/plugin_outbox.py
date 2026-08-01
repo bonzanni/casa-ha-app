@@ -132,6 +132,22 @@ class PluginOutbox:
         # the module self-sufficient (idempotent) for tests and cold starts.
         os.makedirs(self._root_realpath, exist_ok=True)
         os.makedirs(self._claims_realpath, exist_ok=True)
+        # Sol r7: ``.reap`` was a LEGAL producer basename before this
+        # subdirectory existed — an upgrade over such a file would make
+        # makedirs raise FileExistsError, disabling the whole outbox with no
+        # self-heal. Displace a non-directory occupant (file OR symlink — the
+        # lstat never follows) to a fresh producer-visible name: content is
+        # preserved; the producer's returned path is invalidated exactly as
+        # an expiry would have.
+        try:
+            _st = os.lstat(self._reap_realpath)
+            if not stat.S_ISDIR(_st.st_mode):
+                os.replace(
+                    self._reap_realpath,
+                    os.path.join(self._root_realpath,
+                                 f"reap-displaced-{uuid.uuid4().hex}"))
+        except OSError:
+            pass                       # absent (the normal case) — or racing
         os.makedirs(self._reap_realpath, exist_ok=True)
         os.chmod(self._root_realpath, 0o770)
         os.chmod(self._claims_realpath, 0o770)

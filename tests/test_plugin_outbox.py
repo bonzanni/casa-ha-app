@@ -630,3 +630,24 @@ def test_producer_file_named_like_reap_prefix_is_left_alone(outbox):
     assert os.path.exists(p)          # fresh producer file untouched
     assert not os.path.exists(
         os.path.join(outbox._root_realpath, "evil.pdf"))
+
+
+def test_init_displaces_preexisting_producer_file_named_reap(tmp_path):
+    """Sol r7 (#330): `.reap` was a LEGAL producer basename before the
+    sweep-owned subdir existed — an upgrade over such a file must not brick
+    outbox init (makedirs FileExistsError → send_media disabled, no
+    self-heal). The occupant is displaced to a fresh producer-visible name,
+    content preserved."""
+    root = tmp_path / "ob"
+    root.mkdir()
+    (root / ".reap").write_bytes(PDF)
+
+    ob = PluginOutbox(str(root))
+    try:
+        assert (root / ".reap").is_dir()
+        displaced = [p for p in root.iterdir()
+                     if p.name.startswith("reap-displaced-")]
+        assert len(displaced) == 1
+        assert displaced[0].read_bytes() == PDF
+    finally:
+        ob.close()
