@@ -1001,7 +1001,10 @@ class TestInboundSpool:
         env = s._envelopes[0]
         assert env.state == "delivered" and env.delivery_epoch == 7
         await s.on_turn_start()
-        assert s._envelopes and s._envelopes[0].state == "consumed"
+        # #341: consumed with nothing owed ⇒ pruned (no longer deliverable,
+        # never redelivered, spool does not grow without bound).
+        assert env.state == "consumed"
+        assert s._envelopes == []
 
     async def test_delivered_but_no_turn_start_redelivers_next_spawn(self, tmp_path):
         # Process died pre-turn_start ⇒ the delivered envelope reverts to
@@ -2732,3 +2735,188 @@ class TestCompletionGateDriverSurface:
             assert "the initial prompt" not in texts
             assert any("first operator" in t for t in texts)
         asyncio.run(run())
+
+
+# ---------------------------------------------------------------------------
+# #341 — driver durability: completion-escalation epoch guard + single-flight,
+# same-epoch spawn replay, spool crash-durability, notice/receipt fail-safety.
+# ---------------------------------------------------------------------------
+
+
+def _make_driver(tmp_path, *, send_to_topic=None):
+    from drivers.claude_code_driver import ClaudeCodeDriver
+    return ClaudeCodeDriver(
+        engagements_root=str(tmp_path / "engagements"),
+        send_to_topic=send_to_topic or AsyncMock(),
+        casa_framework_mcp_url="http://127.0.0.1:8080/mcp/casa-framework",
+    )
+
+
+class TestCompletionEscalationEpochGuard:
+    """#341 (high): the completion-gate force-end used to run with
+    ``expected_epoch=None`` (epoch guard disabled) and no single-flight
+    state — a delayed escalation could kill a freshly respawned turn that
+    had already consumed a queued operator envelope."""
+
+    async def test_escalation_passes_current_spawn_epoch(self, tmp_path):
+        drv = _make_driver(tmp_path)
+        rec = _make_record()
+        recorded: dict = {}
+
+        async def fake_ftb(**kw):
+            recorded.update(kw)
+            return True
+
+        drv._force_turn_boundary = fake_ftb
+        drv._epoch_pending[rec.id] = 7
+        await drv.force_completion_turn_boundary(rec)
+        assert recorded.get("expected_epoch") == 7
+
+    async def test_escalation_without_live_epoch_does_not_signal(self, tmp_path):
+        """No pending spawn epoch ⇒ no live turn is attributable — the kill
+        must not fire blind (it could only hit a NEWER generation)."""
+        drv = _make_driver(tmp_path)
+        rec = _make_record()
+        recorded: dict = {}
+
+        async def fake_ftb(**kw):
+            recorded.update(kw)
+            return True
+
+        drv._force_turn_boundary = fake_ftb
+        await drv.force_completion_turn_boundary(rec)
+        assert recorded == {}
+
+    async def test_escalation_single_flight_with_inflight_kill(self, tmp_path):
+        """A kill already in flight (completion- or away-triggered) owns the
+        boundary; a racing second emit_completion must not signal again."""
+        drv = _make_driver(tmp_path)
+        rec = _make_record()
+        recorded: dict = {}
+
+        async def fake_ftb(**kw):
+            recorded.update(kw)
+            return True
+
+        drv._force_turn_boundary = fake_ftb
+        drv._epoch_pending[rec.id] = 7
+        hold = asyncio.create_task(asyncio.sleep(30))
+        drv._force_tasks[rec.id] = hold
+        try:
+            await drv.force_completion_turn_boundary(rec)
+            assert recorded == {}
+        finally:
+            hold.cancel()
+
+
+class TestSpawnReplaySameEpoch:
+    """#341: TopicStream delivers spawn at-least-once. A replayed spawn frame
+    carrying the SAME epoch is not a new generation — treating it as one
+    logged a phantom abnormal exit and requeued the already-delivered FIFO
+    envelope (duplicate operator turn on the next real spawn)."""
+
+    async def test_same_epoch_replay_keeps_delivered_envelope(
+        self, tmp_path, caplog,
+    ):
+        import logging
+
+        drv = _make_driver(tmp_path)
+        drv._consume_reanchor = AsyncMock()
+        rec = _make_record()
+        epoch = {"v": None}
+        writer = _FakeWriter(True)
+        s = _make_spool(tmp_path, writer=writer,
+                        current_epoch=lambda: epoch["v"])
+        drv._inbound[rec.id] = s
+        await s.enqueue("msg one")
+
+        epoch["v"] = 5
+        await drv._on_stream_event(rec, "spawn", {"epoch": 5})
+        assert writer.calls == ["msg one"]
+
+        with caplog.at_level(logging.INFO):
+            await drv._on_stream_event(rec, "spawn", {"epoch": 5})
+        assert writer.calls == ["msg one"], "replay redelivered the envelope"
+        assert s._envelopes[0].state == "delivered"
+        assert "exited without a result frame" not in caplog.text
+
+
+class TestSpoolCrashDurability:
+    """#341: spool persistence gaps — missing directory fsync after the
+    rename, a capacity-drop notice lost when its first write fails, and
+    consumed envelopes retained forever (unbounded spool growth)."""
+
+    async def test_persist_fsyncs_spool_directory(self, tmp_path, monkeypatch):
+        import stat as stat_mod
+        import drivers.claude_code_driver as ccd
+
+        dir_synced: list[int] = []
+        real_fsync = os.fsync
+
+        def spy_fsync(fd):
+            if stat_mod.S_ISDIR(os.fstat(fd).st_mode):
+                dir_synced.append(fd)
+            real_fsync(fd)
+
+        monkeypatch.setattr(ccd.os, "fsync", spy_fsync)
+        s = _make_spool(tmp_path)
+        await s.enqueue("durable?")
+        assert dir_synced, "spool directory never fsynced after os.replace"
+
+    async def test_drop_notice_survives_failed_first_persist(self, tmp_path):
+        """A capacity-drop notice whose first spool write fails must still be
+        retried to disk at the next touchpoint — otherwise a crash before any
+        later successful send silently loses the owed notice."""
+        notices = _RecordNotice(ok=False)          # send keeps failing
+        s = _make_spool(tmp_path, notices=notices)
+        for i in range(10):
+            assert await s.enqueue(f"m{i}") == "queued"
+
+        orig_persist = s._persist
+        state = {"failed_once": False}
+
+        def flaky_persist():
+            if not state["failed_once"]:
+                state["failed_once"] = True
+                raise OSError("disk hiccup")
+            orig_persist()
+
+        s._persist = flaky_persist
+        assert await s.enqueue("overflow") == "dropped_full"
+
+        s2 = _make_spool(tmp_path)                 # crash + reload
+        assert s2.has_pending(), (
+            "capacity-drop notice was lost with the failed first persist"
+        )
+
+    async def test_consumed_envelope_pruned_from_spool_file(self, tmp_path):
+        """A consumed envelope with nothing pending owes nothing — it must be
+        pruned at the turn_start persist, not retained forever."""
+        epoch = {"v": 1}
+        s = _make_spool(tmp_path, current_epoch=lambda: epoch["v"])
+        await s.enqueue("job")
+        await s.on_spawn()
+        await s.on_turn_start()
+
+        s2 = _make_spool(tmp_path)                 # reload from disk
+        assert s2._envelopes == []
+
+
+class TestTerminalSpoolNoticeDeliveryEvidence:
+    """#341: the terminal-reconciliation direct-send fallback ignored the
+    returned message id — a ``None`` (Telegram unavailable at boot) was
+    treated as delivered and the receipt dropped."""
+
+    async def test_direct_send_returning_none_is_not_delivered(self, tmp_path):
+        drv = _make_driver(
+            tmp_path, send_to_topic=AsyncMock(return_value=None))
+        rec = _make_record()
+        ok = await drv._spool_send_notice(rec, "receipt text", None)
+        assert ok is False
+
+    async def test_direct_send_returning_mid_is_delivered(self, tmp_path):
+        drv = _make_driver(
+            tmp_path, send_to_topic=AsyncMock(return_value=123))
+        rec = _make_record()
+        ok = await drv._spool_send_notice(rec, "receipt text", None)
+        assert ok is True

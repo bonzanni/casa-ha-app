@@ -74,3 +74,46 @@ def test_existing_file_mode_preserved_on_rewrite(tmp_path: Path) -> None:
     os.chmod(p, 0o640)
     atomic_io.atomic_write_json(p, {"a": 1})
     assert (p.stat().st_mode & 0o777) == 0o640
+
+
+def test_atomic_write_fsyncs_parent_directory(tmp_path: Path, monkeypatch) -> None:
+    """#330/#341 durability root: fsyncing only the temp file makes the DATA
+    durable but not the RENAME — after a power crash the directory entry can
+    still be missing, so a registry that references the file next sees nothing.
+    The parent directory must be fsynced after os.replace."""
+    import stat as stat_mod
+
+    dir_fds_synced: list[int] = []
+    real_fsync = os.fsync
+
+    def spy_fsync(fd: int) -> None:
+        if stat_mod.S_ISDIR(os.fstat(fd).st_mode):
+            dir_fds_synced.append(fd)
+        real_fsync(fd)
+
+    monkeypatch.setattr(atomic_io.os, "fsync", spy_fsync)
+    atomic_io.atomic_write_text(tmp_path / "out.txt", "hello")
+    assert dir_fds_synced, "parent directory was never fsynced after replace"
+
+
+def test_dir_fsync_failure_does_not_fail_the_write(
+    tmp_path: Path, monkeypatch
+) -> None:
+    """A directory-fsync failure after a successful replace must not raise:
+    the file content is already durable and callers roll back in-memory state
+    on exceptions — misreporting a completed write as failed would be worse
+    than the lost rename-ordering guarantee (which only matters across a
+    power crash)."""
+    import stat as stat_mod
+
+    real_fsync = os.fsync
+
+    def failing_dir_fsync(fd: int) -> None:
+        if stat_mod.S_ISDIR(os.fstat(fd).st_mode):
+            raise OSError("simulated EINVAL on directory fsync")
+        real_fsync(fd)
+
+    monkeypatch.setattr(atomic_io.os, "fsync", failing_dir_fsync)
+    p = tmp_path / "out.txt"
+    atomic_io.atomic_write_text(p, "hello")
+    assert p.read_text(encoding="utf-8") == "hello"
