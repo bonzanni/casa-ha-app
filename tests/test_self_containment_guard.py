@@ -496,6 +496,10 @@ class TestGuardArmingAndOracle:
             f"c''d {bad_repo}",
             f"cd</dev/null {bad_repo}",
             f"cd'{bad_repo}'",
+            # Terra r9: backslash is bash's third literal-quoting
+            # mechanism — `c\d` is the cd builtin too.
+            f"c\\d {bad_repo}",
+            f'c"d" {bad_repo}',
         ]
         for i, form in enumerate(forms):
             clean = tmp_path / f"clean-cmdword{i}"

@@ -1877,13 +1877,17 @@ def make_self_containment_guard() -> HookCallback:
         # Sol r8: bash needs no whitespace after `cd` before an operator or
         # a quote (`cd</dev/null /bad`, `cd'/bad'`) — accept those positions
         # too, never just `cd\s`.
-        # Terra r8: the command WORD itself can be quoted (`"cd" /bad`,
-        # `c''d /bad`) — bash resolves both to the builtin. Rather than
-        # enumerate quoting spellings, run the SAME collection over a
-        # quote-stripped shadow of the command as well and union the
-        # candidates. Purely additive, so it can only add scan targets.
+        # Terra r8/r9: the command WORD itself can be quoted or escaped
+        # (`"cd" /bad`, `c''d /bad`, `c\d /bad`) — bash resolves all of them
+        # to the builtin. Rather than enumerate spellings, run the SAME
+        # collection over a shadow of the command with every literal-quoting
+        # character removed. Single quotes, double quotes and backslash are
+        # bash's COMPLETE set of literal-quoting mechanisms for a word (the
+        # rest are expansions, out of scope for a static scan), so no further
+        # spelling of a literal `cd` can exist. Purely additive — the shadow
+        # can only ADD scan targets, never remove one.
         for text in (cmd[: m_push.start()],
-                     cmd[: m_push.start()].replace("'", "").replace('"', "")):
+                     re.sub(r"[\\'\"]", "", cmd[: m_push.start()])):
             for m_cd in re.finditer(r"(?<![\w./-])cd(?=[\s<>\"'])", text):
                 words = _shell_words(_command_segment(text[m_cd.end():]))
                 primary = next(
