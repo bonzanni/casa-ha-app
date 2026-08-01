@@ -408,6 +408,30 @@ class TestGuardArmingAndOracle:
         assert await self._denied(
             clean, f"(cd {bad_repo}; git push origin main)")
 
+    async def test_cd_in_case_branch_is_recognized(
+            self, tmp_path: Path, bad_repo: Path):
+        """Terra/Sol r4 (#348): a case-pattern `)` precedes the cd —
+        recognized because EVERY standalone cd word contributes a
+        candidate."""
+        clean = tmp_path / "clean-case-cwd"
+        clean.mkdir()
+        assert await self._denied(
+            clean,
+            f"case x in x) cd {bad_repo};; esac; git push origin main")
+
+    async def test_negated_and_command_prefixed_cd_are_recognized(
+            self, tmp_path: Path, bad_repo: Path):
+        """Terra/Sol r4 (#348): `! cd <bad>` still changes directory, and
+        `command cd <bad>` is the builtin through a wrapper word."""
+        clean = tmp_path / "clean-neg-cwd"
+        clean.mkdir()
+        assert await self._denied(
+            clean, f"if ! cd {bad_repo}; then :; fi; git push origin main")
+        clean2 = tmp_path / "clean-cmdword-cwd"
+        clean2.mkdir()
+        assert await self._denied(
+            clean2, f"command cd {bad_repo}; git push origin main")
+
     async def test_cd_chain_overflow_fails_closed(
             self, tmp_path: Path, git_plugin_repo: Path):
         """Terra/Sol r3 (#348): once the feasible-base set overflows, later

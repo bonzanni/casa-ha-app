@@ -1795,16 +1795,19 @@ def make_self_containment_guard() -> HookCallback:
         # handful of cds at most; hard cap as a backstop).
         # Sol r2: `cd -P -- dir` — skip option words and an optional `--` so
         # the flag is never mistaken for the target.
-        # Sol r3: a cd can also follow a shell KEYWORD (`if x; then cd /bad`)
-        # or open a subshell/group (`(cd /bad; git push)`) — the pre-context
-        # accepts `(`/`{` in the separator class and any run of the
-        # body-introducing keywords before `cd`.
+        # Sol r3 / Terra+Sol r4: enumerating what may precede an executable
+        # `cd` (separators, `then`, subshell parens, case-pattern `)`, `!`,
+        # `command`, …) is a losing game — every round found another form.
+        # Structural resolution: EVERY standalone `cd` word before the push
+        # contributes a candidate, whatever precedes it. Over-approximation
+        # is fail-closed by construction — a `cd` that would not really
+        # execute (or is mere argument text) only ADDS scan targets, never
+        # removes one, and the hook cwd always stays in the set.
         bases: set = {cwd}
         candidates: list = [cwd]
         cd_overflow = False
         for m_cd in re.finditer(
-                r"(?:^|[;&|\n\r({])\s*(?:(?:then|else|do|elif|if|while|until)"
-                r"\s+)*cd\s+(?:-\S+\s+)*(?:--\s+)?"
+                r"(?<![\w./-])cd\s+(?:-\S+\s+)*(?:--\s+)?"
                 r"(\"[^\"]+\"|'[^']+'|[^\s;&|)}]+)",
                 cmd[: m_push.start()]):
             t = m_cd.group(1).strip("'\"")
