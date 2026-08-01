@@ -2973,10 +2973,19 @@ async def _await_voice_persistence(
         if cancellation is not None:
             raise cancellation
         raise asyncio.CancelledError()
-    result = task.result()
+    # Sol r3: an absorbed cancellation takes PRECEDENCE over the operation's
+    # own outcome. Raising the op failure here instead would send
+    # _persist_voice_terminal into its fallback as an ordinary failure — an
+    # UNBOUNDED wait, with the original cancellation already consumed —
+    # recreating the stranded-permit bug. The op exception is retrieved for
+    # hygiene only (content deliberately not rendered).
     if cancellation is not None:
+        if not task.cancelled() and task.exception() is not None:
+            logger.error(
+                "terminal persistence failed while cancellation was pending",
+            )
         raise cancellation
-    return result
+    return task.result()
 
 
 async def _persist_voice_terminal(
@@ -3036,6 +3045,49 @@ async def _persist_voice_terminal(
                 job_id[:8], specialist_role,
             )
         return "unpersisted"
+
+
+async def _persist_cancelled_terminal(
+    *, registry, job_id: str, specialist_role: str,
+) -> None:
+    """Persist the CANCELLED terminal for a cancelled lifecycle, bounded.
+
+    Terra/Sol r2 + Terra r3: this runs from the lifecycle's CancelledError
+    handler, so (a) the wait gets no fresh ``CancelledError`` to bound it —
+    ``already_cancelled=True`` runs it against its own deadline; and (b) any
+    failure — ordinary exception OR bounded give-up — must hand the row to
+    the CANCEL reconciliation, never the failure-flavored
+    ``persistence_failed`` fallback (`_persist_voice_terminal`), which would
+    terminalize the job FAILED and silently drop the cancel contract.
+    Never raises except propagating nothing: swallows everything (the caller
+    re-raises the original cancellation regardless)."""
+    try:
+        await _await_voice_persistence(
+            registry.fail_compat(
+                job_id,
+                JobFailure("cancelled", "Specialist job was cancelled."),
+            ),
+            already_cancelled=True,
+        )
+        return
+    except asyncio.CancelledError:
+        logger.error(
+            "Voice job %s role=%s cancellation write gave up within the "
+            "bound; scheduling cancel reconciliation",
+            job_id[:8], specialist_role,
+        )
+    except Exception:  # noqa: BLE001 — never render a persistence exception
+        logger.error(
+            "Voice job %s role=%s cancellation write failed; scheduling "
+            "cancel reconciliation", job_id[:8], specialist_role,
+        )
+    try:
+        registry.schedule_cancel_reconciliation(job_id)
+    except Exception:  # noqa: BLE001 — restart recovery remains authoritative
+        logger.error(
+            "Voice job %s cancel reconciliation scheduling failed; "
+            "restart recovery required", job_id[:8],
+        )
 
 
 async def _run_voice_job_lifecycle(
@@ -3171,33 +3223,11 @@ async def _run_voice_job_lifecycle(
     except asyncio.CancelledError:
         # This is also safe after a cancellation arrived during a successful
         # shielded terminal write: fail_compat then observes a terminal row
-        # and is an idempotent no-op. ``already_cancelled=True`` (Terra/Sol
-        # r2): this cleanup gets no fresh CancelledError to bound it, and the
-        # abandoned primary write may still hold the registry lock — the
-        # cleanup wait must run against its own deadline, then give up and
-        # let the task finish cancelled (restart recovery / the registry-
-        # owned reconciliation remain authoritative for the durable row).
-        try:
-            await _persist_voice_terminal(
-                registry.fail_compat(
-                    job_id,
-                    JobFailure("cancelled", "Specialist job was cancelled."),
-                ),
-                registry=registry,
-                job_id=job_id,
-                specialist_role=specialist_role,
-                already_cancelled=True,
-            )
-        except asyncio.CancelledError:
-            # Bounded cleanup gave up — hand the still-RUNNING row to the
-            # registry-owned cancel retry (Sol r2), then finish cancelled.
-            try:
-                registry.schedule_cancel_reconciliation(job_id)
-            except Exception:  # noqa: BLE001 — restart recovery remains authoritative
-                logger.error(
-                    "Voice job %s cancel reconciliation scheduling failed; "
-                    "restart recovery required", job_id[:8],
-                )
+        # and is an idempotent no-op.
+        await _persist_cancelled_terminal(
+            registry=registry, job_id=job_id,
+            specialist_role=specialist_role,
+        )
         raise
 
 

@@ -349,3 +349,37 @@ def test_publish_fails_when_directory_fsync_fails(tmp_path, monkeypatch):
             name="p", repo="o/r", ref="v1", revision="git:" + "a" * 40,
             subdir="", src_root=root, store_root=tmp_path / "store",
             staging_root=tmp_path / "staging")
+
+
+def test_existing_destination_republish_enforces_dir_barrier(
+    tmp_path, monkeypatch,
+):
+    """Sol r3 (#330): a strict-fsync failure AFTER the rename leaves dest
+    installed; the idempotent dest.exists() re-publish then returned success
+    without ever completing the directory barriers — the registry reference
+    could still outlive the artifact across a power crash. The idempotent
+    path must re-run the barriers."""
+    import stat as stat_mod
+    import plugin_store
+
+    root = tmp_path / "src"
+    (root / ".claude-plugin").mkdir(parents=True)
+    (root / ".claude-plugin" / "plugin.json").write_text(
+        json.dumps({"name": "p", "version": "1.0.0"}), encoding="utf-8")
+
+    kwargs = dict(
+        name="p", repo="o/r", ref="v1", revision="git:" + "a" * 40,
+        subdir="", src_root=root, store_root=tmp_path / "store",
+        staging_root=tmp_path / "staging")
+    plugin_store.publish_from_tree(**kwargs)     # dest now installed
+
+    real_fsync = os.fsync
+
+    def failing_dir_fsync(fd: int) -> None:
+        if stat_mod.S_ISDIR(os.fstat(fd).st_mode):
+            raise OSError("simulated dir fsync failure")
+        real_fsync(fd)
+
+    monkeypatch.setattr(plugin_store.os, "fsync", failing_dir_fsync)
+    with pytest.raises(Exception):
+        plugin_store.publish_from_tree(**kwargs)

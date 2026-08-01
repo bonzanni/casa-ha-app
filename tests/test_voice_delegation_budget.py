@@ -1377,3 +1377,78 @@ class TestPostCancellationPersistenceBound:
         finally:
             wedged.set()
             await asyncio.sleep(0.01)
+
+
+@pytest.mark.asyncio
+class TestCancelledTerminalPersistence:
+    async def test_ordinary_failure_schedules_cancel_reconciliation(self):
+        """Terra r3 (#321): an ordinary failure of the cancellation write must
+        hand the row to CANCEL reconciliation — not the failure-flavored
+        persistence_failed fallback, which terminalizes FAILED and silently
+        skips the cancel contract."""
+        import tools as tm
+        from unittest.mock import MagicMock
+
+        registry = MagicMock()
+        registry.fail_compat = AsyncMock(
+            side_effect=OSError("snapshot write failed"))
+
+        await tm._persist_cancelled_terminal(
+            registry=registry, job_id="job-x", specialist_role="finance")
+
+        registry.schedule_cancel_reconciliation.assert_called_once_with(
+            "job-x")
+        registry.schedule_failure_reconciliation.assert_not_called()
+
+    async def test_bounded_giveup_schedules_cancel_reconciliation(
+        self, monkeypatch,
+    ):
+        """A wedged cancellation write gives up within the bound and still
+        hands the row to cancel reconciliation."""
+        import tools as tm
+        from unittest.mock import MagicMock
+
+        monkeypatch.setattr(
+            tm, "_VOICE_PERSIST_CANCEL_BOUND_S", 0.05, raising=False)
+
+        wedged = asyncio.Event()
+        registry = MagicMock()
+
+        def _wedge(*a, **kw):
+            return wedged.wait()
+
+        registry.fail_compat = MagicMock(side_effect=_wedge)
+
+        try:
+            await tm._persist_cancelled_terminal(
+                registry=registry, job_id="job-y", specialist_role="finance")
+        finally:
+            wedged.set()
+            await asyncio.sleep(0.01)
+
+        registry.schedule_cancel_reconciliation.assert_called_once_with(
+            "job-y")
+
+
+@pytest.mark.asyncio
+class TestCancellationPrecedence:
+    async def test_cancellation_precedes_operation_failure(self):
+        """Sol r3 (#321): when a cancellation was absorbed and the write then
+        FAILS, the failure must not eat the cancellation — returning the
+        op error sent _persist_voice_terminal into an UNBOUNDED fallback
+        (already_cancelled=False) with the original cancellation already
+        consumed, recreating the stranded-permit bug."""
+        import tools as tm
+
+        started = asyncio.Event()
+
+        async def failing_op():
+            started.set()
+            await asyncio.sleep(0.05)
+            raise OSError("late write failure")
+
+        outer = asyncio.create_task(tm._await_voice_persistence(failing_op()))
+        await started.wait()
+        outer.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await outer

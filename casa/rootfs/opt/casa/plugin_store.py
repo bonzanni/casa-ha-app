@@ -1052,6 +1052,16 @@ def _stage_and_swap(*, name, repo, ref, revision, subdir, staged: Path,
                                    artifact_id=artifact_id,
                                    manifest_name=manifest_name)
         if verdict is None:
+            # Sol r3 (#330): a prior publish may have crashed (or raised)
+            # AFTER the rename but BEFORE the durability barriers completed
+            # — this fast path used to return success without them, letting
+            # a retry hand the caller a registry-referenceable artifact
+            # whose directory entries were never made durable. Re-run the
+            # full barrier before reporting success (idempotent; publish is
+            # rare, the checksum pass above already walked the tree).
+            _fsync_tree(dest)
+            _fsync_dir_strict(dest.parent)
+            _fsync_dir_strict(Path(store_root))
             shutil.rmtree(staged, ignore_errors=True)
             return PublishResult(name, artifact_id, revision,
                                  manifest["version"], str(dest), manifest)
