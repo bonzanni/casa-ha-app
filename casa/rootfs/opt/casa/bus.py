@@ -319,10 +319,22 @@ class MessageBus:
                             context=msg.context,
                         ))
             except asyncio.CancelledError:
-                # Caller of bus.request cancelled us. Drop the pending
-                # future so nobody waits forever; do not synthesise an
-                # error response (the caller is already gone).
-                self.pending.pop(msg.id, None)
+                # Two distinct cancellation sources land here. Caller of
+                # bus.request cancelled us: request() already popped the
+                # pending future, this pop is a no-op, the caller is gone.
+                # Sol r1-1: unregister/evict cancelled us (#343b) while the
+                # CALLER is still waiting — resolve its future with the
+                # handler-error convention so it returns promptly instead
+                # of sitting out the full request timeout.
+                fut = self.pending.pop(msg.id, None)
+                if fut is not None and not fut.done():
+                    fut.set_result(BusMessage(
+                        type=MessageType.RESPONSE,
+                        source=msg.target,
+                        target=msg.source,
+                        content=f"handler error: cancelled: {msg.id}",
+                        reply_to=msg.id,
+                    ))
                 raise
             except Exception:
                 logger.exception(

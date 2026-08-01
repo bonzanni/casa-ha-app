@@ -632,3 +632,19 @@ async def test_assistant_config_grants_cleanup_tool():
     rt = root / "casa/rootfs/opt/casa/defaults/agents/assistant/runtime.yaml"
     allowed = yaml.safe_load(rt.read_text(encoding="utf-8"))["tools"]["allowed"]
     assert "mcp__casa-framework__cleanup_engagement_topics" in allowed
+
+
+async def test_sweep_pass_nag_not_consumed_when_channel_unready(monkeypatch):
+    """Sol r1-2: an unready channel (send() would log-and-drop) must not
+    consume the once-per-boot nag flag."""
+    result = dict(_CANNED_SWEEP)
+    result.update({"deleted": 0, "kept": 3, "needs_permission": True})
+    _sweep_recorder(monkeypatch, result=result)
+    tch = _telegram_channel()
+    tch.is_ready = False
+    cm = MagicMock()
+    cm.get.return_value = tch
+
+    await casa_core._sweep_engagement_topics(cm)
+    assert tch.send.await_count == 0
+    assert casa_core._topic_permission_notified is False

@@ -681,6 +681,28 @@ class TestCancellationStopsWork:
         await asyncio.gather(loop_task, return_exceptions=True)
         await asyncio.wait_for(cancelled.wait(), timeout=5)
 
+    async def test_evict_cancel_resolves_waiting_request_caller(self):
+        """Sol r1-1: when UNREGISTER (not the caller) cancels an in-flight
+        dispatch, the still-waiting request caller must get a prompt
+        handler-error response, not sit out the full request timeout."""
+        bus = MessageBus()
+        entered = asyncio.Event()
+
+        async def handler(msg):
+            entered.set()
+            await asyncio.sleep(60)
+
+        bus.register("b", handler)
+        loop_task = bus.start_agent_loop("b")
+        caller = asyncio.create_task(bus.request(_msg(target="b"), timeout=300))
+        await asyncio.wait_for(entered.wait(), timeout=5)
+
+        bus.unregister("b")
+        await asyncio.gather(loop_task, return_exceptions=True)
+
+        resp = await asyncio.wait_for(caller, timeout=5)
+        assert str(resp.content).startswith("handler error: cancelled")
+
     async def test_unregister_and_wait_awaits_dispatch_tasks(self):
         """unregister_and_wait returns only after consumer AND dispatch
         tasks have completed — the reload-teardown contract."""

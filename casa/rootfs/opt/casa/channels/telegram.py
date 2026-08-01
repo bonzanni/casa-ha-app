@@ -3521,6 +3521,15 @@ class TelegramChannel(Channel):
         """
         return TopicStreamHandle(self, topic_id)
 
+    @property
+    def is_ready(self) -> bool:
+        """True once the PTB application is started and sends can reach
+        Telegram. Sol r1-2 (#342): ``send()`` returns NORMALLY when the
+        app is absent (log-and-drop) — callers that gate a "delivered"
+        flag on send success must check this first, or a bring-up window
+        counts a dropped message as sent."""
+        return self._app is not None
+
     async def send(self, message: str, context: dict[str, Any]) -> None:
         """Send a complete message (block mode fallback)."""
         # Release THIS turn's lease BEFORE the availability guard — lease

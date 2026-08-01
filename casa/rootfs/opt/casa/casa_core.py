@@ -2051,8 +2051,11 @@ async def notify_plugin_health(
     )
     channel = (channel_manager.get("telegram")
                if channel_manager is not None else None)
-    if channel is None:
-        return  # no configured channel — retry next boot/mutation
+    # Sol r1-2: channel.send() log-and-drops while the PTB app is not
+    # started — is_ready must gate the "notified" mark too, or a
+    # bring-up/reconnect window counts a dropped alert as delivered.
+    if channel is None or not getattr(channel, "is_ready", True):
+        return  # no deliverable channel — retry next boot/mutation
     try:
         await channel.send(content, {"cid": new_cid()})
     except Exception as exc:  # noqa: BLE001
@@ -2119,7 +2122,10 @@ async def _sweep_engagement_topics(channel_manager: Any) -> None:
         # send — never an LLM turn. The flag is consumed only when the SEND
         # succeeds; the old bus enqueue consumed it before the outbound
         # dispatch ran, so a transient Telegram failure suppressed the
-        # reminder for every later sweep that boot.
+        # reminder for every later sweep that boot. Sol r1-2: is_ready
+        # gates the flag too — send() log-and-drops on an unstarted app.
+        if not getattr(channel, "is_ready", True):
+            return
         try:
             await channel.send(content, {"cid": new_cid()})
             _topic_permission_notified = True

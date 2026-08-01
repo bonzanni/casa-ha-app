@@ -14,11 +14,14 @@ pytestmark = [pytest.mark.asyncio, pytest.mark.unit]
 
 
 class _FakeChannel:
-    def __init__(self, raise_on_send=False):
+    def __init__(self, raise_on_send=False, is_ready=True):
         self.raise_on_send = raise_on_send
+        self.is_ready = is_ready
         self.sent = []
 
     async def send(self, message, context):
+        if not self.is_ready:
+            return  # TelegramChannel.send log-and-drops when not started
         if self.raise_on_send:
             raise RuntimeError("telegram down")
         self.sent.append((message, context))
@@ -117,3 +120,21 @@ async def test_warning_only_change_fires_dm(tmp_path):
     # marked notified → second call is a no-op (deduped).
     await casa_core.notify_plugin_health(cm, path=str(path))
     assert len(cm._channel.sent) == 1
+
+
+async def test_unready_channel_defers(tmp_path):
+    """Sol r1-2: TelegramChannel.send returns NORMALLY when the app is not
+    started (log-and-drop) — an unready channel must not consume the
+    fingerprints."""
+    p = _report(tmp_path, PluginIssue("p", "specialist:finance", "resolve",
+                                      "artifact_missing", None))
+    cm = _FakeChannelManager(_FakeChannel(is_ready=False))
+    await casa_core.notify_plugin_health(cm, path=str(p))
+    assert plugin_health.new_fingerprints(plugin_health.load_report(p))
+
+
+async def test_telegram_channel_exposes_is_ready_contract():
+    """The gate above relies on TelegramChannel.is_ready mirroring the
+    send() availability guard (_app is None → log-and-drop)."""
+    from channels.telegram import TelegramChannel
+    assert isinstance(getattr(TelegramChannel, "is_ready", None), property)
