@@ -515,6 +515,23 @@ class TestGuardArmingAndOracle:
             assert await self._denied(
                 clean, f"{form} && git push origin main"), form
 
+    async def test_cd_behind_wrapper_options_and_leading_redirects(
+            self, tmp_path: Path, bad_repo: Path):
+        """Terra/Sol r11 (#348): a wrapper's OWN options (`command -p cd`)
+        and leading redirections (`2>/dev/null cd …`) both sit before the
+        command word — every `cd` token counts, wherever it sits."""
+        forms = [
+            f"command -p cd {bad_repo}",
+            f"2>/dev/null cd {bad_repo}",
+            f"env -i cd {bad_repo}",
+            f"FOO=1 2>/dev/null cd {bad_repo}",
+        ]
+        for i, form in enumerate(forms):
+            clean = tmp_path / f"clean-prefix{i}"
+            clean.mkdir()
+            assert await self._denied(
+                clean, f"{form}; git push origin main"), form
+
     async def test_cd_chain_overflow_fails_closed(
             self, tmp_path: Path, git_plugin_repo: Path):
         """Terra/Sol r3 (#348): once the feasible-base set overflows, later

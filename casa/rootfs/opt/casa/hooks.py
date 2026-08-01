@@ -1799,13 +1799,6 @@ def _shell_words(segment: str) -> list[str]:
         return [w for w in segment.split() if w]
 
 
-# Words that keep the NEXT word in command position: wrapper builtins/prefix
-# commands and the shell keywords that introduce a command body. A `VAR=x`
-# assignment prefix does the same (matched separately).
-_CD_COMMAND_PREFIXES = frozenset({
-    "command", "builtin", "exec", "env", "nohup", "time", "sudo", "!",
-    "then", "else", "elif", "do", "if", "while", "until", "{",
-})
 # Tokens made only of these characters are COMMAND SEPARATORS (`;`, `;;`,
 # `&`, `&&`, `|`, `||`, `(`, `)`) — a redirection operator (`>`, `>&`, `<<`)
 # is not, so it never ends a command.
@@ -1823,11 +1816,16 @@ def _cd_command_words(text: str) -> list[list[str]]:
     so a quoted command word (`c''d`) collapses to `cd` while a quoted
     separator inside a PATH (`'/tmp/bad;repo'`) stays one word.
 
-    Line continuations are removed first (bash's own first pass). A word is
-    a `cd` when it lands in COMMAND POSITION — start of input, after a
-    separator token, or after a wrapper/keyword/assignment prefix. All
-    following words up to the next separator are returned: the caller scans
-    every one of them, so no "which word is the target" decision remains.
+    Line continuations are removed first (bash's own first pass). EVERY `cd`
+    token counts, wherever it sits: r11 showed that deciding whether a `cd`
+    is in "command position" is the same losing enumeration as the earlier
+    two (a wrapper's own options — `command -p cd` — and leading
+    redirections — `2>/dev/null cd /tmp` — both precede the command word).
+    A `cd` token that is really an ARGUMENT to something else
+    (`echo cd /tmp`) only ADDS candidate words, which is fail-closed and
+    costs one is_dir() each. All words up to the next separator are
+    returned: the caller scans every one, so no "which word is the target"
+    decision remains either.
     """
     import shlex
     text = text.replace("\\\n", "")  # bash line continuation
@@ -1870,26 +1868,19 @@ def _cd_command_words(text: str) -> list[list[str]]:
 
     out: list[list[str]] = []
     collecting: list[str] | None = None
-    at_command = True
     for tok in tokens:
         if tok and all(ch in _SEPARATOR_CHARS for ch in tok):
             if collecting is not None:
                 out.append(collecting)
                 collecting = None
-            at_command = True
+            continue
+        if tok == "cd":
+            if collecting is not None:
+                out.append(collecting)   # `cd a; cd b` without a separator
+            collecting = []
             continue
         if collecting is not None:
             collecting.append(tok)
-            continue
-        if at_command:
-            if tok == "cd":
-                collecting = []
-                at_command = False
-            elif tok in _CD_COMMAND_PREFIXES or "=" in tok:
-                pass  # still a command position
-            else:
-                at_command = False
-        # else: an argument of some other command — ignored
     if collecting is not None:
         out.append(collecting)
     return out
