@@ -573,7 +573,16 @@ class JobRegistry:
         """#321: registry-owned retry completing a job whose result was
         already returned to the caller but whose terminal snapshot write
         failed — the answer must never be discarded by restart recovery
-        (ORPHANED) just because the metadata write lost a race with disk."""
+        (ORPHANED) just because the metadata write lost a race with disk.
+
+        SYNC-DELEGATION ONLY (Terra r4): the empty result string here is not
+        a placeholder — it reproduces ``complete_delegation``'s intended
+        terminal exactly (``finish_compat(id, "")``). Sync results are
+        returned synchronously to the engager and are never persisted in the
+        durable job (created with ``delivery_state=NONE``), so there is no
+        stored result to clobber. Voice results go through
+        ``finish_voice_result`` and the ``_persist_voice_terminal`` fallback,
+        never this method."""
         self._schedule_terminal_reconciliation(
             job_id, lambda: self.finish_compat(job_id, ""))
 

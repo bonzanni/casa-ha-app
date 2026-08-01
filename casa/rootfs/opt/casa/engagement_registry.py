@@ -934,18 +934,37 @@ class EngagementRegistry:
         write failure that left the field mutated would silently disable every
         later retry while the durable file never received the ID (the record
         could not resume after a restart). A failed write restores the prior
-        value and PROPAGATES so the caller knows to retry."""
+        value and PROPAGATES so the caller knows to retry.
+
+        CANCELLATION-SAFE (Sol r4): a caller cancelled mid-``to_thread``
+        must not tear the retry guard from disk — the write SETTLES first
+        (shielded, absorbing repeated cancels, like ``create()``'s
+        settle-despite-cancel), then memory reflects the settled outcome:
+        committed ⇒ the sid stays (no compensation needed — a durable sid on
+        a cancelled caller is simply durable), failed ⇒ rolled back so the
+        next message retries. The original cancellation then propagates."""
         async with self._lock:
             rec = self._records.get(engagement_id)
             if rec is None:
                 return
             prior = rec.sdk_session_id
             rec.sdk_session_id = session_id
-            try:
-                await self._write_tombstone_locked(strict=True)
-            except Exception:
+            task = asyncio.ensure_future(
+                self._write_tombstone_locked(strict=True))
+            cancelled: asyncio.CancelledError | None = None
+            while not task.done():
+                try:
+                    await asyncio.shield(task)
+                except asyncio.CancelledError as exc:
+                    cancelled = exc       # settle first; re-raise after
+                except Exception:  # noqa: BLE001 — retrieved below
+                    break
+            if task.cancelled() or task.exception() is not None:
                 rec.sdk_session_id = prior
-                raise
+            if cancelled is not None:
+                raise cancelled
+            if task.exception() is not None:
+                raise task.exception()
 
     async def set_channel_state(
         self,
