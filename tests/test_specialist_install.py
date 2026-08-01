@@ -582,6 +582,115 @@ def test_commit_with_missing_required_config_yields_pending_configuration(tmp_pa
     assert not (tmp_path / "agents-specialists" / "mtg").exists()  # not materialized while pending
 
 
+def _secret_schema_inspection(tmp_path: Path) -> "specialist_install.InspectionResult":
+    """A component whose schema declares one required SECRET key (api_token)."""
+    root = _write_component(tmp_path / "component", slug="mtg")
+    manifest_path = root / "manifest.json"
+    manifest = json.loads(manifest_path.read_text())
+    (root / "config-schema.json").write_text(
+        json.dumps({"required": ["api_token"], "secret_names": ["api_token"]}), encoding="utf-8")
+    files = {
+        "role/role.yaml": (root / "role" / "role.yaml").read_bytes(),
+        "role/doctrine.md": (root / "role" / "doctrine.md").read_bytes(),
+        "config-schema.json": (root / "config-schema.json").read_bytes(),
+    }
+    manifest["checksum"] = compute_component_checksum(files)
+    manifest_path.write_text(json.dumps(manifest), encoding="utf-8")
+
+    from specialist_install import InspectionResult, compute_install_root_digest
+
+    component = load_specialist_component(root, manifest_path)
+    deps = resolve_dependency_closure(component, root)
+    root_digest = compute_install_root_digest(
+        component, deps, manifest_bytes=manifest_path.read_bytes())
+    return InspectionResult(
+        component_id=component.component_id, version=component.version, slug=component.slug,
+        component_checksum=component.checksum, root_digest=root_digest, mission="x",
+        default_persona_ref=component.default_persona_ref,
+        default_persona_checksum=component.default_persona_checksum,
+        required_config_names=(), required_secret_names=("api_token",), dependencies=deps,
+        staged_dir=root,
+    )
+
+
+def _acked(inspection: "specialist_install.InspectionResult", tmp_path: Path) -> SpecialistInstallAckStore:
+    acks = SpecialistInstallAckStore(path=tmp_path / "acks.json")
+    identity = install_consent_identity(
+        component_id=inspection.component_id, version=inspection.version,
+        root_digest=inspection.root_digest, slug=inspection.slug)
+    acks.record(identity=identity, component_id=inspection.component_id, version=inspection.version,
+                component_checksum=inspection.root_digest, slug=inspection.slug)
+    return acks
+
+
+def test_commit_rejects_a_secret_valued_config_key(tmp_path: Path) -> None:
+    """Pins INV-SPEC-006 (plain-channel refusal, #337). Red case demonstrated:
+    pre-fix, a secret-named key with a plaintext VALUE in `config` both
+    satisfied the requirement and was persisted verbatim into
+    desired.yaml/active.yaml (under /config, included in snapshots/backups) —
+    this test failed with state == "active" and the plaintext in the tuple."""
+    inspection = _secret_schema_inspection(tmp_path)
+    acks = _acked(inspection, tmp_path)
+
+    with pytest.raises(SpecialistInstallError) as exc_info:
+        commit_specialist_install(
+            inspection=inspection, config={"api_token": "hunter2"},
+            secret_names_provided=frozenset(), acks=acks,
+            specialists_dir=tmp_path / "specialists",
+            agents_specialists_dir=tmp_path / "agents-specialists",
+        )
+    assert exc_info.value.kind == "secret_value_in_config"
+    # Nothing staged: the refusal happens before any instance-dir mutation.
+    assert not (tmp_path / "specialists" / "mtg" / "desired.yaml").exists()
+    assert not (tmp_path / "specialists" / "mtg" / "active.yaml").exists()
+
+
+def test_commit_rejects_an_undeclared_secret_names_provided_entry(tmp_path: Path) -> None:
+    """#337 (validation gap noted in #331/#324): secret_names_provided may only
+    name keys the schema declares in secret_names — pre-fix, claiming a required
+    NON-secret key there falsely satisfied it with no value ever provided."""
+    inspection = _secret_schema_inspection(tmp_path)
+    # Rebuild the schema with a required non-secret key alongside the secret.
+    root = inspection.staged_dir
+    manifest_path = root / "manifest.json"
+    manifest = json.loads(manifest_path.read_text())
+    (root / "config-schema.json").write_text(
+        json.dumps({"required": ["timezone", "api_token"], "secret_names": ["api_token"]}),
+        encoding="utf-8")
+    files = {
+        "role/role.yaml": (root / "role" / "role.yaml").read_bytes(),
+        "role/doctrine.md": (root / "role" / "doctrine.md").read_bytes(),
+        "config-schema.json": (root / "config-schema.json").read_bytes(),
+    }
+    manifest["checksum"] = compute_component_checksum(files)
+    manifest_path.write_text(json.dumps(manifest), encoding="utf-8")
+    from specialist_install import InspectionResult, compute_install_root_digest
+    component = load_specialist_component(root, manifest_path)
+    deps = resolve_dependency_closure(component, root)
+    root_digest = compute_install_root_digest(
+        component, deps, manifest_bytes=manifest_path.read_bytes())
+    inspection = InspectionResult(
+        component_id=component.component_id, version=component.version, slug=component.slug,
+        component_checksum=component.checksum, root_digest=root_digest, mission="x",
+        default_persona_ref=component.default_persona_ref,
+        default_persona_checksum=component.default_persona_checksum,
+        required_config_names=("timezone",), required_secret_names=("api_token",),
+        dependencies=deps, staged_dir=root,
+    )
+    acks = _acked(inspection, tmp_path)
+
+    with pytest.raises(SpecialistInstallError) as exc_info:
+        commit_specialist_install(
+            inspection=inspection, config={},
+            secret_names_provided=frozenset({"timezone", "api_token"}), acks=acks,
+            specialists_dir=tmp_path / "specialists",
+            agents_specialists_dir=tmp_path / "agents-specialists",
+        )
+    assert exc_info.value.kind == "unknown_secret_name"
+    assert "timezone" in exc_info.value.detail
+    assert not (tmp_path / "specialists" / "mtg" / "desired.yaml").exists()
+
+
 # ---------------------------------------------------------------------------
 # upgrade_specialist / rollback_specialist / uninstall_specialist (Task N1c)
 # ---------------------------------------------------------------------------
@@ -720,6 +829,185 @@ def test_upgrade_with_missing_new_required_config_leaves_the_active_tuple_runnin
     assert instance.state == "pending-configuration"
     assert instance.active is not None  # the OLD (v1) active tuple keeps running
     assert instance.active.root != instance.desired.root  # desired is the staged v2 candidate
+
+
+def _v2_secret_schema_inspection(tmp_path: Path, v2: "specialist_install.InspectionResult") -> "specialist_install.InspectionResult":
+    """Rebuild the staged v2 with a schema declaring api_token as a required secret."""
+    manifest_path = v2.staged_dir / "manifest.json"
+    manifest = json.loads(manifest_path.read_text())
+    (v2.staged_dir / "config-schema.json").write_text(
+        json.dumps({"required": ["api_token"], "secret_names": ["api_token"]}), encoding="utf-8")
+    files = {
+        "role/role.yaml": (v2.staged_dir / "role" / "role.yaml").read_bytes(),
+        "role/doctrine.md": (v2.staged_dir / "role" / "doctrine.md").read_bytes(),
+        "config-schema.json": (v2.staged_dir / "config-schema.json").read_bytes(),
+    }
+    manifest["checksum"] = compute_component_checksum(files)
+    manifest_path.write_text(json.dumps(manifest), encoding="utf-8")
+    from specialist_install import InspectionResult, compute_install_root_digest, resolve_dependency_closure
+    component = load_specialist_component(v2.staged_dir, manifest_path)
+    deps = resolve_dependency_closure(component, v2.staged_dir)
+    root_digest = compute_install_root_digest(
+        component, deps, manifest_bytes=manifest_path.read_bytes())
+    return InspectionResult(
+        component_id=component.component_id, version=component.version, slug=component.slug,
+        component_checksum=component.checksum, root_digest=root_digest, mission="x",
+        default_persona_ref=component.default_persona_ref,
+        default_persona_checksum=component.default_persona_checksum,
+        required_config_names=(), required_secret_names=("api_token",),
+        dependencies=deps, staged_dir=v2.staged_dir,
+    )
+
+
+def test_upgrade_rejects_a_secret_valued_config_key(tmp_path: Path) -> None:
+    """#337 (upgrade arm): the same plaintext-secret refusal applies to
+    upgrade_specialist — and the refusal leaves the v1 active tuple untouched."""
+    from specialist_install import upgrade_specialist
+
+    specialists_dir, agents_specialists_dir, v1 = _installed_mtg(tmp_path)
+    v2 = _v2_secret_schema_inspection(tmp_path, _v2_inspection(tmp_path))
+    acks = _acked(v2, tmp_path)
+    active_before = (specialists_dir / "mtg" / "active.yaml").read_bytes()
+
+    with pytest.raises(SpecialistInstallError) as exc_info:
+        upgrade_specialist(
+            slug="mtg", inspection=v2, config={"api_token": "hunter2"},
+            secret_names_provided=frozenset(), acks=acks,
+            specialists_dir=specialists_dir, agents_specialists_dir=agents_specialists_dir,
+        )
+    assert exc_info.value.kind == "secret_value_in_config"
+    assert (specialists_dir / "mtg" / "active.yaml").read_bytes() == active_before
+
+
+def test_upgrade_strips_stale_plaintext_secret_keys_from_the_carried_snapshot(tmp_path: Path) -> None:
+    """Pins INV-SPEC-006 (upgrade strip, #337). Red case demonstrated: pre-fix
+    the upgrade merge kept secret-named keys (known_keys included secret_names),
+    so a legacy plaintext secret in active.yaml's config_snapshot was carried
+    into the new committed tuple — this test failed with "api_token" present.
+    The secret channel (secret_names_provided) satisfies the requirement
+    instead."""
+    from specialist_install import upgrade_specialist
+    from personality_binding import load_instance_tuple
+
+    specialists_dir, agents_specialists_dir, v1 = _installed_mtg(tmp_path)
+    # Simulate the pre-fix plaintext persistence by hand-editing active.yaml
+    # (config_snapshot content is not digest-checked — only the binding is).
+    active_path = specialists_dir / "mtg" / "active.yaml"
+    raw = yaml.safe_load(active_path.read_text(encoding="utf-8"))
+    raw["config_snapshot"] = {"api_token": "hunter2-legacy-plaintext"}
+    active_path.write_text(yaml.safe_dump(raw, sort_keys=False), encoding="utf-8")
+
+    v2 = _v2_secret_schema_inspection(tmp_path, _v2_inspection(tmp_path))
+    acks = _acked(v2, tmp_path)
+
+    instance = upgrade_specialist(
+        slug="mtg", inspection=v2, config={},
+        secret_names_provided=frozenset({"api_token"}), acks=acks,
+        specialists_dir=specialists_dir, agents_specialists_dir=agents_specialists_dir,
+    )
+    assert instance.state == "active"
+    committed = load_instance_tuple(specialists_dir / "mtg" / "active.yaml")
+    assert "api_token" not in committed.config_snapshot
+    # Sol r1: commit_desired_to_active copies the OLD (plaintext-bearing)
+    # active into active.prior.yaml — which the config git repo tracks and
+    # rollback restores verbatim. The prior must be sanitized too.
+    prior = load_instance_tuple(specialists_dir / "mtg" / "active.prior.yaml")
+    assert prior is not None
+    assert "api_token" not in prior.config_snapshot
+
+
+def test_upgrade_reclassifying_a_secret_as_plain_does_not_carry_its_plaintext(tmp_path: Path) -> None:
+    """Terra r2 (#337): the carried-snapshot strip must use the PRIOR schema's
+    secret_names too — if the incoming component reclassifies a key from
+    secret to plain-required, the old plaintext must not ride the carry-over
+    into the new active.yaml. The operator supplies a fresh plain value (or
+    the upgrade lands pending-configuration)."""
+    from specialist_install import upgrade_specialist
+    from personality_binding import load_instance_tuple
+
+    # v1 whose CAS schema DECLARES api_token secret; installed via the secret
+    # channel, then hand-edited to simulate a pre-#337 plaintext snapshot.
+    v1 = _secret_schema_inspection(tmp_path)
+    acks_v1 = _acked(v1, tmp_path)
+    specialists_dir = tmp_path / "specialists"
+    agents_specialists_dir = tmp_path / "agents-specialists"
+    commit_specialist_install(
+        inspection=v1, config={}, secret_names_provided=frozenset({"api_token"}),
+        acks=acks_v1, specialists_dir=specialists_dir,
+        agents_specialists_dir=agents_specialists_dir,
+    )
+    active_path = specialists_dir / "mtg" / "active.yaml"
+    raw = yaml.safe_load(active_path.read_text(encoding="utf-8"))
+    raw["config_snapshot"] = {"api_token": "hunter2-legacy-plaintext"}
+    active_path.write_text(yaml.safe_dump(raw, sort_keys=False), encoding="utf-8")
+
+    # v2 reclassifies api_token as required NON-secret.
+    v2 = _v2_inspection(tmp_path)
+    manifest_path = v2.staged_dir / "manifest.json"
+    manifest = json.loads(manifest_path.read_text())
+    (v2.staged_dir / "config-schema.json").write_text(
+        json.dumps({"required": ["api_token"], "secret_names": []}), encoding="utf-8")
+    files = {
+        "role/role.yaml": (v2.staged_dir / "role" / "role.yaml").read_bytes(),
+        "role/doctrine.md": (v2.staged_dir / "role" / "doctrine.md").read_bytes(),
+        "config-schema.json": (v2.staged_dir / "config-schema.json").read_bytes(),
+    }
+    manifest["checksum"] = compute_component_checksum(files)
+    manifest_path.write_text(json.dumps(manifest), encoding="utf-8")
+    from specialist_install import InspectionResult, compute_install_root_digest
+    component = load_specialist_component(v2.staged_dir, manifest_path)
+    deps = resolve_dependency_closure(component, v2.staged_dir)
+    root_digest = compute_install_root_digest(
+        component, deps, manifest_bytes=manifest_path.read_bytes())
+    v2 = InspectionResult(
+        component_id=component.component_id, version=component.version, slug=component.slug,
+        component_checksum=component.checksum, root_digest=root_digest, mission="x",
+        default_persona_ref=component.default_persona_ref,
+        default_persona_checksum=component.default_persona_checksum,
+        required_config_names=("api_token",), required_secret_names=(),
+        dependencies=deps, staged_dir=v2.staged_dir,
+    )
+    acks_v2 = _acked(v2, tmp_path)
+
+    instance = upgrade_specialist(
+        slug="mtg", inspection=v2, config={}, secret_names_provided=frozenset(),
+        acks=acks_v2, specialists_dir=specialists_dir,
+        agents_specialists_dir=agents_specialists_dir,
+    )
+    # No fresh plain value supplied → pending-configuration, never a silent
+    # carry-over of the old secret's plaintext.
+    assert instance.state == "pending-configuration"
+    staged = load_instance_tuple(specialists_dir / "mtg" / "desired.yaml")
+    assert "api_token" not in staged.config_snapshot
+
+
+def test_rollback_after_upgrade_does_not_restore_stripped_plaintext(tmp_path: Path) -> None:
+    """Sol r1 (#337, rollback arm): a rollback restores active.prior.yaml —
+    with the prior sanitized at upgrade time, the restored active must not
+    resurrect the legacy plaintext secret."""
+    from specialist_install import rollback_specialist, upgrade_specialist
+    from personality_binding import load_instance_tuple
+
+    specialists_dir, agents_specialists_dir, v1 = _installed_mtg(tmp_path)
+    active_path = specialists_dir / "mtg" / "active.yaml"
+    raw = yaml.safe_load(active_path.read_text(encoding="utf-8"))
+    raw["config_snapshot"] = {"api_token": "hunter2-legacy-plaintext"}
+    active_path.write_text(yaml.safe_dump(raw, sort_keys=False), encoding="utf-8")
+
+    v2 = _v2_secret_schema_inspection(tmp_path, _v2_inspection(tmp_path))
+    acks = _acked(v2, tmp_path)
+    upgrade_specialist(
+        slug="mtg", inspection=v2, config={},
+        secret_names_provided=frozenset({"api_token"}), acks=acks,
+        specialists_dir=specialists_dir, agents_specialists_dir=agents_specialists_dir,
+    )
+
+    rolled_back = rollback_specialist(
+        slug="mtg", specialists_dir=specialists_dir,
+        agents_specialists_dir=agents_specialists_dir)
+    assert "api_token" not in rolled_back.active.config_snapshot
+    restored = load_instance_tuple(specialists_dir / "mtg" / "active.yaml")
+    assert "api_token" not in restored.config_snapshot
 
 
 def test_rollback_restores_the_prior_tuple(tmp_path: Path) -> None:
@@ -1188,3 +1476,236 @@ def test_parse_component_root_rejects_a_non_hex_checksum_suffix(tmp_path: Path) 
     store = tmp_path / "store"
     resolved = cas_store_dir(parse_component_root(good)[2], store_root=store)
     assert store in resolved.parents
+
+
+def test_boot_sweep_scrubs_legacy_plaintext_from_all_tuple_snapshots(tmp_path: Path) -> None:
+    """Sol r2 (#337): a pre-guard install keeps plaintext in tracked tuple
+    files until that slug's next upgrade — and the post-commit prior
+    sanitization has a crash window. The boot sweep (which runs BEFORE the
+    boot config-git snapshot) scrubs every persisted snapshot against its own
+    component's secret_names declaration."""
+    from specialist_install import sanitize_specialist_snapshots
+    from personality_binding import load_instance_tuple
+
+    v1 = _secret_schema_inspection(tmp_path)
+    acks = _acked(v1, tmp_path)
+    specialists_dir = tmp_path / "specialists"
+    commit_specialist_install(
+        inspection=v1, config={}, secret_names_provided=frozenset({"api_token"}),
+        acks=acks, specialists_dir=specialists_dir,
+        agents_specialists_dir=tmp_path / "agents-specialists",
+    )
+    slug_dir = specialists_dir / "mtg"
+    active_raw = yaml.safe_load((slug_dir / "active.yaml").read_text(encoding="utf-8"))
+    active_raw["config_snapshot"] = {"api_token": "hunter2-legacy-plaintext"}
+    (slug_dir / "active.yaml").write_text(yaml.safe_dump(active_raw, sort_keys=False), encoding="utf-8")
+    (slug_dir / "active.prior.yaml").write_text(yaml.safe_dump(active_raw, sort_keys=False), encoding="utf-8")
+    error_raw = dict(active_raw)
+    error_raw["_error_reason"] = "compile boom"
+    (slug_dir / "desired.error.yaml").write_text(yaml.safe_dump(error_raw, sort_keys=False), encoding="utf-8")
+
+    cleaned = sanitize_specialist_snapshots(specialists_dir=specialists_dir)
+
+    assert cleaned == 3
+    for filename in ("active.yaml", "active.prior.yaml", "desired.error.yaml"):
+        payload = yaml.safe_load((slug_dir / filename).read_text(encoding="utf-8"))
+        assert "api_token" not in payload["config_snapshot"], filename
+    # The scrub preserves everything else: the tuples still load, and the
+    # error file keeps its reason.
+    assert load_instance_tuple(slug_dir / "active.yaml") is not None
+    assert load_instance_tuple(slug_dir / "active.prior.yaml") is not None
+    error_payload = yaml.safe_load((slug_dir / "desired.error.yaml").read_text(encoding="utf-8"))
+    assert error_payload["_error_reason"] == "compile boom"
+    # Idempotent: a second sweep finds nothing to clean.
+    assert sanitize_specialist_snapshots(specialists_dir=specialists_dir) == 0
+
+
+def _delete_stored_schema(specialists_dir: Path) -> None:
+    """Simulate a damaged CAS: remove the stored component's config schema."""
+    for schema_file in (specialists_dir / "store").rglob("config-schema.json"):
+        schema_file.unlink()
+
+
+def test_upgrade_with_unloadable_prior_schema_carries_nothing(tmp_path: Path) -> None:
+    """Sol r3 (#337): an unloadable prior CAS schema must fail CLOSED — the
+    carry-over is dropped entirely rather than trusting an empty secret-name
+    set and riding legacy plaintext into the new tuple."""
+    from specialist_install import upgrade_specialist
+    from personality_binding import load_instance_tuple
+
+    specialists_dir, agents_specialists_dir, v1 = _installed_mtg(tmp_path)
+    active_path = specialists_dir / "mtg" / "active.yaml"
+    raw = yaml.safe_load(active_path.read_text(encoding="utf-8"))
+    raw["config_snapshot"] = {"api_token": "hunter2-legacy-plaintext"}
+    active_path.write_text(yaml.safe_dump(raw, sort_keys=False), encoding="utf-8")
+    _delete_stored_schema(specialists_dir)
+
+    # v2 declares api_token as plain-required — the reclassification case.
+    v2 = _v2_inspection(tmp_path)
+    manifest_path = v2.staged_dir / "manifest.json"
+    manifest = json.loads(manifest_path.read_text())
+    (v2.staged_dir / "config-schema.json").write_text(
+        json.dumps({"required": ["api_token"], "secret_names": []}), encoding="utf-8")
+    files = {
+        "role/role.yaml": (v2.staged_dir / "role" / "role.yaml").read_bytes(),
+        "role/doctrine.md": (v2.staged_dir / "role" / "doctrine.md").read_bytes(),
+        "config-schema.json": (v2.staged_dir / "config-schema.json").read_bytes(),
+    }
+    manifest["checksum"] = compute_component_checksum(files)
+    manifest_path.write_text(json.dumps(manifest), encoding="utf-8")
+    from specialist_install import InspectionResult, compute_install_root_digest
+    component = load_specialist_component(v2.staged_dir, manifest_path)
+    deps = resolve_dependency_closure(component, v2.staged_dir)
+    root_digest = compute_install_root_digest(
+        component, deps, manifest_bytes=manifest_path.read_bytes())
+    v2 = InspectionResult(
+        component_id=component.component_id, version=component.version, slug=component.slug,
+        component_checksum=component.checksum, root_digest=root_digest, mission="x",
+        default_persona_ref=component.default_persona_ref,
+        default_persona_checksum=component.default_persona_checksum,
+        required_config_names=("api_token",), required_secret_names=(),
+        dependencies=deps, staged_dir=v2.staged_dir,
+    )
+    acks = _acked(v2, tmp_path)
+
+    instance = upgrade_specialist(
+        slug="mtg", inspection=v2, config={}, secret_names_provided=frozenset(),
+        acks=acks, specialists_dir=specialists_dir,
+        agents_specialists_dir=agents_specialists_dir,
+    )
+    assert instance.state == "pending-configuration"
+    staged = load_instance_tuple(specialists_dir / "mtg" / "desired.yaml")
+    assert "api_token" not in staged.config_snapshot
+
+
+def test_boot_sweep_with_unloadable_schema_scrubs_every_key(tmp_path: Path) -> None:
+    """Sol r3 (#337): the boot sweep must not silently skip a snapshot whose
+    component schema is unloadable — it scrubs EVERY snapshot key instead, so
+    the config-git snapshot that follows can never commit unclassifiable
+    plaintext."""
+    from specialist_install import sanitize_specialist_snapshots
+
+    v1 = _secret_schema_inspection(tmp_path)
+    acks = _acked(v1, tmp_path)
+    specialists_dir = tmp_path / "specialists"
+    commit_specialist_install(
+        inspection=v1, config={}, secret_names_provided=frozenset({"api_token"}),
+        acks=acks, specialists_dir=specialists_dir,
+        agents_specialists_dir=tmp_path / "agents-specialists",
+    )
+    slug_dir = specialists_dir / "mtg"
+    raw = yaml.safe_load((slug_dir / "active.yaml").read_text(encoding="utf-8"))
+    raw["config_snapshot"] = {"api_token": "hunter2", "timezone": "UTC"}
+    (slug_dir / "active.yaml").write_text(yaml.safe_dump(raw, sort_keys=False), encoding="utf-8")
+    _delete_stored_schema(specialists_dir)
+
+    cleaned = sanitize_specialist_snapshots(specialists_dir=specialists_dir)
+
+    assert cleaned == 1
+    payload = yaml.safe_load((slug_dir / "active.yaml").read_text(encoding="utf-8"))
+    assert payload["config_snapshot"] == {}
+
+
+def test_tampered_but_parseable_schema_fails_closed(tmp_path: Path) -> None:
+    """Sol r4 (#337): a damaged schema that still parses (e.g. truncated to
+    `{}`) must not be trusted as "declares no secrets" — the component
+    checksum no longer matches, so the strip treats every key as potentially
+    secret. A GENUINE no-secret schema (checksum intact) keeps its meaning."""
+    from specialist_install import sanitize_specialist_snapshots
+
+    v1 = _secret_schema_inspection(tmp_path)
+    acks = _acked(v1, tmp_path)
+    specialists_dir = tmp_path / "specialists"
+    commit_specialist_install(
+        inspection=v1, config={}, secret_names_provided=frozenset({"api_token"}),
+        acks=acks, specialists_dir=specialists_dir,
+        agents_specialists_dir=tmp_path / "agents-specialists",
+    )
+    slug_dir = specialists_dir / "mtg"
+    raw = yaml.safe_load((slug_dir / "active.yaml").read_text(encoding="utf-8"))
+    raw["config_snapshot"] = {"api_token": "hunter2", "timezone": "UTC"}
+    (slug_dir / "active.yaml").write_text(yaml.safe_dump(raw, sort_keys=False), encoding="utf-8")
+    for schema_file in (specialists_dir / "store").rglob("config-schema.json"):
+        schema_file.chmod(0o600)
+        schema_file.write_text("{}", encoding="utf-8")  # parseable, checksum-broken
+
+    assert sanitize_specialist_snapshots(specialists_dir=specialists_dir) == 1
+    payload = yaml.safe_load((slug_dir / "active.yaml").read_text(encoding="utf-8"))
+    assert payload["config_snapshot"] == {}
+
+
+def test_boot_sweep_scrubs_a_snapshot_with_an_unusable_root(tmp_path: Path) -> None:
+    """Sol r4 (#337): a non-empty snapshot whose `root` is missing or
+    malformed cannot be classified — it must be scrubbed entirely, never
+    silently skipped into the config-git snapshot that follows."""
+    from specialist_install import sanitize_specialist_snapshots
+
+    slug_dir = tmp_path / "specialists" / "mtg"
+    slug_dir.mkdir(parents=True)
+    (slug_dir / "active.prior.yaml").write_text(yaml.safe_dump({
+        "api_version": "casa.instance-tuple/v1",
+        "config_snapshot": {"api_token": "hunter2"},
+        "config_digest": "sha256:beef",
+    }, sort_keys=False), encoding="utf-8")
+
+    assert sanitize_specialist_snapshots(specialists_dir=tmp_path / "specialists") == 1
+    payload = yaml.safe_load((slug_dir / "active.prior.yaml").read_text(encoding="utf-8"))
+    assert payload["config_snapshot"] == {}
+
+
+def test_consistently_rewritten_schema_and_manifest_fails_closed(tmp_path: Path) -> None:
+    """Sol r5 (#337): rewriting config-schema.json AND updating manifest.json's
+    internal checksum keeps load_specialist_component happy — only recomputing
+    the FULL root digest and comparing it to the digest embedded in the
+    component root detects the tamper. The strip must fail closed."""
+    from specialist_install import sanitize_specialist_snapshots
+
+    v1 = _secret_schema_inspection(tmp_path)
+    acks = _acked(v1, tmp_path)
+    specialists_dir = tmp_path / "specialists"
+    commit_specialist_install(
+        inspection=v1, config={}, secret_names_provided=frozenset({"api_token"}),
+        acks=acks, specialists_dir=specialists_dir,
+        agents_specialists_dir=tmp_path / "agents-specialists",
+    )
+    slug_dir = specialists_dir / "mtg"
+    raw = yaml.safe_load((slug_dir / "active.yaml").read_text(encoding="utf-8"))
+    raw["config_snapshot"] = {"api_token": "hunter2", "timezone": "UTC"}
+    (slug_dir / "active.yaml").write_text(yaml.safe_dump(raw, sort_keys=False), encoding="utf-8")
+
+    for schema_file in (specialists_dir / "store").rglob("config-schema.json"):
+        cas_dir = schema_file.parent
+        schema_file.chmod(0o600)
+        schema_file.write_text("{}", encoding="utf-8")
+        manifest_path = cas_dir / "manifest.json"
+        manifest = json.loads(manifest_path.read_text())
+        files = {
+            "role/role.yaml": (cas_dir / "role" / "role.yaml").read_bytes(),
+            "role/doctrine.md": (cas_dir / "role" / "doctrine.md").read_bytes(),
+            "config-schema.json": schema_file.read_bytes(),
+        }
+        manifest["checksum"] = compute_component_checksum(files)
+        manifest_path.chmod(0o600)
+        manifest_path.write_text(json.dumps(manifest), encoding="utf-8")
+
+    assert sanitize_specialist_snapshots(specialists_dir=specialists_dir) == 1
+    payload = yaml.safe_load((slug_dir / "active.yaml").read_text(encoding="utf-8"))
+    assert payload["config_snapshot"] == {}
+
+
+def test_boot_sweep_handles_mixed_type_snapshot_keys(tmp_path: Path) -> None:
+    """Sol r5 (#337): mixed-type mapping keys must not TypeError out of the
+    fail-closed scrub into the broad skip handler."""
+    from specialist_install import sanitize_specialist_snapshots
+
+    slug_dir = tmp_path / "specialists" / "mtg"
+    slug_dir.mkdir(parents=True)
+    (slug_dir / "active.prior.yaml").write_text(yaml.safe_dump({
+        "api_version": "casa.instance-tuple/v1",
+        "config_snapshot": {"api_token": "hunter2", 1: "x"},
+        "config_digest": "sha256:beef",
+    }, sort_keys=False), encoding="utf-8")
+
+    assert sanitize_specialist_snapshots(specialists_dir=tmp_path / "specialists") == 1
+    payload = yaml.safe_load((slug_dir / "active.prior.yaml").read_text(encoding="utf-8"))
+    assert payload["config_snapshot"] == {}

@@ -225,3 +225,17 @@ def test_a_duplicate_ledger_item_is_refused(tmp_path):
 def test_a_missing_ledger_is_a_finding_not_a_traceback(tmp_path):
     root = _repo(tmp_path)
     assert any("coverage.yaml" in p for p in coverage_ledger.check(root))
+
+
+def test_manifest_docs_includes_shard_entries(tmp_path):
+    """#367: a coverage assignment to a document manifested only in a
+    docs/manifest.d/ shard must be recognized — pre-shard the ledger read only
+    the root manifest and would refuse the assignment as unknown."""
+    (tmp_path / "docs" / "manifest.d").mkdir(parents=True)
+    (tmp_path / "docs" / "manifest.yaml").write_text(
+        "- doc: manifest.yaml\n  kind: meta\n  summary: x\n")
+    (tmp_path / "docs" / "manifest.d" / "architecture.yaml").write_text(
+        "- doc: architecture/x.md\n  summary: y\n")
+    docs = coverage_ledger._manifest_docs(tmp_path)
+    assert "architecture/x.md" in docs
+    assert "manifest.yaml" in docs

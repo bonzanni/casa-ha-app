@@ -1858,6 +1858,14 @@ class Agent:
             self._unsub_reset()
         except Exception:  # noqa: BLE001
             pass
+        # Sol r1 (#345): settle detached background cold-retains while the
+        # loop is still alive — cancelling here runs retain_cold_session's
+        # CancelledError arm (a synchronous spool write) deterministically,
+        # instead of relying on the runtime's final task-cancellation sweep.
+        for task in list(self._bg_tasks):
+            task.cancel()
+        if self._bg_tasks:
+            await asyncio.gather(*list(self._bg_tasks), return_exceptions=True)
         await self._pool.aclose()
 
     async def _maybe_prepend_health_notice(self, text: str) -> str:

@@ -47,6 +47,15 @@ _TMP_SWEEP_SECS = 60
 _TS_RE = re.compile(r"^t=(\d{1,19}),v0=([0-9a-f]{1,128})$")
 
 
+def usable_webhook_secret(value: str) -> str:
+    """#333 (Terra r1): never use an unresolved ``op://`` reference as an HMAC
+    key. A vault path is a predictable, non-secret string — verifying against
+    it is fail-open (anything that knows the reference can sign). Returning
+    empty means every authenticated request is rejected loudly until
+    resolution succeeds or the operator inlines the secret."""
+    return "" if value.startswith("op://") else value
+
+
 def _ct_eq(a: bytes, b: bytes) -> bool:
     return hmac.compare_digest(a, b)
 

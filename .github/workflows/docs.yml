@@ -122,6 +122,14 @@ jobs:
           # until the corpus first lands and false forever after.
           if git cat-file -e "$base:docs/manifest.yaml" 2>/dev/null; then
             git show "$base:docs/manifest.yaml" > "$RUNNER_TEMP/base-manifest.yaml"
+            # #367: base-side claims live in manifest shards too. Each shard is a
+            # top-level YAML list, so plain concatenation yields one valid list.
+            # `grep || true`: a base with no shards (grep exit 1) must not kill
+            # the job under pipefail — that is every PR until shards first land.
+            git ls-tree --name-only "$base" -- docs/manifest.d/ 2>/dev/null \
+              | { grep '\.yaml$' || true; } | while read -r shard; do
+                git show "$base:$shard" >> "$RUNNER_TEMP/base-manifest.yaml"
+              done
           else
             echo "note: $base has no docs/manifest.yaml yet — no base-side claims to carry"
             : > "$RUNNER_TEMP/base-manifest.yaml"

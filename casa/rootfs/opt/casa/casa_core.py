@@ -2193,6 +2193,10 @@ async def main() -> None:
         "CLAUDE_CODE_OAUTH_TOKEN",
         "TELEGRAM_BOT_TOKEN",
         "WEBHOOK_SECRET",
+        # #277: context7_api_key is password-typed too — exported by
+        # svc-casa/run; without this entry an op:// value reached the
+        # context7 MCP server as the literal reference.
+        "CONTEXT7_API_KEY",
     )
     for _var in _PASSWORD_ENV_VARS:
         _raw = os.environ.get(_var, "")
@@ -2302,7 +2306,14 @@ async def main() -> None:
     _maybe_register_n8n(mcp_registry)
 
     # 5b. Config git repo — initialise (idempotent) and snapshot any
-    # manual edits that landed between boots.
+    # manual edits that landed between boots. #337 (Sol r2): scrub legacy
+    # plaintext secret keys from persisted specialist tuple snapshots FIRST,
+    # so the boot snapshot below can never commit them to the config repo.
+    try:
+        from specialist_install import sanitize_specialist_snapshots
+        sanitize_specialist_snapshots()
+    except Exception:  # noqa: BLE001 — best-effort; never boot-fatal
+        logger.warning("specialist snapshot scrub failed", exc_info=True)
     try:
         init_repo(CONFIG_DIR)
         snapshot_manual_edits(CONFIG_DIR)
@@ -2597,6 +2608,19 @@ async def main() -> None:
         if os.path.exists(secret_path):
             with open(secret_path, "r", encoding="utf-8") as fh:
                 webhook_secret = fh.read().strip()
+    # #333 (Terra r1): if op:// resolution failed above, the env (and the file,
+    # for an op://-valued option) still holds the literal reference — a
+    # predictable string that must never become the HMAC verification key.
+    # Blank it: every authenticated request is rejected loudly instead.
+    from webhook_auth import usable_webhook_secret
+    _usable = usable_webhook_secret(webhook_secret)
+    if webhook_secret and not _usable:
+        logger.error(
+            "webhook secret is an unresolved op:// reference — refusing to use "
+            "the literal as an HMAC key; webhook/voice authentication will "
+            "reject all requests until resolution succeeds (check the "
+            "1Password service-account token) or the secret is inlined")
+    webhook_secret = _usable
     if webhook_secret:
         logger.info("Webhook secret loaded (%d chars)", len(webhook_secret))
 

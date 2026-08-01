@@ -354,13 +354,20 @@ def _load_ledger(repo_root: Path) -> tuple[list[dict], list[str]]:
 
 
 def _manifest_docs(repo_root: Path) -> set[str]:
-    try:
-        raw = yaml.safe_load((repo_root / "docs" / "manifest.yaml").read_text())
-    except (OSError, yaml.YAMLError):
-        return set()
-    if not isinstance(raw, list):
-        return set()
-    return {e["doc"] for e in raw if isinstance(e, dict) and isinstance(e.get("doc"), str)}
+    docs_dir = repo_root / "docs"
+    # #367: the manifest shards at its index ceiling — read the root plus every
+    # docs/manifest.d/*.yaml shard, mirroring verify_docs._manifest_files.
+    sources = [docs_dir / "manifest.yaml"] + sorted((docs_dir / "manifest.d").glob("*.yaml"))
+    out: set[str] = set()
+    for source in sources:
+        try:
+            raw = yaml.safe_load(source.read_text())
+        except (OSError, yaml.YAMLError):
+            continue
+        if not isinstance(raw, list):
+            continue
+        out |= {e["doc"] for e in raw if isinstance(e, dict) and isinstance(e.get("doc"), str)}
+    return out
 
 
 def check(repo_root: Path) -> list[str]:

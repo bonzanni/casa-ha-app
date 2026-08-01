@@ -17,7 +17,7 @@ from datetime import datetime, timedelta, timezone
 from typing import Awaitable, Callable
 
 from channel_policy import writes_to_bank
-from session_saver import freshness_window, save_session
+from session_saver import freshness_window, retry_spooled_cold_retains, save_session
 
 logger = logging.getLogger(__name__)
 
@@ -134,6 +134,16 @@ class FreshnessReaper:
                 raise
             except Exception as exc:  # noqa: BLE001 — one bad entry must not block the rest
                 logger.error("freshness reaper: entry %s failed: %s", key, exc, exc_info=True)
+
+        # #345: drive the durable retry spool for failed gap retains
+        # (retain_cold_session runs registry-decoupled, so this sweep is its
+        # only retry path). Guarded — a spool failure must not kill the sweep.
+        try:
+            await retry_spooled_cold_retains(self._sem)
+        except asyncio.CancelledError:
+            raise
+        except Exception:  # noqa: BLE001
+            logger.error("freshness reaper: cold-retain retry pass failed", exc_info=True)
 
     async def _run(self) -> None:
         try:

@@ -28,3 +28,22 @@ def resolve(value: str) -> str:
         ) from exc
     except subprocess.TimeoutExpired as exc:
         raise RuntimeError(f"Timeout resolving {value!r}") from exc
+    except OSError as exc:
+        # #345: an absent/broken `op` binary raises FileNotFoundError (an
+        # OSError) from subprocess.run. Callers handle only RuntimeError —
+        # translate so a missing binary degrades with a warning instead of
+        # aborting secret-consuming startup.
+        raise RuntimeError(f"op CLI unavailable resolving {value!r}: {exc}") from exc
+
+
+# Bound at import time so invalidate_cache always reaches the REAL cached
+# function even when tests monkeypatch the `resolve` module attribute.
+_CACHED_RESOLVE = resolve
+
+
+def invalidate_cache() -> None:
+    """#345: drop every cached resolution so the next :func:`resolve` re-reads
+    1Password. Reload paths call this first — without it a rotated field keeps
+    feeding the revoked plaintext (cached under the unchanged op:// reference)
+    for the container's lifetime while the reload reports success."""
+    _CACHED_RESOLVE.cache_clear()

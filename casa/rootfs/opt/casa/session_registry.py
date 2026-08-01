@@ -137,6 +137,21 @@ class SessionRegistry:
                     loaded = json.load(fh)
                 if not isinstance(loaded, dict):
                     raise ValueError(f"expected dict, got {type(loaded).__name__}")
+                # #345: validate each ENTRY too — a structurally corrupt value
+                # (list/str/None) would otherwise crash register()'s
+                # deepcopy+update, abort every sweeper pass, and break
+                # _save_locked's per-entry dict() copy for ALL entries. Losing
+                # the bad pointer is recoverable (that scope starts a fresh
+                # session); a wedged registry is not.
+                corrupt = [k for k, v in loaded.items() if not isinstance(v, dict)]
+                for key in corrupt:
+                    loaded.pop(key)
+                if corrupt:
+                    logger.error(
+                        "sessions.json: quarantined %d structurally corrupt "
+                        "entr(y|ies) %s — their sessions start fresh",
+                        len(corrupt), corrupt,
+                    )
                 self._data = loaded
             except (json.JSONDecodeError, OSError, ValueError):
                 # Corrupt/unreadable registry (e.g. truncated by power loss or

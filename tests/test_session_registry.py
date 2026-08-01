@@ -30,6 +30,32 @@ class TestSessionRegistry:
         reg = SessionRegistry(path)
         assert reg.get("nonexistent") is None
 
+    async def test_load_quarantines_structurally_corrupt_entries(self, tmp_path, caplog):
+        """#345: load validated only the JSON root, so a non-dict ENTRY (e.g.
+        `[]`) was accepted — then register() (deepcopy+.update), the sweepers,
+        and every _save_locked (`dict(entry)`) blew up on it, breaking healthy
+        entries too. Bad entries must be dropped at load; good ones kept."""
+        path = str(tmp_path / "sessions.json")
+        with open(path, "w", encoding="utf-8") as fh:
+            json.dump({
+                "telegram-v2-bad": [],
+                "telegram-v2-worse": "nope",
+                "telegram-v2-good": {"agent": "assistant", "sdk_session_id": "sid-1"},
+            }, fh)
+        import logging
+        with caplog.at_level(logging.ERROR):
+            reg = SessionRegistry(path)
+        assert reg.get("telegram-v2-bad") is None
+        assert reg.get("telegram-v2-worse") is None
+        assert reg.get("telegram-v2-good") == {"agent": "assistant", "sdk_session_id": "sid-1"}
+        assert any("quarantin" in r.getMessage() for r in caplog.records)
+        # The registry stays fully functional: register over a quarantined key
+        # and persist (pre-fix _save_locked crashed on `dict([])`).
+        await reg.register(
+            "telegram-v2-bad", "assistant", "sid-2", binding_digest=STUB_BINDING_DIGEST,
+            speaker_provenance=STUB_SPEAKER_PROV, user_provenance=STUB_USER_PROV)
+        assert reg.get("telegram-v2-bad")["sdk_session_id"] == "sid-2"
+
     async def test_touch_updates_last_active(self, tmp_path):
         path = str(tmp_path / "sessions.json")
         reg = SessionRegistry(path)

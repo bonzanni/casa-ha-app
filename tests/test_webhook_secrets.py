@@ -207,3 +207,23 @@ def test_prefix_retirement_covers_ident_sidecars(tmp_path):
     retired = retire_secrets_with_prefix("plg-p--", secrets_dir=tmp_path)
     assert retired == ["plg-p--t"]
     assert not (tmp_path / "plg-p--t.ident").exists()
+
+
+def test_usable_webhook_secret_refuses_an_unresolved_reference():
+    """Terra r1 (#333): when op:// resolution fails at boot, the raw reference
+    must never become the HMAC verification key — a vault path is a
+    predictable, non-secret string, so verifying against it is fail-open.
+    Blank means every authenticated request is rejected loudly instead."""
+    from webhook_auth import usable_webhook_secret
+    assert usable_webhook_secret("op://Casa/Webhook/credential") == ""
+    assert usable_webhook_secret("real-secret") == "real-secret"
+    assert usable_webhook_secret("") == ""
+
+
+def test_casa_core_filters_the_loaded_webhook_secret():
+    """Wiring pin: both sources of the effective webhook secret (resolved env
+    and the /data file fallback) pass through usable_webhook_secret."""
+    import inspect
+    import casa_core
+    source = inspect.getsource(casa_core.main)
+    assert "usable_webhook_secret(" in source

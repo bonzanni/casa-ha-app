@@ -282,10 +282,15 @@ fi
 # it reads the selected secret above and never logs or persists that secret.
 # Always "true" since v0.125.0 (#228) — the discovery payload field stays in
 # the contract the companion integration reads; only the toggle behind it is
-# gone.
-CASA_DISCOVERY_AUTH_ENABLED=true \
+# gone. #333: the OP service-account token rides along (scoped to this one
+# invocation, same pattern as the op-read blocks below) so an op://-valued
+# webhook_secret can be resolved to the value Casa actually verifies with.
+_op_tok_discovery="$(bashio::config 'onepassword_service_account_token')"
+[ "$_op_tok_discovery" = "null" ] && _op_tok_discovery=""
+CASA_DISCOVERY_AUTH_ENABLED=true OP_SERVICE_ACCOUNT_TOKEN="$_op_tok_discovery" \
     python3 /opt/casa/supervisor_discovery.py || \
     bashio::log.warning "Supervisor discovery publisher exited non-zero"
+unset _op_tok_discovery
 
 # --- cc-home HOME setup -----------------------------------------------------
 # casa-main + the CC CLI both require HOME=cc-home. Plugin materialization

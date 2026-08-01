@@ -162,3 +162,26 @@ async def test_sweep_direct_removals_spare_a_racing_fresh_registration(tmp_path)
     entry = reg.get("voice-b")
     assert entry is not None, "the racing fresh voice session must survive the sweep"
     assert entry["sdk_session_id"] == "sid-live"
+
+
+async def test_sweep_processes_the_cold_retain_retry_spool(tmp_path, monkeypatch):
+    """#345: the reaper is the durable retry driver for failed gap retains —
+    every sweep must process the spool (session_saver.retry_spooled_cold_retains)
+    so a transient Hindsight outage no longer loses the old transcript."""
+    import freshness_reaper as reaper_mod
+
+    reg = SessionRegistry(str(tmp_path / "s.json"))
+    sem = AsyncMock()
+    calls = []
+
+    async def fake_retry(semantic_memory, *, retry_dir=None):
+        calls.append((semantic_memory, retry_dir))
+
+    monkeypatch.setattr(reaper_mod, "retry_spooled_cold_retains", fake_retry)
+    reaper = FreshnessReaper(
+        registry=reg, semantic_memory=sem,
+        directory_for=lambda role: "/h",
+        now=lambda: datetime(2026, 6, 2, 12, 0, tzinfo=timezone.utc),
+    )
+    await reaper.sweep_once()
+    assert calls and calls[0][0] is sem

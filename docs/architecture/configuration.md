@@ -54,11 +54,14 @@ your edits survive means knowing which of the three cases each file is in.
 reload path returns a restart-required outcome *before* mutating live state rather than
 attempting a swap.
 
-**Secret indirection is narrower than the option types suggest.** Exactly three options
-resolve an external `op://` secret reference at startup — the Claude OAuth token, the
-Telegram bot token and the webhook secret. Options typed as passwords that are not in that
-set are used verbatim: a valid-looking reference reaches its consumer as the literal
-string and fails there, not at boot.
+**Secret indirection covers every password-typed option.** Exactly four options resolve an
+external `op://` secret reference at startup — the Claude OAuth token, the Telegram bot
+token, the webhook secret and the context7 API key. Resolved values are cached for the
+process lifetime by the reference string; the plugin-environment reload scope invalidates
+that cache first, so rotating a referenced field takes effect on reload for plugin
+variables but requires a restart for the four startup options. The webhook secret is also
+resolved by the Supervisor discovery publisher, so the companion integration signs with
+the same value the add-on verifies.
 
 ## Contracts & invariants
 
@@ -119,9 +122,12 @@ overwritten local edit is recoverable.
 everything else proceeds.
 
 **A secret reference fails to resolve.** Absorbed, and the behaviour differs by path in a way
-worth knowing: on the startup path the raw reference is retained, while the plugin
-environment leaves the variable unset at boot but installs the literal reference on reload.
-Same failure, three outcomes.
+worth knowing: on the startup path the raw reference is retained — except the webhook
+secret, which is blanked rather than used as an HMAC key (a vault path is a predictable
+string, and the discovery publisher also removes any previously published record so the
+companion integration cannot keep signing with it) — while the plugin environment leaves
+the variable unset at boot but installs the literal reference on reload. Same failure,
+several outcomes.
 
 **A reload handler raises.** The dispatcher returns an error envelope rather than propagating
 — a failed reload is a reported outcome, not an exception at the caller.
