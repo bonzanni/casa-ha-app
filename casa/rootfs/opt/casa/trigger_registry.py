@@ -86,8 +86,12 @@ def _translate_cron_dow(field: str) -> str:
             lo, hi = _cron_dow_token(lo_s), _cron_dow_token(hi_s)
         else:
             lo = hi = _cron_dow_token(expr)
-            if sep:               # "n/step" = n through Saturday, stepped
-                hi = 6
+            if sep:
+                # "n/step" = n through the field MAX, stepped (the
+                # n-max/step convention). Terra r3-1: the max is RAW 7 —
+                # capping at 6 turned "7/2" (Sunday only) into a
+                # wraparound over the whole week.
+                hi = 7
         if lo <= hi:
             days = list(range(lo, hi + 1))
         else:                     # cron wrap range, e.g. 6-0 = Sat,Sun

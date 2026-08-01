@@ -87,8 +87,9 @@ the registry's word is already given.
 ## Failure behavior
 
 **A malformed request.** Invalid JSON, a missing or unknown name, a non-object request,
-and a truthy non-object `params` or `arguments` all come back as typed JSON-RPC-style
-error objects from the route, before any tool runs; a tool that raises becomes an error
+and any non-object `params` or `arguments` — truthy or falsy alike — all come back as
+typed JSON-RPC-style error objects from the route, before any tool runs (an absent or
+null value defaults to an empty object instead); a tool that raises becomes an error
 object rather than a transport failure.
 
 **A completion is invalid or refused.** Bad arguments, the plugin-developer release guard,
