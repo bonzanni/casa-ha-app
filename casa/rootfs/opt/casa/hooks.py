@@ -1810,6 +1810,19 @@ _GIT_PUSH_RE = r"\bgit((\s+-\S+(\s+(\"[^\"]*\"|'[^']*'|[^-\s]\S*))?)*)\s+push\b"
 _SEPARATOR_CHARS = frozenset(";&|()")
 
 
+def _logical_and_physical(path: Path) -> list[Path]:
+    """*path* under BOTH `..` resolutions (Terra r15).
+
+    `cd` is LOGICAL by default (`-L`): `cd /a/link; cd ../b` lands in `/a/b`
+    even when `link` points elsewhere, because bash collapses `..` against
+    the path it printed, not against the symlink's physical parent. Handing
+    the un-collapsed path to the filesystem gives the PHYSICAL answer
+    instead (what `cd -P` would do). Both are plausible, so both are
+    scanned."""
+    logical = Path(os.path.normpath(str(path)))
+    return [path] if logical == path else [path, logical]
+
+
 def _cd_operand_words(words: list[str]) -> list[str]:
     """The real OPERANDS among a `cd` command's words — options, redirection
     operators, the words those operators consume, and the fd prefixes that
@@ -1948,7 +1961,40 @@ def _cd_command_words(text: str) -> list[list[str]]:
 
 
 def make_self_containment_guard() -> HookCallback:
-    """Pre-push grep for §2.0 self-containment anti-patterns."""
+    """Pre-push grep for §2.0 self-containment anti-patterns.
+
+    ── SCOPE NOTE — READ BEFORE "HARDENING" THE cd RECOGNIZER (v0.145.0) ──
+    This guard is DEFENSE IN DEPTH, not a security boundary. It advises an
+    already-trusted operator/agent channel inside the container, it carries
+    a deliberate logged escape hatch (``CASA_ALLOW_ANTI_PATTERN=1``), and
+    the authoritative check on the real push path is ``scripts/gate.sh``,
+    which evaluates HEAD on a clean tree and runs a pinned secret scanner.
+
+    Deciding which directory a shell command ends up in is UNDECIDABLE from
+    the command text, and approximating it is a KNOWN FINDING GENERATOR: the
+    v0.145.0 adversarial review spent ELEVEN consecutive rounds here, each
+    surfacing one further bash spelling (``2>& 1``, ``{fd}>&-``, quoted and
+    backslash-escaped command words, a directory named ``cd``, one named
+    ``-weird``, ``#`` inside a path, a single-quoted ``\\<newline>``, logical
+    vs physical ``..``). Every one was fixed and every one was individually
+    real; the marginal value nevertheless reached zero long before the
+    rounds did. The design settled on removing JUDGMENT rather than adding
+    rules — every ``cd`` token counts, every word of its command is scanned,
+    quoting is the lexer's job, operands are computed from the token stream,
+    and the base set is capped with a fail-closed deny.
+
+    ACCEPTED RESIDUAL, deliberately not fixed: targets that are not
+    statically resolvable (parameter/command substitution, ``eval``,
+    aliases) and adversarially-constructed paths named after shell syntax.
+    An actor able to craft those already runs arbitrary commands in this
+    container, so the guard was never what stood between them and a push.
+
+    Do NOT reopen this to chase another spelling on the strength of a code
+    scan or review sweep alone. Change it when a REAL incident shows a
+    plausible operator command slipping through, and record that incident
+    in the commit. Over-scanning (extra candidate directories) is BY DESIGN
+    and is not a defect.
+    """
 
     async def hook(
         input_data: dict[str, Any],
@@ -1969,7 +2015,14 @@ def make_self_containment_guard() -> HookCallback:
         # flag was never implemented and would make git itself error.)
         # Option arguments may be quoted and contain spaces (Sol r6-1:
         # `git -C "path with spaces" push`).
-        m_push = re.search(_GIT_PUSH_RE, cmd)
+        # Sol r15: arm against a continuation-flattened copy — a line
+        # continuation may sit between `git` and `push` (`git \<newline>
+        # push`), which bash removes before the words are formed. Flattening
+        # can only make the guard arm MORE often (fail-closed); the cd
+        # collector does its own quote-aware continuation handling on the
+        # raw command.
+        cmd_flat = cmd.replace("\\\n", "")
+        m_push = re.search(_GIT_PUSH_RE, cmd_flat)
         if not m_push:
             return {}
         override = bool(
@@ -2036,9 +2089,11 @@ def make_self_containment_guard() -> HookCallback:
             new_bases = set()
             for b in bases:
                 for w in words:
-                    candidates.append(Path(w) if os.path.isabs(w) else b / w)
+                    candidates.extend(_logical_and_physical(
+                        Path(w) if os.path.isabs(w) else b / w))
                 for w in operands:
-                    new_bases.add(Path(w) if os.path.isabs(w) else b / w)
+                    new_bases.update(_logical_and_physical(
+                        Path(w) if os.path.isabs(w) else b / w))
             bases |= new_bases
             if len(bases) > 64:
                 # Terra/Sol r3: stopping silently would leave every LATER cd
@@ -2052,7 +2107,7 @@ def make_self_containment_guard() -> HookCallback:
         # against the previous one) — fold the whole chain over each base.
         # Sol r12: do this for EVERY `git … push` occurrence, since the first
         # textual match may not be the real one.
-        for m_g in re.finditer(_GIT_PUSH_RE, cmd):
+        for m_g in re.finditer(_GIT_PUSH_RE, cmd_flat):
             c_targets = [m.group(1).strip("'\"") for m in re.finditer(
                 r"-C\s+(\"[^\"]+\"|'[^']+'|\S+)", m_g.group(1))]
             if not c_targets:

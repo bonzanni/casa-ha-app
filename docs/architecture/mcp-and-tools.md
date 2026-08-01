@@ -82,6 +82,21 @@ document root, a non-list hook section, a non-mapping list member, or an unparse
 per-hook timeout is skipped instead of crashing engagement provisioning, and the
 code-mandatory guard entry is emitted regardless of what the document declares.
 
+**Some guards are advisory by construction, and one of them is deliberately imperfect.**
+The pre-push self-containment guard inspects the shell command an agent is about to run,
+works out which repository the push targets, and scans that tree for anti-patterns. Working
+out where a shell command ends up is not decidable from the command text, so the guard
+over-approximates: every `cd` token counts, every word of that command is treated as a
+possible destination, and the scan covers the union. Extra scanned directories are the
+intended cost. What it cannot see are destinations that are not statically resolvable —
+parameter and command substitution, `eval`, aliases — and paths adversarially named after
+shell syntax. That residual is accepted rather than pursued: the guard advises an
+already-trusted in-container channel, it carries a logged `CASA_ALLOW_ANTI_PATTERN=1`
+override, and `scripts/gate.sh` is the authoritative check on the real push path. Attempts
+to close the residual by adding parser rules have a measured history of generating findings
+without reducing risk (eleven review rounds in v0.145.0), so the scope note in the code is
+binding: change it in response to an incident, not to a scan.
+
 ## Contracts & invariants
 
 **INV-MCP-001**: The internal tool dispatch path resolves a call by name against the full tool map and does not consult any per-agent allowlist.

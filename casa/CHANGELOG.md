@@ -32,9 +32,14 @@ ordering, guard parsing, and specialist role materialization (#301, #309,
   output — narration, reply or ask — now reliably reply-threads to the
   operator's message, including after a transient send failure.
 - **Pre-push and file-copy guard parsing** (#348). The self-containment
-  guard now recognizes a `cd` separated by a newline (or `|`/`&`) and
-  scans the repository the push actually targets; copying a file out of a
-  managed tree with `cp -t /tmp <file>` is no longer misread as a write.
+  guard now works out which repository a push targets by tokenizing the
+  command the way a shell does, instead of pattern-matching it, so a `cd`
+  written across a newline, behind a wrapper command, inside quotes or with
+  redirections no longer hides the target; when the command is too tangled
+  to model, the push is refused rather than waved through. Copying a file
+  out of a managed tree with `cp -t /tmp <file>` is no longer misread as a
+  write. This guard stays advisory by design — it can over-scan, it has a
+  logged override, and the authoritative pre-push check is unchanged.
 - **Specialists with an operator-selectable model now survive loading**
   (#355). Install froze the model at its default, so a non-default
   `PRIMARY_AGENT_MODEL` made the loader drop the specialist as a binding

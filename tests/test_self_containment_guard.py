@@ -608,6 +608,31 @@ class TestGuardArmingAndOracle:
         assert await self._denied(
             clean, f"cd '{target}'; git push origin main")
 
+    async def test_line_continuation_inside_git_push_still_arms(
+            self, tmp_path: Path, bad_repo: Path):
+        """Sol r15 (#348): a continuation between `git` and `push` is
+        removed by bash before the words are formed — the guard must arm."""
+        clean = tmp_path / "clean-contarm"
+        clean.mkdir()
+        assert await self._denied(
+            clean, f"cd {bad_repo} && git \\\npush origin main")
+
+    async def test_logical_dotdot_across_symlink_is_scanned(
+            self, tmp_path: Path, bad_repo: Path):
+        """Terra r15 (#348): `cd` is LOGICAL by default — `cd /a/link;
+        cd ../b` lands in `/a/b`, not in the symlink target's parent."""
+        import shutil
+        physical = tmp_path / "physical" / "elsewhere"
+        physical.mkdir(parents=True)
+        lexical = tmp_path / "lexical"
+        lexical.mkdir()
+        (lexical / "link").symlink_to(physical, target_is_directory=True)
+        shutil.copytree(bad_repo, lexical / "bad", symlinks=True)
+        clean = tmp_path / "clean-logical"
+        clean.mkdir()
+        assert await self._denied(
+            clean, f"cd {lexical}/link; cd ../bad; git push origin main")
+
     async def test_cd_chain_overflow_fails_closed(
             self, tmp_path: Path, git_plugin_repo: Path):
         """Terra/Sol r3 (#348): once the feasible-base set overflows, later
