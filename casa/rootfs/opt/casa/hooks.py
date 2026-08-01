@@ -1799,6 +1799,102 @@ def _shell_words(segment: str) -> list[str]:
         return [w for w in segment.split() if w]
 
 
+# Words that keep the NEXT word in command position: wrapper builtins/prefix
+# commands and the shell keywords that introduce a command body. A `VAR=x`
+# assignment prefix does the same (matched separately).
+_CD_COMMAND_PREFIXES = frozenset({
+    "command", "builtin", "exec", "env", "nohup", "time", "sudo", "!",
+    "then", "else", "elif", "do", "if", "while", "until", "{",
+})
+# Tokens made only of these characters are COMMAND SEPARATORS (`;`, `;;`,
+# `&`, `&&`, `|`, `||`, `(`, `)`) — a redirection operator (`>`, `>&`, `<<`)
+# is not, so it never ends a command.
+_SEPARATOR_CHARS = frozenset(";&|()")
+
+
+def _cd_command_words(text: str) -> list[list[str]]:
+    """Every `cd` invocation in *text*, as its list of argument WORDS.
+
+    Terra/Sol r7-r10: this replaced a regex + quote-stripped shadow that kept
+    losing to one more spelling per review round (`2>& 1`, `{fd}>&-`,
+    `>"log file"`, `"cd"`, `c''d`, `c\\d`, `c\\<newline>d`,
+    `c''d '/tmp/bad;repo'`). Tokenizing ONCE the way the shell does resolves
+    the whole family structurally: quote/escape removal is the lexer's job,
+    so a quoted command word (`c''d`) collapses to `cd` while a quoted
+    separator inside a PATH (`'/tmp/bad;repo'`) stays one word.
+
+    Line continuations are removed first (bash's own first pass). A word is
+    a `cd` when it lands in COMMAND POSITION — start of input, after a
+    separator token, or after a wrapper/keyword/assignment prefix. All
+    following words up to the next separator are returned: the caller scans
+    every one of them, so no "which word is the target" decision remains.
+    """
+    import shlex
+    text = text.replace("\\\n", "")  # bash line continuation
+    # A newline SEPARATES commands, but shlex treats it as plain whitespace —
+    # make unquoted newlines explicit separator tokens (a newline inside
+    # quotes is data and is left alone).
+    out_chars: list[str] = []
+    quote = ""
+    i = 0
+    while i < len(text):
+        ch = text[i]
+        if quote:
+            if ch == "\\" and quote == '"':
+                out_chars.append(text[i:i + 2])
+                i += 2
+                continue
+            if ch == quote:
+                quote = ""
+        elif ch == "\\":
+            out_chars.append(text[i:i + 2])
+            i += 2
+            continue
+        elif ch in "'\"":
+            quote = ch
+        elif ch in "\n\r":
+            out_chars.append(" ; ")
+            i += 1
+            continue
+        out_chars.append(ch)
+        i += 1
+    text = "".join(out_chars)
+    lexer = shlex.shlex(text, posix=True, punctuation_chars=True)
+    lexer.whitespace_split = True
+    try:
+        tokens = list(lexer)
+    except ValueError:
+        # Unbalanced quote (a truncated command) — degrade to a whitespace
+        # split; over-splitting only ADDS candidate words.
+        tokens = text.split()
+
+    out: list[list[str]] = []
+    collecting: list[str] | None = None
+    at_command = True
+    for tok in tokens:
+        if tok and all(ch in _SEPARATOR_CHARS for ch in tok):
+            if collecting is not None:
+                out.append(collecting)
+                collecting = None
+            at_command = True
+            continue
+        if collecting is not None:
+            collecting.append(tok)
+            continue
+        if at_command:
+            if tok == "cd":
+                collecting = []
+                at_command = False
+            elif tok in _CD_COMMAND_PREFIXES or "=" in tok:
+                pass  # still a command position
+            else:
+                at_command = False
+        # else: an argument of some other command — ignored
+    if collecting is not None:
+        out.append(collecting)
+    return out
+
+
 def make_self_containment_guard() -> HookCallback:
     """Pre-push grep for §2.0 self-containment anti-patterns."""
 
@@ -1877,41 +1973,30 @@ def make_self_containment_guard() -> HookCallback:
         # Sol r8: bash needs no whitespace after `cd` before an operator or
         # a quote (`cd</dev/null /bad`, `cd'/bad'`) — accept those positions
         # too, never just `cd\s`.
-        # Terra r8/r9: the command WORD itself can be quoted or escaped
-        # (`"cd" /bad`, `c''d /bad`, `c\d /bad`) — bash resolves all of them
-        # to the builtin. Rather than enumerate spellings, run the SAME
-        # collection over a shadow of the command with every literal-quoting
-        # character removed. Single quotes, double quotes and backslash are
-        # bash's COMPLETE set of literal-quoting mechanisms for a word (the
-        # rest are expansions, out of scope for a static scan), so no further
-        # spelling of a literal `cd` can exist. Purely additive — the shadow
-        # can only ADD scan targets, never remove one.
-        for text in (cmd[: m_push.start()],
-                     re.sub(r"[\\'\"]", "", cmd[: m_push.start()])):
-            for m_cd in re.finditer(r"(?<![\w./-])cd(?=[\s<>\"'])", text):
-                words = _shell_words(_command_segment(text[m_cd.end():]))
-                primary = next(
-                    (w for w in words
-                     if not w.startswith("-") and not _REDIR_SHAPED.search(w)),
-                    None)
-                new_bases = set()
-                for b in bases:
-                    for w in words:
-                        candidates.append(
-                            Path(w) if os.path.isabs(w) else b / w)
-                    if primary is not None:
-                        new_bases.add(Path(primary) if os.path.isabs(primary)
-                                      else b / primary)
-                bases |= new_bases
-                if len(bases) > 64:
-                    # Terra/Sol r3: breaking out silently would leave every
-                    # LATER cd unexamined — fail CLOSED instead (a finding
-                    # below denies the push; the logged
-                    # CASA_ALLOW_ANTI_PATTERN override remains the escape
-                    # hatch for a legitimate pathological command).
-                    cd_overflow = True
-                    break
-            if cd_overflow:
+        for words in _cd_command_words(cmd[: m_push.start()]):
+            # The PRIMARY word (the one bash most likely resolves to) also
+            # propagates into ``bases`` so a relative cd CHAIN keeps working:
+            # skip options, redirection operators and bare fd numbers.
+            primary = next(
+                (w for w in words
+                 if not w.startswith("-") and not w.isdigit()
+                 and not _REDIR_SHAPED.search(w)),
+                None)
+            new_bases = set()
+            for b in bases:
+                for w in words:
+                    candidates.append(Path(w) if os.path.isabs(w) else b / w)
+                if primary is not None:
+                    new_bases.add(Path(primary) if os.path.isabs(primary)
+                                  else b / primary)
+            bases |= new_bases
+            if len(bases) > 64:
+                # Terra/Sol r3: stopping silently would leave every LATER cd
+                # unexamined — fail CLOSED instead (the finding below denies
+                # the push; the logged CASA_ALLOW_ANTI_PATTERN override
+                # remains the escape hatch for a legitimate pathological
+                # command).
+                cd_overflow = True
                 break
         # Sol r2: git applies EVERY -C sequentially (a relative -C resolves
         # against the previous one) — fold the whole chain over each base.

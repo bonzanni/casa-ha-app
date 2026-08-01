@@ -488,18 +488,26 @@ class TestGuardArmingAndOracle:
 
     async def test_quoted_or_glued_cd_command_word_is_recognized(
             self, tmp_path: Path, bad_repo: Path):
-        """Terra/Sol r8 (#348): the command word itself may be quoted
-        (`"cd" /bad`, `c''d /bad`) and needs no space before an operator
-        (`cd</dev/null /bad`, `cd'/bad'`)."""
+        """Terra/Sol r8-r10 (#348): the command word itself may be quoted or
+        escaped (`"cd" /bad`, `c''d /bad`, `c\\d /bad`) and needs no space
+        before an operator (`cd</dev/null /bad`).
+
+        Deliberately NOT included: `cd'/bad'` — verified against bash, that
+        concatenates into the single word `cd/bad` (command-not-found), so
+        it is not a cd invocation and nothing is owed."""
         forms = [
             f'"cd" {bad_repo}',
             f"c''d {bad_repo}",
             f"cd</dev/null {bad_repo}",
-            f"cd'{bad_repo}'",
-            # Terra r9: backslash is bash's third literal-quoting
-            # mechanism — `c\d` is the cd builtin too.
+            # Terra r9/r10: backslash — including a line continuation — is
+            # bash's third literal-quoting mechanism; `c\d` and `c\<nl>d`
+            # are the cd builtin too.
             f"c\\d {bad_repo}",
             f'c"d" {bad_repo}',
+            f"c\\\nd {bad_repo}",
+            # Terra r10: quoted command word AND a quoted separator inside
+            # the target, together.
+            f"c''d '{bad_repo}'",
         ]
         for i, form in enumerate(forms):
             clean = tmp_path / f"clean-cmdword{i}"
