@@ -858,9 +858,9 @@ async def reload_agent(runtime: Any, *, role: str | None = None) -> list[str]:
         raise ReloadError(
             "reregister_failed",
             f"agent swap for role={role} applied, but trigger "
-            f"re-registration failed — the underlying error states the "
-            f"resulting trigger state (no triggers, or the previous set "
-            f"still live if removal was refused): {exc}",
+            f"re-registration failed; the role is left with NO active "
+            f"triggers unless the error below names job(s) that remain "
+            f"live: {exc}",
         ) from exc
 
     # Drain pending-reload guard if any.

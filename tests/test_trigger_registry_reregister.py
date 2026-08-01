@@ -159,3 +159,35 @@ class TestReregisterFor:
         reg.reregister_for("assistant", [t1], channels=["telegram"])
         assert "assistant:t0" not in reg._seen_job_ids
         assert "assistant:t1" in reg._seen_job_ids
+
+    def test_double_failure_error_discloses_leftover_live_jobs(self):
+        """Terra r2-2: when registration fails AND the follow-up unwind
+        cannot remove an already-installed replacement, the raised error
+        must SAY which job(s) remain live — a caller relaying 'fail-closed'
+        would otherwise misreport a still-firing trigger."""
+        from config import TriggerSpec
+        from trigger_registry import TriggerError
+        reg, scheduler, _app = self._make_registry()
+        t0 = TriggerSpec(
+            name="t0", type="interval", minutes=5,
+            channel="telegram", prompt="p",
+        )
+        reg.register_agent("assistant", [t0], channels=["telegram"])
+        # First unwind removal (t0) succeeds; the post-failure unwind's
+        # removal of the just-installed "good" job fails.
+        scheduler.remove_job.side_effect = [None, RuntimeError("stuck")]
+
+        good = TriggerSpec(
+            name="good", type="interval", minutes=10,
+            channel="telegram", prompt="p",
+        )
+        bad = TriggerSpec(
+            name="bad", type="cron", schedule="not-a-cron",
+            channel="telegram", prompt="q",
+        )
+        with pytest.raises(TriggerError) as excinfo:
+            reg.reregister_for("assistant", [good, bad], channels=["telegram"])
+        msg = str(excinfo.value)
+        assert "assistant:good" in msg and "remain live" in msg
+        # And the leftover stays tracked.
+        assert "assistant:good" in reg._seen_job_ids

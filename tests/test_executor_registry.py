@@ -152,3 +152,24 @@ class TestLoadFailureKeepsRegistry:
         # The live registry survives the failed scan untouched.
         assert r.list_types() == ["configurator"]
         assert r.get("configurator") is not None
+
+    def test_state_publishes_atomically(self, tmp_path, monkeypatch):
+        """Sol r2-3: load() runs in a worker thread while readers run on the
+        loop — the registry's collections must publish as ONE assignment so
+        a reader can never see e.g. new defs beside old disabled. Pinned by
+        asserting all views come off a single state tuple."""
+        from executor_registry import ExecutorRegistry
+
+        _write(str(tmp_path), "configurator", enabled=True)
+        r = ExecutorRegistry(str(tmp_path / "executors"))
+        r.load()
+        state = r._state
+        assert r._defs is state.defs
+        assert r._disabled is state.disabled
+        assert r._disabled_defs is state.disabled_defs
+        assert r._failed_types is state.failed_types
+        assert r.get("configurator") is state.defs["configurator"]
+        # A reload swaps the whole tuple; the old snapshot stays coherent.
+        r.load()
+        assert r._state is not state
+        assert state.defs["configurator"] is not None

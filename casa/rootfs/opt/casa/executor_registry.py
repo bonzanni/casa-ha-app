@@ -8,10 +8,28 @@ from __future__ import annotations
 
 import logging
 import os
+from typing import NamedTuple
 
 from config import ExecutorDefinition
 
 logger = logging.getLogger(__name__)
+
+
+class _RegistryState(NamedTuple):
+    """One immutable-by-convention publication of the registry's view.
+
+    Sol v0.142.0 r2-3: load() runs in a worker thread while readers run on
+    the event loop — four independent attribute assignments let a reader
+    observe e.g. the new ``defs`` beside the old ``disabled`` (an executor
+    momentarily neither enabled nor disabled). All collections publish
+    together via ONE reference assignment of this tuple; multi-collection
+    readers snapshot it once.
+    """
+
+    defs: dict[str, ExecutorDefinition]
+    disabled: set[str]
+    disabled_defs: dict[str, ExecutorDefinition]
+    failed_types: set[str]
 
 
 class ExecutorRegistry:
@@ -19,19 +37,35 @@ class ExecutorRegistry:
 
     def __init__(self, executors_dir: str) -> None:
         self._dir = executors_dir
-        self._defs: dict[str, ExecutorDefinition] = {}
-        self._disabled: set[str] = set()
-        # #340 (Sol r1-1): types whose LOAD failed on the most recent load()
-        # — kept so reload can tell "failed to load" apart from "genuinely
-        # removed" when refreshing the HTTP hook-policy map: a failed
-        # executor's live engagements must keep their old (possibly tighter)
-        # callbacks rather than fall back to the broader defaults.
-        self._failed_types: set[str] = set()
-        # Disabled executors' definitions, kept so verify/health can validate a
-        # plugin assigned to a currently-disabled executor (the executor being
-        # off by config is not a plugin-health failure). NEVER exposed via get()
-        # — engagement launch relies on get()==None to refuse a disabled type.
-        self._disabled_defs: dict[str, ExecutorDefinition] = {}
+        self._state = _RegistryState({}, set(), {}, set())
+
+    # Legacy views (tests poke collection CONTENTS through these; rebinding
+    # goes through _state):
+    @property
+    def _defs(self) -> dict[str, ExecutorDefinition]:
+        return self._state.defs
+
+    @property
+    def _disabled(self) -> set[str]:
+        """Config-disabled types. NEVER exposed via get() — engagement
+        launch relies on get()==None to refuse a disabled type."""
+        return self._state.disabled
+
+    @property
+    def _disabled_defs(self) -> dict[str, ExecutorDefinition]:
+        """Disabled executors' definitions, kept so verify/health can
+        validate a plugin assigned to a currently-disabled executor (the
+        executor being off by config is not a plugin-health failure)."""
+        return self._state.disabled_defs
+
+    @property
+    def _failed_types(self) -> set[str]:
+        """#340 (Sol r1-1): types whose LOAD failed on the most recent
+        load() — kept so reload can tell "failed to load" apart from
+        "genuinely removed" when refreshing the HTTP hook-policy map: a
+        failed executor's live engagements must keep their old (possibly
+        tighter) callbacks rather than fall back to the broader defaults."""
+        return self._state.failed_types
 
     def load(self) -> None:
         """Load every executor type under ``<self._dir>``.
@@ -89,24 +123,24 @@ class ExecutorRegistry:
                 type_name, defn.model, defn.driver,
             )
 
-        self._defs = defs
-        self._disabled = disabled
-        self._disabled_defs = disabled_defs
-        self._failed_types = failed_types
+        # Sol r2-3: ONE reference assignment publishes every collection
+        # together — no torn cross-collection read from the loop thread.
+        self._state = _RegistryState(defs, disabled, disabled_defs,
+                                     failed_types)
 
         logger.info(
             "Executors: loaded=%s failed=%s disabled=%s",
-            sorted(self._defs.keys()),
+            sorted(defs.keys()),
             sorted(n for n, _ in failed),
-            sorted(self._disabled),
+            sorted(disabled),
         )
 
     def get(self, type_name: str) -> ExecutorDefinition | None:
-        return self._defs.get(type_name)
+        return self._state.defs.get(type_name)
 
     def is_disabled(self, type_name: str) -> bool:
         """True iff ``type_name`` loaded but is config-disabled (enabled: false)."""
-        return type_name in self._disabled
+        return type_name in self._state.disabled
 
     def definition_any(self, type_name: str) -> ExecutorDefinition | None:
         """The definition whether the executor is ENABLED or DISABLED — for
@@ -117,15 +151,16 @@ class ExecutorRegistry:
         executor can likewise still have its tools.allowed inspected.
         Engagement LAUNCH (a NEW engagement) must keep using ``get()`` (None
         for disabled) to refuse a disabled type."""
-        return self._defs.get(type_name) or self._disabled_defs.get(type_name)
+        s = self._state
+        return s.defs.get(type_name) or s.disabled_defs.get(type_name)
 
     def list_types(self) -> list[str]:
-        return sorted(self._defs.keys())
+        return sorted(self._state.defs.keys())
 
     @property
     def failed_types(self) -> set[str]:
-        """Types whose most recent load() failed (copy — see __init__ note)."""
-        return set(self._failed_types)
+        """Types whose most recent load() failed (copy — see _RegistryState)."""
+        return set(self._state.failed_types)
 
     def list_types_any(self) -> list[str]:
         """Every loaded type, ENABLED or DISABLED — the iteration counterpart
@@ -134,4 +169,5 @@ class ExecutorRegistry:
         brief-bearing engagements), so its builder iterates this, not
         ``list_types()``. Engagement LAUNCH keeps using ``list_types()``/
         ``get()`` to refuse a disabled type."""
-        return sorted(set(self._defs) | set(self._disabled_defs))
+        s = self._state
+        return sorted(set(s.defs) | set(s.disabled_defs))

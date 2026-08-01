@@ -498,3 +498,33 @@ class TestRestoreFileBadSha:
             ["git", "-C", str(tmp_path), "log", "-1", "--format=%s"],
         ).decode().strip()
         assert msg == "external"
+
+    def test_success_preserves_concurrent_manual_staging(self, tmp_path):
+        """Terra r2-1: a successful checked commit must not drop an
+        operator's mid-window `git add` from the real index. The reset that
+        refreshes the index is limited to the paths the commit touched, so
+        an unrelated concurrently-staged entry stays staged (and the tree
+        shows no phantom diffs)."""
+        from config_git import commit_config_checked, init_repo
+
+        _seed(tmp_path)
+        init_repo(str(tmp_path))
+        (tmp_path / "agents" / "marker.txt").write_text(
+            "validated", encoding="utf-8")
+        other = tmp_path / "agents" / "other.txt"
+
+        def validator(tree):
+            other.write_text("operator work", encoding="utf-8")
+            subprocess.check_call(
+                ["git", "-C", str(tmp_path), "add", "agents/other.txt"])
+            return []
+
+        sha, errors = commit_config_checked(
+            str(tmp_path), "checked", validator)
+        assert errors == [] and sha
+        status = subprocess.check_output(
+            ["git", "-C", str(tmp_path), "status", "--porcelain"],
+        ).decode().splitlines()
+        # Exactly the operator's staged add remains — nothing else dirty,
+        # no phantom staged deletions from an over-broad reset.
+        assert status == ["A  agents/other.txt"]

@@ -213,9 +213,30 @@ def commit_config_checked(
             # add-then-commit flow could never do. The caller surfaces the
             # git error; a retry re-runs the gate on the new HEAD.
             _run(config_dir, ["update-ref", "HEAD", sha, head])
-        # Refresh the real index to the new HEAD — the state an ordinary
-        # `git commit` leaves. Worktree untouched.
-        _run(config_dir, ["reset", "-q"], check=False)
+            # Refresh the real index ONLY for the paths this commit touched
+            # (Terra/Sol r2-1: a full `git reset` would also drop an
+            # operator's concurrently staged unrelated entry). Unchanged
+            # paths keep index entries identical to the new HEAD, so no
+            # phantom diffs appear; a concurrent stage of a path we DID
+            # commit is superseded (its content survives in the worktree).
+            changed = subprocess.run(
+                ["git", "diff-tree", "--no-commit-id", "--name-only",
+                 "-z", "-r", sha],
+                cwd=config_dir, capture_output=True, text=True, check=True,
+            ).stdout
+            refresh = subprocess.run(
+                ["git", "reset", "-q", "HEAD", "--pathspec-file-nul",
+                 "--pathspec-from-file=-"],
+                cwd=config_dir, capture_output=True, text=True, input=changed,
+            )
+            if refresh.returncode != 0:
+                # Sol r2-1b: surface, don't swallow — the commit landed;
+                # stale index entries for these paths self-heal on the next
+                # stage (every Casa flow stages with add -A).
+                logger.warning(
+                    "config commit %s landed but the index refresh failed: "
+                    "%s", sha[:8], refresh.stderr.strip(),
+                )
         return sha, []
 
 

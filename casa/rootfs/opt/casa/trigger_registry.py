@@ -305,20 +305,34 @@ class TriggerRegistry:
         """
         stuck = self._unwind_role(role)
         if stuck:
+            # Sol r2-2a: precise state disclosure — the unwind already
+            # evicted the role's webhook allowlist entries (pure dict ops
+            # that cannot fail), so only the STUCK JOBS remain live.
             raise TriggerError(
                 f"agent {role!r}: could not remove existing scheduler "
-                f"job(s) {stuck} — refusing re-registration to avoid "
-                f"zombie/duplicate jobs; the previous trigger(s) remain live"
+                f"job(s) {stuck} — those jobs remain live; every other "
+                f"trigger for the role (webhooks included) is now "
+                f"unregistered. Refusing re-registration to avoid "
+                f"zombie/duplicate jobs"
             )
         try:
             self.register_agent(role, triggers, channels)
-        except Exception:
+        except Exception as exc:
             leftover = self._unwind_role(role)
             if leftover:
                 logger.error(
                     "unwind after failed re-registration left job(s) live "
                     "for role=%s: %s", role, leftover,
                 )
+                # Terra r2-2 / Sol r2-2b: the raised error must DISCLOSE the
+                # leftover live jobs — callers relay this message as the
+                # role's resulting trigger state.
+                raise TriggerError(
+                    f"{exc} — additionally, the post-failure unwind could "
+                    f"not remove job(s) {leftover}; those replacement "
+                    f"job(s) remain live while every other trigger for the "
+                    f"role is unregistered"
+                ) from exc
             raise
 
     def list_jobs_for(
