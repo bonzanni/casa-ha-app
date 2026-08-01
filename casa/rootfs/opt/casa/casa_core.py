@@ -563,6 +563,19 @@ async def replay_undergoing_engagements(
         checked-teardown ladder (retryable next boot when containment is
         confirmed, terminal-marked when it is not)."""
         fifo = os.path.join(engagements_root, rec.id, "stdin.fifo")
+        # Sol r5-1: never run the destructive repair below THROUGH a
+        # symlinked workspace dir — isdir/lstat would examine (and rmtree
+        # could delete) entries under the symlink's target. Workspaces
+        # are always created as real directories, so a symlink here is
+        # corruption: refuse the resume.
+        if os.path.islink(os.path.dirname(fifo)):
+            await _refuse_brief_resume(
+                rec,
+                "workspace directory is a symlink; refusing FIFO "
+                "verification/repair through it",
+                kind="fifo_recreate_failed",
+            )
+            return False
         try:
             if os.path.isdir(os.path.dirname(fifo)):
                 st = os.lstat(fifo) if os.path.lexists(fifo) else None

@@ -703,6 +703,24 @@ class TestCancellationStopsWork:
         resp = await asyncio.wait_for(caller, timeout=5)
         assert str(resp.content).startswith("handler error: cancelled")
 
+    async def test_evict_settles_queued_request_callers(self):
+        """Sol r5-2: a request still QUEUED (never dispatched) when its
+        role is evicted must get a prompt handler-error response too —
+        unregister pops the queue, so nothing would ever answer it."""
+        bus = MessageBus()
+        bus.register("b")  # no consumer started: message stays queued
+        req = _msg(target="b")
+        caller = asyncio.create_task(bus.request(req, timeout=300))
+
+        deadline = asyncio.get_running_loop().time() + 5
+        while req.id not in bus.pending:
+            assert asyncio.get_running_loop().time() < deadline
+            await asyncio.sleep(0.001)
+
+        bus.unregister("b")
+        resp = await asyncio.wait_for(caller, timeout=5)
+        assert str(resp.content).startswith("handler error: cancelled")
+
     async def test_unregister_and_wait_awaits_dispatch_tasks(self):
         """unregister_and_wait returns only after consumer AND dispatch
         tasks have completed — the reload-teardown contract."""

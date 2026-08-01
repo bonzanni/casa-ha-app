@@ -1428,6 +1428,37 @@ async def test_fast_path_replaces_non_fifo_stdin_path(monkeypatch, tmp_path):
     assert stat_mod.S_ISFIFO(st.st_mode), "directory must be replaced"
 
 
+async def test_fast_path_symlinked_workspace_refuses_without_repair(
+    monkeypatch, tmp_path,
+):
+    """Sol r5-1: the FIFO verify/repair must never operate THROUGH a
+    symlinked workspace dir — a corrupted symlink targeting a foreign
+    tree would let the repair rmtree entries outside the workspace.
+    Refused instead; the foreign target is untouched."""
+    import os as os_mod
+
+    from casa_core import replay_undergoing_engagements
+
+    start_calls = _fast_path_env(monkeypatch, tmp_path)
+    ws_root = tmp_path / "eng"
+    ws_root.mkdir()
+    outside = tmp_path / "outside"
+    (outside / "stdin.fifo").mkdir(parents=True)  # a DIRECTORY at the name
+    (outside / "stdin.fifo" / "precious.txt").write_text("keep me")
+    os_mod.symlink(outside, ws_root / "keep1")    # workspace IS a symlink
+
+    reg = await _make_registry([_rec("keep1")])
+    driver = _boot_driver()
+    driver._spawn_background_tasks = lambda rec, **kw: None
+
+    await replay_undergoing_engagements(
+        registry=reg, driver=driver, engagements_root=str(ws_root))
+
+    assert start_calls == []
+    assert (outside / "stdin.fifo" / "precious.txt").exists(), (
+        "repair must not reach through the symlink")
+
+
 async def test_fast_path_fifo_failure_refuses_start(monkeypatch, tmp_path):
     """Sol r3-2: when the fast-path FIFO recreation fails, the record is
     refused (no start, pair removed) instead of started into a

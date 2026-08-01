@@ -149,7 +149,26 @@ class MessageBus:
         for dispatch in self._dispatch_by_agent.pop(name, set()):
             if not dispatch.done():
                 dispatch.cancel()
-        self.queues.pop(name, None)
+        # Sol r5-2: requests still QUEUED (never dispatched) also have
+        # waiting callers — settle their futures with the handler-error
+        # convention so eviction cannot strand a caller until the full
+        # request timeout.
+        queue = self.queues.pop(name, None)
+        if queue is not None:
+            while True:
+                try:
+                    _priority, _seq, qmsg = queue.get_nowait()
+                except asyncio.QueueEmpty:
+                    break
+                fut = self.pending.pop(qmsg.id, None)
+                if fut is not None and not fut.done():
+                    fut.set_result(BusMessage(
+                        type=MessageType.RESPONSE,
+                        source=qmsg.target,
+                        target=qmsg.source,
+                        content=f"handler error: cancelled: {qmsg.id}",
+                        reply_to=qmsg.id,
+                    ))
         self.handlers.pop(name, None)
         return task
 
