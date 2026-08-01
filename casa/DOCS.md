@@ -1017,7 +1017,7 @@ Set `onepassword_service_account_token` (from https://developer.1password.com/do
 as a plaintext app option — it's the single root of trust and cannot
 self-reference. Set `onepassword_default_vault` to the vault name (default
 "Casa"). Every other password-typed option (`claude_oauth_token`,
-`telegram_bot_token`, `webhook_secret`) accepts either
+`telegram_bot_token`, `webhook_secret`, `context7_api_key`) accepts either
 plaintext OR an `op://` reference.
 
 Plugin env vars resolved via `plugin-env.conf` (`/config/plugin-env.conf`),

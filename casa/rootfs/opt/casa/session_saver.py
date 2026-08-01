@@ -5,16 +5,21 @@ conversations to Hindsight at session granularity (short-term covers live turns)
 from __future__ import annotations
 
 import asyncio
+import json
 import logging
 import os
+import re
 from datetime import timedelta
+from pathlib import Path
 from typing import TYPE_CHECKING, Any
 
+from atomic_io import atomic_write_json
 from channel_policy import writes_to_bank
 from claude_agent_sdk import get_session_messages
 from hindsight_ids import bank_id
 from memory_provenance import build_retain_items
 from personality_types import RetainedTurn, SpeakerProvenance
+from speaker_provenance import provenance_from_mapping, provenance_mapping
 from tier_classifier import classify_tier
 
 if TYPE_CHECKING:
@@ -25,6 +30,15 @@ logger = logging.getLogger(__name__)
 # Per-channel freshness windows (spec §3.3). Independent of SESSION_TTL.
 _DEFAULT_VOICE_MIN = 30
 _DEFAULT_TELEGRAM_H = 12
+
+# #345: durable retry spool for failed gap retains. retain_cold_session runs
+# DECOUPLED from the registry, so once the new turn overwrites the entry a
+# failure has no in-registry retry — the spool (one JSON record per sid under
+# /data) is the durable path; the FreshnessReaper drives retries each sweep.
+_COLD_RETAIN_RETRY_DIR = "/data/cold-retain-retry"
+# Hourly reaper cadence → ~2 days of retries before a poison record (e.g. a
+# transcript the TTL sweeper already reaped) is dropped, loudly.
+_COLD_RETAIN_MAX_ATTEMPTS = 48
 
 # M29: bound the concurrency of per-item tier classification (each is a full
 # claude-CLI subprocess + LLM turn). Classifying a long transcript serially
@@ -147,14 +161,124 @@ async def save_session(
         # mid-save (slow multi-minute reaper retain) is not clobbered (M24).
         await registry.finish_save(channel_key, sid)
         return True
+    except asyncio.CancelledError:
+        # #345: a cancel (shutdown, task teardown) bypassed the Exception arm
+        # below and stranded the claim — the reaper then skipped this entry for
+        # ~2 sweep intervals before C3 stale-claim recovery reopened it. Release
+        # the claim on the way out. Loop-shield (cf. engagement_registry's
+        # _settle_despite_cancel): the clear is a to_thread file commit that can
+        # only be abandoned, never cancelled — re-shield until it settles even
+        # if further cancels land, then re-raise. Best-effort: if the clear
+        # itself fails, C3 recovery remains the backstop.
+        settle = asyncio.ensure_future(registry.clear_save_claim(channel_key, sid))
+        while not settle.done():
+            try:
+                await asyncio.shield(settle)
+            except asyncio.CancelledError:
+                continue
+            except Exception:  # noqa: BLE001 — best-effort; C3 is the backstop
+                break
+        raise
     except Exception as exc:  # noqa: BLE001 — never crash a save; reaper retries
         logger.warning("save_session failed for %s: %s — will retry", channel_key, exc)
         await registry.clear_save_claim(channel_key, sid)
         return False
 
 
+def _cold_retry_path(retry_dir: str | Path, sdk_session_id: str) -> Path:
+    safe = re.sub(r"[^A-Za-z0-9._-]", "_", sdk_session_id) or "unnamed"
+    return Path(retry_dir) / f"{safe}.json"
+
+
+def _spool_cold_retain(
+    old: "SessionEntrySnapshot", *, directory: str, channel: str,
+    retry_dir: str | Path,
+) -> None:
+    """#345: persist a durable retry record for a failed cold retain. Preserves
+    an existing record's attempt count; itself best-effort (a spool failure
+    logs — it must never crash the background retain's caller)."""
+    try:
+        path = _cold_retry_path(retry_dir, old.sdk_session_id)
+        attempts = 0
+        if path.exists():
+            try:
+                attempts = int(json.loads(path.read_text(encoding="utf-8")).get("attempts", 0))
+            except (OSError, ValueError, TypeError, AttributeError):
+                attempts = 0
+        path.parent.mkdir(parents=True, exist_ok=True)
+        atomic_write_json(str(path), {
+            "sdk_session_id": old.sdk_session_id,
+            "directory": directory,
+            "channel": channel,
+            "speaker_provenance": provenance_mapping(old.speaker_provenance),
+            "user_provenance": provenance_mapping(old.user_provenance),
+            "attempts": attempts,
+        })
+    except Exception:  # noqa: BLE001 — spooling is best-effort
+        logger.warning(
+            "cold-retain retry: failed to spool sid=%s", old.sdk_session_id,
+            exc_info=True,
+        )
+
+
+async def retry_spooled_cold_retains(
+    semantic_memory, *, retry_dir: str | Path | None = None,
+) -> None:
+    """#345: drive the durable retry spool (called by the FreshnessReaper each
+    sweep). Success removes the record; failure increments its attempt count
+    and gives up loudly at ``_COLD_RETAIN_MAX_ATTEMPTS``; a structurally
+    unreadable record is dropped rather than retried forever."""
+    root = Path(retry_dir if retry_dir is not None else _COLD_RETAIN_RETRY_DIR)
+    try:
+        records = sorted(root.glob("*.json"))
+    except OSError:
+        return
+    for path in records:
+        try:
+            record = json.loads(path.read_text(encoding="utf-8"))
+            sid = str(record["sdk_session_id"])
+            directory = str(record["directory"])
+            speaker = provenance_from_mapping(record["speaker_provenance"])
+            user = provenance_from_mapping(record["user_provenance"])
+        except (OSError, ValueError, KeyError, TypeError):
+            logger.error(
+                "cold-retain retry: unreadable record %s — dropping", path.name)
+            path.unlink(missing_ok=True)
+            continue
+        try:
+            messages = await asyncio.to_thread(get_session_messages, sid, directory)
+            items = await transcript_to_items(
+                messages, speaker_provenance=speaker, user_provenance=user)
+            if items:
+                await semantic_memory.retain(bank_id("casa"), items, async_=True)
+            path.unlink(missing_ok=True)
+        except asyncio.CancelledError:
+            raise
+        except Exception as exc:  # noqa: BLE001 — per-record; next sweep retries
+            attempts = 0
+            try:
+                attempts = int(record.get("attempts", 0))
+            except (ValueError, TypeError):
+                pass
+            attempts += 1
+            if attempts >= _COLD_RETAIN_MAX_ATTEMPTS:
+                logger.error(
+                    "cold-retain retry: giving up on sid=%s after %d attempts (%s)",
+                    sid, attempts, exc,
+                )
+                path.unlink(missing_ok=True)
+                continue
+            record["attempts"] = attempts
+            try:
+                atomic_write_json(str(path), record)
+            except OSError:
+                logger.warning(
+                    "cold-retain retry: failed to update attempts for sid=%s", sid)
+
+
 async def retain_cold_session(
     old: "SessionEntrySnapshot", *, directory: str, channel: str, semantic_memory,
+    retry_dir: str | Path = _COLD_RETAIN_RETRY_DIR,
 ) -> None:
     """Retain a specific cold SDK session's transcript to the shared ``casa`` bank,
     OFF the turn's critical path and DECOUPLED from the session registry (no
@@ -179,11 +303,22 @@ async def retain_cold_session(
         )
         if items:
             await semantic_memory.retain(bank_id("casa"), items, async_=True)
+    except asyncio.CancelledError:
+        # Terra r1 (#345): shutdown cancels these unawaited background tasks —
+        # without this arm the cancel bypassed the spool and lost exactly the
+        # registry-decoupled transcript the spool protects. The spool write is
+        # synchronous (no await), so it completes before the cancel propagates.
+        _spool_cold_retain(old, directory=directory, channel=channel, retry_dir=retry_dir)
+        raise
     except Exception:  # noqa: BLE001 — background; never surface to the turn
         logger.warning(
-            "background cold-session retain failed for sid=%s", old.sdk_session_id,
-            exc_info=True,
+            "background cold-session retain failed for sid=%s — spooling for "
+            "durable retry", old.sdk_session_id, exc_info=True,
         )
+        # #345: the registry entry is (about to be) overwritten by the new
+        # turn — without a durable record this transcript would be lost for
+        # good on a transient outage. The reaper retries the spool each sweep.
+        _spool_cold_retain(old, directory=directory, channel=channel, retry_dir=retry_dir)
 
 
 async def reset_channel(

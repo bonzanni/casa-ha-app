@@ -973,7 +973,13 @@ async def reload_plugin_env(runtime: Any, *, role: str | None = None) -> list[st
     """
     global _PLUGIN_ENV_LAST_KEYS
     import plugin_env_conf
+    import secrets_resolver
     from secrets_resolver import resolve as resolve_secret
+
+    # #345: a reload is the rotation path — drop the resolver's plaintext cache
+    # so op:// references are re-read from 1Password instead of returning the
+    # possibly-revoked cached value (which made rotation a silent no-op).
+    secrets_resolver.invalidate_cache()
 
     try:
         entries = await asyncio.to_thread(plugin_env_conf.read_entries)

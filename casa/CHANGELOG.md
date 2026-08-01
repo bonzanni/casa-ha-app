@@ -1,5 +1,40 @@
 # Changelog
 
+## [0.137.0] - 2026-08-01
+
+### Fixed / Security
+
+Secrets-family batch — four issues where a secret value leaked into the wrong
+channel, went stale, or got lost:
+
+- **Specialist config can no longer carry secret plaintext** (#337, high): a
+  config key the component's schema declares in `secret_names` is refused with
+  a typed error instead of being persisted verbatim into the instance tuple
+  under `/config` (which backups include). `secret_names_provided` now accepts
+  only schema-declared secret names, and an upgrade strips legacy plaintext
+  secret keys from the carried config snapshot.
+- **Vault-backed `webhook_secret` works for voice** (#333): an `op://…` value
+  is resolved before Supervisor discovery publishes it, so the companion
+  integration signs voice requests with the same secret Casa verifies —
+  previously every voice request failed HMAC until the secret was inlined.
+- **1Password rotations take effect on reload** (#345): a plugin-env reload
+  invalidates the resolver's cache instead of silently reusing the revoked
+  credential. A missing `op` binary now degrades with a warning instead of
+  aborting startup.
+- **Session persistence robustness** (#345): a structurally corrupt
+  `sessions.json` entry is quarantined at load instead of wedging the registry
+  and both sweepers; a session save cancelled at shutdown releases its claim;
+  a gap-superseded session whose background retain fails is spooled and
+  retried durably by the freshness reaper instead of being lost.
+- **`context7_api_key` accepts `op://` references** (#277), like every other
+  password-typed option.
+
+### Changed
+
+- docs: the corpus manifest sharded into `docs/manifest.d/` (#367) — the root
+  index had reached its 40 KB ceiling; the verifier, coverage ledger and CI
+  now read the root plus shards.
+
 ## [0.136.0] - 2026-08-01
 
 ### Fixed / Security

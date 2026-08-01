@@ -107,6 +107,68 @@ async def test_publishes_exact_schema_one_record_with_runtime_hostname(paths):
 
 
 @pytest.mark.asyncio
+async def test_op_reference_secret_is_resolved_before_publish(paths, monkeypatch):
+    """#333: when the operator stores webhook_secret as an op:// reference, Casa
+    verifies HMAC with the RESOLVED value (casa_core §8 in-place env resolution) —
+    so discovery must publish the resolved value too, or the companion
+    integration signs with the literal ``op://...`` string and every voice
+    request fails HMAC (401)."""
+    import secrets_resolver
+    from supervisor_discovery import publish_or_remove_discovery
+
+    secret, state = paths
+    secret.write_text("op://Casa/Webhook/credential")
+    monkeypatch.setattr(
+        secrets_resolver, "resolve",
+        lambda value: "resolved-secret" if value == "op://Casa/Webhook/credential" else value,
+    )
+    session = _Session([
+        _Response(200, {"data": {"hostname": "casa-runtime"}}),
+        _Response(200, {"data": {"uuid": "new-uuid"}}),
+    ])
+
+    await publish_or_remove_discovery(
+        auth_enabled=True,
+        secret_file=secret, state_file=state,
+        session_factory=_session_factory(session), sleep=AsyncMock(),
+    )
+
+    posted = [c for c in session.calls if c[0] == "POST"]
+    assert len(posted) == 1
+    assert posted[0][2]["json"]["config"]["webhook_secret"] == "resolved-secret"
+
+
+@pytest.mark.asyncio
+async def test_unresolvable_op_reference_publishes_nothing(paths, monkeypatch, caplog):
+    """#333: a failed op:// resolution must publish NOTHING — a missing
+    discovery record is a loud, diagnosable state in the companion integration,
+    while publishing the literal reference silently breaks HMAC."""
+    import secrets_resolver
+    from supervisor_discovery import publish_or_remove_discovery
+
+    secret, state = paths
+    secret.write_text("op://Casa/Webhook/credential")
+
+    def _boom(value: str) -> str:
+        raise RuntimeError("op read failed")
+
+    monkeypatch.setattr(secrets_resolver, "resolve", _boom)
+    session = _Session([])
+
+    with caplog.at_level(logging.WARNING):
+        await publish_or_remove_discovery(
+            auth_enabled=True,
+            secret_file=secret, state_file=state,
+            session_factory=_session_factory(session), sleep=AsyncMock(),
+        )
+
+    assert session.calls == []
+    assert any("webhook secret" in r.getMessage() for r in caplog.records)
+    # The reference VALUE (vault path) itself is never logged.
+    assert all("Casa/Webhook" not in r.getMessage() for r in caplog.records)
+
+
+@pytest.mark.asyncio
 async def test_retries_transient_failure_a_bounded_number_of_times(paths):
     from supervisor_discovery import publish_or_remove_discovery
 
@@ -350,3 +412,59 @@ def test_manifest_and_docs_declare_discovery_contract():
     docs = Path("casa/DOCS.md").read_text()
     assert "discovery: [casa]" in manifest
     assert "/data/casa-supervisor-discovery.json" in docs
+
+
+@pytest.mark.asyncio
+async def test_unresolvable_op_reference_removes_a_stale_record(paths, monkeypatch):
+    """Terra r1 (#333): skipping the publish is not enough when a PRIOR record
+    exists — on upgrade it may carry the literal op:// reference as the signing
+    key, and an HMAC keyed on a predictable string is fail-open. The stale
+    record must be removed so the integration fails loud instead."""
+    import json as json_mod
+    import secrets_resolver
+    from supervisor_discovery import publish_or_remove_discovery
+
+    secret, state = paths
+    secret.write_text("op://Casa/Webhook/credential")
+    state.write_text(json_mod.dumps({"uuid": "stale-uuid"}))
+
+    def _boom(value: str) -> str:
+        raise RuntimeError("op read failed")
+
+    monkeypatch.setattr(secrets_resolver, "resolve", _boom)
+    session = _Session([_Response(200, {})])
+
+    await publish_or_remove_discovery(
+        auth_enabled=True,
+        secret_file=secret, state_file=state,
+        session_factory=_session_factory(session), sleep=AsyncMock(),
+    )
+
+    assert session.calls == [("DELETE", "http://supervisor/discovery/stale-uuid", {})]
+    assert not state.exists()
+
+
+@pytest.mark.asyncio
+async def test_op_reference_resolving_empty_is_treated_as_failure(paths, monkeypatch):
+    """Terra r2 (#333): an op:// reference resolving to an EMPTY value must be
+    treated as a failed resolution — publishing an empty webhook secret while
+    Casa fails closed advertises a broken (and trivially satisfiable) key.
+    Any stale record is removed instead."""
+    import json as json_mod
+    import secrets_resolver
+    from supervisor_discovery import publish_or_remove_discovery
+
+    secret, state = paths
+    secret.write_text("op://Casa/Webhook/credential")
+    state.write_text(json_mod.dumps({"uuid": "stale-uuid"}))
+    monkeypatch.setattr(secrets_resolver, "resolve", lambda value: "")
+    session = _Session([_Response(200, {})])
+
+    await publish_or_remove_discovery(
+        auth_enabled=True,
+        secret_file=secret, state_file=state,
+        session_factory=_session_factory(session), sleep=AsyncMock(),
+    )
+
+    assert session.calls == [("DELETE", "http://supervisor/discovery/stale-uuid", {})]
+    assert not state.exists()

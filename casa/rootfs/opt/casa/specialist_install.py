@@ -1420,7 +1420,7 @@ def commit_specialist_install(
     from prompt_compiler import compile_prompt_bundle
     from role_slot import materialize_role
     from role_artifact import load_role_artifact
-    from specialist_lifecycle import SpecialistInstance, satisfy_config
+    from specialist_lifecycle import SpecialistInstance, satisfy_config, secret_config_violations
     from specialist_component import load_specialist_component
     from specialist_install_consent import install_consent_identity
     import plugin_registry
@@ -1555,6 +1555,26 @@ def commit_specialist_install(
             raise SpecialistInstallError(
                 "checksum_changed", "CAS-persisted component no longer matches the approved inspection")
 
+        # #337: refuse BEFORE satisfy_config and before any instance-dir
+        # mutation — a secret-named key with a plaintext value must never be
+        # persisted into a config_snapshot, and secret_names_provided may only
+        # name schema-declared secrets (else a required non-secret key could be
+        # "satisfied" with no value ever provided).
+        secret_valued, unknown_secret_names = secret_config_violations(
+            schema=component.config_schema, provided_non_secret=config,
+            provided_secret_names=secret_names_provided,
+        )
+        if secret_valued:
+            raise SpecialistInstallError(
+                "secret_value_in_config",
+                f"config keys {secret_valued} are declared secret_names — secret values "
+                "are never accepted as plaintext config; provide the secret through the "
+                "secret channel and list its name in secret_names_provided")
+        if unknown_secret_names:
+            raise SpecialistInstallError(
+                "unknown_secret_name",
+                f"secret_names_provided entries {unknown_secret_names} are not declared "
+                "in the component's config_schema secret_names")
         satisfied, missing = satisfy_config(
             schema=component.config_schema, provided_non_secret=config,
             provided_secret_names=secret_names_provided,
@@ -1959,7 +1979,7 @@ def _upgrade_core(
     from prompt_compiler import compile_prompt_bundle
     from role_slot import materialize_role
     from role_artifact import load_role_artifact
-    from specialist_lifecycle import SpecialistInstance, satisfy_config
+    from specialist_lifecycle import SpecialistInstance, satisfy_config, secret_config_violations
     from specialist_install_consent import install_consent_identity
     import specialist_materialize
 
@@ -2057,17 +2077,66 @@ def _upgrade_core(
     else:
         persona = load_persona_pack(cas_dir / "persona" / "pack", cas_dir / "persona" / "manifest.json")
 
+    # #337: same channel discipline as commit_specialist_install — refuse a
+    # secret-named key arriving with a plaintext value, and an undeclared
+    # secret_names_provided entry, BEFORE any staging.
+    secret_valued, unknown_secret_names = secret_config_violations(
+        schema=component.config_schema, provided_non_secret=config,
+        provided_secret_names=secret_names_provided,
+    )
+    if secret_valued:
+        raise SpecialistInstallError(
+            "secret_value_in_config",
+            f"config keys {secret_valued} are declared secret_names — secret values "
+            "are never accepted as plaintext config; provide the secret through the "
+            "secret channel and list its name in secret_names_provided")
+    if unknown_secret_names:
+        raise SpecialistInstallError(
+            "unknown_secret_name",
+            f"secret_names_provided entries {unknown_secret_names} are not declared "
+            "in the component's config_schema secret_names")
+
     # Re-validate the OPERATOR'S EXISTING non-secret config against the NEW
     # schema, fail-closed, into the DESIRED snapshot only (spec §4.1) — the
     # active config_snapshot is never read or touched here. Keys the NEW
     # schema no longer declares are DROPPED, not carried forward forever —
     # "re-validate ... fail-closed" means the schema is authoritative on
-    # every upgrade, not just at fresh install.
-    known_keys = set(component.config_schema.get("required", [])) | set(
-        component.config_schema.get("secret_names", []))
-    stale_config = {**dict(active_before.config_snapshot), **dict(config)}
+    # every upgrade, not just at fresh install. #337: secret-named keys are
+    # ALSO stripped from the carried snapshot — a pre-#337 install may have
+    # persisted a secret's plaintext there, and an upgrade must not carry it
+    # forward (the secret channel, secret_names_provided, satisfies instead).
+    secret_names = set(component.config_schema.get("secret_names", []) or [])
+    # Terra r2 (#337): the CARRIED snapshot is stripped against the PRIOR
+    # component's declaration too — a key the incoming schema reclassifies
+    # from secret to plain-required must not smuggle its legacy plaintext
+    # through the carry-over (the operator supplies a fresh plain value, or
+    # the upgrade lands pending-configuration). Caller-supplied `config` is
+    # untouched here; it was already guarded against the NEW secret_names.
+    prior_secret_names = _declared_secret_names_for_root(
+        active_before.root, specialists_dir=specialists_dir)
+    if prior_secret_names is None:
+        # Sol r3: unloadable prior schema — fail CLOSED. Nothing carries; the
+        # operator re-supplies config (or the upgrade lands
+        # pending-configuration) rather than legacy plaintext riding through.
+        prior_secret_names = set(active_before.config_snapshot)
+    carried_config = {
+        k: v for k, v in dict(active_before.config_snapshot).items()
+        if k not in prior_secret_names
+    }
+    known_keys = set(component.config_schema.get("required", [])) | secret_names
+    stale_config = {**carried_config, **dict(config)}
     dropped_keys = sorted(k for k in stale_config if k not in known_keys)
-    merged_config = {k: v for k, v in stale_config.items() if k in known_keys}
+    stripped_secret_keys = sorted(
+        {k for k in active_before.config_snapshot if k in prior_secret_names}
+        | {k for k in stale_config if k in secret_names})
+    if stripped_secret_keys:
+        logger.info(
+            "specialist upgrade %r: stripped legacy plaintext secret key(s) %s from "
+            "the carried config_snapshot (#337)", slug, stripped_secret_keys)
+    merged_config = {
+        k: v for k, v in stale_config.items()
+        if k in known_keys and k not in secret_names
+    }
     satisfied, missing = satisfy_config(
         schema=component.config_schema, provided_non_secret=merged_config,
         provided_secret_names=secret_names_provided,
@@ -2167,6 +2236,13 @@ def _upgrade_core(
         instance_dir.stage_desired(InstanceTuple(
             root=root, binding=binding, config_snapshot=merged_config, config_digest=effective_config_digest))
         committed = instance_dir.commit_desired_to_active()  # new binding digest -> new session epoch
+        # #337 (Sol r1): the commit just rotated the OLD active — possibly
+        # carrying legacy plaintext — into active.prior.yaml; strip
+        # secret-named keys (the union of both components' declarations).
+        _sanitize_prior_snapshot(
+            specialists_dir / slug / "active.prior.yaml",
+            secret_names=secret_names | prior_secret_names,
+            slug=slug)
         try:
             specialist_materialize.materialize_specialist_operational_files(
                 agents_specialists_dir=agents_specialists_dir, slug=slug, role=role, persona=persona,
@@ -2180,6 +2256,166 @@ def _upgrade_core(
     return SpecialistInstance(
         slug=slug, stable_agent_id=f"specialist:{slug}", state="active", active=committed,
         desired=None, last_activation_error=note)
+
+
+def _sanitize_prior_snapshot(prior_path: Path, *, secret_names: "set[str]", slug: str) -> None:
+    """#337 (Sol r1): ``commit_desired_to_active`` copies the OLD active tuple
+    — possibly carrying pre-#337 plaintext secrets in its ``config_snapshot``
+    — into ``active.prior.yaml``, which the config git repository tracks and
+    rollback restores verbatim. Strip secret-named keys from the retained
+    prior. Best-effort by design: this runs post-commit, when the new active
+    is already durable, so a failure logs and degrades (the rollback path
+    strips again as defense-in-depth)."""
+    if not secret_names:
+        return
+    from personality_binding import (
+        InstanceTuple, atomic_write_instance_tuple, load_instance_tuple,
+    )
+    try:
+        prior = load_instance_tuple(prior_path)
+        if prior is None:
+            return
+        cleaned = {k: v for k, v in dict(prior.config_snapshot).items()
+                   if k not in secret_names}
+        if len(cleaned) == len(prior.config_snapshot):
+            return
+        atomic_write_instance_tuple(prior_path, InstanceTuple(
+            root=prior.root, binding=prior.binding,
+            config_snapshot=cleaned, config_digest=prior.config_digest))
+        logger.info(
+            "specialist upgrade %r: stripped legacy plaintext secret key(s) "
+            "from active.prior.yaml (#337)", slug)
+    except Exception:  # noqa: BLE001 — post-commit, best-effort
+        logger.warning(
+            "specialist %r: prior-snapshot sanitization failed (best-effort; "
+            "the committed active is unaffected)", slug, exc_info=True)
+
+
+def _declared_secret_names_for_root(
+    component_root: str, *, specialists_dir: Path,
+) -> "set[str] | None":
+    """Read a CAS-stored component's ``secret_names`` — used to sanitize
+    snapshots that belong to the PRIOR component, whose schema may declare
+    different secret names than the incoming one.
+
+    Sol r3 (#337): returns ``None`` — not an empty set — when the schema
+    cannot be loaded, so callers FAIL CLOSED (treat every snapshot key as
+    potentially secret) instead of silently skipping the strip. Sol r4: the
+    schema is read through :func:`load_specialist_component`, whose checksum
+    verification distinguishes a GENUINE no-secret declaration from parseable
+    corruption (a truncated ``{}`` no longer matches the manifest checksum)."""
+    try:
+        _, _, checksum = parse_component_root(component_root)
+        cas_dir = cas_store_dir(checksum, store_root=specialists_dir / "store")
+        component = load_specialist_component(cas_dir, cas_dir / "manifest.json")
+        # Sol r5: the loader's internal check only proves manifest↔files
+        # consistency — a tamper that rewrites BOTH passes it. The CAS dir is
+        # named by the FULL root digest; recompute it and require a match.
+        deps = resolve_dependency_closure(component, cas_dir)
+        recomputed = compute_install_root_digest(
+            component, deps, manifest_bytes=(cas_dir / "manifest.json").read_bytes())
+        if recomputed != checksum:
+            logger.warning(
+                "component %s: CAS content no longer matches its root digest — "
+                "treating every carried snapshot key as potentially secret "
+                "(fail closed)", component_root)
+            return None
+        return set(component.config_schema.get("secret_names", []) or [])
+    except Exception:  # noqa: BLE001 — callers treat None as "strip everything"
+        logger.warning(
+            "component schema for %s is unloadable — treating every carried "
+            "snapshot key as potentially secret (fail closed)", component_root,
+            exc_info=True)
+        return None
+
+
+_TUPLE_SNAPSHOT_FILES = (
+    "active.yaml", "desired.yaml", "active.prior.yaml",
+    "active.yaml.rollback-tmp", "desired.error.yaml",
+)
+
+
+def sanitize_specialist_snapshots(
+    specialists_dir: Path = Path("/config/specialists"),
+) -> int:
+    """#337 (Sol r2): boot-time scrub of legacy plaintext secret keys from
+    every persisted specialist tuple snapshot. Two gaps this closes: a
+    pre-guard install keeps its plaintext until that slug's next
+    upgrade/rollback, and the upgrade's post-commit prior sanitization has a
+    crash window — both are healed at the next boot, BEFORE the boot
+    config-git snapshot can commit the plaintext.
+
+    Works on the raw YAML payload (so ``desired.error.yaml``'s extra
+    ``_error_reason`` and a pending ``.rollback-tmp`` are handled uniformly)
+    and strips each snapshot against ITS OWN component root's declared
+    ``secret_names``. Everything else — binding, digest, error reason — is
+    preserved byte-compatibly. Best-effort per file; returns the number of
+    files cleaned."""
+    from atomic_io import atomic_write_text
+
+    cleaned = 0
+    if not specialists_dir.is_dir():
+        return 0
+    # One schema lookup per distinct root, not per file — a slug's five
+    # snapshot files usually share at most two roots.
+    schema_cache: dict[str, "set[str] | None"] = {}
+    for slug_dir in sorted(specialists_dir.iterdir()):
+        if not slug_dir.is_dir() or slug_dir.name in {"store", ".bundle-staging"}:
+            continue
+        for filename in _TUPLE_SNAPSHOT_FILES:
+            path = slug_dir / filename
+            if not path.is_file():
+                continue
+            try:
+                payload = yaml.safe_load(path.read_text(encoding="utf-8"))
+                if not isinstance(payload, dict):
+                    continue
+                snapshot = payload.get("config_snapshot")
+                root = payload.get("root")
+                if snapshot and not isinstance(snapshot, dict):
+                    # Sol r4 family: a truthy non-mapping snapshot cannot be
+                    # classified key-by-key — replace it outright.
+                    payload["config_snapshot"] = {}
+                    atomic_write_text(
+                        path, yaml.safe_dump(payload, sort_keys=False), mode=0o600)
+                    cleaned += 1
+                    logger.info(
+                        "specialist %r: replaced a non-mapping config_snapshot "
+                        "in %s (#337)", slug_dir.name, filename)
+                    continue
+                if not isinstance(snapshot, dict) or not snapshot:
+                    continue
+                if not isinstance(root, str) or not root:
+                    # Sol r4: an unusable root cannot be classified — scrub
+                    # everything rather than skipping into the git snapshot.
+                    secret_names: "set[str] | None" = set(snapshot)
+                else:
+                    if root not in schema_cache:
+                        schema_cache[root] = _declared_secret_names_for_root(
+                            root, specialists_dir=specialists_dir)
+                    secret_names = schema_cache[root]
+                    if secret_names is None:
+                        # Sol r3: unloadable schema — scrub EVERY key rather
+                        # than silently skipping; the config-git snapshot follows.
+                        secret_names = set(snapshot)
+                # Sol r5: str() before sorting — mixed-type mapping keys must
+                # not TypeError out of a fail-closed scrub into the skip arm.
+                stripped = sorted(str(k) for k in snapshot if k in secret_names)
+                if not stripped:
+                    continue
+                payload["config_snapshot"] = {
+                    k: v for k, v in snapshot.items() if k not in secret_names}
+                atomic_write_text(
+                    path, yaml.safe_dump(payload, sort_keys=False), mode=0o600)
+                cleaned += 1
+                logger.info(
+                    "specialist %r: scrubbed legacy plaintext secret key(s) %s "
+                    "from %s (#337)", slug_dir.name, stripped, filename)
+            except Exception:  # noqa: BLE001 — best-effort per file
+                logger.warning(
+                    "specialist %r: snapshot scrub of %s failed",
+                    slug_dir.name, filename, exc_info=True)
+    return cleaned
 
 
 def _prior_owned_entry(slug: str, row: dict) -> dict:
@@ -2339,7 +2575,7 @@ def _rollback_core(
     because a retained tuple still references them, see Task N1d's
     cas_pin_roots). Rollback IS an upgrade to the prior tuple — reuse
     InstanceDir's own stage/commit, never a bespoke restore path."""
-    from personality_binding import InstanceDir, load_instance_tuple
+    from personality_binding import InstanceDir, InstanceTuple, load_instance_tuple
     from prompt_compiler import compile_prompt_bundle
     from role_slot import materialize_role
     from role_artifact import load_role_artifact
@@ -2405,6 +2641,21 @@ def _rollback_core(
         )
     except ValueError as exc:
         raise SpecialistInstallError("compile_failed", str(exc)) from exc
+
+    # #337 (Sol r1, defense-in-depth): a pre-#337 prior can still carry a
+    # secret's plaintext in its config_snapshot — never restore it. Strip
+    # against the prior component's own secret_names declaration.
+    _prior_secret_names = set(prior_component.config_schema.get("secret_names", []) or [])
+    _stripped = sorted(k for k in prior.config_snapshot if k in _prior_secret_names)
+    if _stripped:
+        logger.info(
+            "specialist rollback %r: stripped legacy plaintext secret key(s) "
+            "%s from the restored snapshot (#337)", slug, _stripped)
+        prior = InstanceTuple(
+            root=prior.root, binding=prior.binding,
+            config_snapshot={k: v for k, v in dict(prior.config_snapshot).items()
+                             if k not in _prior_secret_names},
+            config_digest=prior.config_digest)
 
     # Commit FIRST, same reordering as commit_specialist_install/
     # upgrade_specialist — `prior` is a previously-active, already-validated

@@ -570,3 +570,65 @@ def test_default_invocation_fails_on_stale_nav(tmp_path, monkeypatch, capsys):
     assert verify_docs.main() == 1
     out = capsys.readouterr().out
     assert "generated navigation is stale" in out
+
+
+# --- manifest shards (#367) ----------------------------------------------------------
+
+SHARD_META = """
+- doc: manifest.d/architecture.yaml
+  kind: meta
+  summary: Manifest shard - architecture documents.
+"""
+
+
+def _sharded_corpus(tmp_path: Path, shard_body: str) -> Path:
+    root = _corpus(tmp_path, manifest=SHARD_META, stage=False)
+    shard_dir = tmp_path / "docs" / "manifest.d"
+    shard_dir.mkdir()
+    (shard_dir / "architecture.yaml").write_text(shard_body)
+    subprocess.run(["git", "-C", str(tmp_path), "add", "-A"], check=True)
+    return root
+
+
+def test_a_shard_under_manifest_d_contributes_entries(tmp_path):
+    """#367: the manifest shards at its ceiling — entries in docs/manifest.d/*.yaml
+    are loaded exactly like root entries, so a corpus whose documents are claimed
+    only by a shard verifies clean."""
+    root = _sharded_corpus(tmp_path, ENTRY)
+    assert verify_docs.verify(root) == []
+
+
+def test_a_dead_anchor_in_a_shard_is_caught(tmp_path):
+    """Shard entries are VERIFIED, not merely admitted — a dead anchor in a
+    shard must bite exactly as it does in the root manifest."""
+    root = _sharded_corpus(tmp_path, ENTRY.replace("casa/a.py::A.b", "casa/a.py::A.zzz"))
+    assert any("A.zzz" in p for p in verify_docs.verify(root))
+
+
+def test_a_shard_over_the_index_ceiling_is_rejected(tmp_path):
+    root = _sharded_corpus(tmp_path, ENTRY + ("# pad\n" * 7000))
+    assert any("40 KB" in p and "architecture.yaml" in p for p in verify_docs.verify(root))
+
+
+def test_a_document_may_not_live_under_manifest_d(tmp_path):
+    """manifest.d/ holds manifest shards only — a kind:document entry whose file
+    hides there escapes the routing/index rules and is refused."""
+    rogue = (
+        "- doc: manifest.d/rogue.md\n"
+        "  summary: Sneaky.\n"
+        "  when_changing: nothing\n"
+    )
+    root = _corpus(
+        tmp_path, manifest=rogue,
+        docs={"manifest.d/rogue.md": "# Rogue\n" + CODE_WINS + SOURCEMAP},
+    )
+    assert any("manifest.d" in p and "rogue.md" in p for p in verify_docs.verify(root))
+
+
+def test_a_doc_duplicated_between_root_and_shard_is_caught(tmp_path):
+    root = _corpus(tmp_path, manifest=SHARD_META + ENTRY, stage=False)
+    shard_dir = tmp_path / "docs" / "manifest.d"
+    shard_dir.mkdir()
+    (shard_dir / "architecture.yaml").write_text(ENTRY)
+    subprocess.run(["git", "-C", str(tmp_path), "add", "-A"], check=True)
+    assert any("listed twice" in p for p in verify_docs.verify(root))

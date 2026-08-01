@@ -181,23 +181,38 @@ def _no_duplicate_keys(loader, node, deep=False):
 _DuplicateKeyLoader.construct_mapping = _no_duplicate_keys
 
 
+def _manifest_files(docs_dir: Path) -> list[Path]:
+    """The root manifest plus every shard, in a deterministic order (#367).
+
+    `manifest.yaml` is required and stays the entry point; when it reaches the
+    index ceiling, entries move to `manifest.d/<name>.yaml` shards. Each shard
+    is a plain top-level list, exactly like the root, and each shard FILE must
+    itself carry a manifest entry (publication is allowlist-only)."""
+    return [docs_dir / "manifest.yaml"] + sorted((docs_dir / "manifest.d").glob("*.yaml"))
+
+
 def _load_entries(docs_dir: Path) -> tuple[list[dict], list[str]]:
-    """Parse the manifest, normalising anything a later caller would trip over.
+    """Parse the manifest (root + `manifest.d/` shards), normalising anything a
+    later caller would trip over.
 
     Normalisation happens HERE rather than per-entry because `verify()` builds sets from
     these values before per-entry validation runs, and `kind: []` is unhashable.
     """
-    try:
-        raw = yaml.load((docs_dir / "manifest.yaml").read_text(), _DuplicateKeyLoader)
-    except yaml.YAMLError as exc:
-        return [], [f"docs/manifest.yaml is not valid YAML: {exc}"]
-    except OSError as exc:
-        return [], [f"docs/manifest.yaml is unreadable: {exc}"]
-    if not isinstance(raw, list):
-        return [], ["docs/manifest.yaml must be a list of entries"]
+    raw: list = []
+    problems: list[str] = []
+    for source in _manifest_files(docs_dir):
+        label = f"docs/{source.relative_to(docs_dir)}"
+        try:
+            part = yaml.load(source.read_text(), _DuplicateKeyLoader)
+        except yaml.YAMLError as exc:
+            return [], [f"{label} is not valid YAML: {exc}"]
+        except OSError as exc:
+            return [], [f"{label} is unreadable: {exc}"]
+        if not isinstance(part, list):
+            return [], [f"{label} must be a list of entries"]
+        raw.extend(part)
 
     entries: list[dict] = []
-    problems: list[str] = []
     for index, entry in enumerate(raw):
         if not isinstance(entry, dict) or not isinstance(entry.get("doc"), str):
             problems.append(f"manifest entry {index} is not a mapping with a string `doc` key")
@@ -602,7 +617,15 @@ def verify(repo_root: Path) -> list[str]:
 
         parts = Path(doc).parts
         top = parts[0] if len(parts) > 1 else ""
-        if top and top not in ALLOWED_TOP_DIRS:
+        if top == "manifest.d":
+            # #367: manifest shards only. A document hidden here would escape
+            # the routing table and the generated index.
+            if kind in DOCUMENT_KINDS:
+                problems.append(
+                    f"{doc}: manifest.d/ holds manifest shards only — a document "
+                    f"must live under one of {', '.join(sorted(ALLOWED_TOP_DIRS))}/"
+                )
+        elif top and top not in ALLOWED_TOP_DIRS:
             problems.append(
                 f"{doc}: {top}/ is not an admitted corpus directory "
                 f"({', '.join(sorted(ALLOWED_TOP_DIRS))})"

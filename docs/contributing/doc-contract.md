@@ -88,13 +88,19 @@ and CI refuse an unmanifested tracked document wherever they run; like every lay
 `doctrine/publishing.md`, that is enforced defence, not an absolute guarantee against a
 deliberate bypass.
 
+The manifest itself splits the same way it makes documents split: at its index ceiling,
+entries move to `manifest.d/<name>.yaml` shards — each a plain top-level list loaded
+together with the root by the verifier and the coverage ledger, and each shard file
+carrying its own `kind: meta` entry in the allowlist. Documents never live under
+`manifest.d/`; the verifier refuses one there.
+
 `when_changing` is phrased as the *task* an agent is about to do, not the subsystem name.
 An agent knows what it is about to change before it knows which subsystem owns it, and the
 routing table has to meet it where it is.
 
 Never hand-edit a generated block or file: `llms.txt`, `doctrine/invariants.md`, the routing
 table between the README's markers, and each document's Source & test map are all rendered
-from `manifest.yaml`. Hand-kept indexes rot behind the corpus they index; generated ones
+from the manifest (root plus shards). Hand-kept indexes rot behind the corpus they index; generated ones
 cannot. Regenerate with `python -m scripts.verify_docs . --write-nav`.
 
 ## Source & test map

@@ -24,7 +24,11 @@ SECTION_ORDER = [
 
 
 def _documents():
-    entries = yaml.safe_load((DOCS / "manifest.yaml").read_text())
+    # #367: the manifest shards at its index ceiling — read the root plus every
+    # docs/manifest.d/*.yaml shard, or these pins silently skip sharded docs.
+    entries = []
+    for source in [DOCS / "manifest.yaml"] + sorted((DOCS / "manifest.d").glob("*.yaml")):
+        entries.extend(yaml.safe_load(source.read_text()))
     return [
         e["doc"] for e in entries
         if e.get("kind", "document") == "document"
@@ -96,3 +100,11 @@ def test_pin_inv_pub_002_doctrine_carries_no_dated_history():
             continue
         body = _body_without_front_matter((DOCS / doc).read_text())
         assert not re.search(r"\b20\d{2}-\d{2}-\d{2}\b", body), doc
+
+
+def test_documents_loader_sees_sharded_entries():
+    """Terra r1 (#367): with architecture entries moved to docs/manifest.d/
+    shards, a root-only loader silently exempts every architecture document
+    from the front-matter, section-order and no-changelog pins."""
+    docs = _documents()
+    assert any(d.startswith("architecture/") for d in docs)

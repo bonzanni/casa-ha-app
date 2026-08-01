@@ -612,6 +612,41 @@ class TestReloadPluginEnv:
         assert os.environ["FOO"] == "bar"
         assert os.environ["BAZ"] == "RESOLVED"
 
+    async def test_op_rotation_is_picked_up_on_reload(self, monkeypatch):
+        """#345: resolve() lru-caches plaintext by the unchanged op:// reference,
+        so without a cache invalidation a rotated 1Password field keeps feeding
+        the revoked credential to reload (which then reports success). A
+        plugin_env reload must re-read the vault."""
+        from unittest.mock import MagicMock
+        from reload import dispatch, register_handler, reload_plugin_env
+        import secrets_resolver
+        register_handler("plugin_env", reload_plugin_env)
+        import tools as tools_mod
+        monkeypatch.setattr(tools_mod, "_regenerate_plugin_health", lambda extra: None)
+
+        monkeypatch.setattr("plugin_env_conf.read_entries", lambda: {"KEY": "op://v/i/f"})
+        secrets_resolver.resolve.cache_clear()
+        values = iter(["old-secret", "new-secret"])
+
+        def fake_run(cmd, **kwargs):
+            result = MagicMock()
+            result.stdout = next(values) + "\n"
+            result.returncode = 0
+            return result
+
+        monkeypatch.setattr(secrets_resolver.subprocess, "run", fake_run)
+        monkeypatch.delenv("KEY", raising=False)
+
+        runtime = _make_runtime()
+        result = await dispatch("plugin_env", runtime=runtime)
+        assert result["status"] == "ok"
+        assert os.environ["KEY"] == "old-secret"
+        # The operator rotates the 1Password field, then reloads again.
+        result = await dispatch("plugin_env", runtime=runtime)
+        assert result["status"] == "ok"
+        assert os.environ["KEY"] == "new-secret"
+        secrets_resolver.resolve.cache_clear()  # never leak the fake into other tests
+
     async def test_regenerates_plugin_health_after_env_applied(self, monkeypatch):
         """P4b (2026-07-18 self-containment plan): a secrets-only repair must
         clear a stale-red plugin-health.json — reload regenerates + notifies

@@ -122,6 +122,43 @@ async def test_save_session_releases_claim_on_failure(tmp_path, monkeypatch):
     assert not reg.get("telegram-r1").get("consolidated_at")  # claim released
 
 
+async def test_save_session_cancellation_releases_the_claim(tmp_path, monkeypatch):
+    """#345: CancelledError bypassed the `except Exception` that releases the
+    save claim, so a shutdown mid-retain stranded `consolidated_at` — the
+    reaper then skipped the entry for ~2 sweep intervals (C3 window) before
+    stale-claim recovery kicked in."""
+    import asyncio
+
+    async def fake_classify(content: str) -> str:
+        return "public"
+    monkeypatch.setattr(session_saver, "classify_tier", fake_classify)
+
+    from session_registry import SessionRegistry
+    reg = SessionRegistry(str(tmp_path / "s.json"))
+    await reg.register("telegram-r1", "assistant", "sid-9", binding_digest=STUB_BINDING_DIGEST, speaker_provenance=STUB_SPEAKER_PROV, user_provenance=STUB_USER_PROV)
+
+    retain_started = asyncio.Event()
+
+    class _HangingMemory:
+        async def retain(self, *args, **kwargs):
+            retain_started.set()
+            await asyncio.Event().wait()  # hang until cancelled
+
+    msgs = [type("M", (), {"type": "user", "message": {"content": "hi"}})()]
+    with patch("session_saver.get_session_messages", return_value=msgs):
+        task = asyncio.create_task(save_session(
+            "telegram-r1", reg, _HangingMemory(), directory="/d", channel="telegram",
+        ))
+        await retain_started.wait()
+        task.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await task
+
+    entry = reg.get("telegram-r1")
+    assert entry is not None                       # kept for retry
+    assert not entry.get("consolidated_at")        # claim released despite the cancel
+
+
 async def test_save_session_skips_when_already_claimed(tmp_path):
     from session_registry import SessionRegistry
     reg = SessionRegistry(str(tmp_path / "s.json"))

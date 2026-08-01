@@ -43,3 +43,29 @@ def satisfy_config(
     required = list(schema.get("required", []))
     missing = [name for name in required if name not in provided_non_secret and name not in provided_secret_names]
     return (not missing, missing)
+
+
+def secret_config_violations(
+    *, schema: Mapping[str, object], provided_non_secret: Mapping[str, object],
+    provided_secret_names: frozenset[str],
+) -> tuple[list[str], list[str]]:
+    """#337: the two channels must respect the schema's secret declaration.
+
+    Returns ``(secret_valued, unknown_secret_names)``:
+
+    - ``secret_valued`` — keys of ``provided_non_secret`` that the schema
+      declares in ``secret_names``. A secret VALUE must never arrive in the
+      plain config channel: pre-#337 it both satisfied the requirement and was
+      persisted verbatim into desired.yaml/active.yaml ``config_snapshot``
+      (under /config, which snapshots/backups include).
+    - ``unknown_secret_names`` — entries of ``provided_secret_names`` the
+      schema does NOT declare secret. Accepting these lets a caller "satisfy"
+      a required non-secret key without ever providing a value (#331/#324).
+
+    Callers must refuse (typed error) when either list is non-empty, BEFORE
+    :func:`satisfy_config` and before any durable mutation.
+    """
+    declared = set(schema.get("secret_names", []) or [])
+    secret_valued = sorted(k for k in provided_non_secret if k in declared)
+    unknown_secret_names = sorted(n for n in provided_secret_names if n not in declared)
+    return secret_valued, unknown_secret_names

@@ -1,6 +1,10 @@
 import pytest
 
-from specialist_lifecycle import check_slug_uniqueness, satisfy_config
+from specialist_lifecycle import (
+    check_slug_uniqueness,
+    satisfy_config,
+    secret_config_violations,
+)
 
 
 def test_slug_colliding_with_a_fixed_resident_slot_is_rejected() -> None:
@@ -44,3 +48,38 @@ def test_satisfy_config_true_when_secret_name_is_present() -> None:
     satisfied, missing = satisfy_config(schema=schema, provided_non_secret={"api_base": "https://x"}, provided_secret_names=frozenset({"api_token"}))
     assert satisfied is True
     assert missing == []
+
+
+def test_secret_config_violations_flags_a_secret_valued_config_key() -> None:
+    """#337: a secret-named key arriving with a VALUE in the plain config channel
+    must be flagged — pre-fix it both satisfied the requirement and was persisted
+    verbatim into desired.yaml/active.yaml config_snapshot."""
+    schema = {"required": ["api_base", "api_token"], "secret_names": ["api_token"]}
+    secret_valued, unknown = secret_config_violations(
+        schema=schema, provided_non_secret={"api_base": "https://x", "api_token": "hunter2"},
+        provided_secret_names=frozenset(),
+    )
+    assert secret_valued == ["api_token"]
+    assert unknown == []
+
+
+def test_secret_config_violations_flags_an_undeclared_secret_name() -> None:
+    """#337 (gap also noted in #331/#324): claiming a non-secret required key via
+    secret_names_provided must be flagged — pre-fix it falsely satisfied the
+    requirement without any value ever being provided."""
+    schema = {"required": ["timezone"], "secret_names": []}
+    secret_valued, unknown = secret_config_violations(
+        schema=schema, provided_non_secret={}, provided_secret_names=frozenset({"timezone"}),
+    )
+    assert secret_valued == []
+    assert unknown == ["timezone"]
+
+
+def test_secret_config_violations_clean_when_channels_are_respected() -> None:
+    schema = {"required": ["api_base", "api_token"], "secret_names": ["api_token"]}
+    secret_valued, unknown = secret_config_violations(
+        schema=schema, provided_non_secret={"api_base": "https://x"},
+        provided_secret_names=frozenset({"api_token"}),
+    )
+    assert secret_valued == []
+    assert unknown == []

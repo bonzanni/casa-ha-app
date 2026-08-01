@@ -99,6 +99,28 @@ async def _request(
     raise AssertionError("unreachable")
 
 
+async def _delete_record(
+    uuid: str,
+    *,
+    state_file: Path,
+    session_factory: Callable[..., Any],
+    sleep: Callable[[float], Awaitable[None]],
+) -> None:
+    """Remove a published discovery record and, on success, the local UUID."""
+    token = os.environ.get("SUPERVISOR_TOKEN")
+    if not token:
+        _LOGGER.warning("Supervisor discovery unavailable: no Supervisor token")
+        return
+    async with session_factory(
+        headers={"Authorization": f"Bearer {token}"}, timeout=_REQUEST_TIMEOUT,
+    ) as session:
+        status, _ = await _request(
+            session, "DELETE", f"/discovery/{uuid}", sleep=sleep,
+        )
+        if status == 404 or (status is not None and 200 <= status < 300):
+            _clear_state(state_file)
+
+
 async def publish_or_remove_discovery(
     *,
     auth_enabled: bool,
@@ -113,18 +135,9 @@ async def publish_or_remove_discovery(
         if uuid is None:
             _clear_state(state_file)
             return
-        token = os.environ.get("SUPERVISOR_TOKEN")
-        if not token:
-            _LOGGER.warning("Supervisor discovery unavailable: no Supervisor token")
-            return
-        async with session_factory(
-            headers={"Authorization": f"Bearer {token}"}, timeout=_REQUEST_TIMEOUT,
-        ) as session:
-            status, _ = await _request(
-                session, "DELETE", f"/discovery/{uuid}", sleep=sleep,
-            )
-            if status == 404 or (status is not None and 200 <= status < 300):
-                _clear_state(state_file)
+        await _delete_record(
+            uuid, state_file=state_file, session_factory=session_factory, sleep=sleep,
+        )
         return
 
     try:
@@ -134,6 +147,46 @@ async def publish_or_remove_discovery(
     if not secret:
         _LOGGER.warning("Supervisor discovery unavailable: webhook secret missing")
         return
+
+    if secret.startswith("op://"):
+        # #333: the operator stored an op:// REFERENCE. Casa's HMAC verifier
+        # uses the RESOLVED value (casa_core resolves WEBHOOK_SECRET in-place
+        # at boot), so discovery must publish the resolved value too — the
+        # literal reference would have the companion integration signing with
+        # the wrong key and every voice request failing HMAC. A failed
+        # resolution publishes NOTHING: a missing discovery record is loud and
+        # diagnosable; a knowably-wrong secret is silent breakage. The
+        # resolved value goes only into the discovery payload — never a log
+        # line or a local state file (module contract above).
+        from secrets_resolver import resolve as _resolve_secret
+        resolved: str | None
+        try:
+            resolved = await asyncio.to_thread(_resolve_secret, secret)
+        except RuntimeError as exc:
+            _LOGGER.warning(
+                "Supervisor discovery unavailable: webhook secret op:// "
+                "resolution failed (%s)", type(exc).__name__)
+            resolved = None
+        if not resolved:
+            # Terra r2: an empty resolved value is a failure too — publishing
+            # an empty signing key while Casa fails closed advertises a
+            # broken (and trivially satisfiable) secret.
+            if resolved == "":
+                _LOGGER.warning(
+                    "Supervisor discovery unavailable: webhook secret op:// "
+                    "reference resolved to an empty value")
+            # Terra r1: an EXISTING record must not survive an unresolvable
+            # reference — on upgrade it can be the pre-#333 record whose
+            # signing key IS the literal reference, and an HMAC keyed on a
+            # predictable string is fail-open. Removing it makes the
+            # companion integration fail loud instead.
+            if uuid is not None:
+                await _delete_record(
+                    uuid, state_file=state_file,
+                    session_factory=session_factory, sleep=sleep,
+                )
+            return
+        secret = resolved
 
     token = os.environ.get("SUPERVISOR_TOKEN")
     if not token:

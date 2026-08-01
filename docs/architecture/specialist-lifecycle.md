@@ -82,11 +82,27 @@ Enforced by digest recomputation in the receipt loader.
 What it does not cover: freshness of the fetched bytes. A valid receipt attests what was
 inspected; the commit separately re-checks that what it fetched still matches.
 
+**INV-SPEC-006**: A secret value never persists into an instance tuple — a schema-declared secret name is refused in the plain config channel, the secret channel accepts only schema-declared names, and an upgrade strips legacy plaintext secret keys from the carried snapshot.
+
+Enforced as a typed refusal in the commit and upgrade cores before any staging, by the
+upgrade's snapshot merge excluding secret-named keys (the prior component's declaration
+included, so a key reclassified to plain never carries its old plaintext forward), by a
+post-commit sanitization of the retained prior tuple, by the rollback core stripping again
+before it restores, and by a boot-time scrub of every persisted tuple snapshot that runs
+before the boot config-git snapshot.
+
+What it does not cover: a config digest computed before the guard existed was derived from
+the plaintext-bearing mapping and is retained (rewriting it would rebuild the binding,
+which the rollback contract forbids — the digest is unguessable only to the extent the
+secret was); a runtime config-git commit issued between an upgrade crash and the next boot
+can still capture pre-scrub bytes; persona overrides copy the active snapshot unchanged.
+
 ## Failure behavior
 
 **Resolution, fetch, manifest or dependency problems.** Typed refusals before anything
 durable — reference not found, fetch failure, invalid manifest, slug collision, dependency
-unavailable. Sourced plugin dependencies are additionally refused categorically when they
+unavailable, a secret value in the plain config channel, an undeclared secret name in the
+secret channel (INV-SPEC-006). Sourced plugin dependencies are additionally refused categorically when they
 declare system requirements or triggers of their own, or when a required environment name
 collides with another installed plugin's — otherwise-valid bundles fail with dedicated
 error kinds the dependency model alone would not predict.

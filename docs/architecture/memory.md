@@ -232,13 +232,21 @@ public; it is family") is ambiguity, not an answer, and falls to the private def
 rather than having its leftmost tier word extracted. The write is not lost — but the fact becomes invisible below the highest
 clearance, which reads as absence on voice and friends surfaces.
 
-**Saving a session fails.** The save is abandoned, its claim is released, and the entry stays
-for a later sweep to retry. An explicit reset is the exception — it drops the pointer whether
-or not the save succeeded, unless a newer session registered meanwhile (INV-MEM-006), in
-which case the newer registration stands.
+**Saving a session fails.** The save is abandoned, its claim is released — including when the
+failure is a cancellation at shutdown — and the entry stays for a later sweep to retry. An
+explicit reset is the exception — it drops the pointer whether or not the save succeeded,
+unless a newer session registered meanwhile (INV-MEM-006), in which case the newer
+registration stands.
 
-**The session registry file is corrupt at boot.** It is renamed aside and the process starts
-with an empty registry. Session pointers are lost; the app comes up.
+**A gap-superseded session's background retain fails.** That retain runs decoupled from the
+registry (the new turn is about to overwrite the entry), so failure spools a durable retry
+record instead; the freshness sweep drives retries and gives up loudly after a bounded
+number of attempts. An unreadable record is dropped, not retried forever.
+
+**The session registry file is corrupt at boot.** An unparseable file is renamed aside and
+the process starts with an empty registry; a parseable file with structurally corrupt
+individual entries quarantines just those entries and keeps the rest. Affected session
+pointers are lost; the app comes up.
 
 ## Extension points
 
