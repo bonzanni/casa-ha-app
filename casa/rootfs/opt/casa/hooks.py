@@ -1799,6 +1799,11 @@ def _shell_words(segment: str) -> list[str]:
         return [w for w in segment.split() if w]
 
 
+# A `git … push` invocation: only options may sit between `git` and `push`
+# (so `git stash push` never arms). Group 1 is the option run, which carries
+# any `-C <dir>` retargeting.
+_GIT_PUSH_RE = r"\bgit((\s+-\S+(\s+(\"[^\"]*\"|'[^']*'|[^-\s]\S*))?)*)\s+push\b"
+
 # Tokens made only of these characters are COMMAND SEPARATORS (`;`, `;;`,
 # `&`, `&&`, `|`, `||`, `(`, `)`) — a redirection operator (`>`, `>&`, `<<`)
 # is not, so it never ends a command.
@@ -1908,9 +1913,7 @@ def make_self_containment_guard() -> HookCallback:
         # flag was never implemented and would make git itself error.)
         # Option arguments may be quoted and contain spaces (Sol r6-1:
         # `git -C "path with spaces" push`).
-        m_push = re.search(
-            r"\bgit((\s+-\S+(\s+(\"[^\"]*\"|'[^']*'|[^-\s]\S*))?)*)\s+push\b",
-            cmd)
+        m_push = re.search(_GIT_PUSH_RE, cmd)
         if not m_push:
             return {}
         override = bool(
@@ -1964,15 +1967,28 @@ def make_self_containment_guard() -> HookCallback:
         # Sol r8: bash needs no whitespace after `cd` before an operator or
         # a quote (`cd</dev/null /bad`, `cd'/bad'`) — accept those positions
         # too, never just `cd\s`.
-        for words in _cd_command_words(cmd[: m_push.start()]):
+        # Sol r12: scan the WHOLE command, not just the text before the first
+        # `git push` match — that match may be another command's ARGUMENT
+        # (`echo git push; cd /bad; git push`), which would truncate the scan
+        # before the real cd. Collecting cds from the entire string is the
+        # same fail-closed over-approximation used everywhere else here.
+        for words in _cd_command_words(cmd):
             # The PRIMARY word (the one bash most likely resolves to) also
             # propagates into ``bases`` so a relative cd CHAIN keeps working:
             # skip options, redirection operators and bare fd numbers.
-            primary = next(
-                (w for w in words
-                 if not w.startswith("-") and not w.isdigit()
-                 and not _REDIR_SHAPED.search(w)),
-                None)
+            # Terra r12: after `--` every word is an OPERAND, so a directory
+            # whose name starts with `-` (`cd -- -weird-dir`) still becomes
+            # the base for a following relative cd.
+            if "--" in words:
+                rest = words[words.index("--") + 1:]
+                primary = next(
+                    (w for w in rest if not _REDIR_SHAPED.search(w)), None)
+            else:
+                primary = next(
+                    (w for w in words
+                     if not w.startswith("-") and not w.isdigit()
+                     and not _REDIR_SHAPED.search(w)),
+                    None)
             new_bases = set()
             for b in bases:
                 for w in words:
@@ -1991,9 +2007,13 @@ def make_self_containment_guard() -> HookCallback:
                 break
         # Sol r2: git applies EVERY -C sequentially (a relative -C resolves
         # against the previous one) — fold the whole chain over each base.
-        c_targets = [m.group(1).strip("'\"") for m in re.finditer(
-            r"-C\s+(\"[^\"]+\"|'[^']+'|\S+)", m_push.group(1))]
-        if c_targets:
+        # Sol r12: do this for EVERY `git … push` occurrence, since the first
+        # textual match may not be the real one.
+        for m_g in re.finditer(_GIT_PUSH_RE, cmd):
+            c_targets = [m.group(1).strip("'\"") for m in re.finditer(
+                r"-C\s+(\"[^\"]+\"|'[^']+'|\S+)", m_g.group(1))]
+            if not c_targets:
+                continue
             for b in bases:
                 cur = b
                 for t in c_targets:

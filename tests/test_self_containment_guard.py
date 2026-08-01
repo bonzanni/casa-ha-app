@@ -532,6 +532,28 @@ class TestGuardArmingAndOracle:
             assert await self._denied(
                 clean, f"{form}; git push origin main"), form
 
+    async def test_dash_prefixed_dir_after_ddash_propagates_to_chain(
+            self, tmp_path: Path, bad_repo: Path):
+        """Terra r12 (#348): after `--` every word is an OPERAND — a
+        directory literally named `-weird` must become the base for the
+        following relative cd, or the chain's real target is never scanned."""
+        import shutil
+        holder = tmp_path / "holder"
+        (holder / "-weird").mkdir(parents=True)
+        shutil.copytree(bad_repo, holder / "-weird" / "inner", symlinks=True)
+        assert await self._denied(
+            holder, "cd -- -weird; cd inner; git push origin main")
+
+    async def test_earlier_quoted_git_push_does_not_truncate_scan(
+            self, tmp_path: Path, bad_repo: Path):
+        """Sol r12 (#348): the arming match may be another command's
+        ARGUMENT (`echo git push; cd <bad>; git push`) — collecting cds only
+        from the text before it would skip the real one."""
+        clean = tmp_path / "clean-echo-cwd"
+        clean.mkdir()
+        assert await self._denied(
+            clean, f"echo git push; cd {bad_repo}; git push origin main")
+
     async def test_cd_chain_overflow_fails_closed(
             self, tmp_path: Path, git_plugin_repo: Path):
         """Terra/Sol r3 (#348): once the feasible-base set overflows, later
