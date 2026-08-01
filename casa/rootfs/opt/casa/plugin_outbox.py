@@ -279,6 +279,18 @@ class PluginOutbox:
         return reaped
 
     def _reap(self, dirfd: int, name: str, st: os.stat_result) -> int:
+        # #330: producers publish via atomic rename OUTSIDE self._lock, so
+        # between the expiry lstat and this unlink the name can come to
+        # denote a FRESH inode — deleting it would vanish a path the
+        # producer just returned. Re-stat and require the same inode before
+        # acting; a mismatch means the entry was just replaced (young by
+        # construction) and is left for a later sweep. The residual re-stat→
+        # unlink window is syscall-adjacent (POSIX has no unlink-by-inode).
+        current = _lstat_quiet(name, dirfd)
+        if (current is None
+                or current.st_ino != st.st_ino
+                or current.st_dev != st.st_dev):
+            return 0
         # All relative to the pinned dir-FD (rmtree dir_fd is 3.11+).
         try:
             if stat.S_ISDIR(st.st_mode):

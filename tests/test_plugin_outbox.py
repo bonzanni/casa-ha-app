@@ -496,3 +496,28 @@ async def test_wire_inits_and_registers_hourly_job(tmp_path):
     finally:
         plugin_outbox.get_outbox().close()
         plugin_outbox._OUTBOX = None
+
+
+# ---------------------------------------------------------------------------
+# #330 — sweep TOCTOU: expiry decided on one inode must not delete another
+# ---------------------------------------------------------------------------
+
+
+def test_sweep_does_not_reap_fresh_file_renamed_over_expired_name(outbox):
+    """#330: producers publish via atomic rename OUTSIDE the outbox lock — a
+    fresh file renamed over a reused name between the sweep's lstat and its
+    unlink was deleted, and the producer's returned path went missing. The
+    reap must confirm the name still names the inode it judged expired."""
+    old = _write_outbox_file(outbox._root_realpath, "reused.pdf", PDF)
+    past = (plugin_outbox._now_ms() - (MAX_AGE_S + 60) * 1000) / 1000
+    os.utime(old, (past, past))
+    st_old = os.lstat(old)
+
+    # Simulate the producer racing the sweep: a FRESH inode appears under
+    # the same name after the sweep captured st_old.
+    tmp = _write_outbox_file(outbox._root_realpath, ".fresh.tmp", JPEG)
+    os.rename(tmp, old)
+
+    reaped = outbox._reap(outbox._outbox_dirfd, "reused.pdf", st_old)
+    assert reaped == 0
+    assert os.path.exists(old), "fresh producer file was deleted by the sweep"

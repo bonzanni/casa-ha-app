@@ -21,6 +21,7 @@ import time
 from dataclasses import dataclass
 from pathlib import Path, PurePosixPath
 
+from atomic_io import fsync_directory
 from plugin_registry import STORE_ROOT, compute_artifact_id, normalize_subdir
 from text_util import is_unsafe_text, sanitize_segment
 
@@ -288,6 +289,13 @@ def parse_mcp_servers_text(text: str, *, source: str = "<text>",
         args = cfg.get("args")
         if args is not None and (not isinstance(args, list)
                                  or any(not isinstance(a, str) for a in args)):
+            return False
+        # #330: a declared `env` must be a mapping — `"env": []` used to pass
+        # here and later crash extract_env_vars (env.values() on a list),
+        # aborting specialist repo inspection instead of yielding a typed
+        # invalid-dependency verdict. Malformed env ⇒ not runnable.
+        env = cfg.get("env")
+        if env is not None and not isinstance(env, dict):
             return False
         return (
             bool(cfg.get("command")) and isinstance(cfg.get("command"), str)
@@ -572,6 +580,14 @@ def artifact_verdict(path: Path, *, name: str, repo: str, revision: str,
         manifest_triggers(manifest, manifest_name or name)
     except StoreError:
         return "triggers_invalid"
+    # #330: same upgrade-path posture for casa.setupTool (gate added
+    # v0.112.0) — a pre-validator artifact with an invalid declaration used
+    # to pass snapshot validation and load with automatic setup silently
+    # skipped.
+    try:
+        manifest_setup_tool(manifest)
+    except StoreError:
+        return "setup_tool_invalid"
     return None
 
 
@@ -1048,11 +1064,37 @@ def _stage_and_swap(*, name, repo, ref, revision, subdir, staged: Path,
                    subdir=subdir, artifact_id=artifact_id,
                    version=manifest["version"], checksum=checksum,
                    manifest_name=manifest_name)
+    # #330: make the artifact CRASH-DURABLE before anything can reference it.
+    # Only the metadata file used to be fsynced — after a power loss the
+    # caller-persisted registry entry could point at a missing/corrupt tree.
+    # fsync every file + directory in staging, rename, then fsync the
+    # destination parent so the rename itself is durable.
+    _fsync_tree(staged)
     dest.parent.mkdir(parents=True, exist_ok=True)
     os.rename(staged, dest)
+    fsync_directory(dest.parent)
     _freeze_artifact_files(dest)
     return PublishResult(name, artifact_id, revision, manifest["version"],
                          str(dest), manifest)
+
+
+def _fsync_tree(root: Path) -> None:
+    """fsync every regular file and directory under *root* (bottom-up,
+    symlinks skipped — never open through one). Raises OSError on a file
+    fsync failure: publication must fail loudly rather than hand the caller
+    an artifact that may not survive a power crash."""
+    for dirpath, _dirs, files in os.walk(root, topdown=False,
+                                         followlinks=False):
+        for fn in files:
+            p = os.path.join(dirpath, fn)
+            if os.path.islink(p):
+                continue
+            fd = os.open(p, os.O_RDONLY)
+            try:
+                os.fsync(fd)
+            finally:
+                os.close(fd)
+        fsync_directory(dirpath)
 
 
 def _freeze_artifact_files(root: Path) -> None:
