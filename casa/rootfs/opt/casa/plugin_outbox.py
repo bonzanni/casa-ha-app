@@ -86,6 +86,27 @@ def _lstat_quiet(name: str, dirfd: int):
         return None
 
 
+_REAP_PREFIX = ".reap."
+
+
+def _reap_private_name(name: str) -> str:
+    """The private ownership name for a reap candidate — pid + uuid make it
+    collision-free; the ORIGINAL name rides along so a crash-stranded entry
+    can be restored by the next sweep (Terra r5)."""
+    return f"{_REAP_PREFIX}{os.getpid()}.{uuid.uuid4().hex}.{name}"
+
+
+def _reap_original_name(private: str) -> str | None:
+    """Parse a ``.reap.<pid>.<uuid>.<orig>`` private name back to ``orig``;
+    None when *private* is not a parseable reap name."""
+    if not private.startswith(_REAP_PREFIX):
+        return None
+    parts = private[len(_REAP_PREFIX):].split(".", 2)
+    if len(parts) != 3 or not parts[2]:
+        return None
+    return parts[2]
+
+
 def _claim_epoch_ms(name: str):
     """Parse the ``<epoch_ms>`` prefix of a claim name; None if unparseable."""
     prefix = name.split("-", 1)[0]
@@ -257,9 +278,21 @@ class PluginOutbox:
     def _sweep_locked(self, now_ms: int) -> int:
         cutoff_ms = MAX_AGE_S * 1000
         reaped = 0
+        # Terra r5 (#330): FIRST restore any stranded ``.reap.*`` entries — a
+        # crash between the ownership rename and its restore/unlink leaves a
+        # publication parked under the private name; age-reaping it would
+        # lose a FRESH file. The original name is encoded in the private
+        # name, so restoration is total: fresh ⇒ back under its name,
+        # superseded ⇒ dropped, expired ⇒ back under its name and reaped by
+        # the ordinary expiry pass below (which re-lists after this).
+        for dirfd in (self._outbox_dirfd, self._claims_dirfd):
+            for name in _listdir_quiet(dirfd):
+                orig = _reap_original_name(name)
+                if orig is not None:
+                    self._restore_fresh(dirfd, name, orig)
         # Outbox root — skip the .claims dir; reap producer leftovers by mtime.
         for name in _listdir_quiet(self._outbox_dirfd):
-            if name == CLAIMS_SUBDIR:
+            if name == CLAIMS_SUBDIR or _reap_original_name(name) is not None:
                 continue
             st = _lstat_quiet(name, self._outbox_dirfd)
             if st is None:
@@ -269,6 +302,8 @@ class PluginOutbox:
         # Claims — age is the embedded epoch (rename preserves source mtime, so
         # mtime is NOT claim age). Unparseable names fall back to mtime.
         for name in _listdir_quiet(self._claims_dirfd):
+            if _reap_original_name(name) is not None:
+                continue
             epoch_ms = _claim_epoch_ms(name)
             st = _lstat_quiet(name, self._claims_dirfd)
             if st is None:
@@ -290,9 +325,10 @@ class PluginOutbox:
         # restored; a same-name republication landing in this microsecond
         # window would be replaced by the rename-back, which is the residual
         # POSIX leaves — strictly narrower than the old delete-by-name).
-        # A crash between the two renames leaves a ``.reap.`` entry that a
-        # later sweep age-reaps like any other orphan.
-        private = f".reap.{os.getpid()}.{uuid.uuid4().hex}"
+        # A crash between the two renames leaves a ``.reap.`` entry that the
+        # NEXT sweep's restore pass puts back under its original name — the
+        # name is encoded in the private name for exactly that (Terra r5).
+        private = _reap_private_name(name)
         try:
             os.rename(name, private, src_dir_fd=dirfd, dst_dir_fd=dirfd)
         except OSError:

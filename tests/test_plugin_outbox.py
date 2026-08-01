@@ -552,3 +552,50 @@ def test_reap_restore_puts_fresh_file_back_when_name_free(outbox):
         assert fh.read() == PDF
     assert not os.path.exists(
         os.path.join(outbox._root_realpath, ".reap.test.held2"))
+
+
+def test_stranded_reap_entry_restored_on_next_sweep(outbox):
+    """Terra r5 (#330): a crash between the ownership rename and the restore
+    leaves a fresh publication stranded under `.reap.*`. The sweep must
+    RESTORE stranded entries (the original name is encoded in the private
+    name) — never age-reap a fresh one."""
+    _write_outbox_file(
+        outbox._root_realpath, ".reap.123.deadbeef.fresh.pdf", PDF)
+
+    outbox.sweep_once(plugin_outbox._now_ms())
+
+    restored = os.path.join(outbox._root_realpath, "fresh.pdf")
+    assert os.path.exists(restored), "stranded fresh publication not restored"
+    with open(restored, "rb") as fh:
+        assert fh.read() == PDF
+    assert not os.path.exists(
+        os.path.join(outbox._root_realpath, ".reap.123.deadbeef.fresh.pdf"))
+
+
+def test_stranded_expired_reap_entry_restored_then_reaped(outbox):
+    """A stranded EXPIRED entry is restored to its original name and then
+    reaped by the normal expiry pass — never lost, never leaked."""
+    p = _write_outbox_file(
+        outbox._root_realpath, ".reap.123.cafebabe.old.pdf", PDF)
+    past = (plugin_outbox._now_ms() - (MAX_AGE_S + 60) * 1000) / 1000
+    os.utime(p, (past, past))
+
+    outbox.sweep_once(plugin_outbox._now_ms())
+
+    assert not os.path.exists(p)
+    assert not os.path.exists(os.path.join(outbox._root_realpath, "old.pdf"))
+
+
+def test_stranded_reap_entry_superseded_by_newer_publication(outbox):
+    """If the original name was re-published while the entry was stranded,
+    the newer publication wins and the stranded copy is dropped."""
+    _write_outbox_file(
+        outbox._root_realpath, ".reap.123.feedface.reused.pdf", PDF)
+    newest = _write_outbox_file(outbox._root_realpath, "reused.pdf", JPEG)
+
+    outbox.sweep_once(plugin_outbox._now_ms())
+
+    with open(newest, "rb") as fh:
+        assert fh.read() == JPEG
+    assert not os.path.exists(
+        os.path.join(outbox._root_realpath, ".reap.123.feedface.reused.pdf"))
