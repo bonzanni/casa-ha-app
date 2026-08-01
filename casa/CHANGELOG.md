@@ -12,10 +12,12 @@ replay, drivers, and scheduling (#316, #342, #343, #344, #380):
   its full turn anyway once the consumer got to it — tools, output and
   all, for a caller that was long gone. A cancelled queued message is now
   dropped on dequeue.
-- **Evicting an agent cancels its in-flight work** (#343). Removing or
-  reloading a role only stopped its queue consumer; handler tasks already
-  dispatched kept running (and could keep sending as that role) after
-  teardown reported complete. Eviction now cancels and drains them.
+- **Evicting an agent cancels its in-flight work** (#343). Removing a
+  role (deleting a resident, disabling a specialist) only stopped its
+  queue consumer; handler tasks already dispatched kept running (and
+  could keep sending as that role) after teardown reported complete.
+  Eviction now cancels and drains them. A hot-swap reload deliberately
+  still lets in-flight turns finish on the agent they started with.
 - **Shutdown no longer strands late requests** (#316). A request arriving
   after the agent loops were cancelled but before the HTTP listeners
   closed used to hang until the bus timeout, stalling container shutdown

@@ -549,6 +549,32 @@ async def replay_undergoing_engagements(
             svc_root=s6_rc.ENGAGEMENT_SOURCES_ROOT, engagement_id=rec.id,
         )
 
+    async def _ensure_stdin_fifo(rec) -> bool:
+        """Sol r3-2 (#342): ensure the workspace stdin.fifo exists before
+        ANY path lets this record reach start_service — the run template
+        ``set -e``-reads it, so a missing FIFO is a guaranteed crash-loop.
+        Runs on BOTH the complete-pair fast path and the heal path: an
+        intact pair does not imply an intact FIFO (a prior refusal's pair
+        removal is best-effort and its error mark can fail, leaving an
+        intact pair + undergoing record for this boot's fast path).
+        True = present/created; False = resume refused via the
+        checked-teardown ladder (retryable next boot when containment is
+        confirmed, terminal-marked when it is not)."""
+        fifo = os.path.join(engagements_root, rec.id, "stdin.fifo")
+        try:
+            if (os.path.isdir(os.path.dirname(fifo))
+                    and not os.path.exists(fifo)):
+                os.mkfifo(fifo, 0o600)
+            return True
+        except OSError as exc:
+            await _refuse_brief_resume(
+                rec,
+                f"stdin.fifo recreation failed ({exc}); the run template "
+                "reads this FIFO, so starting would crash-loop",
+                kind="fifo_recreate_failed",
+            )
+            return False
+
     # §A3(b) boot reconciliation owner — TERMINAL records (Sol r7-3): terminal
     # records are DISJOINT from ``undergoing`` (they never attach), so schedule
     # their readiness-gated reconcile HERE, BEFORE the compile lock — the lock's
@@ -809,6 +835,11 @@ async def replay_undergoing_engagements(
                         svc_root=s6_rc.ENGAGEMENT_SOURCES_ROOT,
                         engagement_id=rec.id,
                     ):
+                        # Sol r3-2 (#342): the fast path must not trust
+                        # pair-completeness as FIFO-existence — recreate
+                        # (or refuse) before the start loop can run this
+                        # record. Refusal populates refused_ids itself.
+                        await _ensure_stdin_fifo(rec)
                         continue
                     logger.info(
                         "boot replay: migrating pre-v0.75 run script for "
@@ -893,61 +924,11 @@ async def replay_undergoing_engagements(
                 )
                 # Ensure FIFO exists — it might have been wiped alongside the
                 # svc dir.
-                fifo = os.path.join(engagements_root, rec.id, "stdin.fifo")
-                try:
-                    if (os.path.isdir(os.path.dirname(fifo))
-                            and not os.path.exists(fifo)):
-                        os.mkfifo(fifo, 0o600)
-                except OSError as exc:
-                    # #342: NOT survivable — the run template (`set -e`,
-                    # stdin redirected from this FIFO) makes every spawn
-                    # exit immediately, so starting the service would
-                    # crash-loop under s6 forever. Refuse the resume
-                    # (same treatment as the #314 missing-workspace M7
-                    # refusal) instead of "continuing" into a doomed start.
-                    logger.warning(
-                        "boot replay: mkfifo %s failed: %s — refusing "
-                        "resume (run template reads this FIFO; starting "
-                        "would crash-loop)", fifo, exc,
-                    )
-                    refused_ids.add(rec.id)
-                    # Sol r2-1: the pair was REPLANTED above — remove it so
-                    # the compile below drops the doomed service (a live
-                    # remnant is downed best-effort first), and so a failed
-                    # error-mark cannot leave an intact pair for next
-                    # boot's fast path (which never retries the mkfifo).
-                    try:
-                        await s6_rc.ensure_service_down(engagement_id=rec.id)
-                    except Exception:  # noqa: BLE001 — best-effort down
-                        logger.warning(
-                            "boot replay: ensure_service_down after mkfifo "
-                            "failure for %s failed", rec.id[:8],
-                            exc_info=True,
-                        )
-                    try:
-                        s6_rc.remove_service_dir(
-                            svc_root=s6_rc.ENGAGEMENT_SOURCES_ROOT,
-                            engagement_id=rec.id,
-                        )
-                    except Exception:  # noqa: BLE001 — best-effort removal
-                        logger.warning(
-                            "boot replay: service-pair removal after mkfifo "
-                            "failure for %s failed", rec.id[:8],
-                            exc_info=True,
-                        )
-                    try:
-                        await registry.mark_error(
-                            rec.id, kind="fifo_recreate_failed",
-                            message=(
-                                "resume refused: stdin.fifo recreation "
-                                f"failed ({exc})"
-                            ),
-                        )
-                    except Exception:  # noqa: BLE001 — best-effort mark
-                        logger.warning(
-                            "boot replay: mark_error(fifo_recreate_failed) "
-                            "failed for %s", rec.id[:8], exc_info=True,
-                        )
+                # #342/Sol r2-1/Sol r3-2: a failed recreation refuses the
+                # resume through the checked-teardown ladder (down +
+                # pair removal + terminal mark when containment is
+                # unconfirmed) — never "continue" into a doomed start.
+                if not await _ensure_stdin_fifo(rec):
                     continue
                 logger.info(
                     "boot replay: healed engagement %s (%s)",

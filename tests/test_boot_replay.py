@@ -1289,10 +1289,10 @@ async def test_replay_fifo_recreate_failure_refuses_resume(
     """#342: a failed stdin.fifo recreation in the heal path must refuse
     the resume — the run template (`set -e`, stdin from the FIFO) makes
     every spawn exit immediately, so starting it crash-loops forever.
-    Sol r2-1: the refusal also downs any live remnant and REMOVES the
-    just-replanted service pair, so the compile drops the doomed service
-    and a failed error-mark cannot leave an intact pair for next boot's
-    fast path (which never retries the mkfifo)."""
+    Sol r2-1/r3-2: the refusal runs the checked-teardown ladder — downs
+    any live remnant and REMOVES the just-replanted service pair — and
+    with containment confirmed the record stays non-terminal so the next
+    boot retries the heal (and its mkfifo)."""
     from casa_core import replay_undergoing_engagements
     from drivers import s6_rc
     from config import ExecutorDefinition
@@ -1364,10 +1364,62 @@ async def test_replay_fifo_recreate_failure_refuses_resume(
 
     assert start_calls == []                       # never started
     assert attached == []                          # no background machinery
-    assert reg.get("keep1").status == "error"      # marked error
     # Sol r2-1: remnant downed + the replanted pair removed (not compiled).
     assert "keep1" in down_calls
     assert not (svc_root / "engagement-keep1").exists()
+    # Containment confirmed → no terminal mark; the next boot retries.
+    assert reg.get("keep1").status != "error"
+
+
+async def test_fast_path_recreates_missing_fifo(monkeypatch, tmp_path):
+    """Sol r3-2: an intact COMPLETE pair does not imply an intact FIFO —
+    the fast path must recreate a missing stdin.fifo before the start
+    loop runs the record (a `set -e` read of a missing FIFO crash-loops
+    under s6 forever)."""
+    from casa_core import replay_undergoing_engagements
+
+    start_calls = _fast_path_env(monkeypatch, tmp_path)
+    ws_root = tmp_path / "eng"
+    (ws_root / "keep1").mkdir(parents=True)
+
+    reg = await _make_registry([_rec("keep1")])
+    driver = _boot_driver()
+    driver._spawn_background_tasks = lambda rec, **kw: None
+
+    await replay_undergoing_engagements(
+        registry=reg, driver=driver, engagements_root=str(ws_root))
+
+    assert (ws_root / "keep1" / "stdin.fifo").exists()
+    assert start_calls == ["keep1"]
+
+
+async def test_fast_path_fifo_failure_refuses_start(monkeypatch, tmp_path):
+    """Sol r3-2: when the fast-path FIFO recreation fails, the record is
+    refused (no start, pair removed) instead of started into a
+    crash-loop — closing the intact-pair-after-failed-refusal residue."""
+    import os as os_mod
+
+    from casa_core import replay_undergoing_engagements
+    from drivers import s6_rc
+
+    start_calls = _fast_path_env(monkeypatch, tmp_path)
+    ws_root = tmp_path / "eng"
+    (ws_root / "keep1").mkdir(parents=True)
+
+    def _mkfifo_boom(path, mode=0o600):
+        raise OSError("no space")
+    monkeypatch.setattr(os_mod, "mkfifo", _mkfifo_boom)
+
+    reg = await _make_registry([_rec("keep1")])
+    driver = _boot_driver()
+    driver._spawn_background_tasks = lambda rec, **kw: None
+
+    await replay_undergoing_engagements(
+        registry=reg, driver=driver, engagements_root=str(ws_root))
+
+    assert start_calls == []
+    assert not (
+        Path(s6_rc.ENGAGEMENT_SOURCES_ROOT) / "engagement-keep1").exists()
 
 
 async def test_replay_adopts_summary_before_start(monkeypatch, tmp_path):
