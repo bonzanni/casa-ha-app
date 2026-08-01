@@ -893,6 +893,16 @@ _DENY_POSTED = (
     "SAME call with EXACTLY the same arguments."
 )
 _DENY_INTERNAL = "internal authorization error — the call was not executed"
+_DENY_NOT_OPERATOR = (
+    # #368: an authorization challenge is answerable only by the configured
+    # operator, so a turn from any other sender is refused OUTRIGHT — posting
+    # a challenge would hand the requester their own approval button. Same
+    # instruction-not-description rule as _DENY_POSTED: control flow only,
+    # nothing about who is (or is not) at the keyboard for the model to relay.
+    "not executed: this protected action requires authorization by the "
+    "configured operator, and this conversation cannot provide it. Do NOT "
+    "retry the call."
+)
 
 
 def make_resident_authz_hook(
@@ -969,6 +979,17 @@ def make_resident_authz_hook(
             if operator_id is None or chat_id is None:
                 # The transport gate already guarantees these; stay fail-closed.
                 return _deny(_DENY_UNSUPPORTED_ORIGIN)
+
+            # 4b. #368: only the CONFIGURED operator may satisfy an
+            # authorization challenge — deny OUTRIGHT for any other sender,
+            # BEFORE the grant lookup and with NO challenge (the requester
+            # must never receive their own approval button). With
+            # ``telegram_chat_id`` empty (accept-all mode) NO sender is the
+            # operator (#336), so protected tools are always denied there.
+            # Fail-closed when the channel cannot answer the question.
+            is_op = getattr(deps.channel, "_user_id_is_operator", None)
+            if not callable(is_op) or not is_op(operator_id):
+                return _deny(_DENY_NOT_OPERATOR)
 
             tool_input = (input_data or {}).get("tool_input") or {}
 

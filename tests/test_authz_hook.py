@@ -35,7 +35,7 @@ from authz_grants import (
     canonical_args_hash, make_resident_authz_hook,
     _DENY_ENGAGEMENT, _DENY_UNSUPPORTED_ORIGIN, _DENY_ROLE_MISMATCH,
     _DENY_UNRENDERABLE, _DENY_PENDING, _DENY_DELIVERY_FAILED, _DENY_INACTIVE,
-    _DENY_POSTED, _DENY_INTERNAL,
+    _DENY_POSTED, _DENY_INTERNAL, _DENY_NOT_OPERATOR,
 )
 
 pytestmark = pytest.mark.unit
@@ -129,6 +129,13 @@ class _FakeChannel:
         self.post_raises = False
         self.post_gate: asyncio.Event | None = None
         self.dispatch_result = True
+        # #368: fakes model the CONFIGURED-operator sender by default; the
+        # operator-only gate tests flip this to model a stranger (or an
+        # accept-all deployment, where NO sender is the operator).
+        self.operator_ok = True
+
+    def _user_id_is_operator(self, user_id) -> bool:
+        return self.operator_ok
 
     async def post_dm_keyboard(self, *, chat_id, request_id, text, options):
         self.posts.append((chat_id, request_id, text, tuple(options)))
@@ -264,6 +271,94 @@ class TestProvenanceGates:
             out = await _call(hook, tool_input=ti)
         assert _deny_reason(out) == _DENY_UNSUPPORTED_ORIGIN
         assert store.consume(key) is True  # grant untouched by the hook
+
+
+# ===========================================================================
+# Operator-only authorization (#368)
+# ===========================================================================
+
+
+class TestOperatorOnlyAuthorization:
+    """#368: an authorization challenge is answerable only by the configured
+    operator, so for any other sender the hook denies OUTRIGHT — no challenge
+    is posted (the requester must never approve their own protected call) and
+    no grant is consumed."""
+
+    async def test_non_operator_sender_is_denied_with_no_challenge(self):
+        channel = _FakeChannel()
+        channel.operator_ok = False
+        deps = AuthzDeps(channel=channel, grants=_ExplodingStore(),
+                         challenges=_ExplodingCoord())
+        hook = _mk_hook(deps=deps)
+        with _OriginCtx(_origin()):
+            out = await _call(hook)
+        assert _deny_reason(out) == _DENY_NOT_OPERATOR
+        assert channel.posts == []  # no self-approvable challenge
+        # #221 discipline: instruction, not UI description, and nothing
+        # about the user to paraphrase back at them.
+        assert "the user" not in _DENY_NOT_OPERATOR
+
+    async def test_accept_all_mode_denies_protected_tools_for_everyone(self):
+        """With telegram_chat_id empty ("accept all chats") NO sender is the
+        operator — `_user_id_is_operator` is False for every id — so protected
+        tools are always denied. Same mechanics as the stranger case; pinned
+        separately because it is the deliberate #368 behavior change for
+        accept-all deployments."""
+        channel = _FakeChannel()
+        channel.operator_ok = False  # empty telegram_chat_id: nobody matches
+        deps = AuthzDeps(channel=channel, grants=_ExplodingStore(),
+                         challenges=_ExplodingCoord())
+        hook = _mk_hook(deps=deps)
+        with _OriginCtx(_origin(user_id=999, chat_id="999")):
+            out = await _call(hook)
+        assert _deny_reason(out) == _DENY_NOT_OPERATOR
+        assert channel.posts == []
+
+    async def test_non_operator_with_live_grant_consumes_nothing(self):
+        """The operator gate runs BEFORE consume: a non-operator turn with a
+        LIVE grant for the identical call spends nothing (the grant remains
+        consumable afterward)."""
+        store = GrantStore()
+        ti = {"amount": 10}
+        key = _expected_key(ti)
+        store.mint(key)
+        channel = _FakeChannel()
+        channel.operator_ok = False
+        deps = AuthzDeps(channel=channel, grants=store,
+                         challenges=_ExplodingCoord())
+        hook = _mk_hook(deps=deps)
+        with _OriginCtx(_origin()):
+            out = await _call(hook, tool_input=ti)
+        assert _deny_reason(out) == _DENY_NOT_OPERATOR
+        assert store.consume(key) is True  # grant untouched by the hook
+
+    async def test_operator_sender_still_reaches_consume(self):
+        """The gate passes the configured operator through unchanged: a live
+        grant is consumed and the call allowed."""
+        store = GrantStore()
+        ti = {"amount": 10}
+        store.mint(_expected_key(ti))
+        channel = _FakeChannel()  # operator_ok defaults True
+        deps = AuthzDeps(channel=channel, grants=store,
+                         challenges=_ExplodingCoord())
+        hook = _mk_hook(deps=deps)
+        with _OriginCtx(_origin()):
+            out = await _call(hook, tool_input=ti)
+        assert out == {}
+
+    async def test_channel_without_operator_check_fails_closed(self):
+        """A channel object that cannot answer the operator question denies —
+        the gate must fail closed, never pass by default."""
+        class _NoOperatorMethodChannel:
+            posts: list = []
+
+        deps = AuthzDeps(channel=_NoOperatorMethodChannel(),
+                         grants=_ExplodingStore(),
+                         challenges=_ExplodingCoord())
+        hook = _mk_hook(deps=deps)
+        with _OriginCtx(_origin()):
+            out = await _call(hook)
+        assert _deny_reason(out) == _DENY_NOT_OPERATOR
 
 
 # ===========================================================================
