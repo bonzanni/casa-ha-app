@@ -644,7 +644,7 @@ def _reconcile_specialist_operational_files_locked(
     exactly — regenerating legacy op-files for a pending-configuration slug
     would make it loadable and would be a real regression, not a
     self-heal."""
-    from role_slot import materialize_role
+    from role_slot import _ha_model_options, materialize_role
     from role_artifact import load_role_artifact
     from persona_pack import load_persona_pack
     from personality_binding import InstanceDir
@@ -689,7 +689,12 @@ def _reconcile_specialist_operational_files_locked(
             else:
                 persona = load_persona_pack(
                     cas_dir / "persona" / "pack", cas_dir / "persona" / "manifest.json")
-            role = materialize_role(source=load_role_artifact(cas_dir / "role"), options={})
+            role = materialize_role(
+        source=load_role_artifact(cas_dir / "role"),
+        # #355: resolve ha_option models exactly as the agent loader
+        # does — options={} froze the DEFAULT into the checksum, and
+        # the loader then rejected the persisted binding.
+        options=_ha_model_options())
             materialize_specialist_operational_files(
                 agents_specialists_dir=agents_specialists_dir, slug=slug, role=role, persona=persona,
                 binding_digest=active.binding.binding_digest, component_root=active.root)

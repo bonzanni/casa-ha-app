@@ -676,6 +676,67 @@ class TestDuplicateTaskGuard:
         # Exactly one engagement landed.
         assert len(registry._records) == 1
 
+    async def test_concurrent_duplicates_one_wins(self, tmp_path, monkeypatch):
+        """#320: the fast-path duplicate check is an unlocked read followed
+        by awaits (topic creation) before create(). Two CONCURRENT identical
+        calls — a single model turn can legally emit parallel tool calls —
+        both pass the empty-history check; the re-check inside the creation
+        critical section must refuse the loser with kind=duplicate_task."""
+        import asyncio
+        import agent as agent_mod
+        import tools as tools_mod
+        engage_executor, registry, channel = (
+            await self._setup_with_real_registry(tmp_path, monkeypatch)
+        )
+        # Fresh lock: contended acquire loop-binds an asyncio.Lock, and the
+        # module global must not stay bound to this test's loop.
+        monkeypatch.setattr(tools_mod, "_PLUGIN_TOOLS_LOCK", asyncio.Lock())
+        # Barrier inside open_engagement_topic: both calls must have passed
+        # the fast-path duplicate check (which precedes topic creation)
+        # before either proceeds toward create().
+        arrived = 0
+        gate = asyncio.Event()
+
+        async def _open_topic(*, name, role):
+            nonlocal arrived
+            arrived += 1
+            if arrived >= 2:
+                gate.set()
+            await gate.wait()
+            return 40 + arrived
+
+        channel.open_engagement_topic = AsyncMock(side_effect=_open_topic)
+
+        task = "rotate the credentials for the household media services"
+
+        async def _call():
+            token = agent_mod.origin_var.set({
+                "role": "assistant", "channel": "telegram",
+                "chat_id": "c1", "cid": "x", "user_text": "hi",
+            })
+            try:
+                return await engage_executor.handler({
+                    "executor_type": "configurator",
+                    "task": task, "context": "",
+                })
+            finally:
+                agent_mod.origin_var.reset(token)
+
+        r1, r2 = await asyncio.gather(_call(), _call())
+        payloads = [
+            json.loads(r["content"][0]["text"]) for r in (r1, r2)
+        ]
+        statuses = sorted(p["status"] for p in payloads)
+        assert statuses == ["error", "pending"], (
+            f"exactly one of two concurrent duplicates must win, "
+            f"got {payloads!r}"
+        )
+        loser = next(p for p in payloads if p["status"] == "error")
+        assert loser["kind"] == "duplicate_task"
+        # Exactly one engagement landed — no twin executors doing the
+        # same mutating work in two topics.
+        assert len(registry._records) == 1
+
     async def test_other_channel_does_not_block(self, tmp_path, monkeypatch):
         """A duplicate task in a DIFFERENT channel must not block the
         new spawn. Cross-channel isolation."""
@@ -717,6 +778,88 @@ class TestDuplicateTaskGuard:
         assert p1["status"] == "pending"
         assert p2["status"] == "pending"
         assert len(registry._records) == 2
+
+
+class TestCancelledLaunchAbortsTopic:
+    """#363: the launch path opens the Telegram topic FIRST; a cancellation
+    in the window before create() (lock acquire, plugin resolve) used to
+    unwind the tool call through no handler at all — `_abort_engagement_topic`
+    was reached only via ``except Exception``, which cancellation bypasses —
+    leaving an open topic with no engagement record behind it."""
+
+    async def test_cancel_while_waiting_for_plugin_lock_aborts_topic(
+            self, tmp_path, monkeypatch):
+        import asyncio
+        import agent as agent_mod
+        import tools as tools_mod
+        from tools import engage_executor, init_tools
+
+        defn = _mock_executor_def()
+        p = tmp_path / "prompt.md"
+        p.write_text("t")
+        defn.prompt_template_path = str(p)
+        exec_reg = MagicMock()
+        exec_reg.get = MagicMock(return_value=defn)
+        exec_reg.list_types = MagicMock(return_value=["configurator"])
+
+        channel = MagicMock()
+        channel.engagement_supergroup_id = -100123
+        channel.engagement_permission_ok = True
+        opened = asyncio.Event()
+
+        async def _open_topic(*, name, role):
+            opened.set()
+            return 77
+
+        channel.open_engagement_topic = AsyncMock(side_effect=_open_topic)
+        cm = MagicMock()
+        cm.get = MagicMock(return_value=channel)
+        init_tools(
+            channel_manager=cm, bus=MagicMock(),
+            specialist_registry=MagicMock(), mcp_registry=MagicMock(),
+            trigger_registry=MagicMock(), engagement_registry=MagicMock(),
+            executor_registry=exec_reg,
+        )
+        abort = AsyncMock()
+        monkeypatch.setattr(tools_mod, "_abort_engagement_topic", abort)
+        # Fresh lock: contended acquire loop-binds an asyncio.Lock, and the
+        # module global must not stay bound to this test's loop.
+        monkeypatch.setattr(tools_mod, "_PLUGIN_TOOLS_LOCK", asyncio.Lock())
+
+        async def _call():
+            token = agent_mod.origin_var.set({
+                "role": "assistant", "channel": "telegram",
+                "chat_id": "c1", "cid": "x", "user_text": "hi",
+            })
+            try:
+                return await engage_executor.handler({
+                    "executor_type": "configurator",
+                    "task": "do the thing", "context": "",
+                })
+            finally:
+                agent_mod.origin_var.reset(token)
+
+        # Hold the plugin-tools lock so the handler parks in the
+        # topic-created-but-no-record window, then cancel it there.
+        await tools_mod._PLUGIN_TOOLS_LOCK.acquire()
+        try:
+            task = asyncio.ensure_future(_call())
+            await asyncio.wait_for(opened.wait(), timeout=5)
+            for _ in range(10):  # let it advance to the lock acquire
+                await asyncio.sleep(0)
+            task.cancel()
+            with pytest.raises(asyncio.CancelledError):
+                await task
+        finally:
+            tools_mod._PLUGIN_TOOLS_LOCK.release()
+
+        # The abort is fire-and-forget (a cancelled task cannot await
+        # network RTs) — drain the strong-ref'd background tasks.
+        pending = list(tools_mod._ABORT_BG_TASKS)
+        if pending:
+            await asyncio.gather(*pending, return_exceptions=True)
+        abort.assert_awaited_once()
+        assert abort.await_args.args[2] == 77  # the just-created topic
 
 
 class TestEngageExecutorClaudeCode:

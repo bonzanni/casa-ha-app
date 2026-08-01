@@ -2555,6 +2555,22 @@ class ClaudeCodeDriver(DriverProtocol):
         seq = self._sequencers.get(engagement_id)
         return seq.intent_outcome(request_id) if seq is not None else None
 
+    def consume_turn_reply_to(self, engagement_id: str) -> int | None:
+        """#332: fetch-and-clear the sequencer's one-shot turn reply target
+        (v0.79.0 §3) — the ask/reply ingress posters call this so whichever
+        output posts FIRST this turn threads to the operator's message."""
+        seq = self._sequencers.get(engagement_id)
+        return seq.consume_turn_reply_to() if seq is not None else None
+
+    def restore_turn_reply_to(
+        self, engagement_id: str, message_id: int | None,
+    ) -> None:
+        """#332 failure arm: re-arm a consumed-but-unsent turn reply target
+        (never clobbers a newer one — see the sequencer method)."""
+        seq = self._sequencers.get(engagement_id)
+        if seq is not None:
+            seq.restore_turn_reply_to(message_id)
+
     async def mark_send_intent_posted(
         self, engagement_id: str, request_id: str, message_id: int | None,
     ) -> Any:

@@ -132,6 +132,34 @@ async def test_post_options_keyboard_renders_entities():
     assert mid == 12345
 
 
+async def test_post_options_keyboard_forwards_reply_to():
+    """#332: a deferred ask that is the turn's first output threads to the
+    inbound operator message — the poster passes the consumed turn reply
+    target through as reply_to."""
+    ch, bot = _mk_channel_with_fake_bot()
+    ch._engagement_registry = _fake_registry_with_topic()
+    fresh = VerdictBroker()
+    with pytest.MonkeyPatch.context() as mp:
+        mp.setattr(verdict_broker, "BROKER", fresh)
+        await ch.post_options_keyboard(
+            engagement_id="e1", request_id="r1",
+            question="Q1: Deploy now?\n\n1. Yes\n2. No",
+            options=["Yes", "No"], reply_to=555,
+        )
+    kw = bot.send_message.await_args.kwargs
+    assert kw["reply_to_message_id"] == 555
+    # and omitting it adds nothing
+    ch2, bot2 = _mk_channel_with_fake_bot()
+    ch2._engagement_registry = _fake_registry_with_topic()
+    with pytest.MonkeyPatch.context() as mp:
+        mp.setattr(verdict_broker, "BROKER", VerdictBroker())
+        await ch2.post_options_keyboard(
+            engagement_id="e1", request_id="r1",
+            question="Q", options=["Yes", "No"],
+        )
+    assert "reply_to_message_id" not in bot2.send_message.await_args.kwargs
+
+
 async def test_post_options_keyboard_plain_body_sends_raw():
     ch, bot = _mk_channel_with_fake_bot()
     ch._engagement_registry = _fake_registry_with_topic()

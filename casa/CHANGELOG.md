@@ -1,5 +1,49 @@
 # Changelog
 
+## [0.145.0] - 2026-08-01
+
+### Fixed
+
+Stray-mediums batch — session resume, engagement lifecycle, topic output
+ordering, guard parsing, and specialist role materialization (#301, #309,
+#320, #332, #348, #355, #363):
+
+- **A legacy session entry can no longer wedge a channel** (#309). A
+  stored `last_active` timestamp without a timezone used to crash every
+  turn for that channel key before a fresh session could start; it is now
+  treated as an invalid entry and the channel starts fresh.
+- **Deleting an engagement workspace is refused while the engagement is
+  still live** (#301). If the forced cancellation cannot be persisted,
+  the workspace and logs are left in place and the tool reports a
+  retryable error instead of pulling files out from under a running
+  service. The `force` flag now also requires a real boolean — the
+  string `"false"` no longer counts as consent.
+- **Two identical executor requests fired in parallel can no longer both
+  launch** (#320). The duplicate-task check is re-run inside the creation
+  critical section, so the second call gets the documented refusal and
+  exactly one engagement does the work.
+- **A cancelled engagement launch no longer leaves an orphaned Telegram
+  topic** (#363). Cancellation anywhere in the topic-created-but-no-record
+  window now closes the topic in the background.
+- **Engagement topic output ordering fixes** (#332). The deferred-send
+  timeout now starts when a send is actually armed (a slow validation no
+  longer causes an immediate out-of-band post); a failed or timed-out
+  discrete send no longer seals the open narration; and the turn's first
+  output — narration, reply or ask — now reliably reply-threads to the
+  operator's message, including after a transient send failure.
+- **Pre-push and file-copy guard parsing** (#348). The self-containment
+  guard now recognizes a `cd` separated by a newline (or `|`/`&`) and
+  scans the repository the push actually targets; copying a file out of a
+  managed tree with `cp -t /tmp <file>` is no longer misread as a write.
+- **Specialists with an operator-selectable model now survive loading**
+  (#355). Install froze the model at its default, so a non-default
+  `PRIMARY_AGENT_MODEL` made the loader drop the specialist as a binding
+  mismatch; install, upgrade, rollback and persona override now resolve
+  the model exactly as the loader does. Doctrine sections no longer bleed
+  across text/voice/webhook prompt projections, and agent-home
+  `settings.json` is written atomically and preserved for repair when it
+  does not parse.
+
 ## [0.144.0] - 2026-08-01
 
 ### Fixed

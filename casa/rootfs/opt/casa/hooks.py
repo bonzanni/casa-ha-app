@@ -1147,7 +1147,17 @@ def _dest_family_writes_managed(argv: list[str]) -> bool:
     ``--target-directory`` target resolves managed, or the operand shape is
     ambiguous (options after operands, ``--remove-source*``, a single
     operand, no parseable target) AND any operand resolves managed.
-    Copying FROM a managed tree elsewhere is a legitimate read."""
+    Copying FROM a managed tree elsewhere is a legitimate read.
+
+    #348: ``-t``/``--target-directory`` designates the destination for
+    cp/install ONLY (rsync's ``-t`` is preserve-times, a plain flag). When
+    cp/install carry an explicit UNMANAGED target, every remaining operand
+    is a SOURCE — ``cp -t /tmp <managed-file>`` copies an inspectable
+    artifact OUT, the documented read allowance, and must not be flagged
+    just because a sources-only remainder has fewer than two operands."""
+    prog = os.path.basename(argv[0])
+    t_takes_target = prog in ("cp", "install")
+    dest_unmanaged = False
     args = argv[1:]
     operands: list[str] = []
     ambiguous = False
@@ -1162,26 +1172,28 @@ def _dest_family_writes_managed(argv: list[str]) -> bool:
         if not seen_ddash and a.startswith("-") and a != "-":
             if operands:
                 ambiguous = True  # option-terminated / interleaved options
-            if a in ("-t", "--target-directory"):
+            if t_takes_target and a in ("-t", "--target-directory"):
                 if i + 1 < len(args):
                     if _token_resolves_managed(args[i + 1]):
                         return True
+                    dest_unmanaged = True
                     i += 2
                     continue
                 ambiguous = True
-            elif a.startswith("--target-directory="):
+            elif t_takes_target and a.startswith("--target-directory="):
                 if _token_resolves_managed(a.split("=", 1)[1]):
                     return True
-            elif a.startswith("-t") and len(a) > 2:
-                # GNU cp/install attached form ``-tDIR`` (round-3 S2). rsync's
-                # ``-t`` is preserve-times and never takes a directory, so a
-                # cluster like ``-tv`` reaching here must NOT downgrade the
-                # parse: only a slash-bearing suffix is treated as a target;
-                # anything else marks the shape ambiguous (fail-closed).
+                dest_unmanaged = True
+            elif t_takes_target and a.startswith("-t") and len(a) > 2:
+                # GNU cp/install attached form ``-tDIR`` (round-3 S2). Only
+                # a slash-bearing suffix is treated as a target; a bare
+                # suffix could be a cluster (``-tv``) and marks the shape
+                # ambiguous (fail-closed).
                 suffix = a[2:]
                 if "/" in suffix:
                     if _token_resolves_managed(suffix):
                         return True
+                    dest_unmanaged = True
                 else:
                     ambiguous = True
             elif a.startswith("--remove-source"):
@@ -1191,6 +1203,11 @@ def _dest_family_writes_managed(argv: list[str]) -> bool:
         operands.append(a)
         i += 1
     if not operands:
+        return False
+    if dest_unmanaged and not any(
+            x.startswith("--remove-source") for x in args):
+        # Explicit unmanaged cp/install target: remaining operands are all
+        # sources; reading them out of a managed tree is legitimate.
         return False
     if len(operands) < 2:
         ambiguous = True  # cannot tell source from destination
@@ -1758,8 +1775,12 @@ def make_self_containment_guard() -> HookCallback:
         cwd = Path(input_data.get("cwd") or os.getcwd())
         # Sol r5-3: scan the repo the COMMAND targets, not the hook cwd —
         # `cd <path> && git push` re-bases, `git -C <path> push` retargets.
+        # #348: bash separates commands on newlines, `|`, `&` and `||` just
+        # as on `&&`/`;` — the class below covers them all (the final char
+        # of `&&`/`||` is itself in the class), so a `cd` on its own line
+        # re-bases the scan too instead of silently scanning the hook cwd.
         for m_cd in re.finditer(
-                r"(?:^|&&|;)\s*cd\s+(\"[^\"]+\"|'[^']+'|\S+)",
+                r"(?:^|[;&|\n\r])\s*cd\s+(\"[^\"]+\"|'[^']+'|[^\s;&|]+)",
                 cmd[: m_push.start()]):
             t = m_cd.group(1).strip("'\"")
             cwd = Path(t) if os.path.isabs(t) else cwd / t

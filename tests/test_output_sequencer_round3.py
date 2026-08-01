@@ -162,6 +162,47 @@ async def test_post_discrete_revalidate_declined_returns_none_no_send_no_state()
     assert markup.sends == []
 
 
+async def test_post_discrete_failed_send_leaves_narration_open():
+    """#332: post_discrete's contract says a None/timeout outcome leaves
+    state unchanged — but the pre-fix code sealed the open narration (and
+    dropped its edit-cache entry) BEFORE the send, so a failed discrete
+    forced later streamed text into a new message with nothing posted."""
+    seq, _plain, markup, _clock, _ids = _make_seq()
+    nid = await seq.open_narration("working...")
+    hw_before = seq.high_water
+    cache_before = seq._edit_cache.get(nid)
+
+    markup.send_returns_none = True
+    mid = await seq.post_discrete("q", markup=KBD1)
+    assert mid is None
+    assert seq.narration_msg_id == nid       # narration NOT sealed
+    assert seq.high_water == hw_before       # state unchanged
+    assert seq._edit_cache.get(nid) == cache_before  # edit cache intact
+
+    # A successful discrete afterwards seals as documented.
+    markup.send_returns_none = False
+    mid2 = await seq.post_discrete("q", markup=KBD1)
+    assert mid2 is not None
+    assert seq.narration_msg_id is None
+
+
+async def test_post_discrete_wire_timeout_leaves_narration_open():
+    """#332 companion: the wait_for-timeout outcome is documented as
+    'no state change' too."""
+    import asyncio
+
+    seq, _plain, _markup, _clock, _ids = _make_seq()
+    nid = await seq.open_narration("working...")
+
+    async def _hang(topic_id, text, markup_, reply_to=None):
+        await asyncio.sleep(3600)
+
+    seq._send_message_markup = _hang
+    mid = await seq.post_discrete("q", markup=KBD1, wire_timeout=0.01)
+    assert mid is None
+    assert seq.narration_msg_id == nid       # narration NOT sealed
+
+
 async def test_post_discrete_revalidate_accepted_sends():
     seq, _plain, markup, _clock, _ids = _make_seq()
     mid = await seq.post_discrete("q", markup=KBD1, revalidate=lambda: True)

@@ -322,6 +322,76 @@ async def test_intent_timeout_warns_and_leaves_consumption_debt(caplog):
     assert rec.sends == [(42, "A"), (42, "B")]
 
 
+async def test_intent_timeout_measured_from_arm_not_registration():
+    """#332: an ingress can sit PENDING through validation/allocation long
+    past the timeout — the documented 10s applies to an ARMED intent waiting
+    for its block, so the clock starts at arm time, not registration."""
+    rec, clock = Recorder(), Clock()
+    seq = _make_seq(rec, clock)
+    h = projection_hash(REPLY_TOOL, {"text": "slow"})
+    seq.register_intent(request_id="A", tool_name=REPLY_TOOL,
+                        projection_hash=h, poster=_poster(rec, "A"))
+    # Validation backlog: the intent arms 11s AFTER registration.
+    clock.t = 11.0
+    seq.arm_intent("A")
+    await seq.process_intents_once()
+    assert rec.sends == []  # armed 0s ago — must NOT out-of-band post yet
+    clock.t = 20.9
+    await seq.process_intents_once()
+    assert rec.sends == []  # 9.9s armed — still within the window
+    clock.t = 21.0
+    await seq.process_intents_once()
+    assert rec.sends == [(42, "A")]  # 10s armed — now the timeout post fires
+
+
+async def test_failed_first_narration_open_keeps_reply_target():
+    """#332: _open_narration_locked cleared _turn_reply_to before awaiting
+    the send — a transient failure meant the topic-stream retry re-opened
+    without the inbound message to reply to, posting the turn's first output
+    unthreaded."""
+    rec = _ThreadRecorder()
+    clock = Clock()
+    seq = _make_seq(rec, clock)
+
+    fail_first = {"n": 1}
+    real_send = rec.send
+
+    async def _flaky_send(topic_id, text, reply_to=None):
+        if fail_first["n"]:
+            fail_first["n"] -= 1
+            return None
+        return await real_send(topic_id, text, reply_to=reply_to)
+
+    seq.send_message = _flaky_send
+    seq.set_turn_reply_to(555)
+    assert await seq.open_narration("first") is None      # transient failure
+    # The retry still threads to the operator's message.
+    mid = await seq.open_narration("first")
+    assert mid is not None
+    assert rec.sends[-1] == (42, "first", 555)
+    # Consumed on success — the next open is not a reply.
+    seq._narration_msg_id = None
+    await seq.open_narration("second")
+    assert rec.sends[-1] == (42, "second", None)
+
+
+async def test_restore_turn_reply_to_failure_undo_never_clobbers_newer():
+    """#332: the ask/reply posters consume the one-shot target before their
+    send; a failed send restores it — unless a newer envelope already set
+    a fresh target."""
+    rec = _ThreadRecorder()
+    clock = Clock()
+    seq = _make_seq(rec, clock)
+    seq.set_turn_reply_to(555)
+    assert seq.consume_turn_reply_to() == 555
+    seq.restore_turn_reply_to(555)               # failed send undo
+    assert seq.consume_turn_reply_to() == 555    # target re-armed
+    seq.restore_turn_reply_to(555)
+    seq.set_turn_reply_to(777)                   # newer envelope wins
+    seq.restore_turn_reply_to(555)
+    assert seq.consume_turn_reply_to() == 777
+
+
 async def test_response_loss_after_post_reattaches_without_double_post():
     """§2(1): a transport retry whose request_id matches an already-posted
     intent reattaches idempotently and reads the recorded outcome (incl. the

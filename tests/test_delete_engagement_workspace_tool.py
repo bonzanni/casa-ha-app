@@ -187,6 +187,74 @@ async def test_force_deletes_idle(tmp_path, monkeypatch):
     assert not (tmp_path / "eng-idle").exists()
 
 
+async def test_force_delete_persist_failure_leaves_workspace(
+        tmp_path, monkeypatch):
+    """#301: PERSIST_FAILED means the record rolled back and is STILL LIVE —
+    the workspace and log dir must survive, and the caller gets a retryable
+    error, exactly as cancel_engagement/emit_completion already honor it."""
+    import tools as tools_mod
+    from tools import FinalizeResult, delete_engagement_workspace
+    from engagement_registry import EngagementRegistry, EngagementRecord
+
+    _make_ws(tmp_path, "eng-live", status="UNDERGOING")
+    reg = EngagementRegistry(tombstone_path=str(tmp_path / "t.json"), bus=None)
+    reg._records["eng-live"] = EngagementRecord(
+        id="eng-live", kind="executor", role_or_type="hello-driver",
+        driver="claude_code", status="active", topic_id=None,
+        started_at=0.0, last_user_turn_ts=0.0, last_idle_reminder_ts=0.0,
+        completed_at=None, sdk_session_id=None, origin={}, task="t",
+    )
+    monkeypatch.setattr(tools_mod, "_engagement_registry", reg)
+    monkeypatch.setattr(tools_mod, "_ENGAGEMENTS_ROOT", str(tmp_path),
+                        raising=False)
+    monkeypatch.setattr(
+        tools_mod, "_finalize_engagement",
+        AsyncMock(return_value=FinalizeResult.PERSIST_FAILED),
+    )
+
+    result = await delete_engagement_workspace.handler(
+        {"engagement_id": "eng-live", "force": True},
+    )
+    payload = json.loads(result["content"][0]["text"])
+    assert payload["status"] == "error"
+    assert payload["kind"] == "finalize_persist_failed"
+    assert payload.get("retryable") is True
+    assert (tmp_path / "eng-live").exists()  # workspace untouched
+
+
+@pytest.mark.parametrize("bad_force", ["false", "true", 1, "yes", [True]])
+async def test_non_boolean_force_is_rejected(tmp_path, monkeypatch, bad_force):
+    """#301: the internal/MCP forwarding path does not enforce tool schemas,
+    so truthiness coercion turned the string "false" into an authorization to
+    cancel+delete a live engagement. Non-boolean force is a bad_request."""
+    import tools as tools_mod
+    from tools import delete_engagement_workspace
+    from engagement_registry import EngagementRegistry, EngagementRecord
+
+    _make_ws(tmp_path, "eng-live", status="UNDERGOING")
+    reg = EngagementRegistry(tombstone_path=str(tmp_path / "t.json"), bus=None)
+    reg._records["eng-live"] = EngagementRecord(
+        id="eng-live", kind="executor", role_or_type="hello-driver",
+        driver="claude_code", status="active", topic_id=None,
+        started_at=0.0, last_user_turn_ts=0.0, last_idle_reminder_ts=0.0,
+        completed_at=None, sdk_session_id=None, origin={}, task="t",
+    )
+    monkeypatch.setattr(tools_mod, "_engagement_registry", reg)
+    monkeypatch.setattr(tools_mod, "_ENGAGEMENTS_ROOT", str(tmp_path),
+                        raising=False)
+    finalize = AsyncMock()
+    monkeypatch.setattr(tools_mod, "_finalize_engagement", finalize)
+
+    result = await delete_engagement_workspace.handler(
+        {"engagement_id": "eng-live", "force": bad_force},
+    )
+    payload = json.loads(result["content"][0]["text"])
+    assert payload["status"] == "error"
+    assert payload["kind"] == "bad_request"
+    finalize.assert_not_awaited()
+    assert (tmp_path / "eng-live").exists()  # workspace untouched
+
+
 async def test_force_delete_writes_meta_scope_summary(tmp_path, monkeypatch):
     """M2.G4 (rewritten for the shared-bank rearch) — force=True on a
     still-live engagement must write a summary before pulling the workspace.

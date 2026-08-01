@@ -134,6 +134,14 @@ async def test_hooks_yaml_self_edit_denied(path):
     ("echo x > //config//plugins/registry.json", "plugin_add"),
     ("touch /config/bindings/gary.yaml", "resident_persona_swap"),
     ("rsync -a /tmp/stage/ /config/specialists/x/", "specialist_install_inspect"),
+    # #348 fail-closed pins: a MANAGED -t target is still a write, and
+    # rsync's -t is preserve-times (a flag, not a target) — the managed
+    # destination operand must still deny.
+    ("cp -t /config/plugins/store/x /tmp/evil.json", "plugin_add"),
+    ("cp --target-directory=/config/bindings /tmp/evil.yaml",
+     "resident_persona_swap"),
+    ("rsync -t /tmp/src.yaml /config/specialists/x/dst.yaml",
+     "specialist_install_inspect"),
     ("chmod 755 /config/agents/specialists/x/run.sh", "specialist_install_inspect"),
     ("git checkout -- /config/bindings/ellen.yaml", "resident_persona_swap"),
     ("tar -xf /tmp/a.tar -C /config/specialists/", "specialist_install_inspect"),
@@ -165,6 +173,12 @@ async def test_bash_write_forms_denied(cmd, route_marker):
     "ls /config/bindings 2>&1",
     # No managed prefix mentioned at all.
     "echo hello > /tmp/scratch.txt",
+    # #348: an explicit UNMANAGED -t/--target-directory leaves only source
+    # operands — copying an inspectable artifact OUT is the documented
+    # read allowance and must not be marked ambiguous.
+    "cp -t /tmp /config/plugins/store/x/plugin.json",
+    "cp --target-directory=/tmp /config/plugins/store/x/plugin.json",
+    "install -t /tmp /config/plugins/store/x/tool.bin",
 ])
 async def test_bash_read_forms_pass(cmd):
     out = await _hook()(

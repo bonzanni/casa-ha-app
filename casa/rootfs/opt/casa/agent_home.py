@@ -12,6 +12,7 @@ from __future__ import annotations
 
 import json
 import logging
+import os
 from pathlib import Path
 
 logger = logging.getLogger(__name__)
@@ -36,8 +37,13 @@ def provision_agent_home(
         try:
             existing = json.loads(settings_path.read_text(encoding="utf-8"))
         except json.JSONDecodeError:
-            logger.warning("settings.json at %s is not valid JSON — recreating", settings_path)
-            existing = {}
+            # #355: unparseable content may be the truncated remains of real
+            # user settings (crash mid-rewrite, interrupted edit) — leave the
+            # bytes in place for repair instead of replacing them with {}.
+            logger.warning(
+                "settings.json at %s is not valid JSON — preserving the "
+                "file for repair (not rewriting)", settings_path)
+            return
     if not isinstance(existing, dict):
         logger.warning(
             "settings.json at %s is not a JSON object — recreating",
@@ -48,10 +54,18 @@ def provision_agent_home(
     # v0.71.0: no enabledPlugins seeding — plugin assignment is the registry's
     # job. A stale key from an older deploy is preserved (never deleted).
 
-    # Write back.
+    # Write back atomically (#355): a plain truncate-and-write left invalid
+    # JSON behind on a crash mid-write; temp-file + os.replace never exposes
+    # a partial file.
     claude_dir.mkdir(parents=True, exist_ok=True)
-    settings_path.write_text(json.dumps(existing, indent=2, sort_keys=True) + "\n",
-                             encoding="utf-8")
+    tmp_path = settings_path.with_name(settings_path.name + ".tmp")
+    tmp_path.write_text(json.dumps(existing, indent=2, sort_keys=True) + "\n",
+                        encoding="utf-8")
+    try:
+        os.replace(tmp_path, settings_path)
+    except OSError:
+        tmp_path.unlink(missing_ok=True)
+        raise
     logger.info("agent-home provisioned: role=%s settings=%s", role, settings_path)
 
 

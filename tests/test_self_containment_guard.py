@@ -321,6 +321,25 @@ class TestGuardArmingAndOracle:
         assert await self._denied(
             clean, f"cd {bad_repo} && git push origin main")
 
+    async def test_cd_newline_separated_scans_target(
+            self, tmp_path: Path, bad_repo: Path):
+        """#348: bash treats a newline as a command separator exactly like
+        `;` — a two-line `cd <repo>\\ngit push` must scan <repo>, not the
+        hook cwd."""
+        clean = tmp_path / "clean-cwd3"
+        clean.mkdir()
+        assert await self._denied(
+            clean, f"true\ncd {bad_repo}\ngit push origin main")
+
+    async def test_cd_after_or_separator_scans_target(
+            self, tmp_path: Path, bad_repo: Path):
+        """#348 companion: `||` and `|`-adjacent separators are command
+        separators too — `true || cd <repo>; git push` may run the cd."""
+        clean = tmp_path / "clean-cwd4"
+        clean.mkdir()
+        assert await self._denied(
+            clean, f"false || cd {bad_repo}; git push origin main")
+
     async def test_reserved_env_self_declaration_blocks(
             self, git_plugin_repo: Path):
         """G6 corrected: a committed .mcp.json self-declaring a CLI-reserved

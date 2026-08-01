@@ -324,6 +324,10 @@ def _resume_decision(
         )
     except ValueError:
         last = None
+    if last is not None and last.tzinfo is None:
+        # A naive timestamp parses, but comparing it against the aware ``now``
+        # would raise — treat it as invalid rather than guessing its zone.
+        last = None
     if last is None:
         return ResumeDecision("new", None, True, old, "invalid_entry")
     if (now - last) <= freshness_window(channel):

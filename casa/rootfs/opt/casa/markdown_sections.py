@@ -49,10 +49,11 @@ def validate_markdown(source: str) -> str:
     return canonical
 
 
-def sections(source: str) -> list[tuple[int, str, str]]:
-    canonical = validate_markdown(source)
+def _section_spans(canonical: str) -> list[tuple[int, str, int, int, int]]:
+    """(level, name, heading_start, body_start, end) per heading; a section
+    runs to the next heading of the same or a shallower level."""
     matches = list(_HEADING.finditer(canonical))
-    out = []
+    spans = []
     for index, match in enumerate(matches):
         level = len(match.group(1))
         end = len(canonical)
@@ -60,11 +61,47 @@ def sections(source: str) -> list[tuple[int, str, str]]:
             if len(later.group(1)) <= level:
                 end = later.start()
                 break
-        body = canonical[match.end():end].strip("\n") + "\n"
-        out.append((level, match.group(2).strip(), body))
-    return out
+        spans.append(
+            (level, match.group(2).strip(), match.start(), match.end(), end))
+    return spans
 
 
-def select_markdown_sections(source: str, names: tuple[str, ...]) -> str:
-    selected = [body for _, name, body in sections(source) if name in names]
+def sections(source: str) -> list[tuple[int, str, str]]:
+    canonical = validate_markdown(source)
+    return [
+        (level, name, canonical[body_start:end].strip("\n") + "\n")
+        for level, name, _, body_start, end in _section_spans(canonical)
+    ]
+
+
+def select_markdown_sections(
+    source: str, names: tuple[str, ...], *, exclude: tuple[str, ...] = (),
+) -> str:
+    """Concatenate the named sections' bodies. A section's body includes its
+    nested subsections — EXCEPT any subtree whose heading is in ``exclude``
+    (#355: the shipped doctrines nest every projection heading under
+    ``# Core doctrine``, so without exclusion a single-surface selection
+    drags every sibling surface's instructions along)."""
+    canonical = validate_markdown(source)
+    spans = _section_spans(canonical)
+    cut_ranges = [
+        (heading_start, end)
+        for _, name, heading_start, _, end in spans if name in exclude
+    ]
+    selected = []
+    for _, name, _, body_start, end in spans:
+        if name not in names:
+            continue
+        pos, parts = body_start, []
+        for cut_start, cut_end in sorted(cut_ranges):
+            # Only subtrees strictly INSIDE this section's body are cut —
+            # a selected section that is itself excludable keeps its body
+            # (its own heading starts before its body).
+            if cut_start < body_start or cut_end > end or cut_end <= pos:
+                continue
+            parts.append(canonical[pos:max(pos, cut_start)])
+            pos = max(pos, cut_end)
+        parts.append(canonical[pos:end])
+        body = "".join(parts).strip("\n") + "\n"
+        selected.append(body)
     return "\n".join(body.rstrip("\n") for body in selected) + "\n"

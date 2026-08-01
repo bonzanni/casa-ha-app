@@ -449,13 +449,23 @@ def _make_send_to_topic(
         # tool_use block position — AFTER any preceding narration — or directly
         # here in the no-driver/degraded fallback (pre-v0.79 eager behavior).
         async def _do_post() -> int | None:
+            # #332: the turn's first output threads to the inbound operator
+            # message — consume the one-shot target; a failed send restores it.
+            reply_to = _consume_turn_reply_to(driver, engagement_id)
+            _kw = ({"reply_to_message_id": reply_to}
+                   if reply_to is not None else {})
             try:
-                mid = await telegram_channel.send_response_to_topic(topic_id, text)
+                mid = await telegram_channel.send_response_to_topic(
+                    topic_id, text, **_kw)
             except Exception as exc:  # noqa: BLE001
                 logger.warning(
                     "send_to_topic failed for engagement=%s topic=%s: %s",
                     engagement_id, topic_id, exc,
                 )
+                _restore_turn_reply_to(driver, engagement_id, reply_to)
+                return None
+            if mid is None:
+                _restore_turn_reply_to(driver, engagement_id, reply_to)
                 return None
             # W2/Sol B9 (Task 7): the agent's first outbound reply flips
             # first_contact_required -> awaiting_operator. getattr-tolerant.
@@ -1463,6 +1473,37 @@ def _ask_keyboard_finish(
     return _finish
 
 
+def _consume_turn_reply_to(driver: Any, eng_id: str) -> int | None:
+    """#332: fetch-and-clear the sequencer's one-shot turn reply target via
+    the driver seam so a deferred ask/reply that is the turn's first output
+    threads to the operator's inbound message (v0.79.0 §3). getattr-tolerant:
+    fakes/degraded drivers without the seam simply don't thread."""
+    if driver is None:
+        return None
+    consume = getattr(driver, "consume_turn_reply_to", None)
+    if consume is None:
+        return None
+    try:
+        return consume(eng_id)
+    except Exception:  # noqa: BLE001 — threading is cosmetic, never blocks a post
+        logger.debug("consume_turn_reply_to failed", exc_info=True)
+        return None
+
+
+def _restore_turn_reply_to(driver: Any, eng_id: str, mid: int | None) -> None:
+    """#332 failure arm: re-arm the consumed one-shot target after a FAILED
+    send so the turn's first successful output still threads."""
+    if driver is None or mid is None:
+        return
+    restore = getattr(driver, "restore_turn_reply_to", None)
+    if restore is None:
+        return
+    try:
+        restore(eng_id, mid)
+    except Exception:  # noqa: BLE001
+        logger.debug("restore_turn_reply_to failed", exc_info=True)
+
+
 def _resolve_active_driver() -> Any:
     """Resolve the live ``claude_code`` driver (``agent.active_claude_code_driver``)
     for the inbound gate + discrete-intent registration. Returns ``None`` when
@@ -2460,12 +2501,19 @@ def _make_ask(
                 return _settle
 
             async def _post_ask() -> int | None:
+                # #332: a deferred ask that is the turn's first output
+                # threads to the inbound operator message — consume the
+                # one-shot target; a failed post restores it below.
+                _ask_reply_to = _consume_turn_reply_to(driver, eng_id)
+                _post_kwargs = dict(_kbd_kwargs)
+                if _ask_reply_to is not None:
+                    _post_kwargs["reply_to"] = _ask_reply_to
                 try:
                     await BROKER.ensure_posted(
                         req,
                         lambda: telegram_channel.post_options_keyboard(
                             engagement_id=eng_id, request_id=request_id,
-                            question=display, options=options, **_kbd_kwargs),
+                            question=display, options=options, **_post_kwargs),
                         lambda mid: _ask_keyboard_finish(
                             telegram_channel, rec.topic_id, mid, display, options,
                             on_settle=_close_question,
@@ -2476,6 +2524,7 @@ def _make_ask(
                     if not isinstance(mid, int):
                         # ensure_posted unregistered the request (post raised/None) →
                         # await_result below returns delivery_failed.
+                        _restore_turn_reply_to(driver, eng_id, _ask_reply_to)
                         return None
                     # GENERATION RE-CHECK (§4, Sol r1-4 — reserve→post→re-check, now
                     # relay-mediated): an operator envelope that arrived between

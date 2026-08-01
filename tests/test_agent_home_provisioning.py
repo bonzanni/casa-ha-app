@@ -62,6 +62,51 @@ def test_provision_recreates_non_object_settings(tmp_path: Path, payload: str,
     assert any("not a JSON object" in r.message for r in caplog.records)
 
 
+def test_provision_preserves_unparseable_settings(tmp_path: Path, caplog) -> None:
+    """#355: a settings.json that does not PARSE may be the truncated remains
+    of real user settings (a crash mid-rewrite, an interrupted edit) —
+    provisioning must leave the bytes in place for repair, never replace
+    them with {}."""
+    import logging
+    from agent_home import provision_agent_home
+
+    home_root = tmp_path / "agent-home"
+    settings_path = home_root / "ellen" / ".claude" / "settings.json"
+    settings_path.parent.mkdir(parents=True, exist_ok=True)
+    corrupt = '{"hooks": {"PreToolUse": ['   # truncated mid-write
+    settings_path.write_text(corrupt, encoding="utf-8")
+
+    with caplog.at_level(logging.WARNING, logger="agent_home"):
+        provision_agent_home(role="ellen", home_root=home_root,
+                             defaults_root=tmp_path)
+    assert settings_path.read_text(encoding="utf-8") == corrupt
+    assert any("preserving" in r.message for r in caplog.records)
+
+
+def test_provision_write_replaces_atomically(tmp_path: Path,
+                                             monkeypatch) -> None:
+    """#355: the rewrite must go through a same-dir temp file + os.replace so
+    a crash mid-write can never leave a truncated settings.json behind."""
+    from agent_home import provision_agent_home
+
+    home_root = tmp_path / "agent-home"
+    settings_path = home_root / "ellen" / ".claude" / "settings.json"
+    settings_path.parent.mkdir(parents=True, exist_ok=True)
+    original = '{"hooks": {}}'
+    settings_path.write_text(original, encoding="utf-8")
+
+    def _boom(src, dst):
+        raise OSError("simulated replace failure")
+
+    monkeypatch.setattr("agent_home.os.replace", _boom)
+    with pytest.raises(OSError):
+        provision_agent_home(role="ellen", home_root=home_root,
+                             defaults_root=tmp_path)
+    # The prior valid content is untouched and no temp litter remains.
+    assert settings_path.read_text(encoding="utf-8") == original
+    assert [p.name for p in settings_path.parent.iterdir()] == ["settings.json"]
+
+
 def test_provision_all_homes_includes_residents_and_specialists(tmp_path: Path) -> None:
     """E-4 regression: residents AND specialists must each get an agent-home."""
     from agent_home import provision_all_homes
