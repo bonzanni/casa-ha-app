@@ -8,7 +8,9 @@ the documented Claude Code plugin MCP-tool-name namespace sanitization
 ``is_unsafe_text``, the pinned UNSAFE-TEXT codepoint predicate (v0.78.0
 design doc, W1/W2) reused verbatim by ``plugin_store.manifest_protected_tools``
 for protectedTools summary templates (W1) and by the W2 challenge
-renderer for interpolated values and display names.
+renderer for interpolated values and display names; and ``utf16_len`` /
+``utf16_prefix_end``, the shared UTF-16 code-unit measurement Telegram's
+Bot API limits are counted in (#305/#328).
 
 STDLIB-ONLY (no third-party imports): ``plugin_store.py`` is copied into
 the image and imported by the Dockerfile build helper BEFORE any venv
@@ -57,6 +59,34 @@ _UNSAFE_TEXT_RE = re.compile(
 )
 
 
+def utf16_len(s: str) -> int:
+    """Length of *s* in UTF-16 code units — the unit Telegram's Bot API counts
+    for message-length limits and entity offsets (#305/#328). Astral
+    codepoints (most emoji) are surrogate pairs and count as 2; everything in
+    the BMP counts as 1. Summed per-character rather than via
+    ``encode("utf-16-le")`` so a lone surrogate (surrogateescape'd input) is
+    measured instead of raising mid-send. This is the SINGLE home for the
+    measurement: the plain splitter, the streaming edit checks, the rich
+    paginator, and the authz challenge size gate all resolve here so they can
+    never drift apart again."""
+    return sum(2 if ord(ch) >= 0x10000 else 1 for ch in s)
+
+
+def utf16_prefix_end(s: str, start: int, budget: int) -> int:
+    """Largest index ``end`` such that ``s[start:end]`` fits *budget* UTF-16
+    units. Because the budget is spent per-codepoint, the boundary can never
+    land between the two units of a surrogate pair."""
+    units = 0
+    i = start
+    n = len(s)
+    while i < n:
+        units += 2 if ord(s[i]) >= 0x10000 else 1
+        if units > budget:
+            return i
+        i += 1
+    return n
+
+
 def is_unsafe_text(s: str) -> bool:
     """True iff ``s`` contains any UNSAFE-TEXT codepoint (see module docstring
     and the regex comment above). Reused verbatim for protectedTools summary
@@ -64,6 +94,17 @@ def is_unsafe_text(s: str) -> bool:
     interpolated values and display names, so all three call sites can never
     drift apart."""
     return bool(_UNSAFE_TEXT_RE.search(s))
+
+
+def escape_unsafe_text(s: str) -> str:
+    """Replace every UNSAFE-TEXT codepoint in *s* with its visible ``\\uXXXX``
+    escape (#328). Built for display surfaces that must show operator-facing
+    text FAITHFULLY: a bidi override left raw can reorder what the operator
+    reads (``safe\\u202egpj.exe`` displays as a benign ``...jpg`` name), so the
+    unsafe codepoint is spelled out instead of rendered. Inside a JSON string
+    the replacement is itself a valid JSON escape for the same value, so an
+    escaped canonical-args block still parses to the bound arguments."""
+    return _UNSAFE_TEXT_RE.sub(lambda m: "\\u%04x" % ord(m.group()), s)
 
 
 _ELLIPSIS = "…"

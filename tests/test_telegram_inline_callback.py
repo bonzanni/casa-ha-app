@@ -1548,6 +1548,107 @@ class TestUpdateTopicState:
         )
         ef.assert_not_awaited()
 
+    async def test_live_repaint_refused_on_terminal_record(
+        self, fake_telegram_bot, engagement_fixture, monkeypatch,
+    ):
+        """#347 (Sol+Terra r4/r5): NO live paint (``active`` OR ``awaiting``)
+        may land over a terminal record — the fresh status read happens under
+        the topic-state lock, immediately before the wire edit. A terminal
+        repaint (e.g. re-asserting ``completed``) stays allowed."""
+        from channels.telegram import TelegramChannel
+        ch = TelegramChannel(
+            bot=fake_telegram_bot, chat_id=100, engagement_supergroup_id=-1001,
+        )
+        ch._engagement_registry = engagement_fixture.registry
+        rec = engagement_fixture.active_record
+        rec.topic_id = 1001
+        rec.status = "completed"
+
+        ef = AsyncMock()
+        monkeypatch.setattr(fake_telegram_bot, "edit_forum_topic", ef)
+        await ch.update_topic_state(engagement_id=rec.id, new_state="active")
+        await ch.update_topic_state(engagement_id=rec.id, new_state="awaiting")
+        ef.assert_not_awaited()
+        # Terminal paints still go through on a terminal record.
+        await ch.update_topic_state(
+            engagement_id=rec.id, new_state="completed")
+        ef.assert_awaited_once()
+
+    async def test_delayed_awaiting_after_terminal_edit_refused(
+        self, fake_telegram_bot, engagement_fixture, monkeypatch,
+    ):
+        """Terra r5 regression shape: terminal edit FIRST, then a delayed
+        ``awaiting`` request — the yellow paint must be refused and the
+        persisted emoji must stay terminal."""
+        from channels.state_emoji import STATE_EMOJI
+        from channels.telegram import TelegramChannel
+        ch = TelegramChannel(
+            bot=fake_telegram_bot, chat_id=100, engagement_supergroup_id=-1001,
+        )
+        ch._engagement_registry = engagement_fixture.registry
+        rec = engagement_fixture.active_record
+        rec.topic_id = 1001
+
+        names: list[str] = []
+
+        async def record_edit(**kw):
+            names.append(kw["name"])
+
+        monkeypatch.setattr(fake_telegram_bot, "edit_forum_topic", record_edit)
+        rec.status = "completed"
+        await ch.update_topic_state(
+            engagement_id=rec.id, new_state="completed")
+        await ch.update_topic_state(
+            engagement_id=rec.id, new_state="awaiting")
+        assert len(names) == 1
+        assert names[0].startswith(STATE_EMOJI["completed"])
+        assert rec.current_state_emoji == STATE_EMOJI["completed"]
+
+    async def test_terminal_edit_queued_behind_inflight_edit_paints_last(
+        self, fake_telegram_bot, engagement_fixture, monkeypatch,
+    ):
+        """#347 (Sol+Terra r4): state edits for one engagement are totally
+        ordered by the per-engagement lock — a terminal transition arriving
+        while another state edit's wire call is in flight queues BEHIND it
+        and paints last, so the topic can never end up green after close."""
+        import asyncio
+        from channels.state_emoji import STATE_EMOJI
+        from channels.telegram import TelegramChannel
+
+        ch = TelegramChannel(
+            bot=fake_telegram_bot, chat_id=100, engagement_supergroup_id=-1001,
+        )
+        ch._engagement_registry = engagement_fixture.registry
+        rec = engagement_fixture.active_record
+        rec.topic_id = 1001
+
+        names: list[str] = []
+        gate = asyncio.Event()
+
+        async def slow_edit(**kw):
+            names.append(kw["name"])
+            if len(names) == 1:
+                await gate.wait()
+
+        monkeypatch.setattr(fake_telegram_bot, "edit_forum_topic", slow_edit)
+
+        t1 = asyncio.ensure_future(ch.update_topic_state(
+            engagement_id=rec.id, new_state="awaiting"))
+        async with asyncio.timeout(5.0):
+            while len(names) < 1:
+                await asyncio.sleep(0)
+        # Terminalization lands while t1's wire edit is in flight.
+        rec.status = "completed"
+        t2 = asyncio.ensure_future(ch.update_topic_state(
+            engagement_id=rec.id, new_state="completed"))
+        for _ in range(8):
+            await asyncio.sleep(0)
+        assert len(names) == 1          # t2 is queued behind the lock
+        gate.set()
+        await asyncio.wait_for(asyncio.gather(t1, t2), timeout=5.0)
+        assert len(names) == 2
+        assert names[-1].startswith(STATE_EMOJI["completed"])
+
     async def test_update_state_unknown_state_drops_silently(
         self, fake_telegram_bot, engagement_fixture, monkeypatch,
     ):

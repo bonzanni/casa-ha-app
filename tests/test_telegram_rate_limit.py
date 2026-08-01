@@ -177,3 +177,41 @@ class TestTelegramRateLimit:
 
         await channel._handle(_fake_update("42", "second"), None)  # rejected
         assert started == [], "typing indicator must not start on rejected messages"
+
+
+# ---------------------------------------------------------------------------
+# #347(a): the rate-limit gate must run BEFORE the typed-answer ask
+# cancellation — a rate-limited reply must not expire the pending question
+# it will never deliver an answer to.
+# ---------------------------------------------------------------------------
+
+
+class _RecordingBroker:
+    def __init__(self) -> None:
+        self.cancelled: list[dict] = []
+
+    def cancel_scope(self, **kwargs: Any) -> None:
+        self.cancelled.append(kwargs)
+
+
+class TestRateLimitBeforeAskCancel:
+    async def test_rate_limited_reply_leaves_pending_ask_alive(
+        self, _channel_factory, monkeypatch,
+    ):
+        import verdict_broker
+        broker = _RecordingBroker()
+        monkeypatch.setattr(verdict_broker, "BROKER", broker)
+        channel, _bus, _app = _channel_factory(capacity=1)
+
+        await channel._handle(_fake_update("7", "first"), None)
+        typed = [c for c in broker.cancelled
+                 if c.get("reason") == "typed_answer"]
+        assert len(typed) == 1  # the ALLOWED reply resolves the pending ask
+
+        await channel._handle(_fake_update("7", "second"), None)
+        typed = [c for c in broker.cancelled
+                 if c.get("reason") == "typed_answer"]
+        # The rate-limited reply was dropped — it must NOT have cancelled the
+        # pending ask (pre-#347 the cancel ran first and the answer was lost
+        # while the question expired).
+        assert len(typed) == 1

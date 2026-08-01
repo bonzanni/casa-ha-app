@@ -659,3 +659,52 @@ class TestPermissionRetryReattach:
             option_index=0, actor_id=1) == "delivered"
         await asyncio.wait_for(asyncio.gather(t1, t2), timeout=1.0)
         assert posts == []  # still never eager-posted
+
+
+class TestTerminalRegistrationSentinel:
+    async def test_terminal_registration_denies_and_unregisters(
+        self, _fresh_broker, monkeypatch,
+    ):
+        """Sol r2 (P1): terminalization landing between the hook's active
+        check and intent registration makes ``register_send_intent`` return
+        the ``TERMINAL_REGISTRATION`` sentinel — which is not None and not a
+        tuple. The relay used to unpack it (TypeError) and strand the broker
+        request until timeout. It must deny deterministically and clear the
+        request."""
+        import agent as agent_mod
+        from channels.output_sequencer import TERMINAL_REGISTRATION
+        from hooks import make_engagement_permission_relay
+
+        eid = "t" * 32
+        rec = _FakeRecord()
+
+        class _TerminalDriver:
+            def register_send_intent(self, **kw):
+                # The registration observes the terminalized sequencer — by
+                # this point the registry record is terminal too.
+                rec.status = "completed"
+                return TERMINAL_REGISTRATION
+
+        monkeypatch.setattr(
+            agent_mod, "active_claude_code_driver", _TerminalDriver(),
+            raising=False)
+        reg = _FakeRegistry({eid: rec})
+        ch = _FakeTelegramChannel()
+        hook = make_engagement_permission_relay(
+            engagement_registry=reg, telegram_channel=ch,
+        )
+        result = await hook(
+            {"tool_name": "Bash", "tool_input": {"command": "x"},
+             "tool_use_id": "tu-terminal-1"},
+            None, {"casa_engagement_id": eid},
+        )
+        assert _decision(result) == "deny"
+        assert "terminal" in _reason(result).lower()
+        # No keyboard was ever posted and no permission request is left
+        # pending to burn its timeout.
+        assert ch.keyboard_calls == []
+        assert _fresh_broker.pending(namespace="permission", scope=eid) == []
+        # Terra r3: the exit restore must NOT repaint the terminal
+        # engagement's topic ``active`` — only the entry ``awaiting`` edit
+        # ever ran.
+        assert ch.state_calls == [(eid, "awaiting")]

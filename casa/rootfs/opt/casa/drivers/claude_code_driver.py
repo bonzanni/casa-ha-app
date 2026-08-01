@@ -1360,6 +1360,7 @@ class ClaudeCodeDriver(DriverProtocol):
     async def _write_to_fifo(
         self, engagement: EngagementRecord, text: str,
         *, timeout_s: float = 20.0, poll_s: float = 0.25,
+        retained: bool = False,
     ) -> bool:
         """Write one newline-terminated line to the engagement FIFO.
 
@@ -1367,6 +1368,14 @@ class ClaudeCodeDriver(DriverProtocol):
         keys one-message-per-spawn delivery + retention on this). Any
         no-reader / stall / broken-pipe / missing-FIFO outcome returns
         ``False`` so the caller retains the item for the next spawn.
+
+        #322: ``retained`` declares what the CALLER does with a ``False``
+        return. The spool retains the envelope and auto-redelivers on the
+        next spawn, so its no-reader notice must promise the retry — the old
+        one-size "Try again" copy made the operator resend a turn that was
+        about to redeliver anyway, and the agent did the work twice. The
+        legacy no-spool direct writes retain nothing; "Try again" stays their
+        honest copy.
         """
         # M13: a blocking open(fifo, "a") parks a pooled executor thread
         # FOREVER when no reader exists (crash-looping/downed s6 service).
@@ -1406,12 +1415,23 @@ class ClaudeCodeDriver(DriverProtocol):
                         # the sequencer on an abnormal respawn. ``post_topic_notice``
                         # falls back to a direct send only when no live sequencer
                         # exists.
-                        await self.post_topic_notice(
-                            engagement,
-                            "The engagement isn't accepting input right now — "
-                            "your message was not delivered. Try again, or "
-                            "/cancel if it stays unresponsive.",
-                        )
+                        if retained:
+                            # #322: the spool keeps this envelope and
+                            # redelivers it on the next spawn — a resend
+                            # would duplicate the turn.
+                            copy = (
+                                "The engagement isn't accepting input right "
+                                "now — your message is queued and will be "
+                                "delivered automatically once it recovers. "
+                                "/cancel if it stays unresponsive."
+                            )
+                        else:
+                            copy = (
+                                "The engagement isn't accepting input right "
+                                "now — your message was not delivered. Try "
+                                "again, or /cancel if it stays unresponsive."
+                            )
+                        await self.post_topic_notice(engagement, copy)
                         return False
                     await asyncio.sleep(poll_s)
             # Reader exists; write non-blocking under the same deadline. Turns
@@ -1472,7 +1492,10 @@ class ClaudeCodeDriver(DriverProtocol):
         self._inbound[engagement.id] = _InboundSpool(
             engagement_id=engagement.id,
             spool_path=str(ws / _SPOOL_FILENAME),
-            write_fifo=lambda text: self._write_to_fifo(engagement, text),
+            # #322: the spool RETAINS on a False return (auto-redelivery on
+            # the next spawn) — its no-reader notice promises the retry.
+            write_fifo=lambda text: self._write_to_fifo(
+                engagement, text, retained=True),
             send_notice=lambda text, reply_to: self._spool_send_notice(
                 engagement, text, reply_to),
             is_turn_running=lambda: self._turn_running.get(engagement.id, False),

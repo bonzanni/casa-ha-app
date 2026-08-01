@@ -133,6 +133,7 @@
     - tests/test_verdict_broker.py
     - tests/test_telegram_new_reset.py
     - tests/test_telegram_supervisor.py
+    - tests/test_telegram_split.py
   related: [architecture/overview.md, architecture/engagements.md, architecture/http-surface.md]
   defines_invariants: [INV-TG-001, INV-TG-002, INV-TG-003, INV-TG-004, INV-TG-005]
   invariant_tests:

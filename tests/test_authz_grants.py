@@ -1366,3 +1366,92 @@ async def test_drain_awaits_outstanding_drivers(monkeypatch):
 def test_challenges_singleton_is_a_coordinator():
     from authz_grants import CHALLENGES
     assert isinstance(CHALLENGES, ChallengeCoordinator)
+
+
+# ---------------------------------------------------------------------------
+# #328 — challenge rendering: bidi-control spoofing + UTF-16 size gate
+# ---------------------------------------------------------------------------
+
+
+class TestChallengeBidiEscape:
+    """#328: a bidi control character inside a tool-input VALUE renders
+    verbatim in the challenge, so the human-visible "exact action" can differ
+    materially from the string bound into the grant (RLO makes
+    ``safe\\u202egpj.exe`` display as a benign ``...jpg`` name). The renderer
+    must show unsafe codepoints as visible ``\\uXXXX`` escapes; the BINDING
+    (canonical json + args_hash) stays byte-identical."""
+
+    def test_bidi_override_in_value_is_escaped_in_display(self):
+        canonical = canonical_args_json({"target": "safe" + chr(0x202E) + "gpj.exe"})
+        assert chr(0x202E) in canonical  # the binding keeps the real value
+        text = render_challenge_message(
+            tool_name="invoice_reset", enforcement_role="finance",
+            canonical_json=canonical,
+        )
+        assert chr(0x202E) not in text       # never rendered raw
+        assert "\\u202e" in text             # visible escape instead
+
+    @pytest.mark.parametrize("codepoint", [0x202A, 0x200E, 0x2066, 0x061C, 0x007F])
+    def test_all_unsafe_ranges_escaped(self, codepoint):
+        canonical = canonical_args_json({"v": f"a{chr(codepoint)}b"})
+        text = render_challenge_message(
+            tool_name="t", enforcement_role="r", canonical_json=canonical,
+        )
+        assert chr(codepoint) not in text
+        assert "\\u%04x" % codepoint in text
+
+    def test_escaped_display_block_parses_to_the_same_args(self):
+        """The escape is a JSON string escape — the displayed block is still
+        valid JSON for the SAME value, so what the operator reads IS what the
+        grant binds (just spelled visibly)."""
+        args = {"target": "safe" + chr(0x202E) + "gpj.exe"}
+        canonical = canonical_args_json(args)
+        text = render_challenge_message(
+            tool_name="invoice_reset", enforcement_role="finance",
+            canonical_json=canonical,
+        )
+        block = text.split("```\n", 1)[1].split("\n```", 1)[0]
+        assert json.loads(block) == args
+
+    def test_summarized_form_also_escapes_the_binding_block(self):
+        canonical = canonical_args_json({"period": "x" + chr(0x202E) + "y"})
+        text = render_challenge_message(
+            tool_name="invoice_reset", enforcement_role="finance",
+            canonical_json=canonical, summary="Delete the draft for {other}",
+        )
+        assert chr(0x202E) not in text
+
+    def test_safe_canonical_json_is_untouched(self):
+        canonical = '{"note":"a_*b*_ `c`"}'
+        text = render_challenge_message(
+            tool_name="invoice_reset", enforcement_role="finance",
+            canonical_json=canonical,
+        )
+        assert canonical in text
+        assert "\\" not in text
+
+
+class TestChallengeSizeGateUtf16:
+    async def test_astral_challenge_over_utf16_limit_is_refused(
+        self, monkeypatch,
+    ):
+        """#328 (low): the gate must measure UTF-16 units as Telegram does —
+        an astral-heavy challenge whose ``len()`` is under the ceiling but
+        whose UTF-16 length is over it would pass the old gate and then fail
+        ``post_dm_keyboard``, permanently denying that exact-argument action."""
+        from text_util import utf16_len
+        broker, coord, channel = _fresh_env(monkeypatch)
+        # ~2000 astral chars: len() ~2100 (< 3900) but ~4200 UTF-16 units.
+        blob = "\U0001F389" * 2000
+        canonical = canonical_args_json({"blob": blob})
+        rendered = render_challenge_message(
+            tool_name="invoice_reset", enforcement_role="finance",
+            canonical_json=canonical,
+        )
+        assert len(rendered) <= _CHALLENGE_MAX_CHARS  # old gate would pass
+        assert utf16_len(rendered) > _CHALLENGE_MAX_CHARS
+        key, handle = _create(coord, channel, canonical_json=canonical)
+        await _settle()
+        assert handle.refused == "args_too_large"
+        assert key not in coord._entries
+        assert channel.posts == []

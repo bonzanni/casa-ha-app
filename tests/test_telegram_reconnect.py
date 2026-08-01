@@ -579,3 +579,80 @@ class TestSetupEngagementFeaturesInRebuild:
         )
         # Restore (paranoia).
         ch.setup_engagement_features = original  # type: ignore[method-assign]
+
+
+class TestRebuildCancellation:
+    """#347: ``_rebuild``'s rollback ran only under ``except Exception`` —
+    a cancellation during ``set_webhook()``/``start_polling()`` skipped the
+    stop()/shutdown() rollback, and since the app was never published to
+    ``self._app``, channel ``stop()`` could not tear it down either: the
+    running updater/fetcher leaked."""
+
+    @pytest.mark.unit
+    async def test_rebuild_cancelled_during_set_webhook_rolls_back(
+        self, monkeypatch,
+    ):
+        from channels.telegram import TelegramChannel
+        from telegram.ext import Application
+
+        app = _make_fake_application()
+        app.running = True  # after start()
+        app.bot.set_webhook = AsyncMock(
+            side_effect=asyncio.CancelledError(),
+        )
+
+        def fake_builder():
+            chain = MagicMock()
+            chain.token = MagicMock(return_value=chain)
+            chain.build = MagicMock(return_value=app)
+            return chain
+
+        monkeypatch.setattr(Application, "builder", fake_builder)
+
+        ch = TelegramChannel(
+            bot_token="t", chat_id="1", webhook_url="https://example.test",
+        )
+
+        with pytest.raises(asyncio.CancelledError):
+            await ch._rebuild()
+
+        assert app.stop.await_count == 1
+        assert app.shutdown.await_count == 1
+        assert ch._app is None
+
+    @pytest.mark.unit
+    async def test_rebuild_cancelled_during_start_polling_stops_updater(
+        self, monkeypatch,
+    ):
+        """Sol+Terra r1 (P1): in polling mode a cancellation inside
+        ``start_polling()`` leaves ``updater.running`` set; ``app.stop()``
+        does NOT stop the updater and ``app.shutdown()`` then raises
+        (swallowed) — the polling task survived unpublished. The rollback
+        must stop the updater FIRST, mirroring ``_teardown_app``."""
+        from channels.telegram import TelegramChannel
+        from telegram.ext import Application
+
+        app = _make_fake_application()
+        app.running = True  # after start()
+        app.updater.running = True  # start_polling marked itself running
+        app.updater.start_polling = AsyncMock(
+            side_effect=asyncio.CancelledError(),
+        )
+
+        def fake_builder():
+            chain = MagicMock()
+            chain.token = MagicMock(return_value=chain)
+            chain.build = MagicMock(return_value=app)
+            return chain
+
+        monkeypatch.setattr(Application, "builder", fake_builder)
+
+        ch = TelegramChannel(bot_token="t", chat_id="1")  # polling mode
+
+        with pytest.raises(asyncio.CancelledError):
+            await ch._rebuild()
+
+        assert app.updater.stop.await_count == 1
+        assert app.stop.await_count == 1
+        assert app.shutdown.await_count == 1
+        assert ch._app is None

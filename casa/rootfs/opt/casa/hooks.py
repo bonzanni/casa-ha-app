@@ -2298,6 +2298,24 @@ def make_engagement_permission_relay(
                         tool_name=tool_name, projection_hash=_phash,
                         poster=_post_keyboard,
                     )
+                    # Sol r2 (#347): terminalization landing between the
+                    # active check above and this registration returns the
+                    # TERMINAL_REGISTRATION sentinel — not None, not a
+                    # tuple. Unpacking it raised TypeError and stranded the
+                    # broker request until timeout. Deny deterministically
+                    # and clear the request (no waiters yet — this call IS
+                    # the waiter and returns before awaiting).
+                    from channels.output_sequencer import (
+                        TERMINAL_REGISTRATION as _TERMINAL_REG,
+                    )
+                    if _res is _TERMINAL_REG:
+                        BROKER.unregister(
+                            namespace="permission", scope=eng_id,
+                            request_id=rid,
+                        )
+                        return _deny(
+                            f"engagement is terminal: {eng_id[:8]}"
+                        )
                     if _res is not None:
                         _intent, _created_intent = _res
                         if _created_intent:
@@ -2333,9 +2351,16 @@ def make_engagement_permission_relay(
         finally:
             # r7-B3: restore topic state on EVERY exit — post failure,
             # cancellation during post or await, or normal completion.
-            await telegram_channel.update_topic_state(
-                engagement_id=eng_id, new_state="active",
-            )
+            # Terra r3 (#347): gated on a FRESH status read — an engagement
+            # that terminalized mid-hook (the TERMINAL_REGISTRATION deny, or
+            # any exit racing the terminal sweep) must not be repainted
+            # ``active``; that edit could land AFTER the terminal-state edit
+            # and leave a closed topic showing green.
+            _rec_now = engagement_registry.get(eng_id)
+            if getattr(_rec_now, "status", None) == "active":
+                await telegram_channel.update_topic_state(
+                    engagement_id=eng_id, new_state="active",
+                )
         o = outcome.get("outcome")
         if o == "answered" and outcome.get("option_index") == 0:
             return {}

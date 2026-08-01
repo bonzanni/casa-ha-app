@@ -322,3 +322,37 @@ async def test_near_boundary_single_select_body_passes(
     body = json.loads(resp.text)
     assert body["ok"] is True
     assert body["outcome"] == "answered"
+
+
+async def test_astral_body_over_utf16_limit_refused_invalid_args(
+    tmp_path, monkeypatch,
+) -> None:
+    """#328 family (Terra r1): the body gate measures UTF-16 units. An
+    astral-heavy question whose ``len()`` fits but whose UTF-16 length
+    exceeds the limit is refused ``invalid_args`` here — not passed through
+    to a keyboard post Telegram will reject."""
+    from text_util import utf16_len
+
+    options = ["Alpha", "Beta"]
+    # ~2200 astral chars: code-point length well under 4096, UTF-16 ~4400.
+    question = "\U0001F389" * 2200
+    body = render_ask_body(_FIRST_N, question, options)
+    suffix = max(
+        len(s) for s in ask_lifecycle_suffixes(_FIRST_N, options, False))
+    assert len(body) + suffix <= _ASK_BODY_LIMIT      # old gate would pass
+    assert utf16_len(body) + suffix > _ASK_BODY_LIMIT
+
+    ask, reg, ch, _broker = _make_ask_handler(tmp_path, monkeypatch)
+    rec = await reg.create(
+        "executor", "configurator", "claude_code", "t",
+        {"user_id": 555}, topic_id=42)
+    payload = {
+        "engagement_id": rec.id, "request_id": "r-astral",
+        "engagement_token": rec.auth_token,
+        "question": question, "options": options, "timeout_s": 60,
+    }
+    resp = await ask(_FakeRequest(payload))
+    body_out = json.loads(resp.text)
+    assert body_out["ok"] is False
+    assert body_out["error"] == "invalid_args"
+    assert ch.options_keyboards == []
