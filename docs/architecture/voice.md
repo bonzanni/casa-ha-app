@@ -44,6 +44,11 @@ authentication — so that slow I/O counts against the budget rather than hiding
 the socket path it is captured when a decoded frame is dispatched as an utterance — so the
 handshake, frame receipt and JSON parsing are all outside the budget there. Deferred jobs deliberately outlive it.
 
+**An utterance's route identity is pinned when its frame is received.** The reader stamps
+the server-bound route, capabilities and job-control identity onto the frame at ingress, so
+a registration frame that races an already-received utterance cannot redirect that turn's
+deferred answer or handoff to the new binding.
+
 **Sessions are keyed by role and scope together**, so the same speaker talking to two agents
 gets two sessions rather than one shared context.
 
@@ -129,7 +134,9 @@ to an agent.
 unrecognised type are skipped rather than closing the connection. A registration frame
 whose capability list is malformed — wrong container, non-string or non-hashable elements,
 or the wrong capability set — is refused with an empty accepted set while the socket stays
-open, and a non-string utterance or cancel id is treated as absent. This is an *input*
+open, and a non-string utterance or cancel id is treated as absent. A refused
+re-registration leaves the connection's previous binding in place; a duplicate utterance id
+cancels the in-flight original before the replacement runs. This is an *input*
 guarantee, not a blanket one: an internal failure while handling a well-formed frame still
 aborts the reader and closes the socket, deliberately, so the client reconnects to a clean
 connection rather than talking to a wedged one.

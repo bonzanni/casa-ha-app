@@ -188,6 +188,141 @@ class TestVoiceModes:
         payload = json.loads(res["content"][0]["text"])
         assert payload["status"] == "ok"
 
+    async def test_sync_voice_result_surfaces_outcome_classification(
+        self, monkeypatch,
+    ):
+        """#352: the concierge is documented to vary speech for tentative /
+        not-found / dependency-unavailable outcomes, but the sync tool
+        response carried only status:"ok" + rendered text — no
+        machine-readable signal, so a tentative answer was spoken as if
+        confident."""
+        import agent as agent_mod
+
+        tm, reg = _init_tools_for_voice()
+
+        async def _fake_run(
+            cfg, task_text, context_text, resolution=None, output_format=None,
+        ):
+            return tm.DelegatedOutput(
+                text="It might be Tuesday.",
+                structured_output={
+                    "status": "tentative",
+                    "spoken_summary": "It might be Tuesday.",
+                    "answer": "Tuesday", "clarification": "",
+                    "citations": ["household calendar"],
+                    "assumptions": ["you meant next week"],
+                    "provenance": {}, "sensitivity": "household",
+                    "delivery_ttl_s": 900,
+                },
+            )
+
+        monkeypatch.setattr(tm, "_run_delegated_agent", _fake_run)
+
+        token = agent_mod.origin_var.set(_voice_origin(
+            voice_deadline=asyncio.get_running_loop().time() + 20.0,
+        ))
+        try:
+            res = await tm.delegate_to_agent.handler({
+                "agent": "finance", "task": "t", "context": "", "mode": "sync",
+            })
+        finally:
+            agent_mod.origin_var.reset(token)
+
+        payload = json.loads(res["content"][0]["text"])
+        assert payload["status"] == "ok"
+        assert payload["specialist_status"] == "tentative"
+        assert payload["citations"] == ["household calendar"]
+        assert payload["assumptions"] == ["you meant next week"]
+
+    async def test_sync_voice_outcome_metadata_is_bounded(self, monkeypatch):
+        """#352 (review round 2): the sync result is an explicitly bounded
+        boundary (`text` is truncated) — the citation/assumption arrays
+        must not ride it unbounded, or a specialist can attach megabytes
+        of metadata to a one-line answer."""
+        import agent as agent_mod
+
+        tm, reg = _init_tools_for_voice()
+
+        async def _fake_run(
+            cfg, task_text, context_text, resolution=None, output_format=None,
+        ):
+            return tm.DelegatedOutput(
+                text="Short answer.",
+                structured_output={
+                    "status": "answered", "spoken_summary": "Short answer.",
+                    "answer": "Short answer.", "clarification": "",
+                    "citations": ["c" * 10_000] * 50,
+                    "assumptions": ["a" * 10_000] * 50,
+                    "provenance": {}, "sensitivity": "household",
+                    "delivery_ttl_s": 900,
+                },
+            )
+
+        monkeypatch.setattr(tm, "_run_delegated_agent", _fake_run)
+
+        token = agent_mod.origin_var.set(_voice_origin(
+            voice_deadline=asyncio.get_running_loop().time() + 20.0,
+        ))
+        try:
+            res = await tm.delegate_to_agent.handler({
+                "agent": "finance", "task": "t", "context": "", "mode": "sync",
+            })
+        finally:
+            agent_mod.origin_var.reset(token)
+
+        payload = json.loads(res["content"][0]["text"])
+        assert payload["status"] == "ok"
+        assert len(payload["citations"]) <= 10
+        assert len(payload["assumptions"]) <= 10
+        assert all(len(item) <= 400 for item in payload["citations"])
+        assert all(len(item) <= 400 for item in payload["assumptions"])
+
+    async def test_sync_voice_private_result_withholds_citations(
+        self, monkeypatch,
+    ):
+        """#352: the disclosure gate that withholds a private
+        spoken_summary from a household-clearance route must extend to the
+        machine-readable envelope — citations/assumptions can carry the
+        same private detail the summary does."""
+        import agent as agent_mod
+
+        tm, reg = _init_tools_for_voice()
+
+        async def _fake_run(
+            cfg, task_text, context_text, resolution=None, output_format=None,
+        ):
+            return tm.DelegatedOutput(
+                text="Private detail.",
+                structured_output={
+                    "status": "answered",
+                    "spoken_summary": "Private detail.",
+                    "answer": "Private detail.", "clarification": "",
+                    "citations": ["PRIVATE_CITATION_CANARY"],
+                    "assumptions": ["PRIVATE_ASSUMPTION_CANARY"],
+                    "provenance": {}, "sensitivity": "private",
+                    "delivery_ttl_s": 900,
+                },
+            )
+
+        monkeypatch.setattr(tm, "_run_delegated_agent", _fake_run)
+
+        token = agent_mod.origin_var.set(_voice_origin(
+            voice_deadline=asyncio.get_running_loop().time() + 20.0,
+        ))
+        try:
+            res = await tm.delegate_to_agent.handler({
+                "agent": "finance", "task": "t", "context": "", "mode": "sync",
+            })
+        finally:
+            agent_mod.origin_var.reset(token)
+
+        payload = json.loads(res["content"][0]["text"])
+        assert payload["status"] == "ok"
+        # The classification itself is not sensitive; the content is.
+        assert payload["specialist_status"] == "answered"
+        assert "PRIVATE_CITATION_CANARY" not in json.dumps(payload)
+        assert "PRIVATE_ASSUMPTION_CANARY" not in json.dumps(payload)
+
     async def test_voice_interactive_to_resident_hits_mode_gate_first(self):
         """IMPORTANT 1 (review): the voice mode gate must precede the
         resident-interactive-compat check. A voice interactive delegation

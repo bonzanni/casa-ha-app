@@ -1,5 +1,49 @@
 # Changelog
 
+## [0.140.0] - 2026-08-01
+
+### Fixed
+
+Voice-correctness batch — nine defects across the voice channel's WebSocket
+lifecycle, deferred delivery, and rendering (#303, #304, #329, #352, #357):
+
+- **A retransmitted utterance no longer orphans the in-flight turn** (#303).
+  Re-sending the same utterance id used to overwrite the internal task map
+  while the first request kept running server-side, beyond the reach of any
+  cancel; the original is now cancelled before the retry takes its place.
+- **A malformed re-registration no longer silently unbinds a voice route**
+  (#304). The previous binding survives a refused registration frame, and a
+  socket that re-registers under a new route id now notifies delivery for the
+  displaced one — so an answer already offered to that route is re-offered
+  instead of expiring unsent.
+- **An utterance pins its route identity at ingress** (#329). A registration
+  frame racing an already-received utterance can no longer redirect that
+  turn's deferred answer or specialist handoff to the new route.
+- **A missed delivery authorization can be retried** (#329). If the client
+  lost the socket between Casa authorizing a delivery and the authorization
+  frame arriving, retrying the same attempt after reconnect now re-acks
+  instead of revoking, so the answer plays without waiting out the lease.
+- **Unacknowledged revoked delivery attempts are reclaimed** (#329) instead
+  of accumulating (and pinning closed sockets) for the process lifetime.
+- **Pending specialist handoffs are not replayed to a superseded socket**
+  (#329) — replay stops as soon as another connection takes over the route.
+- **A non-answer can no longer be delivered as silence** (#352). Every
+  terminal specialist status — not just `answered` — now requires spoken
+  content; an empty not-found/failed envelope is rejected and the standard
+  spoken fallback is used.
+- **The voice concierge hears how confident the specialist was** (#352).
+  Synchronous delegation results now carry the specialist's machine-readable
+  outcome status (plus citations and assumptions, under the same disclosure
+  policy as the spoken text), so a tentative answer is no longer spoken as a
+  confident one.
+- **The `none` TTS dialect no longer deletes leading parentheticals** (#357).
+  Only canonical prosody tags are stripped; substantive prose such as
+  "(Important: the oven is still on.)" is spoken.
+- **Overlong topic-title words are ellipsized** (#357) instead of being
+  sliced mid-word, and **voice agent display names containing Unicode
+  line/paragraph separators are rejected** (#357) so a configured name
+  cannot forge a second line in the agent picker.
+
 ## [0.139.0] - 2026-08-01
 
 ### Security

@@ -104,6 +104,105 @@ class TestHandoffRoundTrip:
         assert "minute" in text, f"no wait expectation in: {text!r}"
 
 
+class TestReplayBindingGuard:
+    """#329: `route_connected` replayed pending handoffs to the supplied
+    route object without checking it is still the registry's CURRENT
+    binding — a concurrent re-registration of the same route id could
+    supersede socket 1 mid-ack, and socket 1 then replayed job/handoff
+    metadata to the stale socket."""
+
+    async def test_superseded_socket_receives_no_replayed_handoffs(self):
+        job = _job()
+        registry = _registry(job)
+        registry.pending_handoffs_for_route = MagicMock(return_value=[job])
+        stale = _route()
+        current = _route()
+        route_registry = MagicMock()
+        route_registry.get_connected = MagicMock(return_value=current)
+        coordinator = VoiceHandoffCoordinator(registry, route_registry)
+
+        await coordinator.route_connected(stale)
+
+        stale.send_json.assert_not_awaited()
+
+    async def test_current_socket_still_receives_replayed_handoffs(self):
+        job = _job()
+        registry = _registry(job)
+        registry.pending_handoffs_for_route = MagicMock(return_value=[job])
+        route = _route()
+        route_registry = MagicMock()
+        route_registry.get_connected = MagicMock(return_value=route)
+        coordinator = VoiceHandoffCoordinator(registry, route_registry)
+
+        await coordinator.route_connected(route)
+
+        route.send_json.assert_awaited_once()
+
+    async def test_supersession_mid_replay_stops_further_frames(self):
+        job_a, job_b = _job(), _job()
+        registry = _registry(job_a)
+        registry.pending_handoffs_for_route = MagicMock(
+            return_value=[job_a, job_b],
+        )
+        route = _route()
+        current_holder = {"route": route}
+        route_registry = MagicMock()
+        route_registry.get_connected = MagicMock(
+            side_effect=lambda _rid: current_holder["route"],
+        )
+
+        async def send_and_supersede(_frame, **_kw):
+            # The first replay write completes, then another socket takes
+            # over the route id — the second write must not happen.
+            current_holder["route"] = _route()
+
+        route.send_json = AsyncMock(side_effect=send_and_supersede)
+        coordinator = VoiceHandoffCoordinator(registry, route_registry)
+
+        await coordinator.route_connected(route)
+
+        assert route.send_json.await_count == 1
+
+    async def test_replay_write_is_guarded_against_mid_send_supersession(
+        self,
+    ):
+        """#329 (review round 2): the currency check must ride INSIDE the
+        serialized send — a supersession that lands while the write waits
+        on the connection lock must suppress the frame, not race it."""
+        job = _job()
+        registry = _registry(job)
+        registry.pending_handoffs_for_route = MagicMock(return_value=[job])
+        current_holder: dict = {}
+        route_registry = MagicMock()
+        route_registry.get_connected = MagicMock(
+            side_effect=lambda _rid: current_holder["route"],
+        )
+
+        class _GuardedRoute:
+            """Honors `allow` the way VoiceWsConnection does — evaluated
+            at write time, after supersession has already happened."""
+
+            route_id = _ROUTE_ID
+
+            def __init__(self) -> None:
+                self.frames: list[dict] = []
+
+            async def send_json(self, frame, *, allow=None):
+                current_holder["route"] = object()  # superseded mid-send
+                if allow is not None and not allow():
+                    return False
+                self.frames.append(frame)
+                return True
+
+        route = _GuardedRoute()
+        current_holder["route"] = route
+        coordinator = VoiceHandoffCoordinator(registry, route_registry)
+
+        await coordinator.route_connected(route)
+
+        assert route.frames == []
+
+
 class TestReceiptRejectionsAreLoud:
     """Every refusal must say WHY. Silence here is what hid the bug."""
 

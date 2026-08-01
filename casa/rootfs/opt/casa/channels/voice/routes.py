@@ -49,9 +49,24 @@ class VoiceWsConnection:
         self.voice_route_capabilities: frozenset[str] = frozenset()
         self.voice_job_control_id: str | None = None
 
-    async def send_json(self, frame: dict[str, Any]) -> None:
+    async def send_json(
+        self,
+        frame: dict[str, Any],
+        *,
+        allow: Callable[[], bool] | None = None,
+    ) -> bool:
+        """Serialized write; `allow` is re-evaluated UNDER the lock.
+
+        #329: a currency check taken before the send is TOCTOU — the write
+        can queue behind this lock while the route binding is superseded.
+        A guard evaluated here, immediately before the transport write, is
+        the last point a stale frame can still be suppressed.
+        """
         async with self._send_lock:
+            if allow is not None and not allow():
+                return False
             await self._ws.send_json(frame)
+            return True
 
 
 @dataclass(frozen=True)
@@ -63,8 +78,13 @@ class BoundVoiceRoute:
     connection: VoiceWsConnection
     connected_at: float
 
-    async def send_json(self, frame: dict[str, Any]) -> None:
-        await self.connection.send_json(frame)
+    async def send_json(
+        self,
+        frame: dict[str, Any],
+        *,
+        allow: Callable[[], bool] | None = None,
+    ) -> bool:
+        return await self.connection.send_json(frame, allow=allow)
 
 
 @dataclass
@@ -97,8 +117,14 @@ class VoiceRouteRegistry:
         connection: VoiceWsConnection,
         frame: Mapping[str, Any],
     ) -> BoundVoiceRoute | None:
-        """Validate, acknowledge, and bind a protocol-2 registration."""
-        self._clear_connection_binding(connection)
+        """Validate, acknowledge, and bind a registration.
+
+        #304: validation runs BEFORE any binding mutation. A refused frame
+        is acknowledged with an empty accepted set and leaves the
+        connection's existing binding untouched — clearing it first
+        silently unbound the route with no route-disconnected
+        notification, stranding any already-offered delivery.
+        """
         protocol = frame.get("protocol")
         accepted: tuple[str, ...] = ()
         bound: BoundVoiceRoute | None = None
@@ -133,6 +159,7 @@ class VoiceRouteRegistry:
             and agent_allowed_on("voice", cfg)
             and valid_requested
         ):
+            self._clear_connection_binding(connection)
             self._prune_expired_metadata()
             accepted = _CAPABILITIES
             capabilities = frozenset(accepted)

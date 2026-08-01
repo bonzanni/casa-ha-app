@@ -91,7 +91,7 @@ class _Route:
         })
         self.sent: list[dict] = []
 
-    async def send_json(self, frame: dict) -> None:
+    async def send_json(self, frame: dict, **_kw) -> None:
         self.sent.append(frame)
 
 
@@ -704,6 +704,122 @@ async def test_claimed_attempt_rebinds_to_authenticated_reconnect_for_revoke(
     assert new_route.sent[-1]["delivery_attempt_id"] == (
         offer["delivery_attempt_id"]
     )
+
+
+async def test_missed_authorization_can_be_retried_after_reconnect(delivery):
+    """#329: `job_delivery_start` durably transitions to AUTHORIZED before
+    `job_delivery_authorized` is sent. A client that lost the socket in
+    that window could never retry — authorize() rejected the now-AUTHORIZED
+    row, the coordinator revoked, and the result sat until lease expiry."""
+    registry, routes, route, coordinator, _ = delivery
+    await registry.create(_ready_job("job-1", sequence=1, device="kitchen"))
+    await coordinator.route_connected(route)
+    offer = _offered(route)[0]
+    await coordinator.handle(route, _frame("job_claimed", offer))
+    await coordinator.handle(route, _frame("job_delivery_start", offer))
+    assert registry.get("job-1").delivery_state is DeliveryState.AUTHORIZED
+
+    # The authorization frame died with the socket; the client reconnects
+    # and retries the SAME attempt.
+    new_route = _Route()
+    routes.connected["entry-1"] = new_route
+    await coordinator.route_connected(new_route)
+    await coordinator.handle(new_route, _frame("job_delivery_start", offer))
+
+    authorized = [
+        frame for frame in new_route.sent
+        if frame["type"] == "job_delivery_authorized"
+    ]
+    assert authorized
+    assert authorized[-1]["delivery_attempt_id"] == (
+        offer["delivery_attempt_id"]
+    )
+    assert not any(
+        frame["type"] == "job_revoke" for frame in new_route.sent
+    )
+
+    # The retried delivery then completes normally.
+    await coordinator.handle(new_route, _frame("job_playback_started", offer))
+    await coordinator.handle(new_route, _frame("job_delivered", offer))
+    assert registry.get("job-1").delivery_state is DeliveryState.DELIVERED
+
+
+async def test_delivery_start_retry_with_pending_cancel_is_revoked(delivery):
+    """#329 guard: an idempotent re-authorization must not bypass a pending
+    cancellation — mirror the renew branch's revoke."""
+    registry, _, route, coordinator, _ = delivery
+    await registry.create(_ready_job("job-1", sequence=1, device="kitchen"))
+    await coordinator.route_connected(route)
+    offer = _offered(route)[0]
+    await coordinator.handle(route, _frame("job_claimed", offer))
+    await coordinator.handle(route, _frame("job_delivery_start", offer))
+    await registry.request_cancel("job-1", actor={
+        "creator_peer": "voice", "creator_user_id": None,
+        "scope_id": "scope-1",
+    })
+    sent_before = len(route.sent)
+
+    await coordinator.handle(route, _frame("job_delivery_start", offer))
+
+    assert route.sent[-1]["type"] == "job_revoke"
+    assert not any(
+        frame["type"] == "job_delivery_authorized"
+        for frame in route.sent[sent_before:]
+    )
+
+
+async def test_unacked_revoked_attempt_is_expired_not_retained(delivery):
+    """#329: a reconciliation-revoked attempt was removed only by the
+    client's `job_revoked` ack — a client that disconnected before acking
+    pinned the attempt (and its socket object) for the process lifetime."""
+    registry, routes, route, old_coordinator, now = delivery
+    coordinator = VoiceDeliveryCoordinator(
+        registry, routes, lease_s=15, renew_s=5, clock=lambda: now[0],
+    )
+    await registry.create(_ready_job(
+        "job-1", sequence=1, device="kitchen", expires_at=105.0,
+    ))
+    await coordinator.route_connected(route)
+    offer = _offered(route)[0]
+    await coordinator.handle(route, _frame("job_claimed", offer))
+
+    # TTL expiry makes the durable row terminal; reconciliation revokes.
+    now[0] = 106.0
+    await coordinator.sweep_once()
+    assert any(frame["type"] == "job_revoke" for frame in route.sent)
+    assert "job-1" in coordinator._attempts
+
+    # No ack ever arrives; the attempt must still be reclaimed.
+    now[0] = 130.0
+    await coordinator.sweep_once()
+    assert "job-1" not in coordinator._attempts
+    await coordinator.stop()
+    await old_coordinator.stop()
+
+
+async def test_stale_disconnect_notification_spares_the_new_bindings_offer(
+    delivery,
+):
+    """#304 (review round 2): a late route-disconnected notification for a
+    DISPLACED binding must remove only attempts offered to that binding —
+    matching by route id alone tore down the offer a newer socket had just
+    received for the reused id."""
+    registry, routes, route, coordinator, _ = delivery
+    await registry.create(_ready_job("job-1", sequence=1, device="kitchen"))
+    await coordinator.route_connected(route)
+    displaced = route
+
+    # Socket C takes over the same route id and gets its own fresh offer.
+    new_route = _Route()
+    routes.connected["entry-1"] = new_route
+    await coordinator.route_connected(new_route)
+    offer = _offered(new_route)[-1]
+
+    # The displaced binding's disconnect notification arrives late.
+    await coordinator.route_disconnected(displaced)
+
+    await coordinator.handle(new_route, _frame("job_claimed", offer))
+    assert registry.get("job-1").delivery_state is DeliveryState.CLAIMED
 
 
 async def test_lease_renewal_and_lapse_reoffer_with_new_attempt(delivery):

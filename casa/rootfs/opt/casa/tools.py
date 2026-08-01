@@ -3912,6 +3912,7 @@ async def delegate_to_agent(args: dict) -> dict:
             })
 
         delegated_output = finished.result()
+        voice_meta: dict = {}
         if is_voice:
             # See _run_voice_job_lifecycle: a run the CLI aborted has no
             # envelope to be malformed, and must not be reported as one (#254).
@@ -3976,11 +3977,29 @@ async def delegate_to_agent(args: dict) -> dict:
                 awaiting_input=voice_result.awaiting_input,
                 delivery_ttl_s=voice_result.delivery_ttl_s,
             )
+            identity_clearance = voice_identity_clearance(origin)
             text = spoken_text_for(
                 voice_result,
                 prompted=False,
-                identity_clearance=voice_identity_clearance(origin),
+                identity_clearance=identity_clearance,
             )
+            # #352: the concierge is prompted to vary speech for tentative /
+            # not-found / dependency-unavailable outcomes — surface the
+            # machine-readable classification, not just rendered text. The
+            # envelope CONTENT (citations/assumptions) stays behind the same
+            # disclosure gate as the spoken summary; the classification
+            # itself is not sensitive.
+            voice_meta["specialist_status"] = voice_result.status
+            if (voice_result.sensitivity != "private"
+                    or identity_clearance == "private"):
+                # This tool response is an explicitly bounded boundary
+                # (`text` goes through truncate_output below) — the
+                # advisory metadata must not ride it unbounded, since the
+                # schema puts no item/length limits on these arrays.
+                voice_meta["citations"] = _bounded_str_list(
+                    voice_result.citations)
+                voice_meta["assumptions"] = _bounded_str_list(
+                    voice_result.assumptions)
         else:
             text = delegated_output.text
         # Task 6 (spec §4.6): bound the synchronous result + expose the flag on
@@ -4028,6 +4047,7 @@ async def delegate_to_agent(args: dict) -> dict:
             "elapsed_s": elapsed,
             "text": text,
             "output_truncated": output_truncated,
+            **voice_meta,
         })
     finally:
         if owned is not None:
@@ -4038,6 +4058,18 @@ async def delegate_to_agent(args: dict) -> dict:
 # Metadata-only voice job control. Full case/result data never crosses these
 # tool envelopes; continuation injects it directly into the specialist child.
 # ---------------------------------------------------------------------------
+
+
+def _bounded_str_list(
+    values, *, max_items: int = 10, max_chars: int = 400,
+) -> list[str]:
+    """Cap advisory metadata lists (citations/assumptions) for the wire.
+
+    The voice-result schema bounds neither item count nor item length, so
+    without this a specialist could attach megabytes of metadata to a
+    one-line answer at a boundary that truncates `text` (spec §4.6).
+    """
+    return [value[:max_chars] for value in values[:max_items]]
 
 
 def _job_not_found_result() -> dict:

@@ -153,6 +153,89 @@ class TestVoiceWSSanitize:
         assert "_voice_job_control_id" not in ctx
         assert "chat_id" in ctx and "utterance_id" in ctx and "cid" in ctx
 
+    async def test_utterance_route_binding_is_snapshotted_at_ingress(
+        self, voice_app,
+    ):
+        """#329: the WS reader schedules the utterance task without pinning
+        the server-bound route fields, and the task later reads the MUTABLE
+        connection binding — a registration frame processed before the
+        queued task runs rebound an already-received utterance (and its
+        deferred answer/handoff) to the new route. The task must prefer the
+        ingress snapshot over the live connection."""
+        _client, agent, channel = voice_app
+
+        class ReboundConnection:
+            # By the time the task runs, the socket re-registered as B.
+            voice_route_id = "entry-B"
+            voice_route_capabilities = frozenset({
+                "background_jobs", "endpoint_delivery", "voice_handoff",
+            })
+            voice_job_control_id = "entry-B"
+
+            async def send_json(self, frame):
+                return None
+
+        await channel._run_ws_utterance(
+            ReboundConnection(),
+            {
+                "text": "hi", "agent_role": "butler", "scope_id": "s",
+                "device_id": "kitchen",
+                "_casa_route_snapshot": (
+                    "entry-A",
+                    frozenset({
+                        "background_jobs", "endpoint_delivery",
+                        "voice_handoff",
+                    }),
+                    "entry-A",
+                ),
+            },
+            "u-snap",
+            asyncio.get_running_loop().time() + 20.0,
+        )
+
+        ctx = agent.captured[-1]
+        assert ctx["_voice_route_id"] == "entry-A"
+        assert ctx["_voice_job_control_id"] == "entry-A"
+
+    async def test_ws_reader_stamps_route_snapshot_on_the_frame(
+        self, voice_app, monkeypatch,
+    ):
+        """#329 companion: the snapshot is stamped server-side at frame
+        receipt, and a client-supplied value never survives ingress."""
+        client, _agent, channel = voice_app
+        recorded: list[dict] = []
+        got = asyncio.Event()
+
+        async def stub(ws, frame, uid, voice_deadline):
+            recorded.append(frame)
+            got.set()
+
+        monkeypatch.setattr(channel, "_run_ws_utterance", stub)
+
+        async with client.ws_connect("/api/converse/ws") as ws:
+            await ws.send_json({
+                "type": "voice_route_register", "protocol": 3,
+                "route_id": "entry-A", "agent_role": "butler",
+                "capabilities": [
+                    "background_jobs", "endpoint_delivery", "voice_handoff",
+                ],
+            })
+            await ws.receive_json()
+            await ws.send_json({
+                "type": "utterance", "utterance_id": "u1", "text": "hi",
+                "agent_role": "butler", "scope_id": "s",
+                "_casa_route_snapshot": ["forged", [], "forged"],
+            })
+            await asyncio.wait_for(got.wait(), timeout=2.0)
+
+        assert recorded[0]["_casa_route_snapshot"] == (
+            "entry-A",
+            frozenset({
+                "background_jobs", "endpoint_delivery", "voice_handoff",
+            }),
+            "entry-A",
+        )
+
     async def test_route_capability_comes_only_from_server_connection(
         self, voice_app,
     ):

@@ -29,8 +29,13 @@ def _display_name(cfg: Any) -> str:
     name = raw.strip()
     if not 1 <= len(name) <= MAX_VOICE_AGENT_NAME_LENGTH:
         raise VoiceAgentCatalogError("invalid_name")
-    if any(unicodedata.category(char).startswith("C") for char in name):
-        raise VoiceAgentCatalogError("invalid_name")
+    for char in name:
+        category = unicodedata.category(char)
+        # Category C covers control/format; Zl/Zp (U+2028/U+2029) are
+        # line/paragraph separators that would let a name forge a second
+        # line in the agent picker (#357).
+        if category.startswith("C") or category in ("Zl", "Zp"):
+            raise VoiceAgentCatalogError("invalid_name")
     return name
 
 

@@ -104,6 +104,10 @@ def normalize_topic_title(raw: object) -> str:
         head = s[:TOPIC_TITLE_CHAR_CAP]
         if " " in head:
             head = head.rsplit(" ", 1)[0]
+        else:
+            # #357: a first word longer than the cap has no boundary to
+            # cut at — ellipsize rather than pass off a slice as the word.
+            head = s[:TOPIC_TITLE_CHAR_CAP - 1] + "…"
         s = head.rstrip()
     return s
 

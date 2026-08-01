@@ -38,9 +38,21 @@ class TestNone:
         a = TagDialectAdapter("none")
         assert a.render("[confident] Done.") == "Done."
 
-    def test_strips_leading_parens_tag(self):
+    def test_keeps_lowercase_parenthetical_prose(self):
+        """#357 (review round 2): a lowercase heuristic for "tag-like"
+        parens still deleted substantive speech — "(do not take it)" is
+        indistinguishable from a tag by shape. Canonical tags are ONLY
+        square-bracketed, so under `none` a parenthetical is always prose.
+        """
         a = TagDialectAdapter("none")
-        assert a.render("(confident) Done.") == "Done."
+        block = "(do not take it) Call emergency services."
+        assert a.render(block) == block
+
+    def test_keeps_leading_parens_even_when_tag_shaped(self):
+        # The cost of the fail-safe boundary: a model that emits a
+        # non-canonical parens tag under `none` is spoken, not stripped.
+        a = TagDialectAdapter("none")
+        assert a.render("(confident) Done.") == "(confident) Done."
 
     def test_strips_multiple_leading_tags(self):
         a = TagDialectAdapter("none")
@@ -49,6 +61,30 @@ class TestNone:
     def test_empty_block_empty_result(self):
         a = TagDialectAdapter("none")
         assert a.render("") == ""
+
+    def test_keeps_substantive_leading_parenthetical(self):
+        """#357: only canonical tag atoms are stripped. A leading
+        parenthetical carrying real prose (spaces plus sentence
+        punctuation — nothing a prosody tag ever contains) is content,
+        not markup, and deleting it can drop safety-relevant speech.
+        """
+        a = TagDialectAdapter("none")
+        block = "(Important: the oven is still on.) Turn it off."
+        assert a.render(block) == block
+
+    def test_keeps_capitalized_leading_parenthetical(self):
+        # Canonical tags are lowercase ([confident], [flat]); a
+        # capitalized parenthetical is prose.
+        a = TagDialectAdapter("none")
+        assert a.render("(Important) Turn it off.") == (
+            "(Important) Turn it off."
+        )
+
+    def test_strips_tag_then_keeps_prose_parenthetical(self):
+        a = TagDialectAdapter("none")
+        assert a.render("[flat] (Warning: gas leak.) Leave now.") == (
+            "(Warning: gas leak.) Leave now."
+        )
 
 
 class TestValidation:
