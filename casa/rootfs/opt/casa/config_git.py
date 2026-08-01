@@ -183,8 +183,12 @@ def commit_config_checked(
             return "", []
         with tempfile.TemporaryDirectory(prefix="casa-commit-gate-") as tmp:
             env = {**os.environ, "GIT_INDEX_FILE": os.path.join(tmp, "index")}
+            # Pin the base commit once: it is the private index's seed, the
+            # new commit's parent, AND the compare-and-swap expectation for
+            # the ref update below.
+            head = _run(config_dir, ["rev-parse", "HEAD"])
             # Private index := HEAD, then stage the worktree into it.
-            _run(config_dir, ["read-tree", "HEAD"], env=env)
+            _run(config_dir, ["read-tree", head], env=env)
             _run(config_dir, ["add", "-A"], env=env)
             export = os.path.join(tmp, "export")
             os.makedirs(export)
@@ -199,11 +203,16 @@ def commit_config_checked(
             if errors:
                 return "", errors     # private index discarded; repo untouched
             tree = _run(config_dir, ["write-tree"], env=env)
-            if tree == _run(config_dir, ["rev-parse", "HEAD^{tree}"]):
+            if tree == _run(config_dir, ["rev-parse", f"{head}^{{tree}}"]):
                 return "", []         # staged snapshot identical to HEAD
             sha = _run(config_dir,
-                       ["commit-tree", tree, "-p", "HEAD", "-m", message])
-            _run(config_dir, ["update-ref", "HEAD", sha])
+                       ["commit-tree", tree, "-p", head, "-m", message])
+            # CAS ref update: refuses (raises) if HEAD moved since `head` —
+            # a plain overwrite would silently ORPHAN a commit an external
+            # writer (SSH operator) landed mid-window, which even the old
+            # add-then-commit flow could never do. The caller surfaces the
+            # git error; a retry re-runs the gate on the new HEAD.
+            _run(config_dir, ["update-ref", "HEAD", sha, head])
         # Refresh the real index to the new HEAD — the state an ordinary
         # `git commit` leaves. Worktree untouched.
         _run(config_dir, ["reset", "-q"], check=False)

@@ -469,3 +469,32 @@ class TestRestoreFileBadSha:
         with pytest.raises(subprocess.CalledProcessError):
             restore_file(str(tmp_path), "not-a-sha", "agents/marker.txt")
         assert target.exists()
+
+    def test_head_moved_mid_gate_refuses_instead_of_orphaning(self, tmp_path):
+        """The ref update is compare-and-swap: an external commit landing
+        while the gate validates must make the gate FAIL (caller retries on
+        the new HEAD) — a plain overwrite would orphan the external commit."""
+        from config_git import commit_config_checked, init_repo
+
+        _seed(tmp_path)
+        init_repo(str(tmp_path))
+        (tmp_path / "agents" / "marker.txt").write_text(
+            "gate content", encoding="utf-8")
+
+        def validator(tree):
+            # External writer commits mid-window.
+            (tmp_path / "agents" / "external.txt").write_text(
+                "external commit", encoding="utf-8")
+            subprocess.check_call(
+                ["git", "-C", str(tmp_path), "add", "agents/external.txt"])
+            subprocess.check_call(
+                ["git", "-C", str(tmp_path), "commit", "-qm", "external"])
+            return []
+
+        with pytest.raises(subprocess.CalledProcessError):
+            commit_config_checked(str(tmp_path), "gate", validator)
+        # The external commit survives at HEAD.
+        msg = subprocess.check_output(
+            ["git", "-C", str(tmp_path), "log", "-1", "--format=%s"],
+        ).decode().strip()
+        assert msg == "external"
