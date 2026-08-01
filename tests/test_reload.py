@@ -2758,8 +2758,9 @@ class TestReloadIssue327:
             "constructed without an explicit agent_registry — the Agent "
             "would retain the stale pre-reload registry")
         assert reg.tier_for_role("newspec") == "specialist"
-        # The runtime's registry is the SAME fresh object post-swap.
-        assert runtime.agent_registry is reg
+        # The runtime's published registry equally knows the specialist
+        # (rebuilt from post-load state in the swap window).
+        assert runtime.agent_registry.tier_for_role("newspec") == "specialist"
 
     async def test_backfilled_specialist_constructed_with_fresh_registry(
         self, tmp_path, monkeypatch,
@@ -2848,13 +2849,15 @@ class TestReloadIssue327:
         assert result["status"] == "ok"
         assert cascaded == ["ellen"]
 
-    async def test_specialist_construct_failure_keeps_registries_coherent(
+    async def test_specialist_construct_failure_mutates_nothing(
         self, tmp_path, monkeypatch,
     ):
-        """Sol r1-6: specialist_registry is refreshed before construction;
-        if construction then fails, the agent_registry must be published to
-        match (registry-known specialist without an Agent object — boot's
-        own direct-load state), not left torn at the pre-reload view."""
+        """Sol r1-6 / Terra r4-2: a specialist construction failure must
+        leave EVERY live registry untouched — the construction registry is
+        an overlay built from the freshly loaded config, so no
+        specialist_registry.load happens before construction and no
+        registry state is published on failure (main's all-or-nothing
+        failure semantics)."""
         from reload import dispatch, register_handler, reload_agent
         register_handler("agent", reload_agent)
 
@@ -2878,9 +2881,12 @@ class TestReloadIssue327:
         runtime.agents_dir = str(agents_dir)
         runtime.role_configs = {}
         runtime.specialist_registry.load = MagicMock()
-        runtime.specialist_registry.all_configs = lambda: {"newspec": new_cfg}
+        runtime.specialist_registry.all_configs = lambda: {}
+        registry_before = runtime.agent_registry
 
         result = await dispatch("agent", runtime=runtime, role="newspec")
         assert result["status"] == "error"
         assert result["kind"] == "construct_failed"
-        assert runtime.agent_registry.tier_for_role("newspec") == "specialist"
+        # Nothing mutated: no specialist rescan, no registry publication.
+        runtime.specialist_registry.load.assert_not_called()
+        assert runtime.agent_registry is registry_before

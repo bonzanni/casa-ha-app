@@ -772,45 +772,48 @@ async def reload_agent(runtime: Any, *, role: str | None = None) -> list[str]:
                            role, exc)
         return actions
 
-    # #327(c): refresh the SpecialistRegistry BEFORE construction, and build
-    # the post-swap AgentRegistry up front, so the new Agent is constructed
-    # against a registry that already contains its own tier entry (see
-    # _construct_agent's docstring — the Agent retains that object). A
-    # specialist load failure here mutates only the specialist registry
-    # (toward disk truth); the live agent is untouched.
-    if tier == "specialist":
-        try:
-            await asyncio.to_thread(
-                runtime.specialist_registry.load, roles_dir=roles_dir)
-        except Exception as exc:  # noqa: BLE001
-            raise ReloadError("specialist_reload_failed", str(exc)) from exc
+    # #327(c): build the construction registry as an OVERLAY — the live
+    # registries stay untouched until the swap window. The new Agent must
+    # retain a registry that already contains its own tier entry (see
+    # _construct_agent's docstring), and the overlay provides that from
+    # ``new_cfg`` directly, WITHOUT reloading the SpecialistRegistry first:
+    # Terra r4-2 — a pre-construct load meant a construction failure left
+    # runtime consumers observing the new specialist configuration while
+    # the surviving old agent executed under the old one; on this ordering
+    # a construction failure mutates nothing, exactly like main.
     from agent_registry import AgentRegistry
     residents_view = dict(runtime.role_configs)
+    specialists_view = dict(runtime.specialist_registry.all_configs())
     if tier == "resident":
         residents_view[role] = new_cfg
+    else:
+        specialists_view[role] = new_cfg
     fresh_registry = AgentRegistry.build(
         residents=residents_view,
-        specialists=runtime.specialist_registry.all_configs(),
+        specialists=specialists_view,
     )
 
-    # Construct new Agent instance OUTSIDE the swap window.
+    # Construct new Agent instance OUTSIDE the swap window. Failure leaves
+    # every live registry and agent untouched.
     try:
         new_agent = await asyncio.to_thread(
             _construct_agent, cfg=new_cfg, runtime=runtime,
             agent_registry=fresh_registry,
         )
     except Exception as exc:  # noqa: BLE001
-        # Sol r1-6: for a specialist, specialist_registry was already
-        # refreshed above — publish the matching agent_registry so the pair
-        # stays coherent (registry-known specialist without an Agent object
-        # is boot's own direct-load state; the agents-sweep backfill covers
-        # it). A resident touched no registry, so nothing is published.
-        if tier == "specialist":
-            runtime.agent_registry = fresh_registry
         raise ReloadError("construct_failed", str(exc)) from exc
     actions.append("construct_agent")
 
     # --- ATOMIC SWAP WINDOW ---
+    # SpecialistRegistry refresh first (mirrors main's ordering): a load
+    # failure here raises with the old agent still live and nothing else
+    # mutated.
+    if tier == "specialist":
+        try:
+            await asyncio.to_thread(
+                runtime.specialist_registry.load, roles_dir=roles_dir)
+        except Exception as exc:  # noqa: BLE001
+            raise ReloadError("specialist_reload_failed", str(exc)) from exc
     old_agent = runtime.agents.get(role)  # AR-7: capture before overwrite
     # A:§3.3/§3.4 (r2-B5 enumerated seam): purge+cancel BEFORE the
     # replacement agent becomes dispatchable.
@@ -818,7 +821,14 @@ async def reload_agent(runtime: Any, *, role: str | None = None) -> list[str]:
     if tier == "resident":
         runtime.role_configs[role] = new_cfg
     runtime.agents[role] = new_agent
-    runtime.agent_registry = fresh_registry
+    # Publish the post-swap registry from the ACTUAL post-load state (the
+    # constructed agent's retained overlay differs only if an unrelated
+    # specialist changed on disk mid-reload — its own tier entry, the
+    # #327(c) point, is present in both).
+    runtime.agent_registry = AgentRegistry.build(
+        residents=runtime.role_configs,
+        specialists=runtime.specialist_registry.all_configs(),
+    )
     runtime.bus.register(role, new_agent.handle_message)
     # H10: a role whose dir was created after boot has no consumer yet;
     # idempotent no-op for roles that already have one.

@@ -498,6 +498,14 @@ class TestRestoreFileBadSha:
             ["git", "-C", str(tmp_path), "log", "-1", "--format=%s"],
         ).decode().strip()
         assert msg == "external"
+        # Sol r4-1: the pre-CAS index refresh must be UNDONE on CAS failure
+        # — otherwise the gate's content stays staged over the external
+        # commit and a later ordinary commit silently reverts it. The gate's
+        # worktree edit must be visible as an UNSTAGED modification only.
+        status = subprocess.check_output(
+            ["git", "-C", str(tmp_path), "status", "--porcelain"],
+        ).decode().splitlines()
+        assert status == [" M agents/marker.txt"]
 
     def test_success_preserves_concurrent_manual_staging(self, tmp_path):
         """Terra r2-1: a successful checked commit must not drop an

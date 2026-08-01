@@ -253,7 +253,26 @@ def commit_config_checked(
                     "config commit %s: index refresh failed: %s",
                     sha[:8], refresh.stderr.strip(),
                 )
-            _run(config_dir, ["update-ref", "HEAD", sha, head])
+            try:
+                _run(config_dir, ["update-ref", "HEAD", sha, head])
+            except Exception:
+                # Sol r4-1: HEAD moved between our snapshot and the CAS —
+                # the refresh above staged OUR content for the touched paths
+                # over the external commit; left in place, a later ordinary
+                # commit would silently revert that external work. Undo by
+                # re-resetting the same literal paths to the CURRENT HEAD.
+                undo = subprocess.run(
+                    ["git", "reset", "-q", "HEAD", "--pathspec-file-nul",
+                     "--pathspec-from-file=-"],
+                    cwd=config_dir, capture_output=True, text=True,
+                    input=spec,
+                )
+                if undo.returncode != 0:
+                    logger.warning(
+                        "config commit %s: CAS refused and the index undo "
+                        "also failed: %s", sha[:8], undo.stderr.strip(),
+                    )
+                raise
         return sha, []
 
 
