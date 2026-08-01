@@ -558,26 +558,55 @@ class JobRegistry:
 
     def schedule_failure_reconciliation(self, job_id: str) -> None:
         """Strongly own a metadata-only retry for a still-live failed write."""
+        self._schedule_terminal_reconciliation(
+            job_id,
+            lambda: self.fail_compat(
+                job_id,
+                JobFailure(
+                    "persistence_failed",
+                    "Specialist result could not be saved.",
+                ),
+            ),
+        )
+
+    def schedule_completion_reconciliation(self, job_id: str) -> None:
+        """#321: registry-owned retry completing a job whose result was
+        already returned to the caller but whose terminal snapshot write
+        failed — the answer must never be discarded by restart recovery
+        (ORPHANED) just because the metadata write lost a race with disk."""
+        self._schedule_terminal_reconciliation(
+            job_id, lambda: self.finish_compat(job_id, ""))
+
+    def schedule_cancel_reconciliation(self, job_id: str) -> None:
+        """#321: registry-owned retry for a cancellation whose snapshot write
+        failed (voice-deadline teardown) — the job must not stay RUNNING with
+        its permit accounted for until a restart."""
+        self._schedule_terminal_reconciliation(
+            job_id, lambda: self.cancel(job_id))
+
+    def _schedule_terminal_reconciliation(
+        self,
+        job_id: str,
+        op: Callable[[], Awaitable["VoiceJob | None"]],
+    ) -> None:
         existing = self._reconciliation_tasks.get(job_id)
         if existing is not None and not existing.done():
             return
-        task = asyncio.create_task(self._reconcile_failure(job_id))
+        task = asyncio.create_task(self._reconcile_terminal(job_id, op))
         self._reconciliation_tasks[job_id] = task
         task.add_done_callback(
             lambda done, jid=job_id: self._reconciliation_done(jid, done),
         )
 
-    async def _reconcile_failure(self, job_id: str) -> None:
+    async def _reconcile_terminal(
+        self,
+        job_id: str,
+        op: Callable[[], Awaitable["VoiceJob | None"]],
+    ) -> None:
         while True:
             await asyncio.sleep(self._reconciliation_retry_interval)
             try:
-                current = await self.fail_compat(
-                    job_id,
-                    JobFailure(
-                        "persistence_failed",
-                        "Specialist result could not be saved.",
-                    ),
-                )
+                current = await op()
             except asyncio.CancelledError:
                 raise
             except Exception:  # noqa: BLE001 — never render persistence content
@@ -703,7 +732,12 @@ class JobRegistry:
             ))
 
     def pending_handoffs_for_route(self, route_id: str) -> list[VoiceJob]:
-        """Return pending, still-deliverable handoffs for one bound route."""
+        """Return pending, still-deliverable handoffs for one bound route.
+
+        #321: DELIVERED is excluded alongside CANCELLED/EXPIRED — a job whose
+        result already reached the device but whose handoff frame was lost
+        has nothing left to hand off, and ``expire_due`` skips DELIVERED jobs
+        so nothing else would ever retire the replay."""
         if not isinstance(route_id, str) or not route_id.strip():
             return []
         return [
@@ -716,6 +750,7 @@ class JobRegistry:
                 and job.execution_state is not ExecutionState.CANCELLED
                 and job.delivery_state not in {
                     DeliveryState.CANCELLED, DeliveryState.EXPIRED,
+                    DeliveryState.DELIVERED,
                 }
             )
         ]

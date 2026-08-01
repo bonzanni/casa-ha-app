@@ -1468,3 +1468,106 @@ async def test_prompted_delivery_inherits_the_delivery_promise(tmp_path):
         "job-1", child, actor=actor_for_job(),
     )
     assert prompted.delivery_modality == "text"
+
+
+# ---------------------------------------------------------------------------
+# #321 — DELIVERED handoff replay + generalized terminal reconciliation
+# ---------------------------------------------------------------------------
+
+
+async def test_delivered_job_with_pending_handoff_is_not_replayed(tmp_path):
+    """#321: a job whose result was DELIVERED but whose handoff frame was lost
+    (handoff still PENDING) must NOT re-send voice_handoff on every route
+    reconnect forever — expire_due skips DELIVERED jobs, so nothing else ever
+    retires it."""
+    registry = await loaded_registry(tmp_path, make_job(
+        execution_state=ExecutionState.SUCCEEDED,
+        delivery_state=DeliveryState.DELIVERED,
+        handoff_id="handoff-1",
+        handoff_state=HandoffState.PENDING,
+        result="done",
+        started_at=101.0,
+        terminal_at=110.0,
+        expires_at=500.0,
+    ))
+    assert registry.pending_handoffs_for_route("entry-1") == []
+
+
+async def test_completion_reconciliation_eventually_terminalizes_live_job(
+    tmp_path, caplog,
+):
+    """#321: a successful sync delegation whose terminal write failed keeps
+    its RESULT (returned to the engager) — the durable record is completed by
+    a registry-owned retry, mirroring the failure-reconciliation owner."""
+    registry = JobRegistry(
+        tmp_path / "jobs.json",
+        tmp_path / "delegations.json",
+        clock=lambda: 120.0,
+        reconciliation_retry_interval=0.01,
+    )
+    await registry.load()
+    await registry.create(make_job(
+        started_at=110.0,
+        execution_state=ExecutionState.RUNNING,
+    ))
+    real_finish = registry.finish_compat
+    attempts = 0
+
+    async def finish_once(*args, **kwargs):
+        nonlocal attempts
+        attempts += 1
+        if attempts == 1:
+            raise OSError("PRIVATE_RECONCILE_CANARY")
+        return await real_finish(*args, **kwargs)
+
+    registry.finish_compat = finish_once
+    registry.schedule_completion_reconciliation("job-1")
+
+    terminal = await asyncio.wait_for(
+        registry.wait_for_terminal("job-1"), timeout=1,
+    )
+    await asyncio.wait_for(
+        registry.wait_for_reconciliation("job-1"), timeout=1,
+    )
+    assert attempts == 2
+    assert terminal.execution_state is ExecutionState.SUCCEEDED
+    assert registry.reconciliation_count == 0
+    assert "PRIVATE_RECONCILE_CANARY" not in caplog.text
+
+
+async def test_cancel_reconciliation_eventually_terminalizes_live_job(tmp_path):
+    """#321: a voice-deadline teardown whose cancel snapshot write failed
+    leaves the job RUNNING — the registry-owned retry cancels it."""
+    registry = JobRegistry(
+        tmp_path / "jobs.json",
+        tmp_path / "delegations.json",
+        clock=lambda: 120.0,
+        reconciliation_retry_interval=0.01,
+    )
+    await registry.load()
+    await registry.create(make_job(
+        started_at=110.0,
+        execution_state=ExecutionState.RUNNING,
+    ))
+    real_cancel = registry.cancel
+    attempts = 0
+
+    async def cancel_once(*args, **kwargs):
+        nonlocal attempts
+        attempts += 1
+        if attempts == 1:
+            raise OSError("disk hiccup")
+        return await real_cancel(*args, **kwargs)
+
+    registry.cancel = cancel_once
+    registry.schedule_cancel_reconciliation("job-1")
+
+    terminal = await asyncio.wait_for(
+        registry.wait_for_terminal("job-1"), timeout=1,
+    )
+    await asyncio.wait_for(
+        registry.wait_for_reconciliation("job-1"), timeout=1,
+    )
+    assert attempts == 2
+    assert terminal.execution_state is ExecutionState.CANCELLED
+    assert registry.reconciliation_count == 0

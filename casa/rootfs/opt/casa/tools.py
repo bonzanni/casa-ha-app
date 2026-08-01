@@ -2644,7 +2644,27 @@ async def _voice_deadline_exceeded(
     task.add_done_callback(_retrieve_late_task_exception)
     task.cancel()
     await asyncio.wait({task}, timeout=_VOICE_TEARDOWN_BOUND_S)
-    await _specialist_registry.cancel_delegation(delegation_id)
+    # #321: a snapshot-write failure must not escape — the caller is owed the
+    # documented typed result either way, and the still-RUNNING record is
+    # handed to the registry-owned cancel reconciliation instead of waiting
+    # for restart recovery.
+    try:
+        await _specialist_registry.cancel_delegation(delegation_id)
+    except asyncio.CancelledError:
+        raise
+    except Exception:  # noqa: BLE001 — never render persistence content
+        logger.error(
+            "Delegation %s cancel persistence failed; scheduling "
+            "reconciliation", delegation_id[:8],
+        )
+        try:
+            _specialist_registry.job_registry.schedule_cancel_reconciliation(
+                delegation_id)
+        except Exception:  # noqa: BLE001 — restart recovery remains authoritative
+            logger.error(
+                "Delegation %s cancel reconciliation scheduling failed; "
+                "restart recovery required", delegation_id[:8],
+            )
     logger.info(
         "Delegation %s → %s exceeded the voice turn budget — cancelled",
         delegation_id[:8], agent_name,
@@ -2880,17 +2900,66 @@ def _new_voice_job(
     )
 
 
+# #321: how long a terminal write may keep absorbing cancellation before the
+# wait is abandoned. Generous — a healthy atomic snapshot commits in
+# milliseconds; only a genuinely wedged disk/loop reaches this. The write task
+# itself is NOT cancelled (a to_thread commit can only be abandoned, never
+# cancelled mid-flight); its eventual exception is retrieved by callback.
+_VOICE_PERSIST_CANCEL_BOUND_S: float = 30.0
+
+
+def _retrieve_abandoned_persistence_exception(t: asyncio.Task) -> None:
+    """Done-callback for an abandoned terminal-write task — retrieves the
+    eventual exception so asyncio never logs 'exception was never retrieved'
+    (content deliberately not rendered)."""
+    if t.cancelled():
+        return
+    if t.exception() is not None:
+        logger.error(
+            "abandoned terminal persistence write eventually failed",
+        )
+
+
 async def _await_voice_persistence(operation: Awaitable[Any]) -> Any:
-    """Finish one terminal write even if lifecycle cancellation arrives."""
+    """Finish one terminal write even if lifecycle cancellation arrives.
+
+    #321: cancellation absorption is BOUNDED. The pre-fix loop re-entered
+    ``shield()`` forever, so a wedged write made cancellation permanently
+    ineffective — the registry-owned lifecycle task never completed and the
+    job kept its concurrency permit. Past the bound the wait is abandoned
+    (the write cannot be cancelled mid-commit; if it later lands, the
+    terminal state is simply durable) and the cancellation propagates."""
     task = asyncio.create_task(operation)
     cancellation: asyncio.CancelledError | None = None
+    deadline: float | None = None
+    loop = asyncio.get_running_loop()
     while not task.done():
         try:
-            await asyncio.shield(task)
+            if deadline is None:
+                await asyncio.shield(task)
+            else:
+                remaining = deadline - loop.time()
+                if remaining <= 0:
+                    break
+                await asyncio.wait_for(asyncio.shield(task), timeout=remaining)
         except asyncio.CancelledError as exc:
             cancellation = exc
+            if deadline is None:
+                deadline = loop.time() + _VOICE_PERSIST_CANCEL_BOUND_S
+        except TimeoutError:
+            break
         except Exception:
             break
+    if not task.done():
+        # Only reachable via the deadline branches — cancellation is set.
+        task.add_done_callback(_retrieve_abandoned_persistence_exception)
+        logger.error(
+            "terminal persistence still running %.0fs after cancellation — "
+            "abandoning the wait (restart recovery remains authoritative)",
+            _VOICE_PERSIST_CANCEL_BOUND_S,
+        )
+        assert cancellation is not None
+        raise cancellation
     result = task.result()
     if cancellation is not None:
         raise cancellation
@@ -3846,7 +3915,29 @@ async def delegate_to_agent(args: dict) -> dict:
                 agent_name, original_text_length, specialist_limits._MAX_OUTPUT_CHARS,
             )
         if not is_voice:
-            await _specialist_registry.complete_delegation(delegation_id)
+            # #321: the specialist's work is DONE and its answer is in hand —
+            # a failed terminal snapshot write must not raise it away (the
+            # caller would lose the result and restart recovery would ORPHAN
+            # the job, discarding the success). Return the result; the
+            # durable record is completed by the registry-owned retry.
+            try:
+                await _specialist_registry.complete_delegation(delegation_id)
+            except asyncio.CancelledError:
+                raise
+            except Exception as exc:  # noqa: BLE001
+                logger.error(
+                    "Delegation %s → %s completed but the terminal write "
+                    "failed (%s); scheduling completion reconciliation",
+                    delegation_id[:8], agent_name, exc,
+                )
+                try:
+                    (_specialist_registry.job_registry
+                     .schedule_completion_reconciliation(delegation_id))
+                except Exception:  # noqa: BLE001 — restart recovery remains authoritative
+                    logger.error(
+                        "Delegation %s completion reconciliation scheduling "
+                        "failed; restart recovery required", delegation_id[:8],
+                    )
         elapsed = time.time() - started_at
         logger.info(
             "Delegation %s → %s ok (%.2fs)",

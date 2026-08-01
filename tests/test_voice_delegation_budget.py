@@ -1284,3 +1284,64 @@ class TestVoiceDeadlineOriginPropagation:
         assert "voice_route_id" not in origin
         assert "voice_route_capabilities" not in origin
         assert "origin_device_id" not in origin
+
+
+# ---------------------------------------------------------------------------
+# #321 — terminal-write durability in the voice teardown + persistence wait
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+class TestVoiceTeardownTerminalDurability:
+    async def test_cancel_persist_failure_still_returns_typed_result(self):
+        """#321: a snapshot-write failure inside cancel_delegation must not
+        escape _voice_deadline_exceeded — the caller is owed the documented
+        ``deadline_exceeded`` result, and the RUNNING record is handed to the
+        registry-owned cancel reconciliation."""
+        import tools as tm
+
+        _, reg = _init_tools_for_voice()
+        reg.cancel_delegation = AsyncMock(
+            side_effect=OSError("snapshot write failed"))
+
+        task = asyncio.create_task(asyncio.sleep(0))
+        await asyncio.sleep(0.01)
+
+        res = await tm._voice_deadline_exceeded(task, "did9999", "finance")
+        payload = json.loads(res["content"][0]["text"])
+        assert payload["kind"] == "deadline_exceeded"
+        reg.job_registry.schedule_cancel_reconciliation.assert_called_once_with(
+            "did9999")
+
+
+@pytest.mark.asyncio
+class TestVoicePersistenceCancellationBound:
+    async def test_wedged_terminal_write_does_not_absorb_cancellation_forever(
+        self, monkeypatch,
+    ):
+        """#321: _await_voice_persistence re-entered shield() in an unbounded
+        loop — a wedged terminal write made cancellation permanently
+        ineffective (permit occupied, lifecycle task immortal). Cancellation
+        absorption must be BOUNDED: past the bound the wait is abandoned (the
+        write itself cannot be cancelled mid-commit) and the cancellation
+        propagates."""
+        import tools as tm
+
+        monkeypatch.setattr(
+            tm, "_VOICE_PERSIST_CANCEL_BOUND_S", 0.05, raising=False)
+
+        wedged = asyncio.Event()
+
+        async def never_completes():
+            await wedged.wait()
+
+        outer = asyncio.create_task(
+            tm._await_voice_persistence(never_completes()))
+        await asyncio.sleep(0.01)
+        outer.cancel()
+        try:
+            with pytest.raises(asyncio.CancelledError):
+                await asyncio.wait_for(asyncio.shield(outer), timeout=2)
+        finally:
+            wedged.set()
+            await asyncio.sleep(0.01)
