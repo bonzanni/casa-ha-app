@@ -108,13 +108,8 @@ What it does not cover: unprotected plugin tools, and the executor path entirely
 specialists — a call whose provenance is an interactive *engagement* is denied outright,
 before any grant lookup: protected tools are not available inside engagements at all.
 
-It also does not establish *who* approved. The grant binds the operator id taken from the
-requesting turn, and the confirmation keyboard is answerable only by that same person — so
-on a Telegram deployment configured with an operator chat id, the approver is the operator.
-With that option left empty ("accept all chats") the requesting sender can be anyone, and
-they answer their own challenge: the gate confirms a human decided, not that the *household
-operator* decided. Read this invariant as "one approval authorises one action", not as
-operator authentication.
+Who may approve is a separate guarantee, INV-PLUG-007: read this invariant as "one
+approval authorises one action" and that one as "the approver is the configured operator".
 
 **INV-PLUG-005**: Grants exist only in process memory; a restart revokes every one of them.
 
@@ -132,6 +127,20 @@ oversight and is not one — the executor path is constrained by its code-mandat
 clamps, guard hooks and relay instead; its declared tool list is auto-approval, not a gate.
 Verification will report an executor whose declaration lacks a needed authorisation, but
 nothing merges it automatically.
+
+**INV-PLUG-007**: An authorization challenge is posted, and its grant minted, only for a turn whose sender is the configured operator; any other sender's protected call is denied outright, before any grant lookup and with no challenge.
+
+Enforced in the authorization hook through the Telegram channel's single operator rule —
+the same sender-id match that decides attribution and clearance — so the person who taps
+Approve is the person the deployment names as operator, not whoever asked. Denying without
+a challenge is the point: posting one would hand the requester their own approval button.
+
+What it does not cover: with `telegram_chat_id` empty ("accept all chats") there is no
+configured operator, so protected tools are denied for every sender — deliberate, and
+announced by a warning at channel construction. It also does not cover the in-engagement
+permission relay, whose keyboard is answerable by the engagement's creator rather than the
+configured operator (tracked as #374); and sender identity itself is Telegram's
+authentication of its user ids, not an additional Casa-side proof.
 
 Three runtime integration paths sit beside the install model and are easy to miss. **A
 plugin's declared setup tool is dispatched automatically — but only after its entire

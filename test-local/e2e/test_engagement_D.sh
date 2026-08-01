@@ -693,11 +693,13 @@ pass "D-11 svc-mcp: initialize/tools/list/tools/call all work via svc-casa-mcp"
 run_harness "D-12 svc-hook-deny" "$(cat <<'PY'
 import json, urllib.request
 
-def resolve(policy, payload):
+def resolve(policy, payload, extra_headers=None):
+    headers = {"Content-Type": "application/json"}
+    headers.update(extra_headers or {})
     req = urllib.request.Request(
         "http://127.0.0.1:8100/hooks/resolve",
         data=json.dumps({"policy": policy, "payload": payload}).encode(),
-        headers={"Content-Type": "application/json"},
+        headers=headers,
         method="POST",
     )
     with urllib.request.urlopen(req, timeout=5) as r:
@@ -725,6 +727,18 @@ assert body == {}, f"benign bash should return empty (allow); got {body}"
 status, body = resolve("nope_nope", {"tool_name": "Bash"})
 assert status == 200, (status, body)
 assert body["hookSpecificOutput"]["permissionDecision"] == "deny", body
+
+# 4. #366: an UNKNOWN engagement credential pair must not 500 — the request
+# proceeds unauthenticated (default policies still apply; identity-consuming
+# policies fail closed elsewhere).
+status, body = resolve(
+    "block_dangerous_bash",
+    {"tool_name": "Bash", "tool_input": {"command": "echo hello"}},
+    extra_headers={"X-Casa-Engagement-Id": "9" * 32,
+                   "X-Casa-Engagement-Token": "not-a-real-token"},
+)
+assert status == 200, (status, body)
+assert body == {}, f"unknown credential should degrade to default allow; got {body}"
 
 print("D-12 svc-hook-deny: dangerous denied, benign allowed, unknown denied", flush=True)
 PY

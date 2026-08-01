@@ -59,12 +59,12 @@ container, so a shell-capable engagement can still read a sibling workspace's cr
 file directly; the credential files are `0600` as defense in depth, which is not a boundary
 against a co-resident root process. The inspection tool refuses to return the credential
 file's contents precisely because that surface *is* reachable without any identity at all.
-Hook resolution is a separate, still-unauthenticated identity path: it derives an engagement
-from the caller-supplied working directory, so it can select another engagement's hook
-parameters and post a permission prompt into that engagement's topic. It grants no tool
-authority — that path is token-gated — but it is not covered by this rule. Treat the token
-as removing identity forgery from *knowing an id*, not as containment of a hostile
-in-container process.
+Hook resolution presents the same credential: the shim reads the pair from its own
+workspace `.mcp.json` and the resolver authenticates any engagement-identity claim against
+the record before selecting executor hook parameters or invoking an identity-consuming
+policy — the payload's working directory is never an identity source (INV-MCP-006). Treat
+the token as removing identity forgery from *knowing an id*, not as containment of a
+hostile in-container process.
 
 **The bridge runs as its own supervised service** so that the bridge *connection* survives a
 restart of the main application. Its own client is a thin shell shim, and the failure
@@ -107,10 +107,10 @@ The terminal-binding allowlist is inside this rule, not an exception to it: a te
 record still binds for a completion retry only when the token matches.
 
 What it does not cover: an id the registry does not know — that call dispatches with no
-engagement bound (unchanged), and the tool answers for itself. It also does not cover the
-hook-resolution path, which still identifies an engagement by the caller-supplied working
-directory, nor a co-resident root process reading another workspace's credential file (see
-the mental model).
+engagement bound (unchanged), and the tool answers for itself. It also does not cover a
+co-resident root process reading another workspace's credential file (see the mental
+model; tracked as #365). The hook-resolution path carries its own statement of the same
+rule, INV-MCP-006.
 
 **INV-MCP-005**: The workspace-inspection tool never returns the contents of a credential-bearing workspace file.
 
@@ -121,6 +121,22 @@ still show the name.
 
 What it does not cover: a caller with shell access reads the file directly — this closes the
 *tool* surface, not the filesystem.
+
+**INV-MCP-006**: Hook resolution binds an engagement only via the per-engagement credential — a known id with a missing or mismatched token is refused, an unauthenticated request selects no executor hook parameters and reaches no identity-consuming hook policy, and an authenticated identity contradicting the payload's working-directory claim is refused.
+
+The same verification function as INV-MCP-004, on the hook route. The shim sends the
+credential pair from its own workspace `.mcp.json` as headers; the bridge and the public
+fallback rebuild the forwarded body from those headers alone, so a body-borne identity
+claim cannot bypass them. The resolver threads the authenticated identity to the policy
+callback in-process; the permission relay and the buttons reminder act only on that
+identity, which is what stops a forged working directory from posting a permission
+keyboard into another engagement's topic or borrowing another executor's hook parameters.
+
+What it does not cover: an id the registry does not know proceeds unauthenticated under
+the default-configured policies (mirroring INV-MCP-004's unknown-id clause); the shim's
+fail-open transport contract is unchanged (an unreachable bridge still allows); and a
+co-resident root process can read a sibling's credential file (see the mental model;
+tracked as #365).
 
 ## Failure behavior
 

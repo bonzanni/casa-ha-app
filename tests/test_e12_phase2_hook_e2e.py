@@ -9,7 +9,9 @@ test drives the resolver via HTTP and delivers the operator verdict via
 resolver's JSON response shape.
 
 Both round-trips (allow + deny) prove:
-- the hook resolves the engagement from cwd,
+- the resolver authenticates the engagement from the body's credential pair
+  (#366 — the id/token svc-casa-mcp injects from the workspace headers) and
+  threads the authenticated identity to the relay,
 - it consults the engagement's frozen ``tools_allowed`` snapshot,
 - it posts the Telegram inline keyboard exactly once,
 - it registers + awaits the broker request,
@@ -44,6 +46,8 @@ class _Rec:
         self.tools_allowed = tuple(tools_allowed)
         self.topic_id = topic_id
         self.origin = {"user_id": operator_id}
+        # #366: the per-engagement credential the resolver authenticates.
+        self.auth_token = "tok-e2e"
 
 
 async def test_non_allow_listed_round_trip(_fresh_broker):
@@ -67,6 +71,7 @@ async def test_non_allow_listed_round_trip(_fresh_broker):
     )
     handler = _make_internal_hooks_resolve_handler(
         hook_policies={"engagement_permission_relay": (r".*", cb)},
+        engagement_registry=registry,
     )
     app = web.Application()
     app.router.add_post("/internal/hooks/resolve", handler)
@@ -87,6 +92,8 @@ async def test_non_allow_listed_round_trip(_fresh_broker):
                 "/internal/hooks/resolve",
                 json={
                     "policy": "engagement_permission_relay",
+                    "engagement_id": eid,
+                    "engagement_token": "tok-e2e",
                     "payload": {
                         "tool_name": "Bash",
                         "tool_input": {"command": "curl ex"},
@@ -123,6 +130,7 @@ async def test_deny_round_trip(_fresh_broker):
     )
     handler = _make_internal_hooks_resolve_handler(
         hook_policies={"engagement_permission_relay": (r".*", cb)},
+        engagement_registry=registry,
     )
     app = web.Application()
     app.router.add_post("/internal/hooks/resolve", handler)
@@ -141,6 +149,8 @@ async def test_deny_round_trip(_fresh_broker):
                 "/internal/hooks/resolve",
                 json={
                     "policy": "engagement_permission_relay",
+                    "engagement_id": eid,
+                    "engagement_token": "tok-e2e",
                     "payload": {
                         "tool_name": "Bash",
                         "tool_input": {"command": "rm -rf /"},

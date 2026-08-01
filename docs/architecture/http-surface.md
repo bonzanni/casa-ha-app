@@ -52,10 +52,12 @@ everything arriving on the public app, so the question for any route is which ch
 performs — and several routes perform none.
 
 **The routes with no application-layer check are the ones to understand first.** An MCP
-endpoint and a hook-resolution endpoint are unauthenticated at the backend and are protected
-only by being 404'd on the external listener. They remain reachable over ingress and from
-loopback. A new route registered near them inherits no protection from that arrangement; it
-inherits only its own absence of a check.
+endpoint and a hook-resolution endpoint accept unauthenticated requests at the backend and
+are protected only by being 404'd on the external listener. They remain reachable over
+ingress and from loopback. An engagement-identity *claim* on either is credential-verified
+(INV-MCP-004, INV-MCP-006), but the routes themselves demand nothing to be called. A new
+route registered near them inherits no protection from that arrangement; it inherits only
+its own absence of a check.
 
 ## Contracts & invariants
 
@@ -143,8 +145,9 @@ operator peer can live inside a caller-derived namespace.
 
 What it does not cover: it names the *configured* operator. With `telegram_chat_id` empty
 there is no configured operator identity, so no sender — the operator included — receives
-operator attribution; and a group-id configuration names no sender at all. Sender identity
-is Telegram's authentication of its user ids, not an additional Casa-side proof.
+operator attribution, and protected plugin tools are denied for every sender
+(INV-PLUG-007); a group-id configuration names no sender at all. Sender identity is
+Telegram's authentication of its user ids, not an additional Casa-side proof.
 
 ## Failure behavior
 

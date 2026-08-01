@@ -77,7 +77,26 @@ class _FakeTelegramChannel:
 
 
 class TestUnknownContext:
-    async def test_cwd_not_under_engagements(self):
+    async def test_no_authenticated_identity_denies(self):
+        """#366 red case: an engagement-workspace cwd claim with NO
+        authenticated identity (empty context) is exactly the pre-fix
+        forgery — the relay must deny without consulting the registry."""
+        from hooks import make_engagement_permission_relay
+        hook = make_engagement_permission_relay(
+            engagement_registry=_FakeRegistry(),
+            telegram_channel=_FakeTelegramChannel(),
+        )
+        result = await hook(
+            {"tool_name": "Read", "tool_input": {},
+             "cwd": "/data/engagements/" + "a" * 32},
+            None, {},
+        )
+        assert _decision(result) == "deny"
+        assert "not authenticated" in _reason(result)
+
+    async def test_non_dict_context_denies(self):
+        """A non-dict context (any exotic invoker) carries no authenticated
+        identity — fail closed, never crash."""
         from hooks import make_engagement_permission_relay
         hook = make_engagement_permission_relay(
             engagement_registry=_FakeRegistry(),
@@ -85,10 +104,28 @@ class TestUnknownContext:
         )
         result = await hook(
             {"tool_name": "Read", "tool_input": {}, "cwd": "/etc"},
-            None, {},
+            None, None,
         )
         assert _decision(result) == "deny"
-        assert "engagement context" in _reason(result)
+        assert "not authenticated" in _reason(result)
+
+    async def test_cwd_is_never_an_identity_source(self):
+        """#366: identity comes from the authenticated context even when the
+        payload cwd names a DIFFERENT engagement (the handler cross-checks
+        upstream; the relay itself must bind to the credential)."""
+        from hooks import make_engagement_permission_relay
+        eid = "c" * 32
+        reg = _FakeRegistry({eid: _FakeRecord(tools_allowed=("Read",))})
+        hook = make_engagement_permission_relay(
+            engagement_registry=reg,
+            telegram_channel=_FakeTelegramChannel(),
+        )
+        result = await hook(
+            {"tool_name": "Read", "tool_input": {},
+             "cwd": "/data/engagements/" + "f" * 32},
+            None, {"casa_engagement_id": eid},
+        )
+        assert result == {}  # bound to eid's record, allow-listed Read
 
 
 class TestEngagementResolution:
@@ -98,10 +135,11 @@ class TestEngagementResolution:
             engagement_registry=_FakeRegistry(),
             telegram_channel=_FakeTelegramChannel(),
         )
-        cwd = "/data/engagements/" + "a" * 32
+        eid = "a" * 32
         result = await hook(
-            {"tool_name": "Read", "tool_input": {}, "cwd": cwd},
-            None, {},
+            {"tool_name": "Read", "tool_input": {},
+             "cwd": f"/data/engagements/{eid}"},
+            None, {"casa_engagement_id": eid},
         )
         assert _decision(result) == "deny"
         assert "unknown or inactive" in _reason(result)
@@ -117,7 +155,7 @@ class TestEngagementResolution:
         result = await hook(
             {"tool_name": "Read", "tool_input": {},
              "cwd": f"/data/engagements/{eid}"},
-            None, {},
+            None, {"casa_engagement_id": eid},
         )
         assert _decision(result) == "deny"
         assert "unknown or inactive" in _reason(result)
@@ -134,7 +172,7 @@ class TestEngagementResolution:
         result = await hook(
             {"tool_name": "Read", "tool_input": {},
              "cwd": f"/data/engagements/{eid}/src"},
-            None, {},
+            None, {"casa_engagement_id": eid},
         )
         # tools_allowed=("Read",) so it should pass-through
         assert result == {}
@@ -162,7 +200,7 @@ class TestPermissionModeShortCircuit:
             {"tool_name": "Bash", "tool_input": {"command": "ls"},
              "cwd": f"/data/engagements/{eid}",
              "tool_use_id": "tuse_auto"},
-            None, {},
+            None, {"casa_engagement_id": eid},
         )
         assert result == {}
         # No keyboard ever posted, no state transitions emitted.
@@ -185,7 +223,7 @@ class TestPermissionModeShortCircuit:
              "tool_input": {"file_path": "/tmp/x", "content": "y"},
              "cwd": f"/data/engagements/{eid}",
              "tool_use_id": "tuse_bp"},
-            None, {},
+            None, {"casa_engagement_id": eid},
         )
         assert result == {}
         assert tg.keyboard_calls == []
@@ -206,7 +244,7 @@ class TestPermissionModeShortCircuit:
             {"tool_name": "Bash", "tool_input": {"command": "ls"},
              "cwd": f"/data/engagements/{eid}",
              "tool_use_id": "tuse_ae"},
-            None, {},
+            None, {"casa_engagement_id": eid},
         )
         # acceptEdits MUST take the relay path: keyboard posted, then
         # operator-timeout deny lands.
@@ -233,7 +271,7 @@ class TestPermissionModeShortCircuit:
                             "new_string": "b"},
              "cwd": f"/data/engagements/{eid}",
              "tool_use_id": "tuse_def"},
-            None, {},
+            None, {"casa_engagement_id": eid},
         )
         assert _decision(result) == "deny"
         assert "did not respond" in _reason(result)
@@ -263,7 +301,7 @@ class TestPermissionModeShortCircuit:
             {"tool_name": "Bash", "tool_input": {"command": "ls"},
              "cwd": f"/data/engagements/{eid}",
              "tool_use_id": "tuse_old"},
-            None, {},
+            None, {"casa_engagement_id": eid},
         )
         assert _decision(result) == "deny"
         assert "did not respond" in _reason(result)
@@ -287,7 +325,7 @@ class TestBrokerVerdictRelay:
              "tool_input": {"command": "curl example.com"},
              "cwd": f"/data/engagements/{eid}",
              "tool_use_id": "tuse_12345"},
-            None, {},
+            None, {"casa_engagement_id": eid},
         ))
         await asyncio.sleep(0.05)  # let the hook register + post
         assert _fresh_broker.deliver(
@@ -315,7 +353,7 @@ class TestBrokerVerdictRelay:
             {"tool_name": "Bash", "tool_input": {"command": "rm -rf /"},
              "cwd": f"/data/engagements/{eid}",
              "tool_use_id": "tuse_xyz"},
-            None, {},
+            None, {"casa_engagement_id": eid},
         ))
         await asyncio.sleep(0.05)
         assert _fresh_broker.deliver(
@@ -339,7 +377,7 @@ class TestBrokerVerdictRelay:
             {"tool_name": "Bash", "tool_input": {"command": "curl x"},
              "cwd": f"/data/engagements/{eid}",
              "tool_use_id": "tuse_T"},
-            None, {},
+            None, {"casa_engagement_id": eid},
         )
         assert _decision(result) == "deny"
         assert "did not respond" in _reason(result)
@@ -359,7 +397,7 @@ class TestBrokerVerdictRelay:
             {"tool_name": "Bash", "tool_input": {"command": "x"},
              "cwd": f"/data/engagements/{eid}",
              "tool_use_id": "rid-cancel"},
-            None, {},
+            None, {"casa_engagement_id": eid},
         ))
         await asyncio.sleep(0.05)  # past post + into await_result
         assert _fresh_broker.pending(namespace="permission", scope=eid) == [
@@ -386,7 +424,7 @@ class TestBrokerVerdictRelay:
             {"tool_name": "Bash", "tool_input": {"command": "x"},
              "cwd": f"/data/engagements/{eid}",
              "tool_use_id": "rid"},
-            None, {},
+            None, {"casa_engagement_id": eid},
         )
         assert _decision(result) == "deny"
         assert "keyboard post failed" in _reason(result)
@@ -407,7 +445,7 @@ class TestBrokerVerdictRelay:
             {"tool_name": "Bash", "tool_input": {"command": "x"},
              "cwd": f"/data/engagements/{eid}",
              "tool_use_id": "rid-none"},
-            None, {},
+            None, {"casa_engagement_id": eid},
         )
         assert _decision(result) == "deny"
         assert "keyboard post failed" in _reason(result)
@@ -448,7 +486,7 @@ class TestBrokerVerdictRelay:
             "cwd": f"/data/engagements/{eid}", "tool_use_id": "rid-slow",
         }
 
-        task = asyncio.create_task(hook(payload, None, {}))
+        task = asyncio.create_task(hook(payload, None, {"casa_engagement_id": eid}))
         await asyncio.wait_for(post_started.wait(), timeout=1.0)
         task.cancel()
         with pytest.raises(asyncio.CancelledError):
@@ -466,7 +504,7 @@ class TestBrokerVerdictRelay:
         # A same-id re-invocation reattaches to the (cancelled) tombstone —
         # NOT a second post.
         result2 = await asyncio.wait_for(
-            asyncio.create_task(hook(payload, None, {})), timeout=1.0,
+            asyncio.create_task(hook(payload, None, {"casa_engagement_id": eid})), timeout=1.0,
         )
         assert len(post_calls) == 1  # still exactly one post overall
         assert _decision(result2) == "deny"  # cancelled reattach denies
@@ -493,7 +531,7 @@ class TestBrokerVerdictRelay:
         task = asyncio.create_task(hook(
             {"tool_name": "Bash", "tool_input": {"command": "x"},
              "cwd": f"/data/engagements/{eid}", "tool_use_id": "perm-1"},
-            None, {},
+            None, {"casa_engagement_id": eid},
         ))
         await asyncio.sleep(0.05)
         assert _fresh_broker.deliver(
@@ -533,7 +571,7 @@ class TestKeyboardFailure:
             {"tool_name": "Bash", "tool_input": {"command": "x"},
              "cwd": f"/data/engagements/{eid}",
              "tool_use_id": "rid"},
-            None, {},
+            None, {"casa_engagement_id": eid},
         )
         assert _decision(result) == "deny"
         assert "keyboard post failed" in _reason(result)
@@ -604,11 +642,11 @@ class TestPermissionRetryReattach:
         }
 
         # First attempt: registers + arms the intent (relay-deferred, unposted).
-        t1 = asyncio.create_task(hook(payload, None, {}))
+        t1 = asyncio.create_task(hook(payload, None, {"casa_engagement_id": eid}))
         await asyncio.sleep(0.02)
         # RETRY with the SAME id while the first still awaits → BROKER created=
         # False. Old code eager-posts the keyboard here; the fix reattaches.
-        t2 = asyncio.create_task(hook(payload, None, {}))
+        t2 = asyncio.create_task(hook(payload, None, {"casa_engagement_id": eid}))
         await asyncio.sleep(0.02)
 
         assert posts == []  # no eager keyboard on EITHER attempt

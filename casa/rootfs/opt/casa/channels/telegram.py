@@ -512,6 +512,16 @@ class TelegramChannel(Channel):
     ) -> None:
         self.bot_token = bot_token
         self.chat_id = chat_id
+        if not str(chat_id or "").strip():
+            # #368: empty telegram_chat_id is a SECURITY posture, not just a
+            # convenience default — say so once, loudly, at construction.
+            logger.warning(
+                "telegram_chat_id is empty (accept-all mode): no sender is "
+                "the operator, so no turn receives operator attribution or "
+                "private clearance, and protected plugin tools are always "
+                "denied. Set telegram_chat_id to the operator's chat id to "
+                "restore operator authorization."
+            )
         self.default_agent = default_agent
         self._bus = bus
         self._webhook_url = webhook_url

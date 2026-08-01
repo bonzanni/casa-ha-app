@@ -40,16 +40,23 @@ _DEV = _ROOT / (
 class _Rec:
     status = "active"
     role_or_type = "plugin-developer"
+    auth_token = "tok-b"
 
 
 class _TerminalRec:
     status = "completed"
     role_or_type = "plugin-developer"
+    auth_token = "tok-b"
 
 
 class _Registry:
     def get(self, eng_id):
         return _Rec() if eng_id == ENG_ID else None
+
+
+# #366: identity on the hook path is credential-authenticated — requests that
+# should carry an engagement identity present the workspace credential pair.
+_CREDS = {"engagement_id": ENG_ID, "engagement_token": "tok-b"}
 
 
 def _handler(registry=None):
@@ -71,12 +78,13 @@ def _handler(registry=None):
     )
 
 
-async def _post(handler, *, policy, payload):
+async def _post(handler, *, policy, payload, creds=None):
     app = web.Application()
     app.router.add_post("/hooks/resolve", handler)
     async with TestServer(app) as srv, TestClient(srv) as client:
         resp = await client.post(
-            "/hooks/resolve", json={"policy": policy, "payload": payload},
+            "/hooks/resolve",
+            json={"policy": policy, "payload": payload, **(creds or {})},
         )
         return await resp.json()
 
@@ -91,6 +99,7 @@ async def test_skill_under_active_engagement_injects_reminder():
             "cwd": f"/data/engagements/{ENG_ID}",
             "tool_input": {"command": "superpowers:brainstorming"},
         },
+        creds=_CREDS,
     )
     hso = body["hookSpecificOutput"]
     assert hso["hookEventName"] == "PreToolUse"
@@ -106,13 +115,15 @@ async def test_skill_under_active_engagement_injects_reminder():
 
 
 @pytest.mark.asyncio
-async def test_skill_under_non_engagement_cwd_emits_nothing():
+async def test_skill_without_authenticated_identity_emits_nothing():
+    # #366: no credential ⇒ no engagement identity, even with an
+    # engagement-workspace cwd claim in the payload — silent no-op.
     body = await _post(
         _handler(),
         policy="engagement_buttons_reminder",
         payload={
             "tool_name": "Skill",
-            "cwd": "/somewhere/else",
+            "cwd": f"/data/engagements/{ENG_ID}",
             "tool_input": {"command": "superpowers:brainstorming"},
         },
     )
@@ -133,6 +144,7 @@ async def test_skill_under_inactive_engagement_emits_nothing():
             "cwd": f"/data/engagements/{ENG_ID}",
             "tool_input": {"command": "superpowers:brainstorming"},
         },
+        creds=_CREDS,
     )
     assert body == {}
 

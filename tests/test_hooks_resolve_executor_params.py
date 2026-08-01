@@ -15,10 +15,15 @@ pytestmark = [pytest.mark.unit, pytest.mark.asyncio]
 
 ENG_ID = "a" * 32
 
+# #366: executor-param selection binds only to the AUTHENTICATED engagement —
+# requests present the credential pair the workspace .mcp.json carries.
+_CREDS = {"engagement_id": ENG_ID, "engagement_token": "tok-a"}
+
 
 class _Rec:
     status = "active"
     role_or_type = "plugin-developer"
+    auth_token = "tok-a"
 
 
 class _Registry:
@@ -51,7 +56,7 @@ async def test_write_inside_declared_writable_prefix_is_allowed():
     app.router.add_post("/hooks/resolve", _handler())
     async with TestServer(app) as srv, TestClient(srv) as client:
         resp = await client.post("/hooks/resolve", json={
-            "policy": "path_scope",
+            "policy": "path_scope", **_CREDS,
             "payload": {"tool_name": "Write",
                         "cwd": f"/data/engagements/{ENG_ID}",
                         "tool_input": {
@@ -65,7 +70,7 @@ async def test_read_inside_declared_readable_prefix_is_allowed():
     app.router.add_post("/hooks/resolve", _handler())
     async with TestServer(app) as srv, TestClient(srv) as client:
         resp = await client.post("/hooks/resolve", json={
-            "policy": "path_scope",
+            "policy": "path_scope", **_CREDS,
             "payload": {"tool_name": "Read",
                         "cwd": f"/data/engagements/{ENG_ID}",
                         "tool_input": {"file_path": "/config/plugins/store/x.md"}}})
@@ -77,7 +82,7 @@ async def test_write_outside_declared_prefix_still_denied():
     app.router.add_post("/hooks/resolve", _handler())
     async with TestServer(app) as srv, TestClient(srv) as client:
         resp = await client.post("/hooks/resolve", json={
-            "policy": "path_scope",
+            "policy": "path_scope", **_CREDS,
             "payload": {"tool_name": "Write",
                         "cwd": f"/data/engagements/{ENG_ID}",
                         "tool_input": {"file_path": "/etc/passwd"}}})
@@ -109,7 +114,7 @@ async def test_commit_size_guard_uses_declared_max_files(monkeypatch):
     app.router.add_post("/hooks/resolve", _handler())
     async with TestServer(app) as srv, TestClient(srv) as client:
         resp = await client.post("/hooks/resolve", json={
-            "policy": "commit_size_guard",
+            "policy": "commit_size_guard", **_CREDS,
             "payload": {"tool_name": "Write",
                         "cwd": f"/data/engagements/{ENG_ID}",
                         "tool_input": {

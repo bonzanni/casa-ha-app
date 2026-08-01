@@ -116,6 +116,27 @@ class TestNonOperatorSender:
         assert await _drain(bus) == []
 
 
+class TestAcceptAllBootWarning:
+    """#368: an empty ``telegram_chat_id`` makes the option a security
+    control with real consequences (no operator attribution, protected tools
+    always denied) — the channel must say so loudly at construction."""
+
+    def test_empty_chat_id_warns_at_construction(self, caplog):
+        import logging
+        with caplog.at_level(logging.WARNING, logger="channels.telegram"):
+            _channel("")
+        assert any(
+            "accept-all" in r.message and "protected" in r.message
+            for r in caplog.records
+        ), caplog.records
+
+    def test_configured_chat_id_does_not_warn(self, caplog):
+        import logging
+        with caplog.at_level(logging.WARNING, logger="channels.telegram"):
+            _channel("7")
+        assert not any("accept-all" in r.message for r in caplog.records)
+
+
 class TestOperatorDetermination:
     def test_group_configured_chat_never_names_an_operator(self):
         # A supergroup id is negative and can never equal a user id — group

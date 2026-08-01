@@ -2058,8 +2058,12 @@ _ENG_CWD_RE = re.compile(
 def _engagement_id_from_cwd(cwd: str) -> str | None:
     """Extract the 32-hex engagement id from a cwd path.
 
-    Returns None when cwd is not under ``/data/engagements/<id>/...``.
+    Returns None when cwd is not under ``/data/engagements/<id>/...`` — or
+    when the value is not a string at all (Terra r1: a caller-supplied
+    non-string must degrade to "no claim", never raise past a deny wrapper).
     """
+    if not isinstance(cwd, str):
+        return None
     m = _ENG_CWD_RE.match(cwd or "")
     return m.group(1) if m else None
 
@@ -2138,8 +2142,14 @@ def make_engagement_buttons_reminder(
         # too). NEVER inspect message/tool content.
         if input_data.get("tool_name") != "Skill":
             return {}
-        eng_id = _engagement_id_from_cwd(input_data.get("cwd") or "")
-        if eng_id is None:
+        # #366: identity from the authenticated context only (cwd is
+        # caller-supplied text). Unauthenticated ⇒ no reminder — this hook
+        # only ever ADDS context, so absence of identity is a silent no-op.
+        eng_id = (
+            context.get("casa_engagement_id")
+            if isinstance(context, dict) else None
+        )
+        if not eng_id:
             return {}
         rec = engagement_registry.get(eng_id)
         if rec is None or getattr(rec, "status", None) != "active":
@@ -2185,10 +2195,18 @@ def make_engagement_permission_relay(
         tool_use_id: str | None,
         context: dict[str, Any],
     ) -> dict[str, Any]:
-        cwd = input_data.get("cwd") or ""
-        eng_id = _engagement_id_from_cwd(cwd)
-        if eng_id is None:
-            return _deny("engagement context not found")
+        # #366: identity comes ONLY from the authenticated-identity context
+        # threaded by the /internal/hooks/resolve handler (which verified the
+        # engagement token). The payload's cwd is caller-supplied text and is
+        # no longer an identity source. No authenticated identity ⇒ deny —
+        # this hook exists to gate an engagement's tool use, so a request
+        # that cannot prove WHICH engagement it is gets nothing.
+        eng_id = (
+            context.get("casa_engagement_id")
+            if isinstance(context, dict) else None
+        )
+        if not eng_id:
+            return _deny("engagement identity not authenticated")
         rec = engagement_registry.get(eng_id)
         if rec is None or getattr(rec, "status", None) != "active":
             return _deny(
