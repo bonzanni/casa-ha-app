@@ -1795,11 +1795,17 @@ def make_self_containment_guard() -> HookCallback:
         # handful of cds at most; hard cap as a backstop).
         # Sol r2: `cd -P -- dir` — skip option words and an optional `--` so
         # the flag is never mistaken for the target.
+        # Sol r3: a cd can also follow a shell KEYWORD (`if x; then cd /bad`)
+        # or open a subshell/group (`(cd /bad; git push)`) — the pre-context
+        # accepts `(`/`{` in the separator class and any run of the
+        # body-introducing keywords before `cd`.
         bases: set = {cwd}
         candidates: list = [cwd]
+        cd_overflow = False
         for m_cd in re.finditer(
-                r"(?:^|[;&|\n\r])\s*cd\s+(?:-\S+\s+)*(?:--\s+)?"
-                r"(\"[^\"]+\"|'[^']+'|[^\s;&|]+)",
+                r"(?:^|[;&|\n\r({])\s*(?:(?:then|else|do|elif|if|while|until)"
+                r"\s+)*cd\s+(?:-\S+\s+)*(?:--\s+)?"
+                r"(\"[^\"]+\"|'[^']+'|[^\s;&|)}]+)",
                 cmd[: m_push.start()]):
             t = m_cd.group(1).strip("'\"")
             new_bases = set()
@@ -1808,7 +1814,13 @@ def make_self_containment_guard() -> HookCallback:
                 new_bases.add(nb)
                 candidates.append(nb)
             bases |= new_bases
-            if len(bases) > 64:  # backstop only; never hit in practice
+            if len(bases) > 64:
+                # Terra/Sol r3: breaking out silently would leave every LATER
+                # cd unexamined — fail CLOSED instead (a finding below denies
+                # the push; the logged CASA_ALLOW_ANTI_PATTERN override
+                # remains the escape hatch for a legitimate pathological
+                # command).
+                cd_overflow = True
                 break
         # Sol r2: git applies EVERY -C sequentially (a relative -C resolves
         # against the previous one) — fold the whole chain over each base.
@@ -1822,6 +1834,11 @@ def make_self_containment_guard() -> HookCallback:
                 candidates.append(cur)
 
         findings: list[str] = []
+        if cd_overflow:
+            findings.append(
+                "cd chain too complex to model (feasible-cwd set exceeded "
+                "64) — cannot establish which repository is being pushed; "
+                "simplify the push command")
         seen_roots: set[str] = set()
         for cand in candidates:
             if not cand.is_dir():

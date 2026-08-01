@@ -389,6 +389,42 @@ class TestGuardArmingAndOracle:
             clean,
             f"git -C {bad_repo.parent} -C {bad_repo.name} push origin main")
 
+    async def test_cd_after_then_keyword_is_recognized(
+            self, tmp_path: Path, bad_repo: Path):
+        """Sol r3 (#348): a cd introduced by a shell keyword body
+        (`if …; then cd <bad>`) must still rebase the scan."""
+        clean = tmp_path / "clean-then-cwd"
+        clean.mkdir()
+        assert await self._denied(
+            clean,
+            f"if true; then cd {bad_repo}; git push origin main; fi")
+
+    async def test_cd_inside_subshell_is_recognized(
+            self, tmp_path: Path, bad_repo: Path):
+        """Sol r3 (#348): `(cd <bad>; git push)` — the subshell paren is a
+        cd position too."""
+        clean = tmp_path / "clean-subsh-cwd"
+        clean.mkdir()
+        assert await self._denied(
+            clean, f"(cd {bad_repo}; git push origin main)")
+
+    async def test_cd_chain_overflow_fails_closed(
+            self, tmp_path: Path, git_plugin_repo: Path):
+        """Terra/Sol r3 (#348): once the feasible-base set overflows, later
+        cds are unexamined — the guard must DENY (with the logged override as
+        the escape hatch), never silently scan a partial candidate set."""
+        clean = tmp_path / "clean-overflow-cwd"
+        clean.mkdir()
+        # Seven conditional relative cds double the base set each time
+        # (2^7 = 128 > 64); the push itself targets a CLEAN repo — the denial
+        # must come from the fail-closed complexity finding alone.
+        chain = "; ".join(f"false && cd d{i}" for i in range(7))
+        r = await _run_policy(self._push(
+            clean, f"{chain}; cd {git_plugin_repo}\ngit push origin main"))
+        assert bool(r) and (
+            r["hookSpecificOutput"]["permissionDecision"] == "deny")
+        assert "too complex" in _deny_reason(r)
+
     async def test_reserved_env_self_declaration_blocks(
             self, git_plugin_repo: Path):
         """G6 corrected: a committed .mcp.json self-declaring a CLI-reserved
