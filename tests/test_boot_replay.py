@@ -1393,6 +1393,41 @@ async def test_fast_path_recreates_missing_fifo(monkeypatch, tmp_path):
     assert start_calls == ["keep1"]
 
 
+async def test_fast_path_replaces_non_fifo_stdin_path(monkeypatch, tmp_path):
+    """Terra r4-1: a REGULAR FILE (or dir) at the stdin.fifo path reads as
+    instant EOF / fails outright — the same crash-loop as a missing FIFO.
+    The guard must verify the type and repair, not just existence."""
+    import stat as stat_mod
+
+    from casa_core import replay_undergoing_engagements
+
+    start_calls = _fast_path_env(monkeypatch, tmp_path)
+    ws_root = tmp_path / "eng"
+    (ws_root / "keep1").mkdir(parents=True)
+    (ws_root / "keep1" / "stdin.fifo").write_text("not a fifo")
+
+    reg = await _make_registry([_rec("keep1")])
+    driver = _boot_driver()
+    driver._spawn_background_tasks = lambda rec, **kw: None
+
+    await replay_undergoing_engagements(
+        registry=reg, driver=driver, engagements_root=str(ws_root))
+
+    st = (ws_root / "keep1" / "stdin.fifo").stat()
+    assert stat_mod.S_ISFIFO(st.st_mode), "regular file must be replaced"
+    assert start_calls == ["keep1"]
+
+    # Directory variant: also repaired.
+    import os as os_mod
+    os_mod.remove(ws_root / "keep1" / "stdin.fifo")
+    (ws_root / "keep1" / "stdin.fifo").mkdir()
+    reg2 = await _make_registry([_rec("keep1")])
+    await replay_undergoing_engagements(
+        registry=reg2, driver=driver, engagements_root=str(ws_root))
+    st = (ws_root / "keep1" / "stdin.fifo").stat()
+    assert stat_mod.S_ISFIFO(st.st_mode), "directory must be replaced"
+
+
 async def test_fast_path_fifo_failure_refuses_start(monkeypatch, tmp_path):
     """Sol r3-2: when the fast-path FIFO recreation fails, the record is
     refused (no start, pair removed) instead of started into a

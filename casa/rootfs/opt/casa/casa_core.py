@@ -9,7 +9,9 @@ import json
 import logging
 import math
 import os
+import shutil
 import signal
+import stat
 import sys
 import time
 import uuid
@@ -562,9 +564,26 @@ async def replay_undergoing_engagements(
         confirmed, terminal-marked when it is not)."""
         fifo = os.path.join(engagements_root, rec.id, "stdin.fifo")
         try:
-            if (os.path.isdir(os.path.dirname(fifo))
-                    and not os.path.exists(fifo)):
-                os.mkfifo(fifo, 0o600)
+            if os.path.isdir(os.path.dirname(fifo)):
+                st = os.lstat(fifo) if os.path.lexists(fifo) else None
+                if st is not None and not stat.S_ISFIFO(st.st_mode):
+                    # Terra r4-1: a NON-fifo at the FIFO path (regular
+                    # file, dir, or symlink left by corruption/partial
+                    # recovery) reads as instant EOF or fails outright —
+                    # the same crash-loop as a missing FIFO. Repair by
+                    # replacing it; a repair failure takes the refusal
+                    # ladder below.
+                    logger.warning(
+                        "boot replay: %s exists but is not a FIFO — "
+                        "replacing it", fifo,
+                    )
+                    if stat.S_ISDIR(st.st_mode):
+                        shutil.rmtree(fifo)
+                    else:
+                        os.remove(fifo)
+                    st = None
+                if st is None:
+                    os.mkfifo(fifo, 0o600)
             return True
         except OSError as exc:
             await _refuse_brief_resume(
