@@ -1571,3 +1571,18 @@ async def test_cancel_reconciliation_eventually_terminalizes_live_job(tmp_path):
     assert attempts == 2
     assert terminal.execution_state is ExecutionState.CANCELLED
     assert registry.reconciliation_count == 0
+
+
+async def test_fail_compat_cancelled_kind_persists_cancelled_state(tmp_path):
+    """Terra r7 refutation pin (#321): the lifecycle cancellation handler
+    persists via fail_compat(JobFailure("cancelled", ...)) — the registry's
+    kind-aware terminal maps that to ExecutionState.CANCELLED (delivery
+    CANCELLED), NOT FAILED, so the primary write and the cancel
+    reconciliation retry converge on the same cancelled shape."""
+    registry = await loaded_registry(tmp_path, make_job(
+        started_at=101.0, execution_state=ExecutionState.RUNNING,
+    ))
+    finished = await registry.fail_compat(
+        "job-1", JobFailure("cancelled", "Specialist job was cancelled."))
+    assert finished.execution_state is ExecutionState.CANCELLED
+    assert finished.delivery_state is DeliveryState.NONE

@@ -3060,7 +3060,14 @@ async def _persist_cancelled_terminal(
     ``persistence_failed`` fallback (`_persist_voice_terminal`), which would
     terminalize the job FAILED and silently drop the cancel contract.
     Never raises except propagating nothing: swallows everything (the caller
-    re-raises the original cancellation regardless)."""
+    re-raises the original cancellation regardless).
+
+    Terra r7 note: ``fail_compat(JobFailure("cancelled", ...))`` is NOT a
+    FAILED terminal — the registry's kind-aware ``_fail_current_locked``
+    maps kind "cancelled" to ``ExecutionState.CANCELLED`` (delivery
+    CANCELLED), so this primary write and the reconciliation retry
+    (``registry.cancel``) converge on the same durable shape (pinned by
+    ``test_fail_compat_cancelled_kind_persists_cancelled_state``)."""
     try:
         await _await_voice_persistence(
             registry.fail_compat(
