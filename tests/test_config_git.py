@@ -564,3 +564,84 @@ class TestRestoreFileBadSha:
         # The sibling's staging survives; the committed globby file is
         # fully refreshed (absent from status).
         assert status == ["A  agents/foo1.txt"]
+
+    def test_pre_staged_version_of_committed_path_survives(self, tmp_path):
+        """Terra r5-1: operator stages version A of a path, worktree moves
+        to B, the gate commits B. A must SURVIVE in the index (staged
+        against the new HEAD) — main's add -A flow destroyed it; the gate
+        must do better, not equal."""
+        from config_git import commit_config_checked, init_repo
+
+        _seed(tmp_path)
+        init_repo(str(tmp_path))
+        target = tmp_path / "agents" / "marker.txt"
+        target.write_text("version A", encoding="utf-8")
+        subprocess.check_call(
+            ["git", "-C", str(tmp_path), "add", "agents/marker.txt"])
+        target.write_text("version B", encoding="utf-8")
+
+        sha, errors = commit_config_checked(
+            str(tmp_path), "commits B", validate=lambda tree: [])
+        assert errors == [] and sha
+        committed = subprocess.check_output(
+            ["git", "-C", str(tmp_path), "show", f"{sha}:agents/marker.txt"],
+        ).decode()
+        assert committed == "version B"
+        staged = subprocess.check_output(
+            ["git", "-C", str(tmp_path), "show", ":agents/marker.txt"],
+        ).decode()
+        assert staged == "version A", (
+            "the operator's staged version was destroyed by the index "
+            "refresh")
+        status = subprocess.check_output(
+            ["git", "-C", str(tmp_path), "status", "--porcelain"],
+        ).decode().splitlines()
+        assert status == ["MM agents/marker.txt"]
+
+
+class TestCasUndoPreservesLateStaging:
+    def test_operator_staging_after_refresh_survives_cas_undo(
+        self, tmp_path, monkeypatch,
+    ):
+        """Sol r5-2: the CAS-failure undo must reset only entries still
+        holding the gate's own content — an operator who stages newer
+        content for a touched path between the refresh and the failed CAS
+        keeps their staging."""
+        import config_git
+        from config_git import commit_config_checked, init_repo
+
+        _seed(tmp_path)
+        init_repo(str(tmp_path))
+        target = tmp_path / "agents" / "marker.txt"
+        target.write_text("gate content", encoding="utf-8")
+
+        real_run = config_git._run
+
+        def hooked(cwd, args, **kw):
+            if args[:2] == ["update-ref", "HEAD"]:
+                # Between refresh and CAS: an external commit moves HEAD
+                # (via a second file so the index-wide commit is explicit),
+                # then the operator stages NEWER content for the touched
+                # path.
+                ext = tmp_path / "agents" / "external.txt"
+                ext.write_text("external", encoding="utf-8")
+                subprocess.check_call(
+                    ["git", "-C", str(tmp_path), "add", "agents/external.txt"])
+                subprocess.check_call(
+                    ["git", "-C", str(tmp_path), "commit", "-qm", "external"])
+                target.write_text("operator newer", encoding="utf-8")
+                subprocess.check_call(
+                    ["git", "-C", str(tmp_path), "add", "agents/marker.txt"])
+                target.write_text("gate content", encoding="utf-8")
+            return real_run(cwd, args, **kw)
+
+        monkeypatch.setattr(config_git, "_run", hooked)
+
+        with pytest.raises(subprocess.CalledProcessError):
+            commit_config_checked(
+                str(tmp_path), "gate", validate=lambda tree: [])
+        staged = subprocess.check_output(
+            ["git", "-C", str(tmp_path), "show", ":agents/marker.txt"],
+        ).decode()
+        assert staged == "operator newer", (
+            "the CAS undo erased the operator's post-refresh staging")

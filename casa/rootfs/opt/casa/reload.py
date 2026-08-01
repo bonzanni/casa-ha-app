@@ -821,14 +821,15 @@ async def reload_agent(runtime: Any, *, role: str | None = None) -> list[str]:
     if tier == "resident":
         runtime.role_configs[role] = new_cfg
     runtime.agents[role] = new_agent
-    # Publish the post-swap registry from the ACTUAL post-load state (the
-    # constructed agent's retained overlay differs only if an unrelated
-    # specialist changed on disk mid-reload — its own tier entry, the
-    # #327(c) point, is present in both).
-    runtime.agent_registry = AgentRegistry.build(
-        residents=runtime.role_configs,
-        specialists=runtime.specialist_registry.all_configs(),
-    )
+    # Publish the SAME overlay registry the agent was constructed with
+    # (Sol r5-1): rebuilding from post-load state here could publish a
+    # different version of this very role — the file can change on disk
+    # between load_agent_from_dir and the swap-window rescan — leaving the
+    # published registry describing config the live agent does not run.
+    # The overlay reflects exactly what this reload activated; disk changes
+    # that landed mid-reload (this role's or any other's) activate on their
+    # own reload, with specialist_registry already holding disk truth.
+    runtime.agent_registry = fresh_registry
     runtime.bus.register(role, new_agent.handle_message)
     # H10: a role whose dir was created after boot has no consumer yet;
     # idempotent no-op for roles that already have one.

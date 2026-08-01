@@ -237,41 +237,72 @@ def commit_config_checked(
                  "-z", "-r", sha],
                 cwd=config_dir, capture_output=True, text=True, check=True,
             ).stdout
-            spec = "\0".join(
-                f":(literal){p}" for p in changed.split("\0") if p
-            )
-            refresh = subprocess.run(
-                ["git", "reset", "-q", sha, "--pathspec-file-nul",
-                 "--pathspec-from-file=-"],
-                cwd=config_dir, capture_output=True, text=True, input=spec,
-            )
-            if refresh.returncode != 0:
-                # Sol r2-1b: surface, don't swallow — the commit is still
-                # valid; stale index entries for these paths self-heal on
-                # the next stage (every Casa flow stages with add -A).
-                logger.warning(
-                    "config commit %s: index refresh failed: %s",
-                    sha[:8], refresh.stderr.strip(),
-                )
-            try:
-                _run(config_dir, ["update-ref", "HEAD", sha, head])
-            except Exception:
-                # Sol r4-1: HEAD moved between our snapshot and the CAS —
-                # the refresh above staged OUR content for the touched paths
-                # over the external commit; left in place, a later ordinary
-                # commit would silently revert that external work. Undo by
-                # re-resetting the same literal paths to the CURRENT HEAD.
-                undo = subprocess.run(
-                    ["git", "reset", "-q", "HEAD", "--pathspec-file-nul",
+            committed_paths = [p for p in changed.split("\0") if p]
+            # Terra r5-1: skip any committed path the operator has staged
+            # different from the base commit — refreshing it would DESTROY
+            # their staged version (its content lives only in the index).
+            # Their entry survives, visible as staged-vs-new-HEAD.
+            pre_staged = subprocess.run(
+                ["git", "diff-index", "--cached", "--name-only", "-z", head],
+                cwd=config_dir, capture_output=True, text=True, check=True,
+            ).stdout
+            staged_set = {p for p in pre_staged.split("\0") if p}
+            refresh_paths = [
+                p for p in committed_paths if p not in staged_set
+            ]
+            spec = "\0".join(f":(literal){p}" for p in refresh_paths)
+            if spec:
+                refresh = subprocess.run(
+                    ["git", "reset", "-q", sha, "--pathspec-file-nul",
                      "--pathspec-from-file=-"],
                     cwd=config_dir, capture_output=True, text=True,
                     input=spec,
                 )
-                if undo.returncode != 0:
+                if refresh.returncode != 0:
+                    # Sol r2-1b: surface, don't swallow — the commit is
+                    # still valid; stale index entries for these paths
+                    # self-heal on the next stage (every Casa flow stages
+                    # with add -A).
                     logger.warning(
-                        "config commit %s: CAS refused and the index undo "
-                        "also failed: %s", sha[:8], undo.stderr.strip(),
+                        "config commit %s: index refresh failed: %s",
+                        sha[:8], refresh.stderr.strip(),
                     )
+            try:
+                _run(config_dir, ["update-ref", "HEAD", sha, head])
+            except Exception:
+                # Sol r4-1: HEAD moved between our snapshot and the CAS —
+                # the refresh above staged OUR content for the touched
+                # paths; left in place, a later ordinary commit would
+                # silently revert the external work. Undo by resetting to
+                # the CURRENT HEAD — but only entries STILL HOLDING OUR
+                # content (Sol r5-2): an operator who staged newer content
+                # for a touched path after the refresh keeps their entry
+                # (it no longer matches the candidate commit's version).
+                if spec:
+                    ours = subprocess.run(
+                        ["git", "diff-index", "--cached", "--name-only",
+                         "-z", sha],
+                        cwd=config_dir, capture_output=True, text=True,
+                    ).stdout
+                    changed_since = {p for p in ours.split("\0") if p}
+                    undo_spec = "\0".join(
+                        f":(literal){p}" for p in refresh_paths
+                        if p not in changed_since
+                    )
+                    if undo_spec:
+                        undo = subprocess.run(
+                            ["git", "reset", "-q", "HEAD",
+                             "--pathspec-file-nul",
+                             "--pathspec-from-file=-"],
+                            cwd=config_dir, capture_output=True, text=True,
+                            input=undo_spec,
+                        )
+                        if undo.returncode != 0:
+                            logger.warning(
+                                "config commit %s: CAS refused and the "
+                                "index undo also failed: %s",
+                                sha[:8], undo.stderr.strip(),
+                            )
                 raise
         return sha, []
 
