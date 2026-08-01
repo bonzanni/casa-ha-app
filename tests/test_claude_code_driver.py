@@ -2920,3 +2920,31 @@ class TestTerminalSpoolNoticeDeliveryEvidence:
         rec = _make_record()
         ok = await drv._spool_send_notice(rec, "receipt text", None)
         assert ok is True
+
+
+class TestCompletionEscalationInnerCancel:
+    """Sol r8 (#341): the shared _force_tasks entry can be cancelled by its
+    OWNER (operator re-engagement clears the away kill; teardown cancels) —
+    shield() then raises CancelledError even though the emit_completion
+    caller was never cancelled, and the tool handler (which catches only
+    Exception) dies instead of returning its documented refusal. An
+    inner-task cancel must return quietly; only genuine outer cancellation
+    propagates."""
+
+    async def test_inner_force_task_cancel_returns_quietly(self, tmp_path):
+        drv = _make_driver(tmp_path)
+        rec = _make_record()
+        started = asyncio.Event()
+
+        async def blocking_ftb(**kw):
+            started.set()
+            await asyncio.sleep(30)
+            return True
+
+        drv._force_turn_boundary = blocking_ftb
+        drv._epoch_pending[rec.id] = 7
+
+        outer = asyncio.create_task(drv.force_completion_turn_boundary(rec))
+        await started.wait()
+        drv._force_tasks[rec.id].cancel()      # owner cancels the kill
+        await outer                            # must NOT raise CancelledError

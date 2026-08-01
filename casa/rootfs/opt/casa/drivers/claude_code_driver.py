@@ -2664,7 +2664,23 @@ class ClaudeCodeDriver(DriverProtocol):
         # Awaiting the task keeps the caller's semantics (the tool handler
         # logs best-effort); an outer cancel stops the WAIT, never the kill —
         # the task stays owned by ``_force_tasks`` / the teardown drain.
-        ok = await asyncio.shield(task)
+        # Sol r8: shield() ALSO raises CancelledError when the INNER task is
+        # cancelled by its owner (operator re-engagement clears the away
+        # kill; teardown cancels the shared ``_force_tasks`` entry) — that is
+        # not OUR cancellation, and letting it out would kill the
+        # emit_completion handler (which catches only Exception) instead of
+        # returning its documented refusal. Inner cancel ⇒ the escalation is
+        # simply over — return quietly; only a genuine outer cancellation
+        # propagates.
+        try:
+            ok = await asyncio.shield(task)
+        except asyncio.CancelledError:
+            if task.cancelled():
+                logger.info(
+                    "engagement %s: completion-gate boundary cancelled by "
+                    "its owner (operator returned / teardown)", eng_id[:8])
+                return
+            raise
         logger.info(
             "engagement %s: completion-gate forced turn boundary (ok=%s)",
             eng_id[:8], ok)
