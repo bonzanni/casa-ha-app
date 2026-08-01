@@ -243,19 +243,9 @@ class TriggerRegistry:
         tool's fail-closed direct sweep)."""
         return dict(self._plugin_overlay)
 
-    def reregister_for(
-        self,
-        role: str,
-        triggers: list[TriggerSpec],
-        channels: list[str],
-    ) -> None:
-        """Remove this role's existing APScheduler jobs and webhook paths,
-        then re-wire from the supplied specs.
-
-        Fail-closed: if re-registration raises, the agent is left with NO
-        triggers (the unwind already happened). The caller should surface
-        the error.
-        """
+    def _unwind_role(self, role: str) -> None:
+        """Drop every scheduler job and webhook-allowlist entry owned by
+        *role*. Idempotent; swallows per-job remove failures."""
         prefix = f"{role}:"
         to_drop = [
             jid for jid in list(self._seen_job_ids) if jid.startswith(prefix)
@@ -281,7 +271,28 @@ class TriggerRegistry:
                 self._webhook_auth_policies.pop(name, None)
         self._webhook_names_by_role[role] = []
 
-        self.register_agent(role, triggers, channels)
+    def reregister_for(
+        self,
+        role: str,
+        triggers: list[TriggerSpec],
+        channels: list[str],
+    ) -> None:
+        """Remove this role's existing APScheduler jobs and webhook paths,
+        then re-wire from the supplied specs.
+
+        Fail-closed: if re-registration raises, the agent is left with NO
+        triggers. #307: register_agent stops at the offending entry, so the
+        replacement triggers installed before it must be unwound too —
+        without the second unwind, a `[valid, malformed]` list left the
+        valid trigger firing while the reload reported failure. The caller
+        should surface the error.
+        """
+        self._unwind_role(role)
+        try:
+            self.register_agent(role, triggers, channels)
+        except Exception:
+            self._unwind_role(role)
+            raise
 
     def list_jobs_for(
         self, role: str, within_hours: int,

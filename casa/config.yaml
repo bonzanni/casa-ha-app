@@ -1,6 +1,6 @@
 name: "Casa"
 description: "Personal AI agent framework powered by Claude"
-version: "0.141.0"
+version: "0.142.0"
 slug: casa
 url: https://github.com/bonzanni/ha-casa-app
 image: "ghcr.io/bonzanni/casa"
@@ -47,6 +47,11 @@ options:
   # Scheduling
   casa_tz: "Europe/Amsterdam"
   engagement_reap_days: 7
+
+  # Logging (#279: was schema-only; the omission predates the option audit.
+  # Behavior is unchanged — absent/empty falls back to INFO — but every
+  # schema key now has an install-time default.)
+  log_level: "info"
 
   # Specialist limits (spec A4/§4.6)
   specialist_max_concurrency: 2

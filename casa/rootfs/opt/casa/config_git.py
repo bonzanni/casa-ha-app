@@ -14,9 +14,16 @@ from __future__ import annotations
 import logging
 import os
 import subprocess
-from typing import Sequence
+import tempfile
+import threading
+from typing import Callable, Sequence
 
 logger = logging.getLogger(__name__)
+
+# #351: serialize stage→validate→commit sequences. Two concurrent checked
+# commits would otherwise race each other's `git add -A` / `git reset`.
+# A threading (not asyncio) lock: every caller runs in a worker thread.
+_COMMIT_LOCK = threading.Lock()
 
 
 _GITIGNORE_CONTENT = """\
@@ -51,6 +58,20 @@ specialists/store/
 specialists/.staging/
 !.gitignore
 """
+
+
+# #278: single source of truth for the human-readable tracked-path summary
+# used by config_git_commit's tool description and its no-op warning. Must
+# stay in step with _GITIGNORE_CONTENT above — the pinning test parses the
+# whitelist and asserts every tracked top-level path is named here (the
+# pre-fix strings had drifted: bindings/ (v0.100.0) and the specialists/
+# tracked set were missing, sending agents that wrote there hunting for a
+# nonexistent gitignore rule when they got an empty SHA).
+TRACKED_PATHS_SUMMARY = (
+    "agents/, policies/, bindings/, schema/, plugins/registry.json, and "
+    "under specialists/ the registry.json + per-slug "
+    "active/desired/active.prior tuples"
+)
 
 
 def _run(cwd: str, args: Sequence[str], *, check: bool = True) -> str:
@@ -122,6 +143,48 @@ def commit_config(config_dir: str, message: str) -> str:
     return _run(config_dir, ["rev-parse", "HEAD"])
 
 
+def commit_config_checked(
+    config_dir: str,
+    message: str,
+    validate: Callable[[str], list[str]],
+) -> tuple[str, list[str]]:
+    """Stage all tracked changes, validate EXACTLY the staged tree, then
+    commit the index. Returns ``(sha, errors)``.
+
+    #351 (validate→commit TOCTOU): the tool used to validate the worktree,
+    then stage-and-commit as a separate step — an edit landing in between
+    (an SSH operator writing invalid YAML) was committed unvalidated and
+    failed the next boot. Here the sequence is: ``git add -A`` freezes the
+    snapshot in the index; ``git checkout-index`` exports that exact
+    snapshot to a temp dir; ``validate`` runs over the export; only a clean
+    result commits the index. A worktree edit after staging can neither
+    enter the commit (``git commit`` commits the index) nor influence
+    validation (the export is already taken). On refusal the staging is
+    reset and ``(\"\", errors)`` returned; error strings have the temp
+    export path rewritten to *config_dir* so refusals read as real paths.
+
+    No-op (clean tree) returns ``("", [])`` without calling ``validate``.
+    """
+    with _COMMIT_LOCK:
+        status = _run(config_dir, ["status", "--porcelain"])
+        if not status:
+            return "", []
+        _run(config_dir, ["add", "-A"])
+        with tempfile.TemporaryDirectory(prefix="casa-commit-gate-") as tmp:
+            # Trailing separator is required: checkout-index treats the
+            # prefix as a literal string prepended to each path.
+            _run(config_dir, ["checkout-index", "-a", "-f",
+                              f"--prefix={tmp}{os.sep}"])
+            errors = [
+                e.replace(tmp, config_dir) for e in (validate(tmp) or [])
+            ]
+        if errors:
+            _run(config_dir, ["reset", "-q"], check=False)
+            return "", errors
+        _run(config_dir, ["commit", "-qm", message])
+        return _run(config_dir, ["rev-parse", "HEAD"]), []
+
+
 def changed_paths(config_dir: str, sha: str) -> list[str]:
     """Return the repo-relative paths a commit touched (vs its first parent).
 
@@ -155,7 +218,22 @@ def snapshot_manual_edits(config_dir: str) -> str | None:
 
 
 def restore_file(config_dir: str, sha: str, relpath: str) -> None:
-    """Restore *relpath* to its content at *sha* and commit the restore."""
-    _run(config_dir, ["checkout", sha, "--", relpath])
-    _run(config_dir, ["add", relpath])
-    _run(config_dir, ["commit", "-qm", f"restore {relpath} to {sha[:8]}"])
+    """Restore *relpath* to its content at *sha* and commit the restore.
+
+    #351 (low): a path that did not exist at *sha* (a file ADDED after the
+    target commit) cannot be checked out from it — ``git checkout`` errors
+    and the rollback failed. Restoring to "absent" means removing the file,
+    so that case becomes ``git rm`` + commit.
+    """
+    probe = subprocess.run(
+        ["git", "cat-file", "-e", f"{sha}:{relpath}"],
+        cwd=config_dir, capture_output=True, text=True,
+    )
+    if probe.returncode == 0:
+        _run(config_dir, ["checkout", sha, "--", relpath])
+        _run(config_dir, ["add", relpath])
+        _run(config_dir, ["commit", "-qm", f"restore {relpath} to {sha[:8]}"])
+    else:
+        _run(config_dir, ["rm", "-f", "--ignore-unmatch", "--", relpath])
+        _run(config_dir, ["commit", "-qm",
+                          f"remove {relpath} (absent at {sha[:8]})"])

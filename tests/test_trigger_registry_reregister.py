@@ -56,6 +56,53 @@ class TestReregisterFor:
         assert "assistant:t" not in reg._seen_job_ids
         assert "assistant:bad" not in reg._seen_job_ids
 
+    def test_reregister_partial_failure_unwinds_new_triggers(self):
+        """#307: a failure on a LATER trigger must unwind the earlier
+        replacement triggers already installed — the documented fail-closed
+        contract is 'the agent is left with NO triggers'."""
+        from config import TriggerSpec
+        from trigger_registry import TriggerError
+        reg, scheduler, _app = self._make_registry()
+        t0 = TriggerSpec(
+            name="t0", type="interval", minutes=5,
+            channel="telegram", prompt="p",
+        )
+        reg.register_agent("assistant", [t0], channels=["telegram"])
+
+        good = TriggerSpec(
+            name="good", type="interval", minutes=10,
+            channel="telegram", prompt="p",
+        )
+        bad = TriggerSpec(
+            name="bad", type="cron", schedule="not-a-cron",
+            channel="telegram", prompt="q",
+        )
+        with pytest.raises(TriggerError):
+            reg.reregister_for("assistant", [good, bad], channels=["telegram"])
+        # NO triggers survive: not the old one, not the partial new ones.
+        assert reg._seen_job_ids == set()
+        assert reg._specs_by_job_id == {}
+        scheduler.remove_job.assert_any_call("assistant:good")
+
+    def test_reregister_partial_failure_evicts_new_webhooks(self):
+        """#307 webhook arm: an installed replacement webhook allowlist entry
+        must not survive a later trigger's failure."""
+        from config import TriggerSpec
+        from trigger_registry import TriggerError
+        reg, _sched, _app = self._make_registry()
+        hook = TriggerSpec(
+            name="hooked", type="webhook", path="",
+            channel="telegram", prompt="p",
+        )
+        bad = TriggerSpec(
+            name="bad", type="cron", schedule="not-a-cron",
+            channel="telegram", prompt="q",
+        )
+        with pytest.raises(TriggerError):
+            reg.reregister_for("assistant", [hook, bad], channels=["telegram"])
+        assert reg.get_webhook_target("hooked") is None
+        assert reg.get_auth_policy("hooked") is None
+
     def test_reregister_unknown_role_is_noop_then_registers(self):
         from config import TriggerSpec
         reg, _sched, _app = self._make_registry()

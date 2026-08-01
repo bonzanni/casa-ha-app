@@ -24,7 +24,7 @@ def configurator_origin():
 class TestConfigGitCommitTool:
     async def test_happy_path(self, configurator_origin):
         from tools import config_git_commit
-        with patch("config_git.commit_config", return_value="abc123def"):
+        with patch("config_git.commit_config_checked", return_value=("abc123def", [])):
             result = await config_git_commit.handler({"message": "test"})
         payload = json.loads(result["content"][0]["text"])
         assert payload["sha"] == "abc123def"
@@ -32,7 +32,7 @@ class TestConfigGitCommitTool:
 
     async def test_noop_returns_empty_sha(self, configurator_origin):
         from tools import config_git_commit
-        with patch("config_git.commit_config", return_value=""):
+        with patch("config_git.commit_config_checked", return_value=("", [])):
             result = await config_git_commit.handler({"message": "noop"})
         payload = json.loads(result["content"][0]["text"])
         assert payload["sha"] == ""
@@ -43,7 +43,7 @@ class TestConfigGitCommitTool:
         gitignored paths. The no-op result must SAY that only whitelisted
         paths are tracked."""
         from tools import config_git_commit
-        with patch("config_git.commit_config", return_value=""):
+        with patch("config_git.commit_config_checked", return_value=("", [])):
             result = await config_git_commit.handler({"message": "noop"})
         payload = json.loads(result["content"][0]["text"])
         warning = payload.get("warning", "")
@@ -53,14 +53,14 @@ class TestConfigGitCommitTool:
 
     async def test_real_commit_has_no_warning(self, configurator_origin):
         from tools import config_git_commit
-        with patch("config_git.commit_config", return_value="abc123def"):
+        with patch("config_git.commit_config_checked", return_value=("abc123def", [])):
             result = await config_git_commit.handler({"message": "test"})
         payload = json.loads(result["content"][0]["text"])
         assert "warning" not in payload
 
     async def test_raises_bubbles_as_error_kind(self, configurator_origin):
         from tools import config_git_commit
-        with patch("config_git.commit_config", side_effect=RuntimeError("git broke")):
+        with patch("config_git.commit_config_checked", side_effect=RuntimeError("git broke")):
             result = await config_git_commit.handler({"message": "x"})
         payload = json.loads(result["content"][0]["text"])
         assert payload["status"] == "error"
@@ -94,7 +94,7 @@ class TestConfigGitCommitReloadObligation:
             self, configurator_origin, _bound_engagement):
         import tools as tools_mod
         from tools import config_git_commit
-        with patch("config_git.commit_config", return_value="sha1"), \
+        with patch("config_git.commit_config_checked", return_value=("sha1", [])), \
                 patch("config_git.changed_paths",
                       return_value=["agents/assistant/runtime.yaml"]):
             await config_git_commit.handler({"message": "edit persona"})
@@ -105,7 +105,7 @@ class TestConfigGitCommitReloadObligation:
         import tools as tools_mod
         from tools import config_git_commit
         tools_mod._ENGAGEMENTS_PREACTIVATED.add(_bound_engagement.id)
-        with patch("config_git.commit_config", return_value="sha2"), \
+        with patch("config_git.commit_config_checked", return_value=("sha2", [])), \
                 patch("config_git.changed_paths",
                       return_value=["plugins/registry.json"]):
             await config_git_commit.handler({"message": "persist plugin"})
@@ -120,7 +120,7 @@ class TestConfigGitCommitReloadObligation:
         import tools as tools_mod
         from tools import config_git_commit
         tools_mod._ENGAGEMENTS_PREACTIVATED.add(_bound_engagement.id)
-        with patch("config_git.commit_config", return_value="sha3"), \
+        with patch("config_git.commit_config_checked", return_value=("sha3", [])), \
                 patch("config_git.changed_paths",
                       return_value=["plugins/registry.json",
                                     "agents/assistant/runtime.yaml"]):
@@ -134,7 +134,7 @@ class TestConfigGitCommitReloadObligation:
         import tools as tools_mod
         from tools import config_git_commit
         tools_mod._ENGAGEMENTS_PREACTIVATED.add(_bound_engagement.id)
-        with patch("config_git.commit_config", return_value="sha4"), \
+        with patch("config_git.commit_config_checked", return_value=("sha4", [])), \
                 patch("config_git.changed_paths", return_value=[]):
             await config_git_commit.handler({"message": "persist plugin"})
         assert _bound_engagement.id in tools_mod._ENGAGEMENTS_PENDING_RELOAD
@@ -174,11 +174,22 @@ class TestConfigGitCommitRoleGuard:
         assert payload["kind"] == "not_authorized"
 
 
+def _checked_that_runs_validator(config_dir, message, validate):
+    """Stand-in for commit_config_checked honoring its contract: run the
+    supplied validator; errors refuse (no commit), clean commits."""
+    errors = validate(config_dir)
+    return ("", errors) if errors else ("abcd1234", [])
+
+
 class TestConfigGitCommitSchemaGate:
     """E-G v0.31.0 pre-commit schema-validation gate. The tool must
     refuse a commit that would land schema-invalid YAML and FATAL the
     addon on next boot. See `bug-review-2026-05-01-exploration.md` and
-    `project_eg_configurator_schema_invalid_yaml`."""
+    `project_eg_configurator_schema_invalid_yaml`. #351 moved the gate
+    INSIDE config_git.commit_config_checked (staged-tree validation); the
+    refusal semantics under a real repo are pinned in test_config_git.py —
+    here the stand-in honors the checked contract while the validator's
+    errors are what's under test."""
 
     async def test_refuses_when_validation_errors_found(
         self, configurator_origin,
@@ -191,7 +202,8 @@ class TestConfigGitCommitSchemaGate:
                 "schema violation at (root): Additional properties are not "
                 "allowed ('TRAIT' was unexpected)",
             ],
-        ), patch("config_git.commit_config") as mock_commit:
+        ), patch("config_git.commit_config_checked",
+                 side_effect=_checked_that_runs_validator):
             result = await config_git_commit.handler(
                 {"message": "add trait"},
             )
@@ -201,21 +213,17 @@ class TestConfigGitCommitSchemaGate:
         assert payload["errors"][0].endswith(
             "Additional properties are not allowed ('TRAIT' was unexpected)"
         )
-        # The git commit MUST NOT be reached when validation fails.
-        mock_commit.assert_not_called()
 
     async def test_proceeds_when_validation_clean(self, configurator_origin):
         from tools import config_git_commit
         with patch(
             "agent_loader.validate_config_repo", return_value=[],
-        ), patch(
-            "config_git.commit_config", return_value="abcd1234",
-        ) as mock_commit:
+        ), patch("config_git.commit_config_checked",
+                 side_effect=_checked_that_runs_validator):
             result = await config_git_commit.handler({"message": "ok"})
         payload = json.loads(result["content"][0]["text"])
         assert payload["sha"] == "abcd1234"
         assert payload["message"] == "ok"
-        mock_commit.assert_called_once()
 
     async def test_aggregates_multiple_errors(self, configurator_origin):
         """The error list surfaces every offending file at once so the
@@ -227,10 +235,66 @@ class TestConfigGitCommitSchemaGate:
                 "/p/character.yaml: schema violation at (root): bad1",
                 "/p/runtime.yaml: schema violation at (root): bad2",
             ],
-        ), patch("config_git.commit_config") as mock_commit:
+        ), patch("config_git.commit_config_checked",
+                 side_effect=_checked_that_runs_validator):
             result = await config_git_commit.handler({"message": "bulk"})
         payload = json.loads(result["content"][0]["text"])
         assert payload["kind"] == "schema_invalid"
         assert len(payload["errors"]) == 2
         assert "2 schema validation failure" in payload["message"]
-        mock_commit.assert_not_called()
+
+
+class TestConfigGitCommitCheckedGate:
+    """#351: the tool routes through commit_config_checked so validation
+    covers exactly the staged tree; #278: the tracked-path strings come from
+    config_git.TRACKED_PATHS_SUMMARY (single source of truth)."""
+
+    async def test_validator_refusal_returns_schema_invalid(
+            self, configurator_origin):
+        from tools import config_git_commit
+        with patch("config_git.commit_config_checked",
+                   return_value=("", ["agents/x/character.yaml: bad"])):
+            result = await config_git_commit.handler({"message": "x"})
+        payload = json.loads(result["content"][0]["text"])
+        assert payload["status"] == "error"
+        assert payload["kind"] == "schema_invalid"
+        assert payload["errors"] == ["agents/x/character.yaml: bad"]
+
+    async def test_checked_commit_receives_the_boot_validator(
+            self, configurator_origin):
+        """The gate must run agent_loader.validate_config_repo — the same
+        codepath boot uses — over the exported staged tree."""
+        import agent_loader
+        from tools import config_git_commit
+        with patch("config_git.commit_config_checked",
+                   return_value=("abc", [])) as checked:
+            await config_git_commit.handler({"message": "x"})
+        _dir, _msg, validator = checked.call_args.args
+        assert validator is agent_loader.validate_config_repo
+
+
+class TestTrackedPathsSummaryPinned:
+    """#278: the summary string must stay in step with the gitignore
+    whitelist — a drifting explanatory string told agents that bindings/
+    (tracked since v0.100.0) was 'gitignored by design'."""
+
+    def _tracked_top_level(self):
+        import config_git
+        names = set()
+        for line in config_git._GITIGNORE_CONTENT.splitlines():
+            if line.startswith("!") and line != "!.gitignore":
+                names.add(line[1:].split("/")[0])
+        return names
+
+    def test_every_tracked_top_level_is_named_in_the_summary(self):
+        import config_git
+        for name in self._tracked_top_level():
+            assert name in config_git.TRACKED_PATHS_SUMMARY, (
+                f"tracked path {name!r} missing from TRACKED_PATHS_SUMMARY "
+                f"— the whitelist and the operator-facing strings drifted "
+                f"again (#278)")
+
+    def test_tool_description_and_warning_carry_the_summary(self):
+        import config_git
+        from tools import config_git_commit
+        assert config_git.TRACKED_PATHS_SUMMARY in config_git_commit.description

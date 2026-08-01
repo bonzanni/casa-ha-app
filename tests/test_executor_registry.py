@@ -124,3 +124,31 @@ class TestExecutorRegistryFailedLogging:
             for rec in caplog.records
             if rec.levelname == "INFO"
         ), "expected final summary log line with loaded=/failed=/disabled= shape"
+
+
+class TestLoadFailureKeepsRegistry:
+    def test_unexpected_scan_error_keeps_previous_registry(
+        self, tmp_path, monkeypatch,
+    ):
+        """#351: load() used to clear all collections BEFORE scanning and
+        caught only LoadError — a transient PermissionError while listing the
+        executors dir escaped with the registry already emptied, deleting
+        every executor definition until a later successful reload. The scan
+        must build into fresh structures and swap only on success."""
+        import agent_loader
+        from executor_registry import ExecutorRegistry
+
+        _write(str(tmp_path), "configurator")
+        r = ExecutorRegistry(str(tmp_path / "executors"))
+        r.load()
+        assert r.list_types() == ["configurator"]
+
+        def boom(base):
+            raise PermissionError("transient EACCES listing executors dir")
+
+        monkeypatch.setattr(agent_loader, "load_all_executors", boom)
+        with pytest.raises(PermissionError):
+            r.load()
+        # The live registry survives the failed scan untouched.
+        assert r.list_types() == ["configurator"]
+        assert r.get("configurator") is not None

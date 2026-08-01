@@ -5,9 +5,12 @@ line; remove_entry deletes one (v0.111.0, #236).
 """
 from __future__ import annotations
 
+import logging
 import os
 import re
 from pathlib import Path
+
+logger = logging.getLogger(__name__)
 
 PLUGIN_ENV_CONF_PATH: Path = Path("/config/plugin-env.conf")
 
@@ -32,7 +35,18 @@ def read_entries() -> dict[str, str]:
         if "=" not in line:
             continue
         name, _, value = line.partition("=")
-        entries[name.strip()] = value.strip()
+        name = name.strip()
+        # #351: enforce the same var-name contract as set_entry. A
+        # hand-edited line like `=secret` yielded {"": "secret"}, and boot
+        # copies entries straight into os.environ — os.environ[""] raises
+        # ValueError, which that path does not catch, aborting startup.
+        if not _VAR_NAME_RE.match(name):
+            logger.warning(
+                "plugin-env.conf: skipping line with invalid var name %r",
+                name,
+            )
+            continue
+        entries[name] = value.strip()
     return entries
 
 

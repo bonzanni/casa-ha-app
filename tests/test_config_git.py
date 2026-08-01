@@ -250,3 +250,127 @@ class TestPluginsWhitelist:
         m = re.search(r"cat > \.gitignore <<'EOF'\n(.*?)EOF\n", sh, re.S)
         assert m, "setup-configs.sh .gitignore heredoc not found"
         assert m.group(1) == _GITIGNORE_CONTENT
+
+
+class TestRestoreFileAddedAfterTarget:
+    def test_rolls_back_a_file_added_since_the_target_commit(self, tmp_path):
+        """#351 (low): restore_file always ran `git checkout <sha> -- path`,
+        which ERRORS when the path did not exist at the target commit — so a
+        newly added role config could never be rolled back. The added file
+        must be removed (worktree + index) and the removal committed."""
+        from config_git import commit_config, init_repo, restore_file
+
+        _seed(tmp_path)
+        init_repo(str(tmp_path))
+        original_sha = subprocess.check_output(
+            ["git", "-C", str(tmp_path), "rev-parse", "HEAD"],
+        ).decode().strip()
+
+        added = tmp_path / "agents" / "newrole.txt"
+        added.write_text("new role config", encoding="utf-8")
+        commit_config(str(tmp_path), "add newrole")
+
+        restore_file(str(tmp_path), original_sha, "agents/newrole.txt")
+
+        assert not added.exists()
+        tracked = subprocess.check_output(
+            ["git", "-C", str(tmp_path), "ls-files"],
+        ).decode().splitlines()
+        assert "agents/newrole.txt" not in tracked
+        # The removal is itself a commit (clean tree afterwards).
+        status = subprocess.check_output(
+            ["git", "-C", str(tmp_path), "status", "--porcelain"],
+        ).decode().strip()
+        assert status == ""
+
+
+class TestCommitConfigChecked:
+    """#351: the validate→commit TOCTOU. What is validated must be EXACTLY
+    what is committed, no matter what an external writer (an SSH operator)
+    does to the worktree mid-window."""
+
+    def test_commits_the_validated_snapshot_not_later_edits(self, tmp_path):
+        from config_git import commit_config_checked, init_repo
+
+        _seed(tmp_path)
+        init_repo(str(tmp_path))
+        target = tmp_path / "agents" / "marker.txt"
+        target.write_text("validated-content", encoding="utf-8")
+
+        seen_trees = []
+
+        def validator(tree):
+            # An external edit lands WHILE validation runs — after staging.
+            seen_trees.append(
+                (Path(tree) / "agents" / "marker.txt").read_text())
+            target.write_text("unvalidated-edit", encoding="utf-8")
+            return []
+
+        sha, errors = commit_config_checked(
+            str(tmp_path), "checked commit", validator)
+        assert errors == []
+        assert sha
+        # The validator saw the staged snapshot…
+        assert seen_trees == ["validated-content"]
+        # …and the commit contains that snapshot, NOT the mid-window edit.
+        committed = subprocess.check_output(
+            ["git", "-C", str(tmp_path), "show", f"{sha}:agents/marker.txt"],
+        ).decode()
+        assert committed == "validated-content"
+        # The unvalidated edit stays in the worktree, uncommitted.
+        assert target.read_text() == "unvalidated-edit"
+
+    def test_refusal_unstages_and_reports_errors(self, tmp_path):
+        from config_git import commit_config_checked, init_repo
+
+        _seed(tmp_path)
+        init_repo(str(tmp_path))
+        head_before = subprocess.check_output(
+            ["git", "-C", str(tmp_path), "rev-parse", "HEAD"],
+        ).decode().strip()
+        (tmp_path / "agents" / "marker.txt").write_text(
+            "broken", encoding="utf-8")
+
+        sha, errors = commit_config_checked(
+            str(tmp_path), "refused", lambda tree: ["schema says no"])
+        assert sha == ""
+        assert errors == ["schema says no"]
+        head_after = subprocess.check_output(
+            ["git", "-C", str(tmp_path), "rev-parse", "HEAD"],
+        ).decode().strip()
+        assert head_after == head_before          # nothing committed
+        # The change is back to unstaged (index reset), worktree intact.
+        status = subprocess.check_output(
+            ["git", "-C", str(tmp_path), "status", "--porcelain"],
+        ).decode()
+        assert " M agents/marker.txt" in status
+        assert (tmp_path / "agents" / "marker.txt").read_text() == "broken"
+
+    def test_error_paths_are_rewritten_to_config_dir(self, tmp_path):
+        """Validator messages carry the export-tree tmp path; the caller
+        (and the operator reading the refusal) must see /config-relative
+        paths instead."""
+        from config_git import commit_config_checked, init_repo
+
+        _seed(tmp_path)
+        init_repo(str(tmp_path))
+        (tmp_path / "agents" / "marker.txt").write_text(
+            "broken", encoding="utf-8")
+
+        def validator(tree):
+            return [f"{tree}/agents/marker.txt: invalid"]
+
+        _sha, errors = commit_config_checked(
+            str(tmp_path), "refused", validator)
+        assert errors == [f"{tmp_path}/agents/marker.txt: invalid"]
+
+    def test_noop_skips_validation(self, tmp_path):
+        from config_git import commit_config_checked, init_repo
+
+        _seed(tmp_path)
+        init_repo(str(tmp_path))
+        calls = []
+        sha, errors = commit_config_checked(
+            str(tmp_path), "noop", lambda tree: calls.append(tree) or [])
+        assert (sha, errors) == ("", [])
+        assert calls == []

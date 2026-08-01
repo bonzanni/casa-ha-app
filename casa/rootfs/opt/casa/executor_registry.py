@@ -49,10 +49,17 @@ class ExecutorRegistry:
         """
         from agent_loader import LoadError, load_all_executors
 
-        self._defs.clear()
-        self._disabled.clear()
-        self._disabled_defs.clear()
-        self._failed_types.clear()
+        # #351: build into FRESH structures and swap only on success. The
+        # pre-fix clear-then-scan meant any non-LoadError escaping the scan
+        # (a transient PermissionError listing the dir) left the live
+        # registry already emptied — every executor definition gone until a
+        # later successful reload. An unexpected exception now propagates
+        # with the previous state intact (reload surfaces it as load_error;
+        # boot behavior is unchanged — it never caught these either).
+        defs: dict[str, ExecutorDefinition] = {}
+        disabled: set[str] = set()
+        disabled_defs: dict[str, ExecutorDefinition] = {}
+        failed_types: set[str] = set()
 
         base = os.path.dirname(self._dir)
         try:
@@ -64,7 +71,7 @@ class ExecutorRegistry:
 
         # v0.37.1 B-1b: per-file failures don't poison siblings.
         for name, err in failed:
-            self._failed_types.add(name)
+            failed_types.add(name)
             logger.error(
                 "Executor %r failed to load: %s; other executors continue",
                 name, err,
@@ -73,14 +80,19 @@ class ExecutorRegistry:
         for type_name, defn in found.items():
             if not defn.enabled:
                 logger.info("Executor %r bundled but disabled", type_name)
-                self._disabled.add(type_name)
-                self._disabled_defs[type_name] = defn
+                disabled.add(type_name)
+                disabled_defs[type_name] = defn
                 continue
-            self._defs[type_name] = defn
+            defs[type_name] = defn
             logger.info(
                 "Executor %r loaded (model=%s driver=%s)",
                 type_name, defn.model, defn.driver,
             )
+
+        self._defs = defs
+        self._disabled = disabled
+        self._disabled_defs = disabled_defs
+        self._failed_types = failed_types
 
         logger.info(
             "Executors: loaded=%s failed=%s disabled=%s",

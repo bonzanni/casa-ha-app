@@ -1789,7 +1789,7 @@ class TestDisabledSpecialistReload:
                             lambda *a, **kw: MagicMock())
         built = MagicMock()
         monkeypatch.setattr(reload_mod, "_construct_agent",
-                            lambda *, cfg, runtime: built)
+                            lambda *, cfg, runtime, **kw: built)
         from agent_registry import AgentRegistry
         monkeypatch.setattr(AgentRegistry, "build",
                             classmethod(lambda cls, **kw: MagicMock()))
@@ -2581,3 +2581,269 @@ class TestRestartToSwapGuardCascades:
         assert runtime.role_configs["gary"].channels == ["telegram", "webhook"]
         # ...and the trigger registry was never touched.
         runtime.trigger_registry.reregister_for.assert_not_called()
+
+
+class TestReloadIssue327:
+    """#327: four correctness gaps in the scoped reload path."""
+
+    def _resident_cfg(self, role, *, triggers=None, channels=None):
+        from types import SimpleNamespace
+        return SimpleNamespace(
+            role=role,
+            character=SimpleNamespace(name=role.title(), card=""),
+            triggers=list(triggers or []), channels=list(channels or []),
+            memory=SimpleNamespace(read_strategy="per_turn"),
+        )
+
+    async def test_added_resident_registers_its_triggers(
+        self, tmp_path, monkeypatch,
+    ):
+        """#327(a): a resident added via scope=agents must get its declared
+        triggers wired — pre-fix the bulk add path installed config/agent/
+        bus but never called the trigger registry, so cron/interval/webhook
+        triggers silently never fired until a restart."""
+        from types import SimpleNamespace
+        from reload import dispatch, register_handler, reload_agents
+        register_handler("agents", reload_agents)
+
+        agents_dir = tmp_path / "agents"
+        agents_dir.mkdir()
+        (agents_dir / "newcomer").mkdir()
+
+        trig = SimpleNamespace(name="daily", type="cron")
+        new_cfg = self._resident_cfg(
+            "newcomer", triggers=[trig], channels=["telegram"])
+        monkeypatch.setattr("agent_loader.load_agent_from_dir",
+                            lambda *a, **kw: new_cfg)
+        monkeypatch.setattr("policies.load_policies", lambda *a, **kw: MagicMock())
+        monkeypatch.setattr("agent_home.provision_agent_home",
+                            lambda **kw: None)
+        import reload as reload_mod
+        monkeypatch.setattr(reload_mod, "_construct_agent",
+                            lambda **kw: MagicMock())
+
+        runtime = _make_runtime()
+        runtime.config_dir = str(tmp_path)
+        runtime.agents_dir = str(agents_dir)
+        runtime.role_configs = {}
+        runtime.specialist_registry.all_configs = lambda: {}
+        runtime.trigger_registry.reregister_for = MagicMock()
+
+        result = await dispatch("agents", runtime=runtime)
+        assert result["status"] == "ok"
+        assert "newcomer" in runtime.agents
+        runtime.trigger_registry.reregister_for.assert_any_call(
+            "newcomer", [trig], ["telegram"],
+        )
+        assert any("registered_triggers_newcomer" == a
+                   for a in result["actions"])
+
+    async def test_added_resident_trigger_failure_is_surfaced_not_fatal(
+        self, tmp_path, monkeypatch,
+    ):
+        """#327(a): a bad trigger on an added resident must not kill the
+        sweep, but the failure must be visible in the action trail."""
+        from types import SimpleNamespace
+        from reload import dispatch, register_handler, reload_agents
+        register_handler("agents", reload_agents)
+
+        agents_dir = tmp_path / "agents"
+        agents_dir.mkdir()
+        (agents_dir / "newcomer").mkdir()
+
+        trig = SimpleNamespace(name="bad", type="cron")
+        new_cfg = self._resident_cfg(
+            "newcomer", triggers=[trig], channels=["telegram"])
+        monkeypatch.setattr("agent_loader.load_agent_from_dir",
+                            lambda *a, **kw: new_cfg)
+        monkeypatch.setattr("policies.load_policies", lambda *a, **kw: MagicMock())
+        monkeypatch.setattr("agent_home.provision_agent_home",
+                            lambda **kw: None)
+        import reload as reload_mod
+        monkeypatch.setattr(reload_mod, "_construct_agent",
+                            lambda **kw: MagicMock())
+
+        runtime = _make_runtime()
+        runtime.config_dir = str(tmp_path)
+        runtime.agents_dir = str(agents_dir)
+        runtime.role_configs = {}
+        runtime.specialist_registry.all_configs = lambda: {}
+        from trigger_registry import TriggerError
+        runtime.trigger_registry.reregister_for = MagicMock(
+            side_effect=TriggerError("bad cron"))
+
+        result = await dispatch("agents", runtime=runtime)
+        assert result["status"] == "ok"          # sweep survives
+        assert "newcomer" in runtime.agents      # agent still added
+        assert any(a.startswith("trigger_register_failed_newcomer")
+                   for a in result["actions"])
+
+    async def test_reload_agent_surfaces_reregister_failure(
+        self, tmp_path, monkeypatch,
+    ):
+        """#327(b): reload_agent must surface a reregister failure as
+        kind=reregister_failed — pre-fix it logged and returned ok while
+        the role was left with no (or partial) triggers."""
+        from reload import dispatch, register_handler, reload_agent
+        register_handler("agent", reload_agent)
+
+        agents_dir = tmp_path / "agents"
+        (agents_dir / "ellen").mkdir(parents=True)
+
+        new_cfg = self._resident_cfg(
+            "ellen", triggers=[MagicMock()], channels=["telegram"])
+        new_agent = MagicMock()
+        monkeypatch.setattr("agent_loader.load_agent_from_dir",
+                            lambda *a, **kw: new_cfg)
+        monkeypatch.setattr("policies.load_policies", lambda *a, **kw: MagicMock())
+        import reload as reload_mod
+        monkeypatch.setattr(reload_mod, "_construct_agent",
+                            lambda **kw: new_agent)
+
+        runtime = _make_runtime()
+        runtime.config_dir = str(tmp_path)
+        runtime.agents_dir = str(agents_dir)
+        runtime.role_configs["ellen"] = self._resident_cfg("ellen")
+        from trigger_registry import TriggerError
+        runtime.trigger_registry.reregister_for = MagicMock(
+            side_effect=TriggerError("bad cron"))
+
+        result = await dispatch("agent", runtime=runtime, role="ellen")
+        assert result["status"] == "error"
+        assert result["kind"] == "reregister_failed"
+        # The swap itself DID land (config + agent) — the error is about
+        # the trigger state, and the message must say so.
+        assert runtime.agents["ellen"] is new_agent
+        assert "trigger" in result["message"].lower()
+
+    async def test_specialist_constructed_with_registry_including_itself(
+        self, tmp_path, monkeypatch,
+    ):
+        """#327(c): the Agent must be constructed AGAINST a registry that
+        already contains its own specialist:<role> tier — Agent retains the
+        registry object, so a stale registry makes its lazy plugin
+        resolution tier-miss to resident:<role> forever."""
+        from reload import dispatch, register_handler, reload_agent
+        register_handler("agent", reload_agent)
+
+        agents_dir = tmp_path / "agents"
+        (agents_dir / "specialists" / "newspec").mkdir(parents=True)
+
+        new_cfg = self._resident_cfg("newspec", channels=[])
+        monkeypatch.setattr("agent_loader.load_agent_from_dir",
+                            lambda *a, **kw: new_cfg)
+        monkeypatch.setattr("policies.load_policies", lambda *a, **kw: MagicMock())
+
+        seen = {}
+
+        import reload as reload_mod
+
+        def spy_construct(**kw):
+            seen.update(kw)
+            return MagicMock()
+
+        monkeypatch.setattr(reload_mod, "_construct_agent", spy_construct)
+
+        runtime = _make_runtime()
+        runtime.config_dir = str(tmp_path)
+        runtime.agents_dir = str(agents_dir)
+        runtime.role_configs = {}
+        runtime.specialist_registry.load = MagicMock()
+        runtime.specialist_registry.all_configs = lambda: {"newspec": new_cfg}
+
+        result = await dispatch("agent", runtime=runtime, role="newspec")
+        assert result["status"] == "ok"
+        reg = seen.get("agent_registry")
+        assert reg is not None, (
+            "constructed without an explicit agent_registry — the Agent "
+            "would retain the stale pre-reload registry")
+        assert reg.tier_for_role("newspec") == "specialist"
+        # The runtime's registry is the SAME fresh object post-swap.
+        assert runtime.agent_registry is reg
+
+    async def test_backfilled_specialist_constructed_with_fresh_registry(
+        self, tmp_path, monkeypatch,
+    ):
+        """#327(c), agents-sweep arm: the backfill construction must see the
+        POST-rescan registry (rebuilt before the backfill loop), so the new
+        specialist resolves its own specialist:<role> plugin tier."""
+        from reload import dispatch, register_handler, reload_agents
+        register_handler("agents", reload_agents)
+
+        agents_dir = tmp_path / "agents"
+        agents_dir.mkdir()
+        (agents_dir / "specialists" / "newspec").mkdir(parents=True)
+
+        new_cfg = self._resident_cfg("newspec")
+        monkeypatch.setattr("policies.load_policies", lambda *a, **kw: MagicMock())
+        monkeypatch.setattr("agent_home.provision_agent_home",
+                            lambda **kw: None)
+
+        constructed = []
+
+        import reload as reload_mod
+
+        def spy_construct(**kw):
+            constructed.append(kw)
+            return MagicMock()
+
+        monkeypatch.setattr(reload_mod, "_construct_agent", spy_construct)
+
+        runtime = _make_runtime()
+        runtime.config_dir = str(tmp_path)
+        runtime.agents_dir = str(agents_dir)
+        runtime.role_configs = {}
+        runtime.specialist_registry.load = MagicMock()
+        runtime.specialist_registry.all_configs = lambda: {"newspec": new_cfg}
+        runtime.specialist_registry.load_failures = lambda: []
+
+        result = await dispatch("agents", runtime=runtime)
+        assert result["status"] == "ok"
+        assert constructed, "backfill never constructed the specialist"
+        # The registry handed to construction (retained by the Agent for
+        # its lazy plugin resolution) must ALREADY know the specialist —
+        # the end-of-sweep rebuild is too late for the retained object.
+        reg = constructed[0].get("agent_registry")
+        assert reg is not None, (
+            "backfill constructed without an explicit agent_registry — the "
+            "Agent would retain the stale pre-rescan registry")
+        assert reg.tier_for_role("newspec") == "specialist"
+
+    async def test_policies_cascade_holds_per_role_agent_lock(
+        self, tmp_path, monkeypatch,
+    ):
+        """#327(d): the policies cascade must serialize each role's swap
+        with that role's agent-scope lock — pre-fix an in-flight agent
+        reload could suspend, lose to a policies cascade, then install its
+        stale-policy agent afterwards while both reported success."""
+        import reload as reload_mod
+        from reload import _get_lock, dispatch, register_handler, reload_policies
+        register_handler("policies", reload_policies)
+
+        cascaded = []
+
+        async def fake_role_reload(runtime, r):
+            cascaded.append(r)
+
+        monkeypatch.setattr(
+            reload_mod, "_reload_role_after_policies", fake_role_reload)
+        monkeypatch.setattr("policies.load_policies", lambda *a, **kw: MagicMock())
+
+        runtime = _make_runtime()
+        runtime.config_dir = str(tmp_path)
+        runtime.role_configs = {"ellen": MagicMock()}
+        runtime.specialist_registry.all_configs = lambda: {}
+
+        lock = _get_lock("agent:ellen")
+        await lock.acquire()
+        try:
+            task = asyncio.create_task(dispatch("policies", runtime=runtime))
+            await asyncio.sleep(0.05)
+            assert cascaded == [], (
+                "cascade swapped ellen while the agent:ellen lock was held "
+                "by a concurrent agent-scope reload")
+        finally:
+            lock.release()
+        result = await task
+        assert result["status"] == "ok"
+        assert cascaded == ["ellen"]
