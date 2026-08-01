@@ -300,14 +300,23 @@ class InCasaDriver(DriverProtocol):
                         and self._persist_session_id is not None
                         and engagement.sdk_session_id != sid
                     ):
+                        # #302: mark the ID persisted ONLY after the durable
+                        # write succeeded. Setting it on failure defeated the
+                        # same-sid retry guard above — the in-memory record
+                        # looked current while the registry never received
+                        # the ID, and a restart could not resume the session.
+                        # On failure the next message carrying the same sid
+                        # retries the persist.
                         try:
                             await self._persist_session_id(engagement.id, sid)
                         except Exception as exc:  # noqa: BLE001
                             logger.warning(
-                                "Engagement %s persist_session_id failed: %s",
+                                "Engagement %s persist_session_id failed "
+                                "(retried on the next message): %s",
                                 engagement.id[:8], exc,
                             )
-                        engagement.sdk_session_id = sid
+                        else:
+                            engagement.sdk_session_id = sid
                     # Phase 4b dispatch — wrapped in try/except so a
                     # malformed block does not abort the rest of the turn.
                     try:

@@ -928,12 +928,24 @@ class EngagementRegistry:
             await self._write_tombstone_locked()
 
     async def persist_session_id(self, engagement_id: str, session_id: str) -> None:
+        """#302: STRICT persistence with rollback. The driver's retry guard
+        compares ``engagement.sdk_session_id`` against the observed sid — and
+        ``engagement`` usually IS this registry's record object, so a swallowed
+        write failure that left the field mutated would silently disable every
+        later retry while the durable file never received the ID (the record
+        could not resume after a restart). A failed write restores the prior
+        value and PROPAGATES so the caller knows to retry."""
         async with self._lock:
             rec = self._records.get(engagement_id)
             if rec is None:
                 return
+            prior = rec.sdk_session_id
             rec.sdk_session_id = session_id
-            await self._write_tombstone_locked()
+            try:
+                await self._write_tombstone_locked(strict=True)
+            except Exception:
+                rec.sdk_session_id = prior
+                raise
 
     async def set_channel_state(
         self,
@@ -1467,7 +1479,18 @@ class EngagementRegistry:
                         "sweep: driver.cancel(%s) failed: %s", rec.id[:8], exc,
                     )
                 if session_id is not None:
-                    await self.persist_session_id(rec.id, session_id)
+                    # #302: persist_session_id is STRICT now. The client is
+                    # already cancelled, so on a failed write we still mark
+                    # idle (nothing can be undone) — the session id is then
+                    # lost to a restart, WARN says so.
+                    try:
+                        await self.persist_session_id(rec.id, session_id)
+                    except Exception as exc:  # noqa: BLE001
+                        logger.warning(
+                            "sweep: session-id persist for %s failed — the "
+                            "suspended session cannot resume across a "
+                            "restart: %s", rec.id[:8], exc,
+                        )
                 await self.mark_idle(rec.id)
 
             # 2) Idle reminder

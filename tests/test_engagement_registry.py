@@ -284,6 +284,27 @@ class TestRegistryStateTransitions:
         await reg.persist_session_id(rec.id, "sess-abc")
         assert rec.sdk_session_id == "sess-abc"
 
+    async def test_persist_session_id_failure_raises_and_rolls_back(
+        self, tmp_path, monkeypatch,
+    ):
+        """#302: a swallowed tombstone-write failure made the in-memory record
+        look current while the durable registry never received the session ID
+        — after a restart the engagement could not resume. The write is strict
+        and the record mutation rolls back so the driver's same-sid retry
+        guard fires again."""
+        from engagement_registry import EngagementRegistry
+
+        reg = EngagementRegistry(tombstone_path=str(tmp_path / "e.json"), bus=None)
+        rec = await reg.create("specialist", "finance", "in_casa", "t", {}, 1)
+
+        def boom(snapshot):
+            raise OSError("disk full")
+
+        monkeypatch.setattr(reg, "_write_tombstone", boom)
+        with pytest.raises(OSError):
+            await reg.persist_session_id(rec.id, "sess-abc")
+        assert rec.sdk_session_id is None
+
     async def test_mark_error_captures_kind(self, tmp_path):
         from engagement_registry import EngagementRegistry
 
