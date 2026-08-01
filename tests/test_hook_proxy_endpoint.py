@@ -294,6 +294,43 @@ class TestHooksResolveEngagementAuth:
         assert [c[0] for c in calls] == ["default"]
         assert calls[0][1].get("casa_engagement_id") is None
 
+    async def test_non_string_cwd_never_500s(self):
+        """Terra r1: a non-string truthy cwd (e.g. a list) used to raise
+        TypeError in the cwd regex OUTSIDE the deny wrapper — HTTP 500, which
+        the shim's transport fail-open converts into an ALLOW. Malformed cwd
+        is treated as absent (the field is advisory, never identity)."""
+        calls: list = []
+        registry = _Registry({ENG_A: _Rec()})
+        app = _auth_app(default_cb=_recorder(calls, "default"),
+                        exec_cb=_recorder(calls, "exec"), registry=registry)
+        async with TestServer(app) as srv, TestClient(srv) as client:
+            resp = await client.post("/hooks/resolve", json={
+                "policy": "p",
+                "payload": {"tool_name": "Bash", "cwd": ["x"]},
+                "engagement_id": ENG_A, "engagement_token": "tok-A",
+            })
+            assert resp.status == 200
+            assert await resp.json() == {}
+        assert [c[0] for c in calls] == ["exec"]
+
+    async def test_non_string_tool_name_denies_not_500(self):
+        """Terra r1 (same class): a non-string tool_name raised in
+        re.fullmatch — 500 — fail-open via the shim. Must be a structured
+        deny."""
+        calls: list = []
+        registry = _Registry({ENG_A: _Rec()})
+        app = _auth_app(default_cb=_recorder(calls, "default"),
+                        exec_cb=_recorder(calls, "exec"), registry=registry)
+        async with TestServer(app) as srv, TestClient(srv) as client:
+            resp = await client.post("/hooks/resolve", json={
+                "policy": "p",
+                "payload": {"tool_name": 123},
+            })
+            assert resp.status == 200
+            out = (await resp.json())["hookSpecificOutput"]
+        assert out["permissionDecision"] == "deny"
+        assert calls == []
+
     async def test_callback_receives_authenticated_identity_in_context(self):
         calls: list = []
         registry = _Registry({ENG_A: _Rec()})

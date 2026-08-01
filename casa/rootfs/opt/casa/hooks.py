@@ -2058,8 +2058,12 @@ _ENG_CWD_RE = re.compile(
 def _engagement_id_from_cwd(cwd: str) -> str | None:
     """Extract the 32-hex engagement id from a cwd path.
 
-    Returns None when cwd is not under ``/data/engagements/<id>/...``.
+    Returns None when cwd is not under ``/data/engagements/<id>/...`` — or
+    when the value is not a string at all (Terra r1: a caller-supplied
+    non-string must degrade to "no claim", never raise past a deny wrapper).
     """
+    if not isinstance(cwd, str):
+        return None
     m = _ENG_CWD_RE.match(cwd or "")
     return m.group(1) if m else None
 

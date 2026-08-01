@@ -324,8 +324,14 @@ def _make_internal_hooks_resolve_handler(
                 auth_rec = rec
                 auth_eng_id = str(eng_id_claim)
 
+        # Terra r1: a non-string truthy cwd (list, dict) must not raise in
+        # the regex — that TypeError escaped the deny wrapper as a 500,
+        # which the shim's transport fail-open converts into an ALLOW.
+        # cwd is advisory, never identity: malformed ⇒ treated as absent.
         from hooks import _engagement_id_from_cwd
-        cwd_id = _engagement_id_from_cwd(payload.get("cwd") or "")
+        raw_cwd = payload.get("cwd")
+        cwd_id = _engagement_id_from_cwd(
+            raw_cwd if isinstance(raw_cwd, str) else "")
         if (auth_eng_id is not None and cwd_id is not None
                 and cwd_id != auth_eng_id):
             logger.warning(
@@ -367,6 +373,18 @@ def _make_internal_hooks_resolve_handler(
         matcher_regex, callback = entry
 
         tool_name = payload.get("tool_name", "")
+        if not isinstance(tool_name, str):
+            # Terra r1: non-string tool_name raised in re.fullmatch — a 500
+            # the shim fails open on. The matcher is the dispatch gate, so a
+            # malformed tool identity is a structured deny, never a crash.
+            return web.json_response(
+                {"hookSpecificOutput": {
+                    "hookEventName": "PreToolUse",
+                    "permissionDecision": "deny",
+                    "permissionDecisionReason":
+                        "internal/hooks/resolve: tool_name must be a string",
+                }},
+            )
         if not _re.fullmatch(matcher_regex, tool_name):
             return web.json_response({})  # empty = allow
 
