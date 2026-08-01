@@ -212,31 +212,48 @@ def commit_config_checked(
             # writer (SSH operator) landed mid-window, which even the old
             # add-then-commit flow could never do. The caller surfaces the
             # git error; a retry re-runs the gate on the new HEAD.
-            _run(config_dir, ["update-ref", "HEAD", sha, head])
             # Refresh the real index ONLY for the paths this commit touched
             # (Terra/Sol r2-1: a full `git reset` would also drop an
             # operator's concurrently staged unrelated entry). Unchanged
             # paths keep index entries identical to the new HEAD, so no
             # phantom diffs appear; a concurrent stage of a path we DID
             # commit is superseded (its content survives in the worktree).
+            #
+            # Sol r3-1: entries carry `:(literal)` pathspec magic — a bare
+            # name from diff-tree would be interpreted as a GLOB by reset
+            # (`foo[1].yaml` matching `foo1.yaml`, refreshing the wrong
+            # entry and dropping unrelated staging).
+            #
+            # Sol r3-2 (ordering): the refresh targets the NEW commit and
+            # runs BEFORE the ref update. With the old order there was a
+            # window (new HEAD, old index) where an external `git commit`
+            # would build a child tree from the stale index, silently
+            # reverting every Casa-touched path. With this order the same
+            # external commit either lands before the CAS (carrying the
+            # already-refreshed validated content) and the CAS refuses —
+            # caller retries and no-ops — or lands after and is untouched.
             changed = subprocess.run(
                 ["git", "diff-tree", "--no-commit-id", "--name-only",
                  "-z", "-r", sha],
                 cwd=config_dir, capture_output=True, text=True, check=True,
             ).stdout
+            spec = "\0".join(
+                f":(literal){p}" for p in changed.split("\0") if p
+            )
             refresh = subprocess.run(
-                ["git", "reset", "-q", "HEAD", "--pathspec-file-nul",
+                ["git", "reset", "-q", sha, "--pathspec-file-nul",
                  "--pathspec-from-file=-"],
-                cwd=config_dir, capture_output=True, text=True, input=changed,
+                cwd=config_dir, capture_output=True, text=True, input=spec,
             )
             if refresh.returncode != 0:
-                # Sol r2-1b: surface, don't swallow — the commit landed;
-                # stale index entries for these paths self-heal on the next
-                # stage (every Casa flow stages with add -A).
+                # Sol r2-1b: surface, don't swallow — the commit is still
+                # valid; stale index entries for these paths self-heal on
+                # the next stage (every Casa flow stages with add -A).
                 logger.warning(
-                    "config commit %s landed but the index refresh failed: "
-                    "%s", sha[:8], refresh.stderr.strip(),
+                    "config commit %s: index refresh failed: %s",
+                    sha[:8], refresh.stderr.strip(),
                 )
+            _run(config_dir, ["update-ref", "HEAD", sha, head])
         return sha, []
 
 

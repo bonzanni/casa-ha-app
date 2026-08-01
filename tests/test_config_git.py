@@ -528,3 +528,31 @@ class TestRestoreFileBadSha:
         # Exactly the operator's staged add remains — nothing else dirty,
         # no phantom staged deletions from an over-broad reset.
         assert status == ["A  agents/other.txt"]
+
+    def test_glob_looking_filenames_are_treated_literally(self, tmp_path):
+        """Sol r3-1: reset pathspecs must be literal — a committed
+        `foo[1].txt` must not glob-match a concurrently staged `foo1.txt`
+        (dropping its staging) nor miss its own refresh."""
+        from config_git import commit_config_checked, init_repo
+
+        _seed(tmp_path)
+        init_repo(str(tmp_path))
+        (tmp_path / "agents" / "foo[1].txt").write_text(
+            "globby name", encoding="utf-8")
+        sibling = tmp_path / "agents" / "foo1.txt"
+
+        def validator(tree):
+            sibling.write_text("operator work", encoding="utf-8")
+            subprocess.check_call(
+                ["git", "-C", str(tmp_path), "add", "agents/foo1.txt"])
+            return []
+
+        sha, errors = commit_config_checked(
+            str(tmp_path), "globby", validator)
+        assert errors == [] and sha
+        status = subprocess.check_output(
+            ["git", "-C", str(tmp_path), "status", "--porcelain"],
+        ).decode().splitlines()
+        # The sibling's staging survives; the committed globby file is
+        # fully refreshed (absent from status).
+        assert status == ["A  agents/foo1.txt"]
