@@ -221,6 +221,20 @@ def _build_hooks_handler(*, forward_to_internal: ForwardCallable):
                 }},
             )
 
+        # #366: the engagement credential rides the same header pair the MCP
+        # endpoint uses (hook_proxy.sh reads it from the caller's own
+        # workspace .mcp.json). The forwarded body is REBUILT here — never
+        # passed through — so a caller cannot smuggle identity fields in the
+        # body past the header contract.
+        if isinstance(body, dict):
+            body = {
+                "policy": body.get("policy"),
+                "payload": body.get("payload"),
+                "engagement_id": request.headers.get("X-Casa-Engagement-Id"),
+                "engagement_token": request.headers.get(
+                    "X-Casa-Engagement-Token"),
+            }
+
         try:
             # timeout_s=None: defer to casa-main's policy-driven timeout
             # (e.g. engagement_permission_relay declares 600s in hooks.yaml).

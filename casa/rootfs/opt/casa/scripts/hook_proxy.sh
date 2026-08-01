@@ -27,11 +27,37 @@ BODY=$(jq -nc --arg p "$POLICY" --argjson pl "$PAYLOAD" \
   exit 0
 }
 
+# #366: present the engagement credential provisioned into THIS workspace's
+# .mcp.json (the single source of truth — record creation bakes it in and
+# boot replay refreshes it) so Casa authenticates the engagement identity
+# instead of trusting the payload's cwd claim. CC runs command hooks in the
+# CLI's working directory (the engagement workspace — the run script cd's
+# there) with CLAUDE_PROJECT_DIR set; either way the path is OUR workspace,
+# so we can only ever present our own credential. Missing/malformed file or
+# out-of-shape values ⇒ no identity headers (Casa treats the request as
+# unauthenticated and identity-consuming policies fail closed).
+WS="${CLAUDE_PROJECT_DIR:-$PWD}"
+EID=$(jq -r '.mcpServers["casa-framework"].headers["X-Casa-Engagement-Id"] // empty' \
+      "$WS/.mcp.json" 2>/dev/null) || EID=""
+TOK=$(jq -r '.mcpServers["casa-framework"].headers["X-Casa-Engagement-Token"] // empty' \
+      "$WS/.mcp.json" 2>/dev/null) || TOK=""
+# Shape guards double as header-injection guards (no CR/LF/ctrl can pass):
+# the id is 32 lowercase hex; the token is token_urlsafe ([A-Za-z0-9_-]).
+case "$EID" in *[!0-9a-f]*|"") EID="";; esac
+[ "${#EID}" -eq 32 ] 2>/dev/null || EID=""
+case "$TOK" in *[!A-Za-z0-9_-]*|"") TOK="";; esac
+
+set --
+if [ -n "$EID" ] && [ -n "$TOK" ]; then
+  set -- -H "X-Casa-Engagement-Id: $EID" -H "X-Casa-Engagement-Token: $TOK"
+fi
+
 # Plan 4b/3.6: route hook-resolve via svc-casa-mcp on port 8100. Older
 # workspaces baked the URL into this file at provisioning time and are
 # unaffected. CASA_HOOK_RESOLVE_URL env var override exists for ops use.
 RESP=$(curl -sf -X POST \
      -H "Content-Type: application/json" \
+     "$@" \
      --data-binary "$BODY" \
      "${CASA_HOOK_RESOLVE_URL:-http://127.0.0.1:8100/hooks/resolve}" 2>&1) || {
   # On any transport error, allow by default — the hook should not block

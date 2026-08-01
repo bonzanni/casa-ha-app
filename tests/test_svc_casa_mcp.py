@@ -181,12 +181,56 @@ async def test_svc_hooks_resolve_forwards_body_to_internal() -> None:
         )
         body = await resp.json()
         assert body["hookSpecificOutput"]["permissionDecision"] == "allow"
-        # forward_call received the body as-is.
+        # forward_call received the policy/payload as-is; with no identity
+        # headers the credential fields ride along as None (#366, mirroring
+        # the tools/call contract).
         call_args = fwd.call_args
         assert call_args.kwargs["path"] == "/internal/hooks/resolve"
         assert call_args.kwargs["body"] == {
             "policy": "allow_all", "payload": {"tool_name": "Bash"},
+            "engagement_id": None, "engagement_token": None,
         }
+
+
+async def test_svc_hooks_resolve_injects_engagement_headers_into_body() -> None:
+    """#366: the engagement credential provisioned into the workspace
+    .mcp.json arrives as headers (same pair the MCP endpoint uses) and must
+    ride to casa-main as body fields — the internal handler authenticates the
+    id claim against the record before any identity-consuming callback runs."""
+    fwd = AsyncMock(return_value=(200, {}))
+    app = _make_svc_app(tools=[], forward_call=fwd)
+    async with TestClient(TestServer(app)) as client:
+        resp = await client.post(
+            "/hooks/resolve",
+            json={"policy": "p", "payload": {"tool_name": "Bash"}},
+            headers={"X-Casa-Engagement-Id": "e" * 32,
+                     "X-Casa-Engagement-Token": "tok-abc"},
+        )
+        assert resp.status == 200
+        call_args = fwd.call_args
+        assert call_args.kwargs["body"] == {
+            "policy": "p", "payload": {"tool_name": "Bash"},
+            "engagement_id": "e" * 32,
+            "engagement_token": "tok-abc",
+        }
+
+
+async def test_svc_hooks_resolve_body_identity_cannot_bypass_headers() -> None:
+    """#366: identity comes from the HEADERS this service reads — a body that
+    arrives already carrying engagement_id/engagement_token (a forger POSTing
+    the internal shape at the public route) is overwritten, never trusted."""
+    fwd = AsyncMock(return_value=(200, {}))
+    app = _make_svc_app(tools=[], forward_call=fwd)
+    async with TestClient(TestServer(app)) as client:
+        await client.post(
+            "/hooks/resolve",
+            json={"policy": "p", "payload": {"tool_name": "Bash"},
+                  "engagement_id": "f" * 32,
+                  "engagement_token": "forged"},
+        )
+        call_args = fwd.call_args
+        assert call_args.kwargs["body"]["engagement_id"] is None
+        assert call_args.kwargs["body"]["engagement_token"] is None
 
 
 async def test_svc_hooks_resolve_socket_unreachable_fails_closed() -> None:
