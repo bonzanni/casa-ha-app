@@ -105,7 +105,11 @@ The pre-commit config gate replays the same registration into a throwaway regist
 trigger set that passes the schema but cannot register — duplicate names, an undeclared
 channel, an out-of-range cron field — is refused at commit time rather than discovered as
 a boot loop. Re-registration later behaves differently: the old entries are removed first,
-so a failure partway can leave that role with fewer triggers than it started with.
+and a failure partway unwinds the partially-installed replacements too, leaving the role
+with *no* triggers — the fail-closed state the reload error reports. The one exception is a
+scheduler that refuses to *remove* an existing job: re-registration then refuses, the stuck
+job stays live and tracked while the role's webhook entries are already unregistered, and
+the error names exactly the jobs that remain.
 
 **The approval store is missing or corrupt.** Treated as no approvals. Pending routes stay
 absent rather than opening.

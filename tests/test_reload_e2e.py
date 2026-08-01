@@ -114,7 +114,7 @@ class TestReloadE2E:
         def fake_load(*args, **kwargs):
             return v1_cfg if load_calls["n"] == 0 else v2_cfg
 
-        def fake_construct(*, cfg, runtime):
+        def fake_construct(*, cfg, runtime, **kw):
             return v1_agent if cfg is v1_cfg else v2_agent
 
         monkeypatch.setattr(

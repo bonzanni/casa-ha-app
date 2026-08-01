@@ -10,7 +10,16 @@ if [ "$_public_url" = "null" ] || [ -z "$_public_url" ]; then
 else
     export PUBLIC_URL="$_public_url"
 fi
-export CLAUDE_CODE_OAUTH_TOKEN="$(bashio::config 'claude_oauth_token')"
+# #291: normalize EVERY optional/defaulted option export the same way. A
+# key deleted from the stored options (or a future edit dropping a default)
+# makes bashio return the literal string "null", which downstream truthy
+# checks accept — e.g. `op` invoked with token "null", or a vault named
+# "null". Options with an options-block default are safe TODAY (bashio
+# returns the default), but the guard is what makes that durable.
+_cc_oauth="$(bashio::config 'claude_oauth_token')"
+[ "$_cc_oauth" = "null" ] && _cc_oauth=""
+export CLAUDE_CODE_OAUTH_TOKEN="$_cc_oauth"
+unset _cc_oauth
 # v0.131.0: CLI 2.1.219 changed the default nested-subagent spawn depth from
 # 1 to 3. This pin is LOAD-BEARING for the assistant resident, whose role
 # config ships `disallowed: []` (defaults/roles/resident/assistant/role.yaml)
@@ -20,8 +29,13 @@ export CLAUDE_CODE_OAUTH_TOKEN="$(bashio::config 'claude_oauth_token')"
 # agent's CLI subprocess (all use cli_path=/usr/local/bin/claude —
 # see claude_runtime.py).
 export CLAUDE_CODE_MAX_SUBAGENT_SPAWN_DEPTH=1
-export OP_SERVICE_ACCOUNT_TOKEN="$(bashio::config 'onepassword_service_account_token')"
-export ONEPASSWORD_DEFAULT_VAULT="$(bashio::config 'onepassword_default_vault')"
+_op_token="$(bashio::config 'onepassword_service_account_token')"
+[ "$_op_token" = "null" ] && _op_token=""
+export OP_SERVICE_ACCOUNT_TOKEN="$_op_token"
+_op_vault="$(bashio::config 'onepassword_default_vault')"
+[ "$_op_vault" = "null" ] && _op_vault=""
+export ONEPASSWORD_DEFAULT_VAULT="$_op_vault"
+unset _op_token _op_vault
 _hindsight_url="$(bashio::config 'hindsight_api_url')"
 if [ "$_hindsight_url" != "null" ] && [ -n "$_hindsight_url" ]; then
     export HINDSIGHT_API_URL="$_hindsight_url"
@@ -40,6 +54,7 @@ _tg_chat_id="$(bashio::config 'telegram_chat_id')"
 [ "$_tg_chat_id" = "null" ] && _tg_chat_id=""
 export TELEGRAM_CHAT_ID="$_tg_chat_id"
 _tg_transport="$(bashio::config 'telegram_transport')"
+[ "$_tg_transport" = "null" ] && _tg_transport=""
 export TELEGRAM_TRANSPORT="${_tg_transport:-polling}"
 _tg_supergroup="$(bashio::config 'telegram_engagement_supergroup_id')"
 [ "$_tg_supergroup" = "null" ] && _tg_supergroup=""
@@ -105,7 +120,10 @@ _casa_voice_model="$(bashio::config 'voice_agent_model')"
 export PRIMARY_AGENT_MODEL="$_casa_primary_model"
 export VOICE_AGENT_MODEL="$_casa_voice_model"
 unset _casa_primary_model _casa_voice_model
-export ENABLE_TERMINAL="$(bashio::config 'enable_terminal')"
+_enable_terminal="$(bashio::config 'enable_terminal')"
+[ "$_enable_terminal" = "null" ] && _enable_terminal="false"
+export ENABLE_TERMINAL="$_enable_terminal"
+unset _enable_terminal
 export CASA_VERSION="$(bashio::addon.version)"
 
 # 3.3: scheduler timezone — optional; timekeeping.resolve_tz() falls back
@@ -131,16 +149,21 @@ if [ "$_reap_days" != "null" ] && [ -n "$_reap_days" ]; then
 fi
 
 # Specialist concurrency/cost-alert options. Both ship with a default in the
-# options block above, so bashio never returns "null" here (unlike the
-# optional str?/int? options above) — export unconditionally, matching
-# TELEGRAM_ENGAGEMENT_SUPERGROUP_ID. casa_core.py still validates on top.
+# options block, but #291: a key deleted from the stored options still makes
+# bashio return "null" — normalize to empty so casa_core's guarded numeric
+# parse falls back to its own default instead of choking on the literal.
 #
 # v0.125.0 (#228): the four voice_* tuning options that used to be exported
 # here are gone. The turn budget is derived from the transport timeout in
 # channels/voice/channel.py; route freshness, delivery TTL and the route cap
 # are constants in voice_delivery_config.py.
-export SPECIALIST_MAX_CONCURRENCY="$(bashio::config 'specialist_max_concurrency')"
-export SPECIALIST_COST_ALERT_THRESHOLD="$(bashio::config 'specialist_cost_alert_threshold')"
+_spec_conc="$(bashio::config 'specialist_max_concurrency')"
+[ "$_spec_conc" = "null" ] && _spec_conc=""
+export SPECIALIST_MAX_CONCURRENCY="$_spec_conc"
+_spec_cost="$(bashio::config 'specialist_cost_alert_threshold')"
+[ "$_spec_cost" = "null" ] && _spec_cost=""
+export SPECIALIST_COST_ALERT_THRESHOLD="$_spec_cost"
+unset _spec_conc _spec_cost
 
 # SUPERVISOR_TOKEN is injected automatically by the HA Supervisor.
 

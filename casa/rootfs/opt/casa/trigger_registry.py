@@ -243,19 +243,17 @@ class TriggerRegistry:
         tool's fail-closed direct sweep)."""
         return dict(self._plugin_overlay)
 
-    def reregister_for(
-        self,
-        role: str,
-        triggers: list[TriggerSpec],
-        channels: list[str],
-    ) -> None:
-        """Remove this role's existing APScheduler jobs and webhook paths,
-        then re-wire from the supplied specs.
+    def _unwind_role(self, role: str) -> list[str]:
+        """Drop every scheduler job and webhook-allowlist entry owned by
+        *role*. Idempotent. Returns the job ids that could NOT be removed
+        (Terra r1-2): a failed ``remove_job`` used to be swallowed while the
+        id was dropped from tracking anyway — a zombie job kept firing while
+        the registry reported no triggers, and a same-id replacement would
+        collide. A stuck job stays tracked so the registry never lies; the
+        caller decides whether stuck jobs are fatal."""
+        from apscheduler.jobstores.base import JobLookupError
 
-        Fail-closed: if re-registration raises, the agent is left with NO
-        triggers (the unwind already happened). The caller should surface
-        the error.
-        """
+        stuck: list[str] = []
         prefix = f"{role}:"
         to_drop = [
             jid for jid in list(self._seen_job_ids) if jid.startswith(prefix)
@@ -263,8 +261,12 @@ class TriggerRegistry:
         for jid in to_drop:
             try:
                 self._scheduler.remove_job(jid)
+            except JobLookupError:
+                pass  # already absent — dropping the tracking is correct
             except Exception as exc:  # noqa: BLE001
                 logger.warning("remove_job %s failed: %s", jid, exc)
+                stuck.append(jid)
+                continue
             self._seen_job_ids.discard(jid)
             self._specs_by_job_id.pop(jid, None)
 
@@ -280,8 +282,58 @@ class TriggerRegistry:
                 self._webhook_clearances.pop(name, None)
                 self._webhook_auth_policies.pop(name, None)
         self._webhook_names_by_role[role] = []
+        return stuck
 
-        self.register_agent(role, triggers, channels)
+    def reregister_for(
+        self,
+        role: str,
+        triggers: list[TriggerSpec],
+        channels: list[str],
+    ) -> None:
+        """Remove this role's existing APScheduler jobs and webhook paths,
+        then re-wire from the supplied specs.
+
+        Fail-closed: if re-registration raises, the agent is left with NO
+        triggers. #307: register_agent stops at the offending entry, so the
+        replacement triggers installed before it must be unwound too —
+        without the second unwind, a `[valid, malformed]` list left the
+        valid trigger firing while the reload reported failure. Terra r1-2:
+        if the scheduler refuses to REMOVE an existing job, the old set is
+        still (partially) live — that raises here before any replacement is
+        installed, and the error says the old triggers remain. The caller
+        should surface the error either way.
+        """
+        stuck = self._unwind_role(role)
+        if stuck:
+            # Sol r2-2a: precise state disclosure — the unwind already
+            # evicted the role's webhook allowlist entries (pure dict ops
+            # that cannot fail), so only the STUCK JOBS remain live.
+            raise TriggerError(
+                f"agent {role!r}: could not remove existing scheduler "
+                f"job(s) {stuck} — those jobs remain live; every other "
+                f"trigger for the role (webhooks included) is now "
+                f"unregistered. Refusing re-registration to avoid "
+                f"zombie/duplicate jobs"
+            )
+        try:
+            self.register_agent(role, triggers, channels)
+        except Exception as exc:
+            leftover = self._unwind_role(role)
+            if leftover:
+                logger.error(
+                    "unwind after failed re-registration left job(s) live "
+                    "for role=%s: %s", role, leftover,
+                )
+                # Terra r2-2 / Sol r2-2b: the raised error must DISCLOSE the
+                # leftover live jobs — callers relay this message as the
+                # role's resulting trigger state.
+                raise TriggerError(
+                    f"{exc} — additionally, the post-failure unwind could "
+                    f"not remove job(s) {leftover}; those replacement "
+                    f"job(s) remain live while every other trigger for the "
+                    f"role is unregistered"
+                ) from exc
+            raise
 
     def list_jobs_for(
         self, role: str, within_hours: int,

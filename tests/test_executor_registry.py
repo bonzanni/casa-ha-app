@@ -124,3 +124,52 @@ class TestExecutorRegistryFailedLogging:
             for rec in caplog.records
             if rec.levelname == "INFO"
         ), "expected final summary log line with loaded=/failed=/disabled= shape"
+
+
+class TestLoadFailureKeepsRegistry:
+    def test_unexpected_scan_error_keeps_previous_registry(
+        self, tmp_path, monkeypatch,
+    ):
+        """#351: load() used to clear all collections BEFORE scanning and
+        caught only LoadError — a transient PermissionError while listing the
+        executors dir escaped with the registry already emptied, deleting
+        every executor definition until a later successful reload. The scan
+        must build into fresh structures and swap only on success."""
+        import agent_loader
+        from executor_registry import ExecutorRegistry
+
+        _write(str(tmp_path), "configurator")
+        r = ExecutorRegistry(str(tmp_path / "executors"))
+        r.load()
+        assert r.list_types() == ["configurator"]
+
+        def boom(base):
+            raise PermissionError("transient EACCES listing executors dir")
+
+        monkeypatch.setattr(agent_loader, "load_all_executors", boom)
+        with pytest.raises(PermissionError):
+            r.load()
+        # The live registry survives the failed scan untouched.
+        assert r.list_types() == ["configurator"]
+        assert r.get("configurator") is not None
+
+    def test_state_publishes_atomically(self, tmp_path, monkeypatch):
+        """Sol r2-3: load() runs in a worker thread while readers run on the
+        loop — the registry's collections must publish as ONE assignment so
+        a reader can never see e.g. new defs beside old disabled. Pinned by
+        asserting all views come off a single state tuple."""
+        from executor_registry import ExecutorRegistry
+
+        _write(str(tmp_path), "configurator", enabled=True)
+        r = ExecutorRegistry(str(tmp_path / "executors"))
+        r.load()
+        state = r._state
+        assert r._defs is state.defs
+        assert r._disabled is state.disabled
+        assert r._disabled_defs is state.disabled_defs
+        assert r._failed_types is state.failed_types
+        assert r.get("configurator") is state.defs["configurator"]
+        # A reload swaps the whole tuple; the old snapshot stays coherent.
+        r.load()
+        assert r._state is not state
+        assert state.defs["configurator"] is not None

@@ -268,3 +268,52 @@ def test_setup_configs_and_run_script_agree_on_model_fallbacks():
         )
     for var in ("PRIMARY_AGENT_MODEL", "VOICE_AGENT_MODEL"):
         assert f"export {var}=" in setup and f"export {var}=" in run
+
+
+def test_run_script_has_no_direct_export_from_bashio_config():
+    """#291: no env var may be exported straight from a bashio::config
+    read. A key deleted from the stored options (or a future edit dropping
+    its default) makes bashio return the literal string "null", which
+    downstream truthy checks accept — e.g. `op` invoked with token "null"
+    or a vault named "null". Every read goes through a temp var + null
+    normalization."""
+    script = _read_run_script()
+    offenders = [
+        line.strip() for line in script.splitlines()
+        if line.strip().startswith("export ") and "bashio::config" in line
+    ]
+    assert offenders == [], (
+        f"unguarded direct exports from bashio::config: {offenders}"
+    )
+
+
+@pytest.mark.parametrize("option", [
+    "claude_oauth_token",
+    "onepassword_service_account_token",
+    "onepassword_default_vault",
+    "enable_terminal",
+    "specialist_max_concurrency",
+    "specialist_cost_alert_threshold",
+    "telegram_transport",
+])
+def test_run_script_null_guards_every_option_read(option):
+    """#291: each bashio::config read is followed by a `"null"` guard on
+    the temp var within its handling block (3 lines)."""
+    script = _read_run_script()
+    lines = script.splitlines()
+    read_idxs = [
+        i for i, line in enumerate(lines)
+        if f"bashio::config '{option}'" in line
+    ]
+    assert read_idxs, f"svc-casa/run never reads option {option!r}"
+    for i in read_idxs:
+        read_line = lines[i].strip()
+        var = read_line.split("=", 1)[0].strip()
+        window = "\n".join(lines[i:i + 4])
+        assert (
+            f'"${var}" = "null"' in window
+            or f'"${var}" != "null"' in window
+        ), (
+            f"read of {option!r} into {var} at line {i + 1} has no null "
+            f"guard on THAT var in its handling block:\n{window}"
+        )

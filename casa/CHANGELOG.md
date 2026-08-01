@@ -1,5 +1,65 @@
 # Changelog
 
+## [0.142.0] - 2026-08-01
+
+### Fixed
+
+Config/reload batch — trigger re-registration, the scoped reload paths, and
+the config-commit gate (#278, #279, #291, #307, #327, #351):
+
+- **Replacing a role's triggers is fail-closed for real** (#307). When a
+  later trigger in the replacement list was invalid, the earlier replacements
+  were already installed and kept firing while the reload reported failure.
+  A partial replacement is now unwound, so a failed re-registration leaves
+  the role with no triggers — exactly what the error reports.
+- **A resident added by a bulk agents reload gets its triggers** (#327).
+  The add path wired config, bus queue and consumer but never registered the
+  new resident's cron/interval/webhook triggers, so they silently never
+  fired until a later per-role reload or restart.
+- **A per-role reload reports a trigger failure instead of swallowing it**
+  (#327). `scope=agent` used to return ok after a failed re-registration
+  left the role with no triggers; it now surfaces `reregister_failed` (the
+  agent swap itself stands, and the message says so). A full reload contains
+  such a failure to that role instead of aborting the remaining roles.
+- **Reconstructed specialists resolve their own plugins** (#327). Agents
+  rebuilt by a reload were constructed against the pre-reload agent
+  registry (which they retain for life), so a newly installed specialist
+  missed its own plugin assignment and fell back to an empty set. Every
+  reload path now builds the post-reload registry first and constructs
+  against it.
+- **Concurrent reloads of the same role can no longer race a cascade**
+  (#327). The policies, executors and config-sync cascades now take the
+  per-role/per-scope locks they fan out into, so a suspended per-role reload
+  cannot overwrite a cascade's newer result while both report success.
+- **A config commit validates exactly what it commits** (#351). The
+  pre-commit schema gate used to validate the working tree and then stage
+  and commit as a separate step — an edit landing in between (e.g. over SSH)
+  was committed unvalidated and could fail the next boot. The gate now
+  stages first, validates the staged snapshot, and commits only that.
+- **A malformed plugin-env line no longer aborts boot** (#351). A
+  hand-edited `=secret` line produced an empty variable name that crashed
+  startup; invalid names are now skipped with a warning.
+- **A failed executor rescan keeps the live registry** (#351). The rescan
+  used to clear every executor definition before reading the directory, so
+  a transient filesystem error deleted them all until a later successful
+  reload; the scan now builds fresh state and swaps it in only on success.
+- **Rollback can undo a file added after the target commit** (#351).
+  Restoring a path that did not exist at the target used to error out;
+  restoring to "absent" now removes the file and commits the removal.
+- **The commit tool names the real tracked set** (#278). Its description and
+  no-op warning had drifted behind the tracking whitelist — `bindings/` and
+  the specialists registry/instance tuples were missing — sending agents
+  that wrote there hunting for a nonexistent gitignore rule. Both strings
+  now derive from one pinned source of truth.
+- **Every option export is "null"-normalized** (#291). A key deleted from
+  the stored options made bashio return the literal string `"null"`, which
+  a few unconditional exports (1Password token and vault among them) passed
+  through to truthy checks. Every read in the service run script now guards
+  the sentinel, and a regression test forbids unguarded exports.
+- **`log_level` ships an explicit `info` default** (#279). It was the one
+  schema key with no `options:` entry; behavior is unchanged (absent still
+  falls back to INFO) — the surface is just consistent now.
+
 ## [0.141.0] - 2026-08-01
 
 ### Fixed

@@ -4692,11 +4692,14 @@ def _refuse_unprivileged(tool_name: str, caller: str | None) -> dict:
     })
 
 
+from config_git import TRACKED_PATHS_SUMMARY as _TRACKED_PATHS_SUMMARY
+
+
 @tool(
     "config_git_commit",
-    "Stage and commit all tracked changes under /config/ (tracked: agents/, "
-    "policies/, schema/, plugins/registry.json; everything else incl. "
-    "plugins/store/, plugins/.staging/, and plugin-env.conf is gitignored). "
+    "Stage and commit all tracked changes under /config/ (tracked: "
+    f"{_TRACKED_PATHS_SUMMARY}; everything else incl. plugins/store/, "
+    "plugins/.staging/, and plugin-env.conf is gitignored). "
     "Returns the commit SHA — empty plus a warning when nothing tracked "
     "changed, which is the expected outcome for gitignored-only writes. "
     "Restricted to the configurator executor role.",
@@ -4713,17 +4716,17 @@ async def config_git_commit(args: dict) -> dict:
         import config_git
         import agent_loader
 
-        # E-G (v0.31.0): pre-commit schema-validation gate. Refuse the
-        # commit if any schema-bearing YAML in the repo would fail
-        # boot-time agent_loader validation. Without this, the
-        # configurator can write structurally-valid but schema-invalid
-        # YAML (e.g., the v0.30.0 ``TRAIT:`` top-level-key repro) and
-        # the addon FATALs on next boot. See
-        # ``project_eg_configurator_schema_invalid_yaml`` and
-        # ``docs/bug-review-2026-05-01-exploration.md`` for the
-        # exploration-session repro.
-        errors = await asyncio.to_thread(
-            agent_loader.validate_config_repo, config_dir,
+        # E-G (v0.31.0): pre-commit schema-validation gate — refuse the
+        # commit if any schema-bearing YAML would fail boot-time
+        # agent_loader validation (the v0.30.0 ``TRAIT:`` top-level-key
+        # repro FATALed the addon on next boot). #351 closed the gate's
+        # validate→commit TOCTOU: commit_config_checked stages first, then
+        # validates the exported index snapshot, then commits that exact
+        # snapshot — an SSH edit landing mid-window can no longer be
+        # committed unvalidated (it stays uncommitted for the next round).
+        sha, errors = await asyncio.to_thread(
+            config_git.commit_config_checked, config_dir, message,
+            agent_loader.validate_config_repo,
         )
         if errors:
             return _result({
@@ -4735,10 +4738,6 @@ async def config_git_commit(args: dict) -> dict:
                 ),
                 "errors": errors,
             })
-
-        sha = await asyncio.to_thread(
-            config_git.commit_config, config_dir, message,
-        )
         # G-2 hotfix (v0.33.1): mark this engagement as needing a
         # reload before emit_completion. Drained by casa_reload /
         # casa_reload_triggers; force-honored by emit_completion.
@@ -4771,7 +4770,7 @@ async def config_git_commit(args: dict) -> dict:
             "sha": "", "message": message,
             "warning": (
                 "No tracked changes to commit. The config repo tracks ONLY "
-                "agents/, policies/, schema/ and plugins/registry.json; every "
+                f"{_TRACKED_PATHS_SUMMARY}; every "
                 "other path is gitignored by design — plugins/store/, "
                 "plugins/.staging/, and plugin-env.conf (a secrets file) must "
                 "never enter git history. If you only wrote gitignored paths, "

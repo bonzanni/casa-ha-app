@@ -125,3 +125,20 @@ def test_remove_entry_rejects_bad_name(tmp_path: Path, monkeypatch) -> None:
     monkeypatch.setattr("plugin_env_conf.PLUGIN_ENV_CONF_PATH", tmp_path / "p.conf")
     with pytest.raises(PluginEnvConfError):
         remove_entry("bad-name")
+
+
+def test_read_entries_skips_invalid_var_names(tmp_path: Path, monkeypatch) -> None:
+    """#351: a hand-edited line with an empty or invalid var name must be
+    SKIPPED by read_entries, not returned — boot copies entries straight into
+    os.environ, and `os.environ[""] = ...` raises ValueError and aborts boot
+    (only RuntimeError is caught on that path)."""
+    path = tmp_path / "plugin-env.conf"
+    monkeypatch.setattr("plugin_env_conf.PLUGIN_ENV_CONF_PATH", path)
+    path.write_text(
+        "=secret-with-no-name\n"
+        "lower-case=nope\n"
+        "1LEADING_DIGIT=nope\n"
+        "GOOD_VAR=yes\n",
+        encoding="utf-8",
+    )
+    assert read_entries() == {"GOOD_VAR": "yes"}

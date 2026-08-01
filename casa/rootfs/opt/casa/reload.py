@@ -521,10 +521,20 @@ def _schedule_agent_close(old_agent, *, runtime=None, role=None) -> None:
     task.add_done_callback(_done)
 
 
-def _construct_agent(*, cfg, runtime):
+def _construct_agent(*, cfg, runtime, agent_registry=None):
     """Factory wrapper so tests can monkeypatch construction.
 
     Mirrors the per-role Agent construction in casa_core.main.
+
+    #327(c): ``agent_registry`` lets reload paths hand the Agent the
+    POST-reload registry. ``Agent.__init__`` retains the registry object it
+    is given (``AgentRegistry`` is immutable — a later
+    ``runtime.agent_registry`` rebind can never reach a live Agent), and the
+    Agent's lazy plugin resolution reads its own tier from it — so
+    constructing against the pre-reload registry left a freshly installed
+    specialist tier-missing its own ``specialist:<role>`` plugin assignment
+    for its whole lifetime. ``None`` falls back to the runtime's current
+    registry (correct wherever that registry already contains ``cfg.role``).
 
     G-2 v0.37.7: idempotently provision the agent-home for ``cfg.role``
     BEFORE constructing the Agent. The Agent's cwd resolves to
@@ -556,7 +566,8 @@ def _construct_agent(*, cfg, runtime):
         session_registry=runtime.session_registry,
         mcp_registry=runtime.mcp_registry,
         channel_manager=runtime.channel_manager,
-        agent_registry=runtime.agent_registry,
+        agent_registry=(agent_registry if agent_registry is not None
+                        else runtime.agent_registry),
         # H9 (v0.45.0 regression, fixed v0.49.0): reuse the boot-built
         # long-term memory. Omitting this silently downgraded every
         # reload-constructed resident to NoOpSemanticMemory. getattr with
@@ -761,31 +772,64 @@ async def reload_agent(runtime: Any, *, role: str | None = None) -> list[str]:
                            role, exc)
         return actions
 
-    # Construct new Agent instance OUTSIDE the swap window.
+    # #327(c): build the construction registry as an OVERLAY — the live
+    # registries stay untouched until the swap window. The new Agent must
+    # retain a registry that already contains its own tier entry (see
+    # _construct_agent's docstring), and the overlay provides that from
+    # ``new_cfg`` directly, WITHOUT reloading the SpecialistRegistry first:
+    # Terra r4-2 — a pre-construct load meant a construction failure left
+    # runtime consumers observing the new specialist configuration while
+    # the surviving old agent executed under the old one; on this ordering
+    # a construction failure mutates nothing, exactly like main.
+    from agent_registry import AgentRegistry
+    residents_view = dict(runtime.role_configs)
+    specialists_view = dict(runtime.specialist_registry.all_configs())
+    if tier == "resident":
+        residents_view[role] = new_cfg
+    else:
+        specialists_view[role] = new_cfg
+    fresh_registry = AgentRegistry.build(
+        residents=residents_view,
+        specialists=specialists_view,
+    )
+
+    # Construct new Agent instance OUTSIDE the swap window. Failure leaves
+    # every live registry and agent untouched.
     try:
         new_agent = await asyncio.to_thread(
             _construct_agent, cfg=new_cfg, runtime=runtime,
+            agent_registry=fresh_registry,
         )
     except Exception as exc:  # noqa: BLE001
         raise ReloadError("construct_failed", str(exc)) from exc
     actions.append("construct_agent")
 
     # --- ATOMIC SWAP WINDOW ---
+    # SpecialistRegistry refresh first (mirrors main's ordering): a load
+    # failure here raises with the old agent still live and nothing else
+    # mutated.
+    if tier == "specialist":
+        try:
+            await asyncio.to_thread(
+                runtime.specialist_registry.load, roles_dir=roles_dir)
+        except Exception as exc:  # noqa: BLE001
+            raise ReloadError("specialist_reload_failed", str(exc)) from exc
     old_agent = runtime.agents.get(role)  # AR-7: capture before overwrite
     # A:§3.3/§3.4 (r2-B5 enumerated seam): purge+cancel BEFORE the
     # replacement agent becomes dispatchable.
     _invalidate_role_grants(role)
     if tier == "resident":
         runtime.role_configs[role] = new_cfg
-    else:
-        # SpecialistRegistry update — re-scan the dir to refresh in-memory
-        # config dict. Mirrors specialist_registry.load() pattern but just
-        # for one role.
-        try:
-            await asyncio.to_thread(runtime.specialist_registry.load, roles_dir=roles_dir)
-        except Exception as exc:  # noqa: BLE001
-            raise ReloadError("specialist_reload_failed", str(exc)) from exc
     runtime.agents[role] = new_agent
+    # Publish the SAME overlay registry the agent was constructed with
+    # (Sol r5-1): rebuilding from post-load state here could publish a
+    # different version of this very role — the file can change on disk
+    # between load_agent_from_dir and the swap-window rescan — leaving the
+    # published registry describing config the live agent does not run.
+    # The overlay reflects exactly what this reload activated; disk changes
+    # that landed mid-reload (this role's or any other's) activate on their
+    # own reload, with specialist_registry already holding disk truth.
+    runtime.agent_registry = fresh_registry
     runtime.bus.register(role, new_agent.handle_message)
     # H10: a role whose dir was created after boot has no consumer yet;
     # idempotent no-op for roles that already have one.
@@ -796,13 +840,6 @@ async def reload_agent(runtime: Any, *, role: str | None = None) -> list[str]:
     # background so no warm subprocess outlives this swap. Sol #4: track its
     # binding on runtime.draining so verify discloses the still-draining turn.
     _schedule_agent_close(old_agent, runtime=runtime, role=role)
-
-    # Rebuild agent_registry from current state.
-    from agent_registry import AgentRegistry
-    runtime.agent_registry = AgentRegistry.build(
-        residents=runtime.role_configs,
-        specialists=runtime.specialist_registry.all_configs(),
-    )
     actions.append("rebuild_agent_registry")
 
     # P-6: refresh tools' delegation role map. It is a boot-time snapshot;
@@ -822,8 +859,20 @@ async def reload_agent(runtime: Any, *, role: str | None = None) -> list[str]:
             role, list(new_cfg.triggers), list(new_cfg.channels),
         )
         actions.append("reregister_triggers")
-    except Exception as exc:  # noqa: BLE001 — log but don't fail the swap
+    except Exception as exc:  # noqa: BLE001
+        # #327(b): surface the failure — pre-fix this logged and returned
+        # ok, silently leaving the role with no triggers (reregister_for
+        # unwinds first; #307 makes the no-trigger state actually hold).
+        # The swap above already landed and stays — the error is about the
+        # trigger state, and the message says exactly that.
         logger.warning("trigger reregister failed for role=%s: %s", role, exc)
+        raise ReloadError(
+            "reregister_failed",
+            f"agent swap for role={role} applied, but trigger "
+            f"re-registration failed; the role is left with NO active "
+            f"triggers unless the error below names job(s) that remain "
+            f"live: {exc}",
+        ) from exc
 
     # Drain pending-reload guard if any.
     try:
@@ -933,7 +982,16 @@ async def reload_policies(runtime: Any, *, role: str | None = None) -> list[str]
     )
     for r in role_list:
         try:
-            await _reload_role_after_policies(runtime, r)
+            # #327(d): serialize each role's swap with that role's
+            # agent-scope lock. `agent:<role>` and `policies` are
+            # independent lock keys, so an in-flight scope=agent reload
+            # could otherwise suspend mid-construction and install its
+            # stale-policy agent AFTER this cascade rebuilt the same role
+            # — both reporting success. Lock order is one-directional
+            # (policies -> agent:<r>; the agent handler takes no other
+            # scope lock), so this cannot deadlock.
+            async with _get_lock(_lock_key("agent", r)):
+                await _reload_role_after_policies(runtime, r)
         except Exception as exc:  # noqa: BLE001 — one role's failure shouldn't kill the rest
             logger.warning("policies cascade: role=%s failed: %s", r, exc)
     actions.append(f"cascaded_to_{len(role_list)}_roles")
@@ -1112,6 +1170,27 @@ async def reload_agents(runtime: Any, *, role: str | None = None) -> list[str]:
         # until the next add-on restart.
         _start_bus_loop(runtime, r)
         actions.append(f"added_{r}")
+        # #327(a): wire the added resident's declared triggers — boot does
+        # this for every resident (casa_core step 13b) and the eviction
+        # path unwinds them, but this add path used to skip registration
+        # entirely, so a resident added via scope=agents accepted messages
+        # while its cron/interval/webhook triggers never fired until a
+        # later per-role reload or restart. A trigger failure is per-role
+        # contained (the sweep survives; the add stands) but must be
+        # visible in the action trail.
+        if getattr(new_cfg, "triggers", None):
+            try:
+                await asyncio.to_thread(
+                    runtime.trigger_registry.reregister_for,
+                    r, list(new_cfg.triggers), list(new_cfg.channels),
+                )
+                actions.append(f"registered_triggers_{r}")
+            except Exception as exc:  # noqa: BLE001
+                logger.warning(
+                    "reload_agents: trigger register failed for added "
+                    "role=%s: %s", r, exc,
+                )
+                actions.append(f"trigger_register_failed_{r}")
 
     # Evict deleted residents — H11: full lifecycle teardown (cancel
     # consumer, drop queue/handler, unwind triggers), mirroring the add
@@ -1181,6 +1260,21 @@ async def reload_agents(runtime: Any, *, role: str | None = None) -> list[str]:
     for s in sorted(evicted_from_registry):
         actions.append(f"evicted_specialist_{s}")
 
+    # #327(c): rebuild the AgentRegistry from the freshly-rescanned state
+    # BEFORE the backfill constructions below — the Agent retains the
+    # registry object it is constructed with (see _construct_agent), so
+    # building it only at the end of the sweep left every backfilled
+    # specialist tier-missing its own specialist:<role> plugin assignment.
+    # Inputs (role_configs + specialist configs) are final at this point:
+    # resident adds/evicts and the registry re-scan all happened above; the
+    # remaining loops mutate runtime.agents only.
+    from agent_registry import AgentRegistry
+    runtime.agent_registry = AgentRegistry.build(
+        residents=runtime.role_configs,
+        specialists=runtime.specialist_registry.all_configs(),
+    )
+    actions.append("rebuild_agent_registry")
+
     # Registry-known specialists missing an Agent object need agent-home +
     # Agent construction (boot direct-loads them without one); eviction is
     # handled by the registry's own load() (tombstone-tracked). Reporting
@@ -1198,6 +1292,7 @@ async def reload_agents(runtime: Any, *, role: str | None = None) -> list[str]:
             )
             new_agent = await asyncio.to_thread(
                 _construct_agent, cfg=cfg, runtime=runtime,
+                agent_registry=runtime.agent_registry,
             )
         except Exception as exc:  # noqa: BLE001
             logger.warning("reload_agents: failed to add specialist %s: %s", s, exc)
@@ -1230,13 +1325,9 @@ async def reload_agents(runtime: Any, *, role: str | None = None) -> list[str]:
         if s not in evicted_from_registry:
             actions.append(f"evicted_specialist_{s}")
 
-    # Rebuild agent_registry with fresh state.
-    from agent_registry import AgentRegistry
-    runtime.agent_registry = AgentRegistry.build(
-        residents=runtime.role_configs,
-        specialists=runtime.specialist_registry.all_configs(),
-    )
-    actions.append("rebuild_agent_registry")
+    # (agent_registry rebuild happens ABOVE, before the backfill loop —
+    # #327(c); the eviction loops here mutate runtime.agents only, which is
+    # not a registry input.)
 
     # P-6: refresh tools' delegation role map (adds + evictions included) —
     # same rationale as the reload_agent hook.
@@ -1332,7 +1423,11 @@ async def reload_executors(
 
     for r in list(runtime.role_configs.keys()):
         try:
-            sub = await _HANDLERS["agent"](runtime, role=r)
+            # #327(d): same serialization as the policies cascade — this
+            # fan-out swaps each role's agent outside the dispatcher's
+            # agent:<role> lock, racing a concurrent scope=agent reload.
+            async with _get_lock(_lock_key("agent", r)):
+                sub = await _HANDLERS["agent"](runtime, role=r)
             actions += [f"agent:{r}:{a}" for a in sub]
         except ReloadError as exc:
             actions.append(f"agent:{r}:failed:{exc.kind}:{exc.message}")
@@ -1390,7 +1485,14 @@ async def reload_config_sync(runtime: Any, *, role: str | None = None) -> list[s
         if handler is None:
             continue
         try:
-            sub = await handler(runtime, role=None)
+            # #327(d): take the cascaded scope's own lock — this handler
+            # call bypasses the dispatcher's lock machinery, so a
+            # concurrent dispatch("agents"/"policies") would otherwise
+            # interleave with the same sweep. Lock order stays
+            # one-directional: config_sync -> {agents|policies} ->
+            # agent:<role> (inside the policies cascade).
+            async with _get_lock(_lock_key(scope, None)):
+                sub = await handler(runtime, role=None)
             actions.append(f"{scope}:{sub}")
         except Exception as exc:  # noqa: BLE001 — one cascade failure shouldn't abort the rest
             logger.warning("config_sync cascade: scope=%s failed: %s", scope, exc)

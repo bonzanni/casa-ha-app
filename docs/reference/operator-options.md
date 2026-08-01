@@ -27,16 +27,15 @@ generic placeholder substitution, and model options enter through the role-slot 
 (INV-CFG-001); values are read once by boot scripts and process initialization. The reload
 system covers repository and plugin configuration, not the manifest.
 
-**Export handling is option-specific, not uniform.** One group exports conditionally with
-"null" normalization — the Hindsight URL, the Telegram API base, the webhook secret, the
-Context7 key, the timezone, the log level and the reap TTL are exported only when set to a
-real value; the public URL is normalized the same way but always exported, empty when
-unset. Another group exports *unconditionally* — the Telegram
-token, chat id and supergroup id, the 1Password token and vault among them — relying on the
-shipped `options:` defaults to keep the value an empty string; a key deleted from the
-stored options would surface as the literal string "null" there, which downstream truthy
-checks would accept. Only the webhook secret is explicitly unset before its export
-decision, so an inherited container variable can survive an empty option elsewhere.
+**Every option read is "null"-normalized.** bashio returns the literal string "null" for a
+key absent from the stored options; every read in the run script guards that sentinel
+before exporting. One group exports conditionally — the Hindsight URL, the Telegram API
+base, the webhook secret, the Context7 key, the timezone, the log level and the reap TTL
+are exported only when set to a real value; the public URL is normalized the same way but
+always exported, empty when unset. The rest export unconditionally after normalization —
+empty (or the script-side fallback) when the key is deleted, never the "null" literal.
+Only the webhook secret is explicitly unset before its export decision, so an inherited
+container variable can survive an empty option elsewhere.
 
 ## The options
 
@@ -59,7 +58,7 @@ decision, so an inherited container variable can survive an empty option elsewhe
 | `enable_terminal` | `ENABLE_TERMINAL` | nginx setup, ttyd service, dashboard | false | restart |
 | `casa_tz` | `CASA_TZ` | timekeeping — both scheduler wall-clock and the current-time block every agent turn sees | Europe/Amsterdam | restart |
 | `engagement_reap_days` | `ENGAGEMENT_REAP_DAYS` | engagement reaper | 7 (0 disables) | restart |
-| `log_level` | `LOG_LEVEL` | main startup logging; the standalone MCP service's logging | schema-only (absent from `options:`); runtime falls back to INFO | restart |
+| `log_level` | `LOG_LEVEL` | main startup logging; the standalone MCP service's logging | info (runtime falls back to INFO when absent/empty) | restart |
 | `specialist_max_concurrency` | `SPECIALIST_MAX_CONCURRENCY` | specialist limiter (clamped 1–20) — the *fleet-wide* cap; a separate hard-coded rule allows exactly one active delegation per scope regardless | 2 | restart |
 | `specialist_cost_alert_threshold` | `SPECIALIST_COST_ALERT_THRESHOLD` | specialist telemetry (malformed → default) — a cumulative per-role USD threshold that only *logs* on every result once exceeded; it caps and cancels nothing | 5.0 | restart |
 

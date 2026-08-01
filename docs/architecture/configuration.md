@@ -80,8 +80,11 @@ global channel setup, process environment generally, or arbitrary files in the c
 Enforced by a reader/writer lock, with non-full scopes serialized per scope key.
 
 What it does not cover: the sequence is not transactional. There is no rollback across its
-steps, so a mid-sequence failure leaves earlier steps in effect. Handlers called directly,
-outside the dispatcher, take no lock at all.
+steps, so a mid-sequence failure leaves earlier steps in effect. A handler called directly,
+outside the dispatcher, takes no lock for *itself*; the cascading handlers (policies,
+executors, config_sync) do take the lock of each scope or role they fan out into, in a
+fixed one-directional order, so a cascade cannot interleave with a directly-dispatched
+reload of the same role or scope.
 
 **INV-CFG-003**: A resident identity change is refused as restart-required rather than hot-swapped.
 
