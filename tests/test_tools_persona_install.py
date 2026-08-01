@@ -137,6 +137,118 @@ async def test_persona_apply_on_a_non_installed_specialist_target_reports_not_in
     assert payload["slug"] == "definitely-not-installed"
 
 
+def _plant_pack_dirs(root, persona_id: str, version: str) -> None:
+    """Create the pack/ + manifest.json layout _resolve_local_persona probes
+    (content is irrelevant — load_persona_pack is monkeypatched)."""
+    base = root / persona_id / version
+    (base / "pack").mkdir(parents=True)
+    (base / "manifest.json").write_text("{}", encoding="utf-8")
+
+
+def test_resolve_local_persona_refuses_traversal_ref(monkeypatch, tmp_path) -> None:
+    """#323: a traversal-bearing persona_ref (../../..) escaped the approved
+    roots and loaded an arbitrary on-disk pack. The segments are now validated
+    with the same F1 patterns every other persona path join uses."""
+    import persona_pack
+    import tools
+
+    monkeypatch.setenv("CASA_CONFIG_DIR", str(tmp_path / "config"))
+
+    class _FakePack:
+        persona_id = "evil/x"
+        version = "1.0.0"
+
+    # Plant a loadable-looking pack OUTSIDE the approved roots, reachable
+    # only via traversal from <config>/personas.
+    _plant_pack_dirs(tmp_path / "evil-root", "x", "1.0.0")
+    monkeypatch.setattr(persona_pack, "load_persona_pack", lambda *a, **k: _FakePack())
+
+    with pytest.raises(ValueError, match="invalid persona ref"):
+        tools._resolve_local_persona("../../evil-root/x@1.0.0")
+
+
+def test_resolve_local_persona_refuses_identity_mismatch(monkeypatch, tmp_path) -> None:
+    """#323: the loaded pack must declare the identity the ref names — a pack
+    parked at the wrong <id>/<version> directory never resolves."""
+    import persona_pack
+    import tools
+
+    monkeypatch.setenv("CASA_CONFIG_DIR", str(tmp_path))
+
+    class _WrongPack:
+        persona_id = "casa/other"
+        version = "9.9.9"
+
+    _plant_pack_dirs(tmp_path / "personas", "casa/newton", "0.1.0")
+    monkeypatch.setattr(persona_pack, "load_persona_pack", lambda *a, **k: _WrongPack())
+
+    with pytest.raises(ValueError, match="declares"):
+        tools._resolve_local_persona("casa/newton@0.1.0")
+
+
+def test_resolve_local_persona_honors_casa_config_dir(monkeypatch, tmp_path) -> None:
+    """#323: an installed pack under a custom $CASA_CONFIG_DIR/personas root
+    must resolve — pre-fix the roots were hard-coded to /config/personas and
+    the tool reported the pack unavailable."""
+    import persona_pack
+    import tools
+
+    monkeypatch.setenv("CASA_CONFIG_DIR", str(tmp_path))
+
+    class _Pack:
+        persona_id = "casa/newton"
+        version = "0.1.0"
+
+    _plant_pack_dirs(tmp_path / "personas", "casa/newton", "0.1.0")
+    monkeypatch.setattr(persona_pack, "load_persona_pack", lambda *a, **k: _Pack())
+
+    pack = tools._resolve_local_persona("casa/newton@0.1.0")
+    assert pack.persona_id == "casa/newton"
+
+
+@pytest.mark.asyncio
+async def test_persona_apply_resident_branch_honors_casa_bindings_dir(
+        monkeypatch, tmp_path) -> None:
+    """#323: persona_apply's resident branch hard-coded /config/bindings while
+    boot reads CASA_BINDINGS_DIR — with the override set, the tool reported
+    success + restart_required but the restarted resident read a different
+    directory and kept the prior persona. Both sides must resolve the same
+    seam (agent_loader._resident_bindings_root)."""
+    import persona_install
+    import persona_pack
+    from tools import persona_apply
+
+    monkeypatch.setenv("CASA_CONFIG_DIR", str(tmp_path / "cfg"))
+    monkeypatch.setenv("CASA_BINDINGS_DIR", str(tmp_path / "bindings-root"))
+
+    class _FakePack:
+        persona_id = "casa/newton"
+        version = "0.1.0"
+
+    _plant_pack_dirs(tmp_path / "cfg" / "personas", "casa/newton", "0.1.0")
+    monkeypatch.setattr(persona_pack, "load_persona_pack", lambda *a, **k: _FakePack())
+
+    seen = {}
+
+    def _capture_override(*, target_role_id, persona, role, instance_dir_root):
+        seen["instance_dir_root"] = instance_dir_root
+
+        class _Committed:
+            class binding:
+                binding_digest = "sha256:" + "0" * 64
+        return _Committed()
+
+    monkeypatch.setattr(persona_install, "apply_persona_override", _capture_override)
+
+    result = await persona_apply.handler({
+        "target_role_id": "resident:assistant",
+        "persona_id": "casa/newton", "persona_version": "0.1.0",
+    })
+    payload = _payload(result)
+    assert payload["ok"] is True
+    assert seen["instance_dir_root"] == tmp_path / "bindings-root" / "resident-assistant"
+
+
 @pytest.mark.asyncio
 async def test_persona_apply_invalid_target_kind_reports_invalid_target(monkeypatch) -> None:
     """(d) persona_apply invalid target kind -> invalid_target."""

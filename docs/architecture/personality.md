@@ -1,5 +1,5 @@
 ---
-last_reviewed: 2026-07-31
+last_reviewed: 2026-08-01
 ---
 
 # Personality: roles, personas and bindings
@@ -55,7 +55,20 @@ same `persona_id@version` with different bytes is refused rather than replaced, 
 applying an override to a specialist preserves its component root and configuration. Boot
 reconciliation holds the same line: an override is reloaded by `persona_id@version` and the
 bytes found on disk must match the binding's pinned checksum — changed bytes under a pinned
-version are refused, never silently re-materialized into a fresh binding.
+version are refused, never silently re-materialized into a fresh binding. Inspection
+staging under the personas root is reclaimed on rejection and consumed by a successful
+commit; abandoned trees fall to the boot age sweep beside the specialist staging roots.
+
+**A local persona ref resolves only under the approved roots, and every consumer agrees
+on where those are.** The ref's id and version segments are validated with the same
+patterns every persona path join uses (a traversal-bearing ref never reaches a join),
+the loaded pack must *declare* the identity the ref names, and one call-time seam
+resolves the installed-personas root everywhere — the install flow's staging and
+publication, the apply tools, the resident bindings root, the specialist loader's
+override activation (upgrade and rollback included), and the boot staging sweep — so a
+pack installed under a custom config root is found by everything that later reads it. A
+tool that staged where boot does not look would report success for a swap that never
+activates.
 
 **The observer and secondary passes run on their own model.** `SECONDARY_AGENT_MODEL`
 (default *haiku*) selects the model for engagement observation and engager-query synthesis

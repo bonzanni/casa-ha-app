@@ -31,6 +31,7 @@ from plugin_env_conf import set_entry as _set_env_entry  # noqa: F401 — availa
 from system_requirements.orchestrator import install_requirements, OrchestrationError
 from system_requirements.manifest import (
     add_plugin_entry as add_manifest, remove_plugin_entry as remove_manifest,
+    read_manifest as read_sysreq_manifest, retire_stale_bin,
 )
 import plugin_registry
 import plugin_store
@@ -7773,21 +7774,39 @@ def _safe_remove_manifest(name: str) -> None:
 def _install_plugin_sysreqs(name: str, manifest: dict) -> dict | None:
     """§3.3: install a plugin's system requirements BEFORE registry activation.
     Returns an error envelope on failure (registry left unchanged), else None."""
-    reqs = plugin_store.manifest_sysreqs(manifest)
+    try:
+        reqs = plugin_store.manifest_sysreqs(manifest)
+    except plugin_store.StoreError as exc:
+        # #354: unreachable on the add/update paths (publish already
+        # strict-validated the manifest); belt for any future caller
+        # handing in a stored pre-strictness manifest.
+        return {"ok": False, "kind": "system_requirements_invalid",
+                "detail": str(exc)}
+    tools_root = Path("/config/tools")
+    # #354 (Sol P1-4): snapshot this plugin's PRIOR manifest rows so a
+    # verify_bin rename can retire the old published link — otherwise the
+    # old name stays resolvable (or dangling) forever, invisible to
+    # verification, which only checks the new name.
+    prior_bins = {p.get("verify_bin") for p in read_sysreq_manifest()["plugins"]
+                  if p.get("name") == name and p.get("verify_bin")}
     if not reqs:
         # Sol round-3 M: an update to a manifest with NO requirements must clear
         # any stale row (add_plugin_entry replaces by name on the has-reqs path,
         # so only this branch leaks). No-op for a brand-new plugin. Sol round-4:
         # cleanup failure is non-fatal — never break the mutation sequence.
         _safe_remove_manifest(name)
+        for stale in prior_bins:
+            retire_stale_bin(stale, name, tools_root)
         return None
     try:
         outcomes = install_requirements(
-            plugin_name=name, requirements=reqs,
-            tools_root=Path("/config/tools"))
+            plugin_name=name, requirements=reqs, tools_root=tools_root)
     except OrchestrationError as exc:
         return {"ok": False, "kind": "system_requirements_failed",
                 "detail": str(exc)}
+    new_bins = {o.verify_bin for o in outcomes if o.verify_bin}
+    for stale in prior_bins - new_bins:
+        retire_stale_bin(stale, name, tools_root)
     for outcome in outcomes:
         add_manifest(outcome.manifest_entry(name))
     return None
@@ -8391,6 +8410,7 @@ async def specialist_install_commit(args: dict) -> dict:
     from specialist_install_consent import SpecialistInstallAckStore
     from specialist_component import load_specialist_component
     import specialist_bundle_journal
+    import specialist_install as specialist_install_mod
     import specialist_receipt
 
     # Task 10: the trusted source receipt is loaded by opaque id ONLY — never
@@ -8462,7 +8482,19 @@ async def specialist_install_commit(args: dict) -> dict:
         if not seq.get("ok", True):
             return _result(await _bundle_seq_failure(txn, seq, slug=txn.slug))
         await asyncio.to_thread(specialist_bundle_journal.complete, txn.journal_path)
-        _prune_bundle_receipt(receipt.receipt_id)
+        # #331: a pending-configuration outcome RETAINS the receipt — the
+        # follow-up configure re-commit requires it (receipt_required
+        # otherwise), a fresh re-inspect refuses the desired-only slug as
+        # already installed, and upgrade inspection requires an active tuple
+        # — so pruning here made a first-commit-pending component impossible
+        # to activate through the supported flow. The 7-day receipt age
+        # sweep still reclaims an abandoned pending receipt. #306/Sol r2-1:
+        # the staging tree is consumed HERE too — only after the sequencer
+        # succeeded and the journal completed — because a sequencer failure
+        # compensates back to pending and the retry needs the staged bytes.
+        if instance.state == "active":
+            _prune_bundle_receipt(receipt.receipt_id)
+            specialist_install_mod.reclaim_staging_tree(staged_dir)
     return _result({"ok": True, "slug": instance.slug, "state": instance.state,
                      "activation_committed": instance.state == "active",
                      "reloaded": seq["reloaded"], "verify": seq["verify"]})
@@ -8490,6 +8522,7 @@ async def specialist_upgrade(args: dict) -> dict:
     )
     from specialist_install_consent import SpecialistInstallAckStore
     import specialist_bundle_journal
+    import specialist_install as specialist_install_mod
     import specialist_receipt
 
     receipt_id = args.get("receipt_id")
@@ -8560,7 +8593,13 @@ async def specialist_upgrade(args: dict) -> dict:
         if not seq.get("ok", True):
             return _result(await _bundle_seq_failure(txn, seq, slug=txn.slug))
         await asyncio.to_thread(specialist_bundle_journal.complete, txn.journal_path)
-        _prune_bundle_receipt(receipt.receipt_id)
+        # #331: a pending-configuration upgrade outcome retains the receipt
+        # for the follow-up configure re-commit; #306/Sol r2-1: the staging
+        # tree is likewise consumed only now, after sequencer success (same
+        # rationale as specialist_install_commit above).
+        if instance.state == "active":
+            _prune_bundle_receipt(receipt.receipt_id)
+            specialist_install_mod.reclaim_staging_tree(staged_dir)
     return _result({"ok": True, "slug": instance.slug, "state": instance.state,
                      "reloaded": seq["reloaded"], "verify": seq["verify"]})
 
@@ -8825,7 +8864,13 @@ async def persona_apply(args: dict) -> dict:
         validate_specialist_slug(slot)
     except SpecialistInstallError as exc:
         return _result({"ok": False, "kind": exc.kind, "detail": exc.detail})
-    personas_root = Path("/config/personas") / args["persona_id"] / args["persona_version"]
+    # #323: resolve the installed-personas root through the same env-aware
+    # seam the resident loader uses ($CASA_CONFIG_DIR/personas) — hard-coding
+    # /config here made an installed pack under a custom config root report
+    # persona_unavailable.
+    from persona_install import installed_personas_root
+    personas_root = (installed_personas_root()
+                     / args["persona_id"] / args["persona_version"])
     try:
         persona = load_persona_pack(personas_root / "pack", personas_root / "manifest.json")
     except (PersonaPackError, OSError) as exc:
@@ -8840,7 +8885,11 @@ async def persona_apply(args: dict) -> dict:
         import agent_loader
 
         role_dir = Path(agent_loader.DEFAULT_ROLES_DIR) / "resident" / slot
-        instance_dir_root = Path("/config/bindings") / f"resident-{slot}"
+        # #323: resolve through the same seam boot reads (CASA_BINDINGS_DIR)
+        # — hard-coding /config/bindings made this tool report success +
+        # restart_required while the restarted resident read a different
+        # directory and kept the prior persona.
+        instance_dir_root = agent_loader._resident_bindings_root(None) / f"resident-{slot}"
     elif kind == "specialist":
         from specialist_registry import InstalledSpecialistIndex
 
@@ -8951,7 +9000,13 @@ def _plugin_remove_sync(*, name: str) -> dict:
     # removed plugin leaves no stale reconciliation burden. Sol round-4: this is
     # NON-FATAL — a raise here (unwritable manifest) must not bypass the mandatory
     # reload/verify tail that runs after the sync core returns ok.
+    # #354 (Sol P1-4): retire the removed plugin's published tools/bin links
+    # too (ownership-checked; best-effort) — capture the rows before the prune.
+    removed_bins = {p.get("verify_bin") for p in read_sysreq_manifest()["plugins"]
+                    if p.get("name") == name and p.get("verify_bin")}
     _safe_remove_manifest(name)
+    for stale in removed_bins:
+        retire_stale_bin(stale, name, Path("/config/tools"))
     return {"ok": True, "name": name, "targets": targets,
             "artifact_retained": True, "artifact_id": artifact_id}
 
@@ -9314,7 +9369,19 @@ def _tool_verify_plugin_state(
     # Declared-but-not-installed requirements (Sol #11): every requirement the
     # artifact's manifest declares must have a corresponding installed entry.
     installed_bins = {t.get("verify_bin", "") for t in tool_entries}
-    for req in (plugin_store.manifest_sysreqs(manifest) if checksum_valid else []):
+    declared_reqs: list = []
+    if checksum_valid:
+        try:
+            declared_reqs = plugin_store.manifest_sysreqs(manifest)
+        except plugin_store.StoreError as exc:
+            # #354: a malformed declaration must be VISIBLE on the verify
+            # surface (pre-fix it silently read as "no requirements"), and
+            # must not crash verification for the whole plugin.
+            tools_status.append({
+                "requirement": "declared", "verify_bin": "",
+                "status": "missing",
+                "reason": f"casa.systemRequirements malformed: {exc}"})
+    for req in declared_reqs:
         vb = req.get("verify_bin", "")
         if vb and vb not in installed_bins:
             tools_status.append({
@@ -9636,23 +9703,53 @@ async def get_item_fields(args: dict) -> dict:
 # module-level accessor (mirrors active_semantic_memory), set by casa_core as
 # `agent.active_runtime = runtime`.
 
-_PERSONA_ROOTS = (Path("/config/personas"), Path("/opt/casa/defaults/personas"))
+def _persona_roots() -> tuple[Path, ...]:
+    """#323: resolve the approved persona roots through the SAME seams the
+    resident loader uses (agent_loader.reconcile: ``$CASA_CONFIG_DIR/personas``
+    for operator-installed packs, the module-relative image-defaults tree for
+    shipped ones) — the tool that resolves/stages a persona and the loader
+    that activates it must agree on the directories."""
+    import agent_loader
+    from persona_install import installed_personas_root
+
+    return (
+        installed_personas_root(),
+        Path(agent_loader.SCHEMA_DIR).parent / "personas",
+    )
 
 
 def _resolve_local_persona(ref: str):
     """Load an ALREADY LOCALLY PRESENT persona pack by exact ref (this plan does
     not fetch a bare persona from a remote repo). Persona bytes are installed
-    under /config/personas/<ns>/<slug>/<version>/ (or the image defaults) by the
+    under <config>/personas/<ns>/<slug>/<version>/ (or the image defaults) by the
     same out-of-band means as any other locally-staged content; this only loads
-    and validates what is already there."""
+    and validates what is already there.
+
+    #323: the ref's two path segments are validated with the SAME F1 patterns
+    every other persona path join uses (a traversal-bearing ref like
+    ``../../../tmp/x@1.0.0`` previously escaped the approved roots), and the
+    loaded pack must DECLARE the identity the ref names — a pack parked at the
+    wrong directory never resolves."""
+    from persona_install import validate_persona_path_segments
     from persona_pack import load_persona_pack
+    from specialist_install import SpecialistInstallError
 
     persona_id, _, version = ref.partition("@")
-    for root in _PERSONA_ROOTS:
+    try:
+        validate_persona_path_segments(persona_id, version)
+    except SpecialistInstallError as exc:
+        # Callers uniformly handle ValueError as incompatible_or_missing.
+        raise ValueError(f"invalid persona ref {ref!r}: {exc.detail}") from exc
+    for root in _persona_roots():
         pack_dir = root / persona_id / version / "pack"
         manifest_path = root / persona_id / version / "manifest.json"
         if pack_dir.is_dir() and manifest_path.is_file():
-            return load_persona_pack(pack_dir, manifest_path)
+            pack = load_persona_pack(pack_dir, manifest_path)
+            if pack.persona_id != persona_id or pack.version != version:
+                raise ValueError(
+                    f"persona pack under {root} declares "
+                    f"{pack.persona_id}@{pack.version}, not the requested {ref!r}")
+            return pack
     raise ValueError(f"persona {ref!r} is not present under any configured persona root")
 
 

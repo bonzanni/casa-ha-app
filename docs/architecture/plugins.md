@@ -191,6 +191,15 @@ plugin targets an executor, that executor's own declared tool list must be updat
 uniqueness, **not that the named tool exists**; a typo produces a declaration that protects
 nothing. And it applies only to the resident and specialist paths.
 
+**Declaring system requirements** is strict the same way the other manifest extensions
+are: an absent declaration means none, but a present-but-malformed one (a non-list value,
+a non-object member, or a requirement without a safe executable `verify_bin` name)
+refuses the install or update rather than silently reading as "no requirements" — or
+running an install that can never succeed — and activating a plugin whose binary was
+never installed. Package-manager types keep their own dedicated refusal. On the
+verification surface the same malformation reports as a visible missing-requirement
+status instead of crashing the verify.
+
 **Adding a webhook trigger** requires intrinsic validation plus a durable operator consent
 bound to the exact trigger identity. This approval outlives a restart — one of the durable
 approval ledgers (specialist and persona install acknowledgements are others), in contrast

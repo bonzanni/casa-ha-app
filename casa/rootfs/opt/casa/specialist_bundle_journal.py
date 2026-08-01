@@ -65,6 +65,12 @@ TUPLE_FILENAMES = frozenset({
     # compensation must restore (or re-remove) it with the rest of the
     # tuple state or a compensated crash discards the pending rotation.
     "active.yaml.rollback-tmp",
+    # #331 (Sol r7-2): the pending-receipt marker travels WITH the pending
+    # tuple — an activating retry clears it, and if that retry's sequencer
+    # fails, compensation must restore the marker alongside desired.yaml or
+    # the boot sweep falls back to newest-by-mtime and can retain the wrong
+    # root's receipt while sweeping the only resumable one.
+    "pending-receipt.json",
 })
 
 # Task 11 reads this after every boot to surface reconciliation results in
@@ -355,7 +361,8 @@ def reconcile_boot(*, ops_dir: Path = OPS_DIR,
                     registry_path: Path = plugin_registry.REGISTRY_PATH,
                     specialists_dir: Path = SPECIALISTS_DIR,
                     acks_path: Path = ACKS_PATH,
-                    receipts_dir: Path = RECEIPTS_DIR) -> list[dict]:
+                    receipts_dir: Path = RECEIPTS_DIR,
+                    personas_dir: "Path | None" = None) -> list[dict]:
     """Scan EVERY regular file in `ops_dir` (skipping `*.quarantined`) and
     reconcile it per the module docstring. Runs before the plugin snapshot
     loads. Returns `[{slug, action}]` for the health report; also stashed on
@@ -370,14 +377,93 @@ def reconcile_boot(*, ops_dir: Path = OPS_DIR,
     # Whole-branch N: age-sweep orphan receipt sidecars (an inspect that never
     # committed) on every boot, independent of any journal work below. Never
     # raises — a receipts-dir problem must not block boot.
+    # #331 (Sol r5-2): a slug with a LIVE pending-configuration candidate
+    # keeps its receipt (the configure re-commit requires it) and the staged
+    # paths that receipt references, whatever their age — a pending install
+    # is durable operator-visible state, not an abandoned flow.
+    pending_slugs: set[str] = set()
+    try:
+        if specialists_dir.is_dir():
+            for slug_dir in specialists_dir.iterdir():
+                if slug_dir.is_dir() and (slug_dir / "desired.yaml").is_file():
+                    pending_slugs.add(slug_dir.name)
+    except OSError:
+        pass
+    # Sol r6-2: prefer the durable marker naming the EXACT receipt the
+    # pending candidate was committed with; newest-per-slug is only the
+    # fallback for a pending slug with no readable marker.
+    keep_receipt_ids: set[str] = set()
+    marker_fallback_slugs: set[str] = set()
+    for _slug in pending_slugs:
+        marker = specialists_dir / _slug / "pending-receipt.json"
+        rid = None
+        try:
+            import json as _mjson
+            raw_marker = _mjson.loads(marker.read_text(encoding="utf-8"))
+            if isinstance(raw_marker, dict):
+                rid = raw_marker.get("receipt_id")
+        except (OSError, ValueError):
+            rid = None
+        if isinstance(rid, str) and rid:
+            keep_receipt_ids.add(rid)
+        else:
+            marker_fallback_slugs.add(_slug)
     try:
         import specialist_receipt
-        swept = specialist_receipt.sweep_aged(receipts_dir=receipts_dir)
+        swept = specialist_receipt.sweep_aged(
+            receipts_dir=receipts_dir, keep_slugs=marker_fallback_slugs,
+            keep_receipt_ids=keep_receipt_ids)
         if swept:
             actions.append({"slug": None, "action": "swept_receipts",
                             "count": swept})
     except Exception:  # noqa: BLE001 — degrade-and-boot
         logger.exception("receipt age-sweep failed")
+
+    # #306: age-sweep abandoned STAGING TREES with the same 7-day cutoff —
+    # denied/abandoned consent prompts and crashed flows leave full repo
+    # copies under the .staging roots (and crash-leaked bundle/CAS staging
+    # workspaces) that otherwise grow unbounded on the /config volume.
+    try:
+        import specialist_install
+        if personas_dir is None:
+            # #323 (Sol r3): the same env-aware seam every persona consumer
+            # resolves through — a call-time default, never a frozen literal.
+            from persona_install import installed_personas_root
+            personas_dir = installed_personas_root()
+        # Staged paths still referenced by a surviving receipt (pending
+        # installs kept theirs above) are exempt from the age sweep.
+        keep_paths: set[str] = set()
+        try:
+            import json as _json
+            for rp in Path(receipts_dir).iterdir():
+                if not (rp.is_file() and rp.suffix == ".json"):
+                    continue
+                try:
+                    raw = _json.loads(rp.read_text(encoding="utf-8"))
+                except (OSError, ValueError):
+                    continue
+                if not isinstance(raw, dict):
+                    continue
+                staged = raw.get("component_staged_path")
+                if isinstance(staged, str) and staged:
+                    keep_paths.add(staged)
+                for row in raw.get("plugins") or []:
+                    p = row.get("staged_path") if isinstance(row, dict) else None
+                    if isinstance(p, str) and p:
+                        keep_paths.add(p)
+        except OSError:
+            pass
+        swept_trees = specialist_install.sweep_staging_aged(roots=(
+            specialists_dir / ".staging",
+            specialists_dir / ".bundle-staging",
+            specialists_dir / "store" / ".staging",
+            Path(personas_dir) / ".staging",
+        ), keep_paths=keep_paths)
+        if swept_trees:
+            actions.append({"slug": None, "action": "swept_staging_trees",
+                            "count": swept_trees})
+    except Exception:  # noqa: BLE001 — degrade-and-boot
+        logger.exception("staging-tree age-sweep failed")
 
     if not ops_dir.is_dir():
         last_boot_reconcile_actions = actions

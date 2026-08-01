@@ -96,18 +96,22 @@
   covers:
     - casa/rootfs/opt/casa/specialist_install.py::commit_specialist_install
     - casa/rootfs/opt/casa/specialist_install.py::compute_install_root_digest
+    - casa/rootfs/opt/casa/specialist_install.py::sweep_staging_aged
     - casa/rootfs/opt/casa/specialist_materialize.py::current_specialist_roles_dir
     - casa/rootfs/opt/casa/specialist_materialize.py::materialize_specialist_operational_files
     - casa/rootfs/opt/casa/specialist_receipt.py::compute_receipt_digest
     - casa/rootfs/opt/casa/specialist_bundle_journal.py::reconcile_boot
     - casa/rootfs/opt/casa/specialist_registry.py::InstalledSpecialistIndex
+    - casa/rootfs/opt/casa/system_requirements/tarball.py::install_tarball
+    - casa/rootfs/opt/casa/system_requirements/manifest.py::ensure_bin_claim
   tests:
     - tests/test_specialist_install.py
     - tests/test_specialist_lifecycle_matrix.py
     - tests/test_specialist_materialize.py
     - tests/test_specialist_bundle_journal.py
+    - tests/test_system_requirements_installer_tarball.py
   related: [architecture/agent-taxonomy.md, architecture/personality.md, architecture/plugins.md]
-  defines_invariants: [INV-SPEC-001, INV-SPEC-002, INV-SPEC-003, INV-SPEC-004, INV-SPEC-005, INV-SPEC-006]
+  defines_invariants: [INV-SPEC-001, INV-SPEC-002, INV-SPEC-003, INV-SPEC-004, INV-SPEC-005, INV-SPEC-006, INV-SPEC-007]
   invariant_tests:
     INV-SPEC-001: [tests/test_specialist_lifecycle_matrix.py::test_install_never_writes_cas_without_a_recorded_consent]
     INV-SPEC-002: [tests/test_specialist_lifecycle_matrix.py::test_fresh_install_missing_config_is_pending_configuration_with_no_active_tuple]
@@ -115,6 +119,7 @@
     INV-SPEC-004: [tests/test_specialist_materialize.py::test_materialize_operational_files_repeat_call_swaps_atomically_and_gcs_old_version]
     INV-SPEC-005: [tests/test_specialist_consent_receipt.py::test_pin_inv_spec_005_tampered_receipt_loads_as_none]
     INV-SPEC-006: [tests/test_specialist_install.py::test_commit_rejects_a_secret_valued_config_key, tests/test_specialist_install.py::test_upgrade_strips_stale_plaintext_secret_keys_from_the_carried_snapshot]
+    INV-SPEC-007: [tests/test_system_requirements_installer_tarball.py::test_failed_reinstall_preserves_existing_install, tests/test_system_requirements_installer_tarball.py::test_invalid_install_cmd_shape_checked_before_touching_install]
 
 - doc: architecture/telegram.md
   summary: How Telegram messages become turns — transports, authentication, the per-topic causal log, keyboards, and rendering.

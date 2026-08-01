@@ -206,25 +206,68 @@ def delete(receipt_id: str, receipts_dir: Path = DEFAULT_RECEIPTS_DIR) -> bool:
 
 
 def sweep_aged(*, receipts_dir: Path = DEFAULT_RECEIPTS_DIR,
-               max_age_s: float = 7 * 24 * 3600, now: "float | None" = None) -> int:
+               max_age_s: float = 7 * 24 * 3600, now: "float | None" = None,
+               keep_slugs: "frozenset[str] | set[str]" = frozenset(),
+               keep_receipt_ids: "frozenset[str] | set[str]" = frozenset()) -> int:
     """Whole-branch N: boot-time age sweep — delete receipt sidecars older than
     `max_age_s` (default 7 days). An inspect that never reached commit (operator
     denied, or the flow was abandoned) leaves an orphan receipt behind; without
-    this they accumulate unbounded. Never raises; returns the count removed."""
+    this they accumulate unbounded. Never raises; returns the count removed.
+
+    ``keep_slugs`` (#331, Sol r5-2 / Terra r6-1): slugs with a LIVE
+    pending-configuration candidate — a receipt is required by the supported
+    configure re-commit, so age alone must never delete the last one (a
+    pending install older than the cutoff plus one restart became
+    permanently unfinishable). Exactly the NEWEST receipt per kept slug is
+    exempt — not every receipt naming the slug, or repeated pre-commit
+    inspections would pin unbounded staging forever; any receipt for the
+    same root resumes the flow (re-inspecting for a fresh one is the
+    documented resume path), so one suffices. Unparseable receipts still
+    sweep.
+
+    ``keep_receipt_ids`` (Sol r6-2): the receipts pending candidates were
+    actually committed with (recorded durably at pending time) — exempted by
+    exact id, since a same-slug receipt for a DIFFERENT root cannot resume a
+    pending tuple and newest-by-mtime alone could keep the wrong one.
+    ``keep_slugs`` is the fallback for pending slugs with no readable
+    marker."""
     import time as _time
 
     receipts_dir = Path(receipts_dir)
     if not receipts_dir.is_dir():
         return 0
     cutoff = (now if now is not None else _time.time()) - max_age_s
-    removed = 0
+    rows: list[tuple[Path, float]] = []
     for path in receipts_dir.iterdir():
         if not path.is_file() or path.suffix != ".json":
             continue
         try:
-            if path.stat().st_mtime < cutoff:
-                path.unlink()
-                removed += 1
+            rows.append((path, path.stat().st_mtime))
+        except OSError:
+            continue
+    keep_newest: set[Path] = set()
+    if keep_slugs:
+        newest_by_slug: dict[str, tuple[float, Path]] = {}
+        for path, mtime in rows:
+            try:
+                raw = json.loads(path.read_text(encoding="utf-8"))
+            except (OSError, ValueError):
+                continue
+            slug = raw.get("slug") if isinstance(raw, dict) else None
+            if isinstance(slug, str) and slug in keep_slugs:
+                best = newest_by_slug.get(slug)
+                if best is None or mtime > best[0]:
+                    newest_by_slug[slug] = (mtime, path)
+        keep_newest = {p for _, p in newest_by_slug.values()}
+    removed = 0
+    for path, mtime in rows:
+        if mtime >= cutoff or path in keep_newest:
+            continue
+        if keep_receipt_ids and path.stem in keep_receipt_ids:
+            continue
+        try:
+            path.unlink()
+            removed += 1
         except OSError:
             continue
     return removed

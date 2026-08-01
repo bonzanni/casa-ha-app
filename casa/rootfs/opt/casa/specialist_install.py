@@ -8,7 +8,7 @@ import shutil
 import uuid
 from dataclasses import dataclass
 from pathlib import Path
-from typing import TYPE_CHECKING, Literal, Mapping
+from typing import TYPE_CHECKING, Iterable, Literal, Mapping
 
 import jsonschema
 import yaml
@@ -220,6 +220,87 @@ class InspectionResult:
     receipt_id: str = ""
     receipt_digest: str = ""
     plugin_resolutions: tuple["PluginReceiptRow", ...] = ()
+
+
+def _record_pending_receipt(slug_dir: Path, receipt_id: str) -> None:
+    """#331 (Sol r6-2/r7-2): durably record WHICH receipt the pending
+    candidate was committed with, so the boot sweep exempts exactly that
+    receipt — a same-slug receipt for a different root cannot resume this
+    pending tuple (cross-root restage refuses), so newest-by-mtime alone
+    could keep the wrong one and sweep the only usable one.
+
+    STRICT, and called BEFORE the desired stage in the same locked step: a
+    write failure fails the commit (the bundle rollback handles it) rather
+    than silently leaving a pending tuple whose marker never existed; the
+    marker-first ordering means desired.yaml never exists without it. The
+    filename is journalled in TUPLE_FILENAMES, so compensation restores it
+    with the rest of the tuple state."""
+    from atomic_io import atomic_write_json
+
+    slug_dir.mkdir(parents=True, exist_ok=True)   # fresh install: dir not yet staged
+    atomic_write_json(slug_dir / "pending-receipt.json",
+                      {"receipt_id": receipt_id})
+
+
+def _clear_pending_receipt(slug_dir: Path) -> None:
+    try:
+        (slug_dir / "pending-receipt.json").unlink()
+    except OSError:
+        pass
+
+
+def reclaim_staging_tree(staged_dir: "Path | str") -> None:
+    """#306: best-effort removal of an inspection staging tree once the flow
+    that produced it is terminally done with it (rejected inspection, or a
+    commit that reached state="active").
+
+    Containment guard: only a direct child of a directory named ``.staging``
+    is ever removed — a hand-built InspectionResult (or a test's staged_dir
+    living elsewhere) can never aim this at an arbitrary path. Never raises."""
+    path = Path(staged_dir)
+    if path.parent.name != ".staging":
+        return
+    shutil.rmtree(path, ignore_errors=True)
+
+
+def sweep_staging_aged(*, roots: "Iterable[Path]",
+                       max_age_s: float = 7 * 24 * 3600,
+                       now: "float | None" = None,
+                       keep_paths: "frozenset[str] | set[str]" = frozenset(),
+                       ) -> int:
+    """#306: boot-time age sweep for abandoned staging trees (operator denied
+    or abandoned the consent prompt, or the process died mid-flow), mirroring
+    ``specialist_receipt.sweep_aged``'s 7-day cutoff so a staged tree never
+    outlives the receipt that could still consume it. Sweeps every direct
+    subdirectory of each root older than ``max_age_s``. Never raises; returns
+    the count removed.
+
+    ``keep_paths`` (#331, Sol r5-2): staged paths a RETAINED receipt still
+    references (a live pending-configuration install's attested bytes) —
+    age alone must never delete them, or the supported configure re-commit
+    dead-ends at staged_dir_invalid after a week plus one restart."""
+    import time as _time
+
+    cutoff = (now if now is not None else _time.time()) - max_age_s
+    kept = {str(Path(p)) for p in keep_paths}
+    removed = 0
+    for root in roots:
+        root = Path(root)
+        try:
+            entries = list(root.iterdir())
+        except OSError:
+            continue
+        for entry in entries:
+            try:
+                if str(entry) in kept:
+                    continue
+                if (entry.is_dir() and not entry.is_symlink()
+                        and entry.stat().st_mtime < cutoff):
+                    shutil.rmtree(entry, ignore_errors=True)
+                    removed += 1
+            except OSError:
+                continue
+    return removed
 
 
 def compute_install_root_digest(
@@ -743,7 +824,13 @@ def _validate_sourced_plugin_tree(
     if not isinstance(raw_manifest, dict):
         return "manifest_invalid: plugin.json is not an object", _EMPTY_SURFACES
 
-    if plugin_store.manifest_sysreqs(raw_manifest):
+    try:
+        has_sysreqs = bool(plugin_store.manifest_sysreqs(raw_manifest))
+    except plugin_store.StoreError:
+        # #354: manifest_sysreqs is now strict — a malformed declaration is
+        # still a PRESENT declaration, and this path prohibits any.
+        has_sysreqs = True
+    if has_sysreqs:
         return (f"{BUNDLED_SYSREQS_UNSUPPORTED}: a sourced/bundled plugin dependency "
                 "must not declare casa.systemRequirements", _EMPTY_SURFACES)
     casa = raw_manifest.get("casa")
@@ -907,160 +994,167 @@ def inspect_specialist_repo(
 
     staging_root.mkdir(parents=True, exist_ok=True, mode=0o700)
     component_dir = staging_root / uuid.uuid4().hex
-    component_revision = resolve_and_fetch(
-        repo, ref, subdir, component_dir, expected_revision=expected_revision)
-
-    manifest_path = component_dir / "manifest.json"
-    if not manifest_path.is_file():
-        raise SpecialistInstallError("manifest_missing", f"{repo}@{ref}: manifest.json not found")
+    # #306: any rejection below (manifest_missing/invalid, dependency
+    # failures, slug collisions, ...) must not leave the fetched staging
+    # tree behind; a SUCCESSFUL inspection retains it for commit reuse.
     try:
-        component = load_specialist_component(component_dir, manifest_path)
-    except (ValueError, jsonschema.ValidationError) as exc:
-        # #346: load_specialist_component pins jsonschema.ValidationError —
-        # NOT a ValueError subclass — for a schema-violating manifest; both
-        # must land in the structured manifest_invalid envelope.
-        raise SpecialistInstallError("manifest_invalid", str(exc)) from exc
+        component_revision = resolve_and_fetch(
+            repo, ref, subdir, component_dir, expected_revision=expected_revision)
 
-    _validate_untrusted_bytes(component)
+        manifest_path = component_dir / "manifest.json"
+        if not manifest_path.is_file():
+            raise SpecialistInstallError("manifest_missing", f"{repo}@{ref}: manifest.json not found")
+        try:
+            component = load_specialist_component(component_dir, manifest_path)
+        except (ValueError, jsonschema.ValidationError) as exc:
+            # #346: load_specialist_component pins jsonschema.ValidationError —
+            # NOT a ValueError subclass — for a schema-violating manifest; both
+            # must land in the structured manifest_invalid envelope.
+            raise SpecialistInstallError("manifest_invalid", str(exc)) from exc
 
-    # Task 8: fetch every github-sourced plugin dependency INTO this same
-    # staging tree, at the `.dep-plugins/<identifier>` convention every
-    # closure call site (inspect/CAS-staging/final-CAS/rollback) shares
-    # unconditionally — `dep.identifier` is already PLUGIN_IDENT_RE-validated
-    # (specialist_component's loader), so this join is safe without a
-    # separate containment check. Revision-pinned: `resolve_and_fetch` itself
-    # refuses a moved `ref` against `dep.source.revision`.
-    for dep in component.dependencies:
-        if dep.kind == "plugin/implementation" and dep.source is not None \
-                and dep.source.type == "github":
-            dest = component_dir / ".dep-plugins" / dep.identifier
-            resolve_and_fetch(dep.source.repo, dep.source.ref, "", dest,
-                              expected_revision=dep.source.revision)
+        _validate_untrusted_bytes(component)
 
-    index = installed_index or InstalledSpecialistIndex()
-    if installed_index is None:
-        index.load()
+        # Task 8: fetch every github-sourced plugin dependency INTO this same
+        # staging tree, at the `.dep-plugins/<identifier>` convention every
+        # closure call site (inspect/CAS-staging/final-CAS/rollback) shares
+        # unconditionally — `dep.identifier` is already PLUGIN_IDENT_RE-validated
+        # (specialist_component's loader), so this join is safe without a
+        # separate containment check. Revision-pinned: `resolve_and_fetch` itself
+        # refuses a moved `ref` against `dep.source.revision`.
+        for dep in component.dependencies:
+            if dep.kind == "plugin/implementation" and dep.source is not None \
+                    and dep.source.type == "github":
+                dest = component_dir / ".dep-plugins" / dep.identifier
+                resolve_and_fetch(dep.source.repo, dep.source.ref, "", dest,
+                                  expected_revision=dep.source.revision)
 
-    if mode == "upgrade":
-        if component.slug != target_slug:
-            raise SpecialistInstallError(
-                "slug_mismatch",
-                f"upgrade target_slug={target_slug!r} but the fetched component declares "
-                f"slug={component.slug!r} — a slug rename is a fresh install, not an upgrade")
-        from personality_binding import InstanceDir
-        if InstanceDir(specialists_dir / target_slug).active() is None:
-            raise SpecialistInstallError(
-                "no_active_tuple", f"{target_slug!r} has no active install to upgrade")
-        fixed_role_slots = _discover_image_role_slots() - {target_slug}
-        installed_specialist_slugs = index.installed_slugs() - {target_slug}
-    else:
-        fixed_role_slots = _discover_image_role_slots()
-        installed_specialist_slugs = index.installed_slugs()
+        index = installed_index or InstalledSpecialistIndex()
+        if installed_index is None:
+            index.load()
 
-    try:
-        check_slug_uniqueness(
-            candidate_slug=component.slug,
-            fixed_role_slots=fixed_role_slots,
-            installed_specialist_slugs=installed_specialist_slugs,
-        )
-    except ValueError as exc:
-        raise SpecialistInstallError("slug_collision", str(exc)) from exc
-
-    manifest_name_collisions = _manifest_name_collisions(component)
-    if manifest_name_collisions:
-        raise SpecialistInstallError(
-            "manifest_name_collision",
-            f"specialist:{component.slug} already resolves an entry with effective "
-            f"manifest name(s) {sorted(set(manifest_name_collisions))!r} — a sourced "
-            "plugin dependency must not collide with it")
-
-    dependencies = resolve_dependency_closure(component, component_dir)
-    unavailable = [d for d in dependencies if not d.available]
-    if unavailable:
-        # Task 8: a prohibition (sysreqs/triggers/env-collision) aborts with
-        # its OWN kind, not the generic dependency_unavailable — scan every
-        # unavailable row first (Sol plan-r1).
-        for d in unavailable:
-            for prefix in _PROHIBITION_KIND_PREFIXES:
-                if d.detail.startswith(prefix):
-                    raise SpecialistInstallError(prefix, f"{d.kind}:{d.identifier}: {d.detail}")
-        detail = "; ".join(f"{d.kind}:{d.identifier}: {d.detail}" for d in unavailable)
-        raise SpecialistInstallError("dependency_unavailable", detail)
-
-    # Whole-branch E: cross-sibling env-name collision (the per-plugin check
-    # only saw installed artifacts). Every remaining dep resolved available.
-    sibling_env = _sibling_env_name_collisions(dependencies)
-    if sibling_env:
-        raise SpecialistInstallError(
-            ENV_NAME_COLLISION,
-            "sourced plugins in this bundle require the same env name(s): "
-            + ", ".join(sibling_env))
-
-    root_digest = compute_install_root_digest(
-        component, dependencies, manifest_bytes=manifest_path.read_bytes())
-
-    # Task 8: build one PluginReceiptRow per sourced plugin dependency
-    # (dependencies is 1:1 positional with component.dependencies — every
-    # row appended by resolve_dependency_closure's per-dependency loop, and
-    # any additional synthetic persona-count row would have been `available=
-    # False` and already raised above, so this dict is exhaustive here).
-    resolved_by_identity = {(d.kind, d.identifier): d for d in dependencies}
-    plugin_rows: list[specialist_receipt.PluginReceiptRow] = []
-    for dep in component.dependencies:
-        if dep.kind != "plugin/implementation" or dep.source is None:
-            continue
-        resolution = resolved_by_identity[(dep.kind, dep.identifier)]
-        if dep.source.type == "bundled":
-            tree = component_dir / dep.source.path
-            row_repo, row_ref, row_revision = repo, ref, f"git:{component_revision}"
-            row_subdir = f"{subdir}/{dep.source.path}" if subdir else dep.source.path
+        if mode == "upgrade":
+            if component.slug != target_slug:
+                raise SpecialistInstallError(
+                    "slug_mismatch",
+                    f"upgrade target_slug={target_slug!r} but the fetched component declares "
+                    f"slug={component.slug!r} — a slug rename is a fresh install, not an upgrade")
+            from personality_binding import InstanceDir
+            if InstanceDir(specialists_dir / target_slug).active() is None:
+                raise SpecialistInstallError(
+                    "no_active_tuple", f"{target_slug!r} has no active install to upgrade")
+            fixed_role_slots = _discover_image_role_slots() - {target_slug}
+            installed_specialist_slugs = index.installed_slugs() - {target_slug}
         else:
-            tree = component_dir / ".dep-plugins" / dep.identifier
-            row_repo, row_ref, row_revision = dep.source.repo, dep.source.ref, dep.source.revision
-            row_subdir = ""
-        plugin_rows.append(specialist_receipt.PluginReceiptRow(
-            identifier=dep.identifier,
-            scoped_name=plugin_registry.scoped_name(component.slug, dep.identifier),
-            manifest_name=dep.identifier,
-            version=_sourced_plugin_manifest_version(tree),
-            source_type=dep.source.type,
-            repo=row_repo, ref=row_ref, revision=row_revision, subdir=row_subdir,
-            content_digest=resolution.digest, staged_path=str(tree),
-            # Task 8 fix-round-1 (consent-review CRITICAL): captured by
-            # `_validate_sourced_plugin_tree` during `resolve_dependency_
-            # closure` above — never re-parsed here.
-            mcp_servers=resolution.mcp_servers,
-            protected_tools=resolution.protected_tools,
-            env_names=resolution.env_names,
-        ))
+            fixed_role_slots = _discover_image_role_slots()
+            installed_specialist_slugs = index.installed_slugs()
 
-    receipt = specialist_receipt.build_receipt(
-        slug=component.slug, component_repo=repo, component_ref=ref,
-        component_revision=f"git:{component_revision}", component_subdir=subdir,
-        component_staged_path=str(component_dir), plugins=tuple(plugin_rows),
-    )
-    specialist_receipt.persist(receipt, receipts_dir=receipts_dir)
+        try:
+            check_slug_uniqueness(
+                candidate_slug=component.slug,
+                fixed_role_slots=fixed_role_slots,
+                installed_specialist_slugs=installed_specialist_slugs,
+            )
+        except ValueError as exc:
+            raise SpecialistInstallError("slug_collision", str(exc)) from exc
 
-    required = component.config_schema.get("required", [])
-    secret_names = set(component.config_schema.get("secret_names", []))
-    logger.info(
-        "inspect_specialist_repo passed all gates: mode=%s slug=%s component_id=%s "
-        "version=%s root_digest=%s receipt_id=%s (staged at %s, not yet activated)",
-        mode, component.slug, component.component_id, component.version,
-        root_digest, receipt.receipt_id, component_dir,
-    )
-    return InspectionResult(
-        component_id=component.component_id, version=component.version, slug=component.slug,
-        component_checksum=component.checksum, root_digest=root_digest,
-        mission=str(component.role.role.get("mission", "")),
-        default_persona_ref=component.default_persona_ref,
-        default_persona_checksum=component.default_persona_checksum,
-        required_config_names=tuple(n for n in required if n not in secret_names),
-        required_secret_names=tuple(n for n in required if n in secret_names),
-        dependencies=dependencies, staged_dir=component_dir,
-        receipt_id=receipt.receipt_id, receipt_digest=receipt.receipt_digest,
-        plugin_resolutions=tuple(plugin_rows),
-    )
+        manifest_name_collisions = _manifest_name_collisions(component)
+        if manifest_name_collisions:
+            raise SpecialistInstallError(
+                "manifest_name_collision",
+                f"specialist:{component.slug} already resolves an entry with effective "
+                f"manifest name(s) {sorted(set(manifest_name_collisions))!r} — a sourced "
+                "plugin dependency must not collide with it")
+
+        dependencies = resolve_dependency_closure(component, component_dir)
+        unavailable = [d for d in dependencies if not d.available]
+        if unavailable:
+            # Task 8: a prohibition (sysreqs/triggers/env-collision) aborts with
+            # its OWN kind, not the generic dependency_unavailable — scan every
+            # unavailable row first (Sol plan-r1).
+            for d in unavailable:
+                for prefix in _PROHIBITION_KIND_PREFIXES:
+                    if d.detail.startswith(prefix):
+                        raise SpecialistInstallError(prefix, f"{d.kind}:{d.identifier}: {d.detail}")
+            detail = "; ".join(f"{d.kind}:{d.identifier}: {d.detail}" for d in unavailable)
+            raise SpecialistInstallError("dependency_unavailable", detail)
+
+        # Whole-branch E: cross-sibling env-name collision (the per-plugin check
+        # only saw installed artifacts). Every remaining dep resolved available.
+        sibling_env = _sibling_env_name_collisions(dependencies)
+        if sibling_env:
+            raise SpecialistInstallError(
+                ENV_NAME_COLLISION,
+                "sourced plugins in this bundle require the same env name(s): "
+                + ", ".join(sibling_env))
+
+        root_digest = compute_install_root_digest(
+            component, dependencies, manifest_bytes=manifest_path.read_bytes())
+
+        # Task 8: build one PluginReceiptRow per sourced plugin dependency
+        # (dependencies is 1:1 positional with component.dependencies — every
+        # row appended by resolve_dependency_closure's per-dependency loop, and
+        # any additional synthetic persona-count row would have been `available=
+        # False` and already raised above, so this dict is exhaustive here).
+        resolved_by_identity = {(d.kind, d.identifier): d for d in dependencies}
+        plugin_rows: list[specialist_receipt.PluginReceiptRow] = []
+        for dep in component.dependencies:
+            if dep.kind != "plugin/implementation" or dep.source is None:
+                continue
+            resolution = resolved_by_identity[(dep.kind, dep.identifier)]
+            if dep.source.type == "bundled":
+                tree = component_dir / dep.source.path
+                row_repo, row_ref, row_revision = repo, ref, f"git:{component_revision}"
+                row_subdir = f"{subdir}/{dep.source.path}" if subdir else dep.source.path
+            else:
+                tree = component_dir / ".dep-plugins" / dep.identifier
+                row_repo, row_ref, row_revision = dep.source.repo, dep.source.ref, dep.source.revision
+                row_subdir = ""
+            plugin_rows.append(specialist_receipt.PluginReceiptRow(
+                identifier=dep.identifier,
+                scoped_name=plugin_registry.scoped_name(component.slug, dep.identifier),
+                manifest_name=dep.identifier,
+                version=_sourced_plugin_manifest_version(tree),
+                source_type=dep.source.type,
+                repo=row_repo, ref=row_ref, revision=row_revision, subdir=row_subdir,
+                content_digest=resolution.digest, staged_path=str(tree),
+                # Task 8 fix-round-1 (consent-review CRITICAL): captured by
+                # `_validate_sourced_plugin_tree` during `resolve_dependency_
+                # closure` above — never re-parsed here.
+                mcp_servers=resolution.mcp_servers,
+                protected_tools=resolution.protected_tools,
+                env_names=resolution.env_names,
+            ))
+
+        receipt = specialist_receipt.build_receipt(
+            slug=component.slug, component_repo=repo, component_ref=ref,
+            component_revision=f"git:{component_revision}", component_subdir=subdir,
+            component_staged_path=str(component_dir), plugins=tuple(plugin_rows),
+        )
+        specialist_receipt.persist(receipt, receipts_dir=receipts_dir)
+
+        required = component.config_schema.get("required", [])
+        secret_names = set(component.config_schema.get("secret_names", []))
+        logger.info(
+            "inspect_specialist_repo passed all gates: mode=%s slug=%s component_id=%s "
+            "version=%s root_digest=%s receipt_id=%s (staged at %s, not yet activated)",
+            mode, component.slug, component.component_id, component.version,
+            root_digest, receipt.receipt_id, component_dir,
+        )
+        return InspectionResult(
+            component_id=component.component_id, version=component.version, slug=component.slug,
+            component_checksum=component.checksum, root_digest=root_digest,
+            mission=str(component.role.role.get("mission", "")),
+            default_persona_ref=component.default_persona_ref,
+            default_persona_checksum=component.default_persona_checksum,
+            required_config_names=tuple(n for n in required if n not in secret_names),
+            required_secret_names=tuple(n for n in required if n in secret_names),
+            dependencies=dependencies, staged_dir=component_dir,
+            receipt_id=receipt.receipt_id, receipt_digest=receipt.receipt_digest,
+            plugin_resolutions=tuple(plugin_rows),
+        )
+    except BaseException:
+        shutil.rmtree(component_dir, ignore_errors=True)
+        raise
 
 
 # ---------------------------------------------------------------------------
@@ -1575,16 +1669,40 @@ def commit_specialist_install(
                 "unknown_secret_name",
                 f"secret_names_provided entries {unknown_secret_names} are not declared "
                 "in the component's config_schema secret_names")
-        satisfied, missing = satisfy_config(
-            schema=component.config_schema, provided_non_secret=config,
-            provided_secret_names=secret_names_provided,
-        )
         root = component_root_string(
             component_id=component.component_id, version=component.version,
             component_checksum=fresh_root_digest,
         )
         instance_dir = InstanceDir(specialists_dir / inspection.slug)
         dependency_digests = tuple(sorted(d.digest for d in fresh_deps))
+
+        # #331: a pending-configuration retry supplies only the STILL-MISSING
+        # settings — merge the SAME-ROOT pending candidate's persisted
+        # config_snapshot under the caller's config (caller wins per key) so
+        # already-supplied settings survive the retry instead of being
+        # recomputed from the current argument alone and overwritten. Only
+        # schema-known, non-secret keys carry (same filter as the upgrade
+        # merge, #337). A different-root or unreadable candidate contributes
+        # nothing — _refuse_if_active_present, re-run in-lock below, stays
+        # the authority on whether staging may proceed at all.
+        try:
+            pending_before = instance_dir.desired()
+        except Exception:  # noqa: BLE001 — unreadable candidate: in-lock guard refuses
+            pending_before = None
+        merged_config = dict(config)
+        if pending_before is not None and pending_before.root == root:
+            _secret_declared = set(component.config_schema.get("secret_names", []) or [])
+            _known = set(component.config_schema.get("required", []) or []) | _secret_declared
+            carried = {
+                k: v for k, v in dict(pending_before.config_snapshot).items()
+                if k in _known and k not in _secret_declared
+            }
+            merged_config = {**carried, **dict(config)}
+
+        satisfied, missing = satisfy_config(
+            schema=component.config_schema, provided_non_secret=merged_config,
+            provided_secret_names=secret_names_provided,
+        )
 
         # Persona/compile GATE before any durable mutation (satisfiable path
         # only; the pending path stages a placeholder with no compile).
@@ -1595,7 +1713,7 @@ def commit_specialist_install(
                 check_persona_requirements(role.normalized, persona)
             except ValueError as exc:
                 raise SpecialistInstallError("persona_incompatible", str(exc)) from exc
-            effective_config_digest = compute_effective_config_digest(dict(config))
+            effective_config_digest = compute_effective_config_digest(dict(merged_config))
             binding = materialize_component_default_binding(
                 role=role, persona=persona, component_root=root,
                 dependency_digests=dependency_digests,
@@ -1622,8 +1740,14 @@ def commit_specialist_install(
                 )
                 with specialist_materialize.MATERIALIZE_LOCK:
                     _refuse_if_active_present(instance_dir, slug=inspection.slug, root=root)
+                    if receipt is not None:
+                        # Marker BEFORE the stage (Sol r7-2): desired.yaml
+                        # must never exist without its receipt marker.
+                        _record_pending_receipt(
+                            specialists_dir / inspection.slug, receipt.receipt_id)
                     instance_dir.stage_desired(InstanceTuple(
-                        root=root, binding=placeholder_binding, config_snapshot=dict(config),
+                        root=root, binding=placeholder_binding,
+                        config_snapshot=dict(merged_config),
                         config_digest=placeholder_binding.effective_config_digest,
                     ))
                     if sidecar_doc is not None:
@@ -1637,7 +1761,7 @@ def commit_specialist_install(
             with specialist_materialize.MATERIALIZE_LOCK:
                 _refuse_if_active_present(instance_dir, slug=inspection.slug, root=root)
                 instance_dir.stage_desired(InstanceTuple(
-                    root=root, binding=binding, config_snapshot=dict(config),
+                    root=root, binding=binding, config_snapshot=dict(merged_config),
                     config_digest=effective_config_digest,
                 ))
                 if sidecar_doc is not None:
@@ -1645,6 +1769,7 @@ def commit_specialist_install(
                 committed = instance_dir.commit_desired_to_active()
                 if sidecar_doc is not None:
                     instance_dir.commit_owned_plugins_desired_to_active()
+                _clear_pending_receipt(specialists_dir / inspection.slug)
                 try:
                     specialist_materialize.materialize_specialist_operational_files(
                         agents_specialists_dir=agents_specialists_dir, slug=inspection.slug,
@@ -1738,6 +1863,18 @@ def commit_specialist_install(
         if workspace is not None:
             shutil.rmtree(workspace, ignore_errors=True)
 
+    # #306: the inspection staging tree is consumed once the install is
+    # terminally successful. On the BUNDLE path the tool layer owns that
+    # boundary — its reload-and-verify sequencer can still fail and
+    # compensate back to the pending state, and the retry needs the staged
+    # bytes (Sol r2-1) — so it reclaims beside the receipt prune. Only the
+    # legacy no-receipt path, which has no sequencer, consumes it here. A
+    # pending-configuration outcome always retains the tree (the follow-up
+    # commit reuses the attested bytes; abandonment falls to the boot sweep).
+    if (not bundle_mode and _instance_out is not None
+            and _instance_out.state == "active"):
+        reclaim_staging_tree(inspection.staged_dir)
+
     if bundle_mode:
         return _instance_out, _txn_out
     return _instance_out
@@ -1781,7 +1918,11 @@ def activate_binding_for_config(cfg, *, specialists_root: Path = Path("/config/s
     if active_tuple.binding.mode == "override":
         # The persona to COMPILE with is the override's, not the component's
         # bundled default — role/doctrine still come from cas_dir above.
-        personas_root = Path("/config/personas")
+        # #323 (Sol r3-3): resolved through the same env-aware seam the
+        # persona tools and resident loader use, or an override applied
+        # under a custom config root fails activation on the next reload.
+        from persona_install import installed_personas_root
+        personas_root = installed_personas_root()
         bound_persona = load_persona_pack(
             personas_root / active_tuple.binding.persona_id / active_tuple.binding.persona_version / "pack",
             personas_root / active_tuple.binding.persona_id / active_tuple.binding.persona_version / "manifest.json",
@@ -1847,11 +1988,14 @@ def upgrade_specialist(
     from personality_binding import InstanceDir
 
     if receipt is None:
-        return _upgrade_core(
+        instance = _upgrade_core(
             slug=slug, inspection=inspection, config=config,
             secret_names_provided=secret_names_provided, acks=acks,
             specialists_dir=specialists_dir, agents_specialists_dir=agents_specialists_dir,
             receipt=None)
+        if instance.state == "active":
+            reclaim_staging_tree(inspection.staged_dir)   # #306
+        return instance
 
     if registry_path is None:
         registry_path = plugin_registry.REGISTRY_PATH
@@ -1939,6 +2083,9 @@ def upgrade_specialist(
             raise
     finally:
         shutil.rmtree(workspace, ignore_errors=True)
+    # #306/Sol r2-1: NO staging reclaim here — this is the bundle path, and
+    # the tool layer's sequencer decides terminal success (see
+    # commit_specialist_install's identical note).
     return instance, txn
 
 
@@ -2069,7 +2216,8 @@ def _upgrade_core(
     # silently on every upgrade would discard an operator's explicit
     # persona choice.
     if active_before.binding.mode == "override":
-        personas_root = Path("/config/personas")
+        from persona_install import installed_personas_root
+        personas_root = installed_personas_root()   # #323 (Sol r3-3)
         persona = load_persona_pack(
             personas_root / active_before.binding.persona_id / active_before.binding.persona_version / "pack",
             personas_root / active_before.binding.persona_id / active_before.binding.persona_version / "manifest.json",
@@ -2124,7 +2272,24 @@ def _upgrade_core(
         if k not in prior_secret_names
     }
     known_keys = set(component.config_schema.get("required", [])) | secret_names
-    stale_config = {**carried_config, **dict(config)}
+    # #331: a pending-configuration UPGRADE retry must also keep the settings
+    # its earlier attempt already supplied — carry the SAME-TARGET-ROOT
+    # desired candidate's snapshot too, between the active carry and the
+    # caller's config (precedence: active < prior desired < caller). A
+    # different-root or unreadable candidate contributes nothing.
+    root = component_root_string(component_id=component.component_id, version=component.version,
+                                  component_checksum=fresh_root_digest)
+    try:
+        _desired_before = instance_dir.desired()
+    except Exception:  # noqa: BLE001 — unreadable candidate contributes nothing
+        _desired_before = None
+    desired_carried = {}
+    if _desired_before is not None and _desired_before.root == root:
+        desired_carried = {
+            k: v for k, v in dict(_desired_before.config_snapshot).items()
+            if k in known_keys and k not in secret_names
+        }
+    stale_config = {**carried_config, **desired_carried, **dict(config)}
     dropped_keys = sorted(k for k in stale_config if k not in known_keys)
     stripped_secret_keys = sorted(
         {k for k in active_before.config_snapshot if k in prior_secret_names}
@@ -2141,8 +2306,6 @@ def _upgrade_core(
         schema=component.config_schema, provided_non_secret=merged_config,
         provided_secret_names=secret_names_provided,
     )
-    root = component_root_string(component_id=component.component_id, version=component.version,
-                                  component_checksum=fresh_root_digest)
     dependency_digests = tuple(sorted(d.digest for d in fresh_deps))
 
     def _build_upgrade_binding(*, effective_config_digest: str):
@@ -2168,6 +2331,10 @@ def _upgrade_core(
         # recreate a just-removed InstanceDir).
         with specialist_materialize.MATERIALIZE_LOCK:
             _require_active_unchanged(instance_dir, active_before, slug=slug)
+            if receipt is not None:
+                # Marker BEFORE the stage (Sol r7-2): desired.yaml must
+                # never exist without its receipt marker.
+                _record_pending_receipt(specialists_dir / slug, receipt.receipt_id)
             instance_dir.stage_desired(InstanceTuple(
                 root=root, binding=placeholder, config_snapshot=merged_config,
                 config_digest=placeholder.effective_config_digest))
@@ -2236,6 +2403,7 @@ def _upgrade_core(
         instance_dir.stage_desired(InstanceTuple(
             root=root, binding=binding, config_snapshot=merged_config, config_digest=effective_config_digest))
         committed = instance_dir.commit_desired_to_active()  # new binding digest -> new session epoch
+        _clear_pending_receipt(specialists_dir / slug)
         # #337 (Sol r1): the commit just rotated the OLD active — possibly
         # carrying legacy plaintext — into active.prior.yaml; strip
         # secret-named keys (the union of both components' declarations).
@@ -2609,7 +2777,8 @@ def _rollback_core(
     cas_dir = cas_store_dir(checksum, store_root=specialists_dir / "store")
     role = materialize_role(source=load_role_artifact(cas_dir / "role"), options={})
     if prior.binding.mode == "override":
-        personas_root = Path("/config/personas")
+        from persona_install import installed_personas_root
+        personas_root = installed_personas_root()   # #323 (Sol r3-3)
         persona = load_persona_pack(
             personas_root / prior.binding.persona_id / prior.binding.persona_version / "pack",
             personas_root / prior.binding.persona_id / prior.binding.persona_version / "manifest.json",

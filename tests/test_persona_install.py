@@ -112,6 +112,94 @@ def test_inspect_persona_repo_missing_manifest_raises(tmp_path: Path, monkeypatc
     assert raised.value.kind == "manifest_missing"
 
 
+def test_inspect_persona_repo_failure_reclaims_staging_tree(
+        tmp_path: Path, monkeypatch) -> None:
+    """#306: a rejected persona inspection (missing manifest here) must not
+    leave the fetched tree behind under personas/.staging."""
+    fetched = tmp_path / "fetched"
+    fetched.mkdir()
+
+    def _fake_resolve_and_fetch(repo, ref, subdir, dest, *, expected_revision=None):
+        import shutil
+        shutil.copytree(fetched, dest)
+        return "0" * 40
+
+    monkeypatch.setattr("persona_install.resolve_and_fetch", _fake_resolve_and_fetch)
+    staging = tmp_path / ".staging"
+    with pytest.raises(SpecialistInstallError):
+        inspect_persona_repo("casa-test/newton-persona", "main", staging_root=staging)
+    assert list(staging.iterdir()) == []
+
+
+def test_default_roots_resolve_through_casa_config_dir(tmp_path: Path, monkeypatch) -> None:
+    """#323 (Sol r3-2): the SUPPORTED install flow — inspect then commit with
+    the tools' DEFAULT roots — must stage and publish under
+    $CASA_CONFIG_DIR/personas. Pre-fix the defaults froze /config/personas at
+    import time, so under a custom config root the tools published to one
+    directory while persona_apply and the loaders read another
+    (persona_unavailable for a pack the operator just installed)."""
+    from persona_install import (
+        PersonaInstallAckStore, commit_persona_install, persona_install_consent_identity,
+    )
+
+    custom = tmp_path / "custom"
+    monkeypatch.setenv("CASA_CONFIG_DIR", str(custom))
+    fetched = tmp_path / "fetched"
+    _write_persona_repo(fetched)
+
+    def _fake_resolve_and_fetch(repo, ref, subdir, dest, *, expected_revision=None):
+        import shutil
+        shutil.copytree(fetched, dest)
+        return "0" * 40
+
+    monkeypatch.setattr("persona_install.resolve_and_fetch", _fake_resolve_and_fetch)
+    inspection = inspect_persona_repo("casa-test/newton-persona", "main")
+    assert str(inspection.staged_dir).startswith(
+        str(custom / "personas" / ".staging"))
+
+    acks = PersonaInstallAckStore(path=tmp_path / "acks.json")
+    identity = persona_install_consent_identity(
+        persona_id=inspection.persona_id, version=inspection.version,
+        checksum=inspection.checksum)
+    acks.record(identity=identity, persona_id=inspection.persona_id,
+                version=inspection.version, checksum=inspection.checksum)
+
+    pack = commit_persona_install(inspection=inspection, acks=acks)
+    assert pack.checksum == inspection.checksum
+    dest = custom / "personas" / "casa/newton" / "0.1.0"
+    assert (dest / "manifest.json").is_file()
+    assert (dest / "pack" / "persona.yaml").is_file()
+
+
+def test_commit_persona_install_reclaims_staging_tree(tmp_path: Path) -> None:
+    """#306: a successful persona commit consumes the inspection staging tree
+    (pre-fix commit cleaned only its own commit-time staging copy)."""
+    import dataclasses
+
+    from persona_install import (
+        PersonaInstallAckStore, commit_persona_install, persona_install_consent_identity,
+    )
+
+    inspection = _inspection_from_repo(tmp_path)
+    staging = tmp_path / ".staging"
+    staging.mkdir()
+    staged = staging / "deadbeef"
+    import shutil as _shutil
+    _shutil.copytree(inspection.staged_dir, staged)
+    inspection = dataclasses.replace(inspection, staged_dir=staged)
+
+    acks = PersonaInstallAckStore(path=tmp_path / "acks.json")
+    identity = persona_install_consent_identity(
+        persona_id=inspection.persona_id, version=inspection.version, checksum=inspection.checksum)
+    acks.record(identity=identity, persona_id=inspection.persona_id,
+                version=inspection.version, checksum=inspection.checksum)
+
+    pack = commit_persona_install(
+        inspection=inspection, acks=acks, personas_root=tmp_path / "personas")
+    assert pack.checksum == inspection.checksum
+    assert not staged.exists()
+
+
 # ---------------------------------------------------------------------------
 # commit_persona_install
 # ---------------------------------------------------------------------------

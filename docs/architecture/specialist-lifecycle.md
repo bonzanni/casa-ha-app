@@ -1,5 +1,5 @@
 ---
-last_reviewed: 2026-07-31
+last_reviewed: 2026-08-01
 ---
 
 # The specialist install lifecycle
@@ -44,7 +44,10 @@ stay put as inert residue.
 **One lock serializes every instance mutation.** Install, upgrade, rollback, uninstall and
 the reconcile pass all run under the materialize lock, and mutations re-read the active
 tuple inside it — a pre-lock read that went stale refuses as a concurrent mutation rather
-than overwriting.
+than overwriting. The roles overlay a reload builds under that lock is consumed by the
+agent loader *after* release (holding the non-reentrant lock across the load would
+deadlock the resident reconcile), so a load that fails against a tuple swapped in that
+window rebuilds the overlay once and retries before surfacing the error.
 
 ## Contracts & invariants
 
@@ -97,6 +100,24 @@ which the rollback contract forbids — the digest is unguessable only to the ex
 secret was); a runtime config-git commit issued between an upgrade crash and the next boot
 can still capture pre-scrub bytes; persona overrides copy the active snapshot unchanged.
 
+**INV-SPEC-007**: A failed system-requirement replacement preserves the previously working installation — the replacement is built as a new generation in the plugin's own namespace and published by a single atomic retarget of the launcher link; the serving generation is never moved, and the superseded one is retained until the next install.
+
+Enforced in the tarball strategy: a requirement that can never succeed (no safe
+`verify_bin`) is refused at manifest level before any installer runs; the install-command
+shape is validated before anything is disturbed; the verified tree is fsynced, landed at
+a never-pre-existing generation path under the plugin's own directory (immune to
+plugin-name prefix collisions, whatever the version), and its rename made durable before
+the launcher is retargeted via a temporary link and one rename — no unlink gap, no
+restore step whose own failure could lose the old tree. Superseded generations are
+reclaimed only at the start of the *next* install, so an in-flight consumer of the
+previous tree gets a full install-to-install grace window. All three strategies share the
+atomic link publication.
+
+What it does not cover: the venv and npm strategies still rebuild their per-plugin
+package trees in place — their failure window can leave that one plugin's own requirement
+broken, but never another plugin's — and generation retention means up to two
+generations of a tarball requirement occupy disk between installs.
+
 ## Failure behavior
 
 **Resolution, fetch, manifest or dependency problems.** Typed refusals before anything
@@ -105,12 +126,32 @@ unavailable, a secret value in the plain config channel, an undeclared secret na
 secret channel (INV-SPEC-006). Sourced plugin dependencies are additionally refused categorically when they
 declare system requirements or triggers of their own, or when a required environment name
 collides with another installed plugin's — otherwise-valid bundles fail with dedicated
-error kinds the dependency model alone would not predict.
+error kinds the dependency model alone would not predict. A rejected inspection deletes
+its fetched staging tree; a successful one retains it for the commit to consume.
 
 **A component declares system requirements.** Each installs by its declared strategy —
 verified tarball, virtualenv or npm, processed in declaration order; OS packages are
-refused — and the winning strategy is recorded durably. Boot reconciliation then only *reports* a missing binary as
+refused — and the winning strategy is recorded durably. A present-but-malformed
+declaration refuses rather than reading as "no requirements"; a binary name another
+plugin already publishes refuses rather than repointing the shared `tools/bin` entry —
+by manifest row, and independently by the live launcher's own target, so a corrupt
+manifest (which deliberately reads as empty) cannot authorize a takeover; a tarball
+reinstall preserves the working install until its
+replacement fully succeeds (INV-SPEC-007); and an update or removal that drops a
+previously published binary name retires that launcher link (ownership-checked against
+the plugin's own install namespace) instead of leaving it resolvable but unverified.
+Boot reconciliation then only *reports* a missing binary as
 degraded; nothing reinstalls tooling automatically.
+
+**An install lands pending-configuration.** The staged inspection tree and the source
+receipt are both retained — the follow-up configure re-commit requires that receipt, and
+a fresh re-inspect would refuse the now-occupied slug — and a retry that supplies only
+the still-missing settings merges over the pending candidate's persisted snapshot
+(schema-known, non-secret keys only; the caller wins per key). Upgrades carry the active
+snapshot and a same-target pending candidate the same way. The receipt and staging tree
+are consumed only after the activating bundle's reload-and-verify sequencer succeeds —
+a sequencer failure compensates back to the pending state with both intact, so the retry
+still has its attested bytes; whatever is abandoned falls to the boot age sweep.
 
 **Consent missing or the inspection disagrees with the receipt.** Refused before tuple
 activation; a changed closure means a changed identity means new consent.
@@ -124,7 +165,17 @@ itself fails, the journal stays in progress for boot to finish.
 
 **Boot finds journals.** Complete ones are pruned, valid in-progress ones rolled back,
 corrupt or unrollbackable ones quarantined — a filename that cannot be parsed quarantines
-every owned entry rather than guessing.
+every owned entry rather than guessing. The same boot pass age-sweeps orphan consent
+receipts and abandoned staging trees (inspection, bundle and store staging, the persona
+staging root included) on a shared seven-day cutoff, so a denied or crashed flow's
+fetched repo copies never accumulate unbounded. A live pending-configuration install is
+exempt whatever its age — precisely the receipt its commit recorded in a durable
+per-slug marker (a same-slug receipt for a different root cannot resume it; newest per
+slug is only the fallback when no marker is readable, and keeping every pre-commit
+inspection would pin unbounded staging) — and the staged paths surviving receipts
+reference keep their trees. A pending candidate is durable operator-visible state, and
+sweeping its last usable receipt would make the supported configure re-commit
+permanently impossible.
 
 **Two mutations race.** The loser refuses as a concurrent mutation; nothing is overwritten
 or resurrected. The in-lock re-check covers both generations: an active tuple that appeared
@@ -162,17 +213,21 @@ journal and be restorable by rollback, or a crash leaves it outside recovery.
 **Source**
 - `casa/rootfs/opt/casa/specialist_install.py::commit_specialist_install`
 - `casa/rootfs/opt/casa/specialist_install.py::compute_install_root_digest`
+- `casa/rootfs/opt/casa/specialist_install.py::sweep_staging_aged`
 - `casa/rootfs/opt/casa/specialist_materialize.py::current_specialist_roles_dir`
 - `casa/rootfs/opt/casa/specialist_materialize.py::materialize_specialist_operational_files`
 - `casa/rootfs/opt/casa/specialist_receipt.py::compute_receipt_digest`
 - `casa/rootfs/opt/casa/specialist_bundle_journal.py::reconcile_boot`
 - `casa/rootfs/opt/casa/specialist_registry.py::InstalledSpecialistIndex`
+- `casa/rootfs/opt/casa/system_requirements/tarball.py::install_tarball`
+- `casa/rootfs/opt/casa/system_requirements/manifest.py::ensure_bin_claim`
 
 **Tests**
 - `tests/test_specialist_install.py`
 - `tests/test_specialist_lifecycle_matrix.py`
 - `tests/test_specialist_materialize.py`
 - `tests/test_specialist_bundle_journal.py`
+- `tests/test_system_requirements_installer_tarball.py`
 
 **Related**
 - [`architecture/agent-taxonomy.md`](../architecture/agent-taxonomy.md)

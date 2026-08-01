@@ -299,6 +299,46 @@ async def _specialist_roles_dir(runtime: Any) -> str:
     return await asyncio.to_thread(_resolve)
 
 
+async def _load_agent_with_overlay_retry(runtime: Any, agent_dir: str, *,
+                                         policies: Any, tier: str):
+    """#331(d): ``_specialist_roles_dir`` builds the overlay under
+    ``MATERIALIZE_LOCK`` but the loader consumes it AFTER the lock is
+    released — a concurrent upgrade can commit a new active tuple between
+    the two, so the loader compiles the NEW binding against the OLD overlay
+    role artifact and fails on a checksum mismatch. Holding the lock across
+    the load is not an option (``load_agent_from_dir`` itself acquires the
+    non-reentrant lock via ``reconcile_resident_binding`` on resident
+    loads), so: rebuild the overlay once against the post-swap state and
+    retry the load. Loads are bounded read-only local work, so one retry on
+    a genuine (non-transient) load error only duplicates that bounded work
+    before surfacing the same error.
+
+    Returns ``(cfg, roles_dir)``. NB the overlay is a shared, destructively
+    rebuilt path, not an immutable snapshot: a concurrent mutation committed
+    AFTER a successful load can rebuild it again before the caller's later
+    ``specialist_registry.load(roles_dir=...)`` — that reader then sees the
+    newer, internally consistent overlay (pre-existing behavior, unchanged
+    here). That is convergent, not corrupt: reloads serialize per scope/role
+    (INV-CFG-002), the concurrent mutation's own bundle sequencer re-runs the
+    registry refresh as the last lock-holder, and the overlay rebuild always
+    reflects the full committed tuple state, never a torn mix."""
+    import agent_loader
+
+    roles_dir = await _specialist_roles_dir(runtime) if tier == "specialist" else None
+    try:
+        cfg = await asyncio.to_thread(
+            agent_loader.load_agent_from_dir, agent_dir,
+            policies=policies, roles_dir=roles_dir)
+    except Exception:  # noqa: BLE001 — retried once for specialists, then re-raised
+        if tier != "specialist":
+            raise
+        roles_dir = await _specialist_roles_dir(runtime)
+        cfg = await asyncio.to_thread(
+            agent_loader.load_agent_from_dir, agent_dir,
+            policies=policies, roles_dir=roles_dir)
+    return cfg, roles_dir
+
+
 async def reload_triggers(runtime: Any, *, role: str | None = None) -> list[str]:
     """Soft-reload triggers for one role. Ports tools.casa_reload_triggers body
     to the runtime/dispatcher contract; full lineage in spec §3.
@@ -345,13 +385,9 @@ async def reload_triggers(runtime: Any, *, role: str | None = None) -> list[str]
     # the specialist_registry.load call below), which would otherwise vanish
     # a component-only specialist (no image fallback) on its very first
     # `casa_reload(scope="triggers", role=<slug>)` after install.
-    import agent_loader
-    roles_dir = await _specialist_roles_dir(runtime) if tier == "specialist" else None
     try:
-        cfg = await asyncio.to_thread(
-            agent_loader.load_agent_from_dir,
-            agent_dir, policies=policy_lib, roles_dir=roles_dir,
-        )
+        cfg, roles_dir = await _load_agent_with_overlay_retry(
+            runtime, agent_dir, policies=policy_lib, tier=tier)
     except Exception as exc:  # noqa: BLE001
         raise ReloadError("load_error", str(exc)) from exc
 
@@ -700,15 +736,11 @@ async def reload_agent(runtime: Any, *, role: str | None = None) -> list[str]:
     except Exception as exc:  # noqa: BLE001
         raise ReloadError("load_error", f"policies: {exc}") from exc
 
-    import agent_loader
     # Task N1b Step 25b: an installed specialist's role artifact lives ONLY
     # under the reconciled roles overlay, never agent_loader.DEFAULT_ROLES_DIR.
-    roles_dir = await _specialist_roles_dir(runtime) if tier == "specialist" else None
     try:
-        new_cfg = await asyncio.to_thread(
-            agent_loader.load_agent_from_dir, agent_dir, policies=policy_lib,
-            roles_dir=roles_dir,
-        )
+        new_cfg, roles_dir = await _load_agent_with_overlay_retry(
+            runtime, agent_dir, policies=policy_lib, tier=tier)
     except Exception as exc:  # noqa: BLE001
         raise ReloadError("load_error", str(exc)) from exc
 
@@ -912,13 +944,9 @@ async def _reload_role_after_policies(runtime: Any, role: str) -> None:
     else:
         return  # role disappeared between scan and re-load — silently skip
 
-    import agent_loader
     # Task N1b Step 25b: same roles_dir threading as reload_agent above.
-    roles_dir = await _specialist_roles_dir(runtime) if tier == "specialist" else None
-    new_cfg = await asyncio.to_thread(
-        agent_loader.load_agent_from_dir,
-        agent_dir, policies=runtime.policy_lib, roles_dir=roles_dir,
-    )
+    new_cfg, _roles_dir = await _load_agent_with_overlay_retry(
+        runtime, agent_dir, policies=runtime.policy_lib, tier=tier)
 
     # Personality Phase A, Task 14 (whole-branch review): restart-to-swap must
     # hold on the POLICY cascade too. A resident whose role_checksum OR

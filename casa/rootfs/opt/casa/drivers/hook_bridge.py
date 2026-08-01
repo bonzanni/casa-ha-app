@@ -31,16 +31,30 @@ def translate_hooks_to_settings(
     hollow yaml previously emitted ZERO hooks, shedding every policy for
     the next session. Yaml policies are additive-only.
     """
+    # #354 (Sol r5-3): the document ROOT is attacker-editable too — valid
+    # yaml like `[]` or a bare scalar crashed provisioning on .get(). A
+    # non-mapping root reads as empty; the mandatory guard still emits.
+    if not isinstance(hooks_yaml, dict):
+        hooks_yaml = {}
     out: dict = {"hooks": {}}
     for snake, pascal in (
         ("pre_tool_use", "PreToolUse"),
         ("post_tool_use", "PostToolUse"),
     ):
         entries = hooks_yaml.get(snake, []) or []
+        # #354: the yaml is a mutable trust surface — a non-list section or a
+        # non-mapping member (``pre_tool_use: [null]``) is syntactically valid
+        # yaml that passed boot/reload, then crashed engagement provisioning
+        # on ``e.get()``. Treat malformed shapes as absent (the mandatory
+        # guard below is appended regardless).
+        if not isinstance(entries, list):
+            entries = []
         if not entries:
             continue
         out_entries = []
         for e in entries:
+            if not isinstance(e, dict):
+                continue
             policy = e.get("policy")
             matcher = e.get("matcher", ".*")
             if not policy:
@@ -51,9 +65,13 @@ def translate_hooks_to_settings(
             }
             # Pass-through optional per-hook timeout (seconds). CC's default
             # is 60s; engagement_permission_relay needs ~600s for the
-            # operator-response window (C-1 spec §4.6).
+            # operator-response window (C-1 spec §4.6). #354: an unparseable
+            # timeout is dropped rather than crashing provisioning.
             if "timeout" in e and e["timeout"] is not None:
-                cc_hook["timeout"] = int(e["timeout"])
+                try:
+                    cc_hook["timeout"] = int(e["timeout"])
+                except (TypeError, ValueError, OverflowError):
+                    pass  # OverflowError: yaml `.inf` (Terra r7-1)
             out_entries.append({
                 "matcher": matcher,
                 "hooks": [cc_hook],

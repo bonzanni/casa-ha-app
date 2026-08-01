@@ -93,9 +93,9 @@ def test_integrity_mismatch(tmp_path: Path, http_server) -> None:
             },
             tools_root=tmp_path / "tools",
         )
-    # Clean rollback: tools dir empty.
-    assert list((tmp_path / "tools").rglob("*")) == [tmp_path / "tools" / "bin"] or \
-           list((tmp_path / "tools").rglob("*")) == []
+    # Clean rollback: no published bin, no generation content.
+    assert list((tmp_path / "tools" / "bin").iterdir()) == []
+    assert list((tmp_path / "tools" / "tarball" / "fakebin").iterdir()) == []
 
 
 # ---------------------------------------------------------------------------
@@ -299,6 +299,382 @@ def test_install_cmd_argv_list_runs(tmp_path: Path, fixture_tarball) -> None:
 # the global default timeout of None → an unresponsive server hung the whole
 # casa-main event loop forever).
 # ---------------------------------------------------------------------------
+
+def _install_spec(url: str, sha: str, **extra) -> dict:
+    spec = {"type": "tarball", "url": url, "sha256": sha,
+            "extract": ".", "verify_bin": "fakebin"}
+    spec.update(extra)
+    return spec
+
+
+def _build_tarball(tmp_path: Path, name: str, files: dict[str, str]) -> Path:
+    """Build a tarball at tmp_path/name containing the given path→text files."""
+    pkg_dir = tmp_path / f"{name}-pkg"
+    for rel, text in files.items():
+        dest = pkg_dir / rel
+        dest.parent.mkdir(parents=True, exist_ok=True)
+        dest.write_text(text, encoding="utf-8")
+        dest.chmod(0o755)
+    tar_path = tmp_path / name
+    with tarfile.open(tar_path, "w:gz") as tf:
+        tf.add(pkg_dir, arcname=".")
+    return tar_path
+
+
+def test_failed_reinstall_preserves_existing_install(tmp_path: Path) -> None:
+    """#308: a reinstall whose install_cmd fails must leave the previously
+    working install (tree + resolving symlink) untouched.
+
+    Pre-fix: rmtree(install_dir) ran before install_cmd, so the nonzero
+    exit destroyed the working tree and left a half-installed replacement."""
+    import subprocess
+
+    v1_tar = _build_tarball(tmp_path, "v1.tar.gz",
+                            {"bin/fakebin": "#!/bin/sh\necho v1\n"})
+    v2_tar = _build_tarball(tmp_path, "v2.tar.gz",
+                            {"other/fakebin": "#!/bin/sh\necho v2\n"})
+    url1, sha1, server1 = _serve_local_file(v1_tar)
+    url2, sha2, server2 = _serve_local_file(v2_tar)
+    tools = tmp_path / "tools"
+    try:
+        result = install_tarball(
+            plugin_name="fakebin", spec=_install_spec(url1, sha1),
+            tools_root=tools,
+        )
+        assert result.verify_bin_resolves
+        marker = result.install_dir / "bin" / "fakebin"
+
+        with pytest.raises(subprocess.CalledProcessError):
+            install_tarball(
+                plugin_name="fakebin",
+                spec=_install_spec(url2, sha2, install_cmd=["false"]),
+                tools_root=tools,
+            )
+        # The old tree survives with its original content, and the
+        # published symlink still resolves to a real file.
+        assert marker.read_text(encoding="utf-8") == "#!/bin/sh\necho v1\n"
+        link = tools / "bin" / "fakebin"
+        assert link.is_symlink() and link.resolve().is_file()
+    finally:
+        server1.shutdown()
+        server2.shutdown()
+
+
+def test_invalid_install_cmd_shape_checked_before_touching_install(
+        tmp_path: Path) -> None:
+    """#308: the argv-shape validation of install_cmd must run before the
+    existing install is disturbed."""
+    v1_tar = _build_tarball(tmp_path, "v1.tar.gz",
+                            {"bin/fakebin": "#!/bin/sh\necho v1\n"})
+    v2_tar = _build_tarball(tmp_path, "v2.tar.gz",
+                            {"bin/fakebin": "#!/bin/sh\necho v2\n"})
+    url1, sha1, server1 = _serve_local_file(v1_tar)
+    url2, sha2, server2 = _serve_local_file(v2_tar)
+    tools = tmp_path / "tools"
+    try:
+        result = install_tarball(
+            plugin_name="fakebin", spec=_install_spec(url1, sha1),
+            tools_root=tools,
+        )
+        marker = result.install_dir / "bin" / "fakebin"
+        with pytest.raises(UnsafeArchiveError, match="install_cmd"):
+            install_tarball(
+                plugin_name="fakebin",
+                spec=_install_spec(url2, sha2, install_cmd="rm -rf /"),
+                tools_root=tools,
+            )
+        assert marker.read_text(encoding="utf-8") == "#!/bin/sh\necho v1\n"
+        link = tools / "bin" / "fakebin"
+        assert link.is_symlink() and link.resolve().is_file()
+    finally:
+        server1.shutdown()
+        server2.shutdown()
+
+
+def test_reinstall_keeps_previous_generation_until_next_install(
+        tmp_path: Path, fixture_tarball) -> None:
+    """#308 (review round 2): a successful reinstall publishes a fresh
+    generation and atomically re-points the launcher into it, but RETAINS the
+    previous generation (grace for in-flight consumers of the old tree).
+    The generation before that — no longer serving at the next install's
+    start — is reclaimed then, so at most two generations ever accumulate.
+    Staging leftovers never survive an install."""
+    tar_path, sha = fixture_tarball
+    url, _sha, server = _serve_local_file(tar_path)
+    tools = tmp_path / "tools"
+    gens_dir = tools / "tarball" / "fakebin"
+    try:
+        first = install_tarball(
+            plugin_name="fakebin", spec=_install_spec(url, sha),
+            tools_root=tools,
+        )
+        second = install_tarball(
+            plugin_name="fakebin", spec=_install_spec(url, sha),
+            tools_root=tools,
+        )
+        assert second.ok and second.verify_bin_resolves
+        assert second.install_dir != first.install_dir
+        link = tools / "bin" / "fakebin"
+        # The link resolves INTO the new generation…
+        assert str(link.resolve()).startswith(str(second.install_dir))
+        # …while the previous generation is retained for in-flight consumers.
+        assert first.install_dir.is_dir()
+
+        third = install_tarball(
+            plugin_name="fakebin", spec=_install_spec(url, sha),
+            tools_root=tools,
+        )
+        assert third.ok
+        # The first generation stopped serving before the third install
+        # began, so its start-of-install reclaim removed it.
+        assert not first.install_dir.exists()
+        assert second.install_dir.is_dir()   # still the grace generation
+        gens = sorted(p.name for p in gens_dir.iterdir())
+        assert len(gens) == 2, f"expected exactly two generations: {gens}"
+        assert not any(n.startswith(".") for n in gens), f"staging leaked: {gens}"
+    finally:
+        server.shutdown()
+
+
+def test_legacy_flat_dirs_swept_across_versions_but_never_other_plugins(
+        tmp_path: Path, fixture_tarball, monkeypatch) -> None:
+    """#308 (review round 3, Terra P2): pre-generation flat layouts of EVERY
+    version are reclaimed once they stop serving — while a name-prefix
+    sibling plugin's directories are never touched (manifest-guarded)."""
+    from system_requirements.manifest import add_plugin_entry
+
+    manifest_path = tmp_path / "system-requirements.yaml"
+    monkeypatch.setattr("system_requirements.manifest.MANIFEST_PATH",
+                        manifest_path)
+    tar_path, sha = fixture_tarball
+    url, _sha, server = _serve_local_file(tar_path)
+    tools = tmp_path / "tools"
+    try:
+        # Legacy residue from two old versions of THIS plugin…
+        (tools / "fakebin-0.9").mkdir(parents=True)
+        (tools / "fakebin-1.0").mkdir()
+        # …and a directory owned by a DIFFERENT, prefix-sharing plugin.
+        (tools / "fakebin-extra-1.0").mkdir()
+        add_plugin_entry({"name": "fakebin-extra", "winning_strategy": "tarball",
+                          "install_dir": str(tools / "fakebin-extra-1.0"),
+                          "verify_bin": "othertool",
+                          "declared_at": "2026-08-01T00:00:00Z"})
+
+        result = install_tarball(
+            plugin_name="fakebin", spec=_install_spec(url, sha),
+            tools_root=tools,
+        )
+        assert result.ok
+        assert not (tools / "fakebin-0.9").exists()
+        assert not (tools / "fakebin-1.0").exists()
+        assert (tools / "fakebin-extra-1.0").is_dir()   # other plugin's — kept
+
+        # Sol r4-2 (reverse direction): the LONGER-named plugin must still
+        # reclaim its OWN legacy dirs even though they also match the
+        # shorter sibling's prefix.
+        add_plugin_entry({"name": "fakebin", "winning_strategy": "tarball",
+                          "install_dir": str(result.install_dir),
+                          "verify_bin": "fakebin",
+                          "declared_at": "2026-08-01T00:00:00Z"})
+        (tools / "fakebin-extra-0.9").mkdir()
+        spec_extra = _install_spec(url, sha, verify_bin="othertool")
+        extra = install_tarball(
+            plugin_name="fakebin-extra", spec=spec_extra, tools_root=tools,
+        )
+        # othertool isn't in the archive, so the install itself doesn't
+        # resolve — but the start-of-install sweep already ran: BOTH of the
+        # plugin's own legacy dirs are reclaimed (neither is served by any
+        # launcher of fakebin-extra), despite matching sibling `fakebin`'s
+        # name prefix.
+        assert extra.verify_bin_resolves is False
+        assert not (tools / "fakebin-extra-0.9").exists()
+        assert not (tools / "fakebin-extra-1.0").exists()
+    finally:
+        server.shutdown()
+
+
+def test_verify_bin_rename_with_failed_install_keeps_old_launcher_serving(
+        tmp_path: Path, fixture_tarball, monkeypatch) -> None:
+    """#308 (review round 4, Terra P1-1): during a verify_bin RENAME the
+    incoming name has no launcher yet — serving-detection must fall back to
+    the plugin's manifest-recorded bin, or the start-of-install sweep deletes
+    the tree the OLD launcher still serves and a failed install leaves it
+    dangling."""
+    from system_requirements.manifest import add_plugin_entry
+
+    manifest_path = tmp_path / "system-requirements.yaml"
+    monkeypatch.setattr("system_requirements.manifest.MANIFEST_PATH",
+                        manifest_path)
+    tar_path, sha = fixture_tarball
+    url, _sha, server = _serve_local_file(tar_path)
+    tools = tmp_path / "tools"
+    try:
+        first = install_tarball(
+            plugin_name="fakebin", spec=_install_spec(url, sha),
+            tools_root=tools,
+        )
+        assert first.verify_bin_resolves
+        add_plugin_entry({"name": "fakebin", "winning_strategy": "tarball",
+                          "install_dir": str(first.install_dir),
+                          "verify_bin": "fakebin",
+                          "declared_at": "2026-08-01T00:00:00Z"})
+        old_link = tools / "bin" / "fakebin"
+        target_before = old_link.resolve()
+
+        # Renamed launcher; the archive does not contain "newtool", so the
+        # install fails after the sweep already ran.
+        result = install_tarball(
+            plugin_name="fakebin",
+            spec=_install_spec(url, sha, verify_bin="newtool"),
+            tools_root=tools,
+        )
+        assert result.verify_bin_resolves is False
+        # The old launcher AND the tree it serves survived the failed rename.
+        assert first.install_dir.is_dir()
+        assert old_link.resolve() == target_before
+        assert old_link.resolve().is_file()
+    finally:
+        server.shutdown()
+
+
+def test_rename_with_corrupt_manifest_still_keeps_serving_tree(
+        tmp_path: Path, fixture_tarball, monkeypatch) -> None:
+    """#308 (Sol r5-1): serving-detection must not depend on the manifest —
+    with a CORRUPT manifest (reads as empty) and a verify_bin rename, the
+    tree the old launcher still serves must survive the sweep, because any
+    live tools/bin link marks its target generation as serving."""
+    manifest_path = tmp_path / "system-requirements.yaml"
+    monkeypatch.setattr("system_requirements.manifest.MANIFEST_PATH",
+                        manifest_path)
+    tar_path, sha = fixture_tarball
+    url, _sha, server = _serve_local_file(tar_path)
+    tools = tmp_path / "tools"
+    try:
+        first = install_tarball(
+            plugin_name="fakebin", spec=_install_spec(url, sha),
+            tools_root=tools,
+        )
+        assert first.verify_bin_resolves
+        manifest_path.write_text("{ corrupt", encoding="utf-8")
+        old_link = tools / "bin" / "fakebin"
+        target_before = old_link.resolve()
+
+        result = install_tarball(
+            plugin_name="fakebin",
+            spec=_install_spec(url, sha, verify_bin="newtool"),
+            tools_root=tools,
+        )
+        assert result.verify_bin_resolves is False   # newtool not in archive
+        assert first.install_dir.is_dir()
+        assert old_link.resolve() == target_before
+        assert old_link.resolve().is_file()
+    finally:
+        server.shutdown()
+
+
+def test_missing_verify_bin_is_refused_without_touching_anything(
+        tmp_path: Path, fixture_tarball) -> None:
+    """#308 (review round 2, Terra P1-1): a tarball spec with no verify_bin
+    can never succeed — it must be refused up front, never run the install
+    and never disturb the prior working generation or its launcher."""
+    tar_path, sha = fixture_tarball
+    url, _sha, server = _serve_local_file(tar_path)
+    tools = tmp_path / "tools"
+    try:
+        first = install_tarball(
+            plugin_name="fakebin", spec=_install_spec(url, sha),
+            tools_root=tools,
+        )
+        link = tools / "bin" / "fakebin"
+        target_before = link.resolve()
+
+        bad_spec = _install_spec(url, sha)
+        del bad_spec["verify_bin"]
+        result = install_tarball(
+            plugin_name="fakebin", spec=bad_spec, tools_root=tools,
+        )
+        assert result.ok is False
+        assert result.verify_bin_resolves is False
+        assert first.install_dir.is_dir()
+        assert link.resolve() == target_before
+    finally:
+        server.shutdown()
+
+
+def test_old_generation_serves_until_publication(tmp_path: Path) -> None:
+    """#308 (review round 2): the previous generation is never moved or
+    deleted before the launcher symlink is retargeted — a failed replacement
+    leaves both the old tree AND its resolving link exactly as they were
+    (no rename-aside window, no restore step)."""
+    import subprocess
+
+    v1_tar = _build_tarball(tmp_path, "v1.tar.gz",
+                            {"bin/fakebin": "#!/bin/sh\necho v1\n"})
+    v2_tar = _build_tarball(tmp_path, "v2.tar.gz",
+                            {"bin/fakebin": "#!/bin/sh\necho v2\n"})
+    url1, sha1, server1 = _serve_local_file(v1_tar)
+    url2, sha2, server2 = _serve_local_file(v2_tar)
+    tools = tmp_path / "tools"
+    try:
+        first = install_tarball(
+            plugin_name="fakebin", spec=_install_spec(url1, sha1),
+            tools_root=tools,
+        )
+        link = tools / "bin" / "fakebin"
+        target_before = link.resolve()
+        assert str(target_before).startswith(str(first.install_dir))
+
+        with pytest.raises(subprocess.CalledProcessError):
+            install_tarball(
+                plugin_name="fakebin",
+                spec=_install_spec(url2, sha2, install_cmd=["false"]),
+                tools_root=tools,
+            )
+        # Old generation untouched at its ORIGINAL path, link unmoved.
+        assert first.install_dir.is_dir()
+        assert link.resolve() == target_before
+        assert link.resolve().read_text(encoding="utf-8") == "#!/bin/sh\necho v1\n"
+    finally:
+        server1.shutdown()
+        server2.shutdown()
+
+
+def test_cross_plugin_bin_claim_refused(tmp_path: Path, monkeypatch) -> None:
+    """#354: plugin B declaring plugin A's verify_bin must be refused before
+    anything is downloaded or overwritten — pre-fix B silently repointed
+    A's tools/bin symlink at B's tree while both reported ready."""
+    from system_requirements.manifest import BinOwnershipError, add_plugin_entry
+
+    manifest_path = tmp_path / "system-requirements.yaml"
+    monkeypatch.setattr("system_requirements.manifest.MANIFEST_PATH",
+                        manifest_path)
+    v1_tar = _build_tarball(tmp_path, "v1.tar.gz",
+                            {"bin/fakebin": "#!/bin/sh\necho a\n"})
+    url, sha, server = _serve_local_file(v1_tar)
+    tools = tmp_path / "tools"
+    try:
+        result = install_tarball(
+            plugin_name="plugin-a", spec=_install_spec(url, sha),
+            tools_root=tools,
+        )
+        assert result.verify_bin_resolves
+        add_plugin_entry({"name": "plugin-a", "winning_strategy": "tarball",
+                          "install_dir": str(result.install_dir),
+                          "verify_bin": "fakebin",
+                          "declared_at": "2026-08-01T00:00:00Z"})
+        link = tools / "bin" / "fakebin"
+        target_before = link.resolve()
+
+        with pytest.raises(BinOwnershipError):
+            install_tarball(
+                plugin_name="plugin-b", spec=_install_spec(url, sha),
+                tools_root=tools,
+            )
+        assert link.resolve() == target_before
+        assert not (tools / "tarball" / "plugin-b").exists()
+    finally:
+        server.shutdown()
+
 
 def test_download_times_out_on_stalled_server(tmp_path: Path) -> None:
     """A server that accepts the TCP connection but never sends a response

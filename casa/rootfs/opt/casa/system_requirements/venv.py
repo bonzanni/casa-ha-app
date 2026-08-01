@@ -6,7 +6,8 @@ import shutil
 import subprocess
 from pathlib import Path
 
-from .tarball import InstallResult  # reuse dataclass
+from .manifest import ensure_bin_claim
+from .tarball import InstallResult, _atomic_symlink  # reuse dataclass + helper
 
 logger = logging.getLogger(__name__)
 
@@ -21,6 +22,8 @@ def install_venv(
     package = spec["package"]
     python = spec.get("python", "python3")
     verify_bin = spec["verify_bin"]
+    # #354: refuse up front if another plugin already publishes this bin name.
+    ensure_bin_claim(verify_bin, plugin_name, tools_root)
 
     venv_dir = tools_root / f"venv-{plugin_name}"
     tools_bin = tools_root / "bin"
@@ -43,9 +46,8 @@ def install_venv(
                              install_dir=venv_dir,
                              message=f"verify_bin {verify_bin!r} not found in venv")
     link = tools_bin / verify_bin
-    if link.is_symlink() or link.exists():
-        link.unlink()
-    link.symlink_to(source_bin)
+    # #308 review: atomic retarget — no unlink gap for a concurrent exec.
+    _atomic_symlink(source_bin, link)
 
     return InstallResult(
         ok=True,
