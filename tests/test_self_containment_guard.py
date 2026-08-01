@@ -582,6 +582,32 @@ class TestGuardArmingAndOracle:
             clean,
             f"cd 2> /dev/null {chain}/x; cd ../badsib; git push origin main")
 
+    async def test_hash_inside_target_word_is_literal(
+            self, tmp_path: Path, bad_repo: Path):
+        """Terra r14 (#348): bash treats `#` as a comment only at the START
+        of a word — `cd /tmp/dir#name` is a literal path, so the lexer must
+        not truncate it."""
+        import shutil
+        target = tmp_path / "hashdir" / "repo#bad"
+        shutil.copytree(bad_repo, target, symlinks=True)
+        clean = tmp_path / "clean-hash"
+        clean.mkdir()
+        assert await self._denied(
+            clean, f"cd {target}; git push origin main")
+
+    async def test_single_quoted_line_continuation_is_literal(
+            self, tmp_path: Path, bad_repo: Path):
+        """Sol r14 (#348): bash honors `\\<newline>` outside quotes and in
+        double quotes, but inside SINGLE quotes it is literal path data — so
+        the continuation strip must be quote-aware."""
+        import shutil
+        target = tmp_path / "contdir" / "part\\\nrest"
+        shutil.copytree(bad_repo, target, symlinks=True)
+        clean = tmp_path / "clean-cont"
+        clean.mkdir()
+        assert await self._denied(
+            clean, f"cd '{target}'; git push origin main")
+
     async def test_cd_chain_overflow_fails_closed(
             self, tmp_path: Path, git_plugin_repo: Path):
         """Terra/Sol r3 (#348): once the feasible-base set overflows, later

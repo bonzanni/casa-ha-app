@@ -1871,27 +1871,37 @@ def _cd_command_words(text: str) -> list[list[str]]:
     decision remains either.
     """
     import shlex
-    text = text.replace("\\\n", "")  # bash line continuation
-    # A newline SEPARATES commands, but shlex treats it as plain whitespace —
-    # make unquoted newlines explicit separator tokens (a newline inside
-    # quotes is data and is left alone).
+    # ONE quote-aware pre-pass (Sol r14): remove bash LINE CONTINUATIONS —
+    # which bash honors outside quotes and inside double quotes, but NOT
+    # inside single quotes, where `\<newline>` is literal path data — and
+    # turn the remaining unquoted newlines into explicit `;` separators
+    # (shlex would otherwise treat them as plain whitespace and let one
+    # command's words run into the next).
     out_chars: list[str] = []
     quote = ""
     i = 0
     while i < len(text):
         ch = text[i]
-        if quote:
-            if ch == "\\" and quote == '"':
-                out_chars.append(text[i:i + 2])
-                i += 2
-                continue
-            if ch == quote:
+        if quote == "'":
+            if ch == "'":
                 quote = ""
-        elif ch == "\\":
+            out_chars.append(ch)
+            i += 1
+            continue
+        if ch == "\\" and i + 1 < len(text):
+            if text[i + 1] == "\n":
+                i += 2          # line continuation — drop both characters
+                continue
             out_chars.append(text[i:i + 2])
             i += 2
             continue
-        elif ch in "'\"":
+        if quote == '"':
+            if ch == '"':
+                quote = ""
+            out_chars.append(ch)
+            i += 1
+            continue
+        if ch in "'\"":
             quote = ch
         elif ch in "\n\r":
             out_chars.append(" ; ")
@@ -1901,6 +1911,10 @@ def _cd_command_words(text: str) -> list[list[str]]:
         i += 1
     text = "".join(out_chars)
     lexer = shlex.shlex(text, posix=True, punctuation_chars=True)
+    # Terra r14: bash treats `#` as a comment only at the START of a word —
+    # `cd /tmp/dir#name` is a literal path. shlex's default commenters="#"
+    # would truncate it.
+    lexer.commenters = ""
     lexer.whitespace_split = True
     try:
         tokens = list(lexer)
