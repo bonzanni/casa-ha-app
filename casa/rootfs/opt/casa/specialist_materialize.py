@@ -672,14 +672,14 @@ def _reconcile_specialist_operational_files_locked(
             _, _, checksum = parse_component_root(active.root)
             cas_dir = cas_store_dir(checksum, store_root=specialists_dir / "store")
             if active.binding.mode == "override":
-                # N1d-coupled path (kept verbatim from the brief's draft,
-                # disclosed in the N1b slice-B report): this branch is
-                # unreachable until Plan 2's N1d builds a way to install an
-                # 'override'-mode binding for a specialist — today,
-                # commit_specialist_install only ever produces
-                # 'component-default' bindings. personas_root is fixed at
-                # /config/personas, the persona-install tree N1d will add.
-                personas_root = Path("/config/personas")
+                # #323 (Terra r4-2): resolved through the SAME env-aware seam
+                # every other override-persona consumer uses — pre-fix this
+                # self-heal branch alone read a fixed /config/personas, so a
+                # reload/boot rebuild under a custom config root failed to
+                # load the pack and could drop the specialist's operational
+                # files, making a tool-applied override unloadable.
+                from persona_install import installed_personas_root
+                personas_root = installed_personas_root()
                 persona = load_persona_pack(
                     personas_root / active.binding.persona_id
                     / active.binding.persona_version / "pack",

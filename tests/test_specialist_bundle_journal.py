@@ -170,6 +170,69 @@ def test_reconcile_boot_sweeps_aged_receipts(tmp_path):
     assert {"slug": None, "action": "swept_receipts", "count": 1} in actions
 
 
+def test_reconcile_boot_keeps_pending_installs_receipt_and_staging(tmp_path):
+    """#331 (Sol r5-2): a slug with a live pending-configuration candidate
+    (desired.yaml on disk) keeps its aged receipt AND the staged tree that
+    receipt references — pre-fix, boot age-swept both, so a pending install
+    older than a week plus one restart became permanently unfinishable
+    (receipt_required, staged_dir_invalid, and re-inspect refuses the
+    occupied slug)."""
+    import json
+    import os
+    import time
+
+    receipts = tmp_path / "receipts"
+    receipts.mkdir()
+    specialists = tmp_path / "specialists"
+    staging = specialists / ".staging"
+    staged_tree = staging / "deadbeef01"
+    staged_tree.mkdir(parents=True)
+    (staged_tree / "manifest.json").write_text("{}", encoding="utf-8")
+    (specialists / "mtg").mkdir(parents=True)
+    (specialists / "mtg" / "desired.yaml").write_text("x: 1\n", encoding="utf-8")
+    # The durable marker written at pending-commit time (Sol r6-2) names the
+    # EXACT receipt the pending candidate was committed with.
+    (specialists / "mtg" / "pending-receipt.json").write_text(
+        json.dumps({"receipt_id": "c" * 32}), encoding="utf-8")
+
+    receipt_path = receipts / ("c" * 32 + ".json")
+    receipt_path.write_text(json.dumps({
+        "receipt_id": "c" * 32, "slug": "mtg",
+        "component_staged_path": str(staged_tree), "plugins": []}),
+        encoding="utf-8")
+    # A NEWER same-slug inspection for a different root (Terra r6-1 +
+    # Sol r6-2): mtime must not beat the marker — this one sweeps, the
+    # marker'd (older) one stays.
+    superseded_tree = staging / "0ldbeef03"
+    superseded_tree.mkdir()
+    superseded_receipt = receipts / ("d" * 32 + ".json")
+    superseded_receipt.write_text(json.dumps({
+        "receipt_id": "d" * 32, "slug": "mtg",
+        "component_staged_path": str(superseded_tree), "plugins": []}),
+        encoding="utf-8")
+    # An unrelated aged staging tree still sweeps.
+    orphan = staging / "feedface02"
+    orphan.mkdir()
+    month_ago = time.time() - 30 * 24 * 3600
+    older_ts = month_ago - 10 * 24 * 3600
+    for p in (receipt_path, staged_tree):
+        os.utime(p, (older_ts, older_ts))     # marker'd receipt is the OLDER one
+    for p in (superseded_receipt, superseded_tree, orphan):
+        os.utime(p, (month_ago, month_ago))   # newer, but not the marker'd one
+
+    ops_dir = tmp_path / "ops"
+    ops_dir.mkdir()
+    journal.reconcile_boot(
+        ops_dir=ops_dir, registry_path=tmp_path / "registry.json",
+        specialists_dir=specialists, acks_path=tmp_path / "acks.json",
+        receipts_dir=receipts, personas_dir=tmp_path / "personas")
+    assert receipt_path.exists()      # the marker'd receipt retained (not the newest!)
+    assert staged_tree.is_dir()       # its attested staging retained
+    assert not superseded_receipt.exists()   # newer same-slug receipt swept
+    assert not superseded_tree.exists()      # and its staging with it
+    assert not orphan.exists()        # unreferenced aged tree swept
+
+
 # --------------------------------------------------------------------------
 # reconcile_boot: no-op cases
 # --------------------------------------------------------------------------
@@ -257,6 +320,48 @@ def test_reconcile_boot_rolls_back_inprogress_journal(tmp_path):
         root_digest=ack_record["component_checksum"], slug=ack_record["slug"])
     restored = SpecialistInstallAckStore(acks_path).get(identity)
     assert restored is not None and restored["slug"] == "mtg"
+
+
+def test_rollback_restores_the_pending_receipt_marker(tmp_path):
+    """#331 (Sol r7-2): the pending-receipt marker is journalled with the
+    tuple files — an activating retry clears it, and when that retry's
+    mutation is rolled back (sequencer failure / crash), compensation must
+    restore the marker with desired.yaml, or the boot sweep falls back to
+    newest-by-mtime and can retain the wrong root's receipt."""
+    import json as _json
+
+    ops_dir = tmp_path / "ops"
+    ops_dir.mkdir()
+    registry_path = tmp_path / "registry.json"
+    _write_registry(registry_path, [])
+    specialists_dir = tmp_path / "specialists"
+    slug_dir = specialists_dir / "mtg"
+    slug_dir.mkdir(parents=True)
+    # Mid-mutation state: the activating retry cleared the marker and
+    # consumed desired.yaml.
+    (slug_dir / "active.yaml").write_text("mid-mutation", encoding="utf-8")
+
+    marker_json = _json.dumps({"receipt_id": "e" * 32})
+    journal.begin(
+        "install", "mtg", before_entries=[],
+        before_tuple_files={"active.yaml": None,
+                            "desired.yaml": "pending-tuple",
+                            "pending-receipt.json": marker_json},
+        ack_records=[], ops_dir=ops_dir)
+
+    actions = journal.reconcile_boot(
+        ops_dir=ops_dir, registry_path=registry_path,
+        specialists_dir=specialists_dir, acks_path=tmp_path / "acks.json")
+    assert {"slug": "mtg", "action": "rolled_back"} in actions
+    assert (slug_dir / "desired.yaml").read_text(encoding="utf-8") == "pending-tuple"
+    assert _json.loads((slug_dir / "pending-receipt.json").read_text(
+        encoding="utf-8")) == {"receipt_id": "e" * 32}
+    assert not (slug_dir / "active.yaml").exists()
+
+    # And the snapshot helper records the marker for future journals.
+    from specialist_install import _tuple_files_snapshot
+    snap = _tuple_files_snapshot(slug_dir)
+    assert snap["pending-receipt.json"] == marker_json
 
 
 def test_reconcile_boot_idempotent_second_run_is_noop(tmp_path):

@@ -2893,3 +2893,81 @@ class TestReloadIssue327:
         # Nothing mutated: no specialist rescan, no registry publication.
         runtime.specialist_registry.load.assert_not_called()
         assert runtime.agent_registry is registry_before
+
+
+class TestOverlayConsumptionRetry:
+    """#331(d): the roles overlay is built under MATERIALIZE_LOCK but consumed
+    (agent load) after release — a concurrent upgrade committing between the
+    two makes the loader fail on a role-artifact/binding mismatch. The load
+    wrapper rebuilds the overlay once and retries."""
+
+    async def test_specialist_load_retries_once_after_overlay_rebuild(
+            self, tmp_path, monkeypatch):
+        from types import SimpleNamespace
+        import agent_loader
+        import reload as reload_mod
+
+        calls = {"resolve": 0, "load": 0}
+
+        async def _fake_roles_dir(runtime):
+            calls["resolve"] += 1
+            return str(tmp_path / f"overlay-{calls['resolve']}")
+
+        monkeypatch.setattr(reload_mod, "_specialist_roles_dir", _fake_roles_dir)
+
+        def _flaky_load(agent_dir, *, policies, roles_dir):
+            calls["load"] += 1
+            if calls["load"] == 1:
+                raise ValueError("simulated stale-overlay checksum mismatch")
+            return SimpleNamespace(role="mtg", loaded_from=roles_dir)
+
+        monkeypatch.setattr(agent_loader, "load_agent_from_dir", _flaky_load)
+
+        cfg, roles_dir = await reload_mod._load_agent_with_overlay_retry(
+            SimpleNamespace(), "agents/mtg", policies=None, tier="specialist")
+
+        # The overlay was REBUILT (second resolve) and the returned roles_dir
+        # is the one the successful load actually consumed.
+        assert calls == {"resolve": 2, "load": 2}
+        assert roles_dir.endswith("overlay-2")
+        assert cfg.loaded_from.endswith("overlay-2")
+
+    async def test_second_failure_surfaces_the_load_error(
+            self, tmp_path, monkeypatch):
+        from types import SimpleNamespace
+        import agent_loader
+        import reload as reload_mod
+
+        async def _fake_roles_dir(runtime):
+            return str(tmp_path / "overlay")
+
+        monkeypatch.setattr(reload_mod, "_specialist_roles_dir", _fake_roles_dir)
+        calls = {"load": 0}
+
+        def _always_broken(agent_dir, *, policies, roles_dir):
+            calls["load"] += 1
+            raise ValueError("genuinely broken component")
+
+        monkeypatch.setattr(agent_loader, "load_agent_from_dir", _always_broken)
+
+        with pytest.raises(ValueError, match="genuinely broken"):
+            await reload_mod._load_agent_with_overlay_retry(
+                SimpleNamespace(), "agents/mtg", policies=None, tier="specialist")
+        assert calls["load"] == 2  # exactly one retry, then surfaced
+
+    async def test_resident_load_error_is_not_retried(self, monkeypatch):
+        from types import SimpleNamespace
+        import agent_loader
+        import reload as reload_mod
+
+        calls = {"load": 0}
+
+        def _broken(agent_dir, *, policies, roles_dir):
+            calls["load"] += 1
+            raise ValueError("resident load error")
+
+        monkeypatch.setattr(agent_loader, "load_agent_from_dir", _broken)
+        with pytest.raises(ValueError, match="resident load error"):
+            await reload_mod._load_agent_with_overlay_retry(
+                SimpleNamespace(), "agents/butler", policies=None, tier="resident")
+        assert calls["load"] == 1

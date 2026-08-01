@@ -56,6 +56,71 @@ class TestHookBridgeTranslate:
             "hook_proxy.sh managed_component_guard"
         )
 
+    def test_malformed_list_members_skipped_not_crash(self):
+        """#354: a syntactically valid ``pre_tool_use: [null]`` (or a scalar
+        member) passed boot/reload, then raised AttributeError on ``e.get()``
+        when the first engagement provisioned its workspace. Non-mapping
+        members are skipped; valid members and the mandatory guard survive."""
+        from drivers.hook_bridge import translate_hooks_to_settings
+
+        settings = translate_hooks_to_settings(
+            {"pre_tool_use": [None, "junk", 7,
+                              {"policy": "casa_config_guard",
+                               "matcher": "Write"}]},
+            proxy_script_path=PROXY,
+        )
+        pre = settings["hooks"]["PreToolUse"]
+        commands = [e["hooks"][0]["command"] for e in pre]
+        assert f"{PROXY} casa_config_guard" in commands
+        assert f"{PROXY} managed_component_guard" in commands
+        assert len(pre) == 2   # skipped members emit nothing
+
+    def test_non_mapping_document_root_treated_as_empty(self):
+        """#354 (Sol r5-3): a hooks file whose ROOT is valid yaml but not a
+        mapping (`[]`, a scalar, a list of policies) must not crash
+        provisioning — it reads as empty and the mandatory guard is emitted."""
+        from drivers.hook_bridge import translate_hooks_to_settings
+
+        for bad_root in ([], "oops", 7, [{"policy": "x"}], None):
+            settings = translate_hooks_to_settings(
+                bad_root, proxy_script_path=PROXY,
+            )
+            pre = settings["hooks"]["PreToolUse"]
+            assert len(pre) == 1
+            assert pre[0]["hooks"][0]["command"].endswith(
+                "managed_component_guard")
+
+    def test_non_list_hook_section_treated_as_empty(self):
+        """#354 companion: a scalar/mapping ``pre_tool_use:`` value must not
+        crash provisioning either — only the mandatory guard is emitted."""
+        from drivers.hook_bridge import translate_hooks_to_settings
+
+        for bad in ("oops", {"policy": "x"}, 3):
+            settings = translate_hooks_to_settings(
+                {"pre_tool_use": bad}, proxy_script_path=PROXY,
+            )
+            pre = settings["hooks"]["PreToolUse"]
+            assert len(pre) == 1
+            assert pre[0]["hooks"][0]["command"].endswith(
+                "managed_component_guard")
+
+    def test_unparseable_timeout_skipped_not_crash(self):
+        """#354 companion: ``timeout: abc`` passed boot validation, then
+        ``int()`` raised at provisioning. An unparseable timeout is dropped;
+        the hook entry itself survives."""
+        from drivers.hook_bridge import translate_hooks_to_settings
+
+        for bad_timeout in ("abc", float("inf"), float("nan"), [60]):
+            settings = translate_hooks_to_settings(
+                {"pre_tool_use": [{"policy": "casa_config_guard",
+                                   "matcher": "Write",
+                                   "timeout": bad_timeout}]},
+                proxy_script_path=PROXY,
+            )
+            entry = settings["hooks"]["PreToolUse"][0]
+            assert entry["hooks"][0]["command"].endswith("casa_config_guard")
+            assert "timeout" not in entry["hooks"][0]
+
     def test_translates_bundled_plugin_developer_hooks_yaml(self):
         """L-1b regression: bundled snake_case hooks.yaml must translate."""
         import yaml

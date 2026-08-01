@@ -17,15 +17,21 @@ from __future__ import annotations
 
 import hashlib
 import logging
+import os
 import shutil
 import subprocess
 import tarfile
 import tempfile
 import urllib.parse
+import uuid
 import urllib.request
 import zipfile
 from dataclasses import dataclass
 from pathlib import Path
+
+from atomic_io import fsync_directory
+
+from .manifest import ensure_bin_claim
 
 logger = logging.getLogger(__name__)
 
@@ -154,6 +160,125 @@ def _validate_extract_path(extract_dir: Path, extract: str) -> Path:
     return candidate
 
 
+def _atomic_symlink(target: Path, link: Path) -> None:
+    """Publish/retarget *link* -> *target* in one atomic step (temp symlink +
+    ``os.replace``), so a concurrent exec of the launcher never observes it
+    missing — the pre-#308 ``unlink`` + ``symlink_to`` pair had a window with
+    no link at all. Shared by every install strategy."""
+    tmp = link.parent / f".{link.name}.lnk-{uuid.uuid4().hex[:8]}"
+    os.symlink(target, tmp)
+    try:
+        os.replace(tmp, link)
+    except BaseException:
+        try:
+            os.unlink(tmp)
+        except OSError:
+            pass
+        raise
+
+
+def _locate_verify_bin(root: Path, verify_bin: str) -> Path | None:
+    for candidate in [root / "bin" / verify_bin, root / verify_bin]:
+        if candidate.is_file():
+            return candidate
+    for candidate in root.rglob(verify_bin):
+        if candidate.is_file():
+            return candidate
+    return None
+
+
+def _fsync_tree(root: Path) -> None:
+    """Best-effort durability for a freshly staged tree (review round 2): the
+    rename-based publication below is only old-or-new across a POWER crash if
+    the renamed content itself reached disk first — see atomic_io's module
+    docstring for the same reasoning. Installs are rare, so walking the tree
+    is acceptable. Never raises."""
+    for dirpath, _dirnames, filenames in os.walk(root):
+        for fname in filenames:
+            try:
+                fd = os.open(os.path.join(dirpath, fname), os.O_RDONLY)
+            except OSError:
+                continue
+            try:
+                os.fsync(fd)
+            except OSError:
+                pass
+            finally:
+                os.close(fd)
+        fsync_directory(dirpath)
+
+
+def _reclaim_superseded_generations(
+    gens_dir: Path, tools_bin: Path, verify_bin: str,
+    *, tools_root: Path, plugin_name: str,
+) -> None:
+    """Start-of-install reclaim (review round 2): remove every generation of
+    THIS plugin except the one the launcher currently serves, plus crashed
+    staging leftovers and no-longer-serving legacy in-place layouts.
+
+    Running this at the START of the next install — never right after
+    publication — leaves the superseded generation on disk for a whole
+    install-to-install grace window, so an in-flight consumer that resolved
+    the launcher just before a retarget can finish against its tree. The
+    per-plugin ``gens_dir`` namespace means no glob can ever match another
+    plugin's directories, whatever its name's prefix relationship.
+
+    Legacy flat layouts (pre-generation ``<plugin>-<version>`` directly under
+    tools_root, EVERY version — Terra r3-2) are swept too, guarded against
+    prefix collisions by the system-requirements manifest: a candidate whose
+    name actually belongs to another manifest plugin (reclaiming for ``foo``
+    must never touch ``foo-bar-1.0``, owned by plugin ``foo-bar``) or to the
+    venv namespace is skipped."""
+    from .manifest import read_manifest
+
+    manifest_plugins = read_manifest()["plugins"]
+    # Terra r4-1 / Sol r5-1: on a verify_bin RENAME the incoming name has no
+    # link yet, so serving-detection keyed on it alone would sweep the tree
+    # the plugin's PRIOR launcher still serves — and keying on the manifest
+    # instead fails open when the manifest is corrupt (it deliberately reads
+    # as empty). So: a directory that ANY existing tools/bin launcher points
+    # into is serving, whatever the manifest says. Bounded — one readlink
+    # per published launcher.
+    current_targets: list[Path] = []
+    try:
+        links = list(tools_bin.iterdir())
+    except OSError:
+        links = []
+    for lnk in links:
+        try:
+            current_targets.append(Path(os.readlink(lnk)))
+        except OSError:
+            continue
+
+    def _serving(candidate: Path) -> bool:
+        return any(t.is_relative_to(candidate) for t in current_targets)
+
+    try:
+        entries = list(gens_dir.iterdir())
+    except OSError:
+        entries = []
+    for entry in entries:
+        if not _serving(entry):
+            shutil.rmtree(entry, ignore_errors=True)
+
+    other_names = [p["name"] for p in manifest_plugins
+                   if p.get("name") and p["name"] != plugin_name]
+    for candidate in tools_root.glob(f"{plugin_name}-*"):
+        if not candidate.is_dir() or candidate.is_symlink() or _serving(candidate):
+            continue
+        if candidate.name.startswith("venv-"):
+            continue  # a plugin literally named "venv" never sweeps venv trees
+        # Sol r4-2: the LONGEST matching plugin name owns the directory —
+        # installing `foo` must skip `foo-bar-0.9` (owned by `foo-bar`),
+        # but installing `foo-bar` must still reclaim its own `foo-bar-0.9`
+        # even though it also matches the shorter sibling `foo`.
+        if any((candidate.name == other or candidate.name.startswith(f"{other}-"))
+               and len(other) > len(plugin_name)
+               for other in other_names):
+            continue
+        shutil.rmtree(candidate, ignore_errors=True)
+
+
 def install_tarball(
     *,
     plugin_name: str,
@@ -169,11 +294,60 @@ def install_tarball(
     version = spec.get("version", "latest")
 
     _validate_url(url)
+    # #308: validate install_cmd's shape up front — pre-fix this ran after
+    # the existing install had already been destroyed, so a malformed spec
+    # left no working install behind.
+    if install_cmd is not None and (
+        not isinstance(install_cmd, list)
+        or not all(isinstance(a, str) for a in install_cmd)
+    ):
+        raise UnsafeArchiveError(
+            "install_cmd must be a list of strings (argv); "
+            "shell-string form was removed in v0.14.6 to close a "
+            "marketplace-authored shell-injection vector"
+        )
+
+    # Review round 2 (Terra P1-1): a tarball requirement with no usable
+    # verify_bin can never succeed (the orchestrator gates on the launcher
+    # resolving), so refuse before ANY filesystem mutation — pre-fix it ran
+    # the whole install, published nothing, and still reclaimed the prior
+    # generations, dangling the old launcher. plugin_store.manifest_sysreqs
+    # refuses this at manifest level; this is the belt for direct callers.
+    if not verify_bin or not isinstance(verify_bin, str):
+        return InstallResult(
+            ok=False, verify_bin_resolves=False,
+            install_dir=tools_root / "tarball" / plugin_name,
+            message="tarball requirement declares no verify_bin",
+        )
+
+    # #354: refuse up front if another plugin already publishes this bin name
+    # (manifest row OR — corrupt-manifest-proof — a live launcher pointing
+    # into another plugin's tree; Sol r5-1).
+    ensure_bin_claim(verify_bin, plugin_name, tools_root)
 
     tools_root.mkdir(parents=True, exist_ok=True)
-    install_dir = tools_root / f"{plugin_name}-{version}"
     tools_bin = tools_root / "bin"
     tools_bin.mkdir(parents=True, exist_ok=True)
+    # #308 (review round 2): installs land in a UNIQUE generation directory
+    # under a PER-PLUGIN namespace (`tarball/<plugin>/<version>.g-<nonce>`),
+    # never in place. The serving generation is never moved or deleted by
+    # this install: publication is one atomic launcher retarget, and
+    # superseded generations are reclaimed only at the START of the NEXT
+    # install (an install-to-install grace window for in-flight consumers
+    # of the old tree). The per-plugin directory makes reclamation immune
+    # to plugin-name prefix collisions and covers version changes too.
+    gens_dir = tools_root / "tarball" / plugin_name
+    gens_dir.mkdir(parents=True, exist_ok=True)
+    # Terra r3-1: make the (possibly just-created) ancestor chain durable
+    # BEFORE anything is published beneath it — a power loss must never
+    # recover the durable launcher while losing a new ancestor's entry.
+    fsync_directory(tools_root.parent)
+    fsync_directory(tools_root)
+    fsync_directory(tools_root / "tarball")
+    _reclaim_superseded_generations(
+        gens_dir, tools_bin, verify_bin,
+        tools_root=tools_root, plugin_name=plugin_name)
+    install_dir = gens_dir / f"{version}.g-{uuid.uuid4().hex[:8]}"
 
     with tempfile.TemporaryDirectory() as tmp:
         tmp_path = Path(tmp)
@@ -203,47 +377,65 @@ def install_tarball(
             raise RuntimeError(f"unsupported archive format: {url}")
 
         source = _validate_extract_path(extract_dir, extract)
-        if install_dir.exists():
-            shutil.rmtree(install_dir)
-        shutil.copytree(source, install_dir)
 
-        if install_cmd is not None:
-            if not isinstance(install_cmd, list) or not all(
-                isinstance(a, str) for a in install_cmd
-            ):
-                raise UnsafeArchiveError(
-                    "install_cmd must be a list of strings (argv); "
-                    "shell-string form was removed in v0.14.6 to close a "
-                    "marketplace-authored shell-injection vector"
+        # Build the replacement in a hidden staging sibling inside the
+        # plugin's own generation namespace (same filesystem, so the
+        # publication rename below is atomic; crashed leftovers are swept
+        # by the start-of-install reclaim).
+        staging_root = Path(tempfile.mkdtemp(dir=gens_dir, prefix=".staging-"))
+        try:
+            staging_tree = staging_root / "tree"
+            shutil.copytree(source, staging_tree)
+
+            if install_cmd is not None:
+                env = {
+                    "CASA_TOOLS": str(tools_root),
+                    "PATH": _ALLOWED_INSTALL_PATH,
+                }
+                subprocess.run(
+                    install_cmd, shell=False, cwd=staging_tree,
+                    env=env, check=True, timeout=timeout,
                 )
-            env = {
-                "CASA_TOOLS": str(tools_root),
-                "PATH": _ALLOWED_INSTALL_PATH,
-            }
-            subprocess.run(
-                install_cmd, shell=False, cwd=install_dir,
-                env=env, check=True, timeout=timeout,
-            )
 
-    # Symlink the verify_bin into tools/bin/.
-    resolves = False
-    if verify_bin:
-        source_bin = None
-        for candidate in [install_dir / "bin" / verify_bin, install_dir / verify_bin]:
-            if candidate.is_file():
-                source_bin = candidate
-                break
-        if source_bin is None:
-            for candidate in install_dir.rglob(verify_bin):
-                if candidate.is_file():
-                    source_bin = candidate
-                    break
-        if source_bin is not None:
-            link = tools_bin / verify_bin
-            if link.is_symlink() or link.exists():
-                link.unlink()
-            link.symlink_to(source_bin)
-            resolves = link.is_symlink() and link.resolve().is_file()
+            # Locate verify_bin in the staged tree BEFORE publishing: a
+            # replacement that would not provide the declared binary must
+            # not displace a working install.
+            found = _locate_verify_bin(staging_tree, verify_bin)
+            if found is None:
+                return InstallResult(
+                    ok=True,
+                    verify_bin_resolves=False,
+                    install_dir=install_dir,
+                    message=(
+                        f"verify_bin {verify_bin!r} not present in staged "
+                        "tree; existing install left untouched"
+                    ),
+                )
+            rel_bin = found.relative_to(staging_tree)
+
+            # Power-crash durability (review round 2): the staged bytes must
+            # be on disk BEFORE the renames that make them reachable, and
+            # each rename's directory is fsynced after it — otherwise a
+            # power loss could recover a durable launcher pointing at an
+            # incomplete or missing generation.
+            _fsync_tree(staging_tree)
+            # Land the verified tree at its unique generation path — the
+            # target never pre-exists, so this cannot displace anything.
+            os.replace(staging_tree, install_dir)
+            fsync_directory(gens_dir)
+        finally:
+            shutil.rmtree(staging_root, ignore_errors=True)
+
+    # Publish: atomically retarget the launcher symlink at the new
+    # generation. Until this single os.replace the previous generation's
+    # link (and tree) keep serving; after it, the new one does. No unlink
+    # gap — and the previous generation stays on disk until the next
+    # install's reclaim, so in-flight consumers of it are undisturbed.
+    source_bin = install_dir / rel_bin
+    _atomic_symlink(source_bin, tools_bin / verify_bin)
+    fsync_directory(tools_bin)
+    link = tools_bin / verify_bin
+    resolves = link.is_symlink() and link.resolve().is_file()
 
     return InstallResult(
         ok=True,

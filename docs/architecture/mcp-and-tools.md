@@ -76,6 +76,12 @@ relays that deny. So hook policy is unenforced only when the *bridge* is unreach
 main-application restart denies rather than allows. Anything that must hold regardless
 belongs in a tool, not in a hook.
 
+The hooks document an executor carries is a mutable trust surface, and its translation to
+workspace settings treats malformed shapes as absent rather than fatal: a non-mapping
+document root, a non-list hook section, a non-mapping list member, or an unparseable
+per-hook timeout is skipped instead of crashing engagement provisioning, and the
+code-mandatory guard entry is emitted regardless of what the document declares.
+
 ## Contracts & invariants
 
 **INV-MCP-001**: The internal tool dispatch path resolves a call by name against the full tool map and does not consult any per-agent allowlist.

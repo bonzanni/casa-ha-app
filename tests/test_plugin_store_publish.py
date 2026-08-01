@@ -341,6 +341,87 @@ def test_validate_manifest_rejects_apt(tmp_path):
     assert ei.value.reason_code == "apt_requirements_rejected"
 
 
+# --- #354: casa.systemRequirements is guarded + STRICT -----------------------
+
+
+def test_manifest_sysreqs_absent_is_empty():
+    from plugin_store import manifest_sysreqs
+    assert manifest_sysreqs({"name": "p"}) == []
+    assert manifest_sysreqs({"name": "p", "casa": {}}) == []
+    assert manifest_sysreqs({"name": "p", "casa": "oops"}) == []
+    assert manifest_sysreqs({}) == []
+
+
+@pytest.mark.parametrize("bad_value", [
+    {"type": "npm", "package": "x"},   # object where a list is expected
+    "npm",                             # scalar
+    [{"type": "npm"}, None],           # non-object member
+    [["npm"]],                         # list member
+    [{"type": "npm"}, "x"],            # string member
+])
+def test_manifest_sysreqs_malformed_raises(bad_value):
+    """#354: a PRESENT-but-malformed declaration must raise, not silently
+    become "no requirements" (pre-fix the plugin activated with no install
+    and its MCP server failed at runtime)."""
+    from plugin_store import manifest_sysreqs
+    manifest = {"name": "p", "casa": {"systemRequirements": bad_value}}
+    with pytest.raises(StoreError) as ei:
+        manifest_sysreqs(manifest)
+    assert ei.value.reason_code == "system_requirements_invalid"
+
+
+def test_validate_manifest_rejects_malformed_sysreqs(tmp_path):
+    """#354: install/update of a plugin whose casa.systemRequirements is an
+    object (not a list) is refused instead of proceeding requirement-less."""
+    root = _plugin_tree(tmp_path)
+    (root / ".claude-plugin" / "plugin.json").write_text(json.dumps({
+        "name": "probe", "version": "1.0.0",
+        "casa": {"systemRequirements": {"type": "npm", "package": "x"}},
+    }), encoding="utf-8")
+    with pytest.raises(StoreError) as ei:
+        validate_manifest(root, "probe")
+    assert ei.value.reason_code == "system_requirements_invalid"
+
+
+def test_manifest_sysreqs_empty_list_is_valid():
+    from plugin_store import manifest_sysreqs
+    assert manifest_sysreqs(
+        {"name": "p", "casa": {"systemRequirements": []}}) == []
+
+
+@pytest.mark.parametrize("bad_req", [
+    {"type": "tarball", "url": "https://x/y.tgz", "sha256": "0" * 64},  # absent
+    {"type": "tarball", "url": "u", "sha256": "s", "verify_bin": ""},
+    {"type": "tarball", "url": "u", "sha256": "s", "verify_bin": "../escape"},
+    {"type": "npm", "package": "p", "verify_bin": "a/b"},
+    {"type": "venv", "package": "p", "verify_bin": ".hidden"},
+    {"type": "npm", "package": "p", "verify_bin": ["x"]},
+])
+def test_manifest_sysreqs_requires_safe_verify_bin(bad_req):
+    """#354 (review round 2): a requirement without a safe verify_bin can
+    never succeed (every strategy gates on the launcher resolving) and the
+    name is joined into tools/bin/<name> — refuse at manifest level instead
+    of running a whole install that ends in failure."""
+    from plugin_store import manifest_sysreqs
+    manifest = {"name": "p", "casa": {"systemRequirements": [bad_req]}}
+    with pytest.raises(StoreError) as ei:
+        manifest_sysreqs(manifest)
+    assert ei.value.reason_code == "system_requirements_invalid"
+
+
+def test_manifest_sysreqs_rejected_types_keep_their_own_kind():
+    """The apt/dpkg/... refusal must keep its dedicated reason code — the
+    verify_bin strictness skips package-manager rows so validate_manifest
+    still raises apt_requirements_rejected for them (pinned above in
+    test_validate_manifest_rejects_apt)."""
+    from plugin_store import manifest_sysreqs
+    # No verify_bin on an apt row: passes extraction; refusal happens in
+    # validate_manifest with its own kind.
+    reqs = manifest_sysreqs({"name": "p", "casa": {"systemRequirements": [
+        {"type": "apt", "package": "x"}]}})
+    assert reqs == [{"type": "apt", "package": "x"}]
+
+
 # --- A:§3.7 casa.protectedTools (v0.76.0) ------------------------------------
 
 

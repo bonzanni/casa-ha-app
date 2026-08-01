@@ -1028,6 +1028,64 @@ async def test_inspect_receipt_id_round_trips_into_commit(monkeypatch, tmp_path)
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize("state,expect_pruned", [
+    ("pending-configuration", False),
+    ("active", True),
+])
+async def test_commit_prunes_receipt_only_on_active(
+        monkeypatch, tmp_path, state, expect_pruned) -> None:
+    """#331: a pending-configuration commit RETAINS the source receipt — the
+    follow-up configure re-commit requires it (receipt_required otherwise),
+    and pre-fix the unconditional prune made a first-commit-pending component
+    impossible to activate through the supported flow. An active commit still
+    consumes it. Sol r2-1: the STAGING TREE follows the same boundary — the
+    tool layer consumes it only after the sequencer succeeded, so a
+    compensated failure (or a pending outcome) leaves the retry's bytes
+    intact."""
+    from test_specialist_install import _write_component
+    from specialist_component import load_specialist_component
+    from specialist_install import compute_install_root_digest, resolve_dependency_closure
+    import specialist_install
+    import specialist_receipt
+    import tools as tools_mod
+    from tools import specialist_install_commit
+
+    staging_parent = tmp_path / ".staging"
+    staging_parent.mkdir()
+    staged = _write_component(staging_parent / "staged", slug="mtg")
+    component = load_specialist_component(staged, staged / "manifest.json")
+    deps = resolve_dependency_closure(component, staged)
+    root_digest = compute_install_root_digest(
+        component, deps, manifest_bytes=(staged / "manifest.json").read_bytes())
+
+    receipt_id = "7" * 32
+    monkeypatch.setattr(
+        specialist_receipt, "load",
+        lambda rid, *a, **k: SimpleNamespace(receipt_id=rid, receipt_digest="", plugins=()))
+    pruned: list[str] = []
+    monkeypatch.setattr(tools_mod, "_prune_bundle_receipt", pruned.append)
+
+    instance = SimpleNamespace(slug="mtg", state=state)
+    txn = SimpleNamespace(
+        slug="mtg", removed_artifact_ids=(), new_artifact_ids=(),
+        journal_path=str(tmp_path / "journal.json"))
+    monkeypatch.setattr(
+        specialist_install, "commit_specialist_install", lambda *a, **k: (instance, txn))
+    _stub_bundle_sequencer(monkeypatch)
+
+    payload = _payload(await specialist_install_commit.handler({
+        "component_id": component.component_id, "version": component.version,
+        "slug": component.slug, "staged_dir": str(staged),
+        "root_digest": root_digest, "receipt_id": receipt_id,
+    }))
+    assert payload["ok"] is True
+    assert payload["state"] == state
+    assert (pruned == [receipt_id]) is expect_pruned
+    # Staging consumption mirrors receipt consumption exactly (Sol r2-1).
+    assert staged.exists() is (not expect_pruned)
+
+
+@pytest.mark.asyncio
 async def test_inspect_happy_path_posts_keyboard(monkeypatch, tmp_path) -> None:
     import specialist_install_consent
     from tools import specialist_install_inspect

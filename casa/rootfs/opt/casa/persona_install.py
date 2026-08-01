@@ -53,6 +53,33 @@ __all__ = [
 ]
 
 
+def installed_personas_root() -> Path:
+    """The operator-installed personas root, resolved through the SAME
+    ``$CASA_CONFIG_DIR`` seam the resident loader reads (#323, Sol r3-2/3).
+    Every default in the install/apply/activate flow resolves through this at
+    CALL time — a def-time ``Path("/config/personas")`` default froze the
+    root before the environment was consulted, so under a custom config root
+    the tools published to one directory while apply and the loaders read
+    another."""
+    import os
+
+    return Path(os.environ.get("CASA_CONFIG_DIR", "/config")) / "personas"
+
+
+def _reclaim_inspection_staging(staged_dir: Path) -> None:
+    """#306: consume the inspection staging tree once a commit has succeeded
+    (including the idempotent/race-reconciled outcomes — the staged bytes are
+    verified equal to what is published). Same containment guard as
+    specialist_install.reclaim_staging_tree: only a direct child of a
+    ``.staging`` directory is ever removed. Never raises."""
+    import shutil
+
+    path = Path(staged_dir)
+    if path.parent.name != ".staging":
+        return
+    shutil.rmtree(path, ignore_errors=True)
+
+
 @dataclass(frozen=True, slots=True)
 class PersonaInspectionResult:
     persona_id: str
@@ -64,20 +91,29 @@ class PersonaInspectionResult:
 
 def inspect_persona_repo(
     repo: str, ref: str, *, subdir: str = "", expected_revision: str | None = None,
-    staging_root: Path = Path("/config/personas/.staging"),
+    staging_root: "Path | None" = None,
 ) -> PersonaInspectionResult:
     from persona_pack import PersonaPackError, load_persona_pack
 
+    if staging_root is None:
+        staging_root = installed_personas_root() / ".staging"
     staging_root.mkdir(parents=True, exist_ok=True, mode=0o700)
     dest = staging_root / uuid.uuid4().hex
-    resolve_and_fetch(repo, ref, subdir, dest, expected_revision=expected_revision)
-    manifest_path = dest / "manifest.json"
-    if not manifest_path.is_file():
-        raise SpecialistInstallError("manifest_missing", f"{repo}@{ref}: manifest.json not found")
+    # #306: a rejected inspection must not leave the fetched staging tree
+    # behind; a successful one retains it for commit to consume.
     try:
-        pack = load_persona_pack(dest / "pack", manifest_path)
-    except PersonaPackError as exc:
-        raise SpecialistInstallError("persona_invalid", str(exc)) from exc
+        resolve_and_fetch(repo, ref, subdir, dest, expected_revision=expected_revision)
+        manifest_path = dest / "manifest.json"
+        if not manifest_path.is_file():
+            raise SpecialistInstallError("manifest_missing", f"{repo}@{ref}: manifest.json not found")
+        try:
+            pack = load_persona_pack(dest / "pack", manifest_path)
+        except PersonaPackError as exc:
+            raise SpecialistInstallError("persona_invalid", str(exc)) from exc
+    except BaseException:
+        import shutil
+        shutil.rmtree(dest, ignore_errors=True)
+        raise
     return PersonaInspectionResult(
         persona_id=pack.persona_id, version=pack.version, checksum=pack.checksum,
         display_name=pack.identity.get("display_name", pack.persona_id), staged_dir=dest,
@@ -149,10 +185,13 @@ class PersonaInstallAckStore:
 
 def commit_persona_install(
     *, inspection: PersonaInspectionResult, acks: "PersonaInstallAckStore",
-    personas_root: Path = Path("/config/personas"),
+    personas_root: "Path | None" = None,
 ) -> "PersonaPack":
     import os
     import shutil
+
+    if personas_root is None:
+        personas_root = installed_personas_root()
 
     from persona_pack import PersonaPackError, load_persona_pack
 
@@ -202,6 +241,7 @@ def commit_persona_install(
         # just approved, so returning it is correct (round-3's original
         # short-circuit, now justified by an actual checksum comparison
         # rather than mere path existence).
+        _reclaim_inspection_staging(inspection.staged_dir)   # #306
         return existing_pack
 
     # Round-3 fix (finding #1): this was the ONE commit path in the
@@ -266,7 +306,9 @@ def commit_persona_install(
                 f"{published.checksum!r} != approved {inspection.checksum!r}); "
                 "re-publish under a new version — an existing persona version's "
                 "bytes are never silently replaced") from exc
+        _reclaim_inspection_staging(inspection.staged_dir)   # #306
         return published
+    _reclaim_inspection_staging(inspection.staged_dir)   # #306
     return load_persona_pack(dest / "pack", dest / "manifest.json")
 
 

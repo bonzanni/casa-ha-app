@@ -329,6 +329,64 @@ def test_second_fresh_install_cannot_replace_a_different_pending_candidate(
     assert satisfied.state == "active"
 
 
+def test_pending_retry_merges_already_supplied_config(tmp_path: Path) -> None:
+    """#331: a pending-configuration retry that supplies only the STILL-MISSING
+    setting keeps the earlier attempt's persisted config. Pre-fix
+    satisfiability was recomputed from the retry's config argument alone, so
+    {"region": "eu"} → pending → retry with just the secret treated region as
+    missing (stayed pending) and overwrote the desired snapshot."""
+    from specialist_install import InspectionResult, compute_install_root_digest
+
+    root = _write_component(tmp_path / "component", slug="mtg")
+    manifest_path = root / "manifest.json"
+    schema = json.loads((root / "config-schema.json").read_text(encoding="utf-8"))
+    schema["required"] = ["region", "api_key"]
+    schema["secret_names"] = ["api_key"]
+    (root / "config-schema.json").write_text(json.dumps(schema), encoding="utf-8")
+    manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+    manifest["checksum"] = compute_component_checksum({
+        "role/role.yaml": (root / "role" / "role.yaml").read_bytes(),
+        "role/doctrine.md": (root / "role" / "doctrine.md").read_bytes(),
+        "config-schema.json": (root / "config-schema.json").read_bytes(),
+    })
+    manifest_path.write_text(json.dumps(manifest), encoding="utf-8")
+
+    component = load_specialist_component(root, manifest_path)
+    deps = resolve_dependency_closure(component, root)
+    root_digest = compute_install_root_digest(
+        component, deps, manifest_bytes=manifest_path.read_bytes())
+    inspection = InspectionResult(
+        component_id=component.component_id, version=component.version, slug=component.slug,
+        component_checksum=component.checksum, root_digest=root_digest, mission="x",
+        default_persona_ref=component.default_persona_ref,
+        default_persona_checksum=component.default_persona_checksum,
+        required_config_names=("region",), required_secret_names=("api_key",),
+        dependencies=deps, staged_dir=root,
+    )
+    acks = SpecialistInstallAckStore(path=tmp_path / "acks.json")
+    identity = install_consent_identity(
+        component_id=inspection.component_id, version=inspection.version,
+        root_digest=inspection.root_digest, slug=inspection.slug)
+    acks.record(identity=identity, component_id=inspection.component_id,
+                version=inspection.version, component_checksum=inspection.root_digest,
+                slug=inspection.slug)
+
+    pending = commit_specialist_install(
+        inspection=inspection, config={"region": "eu"}, secret_names_provided=frozenset(),
+        acks=acks, specialists_dir=tmp_path / "specialists",
+        agents_specialists_dir=tmp_path / "agents-specialists")
+    assert pending.state == "pending-configuration"
+    assert pending.desired.config_snapshot == {"region": "eu"}
+
+    # Retry supplies ONLY the missing secret; region must carry forward.
+    satisfied = commit_specialist_install(
+        inspection=inspection, config={}, secret_names_provided=frozenset({"api_key"}),
+        acks=acks, specialists_dir=tmp_path / "specialists",
+        agents_specialists_dir=tmp_path / "agents-specialists")
+    assert satisfied.state == "active"
+    assert satisfied.active.config_snapshot == {"region": "eu"}
+
+
 def test_fresh_install_refuses_an_unreadable_pending_candidate(tmp_path: Path) -> None:
     """#346: a desired.yaml the guard cannot LOAD (bad YAML) is an occupant it
     cannot prove is ours — refuse structurally (concurrent_mutation), never

@@ -1783,6 +1783,107 @@ class TestSpecialistBindingActivation:
         assert cfg.speaker_provenance.speaker_kind == "specialist"
         assert cfg.binding is not None and cfg.binding.mode == "component-default"
 
+    def test_specialist_override_binding_loads_persona_from_env_config_root(
+        self, tmp_path, monkeypatch,
+    ) -> None:
+        """#323 (Sol r3-3): a persona override applied to a specialist from a
+        pack under $CASA_CONFIG_DIR/personas must ACTIVATE on the next load —
+        pre-fix activate_binding_for_config reloaded overrides exclusively
+        from /config/personas, so the tool reported success for a binding the
+        loader could never compile."""
+        from test_specialist_install import _write_component
+        from test_persona_install import _write_persona_repo
+        from specialist_component import load_specialist_component
+        from specialist_install import (
+            InspectionResult, activate_binding_for_config, commit_specialist_install,
+            compute_install_root_digest, resolve_dependency_closure,
+        )
+        from specialist_install_consent import SpecialistInstallAckStore, install_consent_identity
+        from role_slot import materialize_role
+        from role_artifact import load_role_artifact
+        from persona_pack import load_persona_pack
+        from persona_install import apply_persona_override
+
+        monkeypatch.setenv("CASA_CONFIG_DIR", str(tmp_path / "cfgroot"))
+
+        staged = _write_component(tmp_path / "staged-component", slug="mtg")
+        component = load_specialist_component(staged, staged / "manifest.json")
+        deps = resolve_dependency_closure(component, staged)
+        root_digest = compute_install_root_digest(
+            component, deps, manifest_bytes=(staged / "manifest.json").read_bytes())
+        inspection = InspectionResult(
+            component_id=component.component_id, version=component.version, slug=component.slug,
+            component_checksum=component.checksum, root_digest=root_digest,
+            mission=str(component.role.role["mission"]),
+            default_persona_ref=component.default_persona_ref,
+            default_persona_checksum=component.default_persona_checksum,
+            required_config_names=(), required_secret_names=(), dependencies=deps, staged_dir=staged,
+        )
+        acks = SpecialistInstallAckStore(path=tmp_path / "acks.json")
+        identity = install_consent_identity(
+            component_id=inspection.component_id, version=inspection.version,
+            root_digest=inspection.root_digest, slug=inspection.slug)
+        acks.record(identity=identity, component_id=inspection.component_id,
+                    version=inspection.version,
+                    component_checksum=inspection.root_digest, slug=inspection.slug)
+
+        specialists_dir = tmp_path / "specialists"
+        commit_specialist_install(
+            inspection=inspection, config={}, secret_names_provided=frozenset(), acks=acks,
+            specialists_dir=specialists_dir,
+            agents_specialists_dir=tmp_path / "agents-specialists",
+        )
+
+        # Install the override pack ONLY under the custom config root —
+        # casa/judge satisfies the component role's persona_requirements.
+        override_dir = tmp_path / "cfgroot" / "personas" / "casa/judge" / "0.1.0"
+        override_dir.parent.mkdir(parents=True, exist_ok=True)
+        _write_persona_repo(override_dir, persona_id="casa/judge")
+        persona = load_persona_pack(
+            override_dir / "pack", override_dir / "manifest.json")
+
+        role = materialize_role(source=load_role_artifact(staged / "role"), options={})
+        apply_persona_override(
+            target_role_id="specialist:mtg", persona=persona, role=role,
+            instance_dir_root=specialists_dir / "mtg")
+
+        # Sol r4-1: the PRODUCTION pre-load path must survive too — every
+        # reload/boot resolves the roles overlay first, and its operational-
+        # file self-heal reloads the override persona; pre-fix that branch
+        # alone read a fixed /config/personas and could drop the
+        # specialist's operational files.
+        import specialist_materialize
+        from specialist_registry import InstalledSpecialistIndex
+
+        index = InstalledSpecialistIndex(specialists_dir=str(specialists_dir))
+        index.load()
+        agents_specialists_dir = tmp_path / "agents-specialists"
+        roles_dir = specialist_materialize.current_specialist_roles_dir(
+            installed_index=index, specialists_dir=specialists_dir,
+            agents_specialists_dir=agents_specialists_dir,
+        )
+        assert roles_dir
+        op_dir = agents_specialists_dir / "mtg"
+        for name in ("character.yaml", "voice.yaml", "response_shape.yaml",
+                     "runtime.yaml"):
+            assert (op_dir / name).is_file(), name
+
+        class _Cfg:
+            pass
+
+        cfg = _Cfg()
+        cfg.role_slot = role
+        cfg.persona_pack = None
+        cfg.binding = None
+        cfg.compiled_prompt_bundle = None
+        cfg.binding_digest = None
+        cfg.speaker_provenance = None
+        activate_binding_for_config(cfg, specialists_root=specialists_dir)
+
+        assert cfg.binding is not None and cfg.binding.mode == "override"
+        assert cfg.persona_pack.persona_id == "casa/judge"
+        assert cfg.compiled_prompt_bundle is not None
+
     def test_specialist_with_no_active_binding_leaves_cfg_bundle_none(self, tmp_path) -> None:
         from specialist_install import activate_binding_for_config
         from role_slot import RoleSlot, ResolvedModel

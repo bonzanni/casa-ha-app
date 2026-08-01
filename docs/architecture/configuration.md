@@ -1,5 +1,5 @@
 ---
-last_reviewed: 2026-07-30
+last_reviewed: 2026-08-01
 ---
 
 # Configuration, reload and secrets
@@ -53,6 +53,16 @@ your edits survive means knowing which of the three cases each file is in.
 **Some identity changes cannot be hot-swapped at all.** If a resident's identity changes, the
 reload path returns a restart-required outcome *before* mutating live state rather than
 attempting a swap.
+
+**A specialist reload consumes the roles overlay after the lock that built it.** The
+overlay rebuild runs under the personality materialize lock, but the agent load that
+consumes it cannot hold that lock (resident loads re-acquire it internally), so a
+concurrent install or upgrade can swap the active tuple in the gap. A load that fails in
+that gap rebuilds the overlay once and retries before surfacing an error. The overlay
+itself stays a shared, destructively rebuilt path — not a per-reload snapshot — so a
+mutation committing after a successful load can still advance what the following registry
+refresh reads; that state is internally consistent and converges, because reloads
+serialize per scope and the mutating flow's own sequencer re-runs the refresh last.
 
 **Secret indirection covers every password-typed option.** Exactly four options resolve an
 external `op://` secret reference at startup — the Claude OAuth token, the Telegram bot

@@ -592,6 +592,11 @@ def artifact_verdict(path: Path, *, name: str, repo: str, revision: str,
 
 _REJECTED_REQ_TYPES = {"apt", "dpkg", "yum", "dnf", "pacman"}
 
+# #354 review round 2: the shape a systemRequirements verify_bin must have —
+# a plain executable name, since it is joined into tools/bin/<name> and into
+# per-plugin ownership checks (no separators, no traversal, no leading dot).
+_VERIFY_BIN_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]{0,63}$")
+
 
 @dataclass(frozen=True)
 class PublishResult:
@@ -818,12 +823,50 @@ def fetch_commit_tree(repo: str, commit: str, subdir: str, dest: Path,
 
 
 def manifest_sysreqs(manifest: dict) -> list:
-    """Guarded casa.systemRequirements extraction (Sol R2-3): tolerates a
-    non-object `casa` and non-list requirements. THE shared helper — used by
-    validate_manifest, plugin_add, and plugin_update; never re-derive inline."""
+    """Guarded + STRICT ``casa.systemRequirements`` extraction (#354), beside
+    ``manifest_protected_tools``. ABSENT (no ``casa``, a non-object ``casa``,
+    or the key itself missing) means "no requirements" → ``[]``.
+
+    PRESENT-but-malformed (a non-list value, or any non-object member) is a
+    plugin-author error: raises ``StoreError(reason_code=
+    "system_requirements_invalid")``. Pre-fix both shapes silently degraded
+    to the no-requirements path, so the plugin activated with nothing
+    installed and its MCP server failed only at runtime.
+
+    THE shared helper — used by validate_manifest, plugin_add, plugin_update,
+    specialist bundled-dependency vetting, and plugin verification; never
+    re-derive inline."""
     casa = manifest.get("casa") if isinstance(manifest, dict) else None
-    reqs = casa.get("systemRequirements") if isinstance(casa, dict) else None
-    return [r for r in reqs if isinstance(r, dict)] if isinstance(reqs, list) else []
+    if not isinstance(casa, dict) or "systemRequirements" not in casa:
+        return []
+    reqs = casa.get("systemRequirements")
+    if not isinstance(reqs, list):
+        raise StoreError(
+            "casa.systemRequirements must be a list of requirement objects, "
+            f"got {type(reqs).__name__}",
+            reason_code="system_requirements_invalid")
+    for r in reqs:
+        if not isinstance(r, dict):
+            raise StoreError(
+                "casa.systemRequirements members must be objects, got "
+                f"{type(r).__name__}",
+                reason_code="system_requirements_invalid")
+        if r.get("type") in _REJECTED_REQ_TYPES:
+            # Refused downstream with its own dedicated kind
+            # (apt_requirements_rejected) — don't mask that here.
+            continue
+        # Review round 2 (Terra P1-1): every usable strategy gates success on
+        # its launcher resolving, so a requirement without a safe verify_bin
+        # can never succeed — and pre-fix a tarball one still ran the whole
+        # install before failing. The name is also joined into tools/bin/<name>
+        # and ownership checks, so constrain it to a plain executable name.
+        vb = r.get("verify_bin")
+        if not isinstance(vb, str) or not _VERIFY_BIN_RE.fullmatch(vb):
+            raise StoreError(
+                "casa.systemRequirements entries must declare verify_bin as "
+                f"a safe executable name, got {vb!r}",
+                reason_code="system_requirements_invalid")
+    return list(reqs)
 
 
 def manifest_triggers(manifest: dict, plugin_name: str) -> list:

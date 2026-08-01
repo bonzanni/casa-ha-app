@@ -1,5 +1,56 @@
 # Changelog
 
+## [0.144.0] - 2026-08-01
+
+### Fixed
+
+Install/workspace batch — plugin system requirements, specialist/persona
+install staging, and the pending-configuration flow (#306, #308, #323,
+#331, #354, #379):
+
+- **A failed tool reinstall no longer destroys the working install**
+  (#308). The tarball system-requirement installer used to delete the
+  existing installation before its replacement had succeeded — a failed
+  download, extraction or install command left the plugin's CLI broken
+  until a manual reinstall. The replacement is now built alongside and
+  swapped in only on full success; on any failure the previous install
+  (and its launcher link) keeps working.
+- **A malformed system-requirements declaration is now refused** (#354).
+  Previously it silently read as "no requirements", so the plugin
+  installed cleanly and only failed at runtime when its missing binary
+  was invoked. Install/update now reject it with a clear error, and
+  plugin verification shows it as a missing requirement.
+- **One plugin can no longer overwrite another plugin's installed tool**
+  (#354). All three install strategies now refuse to publish a launcher
+  name that another plugin already owns, instead of silently repointing
+  it.
+- **Malformed executor hook entries no longer crash engagement startup**
+  (#354). Odd shapes in a hooks file are skipped (the built-in guard is
+  always emitted) instead of failing the engagement after its workspace
+  was already created.
+- **Install staging is cleaned up** (#306). Rejected or abandoned
+  specialist and persona inspections used to leave full repository
+  copies behind forever; they are now removed on failure, consumed on
+  successful install, and swept at boot after seven days — unbounded
+  disk growth on the config volume is gone.
+- **Persona references are contained and consistent** (#323). A
+  crafted persona reference can no longer load a pack from outside the
+  approved directories; a pack must declare the identity its reference
+  names; and the persona tools now resolve their directories through the
+  same settings the loader uses, so applying a persona in a custom
+  layout takes effect after restart instead of silently staging to the
+  wrong place.
+- **A specialist install that needs more configuration can now be
+  completed** (#331). The first commit's consent receipt is retained
+  while configuration is pending (it was deleted, making the follow-up
+  impossible without a reinstall), and a retry that supplies only the
+  still-missing settings keeps the ones already provided. A concurrent
+  upgrade during a reload can no longer fail that reload with a
+  spurious mismatch.
+- Verified already fixed and closed: the fresh-install guard for pending
+  specialists (#379, fixed in 0.134.0) and atomic-write directory
+  durability (#354 sub-item, fixed in 0.138.0).
+
 ## [0.143.0] - 2026-08-01
 
 ### Fixed

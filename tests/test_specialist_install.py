@@ -271,6 +271,163 @@ def test_inspect_specialist_repo_install_mode_rejects_already_installed_slug(
     assert exc_info.value.kind == "slug_collision"
 
 
+def test_inspect_failure_reclaims_staging_tree(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """#306: a rejected inspection (slug collision here) must delete the
+    fetched staging tree — pre-fix every rejection leaked a full repo copy
+    under /config/specialists/.staging until the volume filled."""
+    slug = "collide-me"
+    component_root = _write_component(tmp_path / "component", slug=slug)
+    monkeypatch.setattr(specialist_install, "resolve_and_fetch", _stub_resolve_and_fetch(component_root))
+
+    specialists_dir = tmp_path / "specialists"
+    InstanceDir(specialists_dir / slug).stage_desired(_specialist_tuple(_specialist_binding(slug)))
+    index = InstalledSpecialistIndex(specialists_dir=str(specialists_dir))
+    index.load()
+
+    staging = tmp_path / ".staging"
+    with pytest.raises(SpecialistInstallError):
+        specialist_install.inspect_specialist_repo(
+            "org/repo", "main", staging_root=staging, installed_index=index,
+        )
+    assert list(staging.iterdir()) == []
+
+
+def test_inspect_success_retains_staging_tree(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """#306 companion pin: a SUCCESSFUL inspection keeps its staged tree —
+    commit prefers the retained attested bytes over a refetch."""
+    component_root = _write_component(tmp_path / "component", slug="fresh-specialist")
+    monkeypatch.setattr(specialist_install, "resolve_and_fetch", _stub_resolve_and_fetch(component_root))
+    index = InstalledSpecialistIndex(specialists_dir=str(tmp_path / "specialists"))
+    index.load()
+
+    result = specialist_install.inspect_specialist_repo(
+        "org/repo", "main", staging_root=tmp_path / ".staging",
+        installed_index=index, receipts_dir=tmp_path / "receipts",
+    )
+    assert Path(result.staged_dir).is_dir()
+
+
+def test_commit_active_reclaims_staging_tree(tmp_path: Path) -> None:
+    """#306: a commit that reaches state="active" consumes the inspection
+    staging tree (pre-fix it survived forever)."""
+    import dataclasses
+
+    inspection = _staged_inspection(tmp_path)
+    staging = tmp_path / ".staging"
+    staging.mkdir()
+    staged = staging / "deadbeef"
+    shutil.copytree(inspection.staged_dir, staged)
+    inspection = dataclasses.replace(inspection, staged_dir=staged)
+
+    acks = SpecialistInstallAckStore(path=tmp_path / "acks.json")
+    identity = install_consent_identity(
+        component_id=inspection.component_id, version=inspection.version,
+        root_digest=inspection.root_digest, slug=inspection.slug)
+    acks.record(identity=identity, component_id=inspection.component_id, version=inspection.version,
+                component_checksum=inspection.root_digest, slug=inspection.slug)
+
+    instance = commit_specialist_install(
+        inspection=inspection, config={}, secret_names_provided=frozenset(), acks=acks,
+        specialists_dir=tmp_path / "specialists",
+        agents_specialists_dir=tmp_path / "agents-specialists",
+    )
+    assert instance.state == "active"
+    assert not staged.exists()
+
+
+def test_commit_pending_configuration_retains_staging_tree(tmp_path: Path) -> None:
+    """#306 companion pin: a pending-configuration commit RETAINS the staged
+    tree so the follow-up commit can reuse the attested bytes."""
+    import dataclasses
+
+    root = _write_component(tmp_path / "component", slug="mtg")
+    manifest_path = root / "manifest.json"
+    manifest = json.loads(manifest_path.read_text())
+    schema = json.loads((root / "config-schema.json").read_text())
+    schema["required"] = ["region"]
+    (root / "config-schema.json").write_text(json.dumps(schema), encoding="utf-8")
+    files = {
+        "role/role.yaml": (root / "role" / "role.yaml").read_bytes(),
+        "role/doctrine.md": (root / "role" / "doctrine.md").read_bytes(),
+        "config-schema.json": (root / "config-schema.json").read_bytes(),
+    }
+    manifest["checksum"] = compute_component_checksum(files)
+    manifest_path.write_text(json.dumps(manifest), encoding="utf-8")
+
+    component = load_specialist_component(root, root / "manifest.json")
+    deps = resolve_dependency_closure(component, root)
+    root_digest = specialist_install.compute_install_root_digest(
+        component, deps, manifest_bytes=manifest_path.read_bytes())
+    staging = tmp_path / ".staging"
+    staging.mkdir()
+    staged = staging / "cafebabe"
+    shutil.copytree(root, staged)
+    inspection = specialist_install.InspectionResult(
+        component_id=component.component_id, version=component.version, slug=component.slug,
+        component_checksum=component.checksum, root_digest=root_digest,
+        mission=str(component.role.role["mission"]),
+        default_persona_ref=component.default_persona_ref,
+        default_persona_checksum=component.default_persona_checksum,
+        required_config_names=("region",), required_secret_names=(),
+        dependencies=deps, staged_dir=staged,
+    )
+    acks = SpecialistInstallAckStore(path=tmp_path / "acks.json")
+    identity = install_consent_identity(
+        component_id=inspection.component_id, version=inspection.version,
+        root_digest=inspection.root_digest, slug=inspection.slug)
+    acks.record(identity=identity, component_id=inspection.component_id, version=inspection.version,
+                component_checksum=inspection.root_digest, slug=inspection.slug)
+
+    instance = commit_specialist_install(
+        inspection=inspection, config={}, secret_names_provided=frozenset(), acks=acks,
+        specialists_dir=tmp_path / "specialists",
+        agents_specialists_dir=tmp_path / "agents-specialists",
+    )
+    assert instance.state == "pending-configuration"
+    assert staged.is_dir()
+
+
+def test_reclaim_staging_tree_containment_guard(tmp_path: Path) -> None:
+    """#306: only a direct child of a `.staging` directory is ever removed —
+    an arbitrary staged_dir (hand-built InspectionResult) is left alone."""
+    outside = tmp_path / "precious"
+    outside.mkdir()
+    specialist_install.reclaim_staging_tree(outside)
+    assert outside.is_dir()
+
+    inside = tmp_path / ".staging" / "tree"
+    inside.mkdir(parents=True)
+    specialist_install.reclaim_staging_tree(inside)
+    assert not inside.exists()
+
+
+def test_sweep_staging_aged_removes_only_old_trees(tmp_path: Path) -> None:
+    """#306: the boot sweep removes trees older than the cutoff and leaves
+    fresh ones (an in-flight consent flow) untouched."""
+    import time
+
+    root_a = tmp_path / "specialists" / ".staging"
+    root_b = tmp_path / "personas" / ".staging"
+    old_a = root_a / "old"; old_a.mkdir(parents=True)
+    (old_a / "f.txt").write_text("x", encoding="utf-8")
+    fresh_a = root_a / "fresh"; fresh_a.mkdir()
+    old_b = root_b / "old"; old_b.mkdir(parents=True)
+    now = time.time()
+    week_plus = now - 8 * 24 * 3600
+    os.utime(old_a, (week_plus, week_plus))
+    os.utime(old_b, (week_plus, week_plus))
+
+    removed = specialist_install.sweep_staging_aged(
+        roots=(root_a, root_b, tmp_path / "absent"), now=now)
+    assert removed == 2
+    assert not old_a.exists() and not old_b.exists()
+    assert fresh_a.is_dir()
+
+
 def test_inspect_specialist_repo_upgrade_mode_requires_target_slug(tmp_path: Path) -> None:
     with pytest.raises(SpecialistInstallError) as exc_info:
         specialist_install.inspect_specialist_repo(

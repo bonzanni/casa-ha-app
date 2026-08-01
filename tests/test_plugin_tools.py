@@ -119,7 +119,7 @@ def _wire(monkeypatch, tmp_path, st, *, publish=None, publish_exc=None,
 async def test_plugin_add_happy_activates_and_sequences(monkeypatch, tmp_path):
     st = _State()
     tools_mod = _wire(monkeypatch, tmp_path, st,
-                      publish=_pr(sysreqs=[{"type": "tarball", "url": "x"}]))
+                      publish=_pr(sysreqs=[{"type": "tarball", "url": "x", "verify_bin": "xbin"}]))
     r = await tools_mod.plugin_add.handler({
         "name": "probe", "repo": "o/r", "ref": "v1",
         "targets": ["resident:assistant"]})
@@ -279,7 +279,7 @@ async def test_plugin_add_sysreq_failure_leaves_registry_unchanged(
     from system_requirements.orchestrator import OrchestrationError
     st = _State()
     tools_mod = _wire(monkeypatch, tmp_path, st,
-                      publish=_pr(sysreqs=[{"type": "tarball", "url": "x"}]),
+                      publish=_pr(sysreqs=[{"type": "tarball", "url": "x", "verify_bin": "xbin"}]),
                       sysreq_exc=OrchestrationError("boom"))
     r = await tools_mod.plugin_add.handler({
         "name": "probe", "repo": "o/r", "ref": "v1",
@@ -340,7 +340,7 @@ async def test_plugin_update_installs_new_requirements_before_activation(
         "artifact_id": "c" * 64, "version": "1.1.0", "targets": []})
     tools_mod = _wire(monkeypatch, tmp_path, st,
                       publish=_pr(version="2.0.0",
-                                  sysreqs=[{"type": "npm", "package": "x"}]),
+                                  sysreqs=[{"type": "npm", "package": "x", "verify_bin": "xbin"}]),
                       sysreq_exc=OrchestrationError("boom"))
     r = await tools_mod.plugin_update.handler({"name": "probe", "new_ref": "v2"})
     assert json.loads(r["content"][0]["text"])["kind"] == \
@@ -646,7 +646,7 @@ async def test_update_matching_tag_and_revision_proceeds_in_order(
     st.raw["plugins"].append(_entry())
     tools_mod = _wire(monkeypatch, tmp_path, st,
                       publish=_pr(version="1.2.0",
-                                  sysreqs=[{"type": "tarball", "url": "x"}]))
+                                  sysreqs=[{"type": "tarball", "url": "x", "verify_bin": "xbin"}]))
     core = tools_mod._plugin_update_sync(
         name="probe", new_ref="v1.2.0", expected_revision="b" * 40)
     assert core["ok"] is True
@@ -659,7 +659,7 @@ async def test_add_revision_mismatch_aborts(monkeypatch, tmp_path):
     and registry mutation (r2-B4: ordering asserted, not just no-save)."""
     st = _State()
     tools_mod = _wire(monkeypatch, tmp_path, st,
-                      publish=_pr(sysreqs=[{"type": "tarball", "url": "x"}]),
+                      publish=_pr(sysreqs=[{"type": "tarball", "url": "x", "verify_bin": "xbin"}]),
                       resolved_sha="c" * 40)
     core = tools_mod._plugin_add_sync(
         name="probe", repo="o/r", ref="v1.2.0",
@@ -677,7 +677,7 @@ async def test_add_tag_version_mismatch_aborts_before_sysreqs_and_save(
     st = _State()
     tools_mod = _wire(monkeypatch, tmp_path, st,
                       publish=_pr(version="1.2.0",
-                                  sysreqs=[{"type": "tarball", "url": "x"}]))
+                                  sysreqs=[{"type": "tarball", "url": "x", "verify_bin": "xbin"}]))
     core = tools_mod._plugin_add_sync(
         name="probe", repo="o/r", ref="v9.9.9",
         targets=["resident:assistant"])

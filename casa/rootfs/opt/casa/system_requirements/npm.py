@@ -6,7 +6,8 @@ import shutil
 import subprocess
 from pathlib import Path
 
-from .tarball import InstallResult
+from .manifest import ensure_bin_claim
+from .tarball import InstallResult, _atomic_symlink
 
 logger = logging.getLogger(__name__)
 
@@ -20,6 +21,8 @@ def install_npm(
 ) -> InstallResult:
     package = spec["package"]
     verify_bin = spec["verify_bin"]
+    # #354: refuse up front if another plugin already publishes this bin name.
+    ensure_bin_claim(verify_bin, plugin_name, tools_root)
 
     # Per-plugin prefix (M25): a shared tools_root/"npm" prefix means the
     # two-stage-commit rollback in tools.py (shutil.rmtree(install_dir)) would
@@ -47,9 +50,8 @@ def install_npm(
             message=f"verify_bin {verify_bin!r} not produced by npm install",
         )
     link = tools_bin / verify_bin
-    if link.is_symlink() or link.exists():
-        link.unlink()
-    link.symlink_to(source_bin)
+    # #308 review: atomic retarget — no unlink gap for a concurrent exec.
+    _atomic_symlink(source_bin, link)
 
     return InstallResult(
         ok=True, verify_bin_resolves=link.is_symlink(),

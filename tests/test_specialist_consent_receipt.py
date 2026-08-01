@@ -179,6 +179,57 @@ def test_sweep_aged_removes_only_old_receipts(tmp_path):
     assert (tmp_path / f"{fresh.receipt_id}.json").exists()
 
 
+def test_sweep_aged_keeps_only_the_newest_pending_slug_receipt(tmp_path):
+    """#331 (Sol r5-2 / Terra r6-1): an aged receipt whose slug still has a
+    LIVE pending-configuration candidate is retained — but only the NEWEST
+    one per slug; repeated pre-commit inspections must not pin unbounded
+    receipts (and through them, staging trees) forever."""
+    import os
+    import time
+    import specialist_receipt
+
+    older = _mint_receipt(tmp_path)     # slug "mtg"
+    newer = _mint_receipt(tmp_path)     # slug "mtg" — a later re-inspect
+    older_path = tmp_path / f"{older.receipt_id}.json"
+    newer_path = tmp_path / f"{newer.receipt_id}.json"
+    now = time.time()
+    os.utime(older_path, (now - 40 * 24 * 3600,) * 2)
+    os.utime(newer_path, (now - 30 * 24 * 3600,) * 2)
+
+    removed = specialist_receipt.sweep_aged(
+        receipts_dir=tmp_path, keep_slugs={"mtg"})
+    assert removed == 1
+    assert not older_path.exists()   # superseded inspection: swept
+    assert newer_path.exists()       # the resumable receipt: kept
+    # Without the keep, the survivor sweeps too.
+    removed = specialist_receipt.sweep_aged(receipts_dir=tmp_path)
+    assert removed == 1
+    assert not newer_path.exists()
+
+
+def test_sweep_aged_keep_receipt_ids_beats_mtime(tmp_path):
+    """Sol r6-2: an exact-id keep (the pending marker's receipt) is exempt
+    even when a NEWER same-slug receipt exists — newest-by-mtime alone could
+    keep a different root's receipt that cannot resume the pending tuple."""
+    import os
+    import time
+    import specialist_receipt
+
+    marked = _mint_receipt(tmp_path)    # the receipt the pending commit used
+    newer = _mint_receipt(tmp_path)     # later inspection, different root
+    marked_path = tmp_path / f"{marked.receipt_id}.json"
+    newer_path = tmp_path / f"{newer.receipt_id}.json"
+    now = time.time()
+    os.utime(marked_path, (now - 40 * 24 * 3600,) * 2)
+    os.utime(newer_path, (now - 30 * 24 * 3600,) * 2)
+
+    removed = specialist_receipt.sweep_aged(
+        receipts_dir=tmp_path, keep_receipt_ids={marked.receipt_id})
+    assert removed == 1
+    assert marked_path.exists()
+    assert not newer_path.exists()
+
+
 def test_pin_inv_spec_005_tampered_receipt_loads_as_none(tmp_path):
     """Pins INV-SPEC-005: a receipt whose attested fields no longer match its
     recorded digest reads as absent, never as attested.
