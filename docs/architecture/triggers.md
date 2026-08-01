@@ -26,6 +26,12 @@ authentication happens.
 set of registered routes, and reconciliation swaps the whole thing at once rather than
 mutating entries. Resident registrations are untouched by that swap.
 
+**Cron fields follow the crontab convention, including day-of-week numbering.** A numeric
+day-of-week uses cron's 0/7 = Sunday; registration translates it into day names before it
+reaches the scheduler, whose own 3.x numbering starts the week on Monday — passing the
+number through verbatim is exactly the silent Sunday-fires-Monday misschedule this
+translation exists to prevent.
+
 **Scheduled jobs do not survive a restart.** The scheduler is configured with no persistent
 job store, so jobs live in process memory. Definitions are rebuilt from configuration at
 boot, which makes it *look* durable — but next-run times and any occurrence missed while the

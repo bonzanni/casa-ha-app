@@ -839,6 +839,45 @@ async def test_new_tool_appears_after_refresh_without_losing_healthy_tools():
 
 
 @pytest.mark.asyncio
+async def test_failed_schema_publication_retries_on_next_refresh():
+    """#343: _refresh_locked used to commit the new surface descriptor
+    BEFORE on_schema_change published it — a publish failure made every
+    later refresh see the surface as unchanged, freezing the agent's tool
+    surface until HA changed schema again or a restart."""
+    sessions = SessionSequence(
+        FakeHaSession(tools=[action_tool("HassTurnOn")]),
+        FakeHaSession(tools=[
+            action_tool("HassTurnOn"),
+            action_tool("HassLightSet"),
+        ]),
+        FakeHaSession(tools=[
+            action_tool("HassTurnOn"),
+            action_tool("HassLightSet"),
+        ]),
+    )
+
+    class FlakyRecorder(SchemaChangeRecorder):
+        async def __call__(self) -> None:
+            await super().__call__()
+            if self.count == 1:
+                raise RuntimeError("SDK reload failed")
+
+    changed = FlakyRecorder()
+    facade = make_facade(sessions, on_schema_change=changed)
+
+    await facade.start()
+    try:
+        with pytest.raises(RuntimeError):
+            await facade.refresh()          # publish fails
+        # Same (already-committed) surface — the failed publication must
+        # still be retried, not silently dropped.
+        await facade.refresh()
+        assert changed.count == 2
+    finally:
+        await facade.aclose()
+
+
+@pytest.mark.asyncio
 async def test_identical_normalized_surface_does_not_notify_schema_change():
     initial = Tool(
         name="HassTurnOn",

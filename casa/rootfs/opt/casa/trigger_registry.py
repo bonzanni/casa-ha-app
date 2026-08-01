@@ -31,6 +31,67 @@ class TriggerError(Exception):
     """Raised on any trigger-wiring conflict or invalid shape."""
 
 
+# #343: cron numbers weekdays 0/7=Sunday..6=Saturday; APScheduler 3.x
+# numbers them 0=Monday..6=Sunday (4.x adopts the cron convention — this
+# translation emits day NAMES, which mean the same days in both).
+_CRON_DOW_NAMES = {
+    "sun": 0, "mon": 1, "tue": 2, "wed": 3, "thu": 4, "fri": 5, "sat": 6,
+}
+_DOW_TOKENS = ["sun", "mon", "tue", "wed", "thu", "fri", "sat"]  # cron order
+
+
+def _cron_dow_token(tok: str) -> int:
+    """One cron DOW token → cron weekday number (0=Sunday)."""
+    if tok.isdigit():
+        n = int(tok)
+        if n > 7:
+            raise TriggerError(f"cron day_of_week out of range: {tok!r}")
+        return n % 7          # cron allows 7 as a Sunday alias
+    if tok in _CRON_DOW_NAMES:
+        return _CRON_DOW_NAMES[tok]
+    raise TriggerError(f"invalid cron day_of_week token: {tok!r}")
+
+
+def _translate_cron_dow(field: str) -> str:
+    """Translate a standard-cron day-of-week field into APScheduler day
+    NAMES (#343). Passing the numeric field through verbatim silently
+    misschedules: APScheduler 3.x reads 0 as Monday, so ``0 9 * * 0``
+    fired Monday instead of Sunday. Handles numbers, names, lists,
+    ranges (wrap-around expanded — APScheduler ranges cannot wrap) and
+    ``/step``; raises :class:`TriggerError` on anything malformed."""
+    field = field.strip().lower()
+    if field == "*":
+        return "*"
+    out: list[int] = []
+    for part in field.split(","):
+        part = part.strip()
+        expr, sep, step_s = part.partition("/")
+        if sep and (not step_s.isdigit() or int(step_s) < 1):
+            raise TriggerError(
+                f"invalid cron day_of_week step in {part!r}")
+        step = int(step_s) if sep else 1
+        if expr == "*":
+            lo, hi = 0, 6
+        elif "-" in expr:
+            lo_s, _, hi_s = expr.partition("-")
+            if not lo_s or not hi_s:
+                raise TriggerError(
+                    f"invalid cron day_of_week range: {expr!r}")
+            lo, hi = _cron_dow_token(lo_s), _cron_dow_token(hi_s)
+        else:
+            lo = hi = _cron_dow_token(expr)
+            if sep:               # "n/step" = n through Saturday, stepped
+                hi = 6
+        if lo <= hi:
+            days = list(range(lo, hi + 1))
+        else:                     # cron wrap range, e.g. 6-0 = Sat,Sun
+            days = list(range(lo, 7)) + list(range(0, hi + 1))
+        for d in days[::step]:
+            if d not in out:
+                out.append(d)
+    return ",".join(_DOW_TOKENS[d] for d in out)
+
+
 @dataclass
 class TriggerSummary:
     name: str
@@ -164,7 +225,9 @@ class TriggerRegistry:
             self._scheduler.add_job(
                 _fire, trigger="cron",
                 minute=minute, hour=hour, day=day, month=month,
-                day_of_week=day_of_week, id=job_id,
+                # #343: cron 0/7=Sunday vs APScheduler 3.x 0=Monday —
+                # translate to day names (identical meaning in both).
+                day_of_week=_translate_cron_dow(day_of_week), id=job_id,
             )
         self._seen_job_ids.add(job_id)
         self._specs_by_job_id[job_id] = trig

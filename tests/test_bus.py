@@ -610,3 +610,176 @@ class TestLoopLifecycle:
     async def test_unregister_unknown_name_is_noop(self):
         bus = MessageBus()
         assert bus.unregister("nope") is None
+
+
+# ------------------------------------------------------------------
+# #343: cancellation must actually stop work (queued + dispatched)
+# ------------------------------------------------------------------
+
+
+class TestCancellationStopsWork:
+    async def test_cancelled_queued_request_never_runs_handler(self):
+        """#343(a): a request cancelled while its message is still QUEUED
+        (no consumer running yet) must not execute the handler when the
+        consumer later drains the queue."""
+        bus = MessageBus()
+        ran = asyncio.Event()
+
+        async def handler(msg):
+            ran.set()
+            return None
+
+        bus.register("b", handler)
+        req = _msg(target="b")
+        caller = asyncio.create_task(bus.request(req, timeout=5))
+
+        # Wait (bounded) until the message is enqueued + pending registered.
+        deadline = asyncio.get_running_loop().time() + 5
+        while req.id not in bus.pending:
+            assert asyncio.get_running_loop().time() < deadline
+            await asyncio.sleep(0.001)
+        assert bus.queues["b"].qsize() == 1
+
+        caller.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await caller
+
+        # NOW start the consumer: it must skip the cancelled message.
+        loop_task = bus.start_agent_loop("b")
+        try:
+            deadline = asyncio.get_running_loop().time() + 5
+            while bus.queues["b"].qsize() > 0:
+                assert asyncio.get_running_loop().time() < deadline
+                await asyncio.sleep(0.001)
+            await asyncio.sleep(0.01)  # let any (wrong) dispatch land
+            assert not ran.is_set()
+        finally:
+            bus.unregister("b")
+            await asyncio.gather(loop_task, return_exceptions=True)
+
+    async def test_unregister_cancels_inflight_dispatch_tasks(self):
+        """#343(b): evicting an agent must cancel dispatch tasks the
+        consumer already spawned, not just the consumer loop."""
+        bus = MessageBus()
+        entered = asyncio.Event()
+        cancelled = asyncio.Event()
+
+        async def handler(msg):
+            entered.set()
+            try:
+                await asyncio.sleep(60)
+            except asyncio.CancelledError:
+                cancelled.set()
+                raise
+
+        bus.register("b", handler)
+        loop_task = bus.start_agent_loop("b")
+        await bus.send(_msg(target="b"))
+        await asyncio.wait_for(entered.wait(), timeout=5)
+
+        bus.unregister("b")
+        await asyncio.gather(loop_task, return_exceptions=True)
+        await asyncio.wait_for(cancelled.wait(), timeout=5)
+
+    async def test_unregister_and_wait_awaits_dispatch_tasks(self):
+        """unregister_and_wait returns only after consumer AND dispatch
+        tasks have completed — the reload-teardown contract."""
+        bus = MessageBus()
+        entered = asyncio.Event()
+        finished = asyncio.Event()
+
+        async def handler(msg):
+            entered.set()
+            try:
+                await asyncio.sleep(60)
+            except asyncio.CancelledError:
+                finished.set()
+                raise
+
+        bus.register("b", handler)
+        bus.start_agent_loop("b")
+        await bus.send(_msg(target="b"))
+        await asyncio.wait_for(entered.wait(), timeout=5)
+
+        await bus.unregister_and_wait("b")
+        assert finished.is_set()
+        assert "b" not in bus.queues
+
+    async def test_dispatch_tasks_hold_strong_references(self):
+        """Non-REQUEST dispatch tasks must be strongly referenced while
+        running (asyncio GC hazard) — tracked per agent."""
+        bus = MessageBus()
+        entered = asyncio.Event()
+
+        async def handler(msg):
+            entered.set()
+            await asyncio.sleep(60)
+
+        bus.register("b", handler)
+        loop_task = bus.start_agent_loop("b")
+        try:
+            await bus.send(_msg(target="b"))
+            await asyncio.wait_for(entered.wait(), timeout=5)
+            assert len(bus.dispatch_tasks_for("b")) == 1
+        finally:
+            bus.unregister("b")
+            await asyncio.gather(loop_task, return_exceptions=True)
+
+
+# ------------------------------------------------------------------
+# #316: shutdown gate — reject new requests, unstrand pending callers
+# ------------------------------------------------------------------
+
+
+class TestShutdownGate:
+    async def test_request_after_begin_shutdown_raises(self):
+        bus = MessageBus()
+        bus.register("b")
+        bus.begin_shutdown()
+        from bus import BusShutdownError
+        with pytest.raises(BusShutdownError):
+            await bus.request(_msg(target="b"), timeout=5)
+        # And nothing was queued for a dead consumer to find later.
+        assert bus.queues["b"].qsize() == 0
+
+    async def test_fail_pending_unblocks_stranded_caller(self):
+        """A caller whose consumer was torn down mid-shutdown gets a fast
+        typed error instead of hanging until the bus timeout."""
+        bus = MessageBus()
+        bus.register("b")  # no consumer ever started
+        req = _msg(target="b")
+        caller = asyncio.create_task(bus.request(req, timeout=300))
+
+        deadline = asyncio.get_running_loop().time() + 5
+        while req.id not in bus.pending:
+            assert asyncio.get_running_loop().time() < deadline
+            await asyncio.sleep(0.001)
+
+        bus.begin_shutdown()
+        bus.fail_pending()
+        from bus import BusShutdownError
+        with pytest.raises(BusShutdownError):
+            await asyncio.wait_for(caller, timeout=5)
+
+    async def test_notifications_still_flow_during_shutdown(self):
+        """begin_shutdown gates request() only — outbound notifications
+        (operator Telegram sends) keep flowing during the drain."""
+        bus = MessageBus()
+        received = []
+
+        async def handler(msg):
+            received.append(msg.content)
+
+        bus.register("b", handler)
+        loop_task = bus.start_agent_loop("b")
+        try:
+            bus.begin_shutdown()
+            await bus.notify(_msg(target="b", content="bye"))
+            deadline = asyncio.get_running_loop().time() + 5
+            while not received:
+                assert asyncio.get_running_loop().time() < deadline
+                await asyncio.sleep(0.001)
+            assert received == ["bye"]
+        finally:
+            bus.unregister("b")
+            await asyncio.gather(loop_task, return_exceptions=True)

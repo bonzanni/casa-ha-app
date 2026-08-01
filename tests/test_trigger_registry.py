@@ -150,6 +150,69 @@ class TestCron:
 
 
 # ---------------------------------------------------------------------------
+# #343: cron day-of-week numbering — cron says 0/7=Sunday, APScheduler 3.x
+# says 0=Monday. Numeric DOW fields must be translated (as day names, which
+# mean the same days in both conventions).
+# ---------------------------------------------------------------------------
+
+
+class TestCronDayOfWeekTranslation:
+    def test_translate_tokens(self):
+        from trigger_registry import _translate_cron_dow
+        assert _translate_cron_dow("*") == "*"
+        assert _translate_cron_dow("0") == "sun"
+        assert _translate_cron_dow("7") == "sun"       # cron allows 7=Sunday
+        assert _translate_cron_dow("1") == "mon"
+        assert _translate_cron_dow("6") == "sat"
+        assert _translate_cron_dow("1-5") == "mon,tue,wed,thu,fri"
+        assert _translate_cron_dow("0,3,6") == "sun,wed,sat"
+        assert _translate_cron_dow("*/2") == "sun,tue,thu,sat"
+        assert _translate_cron_dow("1-5/2") == "mon,wed,fri"
+        assert _translate_cron_dow("sun") == "sun"     # names pass through
+        assert _translate_cron_dow("MON-FRI") == "mon,tue,wed,thu,fri"
+        # cron wrap range (Sat-Sun) expands rather than hitting
+        # APScheduler's no-wrap range rule.
+        assert _translate_cron_dow("6-0") == "sat,sun"
+
+    def test_translate_invalid_raises(self):
+        from trigger_registry import TriggerError, _translate_cron_dow
+        for bad in ("8", "boo", "1-", "-3", "1-5/0", "1//2", ""):
+            with pytest.raises(TriggerError):
+                _translate_cron_dow(bad)
+
+    async def test_numeric_sunday_registers_as_sun(self):
+        from trigger_registry import TriggerRegistry
+
+        sched = _make_scheduler()
+        reg = TriggerRegistry(
+            scheduler=sched, app=web.Application(), bus=_make_bus())
+        reg.register_agent(
+            "assistant", [_trigger_cron(schedule="0 9 * * 0")],
+            channels=["telegram"],
+        )
+        kwargs = sched.add_job.call_args.kwargs
+        assert kwargs["day_of_week"] == "sun"
+
+    def test_translated_sunday_fires_on_sunday_real_apscheduler(self):
+        """Empirical regression pin against the INSTALLED APScheduler:
+        cron `0 9 * * 0` must next fire on a Sunday, not a Monday."""
+        from datetime import datetime, timezone
+
+        from apscheduler.triggers.cron import CronTrigger
+
+        from trigger_registry import _translate_cron_dow
+
+        trig = CronTrigger(
+            minute="0", hour="9", day="*", month="*",
+            day_of_week=_translate_cron_dow("0"), timezone=timezone.utc,
+        )
+        # 2026-08-03 is a Monday.
+        start = datetime(2026, 8, 3, tzinfo=timezone.utc)
+        nxt = trig.get_next_fire_time(None, start)
+        assert nxt.weekday() == 6, f"expected Sunday, got {nxt:%A}"
+
+
+# ---------------------------------------------------------------------------
 # TestWebhook
 # ---------------------------------------------------------------------------
 

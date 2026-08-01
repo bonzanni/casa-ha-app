@@ -147,7 +147,7 @@ class InCasaDriver(DriverProtocol):
             )
             try:
                 await self._deliver_turn(engagement, prompt)
-            except Exception:
+            except BaseException:
                 # M14: Bug-13-style rollback (claude_code got this in v0.14.6).
                 # engage_executor marks the record error, but error records are
                 # excluded from active_and_idle() so no sweeper ever tears this
@@ -156,11 +156,20 @@ class InCasaDriver(DriverProtocol):
                 # then re-raise so the caller's mark_error path still runs.
                 # cancel() pops _clients/_ctx_stack/_locks and swallows close
                 # errors, so the original exception is never masked.
+                # #344: BaseException, not Exception — a CANCELLED initial
+                # delivery took the same leak path (client registered,
+                # never closed, record still "alive" to later turns). The
+                # rollback runs as its own task under shield so a
+                # re-cancellation interrupts our wait, not the close.
                 logger.warning(
                     "Engagement %s first turn failed; rolling back client",
                     engagement.id[:8],
                 )
-                await self.cancel(engagement)
+                cleanup = asyncio.ensure_future(self.cancel(engagement))
+                try:
+                    await asyncio.shield(cleanup)
+                except asyncio.CancelledError:
+                    pass  # cleanup completes in background; re-raise below
                 raise
         finally:
             # Clear from the parent task. The SDK inner task already

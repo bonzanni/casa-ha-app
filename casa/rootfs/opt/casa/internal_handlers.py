@@ -131,6 +131,13 @@ def _make_internal_tools_call_handler(
             return web.json_response(
                 {"error": {"code": -32602, "message": "missing name"}}
             )
+        # #380: refuse a truthy non-object arguments with a typed error
+        # rather than forwarding it into the tool to crash there.
+        if not isinstance(arguments, dict):
+            return web.json_response(
+                {"error": {"code": -32602,
+                           "message": "arguments must be an object"}}
+            )
 
         fn = tool_dispatch.get(name)
         if fn is None:

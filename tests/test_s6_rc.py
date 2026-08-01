@@ -395,6 +395,62 @@ class TestCompileAndUpdateLocked:
         assert not Path(captured_new_db[0]).exists(), "failed new db must be reaped"
 
 
+class TestCompileCancellation:
+    async def test_cancelled_update_does_not_delete_swapped_db(
+        self, tmp_path, monkeypatch,
+    ):
+        """#344: cancelling while ``s6-rc-update`` runs in its worker
+        thread must NOT delete new_db — the worker may still complete the
+        swap, making new_db the LIVE compiled database. Cleanup decisions
+        belong to the worker (which sees the true outcome), not to the
+        cancelled awaiter."""
+        import asyncio
+        import subprocess
+        import threading
+        import time
+
+        from drivers import s6_rc
+
+        old_db = tmp_path / "s6-casa-db-old"
+        old_db.mkdir()
+        live = tmp_path / "compiled"
+        live.symlink_to(old_db)
+        monkeypatch.setattr(s6_rc, "LIVE_DB_SYMLINK", str(live))
+
+        entered = threading.Event()
+        release = threading.Event()
+        captured_new_db: list[str] = []
+
+        def fake_run(argv, check=True, **kwargs):
+            if argv[0] == "s6-rc-compile":
+                captured_new_db.append(argv[1])
+                Path(argv[1]).mkdir(parents=True, exist_ok=True)
+                return subprocess.CompletedProcess(argv, 0)
+            entered.set()                      # s6-rc-update in flight
+            assert release.wait(timeout=5)
+            return subprocess.CompletedProcess(argv, 0)   # update SUCCEEDS
+
+        monkeypatch.setattr(s6_rc.subprocess, "run", fake_run)
+
+        task = asyncio.create_task(s6_rc._compile_and_update_locked())
+        await asyncio.to_thread(entered.wait, 5)
+        task.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await task
+
+        release.set()
+        # Wall-clock-bounded wait for the abandoned worker to finish:
+        # its last act on this path is reaping the old db.
+        deadline = time.monotonic() + 5
+        while old_db.exists() and time.monotonic() < deadline:
+            await asyncio.sleep(0.001)
+
+        assert Path(captured_new_db[0]).exists(), (
+            "the swapped (now live) db must survive the cancellation")
+        assert not old_db.exists(), (
+            "the worker completes the old-db reap even when abandoned")
+
+
 class TestServiceStatus:
     async def test_service_is_up_parses_svstat(self, monkeypatch):
         from drivers import s6_rc

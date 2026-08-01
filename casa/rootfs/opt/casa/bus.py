@@ -44,6 +44,19 @@ class BusMessage:
     # webhook trigger, synthetic, internal) — those record a ``system``
     # user identity, not a fabricated user.
     trusted_user_origin: TrustedUserOriginInput | None = None
+    # #343(a): set by request() when the caller is cancelled while this
+    # message is still QUEUED (no dispatch task exists yet to cancel).
+    # The consumer drops a flagged message on dequeue instead of running
+    # the handler — a cancelled voice utterance must not run a full SDK
+    # turn later. In-memory only; BusMessage is never persisted.
+    cancelled: bool = False
+
+
+class BusShutdownError(RuntimeError):
+    """Raised by request() once begin_shutdown() has been called — new
+    request/response work is refused during teardown so an ingress handler
+    gets a fast typed failure instead of enqueueing for a consumer that is
+    about to be (or already was) cancelled (#316)."""
 
 
 # Type alias for handler callbacks
@@ -67,6 +80,15 @@ class MessageBus:
         # roles added after boot and cancel them on eviction. Populated
         # by start_agent_loop; drained by unregister.
         self._loop_tasks: dict[str, asyncio.Task] = {}
+        # #343(b): name -> live dispatch tasks spawned by that agent's
+        # consumer. Serves two purposes: unregister can cancel in-flight
+        # handler work (not just the consumer loop), and every dispatch
+        # task — non-REQUESTs included — holds a strong reference while
+        # running (asyncio would otherwise be free to GC an unreferenced
+        # task mid-flight).
+        self._dispatch_by_agent: dict[str, set[asyncio.Task]] = {}
+        # #316: once set, request() refuses with BusShutdownError.
+        self._shutting_down = False
         self._log: collections.deque[BusMessage] = collections.deque(
             maxlen=max_log_size
         )
@@ -120,9 +142,47 @@ class MessageBus:
         task = self._loop_tasks.pop(name, None)
         if task is not None and not task.done():
             task.cancel()
+        # #343(b): dispatch tasks are independent of the consumer — a
+        # deleted role's handler must not keep running (and acting as that
+        # role) after eviction. Cancel them here; unregister_and_wait is
+        # the awaiting variant reload teardown uses.
+        for dispatch in self._dispatch_by_agent.pop(name, set()):
+            if not dispatch.done():
+                dispatch.cancel()
         self.queues.pop(name, None)
         self.handlers.pop(name, None)
         return task
+
+    async def unregister_and_wait(self, name: str) -> None:
+        """``unregister`` + await completion of the consumer AND every
+        in-flight dispatch task, so callers (reload teardown) know no
+        handler work for *name* survives the evict."""
+        dispatches = list(self._dispatch_by_agent.get(name, set()))
+        task = self.unregister(name)
+        pending = [t for t in [task, *dispatches] if t is not None]
+        if pending:
+            await asyncio.gather(*pending, return_exceptions=True)
+
+    def dispatch_tasks_for(self, name: str) -> list[asyncio.Task]:
+        """Snapshot of the live dispatch tasks spawned for *name*."""
+        return list(self._dispatch_by_agent.get(name, set()))
+
+    def begin_shutdown(self) -> None:
+        """#316: refuse new request/response work. Notifications and sends
+        keep flowing (outbound operator messages during the drain)."""
+        self._shutting_down = True
+
+    def fail_pending(self) -> None:
+        """#316: resolve every still-pending request future with
+        BusShutdownError so stranded ingress handlers return promptly
+        instead of waiting out the bus timeout (which would stall
+        ``runner.cleanup()`` to aiohttp's shutdown bound)."""
+        for msg_id, fut in list(self.pending.items()):
+            if not fut.done():
+                fut.set_exception(BusShutdownError(
+                    f"bus shutting down; request {msg_id} abandoned"
+                ))
+        self.pending.clear()
 
     def agent_loop_tasks(self) -> list[asyncio.Task]:
         """Snapshot of every tracked consumer task (boot-time and
@@ -163,6 +223,10 @@ class MessageBus:
         the handler stops doing work. This is the cancel contract the
         voice channel relies on (spec §10.3).
         """
+        if self._shutting_down:
+            raise BusShutdownError(
+                "bus shutting down; new requests refused"
+            )
         msg.type = MessageType.REQUEST
         loop = asyncio.get_running_loop()
         fut: asyncio.Future[BusMessage] = loop.create_future()
@@ -178,6 +242,11 @@ class MessageBus:
             dispatch = self._dispatch_tasks.get(msg.id)
             if dispatch is not None and not dispatch.done():
                 dispatch.cancel()
+            # #343(a): if no dispatch task exists the message is still
+            # queued — flag it so the consumer drops it on dequeue
+            # instead of running the handler for a caller that is gone.
+            elif dispatch is None:
+                msg.cancelled = True
             raise
 
     async def respond(self, original_id: str, response: BusMessage) -> None:
@@ -279,9 +348,19 @@ class MessageBus:
 
         while True:
             _priority, _seq, msg = await queue.get()
+            # #343(a): the caller cancelled while this message was queued —
+            # nobody is waiting and the work must not run.
+            if msg.cancelled:
+                queue.task_done()
+                continue
             task = asyncio.create_task(_dispatch(msg))
             if msg.type == MessageType.REQUEST:
                 self._dispatch_tasks[msg.id] = task
+            # #343(b): strong per-agent reference for cancel-on-evict (and
+            # GC safety of non-REQUEST dispatches).
+            tracked = self._dispatch_by_agent.setdefault(agent_name, set())
+            tracked.add(task)
+            task.add_done_callback(tracked.discard)
 
     def get_log(self, last_n: int = 50) -> list[BusMessage]:
         """Return the last *last_n* log entries."""

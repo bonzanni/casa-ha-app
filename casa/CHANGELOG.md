@@ -1,5 +1,65 @@
 # Changelog
 
+## [0.143.0] - 2026-08-01
+
+### Fixed
+
+Cancellation/shutdown batch — the message bus, container shutdown, boot
+replay, drivers, and scheduling (#316, #342, #343, #344, #380):
+
+- **Cancelling a request actually stops the work** (#343). A voice
+  utterance (or any bus request) cancelled while still queued used to run
+  its full turn anyway once the consumer got to it — tools, output and
+  all, for a caller that was long gone. A cancelled queued message is now
+  dropped on dequeue.
+- **Evicting an agent cancels its in-flight work** (#343). Removing or
+  reloading a role only stopped its queue consumer; handler tasks already
+  dispatched kept running (and could keep sending as that role) after
+  teardown reported complete. Eviction now cancels and drains them.
+- **Shutdown no longer strands late requests** (#316). A request arriving
+  after the agent loops were cancelled but before the HTTP listeners
+  closed used to hang until the bus timeout, stalling container shutdown
+  up to aiohttp's bound. The bus now refuses new requests once shutdown
+  begins and resolves any still-pending ones, so teardown stays prompt.
+- **Boot replay refuses engagements whose service cannot start** (#342).
+  A failed s6 service start — or a failed stdin-FIFO recreation, which
+  guarantees a crash-looping service — now marks the engagement errored
+  and skips it, instead of attaching messaging machinery to an engagement
+  with no consumer.
+- **Plugin-health alerts are no longer lost without Telegram** (#342).
+  The health notifier treated "enqueued to the telegram target" as
+  delivered, but that queue exists even when no Telegram channel is
+  configured — so the one-shot alert was consumed unseen. Delivery is now
+  a direct channel send, marked notified only on success; the topic
+  permission reminder got the same treatment.
+- **Numeric Sunday crons fire on Sunday** (#343). Five-field cron
+  day-of-week numbers were passed to the scheduler verbatim, whose 3.x
+  numbering starts at Monday — `0 9 * * 0` fired Monday. Numeric fields
+  (including ranges, lists and steps) are now translated to day names.
+- **A failed Home Assistant schema publication retries** (#343). If
+  pushing a refreshed HA tool surface to the agent failed, later
+  refreshes considered the surface unchanged and never republished,
+  freezing the agent's HA tools until the next upstream change or a
+  restart.
+- **A cancelled s6 compile can no longer delete the live database**
+  (#344). Cancelling during the compile/swap window ran cleanup while the
+  worker thread carried on; if the swap then succeeded, cleanup removed
+  the newly-live compiled database. Cleanup now runs inside the worker,
+  beside the outcome it depends on.
+- **A cancelled engagement launch closes its client** (#344). The in-casa
+  driver's first-turn rollback caught only errors, so a cancelled launch
+  leaked an open SDK client that later turns believed alive.
+- **Executor `extra_dirs` are contained** (#344). Entries are now checked
+  against the approved shared roots (`/share`, `/media`) instead of
+  accepting any absolute path — a definition could previously grant an
+  engagement read/write far outside its workspace (`/`, `/config`).
+- **One bad workspace metadata file no longer halts the retention sweep**
+  (#344), a specialist cannot silently shadow a same-named resident in
+  the agent registry on reload (#343), and non-object JSON-RPC `params`/
+  `arguments` now earn a typed invalid-params error instead of a crash
+  (#342, #380).
+
+
 ## [0.142.0] - 2026-08-01
 
 ### Fixed

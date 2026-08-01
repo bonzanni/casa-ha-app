@@ -7273,11 +7273,16 @@ def _regenerate_plugin_health(extra_issues: list) -> None:
 
 
 async def _notify_plugin_health_if_possible() -> None:
-    if _bus is None:
+    # #342: notify_plugin_health now takes the channel manager — delivery
+    # is a direct channel send gated on a REAL configured channel, not the
+    # always-registered telegram bus queue (whose outbound handler drops
+    # silently when no channel exists).
+    if _channel_manager is None:
         return
     try:
         import casa_core
-        await casa_core.notify_plugin_health(_bus, path=_PLUGIN_HEALTH_PATH)
+        await casa_core.notify_plugin_health(
+            _channel_manager, path=_PLUGIN_HEALTH_PATH)
     except Exception:  # noqa: BLE001 — never fail a mutation on notify
         logger.debug("plugin health notify skipped", exc_info=True)
 

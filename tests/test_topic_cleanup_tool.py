@@ -81,6 +81,7 @@ def _reset_permission_nag(monkeypatch):
 def _telegram_channel(supergroup=SUPERGROUP):
     tch = MagicMock()
     tch.engagement_supergroup_id = supergroup
+    tch.send = AsyncMock()          # #342: direct nag delivery path
     tch.send_to_topic = AsyncMock()
     tch.update_topic_state = AsyncMock()
     tch.close_topic = AsyncMock()
@@ -505,39 +506,26 @@ async def test_tool_all_terminal_purges_real_ledger_end_to_end():
 # ---------------------------------------------------------------------------
 
 
-class _FakeBus:
-    """Records notify() calls. No ``queues`` attr → the helper's getattr
-    default lets the telegram post through (mirrors test_config_sync_notify)."""
-
-    def __init__(self) -> None:
-        self.messages: list = []
-
-    async def notify(self, msg) -> None:
-        self.messages.append(msg)
-
-
 async def test_sweep_pass_skips_when_channel_none(monkeypatch):
     calls = _sweep_recorder(monkeypatch)
     cm = MagicMock()
     cm.get.return_value = None
-    bus = _FakeBus()
 
-    await casa_core._sweep_engagement_topics(cm, bus)
+    await casa_core._sweep_engagement_topics(cm)
 
     assert calls == []
-    assert bus.messages == []
 
 
 async def test_sweep_pass_skips_when_supergroup_unconfigured(monkeypatch):
     calls = _sweep_recorder(monkeypatch)
+    tch = _telegram_channel(supergroup=None)
     cm = MagicMock()
-    cm.get.return_value = _telegram_channel(supergroup=None)
-    bus = _FakeBus()
+    cm.get.return_value = tch
 
-    await casa_core._sweep_engagement_topics(cm, bus)
+    await casa_core._sweep_engagement_topics(cm)
 
     assert calls == []
-    assert bus.messages == []
+    assert tch.send.await_count == 0
 
 
 async def test_sweep_pass_sweeps_due_scope(monkeypatch):
@@ -545,15 +533,14 @@ async def test_sweep_pass_sweeps_due_scope(monkeypatch):
     tch = _telegram_channel()
     cm = MagicMock()
     cm.get.return_value = tch
-    bus = _FakeBus()
 
-    await casa_core._sweep_engagement_topics(cm, bus)
+    await casa_core._sweep_engagement_topics(cm)
 
     assert calls == [{
         "channel": tch, "chat_id": SUPERGROUP,
         "scope": "due", "dry_run": False,
     }]
-    assert bus.messages == [], "no nag without needs_permission"
+    assert tch.send.await_count == 0, "no nag without needs_permission"
 
 
 async def test_sweep_pass_notifies_once_per_boot_on_needs_permission(
@@ -562,49 +549,39 @@ async def test_sweep_pass_notifies_once_per_boot_on_needs_permission(
     result = dict(_CANNED_SWEEP)
     result.update({"deleted": 0, "kept": 3, "needs_permission": True})
     calls = _sweep_recorder(monkeypatch, result=result)
+    tch = _telegram_channel()
     cm = MagicMock()
-    cm.get.return_value = _telegram_channel()
-    bus = _FakeBus()
+    cm.get.return_value = tch
 
-    await casa_core._sweep_engagement_topics(cm, bus)
-    await casa_core._sweep_engagement_topics(cm, bus)
+    await casa_core._sweep_engagement_topics(cm)
+    await casa_core._sweep_engagement_topics(cm)
 
     assert len(calls) == 2, "the nag dedupe must not stop the sweeps"
-    assert len(bus.messages) == 1, "operator is nagged at most once per boot"
-    msg = bus.messages[0]
-    assert msg.target == "telegram"
-    assert msg.channel == "telegram"
-    assert "Delete messages" in str(msg.content)
+    # #342: the nag is a DIRECT channel send, consumed on send success.
+    assert tch.send.await_count == 1, "operator is nagged at most once per boot"
+    message, _ctx = tch.send.await_args.args
+    assert "Delete messages" in message
 
 
 async def test_sweep_pass_retries_nag_when_notify_fails(monkeypatch, caplog):
-    """A failed nag delivery must NOT consume the once-per-boot flag — the
+    """#342: a failed nag SEND must NOT consume the once-per-boot flag — the
     operator never saw it. Retried at the next sweep, then consumed on the
-    first successful delivery (the notify_config_sync convention)."""
+    first successful delivery."""
     result = dict(_CANNED_SWEEP)
     result.update({"deleted": 0, "kept": 3, "needs_permission": True})
     _sweep_recorder(monkeypatch, result=result)
+    tch = _telegram_channel()
+    tch.send = AsyncMock(side_effect=[RuntimeError("telegram down"), None, None])
     cm = MagicMock()
-    cm.get.return_value = _telegram_channel()
-
-    class _FlakyBus(_FakeBus):
-        attempts = 0
-
-        async def notify(self, msg) -> None:
-            self.attempts += 1
-            if self.attempts == 1:
-                raise RuntimeError("bus down")
-            await super().notify(msg)
-
-    bus = _FlakyBus()
+    cm.get.return_value = tch
 
     with caplog.at_level(logging.WARNING, logger="casa_core"):
-        await casa_core._sweep_engagement_topics(cm, bus)  # notify raises
-    await casa_core._sweep_engagement_topics(cm, bus)      # retried, delivers
-    await casa_core._sweep_engagement_topics(cm, bus)      # consumed — silent
+        await casa_core._sweep_engagement_topics(cm)  # send raises
+    await casa_core._sweep_engagement_topics(cm)      # retried, delivers
+    await casa_core._sweep_engagement_topics(cm)      # consumed — silent
 
-    assert bus.attempts == 2, "exactly one retry, then the flag is consumed"
-    assert len(bus.messages) == 1
+    assert tch.send.await_count == 2, (
+        "exactly one retry, then the flag is consumed")
     assert any(
         "permission nag notify failed" in r.getMessage() for r in caplog.records
     )
@@ -618,14 +595,14 @@ async def test_sweep_pass_survives_sweep_exception(monkeypatch, caplog):
         raise RuntimeError("broken channel object")
 
     monkeypatch.setattr(topic_ledger, "sweep_topics", _boom)
+    tch = _telegram_channel()
     cm = MagicMock()
-    cm.get.return_value = _telegram_channel()
-    bus = _FakeBus()
+    cm.get.return_value = tch
 
     with caplog.at_level(logging.WARNING, logger="casa_core"):
-        await casa_core._sweep_engagement_topics(cm, bus)  # no raise
+        await casa_core._sweep_engagement_topics(cm)  # no raise
 
-    assert bus.messages == []
+    assert tch.send.await_count == 0
     assert any(
         "topic sweep" in r.getMessage() for r in caplog.records
     ), "the failure must be warned about"
@@ -637,10 +614,9 @@ async def test_sweep_pass_logs_info_counts_when_deleted(monkeypatch, caplog):
     _sweep_recorder(monkeypatch, result=result)
     cm = MagicMock()
     cm.get.return_value = _telegram_channel()
-    bus = _FakeBus()
 
     with caplog.at_level(logging.INFO, logger="casa_core"):
-        await casa_core._sweep_engagement_topics(cm, bus)
+        await casa_core._sweep_engagement_topics(cm)
 
     assert any(
         "deleted=3" in r.getMessage() and "kept=1" in r.getMessage()

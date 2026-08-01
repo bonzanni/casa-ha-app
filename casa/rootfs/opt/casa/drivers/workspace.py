@@ -117,6 +117,32 @@ def _validate_extra_dir(d: str) -> None:
         )
 
 
+# #344: containment roots for extra_dirs. An executor definition is
+# operator-editable runtime configuration, not trusted code ("executor
+# definition is a mutable trust surface", #312 family) — an entry like "/"
+# or "/config" handed the engagement CLI read/write far outside its
+# workspace via --add-dir, unlike every other definition field, which is
+# ceiling-checked. Only the HA shared mounts are approvable; the
+# per-engagement workspace is always added separately by render_run_script,
+# and plugin_dirs (immutable store paths) have their own validation.
+APPROVED_EXTRA_DIR_ROOTS = ("/share", "/media")
+
+
+def _validate_extra_dir_containment(d: str) -> None:
+    """Reject an extra_dir outside the approved shared roots (#344)."""
+    if any(part in ("..", ".") for part in d.split("/")):
+        raise WorkspaceConfigError(
+            f"extra_dir must not contain traversal segments: {d!r}"
+        )
+    for root in APPROVED_EXTRA_DIR_ROOTS:
+        if d == root or d.startswith(root + "/"):
+            return
+    raise WorkspaceConfigError(
+        f"extra_dir {d!r} is outside every approved root "
+        f"{APPROVED_EXTRA_DIR_ROOTS}"
+    )
+
+
 def render_run_script(
     *, engagement_id: str, permission_mode: str,
     extra_dirs: list[str], extra_unset: list[str] | None = None,
@@ -143,6 +169,7 @@ def render_run_script(
 
     for d in extra_dirs:
         _validate_extra_dir(d)
+        _validate_extra_dir_containment(d)
     all_dirs = [f"/data/engagements/{engagement_id}/", *extra_dirs]
     add_dir_flags = " ".join(f"--add-dir {shlex.quote(d)}" for d in all_dirs)
 
@@ -504,7 +531,17 @@ def load_casa_meta(workspace_path: str) -> dict | None:
     if not path.exists():
         return None
     try:
-        return json.loads(path.read_text(encoding="utf-8"))
+        data = json.loads(path.read_text(encoding="utf-8"))
+        # #344: valid-but-non-object JSON ([]/string/number) used to
+        # escape here and crash the first .get() in a consumer — one bad
+        # file aborted the whole retention sweep for later workspaces.
+        if not isinstance(data, dict):
+            logger.warning(
+                "load_casa_meta: %s is not a JSON object — treating as "
+                "absent", path,
+            )
+            return None
+        return data
     except json.JSONDecodeError:
         logger.warning(
             "load_casa_meta: %s is not valid JSON — treating as absent", path,

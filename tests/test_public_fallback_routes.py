@@ -136,6 +136,33 @@ async def test_public_mcp_tools_call_unknown_tool_returns_jsonrpc_error() -> Non
         assert "Unknown tool: nope" in body["error"]["message"]
 
 
+async def test_public_mcp_non_object_params_returns_32602() -> None:
+    """#380/#342: a truthy non-object ``params`` must earn a typed -32602,
+    not an AttributeError → HTTP 500."""
+    async with TestClient(TestServer(_build_app())) as client:
+        for bad in ("scalar", 42, ["list"]):
+            resp = await client.post("/mcp/casa-framework", json={
+                "jsonrpc": "2.0", "id": 9, "method": "tools/call",
+                "params": bad,
+            })
+            assert resp.status == 200
+            body = await resp.json()
+            assert body["error"]["code"] == -32602
+            assert body["id"] == 9
+
+
+async def test_public_mcp_non_object_arguments_returns_32602() -> None:
+    """#380: same gate one level down — ``arguments`` must be an object."""
+    async with TestClient(TestServer(_build_app())) as client:
+        resp = await client.post("/mcp/casa-framework", json={
+            "jsonrpc": "2.0", "id": 10, "method": "tools/call",
+            "params": {"name": "ok", "arguments": "not-an-object"},
+        })
+        assert resp.status == 200
+        body = await resp.json()
+        assert body["error"]["code"] == -32602
+
+
 async def test_public_mcp_notifications_initialized_returns_202() -> None:
     async with TestClient(TestServer(_build_app())) as client:
         resp = await client.post("/mcp/casa-framework", json={

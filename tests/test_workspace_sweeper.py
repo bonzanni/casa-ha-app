@@ -158,3 +158,29 @@ async def test_sweeper_warns_when_log_dir_removal_fails(
     assert any(
         "casa-engagement-eng-x" in r.getMessage() for r in caplog.records
     ), "log-dir removal failure must be warned about"
+
+
+async def test_sweeper_survives_non_object_meta(tmp_path):
+    """#344: one .casa-meta.json holding valid-but-non-object JSON ([]/
+    string/number) must not abort the whole sweep — later workspaces
+    still get swept."""
+    from drivers.workspace import _sweep_workspaces
+
+    # Names sort before the expired one so the bad entries are hit first.
+    ws_list = tmp_path / "a-eng-list"
+    ws_list.mkdir()
+    (ws_list / ".casa-meta.json").write_text("[]", encoding="utf-8")
+    ws_str = tmp_path / "b-eng-str"
+    ws_str.mkdir()
+    (ws_str / ".casa-meta.json").write_text('"oops"', encoding="utf-8")
+
+    ws_expired = tmp_path / "z-eng-done-old"
+    ws_expired.mkdir()
+    _write_meta(ws_expired, status="COMPLETED",
+                retention_iso="2020-01-01T00:00:00Z")
+
+    await _sweep_workspaces(engagements_root=str(tmp_path))
+
+    assert ws_list.exists(), "non-object meta is skipped, not deleted"
+    assert ws_str.exists()
+    assert not ws_expired.exists(), "the sweep must reach later workspaces"

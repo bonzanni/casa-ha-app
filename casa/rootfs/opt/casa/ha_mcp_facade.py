@@ -88,6 +88,10 @@ class HomeAssistantFacade:
         self._surface_descriptor: SurfaceDescriptor = ()
         self._refresh_task: asyncio.Task[None] | None = None
         self._refresh_pending = False
+        # #343: True while a changed surface has been committed but its
+        # on_schema_change publication has not yet SUCCEEDED — the next
+        # refresh must republish even though the descriptor is unchanged.
+        self._publish_pending = False
         self._closed = False
 
     @property
@@ -118,10 +122,19 @@ class HomeAssistantFacade:
             if self._closed:
                 raise RuntimeError("Home Assistant facade is closed")
             surface_changed = await self._refresh_locked()
-        if surface_changed and self._on_schema_change is not None:
+            if surface_changed:
+                # #343: the descriptor commits under the lock but the
+                # publication runs after it — flag first, clear only on
+                # publish SUCCESS, so a raising callback leaves the next
+                # refresh obligated to republish (the descriptor alone
+                # would report "unchanged" forever).
+                self._publish_pending = True
+            must_publish = self._publish_pending
+        if must_publish and self._on_schema_change is not None:
             callback_result = self._on_schema_change()
             if inspect.isawaitable(callback_result):
                 await callback_result
+            self._publish_pending = False
 
     async def aclose(self) -> None:
         self._closed = True

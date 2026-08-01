@@ -81,7 +81,7 @@ def test_engagement_topics_sweep_target_is_coroutine_function():
 def test_workspace_sweep_job_runs_both_workspace_and_topics_passes():
     """Static wiring guard (v0.65.0): the ``workspace_sweep`` job must be
     registered with a closure that awaits BOTH ``_sweep_workspaces`` (as
-    ``_sweep_ws``) and ``_sweep_engagement_topics(channel_manager, bus)``.
+    ``_sweep_ws``) and ``_sweep_engagement_topics(channel_manager)``.
     Silently dropping either half would disable that sweeper with no test
     noticing — topics and workspaces expire together."""
     text = _CASA_CORE_SRC.read_text(encoding="utf-8")
@@ -103,10 +103,10 @@ def test_workspace_sweep_job_runs_both_workspace_and_topics_passes():
         "the workspace_sweep closure must await the workspace sweep"
     )
     assert re.search(
-        r"await _sweep_engagement_topics\(channel_manager, bus\)", body
+        r"await _sweep_engagement_topics\(channel_manager\)", body
     ), (
         "the workspace_sweep closure must await "
-        "_sweep_engagement_topics(channel_manager, bus)"
+        "_sweep_engagement_topics(channel_manager)"
     )
 
     assert re.search(

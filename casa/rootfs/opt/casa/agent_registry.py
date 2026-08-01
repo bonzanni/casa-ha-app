@@ -13,10 +13,13 @@ module is a rendering / utility layer only.
 
 from __future__ import annotations
 
+import logging
 from dataclasses import dataclass
 from typing import Literal
 
 from config import AgentConfig
+
+logger = logging.getLogger(__name__)
 
 
 Tier = Literal["resident", "specialist"]
@@ -65,6 +68,18 @@ class AgentRegistry:
         for role, cfg in residents.items():
             _register(role, cfg, "resident")
         for role, cfg in specialists.items():
+            # #343: never let a specialist silently shadow a same-named
+            # resident. Boot refuses the collision outright
+            # (casa_core._build_role_registry raises); on a reload path
+            # that reaches here anyway, resident wins — matching
+            # tools.sync_agent_role_map — so every component agrees
+            # about the role's tier.
+            if role in role_to_known:
+                logger.warning(
+                    "AgentRegistry.build: role %r exists in both tiers — "
+                    "resident entry wins", role,
+                )
+                continue
             _register(role, cfg, "specialist")
 
         return cls(
