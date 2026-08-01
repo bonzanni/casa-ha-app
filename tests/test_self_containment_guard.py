@@ -432,6 +432,33 @@ class TestGuardArmingAndOracle:
         assert await self._denied(
             clean2, f"command cd {bad_repo}; git push origin main")
 
+    async def test_cd_with_redirection_before_target_is_recognized(
+            self, tmp_path: Path, bad_repo: Path):
+        """Terra r5 (#348): bash resolves `cd 2>/dev/null /bad` (and the
+        stdin form) to /bad — redirection tokens between cd and its target
+        must be skipped, never captured as the target."""
+        for i, redir in enumerate(("2>/dev/null", "</dev/null",
+                                   "-P 2>/dev/null", "2> /dev/null")):
+            clean = tmp_path / f"clean-redir-cwd{i}"
+            clean.mkdir()
+            assert await self._denied(
+                clean, f"cd {redir} {bad_repo} && git push origin main"), redir
+
+    async def test_cd_target_with_brace_char_is_kept_whole(
+            self, tmp_path: Path, git_plugin_repo: Path, bad_repo: Path):
+        """Sol r5 (#348): `}` is a reserved word, not a metachar — a glued
+        `}` belongs to the target word. A bad repo literally named `bad}`
+        must be scanned as such."""
+        import shutil
+        # A parent where the BRACE-TRUNCATED name resolves to nothing — a
+        # truncating parser sees a nonexistent candidate and allows.
+        brace_repo = tmp_path / "braceland" / "bad}"
+        shutil.copytree(bad_repo, brace_repo, symlinks=True)
+        clean = tmp_path / "clean-brace-cwd"
+        clean.mkdir()
+        assert await self._denied(
+            clean, f"cd {brace_repo}; git push origin main")
+
     async def test_cd_chain_overflow_fails_closed(
             self, tmp_path: Path, git_plugin_repo: Path):
         """Terra/Sol r3 (#348): once the feasible-base set overflows, later
