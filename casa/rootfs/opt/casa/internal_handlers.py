@@ -124,12 +124,22 @@ def _make_internal_tools_call_handler(
             )
 
         name = body.get("name")
-        arguments = body.get("arguments") or {}
+        # #380: any non-object arguments — truthy or falsy — is refused
+        # with a typed error rather than forwarded (truthy) or silently
+        # coerced to an empty call (falsy). Absent/null defaults to {}.
+        arguments = body.get("arguments")
+        if arguments is None:
+            arguments = {}
         eng_id = body.get("engagement_id")
 
         if not isinstance(name, str):
             return web.json_response(
                 {"error": {"code": -32602, "message": "missing name"}}
+            )
+        if not isinstance(arguments, dict):
+            return web.json_response(
+                {"error": {"code": -32602,
+                           "message": "arguments must be an object"}}
             )
 
         fn = tool_dispatch.get(name)

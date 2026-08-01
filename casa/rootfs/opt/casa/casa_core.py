@@ -9,7 +9,9 @@ import json
 import logging
 import math
 import os
+import shutil
 import signal
+import stat
 import sys
 import time
 import uuid
@@ -26,7 +28,7 @@ from apscheduler.schedulers.asyncio import AsyncIOScheduler
 
 from agent_loader import load_all_agents
 from authz_grants import CHALLENGES, GRANTS
-from bus import BusMessage, MessageBus, MessageType
+from bus import BusMessage, BusShutdownError, MessageBus, MessageType
 from channel_authz import agent_allowed_on
 from channels import ChannelManager
 from claude_runtime import (
@@ -264,7 +266,16 @@ def _make_public_mcp_fallback_handler(
 
         method = msg.get("method")
         req_id = msg.get("id")
-        params = msg.get("params") or {}
+        # #380: any non-object params — truthy OR falsy ([], "", 0, false)
+        # — earns a typed error; only an absent/null params defaults to {}.
+        # The old `or {}` coerced falsy non-objects into a silent empty
+        # call and truthy ones raised at params.get() → HTTP 500.
+        params = msg.get("params")
+        if params is None:
+            params = {}
+        if not isinstance(params, dict):
+            return _jsonrpc_error(
+                req_id, -32602, "params must be an object")
 
         if method == "notifications/initialized":
             return web.Response(status=202)
@@ -288,7 +299,11 @@ def _make_public_mcp_fallback_handler(
             # #335: the token header is what actually authenticates the id
             # claim (verified against the record in the dispatcher).
             name = params.get("name")
-            arguments = params.get("arguments") or {}
+            # #380: pass arguments through un-coerced (None → {} only) so
+            # the dispatcher's non-object gate sees falsy non-objects too.
+            arguments = params.get("arguments")
+            if arguments is None:
+                arguments = {}
             eng_id = request.headers.get("X-Casa-Engagement-Id")
             inner_body = {
                 "name": name,
@@ -362,11 +377,19 @@ async def _dispatch_internal_tools_call(
     fallback doesn't need to synthesize an aiohttp web.Request.
     """
     name = body.get("name")
-    arguments = body.get("arguments") or {}
+    # #380: any non-object arguments — truthy or falsy — is refused with a
+    # typed error rather than forwarded (truthy) or silently coerced to an
+    # empty call (falsy: [], "", 0, false). Absent/null defaults to {}.
+    arguments = body.get("arguments")
+    if arguments is None:
+        arguments = {}
     eng_id = body.get("engagement_id")
 
     if not isinstance(name, str):
         return {"error": {"code": -32602, "message": "missing name"}}
+    if not isinstance(arguments, dict):
+        return {"error": {"code": -32602,
+                          "message": "arguments must be an object"}}
 
     fn = tool_dispatch.get(name)
     if fn is None:
@@ -527,6 +550,62 @@ async def replay_undergoing_engagements(
         s6_rc.remove_service_dir(
             svc_root=s6_rc.ENGAGEMENT_SOURCES_ROOT, engagement_id=rec.id,
         )
+
+    async def _ensure_stdin_fifo(rec) -> bool:
+        """Sol r3-2 (#342): ensure the workspace stdin.fifo exists before
+        ANY path lets this record reach start_service — the run template
+        ``set -e``-reads it, so a missing FIFO is a guaranteed crash-loop.
+        Runs on BOTH the complete-pair fast path and the heal path: an
+        intact pair does not imply an intact FIFO (a prior refusal's pair
+        removal is best-effort and its error mark can fail, leaving an
+        intact pair + undergoing record for this boot's fast path).
+        True = present/created; False = resume refused via the
+        checked-teardown ladder (retryable next boot when containment is
+        confirmed, terminal-marked when it is not)."""
+        fifo = os.path.join(engagements_root, rec.id, "stdin.fifo")
+        # Sol r5-1: never run the destructive repair below THROUGH a
+        # symlinked workspace dir — isdir/lstat would examine (and rmtree
+        # could delete) entries under the symlink's target. Workspaces
+        # are always created as real directories, so a symlink here is
+        # corruption: refuse the resume.
+        if os.path.islink(os.path.dirname(fifo)):
+            await _refuse_brief_resume(
+                rec,
+                "workspace directory is a symlink; refusing FIFO "
+                "verification/repair through it",
+                kind="fifo_recreate_failed",
+            )
+            return False
+        try:
+            if os.path.isdir(os.path.dirname(fifo)):
+                st = os.lstat(fifo) if os.path.lexists(fifo) else None
+                if st is not None and not stat.S_ISFIFO(st.st_mode):
+                    # Terra r4-1: a NON-fifo at the FIFO path (regular
+                    # file, dir, or symlink left by corruption/partial
+                    # recovery) reads as instant EOF or fails outright —
+                    # the same crash-loop as a missing FIFO. Repair by
+                    # replacing it; a repair failure takes the refusal
+                    # ladder below.
+                    logger.warning(
+                        "boot replay: %s exists but is not a FIFO — "
+                        "replacing it", fifo,
+                    )
+                    if stat.S_ISDIR(st.st_mode):
+                        shutil.rmtree(fifo)
+                    else:
+                        os.remove(fifo)
+                    st = None
+                if st is None:
+                    os.mkfifo(fifo, 0o600)
+            return True
+        except OSError as exc:
+            await _refuse_brief_resume(
+                rec,
+                f"stdin.fifo recreation failed ({exc}); the run template "
+                "reads this FIFO, so starting would crash-loop",
+                kind="fifo_recreate_failed",
+            )
+            return False
 
     # §A3(b) boot reconciliation owner — TERMINAL records (Sol r7-3): terminal
     # records are DISJOINT from ``undergoing`` (they never attach), so schedule
@@ -788,6 +867,11 @@ async def replay_undergoing_engagements(
                         svc_root=s6_rc.ENGAGEMENT_SOURCES_ROOT,
                         engagement_id=rec.id,
                     ):
+                        # Sol r3-2 (#342): the fast path must not trust
+                        # pair-completeness as FIFO-existence — recreate
+                        # (or refuse) before the start loop can run this
+                        # record. Refusal populates refused_ids itself.
+                        await _ensure_stdin_fifo(rec)
                         continue
                     logger.info(
                         "boot replay: migrating pre-v0.75 run script for "
@@ -872,16 +956,12 @@ async def replay_undergoing_engagements(
                 )
                 # Ensure FIFO exists — it might have been wiped alongside the
                 # svc dir.
-                fifo = os.path.join(engagements_root, rec.id, "stdin.fifo")
-                try:
-                    if (os.path.isdir(os.path.dirname(fifo))
-                            and not os.path.exists(fifo)):
-                        os.mkfifo(fifo, 0o600)
-                except OSError as exc:
-                    logger.warning(
-                        "boot replay: mkfifo %s failed: %s — continuing",
-                        fifo, exc,
-                    )
+                # #342/Sol r2-1/Sol r3-2: a failed recreation refuses the
+                # resume through the checked-teardown ladder (down +
+                # pair removal + terminal mark when containment is
+                # unconfirmed) — never "continue" into a doomed start.
+                if not await _ensure_stdin_fifo(rec):
+                    continue
                 logger.info(
                     "boot replay: healed engagement %s (%s)",
                     rec.id[:8], rec.role_or_type,
@@ -940,10 +1020,32 @@ async def replay_undergoing_engagements(
             try:
                 await s6_rc.start_service(engagement_id=rec.id)
             except Exception as exc:  # noqa: BLE001
+                # #342: refuse — the background loop below must not build
+                # spool/relay/summary machinery for an engagement whose
+                # service never started (operator messages would be
+                # accepted into an engagement with no CLI consumer).
                 logger.warning(
-                    "boot replay: start_service(%s) failed: %s",
-                    rec.id[:8], exc,
+                    "boot replay: start_service(%s) failed: %s — refusing "
+                    "resume (no background attach)", rec.id[:8], exc,
                 )
+                refused_ids.add(rec.id)
+                try:
+                    await registry.mark_error(
+                        rec.id, kind="start_service_failed",
+                        message=f"resume aborted: s6 start failed ({exc})",
+                    )
+                except Exception:  # noqa: BLE001 — best-effort mark
+                    logger.warning(
+                        "boot replay: mark_error(start_service_failed) "
+                        "failed for %s", rec.id[:8], exc_info=True,
+                    )
+                try:
+                    await s6_rc.ensure_service_down(engagement_id=rec.id)
+                except Exception:  # noqa: BLE001 — best-effort teardown
+                    logger.warning(
+                        "boot replay: ensure_service_down after start "
+                        "failure for %s failed", rec.id[:8], exc_info=True,
+                    )
 
     # 5. Background tasks OUTSIDE the lock (long-lived).
     for rec in undergoing:
@@ -1724,6 +1826,11 @@ def _make_invoke_handler(
             return web.json_response({"response": str(result.content)})
         except asyncio.TimeoutError:
             return web.json_response({"error": "timeout"}, status=504)
+        except BusShutdownError:
+            # #316: the bus gate refused (or abandoned) the request
+            # because the container is shutting down.
+            return web.json_response(
+                {"error": "shutting down"}, status=503)
 
     return invoke_handler
 
@@ -1942,14 +2049,21 @@ async def _boot_reconcile_plugin_triggers(
 
 
 async def notify_plugin_health(
-    bus: Any,
+    channel_manager: Any,
     *,
     path: str = "/data/plugin-health.json",
 ) -> None:
-    """Push an operator DM for NEW plugin-health issues (§3.10), via the
-    deterministic ``telegram`` outbound router. Deduped by STRUCTURED
-    fingerprints (not free text). Marks notified ONLY after a successful
-    enqueue, so a Telegram-down boot/mutation retries next time. Non-fatal.
+    """Push an operator DM for NEW plugin-health issues (§3.10). Deduped by
+    STRUCTURED fingerprints (not free text). Marks notified ONLY after a
+    successful SEND, so a Telegram-down boot/mutation retries next time.
+    Non-fatal.
+
+    #342: delivery is a direct, awaited ``channel.send`` — NOT a bus
+    enqueue. The ``telegram`` bus target is registered unconditionally by
+    ``main()`` and its outbound handler silently drops when no channel is
+    configured, so "enqueued" never meant "sent": a boot without Telegram
+    marked the fingerprints notified and the alert was lost forever even
+    once Telegram was configured later.
     """
     import plugin_health
     report = plugin_health.load_report(path)
@@ -1972,19 +2086,17 @@ async def notify_plugin_health(
         f"⚠️ Plugin health: {len(entries)} plugin item(s) need attention: "
         f"{listed}. See /data/plugin-health.json."
     )
-    if "telegram" not in getattr(bus, "queues", {"telegram": None}):
-        return  # retry next boot/mutation once telegram is up
+    channel = (channel_manager.get("telegram")
+               if channel_manager is not None else None)
+    # Sol r1-2: channel.send() log-and-drops while the PTB app is not
+    # started — is_ready must gate the "notified" mark too, or a
+    # bring-up/reconnect window counts a dropped alert as delivered.
+    if channel is None or not getattr(channel, "is_ready", True):
+        return  # no deliverable channel — retry next boot/mutation
     try:
-        await bus.notify(BusMessage(
-            type=MessageType.NOTIFICATION,
-            source="plugin_health",
-            target="telegram",
-            content=content,
-            channel="telegram",
-            context={"cid": new_cid()},
-        ))
+        await channel.send(content, {"cid": new_cid()})
     except Exception as exc:  # noqa: BLE001
-        logger.warning("plugin_health notify: enqueue failed: %s", exc)
+        logger.warning("plugin_health notify: send failed: %s", exc)
         return  # not marked → retried next boot/mutation
     plugin_health.mark_notified(fps, path)
 
@@ -2001,7 +2113,7 @@ async def notify_plugin_health(
 _topic_permission_notified = False
 
 
-async def _sweep_engagement_topics(channel_manager: Any, bus: Any) -> None:
+async def _sweep_engagement_topics(channel_manager: Any) -> None:
     """Periodic topics pass — runs right after the workspace sweep [AR-8].
 
     Deletes due terminal-engagement topics recorded in the topic ledger
@@ -2043,25 +2155,21 @@ async def _sweep_engagement_topics(channel_manager: Any, bus: Any) -> None:
             "for the bot (DOCS.md Setup step 6) and I'll retry at the next "
             "sweep."
         )
-        # Deterministic operator delivery over the telegram outbound
-        # target, exactly like notify_config_sync — never an LLM turn.
-        # The flag is consumed only on successful delivery: a failed
-        # notify must be retried at the next sweep, not swallowed.
-        if "telegram" in getattr(bus, "queues", {"telegram": None}):
-            try:
-                await bus.notify(BusMessage(
-                    type=MessageType.NOTIFICATION,
-                    source="topic_sweep",
-                    target="telegram",
-                    content=content,
-                    channel="telegram",
-                    context={"cid": new_cid()},
-                ))
-                _topic_permission_notified = True
-            except Exception as exc:  # noqa: BLE001
-                logger.warning(
-                    "topic sweep: permission nag notify failed: %s", exc,
-                )
+        # #342: deterministic operator delivery as a DIRECT awaited channel
+        # send — never an LLM turn. The flag is consumed only when the SEND
+        # succeeds; the old bus enqueue consumed it before the outbound
+        # dispatch ran, so a transient Telegram failure suppressed the
+        # reminder for every later sweep that boot. Sol r1-2: is_ready
+        # gates the flag too — send() log-and-drops on an unstarted app.
+        if not getattr(channel, "is_ready", True):
+            return
+        try:
+            await channel.send(content, {"cid": new_cid()})
+            _topic_permission_notified = True
+        except Exception as exc:  # noqa: BLE001
+            logger.warning(
+                "topic sweep: permission nag notify failed: %s", exc,
+            )
 
 
 # ------------------------------------------------------------------
@@ -3454,7 +3562,7 @@ async def main() -> None:
         await asyncio.to_thread(_regenerate_plugin_health, [])
     except Exception:  # noqa: BLE001
         logger.warning("boot plugin-health runtime regen failed", exc_info=True)
-    await notify_plugin_health(bus)
+    await notify_plugin_health(channel_manager)
 
     # 14. Kick off timers.
     # AsyncIOScheduler's AsyncIOExecutor schedules coroutine functions on
@@ -3513,7 +3621,7 @@ async def main() -> None:
             await _sweep_ws(engagements_root="/data/engagements")
         except Exception:  # noqa: BLE001
             logger.warning("workspace sweep failed", exc_info=True)
-        await _sweep_engagement_topics(channel_manager, bus)
+        await _sweep_engagement_topics(channel_manager)
 
     scheduler.add_job(
         _sweep_workspaces_and_topics,
@@ -3568,6 +3676,14 @@ async def main() -> None:
                 logger.warning("agent %s aclose failed/timed out", _role)
     await _close_tina_ha_facade(ha_facade)
 
+    # #316: gate the bus BEFORE cancelling its consumers — the HTTP
+    # listeners stay open until runner.cleanup() below, and a signed
+    # /invoke or voice request landing in that window used to enqueue for
+    # a consumer that no longer exists, hanging the handler until the bus
+    # timeout and stalling runner.cleanup() to aiohttp's shutdown bound.
+    # New requests now fail fast with a typed error instead.
+    bus.begin_shutdown()
+
     # H10 (v0.49.0): include consumers spawned after boot by reload
     # (bus.start_agent_loop) — the local loop_tasks list only has the
     # boot-time ones. cancel() is idempotent for already-evicted tasks.
@@ -3575,6 +3691,11 @@ async def main() -> None:
     for task in all_loop_tasks:
         task.cancel()
     await asyncio.gather(*all_loop_tasks, return_exceptions=True)
+
+    # #316: unstrand any request that was already awaiting a reply when
+    # its consumer was cancelled above — resolve those futures now so
+    # in-flight ingress handlers return before runner.cleanup() drains.
+    bus.fail_pending()
 
     # Channel teardown (Telegram bot, voice, etc.) — resolve in-flight broker
     # work first, then stop the channels.

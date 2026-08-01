@@ -1764,7 +1764,10 @@ class TestDisabledSpecialistReload:
         assert "teardown_disabled_specialist" in result["actions"]
         assert "construct_agent" not in result["actions"]
         assert "finance" not in runtime.agents            # instance gone
-        runtime.bus.unregister.assert_called_with("finance")
+        # #343(b): teardown goes through the awaiting variant, which also
+        # cancels the role's in-flight dispatch tasks (real-method
+        # existence is pinned by test_bus.py's unregister_and_wait tests).
+        runtime.bus.unregister_and_wait.assert_called_with("finance")
         runtime.bus.register.assert_not_called()          # never re-registered
         # Triggers unwound (the _teardown_role path).
         runtime.trigger_registry.reregister_for.assert_called_with(

@@ -113,6 +113,24 @@ async def test_tools_call_missing_name_returns_error_object() -> None:
         assert body == {"error": {"code": -32602, "message": "missing name"}}
 
 
+async def test_tools_call_non_object_arguments_returns_error_object() -> None:
+    """#380: a truthy non-object ``arguments`` must earn a typed -32602 —
+    not be forwarded into the tool to crash there."""
+    reg = _FakeRegistry()
+    app = _make_app(dispatch={"ok_tool": _ok_tool}, registry=reg)
+    async with TestClient(TestServer(app)) as client:
+        for bad in ("scalar", 7, ["list"], [], "", 0, False):
+            resp = await client.post(
+                "/internal/tools/call",
+                json={"name": "ok_tool", "arguments": bad,
+                      "engagement_id": None},
+            )
+            assert resp.status == 200
+            body = await resp.json()
+            assert body["error"]["code"] == -32602
+            assert "arguments" in body["error"]["message"]
+
+
 async def test_tools_call_engagement_id_binds_contextvar() -> None:
     """#335: the engagement id binds only together with the record's
     auth token (the id alone is no longer an authenticator)."""

@@ -37,9 +37,12 @@ share one tool-level lock (INV-TOOL-003). The specialist lifecycle serializes un
 materialize lock. Agents keep a small first-publication lock for their plugin-resolution
 snapshot — it does not serialize turns. The Telegram channel re-imposes ordering per scope
 above the bus: a per-topic handler lock for engagement topics and a per-chat lock
-serializing `/new` with same-chat enqueue (both documented in the Telegram map). The one
-cross-*thread* lock is plugin health's report lock — a `threading.Lock`, because its
-writers run both on the loop and in the thread offload.
+serializing `/new` with same-chat enqueue (both documented in the Telegram map). Two
+cross-*thread* locks exist, both `threading.Lock`: plugin health's report lock, because
+its writers run both on the loop and in the thread offload; and the s6 compile-worker
+lock, which serializes the compile/swap/reap worker threads themselves — a cancelled
+compile abandons its worker mid-run, and the successor's worker must queue behind the
+abandoned one rather than race it.
 
 **Blocking work goes to threads; coordination stays on the loop.** Filesystem and config
 I/O is pushed through the thread offload helper (well over a hundred call sites);
@@ -64,9 +67,11 @@ place — a live consumer is never orphaned by a reload.
 
 What it does not cover: a handler captured by an already-running dispatch (replacement is
 prospective; in-flight dispatches finish on the handler they started with), and the
-unregister path — unregister cancels the consumer without awaiting it and hands the task
-back, so an unregister-then-re-register that does not await it can briefly overlap the old
-loop with the new one.
+unregister path — unregister cancels the consumer *and* the role's in-flight dispatch
+tasks without awaiting either, handing the consumer task back; the awaiting variant
+(`unregister_and_wait`, the reload-teardown path) gathers them all, so only an
+unregister-then-re-register that does not await can briefly overlap the old loop with the
+new one.
 
 **INV-CONC-003**: Turns sharing a session key serialize under the pool entry's lock, decision through publication; distinct keys are concurrent.
 
@@ -81,10 +86,20 @@ What it does not cover: unpooled turn types, and the bus layer above (INV-CONC-0
 drops silently. Nothing queues.
 
 **A request gets no answer.** The caller times out and its pending future is removed —
-but a slow handler is *not* cancelled by the timeout and runs to completion; only the
-caller's own cancellation cancels the dispatch task. A handler returning nothing produces
-an empty response rather than a hang, and a handler that raises produces an error
-response.
+but a slow handler is *not* cancelled by the timeout and runs to completion; the dispatch
+task is cancelled by exactly two things: the caller's own cancellation (which also marks
+a not-yet-dequeued message so the consumer drops it instead of running the handler for a
+caller that is gone), and eviction of the target role, which resolves a still-waiting
+caller with a handler-error response rather than leaving it to time out. A handler
+returning nothing produces an empty response rather than a hang, and a handler that
+raises produces an error response.
+
+**The process is shutting down.** Once the shutdown gate is set, new requests fail
+immediately with a typed shutdown error rather than enqueueing for consumers that are
+about to be cancelled, and after the consumers are gone every still-pending request
+future is resolved with the same error so no ingress handler waits out the bus timeout.
+Notifications and plain sends are deliberately not gated — outbound operator messages
+keep flowing during the drain.
 
 **The pool cannot serve.** The turn raises pool-unavailable and the agent falls back to a
 one-shot client (the turn loop's contract); a failure mid-publication drops that pool

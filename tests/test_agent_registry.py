@@ -62,3 +62,20 @@ def test_all_known_returns_residents_and_specialists_with_tier():
     assert known["assistant"].tier == "resident"
     assert known["assistant"].card == "primary"
     assert known["finance"].tier == "specialist"
+
+
+def test_cross_tier_role_collision_resident_wins(caplog):
+    """#343: a specialist sharing a resident's role must NOT silently
+    overwrite it — boot refuses this outright (_build_role_registry
+    raises), and on reload the delegation map keeps the resident, so the
+    registry must agree: resident wins, with a warning."""
+    import logging
+
+    with caplog.at_level(logging.WARNING, logger="agent_registry"):
+        reg = AgentRegistry.build(
+            residents={"butler": _cfg("butler", "Tina")},
+            specialists={"butler": _cfg("butler", "Impostor")},
+        )
+    assert reg.role_to_name("butler") == "Tina"
+    assert reg.tier_for_role("butler") == "resident"
+    assert any("both tiers" in r.getMessage() for r in caplog.records)

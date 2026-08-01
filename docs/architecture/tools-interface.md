@@ -86,11 +86,11 @@ the registry's word is already given.
 
 ## Failure behavior
 
-**A malformed request.** Invalid JSON, a missing or unknown name, and a non-object request
-come back as typed JSON-RPC-style error objects from the route, before any tool runs; a
-tool that raises becomes an error object rather than a transport failure. The shape
-checking is exactly that list — a request whose `params` is a truthy non-object slips past
-it and raises instead of earning a typed error.
+**A malformed request.** Invalid JSON, a missing or unknown name, a non-object request,
+and any non-object `params` or `arguments` — truthy or falsy alike — all come back as
+typed JSON-RPC-style error objects from the route, before any tool runs (an absent or
+null value defaults to an empty object instead); a tool that raises becomes an error
+object rather than a transport failure.
 
 **A completion is invalid or refused.** Bad arguments, the plugin-developer release guard,
 and the unread-inbound veto all leave the engagement active; a duplicate completion is

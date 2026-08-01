@@ -607,9 +607,11 @@ async def _teardown_role(runtime: Any, role: str) -> None:
     the next add-on restart.
     """
     try:
-        task = runtime.bus.unregister(role)
-        if isinstance(task, asyncio.Task):
-            await asyncio.gather(task, return_exceptions=True)
+        # #343(b): the awaiting variant also cancels + drains the role's
+        # in-flight dispatch tasks, so no handler work survives the evict
+        # (a deleted role must not keep sending/acting after teardown
+        # reports complete).
+        await runtime.bus.unregister_and_wait(role)
     except Exception as exc:  # noqa: BLE001
         logger.warning(
             "reload_agents: bus.unregister(%s) failed: %s", role, exc,

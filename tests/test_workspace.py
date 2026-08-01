@@ -23,7 +23,7 @@ class TestRenderRunScript:
         out = render_run_script(
             engagement_id="abc12345def67890",
             permission_mode="acceptEdits",
-            extra_dirs=["/data/casa-plugins-repo"],
+            extra_dirs=["/share/casa-plugins-repo"],
         )
 
         assert "{ID}" not in out
@@ -35,7 +35,7 @@ class TestRenderRunScript:
         assert 'HOME="/data/engagements/abc12345def67890/.home"' in out
         assert "--permission-mode acceptEdits" in out
         assert "--add-dir /data/engagements/abc12345def67890/" in out
-        assert "--add-dir /data/casa-plugins-repo" in out
+        assert "--add-dir /share/casa-plugins-repo" in out
 
     def test_default_extra_dirs_still_includes_workspace(self):
         from drivers.workspace import render_run_script
@@ -282,12 +282,12 @@ class TestRenderRunScriptShellInjection:
         out = render_run_script(
             engagement_id="x" * 16,
             permission_mode="dontAsk",
-            extra_dirs=["/path/with space"],
+            extra_dirs=["/share/with space"],
         )
         # Either shlex.quote'd or single-quoted — never bare.
-        assert "/path/with space" in out
+        assert "/share/with space" in out
         # The bare unquoted form would be a defect.
-        assert "--add-dir /path/with space\n" not in out
+        assert "--add-dir /share/with space\n" not in out
 
     def test_extra_env_key_with_newline_rejected(self):
         """Bug 5: a newline in the key escapes the export statement."""
@@ -1004,3 +1004,87 @@ class TestRefreshClaudeMd:
         claude_md = (Path(path) / "CLAUDE.md").read_text()
         assert "plain fallback task" in claude_md
         assert "CTX:c1" in claude_md
+
+
+class TestExtraDirContainment:
+    """#344: extra_dirs is part of an operator-editable executor definition
+    (a mutable trust surface, #312 family) — entries must be contained to
+    the approved shared roots, never arbitrary host paths like "/" or
+    "/config" (--add-dir grants the engagement CLI read/write there)."""
+
+    @pytest.mark.parametrize("bad", [
+        "/", "/config", "/data", "/data/engagements", "/etc",
+        "/opt/casa", "/root", "/sharex",
+    ])
+    def test_outside_approved_roots_rejected(self, bad):
+        from drivers.workspace import WorkspaceConfigError, render_run_script
+        with pytest.raises(WorkspaceConfigError, match="approved root"):
+            render_run_script(
+                engagement_id="x" * 16,
+                permission_mode="dontAsk",
+                extra_dirs=[bad],
+            )
+
+    @pytest.mark.parametrize("ok", ["/share", "/share/foo", "/media/nas"])
+    def test_under_approved_roots_allowed(self, ok):
+        from drivers.workspace import render_run_script
+        out = render_run_script(
+            engagement_id="x" * 16,
+            permission_mode="dontAsk",
+            extra_dirs=[ok],
+        )
+        assert f"--add-dir {ok}" in out
+
+    def test_dotdot_traversal_rejected(self):
+        from drivers.workspace import WorkspaceConfigError, render_run_script
+        with pytest.raises(WorkspaceConfigError):
+            render_run_script(
+                engagement_id="x" * 16,
+                permission_mode="dontAsk",
+                extra_dirs=["/share/../config"],
+            )
+
+    def test_symlink_escaping_approved_root_rejected(self, tmp_path, monkeypatch):
+        """Terra r1-2: a symlink under an approved root pointing outside
+        it must be rejected — --add-dir follows it at CLI runtime."""
+        import os
+
+        from drivers import workspace
+        from drivers.workspace import WorkspaceConfigError, render_run_script
+
+        share = tmp_path / "share"
+        share.mkdir()
+        outside = tmp_path / "outside"
+        outside.mkdir()
+        link = share / "escape"
+        os.symlink(outside, link)
+        monkeypatch.setattr(
+            workspace, "APPROVED_EXTRA_DIR_ROOTS", (str(share),))
+
+        with pytest.raises(WorkspaceConfigError, match="resolves to"):
+            render_run_script(
+                engagement_id="x" * 16,
+                permission_mode="dontAsk",
+                extra_dirs=[str(link)],
+            )
+        # A real subdir under the root still passes.
+        real = share / "ok"
+        real.mkdir()
+        out = render_run_script(
+            engagement_id="x" * 16,
+            permission_mode="dontAsk",
+            extra_dirs=[str(real)],
+        )
+        assert f"--add-dir {real}" in out
+
+    def test_plugin_dirs_are_not_containment_checked(self):
+        """plugin_dirs are immutable store paths under /data (§3.8) —
+        the containment rule applies to extra_dirs only."""
+        from drivers.workspace import render_run_script
+        out = render_run_script(
+            engagement_id="x" * 16,
+            permission_mode="dontAsk",
+            extra_dirs=[],
+            plugin_dirs=["/data/casa/plugin-store/sha256-abc/artifact"],
+        )
+        assert "--plugin-dir /data/casa/plugin-store/sha256-abc/artifact" in out

@@ -896,3 +896,54 @@ async def test_start_rolls_back_client_when_first_turn_fails(monkeypatch):
     assert drv.is_alive(rec) is False, "client leaked in _clients after failed start"
     assert rec.id not in drv._ctx_stack and rec.id not in drv._locks
     assert closed, "client was never closed on first-turn failure"
+
+
+@pytest.mark.unit
+async def test_start_rolls_back_client_when_first_turn_cancelled(monkeypatch):
+    """#344: the M14 rollback caught only Exception — a CANCELLED initial
+    delivery left _clients populated with an unclosed client while the
+    record stayed active (later turns believed it alive). Cancellation
+    must roll back the same way, then re-raise CancelledError."""
+    import asyncio
+
+    from drivers.in_casa_driver import InCasaDriver
+
+    closed = []
+    entered = asyncio.Event()
+
+    class _FakeClient:
+        def __init__(self, options):
+            pass
+
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, *a):
+            closed.append("aexit")
+
+        async def query(self, prompt):
+            entered.set()
+            await asyncio.sleep(60)
+
+        async def receive_response(self):
+            if False:
+                yield None  # pragma: no cover
+
+        async def close(self):
+            closed.append("close")
+
+    monkeypatch.setattr("drivers.in_casa_driver.ClaudeSDKClient", _FakeClient)
+    drv = InCasaDriver(topic_stream_factory=_mk_noop_factory())
+    rec = _make_record()
+
+    task = asyncio.create_task(drv.start(
+        rec, prompt="hi", options=ClaudeAgentOptions(model="sonnet")))
+    await asyncio.wait_for(entered.wait(), timeout=5)
+    task.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await task
+
+    assert drv.is_alive(rec) is False, (
+        "client leaked in _clients after cancelled start")
+    assert rec.id not in drv._ctx_stack and rec.id not in drv._locks
+    assert closed, "client was never closed on cancelled first turn"

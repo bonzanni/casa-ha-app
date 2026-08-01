@@ -1238,6 +1238,256 @@ async def test_replay_aborts_resume_when_summary_adopt_fails(monkeypatch, tmp_pa
     assert reg.get("keep1").status == "error"      # marked error
 
 
+async def test_replay_start_failure_refuses_background_attach(
+    monkeypatch, tmp_path,
+):
+    """#342: a start_service failure must refuse the record (mark error,
+    no background spool/relay machinery) — not attach operator-facing
+    state to an engagement whose service never started."""
+    from casa_core import replay_undergoing_engagements
+    from drivers import s6_rc
+
+    svc_root = tmp_path / "svc"
+    svc_root.mkdir()
+    (svc_root / "engagement-keep1").mkdir()
+    (svc_root / "engagement-keep1" / "type").write_text("longrun\n")
+    monkeypatch.setattr(s6_rc, "ENGAGEMENT_SOURCES_ROOT", str(svc_root))
+
+    async def fake_cau():
+        pass
+
+    async def fake_start(*, engagement_id):
+        raise RuntimeError("s6-rc change failed")
+
+    async def fake_down(*, engagement_id):
+        return True
+
+    monkeypatch.setattr(s6_rc, "_compile_and_update_locked", fake_cau)
+    monkeypatch.setattr(s6_rc, "start_service", fake_start)
+    monkeypatch.setattr(s6_rc, "ensure_service_down", fake_down)
+
+    reg = await _make_registry([_rec("keep1")])
+
+    attached: list = []
+    driver = _boot_driver()
+    driver._spawn_background_tasks = (
+        lambda rec, **kw: attached.append(rec.id))
+
+    ws_root = tmp_path / "eng"
+    (ws_root / "keep1").mkdir(parents=True)
+
+    await replay_undergoing_engagements(
+        registry=reg, driver=driver, engagements_root=str(ws_root))
+
+    assert attached == []                          # no background machinery
+    assert reg.get("keep1").status == "error"      # marked error
+
+
+async def test_replay_fifo_recreate_failure_refuses_resume(
+    monkeypatch, tmp_path,
+):
+    """#342: a failed stdin.fifo recreation in the heal path must refuse
+    the resume — the run template (`set -e`, stdin from the FIFO) makes
+    every spawn exit immediately, so starting it crash-loops forever.
+    Sol r2-1/r3-2: the refusal runs the checked-teardown ladder — downs
+    any live remnant and REMOVES the just-replanted service pair — and
+    with containment confirmed the record stays non-terminal so the next
+    boot retries the heal (and its mkfifo)."""
+    from casa_core import replay_undergoing_engagements
+    from drivers import s6_rc
+    from config import ExecutorDefinition
+
+    svc_root = tmp_path / "svc"
+    svc_root.mkdir()
+    # NO service dir for keep1 — the heal path re-plants it.
+    monkeypatch.setattr(s6_rc, "ENGAGEMENT_SOURCES_ROOT", str(svc_root))
+
+    def fake_write(**kw):
+        (svc_root / f"engagement-{kw['engagement_id']}").mkdir()
+        return str(svc_root / f"engagement-{kw['engagement_id']}")
+    monkeypatch.setattr(s6_rc, "write_service_dir", fake_write)
+
+    start_calls: list = []
+    down_calls: list = []
+
+    async def fake_cau():
+        pass
+
+    async def fake_start(*, engagement_id):
+        start_calls.append(engagement_id)
+
+    async def fake_down(*, engagement_id):
+        down_calls.append(engagement_id)
+        return True
+
+    monkeypatch.setattr(s6_rc, "_compile_and_update_locked", fake_cau)
+    monkeypatch.setattr(s6_rc, "start_service", fake_start)
+    monkeypatch.setattr(s6_rc, "ensure_service_down", fake_down)
+
+    def _mkfifo_boom(path, mode=0o600):
+        raise OSError("no space")
+    monkeypatch.setattr(os, "mkfifo", _mkfifo_boom)
+
+    class FakeExecReg:
+        def __init__(self, defs):
+            self._defs = defs
+        def get(self, t):
+            return self._defs.get(t)
+
+    exec_reg = FakeExecReg({
+        "hello-driver": ExecutorDefinition(role_artifact=STUB_ROLE_ARTIFACT,
+            type="hello-driver", description="test", model="haiku",
+            driver="claude_code", enabled=True,
+            tools_allowed=[], tools_disallowed=[], permission_mode="bypassPermissions",
+            mcp_server_names=[], idle_reminder_days=1,
+            prompt_template_path="/nope/prompt.md", hooks_path=None,
+            observer_policy_path=None, doctrine_dir="/nope/doctrine",
+            extra_dirs=[], mirror_chat_to_topic=False,
+            plugins_dir="",
+        ),
+    })
+
+    reg = await _make_registry([_rec("keep1")])
+
+    attached: list = []
+    driver = _boot_driver()
+    driver._spawn_background_tasks = (
+        lambda rec, **kw: attached.append(rec.id))
+
+    ws_root = tmp_path / "eng"
+    (ws_root / "keep1").mkdir(parents=True)
+
+    await replay_undergoing_engagements(
+        registry=reg, driver=driver, executor_registry=exec_reg,
+        engagements_root=str(ws_root),
+    )
+
+    assert start_calls == []                       # never started
+    assert attached == []                          # no background machinery
+    # Sol r2-1: remnant downed + the replanted pair removed (not compiled).
+    assert "keep1" in down_calls
+    assert not (svc_root / "engagement-keep1").exists()
+    # Containment confirmed → no terminal mark; the next boot retries.
+    assert reg.get("keep1").status != "error"
+
+
+async def test_fast_path_recreates_missing_fifo(monkeypatch, tmp_path):
+    """Sol r3-2: an intact COMPLETE pair does not imply an intact FIFO —
+    the fast path must recreate a missing stdin.fifo before the start
+    loop runs the record (a `set -e` read of a missing FIFO crash-loops
+    under s6 forever)."""
+    from casa_core import replay_undergoing_engagements
+
+    start_calls = _fast_path_env(monkeypatch, tmp_path)
+    ws_root = tmp_path / "eng"
+    (ws_root / "keep1").mkdir(parents=True)
+
+    reg = await _make_registry([_rec("keep1")])
+    driver = _boot_driver()
+    driver._spawn_background_tasks = lambda rec, **kw: None
+
+    await replay_undergoing_engagements(
+        registry=reg, driver=driver, engagements_root=str(ws_root))
+
+    assert (ws_root / "keep1" / "stdin.fifo").exists()
+    assert start_calls == ["keep1"]
+
+
+async def test_fast_path_replaces_non_fifo_stdin_path(monkeypatch, tmp_path):
+    """Terra r4-1: a REGULAR FILE (or dir) at the stdin.fifo path reads as
+    instant EOF / fails outright — the same crash-loop as a missing FIFO.
+    The guard must verify the type and repair, not just existence."""
+    import stat as stat_mod
+
+    from casa_core import replay_undergoing_engagements
+
+    start_calls = _fast_path_env(monkeypatch, tmp_path)
+    ws_root = tmp_path / "eng"
+    (ws_root / "keep1").mkdir(parents=True)
+    (ws_root / "keep1" / "stdin.fifo").write_text("not a fifo")
+
+    reg = await _make_registry([_rec("keep1")])
+    driver = _boot_driver()
+    driver._spawn_background_tasks = lambda rec, **kw: None
+
+    await replay_undergoing_engagements(
+        registry=reg, driver=driver, engagements_root=str(ws_root))
+
+    st = (ws_root / "keep1" / "stdin.fifo").stat()
+    assert stat_mod.S_ISFIFO(st.st_mode), "regular file must be replaced"
+    assert start_calls == ["keep1"]
+
+    # Directory variant: also repaired.
+    import os as os_mod
+    os_mod.remove(ws_root / "keep1" / "stdin.fifo")
+    (ws_root / "keep1" / "stdin.fifo").mkdir()
+    reg2 = await _make_registry([_rec("keep1")])
+    await replay_undergoing_engagements(
+        registry=reg2, driver=driver, engagements_root=str(ws_root))
+    st = (ws_root / "keep1" / "stdin.fifo").stat()
+    assert stat_mod.S_ISFIFO(st.st_mode), "directory must be replaced"
+
+
+async def test_fast_path_symlinked_workspace_refuses_without_repair(
+    monkeypatch, tmp_path,
+):
+    """Sol r5-1: the FIFO verify/repair must never operate THROUGH a
+    symlinked workspace dir — a corrupted symlink targeting a foreign
+    tree would let the repair rmtree entries outside the workspace.
+    Refused instead; the foreign target is untouched."""
+    import os as os_mod
+
+    from casa_core import replay_undergoing_engagements
+
+    start_calls = _fast_path_env(monkeypatch, tmp_path)
+    ws_root = tmp_path / "eng"
+    ws_root.mkdir()
+    outside = tmp_path / "outside"
+    (outside / "stdin.fifo").mkdir(parents=True)  # a DIRECTORY at the name
+    (outside / "stdin.fifo" / "precious.txt").write_text("keep me")
+    os_mod.symlink(outside, ws_root / "keep1")    # workspace IS a symlink
+
+    reg = await _make_registry([_rec("keep1")])
+    driver = _boot_driver()
+    driver._spawn_background_tasks = lambda rec, **kw: None
+
+    await replay_undergoing_engagements(
+        registry=reg, driver=driver, engagements_root=str(ws_root))
+
+    assert start_calls == []
+    assert (outside / "stdin.fifo" / "precious.txt").exists(), (
+        "repair must not reach through the symlink")
+
+
+async def test_fast_path_fifo_failure_refuses_start(monkeypatch, tmp_path):
+    """Sol r3-2: when the fast-path FIFO recreation fails, the record is
+    refused (no start, pair removed) instead of started into a
+    crash-loop — closing the intact-pair-after-failed-refusal residue."""
+    import os as os_mod
+
+    from casa_core import replay_undergoing_engagements
+    from drivers import s6_rc
+
+    start_calls = _fast_path_env(monkeypatch, tmp_path)
+    ws_root = tmp_path / "eng"
+    (ws_root / "keep1").mkdir(parents=True)
+
+    def _mkfifo_boom(path, mode=0o600):
+        raise OSError("no space")
+    monkeypatch.setattr(os_mod, "mkfifo", _mkfifo_boom)
+
+    reg = await _make_registry([_rec("keep1")])
+    driver = _boot_driver()
+    driver._spawn_background_tasks = lambda rec, **kw: None
+
+    await replay_undergoing_engagements(
+        registry=reg, driver=driver, engagements_root=str(ws_root))
+
+    assert start_calls == []
+    assert not (
+        Path(s6_rc.ENGAGEMENT_SOURCES_ROOT) / "engagement-keep1").exists()
+
+
 async def test_replay_adopts_summary_before_start(monkeypatch, tmp_path):
     """F7: on the happy path, adoption runs BEFORE start_service (ordering)."""
     from casa_core import replay_undergoing_engagements

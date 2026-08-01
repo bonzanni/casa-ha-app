@@ -158,3 +158,52 @@ async def test_sweeper_warns_when_log_dir_removal_fails(
     assert any(
         "casa-engagement-eng-x" in r.getMessage() for r in caplog.records
     ), "log-dir removal failure must be warned about"
+
+
+async def test_sweeper_survives_non_object_meta(tmp_path):
+    """#344: one .casa-meta.json holding valid-but-non-object JSON ([]/
+    string/number) must not abort the whole sweep — later workspaces
+    still get swept."""
+    from drivers.workspace import _sweep_workspaces
+
+    # Names sort before the expired one so the bad entries are hit first.
+    ws_list = tmp_path / "a-eng-list"
+    ws_list.mkdir()
+    (ws_list / ".casa-meta.json").write_text("[]", encoding="utf-8")
+    ws_str = tmp_path / "b-eng-str"
+    ws_str.mkdir()
+    (ws_str / ".casa-meta.json").write_text('"oops"', encoding="utf-8")
+
+    ws_expired = tmp_path / "z-eng-done-old"
+    ws_expired.mkdir()
+    _write_meta(ws_expired, status="COMPLETED",
+                retention_iso="2020-01-01T00:00:00Z")
+
+    await _sweep_workspaces(engagements_root=str(tmp_path))
+
+    assert ws_list.exists(), "non-object meta is skipped, not deleted"
+    assert ws_str.exists()
+    assert not ws_expired.exists(), "the sweep must reach later workspaces"
+
+
+async def test_sweeper_survives_non_string_retention(tmp_path):
+    """Sol r6-1: a numeric retention_until must not TypeError the sweep —
+    warned + skipped like null, and later workspaces still processed."""
+    from drivers.workspace import _sweep_workspaces
+
+    ws_bad = tmp_path / "a-eng-badret"
+    ws_bad.mkdir()
+    (ws_bad / ".casa-meta.json").write_text(
+        json.dumps({"status": "COMPLETED", "retention_until": 0}),
+        encoding="utf-8",
+    )
+
+    ws_expired = tmp_path / "z-eng-done-old"
+    ws_expired.mkdir()
+    _write_meta(ws_expired, status="COMPLETED",
+                retention_iso="2020-01-01T00:00:00Z")
+
+    await _sweep_workspaces(engagements_root=str(tmp_path))
+
+    assert ws_bad.exists(), "bad retention_until is skipped, not deleted"
+    assert not ws_expired.exists(), "the sweep must reach later workspaces"

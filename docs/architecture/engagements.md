@@ -161,6 +161,10 @@ by design.
 workspace or recorded plugin artifact is missing is *refused* with a warning — validated
 before the intact-service fast path, so an ordinary restart cannot start a service whose run
 script would exit-and-respawn forever — and a missing definition is skipped with a warning.
+A failed stdin-FIFO recreation and a failed service start are refusals of the same kind:
+the record is marked errored and no background spool/relay machinery attaches, rather than
+accepting operator messages into an engagement with no consumer (or starting one that
+would crash-loop under its supervisor).
 
 ## Extension points
 
