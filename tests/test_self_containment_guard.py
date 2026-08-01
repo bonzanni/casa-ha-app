@@ -358,6 +358,37 @@ class TestGuardArmingAndOracle:
         assert await self._denied(
             bad_repo, "cd /nonexistent-dir-xyz; git push origin main")
 
+    async def test_branching_relative_cd_scans_diverged_base(
+            self, tmp_path: Path, bad_repo: Path):
+        """Terra r2 (#348): each cd may or may not have executed — a relative
+        cd must rebase from EVERY feasible prior base. `false && cd decoy;
+        cd ../<bad>` really lands in <bad> (decoy never ran), which one
+        linear chain would compute as decoy/../<bad> and fail to resolve."""
+        clean = bad_repo.parent / "clean-branch-cwd"
+        clean.mkdir()
+        assert await self._denied(
+            clean,
+            f"false && cd decoy; cd ../{bad_repo.name}; git push origin main")
+
+    async def test_cd_dashdash_and_flag_target_is_parsed(
+            self, tmp_path: Path, bad_repo: Path):
+        """Sol r2 (#348): `cd -P -- <dir>` — flags and the `--` terminator
+        must not be mistaken for the target."""
+        clean = tmp_path / "clean-flags-cwd"
+        clean.mkdir()
+        assert await self._denied(
+            clean, f"cd -P -- {bad_repo} && git push origin main")
+
+    async def test_multiple_git_dash_c_options_apply_sequentially(
+            self, tmp_path: Path, bad_repo: Path):
+        """Sol r2 (#348): git applies every -C in order, a relative -C
+        resolving against the previous one."""
+        clean = tmp_path / "clean-multic-cwd"
+        clean.mkdir()
+        assert await self._denied(
+            clean,
+            f"git -C {bad_repo.parent} -C {bad_repo.name} push origin main")
+
     async def test_reserved_env_self_declaration_blocks(
             self, git_plugin_repo: Path):
         """G6 corrected: a committed .mcp.json self-declaring a CLI-reserved

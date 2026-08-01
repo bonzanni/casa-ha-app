@@ -5532,7 +5532,7 @@ async def engage_executor(args: dict) -> dict:
                 })
 
     except asyncio.CancelledError:
-        _abort_launch_on_cancel(channel, rec.id, topic_id)
+        _abort_launch_on_cancel(channel, rec, topic_id)
         raise
     return _result({
         "status": "pending",
@@ -5580,27 +5580,45 @@ def _abort_topic_on_cancel(channel: Any, engagement_id: str,
     task.add_done_callback(_ABORT_BG_TASKS.discard)
 
 
-def _abort_launch_on_cancel(channel: Any, engagement_id: str,
+def _abort_launch_on_cancel(channel: Any, rec: "EngagementRecord",
                             topic_id: int | None) -> None:
     """Sol r1 (#363 family): background compensation for a launch cancelled
-    AFTER its record was created but BEFORE its driver started. Without this,
-    the cancellation unwound the tool call leaving a durably-active record
-    and an open topic with nothing driving them. Marks the record errored
-    (a terminal registry transition) then aborts the topic — fire-and-forget
-    and strong-ref'd, since a cancelled task cannot await."""
+    AFTER its record was created but BEFORE its driver was confirmed live.
+    Without this, the cancellation unwound the tool call leaving a
+    durably-active record and an open topic with nothing driving them.
+
+    Terra/Sol r2: the driver may in fact have gone LIVE before the
+    cancellation landed (claude_code starts its s6 service, then awaits the
+    initial-prompt enqueue — cancellation there escapes start()'s rollback),
+    so the compensation FIRST runs the driver's idempotent terminal teardown
+    (``cancel()`` — stop_service is tolerant of "already down"/never-started),
+    then marks the record errored and aborts the topic. Fire-and-forget and
+    strong-ref'd, since a cancelled task cannot await."""
     async def _run() -> None:
+        try:
+            import agent as agent_mod
+            driver = (getattr(agent_mod, "active_claude_code_driver", None)
+                      if rec.driver == "claude_code"
+                      else getattr(agent_mod, "active_engagement_driver", None))
+            if driver is not None and hasattr(driver, "cancel"):
+                await driver.cancel(rec)
+        except Exception:  # noqa: BLE001 — best-effort; the rest still runs
+            logger.warning(
+                "launch-cancel compensation: driver teardown failed for %s",
+                rec.id[:8], exc_info=True,
+            )
         try:
             if _engagement_registry is not None:
                 await _engagement_registry.mark_error(
-                    engagement_id, kind="launch_cancelled",
+                    rec.id, kind="launch_cancelled",
                     message="tool call cancelled during launch",
                 )
         except Exception:  # noqa: BLE001 — best-effort; topic abort still runs
             logger.warning(
                 "launch-cancel compensation: mark_error failed for %s",
-                engagement_id[:8], exc_info=True,
+                rec.id[:8], exc_info=True,
             )
-        await _abort_engagement_topic(channel, engagement_id, topic_id)
+        await _abort_engagement_topic(channel, rec.id, topic_id)
 
     task = asyncio.ensure_future(_run())
     _ABORT_BG_TASKS.add(task)

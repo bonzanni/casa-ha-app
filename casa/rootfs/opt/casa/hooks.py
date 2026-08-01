@@ -1787,18 +1787,39 @@ def make_self_containment_guard() -> HookCallback:
         # conditional or failing cd can never redirect the scan away from
         # the repository the push actually operates on, and a nonexistent
         # target never turns into an allow.
-        candidates = [cwd]
-        cur = cwd
+        # Terra r2: each cd may or may not have EXECUTED (conditionals), so a
+        # relative cd must be resolved from EVERY feasible prior base, not one
+        # linear chain — `false && cd decoy; cd ../bad` rebases from the hook
+        # cwd, not from decoy. The feasible-base set only ever GROWS (base
+        # without the cd stays feasible); growth is bounded (commands carry a
+        # handful of cds at most; hard cap as a backstop).
+        # Sol r2: `cd -P -- dir` — skip option words and an optional `--` so
+        # the flag is never mistaken for the target.
+        bases: set = {cwd}
+        candidates: list = [cwd]
         for m_cd in re.finditer(
-                r"(?:^|[;&|\n\r])\s*cd\s+(\"[^\"]+\"|'[^']+'|[^\s;&|]+)",
+                r"(?:^|[;&|\n\r])\s*cd\s+(?:-\S+\s+)*(?:--\s+)?"
+                r"(\"[^\"]+\"|'[^']+'|[^\s;&|]+)",
                 cmd[: m_push.start()]):
             t = m_cd.group(1).strip("'\"")
-            cur = Path(t) if os.path.isabs(t) else cur / t
-            candidates.append(cur)
-        m_c = re.search(r"-C\s+(\"[^\"]+\"|'[^']+'|\S+)", m_push.group(1))
-        if m_c:
-            t = m_c.group(1).strip("'\"")
-            candidates.append(Path(t) if os.path.isabs(t) else cur / t)
+            new_bases = set()
+            for b in bases:
+                nb = Path(t) if os.path.isabs(t) else b / t
+                new_bases.add(nb)
+                candidates.append(nb)
+            bases |= new_bases
+            if len(bases) > 64:  # backstop only; never hit in practice
+                break
+        # Sol r2: git applies EVERY -C sequentially (a relative -C resolves
+        # against the previous one) — fold the whole chain over each base.
+        c_targets = [m.group(1).strip("'\"") for m in re.finditer(
+            r"-C\s+(\"[^\"]+\"|'[^']+'|\S+)", m_push.group(1))]
+        if c_targets:
+            for b in bases:
+                cur = b
+                for t in c_targets:
+                    cur = Path(t) if os.path.isabs(t) else cur / t
+                candidates.append(cur)
 
         findings: list[str] = []
         seen_roots: set[str] = set()

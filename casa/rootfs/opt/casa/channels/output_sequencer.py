@@ -1568,6 +1568,24 @@ class OutputSequencer:
                 mid = await _maybe_await(
                     self.send_message(self.topic_id, str(intent.poster))
                 )
+        except asyncio.CancelledError:
+            # Sol r2 (#332): the poster may have SENT and then been cancelled
+            # during its post-send bookkeeping — ambiguous, exactly like a
+            # wire timeout. Seal conservatively (later narration can never
+            # edit above a message that may exist below it) and resolve
+            # fail-closed, retiring the intent from matching so the watcher
+            # can never repost a possibly-landed message. A compensated
+            # self-account recorded before the cancellation wins untouched.
+            if intent.outcome is None:
+                self._seal_narration_locked()
+                intent.post_failed = True
+                intent.consumed = True
+                intent.outcome = {
+                    "ok": False, "message_id": None,
+                    "out_of_band": out_of_band, "cancelled": True,
+                }
+                self._signal_resolution(intent.request_id)
+            raise
         except Exception as exc:  # noqa: BLE001 — a poster failure must not wedge
             logger.warning(
                 "output sequencer: intent %s poster failed: %s",

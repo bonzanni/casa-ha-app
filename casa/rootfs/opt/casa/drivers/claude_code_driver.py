@@ -1120,7 +1120,14 @@ class ClaudeCodeDriver(DriverProtocol):
                 # an engagement running without its summary anchor.
                 await self._post_initial_summary(engagement)
                 await s6_rc.start_service(engagement_id=engagement.id)
-            except Exception as start_exc:  # noqa: BLE001 — rollback is opportunistic
+            except BaseException as start_exc:  # noqa: BLE001 — rollback is
+                # opportunistic. Sol r2 (#363 family): BaseException, not
+                # Exception — a task CANCELLATION mid-launch (compile, summary
+                # post, service start) must run the same rollback instead of
+                # abandoning half-written service dirs; the trailing `raise`
+                # re-raises the CancelledError unchanged. (Rollback awaits run
+                # normally — a cancellation is delivered once, at the await
+                # that was pending when cancel() landed.)
                 logger.warning(
                     "claude_code start failed for engagement %s: %s; rolling back",
                     engagement.id[:8], start_exc,

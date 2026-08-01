@@ -10,6 +10,8 @@ from __future__ import annotations
 
 import asyncio
 
+import pytest
+
 from channels.output_sequencer import (
     APPLIED,
     ASK_TOOL,
@@ -412,6 +414,42 @@ async def test_failed_intent_poster_leaves_narration_open():
     assert intent.post_failed is True
     assert seq.narration_msg_id == nid   # narration still open + editable
     assert await seq.edit_narration_if_latest(nid, "still editing") == APPLIED
+
+
+async def test_cancelled_poster_seals_and_retires_intent():
+    """Sol r2 (#332): a poster can SEND and then be cancelled during its
+    post-send bookkeeping — ambiguous, like a wire timeout. The sequencer
+    must seal conservatively and retire the intent fail-closed so the
+    watcher can never repost a possibly-landed message."""
+    import asyncio
+
+    rec, clock = Recorder(), Clock()
+    seq = _make_seq(rec, clock)
+    nid = await seq.open_narration("working...")
+    assert nid is not None
+    h = projection_hash(REPLY_TOOL, {"text": "R"})
+
+    async def _send_then_cancelled():
+        await rec.send(42, "R")             # the message LANDS...
+        raise asyncio.CancelledError()      # ...then bookkeeping is cancelled
+
+    seq.register_intent(request_id="r1", tool_name=REPLY_TOOL,
+                        projection_hash=h, poster=_send_then_cancelled)
+    seq.arm_intent("r1")
+    with pytest.raises(asyncio.CancelledError):
+        await seq.post_for_block(REPLY_TOOL, h)
+    assert seq.narration_msg_id is None          # sealed: send may have landed
+    intent = seq.registry.by_request_id("r1")
+    assert intent.post_failed is True            # resolved fail-closed
+    assert intent.outcome == {
+        "ok": False, "message_id": None, "out_of_band": False,
+        "cancelled": True,
+    }
+    # The watcher can never repost it.
+    sends_before = list(rec.sends)
+    clock.t = 100.0
+    await seq.process_intents_once()
+    assert rec.sends == sends_before
 
 
 async def test_compensated_intent_seals_narration():

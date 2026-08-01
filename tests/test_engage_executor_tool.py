@@ -909,9 +909,12 @@ class TestCancelledLaunchAfterRecordCompensates:
             started.set()
             await asyncio.Event().wait()
 
+        fake_driver = MagicMock(
+            start=AsyncMock(side_effect=_hanging_start),
+            cancel=AsyncMock(),
+        )
         monkeypatch.setattr(
-            agent_mod, "active_engagement_driver",
-            MagicMock(start=AsyncMock(side_effect=_hanging_start)),
+            agent_mod, "active_engagement_driver", fake_driver,
             raising=False,
         )
 
@@ -943,6 +946,10 @@ class TestCancelledLaunchAfterRecordCompensates:
         assert recs[0].status == "error"
         abort.assert_awaited_once()
         assert abort.await_args.args[2] == 88
+        # Terra/Sol r2: the driver may have gone LIVE before the cancellation
+        # — the compensation runs its idempotent terminal teardown.
+        fake_driver.cancel.assert_awaited_once()
+        assert fake_driver.cancel.await_args.args[0].id == recs[0].id
 
 
 class TestEngageExecutorClaudeCode:
