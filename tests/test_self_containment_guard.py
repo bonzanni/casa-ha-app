@@ -468,6 +468,41 @@ class TestGuardArmingAndOracle:
         assert await self._denied(
             clean, f"cd {brace_repo}; git push origin main")
 
+    async def test_quoted_separator_in_target_is_not_truncated(
+            self, tmp_path: Path, bad_repo: Path):
+        """Terra/Sol r8 (#348): a separator INSIDE quotes (or behind a
+        backslash) is part of the path word — `cd '/tmp/bad;repo'` really
+        enters that directory and must be scanned."""
+        import shutil
+        for i, (name, spell) in enumerate((
+                ("bad;repo", "'{p}'"), ("bad&repo", '"{p}"'),
+                ("bad|repo", "'{p}'"), ("bad;esc", "{esc}"))):
+            target = tmp_path / f"qsep{i}" / name
+            shutil.copytree(bad_repo, target, symlinks=True)
+            clean = tmp_path / f"clean-qsep-cwd{i}"
+            clean.mkdir()
+            arg = spell.format(p=target,
+                               esc=str(target).replace(";", "\\;"))
+            assert await self._denied(
+                clean, f"cd {arg} && git push origin main"), arg
+
+    async def test_quoted_or_glued_cd_command_word_is_recognized(
+            self, tmp_path: Path, bad_repo: Path):
+        """Terra/Sol r8 (#348): the command word itself may be quoted
+        (`"cd" /bad`, `c''d /bad`) and needs no space before an operator
+        (`cd</dev/null /bad`, `cd'/bad'`)."""
+        forms = [
+            f'"cd" {bad_repo}',
+            f"c''d {bad_repo}",
+            f"cd</dev/null {bad_repo}",
+            f"cd'{bad_repo}'",
+        ]
+        for i, form in enumerate(forms):
+            clean = tmp_path / f"clean-cmdword{i}"
+            clean.mkdir()
+            assert await self._denied(
+                clean, f"{form} && git push origin main"), form
+
     async def test_cd_chain_overflow_fails_closed(
             self, tmp_path: Path, git_plugin_repo: Path):
         """Terra/Sol r3 (#348): once the feasible-base set overflows, later

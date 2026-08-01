@@ -1750,18 +1750,40 @@ _REDIR_SHAPED = re.compile(r"[<>]")
 
 def _command_segment(text: str) -> str:
     """The leading COMMAND segment of *text* — up to the first separator
-    (`;`, newline, `)`, `&`, `|`). An `&`/`|` that is adjacent to a `<`/`>`
+    (`;`, newline, `)`, `&`, `|`).
+
+    Quote- and escape-AWARE (Sol r8): a separator inside `'…'`/`"…"` or
+    behind a backslash is DATA, part of a path word (`cd '/tmp/bad;repo'`),
+    and must not truncate the segment. An `&`/`|` adjacent to a `<`/`>`
     belongs to a redirection operator (`&>f`, `2>&1`, `2>| f`, `{fd}>&-`),
-    not to a separator, so it does not end the segment."""
-    for i, ch in enumerate(text):
+    not to a separator, so it does not end the segment either."""
+    quote = ""
+    i = 0
+    while i < len(text):
+        ch = text[i]
+        if quote:
+            if ch == "\\" and quote == '"':
+                i += 2
+                continue
+            if ch == quote:
+                quote = ""
+            i += 1
+            continue
+        if ch == "\\":
+            i += 2  # escaped char is data, whatever it is
+            continue
+        if ch in "'\"":
+            quote = ch
+            i += 1
+            continue
         if ch in ";\n\r)":
             return text[:i]
         if ch in "&|":
             prev = text[i - 1] if i else ""
             nxt = text[i + 1] if i + 1 < len(text) else ""
-            if prev in "<>" or nxt in "<>":
-                continue  # part of a redirection operator
-            return text[:i]
+            if prev not in "<>" and nxt not in "<>":
+                return text[:i]
+        i += 1
     return text
 
 
@@ -1852,28 +1874,40 @@ def make_self_containment_guard() -> HookCallback:
         # Only the PRIMARY word (first that is neither an option nor
         # redirect-shaped) propagates into ``bases``, so a relative cd chain
         # still grows the feasible-base set at the same bounded rate.
-        for m_cd in re.finditer(r"(?<![\w./-])cd(?=\s)", cmd[: m_push.start()]):
-            words = _shell_words(
-                _command_segment(cmd[m_cd.end():m_push.start()]))
-            primary = next(
-                (w for w in words
-                 if not w.startswith("-") and not _REDIR_SHAPED.search(w)),
-                None)
-            new_bases = set()
-            for b in bases:
-                for w in words:
-                    candidates.append(Path(w) if os.path.isabs(w) else b / w)
-                if primary is not None:
-                    new_bases.add(Path(primary) if os.path.isabs(primary)
-                                  else b / primary)
-            bases |= new_bases
-            if len(bases) > 64:
-                # Terra/Sol r3: breaking out silently would leave every LATER
-                # cd unexamined — fail CLOSED instead (a finding below denies
-                # the push; the logged CASA_ALLOW_ANTI_PATTERN override
-                # remains the escape hatch for a legitimate pathological
-                # command).
-                cd_overflow = True
+        # Sol r8: bash needs no whitespace after `cd` before an operator or
+        # a quote (`cd</dev/null /bad`, `cd'/bad'`) — accept those positions
+        # too, never just `cd\s`.
+        # Terra r8: the command WORD itself can be quoted (`"cd" /bad`,
+        # `c''d /bad`) — bash resolves both to the builtin. Rather than
+        # enumerate quoting spellings, run the SAME collection over a
+        # quote-stripped shadow of the command as well and union the
+        # candidates. Purely additive, so it can only add scan targets.
+        for text in (cmd[: m_push.start()],
+                     cmd[: m_push.start()].replace("'", "").replace('"', "")):
+            for m_cd in re.finditer(r"(?<![\w./-])cd(?=[\s<>\"'])", text):
+                words = _shell_words(_command_segment(text[m_cd.end():]))
+                primary = next(
+                    (w for w in words
+                     if not w.startswith("-") and not _REDIR_SHAPED.search(w)),
+                    None)
+                new_bases = set()
+                for b in bases:
+                    for w in words:
+                        candidates.append(
+                            Path(w) if os.path.isabs(w) else b / w)
+                    if primary is not None:
+                        new_bases.add(Path(primary) if os.path.isabs(primary)
+                                      else b / primary)
+                bases |= new_bases
+                if len(bases) > 64:
+                    # Terra/Sol r3: breaking out silently would leave every
+                    # LATER cd unexamined — fail CLOSED instead (a finding
+                    # below denies the push; the logged
+                    # CASA_ALLOW_ANTI_PATTERN override remains the escape
+                    # hatch for a legitimate pathological command).
+                    cd_overflow = True
+                    break
+            if cd_overflow:
                 break
         # Sol r2: git applies EVERY -C sequentially (a relative -C resolves
         # against the previous one) — fold the whole chain over each base.
