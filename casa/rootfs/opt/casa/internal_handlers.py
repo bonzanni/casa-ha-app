@@ -15,7 +15,9 @@ Body shape (no JSON-RPC envelope, no header dependency):
     POST /internal/hooks/resolve
     {
       "policy": "<policy_name>",
-      "payload": {...}            # CC PreToolUse payload
+      "payload": {...},           # CC PreToolUse payload
+      "engagement_id": "<32-hex>" | null,   # #366: from X-Casa-Engagement-Id
+      "engagement_token": "<token>" | null  # #366: from X-Casa-Engagement-Token
     }
 
 Responses are bare (no JSON-RPC wrapping):
@@ -200,6 +202,7 @@ def _make_internal_hooks_resolve_handler(
     hook_policies: dict[str, tuple[str, HookCallback]],
     executor_hook_policies: dict | None = None,
     engagement_registry=None,
+    identity_from_headers: bool = False,
 ):
     """Build the aiohttp POST handler for /internal/hooks/resolve.
 
@@ -210,12 +213,17 @@ def _make_internal_hooks_resolve_handler(
     H3 (v0.53.0): `executor_hook_policies` (built by
     `casa_core._build_executor_cc_hook_policies`) is
     ``{executor_type: {policy_name: (matcher, callback)}}`` carrying the
-    per-executor ``hooks.yaml`` parameters. When both it and
-    `engagement_registry` are supplied, the handler resolves the engagement
-    from the CC payload's ``cwd`` and prefers that executor's parameterised
-    callback for the policy; it falls back to the default `hook_policies`
-    callback for unknown engagements / executors / policies. Both default to
-    None so existing call sites (and tests) keep the original behaviour.
+    per-executor ``hooks.yaml`` parameters. #366: the handler resolves the
+    engagement ONLY from the body's ``engagement_id``/``engagement_token``
+    pair, verified against the record via :func:`engagement_auth_ok`; the CC
+    payload's ``cwd`` is caller-supplied text used solely as a cross-check
+    (an authenticated id contradicting a cwd engagement claim is refused).
+    It prefers the authenticated executor's parameterised callback for the
+    policy and falls back to the default `hook_policies` callback for
+    unauthenticated requests / unknown executors / unknown policies, and it
+    threads ``{"casa_engagement_id": <id-or-None>}`` to the callback as the
+    authenticated-identity context. Both kwargs default to None so existing
+    call sites (and tests) keep the original behaviour.
     """
     async def handler(request: web.Request) -> web.Response:
         try:
@@ -261,25 +269,90 @@ def _make_internal_hooks_resolve_handler(
                 }},
             )
 
-        # H3 (v0.53.0): prefer the engagement's executor-specific callback
-        # (carrying its hooks.yaml params) when we can resolve the engagement
-        # from the CC payload's cwd; otherwise fall back to the default
-        # policy callback. Same cwd-trust model the C-1 permission relay uses.
-        entry = None
-        if executor_hook_policies and engagement_registry is not None:
-            from hooks import _engagement_id_from_cwd
-            eng_id = _engagement_id_from_cwd(payload.get("cwd") or "")
-            if eng_id:
+        # #366: authenticate any engagement-identity claim BEFORE deriving
+        # anything from it. Identity arrives as body fields injected from the
+        # X-Casa-Engagement-Id/Token headers (svc-casa-mcp and the public-8099
+        # twin both rebuild the body from headers; hook_proxy.sh reads the
+        # credential from its OWN workspace .mcp.json). The payload's cwd is
+        # caller-supplied text: it is never an identity source, only a
+        # cross-check. Contract mirrors /internal/tools/call (#335):
+        #   known id + valid token  -> authenticated (identity threaded below)
+        #   known id + bad/missing  -> explicit REJECT, callback never runs
+        #   unknown id / no id      -> unauthenticated (default policies;
+        #                              identity-consuming callbacks fail closed)
+        if identity_from_headers:
+            # #366: public-8099 twin — the credential comes ONLY from the
+            # header pair (the same one the MCP twin reads; hook_proxy.sh
+            # sends it on both routes). Overwrite ANY body-borne identity so
+            # a caller cannot smuggle the internal body shape past the
+            # header contract. The Unix-socket route keeps body fields — its
+            # only writer is svc-casa-mcp, which itself rebuilds from headers.
+            body = {
+                **body,
+                "engagement_id":
+                    request.headers.get("X-Casa-Engagement-Id"),
+                "engagement_token":
+                    request.headers.get("X-Casa-Engagement-Token"),
+            }
+
+        eng_id_claim = body.get("engagement_id")
+        auth_rec = None
+        auth_eng_id = None
+        if eng_id_claim:
+            rec = None
+            if engagement_registry is not None:
                 try:
-                    rec = engagement_registry.get(eng_id)
-                except Exception:
+                    rec = engagement_registry.get(eng_id_claim)
+                except Exception:  # noqa: BLE001
                     rec = None
-                if rec is not None:
-                    entry = (
-                        executor_hook_policies.get(
-                            getattr(rec, "role_or_type", "")
-                        ) or {}
-                    ).get(policy_name)
+            if rec is not None:
+                if not engagement_auth_ok(rec, body.get("engagement_token")):
+                    logger.warning(
+                        "internal /hooks/resolve: rejected engagement id "
+                        "claim for %s (policy=%r): missing/invalid "
+                        "engagement token", str(eng_id_claim)[:8], policy_name,
+                    )
+                    return web.json_response(
+                        {"hookSpecificOutput": {
+                            "hookEventName": "PreToolUse",
+                            "permissionDecision": "deny",
+                            "permissionDecisionReason":
+                                "engagement_auth_failed: invalid engagement "
+                                "token — the tool was not run",
+                        }},
+                    )
+                auth_rec = rec
+                auth_eng_id = str(eng_id_claim)
+
+        from hooks import _engagement_id_from_cwd
+        cwd_id = _engagement_id_from_cwd(payload.get("cwd") or "")
+        if (auth_eng_id is not None and cwd_id is not None
+                and cwd_id != auth_eng_id):
+            logger.warning(
+                "internal /hooks/resolve: authenticated engagement %s "
+                "presented a cwd claiming %s — refusing",
+                auth_eng_id[:8], cwd_id[:8],
+            )
+            return web.json_response(
+                {"hookSpecificOutput": {
+                    "hookEventName": "PreToolUse",
+                    "permissionDecision": "deny",
+                    "permissionDecisionReason":
+                        "engagement cwd does not match the authenticated "
+                        "engagement — the tool was not run",
+                }},
+            )
+
+        # H3 (v0.53.0): prefer the engagement's executor-specific callback
+        # (carrying its hooks.yaml params); since #366 the engagement resolves
+        # ONLY from the authenticated credential, never from the cwd claim.
+        entry = None
+        if executor_hook_policies and auth_rec is not None:
+            entry = (
+                executor_hook_policies.get(
+                    getattr(auth_rec, "role_or_type", "")
+                ) or {}
+            ).get(policy_name)
         if entry is None:
             entry = hook_policies.get(policy_name)
         if entry is None:
@@ -298,7 +371,12 @@ def _make_internal_hooks_resolve_handler(
             return web.json_response({})  # empty = allow
 
         try:
-            result = await callback(payload, None, {})
+            # #366: the context dict is the AUTHENTICATED-identity channel to
+            # the callback (None = unauthenticated). Identity-consuming
+            # callbacks (permission relay, buttons reminder) read this key
+            # and fail closed without it — they no longer parse the cwd.
+            result = await callback(
+                payload, None, {"casa_engagement_id": auth_eng_id})
         except Exception as exc:  # noqa: BLE001
             return web.json_response(
                 {"hookSpecificOutput": {

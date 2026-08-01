@@ -321,16 +321,19 @@ def _make_public_hooks_fallback_handler(
     """Public-8099 /hooks/resolve handler.
 
     Same body shape as the internal handler ({"policy": ..., "payload": ...}).
-    Just re-exports the internal factory under a different name for clarity
-    at the call site — behavior is identical. H3 (v0.53.0): forwards the
-    per-executor hook policies + engagement registry so parameterised
-    callbacks apply on this path too.
+    H3 (v0.53.0): forwards the per-executor hook policies + engagement
+    registry so parameterised callbacks apply on this path too. #366: on this
+    PUBLIC route the engagement credential is read from the
+    X-Casa-Engagement-Id/Token headers only (``identity_from_headers``) —
+    body-borne identity fields are overwritten, mirroring svc-casa-mcp's
+    body rebuild on the 8100 route.
     """
     from internal_handlers import _make_internal_hooks_resolve_handler
     return _make_internal_hooks_resolve_handler(
         hook_policies=hook_policies,
         executor_hook_policies=executor_hook_policies,
         engagement_registry=engagement_registry,
+        identity_from_headers=True,
     )
 
 

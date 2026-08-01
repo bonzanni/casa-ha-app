@@ -169,3 +169,74 @@ async def test_public_hooks_resolve_unknown_policy_denies() -> None:
         body = await resp.json()
         assert body["hookSpecificOutput"]["permissionDecision"] == "deny"
         assert "unknown policy" in body["hookSpecificOutput"]["permissionDecisionReason"]
+
+
+# ---------------------------------------------------------------------------
+# #366: on the public route (old workspaces with the baked 8099 URL) the
+# engagement identity comes from the SAME header pair the MCP twin reads —
+# never from body fields a caller could smuggle in.
+# ---------------------------------------------------------------------------
+
+
+def _build_hooks_auth_app(calls: list) -> web.Application:
+    from casa_core import _make_public_hooks_fallback_handler
+
+    async def _recording_cb(_p, _t, context):
+        calls.append(context)
+        return None
+
+    reg = _FakeReg()
+    reg.add(_FakeRec("e" * 32))
+    app = web.Application()
+    app.router.add_post(
+        "/hooks/resolve",
+        _make_public_hooks_fallback_handler(
+            hook_policies={"p": ("Bash", _recording_cb)},
+            engagement_registry=reg,
+        ),
+    )
+    return app
+
+
+async def test_public_hooks_resolve_headers_authenticate_identity() -> None:
+    calls: list = []
+    async with TestClient(TestServer(_build_hooks_auth_app(calls))) as client:
+        resp = await client.post(
+            "/hooks/resolve",
+            json={"policy": "p", "payload": {"tool_name": "Bash"}},
+            headers={"X-Casa-Engagement-Id": "e" * 32,
+                     "X-Casa-Engagement-Token": "tok-" + "e" * 32},
+        )
+        assert await resp.json() == {}
+    assert calls[0].get("casa_engagement_id") == "e" * 32
+
+
+async def test_public_hooks_resolve_bad_token_denies() -> None:
+    calls: list = []
+    async with TestClient(TestServer(_build_hooks_auth_app(calls))) as client:
+        resp = await client.post(
+            "/hooks/resolve",
+            json={"policy": "p", "payload": {"tool_name": "Bash"}},
+            headers={"X-Casa-Engagement-Id": "e" * 32,
+                     "X-Casa-Engagement-Token": "WRONG"},
+        )
+        body = await resp.json()
+    assert body["hookSpecificOutput"]["permissionDecision"] == "deny"
+    assert "engagement_auth_failed" in (
+        body["hookSpecificOutput"]["permissionDecisionReason"])
+    assert calls == []
+
+
+async def test_public_hooks_resolve_body_identity_ignored() -> None:
+    """A forger POSTing the INTERNAL body shape (id+token as body fields) at
+    the public route gets no identity — the public twin reads headers only."""
+    calls: list = []
+    async with TestClient(TestServer(_build_hooks_auth_app(calls))) as client:
+        resp = await client.post(
+            "/hooks/resolve",
+            json={"policy": "p", "payload": {"tool_name": "Bash"},
+                  "engagement_id": "e" * 32,
+                  "engagement_token": "tok-" + "e" * 32},
+        )
+        assert await resp.json() == {}
+    assert calls[0].get("casa_engagement_id") is None
