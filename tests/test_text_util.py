@@ -149,3 +149,50 @@ def test_is_unsafe_text_boundary_just_outside_ranges_is_safe():
     assert is_unsafe_text(chr(0x202F)) is False   # just after bidi embed group
     assert is_unsafe_text(chr(0x2065)) is False   # just before bidi isolates
     assert is_unsafe_text(chr(0x206A)) is False   # just after bidi isolates
+
+
+# ---------------------------------------------------------------------------
+# utf16_len / utf16_prefix_end (#305/#328 — Telegram counts UTF-16 units, not
+# code points; the shared helper is the single home for that measurement so
+# the splitter, the plain streaming checks, and the authz challenge size gate
+# can never drift apart again).
+# ---------------------------------------------------------------------------
+
+from text_util import utf16_len, utf16_prefix_end  # noqa: E402
+
+
+def test_utf16_len_ascii_matches_len():
+    assert utf16_len("hello") == 5
+    assert utf16_len("") == 0
+
+
+def test_utf16_len_bmp_counts_one_per_char():
+    # CJK + accents live in the BMP: 1 UTF-16 unit each, same as len().
+    assert utf16_len("中文ü") == 3
+
+
+def test_utf16_len_astral_counts_two():
+    # Astral codepoints (most emoji) are surrogate PAIRS: 2 units each.
+    assert utf16_len("\U0001F389") == 2
+    assert utf16_len("a\U0001F389b") == 4
+
+
+def test_utf16_len_never_raises_on_lone_surrogate():
+    # A surrogateescape'd str must be measured, not crash the send path.
+    assert utf16_len("a\ud800b") == 3
+
+
+def test_utf16_prefix_end_ascii():
+    assert utf16_prefix_end("abcdef", 0, 3) == 3
+    assert utf16_prefix_end("abc", 0, 10) == 3
+
+
+def test_utf16_prefix_end_never_splits_inside_astral_pair():
+    # budget 2 after "a" (1 unit): the astral char needs 2 more units — it
+    # does not fit, so the boundary lands BEFORE it, never between surrogates.
+    assert utf16_prefix_end("a\U0001F389b", 0, 2) == 1
+    assert utf16_prefix_end("a\U0001F389b", 0, 3) == 2
+
+
+def test_utf16_prefix_end_honours_start():
+    assert utf16_prefix_end("abcdef", 2, 2) == 4

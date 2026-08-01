@@ -166,3 +166,27 @@ class TestPostPermKeyboard:
         )
         assert msg_id is None
         ch.send_to_topic.assert_not_called()
+
+    @pytest.mark.parametrize("status", ["completed", "cancelled", "error"])
+    async def test_terminal_engagement_refused_no_keyboard(self, status):
+        """#347: the relay hook's status check goes stale across its awaits —
+        terminalization can land between the hook's gate and the post. The
+        poster re-fetches the record, so IT owns the authoritative re-check:
+        a terminal engagement never gets a live Allow/Deny keyboard."""
+        from channels import telegram as tg_mod
+
+        ch = tg_mod.TelegramChannel.__new__(tg_mod.TelegramChannel)
+        ch._engagement_registry = MagicMock()
+        ch._engagement_registry.get = MagicMock(
+            return_value=MagicMock(topic_id=42, status=status)
+        )
+        ch.send_to_topic = AsyncMock()
+
+        msg_id = await ch.post_perm_keyboard(
+            engagement_id="t" * 32,
+            request_id="r",
+            tool_name="Bash",
+            tool_input={"command": "x"},
+        )
+        assert msg_id is None
+        ch.send_to_topic.assert_not_called()

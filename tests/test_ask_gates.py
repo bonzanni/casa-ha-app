@@ -2645,3 +2645,111 @@ class TestTerminalExitsPublishGate:
         assert gate.effective() == ("FAILED", payload)
         resp2 = await wired["ask"](_FakeRequest(_btn_payload(wired["rec"], rid="wb7-breg")))
         assert _body(resp2) == payload
+
+
+# ===========================================================================
+# #347(e): a non-finite ``timeout_s`` (nan/inf) survives ``min(max(...))``
+# clamping (NaN comparisons are all False) and reaches the broker's timer —
+# reject it at validation instead.
+# ===========================================================================
+
+
+class TestValidateTimeoutFinite:
+    async def test_nan_timeout_rejected(self):
+        from channels.channel_handlers import _validate_ask_args
+        assert _validate_ask_args(
+            {"question": "q", "options": [], "timeout_s": float("nan")}
+        ) is None
+
+    async def test_inf_timeout_rejected(self):
+        from channels.channel_handlers import _validate_ask_args
+        for bad in (float("inf"), float("-inf")):
+            assert _validate_ask_args(
+                {"question": "q", "options": [], "timeout_s": bad}
+            ) is None
+
+    async def test_finite_out_of_range_still_clamped_not_rejected(self):
+        from channels.channel_handlers import _validate_ask_args
+        out = _validate_ask_args(
+            {"question": "q", "options": [], "timeout_s": 1e12})
+        assert out is not None
+        assert out[2] == 570.0
+        out = _validate_ask_args(
+            {"question": "q", "options": [], "timeout_s": 0.001})
+        assert out is not None
+        assert out[2] == 30.0
+
+
+# ===========================================================================
+# #347(b): a deferred keyboard post that FAILS records ``{"ok": false}`` on
+# the intent while ``ensure_posted`` unregisters the broker request (no
+# tombstone). A same-id transport retry saw a reattachable intent, but the
+# recorded post-failure is not in ``_refused_intent_outcome``'s set — so it
+# re-registered a FRESH broker request with no poster and burned the full
+# timeout to ``no_answer`` (which can pause the engagement). The recorded
+# ok:false post outcome is TERMINAL: the retry returns ``delivery_failed``.
+# ===========================================================================
+
+
+class TestRetryAfterFailedPost:
+    async def test_retry_of_failed_post_returns_delivery_failed_immediately(
+        self, wired, monkeypatch,
+    ):
+        async def _none_keyboard(**kwargs):
+            return None  # r10-B3 delivery failure
+
+        monkeypatch.setattr(
+            wired["chan"], "post_options_keyboard", _none_keyboard)
+        task = asyncio.ensure_future(
+            wired["ask"](_FakeRequest(_btn_payload(wired["rec"], "pf1"))))
+        await _wait_armed(wired, "pf1")
+        await wired["seq"].post_for_block(ASK_TOOL, _BTN_HASH)
+        resp = await asyncio.wait_for(task, timeout=2.0)
+        assert _body(resp)["error"] == "delivery_failed"
+
+        # The same-id transport retry: immediate delivery_failed, no fresh
+        # poster-less broker request left pending.
+        resp2 = await asyncio.wait_for(
+            wired["ask"](_FakeRequest(_btn_payload(wired["rec"], "pf1"))),
+            timeout=2.0,
+        )
+        assert _body(resp2)["error"] == "delivery_failed"
+        assert wired["broker"].pending(
+            namespace="engagement_ask", scope=wired["rec"].id) == []
+        # And no second keyboard was ever posted.
+        assert wired["chan"].keyboards == []
+
+
+class TestRetryWithLiveBrokerRecordNotCollapsed:
+    async def test_ok_false_intent_with_live_broker_record_reattaches(
+        self, wired,
+    ):
+        """Terra r1: the ok:false-is-terminal short-circuit must fire ONLY
+        when the broker has no live/tombstoned record — an ok:false shape on
+        the intent while the broker still holds the request must reattach
+        and return the broker's ACCURATE outcome, not collapse it to
+        ``delivery_failed``."""
+        eid = wired["rec"].id
+        drv, broker = wired["drv"], wired["broker"]
+        # A recorded ok:false outcome on the intent (no ``error`` key, so the
+        # refusal short-circuit does not apply)...
+        drv.register_send_intent(
+            engagement_id=eid, request_id="gm1", tool_name=ASK_TOOL,
+            projection_hash=_BTN_HASH, poster=lambda: None)
+        drv.record_send_intent_refusal(
+            eid, "gm1", {"ok": False, "message_id": None})
+        # ...while the broker STILL holds a live request for the same id.
+        broker.register(
+            namespace="engagement_ask", scope=eid, request_id="gm1",
+            timeout_s=60, meta={"options": ["A", "B"]})
+
+        task = asyncio.ensure_future(
+            wired["ask"](_FakeRequest(_btn_payload(wired["rec"], "gm1"))))
+        await _settle_turns()
+        assert not task.done()  # reattached and awaiting — NOT delivery_failed
+        broker.cancel(
+            namespace="engagement_ask", scope=eid, request_id="gm1",
+            reason="internal_error")
+        resp = await asyncio.wait_for(task, timeout=2.0)
+        body = _body(resp)
+        assert body["error"] == "internal_error"   # the broker's outcome wins

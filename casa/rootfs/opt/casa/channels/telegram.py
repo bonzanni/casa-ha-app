@@ -57,6 +57,7 @@ from channels.output_sequencer import (  # noqa: F401 — re-export
     projection_hash as discrete_projection_hash,
 )
 from media_policies import MEDIA_POLICIES
+from text_util import utf16_len, utf16_prefix_end
 from channels.telegram_supervisor import ReconnectSupervisor
 from log_cid import cid_var, new_cid
 from provenance import sanitize_external_context, strict_positive_id
@@ -624,6 +625,11 @@ class TelegramChannel(Channel):
         # by chat_id; entries are not pruned — bounded growth (DM chats),
         # cleared on add-on restart, mirroring _engagement_handler_locks.
         self._chat_serial_locks: dict[str, asyncio.Lock] = {}
+        # #347: per-engagement topic-STATE edit serialization (see
+        # update_topic_state) — orders the relay's awaiting/active round-trip
+        # against terminal-transition edits so a closed topic can never be
+        # repainted active.
+        self._topic_state_locks: dict[str, asyncio.Lock] = {}
         # R5 (v0.89.0): NON-PERSISTENT current-inbound target for the `react`
         # framework tool. Maps engagement_id -> (chat_id, topic_id, message_id)
         # of the LATEST operator message seen in that engagement's topic.
@@ -855,10 +861,31 @@ class TelegramChannel(Channel):
                     "Telegram started (polling, chat_id=%s)",
                     self.chat_id,
                 )
-        except Exception:
+        except BaseException:
             # PTB 22.7 ordering: stop() raises if not running (guard with
             # app.running); shutdown() raises while running (only after
             # stop()).
+            #
+            # #347: ``BaseException``, not ``Exception`` — a CancelledError
+            # during set_webhook()/start_polling() used to skip this rollback
+            # entirely, and since the app is not yet published to
+            # ``self._app``, channel stop() could never tear it down either:
+            # the running updater/fetcher leaked for the process lifetime.
+            # Rollback here is already best-effort per step, then the original
+            # exception (cancellation included) is re-raised.
+            #
+            # Updater FIRST, mirroring ``_teardown_app`` (Sol+Terra r1): a
+            # cancellation landing inside ``start_polling()`` leaves
+            # ``updater.running`` set, ``app.stop()`` does NOT stop the
+            # updater, and ``app.shutdown()`` then raises (swallowed below) —
+            # the polling task would survive unpublished.
+            try:
+                if app.updater is not None and getattr(
+                        app.updater, "running", False):
+                    await app.updater.stop()
+            except Exception as exc:  # noqa: BLE001 — best-effort rollback
+                logger.debug(
+                    "Telegram rebuild rollback: updater.stop failed: %s", exc)
             try:
                 if getattr(app, "running", False):
                     await app.stop()
@@ -1276,6 +1303,23 @@ class TelegramChannel(Channel):
                 )
             return  # do NOT feed /new to the agent
 
+        # Rate limit BEFORE typing indicator or bus dispatch (spec 5.2 §8) —
+        # and BEFORE the typed-answer ask cancellation below (#347): a
+        # rate-limited reply is dropped, so it must not expire the pending
+        # question it will never answer. Pre-fix the cancel ran first and a
+        # "Slow down"-rejected answer left the ask expired with the answer
+        # lost; now the question stays live for the operator's next attempt.
+        if self._rate_limiter is not None and self._rate_limiter.enabled:
+            decision = self._rate_limiter.check(chat_id)
+            if not decision.allowed:
+                if decision.should_notify:
+                    logger.info(
+                        "Telegram rate limit hit for chat_id=%s; replying with one-shot notice",
+                        chat_id,
+                    )
+                    await self._send_rate_limit_reply(chat_id)
+                return
+
         # v0.76.0 (W5b, r1-B2): a same-DM plain-text reply resolves any
         # pending resident_ask ("the text IS the answer") — cancel it BEFORE
         # normal dispatch so the finish hook edits the stale keyboard to
@@ -1292,18 +1336,6 @@ class TelegramChannel(Channel):
 
         user = update.effective_user
         user_name = user.first_name if user else "unknown"
-
-        # Rate limit BEFORE typing indicator or bus dispatch (spec 5.2 §8).
-        if self._rate_limiter is not None and self._rate_limiter.enabled:
-            decision = self._rate_limiter.check(chat_id)
-            if not decision.allowed:
-                if decision.should_notify:
-                    logger.info(
-                        "Telegram rate limit hit for chat_id=%s; replying with one-shot notice",
-                        chat_id,
-                    )
-                    await self._send_rate_limit_reply(chat_id)
-                return
 
         inherited = cid_var.get()
         cid = inherited if inherited != "-" else new_cid()
@@ -2284,6 +2316,19 @@ class TelegramChannel(Channel):
             logger.warning(
                 "post_perm_keyboard: unknown engagement or no topic_id "
                 "(engagement=%s)", engagement_id[:8],
+            )
+            return None
+        # #347: the relay hook's status==active gate goes stale across its
+        # awaits — terminalization can land between that check and this post
+        # (the terminal sweep cancels the broker scope BEFORE this request
+        # registers, so nothing else withdraws it). This fresh-fetch is the
+        # authoritative re-check: a terminal engagement never gets a live
+        # Allow/Deny keyboard; returning None resolves waiters as
+        # delivery_failed (→ deny) instead of a full-timeout wait.
+        if getattr(rec, "status", None) in ("completed", "cancelled", "error"):
+            logger.warning(
+                "post_perm_keyboard: engagement %s is terminal (%s) — "
+                "refusing keyboard", engagement_id[:8], rec.status,
             )
             return None
 
@@ -3291,46 +3336,71 @@ class TelegramChannel(Channel):
         )
         if self._engagement_registry is None:
             return
-        rec = self._engagement_registry.get(engagement_id)
-        if rec is None or rec.topic_id is None:
-            return
-        new_emoji = STATE_EMOJI.get(new_state)
-        if new_emoji is None or new_emoji == rec.current_state_emoji:
-            return
+        # #347 (Sol+Terra r4): ONE per-engagement lock totally orders every
+        # state edit — all writers (the permission relay's awaiting/active
+        # round-trip AND the terminal-transition paths) go through this
+        # method, so under the lock the record re-read below is authoritative
+        # for the whole check→wire-edit→persist span. A terminal transition
+        # marks the registry BEFORE calling here, so any ``active`` repaint
+        # ordered after it observes the terminal status and refuses; one
+        # ordered before it is simply overwritten by the terminal edit that
+        # queued behind the lock. This closes the check-to-edit interleaving
+        # a caller-side status gate cannot (the wire call was already in
+        # flight).
+        lock = self._topic_state_locks.setdefault(engagement_id, asyncio.Lock())
+        async with lock:
+            rec = self._engagement_registry.get(engagement_id)
+            if rec is None or rec.topic_id is None:
+                return
+            # Terra r5: EVERY non-terminal paint (active 🟢 / awaiting 🟡) is
+            # refused over a terminal record — a delayed authenticated
+            # update_state request must not repaint a closed topic; terminal
+            # paints (completed/failed/cancelled) remain allowed.
+            if (
+                getattr(rec, "status", None)
+                in ("completed", "cancelled", "error")
+                and new_state not in ("completed", "failed", "cancelled")
+            ):
+                return  # never repaint a terminal engagement live
+            new_emoji = STATE_EMOJI.get(new_state)
+            if new_emoji is None or new_emoji == rec.current_state_emoji:
+                return
 
-        # W-R6 (v0.81.0): read the persisted short topic title (engager-supplied
-        # or Casa-derived at ingest); legacy rows with no persisted title fall
-        # back to the concise_task label so old tombstones never crash.
-        short_title = (
-            getattr(rec, "topic_title", "") or concise_task(rec.task or "")
-        )
-        title = compose_topic_title(
-            state=new_state,
-            short_task=short_title,
-        )
-        if not self.engagement_supergroup_id:
-            return
-        try:
-            await self.bot.edit_forum_topic(
-                chat_id=self.engagement_supergroup_id,
-                message_thread_id=rec.topic_id,
-                name=title,
+            # W-R6 (v0.81.0): read the persisted short topic title
+            # (engager-supplied or Casa-derived at ingest); legacy rows with
+            # no persisted title fall back to the concise_task label so old
+            # tombstones never crash.
+            short_title = (
+                getattr(rec, "topic_title", "") or concise_task(rec.task or "")
             )
-        except Exception as exc:  # noqa: BLE001
-            logger.warning(
-                "U3 update_topic_state edit_forum_topic failed (engagement=%s "
-                "state=%s): %s", engagement_id[:8], new_state, exc,
+            title = compose_topic_title(
+                state=new_state,
+                short_task=short_title,
             )
-            return
-        try:
-            await self._engagement_registry.set_channel_state(
-                engagement_id, current_state_emoji=new_emoji,
-            )
-        except Exception as exc:  # noqa: BLE001
-            logger.warning(
-                "U3 set_channel_state(%s, %s) failed: %s",
-                engagement_id[:8], new_emoji, exc,
-            )
+            if not self.engagement_supergroup_id:
+                return
+            try:
+                await self.bot.edit_forum_topic(
+                    chat_id=self.engagement_supergroup_id,
+                    message_thread_id=rec.topic_id,
+                    name=title,
+                )
+            except Exception as exc:  # noqa: BLE001
+                logger.warning(
+                    "U3 update_topic_state edit_forum_topic failed "
+                    "(engagement=%s state=%s): %s",
+                    engagement_id[:8], new_state, exc,
+                )
+                return
+            try:
+                await self._engagement_registry.set_channel_state(
+                    engagement_id, current_state_emoji=new_emoji,
+                )
+            except Exception as exc:  # noqa: BLE001
+                logger.warning(
+                    "U3 set_channel_state(%s, %s) failed: %s",
+                    engagement_id[:8], new_emoji, exc,
+                )
 
     async def close_topic(self, thread_id: int) -> None:
         """Close a forum topic (v0.37.1 D-1 rename + simplification).
@@ -3698,6 +3768,11 @@ class TelegramChannel(Channel):
 
             if state["message_id"] is None:
                 # First token: send new message (typing already stopped above).
+                # #305 (Sol r1): the first send needs the same UTF-16 guard as
+                # the edits — an oversized first payload would be rejected on
+                # every callback; skip and let finalize_stream split it.
+                if utf16_len(accumulated_text) > _TG_MAX_LENGTH:
+                    return
                 try:
                     result = await self._app.bot.send_message(
                         chat_id=target_chat,
@@ -3708,8 +3783,8 @@ class TelegramChannel(Channel):
                 except TelegramError as exc:
                     logger.warning("Stream send failed: %s", exc)
             elif now - state["last_edit"] >= _STREAM_THROTTLE:
-                # Throttled edit
-                if len(accumulated_text) > _TG_MAX_LENGTH:
+                # Throttled edit (#305: UTF-16 units, Telegram's unit)
+                if utf16_len(accumulated_text) > _TG_MAX_LENGTH:
                     return  # Stop editing, final send will split
                 try:
                     await self._app.bot.edit_message_text(
@@ -3760,8 +3835,8 @@ class TelegramChannel(Channel):
             await self.send(full_text, context)
             return
 
-        # Final edit with complete text
-        if len(full_text) <= _TG_MAX_LENGTH:
+        # Final edit with complete text (#305: UTF-16 units)
+        if utf16_len(full_text) <= _TG_MAX_LENGTH:
             try:
                 await self._app.bot.edit_message_text(
                     chat_id=target_chat,
@@ -3774,6 +3849,10 @@ class TelegramChannel(Channel):
         else:
             # Response exceeded the limit — edit first chunk, send the rest
             chunks = _split_message(full_text)
+            if not chunks:
+                # Whitespace-only overflow (#305 drops unsendable chunks) —
+                # keep the streamed message as-is rather than index [].
+                return
             try:
                 await self._app.bot.edit_message_text(
                     chat_id=target_chat,
@@ -3822,6 +3901,10 @@ class TopicStreamHandle:
         now = time.monotonic()
 
         if self._message_id is None:
+            # #305 (Sol r1): first-send UTF-16 guard, sibling of the DM
+            # streaming closure — finalize() splits/paginate what emit skips.
+            if utf16_len(accumulated_text) > _TG_MAX_LENGTH:
+                return
             try:
                 result = await bot.send_message(
                     chat_id=self._channel.engagement_supergroup_id,
@@ -3837,7 +3920,8 @@ class TopicStreamHandle:
         if now - self._last_edit < _STREAM_THROTTLE:
             return
 
-        if len(accumulated_text) > _TG_MAX_LENGTH:
+        # #305: UTF-16 units, Telegram's unit.
+        if utf16_len(accumulated_text) > _TG_MAX_LENGTH:
             return
 
         try:
@@ -3930,21 +4014,34 @@ class TopicStreamHandle:
 
 
 def _split_message(text: str) -> list[str]:
-    """Split *text* into chunks that fit within Telegram's message limit."""
-    if len(text) <= _TG_MAX_LENGTH:
+    """Split *text* into chunks that fit within Telegram's message limit.
+
+    #305: the limit is measured in UTF-16 code units (Telegram's unit — an
+    astral emoji counts 2), never Python code points, and a newline split
+    consumes exactly the ONE split newline so blank-line separation survives
+    into the next chunk. A whitespace-only chunk is never emitted (Telegram
+    rejects an effectively-empty message) — including the degenerate case of
+    whole-input whitespace, which returns ``[]`` (Sol r1: the old fast path
+    returned ``[""]``, and send() then attempted an empty Bot API message).
+    """
+    if not text.strip():
+        return []
+    if utf16_len(text) <= _TG_MAX_LENGTH:
         return [text]
 
     chunks: list[str] = []
     while text:
-        if len(text) <= _TG_MAX_LENGTH:
+        hard = utf16_prefix_end(text, 0, _TG_MAX_LENGTH)
+        if hard >= len(text):
             chunks.append(text)
             break
 
-        split_at = text.rfind("\n", 0, _TG_MAX_LENGTH)
-        if split_at == -1 or split_at == 0:
-            split_at = _TG_MAX_LENGTH
+        split_at = text.rfind("\n", 0, hard)
+        if split_at <= 0:
+            chunks.append(text[:hard])
+            text = text[hard:]
+        else:
+            chunks.append(text[:split_at])
+            text = text[split_at + 1:]
 
-        chunks.append(text[:split_at])
-        text = text[split_at:].lstrip("\n")
-
-    return chunks
+    return [c for c in chunks if c.strip()]

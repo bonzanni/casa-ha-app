@@ -1,5 +1,5 @@
 ---
-last_reviewed: 2026-07-30
+last_reviewed: 2026-08-01
 ---
 
 # The Telegram channel
@@ -57,10 +57,13 @@ permission format — but actionability is bounded by process memory: a callback
 while its request lives in the current process's broker, so buttons from before a restart
 are rejected as expired however well their format parses.
 
-**Two rendering paths count length differently, and only one of them counts what Telegram
-counts.** The rich path paginates against Telegram's limits, adjusting for UTF-16. The plain
-streaming and splitting path counts Python code points. For text outside the basic plane —
-emoji, most notably — those two numbers differ, and only the first matches the platform.
+**Both rendering paths measure length in the unit Telegram counts.** The platform's limits
+are counted in UTF-16 code units — an astral character (most emoji) counts as two. The rich
+paginator, the plain splitter and streaming edits, and the authorization-challenge size gate
+all resolve to one shared measurement helper, so the paths cannot drift apart again. The
+plain splitter prefers newline boundaries, consumes exactly the one newline it splits at
+(blank-line separation survives into the next chunk), and drops a whitespace-only chunk
+rather than sending a message the platform would reject.
 
 ## Contracts & invariants
 
@@ -112,8 +115,9 @@ that bypass the sequencer, including the fallback used when no driver seam is pr
 Enforced in the rich renderer's pagination, which measures in UTF-16 units as the platform
 does.
 
-What it does not cover: the plain streaming and splitting path applies its own limit counted
-in code points, so the two paths do not agree for non-basic-plane text.
+What it does not cover: the plain streaming and splitting path. That path now measures the
+same UTF-16 units through the shared helper, but it splits plain text only — it carries no
+entities and makes no entity-budget promise.
 
 ## Failure behavior
 
@@ -151,8 +155,8 @@ none of which will tell you the others were missed.
 **A new topic output** should go through the sequencer seam if causal order matters. A direct
 send is available and is not prevented.
 
-**A new rich response** belongs on the paginating path. The plain splitter does not measure
-what Telegram measures.
+**A new rich response** belongs on the paginating path. The plain splitter measures the same
+units but sends unformatted text only.
 
 ## Source & test map
 
@@ -174,6 +178,7 @@ what Telegram measures.
 - `tests/test_verdict_broker.py`
 - `tests/test_telegram_new_reset.py`
 - `tests/test_telegram_supervisor.py`
+- `tests/test_telegram_split.py`
 
 **Related**
 - [`architecture/overview.md`](../architecture/overview.md)

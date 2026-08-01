@@ -44,6 +44,8 @@ import re
 
 from telegram import MessageEntity
 
+from text_util import utf16_len, utf16_prefix_end
+
 Span = tuple[int, int, str]  # (start, end, kind); kind in pre/code/bold/italic
 
 MAX_LEN = 4096
@@ -437,7 +439,9 @@ def _parse_inline(text: str) -> tuple[str, list[Span]]:
 
 
 def _utf16_units(s: str) -> int:
-    return len(s) + sum(1 for ch in s if ord(ch) > 0xFFFF)
+    # #305: delegates to the shared text_util measurement so the rich
+    # paginator, the plain splitter, and the authz size gate use ONE unit.
+    return utf16_len(s)
 
 
 def _spans_to_entities(
@@ -477,16 +481,8 @@ def render(text: str) -> tuple[str, "list[MessageEntity] | None"]:
 
 def _advance_by_utf16(display: str, start: int, budget: int) -> int:
     """Largest index ``end`` such that ``display[start:end]`` fits *budget*
-    UTF-16 units."""
-    units = 0
-    i = start
-    n = len(display)
-    while i < n:
-        units += 2 if ord(display[i]) > 0xFFFF else 1
-        if units > budget:
-            return i
-        i += 1
-    return n
+    UTF-16 units (shared implementation: ``text_util.utf16_prefix_end``)."""
+    return utf16_prefix_end(display, start, budget)
 
 
 def _preferred_cut(display: str, start: int, end: int) -> int:

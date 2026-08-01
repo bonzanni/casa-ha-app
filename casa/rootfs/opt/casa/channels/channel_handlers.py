@@ -21,6 +21,7 @@ from __future__ import annotations
 import asyncio
 import inspect
 import logging
+import math
 import time
 from collections import defaultdict
 from typing import Any, Awaitable, Callable
@@ -29,6 +30,7 @@ from aiohttp import web
 from telegram.error import BadRequest
 
 from settle_gate import confirmed_settle_edit
+from text_util import utf16_len
 
 logger = logging.getLogger(__name__)
 
@@ -1254,6 +1256,12 @@ def _validate_ask_args(
         timeout_s = float(body.get("timeout_s", _ASK_DEFAULT_TIMEOUT_S))
     except (TypeError, ValueError):
         return None
+    # #347: NaN survives min(max(...)) — every NaN comparison is False, so
+    # both clamps return it unchanged and the broker's timer fires
+    # immediately (→ instant no_answer on an already-posted keyboard).
+    # Reject every non-finite value (inf would arm a timer that never fires).
+    if not math.isfinite(timeout_s):
+        return None
     timeout_s = min(max(timeout_s, _ASK_MIN_TIMEOUT_S), _ASK_MAX_TIMEOUT_S)
     return question, labels, timeout_s, shorts
 
@@ -1550,10 +1558,14 @@ def _make_ask(
             Telegram's 4096-char message limit; ``None`` when it fits. Rendered
             with the REAL allocated ``number`` (multi worst case = every option
             selected) so the measurement is exact (spec §D1 bullets 3 & 6)."""
+            # #328 family (Terra r1): measured in UTF-16 units — Telegram's
+            # unit — so an astral-heavy body is refused ``invalid_args`` here
+            # instead of passing ``len()`` and failing the keyboard post.
             body_ = render_ask_body(number, question, options)
             worst_suffix_len = max(
-                len(s) for s in ask_lifecycle_suffixes(number, options, multi))
-            rendered_len = len(body_) + worst_suffix_len
+                utf16_len(s)
+                for s in ask_lifecycle_suffixes(number, options, multi))
+            rendered_len = utf16_len(body_) + worst_suffix_len
             if rendered_len <= _ASK_BODY_LIMIT:
                 return None
             return {
@@ -2153,6 +2165,31 @@ def _make_ask(
                         prior = driver.send_intent_outcome(eng_id, request_id)
                         if _refused_intent_outcome(prior):
                             return web.json_response(prior)
+                        # #347: a recorded ``ok: false`` post outcome (the
+                        # deferred keyboard post failed, or the sequencer's
+                        # terminal latch resolved it fail-closed) is TERMINAL
+                        # — ``ensure_posted`` unregistered the broker request
+                        # WITHOUT a tombstone, so falling through to the F2
+                        # reattach would register a FRESH request that no
+                        # poster will ever serve, burning the full timeout to
+                        # ``no_answer`` (which can pause the engagement).
+                        # Return the same delivery_failed the first attempt
+                        # returned — but ONLY when the broker really has no
+                        # live/tombstoned record for this id (Terra r1): a
+                        # posted-then-withdrawn ask (add_open_question
+                        # failure → internal_error cancel) can leave an
+                        # ok:false shape on the intent while the broker
+                        # tombstone still holds the ACCURATE outcome; the F2
+                        # reattach below returns that verbatim.
+                        if (
+                            isinstance(prior, dict)
+                            and prior.get("ok") is False
+                            and BROKER.get_meta(
+                                namespace="engagement_ask", scope=eng_id,
+                                request_id=request_id) is None
+                        ):
+                            return web.json_response(
+                                {"ok": False, "error": "delivery_failed"})
                         # GATE HANDSHAKE (spec §D1 r3-1, Task A5): a reattacher
                         # NEVER registers a broker request until the single
                         # validation owner marks the gate PASSED. A PENDING gate

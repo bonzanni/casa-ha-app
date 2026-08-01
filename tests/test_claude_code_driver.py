@@ -836,6 +836,80 @@ class TestWriteToFifoBounded:
         assert sent and sent[0][0] == 42
         assert rec.id not in driver._last_turn_ts
 
+    async def test_no_reader_retained_notice_promises_auto_retry(self, tmp_path):
+        """#322: when the caller RETAINS the envelope for auto-redelivery (the
+        spool path), the no-reader notice must not tell the operator to
+        resend — the retained envelope redelivers on the next spawn, so a
+        resend duplicates the turn. The notice promises the retry instead."""
+        import os
+        from types import SimpleNamespace
+
+        ws = tmp_path / "eng-retained"
+        ws.mkdir()
+        os.mkfifo(str(ws / "stdin.fifo"))
+        sent = []
+        driver = self._driver(tmp_path, sent)
+        rec = SimpleNamespace(id="eng-retained", topic_id=42)
+        ok = await asyncio.wait_for(
+            driver._write_to_fifo(
+                rec, "hello", timeout_s=1.0, poll_s=0.05, retained=True),
+            timeout=5.0,
+        )
+        assert ok is False
+        assert sent and sent[0][0] == 42
+        notice = sent[0][1]
+        assert "Try again" not in notice
+        assert "will be delivered" in notice
+
+    async def test_no_reader_default_notice_still_asks_for_resend(self, tmp_path):
+        """The legacy no-spool direct-write path retains nothing — 'Try
+        again' stays the honest copy there."""
+        import os
+        from types import SimpleNamespace
+
+        ws = tmp_path / "eng-legacy"
+        ws.mkdir()
+        os.mkfifo(str(ws / "stdin.fifo"))
+        sent = []
+        driver = self._driver(tmp_path, sent)
+        rec = SimpleNamespace(id="eng-legacy", topic_id=42)
+        await asyncio.wait_for(
+            driver._write_to_fifo(rec, "hello", timeout_s=1.0, poll_s=0.05),
+            timeout=5.0,
+        )
+        assert sent and "Try again" in sent[0][1]
+
+    async def test_spool_pump_writes_fifo_with_retained_notice_wiring(self, tmp_path):
+        """#322 wiring: the spool's ``write_fifo`` seam passes
+        ``retained=True`` — the spool is exactly the caller that retains."""
+        from unittest.mock import AsyncMock
+        from drivers.claude_code_driver import ClaudeCodeDriver
+
+        driver = ClaudeCodeDriver(
+            engagements_root=str(tmp_path),
+            send_to_topic=AsyncMock(), casa_framework_mcp_url="http://unused",
+        )
+        rec = _make_record()
+        (tmp_path / rec.id).mkdir()
+        seen: list[dict] = []
+
+        async def probe(engagement, text, **kwargs):
+            seen.append(kwargs)
+            return True
+
+        driver._write_to_fifo = probe  # type: ignore[assignment]
+        tasks = []
+        try:
+            driver._spawn_background_tasks(rec)
+            tasks = driver._tasks[rec.id]
+            spool = driver._inbound[rec.id]
+            await spool._write_fifo("ping")
+            assert seen and seen[0].get("retained") is True
+        finally:
+            for t in tasks:
+                t.cancel()
+            await asyncio.gather(*tasks, return_exceptions=True)
+
     async def test_with_reader_delivers_text(self, tmp_path):
         import os
         import threading

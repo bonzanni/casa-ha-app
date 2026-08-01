@@ -32,7 +32,7 @@ import uuid
 from dataclasses import dataclass, field
 from typing import Any, Callable
 
-from text_util import is_unsafe_text
+from text_util import escape_unsafe_text, is_unsafe_text, utf16_len
 
 logger = logging.getLogger(__name__)
 
@@ -229,7 +229,8 @@ GRANTS = GrantStore()
 
 # Challenge message size ceiling (plan Global Constraints): a rendered
 # challenge body longer than this is REFUSED rather than posted (Telegram's
-# hard message cap is ~4096; 3900 leaves headroom for the keyboard + envelope).
+# hard message cap is 4096 UTF-16 units; 3900 leaves headroom for the keyboard
+# + envelope). #328: measured in UTF-16 units via ``text_util.utf16_len``.
 _CHALLENGE_MAX_CHARS = 3900
 
 # Challenge TTL (plan Global Constraints): 120 s.
@@ -383,23 +384,32 @@ def render_challenge_message(
     *display_name* is the CURRENT ``cfg.character.name`` threaded from the
     AuthzDeps factory; it passes through ``_resolve_display_name`` (empty / >64
     / UNSAFE-TEXT ⇒ the role string). Sent WITHOUT ``parse_mode`` — there is no
-    Markdown/entity escaping here (pinned by a test)."""
+    Markdown/entity escaping here (pinned by a test).
+
+    #328: the DISPLAYED args block passes through ``escape_unsafe_text`` —
+    a bidi control inside a tool-input value would otherwise reorder what the
+    operator reads, approving a display that differs from the bound value.
+    The escape is a JSON string escape, so the shown block still parses to
+    exactly the arguments the grant binds; the BINDING (``canonical_json`` /
+    ``args_hash``) is untouched. For safe input the block is byte-identical
+    (B8 verbatim contract preserved)."""
     short = short_tool_name(tool_name)
     display = _resolve_display_name(display_name, enforcement_role)
+    shown_json = escape_unsafe_text(canonical_json)
     interpolated = _interpolated_summary_or_none(summary, canonical_json)
     if interpolated is not None:
         return (
             "\U0001F510 Approval needed\n\n"
             f"{display} ({enforcement_role}) wants to: {interpolated}\n\n"
             "Exact action (binding):\n"
-            f"```\n{canonical_json}\n```\n"
+            f"```\n{shown_json}\n```\n"
             f"Tool id: {tool_name}"
         )
     return (
         "\U0001F510 Approval needed\n\n"
         f"{display} ({enforcement_role}) wants to run {short} with EXACTLY "
         "these arguments:\n\n"
-        f"```\n{canonical_json}\n```\n"
+        f"```\n{shown_json}\n```\n"
         f"Tool id: {tool_name}"
     )
 
@@ -525,7 +535,11 @@ class ChallengeCoordinator:
         if existing is not None:
             return ChallengeHandle(created=False, _challenge=existing)
 
-        if len(challenge_text) > _CHALLENGE_MAX_CHARS:
+        # #328: measured in UTF-16 units — Telegram's unit. A code-point
+        # ``len()`` under-counts astral characters, letting a challenge pass
+        # here and then fail ``post_dm_keyboard``, which unregisters it as a
+        # delivery failure — permanently denying that exact-argument action.
+        if utf16_len(challenge_text) > _CHALLENGE_MAX_CHARS:
             return ChallengeHandle(created=True, refused="args_too_large")
 
         options = list(options or ["Approve", "Deny"])

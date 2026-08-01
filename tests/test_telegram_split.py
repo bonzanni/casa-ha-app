@@ -39,9 +39,12 @@ class TestSplitMessage:
         result = _split_message("Hello world")
         assert result == ["Hello world"]
 
-    def test_empty_message(self):
-        result = _split_message("")
-        assert result == [""]
+    def test_empty_message_yields_nothing_sendable(self):
+        # #305 (Sol r1): the old fast path returned [""] and send() then
+        # attempted an empty Bot API message (rejected). Whitespace-only
+        # input — including "" — now yields no chunks at all.
+        assert _split_message("") == []
+        assert _split_message("\n\n  \n") == []
 
     def test_exact_limit(self):
         text = "a" * _TG_MAX_LENGTH
@@ -75,10 +78,53 @@ class TestSplitMessage:
         lines = [f"Line {i}: " + "x" * 100 for i in range(100)]
         text = "\n".join(lines)
         result = _split_message(text)
-        rejoined = "\n".join(result)
-        # All original content should be present
-        for line in lines:
-            assert line in rejoined
+        # #305: every split lands on a newline here, and the splitter consumes
+        # EXACTLY the one split newline — so rejoining with "\n" reconstructs
+        # the original byte-for-byte (stronger than the old "each line appears
+        # somewhere" check, which passed even when blank lines were eaten).
+        assert "\n".join(result) == text
+
+
+class TestSplitMessageUtf16:
+    """#305: Telegram's 4096 limit counts UTF-16 code units, not code points.
+    Astral chars (most emoji) are 2 units; the splitter must measure what the
+    platform measures or an under-4096-``len()`` chunk still gets rejected."""
+
+    async def test_astral_heavy_message_splits_within_utf16_limit(self):
+        from text_util import utf16_len
+        text = "\U0001F389" * 3000  # len() 3000, but 6000 UTF-16 units
+        result = _split_message(text)
+        assert len(result) >= 2
+        for chunk in result:
+            assert utf16_len(chunk) <= _TG_MAX_LENGTH
+        # No newlines involved: hard splits must reassemble exactly.
+        assert "".join(result) == text
+
+    async def test_hard_split_never_lands_inside_an_astral_pair(self):
+        # 4095 ASCII then an astral char: the emoji (2 units) does not fit the
+        # first chunk's remaining 1 unit — it must move whole to chunk 2.
+        text = "a" * 4095 + "\U0001F389" + "b" * 10
+        result = _split_message(text)
+        assert result[0] == "a" * 4095
+        assert result[1].startswith("\U0001F389")
+        assert "".join(result) == text
+
+    async def test_blank_lines_preserved_at_split_boundary(self):
+        # "...\n\n\nImportant": the split consumes exactly ONE newline, so the
+        # blank-line separation survives into the next chunk (the old
+        # lstrip("\n") deleted it — content mutation, not partitioning).
+        first = "x" * (_TG_MAX_LENGTH - 2)
+        text = first + "\n\n\nImportant"
+        result = _split_message(text)
+        assert len(result) == 2
+        assert "\n".join(result) == text
+
+    async def test_whitespace_only_chunk_is_never_emitted(self):
+        # A pure-newline tail would render as an empty Telegram message (the
+        # API rejects it) — it is dropped, not sent.
+        text = "a" * 4095 + "\n" + "\n" * 4
+        result = _split_message(text)
+        assert result == ["a" * 4095]
 
 
 # ---------------------------------------------------------------------------

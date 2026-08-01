@@ -1,5 +1,59 @@
 # Changelog
 
+## [0.141.0] - 2026-08-01
+
+### Fixed
+
+Telegram/ask lifecycle batch — nine defects across message splitting, the
+ask/permission keyboards, and delivery notices (#305, #322, #328, #347):
+
+- **Long messages split by what Telegram actually counts** (#305). The plain
+  splitter and streaming edits measured Python code points, but Telegram's
+  4096 limit counts UTF-16 units — an emoji-heavy message could pass the
+  local check and be rejected on send. All plain-path length checks now share
+  the same UTF-16 measurement as the rich renderer.
+- **Splitting no longer eats blank lines** (#305). A split at a newline used
+  to strip every leading newline from the next chunk, silently deleting
+  paragraph separation; exactly one newline is consumed now.
+- **The authorization challenge shows bidi control characters instead of
+  obeying them** (#328). A right-to-left override inside a tool argument
+  could make the displayed "exact action" read differently from the value
+  being approved; unsafe codepoints now render as visible `\uXXXX` escapes
+  (the displayed block still parses to exactly the bound arguments).
+- **The challenge size gate measures UTF-16 units** (#328), so an
+  astral-heavy challenge can no longer pass the gate and then fail to post,
+  permanently denying that action.
+- **A queued turn no longer asks you to resend it** (#322). When the
+  engagement's input pipe had no reader, the notice said "Try again" while
+  the turn stayed queued for automatic redelivery — a resend ran the request
+  twice. The notice now says the message is queued and will deliver
+  automatically.
+- **A rate-limited reply no longer expires the question it was answering**
+  (#347). The "Slow down" drop used to also cancel the pending ask, losing
+  both; the question now stays live for the next attempt.
+- **Retrying an ask whose keyboard failed to post returns the failure
+  immediately** (#347) instead of waiting the full timeout on a keyboard
+  that will never appear (which could pause the engagement as unanswered).
+- **No permission keyboard on a finished engagement** (#347). A permission
+  request racing engagement completion could post a live Allow/Deny keyboard
+  into a closed topic and wait out its timeout; it is refused instead.
+- **A cancelled Telegram reconnect no longer leaks a running client** (#347),
+  and a non-finite ask timeout is rejected instead of firing instantly.
+
+Adversarial-review hardening found during the batch's six review rounds:
+
+- **A cancelled reconnect in polling mode also stops the update poller** —
+  without it the rolled-back client's poller kept running unreachably.
+- **The ask question/options size check measures UTF-16 units** too, so an
+  emoji-heavy question is refused up front instead of failing to post.
+- **A permission request racing engagement completion is denied cleanly**
+  instead of erroring internally and waiting out its timeout.
+- **A finished engagement's topic can no longer be repainted as live**: topic
+  state edits are serialized per engagement and a closed engagement refuses
+  the green/yellow states, so the ✅/⏹/❌ marker always wins.
+- **Oversized first streaming updates are held back** until the final
+  message, which is split correctly, instead of being rejected by Telegram.
+
 ## [0.140.0] - 2026-08-01
 
 ### Fixed

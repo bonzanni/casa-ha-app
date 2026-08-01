@@ -95,3 +95,28 @@ async def test_topic_finalize_without_emit_applies_entities():
     assert kw["message_thread_id"] == 42
     assert kw["text"] == "hi x"
     assert {e.type for e in kw["entities"]} == {MessageEntity.BOLD, MessageEntity.CODE}
+
+
+async def test_stream_first_send_over_utf16_limit_is_skipped():
+    """#305 (Sol r1): the FIRST stream send needs the same UTF-16 guard as
+    the edits — an oversized first payload would be rejected by the Bot API
+    on every callback; it is skipped and finalize splits instead."""
+    ch, bot = _mk_channel_with_fake_bot()
+    ch._delivery_mode = "stream"
+    on_token = ch.create_on_token({"chat_id": "42"})
+    await on_token("\U0001F389" * 3000)  # 6000 UTF-16 units
+    assert bot.send_message.await_count == 0
+    # finalize falls back to the splitting send path (no message_id).
+    await ch.finalize_response_stream(
+        "\U0001F389" * 3000, {"chat_id": "42"}, on_token)
+    assert bot.send_message.await_count >= 2  # split into UTF-16-sized chunks
+
+
+async def test_topic_stream_first_emit_over_utf16_limit_is_skipped():
+    """Sibling guard on the engagement-topic stream handle."""
+    ch, bot = _mk_channel_with_fake_bot()
+    ch.engagement_supergroup_id = 777
+    handle = ch.create_topic_stream(topic_id=5)
+    await handle.emit("\U0001F389" * 3000)
+    assert bot.send_message.await_count == 0
+    assert handle._message_id is None
