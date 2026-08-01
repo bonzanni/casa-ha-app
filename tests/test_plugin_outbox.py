@@ -523,44 +523,49 @@ def test_sweep_does_not_reap_fresh_file_renamed_over_expired_name(outbox):
     assert os.path.exists(old), "fresh producer file was deleted by the sweep"
 
 
+def _strand_reap_entry(outbox, dname: str, ename: str, data: bytes) -> str:
+    """Simulate a crash mid-reap: a held entry inside a per-reap ownership
+    dir (`.reap/<origin>.<pid>.<uuid>/<original-name>`)."""
+    pdir = os.path.join(outbox._reap_realpath, dname)
+    os.mkdir(pdir, 0o700)
+    p = os.path.join(pdir, ename)
+    with open(p, "wb") as fh:
+        fh.write(data)
+    return p
+
+
 def test_reap_restore_yields_to_newer_same_name_publication(outbox):
     """Terra r2 (#330): restoring a fresh inode after the ownership rename
     must NOT replace an even newer publication that took the name in the
     meantime — the no-replace restore keeps the newest file and drops the
-    superseded private copy (same outcome as producer-overwrites-producer)."""
-    fresh = _write_outbox_file(outbox._root_realpath, ".held.tmp", PDF)
-    os.rename(fresh, os.path.join(outbox._root_realpath, ".reap.test.held"))
+    superseded held copy (same outcome as producer-overwrites-producer)."""
+    held = _strand_reap_entry(outbox, "root.1.aaaa", "reused.pdf", PDF)
     newest = _write_outbox_file(outbox._root_realpath, "reused.pdf", JPEG)
 
-    outbox._restore_fresh(outbox._outbox_dirfd, ".reap.test.held", "reused.pdf")
+    outbox.sweep_once(plugin_outbox._now_ms())
 
     with open(newest, "rb") as fh:
         assert fh.read() == JPEG          # newest publication untouched
-    assert not os.path.exists(
-        os.path.join(outbox._root_realpath, ".reap.test.held"))
+    assert not os.path.exists(held)
 
 
 def test_reap_restore_puts_fresh_file_back_when_name_free(outbox):
     """The ordinary restore: the name is free again, the held fresh inode
     goes back under its published name."""
-    fresh = _write_outbox_file(outbox._root_realpath, ".held2.tmp", PDF)
-    os.rename(fresh, os.path.join(outbox._root_realpath, ".reap.test.held2"))
+    held = _strand_reap_entry(outbox, "root.1.bbbb", "back.pdf", PDF)
 
-    outbox._restore_fresh(outbox._outbox_dirfd, ".reap.test.held2", "back.pdf")
+    outbox.sweep_once(plugin_outbox._now_ms())
 
     with open(os.path.join(outbox._root_realpath, "back.pdf"), "rb") as fh:
         assert fh.read() == PDF
-    assert not os.path.exists(
-        os.path.join(outbox._root_realpath, ".reap.test.held2"))
+    assert not os.path.exists(held)
 
 
 def test_stranded_reap_entry_restored_on_next_sweep(outbox):
     """Terra r5 (#330): a crash between the ownership rename and the restore
-    leaves a fresh publication stranded under `.reap.*`. The sweep must
-    RESTORE stranded entries (the original name is encoded in the private
-    name) — never age-reap a fresh one."""
-    _write_outbox_file(
-        outbox._root_realpath, ".reap.123.deadbeef.fresh.pdf", PDF)
+    leaves a fresh publication stranded inside its per-reap dir. The sweep
+    must RESTORE stranded entries — never age-reap a fresh one."""
+    held = _strand_reap_entry(outbox, "root.123.deadbeef", "fresh.pdf", PDF)
 
     outbox.sweep_once(plugin_outbox._now_ms())
 
@@ -568,34 +573,60 @@ def test_stranded_reap_entry_restored_on_next_sweep(outbox):
     assert os.path.exists(restored), "stranded fresh publication not restored"
     with open(restored, "rb") as fh:
         assert fh.read() == PDF
-    assert not os.path.exists(
-        os.path.join(outbox._root_realpath, ".reap.123.deadbeef.fresh.pdf"))
+    assert not os.path.exists(held)
+    assert not os.path.exists(os.path.dirname(held))   # ownership dir gone
 
 
 def test_stranded_expired_reap_entry_restored_then_reaped(outbox):
     """A stranded EXPIRED entry is restored to its original name and then
     reaped by the normal expiry pass — never lost, never leaked."""
-    p = _write_outbox_file(
-        outbox._root_realpath, ".reap.123.cafebabe.old.pdf", PDF)
+    held = _strand_reap_entry(outbox, "root.123.cafebabe", "old.pdf", PDF)
     past = (plugin_outbox._now_ms() - (MAX_AGE_S + 60) * 1000) / 1000
-    os.utime(p, (past, past))
+    os.utime(held, (past, past))
 
     outbox.sweep_once(plugin_outbox._now_ms())
 
-    assert not os.path.exists(p)
+    assert not os.path.exists(held)
     assert not os.path.exists(os.path.join(outbox._root_realpath, "old.pdf"))
 
 
 def test_stranded_reap_entry_superseded_by_newer_publication(outbox):
     """If the original name was re-published while the entry was stranded,
     the newer publication wins and the stranded copy is dropped."""
-    _write_outbox_file(
-        outbox._root_realpath, ".reap.123.feedface.reused.pdf", PDF)
+    held = _strand_reap_entry(outbox, "root.123.feedface", "reused.pdf", PDF)
     newest = _write_outbox_file(outbox._root_realpath, "reused.pdf", JPEG)
 
     outbox.sweep_once(plugin_outbox._now_ms())
 
     with open(newest, "rb") as fh:
         assert fh.read() == JPEG
+    assert not os.path.exists(held)
+
+
+def test_long_name_orphan_is_still_collectable(outbox):
+    """Sol r6 (#330): a legal near-NAME_MAX producer name must still be
+    reapable — the bounded per-reap ownership dir keeps the entry's own
+    name unchanged, so no ENAMETOOLONG."""
+    long_name = "x" * 250 + ".pdf"
+    p = _write_outbox_file(outbox._root_realpath, long_name, PDF)
+    past = (plugin_outbox._now_ms() - (MAX_AGE_S + 60) * 1000) / 1000
+    os.utime(p, (past, past))
+
+    reaped = outbox.sweep_once(plugin_outbox._now_ms())
+
+    assert reaped == 1
+    assert not os.path.exists(p)
+
+
+def test_producer_file_named_like_reap_prefix_is_left_alone(outbox):
+    """Terra r6 (#330): `_safe_basename` allows dotfiles, so a producer may
+    legally publish a root file named `.reap.<x>.<y>.<z>` — the sweep must
+    never hijack it as a crash-stranded ownership entry (stranded entries
+    live in the sweep-owned `.reap/` SUBDIRECTORY, not the root)."""
+    p = _write_outbox_file(outbox._root_realpath, ".reap.a.b.evil.pdf", PDF)
+
+    outbox.sweep_once(plugin_outbox._now_ms())
+
+    assert os.path.exists(p)          # fresh producer file untouched
     assert not os.path.exists(
-        os.path.join(outbox._root_realpath, ".reap.123.feedface.reused.pdf"))
+        os.path.join(outbox._root_realpath, "evil.pdf"))
