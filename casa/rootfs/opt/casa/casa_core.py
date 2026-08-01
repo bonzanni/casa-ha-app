@@ -3068,7 +3068,7 @@ async def main() -> None:
             freshness_s=voice_delivery_config.route_freshness_s,
         )
         voice_delivery = VoiceDeliveryCoordinator(job_registry, voice_routes)
-        voice_handoff = VoiceHandoffCoordinator(job_registry)
+        voice_handoff = VoiceHandoffCoordinator(job_registry, voice_routes)
         runtime.voice_route_registry = voice_routes
         runtime.voice_delivery_coordinator = voice_delivery
         runtime.voice_handoff_coordinator = voice_handoff

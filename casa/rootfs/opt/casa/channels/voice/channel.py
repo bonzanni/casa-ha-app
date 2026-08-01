@@ -196,8 +196,9 @@ class VoiceHandoffReservation:
 class VoiceHandoffCoordinator:
     """Send and acknowledge durable handoffs on authenticated routes only."""
 
-    def __init__(self, registry: Any) -> None:
+    def __init__(self, registry: Any, route_registry: Any | None = None) -> None:
         self._registry = registry
+        self._route_registry = route_registry
 
     @staticmethod
     def _frame(job: VoiceJob) -> dict[str, Any]:
@@ -216,7 +217,18 @@ class VoiceHandoffCoordinator:
         if route_id is None:
             return
         for job in self._registry.pending_handoffs_for_route(route_id):
+            if not self._is_current(route_id, route):
+                # #329: a concurrent re-registration of the same route id
+                # superseded this socket mid-replay — job/handoff metadata
+                # must not reach the stale socket. The current binding got
+                # (or will get) its own route_connected replay.
+                return
             await route.send_json(self._frame(job))
+
+    def _is_current(self, route_id: str, route: Any) -> bool:
+        if self._route_registry is None:
+            return True
+        return self._route_registry.get_connected(route_id) is route
 
     async def handle(self, route: Any, frame: Mapping[str, Any]) -> None:
         """Accept a receipt only for the server-bound route that owns it.
@@ -910,8 +922,28 @@ class VoiceChannel(Channel):
                 self.routes.touch(connection)
 
                 if t == "voice_route_register":
+                    previous = None
+                    if connection.voice_route_id is not None:
+                        candidate = self.routes.get_connected(
+                            connection.voice_route_id,
+                        )
+                        if (
+                            candidate is not None
+                            and candidate.connection is connection
+                        ):
+                            previous = candidate
                     bound = await self.routes.register(connection, frame)
                     if bound is not None and self._delivery is not None:
+                        if (
+                            previous is not None
+                            and previous.route_id != bound.route_id
+                        ):
+                            # #304: re-registering under a new route id
+                            # displaces the old binding — emit the same
+                            # notification socket teardown emits, or an
+                            # offered attempt for the old id is never
+                            # re-offered.
+                            await self._delivery.route_disconnected(previous)
                         await self._delivery.route_connected(bound)
                     if bound is not None and self._handoff is not None:
                         await self._handoff.route_connected(bound)
@@ -976,9 +1008,17 @@ class VoiceChannel(Channel):
                         # #287 r2: non-str ids (unhashable → closed socket)
                         # get a server-minted id like absent ones.
                         uid = str(uuid.uuid4())
-                    # Server-owned anchor: overwrite any identically named client
-                    # field before handing the frame to the scheduled task.
+                    # Server-owned anchors: overwrite any identically named
+                    # client fields before handing the frame to the task.
                     frame["_casa_ingress_started_ms"] = self._monotonic() * 1000
+                    # #329: pin the route binding AT FRAME RECEIPT. The task
+                    # may not run for an unbounded interval, and a
+                    # registration frame processed first must not rebind an
+                    # already-received utterance (and its deferred answer /
+                    # handoff) to the new route.
+                    frame["_casa_route_snapshot"] = _connection_voice_route(
+                        connection,
+                    )
                     # A4: capture the deadline at TRUE ingress — the moment the
                     # utterance frame is RECEIVED here, not inside the separately-
                     # scheduled _run_ws_utterance task (which may not run for an
@@ -987,6 +1027,13 @@ class VoiceChannel(Channel):
                         asyncio.get_running_loop().time()
                         + _voice_turn_budget_s()
                     )
+                    existing = tasks.get(uid)
+                    if existing is not None and not existing.done():
+                        # #303: a retransmitted utterance_id must not orphan
+                        # the in-flight original — once the map entry is
+                        # replaced, no cancel frame or teardown can ever
+                        # reach it again.
+                        existing.cancel()
                     task = asyncio.create_task(
                         self._run_ws_utterance(
                             connection, frame, uid, voice_deadline,
@@ -1209,9 +1256,16 @@ class VoiceChannel(Channel):
                 error_emitted = True
 
         external_context = sanitize_external_context(frame.get("context"))
-        route_id, route_capabilities, job_control_id = (
-            _connection_voice_route(ws)
-        )
+        snapshot = frame.get("_casa_route_snapshot")
+        if isinstance(snapshot, tuple) and len(snapshot) == 3:
+            # #329: stamped by _ws_handler at frame receipt (server-owned —
+            # any client-supplied value was overwritten there). Direct
+            # internal callers without a snapshot read the live binding.
+            route_id, route_capabilities, job_control_id = snapshot
+        else:
+            route_id, route_capabilities, job_control_id = (
+                _connection_voice_route(ws)
+            )
         # The integration frame is authenticated by the WS route.  Ordinary
         # external context remains available to the agent but must never be
         # promoted into trusted job-delivery provenance.

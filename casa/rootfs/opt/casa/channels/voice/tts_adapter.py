@@ -10,9 +10,15 @@ import re
 
 _VALID = ("square_brackets", "parens", "none")
 
-# Leading-only: one or more [...] or (...) atoms at the start of the block,
-# each followed by optional whitespace.
-_LEADING_TAGS_RE = re.compile(r"^(?:\s*[\[(][^\])]*[\])]\s*)+")
+# Leading-only: one or more tag atoms at the start of the block, each
+# followed by optional whitespace. Square-bracket atoms are the canonical
+# tag syntax and stripped unconditionally; a parenthesised atom is a tag
+# only in its `parens`-rendered form — short, lowercase, no punctuation
+# (#357: an arbitrary leading parenthetical is prose, and deleting it can
+# drop substantive speech).
+_LEADING_TAGS_RE = re.compile(
+    r"^(?:\s*(?:\[[^\]]*\]|\([a-z][a-z -]{0,30}\))\s*)+"
+)
 _ANY_SQUARE_TAG_RE = re.compile(r"\[([^\]]+)\]")
 
 

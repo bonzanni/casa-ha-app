@@ -26,7 +26,9 @@ VOICE_JOB_OUTPUT_FORMAT = {
                 "answered", "needs_clarification", "tentative", "not_found",
                 "dependency_unavailable", "deadline_exceeded", "cancelled", "failed",
             ]},
-            "spoken_summary": {"type": "string", "maxLength": 1200},
+            "spoken_summary": {
+                "type": "string", "minLength": 1, "maxLength": 1200,
+            },
             "answer": {"type": "string"},
             "clarification": {"type": "string", "maxLength": 600},
             "citations": {"type": "array", "items": {"type": "string"}},
@@ -156,13 +158,13 @@ def parse_voice_job_result(structured_output: Any) -> VoiceJobResult:
             or not 30 <= delivery_ttl_s <= 3600):
         raise VoiceJobResultError("delivery_ttl_s must be an integer from 30 to 3600")
 
-    if status == "answered" and not spoken_summary.strip():
-        raise VoiceJobResultError("answered result requires spoken_summary")
+    if not spoken_summary.strip():
+        # #352: EVERY status requires spoken content, not just answered /
+        # needs_clarification — a valid not_found/failed/cancelled envelope
+        # with an empty summary was persisted as a successful voice result
+        # and delivered as silence.
+        raise VoiceJobResultError(f"{status} result requires spoken_summary")
     if status == "needs_clarification":
-        if not spoken_summary.strip():
-            raise VoiceJobResultError(
-                "needs_clarification result requires spoken_summary"
-            )
         question = clarification.strip()
         if not question or not question.endswith("?") or question.count("?") != 1:
             raise VoiceJobResultError(

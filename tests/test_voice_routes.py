@@ -128,6 +128,53 @@ async def test_invalid_registration_accepts_no_capabilities(
     assert connection.voice_job_control_id is None
 
 
+async def test_invalid_reregistration_keeps_previous_binding():
+    """#304: register() cleared the connection's old binding BEFORE
+    validating the new frame, so one malformed re-registration silently
+    unbound the route — nothing notified the delivery coordinator, and an
+    already-offered delivery stayed pinned to a route id that could never
+    reconnect."""
+    raw = _RawSocket()
+    connection = VoiceWsConnection(raw)
+    routes = VoiceRouteRegistry(
+        secret_present=True,
+        agent_configs={"concierge": _cfg("concierge", ["ha_voice"])},
+    )
+    bound = await routes.register(connection, _register_frame())
+    assert bound is not None
+
+    refused = await routes.register(
+        connection, _register_frame(capabilities="not-a-list"),
+    )
+
+    assert refused is None
+    assert raw.sent[-1]["accepted_capabilities"] == []
+    # The prior binding survives the refused frame.
+    assert routes.get_connected("entry-1") is bound
+    assert connection.voice_route_id == "entry-1"
+    assert connection.voice_job_control_id == "entry-1"
+
+
+async def test_valid_reregistration_still_replaces_previous_binding():
+    """Control for #304: a VALID re-registration (same socket, new route
+    id) must still displace the old binding."""
+    raw = _RawSocket()
+    connection = VoiceWsConnection(raw)
+    routes = VoiceRouteRegistry(
+        secret_present=True,
+        agent_configs={"concierge": _cfg("concierge", ["ha_voice"])},
+    )
+    await routes.register(connection, _register_frame())
+    rebound = await routes.register(
+        connection, _register_frame(route_id="entry-2"),
+    )
+
+    assert rebound is not None
+    assert routes.get_connected("entry-1") is None
+    assert routes.get_connected("entry-2") is rebound
+    assert connection.voice_route_id == "entry-2"
+
+
 async def test_unknown_protocol_and_capability_fail_closed_but_are_acknowledged():
     raw = _RawSocket()
     connection = VoiceWsConnection(raw)

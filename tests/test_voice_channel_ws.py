@@ -65,8 +65,13 @@ class _DeliverySpy:
         self.calls.append((connection, frame))
         self.called.set()
 
-    async def route_connected(self, _route):
-        return None
+    async def route_connected(self, route):
+        self.connected: list = getattr(self, "connected", [])
+        self.connected.append(route)
+
+    async def route_disconnected(self, route):
+        self.disconnected: list = getattr(self, "disconnected", [])
+        self.disconnected.append(route)
 
 
 class _HandoffJob:
@@ -595,6 +600,68 @@ class TestWSTurn:
             assert bound is not None
             assert bound.role == "concierge"
 
+    async def test_renamed_registration_notifies_displaced_route(
+        self, signed_ws_app,
+    ):
+        """#304: a socket that re-registers under a NEW route id displaces
+        its old binding — the delivery coordinator must hear the same
+        route-disconnected notification the socket-teardown path emits, or
+        an offered attempt for the old id is never re-offered."""
+        client, channel, delivery, headers = signed_ws_app
+        register = {
+            "type": "voice_route_register", "protocol": 3,
+            "route_id": "entry-1", "agent_role": "concierge",
+            "capabilities": [
+                "background_jobs", "endpoint_delivery", "voice_handoff",
+            ],
+        }
+        async with client.ws_connect(
+            "/api/converse/ws", headers=headers,
+        ) as ws:
+            await ws.send_json(register)
+            await ws.receive_json()
+            displaced = channel.routes.get_connected("entry-1")
+            await ws.send_json({**register, "route_id": "entry-2"})
+            await ws.receive_json()
+
+            assert channel.routes.get_connected("entry-1") is None
+            assert channel.routes.get_connected("entry-2") is not None
+            assert [
+                route.route_id
+                for route in getattr(delivery, "disconnected", [])
+            ] == [displaced.route_id]
+
+    async def test_invalid_reregistration_keeps_binding_and_stays_offerable(
+        self, signed_ws_app,
+    ):
+        """#304 (channel seam): a malformed re-registration frame must not
+        strand the route — the binding survives and no disconnect is
+        reported."""
+        client, channel, delivery, headers = signed_ws_app
+        async with client.ws_connect(
+            "/api/converse/ws", headers=headers,
+        ) as ws:
+            await ws.send_json({
+                "type": "voice_route_register", "protocol": 3,
+                "route_id": "entry-1", "agent_role": "concierge",
+                "capabilities": [
+                    "background_jobs", "endpoint_delivery", "voice_handoff",
+                ],
+            })
+            await ws.receive_json()
+            bound = channel.routes.get_connected("entry-1")
+
+            await ws.send_json({
+                "type": "voice_route_register", "protocol": 3,
+                "route_id": "entry-1", "agent_role": "concierge",
+                "capabilities": [{"malformed": True}],
+            })
+            refusal = await ws.receive_json()
+
+            assert refusal["accepted_capabilities"] == []
+            assert channel.routes.get_connected("entry-1") is bound
+            assert getattr(delivery, "disconnected", []) == []
+
     async def test_handler_failure_still_clears_connection_bound_writer(
         self, signed_ws_app,
     ):
@@ -672,6 +739,46 @@ class TestWSTurn:
             await asyncio.wait_for(started.wait(), timeout=2.0)
             await ws.send_json({"type": "cancel", "utterance_id": "u1"})
             await asyncio.wait_for(cancelled.wait(), timeout=3.0)
+
+    async def test_duplicate_utterance_id_cancels_the_orphaned_original(
+        self, ws_app,
+    ):
+        """#303: a retransmitted utterance_id overwrote the task map while
+        the first task was still running — cancel frames and teardown then
+        reached only the replacement, and the original ran on unseen."""
+        client, bus, _, _ = ws_app
+        starts = [asyncio.Event(), asyncio.Event()]
+        cancels = [asyncio.Event(), asyncio.Event()]
+        calls = 0
+
+        async def slow(msg: BusMessage):
+            nonlocal calls
+            index = min(calls, 1)
+            calls += 1
+            starts[index].set()
+            try:
+                await asyncio.sleep(60)
+            except asyncio.CancelledError:
+                cancels[index].set()
+                raise
+
+        bus.handlers["butler"] = slow
+
+        utterance = {
+            "type": "utterance", "utterance_id": "u1", "text": "x",
+            "agent_role": "butler", "scope_id": "s",
+        }
+        async with client.ws_connect("/api/converse/ws") as ws:
+            await ws.send_json(utterance)
+            await asyncio.wait_for(starts[0].wait(), timeout=2.0)
+            # The client retransmits the same utterance_id mid-flight.
+            await ws.send_json(utterance)
+            await asyncio.wait_for(starts[1].wait(), timeout=2.0)
+            # The replaced original must be cancelled, not orphaned.
+            await asyncio.wait_for(cancels[0].wait(), timeout=2.0)
+            # A cancel frame still reaches the replacement.
+            await ws.send_json({"type": "cancel", "utterance_id": "u1"})
+            await asyncio.wait_for(cancels[1].wait(), timeout=2.0)
 
     async def test_client_context_cannot_clobber_computed_keys(self, ws_app):
         """L59/L8 (WS side): a client-supplied context dict must not

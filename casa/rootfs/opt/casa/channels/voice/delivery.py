@@ -79,6 +79,9 @@ class _Attempt:
     endpoint: Any
     offered: bool = True
     revoke_sent: bool = False
+    # #329: set when reconciliation decides the attempt is no longer
+    # deliverable — an unacked revoke must eventually free the entry.
+    revoke_deadline: float | None = None
 
 
 class VoiceDeliveryCoordinator:
@@ -165,6 +168,7 @@ class VoiceDeliveryCoordinator:
                     # writer only to the newly authenticated route instance.
                     attempt.endpoint = bound
                     attempt.revoke_sent = False
+                    attempt.revoke_deadline = None
             await self._recover_due_locked()
             await self._offer_heads_locked()
 
@@ -256,7 +260,19 @@ class VoiceDeliveryCoordinator:
                     # wire; authorization is correlated only by the durable
                     # job/attempt pair.
                     self._spoken_text(job)
-                    await self._jobs.authorize(job_id, attempt_id)
+                    if job.delivery_state is DeliveryState.AUTHORIZED:
+                        # #329: the durable transition precedes the
+                        # authorization send, so a client that lost the
+                        # socket in that window retries the SAME attempt —
+                        # re-ack idempotently rather than revoking. Never
+                        # past a pending cancel (mirror the renew branch).
+                        if job.cancel_pending:
+                            attempt = self._attempts.get(job_id)
+                            if attempt is not None:
+                                await self._send_revoke(attempt, "cancelled")
+                            return
+                    else:
+                        await self._jobs.authorize(job_id, attempt_id)
                     await bound.send_json({
                         "type": "job_delivery_authorized",
                         "protocol": _PROTOCOL,
@@ -296,6 +312,20 @@ class VoiceDeliveryCoordinator:
         self._release_due_parks_locked()
         self._restore_durable_attempts_locked()
         await self._reconcile_attempts_locked()
+        self._expire_dead_attempts_locked()
+
+    def _expire_dead_attempts_locked(self) -> None:
+        # #329: an attempt whose revoke was never acknowledged (client gone
+        # before `job_revoked`) must not pin its entry — and its endpoint
+        # socket object — for the process lifetime. Durable-live rows are
+        # exempt: restore recreates them, so pruning would only churn.
+        now = self._clock()
+        for job_id, attempt in list(self._attempts.items()):
+            if (
+                attempt.revoke_deadline is not None
+                and attempt.revoke_deadline <= now
+            ):
+                self._attempts.pop(job_id, None)
 
     def _release_due_parks_locked(self) -> None:
         now = self._clock()
@@ -452,6 +482,11 @@ class VoiceDeliveryCoordinator:
                             attempt, "cancelled",
                         )
                 continue
+            if attempt.revoke_deadline is None:
+                # #329: start the reclamation window whether or not the
+                # revoke can currently be sent — a route that never
+                # reconnects must not retain the attempt forever.
+                attempt.revoke_deadline = self._clock() + self._lease_s
             if not attempt.revoke_sent:
                 attempt.revoke_sent = await self._send_revoke(
                     attempt, "no_longer_deliverable",

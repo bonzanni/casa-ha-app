@@ -57,7 +57,9 @@ def test_output_format_is_the_exact_closed_voice_job_schema():
                     "answered", "needs_clarification", "tentative", "not_found",
                     "dependency_unavailable", "deadline_exceeded", "cancelled", "failed",
                 ]},
-                "spoken_summary": {"type": "string", "maxLength": 1200},
+                "spoken_summary": {
+                    "type": "string", "minLength": 1, "maxLength": 1200,
+                },
                 "answer": {"type": "string"},
                 "clarification": {"type": "string", "maxLength": 600},
                 "citations": {"type": "array", "items": {"type": "string"}},
@@ -77,6 +79,31 @@ def test_answered_result_requires_spoken_summary():
             "clarification": "", "citations": [], "assumptions": [],
             "provenance": {}, "sensitivity": "public", "delivery_ttl_s": 900,
         })
+
+
+@pytest.mark.parametrize("status", [
+    "tentative", "not_found", "dependency_unavailable",
+    "deadline_exceeded", "cancelled", "failed",
+])
+@pytest.mark.parametrize("summary", ["", "   "])
+def test_every_terminal_status_requires_spoken_summary(status, summary):
+    """#352: a valid non-answer envelope with an empty spoken_summary was
+    persisted as a successful voice result and delivered as silence."""
+    with pytest.raises(VoiceJobResultError, match="spoken_summary"):
+        parse_voice_job_result({
+            "status": status, "answer": "", "spoken_summary": summary,
+            "clarification": "", "citations": [], "assumptions": [],
+            "provenance": {}, "sensitivity": "public", "delivery_ttl_s": 900,
+        })
+
+
+@pytest.mark.parametrize("status", [
+    "tentative", "not_found", "dependency_unavailable",
+    "deadline_exceeded", "cancelled", "failed",
+])
+def test_terminal_status_with_spoken_summary_parses(status):
+    result = valid_result(status=status, spoken_summary="I could not do that.")
+    assert result.status == status
 
 
 def test_needs_clarification_requires_one_question():

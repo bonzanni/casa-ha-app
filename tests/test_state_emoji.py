@@ -106,6 +106,24 @@ def test_normalize_topic_title_caps_to_char_budget_at_word_boundary():
     assert not out.endswith(" ")
 
 
+def test_normalize_topic_title_ellipsizes_lone_long_word():
+    from channels.state_emoji import normalize_topic_title, TOPIC_TITLE_CHAR_CAP
+    # #357: a single word longer than the cap has no word boundary to cut
+    # at — ellipsize instead of returning a raw character slice that
+    # masquerades as the whole word.
+    out = normalize_topic_title("restart-backup-after-migration")
+    assert len(out) <= TOPIC_TITLE_CHAR_CAP
+    assert out.endswith("…")
+    assert "restart-backup-after-migration".startswith(out[:-1])
+
+
+def test_normalize_topic_title_ellipsizes_when_first_word_exceeds_cap():
+    from channels.state_emoji import normalize_topic_title, TOPIC_TITLE_CHAR_CAP
+    out = normalize_topic_title("supercalifragilisticexpialidocious now")
+    assert len(out) <= TOPIC_TITLE_CHAR_CAP
+    assert out.endswith("…")
+
+
 def test_normalize_topic_title_unsafe_text_falls_back_to_empty():
     from channels.state_emoji import normalize_topic_title
     # A newline (C0 control) is UNSAFE-TEXT → rejected → "" (caller derives).

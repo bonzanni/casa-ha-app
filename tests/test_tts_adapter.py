@@ -50,6 +50,30 @@ class TestNone:
         a = TagDialectAdapter("none")
         assert a.render("") == ""
 
+    def test_keeps_substantive_leading_parenthetical(self):
+        """#357: only canonical tag atoms are stripped. A leading
+        parenthetical carrying real prose (spaces plus sentence
+        punctuation — nothing a prosody tag ever contains) is content,
+        not markup, and deleting it can drop safety-relevant speech.
+        """
+        a = TagDialectAdapter("none")
+        block = "(Important: the oven is still on.) Turn it off."
+        assert a.render(block) == block
+
+    def test_keeps_capitalized_leading_parenthetical(self):
+        # Canonical tags are lowercase ([confident], [flat]); a
+        # capitalized parenthetical is prose.
+        a = TagDialectAdapter("none")
+        assert a.render("(Important) Turn it off.") == (
+            "(Important) Turn it off."
+        )
+
+    def test_strips_tag_then_keeps_prose_parenthetical(self):
+        a = TagDialectAdapter("none")
+        assert a.render("[flat] (Warning: gas leak.) Leave now.") == (
+            "(Warning: gas leak.) Leave now."
+        )
+
 
 class TestValidation:
     def test_unknown_dialect_rejected(self):

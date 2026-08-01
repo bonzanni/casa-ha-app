@@ -80,6 +80,11 @@ def test_catalog_filters_sorts_and_limits_output_fields():
         ("valid", ""),
         ("valid", "x" * 129),
         ("valid", "bad\nname"),
+        # #357: U+2028 LINE SEPARATOR (Zl) / U+2029 PARAGRAPH SEPARATOR (Zp)
+        # are not category C, but let a configured name render a forged
+        # second line in the agent picker.
+        ("valid", "Kitchen\u2028Attacker"),
+        ("valid", "Kitchen\u2029Attacker"),
     ],
 )
 def test_catalog_rejects_invalid_identity(role, name):
