@@ -438,7 +438,10 @@ class TestGuardArmingAndOracle:
         stdin form) to /bad — redirection tokens between cd and its target
         must be skipped, never captured as the target."""
         for i, redir in enumerate(("2>/dev/null", "</dev/null",
-                                   "-P 2>/dev/null", "2> /dev/null")):
+                                   "-P 2>/dev/null", "2> /dev/null",
+                                   "&>/dev/null", "2>& 1", "2>| /dev/null",
+                                   "<<< x", "<& 0", "&> /dev/null",
+                                   "1>&2", ">> log")):
             clean = tmp_path / f"clean-redir-cwd{i}"
             clean.mkdir()
             assert await self._denied(

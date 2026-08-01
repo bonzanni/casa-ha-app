@@ -1806,18 +1806,22 @@ def make_self_containment_guard() -> HookCallback:
         bases: set = {cwd}
         candidates: list = [cwd]
         cd_overflow = False
-        # Terra/Sol r5: the skipper consumes option words, `--`, AND
-        # redirections in both spellings — operand glued (`2>/dev/null`,
-        # `2>&1`) or space-separated (`2> /dev/null`) — bash resolves the
-        # target around redirections wherever they sit, so the first PLAIN
-        # word after `cd` is the target. The target class excludes `<>` (so
-        # a missed redirect form is never mistaken for the target) and the
-        # true bash metachars, but NOT `}` — `}` is only a reserved word,
-        # a glued `}` belongs to the target word (`cd /tmp/bad}` really
-        # enters `bad}`).
+        # Terra/Sol r5-r6: the skipper consumes option words, `--`, AND the
+        # WHOLE bash redirection grammar in one general token — optional fd
+        # digits or `&` prefix, 1-3 `<`/`>` chars, optional `|`/`&` suffix
+        # (`2>`, `&>`, `>>`, `<<<`, `>|`, `2>&`), with the operand glued OR
+        # space-separated (`2>/dev/null`, `2>& 1`, `2>| /dev/null`,
+        # `<<< x`). Bash resolves the target around redirections wherever
+        # they sit, so the first PLAIN word after `cd` is the target. The
+        # target class excludes `<>`/`&` (a missed redirect form is never
+        # mistaken for the target) and the true bash metachars, but NOT
+        # `}` — `}` is only a reserved word, a glued `}` belongs to the
+        # target word (`cd /tmp/bad}` really enters `bad}`).
         for m_cd in re.finditer(
                 r"(?<![\w./-])cd\s+"
-                r"(?:(?:-\S+|--|\d*[<>]{1,2}(?:\S+|\s+\S+))\s+)*"
+                r"(?:(?:-\S+|--|"
+                r"[&\d]*[<>]{1,3}[|&]?(?:\s*[^\s;&|()<>]+)?"
+                r")\s+)*"
                 r"(\"[^\"]+\"|'[^']+'|[^\s;&|)<>]+)",
                 cmd[: m_push.start()]):
             t = m_cd.group(1).strip("'\"")
