@@ -928,12 +928,43 @@ class EngagementRegistry:
             await self._write_tombstone_locked()
 
     async def persist_session_id(self, engagement_id: str, session_id: str) -> None:
+        """#302: STRICT persistence with rollback. The driver's retry guard
+        compares ``engagement.sdk_session_id`` against the observed sid — and
+        ``engagement`` usually IS this registry's record object, so a swallowed
+        write failure that left the field mutated would silently disable every
+        later retry while the durable file never received the ID (the record
+        could not resume after a restart). A failed write restores the prior
+        value and PROPAGATES so the caller knows to retry.
+
+        CANCELLATION-SAFE (Sol r4): a caller cancelled mid-``to_thread``
+        must not tear the retry guard from disk — the write SETTLES first
+        (shielded, absorbing repeated cancels, like ``create()``'s
+        settle-despite-cancel), then memory reflects the settled outcome:
+        committed ⇒ the sid stays (no compensation needed — a durable sid on
+        a cancelled caller is simply durable), failed ⇒ rolled back so the
+        next message retries. The original cancellation then propagates."""
         async with self._lock:
             rec = self._records.get(engagement_id)
             if rec is None:
                 return
+            prior = rec.sdk_session_id
             rec.sdk_session_id = session_id
-            await self._write_tombstone_locked()
+            task = asyncio.ensure_future(
+                self._write_tombstone_locked(strict=True))
+            cancelled: asyncio.CancelledError | None = None
+            while not task.done():
+                try:
+                    await asyncio.shield(task)
+                except asyncio.CancelledError as exc:
+                    cancelled = exc       # settle first; re-raise after
+                except Exception:  # noqa: BLE001 — retrieved below
+                    break
+            if task.cancelled() or task.exception() is not None:
+                rec.sdk_session_id = prior
+            if cancelled is not None:
+                raise cancelled
+            if task.exception() is not None:
+                raise task.exception()
 
     async def set_channel_state(
         self,
@@ -1467,7 +1498,18 @@ class EngagementRegistry:
                         "sweep: driver.cancel(%s) failed: %s", rec.id[:8], exc,
                     )
                 if session_id is not None:
-                    await self.persist_session_id(rec.id, session_id)
+                    # #302: persist_session_id is STRICT now. The client is
+                    # already cancelled, so on a failed write we still mark
+                    # idle (nothing can be undone) — the session id is then
+                    # lost to a restart, WARN says so.
+                    try:
+                        await self.persist_session_id(rec.id, session_id)
+                    except Exception as exc:  # noqa: BLE001
+                        logger.warning(
+                            "sweep: session-id persist for %s failed — the "
+                            "suspended session cannot resume across a "
+                            "restart: %s", rec.id[:8], exc,
+                        )
                 await self.mark_idle(rec.id)
 
             # 2) Idle reminder

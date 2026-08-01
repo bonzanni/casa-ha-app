@@ -798,6 +798,38 @@ class TestInCasaEngagementContext:
         assert persist.await_count == 1
         assert rec.sdk_session_id == "sess-abc"
 
+    async def test_failed_persist_retries_on_next_turn(self, monkeypatch):
+        """#302: a raised persist_session_id must NOT mark the ID persisted —
+        ``engagement.sdk_session_id`` stays unset so the next message carrying
+        the same session ID retries the durable write (pre-fix the in-memory
+        assignment ran regardless, and restart lost the resumable session)."""
+        from drivers.in_casa_driver import InCasaDriver
+
+        class _FakeClient:
+            def __init__(self, options): pass
+            async def __aenter__(self): return self
+            async def __aexit__(self, *a): pass
+            async def query(self, prompt): pass
+            async def receive_response(self):
+                yield _mk_system_init("sess-abc")
+                yield _mk_assistant("hi")
+            async def close(self): pass
+
+        monkeypatch.setattr(
+            "drivers.in_casa_driver.ClaudeSDKClient", _FakeClient)
+
+        persist = AsyncMock(side_effect=[OSError("registry write failed"), None])
+        drv = InCasaDriver(
+            topic_stream_factory=_mk_noop_factory(), persist_session_id=persist)
+        rec = _make_record()
+
+        await drv.start(rec, "hi", ClaudeAgentOptions(model="sonnet"))
+        assert rec.sdk_session_id is None       # failure ⇒ NOT marked persisted
+
+        await drv.send_user_turn(rec, "another turn")
+        assert persist.await_count == 2         # same-sid retry happened
+        assert rec.sdk_session_id == "sess-abc"
+
     async def test_deliver_turn_persist_callback_optional(self, monkeypatch):
         """Driver constructed with default persist_session_id=None runs cleanly."""
         from drivers.in_casa_driver import InCasaDriver

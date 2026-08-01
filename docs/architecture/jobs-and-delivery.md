@@ -108,9 +108,12 @@ non-starvation half is INV-VOICE-006's territory).
 failed envelope is persisted, with no model or result text interpolated into the failure
 message; a routed job becomes ready so the failure itself is delivered.
 
-**The terminal write fails.** The lifecycle falls back to a compatibility failure write;
-if that also fails, registry-owned reconciliation retries in the background and the live
-row stays restart-recoverable. Runtime ownership (the permit) is released either way.
+**The terminal write fails.** The voice lifecycle falls back to a compatibility failure
+write; if that also fails, registry-owned reconciliation retries in the background and the
+live row stays restart-recoverable. A synchronous delegation whose *successful* terminal
+write fails still returns its result — the record is completed by the same background
+reconciliation rather than raising the answer away — and a cancellation whose write fails is
+likewise retried in the background. Runtime ownership (the permit) is released either way.
 
 **A send fails.** Only the local offer is removed; the durable row stays ready and is
 re-offered. A failed revocation stays locally pending for a later sweep.

@@ -1711,6 +1711,17 @@ class TestBootReplayOwner:
         # schedule_boot_reconcile is SYNC in production (returns a task/None); the
         # casa_core refused-pass calls it un-awaited, so keep it a sync mock.
         driver.schedule_boot_reconcile = MagicMock(return_value=None)
+        # #335: the replay loop reads this URL for the .mcp.json refresh; an
+        # AsyncMock auto-attribute is not JSON-serializable.
+        driver._casa_framework_mcp_url = "http://127.0.0.1:8100/mcp/casa-framework"
+
+        # #314: provision the workspace — a missing one is now refused before
+        # the fast path, and this test's subject is the snapshot contract.
+        # The fresh workspace has no .mcp.json, so the #335 migration cycles
+        # the service — confirm the stop instead of shelling out to s6-rc.
+        (tmp_path / "eng" / rec.id).mkdir(parents=True)
+        monkeypatch.setattr(
+            s6_rc, "ensure_service_down", AsyncMock(return_value=True))
 
         await casa_core.replay_undergoing_engagements(
             registry=reg, driver=driver, executor_registry=None,

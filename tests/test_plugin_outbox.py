@@ -496,3 +496,158 @@ async def test_wire_inits_and_registers_hourly_job(tmp_path):
     finally:
         plugin_outbox.get_outbox().close()
         plugin_outbox._OUTBOX = None
+
+
+# ---------------------------------------------------------------------------
+# #330 — sweep TOCTOU: expiry decided on one inode must not delete another
+# ---------------------------------------------------------------------------
+
+
+def test_sweep_does_not_reap_fresh_file_renamed_over_expired_name(outbox):
+    """#330: producers publish via atomic rename OUTSIDE the outbox lock — a
+    fresh file renamed over a reused name between the sweep's lstat and its
+    unlink was deleted, and the producer's returned path went missing. The
+    reap must confirm the name still names the inode it judged expired."""
+    old = _write_outbox_file(outbox._root_realpath, "reused.pdf", PDF)
+    past = (plugin_outbox._now_ms() - (MAX_AGE_S + 60) * 1000) / 1000
+    os.utime(old, (past, past))
+    st_old = os.lstat(old)
+
+    # Simulate the producer racing the sweep: a FRESH inode appears under
+    # the same name after the sweep captured st_old.
+    tmp = _write_outbox_file(outbox._root_realpath, ".fresh.tmp", JPEG)
+    os.rename(tmp, old)
+
+    reaped = outbox._reap(outbox._outbox_dirfd, "reused.pdf", st_old)
+    assert reaped == 0
+    assert os.path.exists(old), "fresh producer file was deleted by the sweep"
+
+
+def _strand_reap_entry(outbox, dname: str, ename: str, data: bytes) -> str:
+    """Simulate a crash mid-reap: a held entry inside a per-reap ownership
+    dir (`.reap/<origin>.<pid>.<uuid>/<original-name>`)."""
+    pdir = os.path.join(outbox._reap_realpath, dname)
+    os.mkdir(pdir, 0o700)
+    p = os.path.join(pdir, ename)
+    with open(p, "wb") as fh:
+        fh.write(data)
+    return p
+
+
+def test_reap_restore_yields_to_newer_same_name_publication(outbox):
+    """Terra r2 (#330): restoring a fresh inode after the ownership rename
+    must NOT replace an even newer publication that took the name in the
+    meantime — the no-replace restore keeps the newest file and drops the
+    superseded held copy (same outcome as producer-overwrites-producer)."""
+    held = _strand_reap_entry(outbox, "root.1.aaaa", "reused.pdf", PDF)
+    newest = _write_outbox_file(outbox._root_realpath, "reused.pdf", JPEG)
+
+    outbox.sweep_once(plugin_outbox._now_ms())
+
+    with open(newest, "rb") as fh:
+        assert fh.read() == JPEG          # newest publication untouched
+    assert not os.path.exists(held)
+
+
+def test_reap_restore_puts_fresh_file_back_when_name_free(outbox):
+    """The ordinary restore: the name is free again, the held fresh inode
+    goes back under its published name."""
+    held = _strand_reap_entry(outbox, "root.1.bbbb", "back.pdf", PDF)
+
+    outbox.sweep_once(plugin_outbox._now_ms())
+
+    with open(os.path.join(outbox._root_realpath, "back.pdf"), "rb") as fh:
+        assert fh.read() == PDF
+    assert not os.path.exists(held)
+
+
+def test_stranded_reap_entry_restored_on_next_sweep(outbox):
+    """Terra r5 (#330): a crash between the ownership rename and the restore
+    leaves a fresh publication stranded inside its per-reap dir. The sweep
+    must RESTORE stranded entries — never age-reap a fresh one."""
+    held = _strand_reap_entry(outbox, "root.123.deadbeef", "fresh.pdf", PDF)
+
+    outbox.sweep_once(plugin_outbox._now_ms())
+
+    restored = os.path.join(outbox._root_realpath, "fresh.pdf")
+    assert os.path.exists(restored), "stranded fresh publication not restored"
+    with open(restored, "rb") as fh:
+        assert fh.read() == PDF
+    assert not os.path.exists(held)
+    assert not os.path.exists(os.path.dirname(held))   # ownership dir gone
+
+
+def test_stranded_expired_reap_entry_restored_then_reaped(outbox):
+    """A stranded EXPIRED entry is restored to its original name and then
+    reaped by the normal expiry pass — never lost, never leaked."""
+    held = _strand_reap_entry(outbox, "root.123.cafebabe", "old.pdf", PDF)
+    past = (plugin_outbox._now_ms() - (MAX_AGE_S + 60) * 1000) / 1000
+    os.utime(held, (past, past))
+
+    outbox.sweep_once(plugin_outbox._now_ms())
+
+    assert not os.path.exists(held)
+    assert not os.path.exists(os.path.join(outbox._root_realpath, "old.pdf"))
+
+
+def test_stranded_reap_entry_superseded_by_newer_publication(outbox):
+    """If the original name was re-published while the entry was stranded,
+    the newer publication wins and the stranded copy is dropped."""
+    held = _strand_reap_entry(outbox, "root.123.feedface", "reused.pdf", PDF)
+    newest = _write_outbox_file(outbox._root_realpath, "reused.pdf", JPEG)
+
+    outbox.sweep_once(plugin_outbox._now_ms())
+
+    with open(newest, "rb") as fh:
+        assert fh.read() == JPEG
+    assert not os.path.exists(held)
+
+
+def test_long_name_orphan_is_still_collectable(outbox):
+    """Sol r6 (#330): a legal near-NAME_MAX producer name must still be
+    reapable — the bounded per-reap ownership dir keeps the entry's own
+    name unchanged, so no ENAMETOOLONG."""
+    long_name = "x" * 250 + ".pdf"
+    p = _write_outbox_file(outbox._root_realpath, long_name, PDF)
+    past = (plugin_outbox._now_ms() - (MAX_AGE_S + 60) * 1000) / 1000
+    os.utime(p, (past, past))
+
+    reaped = outbox.sweep_once(plugin_outbox._now_ms())
+
+    assert reaped == 1
+    assert not os.path.exists(p)
+
+
+def test_producer_file_named_like_reap_prefix_is_left_alone(outbox):
+    """Terra r6 (#330): `_safe_basename` allows dotfiles, so a producer may
+    legally publish a root file named `.reap.<x>.<y>.<z>` — the sweep must
+    never hijack it as a crash-stranded ownership entry (stranded entries
+    live in the sweep-owned `.reap/` SUBDIRECTORY, not the root)."""
+    p = _write_outbox_file(outbox._root_realpath, ".reap.a.b.evil.pdf", PDF)
+
+    outbox.sweep_once(plugin_outbox._now_ms())
+
+    assert os.path.exists(p)          # fresh producer file untouched
+    assert not os.path.exists(
+        os.path.join(outbox._root_realpath, "evil.pdf"))
+
+
+def test_init_displaces_preexisting_producer_file_named_reap(tmp_path):
+    """Sol r7 (#330): `.reap` was a LEGAL producer basename before the
+    sweep-owned subdir existed — an upgrade over such a file must not brick
+    outbox init (makedirs FileExistsError → send_media disabled, no
+    self-heal). The occupant is displaced to a fresh producer-visible name,
+    content preserved."""
+    root = tmp_path / "ob"
+    root.mkdir()
+    (root / ".reap").write_bytes(PDF)
+
+    ob = PluginOutbox(str(root))
+    try:
+        assert (root / ".reap").is_dir()
+        displaced = [p for p in root.iterdir()
+                     if p.name.startswith("reap-displaced-")]
+        assert len(displaced) == 1
+        assert displaced[0].read_bytes() == PDF
+    finally:
+        ob.close()

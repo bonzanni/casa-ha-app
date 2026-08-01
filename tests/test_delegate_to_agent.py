@@ -1903,3 +1903,57 @@ class TestMergedRoleMap:
             assert payload["kind"] == "delegation_depth_exceeded"
         finally:
             agent_mod.origin_var.reset(token)
+
+
+# ---------------------------------------------------------------------------
+# #321 — sync terminal-write durability: a failed complete_delegation must
+# not discard the specialist's successful answer
+# ---------------------------------------------------------------------------
+
+
+class TestSyncCompletionPersistFailure:
+    async def test_failed_complete_delegation_still_returns_result(
+        self, tmp_path, monkeypatch,
+    ):
+        """#321: the specialist's work is DONE — a failed terminal snapshot
+        write must not turn it into a raised error (the caller would lose the
+        answer, and restart recovery ORPHANs the job discarding it). The tool
+        returns the result and hands the RUNNING record to the registry-owned
+        completion reconciliation."""
+        from unittest.mock import AsyncMock, MagicMock
+        from tools import delegate_to_agent, init_tools
+
+        specialists = tmp_path / "ex"
+        specialists.mkdir()
+        _seed_specialist_dir(specialists, "finance", enabled=True)
+        _use_synthetic_roles_dir(monkeypatch, tmp_path, "finance")
+        reg = SpecialistRegistry(str(specialists),
+                                 tombstone_path=str(tmp_path / "del.json"))
+        reg.load()
+        bus = MessageBus()
+        cm = ChannelManager()
+        init_tools(cm, bus, reg, agent_role_map={
+            "assistant": _caller_cfg(delegates=("finance",))})
+
+        monkeypatch.setattr(
+            reg, "complete_delegation",
+            AsyncMock(side_effect=OSError("snapshot write failed")))
+        recon = MagicMock()
+        monkeypatch.setattr(
+            reg.job_registry, "schedule_completion_reconciliation", recon,
+            raising=False)
+
+        _FakeSpecialistClient.reset(response="invoice drafted", delay=0)
+        with patch("tools.ClaudeSDKClient", _FakeSpecialistClient):
+            result = await _with_origin(
+                delegate_to_agent.handler({
+                    "agent": "finance", "task": "draft invoice",
+                    "context": "lesina march",
+                    "mode": "sync",
+                }),
+                _origin(),
+            )
+        payload = json.loads(result["content"][0]["text"])
+        assert payload["status"] == "ok"
+        assert payload["text"] == "invoice drafted"
+        recon.assert_called_once_with(payload["delegation_id"])

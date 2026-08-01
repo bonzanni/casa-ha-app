@@ -11,13 +11,43 @@ Deliberately tiny and dependency-free (stdlib only): these are called from
 sync code, often via :func:`asyncio.to_thread`. If the write fails at any
 point before the final replace, the original target file is left untouched
 and the temp file is cleaned up.
+
+After a successful replace the containing directory is fsynced too (#330 /
+#341 root cause): fsyncing only the temp file makes the *data* durable but
+not the *rename* — across a power crash the new directory entry can be
+missing while a later write (e.g. a registry entry referencing this file)
+survived, breaking write-ordering assumptions everywhere these helpers are
+used. The directory fsync is best-effort: at that point the content is
+already committed and callers roll back in-memory state on exceptions, so
+misreporting a completed write as failed would be strictly worse than the
+lost ordering guarantee (which only matters across a power crash).
 """
 from __future__ import annotations
 
 import json
+import logging
 import os
 import tempfile
 from typing import Any
+
+logger = logging.getLogger(__name__)
+
+
+def fsync_directory(directory: str | os.PathLike[str]) -> None:
+    """Best-effort fsync of *directory* so a just-committed rename in it is
+    durable across a power crash. Failures are logged, never raised — see the
+    module docstring for why."""
+    try:
+        fd = os.open(os.fspath(directory), os.O_RDONLY | os.O_DIRECTORY)
+    except OSError as exc:
+        logger.warning("directory fsync open(%s) failed: %s", directory, exc)
+        return
+    try:
+        os.fsync(fd)
+    except OSError as exc:
+        logger.warning("directory fsync (%s) failed: %s", directory, exc)
+    finally:
+        os.close(fd)
 
 
 def atomic_write_text(
@@ -64,6 +94,7 @@ def atomic_write_text(
         except OSError:
             pass
         raise
+    fsync_directory(directory)
 
 
 def atomic_write_json(

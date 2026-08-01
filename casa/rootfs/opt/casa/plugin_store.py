@@ -289,6 +289,13 @@ def parse_mcp_servers_text(text: str, *, source: str = "<text>",
         if args is not None and (not isinstance(args, list)
                                  or any(not isinstance(a, str) for a in args)):
             return False
+        # #330: a declared `env` must be a mapping — `"env": []` used to pass
+        # here and later crash extract_env_vars (env.values() on a list),
+        # aborting specialist repo inspection instead of yielding a typed
+        # invalid-dependency verdict. Malformed env ⇒ not runnable.
+        env = cfg.get("env")
+        if env is not None and not isinstance(env, dict):
+            return False
         return (
             bool(cfg.get("command")) and isinstance(cfg.get("command"), str)
             or bool(cfg.get("url")) and isinstance(cfg.get("url"), str))
@@ -572,6 +579,14 @@ def artifact_verdict(path: Path, *, name: str, repo: str, revision: str,
         manifest_triggers(manifest, manifest_name or name)
     except StoreError:
         return "triggers_invalid"
+    # #330: same upgrade-path posture for casa.setupTool (gate added
+    # v0.112.0) — a pre-validator artifact with an invalid declaration used
+    # to pass snapshot validation and load with automatic setup silently
+    # skipped.
+    try:
+        manifest_setup_tool(manifest)
+    except StoreError:
+        return "setup_tool_invalid"
     return None
 
 
@@ -1037,6 +1052,16 @@ def _stage_and_swap(*, name, repo, ref, revision, subdir, staged: Path,
                                    artifact_id=artifact_id,
                                    manifest_name=manifest_name)
         if verdict is None:
+            # Sol r3 (#330): a prior publish may have crashed (or raised)
+            # AFTER the rename but BEFORE the durability barriers completed
+            # — this fast path used to return success without them, letting
+            # a retry hand the caller a registry-referenceable artifact
+            # whose directory entries were never made durable. Re-run the
+            # full barrier before reporting success (idempotent; publish is
+            # rare, the checksum pass above already walked the tree).
+            _fsync_tree(dest)
+            _fsync_dir_strict(dest.parent)
+            _fsync_dir_strict(Path(store_root))
             shutil.rmtree(staged, ignore_errors=True)
             return PublishResult(name, artifact_id, revision,
                                  manifest["version"], str(dest), manifest)
@@ -1048,11 +1073,59 @@ def _stage_and_swap(*, name, repo, ref, revision, subdir, staged: Path,
                    subdir=subdir, artifact_id=artifact_id,
                    version=manifest["version"], checksum=checksum,
                    manifest_name=manifest_name)
+    # #330: make the artifact CRASH-DURABLE before anything can reference it.
+    # Only the metadata file used to be fsynced — after a power loss the
+    # caller-persisted registry entry could point at a missing/corrupt tree.
+    # fsync every file + directory in staging, rename, then fsync the
+    # destination parent so the rename itself is durable — AND the store root
+    # (Sol r1): fsyncing store_root/<name>/ does not persist <name>'s own
+    # entry in store_root, so a first-time publication could still lose the
+    # whole plugin-name directory. store_root is created by setup, so the
+    # chain ends there. STRICT throughout (Terra/Sol r2): this is the
+    # durability barrier that must complete before anything can reference
+    # the artifact — a swallowed fsync failure here would let a registry
+    # write survive a power loss that the artifact tree does not, which is
+    # the exact state #330 forbids. Nothing references the artifact yet, so
+    # failing the publish loudly is safe (a retry is idempotent).
+    _fsync_tree(staged)
     dest.parent.mkdir(parents=True, exist_ok=True)
     os.rename(staged, dest)
+    _fsync_dir_strict(dest.parent)
+    _fsync_dir_strict(Path(store_root))
     _freeze_artifact_files(dest)
     return PublishResult(name, artifact_id, revision, manifest["version"],
                          str(dest), manifest)
+
+
+def _fsync_dir_strict(directory: Path | str) -> None:
+    """STRICT directory fsync for the publication durability barrier —
+    unlike :func:`atomic_io.fsync_directory` (best-effort, for writes whose
+    content is already committed and whose callers roll back on exceptions),
+    a failure here must abort the publish: OSError propagates."""
+    fd = os.open(os.fspath(directory), os.O_RDONLY | os.O_DIRECTORY)
+    try:
+        os.fsync(fd)
+    finally:
+        os.close(fd)
+
+
+def _fsync_tree(root: Path) -> None:
+    """fsync every regular file and directory under *root* (bottom-up,
+    symlinks skipped — never open through one). Raises OSError on ANY fsync
+    failure: publication must fail loudly rather than hand the caller an
+    artifact that may not survive a power crash."""
+    for dirpath, _dirs, files in os.walk(root, topdown=False,
+                                         followlinks=False):
+        for fn in files:
+            p = os.path.join(dirpath, fn)
+            if os.path.islink(p):
+                continue
+            fd = os.open(p, os.O_RDONLY)
+            try:
+                os.fsync(fd)
+            finally:
+                os.close(fd)
+        _fsync_dir_strict(dirpath)
 
 
 def _freeze_artifact_files(root: Path) -> None:

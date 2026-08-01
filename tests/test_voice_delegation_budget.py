@@ -1284,3 +1284,171 @@ class TestVoiceDeadlineOriginPropagation:
         assert "voice_route_id" not in origin
         assert "voice_route_capabilities" not in origin
         assert "origin_device_id" not in origin
+
+
+# ---------------------------------------------------------------------------
+# #321 — terminal-write durability in the voice teardown + persistence wait
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+class TestVoiceTeardownTerminalDurability:
+    async def test_cancel_persist_failure_still_returns_typed_result(self):
+        """#321: a snapshot-write failure inside cancel_delegation must not
+        escape _voice_deadline_exceeded — the caller is owed the documented
+        ``deadline_exceeded`` result, and the RUNNING record is handed to the
+        registry-owned cancel reconciliation."""
+        import tools as tm
+
+        _, reg = _init_tools_for_voice()
+        reg.cancel_delegation = AsyncMock(
+            side_effect=OSError("snapshot write failed"))
+
+        task = asyncio.create_task(asyncio.sleep(0))
+        await asyncio.sleep(0.01)
+
+        res = await tm._voice_deadline_exceeded(task, "did9999", "finance")
+        payload = json.loads(res["content"][0]["text"])
+        assert payload["kind"] == "deadline_exceeded"
+        reg.job_registry.schedule_cancel_reconciliation.assert_called_once_with(
+            "did9999")
+
+
+@pytest.mark.asyncio
+class TestVoicePersistenceCancellationBound:
+    async def test_wedged_terminal_write_does_not_absorb_cancellation_forever(
+        self, monkeypatch,
+    ):
+        """#321: _await_voice_persistence re-entered shield() in an unbounded
+        loop — a wedged terminal write made cancellation permanently
+        ineffective (permit occupied, lifecycle task immortal). Cancellation
+        absorption must be BOUNDED: past the bound the wait is abandoned (the
+        write itself cannot be cancelled mid-commit) and the cancellation
+        propagates."""
+        import tools as tm
+
+        monkeypatch.setattr(
+            tm, "_VOICE_PERSIST_CANCEL_BOUND_S", 0.05, raising=False)
+
+        wedged = asyncio.Event()
+
+        async def never_completes():
+            await wedged.wait()
+
+        outer = asyncio.create_task(
+            tm._await_voice_persistence(never_completes()))
+        await asyncio.sleep(0.01)
+        outer.cancel()
+        try:
+            with pytest.raises(asyncio.CancelledError):
+                await asyncio.wait_for(asyncio.shield(outer), timeout=2)
+        finally:
+            wedged.set()
+            await asyncio.sleep(0.01)
+
+
+@pytest.mark.asyncio
+class TestPostCancellationPersistenceBound:
+    async def test_already_cancelled_wait_is_bounded_from_entry(
+        self, monkeypatch,
+    ):
+        """Terra r2 (#321): the lifecycle's CancelledError handler persists a
+        cancelled terminal via a FRESH _await_voice_persistence call — with no
+        new cancellation arriving, that wait was unbounded again, so a wedged
+        write still stranded the lifecycle task and its permit. A wait entered
+        from a cancellation handler must be bounded from entry."""
+        import tools as tm
+
+        monkeypatch.setattr(
+            tm, "_VOICE_PERSIST_CANCEL_BOUND_S", 0.05, raising=False)
+
+        wedged = asyncio.Event()
+
+        async def never_completes():
+            await wedged.wait()
+
+        try:
+            with pytest.raises(asyncio.CancelledError):
+                await asyncio.wait_for(
+                    tm._await_voice_persistence(
+                        never_completes(), already_cancelled=True),
+                    timeout=2,
+                )
+        finally:
+            wedged.set()
+            await asyncio.sleep(0.01)
+
+
+@pytest.mark.asyncio
+class TestCancelledTerminalPersistence:
+    async def test_ordinary_failure_schedules_cancel_reconciliation(self):
+        """Terra r3 (#321): an ordinary failure of the cancellation write must
+        hand the row to CANCEL reconciliation — not the failure-flavored
+        persistence_failed fallback, which terminalizes FAILED and silently
+        skips the cancel contract."""
+        import tools as tm
+        from unittest.mock import MagicMock
+
+        registry = MagicMock()
+        registry.fail_compat = AsyncMock(
+            side_effect=OSError("snapshot write failed"))
+
+        await tm._persist_cancelled_terminal(
+            registry=registry, job_id="job-x", specialist_role="finance")
+
+        registry.schedule_cancel_reconciliation.assert_called_once_with(
+            "job-x")
+        registry.schedule_failure_reconciliation.assert_not_called()
+
+    async def test_bounded_giveup_schedules_cancel_reconciliation(
+        self, monkeypatch,
+    ):
+        """A wedged cancellation write gives up within the bound and still
+        hands the row to cancel reconciliation."""
+        import tools as tm
+        from unittest.mock import MagicMock
+
+        monkeypatch.setattr(
+            tm, "_VOICE_PERSIST_CANCEL_BOUND_S", 0.05, raising=False)
+
+        wedged = asyncio.Event()
+        registry = MagicMock()
+
+        def _wedge(*a, **kw):
+            return wedged.wait()
+
+        registry.fail_compat = MagicMock(side_effect=_wedge)
+
+        try:
+            await tm._persist_cancelled_terminal(
+                registry=registry, job_id="job-y", specialist_role="finance")
+        finally:
+            wedged.set()
+            await asyncio.sleep(0.01)
+
+        registry.schedule_cancel_reconciliation.assert_called_once_with(
+            "job-y")
+
+
+@pytest.mark.asyncio
+class TestCancellationPrecedence:
+    async def test_cancellation_precedes_operation_failure(self):
+        """Sol r3 (#321): when a cancellation was absorbed and the write then
+        FAILS, the failure must not eat the cancellation — returning the
+        op error sent _persist_voice_terminal into an UNBOUNDED fallback
+        (already_cancelled=False) with the original cancellation already
+        consumed, recreating the stranded-permit bug."""
+        import tools as tm
+
+        started = asyncio.Event()
+
+        async def failing_op():
+            started.set()
+            await asyncio.sleep(0.05)
+            raise OSError("late write failure")
+
+        outer = asyncio.create_task(tm._await_voice_persistence(failing_op()))
+        await started.wait()
+        outer.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await outer

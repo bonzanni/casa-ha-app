@@ -35,6 +35,10 @@ logger = logging.getLogger(__name__)
 
 OUTBOX_ENV = "CASA_PLUGIN_OUTBOX_DIR"
 CLAIMS_SUBDIR = ".claims"
+# Terra r6 (#330): reap-ownership entries live in their own sweep-owned
+# subdirectory — a marker in the outbox ROOT could collide with a legal
+# producer dotfile name and the sweep would hijack it.
+REAP_SUBDIR = ".reap"
 MAX_AGE_S = 2 * 3600  # orphan reap threshold for the sweep
 
 _DIR_OPEN_FLAGS = os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW | os.O_CLOEXEC
@@ -86,6 +90,23 @@ def _lstat_quiet(name: str, dirfd: int):
         return None
 
 
+def _reap_dir_name(origin: str) -> str:
+    """The per-reap ownership DIRECTORY name inside ``.reap/`` — bounded
+    length regardless of the candidate's own name (Sol r6: appending the
+    original name to a private name overflows NAME_MAX for long-but-legal
+    producer names, making those orphans uncollectable). The moved entry
+    keeps its ORIGINAL name inside this directory, so recovery is
+    self-describing: ``.reap/<origin>.<pid>.<uuid>/<original-name>``."""
+    return f"{origin}.{os.getpid()}.{uuid.uuid4().hex}"
+
+
+def _reap_dir_origin(dname: str) -> str | None:
+    """Parse the origin ("root"/"claims") from a per-reap directory name;
+    None when unparseable (sweep-owned garbage, age-reaped)."""
+    origin = dname.split(".", 1)[0]
+    return origin if origin in ("root", "claims") else None
+
+
 def _claim_epoch_ms(name: str):
     """Parse the ``<epoch_ms>`` prefix of a claim name; None if unparseable."""
     prefix = name.split("-", 1)[0]
@@ -106,17 +127,37 @@ class PluginOutbox:
         self._closed = False
         self._root_realpath = os.path.realpath(root)
         self._claims_realpath = os.path.join(self._root_realpath, CLAIMS_SUBDIR)
+        self._reap_realpath = os.path.join(self._root_realpath, REAP_SUBDIR)
         # Belt-and-suspenders: setup-configs.sh creates these at boot, but make
         # the module self-sufficient (idempotent) for tests and cold starts.
         os.makedirs(self._root_realpath, exist_ok=True)
         os.makedirs(self._claims_realpath, exist_ok=True)
+        # Sol r7: ``.reap`` was a LEGAL producer basename before this
+        # subdirectory existed — an upgrade over such a file would make
+        # makedirs raise FileExistsError, disabling the whole outbox with no
+        # self-heal. Displace a non-directory occupant (file OR symlink — the
+        # lstat never follows) to a fresh producer-visible name: content is
+        # preserved; the producer's returned path is invalidated exactly as
+        # an expiry would have.
+        try:
+            _st = os.lstat(self._reap_realpath)
+            if not stat.S_ISDIR(_st.st_mode):
+                os.replace(
+                    self._reap_realpath,
+                    os.path.join(self._root_realpath,
+                                 f"reap-displaced-{uuid.uuid4().hex}"))
+        except OSError:
+            pass                       # absent (the normal case) — or racing
+        os.makedirs(self._reap_realpath, exist_ok=True)
         os.chmod(self._root_realpath, 0o770)
         os.chmod(self._claims_realpath, 0o770)
+        os.chmod(self._reap_realpath, 0o770)
         # Long-lived dir FDs pinned to the real inodes: subsequent operations go
         # through these, immune to a later swap of the /data/plugin-outbox path
         # to a symlink.
         self._outbox_dirfd = os.open(self._root_realpath, _DIR_OPEN_FLAGS)
         self._claims_dirfd = os.open(self._claims_realpath, _DIR_OPEN_FLAGS)
+        self._reap_dirfd = os.open(self._reap_realpath, _DIR_OPEN_FLAGS)
 
     def _ensure_open(self) -> None:
         # A closed instance must FAIL CLOSED — never fall through to a
@@ -257,9 +298,21 @@ class PluginOutbox:
     def _sweep_locked(self, now_ms: int) -> int:
         cutoff_ms = MAX_AGE_S * 1000
         reaped = 0
-        # Outbox root — skip the .claims dir; reap producer leftovers by mtime.
+        # Terra r5/r6 + Sol r6 (#330): FIRST recover any stranded per-reap
+        # ownership directories — a crash between the ownership rename and
+        # its restore/unlink leaves the publication parked inside
+        # ``.reap/<origin>.<pid>.<uuid>/`` under its ORIGINAL name;
+        # age-reaping it would lose a FRESH file. Recovery is total: fresh ⇒
+        # back under its name in the origin dir (no-replace), superseded ⇒
+        # dropped, expired ⇒ back under its name and reaped by the ordinary
+        # expiry pass below (which re-lists after this). Non-directory or
+        # unparseable ``.reap/`` residue is sweep-owned garbage — age-reaped.
+        for dname in _listdir_quiet(self._reap_dirfd):
+            self._recover_reap_dir(dname, now_ms, cutoff_ms)
+        # Outbox root — skip the sweep-owned subdirs; reap producer leftovers
+        # by mtime.
         for name in _listdir_quiet(self._outbox_dirfd):
-            if name == CLAIMS_SUBDIR:
+            if name in (CLAIMS_SUBDIR, REAP_SUBDIR):
                 continue
             st = _lstat_quiet(name, self._outbox_dirfd)
             if st is None:
@@ -279,16 +332,146 @@ class PluginOutbox:
         return reaped
 
     def _reap(self, dirfd: int, name: str, st: os.stat_result) -> int:
-        # All relative to the pinned dir-FD (rmtree dir_fd is 3.11+).
+        # #330 (Sol r1): producers publish via atomic rename OUTSIDE
+        # self._lock (they are separate processes — the in-process lock
+        # cannot serialize them), so between the expiry lstat and a deletion
+        # the name can come to denote a FRESH inode. Deleting by name would
+        # vanish a path the producer just returned. Take OWNERSHIP first:
+        # atomically rename the entry into a fresh per-reap directory under
+        # the sweep-owned ``.reap/``, keeping its ORIGINAL name (bounded dir
+        # name — Sol r6 — so NAME_MAX-length producer names stay
+        # collectable), then decide on the inode we now exclusively hold:
+        # matching the expiry stat ⇒ delete; a fresh inode ⇒ restore it
+        # (no-replace: a newer same-name publication wins). A crash mid-
+        # protocol leaves the entry inside the per-reap dir; the next
+        # sweep's recovery pass restores it (Terra r5/r6).
+        origin = "claims" if dirfd == self._claims_dirfd else "root"
+        pdir = _reap_dir_name(origin)
+        try:
+            os.mkdir(pdir, 0o700, dir_fd=self._reap_dirfd)
+            pfd = os.open(pdir, _DIR_OPEN_FLAGS, dir_fd=self._reap_dirfd)
+        except OSError as exc:
+            logger.warning(
+                "plugin-outbox: could not create reap-ownership dir for %r: "
+                "%s", name, exc)
+            return 0
+        try:
+            try:
+                os.rename(name, name, src_dir_fd=dirfd, dst_dir_fd=pfd)
+            except OSError:
+                return 0              # already gone / replaced mid-scan
+            current = _lstat_quiet(name, pfd)
+            if current is None:
+                return 0
+            if current.st_ino != st.st_ino or current.st_dev != st.st_dev:
+                self._restore_entry(pfd, name, dirfd)
+                return 0
+            return self._delete_owned_entry(pfd, name, current)
+        finally:
+            os.close(pfd)
+            try:
+                os.rmdir(pdir, dir_fd=self._reap_dirfd)
+            except OSError:
+                pass                  # non-empty (a failed delete/restore) —
+                                      # the recovery pass retries next sweep
+
+    def _recover_reap_dir(
+        self, dname: str, now_ms: int, cutoff_ms: int,
+    ) -> None:
+        """Recover one ``.reap/`` residue entry: restore a stranded held
+        publication to its origin dir, or age-reap unparseable garbage."""
+        origin = _reap_dir_origin(dname)
+        dst_dirfd = (self._claims_dirfd if origin == "claims"
+                     else self._outbox_dirfd)
+        try:
+            pfd = os.open(dname, _DIR_OPEN_FLAGS, dir_fd=self._reap_dirfd)
+        except OSError:
+            # Not a directory / unopenable — sweep-owned garbage by age.
+            st = _lstat_quiet(dname, self._reap_dirfd)
+            if (st is not None
+                    and now_ms - int(st.st_mtime * 1000) > cutoff_ms):
+                try:
+                    if stat.S_ISDIR(st.st_mode):
+                        shutil.rmtree(dname, dir_fd=self._reap_dirfd)
+                    else:
+                        os.unlink(dname, dir_fd=self._reap_dirfd)
+                except OSError as exc:
+                    logger.warning(
+                        "plugin-outbox: failed to clear reap residue %r: %s",
+                        dname, exc)
+            return
+        try:
+            for ename in os.listdir(pfd):
+                if origin is not None and _safe_basename(ename):
+                    self._restore_entry(pfd, ename, dst_dirfd)
+                else:
+                    st = _lstat_quiet(ename, pfd)
+                    if st is not None:
+                        self._delete_owned_entry(pfd, ename, st)
+        except OSError as exc:
+            logger.warning(
+                "plugin-outbox: reap recovery scan of %r failed: %s",
+                dname, exc)
+        finally:
+            os.close(pfd)
+        try:
+            os.rmdir(dname, dir_fd=self._reap_dirfd)
+        except OSError:
+            pass                      # non-empty — retried next sweep
+
+    @staticmethod
+    def _delete_owned_entry(pfd: int, name: str, st: os.stat_result) -> int:
+        """Delete an exclusively-owned entry inside a per-reap directory
+        (rmtree dir_fd is 3.11+)."""
         try:
             if stat.S_ISDIR(st.st_mode):
-                shutil.rmtree(name, dir_fd=dirfd)
+                shutil.rmtree(name, dir_fd=pfd)
             else:
-                os.unlink(name, dir_fd=dirfd)
+                os.unlink(name, dir_fd=pfd)
             return 1
         except OSError as exc:
             logger.warning("plugin-outbox: failed to reap %r: %s", name, exc)
             return 0
+
+    @staticmethod
+    def _restore_entry(pfd: int, name: str, dst_dirfd: int) -> None:
+        """Give a privately-held FRESH inode (inside a per-reap dir) back its
+        published name without ever replacing a newer publication (Terra/Sol
+        r2): ``os.link`` is the atomic no-replace primitive — it fails
+        EEXIST when a newer same-name publication landed meanwhile, in which
+        case the held copy is simply superseded (identical outcome to
+        producer-overwrites-producer) and dropped. Directories cannot be
+        hardlinked; a held directory falls back to a replacing rename —
+        producers publish regular files, so a same-name DIRECTORY
+        republication racing its own reap is not a real traffic pattern, and
+        the entry is otherwise restored intact."""
+        current = _lstat_quiet(name, pfd)
+        if current is None:
+            return
+        if stat.S_ISDIR(current.st_mode):
+            try:
+                os.rename(name, name, src_dir_fd=pfd, dst_dir_fd=dst_dirfd)
+            except OSError as exc:
+                logger.warning(
+                    "plugin-outbox: could not restore fresh dir %r after "
+                    "reap-ownership check: %s", name, exc)
+            return
+        superseded_or_restored = False
+        try:
+            os.link(name, name, src_dir_fd=pfd, dst_dir_fd=dst_dirfd,
+                    follow_symlinks=False)
+            superseded_or_restored = True
+        except FileExistsError:
+            superseded_or_restored = True     # newer publication wins
+        except OSError as exc:
+            logger.warning(
+                "plugin-outbox: could not restore fresh entry %r after "
+                "reap-ownership check: %s", name, exc)
+        if superseded_or_restored:
+            try:
+                os.unlink(name, dir_fd=pfd)
+            except OSError:
+                pass
 
     def sweep_now(self) -> int:
         """Production sweep entry — uses the module clock. Tests drive
@@ -303,7 +486,7 @@ class PluginOutbox:
         # the lock mid-syscall, close() just waits for it.
         with self._lock:
             self._closed = True
-            for fd_attr in ("_outbox_dirfd", "_claims_dirfd"):
+            for fd_attr in ("_outbox_dirfd", "_claims_dirfd", "_reap_dirfd"):
                 fd = getattr(self, fd_attr, None)
                 if isinstance(fd, int):
                     try:

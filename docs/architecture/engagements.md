@@ -157,8 +157,10 @@ reached the resident. These are best-effort effects *after* the authoritative st
 by design.
 
 **A restart interrupts an engagement.** Persisted records load with `active` rewritten to
-`idle`. Replay is attempted only for the driver kind that supports it, and is skipped with a
-warning when its workspace or definition is missing.
+`idle`. Replay is attempted only for the driver kind that supports it. A record whose
+workspace or recorded plugin artifact is missing is *refused* with a warning — validated
+before the intact-service fast path, so an ordinary restart cannot start a service whose run
+script would exit-and-respawn forever — and a missing definition is skipped with a warning.
 
 ## Extension points
 

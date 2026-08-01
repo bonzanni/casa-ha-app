@@ -17,6 +17,7 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Awaitable, Callable
 
+from atomic_io import fsync_directory
 from drivers import s6_rc
 from drivers.brief import brief_task_for
 from drivers.driver_protocol import DriverProtocol
@@ -378,6 +379,12 @@ class _InboundSpool:
         self.reader_ready = False
         self._pump_lock = asyncio.Lock()
         self._next_seq = 0
+        # #341: True while the in-memory envelope state has changes the last
+        # persist failed to commit — the touchpoint flush retries the write
+        # even when no send outcome changed (a recorded-but-unpersisted
+        # capacity-drop notice must not wait for a successful send to become
+        # durable).
+        self._persist_dirty = False
         # v0.79.0 (§4): monotonic operator-message generation — the ask inbound
         # gate reserves this before BROKER.register and re-checks it after
         # posting to close the arrival race.
@@ -402,6 +409,12 @@ class _InboundSpool:
     def _persist(self) -> None:
         """Atomic whole-file rewrite (temp + os.replace). Raises OSError on
         failure so the enqueue path can surface the spool-write-FAILURE notice.
+
+        #341: the containing directory is fsynced after the replace so a
+        newly-created spool file (and the ``queued``-acked turn in it)
+        survives a power crash; a failure sets ``_persist_dirty`` so the
+        best-effort touchpoints (``_flush_pending``) retry the write even
+        when no send outcome changed.
         """
         payload = "".join(e.to_line() + "\n" for e in self._envelopes)
         tmp = f"{self._spool_path}.tmp"
@@ -412,11 +425,14 @@ class _InboundSpool:
                 os.fsync(fh.fileno())
             os.replace(tmp, self._spool_path)
         except OSError:
+            self._persist_dirty = True
             try:
                 os.unlink(tmp)
             except OSError:
                 pass
             raise
+        self._persist_dirty = False
+        fsync_directory(os.path.dirname(self._spool_path) or ".")
 
     # -- lane / prune helpers ---------------------------------------------
 
@@ -629,8 +645,12 @@ class _InboundSpool:
                 if ok:
                     env.receipt = "sent"
                     changed = True
+        # #341: also persist when a PRIOR write failed (``_persist_dirty``) —
+        # otherwise a recorded notice/receipt whose first write failed stays
+        # memory-only until some send succeeds, and a crash loses it.
         if changed:
             self._prune()
+        if changed or self._persist_dirty:
             try:
                 self._persist()
             except OSError as exc:                 # best-effort; retried next tick
@@ -668,7 +688,12 @@ class _InboundSpool:
 
     async def on_turn_start(self) -> None:
         """turn_start evidence: the envelope delivered THIS epoch is now
-        ``consumed``. Retry pending receipts/notices."""
+        ``consumed``. Retry pending receipts/notices.
+
+        #341: consumed envelopes owing nothing are PRUNED before the persist
+        — they used to be retained forever (``_prune`` only ran when a
+        pending send succeeded), growing the spool without bound and making
+        every later whole-file rewrite larger and likelier to fail."""
         epoch = self._current_epoch()
         changed = False
         for env in self._envelopes:
@@ -676,6 +701,7 @@ class _InboundSpool:
                 env.state = "consumed"
                 changed = True
         if changed:
+            self._prune()
             self._persist_quiet()
         await self._flush_pending()
 
@@ -707,6 +733,10 @@ class _InboundSpool:
         try:
             self._persist()
         except OSError as exc:
+            # #341: remember the unpersisted state so the touchpoint flush
+            # retries the write (belt-and-suspenders beside _persist's own
+            # flag — this also covers a persist injected/wrapped in tests).
+            self._persist_dirty = True
             logger.warning(
                 "engagement %s: spool persist failed: %s",
                 self._engagement_id[:8], exc,
@@ -1624,12 +1654,17 @@ class ClaudeCodeDriver(DriverProtocol):
             if seq is not None:
                 mid = await seq.post_platform_notice(text, reply_to=reply_to)
                 return mid is not None
+            # #341: the direct-send fallback must apply the SAME delivery
+            # evidence as the sequencer path — a ``None`` message id (e.g.
+            # Telegram unavailable during terminal boot reconciliation) is a
+            # FAILED send, and returning True here dropped the pending
+            # receipt/notice instead of retrying it at the next touchpoint.
             if reply_to is not None:
-                await self._send_to_topic(
+                mid = await self._send_to_topic(
                     engagement.topic_id, text, reply_to_message_id=reply_to)
             else:
-                await self._send_to_topic(engagement.topic_id, text)
-            return True
+                mid = await self._send_to_topic(engagement.topic_id, text)
+            return mid is not None
         except Exception as exc:  # noqa: BLE001 — retried at the next touchpoint
             logger.warning(
                 "engagement %s: spool notice send failed (retried): %s",
@@ -2581,15 +2616,71 @@ class ClaudeCodeDriver(DriverProtocol):
         only at ``on_spawn``; doctrine alone can livelock a completion-bent
         model — Sol g4-r1-4). Reuses the operator-away verified group-kill;
         s6 respawns the run script, which resumes the session and receives
-        the pending envelope."""
+        the pending envelope.
+
+        #341 (v0.138.0): the kill is EPOCH-GUARDED and SINGLE-FLIGHT.
+        ``emit_completion`` handlers dispatch without a per-engagement lock,
+        so overlapping refusals (or a delayed escalation) used to signal with
+        ``expected_epoch=None`` — the helper's epoch guard was disabled and a
+        late kill could land on a FRESHLY RESPAWNED turn that had already
+        consumed a queued operator envelope (consumed ⇒ never redelivered ⇒
+        operator-turn loss). Now: (a) an in-flight force task (completion- or
+        away-triggered) owns the boundary — a second call defers to it;
+        (b) the CURRENT spawn epoch is stamped and passed so the guard (and
+        the pid-stability re-probe behind it) aborts against any newer
+        generation; (c) no known live epoch ⇒ nothing attributable to kill ⇒
+        no signal (the refusal reply alone must do the work)."""
         eng_id = engagement.id
-        ok = await self._force_turn_boundary(
-            engagement_id=eng_id,
-            workspace_dir=str(Path(self._engagements_root) / eng_id),
-            expected_epoch=None,
-            track_task=(lambda t, eid=eng_id:
-                        self._register_force_cleanup(eid, t)),
-        )
+        existing = self._force_tasks.get(eng_id)
+        if existing is not None and not existing.done():
+            logger.info(
+                "engagement %s: completion-gate boundary — kill already in "
+                "flight, deferring to it", eng_id[:8])
+            return
+        epoch = self._epoch_pending.get(eng_id)
+        if epoch is None:
+            logger.info(
+                "engagement %s: completion-gate boundary — no live spawn "
+                "epoch, not signalling", eng_id[:8])
+            return
+        # Stamp the epoch expected-terminated so the ensuing respawn's
+        # spawn-without-result is logged as an expected forced end, and so
+        # the guard kills ONLY this generation.
+        self._forced_suspend_epochs[eng_id] = epoch
+        task = asyncio.create_task(
+            self._force_turn_boundary(
+                engagement_id=eng_id,
+                workspace_dir=str(Path(self._engagements_root) / eng_id),
+                expected_epoch=epoch,
+                track_task=(lambda t, eid=eng_id:
+                            self._register_force_cleanup(eid, t)),
+            ),
+            name=f"force_completion:{eng_id[:8]}")
+        self._force_tasks[eng_id] = task
+        task.add_done_callback(
+            lambda t, eid=eng_id: (
+                self._force_tasks.pop(eid, None)
+                if self._force_tasks.get(eid) is t else None))
+        # Awaiting the task keeps the caller's semantics (the tool handler
+        # logs best-effort); an outer cancel stops the WAIT, never the kill —
+        # the task stays owned by ``_force_tasks`` / the teardown drain.
+        # Sol r8: shield() ALSO raises CancelledError when the INNER task is
+        # cancelled by its owner (operator re-engagement clears the away
+        # kill; teardown cancels the shared ``_force_tasks`` entry) — that is
+        # not OUR cancellation, and letting it out would kill the
+        # emit_completion handler (which catches only Exception) instead of
+        # returning its documented refusal. Inner cancel ⇒ the escalation is
+        # simply over — return quietly; only a genuine outer cancellation
+        # propagates.
+        try:
+            ok = await asyncio.shield(task)
+        except asyncio.CancelledError:
+            if task.cancelled():
+                logger.info(
+                    "engagement %s: completion-gate boundary cancelled by "
+                    "its owner (operator returned / teardown)", eng_id[:8])
+                return
+            raise
         logger.info(
             "engagement %s: completion-gate forced turn boundary (ok=%s)",
             eng_id[:8], ok)
@@ -4022,6 +4113,17 @@ class ClaudeCodeDriver(DriverProtocol):
         if kind == "spawn":
             epoch = payload.get("epoch")
             prev = self._epoch_pending.get(eng_id)
+            # #341 (v0.138.0): TopicStream delivers frames at-least-once. A
+            # replayed spawn carrying the SAME epoch is THIS generation seen
+            # again, not a new one — processing it would log a phantom
+            # abnormal exit and (worse) ``on_spawn`` would revert the
+            # already-delivered envelope to queued, producing a duplicate
+            # operator turn at the next real spawn. Full no-op.
+            if prev is not None and epoch is not None and prev == epoch:
+                logger.debug(
+                    "engagement %s: replayed spawn frame for epoch %s — "
+                    "ignored", eng_id[:8], epoch)
+                return
             if prev is not None:
                 # A previous epoch spawned but never emitted a result before
                 # this new spawn — abnormal exit. ``result`` is at-most-once,

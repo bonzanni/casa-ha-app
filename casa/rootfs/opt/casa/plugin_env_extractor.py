@@ -32,6 +32,11 @@ def extract_env_vars(mcp_json_path: Path | str) -> set[str]:
     vars_found: set[str] = set()
     for server in mcp_servers_map(mcp_json_path).values():
         env = (server or {}).get("env") or {}
+        # #330: the wrapper-form servers map still carries bad-env entries
+        # for grant derivation — skip them here rather than AttributeError
+        # on a non-mapping env.
+        if not isinstance(env, dict):
+            continue
         for val in env.values():
             if not isinstance(val, str):
                 continue

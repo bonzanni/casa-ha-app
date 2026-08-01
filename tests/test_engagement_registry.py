@@ -284,6 +284,27 @@ class TestRegistryStateTransitions:
         await reg.persist_session_id(rec.id, "sess-abc")
         assert rec.sdk_session_id == "sess-abc"
 
+    async def test_persist_session_id_failure_raises_and_rolls_back(
+        self, tmp_path, monkeypatch,
+    ):
+        """#302: a swallowed tombstone-write failure made the in-memory record
+        look current while the durable registry never received the session ID
+        — after a restart the engagement could not resume. The write is strict
+        and the record mutation rolls back so the driver's same-sid retry
+        guard fires again."""
+        from engagement_registry import EngagementRegistry
+
+        reg = EngagementRegistry(tombstone_path=str(tmp_path / "e.json"), bus=None)
+        rec = await reg.create("specialist", "finance", "in_casa", "t", {}, 1)
+
+        def boom(snapshot):
+            raise OSError("disk full")
+
+        monkeypatch.setattr(reg, "_write_tombstone", boom)
+        with pytest.raises(OSError):
+            await reg.persist_session_id(rec.id, "sess-abc")
+        assert rec.sdk_session_id is None
+
     async def test_mark_error_captures_kind(self, tmp_path):
         from engagement_registry import EngagementRegistry
 
@@ -1312,3 +1333,63 @@ class TestResumeFailCountPersistence:
         assert registry.by_topic_id(45) is None
         rows = json.loads(Path(registry._tombstone_path).read_text())
         assert rows == []
+
+
+class TestPersistSessionIdCancellationSafety:
+    """Sol r4 (#302): a caller cancelled mid-write must not tear the
+    in-memory retry guard from disk — the write settles first, then memory
+    reflects the settled outcome, then the cancellation propagates."""
+
+    async def test_cancelled_failed_write_rolls_back(
+        self, tmp_path, monkeypatch,
+    ):
+        import threading
+        from engagement_registry import EngagementRegistry
+
+        reg = EngagementRegistry(
+            tombstone_path=str(tmp_path / "e.json"), bus=None)
+        rec = await reg.create("specialist", "finance", "in_casa", "t", {}, 1)
+
+        release = threading.Event()
+
+        def slow_fail(snapshot):
+            release.wait(2)
+            raise OSError("disk full")
+
+        monkeypatch.setattr(reg, "_write_tombstone", slow_fail)
+        t = asyncio.create_task(reg.persist_session_id(rec.id, "sess-abc"))
+        await asyncio.sleep(0.05)          # inside the to_thread write
+        t.cancel()
+        await asyncio.sleep(0.05)          # cancellation delivered pre-settle
+        release.set()
+        with pytest.raises(asyncio.CancelledError):
+            await t
+        # The write CONFIRMED-failed → the retry guard must be re-armed.
+        assert rec.sdk_session_id is None
+
+    async def test_cancelled_committed_write_keeps_sid(
+        self, tmp_path, monkeypatch,
+    ):
+        import threading
+        from engagement_registry import EngagementRegistry
+
+        reg = EngagementRegistry(
+            tombstone_path=str(tmp_path / "e.json"), bus=None)
+        rec = await reg.create("specialist", "finance", "in_casa", "t", {}, 1)
+
+        release = threading.Event()
+        real_write = reg._write_tombstone
+
+        def slow_commit(snapshot):
+            release.wait(2)
+            real_write(snapshot)
+
+        monkeypatch.setattr(reg, "_write_tombstone", slow_commit)
+        t = asyncio.create_task(reg.persist_session_id(rec.id, "sess-abc"))
+        await asyncio.sleep(0.05)
+        t.cancel()
+        release.set()
+        with pytest.raises(asyncio.CancelledError):
+            await t
+        # The write settled COMMITTED → memory matches disk (no rollback).
+        assert rec.sdk_session_id == "sess-abc"

@@ -37,9 +37,13 @@ those lose data, and one of them stops the load. Before assuming a corrupt file 
 recoverable, read that specific loader — the neighbouring one probably does something else.
 
 **Atomicity is a property of individual writers, not of the system.** There are helpers that
-write to a temporary file, flush, and replace. Writers that use them are atomic; writers that
-do not are not, and several ordinary paths do a direct write. Some repair paths — including
-one that rewrites a corrupt file — are themselves non-atomic.
+write to a temporary file, flush and fsync it, replace, then fsync the containing directory —
+the last step makes the *rename itself* durable across a power crash, so a later write cannot
+survive while an earlier one's directory entry vanished. The directory fsync is best-effort
+(content durability and the caller's success signal never depend on it). Writers that use the
+helpers are atomic; writers that do not are not, and several ordinary paths do a direct
+write. Some repair paths — including one that rewrites a corrupt file — are themselves
+non-atomic.
 
 **Some state is produced by things this application does not control.** Engagement workspaces
 and plugin outbox directories receive content from child processes and plugins. There is no
