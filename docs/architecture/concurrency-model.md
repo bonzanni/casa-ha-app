@@ -37,9 +37,12 @@ share one tool-level lock (INV-TOOL-003). The specialist lifecycle serializes un
 materialize lock. Agents keep a small first-publication lock for their plugin-resolution
 snapshot — it does not serialize turns. The Telegram channel re-imposes ordering per scope
 above the bus: a per-topic handler lock for engagement topics and a per-chat lock
-serializing `/new` with same-chat enqueue (both documented in the Telegram map). The one
-cross-*thread* lock is plugin health's report lock — a `threading.Lock`, because its
-writers run both on the loop and in the thread offload.
+serializing `/new` with same-chat enqueue (both documented in the Telegram map). Two
+cross-*thread* locks exist, both `threading.Lock`: plugin health's report lock, because
+its writers run both on the loop and in the thread offload; and the s6 compile-worker
+lock, which serializes the compile/swap/reap worker threads themselves — a cancelled
+compile abandons its worker mid-run, and the successor's worker must queue behind the
+abandoned one rather than race it.
 
 **Blocking work goes to threads; coordination stays on the loop.** Filesystem and config
 I/O is pushed through the thread offload helper (well over a hundred call sites);

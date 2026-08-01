@@ -1288,7 +1288,11 @@ async def test_replay_fifo_recreate_failure_refuses_resume(
 ):
     """#342: a failed stdin.fifo recreation in the heal path must refuse
     the resume — the run template (`set -e`, stdin from the FIFO) makes
-    every spawn exit immediately, so starting it crash-loops forever."""
+    every spawn exit immediately, so starting it crash-loops forever.
+    Sol r2-1: the refusal also downs any live remnant and REMOVES the
+    just-replanted service pair, so the compile drops the doomed service
+    and a failed error-mark cannot leave an intact pair for next boot's
+    fast path (which never retries the mkfifo)."""
     from casa_core import replay_undergoing_engagements
     from drivers import s6_rc
     from config import ExecutorDefinition
@@ -1304,6 +1308,7 @@ async def test_replay_fifo_recreate_failure_refuses_resume(
     monkeypatch.setattr(s6_rc, "write_service_dir", fake_write)
 
     start_calls: list = []
+    down_calls: list = []
 
     async def fake_cau():
         pass
@@ -1312,6 +1317,7 @@ async def test_replay_fifo_recreate_failure_refuses_resume(
         start_calls.append(engagement_id)
 
     async def fake_down(*, engagement_id):
+        down_calls.append(engagement_id)
         return True
 
     monkeypatch.setattr(s6_rc, "_compile_and_update_locked", fake_cau)
@@ -1359,6 +1365,9 @@ async def test_replay_fifo_recreate_failure_refuses_resume(
     assert start_calls == []                       # never started
     assert attached == []                          # no background machinery
     assert reg.get("keep1").status == "error"      # marked error
+    # Sol r2-1: remnant downed + the replanted pair removed (not compiled).
+    assert "keep1" in down_calls
+    assert not (svc_root / "engagement-keep1").exists()
 
 
 async def test_replay_adopts_summary_before_start(monkeypatch, tmp_path):

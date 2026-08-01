@@ -911,6 +911,30 @@ async def replay_undergoing_engagements(
                         "would crash-loop)", fifo, exc,
                     )
                     refused_ids.add(rec.id)
+                    # Sol r2-1: the pair was REPLANTED above — remove it so
+                    # the compile below drops the doomed service (a live
+                    # remnant is downed best-effort first), and so a failed
+                    # error-mark cannot leave an intact pair for next
+                    # boot's fast path (which never retries the mkfifo).
+                    try:
+                        await s6_rc.ensure_service_down(engagement_id=rec.id)
+                    except Exception:  # noqa: BLE001 — best-effort down
+                        logger.warning(
+                            "boot replay: ensure_service_down after mkfifo "
+                            "failure for %s failed", rec.id[:8],
+                            exc_info=True,
+                        )
+                    try:
+                        s6_rc.remove_service_dir(
+                            svc_root=s6_rc.ENGAGEMENT_SOURCES_ROOT,
+                            engagement_id=rec.id,
+                        )
+                    except Exception:  # noqa: BLE001 — best-effort removal
+                        logger.warning(
+                            "boot replay: service-pair removal after mkfifo "
+                            "failure for %s failed", rec.id[:8],
+                            exc_info=True,
+                        )
                     try:
                         await registry.mark_error(
                             rec.id, kind="fifo_recreate_failed",
