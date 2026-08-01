@@ -392,6 +392,45 @@ async def test_restore_turn_reply_to_failure_undo_never_clobbers_newer():
     assert seq.consume_turn_reply_to() == 777
 
 
+async def test_failed_intent_poster_leaves_narration_open():
+    """Sol r1 (#332): the relay-mediated path is the PRINCIPAL ask/reply
+    route — a poster that fails (None, no compensation) must leave the open
+    narration editable, exactly like a failed post_discrete."""
+    rec, clock = Recorder(), Clock()
+    seq = _make_seq(rec, clock)
+    nid = await seq.open_narration("working...")
+    h = projection_hash(REPLY_TOOL, {"text": "R"})
+
+    async def _fail():
+        return None
+
+    seq.register_intent(request_id="r1", tool_name=REPLY_TOOL,
+                        projection_hash=h, poster=_fail)
+    seq.arm_intent("r1")
+    await seq.post_for_block(REPLY_TOOL, h)
+    intent = seq.registry.by_request_id("r1")
+    assert intent.post_failed is True
+    assert seq.narration_msg_id == nid   # narration still open + editable
+    assert await seq.edit_narration_if_latest(nid, "still editing") == APPLIED
+
+
+async def test_compensated_intent_seals_narration():
+    """Sol r1 (#332): a compensated post PHYSICALLY landed — narration must
+    seal exactly as on the confirmed-post path (pre-#332 the unconditional
+    pre-poster seal covered this)."""
+    rec, clock = Recorder(), Clock()
+    seq = _make_seq(rec, clock)
+    nid = await seq.open_narration("working...")
+    h = projection_hash(REPLY_TOOL, {"text": "R"})
+    seq.register_intent(request_id="r1", tool_name=REPLY_TOOL,
+                        projection_hash=h, poster=_poster(rec, "R"))
+    seq.arm_intent("r1")
+    await seq.mark_intent_compensated("r1", 500)
+    assert seq.narration_msg_id is None   # sealed: the message exists
+    assert seq.high_water == 500
+    assert nid is not None
+
+
 async def test_response_loss_after_post_reattaches_without_double_post():
     """§2(1): a transport retry whose request_id matches an already-posted
     intent reattaches idempotently and reads the recorded outcome (incl. the

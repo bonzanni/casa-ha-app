@@ -5390,141 +5390,150 @@ async def engage_executor(args: dict) -> dict:
         _abort_topic_on_cancel(channel, "engage-abort", topic_id)
         raise
 
-    # Sol round-4: the manual-edit seam `casa_reload(scope="full")` bumps the
-    # snapshot generation WITHOUT the plugin-tools lock, so it can move the
-    # snapshot while create() awaits. Recheck against the pre-create generation
-    # and abort before the driver starts — the record must not launch stale.
-    if plugin_registry.snapshot_generation() != _gen_at_create:
-        await _engagement_registry.mark_error(
-            rec.id, kind="plugin_superseded",
-            message="plugin snapshot changed during launch")
-        await _abort_engagement_topic(channel, rec.id, topic_id)
-        return _result({
-            "status": "error", "kind": "plugin_superseded",
-            "message": ("plugin registry changed during launch — engagement "
-                        "aborted before start; retry")})
-
-    # Persist the initial state emoji so Task 23 ``update_topic_state`` knows
-    # whether it needs to edit the title (no-op when state didn't change).
+    # Sol r1 (#363 family): the record now EXISTS — a cancellation anywhere
+    # from here until the driver is live (state persist, prompt read, memory
+    # fetch, options build, driver.start) used to unwind through no handler,
+    # leaving a durably-active record and an open topic with no driver.
+    # Compensate in the background: mark the record errored + abort the topic.
     try:
-        await _engagement_registry.set_channel_state(
-            rec.id, current_state_emoji=STATE_EMOJI["active"],
-        )
-    except Exception as exc:  # noqa: BLE001
-        logger.warning("set_channel_state(active) failed: %s", exc)
-
-    # Read + interpolate prompt template (needed by both driver paths —
-    # in_casa: options.system_prompt; claude_code: CLAUDE.md body).
-    prompt_template = ""
-    try:
-        with open(defn.prompt_template_path, "r", encoding="utf-8") as fh:
-            prompt_template = fh.read()
-    except OSError as exc:
-        await _engagement_registry.mark_error(
-            rec.id, kind="prompt_template_missing", message=str(exc),
-        )
-        await _abort_engagement_topic(channel, rec.id, topic_id)
-        return _result({
-            "status": "error", "kind": "prompt_template_missing",
-            "message": str(exc),
-        })
-
-    # Semantic-recall memory injection (design §3, plan 3): when the executor
-    # opts in (defn.memory.enabled=True, off by default), fetch prior-engagement
-    # lessons from the shared `casa` bank at the origin channel's read-clearance.
-    executor_memory_block = ""
-    if defn.memory.enabled:
-        executor_memory_block = await _fetch_executor_archive(
-            task=task_text,
-            origin_channel=origin.get("channel", "telegram"),
-            token_budget=defn.memory.token_budget,
-            origin_route=origin.get("_origin_route"),
-            origin_clearance=origin.get("_origin_clearance"),
-        )
-
-    # W3/Sol r5-B8: the {task} value reaches BOTH driver paths through this ONE
-    # seam (in_casa options.system_prompt AND claude_code initial FIFO prompt).
-    # When a brief is present it becomes the full rendered markdown block
-    # (render_brief_task, two-phase gated to claude_code+interaction_required —
-    # ``_two_phase`` computed at create above); no brief → the canonical
-    # task_text (the else branch is task_text, NOT `task`, which doesn't exist
-    # here — using it would break every legacy task= invocation).
-    task_for_prompt = (
-        render_brief_task(normalized_brief, two_phase=_two_phase)
-        if brief is not None else task_text
-    )
-    prompt = (
-        prompt_template
-        .replace("{task}", task_for_prompt)
-        .replace("{context}", context_text or "(none)")
-        .replace("{world_state_summary}", world_state)
-        .replace("{executor_memory}", executor_memory_block)
-    )
-
-    # Driver dispatch — in_casa uses ClaudeAgentOptions + system_prompt;
-    # claude_code uses the ExecutorDefinition + workspace-CLAUDE.md.
-    if defn.driver == "claude_code":
-        driver = getattr(agent_mod, "active_claude_code_driver", None)
-        if driver is None:
+        # Sol round-4: the manual-edit seam `casa_reload(scope="full")` bumps the
+        # snapshot generation WITHOUT the plugin-tools lock, so it can move the
+        # snapshot while create() awaits. Recheck against the pre-create generation
+        # and abort before the driver starts — the record must not launch stale.
+        if plugin_registry.snapshot_generation() != _gen_at_create:
             await _engagement_registry.mark_error(
-                rec.id, kind="no_driver",
-                message="claude_code driver not initialized",
-            )
+                rec.id, kind="plugin_superseded",
+                message="plugin snapshot changed during launch")
             await _abort_engagement_topic(channel, rec.id, topic_id)
             return _result({
-                "status": "error", "kind": "no_driver",
-                "message": "claude_code driver not initialized",
-            })
+                "status": "error", "kind": "plugin_superseded",
+                "message": ("plugin registry changed during launch — engagement "
+                            "aborted before start; retry")})
+
+        # Persist the initial state emoji so Task 23 ``update_topic_state`` knows
+        # whether it needs to edit the title (no-op when state didn't change).
         try:
-            await driver.start(rec, prompt=prompt, options=defn)
+            await _engagement_registry.set_channel_state(
+                rec.id, current_state_emoji=STATE_EMOJI["active"],
+            )
         except Exception as exc:  # noqa: BLE001
-            logger.exception(
-                "claude_code driver.start failed for %s", rec.id[:8],
-            )
-            await _engagement_registry.mark_error(
-                rec.id, kind="driver_start_failed", message=str(exc),
-            )
-            await _abort_engagement_topic(channel, rec.id, topic_id)
-            return _result({
-                "status": "error", "kind": "driver_start_failed",
-                "message": str(exc),
-            })
-    else:
-        # Off-loop: _build_executor_options reads hooks.yaml. §3.9: feed the
-        # SAME resolution gated + recorded above (one resolve, one binding).
-        options = await asyncio.to_thread(
-            _build_executor_options, defn, executor_type=executor_type,
-            resolution=plugin_resolution,
-            extra_casa_tools=(
-                "mcp__casa-framework__query_engager",
-                "mcp__casa-framework__emit_completion",
-            ),
-        )
-        options.system_prompt = prompt
+            logger.warning("set_channel_state(active) failed: %s", exc)
 
-        driver = getattr(agent_mod, "active_engagement_driver", None)
-        if driver is None:
-            await _engagement_registry.mark_error(
-                rec.id, kind="no_driver",
-                message="engagement driver not initialized",
-            )
-            await _abort_engagement_topic(channel, rec.id, topic_id)
-            return _result({
-                "status": "error", "kind": "no_driver",
-                "message": "engagement driver not initialized",
-            })
+        # Read + interpolate prompt template (needed by both driver paths —
+        # in_casa: options.system_prompt; claude_code: CLAUDE.md body).
+        prompt_template = ""
         try:
-            await driver.start(rec, prompt=prompt, options=options)
-        except Exception as exc:  # noqa: BLE001
+            with open(defn.prompt_template_path, "r", encoding="utf-8") as fh:
+                prompt_template = fh.read()
+        except OSError as exc:
             await _engagement_registry.mark_error(
-                rec.id, kind="driver_start_failed", message=str(exc),
+                rec.id, kind="prompt_template_missing", message=str(exc),
             )
             await _abort_engagement_topic(channel, rec.id, topic_id)
             return _result({
-                "status": "error", "kind": "driver_start_failed",
+                "status": "error", "kind": "prompt_template_missing",
                 "message": str(exc),
             })
 
+        # Semantic-recall memory injection (design §3, plan 3): when the executor
+        # opts in (defn.memory.enabled=True, off by default), fetch prior-engagement
+        # lessons from the shared `casa` bank at the origin channel's read-clearance.
+        executor_memory_block = ""
+        if defn.memory.enabled:
+            executor_memory_block = await _fetch_executor_archive(
+                task=task_text,
+                origin_channel=origin.get("channel", "telegram"),
+                token_budget=defn.memory.token_budget,
+                origin_route=origin.get("_origin_route"),
+                origin_clearance=origin.get("_origin_clearance"),
+            )
+
+        # W3/Sol r5-B8: the {task} value reaches BOTH driver paths through this ONE
+        # seam (in_casa options.system_prompt AND claude_code initial FIFO prompt).
+        # When a brief is present it becomes the full rendered markdown block
+        # (render_brief_task, two-phase gated to claude_code+interaction_required —
+        # ``_two_phase`` computed at create above); no brief → the canonical
+        # task_text (the else branch is task_text, NOT `task`, which doesn't exist
+        # here — using it would break every legacy task= invocation).
+        task_for_prompt = (
+            render_brief_task(normalized_brief, two_phase=_two_phase)
+            if brief is not None else task_text
+        )
+        prompt = (
+            prompt_template
+            .replace("{task}", task_for_prompt)
+            .replace("{context}", context_text or "(none)")
+            .replace("{world_state_summary}", world_state)
+            .replace("{executor_memory}", executor_memory_block)
+        )
+
+        # Driver dispatch — in_casa uses ClaudeAgentOptions + system_prompt;
+        # claude_code uses the ExecutorDefinition + workspace-CLAUDE.md.
+        if defn.driver == "claude_code":
+            driver = getattr(agent_mod, "active_claude_code_driver", None)
+            if driver is None:
+                await _engagement_registry.mark_error(
+                    rec.id, kind="no_driver",
+                    message="claude_code driver not initialized",
+                )
+                await _abort_engagement_topic(channel, rec.id, topic_id)
+                return _result({
+                    "status": "error", "kind": "no_driver",
+                    "message": "claude_code driver not initialized",
+                })
+            try:
+                await driver.start(rec, prompt=prompt, options=defn)
+            except Exception as exc:  # noqa: BLE001
+                logger.exception(
+                    "claude_code driver.start failed for %s", rec.id[:8],
+                )
+                await _engagement_registry.mark_error(
+                    rec.id, kind="driver_start_failed", message=str(exc),
+                )
+                await _abort_engagement_topic(channel, rec.id, topic_id)
+                return _result({
+                    "status": "error", "kind": "driver_start_failed",
+                    "message": str(exc),
+                })
+        else:
+            # Off-loop: _build_executor_options reads hooks.yaml. §3.9: feed the
+            # SAME resolution gated + recorded above (one resolve, one binding).
+            options = await asyncio.to_thread(
+                _build_executor_options, defn, executor_type=executor_type,
+                resolution=plugin_resolution,
+                extra_casa_tools=(
+                    "mcp__casa-framework__query_engager",
+                    "mcp__casa-framework__emit_completion",
+                ),
+            )
+            options.system_prompt = prompt
+
+            driver = getattr(agent_mod, "active_engagement_driver", None)
+            if driver is None:
+                await _engagement_registry.mark_error(
+                    rec.id, kind="no_driver",
+                    message="engagement driver not initialized",
+                )
+                await _abort_engagement_topic(channel, rec.id, topic_id)
+                return _result({
+                    "status": "error", "kind": "no_driver",
+                    "message": "engagement driver not initialized",
+                })
+            try:
+                await driver.start(rec, prompt=prompt, options=options)
+            except Exception as exc:  # noqa: BLE001
+                await _engagement_registry.mark_error(
+                    rec.id, kind="driver_start_failed", message=str(exc),
+                )
+                await _abort_engagement_topic(channel, rec.id, topic_id)
+                return _result({
+                    "status": "error", "kind": "driver_start_failed",
+                    "message": str(exc),
+                })
+
+    except asyncio.CancelledError:
+        _abort_launch_on_cancel(channel, rec.id, topic_id)
+        raise
     return _result({
         "status": "pending",
         "engagement_id": rec.id,
@@ -5567,6 +5576,33 @@ def _abort_topic_on_cancel(channel: Any, engagement_id: str,
     task = asyncio.ensure_future(
         _abort_engagement_topic(channel, engagement_id, topic_id),
     )
+    _ABORT_BG_TASKS.add(task)
+    task.add_done_callback(_ABORT_BG_TASKS.discard)
+
+
+def _abort_launch_on_cancel(channel: Any, engagement_id: str,
+                            topic_id: int | None) -> None:
+    """Sol r1 (#363 family): background compensation for a launch cancelled
+    AFTER its record was created but BEFORE its driver started. Without this,
+    the cancellation unwound the tool call leaving a durably-active record
+    and an open topic with nothing driving them. Marks the record errored
+    (a terminal registry transition) then aborts the topic — fire-and-forget
+    and strong-ref'd, since a cancelled task cannot await."""
+    async def _run() -> None:
+        try:
+            if _engagement_registry is not None:
+                await _engagement_registry.mark_error(
+                    engagement_id, kind="launch_cancelled",
+                    message="tool call cancelled during launch",
+                )
+        except Exception:  # noqa: BLE001 — best-effort; topic abort still runs
+            logger.warning(
+                "launch-cancel compensation: mark_error failed for %s",
+                engagement_id[:8], exc_info=True,
+            )
+        await _abort_engagement_topic(channel, engagement_id, topic_id)
+
+    task = asyncio.ensure_future(_run())
     _ABORT_BG_TASKS.add(task)
     task.add_done_callback(_ABORT_BG_TASKS.discard)
 

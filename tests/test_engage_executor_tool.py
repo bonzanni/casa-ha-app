@@ -862,6 +862,89 @@ class TestCancelledLaunchAbortsTopic:
         assert abort.await_args.args[2] == 77  # the just-created topic
 
 
+class TestCancelledLaunchAfterRecordCompensates:
+    """Sol r1 (#363 family): a cancellation AFTER create() but BEFORE the
+    driver started used to leave a durably-active record and an open topic
+    with nothing driving them — the record must be marked errored and the
+    topic aborted, in the background."""
+
+    async def test_cancel_during_driver_start_marks_error_and_aborts_topic(
+            self, tmp_path, monkeypatch):
+        import asyncio
+        import agent as agent_mod
+        import tools as tools_mod
+        from tools import engage_executor, init_tools
+        from engagement_registry import EngagementRegistry
+
+        registry = EngagementRegistry(
+            tombstone_path=str(tmp_path / "engagements.json"), bus=None)
+        defn = _mock_executor_def()
+        p = tmp_path / "prompt.md"
+        p.write_text("t")
+        defn.prompt_template_path = str(p)
+        exec_reg = MagicMock()
+        exec_reg.get = MagicMock(return_value=defn)
+        exec_reg.list_types = MagicMock(return_value=["configurator"])
+
+        channel = MagicMock()
+        channel.engagement_supergroup_id = -100123
+        channel.engagement_permission_ok = True
+        channel.open_engagement_topic = AsyncMock(return_value=88)
+        channel.bot = MagicMock()
+        channel.bot.edit_forum_topic = AsyncMock()
+        cm = MagicMock()
+        cm.get = MagicMock(return_value=channel)
+        init_tools(
+            channel_manager=cm, bus=MagicMock(),
+            specialist_registry=MagicMock(), mcp_registry=MagicMock(),
+            trigger_registry=MagicMock(), engagement_registry=registry,
+            executor_registry=exec_reg,
+        )
+        abort = AsyncMock()
+        monkeypatch.setattr(tools_mod, "_abort_engagement_topic", abort)
+
+        started = asyncio.Event()
+
+        async def _hanging_start(rec, *, prompt, options):
+            started.set()
+            await asyncio.Event().wait()
+
+        monkeypatch.setattr(
+            agent_mod, "active_engagement_driver",
+            MagicMock(start=AsyncMock(side_effect=_hanging_start)),
+            raising=False,
+        )
+
+        async def _call():
+            token = agent_mod.origin_var.set({
+                "role": "assistant", "channel": "telegram",
+                "chat_id": "c1", "cid": "x", "user_text": "hi",
+            })
+            try:
+                return await engage_executor.handler({
+                    "executor_type": "configurator",
+                    "task": "do the thing", "context": "",
+                })
+            finally:
+                agent_mod.origin_var.reset(token)
+
+        task = asyncio.ensure_future(_call())
+        await asyncio.wait_for(started.wait(), timeout=5)
+        task.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await task
+
+        pending = list(tools_mod._ABORT_BG_TASKS)
+        if pending:
+            await asyncio.gather(*pending, return_exceptions=True)
+        # The record is terminally errored — not left active with no driver.
+        recs = list(registry._records.values())
+        assert len(recs) == 1
+        assert recs[0].status == "error"
+        abort.assert_awaited_once()
+        assert abort.await_args.args[2] == 88
+
+
 class TestEngageExecutorClaudeCode:
     @pytest.mark.skip(reason="TODO(Phase G): Full wiring test — covered by D-block E2E")
     async def test_dispatches_to_claude_code_driver(self, monkeypatch, tmp_path):

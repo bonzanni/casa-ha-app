@@ -340,6 +340,24 @@ class TestGuardArmingAndOracle:
         assert await self._denied(
             clean, f"false || cd {bad_repo}; git push origin main")
 
+    async def test_unexecuted_conditional_cd_cannot_redirect_scan(
+            self, tmp_path: Path, bad_repo: Path):
+        """Terra r1 (#348): the guard cannot know which cds actually execute —
+        `true || cd <clean>` never runs, the push happens FROM bad_repo. The
+        scan is a UNION over the hook cwd and every textual cd target, so a
+        conditional cd can never redirect it away from the pushed repo."""
+        clean = tmp_path / "clean-decoy"
+        clean.mkdir()
+        assert await self._denied(
+            bad_repo, f"true || cd {clean}\ngit push origin main")
+
+    async def test_nonexistent_cd_target_still_scans_hook_cwd(
+            self, bad_repo: Path):
+        """Terra r1 (#348): a nonexistent cd target must not fail OPEN — the
+        hook cwd is always in the scanned union."""
+        assert await self._denied(
+            bad_repo, "cd /nonexistent-dir-xyz; git push origin main")
+
     async def test_reserved_env_self_declaration_blocks(
             self, git_plugin_repo: Path):
         """G6 corrected: a committed .mcp.json self-declaring a CLI-reserved

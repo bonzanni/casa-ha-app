@@ -265,6 +265,46 @@ async def test_deferred_reply_first_output_threads_to_inbound(
     assert driver.reply_target is None  # consumed by the successful post
 
 
+async def test_deferred_reply_cancelled_send_restores_reply_target(
+    app_factory, monkeypatch,
+) -> None:
+    """Terra r1 (#332): task cancellation bypasses ``except Exception`` — a
+    cancelled poster must still restore the consumed one-shot target when no
+    message id was recorded."""
+    from channels import channel_handlers as ch_mod
+
+    driver = _FakeIntentDriver(reply_target=555)
+
+    # First run the handler with a NON-invoking await seam so the poster
+    # closure is captured without being executed.
+    async def _no_invoke(eng_id, rid):
+        return {"ok": True, "message_id": 1}
+
+    driver.await_send_intent = _no_invoke  # type: ignore[method-assign]
+
+    class _CancellingChannel(_FakeChannel):
+        async def send_response_to_topic(self, thread_id, text, **kwargs):
+            raise asyncio.CancelledError()
+
+    monkeypatch.setattr(ch_mod, "_resolve_active_driver", lambda: driver)
+    app, _ch, _reg = app_factory(channel=_CancellingChannel())
+    async with TestClient(TestServer(app)) as client:
+        resp = await client.post(
+            "/internal/channel/send_to_topic",
+            json={"engagement_id": "eng-1", "text": "hello",
+                  "engagement_token": "tok-eng-1",
+                  "request_id": "r1", "projection_hash": "h1"},
+        )
+        assert resp.status == 200
+
+    poster = driver.posters["r1"]
+    driver.reply_target = 999
+    with pytest.raises(asyncio.CancelledError):
+        await poster()
+    assert driver.restored == [999]
+    assert driver.reply_target == 999  # re-armed
+
+
 async def test_deferred_reply_failed_send_restores_reply_target(
     app_factory, monkeypatch,
 ) -> None:

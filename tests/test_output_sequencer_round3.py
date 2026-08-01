@@ -186,13 +186,16 @@ async def test_post_discrete_failed_send_leaves_narration_open():
     assert seq.narration_msg_id is None
 
 
-async def test_post_discrete_wire_timeout_leaves_narration_open():
-    """#332 companion: the wait_for-timeout outcome is documented as
-    'no state change' too."""
+async def test_post_discrete_wire_timeout_seals_narration_conservatively():
+    """#332 + Sol r1: a TIMED-OUT send is AMBIGUOUS — Telegram may have
+    accepted the message before the response was lost, so narration must
+    seal (later streamed text can never edit above a keyboard that may
+    exist below it). Only a CONFIRMED-failure None preserves state."""
     import asyncio
 
     seq, _plain, _markup, _clock, _ids = _make_seq()
     nid = await seq.open_narration("working...")
+    assert nid is not None
 
     async def _hang(topic_id, text, markup_, reply_to=None):
         await asyncio.sleep(3600)
@@ -200,7 +203,7 @@ async def test_post_discrete_wire_timeout_leaves_narration_open():
     seq._send_message_markup = _hang
     mid = await seq.post_discrete("q", markup=KBD1, wire_timeout=0.01)
     assert mid is None
-    assert seq.narration_msg_id == nid       # narration NOT sealed
+    assert seq.narration_msg_id is None      # sealed: send may have landed
 
 
 async def test_post_discrete_revalidate_accepted_sends():

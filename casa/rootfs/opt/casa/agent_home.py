@@ -13,6 +13,8 @@ from __future__ import annotations
 import json
 import logging
 import os
+import stat
+import tempfile
 from pathlib import Path
 
 logger = logging.getLogger(__name__)
@@ -54,17 +56,30 @@ def provision_agent_home(
     # v0.71.0: no enabledPlugins seeding — plugin assignment is the registry's
     # job. A stale key from an older deploy is preserved (never deleted).
 
-    # Write back atomically (#355): a plain truncate-and-write left invalid
-    # JSON behind on a crash mid-write; temp-file + os.replace never exposes
-    # a partial file.
+    # Write back atomically (#355 + Terra/Sol r1): a plain truncate-and-write
+    # left invalid JSON behind on a crash mid-write. A UNIQUE same-directory
+    # temp file (mkstemp — no fixed-name race between concurrent provisions)
+    # + os.replace never exposes a partial file; the try covers the WRITE as
+    # well as the replace so no temp litter survives any failure; and the
+    # destination's existing mode is preserved (an operator-tightened 0600
+    # must not widen to the umask default).
     claude_dir.mkdir(parents=True, exist_ok=True)
-    tmp_path = settings_path.with_name(settings_path.name + ".tmp")
-    tmp_path.write_text(json.dumps(existing, indent=2, sort_keys=True) + "\n",
-                        encoding="utf-8")
     try:
-        os.replace(tmp_path, settings_path)
+        prior_mode = stat.S_IMODE(os.stat(settings_path).st_mode)
     except OSError:
-        tmp_path.unlink(missing_ok=True)
+        prior_mode = 0o644  # new file: match the previous write_text default
+    fd, tmp_name = tempfile.mkstemp(
+        dir=claude_dir, prefix=".settings.json.", suffix=".tmp")
+    try:
+        with os.fdopen(fd, "w", encoding="utf-8") as fh:
+            fh.write(json.dumps(existing, indent=2, sort_keys=True) + "\n")
+        os.chmod(tmp_name, prior_mode)
+        os.replace(tmp_name, settings_path)
+    except BaseException:
+        try:
+            os.unlink(tmp_name)
+        except OSError:
+            pass
         raise
     logger.info("agent-home provisioned: role=%s settings=%s", role, settings_path)
 

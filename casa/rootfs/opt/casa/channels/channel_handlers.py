@@ -457,6 +457,13 @@ def _make_send_to_topic(
             try:
                 mid = await telegram_channel.send_response_to_topic(
                     topic_id, text, **_kw)
+            except asyncio.CancelledError:
+                # Terra/Sol r1 (#332): cancellation bypasses the except
+                # below — the send may or may not have landed, but the
+                # restore never clobbers a newer target and a doubly
+                # threaded pair is cosmetic, so re-arm and re-raise.
+                _restore_turn_reply_to(driver, engagement_id, reply_to)
+                raise
             except Exception as exc:  # noqa: BLE001
                 logger.warning(
                     "send_to_topic failed for engagement=%s topic=%s: %s",
@@ -2576,6 +2583,14 @@ def _make_ask(
                     # advance only after the keyboard actually posted.
                     await _advance_first_contact()
                     return mid
+                except asyncio.CancelledError:
+                    # Terra/Sol r1 (#332): cancellation bypasses the normal
+                    # result-based restore. Re-arm the one-shot target ONLY
+                    # when no keyboard message id was recorded (a posted
+                    # keyboard already consumed it correctly), then re-raise.
+                    if not isinstance(req.meta.get("message_id"), int):
+                        _restore_turn_reply_to(driver, eng_id, _ask_reply_to)
+                    raise
                 finally:
                     # Unblock the (possibly already-runnable) settlement path: the
                     # registration + waiting submission above are now durable.

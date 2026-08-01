@@ -1773,35 +1773,54 @@ def make_self_containment_guard() -> HookCallback:
             re.search(r"\bCASA_ALLOW_ANTI_PATTERN=([\"']?)1\1(\s|$)", cmd))
 
         cwd = Path(input_data.get("cwd") or os.getcwd())
-        # Sol r5-3: scan the repo the COMMAND targets, not the hook cwd —
-        # `cd <path> && git push` re-bases, `git -C <path> push` retargets.
-        # #348: bash separates commands on newlines, `|`, `&` and `||` just
-        # as on `&&`/`;` — the class below covers them all (the final char
-        # of `&&`/`||` is itself in the class), so a `cd` on its own line
-        # re-bases the scan too instead of silently scanning the hook cwd.
+        # Sol r5-3: scan the repo the COMMAND targets — `cd <path> && git
+        # push` re-bases, `git -C <path> push` retargets. #348: bash
+        # separates commands on newlines, `|`, `&` and `||` just as on
+        # `&&`/`;` — the class below covers them all (the final char of
+        # `&&`/`||` is itself in the class).
+        #
+        # Terra/Sol r1 (#348): the guard cannot know which cds actually
+        # EXECUTE (`true || cd X` skips X; a `cd` in a pipeline runs in a
+        # subshell; a failed `cd nonexistent` leaves the shell where it
+        # was). Fail CLOSED: scan the UNION of every candidate repo — the
+        # hook cwd plus every textual cd rebase and the -C target — so a
+        # conditional or failing cd can never redirect the scan away from
+        # the repository the push actually operates on, and a nonexistent
+        # target never turns into an allow.
+        candidates = [cwd]
+        cur = cwd
         for m_cd in re.finditer(
                 r"(?:^|[;&|\n\r])\s*cd\s+(\"[^\"]+\"|'[^']+'|[^\s;&|]+)",
                 cmd[: m_push.start()]):
             t = m_cd.group(1).strip("'\"")
-            cwd = Path(t) if os.path.isabs(t) else cwd / t
+            cur = Path(t) if os.path.isabs(t) else cur / t
+            candidates.append(cur)
         m_c = re.search(r"-C\s+(\"[^\"]+\"|'[^']+'|\S+)", m_push.group(1))
         if m_c:
             t = m_c.group(1).strip("'\"")
-            cwd = Path(t) if os.path.isabs(t) else cwd / t
-        if not cwd.is_dir():
-            return {}
+            candidates.append(Path(t) if os.path.isabs(t) else cur / t)
 
-        # Sol r4-7: anchor the tree scan at the REPO ROOT when resolvable —
-        # a push from a subdirectory must still see a root README
-        # anti-pattern. Fall back to cwd outside a worktree.
-        top = await asyncio.to_thread(
-            _git_lines, cwd, "rev-parse", "--show-toplevel")
-        scan_root = Path(top[0]) if top else cwd
-
-        # M28: the walk+read blocks the shared event loop — run it off-loop.
-        findings = await asyncio.to_thread(
-            _scan_tree_for_anti_patterns, scan_root)
-        findings += await asyncio.to_thread(_scan_mcp_launch_refs, cwd)
+        findings: list[str] = []
+        seen_roots: set[str] = set()
+        for cand in candidates:
+            if not cand.is_dir():
+                continue
+            # Sol r4-7: anchor the tree scan at the REPO ROOT when
+            # resolvable — a push from a subdirectory must still see a root
+            # README anti-pattern. Fall back to the candidate itself.
+            top = await asyncio.to_thread(
+                _git_lines, cand, "rev-parse", "--show-toplevel")
+            scan_root = Path(top[0]) if top else cand
+            if str(scan_root) in seen_roots:
+                continue
+            seen_roots.add(str(scan_root))
+            # M28: the walk+read blocks the shared event loop — off-loop.
+            findings += await asyncio.to_thread(
+                _scan_tree_for_anti_patterns, scan_root)
+            findings += await asyncio.to_thread(_scan_mcp_launch_refs, cand)
+        # De-duplicate while preserving order (overlapping candidates can
+        # surface the same finding via tree + cwd scans).
+        findings = list(dict.fromkeys(findings))
 
         if findings:
             if override:

@@ -985,6 +985,11 @@ class OutputSequencer:
                 return None
             if intent.outcome is not None and intent.outcome.get("compensated"):
                 return intent  # already compensated — exactly-once
+            # Sol r1 (#332): the compensated message PHYSICALLY landed below
+            # the open narration — seal it, exactly like the confirmed-post
+            # path in _post_intent_locked (pre-#332 the unconditional
+            # pre-poster seal covered this; the seal is now landed-only).
+            self._seal_narration_locked()
             intent.state = "posted"
             intent.consumed = True          # retired from matching
             intent.timeout_posted = False   # no consumption debt (not a success)
@@ -1221,6 +1226,14 @@ class OutputSequencer:
                 try:
                     mid = await asyncio.wait_for(send, wire_timeout)
                 except asyncio.TimeoutError:
+                    # Sol r1 (#332): a TIMED-OUT send is AMBIGUOUS — Telegram
+                    # may have accepted the message before the response was
+                    # lost (§D6 r17-2 semantics). Seal conservatively so later
+                    # streamed text can never edit narration ABOVE a keyboard
+                    # that may exist below it. A confirmed None return (the
+                    # wire wrapper caught a definite failure) stays
+                    # no-state-change per the #332 contract.
+                    self._seal_narration_locked()
                     return None
             if mid is None:
                 return None
@@ -1529,7 +1542,10 @@ class OutputSequencer:
             intent.outcome = {"ok": False, "message_id": None, "terminal": True}
             self._signal_resolution(intent.request_id)
             return
-        self._seal_narration_locked()
+        # Sol r1 (#332): the seal moved to the CONFIRMED-post paths below —
+        # a poster that fails (returns None, no compensation) must leave the
+        # open narration editable, exactly like a failed post_discrete. The
+        # writer lock is held across poster + seal, so order is preserved.
         if warn:
             logger.warning(
                 "output sequencer: intent %s (%s) unmatched by any block for "
@@ -1595,6 +1611,9 @@ class OutputSequencer:
                 intent.request_id, mid, intent.outcome, self.engagement_id,
             )
             return
+        # Sol r1 (#332): the discrete message LANDED below the open narration —
+        # seal it now (rollover-on-interleave, §2), on the confirmed path only.
+        self._seal_narration_locked()
         intent.state = "posted"
         intent.consumed = True
         self._high_water = mid

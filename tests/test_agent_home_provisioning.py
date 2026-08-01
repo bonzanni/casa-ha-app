@@ -107,6 +107,47 @@ def test_provision_write_replaces_atomically(tmp_path: Path,
     assert [p.name for p in settings_path.parent.iterdir()] == ["settings.json"]
 
 
+def test_provision_preserves_existing_file_mode(tmp_path: Path) -> None:
+    """Terra r1 (#355): replacing via a fresh temp file must not widen an
+    operator-tightened mode (0600 settings must stay 0600)."""
+    import os
+    import stat
+    from agent_home import provision_agent_home
+
+    home_root = tmp_path / "agent-home"
+    settings_path = home_root / "ellen" / ".claude" / "settings.json"
+    settings_path.parent.mkdir(parents=True, exist_ok=True)
+    settings_path.write_text('{"hooks": {}}', encoding="utf-8")
+    os.chmod(settings_path, 0o600)
+
+    provision_agent_home(role="ellen", home_root=home_root,
+                         defaults_root=tmp_path)
+    assert stat.S_IMODE(os.stat(settings_path).st_mode) == 0o600
+
+
+def test_provision_serialization_failure_leaves_no_temp_litter(
+        tmp_path: Path, monkeypatch) -> None:
+    """Terra r1 (#355): a failure while WRITING the temp file (not only at
+    replace time) must clean the temp up and leave the original intact."""
+    from agent_home import provision_agent_home
+
+    home_root = tmp_path / "agent-home"
+    settings_path = home_root / "ellen" / ".claude" / "settings.json"
+    settings_path.parent.mkdir(parents=True, exist_ok=True)
+    original = '{"hooks": {}}'
+    settings_path.write_text(original, encoding="utf-8")
+
+    def _boom(*a, **kw):
+        raise OSError("simulated serialization failure")
+
+    monkeypatch.setattr("agent_home.json.dumps", _boom)
+    with pytest.raises(OSError):
+        provision_agent_home(role="ellen", home_root=home_root,
+                             defaults_root=tmp_path)
+    assert settings_path.read_text(encoding="utf-8") == original
+    assert [p.name for p in settings_path.parent.iterdir()] == ["settings.json"]
+
+
 def test_provision_all_homes_includes_residents_and_specialists(tmp_path: Path) -> None:
     """E-4 regression: residents AND specialists must each get an agent-home."""
     from agent_home import provision_all_homes
