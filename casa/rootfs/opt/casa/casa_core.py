@@ -26,7 +26,7 @@ from apscheduler.schedulers.asyncio import AsyncIOScheduler
 
 from agent_loader import load_all_agents
 from authz_grants import CHALLENGES, GRANTS
-from bus import BusMessage, MessageBus, MessageType
+from bus import BusMessage, BusShutdownError, MessageBus, MessageType
 from channel_authz import agent_allowed_on
 from channels import ChannelManager
 from claude_runtime import (
@@ -1779,6 +1779,11 @@ def _make_invoke_handler(
             return web.json_response({"response": str(result.content)})
         except asyncio.TimeoutError:
             return web.json_response({"error": "timeout"}, status=504)
+        except BusShutdownError:
+            # #316: the bus gate refused (or abandoned) the request
+            # because the container is shutting down.
+            return web.json_response(
+                {"error": "shutting down"}, status=503)
 
     return invoke_handler
 
