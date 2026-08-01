@@ -1,5 +1,36 @@
 # Changelog
 
+## [0.138.0] - 2026-08-01
+
+### Fixed
+
+Driver-durability batch — five issues where a crash, a race, or a failed
+write could lose an operator message, a specialist's answer, or a plugin:
+
+- An engagement that repeatedly refused to finish could have its **fresh turn
+  killed by a delayed forced restart**, silently losing the operator message
+  that turn had just picked up. The forced restart is now single-flight and
+  generation-guarded, and replayed control frames no longer trigger duplicate
+  operator turns or phantom "abnormal exit" warnings.
+- The engagement **inbound message queue is now crash-safe**: queued messages,
+  capacity notices and delivery receipts survive a power loss, failed sends
+  are retried instead of dropped, and the queue no longer grows without bound.
+- **Suspended specialist conversations resume reliably** after a restart: a
+  failed session-ID save is retried on the next message instead of being
+  silently treated as saved (previously the conversation could not be resumed
+  and looked like an orphan).
+- A specialist's **finished answer is never discarded** when the final status
+  write fails — the result is returned and the durable record is completed in
+  the background. Cancellations and voice-deadline teardowns are equally
+  durable, and an already-delivered voice job no longer replays its handoff
+  on every reconnect.
+- **Installed plugins survive a power loss**: published artifacts are fully
+  synced to disk before anything references them, and the media-outbox
+  cleanup can no longer delete a freshly published file it raced with.
+- **Boot replay refuses to resume** an engagement whose workspace or pinned
+  plugin artifacts are missing — previously an intact service entry could
+  enter an endless restart loop.
+
 ## [0.137.0] - 2026-08-01
 
 ### Fixed / Security
