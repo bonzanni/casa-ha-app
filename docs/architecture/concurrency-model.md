@@ -83,11 +83,13 @@ What it does not cover: unpooled turn types, and the bus layer above (INV-CONC-0
 drops silently. Nothing queues.
 
 **A request gets no answer.** The caller times out and its pending future is removed —
-but a slow handler is *not* cancelled by the timeout and runs to completion; only the
-caller's own cancellation cancels the dispatch task, and if the message has not been
-dequeued yet that same cancellation marks it so the consumer drops it instead of running
-the handler for a caller that is gone. A handler returning nothing produces an empty
-response rather than a hang, and a handler that raises produces an error response.
+but a slow handler is *not* cancelled by the timeout and runs to completion; the dispatch
+task is cancelled by exactly two things: the caller's own cancellation (which also marks
+a not-yet-dequeued message so the consumer drops it instead of running the handler for a
+caller that is gone), and eviction of the target role, which resolves a still-waiting
+caller with a handler-error response rather than leaving it to time out. A handler
+returning nothing produces an empty response rather than a hang, and a handler that
+raises produces an error response.
 
 **The process is shutting down.** Once the shutdown gate is set, new requests fail
 immediately with a typed shutdown error rather than enqueueing for consumers that are

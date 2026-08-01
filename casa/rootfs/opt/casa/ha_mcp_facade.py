@@ -130,11 +130,19 @@ class HomeAssistantFacade:
                 # would report "unchanged" forever).
                 self._publish_pending = True
             must_publish = self._publish_pending
+            observed_generation = self._session_generation
         if must_publish and self._on_schema_change is not None:
             callback_result = self._on_schema_change()
             if inspect.isawaitable(callback_result):
                 await callback_result
-            self._publish_pending = False
+            async with self._lock:
+                # Terra r2-1: only the publisher of the LATEST committed
+                # surface may clear the flag. A slower publisher that
+                # started before a newer commit must leave it set —
+                # otherwise its late success absorbs the newer surface's
+                # failed publication and the next refresh skips it.
+                if self._session_generation == observed_generation:
+                    self._publish_pending = False
 
     async def aclose(self) -> None:
         self._closed = True

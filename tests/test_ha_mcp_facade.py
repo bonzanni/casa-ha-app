@@ -878,6 +878,62 @@ async def test_failed_schema_publication_retries_on_next_refresh():
 
 
 @pytest.mark.asyncio
+async def test_slow_publisher_success_does_not_clear_newer_failed_publication():
+    """Terra r2-1: refresh A's callback is still in flight when refresh B
+    commits a NEWER surface and B's publication fails. A's late success
+    must not clear the pending-publication flag B set — the next refresh
+    still owes a republication of B's surface."""
+    sessions = SessionSequence(
+        FakeHaSession(tools=[action_tool("HassTurnOn")]),
+        FakeHaSession(tools=[
+            action_tool("HassTurnOn"),
+            action_tool("HassLightSet"),
+        ]),
+        FakeHaSession(tools=[
+            action_tool("HassTurnOn"),
+            action_tool("HassLightSet"),
+            action_tool("HassClimateSet"),
+        ]),
+        FakeHaSession(tools=[
+            action_tool("HassTurnOn"),
+            action_tool("HassLightSet"),
+            action_tool("HassClimateSet"),
+        ]),
+    )
+
+    release_a = asyncio.Event()
+    entered_a = asyncio.Event()
+
+    class Recorder(SchemaChangeRecorder):
+        async def __call__(self) -> None:
+            await super().__call__()
+            if self.count == 1:          # refresh A: block until released
+                entered_a.set()
+                await release_a.wait()
+            elif self.count == 2:        # refresh B: newer surface, fails
+                raise RuntimeError("SDK reload failed")
+
+    changed = Recorder()
+    facade = make_facade(sessions, on_schema_change=changed)
+
+    await facade.start()
+    try:
+        task_a = asyncio.create_task(facade.refresh())
+        await asyncio.wait_for(entered_a.wait(), timeout=5)
+        with pytest.raises(RuntimeError):
+            await facade.refresh()       # B commits newer, publish fails
+        release_a.set()
+        await asyncio.wait_for(task_a, timeout=5)  # A succeeds late
+
+        # The flag must still be pending: the next refresh republishes.
+        await facade.refresh()
+        assert changed.count == 3
+    finally:
+        release_a.set()
+        await facade.aclose()
+
+
+@pytest.mark.asyncio
 async def test_identical_normalized_surface_does_not_notify_schema_change():
     initial = Tool(
         name="HassTurnOn",
