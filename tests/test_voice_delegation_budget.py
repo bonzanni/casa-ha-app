@@ -1345,3 +1345,35 @@ class TestVoicePersistenceCancellationBound:
         finally:
             wedged.set()
             await asyncio.sleep(0.01)
+
+
+@pytest.mark.asyncio
+class TestPostCancellationPersistenceBound:
+    async def test_already_cancelled_wait_is_bounded_from_entry(
+        self, monkeypatch,
+    ):
+        """Terra r2 (#321): the lifecycle's CancelledError handler persists a
+        cancelled terminal via a FRESH _await_voice_persistence call — with no
+        new cancellation arriving, that wait was unbounded again, so a wedged
+        write still stranded the lifecycle task and its permit. A wait entered
+        from a cancellation handler must be bounded from entry."""
+        import tools as tm
+
+        monkeypatch.setattr(
+            tm, "_VOICE_PERSIST_CANCEL_BOUND_S", 0.05, raising=False)
+
+        wedged = asyncio.Event()
+
+        async def never_completes():
+            await wedged.wait()
+
+        try:
+            with pytest.raises(asyncio.CancelledError):
+                await asyncio.wait_for(
+                    tm._await_voice_persistence(
+                        never_completes(), already_cancelled=True),
+                    timeout=2,
+                )
+        finally:
+            wedged.set()
+            await asyncio.sleep(0.01)

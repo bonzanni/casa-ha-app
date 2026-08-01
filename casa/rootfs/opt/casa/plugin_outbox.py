@@ -301,12 +301,7 @@ class PluginOutbox:
         if current is None:
             return 0
         if current.st_ino != st.st_ino or current.st_dev != st.st_dev:
-            try:
-                os.rename(private, name, src_dir_fd=dirfd, dst_dir_fd=dirfd)
-            except OSError as exc:
-                logger.warning(
-                    "plugin-outbox: could not restore fresh entry %r after "
-                    "reap-ownership check: %s", name, exc)
+            self._restore_fresh(dirfd, private, name)
             return 0
         # All relative to the pinned dir-FD (rmtree dir_fd is 3.11+).
         try:
@@ -318,6 +313,43 @@ class PluginOutbox:
         except OSError as exc:
             logger.warning("plugin-outbox: failed to reap %r: %s", name, exc)
             return 0
+
+    @staticmethod
+    def _restore_fresh(dirfd: int, private: str, name: str) -> None:
+        """Give a privately-held FRESH inode back its published name without
+        ever replacing a newer publication (Terra/Sol r2): ``os.link`` is the
+        atomic no-replace primitive — it fails EEXIST when a newer same-name
+        publication landed meanwhile, in which case the held copy is simply
+        superseded (identical outcome to producer-overwrites-producer) and
+        dropped. Directories cannot be hardlinked; a held directory falls
+        back to a replacing rename — producers publish regular files, so a
+        same-name DIRECTORY republication racing its own reap is not a real
+        traffic pattern, and the entry is otherwise restored intact."""
+        current = _lstat_quiet(private, dirfd)
+        if current is not None and stat.S_ISDIR(current.st_mode):
+            try:
+                os.rename(private, name, src_dir_fd=dirfd, dst_dir_fd=dirfd)
+            except OSError as exc:
+                logger.warning(
+                    "plugin-outbox: could not restore fresh dir %r after "
+                    "reap-ownership check: %s", name, exc)
+            return
+        superseded_or_restored = False
+        try:
+            os.link(private, name, src_dir_fd=dirfd, dst_dir_fd=dirfd,
+                    follow_symlinks=False)
+            superseded_or_restored = True
+        except FileExistsError:
+            superseded_or_restored = True     # newer publication wins
+        except OSError as exc:
+            logger.warning(
+                "plugin-outbox: could not restore fresh entry %r after "
+                "reap-ownership check: %s", name, exc)
+        if superseded_or_restored:
+            try:
+                os.unlink(private, dir_fd=dirfd)
+            except OSError:
+                pass
 
     def sweep_now(self) -> int:
         """Production sweep entry — uses the module clock. Tests drive

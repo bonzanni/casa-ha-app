@@ -21,7 +21,6 @@ import time
 from dataclasses import dataclass
 from pathlib import Path, PurePosixPath
 
-from atomic_io import fsync_directory
 from plugin_registry import STORE_ROOT, compute_artifact_id, normalize_subdir
 from text_util import is_unsafe_text, sanitize_segment
 
@@ -1072,22 +1071,39 @@ def _stage_and_swap(*, name, repo, ref, revision, subdir, staged: Path,
     # (Sol r1): fsyncing store_root/<name>/ does not persist <name>'s own
     # entry in store_root, so a first-time publication could still lose the
     # whole plugin-name directory. store_root is created by setup, so the
-    # chain ends there.
+    # chain ends there. STRICT throughout (Terra/Sol r2): this is the
+    # durability barrier that must complete before anything can reference
+    # the artifact — a swallowed fsync failure here would let a registry
+    # write survive a power loss that the artifact tree does not, which is
+    # the exact state #330 forbids. Nothing references the artifact yet, so
+    # failing the publish loudly is safe (a retry is idempotent).
     _fsync_tree(staged)
     dest.parent.mkdir(parents=True, exist_ok=True)
     os.rename(staged, dest)
-    fsync_directory(dest.parent)
-    fsync_directory(Path(store_root))
+    _fsync_dir_strict(dest.parent)
+    _fsync_dir_strict(Path(store_root))
     _freeze_artifact_files(dest)
     return PublishResult(name, artifact_id, revision, manifest["version"],
                          str(dest), manifest)
 
 
+def _fsync_dir_strict(directory: Path | str) -> None:
+    """STRICT directory fsync for the publication durability barrier —
+    unlike :func:`atomic_io.fsync_directory` (best-effort, for writes whose
+    content is already committed and whose callers roll back on exceptions),
+    a failure here must abort the publish: OSError propagates."""
+    fd = os.open(os.fspath(directory), os.O_RDONLY | os.O_DIRECTORY)
+    try:
+        os.fsync(fd)
+    finally:
+        os.close(fd)
+
+
 def _fsync_tree(root: Path) -> None:
     """fsync every regular file and directory under *root* (bottom-up,
-    symlinks skipped — never open through one). Raises OSError on a file
-    fsync failure: publication must fail loudly rather than hand the caller
-    an artifact that may not survive a power crash."""
+    symlinks skipped — never open through one). Raises OSError on ANY fsync
+    failure: publication must fail loudly rather than hand the caller an
+    artifact that may not survive a power crash."""
     for dirpath, _dirs, files in os.walk(root, topdown=False,
                                          followlinks=False):
         for fn in files:
@@ -1099,7 +1115,7 @@ def _fsync_tree(root: Path) -> None:
                 os.fsync(fd)
             finally:
                 os.close(fd)
-        fsync_directory(dirpath)
+        _fsync_dir_strict(dirpath)
 
 
 def _freeze_artifact_files(root: Path) -> None:

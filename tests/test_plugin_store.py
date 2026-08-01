@@ -319,3 +319,33 @@ def test_publish_fsyncs_store_root_for_new_plugin_dir(tmp_path, monkeypatch):
         "store_root itself was never fsynced — the new plugin-name entry is "
         "not durable"
     )
+
+
+def test_publish_fails_when_directory_fsync_fails(tmp_path, monkeypatch):
+    """Terra r2 (#330): the publication durability barrier must be STRICT —
+    a failed directory fsync silently reported success, so a registry write
+    could survive a power loss while the artifact tree's directory entries
+    did not. Nothing references the artifact yet, so failing loudly is
+    safe."""
+    import stat as stat_mod
+    import plugin_store
+
+    real_fsync = os.fsync
+
+    def failing_dir_fsync(fd: int) -> None:
+        if stat_mod.S_ISDIR(os.fstat(fd).st_mode):
+            raise OSError("simulated dir fsync failure")
+        real_fsync(fd)
+
+    monkeypatch.setattr(plugin_store.os, "fsync", failing_dir_fsync)
+
+    root = tmp_path / "src"
+    (root / ".claude-plugin").mkdir(parents=True)
+    (root / ".claude-plugin" / "plugin.json").write_text(
+        json.dumps({"name": "p", "version": "1.0.0"}), encoding="utf-8")
+
+    with pytest.raises(Exception):
+        plugin_store.publish_from_tree(
+            name="p", repo="o/r", ref="v1", revision="git:" + "a" * 40,
+            subdir="", src_root=root, store_root=tmp_path / "store",
+            staging_root=tmp_path / "staging")

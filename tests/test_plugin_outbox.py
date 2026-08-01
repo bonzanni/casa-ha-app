@@ -521,3 +521,34 @@ def test_sweep_does_not_reap_fresh_file_renamed_over_expired_name(outbox):
     reaped = outbox._reap(outbox._outbox_dirfd, "reused.pdf", st_old)
     assert reaped == 0
     assert os.path.exists(old), "fresh producer file was deleted by the sweep"
+
+
+def test_reap_restore_yields_to_newer_same_name_publication(outbox):
+    """Terra r2 (#330): restoring a fresh inode after the ownership rename
+    must NOT replace an even newer publication that took the name in the
+    meantime — the no-replace restore keeps the newest file and drops the
+    superseded private copy (same outcome as producer-overwrites-producer)."""
+    fresh = _write_outbox_file(outbox._root_realpath, ".held.tmp", PDF)
+    os.rename(fresh, os.path.join(outbox._root_realpath, ".reap.test.held"))
+    newest = _write_outbox_file(outbox._root_realpath, "reused.pdf", JPEG)
+
+    outbox._restore_fresh(outbox._outbox_dirfd, ".reap.test.held", "reused.pdf")
+
+    with open(newest, "rb") as fh:
+        assert fh.read() == JPEG          # newest publication untouched
+    assert not os.path.exists(
+        os.path.join(outbox._root_realpath, ".reap.test.held"))
+
+
+def test_reap_restore_puts_fresh_file_back_when_name_free(outbox):
+    """The ordinary restore: the name is free again, the held fresh inode
+    goes back under its published name."""
+    fresh = _write_outbox_file(outbox._root_realpath, ".held2.tmp", PDF)
+    os.rename(fresh, os.path.join(outbox._root_realpath, ".reap.test.held2"))
+
+    outbox._restore_fresh(outbox._outbox_dirfd, ".reap.test.held2", "back.pdf")
+
+    with open(os.path.join(outbox._root_realpath, "back.pdf"), "rb") as fh:
+        assert fh.read() == PDF
+    assert not os.path.exists(
+        os.path.join(outbox._root_realpath, ".reap.test.held2"))

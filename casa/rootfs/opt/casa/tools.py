@@ -2920,7 +2920,9 @@ def _retrieve_abandoned_persistence_exception(t: asyncio.Task) -> None:
         )
 
 
-async def _await_voice_persistence(operation: Awaitable[Any]) -> Any:
+async def _await_voice_persistence(
+    operation: Awaitable[Any], *, already_cancelled: bool = False,
+) -> Any:
     """Finish one terminal write even if lifecycle cancellation arrives.
 
     #321: cancellation absorption is BOUNDED. The pre-fix loop re-entered
@@ -2928,11 +2930,21 @@ async def _await_voice_persistence(operation: Awaitable[Any]) -> Any:
     ineffective — the registry-owned lifecycle task never completed and the
     job kept its concurrency permit. Past the bound the wait is abandoned
     (the write cannot be cancelled mid-commit; if it later lands, the
-    terminal state is simply durable) and the cancellation propagates."""
+    terminal state is simply durable) and the cancellation propagates.
+
+    ``already_cancelled`` (Terra r2): a call made FROM a cancellation
+    handler (the lifecycle's terminal fallback) gets no fresh
+    ``CancelledError`` to start its clock — without this flag that wait was
+    unbounded again, and a wedged write still stranded the lifecycle task
+    and its permit. When set, the bound runs from entry and giving up
+    raises ``CancelledError`` so the task finishes cancelled."""
     task = asyncio.create_task(operation)
     cancellation: asyncio.CancelledError | None = None
-    deadline: float | None = None
     loop = asyncio.get_running_loop()
+    deadline: float | None = (
+        loop.time() + _VOICE_PERSIST_CANCEL_BOUND_S
+        if already_cancelled else None
+    )
     while not task.done():
         try:
             if deadline is None:
@@ -2951,15 +2963,16 @@ async def _await_voice_persistence(operation: Awaitable[Any]) -> Any:
         except Exception:
             break
     if not task.done():
-        # Only reachable via the deadline branches — cancellation is set.
+        # Only reachable via the deadline branches.
         task.add_done_callback(_retrieve_abandoned_persistence_exception)
         logger.error(
             "terminal persistence still running %.0fs after cancellation — "
             "abandoning the wait (restart recovery remains authoritative)",
             _VOICE_PERSIST_CANCEL_BOUND_S,
         )
-        assert cancellation is not None
-        raise cancellation
+        if cancellation is not None:
+            raise cancellation
+        raise asyncio.CancelledError()
     result = task.result()
     if cancellation is not None:
         raise cancellation
@@ -2972,10 +2985,18 @@ async def _persist_voice_terminal(
     registry,
     job_id: str,
     specialist_role: str,
+    already_cancelled: bool = False,
 ) -> str:
-    """Persist a terminal state, then try one metadata-only safe fallback."""
+    """Persist a terminal state, then try one metadata-only safe fallback.
+
+    ``already_cancelled`` (Terra/Sol r2): set by the lifecycle's
+    CancelledError handler so BOTH waits here are bounded from entry — the
+    abandoned first write may still hold the registry lock, and an unbounded
+    second wait would strand the lifecycle task and its permit exactly the
+    way #321 forbids."""
     try:
-        await _await_voice_persistence(operation)
+        await _await_voice_persistence(
+            operation, already_cancelled=already_cancelled)
         return "primary"
     except asyncio.CancelledError:
         raise
@@ -2987,13 +3008,16 @@ async def _persist_voice_terminal(
         )
 
     try:
-        await _await_voice_persistence(registry.fail_compat(
-            job_id,
-            JobFailure(
-                "persistence_failed",
-                "Specialist result could not be saved.",
+        await _await_voice_persistence(
+            registry.fail_compat(
+                job_id,
+                JobFailure(
+                    "persistence_failed",
+                    "Specialist result could not be saved.",
+                ),
             ),
-        ))
+            already_cancelled=already_cancelled,
+        )
         return "fallback"
     except asyncio.CancelledError:
         raise
@@ -3147,16 +3171,33 @@ async def _run_voice_job_lifecycle(
     except asyncio.CancelledError:
         # This is also safe after a cancellation arrived during a successful
         # shielded terminal write: fail_compat then observes a terminal row
-        # and is an idempotent no-op.
-        await _persist_voice_terminal(
-            registry.fail_compat(
-                job_id,
-                JobFailure("cancelled", "Specialist job was cancelled."),
-            ),
-            registry=registry,
-            job_id=job_id,
-            specialist_role=specialist_role,
-        )
+        # and is an idempotent no-op. ``already_cancelled=True`` (Terra/Sol
+        # r2): this cleanup gets no fresh CancelledError to bound it, and the
+        # abandoned primary write may still hold the registry lock — the
+        # cleanup wait must run against its own deadline, then give up and
+        # let the task finish cancelled (restart recovery / the registry-
+        # owned reconciliation remain authoritative for the durable row).
+        try:
+            await _persist_voice_terminal(
+                registry.fail_compat(
+                    job_id,
+                    JobFailure("cancelled", "Specialist job was cancelled."),
+                ),
+                registry=registry,
+                job_id=job_id,
+                specialist_role=specialist_role,
+                already_cancelled=True,
+            )
+        except asyncio.CancelledError:
+            # Bounded cleanup gave up — hand the still-RUNNING row to the
+            # registry-owned cancel retry (Sol r2), then finish cancelled.
+            try:
+                registry.schedule_cancel_reconciliation(job_id)
+            except Exception:  # noqa: BLE001 — restart recovery remains authoritative
+                logger.error(
+                    "Voice job %s cancel reconciliation scheduling failed; "
+                    "restart recovery required", job_id[:8],
+                )
         raise
 
 
