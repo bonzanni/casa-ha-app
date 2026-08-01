@@ -129,18 +129,38 @@ APPROVED_EXTRA_DIR_ROOTS = ("/share", "/media")
 
 
 def _validate_extra_dir_containment(d: str) -> None:
-    """Reject an extra_dir outside the approved shared roots (#344)."""
+    """Reject an extra_dir outside the approved shared roots (#344).
+
+    Both the LEXICAL path and its REALPATH resolution must sit under an
+    approved root (Terra r1-2): a symlink planted at ``/share/x`` →
+    ``/config`` passes any purely lexical check, and ``--add-dir``
+    follows it at CLI runtime. Realpath at render time closes that for
+    anything present when the script is rendered; a link swapped in
+    afterwards is out of this validator's reach (the roots themselves
+    are not casa-writable).
+    """
     if any(part in ("..", ".") for part in d.split("/")):
         raise WorkspaceConfigError(
             f"extra_dir must not contain traversal segments: {d!r}"
         )
-    for root in APPROVED_EXTRA_DIR_ROOTS:
-        if d == root or d.startswith(root + "/"):
-            return
-    raise WorkspaceConfigError(
-        f"extra_dir {d!r} is outside every approved root "
-        f"{APPROVED_EXTRA_DIR_ROOTS}"
-    )
+
+    def _under_approved(path: str) -> bool:
+        return any(
+            path == root or path.startswith(root + "/")
+            for root in APPROVED_EXTRA_DIR_ROOTS
+        )
+
+    if not _under_approved(d):
+        raise WorkspaceConfigError(
+            f"extra_dir {d!r} is outside every approved root "
+            f"{APPROVED_EXTRA_DIR_ROOTS}"
+        )
+    resolved = os.path.realpath(d)
+    if not _under_approved(resolved):
+        raise WorkspaceConfigError(
+            f"extra_dir {d!r} resolves to {resolved!r}, outside every "
+            f"approved root {APPROVED_EXTRA_DIR_ROOTS}"
+        )
 
 
 def render_run_script(

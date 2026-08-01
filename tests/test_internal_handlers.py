@@ -119,7 +119,7 @@ async def test_tools_call_non_object_arguments_returns_error_object() -> None:
     reg = _FakeRegistry()
     app = _make_app(dispatch={"ok_tool": _ok_tool}, registry=reg)
     async with TestClient(TestServer(app)) as client:
-        for bad in ("scalar", 7, ["list"]):
+        for bad in ("scalar", 7, ["list"], [], "", 0, False):
             resp = await client.post(
                 "/internal/tools/call",
                 json={"name": "ok_tool", "arguments": bad,

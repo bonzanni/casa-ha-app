@@ -264,10 +264,13 @@ def _make_public_mcp_fallback_handler(
 
         method = msg.get("method")
         req_id = msg.get("id")
-        params = msg.get("params") or {}
-        # #380: a truthy non-object params used to slip past the shape
-        # checks and raise at params.get() → HTTP 500 instead of a typed
-        # JSON-RPC error.
+        # #380: any non-object params — truthy OR falsy ([], "", 0, false)
+        # — earns a typed error; only an absent/null params defaults to {}.
+        # The old `or {}` coerced falsy non-objects into a silent empty
+        # call and truthy ones raised at params.get() → HTTP 500.
+        params = msg.get("params")
+        if params is None:
+            params = {}
         if not isinstance(params, dict):
             return _jsonrpc_error(
                 req_id, -32602, "params must be an object")
@@ -294,7 +297,11 @@ def _make_public_mcp_fallback_handler(
             # #335: the token header is what actually authenticates the id
             # claim (verified against the record in the dispatcher).
             name = params.get("name")
-            arguments = params.get("arguments") or {}
+            # #380: pass arguments through un-coerced (None → {} only) so
+            # the dispatcher's non-object gate sees falsy non-objects too.
+            arguments = params.get("arguments")
+            if arguments is None:
+                arguments = {}
             eng_id = request.headers.get("X-Casa-Engagement-Id")
             inner_body = {
                 "name": name,
@@ -368,13 +375,16 @@ async def _dispatch_internal_tools_call(
     fallback doesn't need to synthesize an aiohttp web.Request.
     """
     name = body.get("name")
-    arguments = body.get("arguments") or {}
+    # #380: any non-object arguments — truthy or falsy — is refused with a
+    # typed error rather than forwarded (truthy) or silently coerced to an
+    # empty call (falsy: [], "", 0, false). Absent/null defaults to {}.
+    arguments = body.get("arguments")
+    if arguments is None:
+        arguments = {}
     eng_id = body.get("engagement_id")
 
     if not isinstance(name, str):
         return {"error": {"code": -32602, "message": "missing name"}}
-    # #380: refuse a truthy non-object arguments with a typed error rather
-    # than forwarding it into the tool to crash there.
     if not isinstance(arguments, dict):
         return {"error": {"code": -32602,
                           "message": "arguments must be an object"}}

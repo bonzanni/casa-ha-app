@@ -237,7 +237,7 @@ _compile_lock = asyncio.Lock()
 _compile_worker_lock = threading.Lock()
 
 
-def _compile_swap_reap_sync(new_db: str, old_db: str) -> None:
+def _compile_swap_reap_sync(new_db: str) -> None:
     """The full compile → swap → reap sequence, run in ONE worker thread.
 
     #344: cleanup decisions live HERE, beside the outcome they depend on.
@@ -250,6 +250,11 @@ def _compile_swap_reap_sync(new_db: str, old_db: str) -> None:
     and cleans up according to what actually happened.
     """
     with _compile_worker_lock:
+        # Terra r1-4: snapshot the live db INSIDE the worker lock — a
+        # successor that snapshotted before an abandoned predecessor's
+        # swap landed would reap the predecessor's OLD db (a no-op) and
+        # orphan the one the predecessor made live.
+        old_db = os.path.realpath(LIVE_DB_SYMLINK)
         try:
             subprocess.run(
                 [
@@ -287,9 +292,8 @@ async def _compile_and_update_locked() -> None:
     # single dangling cross-reference fails the whole compile.
     _prune_broken_pairs(svc_root=ENGAGEMENT_SOURCES_ROOT)
 
-    old_db = os.path.realpath(LIVE_DB_SYMLINK)
     new_db = f"/tmp/s6-casa-db-{uuid.uuid4().hex}"
-    await asyncio.to_thread(_compile_swap_reap_sync, new_db, old_db)
+    await asyncio.to_thread(_compile_swap_reap_sync, new_db)
 
 
 async def compile_and_update() -> None:

@@ -1044,6 +1044,39 @@ class TestExtraDirContainment:
                 extra_dirs=["/share/../config"],
             )
 
+    def test_symlink_escaping_approved_root_rejected(self, tmp_path, monkeypatch):
+        """Terra r1-2: a symlink under an approved root pointing outside
+        it must be rejected — --add-dir follows it at CLI runtime."""
+        import os
+
+        from drivers import workspace
+        from drivers.workspace import WorkspaceConfigError, render_run_script
+
+        share = tmp_path / "share"
+        share.mkdir()
+        outside = tmp_path / "outside"
+        outside.mkdir()
+        link = share / "escape"
+        os.symlink(outside, link)
+        monkeypatch.setattr(
+            workspace, "APPROVED_EXTRA_DIR_ROOTS", (str(share),))
+
+        with pytest.raises(WorkspaceConfigError, match="resolves to"):
+            render_run_script(
+                engagement_id="x" * 16,
+                permission_mode="dontAsk",
+                extra_dirs=[str(link)],
+            )
+        # A real subdir under the root still passes.
+        real = share / "ok"
+        real.mkdir()
+        out = render_run_script(
+            engagement_id="x" * 16,
+            permission_mode="dontAsk",
+            extra_dirs=[str(real)],
+        )
+        assert f"--add-dir {real}" in out
+
     def test_plugin_dirs_are_not_containment_checked(self):
         """plugin_dirs are immutable store paths under /data (§3.8) —
         the containment rule applies to extra_dirs only."""

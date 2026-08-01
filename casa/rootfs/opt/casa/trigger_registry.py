@@ -41,12 +41,16 @@ _DOW_TOKENS = ["sun", "mon", "tue", "wed", "thu", "fri", "sat"]  # cron order
 
 
 def _cron_dow_token(tok: str) -> int:
-    """One cron DOW token → cron weekday number (0=Sunday)."""
+    """One cron DOW token → RAW cron weekday number (0..7; 0 and 7 are
+    both Sunday). Kept raw — NOT collapsed mod 7 — so range endpoints
+    keep their ordering: collapsing ``7`` early turned ``0-7`` (every
+    day) into ``0-0`` (Sundays only). Callers normalize per expanded day.
+    """
     if tok.isdigit():
         n = int(tok)
         if n > 7:
             raise TriggerError(f"cron day_of_week out of range: {tok!r}")
-        return n % 7          # cron allows 7 as a Sunday alias
+        return n
     if tok in _CRON_DOW_NAMES:
         return _CRON_DOW_NAMES[tok]
     raise TriggerError(f"invalid cron day_of_week token: {tok!r}")
@@ -77,6 +81,8 @@ def _translate_cron_dow(field: str) -> str:
             if not lo_s or not hi_s:
                 raise TriggerError(
                     f"invalid cron day_of_week range: {expr!r}")
+            # Raw 0..7 endpoints: 0-7 and 1-7 stay ascending full ranges
+            # (7=Sunday alias) instead of collapsing/wrapping.
             lo, hi = _cron_dow_token(lo_s), _cron_dow_token(hi_s)
         else:
             lo = hi = _cron_dow_token(expr)
@@ -86,7 +92,8 @@ def _translate_cron_dow(field: str) -> str:
             days = list(range(lo, hi + 1))
         else:                     # cron wrap range, e.g. 6-0 = Sat,Sun
             days = list(range(lo, 7)) + list(range(0, hi + 1))
-        for d in days[::step]:
+        for d_raw in days[::step]:
+            d = d_raw % 7         # normalize the Sunday alias per day
             if d not in out:
                 out.append(d)
     return ",".join(_DOW_TOKENS[d] for d in out)

@@ -170,6 +170,12 @@ class TestCronDayOfWeekTranslation:
         assert _translate_cron_dow("1-5/2") == "mon,wed,fri"
         assert _translate_cron_dow("sun") == "sun"     # names pass through
         assert _translate_cron_dow("MON-FRI") == "mon,tue,wed,thu,fri"
+        # Terra r1-3: ranges ending in the Sunday alias 7 must not
+        # collapse — 0-7 and 1-7 are full ascending ranges.
+        assert _translate_cron_dow("0-7") == "sun,mon,tue,wed,thu,fri,sat"
+        assert (_translate_cron_dow("1-7")
+                == "mon,tue,wed,thu,fri,sat,sun")
+        assert _translate_cron_dow("5-7") == "fri,sat,sun"
         # cron wrap range (Sat-Sun) expands rather than hitting
         # APScheduler's no-wrap range rule.
         assert _translate_cron_dow("6-0") == "sat,sun"
