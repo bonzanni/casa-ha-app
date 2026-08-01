@@ -25,7 +25,7 @@ Casa runs always-on AI agents inside your Home Assistant instance. The primary a
 | Option | Description |
 |--------|-------------|
 | `telegram_bot_token` | Telegram bot token from @BotFather. Enables the Telegram channel. |
-| `telegram_chat_id` | Telegram chat ID to restrict messages to. Leave empty to accept all chats. **Setting it is a security control**, not just a filter: this id is the operator identity, so only the sender whose Telegram user id matches it is attributed as the operator and reads memory at private clearance — any other accepted sender is recorded under its own `telegram:<id>` identity and reads at public clearance only, as does any engagement they start. With the option empty (accept-all) no sender is the operator, and note that a non-operator sender can still answer their own protected-tool confirmation prompt. Set this id unless you specifically want an open bot. |
+| `telegram_chat_id` | Telegram chat ID to restrict messages to. Leave empty to accept all chats. **Setting it is a security control**, not just a filter: this id is the operator identity, so only the sender whose Telegram user id matches it is attributed as the operator and reads memory at private clearance — any other accepted sender is recorded under its own `telegram:<id>` identity and reads at public clearance only, as does any engagement they start. Protected plugin tools (v0.139.0) can only be authorized by the configured operator: a non-operator sender's protected call is denied outright, and with the option empty (accept-all) no sender is the operator, so protected tools are denied for everyone — the add-on logs a warning at startup in that mode. Set this id unless you specifically want an open bot. |
 | `telegram_engagement_supergroup_id` | Chat ID of the dedicated Telegram forum supergroup used for interactive engagements (Tier 2 Specialist interactive mode; Tier 3 Executor types, Plan 3+). Must be a negative integer. Leave at 0 to disable engagements. |
 
 ### Optional -- Memory
@@ -886,17 +886,21 @@ same `CASA_TOOLS` tuple backs both the SDK path and the HTTP path, so
 every in-process tool is automatically reachable from real CLI
 engagements.
 
-### Hook enforcement (v0.13.1)
+### Hook enforcement (v0.13.1, credential-bound since v0.139.0)
 
 `/hooks/resolve` is the CC-side counterpart to the in-process hook layer.
-`hook_proxy.sh` POSTs the CC hook payload to `http://127.0.0.1:8099/hooks/resolve`
-with a policy name; the handler resolves `HOOK_POLICIES[name]["factory"]()`,
-gates on the policy's matcher regex, and awaits the callback to produce a
-CC-native `{"hookSpecificOutput": {...}}` response. Callback exceptions
-deny (not fail-open). Unknown policy denies. Matcher mismatch returns an
-empty `{}` (CC allow). Per-executor hook parameters on the HTTP path use
-factory defaults (the Configurator's defaults match what it wants);
-wiring YAML params into the HTTP path is a later item.
+`hook_proxy.sh` POSTs the CC hook payload (policy name + payload) to the
+resolver, presenting the engagement credential pair from its own
+workspace `.mcp.json` as the same `X-Casa-Engagement-Id` /
+`X-Casa-Engagement-Token` headers the MCP bridge uses. The resolver
+authenticates any identity claim against the engagement record before
+selecting per-executor hook parameters (from the executor's `hooks.yaml`)
+or invoking an identity-consuming policy such as the engagement
+permission relay; the payload's `cwd` is only cross-checked, never
+trusted as identity. An unauthenticated request falls back to the
+default-configured policy callbacks. Callback exceptions deny (not
+fail-open). Unknown policy denies. Matcher mismatch returns an empty
+`{}` (CC allow).
 
 ### Workspace lifecycle (v0.13.1)
 

@@ -193,13 +193,14 @@
     - tests/test_svc_casa_mcp.py
     - tests/test_mcp_envelope.py
   related: [architecture/plugins.md, architecture/agent-taxonomy.md, architecture/http-surface.md]
-  defines_invariants: [INV-MCP-001, INV-MCP-002, INV-MCP-003, INV-MCP-004, INV-MCP-005]
+  defines_invariants: [INV-MCP-001, INV-MCP-002, INV-MCP-003, INV-MCP-004, INV-MCP-005, INV-MCP-006]
   invariant_tests:
     INV-MCP-001: [tests/test_pin_g4_invariants.py::test_pin_inv_mcp_001_internal_dispatch_ignores_agent_allowlist]
     INV-MCP-002: [tests/test_unix_socket_runner.py::test_unix_runner_creates_socket_with_mode_0600]
     INV-MCP-003: [tests/test_role_scoped_mcp.py::test_casa_framework_factory_exposes_only_granted_tools, tests/test_svc_casa_mcp.py::test_svc_tools_list_uses_static_snapshot]
     INV-MCP-004: [tests/test_engagement_auth_token.py::test_forged_id_without_token_is_rejected_and_tool_never_runs]
     INV-MCP-005: [tests/test_engagement_auth_token.py::test_peek_refuses_to_return_mcp_json_contents]
+    INV-MCP-006: [tests/test_hook_proxy_endpoint.py::test_known_id_with_bad_token_denies_without_callback, tests/test_hook_proxy_endpoint.py::test_unauthenticated_engagement_cwd_uses_defaults_no_identity, tests/test_hook_proxy_endpoint.py::test_authenticated_id_mismatching_cwd_denies, tests/test_hooks_engagement_permission_relay.py::test_no_authenticated_identity_denies]
 
 - doc: architecture/memory.md
   summary: Long-term memory — how a fact is written, who may read it back, and what a caller is told when the store cannot answer.

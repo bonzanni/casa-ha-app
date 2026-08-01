@@ -18,7 +18,11 @@ configuration:
   telegram_chat_id:
     name: Telegram Chat ID
     description: >-
-      Restrict Telegram messages to this chat ID. Leave empty to accept all.
+      Restrict Telegram messages to this chat ID. This id is also the operator
+      identity: only the matching sender gets operator attribution, private
+      memory clearance, and the ability to authorize protected plugin tools.
+      Leave empty to accept all chats — then no sender is the operator and
+      protected plugin tools are denied for everyone.
       Also names the operator: only this sender gets operator attribution
       and private-memory clearance; other accepted senders read at public
       clearance under their own identity.

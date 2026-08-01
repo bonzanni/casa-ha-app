@@ -1,5 +1,33 @@
 # Changelog
 
+## [0.139.0] - 2026-08-01
+
+### Security
+
+Engagement-security batch — who may authorize a protected tool, and how an
+engagement proves its identity on the hook path:
+
+- **Protected plugin tools can now only be authorized by the configured
+  operator** (#368). Previously the confirmation keyboard was answerable by
+  whoever requested the call, so on an accept-all deployment
+  (`telegram_chat_id` empty) any Telegram user could approve their own
+  protected calls. A non-operator's protected call is now denied outright —
+  no challenge is posted — and with `telegram_chat_id` empty protected tools
+  are denied for every sender; the add-on logs a startup warning explaining
+  the accept-all consequences.
+- **Hook resolution now authenticates the engagement credential instead of
+  trusting the caller's working directory** (#366). The hook proxy presents
+  the per-engagement secret from its own workspace, and the resolver verifies
+  it before selecting an executor's hook parameters or posting a permission
+  keyboard — a forged working-directory claim can no longer surface a
+  permission prompt in another engagement's Telegram topic or borrow another
+  executor's hook configuration.
+
+### Notes
+
+- The pre-v0.137.0 config-digest residual (#372) was investigated and needs a
+  designed digest-rotation migration; findings recorded on the issue.
+
 ## [0.138.0] - 2026-08-01
 
 ### Fixed
