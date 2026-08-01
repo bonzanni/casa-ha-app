@@ -441,7 +441,13 @@ class TestGuardArmingAndOracle:
                                    "-P 2>/dev/null", "2> /dev/null",
                                    "&>/dev/null", "2>& 1", "2>| /dev/null",
                                    "<<< x", "<& 0", "&> /dev/null",
-                                   "1>&2", ">> log")):
+                                   "1>&2", ">> log",
+                                   # Terra/Sol r7: {fd} descriptors, quoted
+                                   # and escaped operands, `<<-` heredoc.
+                                   "{fd}>/dev/null", "{fd}>&-",
+                                   '2>"log file"', "2>'log file'",
+                                   "2>log\\ file", '>"literal log"',
+                                   "<<- EOF")):
             clean = tmp_path / f"clean-redir-cwd{i}"
             clean.mkdir()
             assert await self._denied(

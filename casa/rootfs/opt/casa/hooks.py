@@ -1742,6 +1742,41 @@ def _scan_mcp_launch_refs(cwd: Path) -> list[str]:
     return findings
 
 
+# A word carrying a redirection operator anywhere (`2>f`, `&>f`, `{fd}>f`,
+# `<<-`, `>|`) — never the `cd` target itself, so it does not propagate into
+# the feasible-base set (it still contributes a scan candidate).
+_REDIR_SHAPED = re.compile(r"[<>]")
+
+
+def _command_segment(text: str) -> str:
+    """The leading COMMAND segment of *text* — up to the first separator
+    (`;`, newline, `)`, `&`, `|`). An `&`/`|` that is adjacent to a `<`/`>`
+    belongs to a redirection operator (`&>f`, `2>&1`, `2>| f`, `{fd}>&-`),
+    not to a separator, so it does not end the segment."""
+    for i, ch in enumerate(text):
+        if ch in ";\n\r)":
+            return text[:i]
+        if ch in "&|":
+            prev = text[i - 1] if i else ""
+            nxt = text[i + 1] if i + 1 < len(text) else ""
+            if prev in "<>" or nxt in "<>":
+                continue  # part of a redirection operator
+            return text[:i]
+    return text
+
+
+def _shell_words(segment: str) -> list[str]:
+    """Split one command segment into shell WORDS, honoring quotes and
+    backslash escapes (`>"log file"` is one word, not two). Falls back to a
+    whitespace split when the segment is not lexable (an unbalanced quote
+    from our own separator split) — over-splitting only adds candidates."""
+    import shlex
+    try:
+        return [w for w in shlex.split(segment, posix=True) if w]
+    except ValueError:
+        return [w for w in segment.split() if w]
+
+
 def make_self_containment_guard() -> HookCallback:
     """Pre-push grep for §2.0 self-containment anti-patterns."""
 
@@ -1806,30 +1841,31 @@ def make_self_containment_guard() -> HookCallback:
         bases: set = {cwd}
         candidates: list = [cwd]
         cd_overflow = False
-        # Terra/Sol r5-r6: the skipper consumes option words, `--`, AND the
-        # WHOLE bash redirection grammar in one general token — optional fd
-        # digits or `&` prefix, 1-3 `<`/`>` chars, optional `|`/`&` suffix
-        # (`2>`, `&>`, `>>`, `<<<`, `>|`, `2>&`), with the operand glued OR
-        # space-separated (`2>/dev/null`, `2>& 1`, `2>| /dev/null`,
-        # `<<< x`). Bash resolves the target around redirections wherever
-        # they sit, so the first PLAIN word after `cd` is the target. The
-        # target class excludes `<>`/`&` (a missed redirect form is never
-        # mistaken for the target) and the true bash metachars, but NOT
-        # `}` — `}` is only a reserved word, a glued `}` belongs to the
-        # target word (`cd /tmp/bad}` really enters `bad}`).
-        for m_cd in re.finditer(
-                r"(?<![\w./-])cd\s+"
-                r"(?:(?:-\S+|--|"
-                r"[&\d]*[<>]{1,3}[|&]?(?:\s*[^\s;&|()<>]+)?"
-                r")\s+)*"
-                r"(\"[^\"]+\"|'[^']+'|[^\s;&|)<>]+)",
-                cmd[: m_push.start()]):
-            t = m_cd.group(1).strip("'\"")
+        # Terra/Sol r5-r7: pinpointing WHICH word after `cd` is the target is
+        # the same losing game as the pre-context was — six rounds produced
+        # `2> f`, `&>f`, `2>& 1`, `2>| f`, `<<< x`, `<<- EOF`, `{fd}>f`,
+        # `>"log file"`, `>log\ file`, … Structural resolution: stop deciding.
+        # EVERY word between `cd` and the next separator becomes a scan
+        # candidate, so whichever word bash actually resolves to is always in
+        # the set. Redirect operands and option words simply add candidates
+        # that are usually not directories and cost one is_dir() each.
+        # Only the PRIMARY word (first that is neither an option nor
+        # redirect-shaped) propagates into ``bases``, so a relative cd chain
+        # still grows the feasible-base set at the same bounded rate.
+        for m_cd in re.finditer(r"(?<![\w./-])cd(?=\s)", cmd[: m_push.start()]):
+            words = _shell_words(
+                _command_segment(cmd[m_cd.end():m_push.start()]))
+            primary = next(
+                (w for w in words
+                 if not w.startswith("-") and not _REDIR_SHAPED.search(w)),
+                None)
             new_bases = set()
             for b in bases:
-                nb = Path(t) if os.path.isabs(t) else b / t
-                new_bases.add(nb)
-                candidates.append(nb)
+                for w in words:
+                    candidates.append(Path(w) if os.path.isabs(w) else b / w)
+                if primary is not None:
+                    new_bases.add(Path(primary) if os.path.isabs(primary)
+                                  else b / primary)
             bases |= new_bases
             if len(bases) > 64:
                 # Terra/Sol r3: breaking out silently would leave every LATER
