@@ -279,24 +279,41 @@ class PluginOutbox:
         return reaped
 
     def _reap(self, dirfd: int, name: str, st: os.stat_result) -> int:
-        # #330: producers publish via atomic rename OUTSIDE self._lock, so
-        # between the expiry lstat and this unlink the name can come to
-        # denote a FRESH inode — deleting it would vanish a path the
-        # producer just returned. Re-stat and require the same inode before
-        # acting; a mismatch means the entry was just replaced (young by
-        # construction) and is left for a later sweep. The residual re-stat→
-        # unlink window is syscall-adjacent (POSIX has no unlink-by-inode).
-        current = _lstat_quiet(name, dirfd)
-        if (current is None
-                or current.st_ino != st.st_ino
-                or current.st_dev != st.st_dev):
+        # #330 (Sol r1): producers publish via atomic rename OUTSIDE
+        # self._lock (they are separate processes — the in-process lock
+        # cannot serialize them), so between the expiry lstat and a deletion
+        # the name can come to denote a FRESH inode. Deleting by name would
+        # vanish a path the producer just returned. Take OWNERSHIP first:
+        # atomically rename the entry to a private cleanup name, then decide
+        # on the inode we now exclusively hold — matching the expiry stat ⇒
+        # delete; a fresh inode ⇒ rename it back (the producer's path is
+        # restored; a same-name republication landing in this microsecond
+        # window would be replaced by the rename-back, which is the residual
+        # POSIX leaves — strictly narrower than the old delete-by-name).
+        # A crash between the two renames leaves a ``.reap.`` entry that a
+        # later sweep age-reaps like any other orphan.
+        private = f".reap.{os.getpid()}.{uuid.uuid4().hex}"
+        try:
+            os.rename(name, private, src_dir_fd=dirfd, dst_dir_fd=dirfd)
+        except OSError:
+            return 0                      # already gone / replaced mid-scan
+        current = _lstat_quiet(private, dirfd)
+        if current is None:
+            return 0
+        if current.st_ino != st.st_ino or current.st_dev != st.st_dev:
+            try:
+                os.rename(private, name, src_dir_fd=dirfd, dst_dir_fd=dirfd)
+            except OSError as exc:
+                logger.warning(
+                    "plugin-outbox: could not restore fresh entry %r after "
+                    "reap-ownership check: %s", name, exc)
             return 0
         # All relative to the pinned dir-FD (rmtree dir_fd is 3.11+).
         try:
-            if stat.S_ISDIR(st.st_mode):
-                shutil.rmtree(name, dir_fd=dirfd)
+            if stat.S_ISDIR(current.st_mode):
+                shutil.rmtree(private, dir_fd=dirfd)
             else:
-                os.unlink(name, dir_fd=dirfd)
+                os.unlink(private, dir_fd=dirfd)
             return 1
         except OSError as exc:
             logger.warning("plugin-outbox: failed to reap %r: %s", name, exc)

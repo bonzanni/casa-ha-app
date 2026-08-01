@@ -1527,3 +1527,40 @@ async def test_heal_path_missing_workspace_refuses_start(
         engagements_root=str(tmp_path / "eng"),   # workspace ABSENT
     )
     assert start_calls == []
+
+
+async def test_brief_record_missing_workspace_takes_m7_refusal(
+    monkeypatch, tmp_path,
+):
+    """Terra r1 (#314): a brief-bearing record with a deleted workspace must
+    take the M7 refusal (retained UNDERGOING, no teardown) — not the brief
+    CLAUDE.md-refresh checked teardown, which removes the service pair and
+    can terminal-mark the record."""
+    from casa_core import replay_undergoing_engagements
+    from drivers import s6_rc
+
+    start_calls = _fast_path_env(monkeypatch, tmp_path)
+    down_calls: list[str] = []
+
+    async def fake_down(*, engagement_id):
+        down_calls.append(engagement_id)
+        return True
+
+    monkeypatch.setattr(s6_rc, "ensure_service_down", fake_down)
+
+    rec = _rec("keep1")
+    rec.origin["brief"] = {"objective": "x"}
+    reg = await _make_registry([rec])
+    driver = _boot_driver()
+    driver._spawn_background_tasks = lambda rec: None
+
+    await replay_undergoing_engagements(
+        registry=reg, driver=driver, executor_registry=None,
+        engagements_root=str(tmp_path / "eng"),   # workspace ABSENT
+    )
+    assert start_calls == []
+    assert down_calls == []                       # no checked teardown ran
+    # The M7 refusal retains the record and its service sources for diagnosis.
+    assert reg.get("keep1").status == "active"
+    svc_root = Path(s6_rc.ENGAGEMENT_SOURCES_ROOT)
+    assert (svc_root / "engagement-keep1").exists()

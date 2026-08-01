@@ -282,3 +282,40 @@ def test_extract_env_vars_tolerates_non_mapping_env(tmp_path):
         },
     }), encoding="utf-8")
     assert extract_env_vars(p) == {"MY_SECRET"}
+
+
+def test_publish_fsyncs_store_root_for_new_plugin_dir(tmp_path, monkeypatch):
+    """Sol r1 (#330): fsyncing store_root/<name>/ does not make <name>'s OWN
+    entry in store_root durable — a first-time publication must fsync the
+    store root too, or a power crash can lose the whole plugin-name directory
+    while the registry survives referencing it."""
+    import stat as stat_mod
+    import plugin_store
+
+    dir_inodes_synced: set[tuple[int, int]] = set()
+    real_fsync = os.fsync
+
+    def spy_fsync(fd: int) -> None:
+        st = os.fstat(fd)
+        if stat_mod.S_ISDIR(st.st_mode):
+            dir_inodes_synced.add((st.st_dev, st.st_ino))
+        real_fsync(fd)
+
+    monkeypatch.setattr(plugin_store.os, "fsync", spy_fsync)
+
+    root = tmp_path / "src"
+    (root / ".claude-plugin").mkdir(parents=True)
+    (root / ".claude-plugin" / "plugin.json").write_text(
+        json.dumps({"name": "p", "version": "1.0.0"}), encoding="utf-8")
+    store_root = tmp_path / "store"
+
+    plugin_store.publish_from_tree(
+        name="p", repo="o/r", ref="v1", revision="git:" + "a" * 40,
+        subdir="", src_root=root, store_root=store_root,
+        staging_root=tmp_path / "staging")
+
+    st = os.stat(store_root)
+    assert (st.st_dev, st.st_ino) in dir_inodes_synced, (
+        "store_root itself was never fsynced — the new plugin-name entry is "
+        "not durable"
+    )

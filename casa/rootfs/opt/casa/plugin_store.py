@@ -1068,11 +1068,16 @@ def _stage_and_swap(*, name, repo, ref, revision, subdir, staged: Path,
     # Only the metadata file used to be fsynced — after a power loss the
     # caller-persisted registry entry could point at a missing/corrupt tree.
     # fsync every file + directory in staging, rename, then fsync the
-    # destination parent so the rename itself is durable.
+    # destination parent so the rename itself is durable — AND the store root
+    # (Sol r1): fsyncing store_root/<name>/ does not persist <name>'s own
+    # entry in store_root, so a first-time publication could still lose the
+    # whole plugin-name directory. store_root is created by setup, so the
+    # chain ends there.
     _fsync_tree(staged)
     dest.parent.mkdir(parents=True, exist_ok=True)
     os.rename(staged, dest)
     fsync_directory(dest.parent)
+    fsync_directory(Path(store_root))
     _freeze_artifact_files(dest)
     return PublishResult(name, artifact_id, revision, manifest["version"],
                          str(dest), manifest)

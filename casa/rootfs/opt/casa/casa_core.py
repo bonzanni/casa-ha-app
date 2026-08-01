@@ -575,48 +575,17 @@ async def replay_undergoing_engagements(
         # compile/start below.
         for rec in undergoing:
             try:
-                # W3 (r8-B5/r9-B5): re-render the workspace CLAUDE.md from the
-                # VERBATIM origin["brief"] for EVERY resumed brief-bearing
-                # engagement — placed at the TOP of the loop, BEFORE the
-                # service_pair_complete fast path. /data/casa-s6-services
-                # persists across restarts, so an ordinary restart takes the
-                # early `continue`; a refresh after the pair-rewrite would never
-                # run. Resolve the executor via definition_any (r10-B5) so a
-                # specialist DISABLED after launch still resumes; registry
-                # absent OR unresolved → fail-closed refuse (checked teardown).
-                brief_defn = None
-                has_brief = bool(rec.origin.get("brief"))
-                if has_brief:
-                    brief_defn = (
-                        executor_registry.definition_any(rec.role_or_type)
-                        if executor_registry is not None else None
-                    )
-                    if brief_defn is None:
-                        await _refuse_brief_resume(
-                            rec,
-                            "no executor_registry passed"
-                            if executor_registry is None
-                            else f"executor type {rec.role_or_type!r} "
-                                 "not resolvable (definition_any → None)",
-                        )
-                        continue
-                    ws_dir = os.path.join(engagements_root, rec.id)
-                    try:
-                        refresh_claude_md(ws_dir, defn=brief_defn, rec=rec)
-                    except Exception as exc:  # noqa: BLE001 — fail-closed
-                        await _refuse_brief_resume(
-                            rec, f"CLAUDE.md refresh failed: {exc}",
-                        )
-                        continue
-
                 # #314: the M7 (missing workspace) and §3.8 (missing recorded
                 # artifact) validations must gate EVERY resume — they used to
                 # sit below the service_pair_complete fast path, so an intact
                 # pair skipped both: replay started a service whose run script
                 # does `set -e; cd <workspace>` (instant exit, s6 respawn
                 # loop) or resumed a CLI with a missing --plugin-dir target.
-                # Placed BEFORE the #335 credential refresh so a record we
-                # refuse is not pointlessly cycled first.
+                # Placed FIRST in the loop (Terra r1): the brief CLAUDE.md
+                # refresh below would otherwise fail on the missing workspace
+                # and take the checked-teardown refusal — possibly terminal-
+                # marking a record M7 deliberately retains — and the #335
+                # credential refresh must not cycle a record we refuse.
                 #
                 # M7: missing workspace ⇒ REFUSED (was warn-and-skip, which
                 # the start loop ignored — it filters on refused_ids alone,
@@ -656,6 +625,42 @@ async def replay_undergoing_engagements(
                             pass
                     refused_ids.add(rec.id)
                     continue
+
+                # W3 (r8-B5/r9-B5): re-render the workspace CLAUDE.md from the
+                # VERBATIM origin["brief"] for EVERY resumed brief-bearing
+                # engagement — placed BEFORE the service_pair_complete fast
+                # path (but after the #314 refusal guards, so its failure
+                # path never fires for a record M7 already refused).
+                # /data/casa-s6-services persists across restarts, so an
+                # ordinary restart takes the early `continue`; a refresh after
+                # the pair-rewrite would never run. Resolve the executor via
+                # definition_any (r10-B5) so a specialist DISABLED after
+                # launch still resumes; registry absent OR unresolved →
+                # fail-closed refuse (checked teardown).
+                brief_defn = None
+                has_brief = bool(rec.origin.get("brief"))
+                if has_brief:
+                    brief_defn = (
+                        executor_registry.definition_any(rec.role_or_type)
+                        if executor_registry is not None else None
+                    )
+                    if brief_defn is None:
+                        await _refuse_brief_resume(
+                            rec,
+                            "no executor_registry passed"
+                            if executor_registry is None
+                            else f"executor type {rec.role_or_type!r} "
+                                 "not resolvable (definition_any → None)",
+                        )
+                        continue
+                    ws_dir = os.path.join(engagements_root, rec.id)
+                    try:
+                        refresh_claude_md(ws_dir, defn=brief_defn, rec=rec)
+                    except Exception as exc:  # noqa: BLE001 — fail-closed
+                        await _refuse_brief_resume(
+                            rec, f"CLAUDE.md refresh failed: {exc}",
+                        )
+                        continue
 
                 # #335: refresh the workspace credential from the RECORD's
                 # auth token. Placed, like the CLAUDE.md refresh above, BEFORE
