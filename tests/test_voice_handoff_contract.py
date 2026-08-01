@@ -151,7 +151,7 @@ class TestReplayBindingGuard:
             side_effect=lambda _rid: current_holder["route"],
         )
 
-        async def send_and_supersede(_frame):
+        async def send_and_supersede(_frame, **_kw):
             # The first replay write completes, then another socket takes
             # over the route id — the second write must not happen.
             current_holder["route"] = _route()
@@ -162,6 +162,45 @@ class TestReplayBindingGuard:
         await coordinator.route_connected(route)
 
         assert route.send_json.await_count == 1
+
+    async def test_replay_write_is_guarded_against_mid_send_supersession(
+        self,
+    ):
+        """#329 (review round 2): the currency check must ride INSIDE the
+        serialized send — a supersession that lands while the write waits
+        on the connection lock must suppress the frame, not race it."""
+        job = _job()
+        registry = _registry(job)
+        registry.pending_handoffs_for_route = MagicMock(return_value=[job])
+        current_holder: dict = {}
+        route_registry = MagicMock()
+        route_registry.get_connected = MagicMock(
+            side_effect=lambda _rid: current_holder["route"],
+        )
+
+        class _GuardedRoute:
+            """Honors `allow` the way VoiceWsConnection does — evaluated
+            at write time, after supersession has already happened."""
+
+            route_id = _ROUTE_ID
+
+            def __init__(self) -> None:
+                self.frames: list[dict] = []
+
+            async def send_json(self, frame, *, allow=None):
+                current_holder["route"] = object()  # superseded mid-send
+                if allow is not None and not allow():
+                    return False
+                self.frames.append(frame)
+                return True
+
+        route = _GuardedRoute()
+        current_holder["route"] = route
+        coordinator = VoiceHandoffCoordinator(registry, route_registry)
+
+        await coordinator.route_connected(route)
+
+        assert route.frames == []
 
 
 class TestReceiptRejectionsAreLoud:

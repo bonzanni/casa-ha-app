@@ -234,6 +234,49 @@ class TestVoiceModes:
         assert payload["citations"] == ["household calendar"]
         assert payload["assumptions"] == ["you meant next week"]
 
+    async def test_sync_voice_outcome_metadata_is_bounded(self, monkeypatch):
+        """#352 (review round 2): the sync result is an explicitly bounded
+        boundary (`text` is truncated) — the citation/assumption arrays
+        must not ride it unbounded, or a specialist can attach megabytes
+        of metadata to a one-line answer."""
+        import agent as agent_mod
+
+        tm, reg = _init_tools_for_voice()
+
+        async def _fake_run(
+            cfg, task_text, context_text, resolution=None, output_format=None,
+        ):
+            return tm.DelegatedOutput(
+                text="Short answer.",
+                structured_output={
+                    "status": "answered", "spoken_summary": "Short answer.",
+                    "answer": "Short answer.", "clarification": "",
+                    "citations": ["c" * 10_000] * 50,
+                    "assumptions": ["a" * 10_000] * 50,
+                    "provenance": {}, "sensitivity": "household",
+                    "delivery_ttl_s": 900,
+                },
+            )
+
+        monkeypatch.setattr(tm, "_run_delegated_agent", _fake_run)
+
+        token = agent_mod.origin_var.set(_voice_origin(
+            voice_deadline=asyncio.get_running_loop().time() + 20.0,
+        ))
+        try:
+            res = await tm.delegate_to_agent.handler({
+                "agent": "finance", "task": "t", "context": "", "mode": "sync",
+            })
+        finally:
+            agent_mod.origin_var.reset(token)
+
+        payload = json.loads(res["content"][0]["text"])
+        assert payload["status"] == "ok"
+        assert len(payload["citations"]) <= 10
+        assert len(payload["assumptions"]) <= 10
+        assert all(len(item) <= 400 for item in payload["citations"])
+        assert all(len(item) <= 400 for item in payload["assumptions"])
+
     async def test_sync_voice_private_result_withholds_citations(
         self, monkeypatch,
     ):

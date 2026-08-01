@@ -49,9 +49,24 @@ class VoiceWsConnection:
         self.voice_route_capabilities: frozenset[str] = frozenset()
         self.voice_job_control_id: str | None = None
 
-    async def send_json(self, frame: dict[str, Any]) -> None:
+    async def send_json(
+        self,
+        frame: dict[str, Any],
+        *,
+        allow: Callable[[], bool] | None = None,
+    ) -> bool:
+        """Serialized write; `allow` is re-evaluated UNDER the lock.
+
+        #329: a currency check taken before the send is TOCTOU — the write
+        can queue behind this lock while the route binding is superseded.
+        A guard evaluated here, immediately before the transport write, is
+        the last point a stale frame can still be suppressed.
+        """
         async with self._send_lock:
+            if allow is not None and not allow():
+                return False
             await self._ws.send_json(frame)
+            return True
 
 
 @dataclass(frozen=True)
@@ -63,8 +78,13 @@ class BoundVoiceRoute:
     connection: VoiceWsConnection
     connected_at: float
 
-    async def send_json(self, frame: dict[str, Any]) -> None:
-        await self.connection.send_json(frame)
+    async def send_json(
+        self,
+        frame: dict[str, Any],
+        *,
+        allow: Callable[[], bool] | None = None,
+    ) -> bool:
+        return await self.connection.send_json(frame, allow=allow)
 
 
 @dataclass

@@ -223,7 +223,13 @@ class VoiceHandoffCoordinator:
                 # must not reach the stale socket. The current binding got
                 # (or will get) its own route_connected replay.
                 return
-            await route.send_json(self._frame(job))
+            # The guard rides inside the connection's serialized send (see
+            # VoiceWsConnection.send_json): a supersession that lands while
+            # this write waits on the send lock still suppresses the frame.
+            await route.send_json(
+                self._frame(job),
+                allow=lambda: self._is_current(route_id, route),
+            )
 
     def _is_current(self, route_id: str, route: Any) -> bool:
         if self._route_registry is None:
@@ -906,6 +912,10 @@ class VoiceChannel(Channel):
 
         # Per-utterance task map so `cancel` frames can target them.
         tasks: dict[str, asyncio.Task] = {}
+        # #303: originals displaced by a duplicate utterance_id. Cancelled
+        # on replacement, but cancellation is cooperative — they stay here
+        # so teardown re-cancels and awaits them like every other task.
+        orphans: set[asyncio.Task] = set()
 
         try:
             async for msg in ws:
@@ -1034,6 +1044,8 @@ class VoiceChannel(Channel):
                         # replaced, no cancel frame or teardown can ever
                         # reach it again.
                         existing.cancel()
+                        orphans.add(existing)
+                        existing.add_done_callback(orphans.discard)
                     task = asyncio.create_task(
                         self._run_ws_utterance(
                             connection, frame, uid, voice_deadline,
@@ -1071,7 +1083,10 @@ class VoiceChannel(Channel):
         finally:
             # Clear the server-bound writer even when a handler or server
             # shutdown aborts the reader loop.
-            pending = [task for task in tasks.values() if not task.done()]
+            pending = [
+                task for task in (*tasks.values(), *orphans)
+                if not task.done()
+            ]
             for task in pending:
                 task.cancel()
             if pending:

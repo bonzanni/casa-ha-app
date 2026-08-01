@@ -91,7 +91,7 @@ class _Route:
         })
         self.sent: list[dict] = []
 
-    async def send_json(self, frame: dict) -> None:
+    async def send_json(self, frame: dict, **_kw) -> None:
         self.sent.append(frame)
 
 
@@ -795,6 +795,31 @@ async def test_unacked_revoked_attempt_is_expired_not_retained(delivery):
     assert "job-1" not in coordinator._attempts
     await coordinator.stop()
     await old_coordinator.stop()
+
+
+async def test_stale_disconnect_notification_spares_the_new_bindings_offer(
+    delivery,
+):
+    """#304 (review round 2): a late route-disconnected notification for a
+    DISPLACED binding must remove only attempts offered to that binding —
+    matching by route id alone tore down the offer a newer socket had just
+    received for the reused id."""
+    registry, routes, route, coordinator, _ = delivery
+    await registry.create(_ready_job("job-1", sequence=1, device="kitchen"))
+    await coordinator.route_connected(route)
+    displaced = route
+
+    # Socket C takes over the same route id and gets its own fresh offer.
+    new_route = _Route()
+    routes.connected["entry-1"] = new_route
+    await coordinator.route_connected(new_route)
+    offer = _offered(new_route)[-1]
+
+    # The displaced binding's disconnect notification arrives late.
+    await coordinator.route_disconnected(displaced)
+
+    await coordinator.handle(new_route, _frame("job_claimed", offer))
+    assert registry.get("job-1").delivery_state is DeliveryState.CLAIMED
 
 
 async def test_lease_renewal_and_lapse_reoffer_with_new_attempt(delivery):

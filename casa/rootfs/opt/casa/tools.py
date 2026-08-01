@@ -3992,8 +3992,14 @@ async def delegate_to_agent(args: dict) -> dict:
             voice_meta["specialist_status"] = voice_result.status
             if (voice_result.sensitivity != "private"
                     or identity_clearance == "private"):
-                voice_meta["citations"] = list(voice_result.citations)
-                voice_meta["assumptions"] = list(voice_result.assumptions)
+                # This tool response is an explicitly bounded boundary
+                # (`text` goes through truncate_output below) — the
+                # advisory metadata must not ride it unbounded, since the
+                # schema puts no item/length limits on these arrays.
+                voice_meta["citations"] = _bounded_str_list(
+                    voice_result.citations)
+                voice_meta["assumptions"] = _bounded_str_list(
+                    voice_result.assumptions)
         else:
             text = delegated_output.text
         # Task 6 (spec §4.6): bound the synchronous result + expose the flag on
@@ -4052,6 +4058,18 @@ async def delegate_to_agent(args: dict) -> dict:
 # Metadata-only voice job control. Full case/result data never crosses these
 # tool envelopes; continuation injects it directly into the specialist child.
 # ---------------------------------------------------------------------------
+
+
+def _bounded_str_list(
+    values, *, max_items: int = 10, max_chars: int = 400,
+) -> list[str]:
+    """Cap advisory metadata lists (citations/assumptions) for the wire.
+
+    The voice-result schema bounds neither item count nor item length, so
+    without this a specialist could attach megabytes of metadata to a
+    one-line answer at a boundary that truncates `text` (spec §4.6).
+    """
+    return [value[:max_chars] for value in values[:max_items]]
 
 
 def _job_not_found_result() -> dict:

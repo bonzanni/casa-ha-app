@@ -780,6 +780,53 @@ class TestWSTurn:
             await ws.send_json({"type": "cancel", "utterance_id": "u1"})
             await asyncio.wait_for(cancels[1].wait(), timeout=2.0)
 
+    async def test_orphaned_duplicate_task_is_still_owned_by_teardown(
+        self, ws_app, monkeypatch,
+    ):
+        """#303 (review round 2): cancel() is cooperative — a replaced
+        original that is slow to unwind must remain reachable by socket
+        teardown (re-cancelled and awaited), not dropped from the map and
+        abandoned mid-cleanup."""
+        client, _, _, channel = ws_app
+        started: list[asyncio.Task] = []
+
+        async def stub(ws, frame, uid, voice_deadline):
+            first = not started
+            started.append(asyncio.current_task())
+            try:
+                await asyncio.Event().wait()
+            except asyncio.CancelledError:
+                if first:
+                    # Slow cooperative cleanup: the duplicate's cancel is
+                    # absorbed; only a LATER cancel (teardown's) ends it.
+                    try:
+                        await asyncio.Event().wait()
+                    except asyncio.CancelledError:
+                        raise
+                raise
+
+        monkeypatch.setattr(channel, "_run_ws_utterance", stub)
+
+        utterance = {
+            "type": "utterance", "utterance_id": "u1", "text": "x",
+            "agent_role": "butler", "scope_id": "s",
+        }
+        async with client.ws_connect("/api/converse/ws") as ws:
+            await ws.send_json(utterance)
+            while not started:
+                await asyncio.sleep(0.01)
+            await ws.send_json(utterance)
+            while len(started) < 2:
+                await asyncio.sleep(0.01)
+
+        # Socket closed: teardown must terminate the orphaned original too.
+        for _ in range(100):
+            if started[0].done():
+                break
+            await asyncio.sleep(0.01)
+        assert started[0].done()
+        assert started[1].done()
+
     async def test_client_context_cannot_clobber_computed_keys(self, ws_app):
         """L59/L8 (WS side): a client-supplied context dict must not
         override the channel-computed chat_id/cid/utterance_id."""

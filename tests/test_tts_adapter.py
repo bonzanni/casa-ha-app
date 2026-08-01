@@ -38,9 +38,21 @@ class TestNone:
         a = TagDialectAdapter("none")
         assert a.render("[confident] Done.") == "Done."
 
-    def test_strips_leading_parens_tag(self):
+    def test_keeps_lowercase_parenthetical_prose(self):
+        """#357 (review round 2): a lowercase heuristic for "tag-like"
+        parens still deleted substantive speech — "(do not take it)" is
+        indistinguishable from a tag by shape. Canonical tags are ONLY
+        square-bracketed, so under `none` a parenthetical is always prose.
+        """
         a = TagDialectAdapter("none")
-        assert a.render("(confident) Done.") == "Done."
+        block = "(do not take it) Call emergency services."
+        assert a.render(block) == block
+
+    def test_keeps_leading_parens_even_when_tag_shaped(self):
+        # The cost of the fail-safe boundary: a model that emits a
+        # non-canonical parens tag under `none` is spoken, not stripped.
+        a = TagDialectAdapter("none")
+        assert a.render("(confident) Done.") == "(confident) Done."
 
     def test_strips_multiple_leading_tags(self):
         a = TagDialectAdapter("none")

@@ -182,7 +182,14 @@ class VoiceDeliveryCoordinator:
             if route_id is None:
                 return
             for job_id, attempt in list(self._attempts.items()):
-                if attempt.route_id == route_id and attempt.offered:
+                if (
+                    attempt.route_id == route_id
+                    and attempt.offered
+                    # #304 (review round 2): a LATE disconnect notification
+                    # for a displaced binding must not tear down the offer a
+                    # newer socket already received for the reused route id.
+                    and attempt.endpoint is endpoint
+                ):
                     self._attempts.pop(job_id, None)
 
     async def sweep_once(self) -> None:
