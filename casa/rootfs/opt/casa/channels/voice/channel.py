@@ -942,7 +942,25 @@ class VoiceChannel(Channel):
                             and candidate.connection is connection
                         ):
                             previous = candidate
-                    bound = await self.routes.register(connection, frame)
+                    try:
+                        bound = await self.routes.register(connection, frame)
+                    except BaseException:
+                        # #304: register() mutates the binding before its
+                        # ack write. If that write fails, teardown will
+                        # report only the connection's CURRENT binding — a
+                        # binding this frame displaced must be reported
+                        # here or its offered attempts stay pinned to it.
+                        # A refused frame mutates nothing (previous is
+                        # still the registry's current), so this fires only
+                        # when displacement actually happened.
+                        if (
+                            previous is not None
+                            and self._delivery is not None
+                            and self.routes.get_connected(previous.route_id)
+                            is not previous
+                        ):
+                            await self._delivery.route_disconnected(previous)
+                        raise
                     if bound is not None and self._delivery is not None:
                         if (
                             previous is not None
