@@ -447,10 +447,83 @@ async def test_dropping_one_callback_retires_the_marker_before_the_swap(
     calls.clear()
     p1 = _plugin(callbacks=("authorize",))
     await _reconcile(registry, plugins=[p1], acks=acks, spool=_SpoolStub(calls))
-    assert [c[0] for c in calls] == ["del_ready", "swap", "ensure", "ready",
-                                     "index"]
-    assert set(calls[3][2]["callbacks"]) == {"authorize"}
+    # BOTH published files carry the callbacks map, so both retire first
+    assert [c[0] for c in calls] == ["del_ready", "del_index", "swap",
+                                     "ensure", "ready", "index"]
+    assert set(calls[4][2]["callbacks"]) == {"authorize"}
     assert registry.get_callback("plg-gmail--renew") is None
+
+
+async def test_dropping_while_adding_retires_both_markers(tmp_path):
+    """r2 review: a strict-subset test misses the MIXED transition — drop one
+    callback and add another in the same pass and the old marker still named
+    the dropped one. Additions are irrelevant to the property."""
+    calls: list = []
+    registry = _SpyRegistry(calls)
+    acks = CallbackAckStore(path=tmp_path / "acks.json")
+    _ack(acks, declared="authorize")
+    _ack(acks, declared="renew")
+    await _reconcile(registry,
+                     plugins=[_plugin(callbacks=("authorize", "renew"))],
+                     acks=acks, spool=_SpoolStub(calls))
+    calls.clear()
+    _ack(acks, declared="refresh")
+    await _reconcile(registry,
+                     plugins=[_plugin(callbacks=("authorize", "refresh"))],
+                     acks=acks, spool=_SpoolStub(calls))
+    assert [c[0] for c in calls] == ["del_ready", "del_index", "swap",
+                                     "ensure", "ready", "index"]
+    assert set(calls[4][2]["callbacks"]) == {"authorize", "refresh"}
+    assert registry.get_callback("plg-gmail--renew") is None
+    assert registry.get_callback("plg-gmail--refresh") is not None
+
+
+async def test_failed_rewrite_after_a_drop_and_add_leaves_neither_marker(
+    tmp_path,
+):
+    """The point of retiring both: when the post-swap rewrite fails, the
+    consumer reads 'facility unavailable' from BOTH files rather than a
+    redirect URI for a callback the endpoint now 404s."""
+    root = tmp_path / "spool"
+    art = tmp_path / "store" / "gmail" / "art-1"
+    art.mkdir(parents=True)
+    spool = callback_spool.CallbackSpool(root)
+    try:
+        registry = _SpyRegistry()
+        acks = CallbackAckStore(path=tmp_path / "acks.json")
+        _ack(acks, declared="authorize")
+        _ack(acks, declared="renew")
+        await _reconcile(
+            registry, acks=acks, spool=spool,
+            plugins=[_plugin(callbacks=("authorize", "renew"), path=str(art))])
+        # consented only once the plugin declares it (an ack for an
+        # undeclared name is exactly what the stale prune removes)
+        _ack(acks, declared="refresh")
+        ready = root / "gmail" / "ready.json"
+        index = root / callback_spool.INDEX_DIR / \
+            f"{callback_spool.index_key(str(art))}.json"
+        assert ready.is_file() and index.is_file()
+
+        class _WriteFails:
+            def __init__(self, inner):
+                self._inner = inner
+
+            def __getattr__(self, name):
+                return getattr(self._inner, name)
+
+            def write_ready(self, plugin, payload):
+                raise OSError("disk full")
+
+        issues = await _reconcile(
+            registry, acks=acks, spool=_WriteFails(spool),
+            plugins=[_plugin(callbacks=("authorize", "refresh"),
+                             path=str(art))])
+        assert [i.reason_code for i in issues] == ["callback_spool_error"]
+        assert not ready.exists()
+        assert not index.exists()
+        assert registry.get_callback("plg-gmail--renew") is None
+    finally:
+        spool.close()
 
 
 async def test_a_failed_rewrite_of_a_shrunk_set_leaves_no_marker(tmp_path):
@@ -487,6 +560,8 @@ async def test_a_failed_rewrite_of_a_shrunk_set_leaves_no_marker(tmp_path):
                                   spool=_WriteFails(spool))
         assert [i.reason_code for i in issues] == ["callback_spool_error"]
         assert not ready.exists()
+        assert not (root / callback_spool.INDEX_DIR /
+                    f"{callback_spool.index_key(p1.path)}.json").exists()
         assert registry.get_callback("plg-gmail--renew") is None
     finally:
         spool.close()

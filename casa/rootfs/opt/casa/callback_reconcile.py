@@ -328,10 +328,13 @@ def _pre_swap_files(spool: Any, desired: DesiredCallbacks,
     stay routed but can no longer be published (no base URL), routed plugins
     whose ARTIFACT PATH changed (the index key is the artifact path, so the
     old key must retire in the same pass), and — review M2 — routed plugins
-    whose set SHRANK: "never falsely positive" holds per FILE, not per overlay
-    entry, so a ready.json still advertising a dropped callback is exactly the
-    stale-marker case, both during the swap window and persistently if the
-    post-swap rewrite then fails."""
+    that DROP any previously published callback: "never falsely positive" holds
+    per FILE, not per overlay entry, so a marker still advertising a dropped
+    callback is exactly the stale-marker case, both during the swap window and
+    persistently if the post-swap rewrite then fails. Both published files
+    carry the same ``callbacks`` map, so both retire together on that
+    condition (r2): a failed rewrite then leaves them ABSENT (the consumer
+    reads "facility unavailable") rather than stale."""
     published = {r.plugin: r for r in desired.routed} if desired.base_url \
         else {}
     stale_pairs: set[tuple[str, str]] = set()
@@ -344,11 +347,12 @@ def _pre_swap_files(spool: Any, desired: DesiredCallbacks,
         previous_effectives.setdefault(plugin, set()).add(effective)
     for plugin, path in sorted(stale_pairs):
         keep = published.get(plugin)
-        retire_index = path and (keep is None or keep.path != path)
-        if keep is None:
-            _guard(spool, desired, plugin, None, "delete_ready", plugin)
-        elif _shrank(previous_effectives.get(plugin, set()), keep):
-            _guard(spool, desired, plugin, keep.artifact_id,
+        dropped = keep is not None and _dropped_any(
+            previous_effectives.get(plugin, set()), keep)
+        retire_index = path and (keep is None or keep.path != path or dropped)
+        if keep is None or dropped:
+            _guard(spool, desired, plugin,
+                   keep.artifact_id if keep is not None else None,
                    "delete_ready", plugin)
         if retire_index:
             # An EMPTY path is never handed to the spool: the index key is
@@ -360,14 +364,19 @@ def _pre_swap_files(spool: Any, desired: DesiredCallbacks,
                    "delete_index_entry", path)
 
 
-def _shrank(previous: set[str], keep: RoutedCallbacks) -> bool:
-    """True when the plugin's desired effective set is a STRICT SUBSET of what
-    the last published marker advertised — the only direction that leaves a
-    falsely-positive file (a marker naming a callback the overlay no longer
-    routes). An unchanged or grown set is only ever under-advertised, which is
-    fail-closed, and re-publishing it post-swap is enough."""
+def _dropped_any(previous: set[str], keep: RoutedCallbacks) -> bool:
+    """True when the desired set DROPS anything the last published files
+    advertised — whatever it adds in the same pass (r2 review).
+
+    A strict-subset test missed the mixed transition: rename one callback and
+    add another, and the marker kept naming the dropped one. Additions are
+    irrelevant to the property being protected — a file naming a callback the
+    overlay no longer routes is falsely positive regardless of what else it
+    names. A pure GROWTH (nothing dropped) only ever under-advertises, which is
+    fail-closed, so it must not churn the files at all.
+    """
     now = {cb["effective"] for cb in keep.callbacks}
-    return bool(previous) and now < previous
+    return bool(previous - now)
 
 
 def _post_swap_files(spool: Any, desired: DesiredCallbacks) -> None:
