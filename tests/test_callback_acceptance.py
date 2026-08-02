@@ -114,14 +114,12 @@ class _Facility:
             cr, "_base_url",
             lambda: callback_urls.validated_base({"PUBLIC_URL": BASE}))
 
-        # Wire the delivery-nudge module against this spool, on a private
-        # ledger, with a recording dispatch double (mirrors
+        # Wire the delivery worker against this spool — since v0.147 the
+        # durable ledger IS the spool's attempts dir, so there is nothing else
+        # to isolate — with a recording dispatch double (mirrors
         # tests/test_callback_episodes.py's fixture — never patch a global
         # asyncio.sleep).
-        monkeypatch.setattr(ce, "STORE_PATH",
-                            tmp_path / "callback-episodes.json")
         monkeypatch.setattr(ce, "_worker_task", None)
-        monkeypatch.setattr(ce, "_lock", None)
         monkeypatch.setattr(ce, "_kick", None)
         ce._pending_hints.clear()
         self.dispatches: list[tuple[str, str, dict]] = []
@@ -181,6 +179,14 @@ class _Facility:
 
     def results_dir(self, plugin_dir_name: str) -> Path:
         return self.plugin_dir(plugin_dir_name) / callback_spool.RESULTS_DIR
+
+    def attempt(self, plugin_dir_name: str, state_hash_hex: str) -> dict | None:
+        """The flow's durable attempt record, or ``None`` when the ledger has
+        none — the v0.147 replacement for the retired episode store."""
+        for h, rec in self.spool.list_attempts(plugin_dir_name):
+            if h == state_hash_hex:
+                return rec
+        return None
 
     def ready_payload(self, plugin_dir_name: str) -> dict:
         return json.loads(
@@ -313,12 +319,13 @@ async def test_gmail_shape_end_to_end(facility):
     assert ["code", "AUTHCODE"] in record["query"]
     assert ["state", state] in record["query"]
 
-    # collected: the result file is gone, and a recovery/worker pass settles
-    # the episode + its tombstone so nothing lingers
+    # collected: the result file is gone, and a recovery pass settles the
+    # attempt as `collected` so nothing further is owed
     assert not (facility.results_dir(plugin) / f"{h}.json").exists()
     await ce.recovery(facility.spool)
-    assert ce.episodes() == []
-    assert ce._load()["tombstones"] == []
+    rec = facility.attempt(plugin, h)
+    assert (rec["status"], rec["outcome"]) == ("done", "collected")
+    assert rec["next_nudge_ts"] is None
 
 
 # ---------------------------------------------------------------------------
@@ -355,10 +362,10 @@ async def test_finance_renewal_loop(facility):
         assert record["plugin"] == plugin
         return h
 
-    # first authorization settles fully (collected + episode pruned)
+    # first authorization settles fully (collected — nothing further owed)
     h1 = await _one_flow()
     await ce.recovery(facility.spool)
-    assert ce.episodes() == []
+    assert facility.attempt(plugin, h1)["outcome"] == "collected"
 
     # 180 days later the same callback is re-exercised — a fresh state, a fresh
     # hash, the SAME routed effective name. It must work identically.
@@ -393,15 +400,16 @@ async def test_consumer_dead_recovery_reenqueues_the_nudge(facility):
     assert facility.spool.publish_result(
         claim, {"v": 1, "plugin": plugin, "effective": eff},
     ) is callback_spool.PublishOutcome.PUBLISHED
-    assert ce.episodes() == []           # nothing enqueued it
+    assert facility.dispatches == []     # no kick was delivered
 
-    # the recovery invariant is the backstop: it enqueues a pending episode for
-    # any result lacking an episode/tombstone
+    # the ledger is the backstop: the publish itself wrote a due `result_ready`
+    # attempt, so a recovery pass finds work no in-memory hint remembers
     await ce.recovery(facility.spool)
-    pending = ce.episodes("pending")
-    assert [(e["plugin"], e["result_hash"]) for e in pending] == [(plugin, h)]
+    rec = facility.attempt(plugin, h)
+    assert rec["status"] == "result_ready"
+    assert rec["next_nudge_ts"] is not None
 
-    # and the worker then dispatches the (re-enqueued) nudge with the handle
+    # and the worker then dispatches the nudge with the handle
     await ce._worker_pass()
     assert len(facility.dispatches) == 1
     assert f"(handle {h})" in facility.dispatches[0][1]

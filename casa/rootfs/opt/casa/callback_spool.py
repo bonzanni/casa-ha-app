@@ -132,6 +132,11 @@ _MARKER_READ_FLAGS = (os.O_RDONLY | os.O_NONBLOCK | os.O_NOFOLLOW
                       | os.O_CLOEXEC)
 _HASH_RE = re.compile(r"^[0-9a-f]{64}$")
 _DIR_ID_RE = re.compile(r"^[0-9a-f]{32}$")
+#: The ONLY attempt fields the delivery worker may set
+#: (:meth:`CallbackSpool.update_attempt_nudge`). Status, outcome, identity and
+#: the opaque ``meta`` stay the spool's own derivation.
+_NUDGE_FIELDS = frozenset({"nudges", "last_nudge_ts", "next_nudge_ts",
+                           "deferrals", "noted"})
 
 
 class MarkerState(enum.Enum):
@@ -1691,6 +1696,41 @@ class CallbackSpool:
                 os.close(results)
                 os.close(pfd)
 
+    def result_mtime(self, plugin: str, state_hash_hex: str) -> float | None:
+        """The result inode's mtime — its durable PUBLISH time — or ``None``.
+
+        The delivery worker anchors the result-phase nudge cadence (+0, +60,
+        +180, +480) on this clock rather than on a field of its own: the
+        result file is written once and never rewritten, so its mtime IS the
+        publish instant, durable across restarts without a second source of
+        truth (the one-clock doctrine).
+
+        Three-state-safe by degrading to ``None`` for BOTH "no result" and
+        "cannot tell" (a metadata failure, a non-regular inode, a closed
+        spool, a bad name). The caller treats ``None`` as "no anchor" and
+        falls back to a relative advance — never as "mtime 0", which would
+        schedule every remaining nudge in 1970."""
+        with self._lock:
+            if self._closed or not _safe_component(plugin) \
+                    or not _is_hash(state_hash_hex):
+                return None
+            try:
+                pfd = self._plugin_fd(plugin)
+            except (OSError, ValueError):
+                return None
+            try:
+                try:
+                    results = _open_dir(RESULTS_DIR, pfd)
+                except OSError:
+                    return None
+                try:
+                    st = _regular_stat(f"{state_hash_hex}.json", results)
+                    return None if st is None else float(st.st_mtime)
+                finally:
+                    os.close(results)
+            finally:
+                os.close(pfd)
+
     def list_results(self, plugin: str) -> list[str]:
         """Published result hashes for *plugin* (the recovery invariant's
         input: any result lacking a settled episode is re-enqueued)."""
@@ -1842,6 +1882,43 @@ class CallbackSpool:
         return _strict_replace_at(name, afd, data, parent_fd=pfd,
                                   what=ATTEMPTS_DIR, parent_what=plugin,
                                   role="attempt")
+
+    def update_attempt_nudge(self, plugin: str, h: str, **fields) -> bool:
+        """Merge delivery bookkeeping into ``attempts/<h>.json``.
+
+        The ONE write the delivery worker owns. Only the five nudge fields
+        may be set (``nudges``, ``last_nudge_ts``, ``next_nudge_ts``,
+        ``deferrals``, ``noted``) — status, outcome, ``meta`` and the flow's
+        identity belong to the spool's own derivation, and a worker that
+        could rewrite them would turn an advisory schedule into a second
+        source of truth.
+
+        Read-merge-write under ``_lock`` (re-entrant, so the nested
+        :meth:`write_attempt` is the same critical section): the record is
+        validated on the way in AND after the merge, so a nonsense update is
+        refused rather than persisted. Best-effort durability by design —
+        no deletion depends on it, and a lost update costs exactly one
+        duplicate nudge, which the consumer's collect is idempotent against
+        (INV-CB-008's at-least-once boundary).
+
+        False on anything that did not go through: absent/unreadable/invalid
+        record, an out-of-vocabulary field, a merge that fails validation, a
+        failed write. The caller simply re-derives on its next pass."""
+        if not fields or not set(fields) <= _NUDGE_FIELDS:
+            return False
+        with self._lock:
+            marker = self.read_attempt(plugin, h)
+            if marker.state is not MarkerState.PRESENT:
+                return False
+            rec = callback_attempts.validate_attempt(marker.payload)
+            if rec is None:
+                return False
+            merged = callback_attempts.validate_attempt(dict(rec, **fields))
+            if merged is None:
+                logger.warning("callback-spool: rejected an invalid attempt "
+                               "nudge update (%r)", plugin)
+                return False
+            return self.write_attempt(plugin, h, merged)
 
     def list_attempts(self, plugin: str) -> list[tuple[str, dict]]:
         """``(hash, validated record)`` for every readable, schema-valid

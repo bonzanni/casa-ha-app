@@ -189,13 +189,14 @@ class TestSuccess:
 
     async def test_nudge_seam_delegates_to_episode_kick(self, monkeypatch):
         # The nudge seam delegates to callback_episodes.kick: it records an
-        # in-memory hint and signals the worker, touching NO file (request-path
-        # O(1)). _load/_save raising would prove a filesystem touch.
+        # in-memory hint and signals the worker, touching NO durable state
+        # (request-path O(1)). Reaching for the spool at all — the only
+        # filesystem the module has since v0.147 retired its JSON store —
+        # would prove otherwise.
         import callback_episodes
-        monkeypatch.setattr(callback_episodes, "_save",
-                            lambda *a, **k: pytest.fail("kick touched _save"))
-        monkeypatch.setattr(callback_episodes, "_load",
-                            lambda *a, **k: pytest.fail("kick touched _load"))
+        monkeypatch.setattr(
+            callback_episodes, "_get_spool",
+            lambda *a, **k: pytest.fail("kick reached for the spool"))
         callback_episodes._pending_hints.clear()
         h = "0" * 64
         assert callback_http._nudge(PLUGIN, h) is None
