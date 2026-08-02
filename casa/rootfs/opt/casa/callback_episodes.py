@@ -253,14 +253,22 @@ def start_worker() -> None:
         _kick.set()
 
 
-async def recovery(spool: Any) -> None:
+async def recovery(spool: Any, *, boot: bool = True) -> None:
     """Boot/periodic recovery pass: reconcile the attempt ledger against the
     artifacts (materialize, re-derive, infer receipts, consume acks, apply the
     bounds) and wake the worker. Never dispatches — that is the worker's job —
-    so casa_core can run it before the worker starts. Never raises."""
+    so casa_core can run it before the worker starts. Never raises.
+
+    ``boot`` is the pass's in-flight discipline, not a description of when it
+    runs: ``True`` (the default, for the boot seam) reconciles every hash,
+    which is safe because no handler exists yet; the PERIODIC caller must pass
+    ``False`` so hashes a live handler holds between claim and publish are
+    skipped — reading a half-built flow would judge it against artifacts that
+    are still being written.
+    """
     if spool is not None:
         try:
-            await asyncio.to_thread(spool.attempts_pass, now=_now(), boot=True)
+            await asyncio.to_thread(spool.attempts_pass, now=_now(), boot=boot)
         except asyncio.CancelledError:
             raise
         except Exception:  # noqa: BLE001 — recovery must never brick boot

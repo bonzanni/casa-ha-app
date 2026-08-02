@@ -2063,10 +2063,23 @@ async def _boot_reconcile_plugin_callbacks(
     settlement dispatch never races ahead of the marker.
 
     Also runs, in order: (1) a boot spool recovery pass restoring claims/temps
-    stranded by a crash mid-handler, and (2) a GATED orphan GC of spool dirs
-    for plugins no longer in the registry. Both are off-loop (the lock-stall
-    ruling) and never fatal — a reconcile failure boots with an empty callback
-    overlay (fail-closed for ingress), not a dead Casa.
+    stranded by a crash mid-handler, (2) a boot attempts pass materializing the
+    per-flow ledger from the artifact union, (3) the v0.146→v0.147 retirement
+    of the legacy episode store, (4) the overlay reconcile, and (5) a GATED
+    orphan GC of spool dirs for plugins no longer in the registry. All are
+    off-loop (the lock-stall ruling) and never fatal — a reconcile failure
+    boots with an empty callback overlay (fail-closed for ingress), not a
+    dead Casa.
+
+    Steps (2) before (3) is the migration order and it is load-bearing (spec
+    §12): the attempts pass materializes a record for EVERY hash in
+    ``pending ∪ results ∪ .claims ∪ .collect-*``, including the consumer-held
+    ``.collect-*`` names a v0.146 flow can be sitting in at upgrade time.
+    Deleting the old store first would drop those flows on the floor, because
+    after the delete nothing but the artifact union names them. Once the union
+    is materialized the store carries no state the ledger lacks (only the old
+    dispatch marks are lost — worst case one duplicate nudge, which is
+    idempotent), so it is safe to unlink.
     """
     import callback_spool
 
@@ -2081,7 +2094,35 @@ async def _boot_reconcile_plugin_callbacks(
     except Exception:  # noqa: BLE001
         logger.warning("boot callback-spool recovery failed", exc_info=True)
 
-    # (2) Route the overlay + publish markers.
+    # (2) Boot attempts pass — materialize the ledger from the artifact union
+    # (spec §3.3). MUST precede the legacy-store deletion below: on the first
+    # post-upgrade boot this is what gives pre-upgrade flows — including
+    # `.collect-*`-held ones — an attempt record.
+    try:
+        spool = callback_spool.get_spool()
+        if spool is not None:
+            await asyncio.to_thread(spool.attempts_pass, now=time.time(),
+                                    boot=True)
+    except Exception:  # noqa: BLE001
+        logger.warning("boot callback-attempts pass failed", exc_info=True)
+
+    # (3) Retire the v0.146 episode store. Nothing reads it any more; the
+    # ledger materialized in (2) is the durable truth. One INFO line names the
+    # PATH only (INV-CB-006: no hashes, no plugin names, no state). A failed
+    # unlink is not fatal — the next boot retries, and a surviving store file
+    # is inert.
+    try:
+        import callback_episodes as _cbep_migrate
+        legacy = _cbep_migrate.LEGACY_STORE_PATH
+        if legacy.exists():
+            legacy.unlink()
+            logger.info("callback migration: retired legacy episode store %s",
+                        legacy)
+    except Exception:  # noqa: BLE001
+        logger.warning("boot callback legacy-store retirement failed",
+                       exc_info=True)
+
+    # (4) Route the overlay + publish markers.
     try:
         import callback_reconcile
         issues = await callback_reconcile.reconcile_plugin_callbacks(
@@ -2093,7 +2134,7 @@ async def _boot_reconcile_plugin_callbacks(
     except Exception:  # noqa: BLE001
         logger.warning("boot plugin-callback reconcile failed", exc_info=True)
 
-    # (3) Gated orphan GC — remove spool dirs of plugins no longer installed.
+    # (5) Gated orphan GC — remove spool dirs of plugins no longer installed.
     # A NO-OP unless the registry loaded cleanly (a membership set from a
     # failed load would vaporize every plugin's spool). Membership keys on
     # registry ENTRIES, matching the spool's own contract.
@@ -3588,12 +3629,13 @@ async def main() -> None:
     )
     _pse.start_worker()
 
-    # 13d'. Durable authorization-callback delivery episodes. The
-    # worker reconciles pending results against the spool, then nudges the
-    # plugin's target agent to collect them. Reuses the same late-binding
-    # dispatch/notify/registry seams as the setup worker (the callback context
-    # markers differ but the shapes match). start_worker() runs its own boot
-    # recovery of episodes stranded by a crash.
+    # 13d'. Durable authorization-callback delivery. The worker owns no store
+    # of its own: the spool's per-flow ATTEMPT LEDGER is the durable state, and
+    # every pass re-derives it from the artifacts before dispatching the nudges
+    # it schedules. Reuses the same late-binding dispatch/notify/registry seams
+    # as the setup worker (the callback context markers differ but the shapes
+    # match). start_worker() kicks one immediate pass, which drains whatever
+    # the ledger already owes after a crash and establishes the timed wake.
     import callback_episodes as _cbep
     _cbep.configure(
         dispatch=_setup_dispatch, notify_operator=_setup_notify,
@@ -3795,9 +3837,12 @@ async def main() -> None:
                                     boot=False)
         except Exception:  # noqa: BLE001
             logger.warning("callback-spool recovery failed", exc_info=True)
-        # Re-drive delivery for any result the recovery restored without an
-        # episode (the episode enqueue is cheap and idempotent).
-        await _cbep.recovery(spool)
+        # Reconcile the attempt ledger against whatever the recovery restored
+        # and wake the delivery worker. boot=False is load-bearing: this pass
+        # runs while the handler may hold a claim mid-publish, so it must keep
+        # recovery's in-flight skip (the boot seam, which has no live handlers,
+        # is the only caller that reconciles every hash).
+        await _cbep.recovery(spool, boot=False)
 
     scheduler.add_job(
         _callback_spool_sweep,
