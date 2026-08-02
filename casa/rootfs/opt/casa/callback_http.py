@@ -59,6 +59,7 @@ from typing import Any, Callable
 
 from aiohttp import web
 
+import callback_episodes
 import callback_spool
 from rate_limit import RateLimiter
 
@@ -382,17 +383,19 @@ def _nudge(plugin: str, result_hash: str) -> None:
     """Signal the in-process delivery-nudge worker that a result landed.
 
     Deliberately a module-level function (not a handler argument) so the
-    wiring in Task 7 — ``callback_episodes`` — replaces one seam rather than
-    every construction site, and so tests can observe the kick.
+    wiring — ``callback_episodes`` — replaces one seam rather than every
+    construction site, and so tests can observe the kick.
 
-    Whatever lands here must stay **non-durable and O(1) on the request
-    path**: the episode ledger is a load-scan-rewrite JSON store, and writing
-    it here would make request work grow with ledger size. Durability comes
-    from the recovery invariant instead — any result without a settled
-    episode is re-enqueued by the boot and periodic passes — so a lost kick
-    converges rather than dropping the flow.
+    Stays **non-durable and O(1) on the request path**:
+    :func:`callback_episodes.kick` records an in-memory hint and sets the
+    worker's wake event — no ``_load``/``_save`` — because the episode ledger
+    is a load-scan-rewrite JSON store and writing it here would make request
+    work grow with ledger size. Durability comes from the recovery invariant
+    instead — any result without a settled episode is re-enqueued by the boot
+    and periodic passes — so a lost kick converges rather than dropping the
+    flow.
     """
-    return None
+    callback_episodes.kick(plugin, result_hash)
 
 
 # ---------------------------------------------------------------------------

@@ -187,10 +187,20 @@ class TestSuccess:
             await _get(client, f"/callback/{EFFECTIVE}?state={LONG_STATE}")
         assert kicks == [(PLUGIN, callback_spool.state_hash(STATE))]
 
-    async def test_nudge_seam_is_a_noop_today(self):
-        # Task 7 wires the episode kick here; until then it must neither raise
-        # nor touch the filesystem (the non-durability is pinned in Task 7).
-        assert callback_http._nudge(PLUGIN, "0" * 64) is None
+    async def test_nudge_seam_delegates_to_episode_kick(self, monkeypatch):
+        # Task 7 wires the seam to callback_episodes.kick: it records an
+        # in-memory hint and signals the worker, touching NO file (request-path
+        # O(1)). _load/_save raising would prove a filesystem touch.
+        import callback_episodes
+        monkeypatch.setattr(callback_episodes, "_save",
+                            lambda *a, **k: pytest.fail("kick touched _save"))
+        monkeypatch.setattr(callback_episodes, "_load",
+                            lambda *a, **k: pytest.fail("kick touched _load"))
+        callback_episodes._pending_hints.clear()
+        h = "0" * 64
+        assert callback_http._nudge(PLUGIN, h) is None
+        assert (PLUGIN, h) in callback_episodes._pending_hints
+        callback_episodes._pending_hints.clear()
 
 
 # ---------------------------------------------------------------------------
