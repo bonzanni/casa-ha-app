@@ -235,6 +235,42 @@ class TestStartRollback:
         # once on rollback.
         assert compile_calls.count("compile") == 2
 
+    async def test_cancellation_mid_launch_rolls_back_like_a_failure(
+            self, monkeypatch, tmp_path):
+        """Sol r2 (#363 family): a task CANCELLATION delivered at a launch
+        await (compile, summary post, start_service) must run the same
+        rollback as an exception — pre-fix the ``except Exception`` handler
+        skipped it, abandoning half-written service dirs and the workspace."""
+        from drivers.claude_code_driver import ClaudeCodeDriver
+        from drivers import s6_rc
+
+        async def fake_cau():
+            return None
+
+        async def fake_start_cancelled(*, engagement_id):
+            raise asyncio.CancelledError()
+
+        monkeypatch.setattr(s6_rc, "_compile_and_update_locked", fake_cau)
+        monkeypatch.setattr(s6_rc, "start_service", fake_start_cancelled)
+        monkeypatch.setattr(s6_rc, "ENGAGEMENT_SOURCES_ROOT",
+                            str(tmp_path / "svc-root"))
+        (tmp_path / "svc-root").mkdir()
+
+        defn = _make_defn(tmp_path)
+        rec = _make_record()
+        drv = ClaudeCodeDriver(
+            engagements_root=str(tmp_path / "engagements"),
+            send_to_topic=AsyncMock(),
+            casa_framework_mcp_url="http://127.0.0.1:8080/mcp/casa-framework",
+        )
+        (tmp_path / "engagements").mkdir()
+        (tmp_path / "base-plugins").mkdir()
+
+        with pytest.raises(asyncio.CancelledError):
+            await drv.start(rec, prompt="hi", options=defn)
+        assert not (tmp_path / "engagements" / rec.id).exists()
+        assert not (tmp_path / "svc-root" / f"engagement-{rec.id}").exists()
+
     async def test_provision_failure_cleans_up(self, monkeypatch, tmp_path):
         """Failure during provisioning (before service-dir write) — only
         the workspace tree needs cleanup, not the (never-written) service dir."""

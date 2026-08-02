@@ -10,6 +10,8 @@ from __future__ import annotations
 
 import asyncio
 
+import pytest
+
 from channels.output_sequencer import (
     APPLIED,
     ASK_TOOL,
@@ -320,6 +322,151 @@ async def test_intent_timeout_warns_and_leaves_consumption_debt(caplog):
     # Block B binds B exactly once.
     assert await seq.post_for_block(REPLY_TOOL, h) == "posted"
     assert rec.sends == [(42, "A"), (42, "B")]
+
+
+async def test_intent_timeout_measured_from_arm_not_registration():
+    """#332: an ingress can sit PENDING through validation/allocation long
+    past the timeout — the documented 10s applies to an ARMED intent waiting
+    for its block, so the clock starts at arm time, not registration."""
+    rec, clock = Recorder(), Clock()
+    seq = _make_seq(rec, clock)
+    h = projection_hash(REPLY_TOOL, {"text": "slow"})
+    seq.register_intent(request_id="A", tool_name=REPLY_TOOL,
+                        projection_hash=h, poster=_poster(rec, "A"))
+    # Validation backlog: the intent arms 11s AFTER registration.
+    clock.t = 11.0
+    seq.arm_intent("A")
+    await seq.process_intents_once()
+    assert rec.sends == []  # armed 0s ago — must NOT out-of-band post yet
+    clock.t = 20.9
+    await seq.process_intents_once()
+    assert rec.sends == []  # 9.9s armed — still within the window
+    clock.t = 21.0
+    await seq.process_intents_once()
+    assert rec.sends == [(42, "A")]  # 10s armed — now the timeout post fires
+
+
+async def test_failed_first_narration_open_keeps_reply_target():
+    """#332: _open_narration_locked cleared _turn_reply_to before awaiting
+    the send — a transient failure meant the topic-stream retry re-opened
+    without the inbound message to reply to, posting the turn's first output
+    unthreaded."""
+    rec = _ThreadRecorder()
+    clock = Clock()
+    seq = _make_seq(rec, clock)
+
+    fail_first = {"n": 1}
+    real_send = rec.send
+
+    async def _flaky_send(topic_id, text, reply_to=None):
+        if fail_first["n"]:
+            fail_first["n"] -= 1
+            return None
+        return await real_send(topic_id, text, reply_to=reply_to)
+
+    seq.send_message = _flaky_send
+    seq.set_turn_reply_to(555)
+    assert await seq.open_narration("first") is None      # transient failure
+    # The retry still threads to the operator's message.
+    mid = await seq.open_narration("first")
+    assert mid is not None
+    assert rec.sends[-1] == (42, "first", 555)
+    # Consumed on success — the next open is not a reply.
+    seq._narration_msg_id = None
+    await seq.open_narration("second")
+    assert rec.sends[-1] == (42, "second", None)
+
+
+async def test_restore_turn_reply_to_failure_undo_never_clobbers_newer():
+    """#332: the ask/reply posters consume the one-shot target before their
+    send; a failed send restores it — unless a newer envelope already set
+    a fresh target."""
+    rec = _ThreadRecorder()
+    clock = Clock()
+    seq = _make_seq(rec, clock)
+    seq.set_turn_reply_to(555)
+    assert seq.consume_turn_reply_to() == 555
+    seq.restore_turn_reply_to(555)               # failed send undo
+    assert seq.consume_turn_reply_to() == 555    # target re-armed
+    seq.restore_turn_reply_to(555)
+    seq.set_turn_reply_to(777)                   # newer envelope wins
+    seq.restore_turn_reply_to(555)
+    assert seq.consume_turn_reply_to() == 777
+
+
+async def test_failed_intent_poster_leaves_narration_open():
+    """Sol r1 (#332): the relay-mediated path is the PRINCIPAL ask/reply
+    route — a poster that fails (None, no compensation) must leave the open
+    narration editable, exactly like a failed post_discrete."""
+    rec, clock = Recorder(), Clock()
+    seq = _make_seq(rec, clock)
+    nid = await seq.open_narration("working...")
+    h = projection_hash(REPLY_TOOL, {"text": "R"})
+
+    async def _fail():
+        return None
+
+    seq.register_intent(request_id="r1", tool_name=REPLY_TOOL,
+                        projection_hash=h, poster=_fail)
+    seq.arm_intent("r1")
+    await seq.post_for_block(REPLY_TOOL, h)
+    intent = seq.registry.by_request_id("r1")
+    assert intent.post_failed is True
+    assert seq.narration_msg_id == nid   # narration still open + editable
+    assert await seq.edit_narration_if_latest(nid, "still editing") == APPLIED
+
+
+async def test_cancelled_poster_seals_and_retires_intent():
+    """Sol r2 (#332): a poster can SEND and then be cancelled during its
+    post-send bookkeeping — ambiguous, like a wire timeout. The sequencer
+    must seal conservatively and retire the intent fail-closed so the
+    watcher can never repost a possibly-landed message."""
+    import asyncio
+
+    rec, clock = Recorder(), Clock()
+    seq = _make_seq(rec, clock)
+    nid = await seq.open_narration("working...")
+    assert nid is not None
+    h = projection_hash(REPLY_TOOL, {"text": "R"})
+
+    async def _send_then_cancelled():
+        await rec.send(42, "R")             # the message LANDS...
+        raise asyncio.CancelledError()      # ...then bookkeeping is cancelled
+
+    seq.register_intent(request_id="r1", tool_name=REPLY_TOOL,
+                        projection_hash=h, poster=_send_then_cancelled)
+    seq.arm_intent("r1")
+    with pytest.raises(asyncio.CancelledError):
+        await seq.post_for_block(REPLY_TOOL, h)
+    assert seq.narration_msg_id is None          # sealed: send may have landed
+    intent = seq.registry.by_request_id("r1")
+    assert intent.post_failed is True            # resolved fail-closed
+    assert intent.outcome == {
+        "ok": False, "message_id": None, "out_of_band": False,
+        "cancelled": True,
+    }
+    # The watcher can never repost it.
+    sends_before = list(rec.sends)
+    clock.t = 100.0
+    await seq.process_intents_once()
+    assert rec.sends == sends_before
+
+
+async def test_compensated_intent_seals_narration():
+    """Sol r1 (#332): a compensated post PHYSICALLY landed — narration must
+    seal exactly as on the confirmed-post path (pre-#332 the unconditional
+    pre-poster seal covered this)."""
+    rec, clock = Recorder(), Clock()
+    seq = _make_seq(rec, clock)
+    nid = await seq.open_narration("working...")
+    h = projection_hash(REPLY_TOOL, {"text": "R"})
+    seq.register_intent(request_id="r1", tool_name=REPLY_TOOL,
+                        projection_hash=h, poster=_poster(rec, "R"))
+    seq.arm_intent("r1")
+    await seq.mark_intent_compensated("r1", 500)
+    assert seq.narration_msg_id is None   # sealed: the message exists
+    assert seq.high_water == 500
+    assert nid is not None
 
 
 async def test_response_loss_after_post_reattaches_without_double_post():

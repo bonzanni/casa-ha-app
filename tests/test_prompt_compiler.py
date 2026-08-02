@@ -105,6 +105,31 @@ def test_binding_digest_mismatch_is_rejected(role_factory, persona_factory, bind
         )
 
 
+def test_projection_doctrine_excludes_sibling_projections(
+        role_factory, persona_factory, binding_factory) -> None:
+    """#355: the shipped doctrines nest all three projection headings under
+    '# Core doctrine', and a markdown section's body runs to the next
+    SAME-level heading — selecting Core must not drag sibling surfaces'
+    instructions into a projection, nor duplicate the selected surface."""
+    role, persona = role_factory(), persona_factory()
+    binding = binding_factory(role, persona)
+    bundle = compile_prompt_bundle(
+        role=role, persona=persona, binding=binding,
+        platform_frame="Platform.\n", safety_kernel="Safety.\n",
+    )
+    rw = bundle.restricted_webhook.system_prompt
+    assert "Be plain." in rw                      # its own surface
+    assert "Control things." in rw                # shared core
+    assert "Be brief and spoken." not in rw       # voice must not leak
+    assert "Be brief.\n" not in rw                # text must not leak
+    voice = bundle.voice.system_prompt
+    assert voice.count("Be brief and spoken.") == 1   # not core-copy + own-copy
+    assert "Be plain." not in voice
+    text = bundle.text.system_prompt
+    assert text.count("Be brief.") == 1
+    assert "Be plain." not in text
+
+
 def test_recompiling_the_same_inputs_is_byte_identical(role_factory, persona_factory, binding_factory) -> None:
     role, persona = role_factory(), persona_factory()
     binding = binding_factory(role, persona)

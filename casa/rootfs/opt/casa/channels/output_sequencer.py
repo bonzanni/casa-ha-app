@@ -153,6 +153,9 @@ class SendIntent:
     registered_at: float
     seq: int
     state: str = "pending"          # pending | armed | posted | cancelled
+    armed_at: float | None = None   # #332: the intent timeout runs from ARM
+    #                                 time — an ingress can sit pending through
+    #                                 validation far longer than the timeout.
     message_id: int | None = None
     outcome: dict | None = None
     posting: bool = False           # A3 · F-ORDER (Sol A3 wave 3): the writer is
@@ -250,6 +253,7 @@ class IntentRegistry:
         intent = self._by_request.get(request_id)
         if intent is not None and intent.state == "pending":
             intent.state = "armed"
+            intent.armed_at = self._now()  # #332: timeout clock starts here
         return intent
 
     def cancel(self, request_id: str) -> SendIntent | None:
@@ -629,8 +633,10 @@ class OutputSequencer:
         # v0.79.0 (§3): thread the turn's FIRST post to the inbound envelope
         # that triggered the turn (reply-quoting). Consumed once — a later post
         # this turn is not a reply to the operator's message.
+        # #332: consume the one-shot target only on a SUCCESSFUL send — the
+        # topic-stream retry after a transient failure must still thread the
+        # turn's first output to the inbound message.
         reply_to = self._turn_reply_to
-        self._turn_reply_to = None
         if reply_to is not None:
             mid = await _maybe_await(
                 self.send_message(self.topic_id, text, reply_to=reply_to))
@@ -638,6 +644,8 @@ class OutputSequencer:
             mid = await _maybe_await(self.send_message(self.topic_id, text))
         if mid is None:
             return None
+        if reply_to is not None and self._turn_reply_to == reply_to:
+            self._turn_reply_to = None
         self._high_water = mid
         self._narration_msg_id = mid
         self._edit_cache[mid] = (text, MARKUP_ABSENT)
@@ -783,6 +791,14 @@ class OutputSequencer:
         mid = self._turn_reply_to
         self._turn_reply_to = None
         return mid
+
+    def restore_turn_reply_to(self, message_id: int | None) -> None:
+        """#332: failure-path undo for :meth:`consume_turn_reply_to` — an
+        ask/reply poster that consumed the one-shot target but FAILED its send
+        re-arms it so the turn's first successful output still threads. Never
+        clobbers a newer target set by a later envelope."""
+        if message_id is not None and self._turn_reply_to is None:
+            self._turn_reply_to = message_id
 
     # -- intent registration (the T2/T3 ingress API) -----------------------
 
@@ -969,6 +985,11 @@ class OutputSequencer:
                 return None
             if intent.outcome is not None and intent.outcome.get("compensated"):
                 return intent  # already compensated — exactly-once
+            # Sol r1 (#332): the compensated message PHYSICALLY landed below
+            # the open narration — seal it, exactly like the confirmed-post
+            # path in _post_intent_locked (pre-#332 the unconditional
+            # pre-poster seal covered this; the seal is now landed-only).
+            self._seal_narration_locked()
             intent.state = "posted"
             intent.consumed = True          # retired from matching
             intent.timeout_posted = False   # no consumption debt (not a success)
@@ -1197,7 +1218,6 @@ class OutputSequencer:
                 return None
             if revalidate is not None and not await _maybe_await(revalidate()):
                 return None
-            self._seal_narration_locked()
             send = _maybe_await(self._send_message_markup(
                 self.topic_id, text, markup, reply_to=reply_to))
             if wire_timeout is None:
@@ -1206,9 +1226,23 @@ class OutputSequencer:
                 try:
                     mid = await asyncio.wait_for(send, wire_timeout)
                 except asyncio.TimeoutError:
+                    # Sol r1 (#332): a TIMED-OUT send is AMBIGUOUS — Telegram
+                    # may have accepted the message before the response was
+                    # lost (§D6 r17-2 semantics). Seal conservatively so later
+                    # streamed text can never edit narration ABOVE a keyboard
+                    # that may exist below it. A confirmed None return (the
+                    # wire wrapper caught a definite failure) stays
+                    # no-state-change per the #332 contract.
+                    self._seal_narration_locked()
                     return None
             if mid is None:
                 return None
+            # #332: seal only after a CONFIRMED send — the None/timeout
+            # contract above is "no state change", and pre-sealing dropped
+            # the open narration (and its edit-cache entry) with no discrete
+            # message ever posted. The writer lock is held throughout, so
+            # nothing can interleave between the send and this seal.
+            self._seal_narration_locked()
             if self._high_water is None or mid > self._high_water:
                 self._high_water = mid
             self._edit_cache[mid] = (text, _discrete_markup_tristate(markup))
@@ -1508,7 +1542,10 @@ class OutputSequencer:
             intent.outcome = {"ok": False, "message_id": None, "terminal": True}
             self._signal_resolution(intent.request_id)
             return
-        self._seal_narration_locked()
+        # Sol r1 (#332): the seal moved to the CONFIRMED-post paths below —
+        # a poster that fails (returns None, no compensation) must leave the
+        # open narration editable, exactly like a failed post_discrete. The
+        # writer lock is held across poster + seal, so order is preserved.
         if warn:
             logger.warning(
                 "output sequencer: intent %s (%s) unmatched by any block for "
@@ -1531,6 +1568,24 @@ class OutputSequencer:
                 mid = await _maybe_await(
                     self.send_message(self.topic_id, str(intent.poster))
                 )
+        except asyncio.CancelledError:
+            # Sol r2 (#332): the poster may have SENT and then been cancelled
+            # during its post-send bookkeeping — ambiguous, exactly like a
+            # wire timeout. Seal conservatively (later narration can never
+            # edit above a message that may exist below it) and resolve
+            # fail-closed, retiring the intent from matching so the watcher
+            # can never repost a possibly-landed message. A compensated
+            # self-account recorded before the cancellation wins untouched.
+            if intent.outcome is None:
+                self._seal_narration_locked()
+                intent.post_failed = True
+                intent.consumed = True
+                intent.outcome = {
+                    "ok": False, "message_id": None,
+                    "out_of_band": out_of_band, "cancelled": True,
+                }
+                self._signal_resolution(intent.request_id)
+            raise
         except Exception as exc:  # noqa: BLE001 — a poster failure must not wedge
             logger.warning(
                 "output sequencer: intent %s poster failed: %s",
@@ -1574,6 +1629,9 @@ class OutputSequencer:
                 intent.request_id, mid, intent.outcome, self.engagement_id,
             )
             return
+        # Sol r1 (#332): the discrete message LANDED below the open narration —
+        # seal it now (rollover-on-interleave, §2), on the confirmed path only.
+        self._seal_narration_locked()
         intent.state = "posted"
         intent.consumed = True
         self._high_water = mid
@@ -1600,7 +1658,16 @@ class OutputSequencer:
                 if intent.slot_missed:
                     await self._post_intent_locked(intent, out_of_band=True)
                     self._log_late_post(intent, reason="slot_missed")
-                elif now - intent.registered_at >= self._intent_timeout_s:
+                # #332: the documented timeout applies to an ARMED intent
+                # waiting for its block — measure from arm time, never from
+                # registration (an ingress can sit pending through validation
+                # past the whole timeout and must not post out-of-band the
+                # moment it arms). Fallback to registered_at only for an
+                # intent armed by a path that bypassed IntentRegistry.arm().
+                elif (now - (intent.armed_at
+                             if intent.armed_at is not None
+                             else intent.registered_at)
+                        >= self._intent_timeout_s):
                     await self._post_intent_locked(
                         intent, out_of_band=True, warn=True,
                     )

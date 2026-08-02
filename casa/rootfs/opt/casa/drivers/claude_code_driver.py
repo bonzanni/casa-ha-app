@@ -1120,7 +1120,14 @@ class ClaudeCodeDriver(DriverProtocol):
                 # an engagement running without its summary anchor.
                 await self._post_initial_summary(engagement)
                 await s6_rc.start_service(engagement_id=engagement.id)
-            except Exception as start_exc:  # noqa: BLE001 — rollback is opportunistic
+            except BaseException as start_exc:  # noqa: BLE001 — rollback is
+                # opportunistic. Sol r2 (#363 family): BaseException, not
+                # Exception — a task CANCELLATION mid-launch (compile, summary
+                # post, service start) must run the same rollback instead of
+                # abandoning half-written service dirs; the trailing `raise`
+                # re-raises the CancelledError unchanged. (Rollback awaits run
+                # normally — a cancellation is delivered once, at the await
+                # that was pending when cancel() landed.)
                 logger.warning(
                     "claude_code start failed for engagement %s: %s; rolling back",
                     engagement.id[:8], start_exc,
@@ -2554,6 +2561,22 @@ class ClaudeCodeDriver(DriverProtocol):
         """Recorded outcome (incl. posted message id) for a reattaching retry."""
         seq = self._sequencers.get(engagement_id)
         return seq.intent_outcome(request_id) if seq is not None else None
+
+    def consume_turn_reply_to(self, engagement_id: str) -> int | None:
+        """#332: fetch-and-clear the sequencer's one-shot turn reply target
+        (v0.79.0 §3) — the ask/reply ingress posters call this so whichever
+        output posts FIRST this turn threads to the operator's message."""
+        seq = self._sequencers.get(engagement_id)
+        return seq.consume_turn_reply_to() if seq is not None else None
+
+    def restore_turn_reply_to(
+        self, engagement_id: str, message_id: int | None,
+    ) -> None:
+        """#332 failure arm: re-arm a consumed-but-unsent turn reply target
+        (never clobbers a newer one — see the sequencer method)."""
+        seq = self._sequencers.get(engagement_id)
+        if seq is not None:
+            seq.restore_turn_reply_to(message_id)
 
     async def mark_send_intent_posted(
         self, engagement_id: str, request_id: str, message_id: int | None,

@@ -1147,7 +1147,17 @@ def _dest_family_writes_managed(argv: list[str]) -> bool:
     ``--target-directory`` target resolves managed, or the operand shape is
     ambiguous (options after operands, ``--remove-source*``, a single
     operand, no parseable target) AND any operand resolves managed.
-    Copying FROM a managed tree elsewhere is a legitimate read."""
+    Copying FROM a managed tree elsewhere is a legitimate read.
+
+    #348: ``-t``/``--target-directory`` designates the destination for
+    cp/install ONLY (rsync's ``-t`` is preserve-times, a plain flag). When
+    cp/install carry an explicit UNMANAGED target, every remaining operand
+    is a SOURCE — ``cp -t /tmp <managed-file>`` copies an inspectable
+    artifact OUT, the documented read allowance, and must not be flagged
+    just because a sources-only remainder has fewer than two operands."""
+    prog = os.path.basename(argv[0])
+    t_takes_target = prog in ("cp", "install")
+    dest_unmanaged = False
     args = argv[1:]
     operands: list[str] = []
     ambiguous = False
@@ -1162,26 +1172,28 @@ def _dest_family_writes_managed(argv: list[str]) -> bool:
         if not seen_ddash and a.startswith("-") and a != "-":
             if operands:
                 ambiguous = True  # option-terminated / interleaved options
-            if a in ("-t", "--target-directory"):
+            if t_takes_target and a in ("-t", "--target-directory"):
                 if i + 1 < len(args):
                     if _token_resolves_managed(args[i + 1]):
                         return True
+                    dest_unmanaged = True
                     i += 2
                     continue
                 ambiguous = True
-            elif a.startswith("--target-directory="):
+            elif t_takes_target and a.startswith("--target-directory="):
                 if _token_resolves_managed(a.split("=", 1)[1]):
                     return True
-            elif a.startswith("-t") and len(a) > 2:
-                # GNU cp/install attached form ``-tDIR`` (round-3 S2). rsync's
-                # ``-t`` is preserve-times and never takes a directory, so a
-                # cluster like ``-tv`` reaching here must NOT downgrade the
-                # parse: only a slash-bearing suffix is treated as a target;
-                # anything else marks the shape ambiguous (fail-closed).
+                dest_unmanaged = True
+            elif t_takes_target and a.startswith("-t") and len(a) > 2:
+                # GNU cp/install attached form ``-tDIR`` (round-3 S2). Only
+                # a slash-bearing suffix is treated as a target; a bare
+                # suffix could be a cluster (``-tv``) and marks the shape
+                # ambiguous (fail-closed).
                 suffix = a[2:]
                 if "/" in suffix:
                     if _token_resolves_managed(suffix):
                         return True
+                    dest_unmanaged = True
                 else:
                     ambiguous = True
             elif a.startswith("--remove-source"):
@@ -1191,6 +1203,11 @@ def _dest_family_writes_managed(argv: list[str]) -> bool:
         operands.append(a)
         i += 1
     if not operands:
+        return False
+    if dest_unmanaged and not any(
+            x.startswith("--remove-source") for x in args):
+        # Explicit unmanaged cp/install target: remaining operands are all
+        # sources; reading them out of a managed tree is legitimate.
         return False
     if len(operands) < 2:
         ambiguous = True  # cannot tell source from destination
@@ -1725,8 +1742,259 @@ def _scan_mcp_launch_refs(cwd: Path) -> list[str]:
     return findings
 
 
+# A word carrying a redirection operator anywhere (`2>f`, `&>f`, `{fd}>f`,
+# `<<-`, `>|`) — never the `cd` target itself, so it does not propagate into
+# the feasible-base set (it still contributes a scan candidate).
+_REDIR_SHAPED = re.compile(r"[<>]")
+
+
+def _command_segment(text: str) -> str:
+    """The leading COMMAND segment of *text* — up to the first separator
+    (`;`, newline, `)`, `&`, `|`).
+
+    Quote- and escape-AWARE (Sol r8): a separator inside `'…'`/`"…"` or
+    behind a backslash is DATA, part of a path word (`cd '/tmp/bad;repo'`),
+    and must not truncate the segment. An `&`/`|` adjacent to a `<`/`>`
+    belongs to a redirection operator (`&>f`, `2>&1`, `2>| f`, `{fd}>&-`),
+    not to a separator, so it does not end the segment either."""
+    quote = ""
+    i = 0
+    while i < len(text):
+        ch = text[i]
+        if quote:
+            if ch == "\\" and quote == '"':
+                i += 2
+                continue
+            if ch == quote:
+                quote = ""
+            i += 1
+            continue
+        if ch == "\\":
+            i += 2  # escaped char is data, whatever it is
+            continue
+        if ch in "'\"":
+            quote = ch
+            i += 1
+            continue
+        if ch in ";\n\r)":
+            return text[:i]
+        if ch in "&|":
+            prev = text[i - 1] if i else ""
+            nxt = text[i + 1] if i + 1 < len(text) else ""
+            if prev not in "<>" and nxt not in "<>":
+                return text[:i]
+        i += 1
+    return text
+
+
+def _shell_words(segment: str) -> list[str]:
+    """Split one command segment into shell WORDS, honoring quotes and
+    backslash escapes (`>"log file"` is one word, not two). Falls back to a
+    whitespace split when the segment is not lexable (an unbalanced quote
+    from our own separator split) — over-splitting only adds candidates."""
+    import shlex
+    try:
+        return [w for w in shlex.split(segment, posix=True) if w]
+    except ValueError:
+        return [w for w in segment.split() if w]
+
+
+# A `git … push` invocation: only options may sit between `git` and `push`
+# (so `git stash push` never arms). Group 1 is the option run, which carries
+# any `-C <dir>` retargeting.
+_GIT_PUSH_RE = r"\bgit((\s+-\S+(\s+(\"[^\"]*\"|'[^']*'|[^-\s]\S*))?)*)\s+push\b"
+
+# Tokens made only of these characters are COMMAND SEPARATORS (`;`, `;;`,
+# `&`, `&&`, `|`, `||`, `(`, `)`) — a redirection operator (`>`, `>&`, `<<`)
+# is not, so it never ends a command.
+_SEPARATOR_CHARS = frozenset(";&|()")
+
+
+def _logical_and_physical(path: Path) -> list[Path]:
+    """*path* under BOTH `..` resolutions (Terra r15).
+
+    `cd` is LOGICAL by default (`-L`): `cd /a/link; cd ../b` lands in `/a/b`
+    even when `link` points elsewhere, because bash collapses `..` against
+    the path it printed, not against the symlink's physical parent. Handing
+    the un-collapsed path to the filesystem gives the PHYSICAL answer
+    instead (what `cd -P` would do). Both are plausible, so both are
+    scanned."""
+    logical = Path(os.path.normpath(str(path)))
+    return [path] if logical == path else [path, logical]
+
+
+def _cd_operand_words(words: list[str]) -> list[str]:
+    """The real OPERANDS among a `cd` command's words — options, redirection
+    operators, the words those operators consume, and the fd prefixes that
+    introduce them are all removed.
+
+    Terra r13: this replaced a "first word that doesn't look like an option"
+    heuristic which picked the redirection TARGET (`cd 2> /dev/null /repo`
+    → `/dev/null`) and therefore seeded a following relative `cd` from the
+    wrong base. The token stream makes the redirections explicit, so the
+    operands can be computed rather than guessed. Everything after `--` is
+    an operand, however it is spelled."""
+    consumed: set[int] = set()
+    for i, w in enumerate(words):
+        if not w or not all(ch in "<>&|" for ch in w):
+            continue
+        if "<" not in w and ">" not in w:
+            continue  # not a redirection operator
+        consumed.add(i)
+        if i + 1 < len(words):
+            consumed.add(i + 1)          # the redirection target word
+        if i and (words[i - 1].isdigit()
+                  or (words[i - 1].startswith("{")
+                      and words[i - 1].endswith("}"))):
+            consumed.add(i - 1)          # its fd prefix (`2>`, `{fd}>`)
+    operands: list[str] = []
+    seen_ddash = False
+    for i, w in enumerate(words):
+        if i in consumed:
+            continue
+        if not seen_ddash and w == "--":
+            seen_ddash = True
+            continue
+        if not seen_ddash and w.startswith("-"):
+            continue                     # an option word
+        operands.append(w)
+    return operands
+
+
+def _cd_command_words(text: str) -> list[list[str]]:
+    """Every `cd` invocation in *text*, as its list of argument WORDS.
+
+    Terra/Sol r7-r10: this replaced a regex + quote-stripped shadow that kept
+    losing to one more spelling per review round (`2>& 1`, `{fd}>&-`,
+    `>"log file"`, `"cd"`, `c''d`, `c\\d`, `c\\<newline>d`,
+    `c''d '/tmp/bad;repo'`). Tokenizing ONCE the way the shell does resolves
+    the whole family structurally: quote/escape removal is the lexer's job,
+    so a quoted command word (`c''d`) collapses to `cd` while a quoted
+    separator inside a PATH (`'/tmp/bad;repo'`) stays one word.
+
+    Line continuations are removed first (bash's own first pass). EVERY `cd`
+    token counts, wherever it sits: r11 showed that deciding whether a `cd`
+    is in "command position" is the same losing enumeration as the earlier
+    two (a wrapper's own options — `command -p cd` — and leading
+    redirections — `2>/dev/null cd /tmp` — both precede the command word).
+    A `cd` token that is really an ARGUMENT to something else
+    (`echo cd /tmp`) only ADDS candidate words, which is fail-closed and
+    costs one is_dir() each. All words up to the next separator are
+    returned: the caller scans every one, so no "which word is the target"
+    decision remains either.
+    """
+    import shlex
+    # ONE quote-aware pre-pass (Sol r14): remove bash LINE CONTINUATIONS —
+    # which bash honors outside quotes and inside double quotes, but NOT
+    # inside single quotes, where `\<newline>` is literal path data — and
+    # turn the remaining unquoted newlines into explicit `;` separators
+    # (shlex would otherwise treat them as plain whitespace and let one
+    # command's words run into the next).
+    out_chars: list[str] = []
+    quote = ""
+    i = 0
+    while i < len(text):
+        ch = text[i]
+        if quote == "'":
+            if ch == "'":
+                quote = ""
+            out_chars.append(ch)
+            i += 1
+            continue
+        if ch == "\\" and i + 1 < len(text):
+            if text[i + 1] == "\n":
+                i += 2          # line continuation — drop both characters
+                continue
+            out_chars.append(text[i:i + 2])
+            i += 2
+            continue
+        if quote == '"':
+            if ch == '"':
+                quote = ""
+            out_chars.append(ch)
+            i += 1
+            continue
+        if ch in "'\"":
+            quote = ch
+        elif ch in "\n\r":
+            out_chars.append(" ; ")
+            i += 1
+            continue
+        out_chars.append(ch)
+        i += 1
+    text = "".join(out_chars)
+    lexer = shlex.shlex(text, posix=True, punctuation_chars=True)
+    # Terra r14: bash treats `#` as a comment only at the START of a word —
+    # `cd /tmp/dir#name` is a literal path. shlex's default commenters="#"
+    # would truncate it.
+    lexer.commenters = ""
+    lexer.whitespace_split = True
+    try:
+        tokens = list(lexer)
+    except ValueError:
+        # Unbalanced quote (a truncated command) — degrade to a whitespace
+        # split; over-splitting only ADDS candidate words.
+        tokens = text.split()
+
+    out: list[list[str]] = []
+    collecting: list[str] | None = None
+    for tok in tokens:
+        if tok and all(ch in _SEPARATOR_CHARS for ch in tok):
+            if collecting is not None:
+                out.append(collecting)
+                collecting = None
+            continue
+        if tok == "cd":
+            if collecting is not None:
+                # Sol r13: a directory can be NAMED `cd` (`cd cd`) — the
+                # token is both a possible operand of the cd being collected
+                # AND the start of another one. Record it as both.
+                collecting.append(tok)
+                out.append(collecting)
+            collecting = []
+            continue
+        if collecting is not None:
+            collecting.append(tok)
+    if collecting is not None:
+        out.append(collecting)
+    return out
+
+
 def make_self_containment_guard() -> HookCallback:
-    """Pre-push grep for §2.0 self-containment anti-patterns."""
+    """Pre-push grep for §2.0 self-containment anti-patterns.
+
+    ── SCOPE NOTE — READ BEFORE "HARDENING" THE cd RECOGNIZER (v0.145.0) ──
+    This guard is DEFENSE IN DEPTH, not a security boundary. It advises an
+    already-trusted operator/agent channel inside the container, it carries
+    a deliberate logged escape hatch (``CASA_ALLOW_ANTI_PATTERN=1``), and
+    the authoritative check on the real push path is ``scripts/gate.sh``,
+    which evaluates HEAD on a clean tree and runs a pinned secret scanner.
+
+    Deciding which directory a shell command ends up in is UNDECIDABLE from
+    the command text, and approximating it is a KNOWN FINDING GENERATOR: the
+    v0.145.0 adversarial review spent ELEVEN consecutive rounds here, each
+    surfacing one further bash spelling (``2>& 1``, ``{fd}>&-``, quoted and
+    backslash-escaped command words, a directory named ``cd``, one named
+    ``-weird``, ``#`` inside a path, a single-quoted ``\\<newline>``, logical
+    vs physical ``..``). Every one was fixed and every one was individually
+    real; the marginal value nevertheless reached zero long before the
+    rounds did. The design settled on removing JUDGMENT rather than adding
+    rules — every ``cd`` token counts, every word of its command is scanned,
+    quoting is the lexer's job, operands are computed from the token stream,
+    and the base set is capped with a fail-closed deny.
+
+    ACCEPTED RESIDUAL, deliberately not fixed: targets that are not
+    statically resolvable (parameter/command substitution, ``eval``,
+    aliases) and adversarially-constructed paths named after shell syntax.
+    An actor able to craft those already runs arbitrary commands in this
+    container, so the guard was never what stood between them and a push.
+
+    Do NOT reopen this to chase another spelling on the strength of a code
+    scan or review sweep alone. Change it when a REAL incident shows a
+    plausible operator command slipping through, and record that incident
+    in the commit. Over-scanning (extra candidate directories) is BY DESIGN
+    and is not a defect.
+    """
 
     async def hook(
         input_data: dict[str, Any],
@@ -1747,40 +2015,135 @@ def make_self_containment_guard() -> HookCallback:
         # flag was never implemented and would make git itself error.)
         # Option arguments may be quoted and contain spaces (Sol r6-1:
         # `git -C "path with spaces" push`).
-        m_push = re.search(
-            r"\bgit((\s+-\S+(\s+(\"[^\"]*\"|'[^']*'|[^-\s]\S*))?)*)\s+push\b",
-            cmd)
+        # Sol r15: arm against a continuation-flattened copy — a line
+        # continuation may sit between `git` and `push` (`git \<newline>
+        # push`), which bash removes before the words are formed. Flattening
+        # can only make the guard arm MORE often (fail-closed); the cd
+        # collector does its own quote-aware continuation handling on the
+        # raw command.
+        cmd_flat = cmd.replace("\\\n", "")
+        m_push = re.search(_GIT_PUSH_RE, cmd_flat)
         if not m_push:
             return {}
         override = bool(
             re.search(r"\bCASA_ALLOW_ANTI_PATTERN=([\"']?)1\1(\s|$)", cmd))
 
         cwd = Path(input_data.get("cwd") or os.getcwd())
-        # Sol r5-3: scan the repo the COMMAND targets, not the hook cwd —
-        # `cd <path> && git push` re-bases, `git -C <path> push` retargets.
-        for m_cd in re.finditer(
-                r"(?:^|&&|;)\s*cd\s+(\"[^\"]+\"|'[^']+'|\S+)",
-                cmd[: m_push.start()]):
-            t = m_cd.group(1).strip("'\"")
-            cwd = Path(t) if os.path.isabs(t) else cwd / t
-        m_c = re.search(r"-C\s+(\"[^\"]+\"|'[^']+'|\S+)", m_push.group(1))
-        if m_c:
-            t = m_c.group(1).strip("'\"")
-            cwd = Path(t) if os.path.isabs(t) else cwd / t
-        if not cwd.is_dir():
-            return {}
+        # Sol r5-3: scan the repo the COMMAND targets — `cd <path> && git
+        # push` re-bases, `git -C <path> push` retargets. #348: bash
+        # separates commands on newlines, `|`, `&` and `||` just as on
+        # `&&`/`;` — the class below covers them all (the final char of
+        # `&&`/`||` is itself in the class).
+        #
+        # Terra/Sol r1 (#348): the guard cannot know which cds actually
+        # EXECUTE (`true || cd X` skips X; a `cd` in a pipeline runs in a
+        # subshell; a failed `cd nonexistent` leaves the shell where it
+        # was). Fail CLOSED: scan the UNION of every candidate repo — the
+        # hook cwd plus every textual cd rebase and the -C target — so a
+        # conditional or failing cd can never redirect the scan away from
+        # the repository the push actually operates on, and a nonexistent
+        # target never turns into an allow.
+        # Terra r2: each cd may or may not have EXECUTED (conditionals), so a
+        # relative cd must be resolved from EVERY feasible prior base, not one
+        # linear chain — `false && cd decoy; cd ../bad` rebases from the hook
+        # cwd, not from decoy. The feasible-base set only ever GROWS (base
+        # without the cd stays feasible); growth is bounded (commands carry a
+        # handful of cds at most; hard cap as a backstop).
+        # Sol r2: `cd -P -- dir` — skip option words and an optional `--` so
+        # the flag is never mistaken for the target.
+        # Sol r3 / Terra+Sol r4: enumerating what may precede an executable
+        # `cd` (separators, `then`, subshell parens, case-pattern `)`, `!`,
+        # `command`, …) is a losing game — every round found another form.
+        # Structural resolution: EVERY standalone `cd` word before the push
+        # contributes a candidate, whatever precedes it. Over-approximation
+        # is fail-closed by construction — a `cd` that would not really
+        # execute (or is mere argument text) only ADDS scan targets, never
+        # removes one, and the hook cwd always stays in the set.
+        bases: set = {cwd}
+        candidates: list = [cwd]
+        cd_overflow = False
+        # Terra/Sol r5-r7: pinpointing WHICH word after `cd` is the target is
+        # the same losing game as the pre-context was — six rounds produced
+        # `2> f`, `&>f`, `2>& 1`, `2>| f`, `<<< x`, `<<- EOF`, `{fd}>f`,
+        # `>"log file"`, `>log\ file`, … Structural resolution: stop deciding.
+        # EVERY word between `cd` and the next separator becomes a scan
+        # candidate, so whichever word bash actually resolves to is always in
+        # the set. Redirect operands and option words simply add candidates
+        # that are usually not directories and cost one is_dir() each.
+        # Only the PRIMARY word (first that is neither an option nor
+        # redirect-shaped) propagates into ``bases``, so a relative cd chain
+        # still grows the feasible-base set at the same bounded rate.
+        # Sol r8: bash needs no whitespace after `cd` before an operator or
+        # a quote (`cd</dev/null /bad`, `cd'/bad'`) — accept those positions
+        # too, never just `cd\s`.
+        # Sol r12: scan the WHOLE command, not just the text before the first
+        # `git push` match — that match may be another command's ARGUMENT
+        # (`echo git push; cd /bad; git push`), which would truncate the scan
+        # before the real cd. Collecting cds from the entire string is the
+        # same fail-closed over-approximation used everywhere else here.
+        for words in _cd_command_words(cmd):
+            # EVERY word is scanned (fail-closed over-approximation); the
+            # computed OPERANDS additionally propagate into ``bases`` so a
+            # following RELATIVE cd resolves from the right place.
+            operands = _cd_operand_words(words)
+            new_bases = set()
+            for b in bases:
+                for w in words:
+                    candidates.extend(_logical_and_physical(
+                        Path(w) if os.path.isabs(w) else b / w))
+                for w in operands:
+                    new_bases.update(_logical_and_physical(
+                        Path(w) if os.path.isabs(w) else b / w))
+            bases |= new_bases
+            if len(bases) > 64:
+                # Terra/Sol r3: stopping silently would leave every LATER cd
+                # unexamined — fail CLOSED instead (the finding below denies
+                # the push; the logged CASA_ALLOW_ANTI_PATTERN override
+                # remains the escape hatch for a legitimate pathological
+                # command).
+                cd_overflow = True
+                break
+        # Sol r2: git applies EVERY -C sequentially (a relative -C resolves
+        # against the previous one) — fold the whole chain over each base.
+        # Sol r12: do this for EVERY `git … push` occurrence, since the first
+        # textual match may not be the real one.
+        for m_g in re.finditer(_GIT_PUSH_RE, cmd_flat):
+            c_targets = [m.group(1).strip("'\"") for m in re.finditer(
+                r"-C\s+(\"[^\"]+\"|'[^']+'|\S+)", m_g.group(1))]
+            if not c_targets:
+                continue
+            for b in bases:
+                cur = b
+                for t in c_targets:
+                    cur = Path(t) if os.path.isabs(t) else cur / t
+                candidates.append(cur)
 
-        # Sol r4-7: anchor the tree scan at the REPO ROOT when resolvable —
-        # a push from a subdirectory must still see a root README
-        # anti-pattern. Fall back to cwd outside a worktree.
-        top = await asyncio.to_thread(
-            _git_lines, cwd, "rev-parse", "--show-toplevel")
-        scan_root = Path(top[0]) if top else cwd
-
-        # M28: the walk+read blocks the shared event loop — run it off-loop.
-        findings = await asyncio.to_thread(
-            _scan_tree_for_anti_patterns, scan_root)
-        findings += await asyncio.to_thread(_scan_mcp_launch_refs, cwd)
+        findings: list[str] = []
+        if cd_overflow:
+            findings.append(
+                "cd chain too complex to model (feasible-cwd set exceeded "
+                "64) — cannot establish which repository is being pushed; "
+                "simplify the push command")
+        seen_roots: set[str] = set()
+        for cand in candidates:
+            if not cand.is_dir():
+                continue
+            # Sol r4-7: anchor the tree scan at the REPO ROOT when
+            # resolvable — a push from a subdirectory must still see a root
+            # README anti-pattern. Fall back to the candidate itself.
+            top = await asyncio.to_thread(
+                _git_lines, cand, "rev-parse", "--show-toplevel")
+            scan_root = Path(top[0]) if top else cand
+            if str(scan_root) in seen_roots:
+                continue
+            seen_roots.add(str(scan_root))
+            # M28: the walk+read blocks the shared event loop — off-loop.
+            findings += await asyncio.to_thread(
+                _scan_tree_for_anti_patterns, scan_root)
+            findings += await asyncio.to_thread(_scan_mcp_launch_refs, cand)
+        # De-duplicate while preserving order (overlapping candidates can
+        # surface the same finding via tree + cwd scans).
+        findings = list(dict.fromkeys(findings))
 
         if findings:
             if override:

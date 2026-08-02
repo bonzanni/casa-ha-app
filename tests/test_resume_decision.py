@@ -118,6 +118,20 @@ def test_invalid_last_active_is_new_and_retains_old() -> None:
     assert decision.retain_old is True
 
 
+def test_naive_last_active_is_invalid_entry_not_a_crash() -> None:
+    # A tz-less ISO timestamp parses fine, but comparing it against the aware
+    # ``now`` must not raise — it is an invalid entry like any other bad value.
+    now = datetime.now(timezone.utc)
+    entry = _stored_entry(last_active="2026-07-31T12:00:00")
+    decision = _resume_decision(
+        "telegram", entry, now, role_id=entry["agent"],
+        binding_digest=entry["binding_digest"],
+    )
+    assert decision.action == "new"
+    assert decision.reason == "invalid_entry"
+    assert decision.retain_old is True
+
+
 def test_legacy_short_role_entry_cannot_resume_under_canonical_role_id() -> None:
     now = datetime.now(timezone.utc)
     legacy_entry = {

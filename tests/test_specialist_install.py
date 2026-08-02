@@ -22,13 +22,14 @@ from canonical_bytes import canonical_json_bytes, canonical_text, checksum_bytes
 
 
 def _write_component(root: Path, *, slug: str = "mtg-test",
-                      dependencies: list[dict] | None = None) -> Path:
+                      dependencies: list[dict] | None = None,
+                      model: dict | None = None) -> Path:
     (root / "role").mkdir(parents=True)
     (root / "persona" / "pack").mkdir(parents=True)
     role_yaml = {
         "api_version": "casa.role/v1", "id": f"specialist:{slug}", "kind": "specialist",
         "slot": slug, "mission": "Answer test questions.", "enabled": True,
-        "model": {"source": "fixed", "value": "sonnet"},
+        "model": model or {"source": "fixed", "value": "sonnet"},
         "tools": {"allowed": [], "disallowed": ["Bash"], "permission_mode": "dontAsk",
                    "max_turns": 8, "skills": "none", "voice_guard": "none"},
         "mcp_servers": [], "channels": [], "memory": {"token_budget": 0, "read_strategy": "per_turn"},
@@ -564,10 +565,12 @@ def test_inspect_specialist_repo_rejects_forbidden_markers(
 # ---------------------------------------------------------------------------
 
 
-def _staged_inspection(tmp_path: Path) -> "specialist_install.InspectionResult":
+def _staged_inspection(
+    tmp_path: Path, model: dict | None = None,
+) -> "specialist_install.InspectionResult":
     from specialist_install import InspectionResult, compute_install_root_digest
 
-    root = _write_component(tmp_path / "component", slug="mtg")
+    root = _write_component(tmp_path / "component", slug="mtg", model=model)
     component = load_specialist_component(root, root / "manifest.json")
     deps = resolve_dependency_closure(component, root)
     root_digest = compute_install_root_digest(
@@ -689,6 +692,48 @@ def test_commit_survives_a_materialize_failure_and_self_heals_on_next_reconcile(
     op_dir = agents_specialists_dir / "mtg"
     for name in ("character.yaml", "voice.yaml", "response_shape.yaml", "runtime.yaml"):
         assert (op_dir / name).is_file(), name  # self-healed with no operator action
+
+
+def test_commit_binds_role_checksum_with_live_ha_options(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """#355: install must materialize the role with the SAME option
+    resolution the agent loader uses (`_ha_model_options`). Materializing
+    with options={} binds an ha_option model at its DEFAULT — with a
+    non-default PRIMARY_AGENT_MODEL the loader later resolves a different
+    checksum and compile_prompt_bundle drops the valid specialist as a
+    binding-activation failure."""
+    from role_artifact import load_role_artifact
+    from role_slot import _ha_model_options, materialize_role
+
+    monkeypatch.setenv("PRIMARY_AGENT_MODEL", "sonnet")
+    inspection = _staged_inspection(tmp_path, model={
+        "source": "ha_option", "option": "primary_agent_model",
+        "default": "opus", "allowed": ["opus", "sonnet"],
+    })
+    acks = SpecialistInstallAckStore(path=tmp_path / "acks.json")
+    identity = install_consent_identity(
+        component_id=inspection.component_id, version=inspection.version,
+        root_digest=inspection.root_digest, slug=inspection.slug)
+    acks.record(identity=identity, component_id=inspection.component_id,
+                version=inspection.version,
+                component_checksum=inspection.root_digest, slug=inspection.slug)
+
+    instance = commit_specialist_install(
+        inspection=inspection, config={}, secret_names_provided=frozenset(),
+        acks=acks,
+        specialists_dir=tmp_path / "specialists",
+        agents_specialists_dir=tmp_path / "agents-specialists",
+    )
+    assert instance.state == "active"
+    _, _, checksum = parse_component_root(instance.active.root)
+    cas_role = (tmp_path / "specialists" / "store"
+                / checksum.removeprefix("sha256:") / "role")
+    loader_role = materialize_role(
+        source=load_role_artifact(cas_role), options=_ha_model_options())
+    assert instance.active.binding.role_checksum == loader_role.checksum, (
+        "persisted binding is bound to a role checksum the loader will "
+        "never compute (install froze the ha_option default)")
 
 
 def test_commit_with_missing_required_config_yields_pending_configuration(tmp_path: Path) -> None:

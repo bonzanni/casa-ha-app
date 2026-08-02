@@ -2439,9 +2439,14 @@ class TelegramChannel(Channel):
         options: list,
         shorts: "list | None" = None,
         multi: bool = False,
+        reply_to: "int | None" = None,
     ) -> int | None:
         """Post a rich-text multiple-choice question with one tappable
         button per option (W5 `ask`).
+
+        ``reply_to`` (#332): the consumed turn reply target — a deferred ask
+        that is the turn's first output threads to the operator's inbound
+        message (v0.79.0 §3), like the narration open and reply posters.
 
         Mirrors ``post_perm_keyboard``'s engagement/topic resolution but skips
         MarkdownV2 entirely — the question/options are operator- or agent-authored
@@ -2487,10 +2492,14 @@ class TelegramChannel(Channel):
         if not isinstance(captions, list) or len(captions) != len(options):
             captions = _captions_from_shorts(options, shorts, multi)
 
+        _send_kwargs: dict = {}
+        if reply_to is not None:
+            _send_kwargs["reply_to_message_id"] = reply_to
+
         if multi:
             kbd = _build_multi_keyboard(request_id, options, captions, selected=())
             return await self.post_ask_body_rich(
-                rec.topic_id, question, reply_markup=kbd)
+                rec.topic_id, question, reply_markup=kbd, **_send_kwargs)
 
         kbd = InlineKeyboardMarkup([
             [InlineKeyboardButton(
@@ -2501,7 +2510,7 @@ class TelegramChannel(Channel):
         ])
 
         return await self.post_ask_body_rich(
-            rec.topic_id, question, reply_markup=kbd)
+            rec.topic_id, question, reply_markup=kbd, **_send_kwargs)
 
     async def edit_topic_message(
         self, topic_id: int | None, message_id: int, text: str,

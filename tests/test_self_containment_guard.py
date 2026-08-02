@@ -321,6 +321,335 @@ class TestGuardArmingAndOracle:
         assert await self._denied(
             clean, f"cd {bad_repo} && git push origin main")
 
+    async def test_cd_newline_separated_scans_target(
+            self, tmp_path: Path, bad_repo: Path):
+        """#348: bash treats a newline as a command separator exactly like
+        `;` — a two-line `cd <repo>\\ngit push` must scan <repo>, not the
+        hook cwd."""
+        clean = tmp_path / "clean-cwd3"
+        clean.mkdir()
+        assert await self._denied(
+            clean, f"true\ncd {bad_repo}\ngit push origin main")
+
+    async def test_cd_after_or_separator_scans_target(
+            self, tmp_path: Path, bad_repo: Path):
+        """#348 companion: `||` and `|`-adjacent separators are command
+        separators too — `true || cd <repo>; git push` may run the cd."""
+        clean = tmp_path / "clean-cwd4"
+        clean.mkdir()
+        assert await self._denied(
+            clean, f"false || cd {bad_repo}; git push origin main")
+
+    async def test_unexecuted_conditional_cd_cannot_redirect_scan(
+            self, tmp_path: Path, bad_repo: Path):
+        """Terra r1 (#348): the guard cannot know which cds actually execute —
+        `true || cd <clean>` never runs, the push happens FROM bad_repo. The
+        scan is a UNION over the hook cwd and every textual cd target, so a
+        conditional cd can never redirect it away from the pushed repo."""
+        clean = tmp_path / "clean-decoy"
+        clean.mkdir()
+        assert await self._denied(
+            bad_repo, f"true || cd {clean}\ngit push origin main")
+
+    async def test_nonexistent_cd_target_still_scans_hook_cwd(
+            self, bad_repo: Path):
+        """Terra r1 (#348): a nonexistent cd target must not fail OPEN — the
+        hook cwd is always in the scanned union."""
+        assert await self._denied(
+            bad_repo, "cd /nonexistent-dir-xyz; git push origin main")
+
+    async def test_branching_relative_cd_scans_diverged_base(
+            self, tmp_path: Path, bad_repo: Path):
+        """Terra r2 (#348): each cd may or may not have executed — a relative
+        cd must rebase from EVERY feasible prior base. `false && cd decoy;
+        cd ../<bad>` really lands in <bad> (decoy never ran), which one
+        linear chain would compute as decoy/../<bad> and fail to resolve."""
+        clean = bad_repo.parent / "clean-branch-cwd"
+        clean.mkdir()
+        assert await self._denied(
+            clean,
+            f"false && cd decoy; cd ../{bad_repo.name}; git push origin main")
+
+    async def test_cd_dashdash_and_flag_target_is_parsed(
+            self, tmp_path: Path, bad_repo: Path):
+        """Sol r2 (#348): `cd -P -- <dir>` — flags and the `--` terminator
+        must not be mistaken for the target."""
+        clean = tmp_path / "clean-flags-cwd"
+        clean.mkdir()
+        assert await self._denied(
+            clean, f"cd -P -- {bad_repo} && git push origin main")
+
+    async def test_multiple_git_dash_c_options_apply_sequentially(
+            self, tmp_path: Path, bad_repo: Path):
+        """Sol r2 (#348): git applies every -C in order, a relative -C
+        resolving against the previous one."""
+        clean = tmp_path / "clean-multic-cwd"
+        clean.mkdir()
+        assert await self._denied(
+            clean,
+            f"git -C {bad_repo.parent} -C {bad_repo.name} push origin main")
+
+    async def test_cd_after_then_keyword_is_recognized(
+            self, tmp_path: Path, bad_repo: Path):
+        """Sol r3 (#348): a cd introduced by a shell keyword body
+        (`if …; then cd <bad>`) must still rebase the scan."""
+        clean = tmp_path / "clean-then-cwd"
+        clean.mkdir()
+        assert await self._denied(
+            clean,
+            f"if true; then cd {bad_repo}; git push origin main; fi")
+
+    async def test_cd_inside_subshell_is_recognized(
+            self, tmp_path: Path, bad_repo: Path):
+        """Sol r3 (#348): `(cd <bad>; git push)` — the subshell paren is a
+        cd position too."""
+        clean = tmp_path / "clean-subsh-cwd"
+        clean.mkdir()
+        assert await self._denied(
+            clean, f"(cd {bad_repo}; git push origin main)")
+
+    async def test_cd_in_case_branch_is_recognized(
+            self, tmp_path: Path, bad_repo: Path):
+        """Terra/Sol r4 (#348): a case-pattern `)` precedes the cd —
+        recognized because EVERY standalone cd word contributes a
+        candidate."""
+        clean = tmp_path / "clean-case-cwd"
+        clean.mkdir()
+        assert await self._denied(
+            clean,
+            f"case x in x) cd {bad_repo};; esac; git push origin main")
+
+    async def test_negated_and_command_prefixed_cd_are_recognized(
+            self, tmp_path: Path, bad_repo: Path):
+        """Terra/Sol r4 (#348): `! cd <bad>` still changes directory, and
+        `command cd <bad>` is the builtin through a wrapper word."""
+        clean = tmp_path / "clean-neg-cwd"
+        clean.mkdir()
+        assert await self._denied(
+            clean, f"if ! cd {bad_repo}; then :; fi; git push origin main")
+        clean2 = tmp_path / "clean-cmdword-cwd"
+        clean2.mkdir()
+        assert await self._denied(
+            clean2, f"command cd {bad_repo}; git push origin main")
+
+    async def test_cd_with_redirection_before_target_is_recognized(
+            self, tmp_path: Path, bad_repo: Path):
+        """Terra r5 (#348): bash resolves `cd 2>/dev/null /bad` (and the
+        stdin form) to /bad — redirection tokens between cd and its target
+        must be skipped, never captured as the target."""
+        for i, redir in enumerate(("2>/dev/null", "</dev/null",
+                                   "-P 2>/dev/null", "2> /dev/null",
+                                   "&>/dev/null", "2>& 1", "2>| /dev/null",
+                                   "<<< x", "<& 0", "&> /dev/null",
+                                   "1>&2", ">> log",
+                                   # Terra/Sol r7: {fd} descriptors, quoted
+                                   # and escaped operands, `<<-` heredoc.
+                                   "{fd}>/dev/null", "{fd}>&-",
+                                   '2>"log file"', "2>'log file'",
+                                   "2>log\\ file", '>"literal log"',
+                                   "<<- EOF")):
+            clean = tmp_path / f"clean-redir-cwd{i}"
+            clean.mkdir()
+            assert await self._denied(
+                clean, f"cd {redir} {bad_repo} && git push origin main"), redir
+
+    async def test_cd_target_with_brace_char_is_kept_whole(
+            self, tmp_path: Path, git_plugin_repo: Path, bad_repo: Path):
+        """Sol r5 (#348): `}` is a reserved word, not a metachar — a glued
+        `}` belongs to the target word. A bad repo literally named `bad}`
+        must be scanned as such."""
+        import shutil
+        # A parent where the BRACE-TRUNCATED name resolves to nothing — a
+        # truncating parser sees a nonexistent candidate and allows.
+        brace_repo = tmp_path / "braceland" / "bad}"
+        shutil.copytree(bad_repo, brace_repo, symlinks=True)
+        clean = tmp_path / "clean-brace-cwd"
+        clean.mkdir()
+        assert await self._denied(
+            clean, f"cd {brace_repo}; git push origin main")
+
+    async def test_quoted_separator_in_target_is_not_truncated(
+            self, tmp_path: Path, bad_repo: Path):
+        """Terra/Sol r8 (#348): a separator INSIDE quotes (or behind a
+        backslash) is part of the path word — `cd '/tmp/bad;repo'` really
+        enters that directory and must be scanned."""
+        import shutil
+        for i, (name, spell) in enumerate((
+                ("bad;repo", "'{p}'"), ("bad&repo", '"{p}"'),
+                ("bad|repo", "'{p}'"), ("bad;esc", "{esc}"))):
+            target = tmp_path / f"qsep{i}" / name
+            shutil.copytree(bad_repo, target, symlinks=True)
+            clean = tmp_path / f"clean-qsep-cwd{i}"
+            clean.mkdir()
+            arg = spell.format(p=target,
+                               esc=str(target).replace(";", "\\;"))
+            assert await self._denied(
+                clean, f"cd {arg} && git push origin main"), arg
+
+    async def test_quoted_or_glued_cd_command_word_is_recognized(
+            self, tmp_path: Path, bad_repo: Path):
+        """Terra/Sol r8-r10 (#348): the command word itself may be quoted or
+        escaped (`"cd" /bad`, `c''d /bad`, `c\\d /bad`) and needs no space
+        before an operator (`cd</dev/null /bad`).
+
+        Deliberately NOT included: `cd'/bad'` — verified against bash, that
+        concatenates into the single word `cd/bad` (command-not-found), so
+        it is not a cd invocation and nothing is owed."""
+        forms = [
+            f'"cd" {bad_repo}',
+            f"c''d {bad_repo}",
+            f"cd</dev/null {bad_repo}",
+            # Terra r9/r10: backslash — including a line continuation — is
+            # bash's third literal-quoting mechanism; `c\d` and `c\<nl>d`
+            # are the cd builtin too.
+            f"c\\d {bad_repo}",
+            f'c"d" {bad_repo}',
+            f"c\\\nd {bad_repo}",
+            # Terra r10: quoted command word AND a quoted separator inside
+            # the target, together.
+            f"c''d '{bad_repo}'",
+        ]
+        for i, form in enumerate(forms):
+            clean = tmp_path / f"clean-cmdword{i}"
+            clean.mkdir()
+            assert await self._denied(
+                clean, f"{form} && git push origin main"), form
+
+    async def test_cd_behind_wrapper_options_and_leading_redirects(
+            self, tmp_path: Path, bad_repo: Path):
+        """Terra/Sol r11 (#348): a wrapper's OWN options (`command -p cd`)
+        and leading redirections (`2>/dev/null cd …`) both sit before the
+        command word — every `cd` token counts, wherever it sits."""
+        forms = [
+            f"command -p cd {bad_repo}",
+            f"2>/dev/null cd {bad_repo}",
+            f"env -i cd {bad_repo}",
+            f"FOO=1 2>/dev/null cd {bad_repo}",
+        ]
+        for i, form in enumerate(forms):
+            clean = tmp_path / f"clean-prefix{i}"
+            clean.mkdir()
+            assert await self._denied(
+                clean, f"{form}; git push origin main"), form
+
+    async def test_dash_prefixed_dir_after_ddash_propagates_to_chain(
+            self, tmp_path: Path, bad_repo: Path):
+        """Terra r12 (#348): after `--` every word is an OPERAND — a
+        directory literally named `-weird` must become the base for the
+        following relative cd, or the chain's real target is never scanned."""
+        import shutil
+        holder = tmp_path / "holder"
+        (holder / "-weird").mkdir(parents=True)
+        shutil.copytree(bad_repo, holder / "-weird" / "inner", symlinks=True)
+        assert await self._denied(
+            holder, "cd -- -weird; cd inner; git push origin main")
+
+    async def test_earlier_quoted_git_push_does_not_truncate_scan(
+            self, tmp_path: Path, bad_repo: Path):
+        """Sol r12 (#348): the arming match may be another command's
+        ARGUMENT (`echo git push; cd <bad>; git push`) — collecting cds only
+        from the text before it would skip the real one."""
+        clean = tmp_path / "clean-echo-cwd"
+        clean.mkdir()
+        assert await self._denied(
+            clean, f"echo git push; cd {bad_repo}; git push origin main")
+
+    async def test_directory_literally_named_cd_is_scanned(
+            self, tmp_path: Path, bad_repo: Path):
+        """Sol r13 (#348): `cd cd` — a directory NAMED `cd` is a legitimate
+        operand; the token must count as both operand and (harmlessly) the
+        start of another cd."""
+        holder = tmp_path / "cd-holder"
+        holder.mkdir()
+        (holder / "cd").symlink_to(bad_repo, target_is_directory=True)
+        assert await self._denied(holder, "cd cd; git push origin main")
+
+    async def test_redirect_operand_is_not_the_chain_base(
+            self, tmp_path: Path, bad_repo: Path):
+        """Terra r13 (#348): `cd 2> /dev/null <dir>` — the redirection TARGET
+        must not seed the base for a following relative cd, or the chain's
+        real destination is never scanned."""
+        import shutil
+        # The bad repo is reachable ONLY as a sibling of the first cd's
+        # target — never from the hook cwd — so the scan can only find it
+        # when that target (not the redirection operand) seeded the base.
+        chain = tmp_path / "chain"
+        (chain / "x").mkdir(parents=True)
+        shutil.copytree(bad_repo, chain / "badsib", symlinks=True)
+        clean = tmp_path / "clean-redirbase"
+        clean.mkdir()
+        assert await self._denied(
+            clean,
+            f"cd 2> /dev/null {chain}/x; cd ../badsib; git push origin main")
+
+    async def test_hash_inside_target_word_is_literal(
+            self, tmp_path: Path, bad_repo: Path):
+        """Terra r14 (#348): bash treats `#` as a comment only at the START
+        of a word — `cd /tmp/dir#name` is a literal path, so the lexer must
+        not truncate it."""
+        import shutil
+        target = tmp_path / "hashdir" / "repo#bad"
+        shutil.copytree(bad_repo, target, symlinks=True)
+        clean = tmp_path / "clean-hash"
+        clean.mkdir()
+        assert await self._denied(
+            clean, f"cd {target}; git push origin main")
+
+    async def test_single_quoted_line_continuation_is_literal(
+            self, tmp_path: Path, bad_repo: Path):
+        """Sol r14 (#348): bash honors `\\<newline>` outside quotes and in
+        double quotes, but inside SINGLE quotes it is literal path data — so
+        the continuation strip must be quote-aware."""
+        import shutil
+        target = tmp_path / "contdir" / "part\\\nrest"
+        shutil.copytree(bad_repo, target, symlinks=True)
+        clean = tmp_path / "clean-cont"
+        clean.mkdir()
+        assert await self._denied(
+            clean, f"cd '{target}'; git push origin main")
+
+    async def test_line_continuation_inside_git_push_still_arms(
+            self, tmp_path: Path, bad_repo: Path):
+        """Sol r15 (#348): a continuation between `git` and `push` is
+        removed by bash before the words are formed — the guard must arm."""
+        clean = tmp_path / "clean-contarm"
+        clean.mkdir()
+        assert await self._denied(
+            clean, f"cd {bad_repo} && git \\\npush origin main")
+
+    async def test_logical_dotdot_across_symlink_is_scanned(
+            self, tmp_path: Path, bad_repo: Path):
+        """Terra r15 (#348): `cd` is LOGICAL by default — `cd /a/link;
+        cd ../b` lands in `/a/b`, not in the symlink target's parent."""
+        import shutil
+        physical = tmp_path / "physical" / "elsewhere"
+        physical.mkdir(parents=True)
+        lexical = tmp_path / "lexical"
+        lexical.mkdir()
+        (lexical / "link").symlink_to(physical, target_is_directory=True)
+        shutil.copytree(bad_repo, lexical / "bad", symlinks=True)
+        clean = tmp_path / "clean-logical"
+        clean.mkdir()
+        assert await self._denied(
+            clean, f"cd {lexical}/link; cd ../bad; git push origin main")
+
+    async def test_cd_chain_overflow_fails_closed(
+            self, tmp_path: Path, git_plugin_repo: Path):
+        """Terra/Sol r3 (#348): once the feasible-base set overflows, later
+        cds are unexamined — the guard must DENY (with the logged override as
+        the escape hatch), never silently scan a partial candidate set."""
+        clean = tmp_path / "clean-overflow-cwd"
+        clean.mkdir()
+        # Seven conditional relative cds double the base set each time
+        # (2^7 = 128 > 64); the push itself targets a CLEAN repo — the denial
+        # must come from the fail-closed complexity finding alone.
+        chain = "; ".join(f"false && cd d{i}" for i in range(7))
+        r = await _run_policy(self._push(
+            clean, f"{chain}; cd {git_plugin_repo}\ngit push origin main"))
+        assert bool(r) and (
+            r["hookSpecificOutput"]["permissionDecision"] == "deny")
+        assert "too complex" in _deny_reason(r)
+
     async def test_reserved_env_self_declaration_blocks(
             self, git_plugin_repo: Path):
         """G6 corrected: a committed .mcp.json self-declaring a CLI-reserved

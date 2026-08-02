@@ -35,6 +35,13 @@ from trait_renderer import RENDERER_VERSION, estimate_tokens_v1, render_v1
 # turn is latency-bound); restricted_webhook admits no persona at all.
 _LIMITS = {"text": (2000, 12000), "voice": (400, 6000), "restricted_webhook": (0, 4000)}
 
+# #355: every projection heading is excluded from any OTHER selected
+# section's subtree (see compile_projection_set) — the surface's own section
+# is always selected explicitly, never inherited through Core's nesting.
+_PROJECTION_HEADINGS = (
+    "Text projection", "Voice projection", "Restricted webhook projection",
+)
+
 
 @dataclass(frozen=True, slots=True)
 class CompiledProjection:
@@ -98,11 +105,16 @@ def compile_projection_set(
     projections: dict[str, CompiledProjection] = {}
     for surface in ("text", "voice", "restricted_webhook"):
         persona_body = _persona_body(persona, surface)
+        # #355: the shipped doctrines nest all three projection headings
+        # under "# Core doctrine", so Core's body would otherwise carry every
+        # surface's instructions into every projection (and the selected
+        # surface twice). Excluding ALL projection subtrees scopes Core to
+        # the shared text; the surface's own section is selected separately.
         doctrine = select_markdown_sections(role.doctrine, {
             "text": ("Core doctrine", "Text projection"),
             "voice": ("Core doctrine", "Voice projection"),
             "restricted_webhook": ("Core doctrine", "Restricted webhook projection"),
-        }[surface])
+        }[surface], exclude=_PROJECTION_HEADINGS)
         parts = [
             ("platform_frame", canonical_text(platform_frame)),
             ("role_identity", f"id: {role.role_id}\nkind: {role.kind}\nmission: {role.mission}\n"),

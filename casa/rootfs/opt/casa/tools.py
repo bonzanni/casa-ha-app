@@ -4943,6 +4943,58 @@ def _jaccard_task_similarity(a: str, b: str) -> float:
     return len(ta & tb) / len(ta | tb)
 
 
+def _duplicate_task_refusal(origin: dict, task_text: str) -> dict | None:
+    """P32 (v0.37.10) duplicate-task guard: compare against the most-recent
+    engagement for the same channel/chat_id within the last
+    ``_DUPLICATE_TASK_MAX_AGE_S`` seconds; word-level Jaccard overlap >=
+    ``_DUPLICATE_TASK_JACCARD_THRESHOLD`` returns the refusal envelope,
+    else None. Guards against the cumulative-context bleed pattern observed
+    live (back-to-back Ellen turns re-emitting the prior turn's task).
+
+    #320: called TWICE per spawn — a fast path before the topic-creation
+    network RT, then again inside the ``_PLUGIN_TOOLS_LOCK`` critical
+    section right before ``create()``. Only the locked re-check is
+    authoritative: two concurrent identical calls (a single model turn can
+    legally emit parallel tool calls) both pass the unlocked fast path, but
+    the loser re-checks after the winner's create() and sees its record.
+
+    isinstance check falls through gracefully when the registry is a
+    MagicMock in unit tests; production callers always pass a real
+    EngagementRegistry."""
+    if _engagement_registry is None or not hasattr(
+        _engagement_registry, "recent_for_origin",
+    ):
+        return None
+    try:
+        prior = _engagement_registry.recent_for_origin(
+            channel=origin.get("channel", "telegram"),
+            chat_id=str(origin.get("chat_id", "")),
+            max_age_s=_DUPLICATE_TASK_MAX_AGE_S,
+        )
+    except Exception as exc:  # noqa: BLE001 — defensive in mock-driven tests
+        logger.debug("recent_for_origin lookup skipped: %s", exc)
+        return None
+    if not isinstance(prior, EngagementRecord):
+        return None
+    sim = _jaccard_task_similarity(prior.task, task_text)
+    if sim < _DUPLICATE_TASK_JACCARD_THRESHOLD:
+        return None
+    age_s = int(time.time() - prior.started_at)
+    return _result({
+        "status": "error", "kind": "duplicate_task",
+        "message": (
+            f"engage_executor refused: task overlaps with "
+            f"engagement {prior.id[:8]} "
+            f"({prior.role_or_type}, started {age_s}s ago) "
+            f"at Jaccard {sim:.2f} >= "
+            f"{_DUPLICATE_TASK_JACCARD_THRESHOLD}. "
+            f"You may be re-emitting a prior turn's task. "
+            f"If you mean a new task, narrow the task= text. "
+            f"If you mean to retry, /cancel {prior.id[:8]} first."
+        ),
+    })
+
+
 async def _fetch_executor_archive(
     *, task: str, origin_channel: str, token_budget: int,
     origin_route: str | None = None, origin_clearance: str | None = None,
@@ -5208,44 +5260,12 @@ async def engage_executor(args: dict) -> dict:
             or not getattr(channel, "engagement_permission_ok", False)):
         return _engagement_unavailable_result(origin)  # R-2 (v0.69.7)
 
-    # P32 (v0.37.10): refuse duplicate-task spawns. Compare against the
-    # most-recent engagement for the same channel/chat_id within the
-    # last _DUPLICATE_TASK_MAX_AGE_S seconds; if word-level Jaccard
-    # overlap >= _DUPLICATE_TASK_JACCARD_THRESHOLD, return an error
-    # envelope. Guards against the cumulative-context bleed pattern
-    # observed in bug-review-2026-05-14-exploration6.md::O-6 (back-to-back
-    # Ellen turns re-emitting the prior turn's task). isinstance check
-    # falls through gracefully when the registry is a MagicMock in unit
-    # tests; production callers always pass a real EngagementRegistry.
-    if _engagement_registry is not None and hasattr(
-        _engagement_registry, "recent_for_origin",
-    ):
-        try:
-            prior = _engagement_registry.recent_for_origin(
-                channel=origin.get("channel", "telegram"),
-                chat_id=str(origin.get("chat_id", "")),
-                max_age_s=_DUPLICATE_TASK_MAX_AGE_S,
-            )
-        except Exception as exc:  # noqa: BLE001 — defensive in mock-driven tests
-            logger.debug("recent_for_origin lookup skipped: %s", exc)
-            prior = None
-        if isinstance(prior, EngagementRecord):
-            sim = _jaccard_task_similarity(prior.task, task_text)
-            if sim >= _DUPLICATE_TASK_JACCARD_THRESHOLD:
-                age_s = int(time.time() - prior.started_at)
-                return _result({
-                    "status": "error", "kind": "duplicate_task",
-                    "message": (
-                        f"engage_executor refused: task overlaps with "
-                        f"engagement {prior.id[:8]} "
-                        f"({prior.role_or_type}, started {age_s}s ago) "
-                        f"at Jaccard {sim:.2f} >= "
-                        f"{_DUPLICATE_TASK_JACCARD_THRESHOLD}. "
-                        f"You may be re-emitting a prior turn's task. "
-                        f"If you mean a new task, narrow the task= text. "
-                        f"If you mean to retry, /cancel {prior.id[:8]} first."
-                    ),
-                })
+    # P32 (v0.37.10): refuse duplicate-task spawns — fast path, before the
+    # topic-creation network RT. #320: this unlocked read alone is NOT the
+    # guard; the authoritative re-check runs under _PLUGIN_TOOLS_LOCK below.
+    dup = _duplicate_task_refusal(origin, task_text)
+    if dup is not None:
+        return dup
 
     # E-12 (v0.37.0) + v0.37.1 D-1: U3 state-encoded topic title.
     # ``<state-emoji> <concise task>`` per spec §6.3 — the role icon
@@ -5284,199 +5304,236 @@ async def engage_executor(args: dict) -> dict:
     # moved the snapshot mid-resolve. `_gen_at_create` is then the generation the
     # recorded artifacts actually came from, making the post-create recheck sound.
     # The lock covers only this brief section — NOT the topic-creation RT above.
-    async with _PLUGIN_TOOLS_LOCK:
-        _gate_err = None
-        for _attempt in range(5):
-            _gen_at_create = plugin_registry.snapshot_generation()
-            plugin_resolution, plugin_artifacts, _gate_err = \
-                await asyncio.to_thread(_resolve_and_gate)
-            if plugin_registry.snapshot_generation() == _gen_at_create:
-                break   # artifacts + generation agree
-        if _gate_err is not None:
-            await _abort_engagement_topic(channel, "engage-abort", topic_id)
-            return _gate_err
+    #
+    # #363: the topic now exists but no record does — a cancellation anywhere
+    # in this window (lock acquire, the to_thread resolve gate, create()
+    # itself) used to unwind through no handler at all, orphaning the topic
+    # outside the retention ledger. The except CancelledError below closes it
+    # in the background (a cancelled task cannot await network RTs) and
+    # re-raises; create() compensates its own record, so the topic is the
+    # only cleanup owed here.
+    try:
+        async with _PLUGIN_TOOLS_LOCK:
+            # #320: authoritative duplicate re-check. The fast path above is
+            # an unlocked read followed by awaits (topic creation), so two
+            # concurrent identical calls both pass it against an empty
+            # history. create() below runs under THIS lock, so by the time
+            # the loser gets here the winner's record is visible and the
+            # loser gets the documented duplicate_task refusal. The
+            # just-created topic is aborted like every other pre-driver
+            # failure.
+            dup = _duplicate_task_refusal(origin, task_text)
+            if dup is not None:
+                await _abort_engagement_topic(channel, "engage-abort", topic_id)
+                return dup
+            _gate_err = None
+            for _attempt in range(5):
+                _gen_at_create = plugin_registry.snapshot_generation()
+                plugin_resolution, plugin_artifacts, _gate_err = \
+                    await asyncio.to_thread(_resolve_and_gate)
+                if plugin_registry.snapshot_generation() == _gen_at_create:
+                    break   # artifacts + generation agree
+            if _gate_err is not None:
+                await _abort_engagement_topic(channel, "engage-abort", topic_id)
+                return _gate_err
 
-        # Computed BEFORE create() so it can be persisted onto the record's
-        # origin — the claude_code driver reads it (and context_text) back out
-        # of engagement.origin when provisioning the workspace CLAUDE.md.
-        world_state = _build_world_state_summary()
+            # Computed BEFORE create() so it can be persisted onto the
+            # record's origin — the claude_code driver reads it (and
+            # context_text) back out of engagement.origin when provisioning
+            # the workspace CLAUDE.md.
+            world_state = _build_world_state_summary()
 
-        # W3 (Task 8): persist the RAW brief VERBATIM on origin (no injected
-        # default keys) — the single authoritative source every consumer
-        # re-renders from (design §211). W2 is claude_code-ONLY: the same gate
-        # sets interaction_state="first_contact_required" at create; in_casa
-        # (synchronous configurator, no turn-taking transition path) never
-        # enters that state and would otherwise get stuck awaiting.
-        _origin_extra = {"context": context_text, "world_state_summary": world_state}
-        if brief is not None:
-            _origin_extra["brief"] = brief
-        _two_phase = bool(
-            defn.driver == "claude_code"
-            and normalized_brief is not None
-            and normalized_brief["interaction_required"]
-        )
+            # W3 (Task 8): persist the RAW brief VERBATIM on origin (no
+            # injected default keys) — the single authoritative source every
+            # consumer re-renders from (design §211). W2 is claude_code-ONLY:
+            # the same gate sets interaction_state="first_contact_required"
+            # at create; in_casa (synchronous configurator, no turn-taking
+            # transition path) never enters that state and would otherwise
+            # get stuck awaiting.
+            _origin_extra = {
+                "context": context_text, "world_state_summary": world_state,
+            }
+            if brief is not None:
+                _origin_extra["brief"] = brief
+            _two_phase = bool(
+                defn.driver == "claude_code"
+                and normalized_brief is not None
+                and normalized_brief["interaction_required"]
+            )
 
-        # #326: create() persists STRICTLY — a tombstone write failure raises
-        # (no ghost record). Abort the just-created topic before surfacing
-        # the error, mirroring the _gate_err path above.
+            # #326: create() persists STRICTLY — a tombstone write failure
+            # raises (no ghost record). Abort the just-created topic before
+            # surfacing the error, mirroring the _gate_err path above.
+            # (create() compensates its own record on cancellation; the
+            # outer except CancelledError handles the topic.)
+            try:
+                rec = await _engagement_registry.create(
+                    kind="executor", role_or_type=executor_type,
+                    driver=defn.driver,
+                    task=task_text,
+                    origin={**origin, **_origin_extra},
+                    topic_id=topic_id,
+                    tools_allowed=tuple(defn.tools_allowed or ()),
+                    permission_mode=getattr(
+                        defn, "permission_mode", "acceptEdits"),
+                    plugin_artifacts=plugin_artifacts,  # §3.8 recorded binding
+                    interaction_state=(
+                        "first_contact_required" if _two_phase else ""),
+                    topic_title=persisted_title,  # W-R6 durable short title
+                )
+            except Exception as exc:  # noqa: BLE001
+                await _abort_engagement_topic(channel, "engage-abort", topic_id)
+                return _result({
+                    "status": "error", "kind": "record_persist_failed",
+                    "message": str(exc)})
+    except asyncio.CancelledError:
+        _abort_topic_on_cancel(channel, "engage-abort", topic_id)
+        raise
+
+    # Sol r1 (#363 family): the record now EXISTS — a cancellation anywhere
+    # from here until the driver is live (state persist, prompt read, memory
+    # fetch, options build, driver.start) used to unwind through no handler,
+    # leaving a durably-active record and an open topic with no driver.
+    # Compensate in the background: mark the record errored + abort the topic.
+    try:
+        # Sol round-4: the manual-edit seam `casa_reload(scope="full")` bumps the
+        # snapshot generation WITHOUT the plugin-tools lock, so it can move the
+        # snapshot while create() awaits. Recheck against the pre-create generation
+        # and abort before the driver starts — the record must not launch stale.
+        if plugin_registry.snapshot_generation() != _gen_at_create:
+            await _engagement_registry.mark_error(
+                rec.id, kind="plugin_superseded",
+                message="plugin snapshot changed during launch")
+            await _abort_engagement_topic(channel, rec.id, topic_id)
+            return _result({
+                "status": "error", "kind": "plugin_superseded",
+                "message": ("plugin registry changed during launch — engagement "
+                            "aborted before start; retry")})
+
+        # Persist the initial state emoji so Task 23 ``update_topic_state`` knows
+        # whether it needs to edit the title (no-op when state didn't change).
         try:
-            rec = await _engagement_registry.create(
-                kind="executor", role_or_type=executor_type, driver=defn.driver,
+            await _engagement_registry.set_channel_state(
+                rec.id, current_state_emoji=STATE_EMOJI["active"],
+            )
+        except Exception as exc:  # noqa: BLE001
+            logger.warning("set_channel_state(active) failed: %s", exc)
+
+        # Read + interpolate prompt template (needed by both driver paths —
+        # in_casa: options.system_prompt; claude_code: CLAUDE.md body).
+        prompt_template = ""
+        try:
+            with open(defn.prompt_template_path, "r", encoding="utf-8") as fh:
+                prompt_template = fh.read()
+        except OSError as exc:
+            await _engagement_registry.mark_error(
+                rec.id, kind="prompt_template_missing", message=str(exc),
+            )
+            await _abort_engagement_topic(channel, rec.id, topic_id)
+            return _result({
+                "status": "error", "kind": "prompt_template_missing",
+                "message": str(exc),
+            })
+
+        # Semantic-recall memory injection (design §3, plan 3): when the executor
+        # opts in (defn.memory.enabled=True, off by default), fetch prior-engagement
+        # lessons from the shared `casa` bank at the origin channel's read-clearance.
+        executor_memory_block = ""
+        if defn.memory.enabled:
+            executor_memory_block = await _fetch_executor_archive(
                 task=task_text,
-                origin={**origin, **_origin_extra},
-                topic_id=topic_id,
-                tools_allowed=tuple(defn.tools_allowed or ()),
-                permission_mode=getattr(defn, "permission_mode", "acceptEdits"),
-                plugin_artifacts=plugin_artifacts,      # §3.8 recorded binding
-                interaction_state="first_contact_required" if _two_phase else "",
-                topic_title=persisted_title,            # W-R6 durable short title
+                origin_channel=origin.get("channel", "telegram"),
+                token_budget=defn.memory.token_budget,
+                origin_route=origin.get("_origin_route"),
+                origin_clearance=origin.get("_origin_clearance"),
             )
-        except asyncio.CancelledError:
-            # create() already compensated the record; close the topic in the
-            # background (a cancelled task cannot await network RTs).
-            _abort_topic_on_cancel(channel, "engage-abort", topic_id)
-            raise
-        except Exception as exc:  # noqa: BLE001
-            await _abort_engagement_topic(channel, "engage-abort", topic_id)
-            return _result({
-                "status": "error", "kind": "record_persist_failed",
-                "message": str(exc)})
 
-    # Sol round-4: the manual-edit seam `casa_reload(scope="full")` bumps the
-    # snapshot generation WITHOUT the plugin-tools lock, so it can move the
-    # snapshot while create() awaits. Recheck against the pre-create generation
-    # and abort before the driver starts — the record must not launch stale.
-    if plugin_registry.snapshot_generation() != _gen_at_create:
-        await _engagement_registry.mark_error(
-            rec.id, kind="plugin_superseded",
-            message="plugin snapshot changed during launch")
-        await _abort_engagement_topic(channel, rec.id, topic_id)
-        return _result({
-            "status": "error", "kind": "plugin_superseded",
-            "message": ("plugin registry changed during launch — engagement "
-                        "aborted before start; retry")})
-
-    # Persist the initial state emoji so Task 23 ``update_topic_state`` knows
-    # whether it needs to edit the title (no-op when state didn't change).
-    try:
-        await _engagement_registry.set_channel_state(
-            rec.id, current_state_emoji=STATE_EMOJI["active"],
+        # W3/Sol r5-B8: the {task} value reaches BOTH driver paths through this ONE
+        # seam (in_casa options.system_prompt AND claude_code initial FIFO prompt).
+        # When a brief is present it becomes the full rendered markdown block
+        # (render_brief_task, two-phase gated to claude_code+interaction_required —
+        # ``_two_phase`` computed at create above); no brief → the canonical
+        # task_text (the else branch is task_text, NOT `task`, which doesn't exist
+        # here — using it would break every legacy task= invocation).
+        task_for_prompt = (
+            render_brief_task(normalized_brief, two_phase=_two_phase)
+            if brief is not None else task_text
         )
-    except Exception as exc:  # noqa: BLE001
-        logger.warning("set_channel_state(active) failed: %s", exc)
-
-    # Read + interpolate prompt template (needed by both driver paths —
-    # in_casa: options.system_prompt; claude_code: CLAUDE.md body).
-    prompt_template = ""
-    try:
-        with open(defn.prompt_template_path, "r", encoding="utf-8") as fh:
-            prompt_template = fh.read()
-    except OSError as exc:
-        await _engagement_registry.mark_error(
-            rec.id, kind="prompt_template_missing", message=str(exc),
-        )
-        await _abort_engagement_topic(channel, rec.id, topic_id)
-        return _result({
-            "status": "error", "kind": "prompt_template_missing",
-            "message": str(exc),
-        })
-
-    # Semantic-recall memory injection (design §3, plan 3): when the executor
-    # opts in (defn.memory.enabled=True, off by default), fetch prior-engagement
-    # lessons from the shared `casa` bank at the origin channel's read-clearance.
-    executor_memory_block = ""
-    if defn.memory.enabled:
-        executor_memory_block = await _fetch_executor_archive(
-            task=task_text,
-            origin_channel=origin.get("channel", "telegram"),
-            token_budget=defn.memory.token_budget,
-            origin_route=origin.get("_origin_route"),
-            origin_clearance=origin.get("_origin_clearance"),
+        prompt = (
+            prompt_template
+            .replace("{task}", task_for_prompt)
+            .replace("{context}", context_text or "(none)")
+            .replace("{world_state_summary}", world_state)
+            .replace("{executor_memory}", executor_memory_block)
         )
 
-    # W3/Sol r5-B8: the {task} value reaches BOTH driver paths through this ONE
-    # seam (in_casa options.system_prompt AND claude_code initial FIFO prompt).
-    # When a brief is present it becomes the full rendered markdown block
-    # (render_brief_task, two-phase gated to claude_code+interaction_required —
-    # ``_two_phase`` computed at create above); no brief → the canonical
-    # task_text (the else branch is task_text, NOT `task`, which doesn't exist
-    # here — using it would break every legacy task= invocation).
-    task_for_prompt = (
-        render_brief_task(normalized_brief, two_phase=_two_phase)
-        if brief is not None else task_text
-    )
-    prompt = (
-        prompt_template
-        .replace("{task}", task_for_prompt)
-        .replace("{context}", context_text or "(none)")
-        .replace("{world_state_summary}", world_state)
-        .replace("{executor_memory}", executor_memory_block)
-    )
+        # Driver dispatch — in_casa uses ClaudeAgentOptions + system_prompt;
+        # claude_code uses the ExecutorDefinition + workspace-CLAUDE.md.
+        if defn.driver == "claude_code":
+            driver = getattr(agent_mod, "active_claude_code_driver", None)
+            if driver is None:
+                await _engagement_registry.mark_error(
+                    rec.id, kind="no_driver",
+                    message="claude_code driver not initialized",
+                )
+                await _abort_engagement_topic(channel, rec.id, topic_id)
+                return _result({
+                    "status": "error", "kind": "no_driver",
+                    "message": "claude_code driver not initialized",
+                })
+            try:
+                await driver.start(rec, prompt=prompt, options=defn)
+            except Exception as exc:  # noqa: BLE001
+                logger.exception(
+                    "claude_code driver.start failed for %s", rec.id[:8],
+                )
+                await _engagement_registry.mark_error(
+                    rec.id, kind="driver_start_failed", message=str(exc),
+                )
+                await _abort_engagement_topic(channel, rec.id, topic_id)
+                return _result({
+                    "status": "error", "kind": "driver_start_failed",
+                    "message": str(exc),
+                })
+        else:
+            # Off-loop: _build_executor_options reads hooks.yaml. §3.9: feed the
+            # SAME resolution gated + recorded above (one resolve, one binding).
+            options = await asyncio.to_thread(
+                _build_executor_options, defn, executor_type=executor_type,
+                resolution=plugin_resolution,
+                extra_casa_tools=(
+                    "mcp__casa-framework__query_engager",
+                    "mcp__casa-framework__emit_completion",
+                ),
+            )
+            options.system_prompt = prompt
 
-    # Driver dispatch — in_casa uses ClaudeAgentOptions + system_prompt;
-    # claude_code uses the ExecutorDefinition + workspace-CLAUDE.md.
-    if defn.driver == "claude_code":
-        driver = getattr(agent_mod, "active_claude_code_driver", None)
-        if driver is None:
-            await _engagement_registry.mark_error(
-                rec.id, kind="no_driver",
-                message="claude_code driver not initialized",
-            )
-            await _abort_engagement_topic(channel, rec.id, topic_id)
-            return _result({
-                "status": "error", "kind": "no_driver",
-                "message": "claude_code driver not initialized",
-            })
-        try:
-            await driver.start(rec, prompt=prompt, options=defn)
-        except Exception as exc:  # noqa: BLE001
-            logger.exception(
-                "claude_code driver.start failed for %s", rec.id[:8],
-            )
-            await _engagement_registry.mark_error(
-                rec.id, kind="driver_start_failed", message=str(exc),
-            )
-            await _abort_engagement_topic(channel, rec.id, topic_id)
-            return _result({
-                "status": "error", "kind": "driver_start_failed",
-                "message": str(exc),
-            })
-    else:
-        # Off-loop: _build_executor_options reads hooks.yaml. §3.9: feed the
-        # SAME resolution gated + recorded above (one resolve, one binding).
-        options = await asyncio.to_thread(
-            _build_executor_options, defn, executor_type=executor_type,
-            resolution=plugin_resolution,
-            extra_casa_tools=(
-                "mcp__casa-framework__query_engager",
-                "mcp__casa-framework__emit_completion",
-            ),
-        )
-        options.system_prompt = prompt
+            driver = getattr(agent_mod, "active_engagement_driver", None)
+            if driver is None:
+                await _engagement_registry.mark_error(
+                    rec.id, kind="no_driver",
+                    message="engagement driver not initialized",
+                )
+                await _abort_engagement_topic(channel, rec.id, topic_id)
+                return _result({
+                    "status": "error", "kind": "no_driver",
+                    "message": "engagement driver not initialized",
+                })
+            try:
+                await driver.start(rec, prompt=prompt, options=options)
+            except Exception as exc:  # noqa: BLE001
+                await _engagement_registry.mark_error(
+                    rec.id, kind="driver_start_failed", message=str(exc),
+                )
+                await _abort_engagement_topic(channel, rec.id, topic_id)
+                return _result({
+                    "status": "error", "kind": "driver_start_failed",
+                    "message": str(exc),
+                })
 
-        driver = getattr(agent_mod, "active_engagement_driver", None)
-        if driver is None:
-            await _engagement_registry.mark_error(
-                rec.id, kind="no_driver",
-                message="engagement driver not initialized",
-            )
-            await _abort_engagement_topic(channel, rec.id, topic_id)
-            return _result({
-                "status": "error", "kind": "no_driver",
-                "message": "engagement driver not initialized",
-            })
-        try:
-            await driver.start(rec, prompt=prompt, options=options)
-        except Exception as exc:  # noqa: BLE001
-            await _engagement_registry.mark_error(
-                rec.id, kind="driver_start_failed", message=str(exc),
-            )
-            await _abort_engagement_topic(channel, rec.id, topic_id)
-            return _result({
-                "status": "error", "kind": "driver_start_failed",
-                "message": str(exc),
-            })
-
+    except asyncio.CancelledError:
+        _abort_launch_on_cancel(channel, rec, topic_id)
+        raise
     return _result({
         "status": "pending",
         "engagement_id": rec.id,
@@ -5519,6 +5576,51 @@ def _abort_topic_on_cancel(channel: Any, engagement_id: str,
     task = asyncio.ensure_future(
         _abort_engagement_topic(channel, engagement_id, topic_id),
     )
+    _ABORT_BG_TASKS.add(task)
+    task.add_done_callback(_ABORT_BG_TASKS.discard)
+
+
+def _abort_launch_on_cancel(channel: Any, rec: "EngagementRecord",
+                            topic_id: int | None) -> None:
+    """Sol r1 (#363 family): background compensation for a launch cancelled
+    AFTER its record was created but BEFORE its driver was confirmed live.
+    Without this, the cancellation unwound the tool call leaving a
+    durably-active record and an open topic with nothing driving them.
+
+    Terra/Sol r2: the driver may in fact have gone LIVE before the
+    cancellation landed (claude_code starts its s6 service, then awaits the
+    initial-prompt enqueue — cancellation there escapes start()'s rollback),
+    so the compensation FIRST runs the driver's idempotent terminal teardown
+    (``cancel()`` — stop_service is tolerant of "already down"/never-started),
+    then marks the record errored and aborts the topic. Fire-and-forget and
+    strong-ref'd, since a cancelled task cannot await."""
+    async def _run() -> None:
+        try:
+            import agent as agent_mod
+            driver = (getattr(agent_mod, "active_claude_code_driver", None)
+                      if rec.driver == "claude_code"
+                      else getattr(agent_mod, "active_engagement_driver", None))
+            if driver is not None and hasattr(driver, "cancel"):
+                await driver.cancel(rec)
+        except Exception:  # noqa: BLE001 — best-effort; the rest still runs
+            logger.warning(
+                "launch-cancel compensation: driver teardown failed for %s",
+                rec.id[:8], exc_info=True,
+            )
+        try:
+            if _engagement_registry is not None:
+                await _engagement_registry.mark_error(
+                    rec.id, kind="launch_cancelled",
+                    message="tool call cancelled during launch",
+                )
+        except Exception:  # noqa: BLE001 — best-effort; topic abort still runs
+            logger.warning(
+                "launch-cancel compensation: mark_error failed for %s",
+                rec.id[:8], exc_info=True,
+            )
+        await _abort_engagement_topic(channel, rec.id, topic_id)
+
+    task = asyncio.ensure_future(_run())
     _ABORT_BG_TASKS.add(task)
     task.add_done_callback(_ABORT_BG_TASKS.discard)
 
@@ -6874,7 +6976,15 @@ async def delete_engagement_workspace(args: dict) -> dict:
     import shutil
 
     engagement_id = (args.get("engagement_id") or "").strip()
-    force = bool(args.get("force", False))
+    # #301: the internal/MCP forwarding path does not enforce tool schemas,
+    # so bool() truthiness would turn the string "false" into an
+    # authorization to cancel+delete a live engagement. Booleans only.
+    force = args.get("force", False)
+    if not isinstance(force, bool):
+        return _result({
+            "status": "error", "kind": "bad_request",
+            "message": "force must be a boolean",
+        })
 
     if not engagement_id:
         return _result({
@@ -6919,12 +7029,32 @@ async def delete_engagement_workspace(args: dict) -> dict:
                       else getattr(agent_mod, "active_engagement_driver", None))
         except Exception:
             pass
-        await _finalize_engagement(
+        fin = await _finalize_engagement(
             rec, outcome="cancelled",
             text="Workspace deletion forced",
             artifacts=[], next_steps=[],
             driver=driver,
         )
+        # #301: PERSIST_FAILED means the tombstone write rolled back and the
+        # record is STILL LIVE (retryable, same contract cancel_engagement
+        # honors) — deleting the workspace here would yank the files out
+        # from under a running service. ALREADY_TERMINAL is fine: the
+        # engagement is gone and the workspace is deletable.
+        if fin is FinalizeResult.PERSIST_FAILED:
+            return _result({
+                "status": "error", "kind": "finalize_persist_failed",
+                "retryable": True,
+                "message": ("cancellation could not be persisted; the "
+                            "engagement is still active and the workspace "
+                            "was left in place — retry"),
+            })
+        if not fin and fin is not FinalizeResult.ALREADY_TERMINAL:
+            return _result({
+                "status": "error", "kind": "finalize_failed",
+                "retryable": True,
+                "message": (f"finalize returned {fin.value!r}; the "
+                            "workspace was left in place — retry"),
+            })
 
     ws = os.path.join(_ENGAGEMENTS_ROOT, engagement_id)
     if os.path.isdir(ws):
@@ -8851,7 +8981,7 @@ async def persona_install_commit(args: dict) -> dict:
 async def persona_apply(args: dict) -> dict:
     from persona_install import apply_persona_override, validate_persona_path_segments
     from persona_pack import PersonaPackError, load_persona_pack
-    from role_slot import materialize_role
+    from role_slot import _ha_model_options, materialize_role
     from role_artifact import load_role_artifact
     from specialist_install import SpecialistInstallError, validate_specialist_slug
 
@@ -8903,7 +9033,11 @@ async def persona_apply(args: dict) -> dict:
     else:
         return _result({"ok": False, "kind": "invalid_target", "target_role_id": args["target_role_id"]})
 
-    role = materialize_role(source=load_role_artifact(role_dir), options={})
+    # #355: resolve ha_option models exactly as the agent loader does —
+    # options={} would bind the override to the role's DEFAULT checksum,
+    # and the loader would then reject the persisted binding.
+    role = materialize_role(
+        source=load_role_artifact(role_dir), options=_ha_model_options())
     try:
         committed = await asyncio.to_thread(
             apply_persona_override, target_role_id=args["target_role_id"], persona=persona,

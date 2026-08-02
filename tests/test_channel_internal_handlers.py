@@ -204,6 +204,135 @@ async def test_send_to_topic_advances_interaction_state_first_contact(
     assert reg.advances == [("eng-1", "first_contact")]
 
 
+class _FakeIntentDriver:
+    """Minimal claude_code-driver fake for the DEFERRED reply path (§2 C1):
+    registration succeeds, arm is a no-op, and awaiting the intent invokes
+    the installed poster inline (as the relay would at the tool_use block).
+    Carries the #332 turn-reply-target seams."""
+
+    def __init__(self, reply_target: int | None = 555) -> None:
+        self.posters: dict[str, Any] = {}
+        self.reply_target = reply_target
+        self.restored: list[int | None] = []
+
+    def register_send_intent(self, **kwargs: Any):
+        return (object(), True)
+
+    def set_send_intent_poster(self, eng_id: str, rid: str, poster: Any) -> None:
+        self.posters[rid] = poster
+
+    def arm_send_intent(self, eng_id: str, rid: str) -> None:
+        pass
+
+    async def await_send_intent(self, eng_id: str, rid: str) -> dict | None:
+        mid = await self.posters[rid]()
+        return {"ok": mid is not None, "message_id": mid}
+
+    def consume_turn_reply_to(self, eng_id: str) -> int | None:
+        target, self.reply_target = self.reply_target, None
+        return target
+
+    def restore_turn_reply_to(self, eng_id: str, mid: int | None) -> None:
+        self.restored.append(mid)
+        if self.reply_target is None:
+            self.reply_target = mid
+
+
+async def test_deferred_reply_first_output_threads_to_inbound(
+    app_factory, monkeypatch,
+) -> None:
+    """#332: a deferred reply that is the turn's first output must consume
+    the sequencer's one-shot turn reply target and thread to the operator's
+    inbound message."""
+    from channels import channel_handlers as ch_mod
+
+    driver = _FakeIntentDriver(reply_target=555)
+    monkeypatch.setattr(ch_mod, "_resolve_active_driver", lambda: driver)
+    app, ch, _reg = app_factory()
+    async with TestClient(TestServer(app)) as client:
+        resp = await client.post(
+            "/internal/channel/send_to_topic",
+            json={"engagement_id": "eng-1", "text": "hello operator",
+                  "engagement_token": "tok-eng-1",
+                  "request_id": "r1", "projection_hash": "h1"},
+        )
+        assert resp.status == 200
+        body = await resp.json()
+        assert body["ok"] is True
+
+    assert len(ch.calls) == 1
+    assert ch.calls[0]["kwargs"].get("reply_to_message_id") == 555
+    assert driver.reply_target is None  # consumed by the successful post
+
+
+async def test_deferred_reply_cancelled_send_restores_reply_target(
+    app_factory, monkeypatch,
+) -> None:
+    """Terra r1 (#332): task cancellation bypasses ``except Exception`` — a
+    cancelled poster must still restore the consumed one-shot target when no
+    message id was recorded."""
+    from channels import channel_handlers as ch_mod
+
+    driver = _FakeIntentDriver(reply_target=555)
+
+    # First run the handler with a NON-invoking await seam so the poster
+    # closure is captured without being executed.
+    async def _no_invoke(eng_id, rid):
+        return {"ok": True, "message_id": 1}
+
+    driver.await_send_intent = _no_invoke  # type: ignore[method-assign]
+
+    class _CancellingChannel(_FakeChannel):
+        async def send_response_to_topic(self, thread_id, text, **kwargs):
+            raise asyncio.CancelledError()
+
+    monkeypatch.setattr(ch_mod, "_resolve_active_driver", lambda: driver)
+    app, _ch, _reg = app_factory(channel=_CancellingChannel())
+    async with TestClient(TestServer(app)) as client:
+        resp = await client.post(
+            "/internal/channel/send_to_topic",
+            json={"engagement_id": "eng-1", "text": "hello",
+                  "engagement_token": "tok-eng-1",
+                  "request_id": "r1", "projection_hash": "h1"},
+        )
+        assert resp.status == 200
+
+    poster = driver.posters["r1"]
+    driver.reply_target = 999
+    with pytest.raises(asyncio.CancelledError):
+        await poster()
+    assert driver.restored == [999]
+    assert driver.reply_target == 999  # re-armed
+
+
+async def test_deferred_reply_failed_send_restores_reply_target(
+    app_factory, monkeypatch,
+) -> None:
+    """#332 failure arm: a consumed-but-unsent reply target is restored so
+    the turn's first SUCCESSFUL output still threads."""
+    from channels import channel_handlers as ch_mod
+
+    class _FailingChannel(_FakeChannel):
+        async def send_response_to_topic(self, thread_id, text, **kwargs):
+            raise RuntimeError("wire down")
+
+    driver = _FakeIntentDriver(reply_target=555)
+    monkeypatch.setattr(ch_mod, "_resolve_active_driver", lambda: driver)
+    app, _ch, _reg = app_factory(channel=_FailingChannel())
+    async with TestClient(TestServer(app)) as client:
+        resp = await client.post(
+            "/internal/channel/send_to_topic",
+            json={"engagement_id": "eng-1", "text": "hello operator",
+                  "engagement_token": "tok-eng-1",
+                  "request_id": "r1", "projection_hash": "h1"},
+        )
+        body = await resp.json()
+        assert body["ok"] is False
+
+    assert driver.restored == [555]
+    assert driver.reply_target == 555  # re-armed for the next output
+
+
 # ---------------------------------------------------------------------------
 # Phase 2 — /internal/channel/post_inline_keyboard (Task 19)
 # ---------------------------------------------------------------------------

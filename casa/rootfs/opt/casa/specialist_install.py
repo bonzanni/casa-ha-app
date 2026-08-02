@@ -1512,7 +1512,7 @@ def commit_specialist_install(
     )
     from persona_pack import load_persona_pack
     from prompt_compiler import compile_prompt_bundle
-    from role_slot import materialize_role
+    from role_slot import _ha_model_options, materialize_role
     from role_artifact import load_role_artifact
     from specialist_lifecycle import SpecialistInstance, satisfy_config, secret_config_violations
     from specialist_component import load_specialist_component
@@ -1635,7 +1635,12 @@ def commit_specialist_install(
                 f"CAS component slug {component.slug!r} does not match the approved "
                 f"inspection slug {inspection.slug!r}")
         _reject_receiptless_sourced_deps(component, receipt=receipt)
-        role = materialize_role(source=load_role_artifact(cas_dir / "role"), options={})
+        role = materialize_role(
+        source=load_role_artifact(cas_dir / "role"),
+        # #355: resolve ha_option models exactly as the agent loader
+        # does — options={} froze the DEFAULT into the checksum, and
+        # the loader then rejected the persisted binding.
+        options=_ha_model_options())
         persona = load_persona_pack(cas_dir / "persona" / "pack", cas_dir / "persona" / "manifest.json")
 
         fresh_deps = resolve_dependency_closure(component, cas_dir)
@@ -2124,7 +2129,7 @@ def _upgrade_core(
     )
     from persona_pack import load_persona_pack
     from prompt_compiler import compile_prompt_bundle
-    from role_slot import materialize_role
+    from role_slot import _ha_model_options, materialize_role
     from role_artifact import load_role_artifact
     from specialist_lifecycle import SpecialistInstance, satisfy_config, secret_config_violations
     from specialist_install_consent import install_consent_identity
@@ -2209,7 +2214,12 @@ def _upgrade_core(
     if fresh_root_digest != inspection.root_digest:
         raise SpecialistInstallError(
             "checksum_changed", "CAS-persisted component no longer matches the approved inspection")
-    role = materialize_role(source=load_role_artifact(cas_dir / "role"), options={})
+    role = materialize_role(
+        source=load_role_artifact(cas_dir / "role"),
+        # #355: resolve ha_option models exactly as the agent loader
+        # does — options={} froze the DEFAULT into the checksum, and
+        # the loader then rejected the persisted binding.
+        options=_ha_model_options())
     # An existing OVERRIDE binding must survive an upgrade — the component's
     # own bundled default persona is only used when the active binding was
     # already component-default (or this is a first activation). Reverting
@@ -2745,7 +2755,7 @@ def _rollback_core(
     InstanceDir's own stage/commit, never a bespoke restore path."""
     from personality_binding import InstanceDir, InstanceTuple, load_instance_tuple
     from prompt_compiler import compile_prompt_bundle
-    from role_slot import materialize_role
+    from role_slot import _ha_model_options, materialize_role
     from role_artifact import load_role_artifact
     from persona_pack import load_persona_pack
     from specialist_lifecycle import SpecialistInstance
@@ -2775,7 +2785,12 @@ def _rollback_core(
     # touches `root`), independent of prior.binding.mode.
     _, _, checksum = parse_component_root(prior.root)
     cas_dir = cas_store_dir(checksum, store_root=specialists_dir / "store")
-    role = materialize_role(source=load_role_artifact(cas_dir / "role"), options={})
+    role = materialize_role(
+        source=load_role_artifact(cas_dir / "role"),
+        # #355: resolve ha_option models exactly as the agent loader
+        # does — options={} froze the DEFAULT into the checksum, and
+        # the loader then rejected the persisted binding.
+        options=_ha_model_options())
     if prior.binding.mode == "override":
         from persona_install import installed_personas_root
         personas_root = installed_personas_root()   # #323 (Sol r3-3)
