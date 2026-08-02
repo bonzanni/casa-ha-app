@@ -2498,3 +2498,437 @@ def test_derive_attempt_of_a_collect_only_flow_never_opens_the_held_file(
     assert rec["outcome"] is None
     assert not any(cs.COLLECT_PREFIX in name for name in opened), \
         "casa never opens a consumer-held file"
+
+
+# ---------------------------------------------------------------------------
+# attempts_pass — materialization (§3.3), re-derivation (§6), receipt
+# inference (§6, five normative probes) and the §9 bounds. The pass is casa's
+# standing reconcile of the ledger against the artifacts, which are always
+# authoritative: the attempt file is a DERIVED record and every contradiction
+# is resolved in the artifacts' favour.
+# ---------------------------------------------------------------------------
+
+
+def _publish(spool, state, meta=None):
+    """mint -> claim -> publish, returning ``(hash, claim)`` — a flow whose
+    result is live and whose attempt file publish_result already wrote."""
+    mint(_pdir(spool), state, meta=meta)
+    h = state_hash(state)
+    claim = spool.claim(PLUGIN, h, now=time.time())
+    assert spool.publish_result(claim, _record(h)) is cs.PublishOutcome.PUBLISHED
+    return h, claim
+
+
+def _terminal(spool, h, outcome, *, ended: float, claimed: bool = False,
+              status: str = "result_ready") -> dict:
+    """Seed a terminal attempt file whose ``ended_ts`` is *ended*."""
+    rec = ca.terminalize(
+        ca.new_attempt(state_hash=h, minted_ts=ended - 10, status=status,
+                       now=ended),
+        outcome, now=ended, claimed=claimed)
+    assert spool.write_attempt(PLUGIN, h, rec) is True
+    return rec
+
+
+def test_attempts_pass_materializes_a_pending_flow_from_its_envelope(spool):
+    """A minted flow that no scan has seen yet: the pending inode is the
+    derivation source — its mtime is the mint clock, its v2 envelope the
+    consumer's binding."""
+    now = time.time()
+    state, meta = "mat-pending", {"kind": "renewal"}
+    h = state_hash(state)
+    p = mint(_pdir(spool), state, meta=meta)
+
+    report = spool.attempts_pass(now=now, boot=True)
+
+    assert report.materialized == 1
+    rec = _attempt_of(spool, h)
+    assert rec["status"] == "awaiting_redirect" and rec["outcome"] is None
+    assert rec["meta"] == meta
+    assert rec["minted_ts"] == p.stat().st_mtime
+    assert rec["claimed"] is False
+
+
+def test_attempts_pass_materializes_a_claimed_flow_from_the_claim_inode(spool):
+    """The claim IS the pending inode (link preserved mtime and bytes), so a
+    flow known only by its claim materializes with the same two facts."""
+    now = time.time()
+    h = state_hash("mat-claim")
+    c = _put(_claims(spool) / h, now - 30, '{"v": 2, "meta": {"x": 1}}')
+
+    report = spool.attempts_pass(now=now, boot=True)
+
+    assert report.materialized == 1
+    rec = _attempt_of(spool, h)
+    assert rec["status"] == "awaiting_redirect"
+    assert rec["meta"] == {"x": 1} and rec["minted_ts"] == c.stat().st_mtime
+
+
+def test_attempts_pass_materializes_from_a_result_record(spool):
+    """A pre-upgrade (or crash-lost) ledger entry for a published flow is
+    rebuilt from the RECORD's transport keys — never from the result file's
+    own mtime, which is the publish time, not the mint time."""
+    now = time.time()
+    state, meta = "mat-result", {"bank": "b"}
+    h, claim = _publish(spool, state, meta=meta)
+    os.unlink(_attempts(spool) / f"{h}.json")
+
+    report = spool.attempts_pass(now=now, boot=True)
+
+    assert report.materialized == 1
+    rec = _attempt_of(spool, h)
+    assert rec["status"] == "result_ready" and rec["claimed"] is False
+    assert rec["meta"] == meta and rec["minted_ts"] == claim.mtime
+
+
+def test_attempts_pass_materializes_a_hold_without_opening_it(spool,
+                                                              monkeypatch):
+    """A flow known SOLELY by a consumer-held name: `result_ready, claimed`
+    with no mint clock and no binding — and the held file is never opened
+    (it belongs to its holder; casa only reads the name)."""
+    now = time.time()
+    h = state_hash("mat-hold")
+    (_results(spool) / f".collect-{h}-{'a' * 32}").write_text('{"code": "x"}')
+    opened: list[str] = []
+    real_open = os.open
+
+    def spy(path, *a, **kw):
+        if not isinstance(path, int):
+            opened.append(os.fspath(path))
+        return real_open(path, *a, **kw)
+
+    monkeypatch.setattr(cs.os, "open", spy)
+    try:
+        report = spool.attempts_pass(now=now, boot=True)
+    finally:
+        monkeypatch.undo()
+
+    assert report.materialized == 1
+    rec = _attempt_of(spool, h)
+    assert rec["status"] == "result_ready" and rec["claimed"] is True
+    assert rec["meta"] is None and rec["minted_ts"] is None
+    assert not any(cs.COLLECT_PREFIX in name for name in opened)
+
+
+def test_attempts_pass_infers_collected_from_five_confirmed_absences(spool):
+    """The receipt signal (§6): the result name is confirmed ABSENT, no hold
+    remains, no claim, no pending — and casa did not itself delete it, which
+    an OPEN attempt proves, since every casa deletion is write-ahead-terminal
+    BEFORE it happens. Only then is the flow recorded `collected`."""
+    now = time.time()
+    h, _claim = _publish(spool, "collected-flow")
+    os.unlink(_results(spool) / f"{h}.json")
+
+    report = spool.attempts_pass(now=now, boot=True)
+
+    assert report.collected == 1
+    rec = _attempt_of(spool, h)
+    assert rec["status"] == "done" and rec["outcome"] == "collected"
+    assert rec["ended_ts"] == now
+    assert rec["next_nudge_ts"] is None, "a collected flow never nudges"
+
+
+def test_inference_is_blocked_by_a_live_claim(spool):
+    """Probe 3: attempt-first publishing makes "attempt says result_ready,
+    claim still live, result never linked" a real crash state — the claim's
+    presence routes the flow to recovery instead of mislabelling it."""
+    now = time.time()
+    h, _claim = _publish(spool, "blocked-claim")
+    os.unlink(_results(spool) / f"{h}.json")
+    _put(_claims(spool) / h, now - 10)
+
+    report = spool.attempts_pass(now=now, boot=True)
+
+    assert report.collected == 0
+    assert _attempt_of(spool, h)["status"] == "result_ready"
+
+
+def test_inference_is_blocked_by_a_live_pending(spool):
+    """Probe 4: recovery may have RESTORED a crashed claim to pending, and a
+    live pending means the flow rewound, not completed."""
+    now = time.time()
+    h, _claim = _publish(spool, "blocked-pending")
+    os.unlink(_results(spool) / f"{h}.json")
+    _put(_pending(spool) / f"{h}.json", now - 10, '{"v": 2, "meta": null}')
+
+    report = spool.attempts_pass(now=now, boot=True)
+
+    assert report.collected == 0
+    assert _attempt_of(spool, h)["outcome"] is None
+
+
+def test_a_result_ready_attempt_with_a_live_pending_is_rewound(spool):
+    """Terra r3 pin: the re-derivation rule does not merely BLOCK the
+    inference — it rewrites the record back to `awaiting_redirect`, because
+    the artifacts say the flow is waiting for a redirect again."""
+    now = time.time()
+    h, _claim = _publish(spool, "rewound")
+    os.unlink(_results(spool) / f"{h}.json")
+    _put(_pending(spool) / f"{h}.json", now - 10, '{"v": 2, "meta": null}')
+
+    report = spool.attempts_pass(now=now, boot=True)
+
+    assert report.reopened == 1 and report.collected == 0
+    rec = _attempt_of(spool, h)
+    assert rec["status"] == "awaiting_redirect" and rec["outcome"] is None
+
+
+def test_inference_is_blocked_by_a_live_hold(spool):
+    """Probe 2: while a `.collect-*` entry exists the attempt stays open —
+    "claimed, unconfirmed": the consumer renamed but may have died before
+    reading, and only its ack settles the flow."""
+    now = time.time()
+    h, _claim = _publish(spool, "blocked-hold")
+    os.rename(_results(spool) / f"{h}.json",
+              _results(spool) / f".collect-{h}-{'a' * 32}")
+
+    report = spool.attempts_pass(now=now, boot=True)
+
+    assert report.collected == 0
+    assert _attempt_of(spool, h)["status"] == "result_ready"
+
+
+def test_a_terminal_attempt_beside_a_live_result_is_reopened(spool):
+    """Amendment 6: a terminal record coexisting with ANY live artifact of
+    its hash is PROVISIONAL — the artifact witnesses the contradiction and
+    the record is rewritten open."""
+    now = time.time()
+    h, claim = _publish(spool, "reopen-result")
+    _terminal(spool, h, "expired_unread", ended=now - 5)
+
+    report = spool.attempts_pass(now=now, boot=True)
+
+    assert report.reopened == 1
+    rec = _attempt_of(spool, h)
+    assert rec["status"] == "result_ready" and rec["outcome"] is None
+    assert rec["ended_ts"] is None
+    assert rec["minted_ts"] == claim.mtime
+
+
+def test_a_terminal_attempt_beside_a_live_hold_is_reopened_claimed(spool):
+    """Same rule through the other witness: a surviving hold reopens the
+    record AND asserts `claimed` — the rename provably happened."""
+    now = time.time()
+    h, _claim = _publish(spool, "reopen-hold")
+    os.rename(_results(spool) / f"{h}.json",
+              _results(spool) / f".collect-{h}-{'b' * 32}")
+    _terminal(spool, h, "expired", ended=now - 5)
+
+    report = spool.attempts_pass(now=now, boot=True)
+
+    assert report.reopened == 1
+    rec = _attempt_of(spool, h)
+    assert rec["status"] == "result_ready" and rec["outcome"] is None
+    assert rec["claimed"] is True
+
+
+def test_an_unknown_result_probe_defers_the_inference(spool, monkeypatch):
+    """Proved absence, not assumed absence: the probes are three-state, and
+    ANY unknown (EIO/EACCES/…) defers the whole inference to the next pass —
+    `collected` is only ever recorded from confirmed ENOENTs."""
+    now = time.time()
+    h, _claim = _publish(spool, "unknowable")
+    os.unlink(_results(spool) / f"{h}.json")
+    real = cs._marker_lstat
+
+    def flaky(name, dir_fd):
+        try:
+            where = os.readlink(f"/proc/self/fd/{dir_fd}")
+        except OSError:                      # pragma: no cover
+            where = ""
+        if name == f"{h}.json" and where.endswith("/results"):
+            return cs._LSTAT_ERROR
+        return real(name, dir_fd)
+
+    monkeypatch.setattr(cs, "_marker_lstat", flaky)
+    report = spool.attempts_pass(now=now, boot=True)
+    monkeypatch.undo()
+
+    assert report.collected == 0
+    assert _attempt_of(spool, h)["status"] == "result_ready"
+
+
+def test_a_periodic_pass_skips_an_in_flight_hash_a_boot_pass_does_not(spool):
+    """Same rule as recovery: a handler between claim and publish runs in
+    THIS process, so a periodic pass must not settle its flow from an
+    artifact state the handler is still building. A boot pass has no live
+    handlers by construction."""
+    now = time.time()
+    h, _claim = _publish(spool, "still-in-flight")
+    os.unlink(_results(spool) / f"{h}.json")
+    spool._in_flight.add(cs.in_flight_key(PLUGIN, h))
+
+    periodic = spool.attempts_pass(now=now, boot=False)
+
+    assert periodic.collected == 0
+    assert _attempt_of(spool, h)["status"] == "result_ready"
+
+    at_boot = spool.attempts_pass(now=now, boot=True)
+
+    assert at_boot.collected == 1
+    assert _attempt_of(spool, h)["outcome"] == "collected"
+
+
+def test_an_invalid_attempt_beside_a_live_result_is_rewritten_open(spool):
+    """A consumer-scribbled record is never truth: it is rewritten from the
+    artifacts that survive, never treated as an ack and never a reason to
+    delete anything."""
+    now = time.time()
+    h, claim = _publish(spool, "scribbled")
+    (_attempts(spool) / f"{h}.json").write_text('{"scribbled": true}')
+
+    report = spool.attempts_pass(now=now, boot=True)
+
+    rec = _attempt_of(spool, h)
+    assert rec["status"] == "result_ready" and rec["outcome"] is None
+    assert rec["minted_ts"] == claim.mtime, "rebuilt from the result record"
+    assert report.materialized == 1 and report.anomalies == []
+    assert (_results(spool) / f"{h}.json").exists(), "no artifact was deleted"
+
+
+def test_an_invalid_attempt_with_no_artifacts_is_retired_with_an_anomaly(
+        spool):
+    """Fail-closed direction: with nothing left to re-derive from, the
+    unreadable file is RETIRED and the loss recorded as an anomaly — never
+    read as a receipt, never given a terminal outcome it cannot justify."""
+    now = time.time()
+    h = state_hash("lost")
+    (_attempts(spool) / f"{h}.json").write_text("not json at all")
+
+    report = spool.attempts_pass(now=now, boot=True)
+
+    assert spool.read_attempt(PLUGIN, h).state is cs.MarkerState.ABSENT
+    assert report.anomalies and report.materialized == 0
+    assert report.collected == 0
+    assert os.listdir(_attempts(spool)) == [], "not turned into an ack token"
+
+
+def test_terminal_attempts_age_out_at_the_retention_bound(spool):
+    """An attempt is durable until ack OR the retention bound — the file IS
+    the record being retired at its own bound, so no write-ahead applies."""
+    now = time.time()
+    old_h, fresh_h = state_hash("old-record"), state_hash("fresh-record")
+    _terminal(spool, old_h, "expired_unread",
+              ended=now - ca.ATTEMPT_RETENTION_S - 1)
+    _terminal(spool, fresh_h, "expired_unread", ended=now - 60)
+
+    report = spool.attempts_pass(now=now, boot=True)
+
+    assert report.aged_out == 1
+    assert spool.read_attempt(PLUGIN, old_h).state is cs.MarkerState.ABSENT
+    assert _attempt_of(spool, fresh_h)["outcome"] == "expired_unread"
+
+
+def test_the_attempt_cap_deletes_the_oldest_terminal_first(spool, monkeypatch):
+    """§9 eviction order: oldest-`ended_ts` TERMINAL files first. An ack
+    token is the consumer's receipt in flight — never counted, never
+    evicted."""
+    now = time.time()
+    monkeypatch.setattr(cs, "MAX_ATTEMPTS", 3)
+    hashes = []
+    for i in range(4):
+        h = state_hash(f"cap-att-{i}")
+        _terminal(spool, h, "expired", ended=now - 100 + i)
+        hashes.append(h)
+    token = _put(_attempts(spool) / f".ack-{state_hash('receipt')}", now, "")
+
+    report = spool.attempts_pass(now=now, boot=True)
+
+    assert report.capped == 1
+    assert spool.read_attempt(PLUGIN, hashes[0]).state is cs.MarkerState.ABSENT
+    assert all(spool.read_attempt(PLUGIN, h).state is cs.MarkerState.PRESENT
+               for h in hashes[1:])
+    assert token.exists(), "a receipt is never counted toward the cap"
+
+
+def test_the_open_attempt_valve_is_strict_and_skips_an_undurable_eviction(
+        spool, monkeypatch):
+    """Amendment 10: the pathological-overflow valve terminalizes `evicted`
+    STRICTLY first and removes the file only when that is proven durable —
+    so what the cap destroys is always a terminal record, never an open flow
+    whose outcome was lost with it. The next pass converges."""
+    now = time.time()
+    monkeypatch.setattr(cs, "MAX_ATTEMPTS", 1)
+    hashes = []
+    for i in range(2):
+        h = state_hash(f"valve-{i}")
+        assert spool.write_attempt(PLUGIN, h, ca.new_attempt(
+            state_hash=h, minted_ts=now - 100 + i,
+            status="awaiting_redirect", now=now)) is True
+        hashes.append(h)
+    real = cs._fsync_strict
+
+    def boom(fd, what):
+        raise cs.FsyncFailed(errno.EIO, "injected")
+
+    monkeypatch.setattr(cs, "_fsync_strict", boom)
+    first = spool.attempts_pass(now=now, boot=True)
+
+    assert first.skipped_undurable == 1 and first.capped == 0
+    assert spool.read_attempt(PLUGIN, hashes[0]).state is cs.MarkerState.PRESENT
+
+    monkeypatch.setattr(cs, "_fsync_strict", real)
+    second = spool.attempts_pass(now=now, boot=True)
+
+    assert second.capped == 1 and second.skipped_undurable == 0
+    assert spool.read_attempt(PLUGIN, hashes[0]).state is cs.MarkerState.ABSENT
+    assert spool.read_attempt(PLUGIN, hashes[1]).state is cs.MarkerState.PRESENT
+
+
+def test_a_confirmed_absent_result_can_never_be_recreated(spool):
+    """Amendment-15 refutation pin — why `collected` can never be a false
+    positive. Results are publish-once (`link(2)`'s EEXIST) and NO casa path
+    recreates `results/<h>.json`: the pending was consumed by the first
+    claim and the claim itself is gone, so a replayed redirect loses at
+    claim() and never reaches publish_result. Once casa has observed the
+    base name absent, a consumer rename of it is impossible — "collected
+    recorded while the consumer holds a credential casa doesn't know about"
+    would require the file to reappear, which nothing can do."""
+    now = time.time()
+    h, _claim = _publish(spool, "once-only")
+    os.unlink(_results(spool) / f"{h}.json")
+
+    assert spool.attempts_pass(now=now, boot=True).collected == 1
+
+    assert spool.claim(PLUGIN, h, now=now) is None, "the pending is consumed"
+    assert not (_results(spool) / f"{h}.json").exists()
+    assert _attempt_of(spool, h)["outcome"] == "collected"
+
+
+def test_attempts_pass_is_a_noop_on_a_closed_spool(tmp_path):
+    s = CallbackSpool(tmp_path / "callbacks")
+    s.ensure_plugin_dirs(PLUGIN)
+    s.close()
+    report = s.attempts_pass(now=time.time(), boot=True)
+    assert (report.materialized, report.collected, report.reopened,
+            report.aged_out, report.capped) == (0, 0, 0, 0, 0)
+
+
+def test_an_unknown_pending_probe_defers_both_the_rewind_and_the_inference(
+        spool, monkeypatch):
+    """Probe 4's independent binding. A live pending normally REWINDS the
+    record (which alone would also stop the inference) — but when the
+    pending's state is UNKNOWN the rewind cannot fire either, and only the
+    probe's own three-state discipline keeps the flow from being settled
+    `collected` while a pending may exist."""
+    now = time.time()
+    h, _claim = _publish(spool, "unknown-pending")
+    os.unlink(_results(spool) / f"{h}.json")
+    _put(_pending(spool) / f"{h}.json", now - 10, '{"v": 2, "meta": null}')
+    real = cs._marker_lstat
+
+    def flaky(name, dir_fd):
+        try:
+            where = os.readlink(f"/proc/self/fd/{dir_fd}")
+        except OSError:                      # pragma: no cover
+            where = ""
+        if name == f"{h}.json" and where.endswith("/pending"):
+            return cs._LSTAT_ERROR
+        return real(name, dir_fd)
+
+    monkeypatch.setattr(cs, "_marker_lstat", flaky)
+    report = spool.attempts_pass(now=now, boot=True)
+    monkeypatch.undo()
+
+    assert report.collected == 0 and report.reopened == 0
+    assert _attempt_of(spool, h)["status"] == "result_ready"

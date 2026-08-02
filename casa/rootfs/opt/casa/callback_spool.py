@@ -661,6 +661,37 @@ class RecoveryReport:
 
 
 @dataclass
+class AttemptsReport:
+    """What one :meth:`CallbackSpool.attempts_pass` did to the ledger.
+
+    Every counter names a DERIVED change: nothing here destroys a
+    credential-bearing artifact (that is the sweep's job, write-ahead), and
+    nothing here is authoritative over the artifacts — the pass exists to
+    make the ledger agree with them."""
+
+    #: attempt files created for a flow that had none (spec §3.3), plus
+    #: unreadable records rebuilt from the artifacts that survive
+    materialized: int = 0
+    #: open ``result_ready`` attempts settled ``collected`` by the five §6
+    #: probes
+    collected: int = 0
+    #: provisional records rewritten from artifacts that contradict them —
+    #: a terminal attempt beside a live artifact, or a ``result_ready`` one
+    #: whose flow rewound to a live pending
+    reopened: int = 0
+    #: ``.ack-<hash>`` receipt tokens consumed (Task 7's teardown)
+    acks_consumed: int = 0
+    #: terminal attempt files retired at ``ATTEMPT_RETENTION_S``
+    aged_out: int = 0
+    #: attempt files removed by the ``MAX_ATTEMPTS`` ladder
+    capped: int = 0
+    #: cap evictions SKIPPED because the ``evicted`` outcome would not go
+    #: durable — the open record survives and the next pass retries
+    skipped_undurable: int = 0
+    anomalies: list = field(default_factory=list)
+
+
+@dataclass
 class SweepReport:
     deleted_pending: int = 0
     deleted_results: int = 0
@@ -1920,21 +1951,351 @@ class CallbackSpool:
             return                           # UNKNOWN — never guess
         if res is None and not self._collect_present(h, dirs.results):
             return                           # nothing survives to contradict it
+        self._rewrite_from_artifacts(plugin, h, dirs=dirs, now=now)
+
+    def _rewrite_from_artifacts(self, plugin: str, h: str, *,
+                                dirs: _ArtifactDirs,
+                                now: float) -> "dict | None":
+        """Rewrite the attempt for *h* from the artifacts that exist NOW — the
+        re-derivation rule's one write path (spec §6), shared by the
+        lost-deletion repair, the invalid-file rebuild and the reopen/rewind
+        arms of :meth:`attempts_pass`.
+
+        Returns the record written, or ``None`` when the write failed. Not a
+        write-ahead: no deletion depends on this rewrite, so a failure simply
+        leaves the provisional record for the next pass to repair."""
         rec = self._derive_from_artifacts(
             plugin, h, pend_fd=dirs.pend, results_fd=dirs.results,
             claims_fd=dirs.claims, now=now)
         # What survives may no longer carry the consumer's binding — a hold is
         # a NAME, and casa never opens the file it names — so keep what the
-        # provisional record still knows rather than dropping it (§4).
+        # provisional record still knows rather than dropping it (§4). A
+        # record that will not validate knows nothing: nothing is carried.
         prior = callback_attempts.validate_attempt(
             self.read_attempt(plugin, h).payload)
         if prior is not None:
             for key in ("meta", "minted_ts"):
                 if rec[key] is None:
                     rec[key] = prior[key]
-        # Not a write-ahead: no deletion depends on this rewrite, and a
-        # failure leaves the provisional label for the next pass to repair.
-        self.write_attempt(plugin, h, rec)
+        return rec if self.write_attempt(plugin, h, rec) else None
+
+    # -- the attempts pass ----------------------------------------------
+
+    def attempts_pass(self, *, now: float, boot: bool) -> AttemptsReport:
+        """Reconcile the per-flow ledger against the artifacts (spec §§3.3,
+        6, 9) — the standing rule that makes the attempt file a DERIVED
+        record rather than a second source of truth.
+
+        Four phases per plugin, in this order and for this reason:
+
+        1. **Ack consumption** — the consumer's receipt supersedes every
+           record, so it runs before anything can re-materialize what the
+           receipt retires.
+        2. **Materialization** — every hash present in ``pending/`` ∪
+           ``results/`` ∪ ``.claims/`` ∪ the ``.collect-*`` held names that
+           has no attempt file gets one, derived from whichever source
+           survives (§3.3). A flow casa knows about always has a record.
+        3. **Re-derivation** — an unreadable record is rewritten from live
+           artifacts or, with none, retired as an anomaly; a terminal record
+           coexisting with ANY live artifact of its hash is provisional and
+           is rewritten open; a ``result_ready`` record whose flow rewound
+           to a live pending goes back to ``awaiting_redirect`` (§6).
+        4. **Receipt inference** — an open ``result_ready`` attempt whose
+           five §6 probes all confirm absence is settled ``collected``.
+        5. **Bounds** — terminal records age out at
+           ``ATTEMPT_RETENTION_S``; ``MAX_ATTEMPTS`` evicts oldest-terminal
+           first, with a strict terminalize-then-remove valve for the
+           pathological open-attempt overflow (§9).
+
+        Ordering matters: materialization before re-derivation (so a fresh
+        record is judged against the same artifacts), re-derivation before
+        inference (so a rewound flow is never mistaken for a collected one),
+        and the bounds last (so nothing is retired before it is correct).
+
+        A periodic pass (``boot=False``) skips in-flight hashes exactly as
+        recovery does — handler and pass run in the same process, and a
+        handler between claim and publish is still building the artifact
+        state this pass would read. A boot pass has no live handlers by
+        construction.
+        """
+        report = AttemptsReport()
+        with self._lock:
+            if self._closed:
+                return report
+            for plugin in self._plugin_dirs():
+                try:
+                    pfd = self._plugin_fd(plugin)
+                except (OSError, ValueError):
+                    continue
+                try:
+                    self._attempts_plugin(plugin, pfd, now, boot, report)
+                finally:
+                    os.close(pfd)
+        return report
+
+    def _attempts_plugin(self, plugin: str, pfd: int, now: float, boot: bool,
+                         report: AttemptsReport) -> None:
+        """One plugin's attempts pass, with the four artifact directory FDs
+        opened ONCE: every phase reads the same on-disk state, so a flow
+        cannot be judged against one directory as it was and another as it
+        became. Called with ``_lock`` held."""
+        fds: dict[str, "int | None"] = {}
+        for sub in (PENDING_DIR, RESULTS_DIR, CLAIMS_DIR):
+            try:
+                fds[sub] = _open_dir(sub, pfd)
+            except OSError:
+                fds[sub] = None              # that source is simply lost
+        try:
+            try:
+                created = self._mkdir(ATTEMPTS_DIR, pfd)
+                if created:
+                    _fsync(pfd, plugin)      # the dir before entries in it
+                afd = _open_dir(ATTEMPTS_DIR, pfd)
+            except OSError as exc:
+                logger.warning("callback-spool: attempts dir unavailable "
+                               "(errno %s)", exc.errno)
+                return
+            try:
+                if created:
+                    self._chmod_dir(afd, ATTEMPTS_DIR)
+                dirs = _ArtifactDirs(pend=fds[PENDING_DIR],
+                                     results=fds[RESULTS_DIR],
+                                     claims=fds[CLAIMS_DIR])
+                # 1. Ack tokens. Task 7 owns ack consumption — the
+                # race-convergent full-flow teardown, which must run FIRST
+                # (a receipt supersedes every record). Deliberately a no-op
+                # here: a half-implemented teardown would delete credential-
+                # bearing artifacts without the protocol's proof step.
+                _ = report.acks_consumed
+                valid, invalid = self._scan_attempts(plugin)
+                records = dict(valid)
+                self._materialize_attempts(plugin, dirs, records,
+                                           set(invalid), now, report)
+                self._rederive_attempts(plugin, afd, dirs, records, invalid,
+                                        now, report)
+                self._infer_receipts(plugin, dirs, records, now, boot, report)
+                self._bound_attempts(plugin, afd, records, now, report)
+            finally:
+                os.close(afd)
+        finally:
+            for fd in fds.values():
+                if fd is not None:
+                    os.close(fd)
+
+    @staticmethod
+    def _probe(name: str, dir_fd: "int | None") -> "bool | None":
+        """Three-state presence probe: True (present), False (confirmed
+        ENOENT), ``None`` (UNKNOWN — a metadata failure, or a directory that
+        would not open). Only a confirmed absence is ever read as absence
+        (spec §6, "proved absence, not assumed absence")."""
+        if dir_fd is None:
+            return None
+        st = _marker_lstat(name, dir_fd)
+        if st is _LSTAT_ERROR:
+            return None
+        return st is not None
+
+    @staticmethod
+    def _probe_collect(h: str, results_fd: "int | None") -> "bool | None":
+        """The same three states for the ``.collect-<h>-*`` enumeration: a
+        listing that FAILS is UNKNOWN, never an empty directory (which
+        ``_listdir_quiet`` would make it)."""
+        if results_fd is None:
+            return None
+        try:
+            names = os.listdir(results_fd)
+        except OSError:
+            return None
+        return any(_hash_of_collect(name) == h for name in names)
+
+    def _flow_artifacts_live(self, h: str, dirs: _ArtifactDirs) -> bool:
+        """True iff ANY artifact of the flow *h* is still on disk — the
+        witness that contradicts a terminal record (spec §6). Best-effort by
+        design: an unreadable directory yields no witness, so the record is
+        left alone and the next pass re-examines it."""
+        for name, fd in ((f"{h}.json", dirs.pend), (h, dirs.claims),
+                         (f"{h}.json", dirs.results)):
+            if fd is not None and _lstat_quiet(name, fd) is not None:
+                return True
+        return self._collect_present(h, dirs.results)
+
+    def _materialize_attempts(self, plugin: str, dirs: _ArtifactDirs,
+                              records: dict, invalid: set, now: float,
+                              report: AttemptsReport) -> None:
+        """Spec §3.3 phase 3: give every hash casa can see a record.
+
+        The union is read by NAME from all four sources; hashes whose record
+        merely fails to VALIDATE are left to the re-derivation phase (they
+        have a file, and overwriting it here would double-count the same
+        repair)."""
+        union: set[str] = set()
+        if dirs.pend is not None:
+            union.update(h for h in (_hash_of_pending(n)
+                                     for n in _listdir_quiet(dirs.pend))
+                         if h is not None)
+        if dirs.results is not None:
+            for name in _listdir_quiet(dirs.results):
+                h = _hash_of_pending(name) or _hash_of_collect(name)
+                if h is not None:
+                    union.add(h)
+        if dirs.claims is not None:
+            union.update(n for n in _listdir_quiet(dirs.claims) if _is_hash(n))
+        for h in sorted(union - set(records) - invalid):
+            rec = self._derive_attempt(plugin, h, pend_fd=dirs.pend,
+                                       results_fd=dirs.results,
+                                       claims_fd=dirs.claims, now=now)
+            # Not a write-ahead: no deletion depends on a materialization.
+            if self.write_attempt(plugin, h, rec):
+                records[h] = rec
+                report.materialized += 1
+
+    def _rederive_attempts(self, plugin: str, afd: int, dirs: _ArtifactDirs,
+                           records: dict, invalid: list, now: float,
+                           report: AttemptsReport) -> None:
+        """Spec §6 + amendment 6: make every record agree with the artifacts.
+
+        An INVALID file (consumer-scribbled, truncated, non-regular) is
+        rewritten from live artifacts when any exist, and otherwise RETIRED
+        with an anomaly — never read as an ack, never a reason to delete an
+        artifact, and never given a terminal outcome casa cannot justify.
+
+        A record that contradicts a live artifact is then rewritten open, in
+        the amendment-6 precedence: result or hold ⇒ ``result_ready``
+        (``claimed`` iff a hold exists), else pending or claim ⇒
+        ``awaiting_redirect`` — both of which
+        :meth:`_derive_from_artifacts` already encodes."""
+        for h in invalid:
+            if self._flow_artifacts_live(h, dirs):
+                rec = self._rewrite_from_artifacts(plugin, h, dirs=dirs,
+                                                   now=now)
+                if rec is not None:
+                    records[h] = rec
+                    report.materialized += 1
+                continue
+            name = f"{h}.json"
+            st = _lstat_quiet(name, afd)
+            if st is not None and _remove_entry(name, afd, st):
+                _fsync(afd, ATTEMPTS_DIR)
+            # No hash in the message (INV-CB-006): the anomaly is the CLASS.
+            report.anomalies.append(
+                f"{plugin}: unreadable attempt record retired")
+        for h, rec in sorted(records.items()):
+            if rec["status"] == "done":
+                if not self._flow_artifacts_live(h, dirs):
+                    continue                 # nothing contradicts it
+            elif rec["status"] == "result_ready":
+                # The flow rewound: recovery restored the crashed claim to
+                # pending/ and no result or hold survives to say otherwise.
+                if not (self._probe(f"{h}.json", dirs.pend) is True
+                        and self._probe(f"{h}.json", dirs.results) is False
+                        and self._probe_collect(h, dirs.results) is False):
+                    continue
+            else:
+                continue
+            new = self._rewrite_from_artifacts(plugin, h, dirs=dirs, now=now)
+            if new is not None:
+                records[h] = new
+                report.reopened += 1
+
+    def _infer_receipts(self, plugin: str, dirs: _ArtifactDirs, records: dict,
+                        now: float, boot: bool,
+                        report: AttemptsReport) -> None:
+        """Spec §6: settle an open ``result_ready`` attempt as ``collected``.
+
+        The five probes run in the NORMATIVE order and short-circuit: any
+        PRESENT stops the inference, any UNKNOWN defers it to the next pass.
+
+        1. ``results/<h>.json`` confirmed absent;
+        2. no ``results/.collect-<h>-*`` entry remains;
+        3. no ``.claims/<h>`` (attempt-first publishing makes "attempt says
+           ``result_ready``, claim still live" a real crash state);
+        4. no ``pending/<h>.json`` (recovery may have rewound the flow);
+        5. casa did not itself SUCCESSFULLY delete the artifacts — which
+           reaching here with an OPEN attempt already proves: every casa
+           deletion writes its terminal outcome first (INV-CB-007), so a
+           completed casa deletion has left a ``done`` record and this arm is
+           unreachable for it. A provisional record whose deletion LOST to
+           ENOENT is exactly what the re-derivation phase above reopened.
+        """
+        for h, rec in sorted(records.items()):
+            if rec["status"] != "result_ready":
+                continue
+            if not boot and in_flight_key(plugin, h) in self._in_flight:
+                continue
+            if self._probe(f"{h}.json", dirs.results) is not False:
+                continue
+            if self._probe_collect(h, dirs.results) is not False:
+                continue
+            if self._probe(h, dirs.claims) is not False:
+                continue
+            if self._probe(f"{h}.json", dirs.pend) is not False:
+                continue
+            done = callback_attempts.terminalize(rec, "collected", now=now)
+            # Not a write-ahead: no deletion depends on this outcome (there
+            # is nothing left to delete), so a failed write simply means the
+            # next pass infers it again from the same absences.
+            if self.write_attempt(plugin, h, done):
+                records[h] = done
+                report.collected += 1
+
+    def _bound_attempts(self, plugin: str, afd: int, records: dict,
+                        now: float, report: AttemptsReport) -> None:
+        """Spec §9: the retention bound and the ``MAX_ATTEMPTS`` ladder.
+
+        Age-out needs no write-ahead — the file IS the record being retired,
+        at the bound the invariant names. The cap deletes oldest-``ended_ts``
+        TERMINAL files first; only a pathological overflow reaches the open
+        arm, where each victim is terminalized ``evicted`` STRICTLY and the
+        file removed ONLY when that is proven durable (amendment 10), so
+        what the cap destroys is always a terminal record. ``.ack-*`` tokens
+        are neither counted nor evicted: they are the consumer's receipts in
+        flight, and the ack phase consumes them."""
+        retained: list[tuple[str, dict]] = []
+        touched = False
+        for h, rec in sorted(records.items()):
+            ended = rec["ended_ts"]
+            if rec["status"] == "done" and ended is not None \
+                    and now - ended > callback_attempts.ATTEMPT_RETENTION_S:
+                if _unlink_quiet(f"{h}.json", afd):
+                    report.aged_out += 1
+                    touched = True
+                continue
+            retained.append((h, rec))
+        excess = len(retained) - MAX_ATTEMPTS
+        if excess > 0:
+            logger.warning("callback-spool: %s holds %d attempt records — "
+                           "oldest-terminal-first eviction applied",
+                           plugin, len(retained))
+            terminal = sorted(
+                (pair for pair in retained if pair[1]["status"] == "done"),
+                key=lambda pair: (pair[1]["ended_ts"] or 0.0, pair[0]))
+            for h, _rec in terminal[:excess]:
+                if _unlink_quiet(f"{h}.json", afd):
+                    report.capped += 1
+                    excess -= 1
+                    touched = True
+            for h, rec in self._eviction_order(retained)[:max(excess, 0)]:
+                done = callback_attempts.terminalize(rec, "evicted", now=now)
+                if not self.write_attempt(plugin, h, done, strict=True):
+                    report.skipped_undurable += 1
+                    continue
+                if _unlink_quiet(f"{h}.json", afd):
+                    report.capped += 1
+                    touched = True
+        if touched:
+            _fsync(afd, ATTEMPTS_DIR)
+
+    @staticmethod
+    def _eviction_order(retained: list) -> list:
+        """The open attempts of *retained*, oldest mint first — a record with
+        no mint clock (a hold-only materialization) is what casa knows least
+        about, so it sorts oldest."""
+        return sorted((pair for pair in retained
+                       if pair[1]["status"] != "done"),
+                      key=lambda pair: (
+                          pair[1]["minted_ts"]
+                          if pair[1]["minted_ts"] is not None else 0.0,
+                          pair[0]))
 
     # -- recovery -------------------------------------------------------
 
