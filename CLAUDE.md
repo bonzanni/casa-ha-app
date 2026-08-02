@@ -58,6 +58,22 @@ The `tests/conftest.py` auto-adds the code root to `sys.path`.
 > aggregate. That limit also bounds ADDRESS SPACE, not resident memory — CPython
 > reserves far more VA than it touches, which is why the per-worker floor is
 > 6 GiB and why 2 GiB broke the suite outright.
+>
+> **Not every WSL freeze is this bug.** Establish first whether an OOM kill
+> happened at all, using the current boot: `journalctl -k -b | grep -i "killed
+> process"` for an entry naming pytest, plus `/proc/vmstat`'s `oom_kill`. That
+> counter totals every OOM kill of the running kernel, so a non-zero value can
+> belong to an unrelated earlier one, and a zero value says nothing about
+> previous boots — correlate the journal entry's timestamp and process name
+> before concluding. If neither shows a kernel OOM kill, the freeze was not
+> caused by one, and the cage did not trigger one; the cage bounds a single
+> pytest process tree, not the machine. Check `/proc/pressure/memory` for memory
+> stalls: a rising `full` total measures time in which every non-idle task was
+> stalled on memory, but does not identify the source of the pressure. Do not
+> reach for the suite as the default suspect: in one 2026-08-02 measurement,
+> sampled once per second during a 21 s run, the lowest sampled `MemAvailable`
+> was 19.15 GiB, the lowest sampled `SwapFree` was 8.00 GiB, and the largest
+> sampled `/tmp` usage was 85.6 MB.
 
 ## Release flow
 1. Branch `feat/vX.Y.Z-<desc>` off `main`.
