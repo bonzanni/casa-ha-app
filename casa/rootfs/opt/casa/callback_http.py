@@ -93,11 +93,15 @@ DEFAULT_RATE_PER_MIN = 60
 #: is attacker-controlled and must never reach a log line.
 UNKNOWN_SENTINEL = "<unknown>"
 
-#: Outcome vocabulary. ``expired`` is part of the
-#: facility's vocabulary but is NOT reachable from this handler:
+#: Outcome vocabulary. ``expired`` and ``result_exists`` are part of the
+#: facility's vocabulary but are NOT reachable from this handler:
 #: ``CallbackSpool.claim`` refuses expired, replayed and never-minted states
 #: identically by design, so the handler sees one refusal and logs
-#: ``no_pending``. The sweep/recovery passes own the ``expired`` case.
+#: ``no_pending`` (the sweep/recovery passes own the ``expired`` case); and
+#: the EEXIST anomaly inside ``publish_result`` — a result already existing
+#: for a claimed state — cleans up and reports ``PUBLISHED``, so it logs
+#: ``ok``. Publish failures log ``write_failed`` on every arm (recorded,
+#: unrecorded, and raised alike).
 REASONS = frozenset({
     "ok", "unknown_name", "bad_state", "no_pending", "expired",
     "result_exists", "write_failed",
@@ -594,8 +598,8 @@ def make_callback_handler(
         if claim is None:
             return effective, "no_pending"
 
-        # 4. Result record + publish-once. The decode runs
-        #    only for a won claim, so a probe flood never pays for it.
+        # 4. Result record + attempt-first tri-state publish. The decode
+        #    runs only for a won claim, so a probe flood never pays for it.
         record = {
             "v": 1,
             "plugin": plugin,
@@ -605,26 +609,30 @@ def make_callback_handler(
             "query": _decoded_pairs(raw_query),
         }
         try:
-            published = spool.publish_result(claim, record)
-            failure = "result_exists"
+            outcome = spool.publish_result(claim, record)
         except Exception:  # noqa: BLE001
+            # An exception may predate any durable record, so the claim is
+            # LEFT for the recovery pass — only a durably RECORDED failure
+            # authorizes a discard (see below). The response stays the one
+            # neutral 303 regardless (INV-CB-005).
             logger.warning("callback: result publish raised for name=%s",
                            effective)
-            published, failure = False, "write_failed"
-        if not published:
-            # The claim is dropped either way: the state stays consumed
-            # (INV-CB-002), and the credential was never written to results/.
-            # publish_result already removes the claim on the EEXIST anomaly,
-            # so this is a no-op there; on a staging failure it converts the
-            # spool's "leave it for recovery to restore" into a fail-closed
-            # single-use consumption, which is the safer direction for an
-            # unauthenticated endpoint.
+            return effective, "write_failed"
+        if outcome is callback_spool.PublishOutcome.FAILED_RECORDED:
+            # The failure is durably recorded (a done/publish_failed attempt,
+            # strict-fsynced): discarding keeps the state consumed
+            # (INV-CB-002, fail-closed single-use for an unauthenticated
+            # endpoint) while the attempt file carries the flow's record.
             try:
                 spool.discard_claim(claim)
             except (OSError, ValueError):
                 logger.warning("callback: claim discard failed for name=%s",
                                effective)
-            return effective, failure
+            return effective, "write_failed"
+        if outcome is not callback_spool.PublishOutcome.PUBLISHED:
+            # FAILED_UNRECORDED: nothing durable exists — leave the claim so
+            # recovery restores the flow instead of eating it traceless.
+            return effective, "write_failed"
 
         # 5. Nudge kick — non-durable, and never load-bearing for
         #    the response: the result is already published and durable.

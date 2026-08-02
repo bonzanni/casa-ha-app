@@ -1,5 +1,34 @@
 # Changelog
 
+## [0.147.0] - 2026-08-02
+
+### Changed
+
+Authorization callbacks now survive restarts and missed pickups. Signing in
+to an outside service used to depend on a plugin being awake at exactly the
+right moment; it no longer does:
+
+- **Every authorization gets a durable record the plugin can read whenever
+  it next runs.** Casa keeps one small note per sign-in attempt beside the
+  result — what was minted, what happened to it, and how it ended. A plugin
+  that was not running when you tapped "allow" picks the story up later
+  instead of losing it.
+- **Delivery is retried until the plugin actually receives the
+  authorization**, on a schedule tuned to the few minutes a provider's code
+  stays valid, rather than being considered done the moment the message was
+  handed off. If nobody ever collects it, you get one notification rather
+  than silence.
+- **Nothing is now thrown away silently.** An authorization that expires
+  unread, is dropped under load, or fails to be written now says so in its
+  record, so a plugin can tell "it expired" from "it never arrived" and ask
+  you to try again for the right reason.
+- **Removing a plugin reports the authorizations it aborted.** If a plugin
+  is uninstalled while sign-ins are still in flight, Casa tells you how many
+  were cut short instead of deleting them without a word.
+
+Plugins that already use callbacks keep working unchanged; the identity of a
+callback, the approval you gave it and the public URL are all untouched.
+
 ## [0.146.1] - 2026-08-02
 
 ### Fixed
