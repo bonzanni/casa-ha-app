@@ -205,6 +205,16 @@ bound to the exact trigger identity. This approval outlives a restart — one of
 approval ledgers (specialist and persona install acknowledgements are others), in contrast
 to the in-memory tool-call grants above.
 
+**Adding an authorization callback** is a sibling manifest extractor: `casa.callbacks` is a
+peer of `casa.triggers`, parsed and intrinsically validated the same way, and gated by a
+durable operator consent that is another of those restart-surviving ledgers. Its consent
+is deliberately asymmetric to a trigger's, and the asymmetry is the thing to carry away: a
+trigger ack binds the plugin *artifact*, so any update re-consents; a callback ack binds the
+*declaration digest* (the declared name only) and excludes the artifact, so a routine
+upgrade that leaves the declaration unchanged keeps consent — because a callback grants no
+role turn and no memory access, only a spool deposit. The mechanism lives in
+`architecture/callbacks.md`.
+
 **Reloading** refreshes the snapshot before agents and executors are rebuilt, and purges
 role-scoped grants and pending challenges before a role is replaced or removed.
 
@@ -235,4 +245,5 @@ role-scoped grants and pending challenges before a role is replaced or removed.
 **Related**
 - [`architecture/overview.md`](../architecture/overview.md)
 - [`architecture/agent-taxonomy.md`](../architecture/agent-taxonomy.md)
+- [`architecture/callbacks.md`](../architecture/callbacks.md)
 <!-- END SOURCEMAP -->

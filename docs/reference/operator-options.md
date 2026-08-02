@@ -41,7 +41,7 @@ container variable can survive an empty option elsewhere.
 
 | Key | Env | Consumer | Default | Change needs |
 |---|---|---|---|---|
-| `public_url` | `PUBLIC_URL` | main startup (webhook transport base) | empty | restart |
+| `public_url` | `PUBLIC_URL` | main startup (webhook transport base); the authorization-callback redirect base, where it must additionally be a clean `https://` origin (no IP literal, userinfo, path or control character) or the callback facility is unavailable | empty | restart |
 | `claude_oauth_token` | `CLAUDE_CODE_OAUTH_TOKEN` | main startup secret resolution; inherited by CLI children | empty — but **boot-required**: validation refuses to start without a value | restart |
 | `telegram_bot_token` | `TELEGRAM_BOT_TOKEN` | main startup (channel construction) | empty | restart |
 | `telegram_chat_id` | `TELEGRAM_CHAT_ID` | main startup → Telegram channel | empty | restart |
@@ -65,7 +65,9 @@ container variable can survive an empty option elsewhere.
 ## Failure behavior
 
 **A missing Telegram token** means no Telegram channel — not a startup error. **Webhook
-transport without a public URL** warns and falls back to polling. **A non-numeric
+transport without a public URL** warns and falls back to polling; the same unset or
+non-`https` origin leaves the authorization-callback facility unavailable, surfacing
+`callback_base_url_invalid` on every otherwise-routable plugin. **A non-numeric
 supergroup id** fails startup — that conversion is unguarded. **A failed `op://`
 resolution** warns and leaves the raw reference in place, so the downstream credential is
 rejected rather than the boot. **An invalid timezone** warns and falls back to the

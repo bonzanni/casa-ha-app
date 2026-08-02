@@ -126,7 +126,12 @@ unavailable, a secret value in the plain config channel, an undeclared secret na
 secret channel (INV-SPEC-006). Sourced plugin dependencies are additionally refused categorically when they
 declare system requirements or triggers of their own, or when a required environment name
 collides with another installed plugin's — otherwise-valid bundles fail with dedicated
-error kinds the dependency model alone would not predict. A rejected inspection deletes
+error kinds the dependency model alone would not predict. A sourced dependency *may*,
+however, declare `casa.callbacks` — unlike `casa.triggers`, because a callback grants no
+turn or memory access — with one inspect-time gate: its owned entry routes under the scoped
+registry name, so a callback whose *scoped* effective name would overflow the length cap is
+refused as `callback_name_too_long` before it can reach the registry (see
+`architecture/callbacks.md`). A rejected inspection deletes
 its fetched staging tree; a successful one retains it for the commit to consume.
 
 **A component declares system requirements.** Each installs by its declared strategy —

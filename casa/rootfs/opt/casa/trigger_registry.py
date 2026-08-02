@@ -148,6 +148,18 @@ class TriggerRegistry:
         # new-complete overlay, never a partial one. Each value:
         # ``{"role": str, "clearance": str, "auth": dict}``.
         self._plugin_overlay: dict[str, dict] = {}
+        # Plugin-declared authorization callbacks are a SECOND,
+        # independent overlay keyed by effective name (also ``plg-<plugin>--
+        # <declared>``, in its OWN namespace — the callback endpoint is
+        # ``GET /callback/{name}``, never ``/webhook/{name}``, so a name may
+        # legitimately exist in one overlay and not the other). Same atomic
+        # whole-swap discipline: the callback reconciler rebuilds the complete
+        # desired map and rebinds it in one operation, so a removed / revoked /
+        # unconsented plugin's callback ingress is swept by absence (the
+        # handler 404s) and readers never see a partial overlay. Each value:
+        # ``{"plugin": str, "declared": str, "path": str}`` (``path`` is the
+        # RESOLVED artifact root the discovery index is keyed by).
+        self._callback_overlay: dict[str, dict] = {}
 
     def register_agent(
         self,
@@ -306,6 +318,31 @@ class TriggerRegistry:
         (absent from the new map → 404) and readers never see a partial set.
         """
         self._plugin_overlay = dict(overlay)
+
+    def replace_callback_overlay(self, overlay: dict[str, dict]) -> None:
+        """Atomically replace the ENTIRE authorization-callback overlay —
+        the exact counterpart of :meth:`replace_plugin_overlay`.
+
+        ``overlay`` maps effective name → ``{"plugin", "declared", "path"}``.
+        The callback reconciler is its ONE writer: it derives the complete
+        desired map (every resolved, assigned, validly-declared, acked plugin
+        callback) and swaps it in a single dict rebind, so an unrouted
+        plugin's callback endpoint is swept by absence and a concurrent
+        request read sees the old-complete or new-complete overlay.
+        """
+        self._callback_overlay = dict(overlay)
+
+    def get_callback(self, name: str) -> dict | None:
+        """The overlay entry for callback ``name``, or ``None`` when no such
+        callback is currently consented + routed. The ``GET /callback/{name}``
+        handler consults this to 404 unknown names and to learn which plugin's
+        spool a deposit belongs to. There is no resident-callback layer: unlike
+        webhooks, callbacks exist only as plugin declarations."""
+        return self._callback_overlay.get(name)
+
+    def callback_overlay_names(self) -> list[str]:
+        """Effective names currently live in the callback overlay."""
+        return list(self._callback_overlay)
 
     def plugin_overlay_names(self) -> list[str]:
         """Effective names currently live in the plugin overlay."""

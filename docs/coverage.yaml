@@ -11,6 +11,20 @@
   doc: architecture/plugins.md
 - item: casa/rootfs/opt/casa/bus.py
   doc: architecture/concurrency-model.md
+- item: casa/rootfs/opt/casa/callback_acks.py
+  doc: architecture/callbacks.md
+- item: casa/rootfs/opt/casa/callback_consent.py
+  doc: architecture/callbacks.md
+- item: casa/rootfs/opt/casa/callback_episodes.py
+  doc: architecture/callbacks.md
+- item: casa/rootfs/opt/casa/callback_http.py
+  doc: architecture/callbacks.md
+- item: casa/rootfs/opt/casa/callback_reconcile.py
+  doc: architecture/callbacks.md
+- item: casa/rootfs/opt/casa/callback_spool.py
+  doc: architecture/callbacks.md
+- item: casa/rootfs/opt/casa/callback_urls.py
+  doc: architecture/callbacks.md
 - item: casa/rootfs/opt/casa/canonical_bytes.py
   doc: architecture/personality.md
 - item: casa/rootfs/opt/casa/casa_core.py
@@ -109,6 +123,8 @@
   doc: architecture/personality.md
 - item: casa/rootfs/opt/casa/plugin_boot.py
   doc: architecture/plugins.md
+- item: casa/rootfs/opt/casa/plugin_callbacks.py
+  doc: architecture/callbacks.md
 - item: casa/rootfs/opt/casa/plugin_completion_guard.py
   doc: architecture/plugins.md
 - item: casa/rootfs/opt/casa/plugin_env_conf.py
@@ -273,6 +289,8 @@
   doc: architecture/overview.md
 - item: tool:ask_user
   doc: architecture/tools-interface.md
+- item: tool:callback_ack_revoke
+  doc: architecture/callbacks.md
 - item: tool:cancel_engagement
   doc: architecture/tools-interface.md
 - item: tool:cancel_voice_job
@@ -363,6 +381,10 @@
   doc: architecture/tools-interface.md
 - item: route:casa/rootfs/opt/casa/casa_core.py:GET:/
   doc: architecture/http-surface.md
+- item: route:casa/rootfs/opt/casa/casa_core.py:GET:/callback/done
+  doc: architecture/callbacks.md
+- item: route:casa/rootfs/opt/casa/casa_core.py:GET:/callback/{name}
+  doc: architecture/callbacks.md
 - item: route:casa/rootfs/opt/casa/casa_core.py:GET:/healthz
   doc: architecture/observability.md
 - item: route:casa/rootfs/opt/casa/casa_core.py:GET:/mcp/casa-framework

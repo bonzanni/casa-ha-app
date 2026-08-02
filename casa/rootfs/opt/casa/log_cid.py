@@ -152,6 +152,15 @@ class JsonFormatter(_RedactingRenderMixin, logging.Formatter):
         }
         if record.exc_info:
             payload["exc"] = self.formatException(record.exc_info)
+        elif record.exc_text:
+            # A filter or a foreign formatter may have PRE-RENDERED (and
+            # possibly redacted) the traceback onto ``record.exc_text`` and
+            # cleared ``exc_info`` — the stdlib Formatter and HumanFormatter
+            # both fall back to that cache, so JsonFormatter must too, or the
+            # exc field vanishes entirely for such records (e.g. the
+            # ``callback_http`` aiohttp.server redactor). Redact on the way
+            # out for the same reason ``formatException`` does.
+            payload["exc"] = redact(record.exc_text)
         # Flatten any extras (e.g. logger.info("evt", extra={"channel": "x"})).
         payload.update(redact_extras(_record_extras(record)))
         return json.dumps(payload, default=str)

@@ -65,3 +65,79 @@ def test_external_api_server_blocks_internal_mcp_and_hooks():
     # And they return 404, not proxy.
     mcp_block = external[external.index("location /mcp/ {"):]
     assert mcp_block[:mcp_block.index("}")].strip().endswith("return 404;")
+
+
+# ---------------------------------------------------------------------------
+# INV-CB-006: a callback query string (?code=...&state=...) must
+# never reach nginx's access log — the third surface, alongside the aiohttp
+# request-line redaction and log-path suppression.
+# ---------------------------------------------------------------------------
+
+
+def test_http_block_declares_callback_log_suppression_map():
+    """The map is declared once, in the http {} context, before either
+    server block — nginx requires map at http scope to be usable inside a
+    server's access_log directive.
+
+    The ingress server sits in the unquoted (variable-expanding) heredoc, so
+    the SOURCE text escapes nginx's ``$`` as ``\\$`` — this asserts the
+    source form, not the rendered nginx.conf."""
+    text = _SCRIPT.read_text()
+    http_idx = text.index("http {")
+    map_idx = text.index(r"map \$uri \$casa_cb_log {")
+    ingress_idx = text.index("# --- Ingress server")
+    assert http_idx < map_idx < ingress_idx
+    map_block = text[map_idx:text.index("}", map_idx) + 1]
+    # The regex must match both the bare /callback path and its sub-paths
+    # (/callback/<name>), while still excluding lookalikes such as
+    # /callbackish — an end-of-string or slash anchor after the literal,
+    # not a trailing-slash-only match.
+    assert r"~^/callback(/|\$) 0;" in map_block
+    assert "default          1;" in map_block or "default 1;" in map_block
+
+
+def test_callback_log_suppression_regex_matches_bare_and_subpaths_only():
+    """Behavioral check on the map regex (rendered form, backslash-escape
+    stripped): a bare ``/callback`` (no trailing slash — what ``GET
+    /callback?code=...&state=...`` presents as ``$uri``) and any
+    ``/callback/<name>`` sub-path must be classified into the suppressed
+    bucket, while a merely-prefixed path like ``/callbackish`` must not."""
+    import re
+
+    text = _SCRIPT.read_text()
+    map_idx = text.index(r"map \$uri \$casa_cb_log {")
+    map_block = text[map_idx:text.index("}", map_idx) + 1]
+    match = re.search(r"~\^(/callback\(/\|\\\$\))\s+0;", map_block)
+    assert match, "callback-suppression regex not found in map block"
+    # Rendered nginx.conf form: \$ -> $ once bash expands the heredoc.
+    rendered_pattern = match.group(1).replace(r"\$", "$")
+    compiled = re.compile("^" + rendered_pattern)
+    assert compiled.match("/callback")
+    assert compiled.match("/callback/google")
+    assert compiled.match("/callback/effective")
+    assert not compiled.match("/callbackish")
+    assert not compiled.match("/not-callback")
+
+
+def test_ingress_server_suppresses_callback_query_from_access_log():
+    """Ingress server block: still inside the unquoted heredoc — ``\\$``."""
+    text = _SCRIPT.read_text()
+    ingress = _ingress_block(text)
+    directive = r"access_log /dev/stdout combined if=\$casa_cb_log;"
+    assert directive in ingress
+    # Must precede the proxy location so it governs every route in this
+    # server, including /terminal/.
+    assert ingress.index(directive) < ingress.index("location / {")
+
+
+def test_external_api_server_suppresses_callback_query_from_access_log():
+    """The 18065 server is the one an OAuth provider's redirect actually
+    reaches — this is the surface INV-CB-006 exists to protect. This block
+    is emitted from the QUOTED heredoc (``<<'NGINX'``), so the source form
+    has no backslash before ``$``."""
+    text = _SCRIPT.read_text()
+    ext_start = text.index("# --- External API server")
+    external = text[ext_start:]
+    directive = "access_log /dev/stdout combined if=$casa_cb_log;"
+    assert directive in external
+    assert external.index(directive) < external.index("location = / {")

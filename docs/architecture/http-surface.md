@@ -173,6 +173,15 @@ A route that produces a turn also needs an entry in both ingress-identity declar
 Nothing detects its absence at boot, so this is a step to remember rather than one the
 system enforces.
 
+The authorization-callback route (`GET /callback/{name}`) is a public, unauthenticated
+route family that deliberately produces *no* turn — no ingress-identity row, no clearance,
+no provenance — because a browser redirect is not an authenticated principal; it deposits
+into a spool a plugin later collects. It therefore needs no ingress-identity declaration,
+and it carries its own hazard instead: the query string is a bearer credential, so the
+access logger suppresses the query for the `/callback/` prefix and the in-container nginx
+`map` rule does the same. A new public route that carries a credential in its URL inherits
+neither suppression automatically. See `architecture/callbacks.md`.
+
 A new internal route belongs on the internal application, and is worth writing as though it
 were reachable from outside — a later change to the listener is all it would take.
 
@@ -204,4 +213,5 @@ this document establishes; check the call sites for the one you care about.
 
 **Related**
 - [`architecture/overview.md`](../architecture/overview.md)
+- [`architecture/callbacks.md`](../architecture/callbacks.md)
 <!-- END SOURCEMAP -->

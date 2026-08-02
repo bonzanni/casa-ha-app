@@ -754,6 +754,51 @@ template in the manifest:
 "Alex (finance) wants to: Delete the invoice draft for 2025-05" — the exact
 arguments still always appear below, unabridged.
 
+### Plugin authorization callbacks
+
+Some plugins connect to an external service that hands back an authorization
+result through a **browser redirect** — the return leg of an OAuth-style
+"Connect your account" flow. Casa exposes a public `GET /callback/<name>` URL
+for this: the provider redirects the browser to it, Casa parks the result in a
+short-lived on-disk spool, and the plugin's agent collects it. The URL is
+unauthenticated by design (a browser redirect carries no login), produces no
+agent turn, and the deposited authorization code expires within minutes.
+
+To use a plugin that needs one:
+
+1. **Set `public_url`** to the public HTTPS origin external providers reach Casa
+   at — for example `https://casa.example.com`. It must be a clean `https://`
+   origin: no IP address, no path, no embedded credentials. Every callback
+   redirect URI is built from it, so if it is unset or malformed the plugin
+   reports its callback as unavailable.
+2. **Publish the external API port (`18065/tcp`) and forward `/callback/` to
+   it.** That port is not host-published by default; in a typical setup a
+   reverse proxy (for example Nginx Proxy Manager) terminates TLS for your
+   `public_url` origin and forwards to the container's `18065` over the `hassio`
+   Docker network.
+3. **Approve the callback in Telegram.** When a plugin declares a callback, Casa
+   sends you a one-tap consent DM — "Plugin '<name>' wants to receive browser
+   redirects at GET /callback/…". Until you tap Approve the route serves the
+   same neutral response as any other and publishes no result — nothing
+   distinguishes an unapproved route from an approved one. Consent is bound to
+   the callback's declared name, so a routine
+   plugin update that does not change the declaration keeps your approval; a
+   rename asks again. You can withdraw it at any time, which darkens the route
+   until you re-approve.
+4. **Register the exact redirect URI with the provider.** The plugin shows you
+   the precise URI to paste into the provider's app settings (it is your
+   `public_url` joined with `/callback/<effective-name>`). Providers match this
+   value byte-for-byte, so register exactly what the plugin displays.
+
+**Reverse-proxy recommendations.** The callback query string carries a bearer
+credential, so configure your proxy to **redact the query for `/callback/`
+paths in its access log** — Casa already suppresses it in its own logs and in
+the container's nginx access log, but your outer proxy's logs are yours to
+configure. Optionally, apply a **proxy-level rate limit** to `/callback/`:
+Casa answers every callback identically whatever the load (there is no
+distinguishing error response to probe), so any throttling of abusive traffic
+belongs at the proxy.
+
 ### Disk usage
 
 The store lives on `/config` (the `addon_config` volume), so artifacts persist

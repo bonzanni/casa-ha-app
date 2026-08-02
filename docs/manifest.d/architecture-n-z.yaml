@@ -79,7 +79,7 @@
     - tests/test_authz_grants.py
     - tests/test_authz_hook.py
     - tests/test_plugin_boot.py
-  related: [architecture/overview.md, architecture/agent-taxonomy.md]
+  related: [architecture/overview.md, architecture/agent-taxonomy.md, architecture/callbacks.md]
   defines_invariants: [INV-PLUG-001, INV-PLUG-002, INV-PLUG-003, INV-PLUG-004, INV-PLUG-005, INV-PLUG-006, INV-PLUG-007]
   invariant_tests:
     INV-PLUG-001: [tests/test_plugin_registry.py::test_artifact_id_mismatch_is_per_entry_skip]
@@ -186,7 +186,7 @@
     - tests/test_trigger_consent.py
     - tests/test_agent_loader_trigger_auth.py
     - tests/test_casa_reload_triggers_resident.py
-  related: [architecture/plugins.md, architecture/http-surface.md, architecture/overview.md]
+  related: [architecture/plugins.md, architecture/http-surface.md, architecture/overview.md, architecture/callbacks.md]
   defines_invariants: [INV-TRIG-001, INV-TRIG-002, INV-TRIG-003, INV-TRIG-004, INV-TRIG-005]
   invariant_tests:
     INV-TRIG-001: [tests/test_trigger_registry.py::test_interval_channel_must_be_registered_on_agent]
