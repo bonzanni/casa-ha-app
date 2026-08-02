@@ -13,7 +13,7 @@ from __future__ import annotations
 import logging
 from dataclasses import dataclass
 from datetime import datetime, timedelta
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, Callable
 
 from aiohttp import web
 
@@ -118,10 +118,16 @@ class TriggerRegistry:
         scheduler: "AsyncIOScheduler",
         app: web.Application,
         bus: MessageBus,
+        on_one_shot_fired: "Callable[[str, str], None] | None" = None,
     ) -> None:
         self._scheduler = scheduler
         self._app = app
         self._bus = bus
+        # #396: invoked as (role, trigger_name) after a one_shot trigger has
+        # been dispatched, so the owning triggers.yaml entry can be removed.
+        # INJECTED rather than done here — the registry must not learn to
+        # write YAML. Default None keeps every existing call site working.
+        self._on_one_shot_fired = on_one_shot_fired
         self._seen_job_ids: set[str] = set()
         self._specs_by_job_id: dict[str, TriggerSpec] = {}
         # N-1 + N-2 (v0.36.0): per-boot allowlist of webhook trigger names
@@ -179,7 +185,7 @@ class TriggerRegistry:
                 )
             names_seen.add(trig.name)
 
-            if trig.type in ("interval", "cron"):
+            if trig.type in ("interval", "cron", "date"):
                 if trig.channel not in channels:
                     raise TriggerError(
                         f"agent {role!r} trigger {trig.name!r}: channel "
@@ -232,7 +238,44 @@ class TriggerRegistry:
             )
             await self._bus.send(msg)
 
-        if trig.type == "interval":
+            if trig.one_shot:
+                # #396 / INV-TRIG-006. Ordering is load-bearing: the bus send
+                # has ALREADY happened, so everything below is cleanup, not
+                # part of delivery. A failure here leaves the yaml entry in
+                # place and the sweep redelivers — at-least-once by choice
+                # (spec §8), because a duplicate nudge is a far better failure
+                # than a missed reminder.
+                self._drop_job(job_id)
+                if self._on_one_shot_fired is not None:
+                    try:
+                        self._on_one_shot_fired(role, trig.name)
+                    except Exception:  # noqa: BLE001
+                        logger.warning(
+                            "one-shot cleanup failed for %s:%s; the sweep "
+                            "will redeliver", role, trig.name, exc_info=True,
+                        )
+
+        if trig.type == "date":
+            # #396: a genuine point in time. Cron has no year field, so a
+            # dated one-shot written as cron is an ANNUAL trigger in disguise
+            # — this branch is what removes that trap.
+            import reminders
+            when = reminders.parse_at(trig.at)   # raises on naive/absent
+            if when <= datetime.now(when.tzinfo):
+                # Already overdue: the sweep owns it. Registering here would
+                # either fire instantly at boot or vanish as a misfire, and
+                # both destroy the "still present, still owed" evidence.
+                # Deliberately returns BEFORE claiming job_id, so a later
+                # re-registration of the same name is not blocked.
+                logger.info(
+                    "Reminder %s for agent %s is already past (%s); leaving "
+                    "it to the sweep", trig.name, role, trig.at,
+                )
+                return
+            self._scheduler.add_job(
+                _fire, trigger="date", run_date=when, id=job_id,
+            )
+        elif trig.type == "interval":
             self._scheduler.add_job(
                 _fire, trigger="interval", minutes=trig.minutes, id=job_id,
             )
@@ -254,6 +297,31 @@ class TriggerRegistry:
             )
         self._seen_job_ids.add(job_id)
         self._specs_by_job_id[job_id] = trig
+
+    def _drop_job(self, job_id: str) -> bool:
+        """Remove a scheduled job and forget its bookkeeping.
+
+        Returns True if the scheduler actually had it. Freeing ``job_id`` from
+        ``_seen_job_ids`` matters: without it the duplicate-id guard would
+        refuse to re-register the same trigger name after a one-shot fired or
+        a reminder was cancelled.
+        """
+        removed = True
+        try:
+            self._scheduler.remove_job(job_id)
+        except Exception:  # noqa: BLE001 - already gone is success here
+            removed = False
+        self._seen_job_ids.discard(job_id)
+        self._specs_by_job_id.pop(job_id, None)
+        return removed
+
+    def remove_job_for(self, role: str, name: str) -> bool:
+        """Drop a live scheduled job by role and trigger name (#396).
+
+        Used by ``cancel_reminder`` so a cancellation takes effect now rather
+        than at the next boot.
+        """
+        return self._drop_job(f"{role}:{name}")
 
     def _register_webhook(self, role: str, trig: TriggerSpec) -> None:
         # Release A: webhook triggers are served ONLY by the authenticated
