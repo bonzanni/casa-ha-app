@@ -2867,6 +2867,53 @@ def test_a_result_ready_attempt_with_a_live_pending_is_rewound(spool):
     assert rec["status"] == "awaiting_redirect" and rec["outcome"] is None
 
 
+def test_a_live_hold_raises_claimed_on_the_open_attempt(spool):
+    """Spec §6: while a hold lives the attempt stays OPEN, but the `claimed`
+    flag is what "tells its next life the payload may or may not have been
+    seen" — so it must be raised the moment the hold exists, not only when
+    the flow finally terminalizes. A successor consumer reading
+    `result_ready, claimed: false` would call `collect()`, take the ENOENT
+    (retryable, never ackable, §7) and retry until the hold ages out instead
+    of learning its predecessor already renamed the result.
+
+    The raise is a MINIMAL update, not a rebuild: the worker's durable
+    schedule state (§8) survives, so a redelivery budget is never reset by a
+    reconcile."""
+    now = time.time()
+    h, _claim = _publish(spool, "hold-raises-claimed")
+    assert spool.update_attempt_nudge(PLUGIN, h, nudges=2,
+                                      next_nudge_ts=now + 300) is True
+    _rec, held = cs.collect(_pdir(spool), h)
+
+    report = spool.attempts_pass(now=now, boot=True)
+
+    assert report.claimed_raised == 1 and report.collected == 0
+    rec = _attempt_of(spool, h)
+    assert rec["status"] == "result_ready" and rec["outcome"] is None
+    assert rec["claimed"] is True
+    assert (rec["nudges"], rec["next_nudge_ts"]) == (2, now + 300), \
+        "raising the flag must not rebuild the record from artifacts"
+    assert held.exists(), "the held file belongs to its holder"
+
+    again = spool.attempts_pass(now=now, boot=True)
+    assert again.claimed_raised == 0, "the raise is not re-applied"
+    assert _attempt_of(spool, h)["claimed"] is True
+
+
+def test_a_result_ready_attempt_without_a_hold_keeps_claimed_false(spool):
+    """The companion pin: `claimed` follows the hold witness and nothing
+    else. A published result nobody has renamed leaves the flag alone —
+    only a `.collect-<h>-*` entry proves the rename happened."""
+    now = time.time()
+    h, _claim = _publish(spool, "no-hold-no-claim")
+
+    report = spool.attempts_pass(now=now, boot=True)
+
+    assert report.claimed_raised == 0
+    rec = _attempt_of(spool, h)
+    assert rec["status"] == "result_ready" and rec["claimed"] is False
+
+
 def test_inference_is_blocked_by_a_live_hold(spool):
     """Probe 2: while a `.collect-*` entry exists the attempt stays open —
     "claimed, unconfirmed": the consumer renamed but may have died before

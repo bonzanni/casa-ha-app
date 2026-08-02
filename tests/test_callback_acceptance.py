@@ -56,8 +56,9 @@ The scenarios:
 (l) **eviction record** — a cap-destroyed flow leaves an ``evicted``
     outcome: no silent destruction (INV-CB-007, §9).
 (m) **claimed-unconfirmed convergence** — a consumer that collects and dies
-    without acking leaves the attempt open while its hold lives, and the
-    aged-out hold converges to ``expired_unread, claimed: true`` (§6).
+    without acking leaves the attempt open-but-``claimed`` while its hold
+    lives, and the aged-out hold converges to ``expired_unread,
+    claimed: true`` (§6).
 
 (k) The v0.146→v0.147 boot migration is proved in
 ``tests/test_callback_migration.py`` (legacy episode store + pre-upgrade
@@ -984,11 +985,10 @@ async def test_claimed_but_unconfirmed_collect_converges(facility):
     ``expired_unread`` with ``claimed`` set, which is exactly "the consumer
     may or may not have seen it — redo is safe".
 
-    NOTE (a divergence this rehearsal surfaced, reported and deliberately not
-    papered over): while the hold lives, the OPEN record's ``claimed`` flag is
-    not raised — only the terminal write-ahead sets it. So this test asserts
-    the convergent facts the spec guarantees, and says nothing about the open
-    record's flag.
+    The flag is raised while the hold is still LIVE, not only at the terminal
+    write-ahead: it is what a successor consumer reads to learn its
+    predecessor already renamed the result, instead of retrying a ``collect``
+    that can only ever ENOENT until the hold ages out.
     """
     plugin, declared = "gmail", "authorize"
     eff = effective_name(plugin, declared)
@@ -1006,6 +1006,8 @@ async def test_claimed_but_unconfirmed_collect_converges(facility):
     rec = facility.attempt(plugin, h)
     assert rec["status"] == "result_ready" and rec["outcome"] is None, \
         "a rename is not a receipt — only the ack (or absence) settles it"
+    assert rec["claimed"] is True, \
+        "the open record tells a successor the payload may already be taken"
     assert facility.holds(plugin, h) == [held.name]
 
     # the credential's own TTL bounds the hold; the sweep retires it with the

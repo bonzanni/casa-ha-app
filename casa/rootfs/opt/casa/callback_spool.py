@@ -811,6 +811,11 @@ class AttemptsReport:
     #: a terminal attempt beside a live artifact, or a ``result_ready`` one
     #: whose flow rewound to a live pending
     reopened: int = 0
+    #: OPEN ``result_ready`` attempts whose ``claimed`` flag was raised from a
+    #: live ``.collect-*`` hold. Deliberately its own counter: nothing is
+    #: rewritten from the artifacts here — the record keeps its binding, its
+    #: mint clock and the worker's schedule, and only the flag moves.
+    claimed_raised: int = 0
     #: ``.ack-<hash>`` receipt tokens consumed — every artifact of the hash
     #: proven gone, then the token itself (spec §7)
     acks_consumed: int = 0
@@ -2196,7 +2201,9 @@ class CallbackSpool:
            artifacts or, with none, retired as an anomaly; a terminal record
            coexisting with ANY live artifact of its hash is provisional and
            is rewritten open; a ``result_ready`` record whose flow rewound
-           to a live pending goes back to ``awaiting_redirect`` (§6).
+           to a live pending goes back to ``awaiting_redirect``; and an open
+           ``result_ready`` record whose hash has a live hold has ``claimed``
+           raised in place (§6).
         4. **Receipt inference** — an open ``result_ready`` attempt whose
            five §6 probes all confirm absence is settled ``collected``.
         5. **Bounds** — terminal records age out at
@@ -2474,7 +2481,13 @@ class CallbackSpool:
         the amendment-6 precedence: result or hold ⇒ ``result_ready``
         (``claimed`` iff a hold exists), else pending or claim ⇒
         ``awaiting_redirect`` — both of which
-        :meth:`_derive_from_artifacts` already encodes."""
+        :meth:`_derive_from_artifacts` already encodes.
+
+        An ALREADY-open ``result_ready`` record is the third case, and it is
+        not a rewrite: a live hold raises its ``claimed`` flag in place (see
+        :meth:`_raise_claimed`). The rewind arm is tried first — a live hold
+        is precisely what proves the flow did NOT rewind — so the two arms
+        can never both fire for one record."""
         for h in invalid:
             if self._flow_artifacts_live(h, dirs):
                 rec = self._rewrite_from_artifacts(plugin, h, dirs=dirs,
@@ -2500,6 +2513,10 @@ class CallbackSpool:
                 if not (self._probe(f"{h}.json", dirs.pend) is True
                         and self._probe(f"{h}.json", dirs.results) is False
                         and self._probe_collect(h, dirs.results) is False):
+                    # Not a rewind. A hold may still have appeared since the
+                    # record was written, and that is a flag change, not a
+                    # rewrite.
+                    self._raise_claimed(plugin, h, dirs, records, report)
                     continue
             else:
                 continue
@@ -2507,6 +2524,43 @@ class CallbackSpool:
             if new is not None:
                 records[h] = new
                 report.reopened += 1
+
+    def _raise_claimed(self, plugin: str, h: str, dirs: _ArtifactDirs,
+                       records: dict, report: AttemptsReport) -> None:
+        """Raise ``claimed`` on an OPEN ``result_ready`` record whose hash has
+        a live ``.collect-<h>-*`` hold (spec §6).
+
+        The flag is the SUCCESSOR CONSUMER's signal while the hold is still
+        live: it "tells its next life the payload may or may not have been
+        seen", and its own store is the tiebreaker. Left false, a successor
+        calls :func:`collect`, takes the ``FileNotFoundError`` that §7 makes
+        retryable-but-never-ackable, and retries until the hold ages out
+        instead of learning its predecessor already took the result. The
+        terminal write-ahead and the reopen-from-terminal path both already
+        set the flag from this same witness (:meth:`_collect_present`, the
+        one :meth:`_derive_from_artifacts` uses); only the already-open
+        record was left stale.
+
+        Deliberately a MINIMAL merge rather than a
+        :meth:`_rewrite_from_artifacts`: the record is not contradicted by
+        the artifacts, it is merely incomplete, and rebuilding it would
+        discard the worker's durable schedule state (``nudges``,
+        ``next_nudge_ts``, ``deferrals``, ``noted``) — resetting a spent
+        redelivery budget, which INV-CB-008 bounds. Not a write-ahead either:
+        no deletion depends on the flag, so a failed write simply leaves the
+        next pass to raise it again from the same hold.
+
+        Ordering is inert for the receipt inference that follows: a live hold
+        already blocks it at probe 2, and the inference never reads
+        ``claimed``.
+        """
+        rec = records[h]
+        if rec["claimed"] or not self._collect_present(h, dirs.results):
+            return
+        raised = dict(rec, claimed=True)
+        if self.write_attempt(plugin, h, raised):
+            records[h] = raised
+            report.claimed_raised += 1
 
     def _infer_receipts(self, plugin: str, dirs: _ArtifactDirs, records: dict,
                         now: float, boot: bool,
