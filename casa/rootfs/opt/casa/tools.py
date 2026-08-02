@@ -9374,6 +9374,13 @@ async def _remove_plugin_callbacks(name: str) -> None:
         import callback_spool
         spool = callback_spool.get_spool()
         if spool is not None:
+            # The spool owns the abort record: it counts the plugin's
+            # unsettled flows and writes a durable `.removals` record BEFORE
+            # the purge, returning False when that record would not go
+            # durable (the purge is then skipped and the orphan GC converges
+            # on the dir later). Best-effort here by design — the plugin is
+            # already unrouted, so a deferred purge changes nothing the
+            # operator can see.
             await asyncio.to_thread(spool.remove_plugin, name)
     except Exception:  # noqa: BLE001
         logger.warning("plugin_remove: callback spool purge failed (%s)",

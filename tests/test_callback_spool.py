@@ -3379,3 +3379,264 @@ def test_an_attempt_resurrected_by_a_replace_dies_with_the_token(spool):
     assert os.listdir(_attempts(spool)) == [], \
         "the resurrected record dies with the token it could not erase"
     assert os.listdir(_results(spool)) == []
+
+
+# ---------------------------------------------------------------------------
+# removal records (`.removals/`) — spec §10, the documented INV-CB-007
+# exception: the per-flow ledger dies with the plugin, so the abort's durable
+# record is a root-level removal record, and the purge NEVER happens without
+# it (plan amendment 11).
+# ---------------------------------------------------------------------------
+
+
+def _removals(spool) -> Path:
+    return Path(spool.root) / ".removals"
+
+
+def _removal_files(spool) -> list[str]:
+    d = _removals(spool)
+    if not d.is_dir():
+        return []
+    return sorted(n for n in os.listdir(d) if not n.startswith("."))
+
+
+def _read_removal(spool, name: str) -> dict:
+    return json.loads((_removals(spool) / name).read_text())
+
+
+def _removal_rec(*, plugin: str = PLUGIN, count: int = 1,
+                 reason: str = "remove", ts: float, noted: bool = False,
+                 noted_ts: "float | None" = None) -> dict:
+    return {"v": 1, "plugin": plugin, "count": count, "reason": reason,
+            "ts": ts, "noted": noted, "noted_ts": noted_ts}
+
+
+def _put_removal(spool, name: str, rec) -> Path:
+    d = _removals(spool)
+    d.mkdir(exist_ok=True)
+    p = d / name
+    p.write_bytes(rec if isinstance(rec, bytes)
+                  else cs.canonical_marker_bytes(rec))
+    return p
+
+
+def _fail_strict(monkeypatch) -> None:
+    """Every strict fsync fails — the "record will not go durable" arm."""
+    def boom(fd, what):
+        raise cs.FsyncFailed(errno.EIO, "injected")
+    monkeypatch.setattr(cs, "_fsync_strict", boom)
+
+
+def test_remove_plugin_records_the_unsettled_union_then_purges(spool):
+    """A live pending is one unsettled flow: the abort record goes down
+    durably FIRST, then the dir is purged."""
+    h = state_hash("live-1")
+    _put(_pending(spool) / f"{h}.json", time.time())
+
+    assert spool.remove_plugin(PLUGIN) is True
+
+    assert not _pdir(spool).exists()
+    names = _removal_files(spool)
+    assert len(names) == 1 and names[0].startswith(f"{PLUGIN}-")
+    rec = _read_removal(spool, names[0])
+    assert rec["v"] == 1 and rec["plugin"] == PLUGIN
+    assert rec["count"] == 1 and rec["reason"] == "remove"
+    assert rec["noted"] is False and rec["noted_ts"] is None
+    assert abs(rec["ts"] - time.time()) < 60
+
+
+def test_remove_plugin_records_a_terminal_unacked_attempt(spool):
+    """Sol r3 pin: a TERMINAL attempt nobody acked is an outcome the consumer
+    has not read yet — it counts toward the union exactly like an open one."""
+    now = time.time()
+    h = state_hash("terminal-1")
+    rec = ca.terminalize(_attempt_rec(h, now), "expired", now=now)
+    assert spool.write_attempt(PLUGIN, h, rec) is True
+
+    assert spool.remove_plugin(PLUGIN) is True
+
+    names = _removal_files(spool)
+    assert len(names) == 1
+    assert _read_removal(spool, names[0])["count"] == 1
+
+
+def test_an_acked_attempt_is_settled_and_needs_no_record(spool):
+    """The ack SUPERSEDES the record (INV-CB-007 arm (a)): a hash whose
+    receipt token is present is settled, so a plugin holding only that purges
+    directly, with nothing to tell the operator."""
+    now = time.time()
+    h = state_hash("acked-1")
+    assert spool.write_attempt(PLUGIN, h, _attempt_rec(h, now)) is True
+    (_attempts(spool) / f"{cs.ACK_PREFIX}{h}").write_bytes(b"")
+
+    assert spool.remove_plugin(PLUGIN) is True
+
+    assert not _pdir(spool).exists()
+    assert _removal_files(spool) == []
+
+
+def test_remove_plugin_with_nothing_unsettled_writes_no_record(spool):
+    assert spool.remove_plugin(PLUGIN) is True
+
+    assert not _pdir(spool).exists()
+    assert _removal_files(spool) == []
+    assert not _removals(spool).exists(), "no record, no store"
+
+
+def test_remove_plugin_skips_the_purge_without_a_durable_record(
+        spool, monkeypatch):
+    """Amendment 11 (Sol 1 = Terra 7): a removal with unsettled flows whose
+    record will not go durable must NOT proceed — a purge with no record is
+    the one outcome INV-CB-007's exception cannot absorb. The next orphan-GC
+    pass converges."""
+    h = state_hash("undurable-1")
+    _put(_pending(spool) / f"{h}.json", time.time())
+    _fail_strict(monkeypatch)
+
+    assert spool.remove_plugin(PLUGIN) is False
+
+    assert _pdir(spool).is_dir(), "the plugin dir SURVIVES"
+    assert (_pending(spool) / f"{h}.json").exists()
+    assert _removal_files(spool) == []
+
+
+def test_orphan_gc_records_an_unacked_attempt_before_removing_the_dir(spool):
+    """Spec §10 / Sol r2 B7: a quiescent orphan dir can still hold terminal
+    attempts inside their retention — the GC degrades to the removal
+    exception rather than silently violating the retention promise."""
+    now = time.time()
+    spool.ensure_plugin_dirs("ghost")
+    h = state_hash("ghost-1")
+    rec = ca.terminalize(
+        ca.new_attempt(state_hash=h, minted_ts=now - 5.0, status="result_ready",
+                       now=now), "expired_unread", now=now)
+    assert spool.write_attempt("ghost", h, rec) is True
+    _quiesce(_pdir(spool, "ghost"), now - 5 * DAY)
+
+    removed = spool.gc_orphan_dirs(registry_valid=True,
+                                   member_plugins={PLUGIN}, now=now)
+
+    assert removed == ["ghost"]
+    assert not _pdir(spool, "ghost").exists()
+    names = _removal_files(spool)
+    assert len(names) == 1 and names[0].startswith("ghost-")
+    record = _read_removal(spool, names[0])
+    assert record["reason"] == "orphan_gc"
+    assert record["plugin"] == "ghost" and record["count"] == 1
+    assert record["ts"] == now
+
+
+def test_orphan_gc_skips_a_dir_whose_record_will_not_go_durable(
+        spool, monkeypatch):
+    now = time.time()
+    spool.ensure_plugin_dirs("ghost")
+    h = state_hash("ghost-2")
+    rec = ca.terminalize(
+        ca.new_attempt(state_hash=h, minted_ts=now - 5.0, status="result_ready",
+                       now=now), "expired", now=now)
+    assert spool.write_attempt("ghost", h, rec) is True
+    _quiesce(_pdir(spool, "ghost"), now - 5 * DAY)
+    _fail_strict(monkeypatch)
+
+    removed = spool.gc_orphan_dirs(registry_valid=True,
+                                   member_plugins={PLUGIN}, now=now)
+
+    assert removed == []
+    assert _pdir(spool, "ghost").is_dir(), "the dir stays for the next pass"
+    assert _removal_files(spool) == []
+
+
+def test_orphan_gc_of_a_settled_dir_writes_no_record(spool):
+    """An orphan dir with no unacked attempt is a settled dir: it purges with
+    no record, exactly as before this change."""
+    now = time.time()
+    spool.ensure_plugin_dirs("ghost")
+    h = state_hash("ghost-3")
+    assert spool.write_attempt("ghost", h, _attempt_rec(h, now)) is True
+    (_attempts(spool, "ghost") / f"{cs.ACK_PREFIX}{h}").write_bytes(b"")
+    _quiesce(_pdir(spool, "ghost"), now - 5 * DAY)
+
+    removed = spool.gc_orphan_dirs(registry_valid=True,
+                                   member_plugins={PLUGIN}, now=now)
+
+    assert removed == ["ghost"]
+    assert _removal_files(spool) == []
+
+
+def test_a_record_outlives_the_removal_of_a_same_named_plugin(spool):
+    """`.removals` is a reserved dot-root entry: reinstalling and re-removing
+    the SAME plugin never touches the record its first removal wrote."""
+    h = state_hash("outlive-1")
+    _put(_pending(spool) / f"{h}.json", time.time())
+    assert spool.remove_plugin(PLUGIN) is True
+    first = _removal_files(spool)
+    assert len(first) == 1
+
+    spool.ensure_plugin_dirs(PLUGIN)
+    assert spool.remove_plugin(PLUGIN) is True      # nothing unsettled now
+
+    assert _removals(spool).is_dir()
+    assert _removal_files(spool) == first
+
+
+def test_list_removal_records_retires_a_malformed_entry(spool):
+    now = time.time()
+    _put_removal(spool, f"{PLUGIN}-aa.json", _removal_rec(ts=now))
+    bad = _put_removal(spool, f"{PLUGIN}-bb.json", b"{not json")
+    worse = _put_removal(spool, f"{PLUGIN}-cc.json",
+                         _removal_rec(ts=now, reason="nonsense"))
+
+    records = spool.list_removal_records()
+
+    assert [name for name, _ in records] == [f"{PLUGIN}-aa.json"]
+    assert records[0][1]["count"] == 1
+    assert not bad.exists() and not worse.exists(), "invalid entries retired"
+
+
+def test_mark_removal_noted_sets_the_noted_clock(spool):
+    now = time.time()
+    _put_removal(spool, f"{PLUGIN}-aa.json", _removal_rec(ts=now - 10))
+
+    assert spool.mark_removal_noted(f"{PLUGIN}-aa.json", now=now) is True
+
+    rec = _read_removal(spool, f"{PLUGIN}-aa.json")
+    assert rec["noted"] is True and rec["noted_ts"] == now
+    assert rec["ts"] == now - 10, "the creation clock is untouched"
+
+
+def test_mark_removal_noted_strict_failure_leaves_it_unnoted(
+        spool, monkeypatch):
+    """Notify-then-mark is at-LEAST-once: a mark that will not go durable
+    returns False, the record stays un-noted and the next worker pass
+    retries (one duplicate DM is the accepted cost)."""
+    now = time.time()
+    _put_removal(spool, f"{PLUGIN}-aa.json", _removal_rec(ts=now))
+    _fail_strict(monkeypatch)
+
+    assert spool.mark_removal_noted(f"{PLUGIN}-aa.json", now=now) is False
+
+    rec = _read_removal(spool, f"{PLUGIN}-aa.json")
+    assert rec["noted"] is False and rec["noted_ts"] is None
+
+
+@pytest.mark.parametrize("name,age_d,noted_d,pruned", [
+    ("noted-8d", 8, 8, True),          # noted a week+ ago — pruned
+    ("noted-6d", 6, 6, False),         # inside the retention window
+    ("unnoted-31d", 31, None, True),   # hard age bound, noted or not
+    ("unnoted-10d", 10, None, False),
+    ("noted-late", 20, 1, False),      # Sol r3 item 10: created 20 days ago,
+    #                                    noted YESTERDAY — the prune clock is
+    #                                    noted_ts, so it survives
+])
+def test_prune_removal_records_uses_the_noted_clock_and_a_hard_bound(
+        spool, name, age_d, noted_d, pruned):
+    now = time.time()
+    fname = f"{PLUGIN}-{name}.json"
+    _put_removal(spool, fname, _removal_rec(
+        ts=now - age_d * DAY, noted=noted_d is not None,
+        noted_ts=None if noted_d is None else now - noted_d * DAY))
+
+    count = spool.prune_removal_records(now=now)
+
+    assert count == (1 if pruned else 0)
+    assert (_removals(spool) / fname).exists() is not pruned

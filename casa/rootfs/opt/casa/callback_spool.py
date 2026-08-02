@@ -55,6 +55,7 @@ import fcntl
 import hashlib
 import json
 import logging
+import math
 import os
 import re
 import shutil
@@ -85,10 +86,21 @@ MAX_RESULTS = 256            # fill /data
 MAX_ATTEMPTS = 2048          # attempt files are a few hundred bytes; the cap
 #                              bounds disk and scan cost, not policy
 MAX_COLLECT = 64             # consumer-held `.collect-*` inodes per plugin
+REMOVAL_RECORD_PRUNE_S = 7 * 24 * 3600     # a NOTED removal record is kept a
+#                              week (the operator can still ask about it),
+#                              then pruned
+REMOVAL_RECORD_MAX_AGE_S = 30 * 24 * 3600  # hard bound, noted or not: a
+#                              permanently unconfigured notifier must not
+#                              make removal records immortal (spec §10)
 MARKER_STATE_MAX_BYTES = 1 << 16   # a ready.json / index entry read back for
 #                              the reconcile payload compare is tiny (a few
 #                              hundred bytes); anything past this small cap is
 #                              INVALID, never a large read
+
+REMOVAL_SCHEMA_VERSION = 1
+REMOVAL_REASONS = frozenset({"remove", "orphan_gc"})
+_REMOVAL_KEYS = frozenset({"v", "plugin", "count", "reason", "ts", "noted",
+                           "noted_ts"})
 
 PENDING_DIR = "pending"
 RESULTS_DIR = "results"
@@ -233,6 +245,62 @@ def _hash_of_pending(name: str) -> str | None:
     if name.endswith(".json") and _is_hash(name[:-5]):
         return name[:-5]
     return None
+
+
+def _is_clock(value) -> bool:
+    """A usable clock field: a real, FINITE number (never a bool). Finiteness
+    is not pedantry — a ``NaN`` slipped into ``ts``/``noted_ts`` makes every
+    age comparison False, which would make the record immortal in exactly the
+    store whose whole point is a hard age bound."""
+    return (not isinstance(value, bool) and isinstance(value, (int, float))
+            and math.isfinite(value))
+
+
+def _is_removal_name(name: str) -> bool:
+    """The removal-record file grammar: a plain ``<plugin>-<uuid4hex>.json``
+    component. Dot-prefixed names (this module's own staging residue) are
+    excluded, so a listing can never mistake a half-written stage for a
+    record."""
+    return (_safe_component(name) and not name.startswith(".")
+            and name.endswith(".json"))
+
+
+def _validate_removal(obj) -> dict | None:
+    """Total fail-closed validation of a removal record — a copy, or ``None``.
+
+    Same discipline as :func:`callback_attempts.validate_attempt`: exact key
+    set, real bools, finite numbers, a known ``reason``, and a CONSISTENCY
+    gate between ``noted`` and ``noted_ts`` (a record claiming it was noted
+    but carrying no clock would be pruned by neither rule — it would sit
+    there until the hard bound with no way to tell the worker it is done).
+    Never raises: a corrupt file must read as invalid so the reader retires
+    it, never as an exception into the worker pass."""
+    try:
+        if not isinstance(obj, dict) or set(obj) != _REMOVAL_KEYS:
+            return None
+        if isinstance(obj["v"], bool) or obj["v"] != REMOVAL_SCHEMA_VERSION:
+            return None
+        plugin = obj["plugin"]
+        if not isinstance(plugin, str) or not _safe_component(plugin) \
+                or plugin.startswith("."):
+            return None
+        count = obj["count"]
+        if isinstance(count, bool) or not isinstance(count, int) or count < 0:
+            return None
+        if obj["reason"] not in REMOVAL_REASONS:
+            return None
+        if not _is_clock(obj["ts"]):
+            return None
+        if not isinstance(obj["noted"], bool):
+            return None
+        noted_ts = obj["noted_ts"]
+        if noted_ts is not None and not _is_clock(noted_ts):
+            return None
+        if obj["noted"] != (noted_ts is not None):
+            return None
+        return dict(obj)
+    except Exception:  # noqa: BLE001 — total by contract
+        return None
 
 
 def _hash_of_collect(name: str) -> str | None:
@@ -566,6 +634,60 @@ def _read_envelope_at(name: str, dir_fd: int) -> dict | None:
     finally:
         os.close(fd)
     return callback_attempts.parse_envelope(b"".join(chunks))
+
+
+def _strict_replace_at(name: str, dir_fd: int, data: bytes, *, parent_fd: int,
+                       what: str, parent_what: str, role: str) -> bool:
+    """Staged replace with STRICT durability at every step — the write a
+    dependent deletion keys on (an attempt's write-ahead outcome, a removal
+    record's abort notice).
+
+    Sequence, and why each step is strict: stage 0600 + ``_fsync_strict`` the
+    STAGED FILE (a failure aborts BEFORE the rename, leaving the previous
+    record intact), rename over the target, then ``_fsync_strict`` the
+    directory and the PARENT that names it (a failure returns False although
+    the new record may already be VISIBLE — that is correct: the caller skips
+    its dependent action this pass and a later pass converges).
+
+    Returns True only when fully durable; never raises. Every warning names
+    the *role*, never a hash or a payload (INV-CB-006)."""
+    tmp = f".{name}{REPLACE_TEMP_INFIX}{os.getpid()}-{uuid.uuid4().hex}"
+    try:
+        fd = os.open(tmp, _NEW_FILE_FLAGS, FILE_MODE, dir_fd=dir_fd)
+        try:
+            os.fchmod(fd, FILE_MODE)
+            view = memoryview(data)
+            while view:
+                view = view[os.write(fd, view):]
+            # Strict, unlike _write_new_file's best-effort fsync: the rename
+            # below is what the caller's dependent action keys on, so the
+            # staged bytes must be proven durable FIRST.
+            _fsync_strict(fd, f"staged {role}")
+        finally:
+            os.close(fd)
+    except OSError as exc:                     # FsyncFailed included
+        _unlink_quiet(tmp, dir_fd)
+        logger.warning("callback-spool: %s staging failed (errno %s)",
+                       role, exc.errno)
+        return False
+    try:
+        os.rename(tmp, name, src_dir_fd=dir_fd, dst_dir_fd=dir_fd)
+    except OSError as exc:
+        _unlink_quiet(tmp, dir_fd)
+        logger.warning("callback-spool: %s publish failed (errno %s)",
+                       role, exc.errno)
+        return False
+    try:
+        _fsync_strict(dir_fd, what)
+        # …and the entry that NAMES that directory: on a dir created by an
+        # earlier call this is the only pass that can still prove it durable,
+        # and a crash that loses it loses every record inside.
+        _fsync_strict(parent_fd, parent_what)
+    except FsyncFailed as exc:
+        logger.warning("callback-spool: %s dir fsync failed (errno %s)",
+                       role, exc.errno)
+        return False
+    return True
 
 
 def _link_once(src: str, src_dir_fd: int, dst: str, dst_dir_fd: int) -> bool:
@@ -1714,46 +1836,12 @@ class CallbackSpool:
             logger.warning("callback-spool: attempt record is not "
                            "serializable")
             return False
-        tmp = f".{name}{REPLACE_TEMP_INFIX}{os.getpid()}-{uuid.uuid4().hex}"
-        try:
-            fd = os.open(tmp, _NEW_FILE_FLAGS, FILE_MODE, dir_fd=afd)
-            try:
-                os.fchmod(fd, FILE_MODE)
-                view = memoryview(data)
-                while view:
-                    view = view[os.write(fd, view):]
-                # Strict, unlike _write_new_file's best-effort fsync: the
-                # rename below is what the caller's dependent deletion keys
-                # on, so the staged bytes must be proven durable FIRST.
-                _fsync_strict(fd, "staged attempt")
-            finally:
-                os.close(fd)
-        except OSError as exc:                 # FsyncFailed included
-            _unlink_quiet(tmp, afd)
-            logger.warning("callback-spool: attempt staging failed "
-                           "(errno %s)", exc.errno)
-            return False
-        try:
-            os.rename(tmp, name, src_dir_fd=afd, dst_dir_fd=afd)
-        except OSError as exc:
-            _unlink_quiet(tmp, afd)
-            logger.warning("callback-spool: attempt publish failed "
-                           "(errno %s)", exc.errno)
-            return False
-        try:
-            _fsync_strict(afd, ATTEMPTS_DIR)
-            # …and the entry that NAMES attempts/: on a dir created by an
-            # earlier call this is the only pass that can still prove it
-            # durable, and a crash that loses it loses every record inside.
-            _fsync_strict(pfd, plugin)
-        except FsyncFailed as exc:
-            # The new record may be VISIBLE but is not proven durable; the
-            # caller must skip its dependent deletion this pass (a visible
-            # terminal record beside a live artifact converges next pass).
-            logger.warning("callback-spool: attempts dir fsync failed "
-                           "(errno %s)", exc.errno)
-            return False
-        return True
+        # A False here means the new record may be VISIBLE but is not proven
+        # durable; the caller must skip its dependent deletion this pass (a
+        # visible terminal record beside a live artifact converges next pass).
+        return _strict_replace_at(name, afd, data, parent_fd=pfd,
+                                  what=ATTEMPTS_DIR, parent_what=plugin,
+                                  role="attempt")
 
     def list_attempts(self, plugin: str) -> list[tuple[str, dict]]:
         """``(hash, validated record)`` for every readable, schema-valid
@@ -2931,6 +3019,252 @@ class CallbackSpool:
         logger.warning("callback-spool: %s held %d+ collected results — "
                        "oldest-first deletion applied", plugin, MAX_COLLECT)
 
+    # -- removal records (spec §10 — the INV-CB-007 removal exception) -----
+
+    def _removals_fd(self, *, create: bool) -> int:
+        """The ``.removals/`` store FD, created on demand — a RESERVED
+        dot-root entry, so it is excluded from plugin enumeration and
+        therefore from sweep, recovery and orphan GC alike (a record must
+        outlive the plugin dir whose abort it records)."""
+        if create and self._mkdir(REMOVALS_DIR, self._root_fd):
+            # The directory entry itself must be durable before an entry
+            # inside it is (see _index_fd); the record write's own strict
+            # root fsync is what finally proves it.
+            _fsync(self._root_fd, str(self.root))
+        fd = _open_dir(REMOVALS_DIR, self._root_fd)
+        if create:
+            self._chmod_dir(fd, REMOVALS_DIR)
+        return fd
+
+    def _artifact_hashes(self, plugin: str) -> set[str]:
+        """Hashes named by *plugin*'s credential-bearing artifacts —
+        ``pending/`` ∪ ``.claims/`` ∪ ``results/`` (published and
+        consumer-held alike). By NAME only: casa never opens a held file.
+
+        Best-effort per directory, exactly like :meth:`_flow_artifacts_live`:
+        a directory that will not open contributes nothing rather than
+        failing the scan."""
+        with self._lock:
+            if self._closed or not _safe_component(plugin):
+                return set()
+            try:
+                pfd = self._plugin_fd(plugin)
+            except (OSError, ValueError):
+                return set()
+            try:
+                def names(sub: str) -> list[str]:
+                    try:
+                        fd = _open_dir(sub, pfd)
+                    except OSError:
+                        return []
+                    try:
+                        return _listdir_quiet(fd)
+                    finally:
+                        os.close(fd)
+
+                out = {h for h in (_hash_of_pending(n)
+                                   for n in names(PENDING_DIR))
+                       if h is not None}
+                out |= {n for n in names(CLAIMS_DIR) if _is_hash(n)}
+                for name in names(RESULTS_DIR):
+                    h = _hash_of_pending(name) or _hash_of_collect(name)
+                    if h is not None:
+                        out.add(h)
+                return out
+            finally:
+                os.close(pfd)
+
+    def _unacked_attempts(self, plugin: str) -> set[str]:
+        """Hashes with a VALID attempt record and no ``.ack-<h>`` receipt —
+        open OR terminal (Sol r3): a terminal attempt nobody acked is an
+        outcome the consumer has not read yet, which is precisely what a
+        removal is about to destroy."""
+        return ({h for h, _rec in self.list_attempts(plugin)}
+                - set(self.list_ack_tokens(plugin)))
+
+    def _unsettled_hashes(self, plugin: str) -> set[str]:
+        """Every flow of *plugin* with unfinished business — the union spec
+        §10 counts before a purge: unacked attempts ∪ pendings ∪ claims ∪
+        results ∪ consumer-held collects.
+
+        The artifacts are unioned in unconditionally (not only when they
+        carry an attempt file): a flow casa can still see is a flow the purge
+        aborts, whether or not the ledger has caught up with it. The ack is
+        the one settling verb — a hash whose receipt token is present has
+        been absorbed by the consumer and needs no notice (INV-CB-007 arm
+        (a))."""
+        with self._lock:
+            if self._closed or not _safe_component(plugin):
+                return set()
+            return (self._unacked_attempts(plugin)
+                    | self._artifact_hashes(plugin))
+
+    def _write_removal_record(self, plugin: str, count: int, reason: str, *,
+                              now: float) -> bool:
+        """Write ``.removals/<plugin>-<uuid4hex>.json`` with STRICT
+        durability — the abort's record, and the licence for the purge that
+        follows it (plan amendment 11).
+
+        The per-flow ledger dies with the plugin dir, so this record (and the
+        at-least-once operator note the worker drives from it) is the whole
+        of what INV-CB-007 promises across a removal. Returns True only when
+        the record is proven durable; never raises, and never logs anything
+        but the plugin name (INV-CB-006)."""
+        rec = {"v": REMOVAL_SCHEMA_VERSION, "plugin": plugin,
+               "count": int(count), "reason": reason, "ts": float(now),
+               "noted": False, "noted_ts": None}
+        try:
+            data = canonical_marker_bytes(rec)
+        except (TypeError, ValueError):        # pragma: no cover — all plain
+            logger.warning("callback-spool: removal record is not "
+                           "serializable (%r)", plugin)
+            return False
+        try:
+            rfd = self._removals_fd(create=True)
+        except OSError as exc:
+            logger.warning("callback-spool: removals store unavailable "
+                           "(errno %s)", exc.errno)
+            return False
+        try:
+            return _strict_replace_at(
+                f"{plugin}-{uuid.uuid4().hex}.json", rfd, data,
+                parent_fd=self._root_fd, what=REMOVALS_DIR,
+                parent_what=str(self.root), role="removal record")
+        finally:
+            os.close(rfd)
+
+    def list_removal_records(self) -> list[tuple[str, dict]]:
+        """``(filename, record)`` for every schema-valid removal record,
+        sorted by filename — the worker's note worklist.
+
+        A malformed entry is RETIRED here rather than returned: it can drive
+        no note (nothing in it is trustworthy), and leaving it would make the
+        worker re-read the same garbage on every pass. Staging residue and
+        foreign names are skipped, not retired — :meth:`prune_removal_records`
+        ages residue out on the ``TEMP_TTL_S`` clock the rest of the spool
+        uses. ``[]`` on a closed spool or a store that does not exist."""
+        with self._lock:
+            if self._closed:
+                return []
+            try:
+                rfd = self._removals_fd(create=False)
+            except OSError:
+                return []
+            try:
+                out: list[tuple[str, dict]] = []
+                retired = False
+                for name in sorted(_listdir_quiet(rfd)):
+                    if not _is_removal_name(name):
+                        continue
+                    marker = _read_marker_at(name, rfd)
+                    if marker.state is MarkerState.ABSENT:
+                        continue             # vanished mid-scan
+                    rec = (_validate_removal(marker.payload)
+                           if marker.state is MarkerState.PRESENT else None)
+                    if rec is None:
+                        retired |= _retire_marker_entry(name, rfd)
+                        logger.warning("callback-spool: unreadable removal "
+                                       "record retired")
+                        continue
+                    out.append((name, rec))
+                if retired:
+                    _fsync(rfd, REMOVALS_DIR)
+                return out
+            finally:
+                os.close(rfd)
+
+    def mark_removal_noted(self, filename: str, *, now: float) -> bool:
+        """Record that the operator has been told about this removal —
+        ``noted=True, noted_ts=now``, written STRICTLY.
+
+        The removal note is deliberately notify-THEN-mark (spec §10): the
+        note is dispatched first and this mark follows, so a crash in the
+        window costs one duplicate DM rather than a silently lost notice.
+        False on any failure — an unreadable/invalid record, a store that
+        will not open, a write that will not go durable — and the caller
+        simply retries on its next pass."""
+        if not _is_removal_name(filename):
+            return False
+        with self._lock:
+            if self._closed:
+                return False
+            try:
+                rfd = self._removals_fd(create=False)
+            except OSError:
+                return False
+            try:
+                marker = _read_marker_at(filename, rfd)
+                rec = (_validate_removal(marker.payload)
+                       if marker.state is MarkerState.PRESENT else None)
+                if rec is None:
+                    return False
+                rec = dict(rec, noted=True, noted_ts=float(now))
+                try:
+                    data = canonical_marker_bytes(rec)
+                except (TypeError, ValueError):   # pragma: no cover
+                    return False
+                return _strict_replace_at(
+                    filename, rfd, data, parent_fd=self._root_fd,
+                    what=REMOVALS_DIR, parent_what=str(self.root),
+                    role="removal record")
+            finally:
+                os.close(rfd)
+
+    def prune_removal_records(self, *, now: float) -> int:
+        """Retire spent removal records; returns how many were removed.
+
+        Two clocks, both required (spec §10): a NOTED record goes at
+        ``noted_ts + REMOVAL_RECORD_PRUNE_S`` — the operator has had the
+        notice and a week to ask about it — and ANY record goes at
+        ``ts + REMOVAL_RECORD_MAX_AGE_S``, so a permanently unconfigured
+        notifier cannot make un-noted records immortal (that configuration's
+        note is undeliverable by definition). The two are independent: a
+        record created weeks ago but noted yesterday is inside its retention
+        window and stays.
+
+        Staging residue (a crash between stage and rename) ages out here on
+        the shared ``TEMP_TTL_S`` clock; it is not counted, being nobody's
+        record. Invalid records are :meth:`list_removal_records`'s to
+        retire."""
+        with self._lock:
+            if self._closed:
+                return 0
+            try:
+                rfd = self._removals_fd(create=False)
+            except OSError:
+                return 0
+            try:
+                pruned = 0
+                touched = False
+                for name in sorted(_listdir_quiet(rfd)):
+                    if _is_replace_temp(name):
+                        st = _lstat_quiet(name, rfd)
+                        if st is not None and now - st.st_mtime > TEMP_TTL_S:
+                            touched |= _unlink_quiet(name, rfd)
+                        continue
+                    if not _is_removal_name(name):
+                        continue
+                    marker = _read_marker_at(name, rfd)
+                    rec = (_validate_removal(marker.payload)
+                           if marker.state is MarkerState.PRESENT else None)
+                    if rec is None:
+                        continue             # not this method's to judge
+                    noted_age = (now - rec["noted_ts"] if rec["noted"]
+                                 else None)
+                    spent = (noted_age is not None
+                             and noted_age > REMOVAL_RECORD_PRUNE_S)
+                    aged = now - rec["ts"] > REMOVAL_RECORD_MAX_AGE_S
+                    if not spent and not aged:
+                        continue
+                    if _unlink_quiet(name, rfd):
+                        pruned += 1
+                        touched = True
+                if touched:
+                    _fsync(rfd, REMOVALS_DIR)
+                return pruned
+            finally:
+                os.close(rfd)
+
     # -- gated orphan-dir GC ----------------------------------------------
 
     def gc_orphan_dirs(self, *, registry_valid: bool,
@@ -2944,6 +3278,15 @@ class CallbackSpool:
         artifact checksum hiccup must not delete a live spool), and a dir is
         removed only when it has been quiescent for :data:`QUIESCENCE_S` AND
         holds no entry younger than the pending TTL.
+
+        A quiescent dir cannot hold a live *flow* (every credential TTL is
+        long expired) but it CAN hold terminal-unacked attempts still inside
+        their 7-day retention — casa crashed after the registry removal but
+        before :meth:`remove_plugin`. Those get the same durable removal
+        record (reason ``orphan_gc``) BEFORE the purge, so the retention
+        promise degrades to the §10 removal exception instead of being
+        silently violated; a record that will not go durable SKIPS that dir
+        this pass (it stays quiescent, so the next pass retries).
         """
         if registry_valid is not True:
             return []
@@ -2962,6 +3305,14 @@ class CallbackSpool:
                 # QUIESCENCE_S subsumes the pending-TTL floor, but a future
                 # TTL change must not be able to invert that relationship.
                 if age < QUIESCENCE_S or age < PENDING_TTL_S:
+                    continue
+                unacked = len(self._unacked_attempts(plugin))
+                if unacked and not self._write_removal_record(
+                        plugin, unacked, "orphan_gc", now=now):
+                    # No record, no purge (amendment 11): the dir is still
+                    # quiescent, so the next pass tries again.
+                    logger.warning("callback-spool: orphan GC of %r deferred "
+                                   "— removal record not durable", plugin)
                     continue
                 try:
                     shutil.rmtree(plugin, dir_fd=self._root_fd)
@@ -2988,11 +3339,33 @@ class CallbackSpool:
         the ``.index`` discovery entry keyed by the plugin's ARTIFACT PATH
         (not derivable from the plugin name) is retired separately by the
         reconcile's durable marker pass. Returns True when a dir was removed.
+
+        **Abort-with-notice, and never without it (spec §10, amendment 11).**
+        The purge destroys the per-flow ledger with the plugin, so before it
+        runs the §10 union of unsettled flows is counted and — when non-zero
+        — recorded durably under ``.removals/``. A record that will not go
+        durable SKIPS the purge and returns False: a purge with no record is
+        the one outcome INV-CB-007's removal exception cannot absorb. The
+        caller treats this as best-effort (the plugin is already unrouted)
+        and the orphan GC converges on the dir later. A zero-union removal
+        has nothing to tell anyone and purges directly.
+
+        Documented residual (spec §10): the union scan is check-then-act
+        against a same-uid FD holder, which is outside this facility's threat
+        model — a consumer holding a pre-removal directory FD can mint after
+        the scan, into a plugin already unrouted, so only that flow's abort
+        notice can be lost.
         """
         if not _safe_component(plugin) or plugin.startswith("."):
             raise ValueError(f"unsafe plugin spool name {plugin!r}")
         with self._lock:
             if self._closed:
+                return False
+            unsettled = len(self._unsettled_hashes(plugin))
+            if unsettled and not self._write_removal_record(
+                    plugin, unsettled, "remove", now=time.time()):
+                logger.warning("callback-spool: purge of %r skipped — the "
+                               "removal record would not go durable", plugin)
                 return False
             try:
                 shutil.rmtree(plugin, dir_fd=self._root_fd)
