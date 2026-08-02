@@ -1198,6 +1198,22 @@ def load_agent_from_dir(
         _validate(trig_data, "triggers", trig_path)
         cfg.triggers = _build_triggers(trig_data, agent_dir=agent_dir)
 
+    # reminders.yaml — optional, resident only, AGENT-OWNED (#396).
+    #
+    # Reminders are ordinary triggers and are appended to the same list, but
+    # they live in their own file for one specific reason: config_sync's
+    # three-way reconcile treats an edited `triggers.yaml` as a CONFLICT once
+    # the image ships a changed default, and resolves it "image wins" — which
+    # would silently delete every pending reminder on such an update. This
+    # file is not part of the defaults tree, so reconcile adopts it and never
+    # rewrites it. Validated against the same schema as triggers.yaml.
+    rem_path = os.path.join(agent_dir, "reminders.yaml")
+    if os.path.exists(rem_path):
+        rem_data = _read_yaml(rem_path)
+        _validate(rem_data, "triggers", rem_path)
+        cfg.triggers = list(cfg.triggers) + _build_triggers(
+            rem_data, agent_dir=agent_dir)
+
     # hooks.yaml — optional.
     hooks_path = os.path.join(agent_dir, "hooks.yaml")
     if os.path.exists(hooks_path):

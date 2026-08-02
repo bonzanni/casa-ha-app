@@ -4731,7 +4731,7 @@ async def set_reminder(args: dict) -> dict:
         "prompt": f'Send this exact message via {channel}: "{text}"',
     }
 
-    path = reminders.triggers_path(runtime.agents_dir, role)
+    path = reminders.reminders_path(runtime.agents_dir, role)
     try:
         reminders.append_entry(path, entry)
     except (OSError, ValueError) as exc:
@@ -4793,7 +4793,7 @@ async def cancel_reminder(args: dict) -> dict:
         return _result({"status": "error", "kind": "not_initialized",
                         "message": "runtime not wired"})
 
-    path = reminders.triggers_path(runtime.agents_dir, role)
+    path = reminders.reminders_path(runtime.agents_dir, role)
     try:
         removed = reminders.remove_entry(path, name)
     except (OSError, ValueError) as exc:

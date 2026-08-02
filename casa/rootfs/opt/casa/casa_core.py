@@ -2693,7 +2693,7 @@ async def main() -> None:
     def _remove_fired_reminder(role: str, name: str) -> None:
         import reminders
         reminders.remove_entry(
-            reminders.triggers_path(os.path.join(CONFIG_DIR, "agents"), role),
+            reminders.reminders_path(os.path.join(CONFIG_DIR, "agents"), role),
             name,
         )
 

@@ -182,3 +182,54 @@ def test_date_trigger_valid_under_schema_version_2():
         "name": "reminder-a1b2c3", "type": "date",
         "at": "2026-08-03T08:00:00+02:00", "one_shot": True,
         "channel": "telegram", "prompt": "x"}, 2), SCHEMA)
+
+
+# --- #396 round 2: one_shot <=> date, and date names are reminder-bound ----
+
+
+def test_date_trigger_requires_one_shot_true():
+    """A date trigger without one_shot would be skipped at registration when
+    past AND skipped by the sweep — silently never delivered."""
+    with pytest.raises(jsonschema.ValidationError):
+        jsonschema.validate(_doc({
+            "name": "reminder-a1b2c3", "type": "date",
+            "at": "2026-08-03T08:00:00+02:00", "channel": "telegram",
+            "prompt": "x"}, 1), SCHEMA)
+    with pytest.raises(jsonschema.ValidationError):
+        jsonschema.validate(_doc({
+            "name": "reminder-a1b2c3", "type": "date", "one_shot": False,
+            "at": "2026-08-03T08:00:00+02:00", "channel": "telegram",
+            "prompt": "x"}, 1), SCHEMA)
+
+
+def test_date_trigger_name_must_carry_the_reminder_prefix():
+    """Post-fire cleanup is prefix-bounded, so a date trigger without the
+    prefix would re-fire on every restart."""
+    with pytest.raises(jsonschema.ValidationError):
+        jsonschema.validate(_doc({
+            "name": "garbage-day", "type": "date", "one_shot": True,
+            "at": "2026-08-03T08:00:00+02:00", "channel": "telegram",
+            "prompt": "x"}, 1), SCHEMA)
+
+
+def test_date_trigger_forbids_prompt_file():
+    """The sweep delivers the stored prompt verbatim; it has no agent_dir to
+    resolve a file against, so a prompt_file reminder would send nothing."""
+    with pytest.raises(jsonschema.ValidationError):
+        jsonschema.validate(_doc({
+            "name": "reminder-a1b2c3", "type": "date", "one_shot": True,
+            "at": "2026-08-03T08:00:00+02:00", "channel": "telegram",
+            "prompt_file": "prompts/x.md"}, 1), SCHEMA)
+
+
+def test_one_shot_true_is_rejected_on_cron_and_interval():
+    """one_shot on a non-date trigger promises a self-removal that cannot
+    happen: the entry survives and re-fires after every restart."""
+    for trig in (
+        {"name": "reminder-a1b2c3", "type": "cron", "schedule": "0 7 * * thu",
+         "one_shot": True, "channel": "telegram", "prompt": "x"},
+        {"name": "reminder-a1b2c3", "type": "interval", "minutes": 60,
+         "one_shot": True, "channel": "telegram", "prompt": "x"},
+    ):
+        with pytest.raises(jsonschema.ValidationError):
+            jsonschema.validate(_doc(trig, 1), SCHEMA)

@@ -288,12 +288,23 @@ class TriggerRegistry:
                     f"must be a 5-field string; got {trig.schedule!r}"
                 )
             minute, hour, day, month, day_of_week = fields
+            # #396: a recurring reminder carries its first occurrence in
+            # ``at``. Passing it as start_date stops the series firing BEFORE
+            # the date the user asked for — "every Thursday from the 20th"
+            # set on the 3rd would otherwise fire on the 6th and 13th.
+            # Recurrence is still driven by the cron fields, evaluated in the
+            # scheduler's timezone, so this does not affect DST correctness.
+            extra: dict = {}
+            if trig.at:
+                import reminders
+                extra["start_date"] = reminders.parse_at(trig.at)
             self._scheduler.add_job(
                 _fire, trigger="cron",
                 minute=minute, hour=hour, day=day, month=month,
                 # #343: cron 0/7=Sunday vs APScheduler 3.x 0=Monday —
                 # translate to day names (identical meaning in both).
                 day_of_week=_translate_cron_dow(day_of_week), id=job_id,
+                **extra,
             )
         self._seen_job_ids.add(job_id)
         self._specs_by_job_id[job_id] = trig
@@ -314,6 +325,16 @@ class TriggerRegistry:
         self._seen_job_ids.discard(job_id)
         self._specs_by_job_id.pop(job_id, None)
         return removed
+
+    def has_job(self, role: str, name: str) -> bool:
+        """True if a live scheduled job exists for this role and name (#396).
+
+        The reminder sweep consults this to keep ownership exclusive: if the
+        scheduler still holds the job it WILL deliver it, so the sweep must
+        not. Without this the two race for a reminder whose time has just
+        passed and the user gets it twice.
+        """
+        return f"{role}:{name}" in self._seen_job_ids
 
     def remove_job_for(self, role: str, name: str) -> bool:
         """Drop a live scheduled job by role and trigger name (#396).

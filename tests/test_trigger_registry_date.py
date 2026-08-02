@@ -252,3 +252,34 @@ async def test_date_job_outside_the_window_is_not_listed():
         assert reg.list_jobs_for(role="assistant", within_hours=24) == []
     finally:
         sched.shutdown(wait=False)
+
+
+async def test_recurring_reminder_passes_its_anchor_as_start_date():
+    """Sol r1 #3 — the series must not fire before the first occurrence the
+    user asked for."""
+    from config import TriggerSpec
+
+    sched = _make_scheduler()
+    reg = _registry(scheduler=sched)
+    anchor = "2099-08-20T07:00:00+02:00"
+    reg.register_agent("assistant", [TriggerSpec(
+        name="reminder-rec333", type="cron", schedule="0 7 * * thu",
+        at=anchor, channel="telegram", prompt="x")], ["telegram"])
+
+    kwargs = sched.add_job.call_args.kwargs
+    assert kwargs["trigger"] == "cron"
+    assert kwargs["day_of_week"] == "thu"
+    assert kwargs["start_date"].isoformat() == anchor
+
+
+async def test_operator_cron_without_an_anchor_passes_no_start_date():
+    """A hand-authored trigger has no `at`; it must keep firing from now."""
+    from config import TriggerSpec
+
+    sched = _make_scheduler()
+    reg = _registry(scheduler=sched)
+    reg.register_agent("assistant", [TriggerSpec(
+        name="morning", type="cron", schedule="0 7 * * *",
+        channel="telegram", prompt="x")], ["telegram"])
+
+    assert "start_date" not in sched.add_job.call_args.kwargs

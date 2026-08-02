@@ -15,6 +15,8 @@ the exact time she has set, so a misread is obvious straight away:
   the ones you have.
 - **A reminder due while Casa is restarting is no longer lost.** It arrives as
   soon as Casa is back, marked as late, instead of silently never coming.
+- **Reminders survive Casa updates**, including updates that change the shipped
+  default schedule for your agents.
 
 ### Fixed
 

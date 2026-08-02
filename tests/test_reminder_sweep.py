@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import pathlib
 import types
 from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
@@ -32,8 +33,10 @@ def _seed(path):
 class Env:
     runtime: object
     bus: object
+    registry: object
+    reminders_path: str
+    butler_reminders_path: str
     triggers_path: str
-    butler_triggers_path: str
 
 
 @pytest.fixture
@@ -43,15 +46,22 @@ def env(tmp_path):
         (agents_dir / role).mkdir(parents=True)
         _seed(agents_dir / role / "triggers.yaml")
 
+    from aiohttp import web
+    from trigger_registry import TriggerRegistry
+
     bus = MagicMock()
     bus.send = AsyncMock()
+    registry = TriggerRegistry(scheduler=MagicMock(), app=web.Application(),
+                               bus=bus)
     runtime = types.SimpleNamespace(
-        agents_dir=str(agents_dir), bus=bus,
+        agents_dir=str(agents_dir), bus=bus, trigger_registry=registry,
         role_configs={"assistant": object(), "butler": object()},
     )
-    return Env(runtime=runtime, bus=bus,
-               triggers_path=str(agents_dir / "assistant" / "triggers.yaml"),
-               butler_triggers_path=str(agents_dir / "butler" / "triggers.yaml"))
+    return Env(
+        runtime=runtime, bus=bus, registry=registry,
+        reminders_path=str(agents_dir / "assistant" / "reminders.yaml"),
+        butler_reminders_path=str(agents_dir / "butler" / "reminders.yaml"),
+        triggers_path=str(agents_dir / "assistant" / "triggers.yaml"))
 
 
 def _reminder(name="reminder-old111", at=OVERDUE, text="Bins."):
@@ -66,7 +76,7 @@ def _names(path):
 
 
 async def test_overdue_reminder_is_delivered_and_removed(env):
-    reminders.append_entry(env.triggers_path, _reminder())
+    reminders.append_entry(env.reminders_path, _reminder())
 
     delivered = await reminders.sweep_reminders(env.runtime, NOW)
 
@@ -76,11 +86,11 @@ async def test_overdue_reminder_is_delivered_and_removed(env):
     assert "Bins." in msg.content
     assert msg.target == "assistant"
     assert msg.channel == "telegram"
-    assert "reminder-old111" not in _names(env.triggers_path)
+    assert "reminder-old111" not in _names(env.reminders_path)
 
 
 async def test_the_swept_message_is_marked_late(env):
-    reminders.append_entry(env.triggers_path, _reminder())
+    reminders.append_entry(env.reminders_path, _reminder())
     await reminders.sweep_reminders(env.runtime, NOW)
     msg = env.bus.send.await_args.args[0]
     assert msg.context.get("late") is True
@@ -88,35 +98,47 @@ async def test_the_swept_message_is_marked_late(env):
 
 
 async def test_future_reminder_is_left_alone(env):
-    reminders.append_entry(env.triggers_path, _reminder("reminder-new222", LATER))
+    reminders.append_entry(env.reminders_path, _reminder("reminder-new222", LATER))
 
     delivered = await reminders.sweep_reminders(env.runtime, NOW)
 
     assert delivered == 0
     env.bus.send.assert_not_awaited()
-    assert "reminder-new222" in _names(env.triggers_path)
+    assert "reminder-new222" in _names(env.reminders_path)
 
 
 async def test_recurring_reminders_are_never_swept(env):
-    reminders.append_entry(env.triggers_path, {
+    reminders.append_entry(env.reminders_path, {
         "name": "reminder-rec333", "type": "cron", "schedule": "0 7 * * thu",
         "one_shot": False, "channel": "telegram", "prompt": "x"})
 
     assert await reminders.sweep_reminders(env.runtime, NOW) == 0
     env.bus.send.assert_not_awaited()
-    assert "reminder-rec333" in _names(env.triggers_path)
+    assert "reminder-rec333" in _names(env.reminders_path)
 
 
 async def test_operator_triggers_are_never_swept(env):
-    """The heartbeat and morning briefing are not the sweep's business."""
+    """The heartbeat and morning briefing live in triggers.yaml and are not
+    the sweep's business — it only ever reads reminders.yaml."""
     assert await reminders.sweep_reminders(env.runtime, NOW) == 0
     env.bus.send.assert_not_awaited()
     assert _names(env.triggers_path) == ["heartbeat"]
 
 
+async def test_the_sweep_never_touches_the_operator_file(env):
+    """config_sync can overwrite triggers.yaml on an update; reminders must
+    not be in it. Prove the sweep neither reads nor writes it."""
+    before = pathlib.Path(env.triggers_path).read_text()
+    reminders.append_entry(env.reminders_path, _reminder())
+
+    await reminders.sweep_reminders(env.runtime, NOW)
+
+    assert pathlib.Path(env.triggers_path).read_text() == before
+
+
 async def test_every_role_is_swept_not_just_the_first(env):
-    reminders.append_entry(env.triggers_path, _reminder("reminder-aaa111"))
-    reminders.append_entry(env.butler_triggers_path, _reminder("reminder-bbb222"))
+    reminders.append_entry(env.reminders_path, _reminder("reminder-aaa111"))
+    reminders.append_entry(env.butler_reminders_path, _reminder("reminder-bbb222"))
 
     assert await reminders.sweep_reminders(env.runtime, NOW) == 2
 
@@ -126,7 +148,7 @@ async def test_every_role_is_swept_not_just_the_first(env):
 
 async def test_removal_failure_leaves_it_for_the_next_sweep(env, monkeypatch):
     """At-least-once (spec §8): a duplicate nudge beats a missed reminder."""
-    reminders.append_entry(env.triggers_path, _reminder())
+    reminders.append_entry(env.reminders_path, _reminder())
 
     def boom(*a, **k):
         raise OSError("disk full")
@@ -136,29 +158,84 @@ async def test_removal_failure_leaves_it_for_the_next_sweep(env, monkeypatch):
 
     assert delivered == 1
     env.bus.send.assert_awaited_once()
-    assert "reminder-old111" in _names(env.triggers_path)
+    assert "reminder-old111" in _names(env.reminders_path)
 
 
 async def test_a_delivery_failure_does_not_remove_the_entry(env):
     """If the bus rejects the send, the reminder is still owed."""
-    reminders.append_entry(env.triggers_path, _reminder())
+    reminders.append_entry(env.reminders_path, _reminder())
     env.bus.send.side_effect = RuntimeError("bus down")
 
     delivered = await reminders.sweep_reminders(env.runtime, NOW)
 
     assert delivered == 0
-    assert "reminder-old111" in _names(env.triggers_path)
+    assert "reminder-old111" in _names(env.reminders_path)
 
 
 async def test_one_bad_role_does_not_stop_the_others(env):
-    reminders.append_entry(env.butler_triggers_path, _reminder("reminder-bbb222"))
+    reminders.append_entry(env.butler_reminders_path, _reminder("reminder-bbb222"))
     env.runtime.role_configs = {"ghost": object(), "butler": object()}
 
     assert await reminders.sweep_reminders(env.runtime, NOW) == 1
 
 
 async def test_sweeping_twice_delivers_once(env):
-    reminders.append_entry(env.triggers_path, _reminder())
+    reminders.append_entry(env.reminders_path, _reminder())
 
     assert await reminders.sweep_reminders(env.runtime, NOW) == 1
     assert await reminders.sweep_reminders(env.runtime, NOW) == 0
+
+
+# ---------------------------------------------------------------------------
+# Exclusive ownership between the scheduler and the sweep
+# ---------------------------------------------------------------------------
+
+
+async def test_a_reminder_with_a_live_job_is_not_swept(env):
+    """The scheduler still owns it and WILL deliver it. Without this the two
+    race for a reminder whose time has just passed and it arrives twice."""
+    from config import TriggerSpec
+
+    reminders.append_entry(env.reminders_path, _reminder())
+    # Register a live job under the same role:name.
+    env.registry.register_agent("assistant", [TriggerSpec(
+        name="reminder-old111", type="cron", schedule="0 7 * * thu",
+        channel="telegram", prompt="x")], ["telegram"])
+
+    delivered = await reminders.sweep_reminders(env.runtime, NOW)
+
+    assert delivered == 0
+    env.bus.send.assert_not_awaited()
+    assert "reminder-old111" in _names(env.reminders_path)
+
+
+async def test_an_overdue_reminder_without_a_live_job_is_swept(env):
+    """The post-restart case: jobs are memory-only, so a past-dated reminder
+    has no job and the sweep is the only thing that can deliver it."""
+    reminders.append_entry(env.reminders_path, _reminder())
+
+    assert await reminders.sweep_reminders(env.runtime, NOW) == 1
+
+
+async def test_an_entry_with_no_prompt_is_left_in_place(env):
+    """Refuse rather than send an empty message and delete the evidence."""
+    bad = _reminder()
+    bad["prompt"] = "   "
+    reminders.append_entry(env.reminders_path, bad)
+
+    delivered = await reminders.sweep_reminders(env.runtime, NOW)
+
+    assert delivered == 0
+    env.bus.send.assert_not_awaited()
+    assert "reminder-old111" in _names(env.reminders_path)
+
+
+async def test_a_date_entry_missing_one_shot_is_still_swept(env):
+    """Defence in depth: membership is decided on type alone, so an entry
+    that somehow lacked the flag is not skipped by BOTH registration and the
+    sweep and thereby lost."""
+    entry = _reminder()
+    del entry["one_shot"]
+    reminders.append_entry(env.reminders_path, entry)
+
+    assert await reminders.sweep_reminders(env.runtime, NOW) == 1

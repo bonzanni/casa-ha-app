@@ -68,15 +68,21 @@
             }
           },
           {
-            "$comment": "#396: a point-in-time reminder. `at` is an ISO-8601 instant WITH offset. Cron has no year field, so a dated one-shot written as cron is an ANNUAL trigger in disguise — this type is what removes that trap.",
+            "$comment": "#396: a point-in-time reminder. `at` is an ISO-8601 instant WITH offset. Cron has no year field, so a dated one-shot written as cron is an ANNUAL trigger in disguise — this type is what removes that trap. A date trigger is one-shot BY DEFINITION (one_shot must be true) and must carry the reserved reminder- name prefix: the post-fire cleanup that makes one_shot work is bounded to that prefix, so a date trigger without it would re-fire on every restart. `prompt_file` is forbidden because the sweep delivers the stored prompt verbatim and has no agent_dir to resolve a file against.",
             "if": {"properties": {"type": {"const": "date"}}},
             "then": {
-              "required": ["at", "channel"],
-              "oneOf": [
-                {"required": ["prompt"], "not": {"required": ["prompt_file"]}},
-                {"required": ["prompt_file"], "not": {"required": ["prompt"]}}
-              ]
+              "required": ["at", "channel", "one_shot", "prompt"],
+              "not": {"required": ["prompt_file"]},
+              "properties": {
+                "name": {"pattern": "^reminder-"},
+                "one_shot": {"const": true}
+              }
             }
+          },
+          {
+            "$comment": "#396: one_shot is meaningful ONLY for date triggers. Allowing it on cron/interval would promise a self-removal that cannot happen — the cleanup callback is prefix-bounded, so the entry would survive and re-fire after every restart.",
+            "if": {"required": ["one_shot"], "properties": {"one_shot": {"const": true}}},
+            "then": {"properties": {"type": {"const": "date"}}}
           }
         ]
       }

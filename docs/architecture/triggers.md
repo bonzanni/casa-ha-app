@@ -21,15 +21,29 @@ they are `architecture/callbacks.md`.
 declare webhooks only.**
 
 **A reminder is a trigger, not a separate thing.** A resident creates one through a narrow
-writer that may only touch entries carrying a reserved name prefix in its own file;
-everything downstream — registration, firing, listing — is the ordinary trigger path. One-off
-reminders use the point-in-time `date` type, because cron has no year field and a dated
-one-shot written as cron is an *annual* trigger in disguise.
+writer that may only touch entries carrying a reserved name prefix; everything downstream —
+registration, firing, listing — is the ordinary trigger path. One-off reminders use the
+point-in-time `date` type, because cron has no year field and a dated one-shot written as
+cron is an *annual* trigger in disguise.
+
+**Reminders live in their own file, and that placement is load-bearing.** They are declared
+in an agent-owned `reminders.yaml` beside `triggers.yaml`, and the loader merges the two into
+one list. The separation exists because configuration reconciliation resolves an edited
+image-owned file against a changed shipped default as *image wins* — so reminders kept in
+`triggers.yaml` would be deleted wholesale by the first update that touched its default,
+which is precisely the durability this feature exists to provide. A file absent from the
+defaults tree is adopted and never rewritten.
 
 **A reminder still present with a past fire time is one that is owed.** The entry is the
 record and delivery removes it, so there is no second store to keep in sync. This is what
 lets a sweep recover occurrences the process was down for — something the scheduler itself
-cannot do.
+cannot do. Ownership is exclusive: while a live job exists the scheduler owns delivery and
+the sweep leaves it alone.
+
+**A recurring reminder keeps its first occurrence as an anchor.** The derived cron fields
+drive the recurrence — evaluated in the scheduler's timezone, which is what keeps a series
+firing at the same local time across a DST boundary — while the anchor becomes the
+scheduler's start date, so "every Thursday from the 20th" cannot fire on the 6th.
 
 **Every webhook trigger arrives on one wildcard route.** There is no route per trigger. The
 name in the path is looked up against a registry, and an unknown name is refused before any
@@ -128,7 +142,15 @@ Presence is the record: an entry still on disk with a past fire time *is* the ev
 delivery is owed, which is why removal happens only after a successful send. The red case is
 an overdue entry that no sweep ever delivers. Delivery is consequently at-least-once — a
 failed removal redelivers — because a duplicate reminder is a better failure than a missing
-one.
+one. The scheduler and the sweep never both deliver: the sweep skips any reminder that still
+has a live job, so the two never race for one whose time has just passed.
+
+What it does not cover — **"delivered" means placed on the bus, not received by the human.**
+The entry is removed once the turn is dispatched, so a reminder lost further down the channel
+(a Telegram send that fails while the transport is reconnecting) is not retried. This is the
+same contract every other trigger has had since the beginning, and closing it would need an
+end-to-end receipt through the whole turn pipeline rather than anything reminder-specific. It
+is a known residual, not an oversight.
 
 ## Failure behavior
 

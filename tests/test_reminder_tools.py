@@ -34,8 +34,9 @@ def _seed(path):
 @dataclass
 class Env:
     agents_dir: str
+    reminders_path: str
+    butler_reminders_path: str
     triggers_path: str
-    butler_triggers_path: str
     registry: object
     scheduler: object
 
@@ -59,7 +60,7 @@ def env(tmp_path, monkeypatch):
 
     def _remove_fired(role, name):
         reminders.remove_entry(
-            reminders.triggers_path(str(agents_dir), role), name)
+            reminders.reminders_path(str(agents_dir), role), name)
 
     registry = TriggerRegistry(scheduler=scheduler, app=web.Application(),
                                bus=bus, on_one_shot_fired=_remove_fired)
@@ -84,8 +85,9 @@ def env(tmp_path, monkeypatch):
     try:
         yield Env(
             agents_dir=str(agents_dir),
+            reminders_path=str(agents_dir / "assistant" / "reminders.yaml"),
+            butler_reminders_path=str(agents_dir / "butler" / "reminders.yaml"),
             triggers_path=str(agents_dir / "assistant" / "triggers.yaml"),
-            butler_triggers_path=str(agents_dir / "butler" / "triggers.yaml"),
             registry=registry, scheduler=scheduler,
         )
     finally:
@@ -93,6 +95,9 @@ def env(tmp_path, monkeypatch):
 
 
 def _entries(path):
+    import os
+    if not os.path.exists(path):
+        return []
     with open(path, encoding="utf-8") as fh:
         return yaml.safe_load(fh)["triggers"]
 
@@ -114,7 +119,7 @@ async def test_one_shot_writes_a_date_entry(env):
 
     assert out["status"] == "ok"
     assert out["name"].startswith("reminder-")
-    entry = _find(env.triggers_path, out["name"])
+    entry = _find(env.reminders_path, out["name"])
     assert entry["type"] == "date"
     assert entry["one_shot"] is True
     assert entry["channel"] == "telegram"
@@ -127,7 +132,7 @@ async def test_the_prompt_is_imperative(env):
     from tools import set_reminder
 
     out = _payload(await set_reminder.handler({"at": FUTURE, "text": "Bins."}))
-    prompt = _find(env.triggers_path, out["name"])["prompt"]
+    prompt = _find(env.reminders_path, out["name"])["prompt"]
     assert prompt.lower().startswith("send this exact message")
     assert "Bins." in prompt
 
@@ -138,11 +143,13 @@ async def test_weekly_writes_a_cron_entry_with_a_day_name(env):
     out = _payload(await set_reminder.handler({
         "at": FUTURE_THURSDAY, "text": "Gym.", "repeat": "weekly"}))
 
-    entry = _find(env.triggers_path, out["name"])
+    entry = _find(env.reminders_path, out["name"])
     assert entry["type"] == "cron"
     assert entry["schedule"] == "0 7 * * thu"
     assert entry["one_shot"] is False
-    assert "at" not in entry
+    # The anchor is retained as the scheduler's start_date so the series does
+    # not fire before the first occurrence the user asked for (Sol r1 #3).
+    assert entry["at"].startswith("2099-08-06T07:00:00")
 
 
 async def test_recurring_reminder_is_not_one_shot(env):
@@ -152,7 +159,7 @@ async def test_recurring_reminder_is_not_one_shot(env):
         out = _payload(await set_reminder.handler({
             "at": FUTURE_THURSDAY, "text": "x", "repeat": repeat}))
         assert out["status"] == "ok", repeat
-        assert _find(env.triggers_path, out["name"])["one_shot"] is False
+        assert _find(env.reminders_path, out["name"])["one_shot"] is False
 
 
 async def test_the_job_is_registered_immediately(env):
@@ -172,10 +179,16 @@ async def test_response_echoes_the_resolved_time_and_repeat(env):
     assert out["at"].startswith("2099-08-03T08:00:00")
 
 
-async def test_existing_triggers_are_untouched(env):
+async def test_the_operator_trigger_file_is_never_touched(env):
+    """config_sync can overwrite triggers.yaml on an update, so reminders
+    must not live there — and set_reminder must not write to it at all."""
+    import pathlib as _pl
     from tools import set_reminder
 
+    before = _pl.Path(env.triggers_path).read_text()
     await set_reminder.handler({"at": FUTURE, "text": "Bins."})
+
+    assert _pl.Path(env.triggers_path).read_text() == before
     assert _entries(env.triggers_path)[0]["name"] == "heartbeat"
 
 
@@ -185,7 +198,7 @@ async def test_writes_only_to_the_calling_roles_own_file(env):
 
     await set_reminder.handler({"at": FUTURE, "text": "Bins."})
     assert all(not t["name"].startswith("reminder-")
-               for t in _entries(env.butler_triggers_path))
+               for t in _entries(env.butler_reminders_path))
 
 
 async def test_rejects_an_unknown_repeat(env):
@@ -194,7 +207,7 @@ async def test_rejects_an_unknown_repeat(env):
     out = _payload(await set_reminder.handler({
         "at": FUTURE, "text": "x", "repeat": "fortnightly"}))
     assert out["status"] == "error"
-    assert _entries(env.triggers_path) == _entries(env.triggers_path)[:1]
+    assert _entries(env.reminders_path) == []
 
 
 async def test_rejects_a_naive_at(env):
@@ -211,7 +224,7 @@ async def test_rejects_a_time_in_the_past(env):
     out = _payload(await set_reminder.handler({
         "at": "2000-01-01T08:00:00+02:00", "text": "x"}))
     assert out["status"] == "error"
-    assert len(_entries(env.triggers_path)) == 1
+    assert _entries(env.reminders_path) == []
 
 
 async def test_rejects_empty_text(env):
@@ -230,7 +243,7 @@ async def test_registration_failure_rolls_back_the_entry(env):
     out = _payload(await set_reminder.handler({"at": FUTURE, "text": "Bins."}))
 
     assert out["status"] == "error"
-    assert len(_entries(env.triggers_path)) == 1
+    assert _entries(env.reminders_path) == []
 
 
 async def test_refuses_outside_a_turn_context(env):
@@ -259,7 +272,7 @@ async def test_cancels_a_reminder_it_created(env):
 
     assert out["status"] == "ok"
     assert all(t["name"] != created["name"]
-               for t in _entries(env.triggers_path))
+               for t in _entries(env.reminders_path))
     env.scheduler.remove_job.assert_called_with(
         f"assistant:{created['name']}")
 

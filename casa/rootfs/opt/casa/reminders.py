@@ -114,7 +114,13 @@ def derive_schedule(at: datetime, repeat: str) -> dict[str, str]:
         schedule = f"{minute} {hour} * * {_DOW_BY_WEEKDAY[at.weekday()]}"
     else:  # monthly
         schedule = f"{minute} {hour} {at.day} * *"
-    return {"type": "cron", "schedule": schedule}
+    # ``at`` is retained as the ANCHOR — the first occurrence — and becomes
+    # the scheduler's start_date. Without it a "every Thursday from the 20th"
+    # reminder set on the 3rd would fire on the 6th and 13th, two occurrences
+    # the user never asked for. It does NOT drive recurrence: the cron fields
+    # above do, evaluated in the scheduler's timezone, which is what keeps the
+    # series DST-correct.
+    return {"type": "cron", "schedule": schedule, "at": at.isoformat()}
 
 
 # ---------------------------------------------------------------------------
@@ -122,9 +128,19 @@ def derive_schedule(at: datetime, repeat: str) -> dict[str, str]:
 # ---------------------------------------------------------------------------
 
 
-def triggers_path(agents_dir: str, role: str) -> str:
-    """Absolute path to *role*'s triggers.yaml. Residents only."""
-    return os.path.join(agents_dir, role, "triggers.yaml")
+def reminders_path(agents_dir: str, role: str) -> str:
+    """Absolute path to *role*'s reminders.yaml. Residents only.
+
+    Reminders deliberately do NOT live in ``triggers.yaml``, even though they
+    are ordinary triggers and the loader merges them into the same list.
+    ``config_sync``'s three-way reconcile treats an edited ``triggers.yaml``
+    as a conflict once the image ships a changed default and resolves it
+    "image wins" — which would silently delete every pending reminder on such
+    an update, exactly the failure this whole feature exists to prevent.
+    ``reminders.yaml`` is not in the defaults tree, so reconcile adopts it and
+    never rewrites it.
+    """
+    return os.path.join(agents_dir, role, "reminders.yaml")
 
 
 def _load(path: str) -> dict:
@@ -189,7 +205,12 @@ def past_due(path: str, now: datetime) -> list[dict]:
                        exc_info=True)
         return out
     for entry in entries:
-        if entry.get("type") != "date" or not entry.get("one_shot"):
+        # A date trigger is one-shot BY DEFINITION, so membership is decided
+        # on the type alone. Requiring the ``one_shot`` flag here as well
+        # would mean an entry that somehow lacked it was skipped at
+        # registration (past) AND skipped by the sweep — silently never
+        # delivered. The schema forbids that shape; this does not depend on it.
+        if entry.get("type") != "date":
             continue
         if not is_reminder_name(entry.get("name", "")):
             continue
@@ -228,11 +249,36 @@ async def sweep_reminders(runtime, now: datetime) -> int:
     from bus import BusMessage, MessageType
     from log_cid import new_cid
 
+    registry = getattr(runtime, "trigger_registry", None)
+
     delivered = 0
     for role in list(getattr(runtime, "role_configs", {}) or {}):
-        path = triggers_path(runtime.agents_dir, role)
+        path = reminders_path(runtime.agents_dir, role)
         for entry in past_due(path, now):
             name = entry["name"]
+
+            # Exclusive ownership. If the scheduler still holds a live job for
+            # this reminder it WILL deliver it, so the sweep must not: for a
+            # reminder whose time has only just passed, both are otherwise
+            # eligible and the user gets it twice. After a restart there is no
+            # job (they are memory-only and a past-dated one is never
+            # registered), which is exactly when the sweep should act.
+            if registry is not None and registry.has_job(role, name):
+                continue
+
+            # The sweep delivers the stored prompt verbatim — it has no
+            # agent_dir to resolve a prompt_file against. The schema forbids
+            # that combination, so an empty prompt here means a hand-edited or
+            # corrupt entry. Refuse rather than send an empty message and
+            # delete the evidence: a loud no-op beats silent loss.
+            content = (entry.get("prompt") or "").strip()
+            if not content:
+                logger.warning(
+                    "reminder sweep: %s has no prompt; leaving it in place "
+                    "rather than delivering an empty message", name,
+                )
+                continue
+
             logger.info(
                 "reminder sweep: delivering overdue %s for %s (due %s)",
                 name, role, entry.get("at"),
@@ -242,7 +288,7 @@ async def sweep_reminders(runtime, now: datetime) -> int:
                     type=MessageType.SCHEDULED,
                     source="reminder-sweep",
                     target=role,
-                    content=entry.get("prompt", ""),
+                    content=content,
                     channel=entry.get("channel", ""),
                     context={
                         "chat_id": f"date-{name}",

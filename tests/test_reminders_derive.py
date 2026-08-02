@@ -37,7 +37,8 @@ def test_weekly_yields_a_day_name_not_a_number():
     # 2026-08-06 is a Thursday. A NUMBER here would reintroduce #343.
     at = datetime(2026, 8, 6, 7, 0, tzinfo=CEST)
     out = reminders.derive_schedule(at, "weekly")
-    assert out == {"type": "cron", "schedule": "0 7 * * thu"}
+    assert out["type"] == "cron"
+    assert out["schedule"] == "0 7 * * thu"
 
 
 def test_daily_weekdays_monthly():
@@ -64,8 +65,10 @@ def test_recurring_discards_the_supplied_offset():
     winter = datetime(2026, 1, 8, 7, 0, tzinfo=timezone(timedelta(hours=1)))
     assert reminders.derive_schedule(summer, "weekly")["schedule"] == "0 7 * * thu"
     assert reminders.derive_schedule(winter, "weekly")["schedule"] == "0 7 * * thu"
-    # And nothing offset-shaped survives into the persisted fields.
-    assert "at" not in reminders.derive_schedule(summer, "weekly")
+    # `at` is retained purely as the anchor (start_date); recurrence is driven
+    # by the cron fields, so the offset never shifts the series.
+    assert reminders.derive_schedule(summer, "weekly")["at"].startswith(
+        "2026-08-06T07:00:00")
 
 
 def test_unknown_repeat_rejected():
@@ -84,3 +87,13 @@ def test_parse_at_rejects_garbage():
         reminders.parse_at("next tuesday")
     with pytest.raises(ValueError):
         reminders.parse_at("")
+
+
+def test_recurring_retains_its_anchor():
+    """Sol r1 #3: without the anchor, "every Thursday from the 20th" set on
+    the 3rd fires on the 6th and 13th — occurrences the user never asked
+    for."""
+    at = datetime(2026, 8, 20, 7, 0, tzinfo=CEST)
+    out = reminders.derive_schedule(at, "weekly")
+    assert out["schedule"] == "0 7 * * thu"
+    assert reminders.parse_at(out["at"]) == at

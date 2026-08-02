@@ -1,4 +1,4 @@
-"""#396 — reminder entries inside a role's triggers.yaml."""
+"""#396 — reminder entries inside a role's reminders.yaml."""
 from __future__ import annotations
 
 from datetime import datetime, timedelta, timezone
@@ -20,7 +20,7 @@ BASE = {
 
 
 def _write(tmp_path, doc=None):
-    p = tmp_path / "triggers.yaml"
+    p = tmp_path / "reminders.yaml"
     p.write_text(yaml.safe_dump(doc if doc is not None else BASE),
                  encoding="utf-8")
     return str(p)
@@ -45,7 +45,7 @@ def test_append_preserves_existing_triggers(tmp_path):
 
 
 def test_append_creates_the_file_when_absent(tmp_path):
-    path = str(tmp_path / "triggers.yaml")
+    path = str(tmp_path / "reminders.yaml")
     reminders.append_entry(path, _entry())
     doc = _read(path)
     assert doc["schema_version"] == 1
@@ -125,6 +125,10 @@ def test_past_due_on_a_missing_file_is_empty(tmp_path):
     assert reminders.past_due(str(tmp_path / "nope.yaml"), now) == []
 
 
-def test_triggers_path_is_the_roles_own_file():
-    assert reminders.triggers_path("/config/agents", "assistant").endswith(
-        "/config/agents/assistant/triggers.yaml")
+def test_reminders_path_is_a_separate_agent_owned_file():
+    """NOT triggers.yaml: config_sync resolves an edited triggers.yaml as
+    "image wins" once the image ships a changed default, which would delete
+    every pending reminder on an update."""
+    got = reminders.reminders_path("/config/agents", "assistant")
+    assert got.endswith("/config/agents/assistant/reminders.yaml")
+    assert not got.endswith("triggers.yaml")
