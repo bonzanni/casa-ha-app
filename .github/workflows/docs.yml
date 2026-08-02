@@ -2,10 +2,17 @@ name: Docs
 
 # The corpus in docs/ is published, so these checks run on every pull request and on main.
 #
-# CI is DEFENCE IN DEPTH, not the control. `main` has no branch protection and merges use
-# --admin, so CI is not guaranteed to run before a merge; the mandatory control is the local
-# pre-push gate (scripts/gate.sh plus the attestation it requires). What CI adds is a second
-# pair of eyes on every PR, and a check that runs in a clone nobody has configured.
+# The mandatory control is still the local pre-push gate (scripts/gate.sh plus the
+# attestation it requires): it refuses BEFORE anything is published, which a CI check
+# reporting after a pull request exists cannot do. What CI adds is a second pair of eyes on
+# every PR and a check that runs in a clone nobody has configured.
+#
+# Since 2026-08-02 the "Corpus + publication guard" job below is also a REQUIRED status
+# check on `main`, with admin enforcement and strict mode — so a merge cannot outrun it and
+# `--admin` cannot wave it through, which is how PR #383's drift shipped. Protection is the
+# backstop for the path the hook cannot see (hooks uninstalled, or --no-verify); it is not
+# a substitute for the gate, and only THIS job is required — the qa.yml tiers deliberately
+# are not, because ship-fast merges without waiting for them.
 #
 # CI deliberately has NO private supplement: the exact-literal layer lives with the operator
 # and is applied by the hook and the gate. CI runs the generic patterns and the scanner.
@@ -107,11 +114,12 @@ jobs:
         # anything is published; this catches a push made with hooks uninstalled
         # or --no-verify, and anything arriving from elsewhere.
         #
-        # Runs on PUSH as well as pull_request (Terra): `main` is unprotected, so
-        # `git push --no-verify origin HEAD:main` skips the hook — and a
-        # pull_request-only step would skip the check exactly then, which is the
-        # one case the backstop exists for. On push the range is the event's
-        # before..after; the waivers are read from the pushed tip.
+        # Runs on PUSH as well as pull_request (Terra): a hook-bypassing push
+        # would otherwise face no check at all. Branch protection now rejects
+        # such a push to `main` outright, so this arm covers what protection
+        # does not — any other protected-or-not branch, and the record on `main`
+        # itself after a merge. On push the range is the event's before..after;
+        # the waivers are read from the pushed tip.
         #
         # `head.sha`, never HEAD, on a pull request: actions/checkout leaves HEAD
         # at GitHub's synthetic MERGE commit, whose message carries no waiver.
