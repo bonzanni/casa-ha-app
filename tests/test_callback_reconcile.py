@@ -1231,8 +1231,8 @@ async def test_untrustworthy_pass_still_publishes_a_fresh_absent_pair(tmp_path):
 
 class _IndexWriteFails:
     """Wrap a real spool, failing every ``.index`` write while ready.json
-    writes and all deletes/reads pass through — models write-ready-succeeds-
-    then-write-index-FAILS (the r3 Terra split)."""
+    writes and all deletes/reads pass through — models the
+    write-ready-succeeds-then-write-index-FAILS split."""
 
     def __init__(self, inner):
         self._inner = inner
@@ -1245,11 +1245,10 @@ class _IndexWriteFails:
 
 
 async def test_write_index_failure_after_ready_leaves_neither_marker(tmp_path):
-    """r3 Terra: retire-index, then write-ready SUCCEEDS, then write-index
-    FAILS — the pass must leave BOTH markers absent (fail-closed), never the
-    old .index + new ready.json split. The prior stale pair is retired
-    pre-swap; the post-swap index failure deletes the just-written ready.json
-    too."""
+    """Retire-index, then write-ready SUCCEEDS, then write-index FAILS — the
+    pass must leave BOTH markers absent (fail-closed), never the old .index +
+    new ready.json split. The prior stale pair is retired pre-swap; the
+    post-swap index failure deletes the just-written ready.json too."""
     root = tmp_path / "spool"
     art = tmp_path / "store" / "gmail" / "art-1"
     art.mkdir(parents=True)
