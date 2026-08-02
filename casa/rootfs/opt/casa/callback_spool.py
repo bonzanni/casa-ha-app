@@ -43,8 +43,9 @@ Same-uid processes are outside the threat model (as for ``plugin_outbox``):
 all plugin processes run as root in one container. Dirs are 0770 and files
 0600 as defence in depth, not as an inter-plugin boundary.
 
-Stdlib-only leaf module: importable from the reconciler, the HTTP handler,
-the sweeper job and a consumer test alike.
+Leaf module (stdlib plus the pure ``callback_attempts`` sibling): importable
+from the reconciler, the HTTP handler, the sweeper job and a consumer test
+alike.
 """
 from __future__ import annotations
 
@@ -63,6 +64,8 @@ import uuid
 from dataclasses import dataclass, field
 from pathlib import Path
 
+import callback_attempts
+
 logger = logging.getLogger(__name__)
 
 SPOOL_ROOT_ENV = "CASA_CALLBACK_SPOOL_ROOT"
@@ -78,6 +81,9 @@ TEMP_TTL_S = 300             # `.part` / `.tmp-<hash>` residue age-sweep
 QUIESCENCE_S = 24 * 3600     # orphan-dir GC floor
 MAX_PENDING = 256            # per-plugin caps: a buggy consumer must not
 MAX_RESULTS = 256            # fill /data
+MAX_ATTEMPTS = 2048          # attempt files are a few hundred bytes; the cap
+#                              bounds disk and scan cost, not policy
+MAX_COLLECT = 64             # consumer-held `.collect-*` inodes per plugin
 MARKER_STATE_MAX_BYTES = 1 << 16   # a ready.json / index entry read back for
 #                              the reconcile payload compare is tiny (a few
 #                              hundred bytes); anything past this small cap is
@@ -86,7 +92,12 @@ MARKER_STATE_MAX_BYTES = 1 << 16   # a ready.json / index entry read back for
 PENDING_DIR = "pending"
 RESULTS_DIR = "results"
 CLAIMS_DIR = ".claims"
+ATTEMPTS_DIR = "attempts"    # per-flow attempt ledger (casa-written; the
+#                              consumer's one verb there is the ack rename)
 INDEX_DIR = ".index"
+REMOVALS_DIR = ".removals"   # root-level removal-record store — a reserved
+#                              dot-root name, like every dot-prefixed root entry
+ACK_PREFIX = ".ack-"         # consumer receipt-token grammar under attempts/
 READY_NAME = "ready.json"
 DIR_ID_NAME = ".dir-id"      # per-plugin-dir identity token (see Claim)
 TEMP_PREFIX = ".tmp-"        # reserved result-temp grammar under .claims/
@@ -238,6 +249,28 @@ def _fsync(fd: int, what: str) -> None:
         os.fsync(fd)
     except OSError as exc:
         logger.warning("callback-spool: fsync of %s failed: %s", what, exc)
+
+
+class FsyncFailed(OSError):
+    """An fsync whose failure the caller MUST observe — the strict-durability
+    counterpart of :func:`_fsync`'s convention. At a strict call site the
+    caller's decision has NOT yet been made: a write-ahead outcome must be
+    proven durable before the deletion that depends on it, so a swallowed
+    fsync failure would let a crash erase the record while the deletion
+    survives."""
+
+
+def _fsync_strict(fd: int, what: str) -> None:
+    """Strict fsync: raises :class:`FsyncFailed` on ANY failure (chaining the
+    original), so the caller skips its dependent action this pass and a later
+    pass retries. *what* names a directory or a role — never a hash
+    (INV-CB-006: an ``FsyncFailed`` may be logged by its catcher)."""
+    try:
+        os.fsync(fd)
+    except OSError as exc:
+        raise FsyncFailed(
+            exc.errno if exc.errno is not None else errno.EIO,
+            f"fsync of {what} failed") from exc
 
 
 def _open_dir(name: str, dir_fd: int) -> int:
@@ -629,13 +662,14 @@ class CallbackSpool:
     # -- directories --------------------------------------------------------
 
     def ensure_plugin_dirs(self, plugin: str) -> None:
-        """Create ``<plugin>/{pending,results,.claims}`` at 0770. Idempotent —
-        reconcile calls it on every pass. ``mkdir``'s mode is masked by the
-        umask, so each directory's mode is pinned through its own O_NOFOLLOW
-        FD afterwards."""
+        """Create ``<plugin>/{pending,results,.claims,attempts}`` at 0770.
+        Idempotent — reconcile calls it on every pass. ``mkdir``'s mode is
+        masked by the umask, so each directory's mode is pinned through its
+        own O_NOFOLLOW FD afterwards."""
         # A leading dot is reserved for casa's own root-level structures
-        # (``.index``): such a directory would be created here but skipped by
-        # _plugin_dirs(), so it would never be swept, recovered or GC'd.
+        # (``.index``, ``.removals``): such a directory would be created here
+        # but skipped by _plugin_dirs(), so it would never be swept, recovered
+        # or GC'd.
         if not _safe_component(plugin) or plugin.startswith("."):
             raise ValueError(f"unsafe plugin spool name {plugin!r}")
         with self._lock:
@@ -644,7 +678,8 @@ class CallbackSpool:
             pfd = _open_dir(plugin, self._root_fd)
             try:
                 self._chmod_dir(pfd, plugin)
-                for sub in (PENDING_DIR, RESULTS_DIR, CLAIMS_DIR):
+                for sub in (PENDING_DIR, RESULTS_DIR, CLAIMS_DIR,
+                            ATTEMPTS_DIR):
                     self._mkdir(sub, pfd)
                     sfd = _open_dir(sub, pfd)
                     try:
@@ -725,11 +760,15 @@ class CallbackSpool:
         return _open_dir(plugin, self._root_fd)
 
     def _plugin_dirs(self) -> list[str]:
-        """Names of the per-plugin spool dirs (``.index`` and any stray
-        non-directory entry excluded)."""
+        """Names of the per-plugin spool dirs. EVERY dot-prefixed root entry
+        is reserved for casa's own structures (``.index``, ``.removals``, and
+        anything future) and excluded — from enumeration, and therefore from
+        sweep, recovery and orphan GC alike. No legitimate plugin dir can be
+        shadowed: :meth:`ensure_plugin_dirs` refuses dotted names. Stray
+        non-directory entries are excluded as before."""
         out = []
         for name in _listdir_quiet(self._root_fd):
-            if name == INDEX_DIR or not _safe_component(name):
+            if name.startswith(".") or not _safe_component(name):
                 continue
             st = _lstat_quiet(name, self._root_fd)
             if st is not None and stat.S_ISDIR(st.st_mode):
@@ -1262,6 +1301,262 @@ class CallbackSpool:
             if self._closed:
                 return []
             return self._plugin_dirs()
+
+    # -- attempts ledger ------------------------------------------------
+
+    def read_attempt(self, plugin: str, h: str) -> Marker:
+        """Three-state read of ``attempts/<h>.json`` — the per-flow attempt
+        record, under the same marker discipline as :meth:`read_marker`.
+
+        ABSENT for a genuinely missing file (or a closed spool, an unknown
+        plugin, a bad name — the fail-quiet arms every sibling read shares);
+        INVALID for anything present but untrustworthy (non-regular,
+        oversized, malformed — a consumer-scribbled file must read as INVALID
+        so the caller re-derives it from artifacts, never as truth). Never
+        blocks and never raises."""
+        with self._lock:
+            if self._closed or not _safe_component(plugin) or not _is_hash(h):
+                return Marker(MarkerState.ABSENT)
+            try:
+                pfd = self._plugin_fd(plugin)
+            except FileNotFoundError:
+                return Marker(MarkerState.ABSENT)
+            except (OSError, ValueError):
+                return Marker(MarkerState.INVALID)
+            try:
+                try:
+                    afd = _open_dir(ATTEMPTS_DIR, pfd)
+                except FileNotFoundError:
+                    return Marker(MarkerState.ABSENT)   # pre-upgrade dir
+                except OSError:
+                    return Marker(MarkerState.INVALID)
+                try:
+                    return _read_marker_at(f"{h}.json", afd)
+                finally:
+                    os.close(afd)
+            finally:
+                os.close(pfd)
+
+    def write_attempt(self, plugin: str, h: str, rec: dict, *,
+                      strict: bool = False) -> bool:
+        """Atomically replace ``attempts/<h>.json`` with the canonical bytes
+        of *rec* (the :meth:`_replace_json` discipline — attempt files are
+        replacing ADVISORY records, never publish-once artifacts). Creates
+        ``attempts/`` on demand (a pre-upgrade plugin dir grows one on the
+        first write, exactly as :meth:`ensure_plugin_dirs` would have).
+
+        ``strict=False`` (default): best-effort fsyncs; True once the replace
+        sequence completed. ``strict=True`` — the write-ahead-outcome
+        variant: the STAGED file is fsynced strictly BEFORE the rename (a
+        failure aborts with the previous record intact), and the directory is
+        fsynced strictly AFTER it (a failure returns False although the new
+        record may already be VISIBLE — that is correct: the caller skips the
+        dependent deletion this pass, and a visible terminal record beside a
+        live artifact is the provisional state the next pass re-derives).
+        True only when fully durable.
+
+        Never raises into callers: every failure is False plus a warning that
+        names no hash (INV-CB-006)."""
+        if not _safe_component(plugin) or not _is_hash(h):
+            return False
+        with self._lock:
+            if self._closed:
+                return False
+            try:
+                pfd = self._plugin_fd(plugin)
+            except (OSError, ValueError):
+                return False
+            try:
+                try:
+                    created = self._mkdir(ATTEMPTS_DIR, pfd)
+                    if created:
+                        # The directory entry itself must be durable before
+                        # an entry inside it is (see _index_fd).
+                        _fsync(pfd, plugin)
+                    afd = _open_dir(ATTEMPTS_DIR, pfd)
+                except OSError as exc:
+                    logger.warning("callback-spool: attempts dir unavailable "
+                                   "(errno %s)", exc.errno)
+                    return False
+                try:
+                    if created:
+                        self._chmod_dir(afd, ATTEMPTS_DIR)
+                    return self._write_attempt_at(afd, f"{h}.json", rec,
+                                                  strict)
+                finally:
+                    os.close(afd)
+            finally:
+                os.close(pfd)
+
+    def _write_attempt_at(self, afd: int, name: str, rec: dict,
+                          strict: bool) -> bool:
+        """The staged-replace sequence of :meth:`write_attempt`, openat-
+        relative to the attempts dir FD. Called with ``_lock`` held."""
+        if not strict:
+            try:
+                self._replace_json(name, afd, rec, ATTEMPTS_DIR)
+                return True
+            except (OSError, TypeError, ValueError) as exc:
+                logger.warning("callback-spool: attempt write failed "
+                               "(errno %s)", getattr(exc, "errno", None))
+                return False
+        try:
+            data = canonical_marker_bytes(rec)
+        except (TypeError, ValueError):
+            logger.warning("callback-spool: attempt record is not "
+                           "serializable")
+            return False
+        tmp = f".{name}{REPLACE_TEMP_INFIX}{os.getpid()}-{uuid.uuid4().hex}"
+        try:
+            fd = os.open(tmp, _NEW_FILE_FLAGS, FILE_MODE, dir_fd=afd)
+            try:
+                os.fchmod(fd, FILE_MODE)
+                view = memoryview(data)
+                while view:
+                    view = view[os.write(fd, view):]
+                # Strict, unlike _write_new_file's best-effort fsync: the
+                # rename below is what the caller's dependent deletion keys
+                # on, so the staged bytes must be proven durable FIRST.
+                _fsync_strict(fd, "staged attempt")
+            finally:
+                os.close(fd)
+        except OSError as exc:                 # FsyncFailed included
+            _unlink_quiet(tmp, afd)
+            logger.warning("callback-spool: attempt staging failed "
+                           "(errno %s)", exc.errno)
+            return False
+        try:
+            os.rename(tmp, name, src_dir_fd=afd, dst_dir_fd=afd)
+        except OSError as exc:
+            _unlink_quiet(tmp, afd)
+            logger.warning("callback-spool: attempt publish failed "
+                           "(errno %s)", exc.errno)
+            return False
+        try:
+            _fsync_strict(afd, ATTEMPTS_DIR)
+        except FsyncFailed as exc:
+            # The new record may be VISIBLE but is not proven durable; the
+            # caller must skip its dependent deletion this pass (a visible
+            # terminal record beside a live artifact converges next pass).
+            logger.warning("callback-spool: attempts dir fsync failed "
+                           "(errno %s)", exc.errno)
+            return False
+        return True
+
+    def list_attempts(self, plugin: str) -> list[tuple[str, dict]]:
+        """``(hash, validated record)`` for every readable, schema-valid
+        ``attempts/<h>.json``, sorted by hash. Only VALID pairs — a malformed
+        file is never returned as truth; it is named by
+        :meth:`list_invalid_attempts` instead. ``[]`` on a closed spool or a
+        missing plugin/attempts dir."""
+        return self._scan_attempts(plugin)[0]
+
+    def list_invalid_attempts(self, plugin: str) -> list[str]:
+        """Hashes whose attempt file EXISTS but is INVALID or schema-
+        malformed — the re-derivation worklist (rewritten from live
+        artifacts, or retired, by a later pass). ``[]`` on a closed spool or
+        a missing dir."""
+        return self._scan_attempts(plugin)[1]
+
+    def _scan_attempts(self, plugin: str) -> tuple[list[tuple[str, dict]],
+                                                   list[str]]:
+        with self._lock:
+            if self._closed or not _safe_component(plugin):
+                return [], []
+            try:
+                pfd = self._plugin_fd(plugin)
+            except (OSError, ValueError):
+                return [], []
+            try:
+                try:
+                    afd = _open_dir(ATTEMPTS_DIR, pfd)
+                except OSError:
+                    return [], []
+                try:
+                    valid: list[tuple[str, dict]] = []
+                    invalid: list[str] = []
+                    for name in _listdir_quiet(afd):
+                        h = _hash_of_pending(name)
+                        if h is None:
+                            continue         # tokens/residue: not attempts
+                        marker = _read_marker_at(name, afd)
+                        if marker.state is MarkerState.ABSENT:
+                            continue         # vanished mid-scan
+                        rec = (callback_attempts.validate_attempt(
+                                   marker.payload)
+                               if marker.state is MarkerState.PRESENT
+                               else None)
+                        if rec is None:
+                            invalid.append(h)
+                        else:
+                            valid.append((h, rec))
+                    valid.sort(key=lambda pair: pair[0])
+                    return valid, sorted(invalid)
+                finally:
+                    os.close(afd)
+            finally:
+                os.close(pfd)
+
+    def list_ack_tokens(self, plugin: str) -> list[str]:
+        """Hashes for which the consumer left a receipt token — entries named
+        exactly ``.ack-<64hex>`` under ``attempts/``. Near-misses are ignored
+        (they are residue, not receipts). ``[]`` on a closed spool or a
+        missing dir."""
+        with self._lock:
+            if self._closed or not _safe_component(plugin):
+                return []
+            try:
+                pfd = self._plugin_fd(plugin)
+            except (OSError, ValueError):
+                return []
+            try:
+                try:
+                    afd = _open_dir(ATTEMPTS_DIR, pfd)
+                except OSError:
+                    return []
+                try:
+                    return sorted(
+                        name[len(ACK_PREFIX):]
+                        for name in _listdir_quiet(afd)
+                        if name.startswith(ACK_PREFIX)
+                        and _is_hash(name[len(ACK_PREFIX):]))
+                finally:
+                    os.close(afd)
+            finally:
+                os.close(pfd)
+
+    def collect_held_hashes(self, plugin: str) -> list[str]:
+        """Hashes named by live consumer-held ``results/.collect-<h>-<uuid>``
+        entries — exactly 64 hex after the prefix, then ``-`` (anything else
+        is residue, not a hold). Deduplicated and sorted; ``[]`` on a closed
+        spool or a missing dir. Enumeration is by NAME only — casa never
+        opens a consumer-held file."""
+        with self._lock:
+            if self._closed or not _safe_component(plugin):
+                return []
+            try:
+                pfd = self._plugin_fd(plugin)
+            except (OSError, ValueError):
+                return []
+            try:
+                try:
+                    results = _open_dir(RESULTS_DIR, pfd)
+                except OSError:
+                    return []
+                try:
+                    held: set[str] = set()
+                    for name in _listdir_quiet(results):
+                        if not name.startswith(COLLECT_PREFIX):
+                            continue
+                        rest = name[len(COLLECT_PREFIX):]
+                        if len(rest) >= 65 and rest[64] == "-" \
+                                and _is_hash(rest[:64]):
+                            held.add(rest[:64])
+                    return sorted(held)
+                finally:
+                    os.close(results)
+            finally:
+                os.close(pfd)
 
     # -- recovery -------------------------------------------------------
 

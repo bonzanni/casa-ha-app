@@ -24,6 +24,7 @@ from pathlib import Path
 
 import pytest
 
+import callback_attempts as ca
 import callback_spool as cs
 from callback_spool import (
     PENDING_TTL_S,
@@ -157,7 +158,7 @@ def _idx_after(events, needle, after: int) -> int:
 
 
 def test_ensure_plugin_dirs_creates_0770_tree(spool):
-    for sub in ("pending", "results", ".claims"):
+    for sub in ("pending", "results", ".claims", "attempts"):
         d = _pdir(spool) / sub
         assert d.is_dir()
         assert stat.S_IMODE(d.stat().st_mode) == 0o770
@@ -1610,3 +1611,225 @@ def test_delete_index_entry_retires_a_directory_shaped_entry(spool, tmp_path):
     os.mkdir(entry)                                   # directory-shaped entry
     assert spool.delete_index_entry(str(art)) is True
     assert not entry.exists()
+
+
+# ---------------------------------------------------------------------------
+# attempts ledger plumbing (attempts/ dir, reserved dot-root grammar,
+# attempt-file I/O, strict fsync) — the durable per-flow record's substrate
+# ---------------------------------------------------------------------------
+
+
+def _attempts(spool, plugin=PLUGIN) -> Path:
+    return _pdir(spool, plugin) / "attempts"
+
+
+def _attempt_rec(h: str, now: float, status: str = "result_ready") -> dict:
+    return ca.new_attempt(state_hash=h, minted_ts=now - 5.0, status=status,
+                          now=now)
+
+
+def test_plugin_dirs_excludes_every_dotted_root_entry(spool, tmp_path):
+    """EVERY dot-prefixed root entry is reserved (`.index`, `.removals`, and
+    anything future) — excluded from plugin enumeration, and therefore from
+    sweep, recovery and orphan GC alike."""
+    art = tmp_path / "store" / "acme" / "art-1"
+    art.mkdir(parents=True)
+    spool.write_index_entry(str(art), {"v": 1})       # creates .index
+    (Path(spool.root) / ".removals").mkdir()
+    (Path(spool.root) / ".future-reserved").mkdir()
+    spool.ensure_plugin_dirs("beta")
+    assert spool.plugins() == [PLUGIN, "beta"]
+
+
+def test_gc_never_removes_a_dotted_root_dir(spool):
+    """Retention pin: `.removals` (a quiescent, registry-absent dot dir) must
+    SURVIVE orphan GC even when an equally-quiescent plugin dir is removed —
+    a removal record outliving its plugin dir is the whole point of it."""
+    now = time.time()
+    removals = Path(spool.root) / ".removals"
+    removals.mkdir()
+    (removals / "acme-deadbeef.json").write_text("{}")
+    _quiesce(removals, now - 5 * DAY)
+    spool.ensure_plugin_dirs("ghost")
+    _quiesce(_pdir(spool, "ghost"), now - 5 * DAY)
+
+    removed = spool.gc_orphan_dirs(registry_valid=True, member_plugins=set(),
+                                   now=now)
+
+    assert "ghost" in removed, "an equally-quiescent plugin dir IS removed"
+    assert removals.is_dir()
+    assert (removals / "acme-deadbeef.json").is_file()
+
+
+def test_write_and_read_attempt_round_trip(spool):
+    now = time.time()
+    h = state_hash("flow-1")
+    rec = _attempt_rec(h, now)
+    assert spool.write_attempt(PLUGIN, h, rec) is True
+    m = spool.read_attempt(PLUGIN, h)
+    assert m.state is cs.MarkerState.PRESENT
+    assert m.raw == cs.canonical_marker_bytes(rec)
+    assert ca.validate_attempt(m.payload) == rec
+
+
+def test_write_attempt_creates_the_attempts_dir_when_missing(spool):
+    """A pre-upgrade plugin dir has no attempts/; the first write creates it
+    (0770, chmod-via-fd) rather than failing until the next reconcile."""
+    _attempts(spool).rmdir()
+    now = time.time()
+    h = state_hash("flow-2")
+    assert spool.write_attempt(PLUGIN, h, _attempt_rec(h, now)) is True
+    assert stat.S_IMODE(_attempts(spool).stat().st_mode) == 0o770
+    assert spool.read_attempt(PLUGIN, h).state is cs.MarkerState.PRESENT
+
+
+def test_attempt_io_refuses_bad_grammar(spool):
+    now = time.time()
+    rec = _attempt_rec(state_hash("x"), now)
+    assert spool.write_attempt(PLUGIN, "not-a-hash", rec) is False
+    assert spool.write_attempt("../escape", state_hash("x"), rec) is False
+    assert spool.read_attempt(PLUGIN, "not-a-hash").state is cs.MarkerState.ABSENT
+    assert spool.read_attempt("never-made", state_hash("x")).state \
+        is cs.MarkerState.ABSENT
+
+
+def test_read_attempt_of_a_fifo_is_invalid_and_never_blocks(spool):
+    h = state_hash("fifo-flow")
+    os.mkfifo(_attempts(spool) / f"{h}.json")
+    m = spool.read_attempt(PLUGIN, h)
+    assert m.state is cs.MarkerState.INVALID and m.payload is None
+
+
+def test_read_attempt_of_an_oversized_file_is_invalid(spool):
+    h = state_hash("fat-flow")
+    (_attempts(spool) / f"{h}.json").write_bytes(
+        b'{"v":1,"pad":"' + b"p" * (cs.MARKER_STATE_MAX_BYTES + 16) + b'"}')
+    assert spool.read_attempt(PLUGIN, h).state is cs.MarkerState.INVALID
+
+
+def test_list_attempts_returns_only_valid_records(spool):
+    """A malformed (possibly consumer-scribbled) attempt file is never
+    returned as truth — it is named by list_invalid_attempts so the caller
+    re-derives it from live artifacts."""
+    now = time.time()
+    h_good, h_bad, h_fifo = (state_hash(s) for s in ("good", "bad", "worse"))
+    rec = _attempt_rec(h_good, now)
+    assert spool.write_attempt(PLUGIN, h_good, rec)
+    (_attempts(spool) / f"{h_bad}.json").write_text('{"not":"an attempt"}')
+    os.mkfifo(_attempts(spool) / f"{h_fifo}.json")
+
+    assert spool.list_attempts(PLUGIN) == [(h_good, rec)]
+    assert spool.list_invalid_attempts(PLUGIN) == sorted([h_bad, h_fifo])
+
+
+def test_list_ack_tokens_accepts_only_the_exact_grammar(spool):
+    h = state_hash("acked")
+    att = _attempts(spool)
+    (att / f".ack-{h}").write_text("")
+    (att / ".ack-short").write_text("")                # not 64 hex
+    (att / f".ack-{h[:-1]}g").write_text("")           # 64 chars, non-hex
+    (att / f".ack-{h}.json").write_text("")            # trailing garbage
+    (att / f"{h}.json").write_text("{}")               # an attempt, not a token
+    assert spool.list_ack_tokens(PLUGIN) == [h]
+
+
+def test_collect_held_hashes_grammar_dedupe_sorted(spool):
+    h1, h2 = sorted(state_hash(s) for s in ("held-a", "held-b"))
+    res = _results(spool)
+    (res / f".collect-{h1}-{'a' * 32}").write_text("x")
+    (res / f".collect-{h1}-{'b' * 32}").write_text("x")   # same hash: dedupe
+    (res / f".collect-{h2}-{'c' * 32}").write_text("x")
+    (res / ".collect-nothex-uuid").write_text("x")        # not 64 hex
+    (res / f".collect-{h2}").write_text("x")              # no '-<uuid>' part
+    assert spool.collect_held_hashes(PLUGIN) == [h1, h2]
+
+
+def test_write_attempt_strict_staging_fsync_failure_keeps_previous(
+        spool, monkeypatch):
+    """Amendment-3 arm 1: a strict fsync failure of the STAGED file aborts
+    BEFORE the rename — write_attempt returns False, the previous record is
+    intact and readable, and the staged temp is cleaned."""
+    now = time.time()
+    h = state_hash("strict-1")
+    old = _attempt_rec(h, now, status="awaiting_redirect")
+    assert spool.write_attempt(PLUGIN, h, old) is True
+
+    real = cs._fsync_strict
+    calls = {"n": 0}
+
+    def fail_first(fd, what):
+        calls["n"] += 1
+        if calls["n"] == 1:
+            raise cs.FsyncFailed(errno.EIO, "injected")
+        return real(fd, what)
+
+    monkeypatch.setattr(cs, "_fsync_strict", fail_first)
+    new = ca.terminalize(old, "expired", now=now)
+
+    assert spool.write_attempt(PLUGIN, h, new, strict=True) is False
+
+    m = spool.read_attempt(PLUGIN, h)
+    assert m.state is cs.MarkerState.PRESENT
+    assert m.raw == cs.canonical_marker_bytes(old), "previous record intact"
+    residue = [n for n in os.listdir(_attempts(spool))
+               if n.startswith(".") and ".tmp-" in n]
+    assert residue == [], "staged temp cleaned"
+
+
+def test_write_attempt_strict_dir_fsync_failure_new_record_visible(
+        spool, monkeypatch):
+    """Amendment-3 arm 2 (semantics pin): a strict fsync failure of the
+    DIRECTORY (after the rename) still returns False — the caller skips its
+    dependent deletion — but the NEW record may be, and here is, VISIBLE.
+    That is correct: a visible terminal record beside a live artifact is the
+    provisional state, re-derived next pass."""
+    now = time.time()
+    h = state_hash("strict-2")
+    old = _attempt_rec(h, now, status="awaiting_redirect")
+    assert spool.write_attempt(PLUGIN, h, old) is True
+
+    real = cs._fsync_strict
+    calls = {"n": 0}
+
+    def fail_second(fd, what):
+        calls["n"] += 1
+        if calls["n"] == 2:
+            raise cs.FsyncFailed(errno.EIO, "injected")
+        return real(fd, what)
+
+    monkeypatch.setattr(cs, "_fsync_strict", fail_second)
+    new = ca.terminalize(old, "expired", now=now)
+
+    assert spool.write_attempt(PLUGIN, h, new, strict=True) is False
+    assert calls["n"] == 2, "strict write = staged-file fsync + dir fsync"
+
+    m = spool.read_attempt(PLUGIN, h)
+    assert m.state is cs.MarkerState.PRESENT
+    assert m.raw == cs.canonical_marker_bytes(new), "new record IS visible"
+
+
+def test_newest_mtime_still_sees_content_in_attempts(spool):
+    """Depth pin: the orphan-GC quiescence scan (depth 3) covers the new
+    attempts/ subdir — a young attempt file keeps its dir non-quiescent."""
+    now = time.time()
+    _quiesce(_pdir(spool), now - 5 * DAY)
+    assert spool._newest_mtime(PLUGIN) < now - 4 * DAY
+    _put(_attempts(spool) / f"{state_hash('young')}.json", now - 60)
+    _utime(_attempts(spool), now - 5 * DAY)
+    _utime(_pdir(spool), now - 5 * DAY)
+    assert spool._newest_mtime(PLUGIN) >= now - 61
+
+
+def test_attempt_apis_are_empty_on_a_closed_spool(tmp_path):
+    now = time.time()
+    h = state_hash("closed")
+    s = CallbackSpool(tmp_path / "callbacks")
+    s.ensure_plugin_dirs(PLUGIN)
+    assert s.write_attempt(PLUGIN, h, _attempt_rec(h, now)) is True
+    s.close()
+    assert s.read_attempt(PLUGIN, h).state is cs.MarkerState.ABSENT
+    assert s.write_attempt(PLUGIN, h, _attempt_rec(h, now)) is False
+    assert s.list_attempts(PLUGIN) == []
+    assert s.list_invalid_attempts(PLUGIN) == []
+    assert s.list_ack_tokens(PLUGIN) == []
+    assert s.collect_held_hashes(PLUGIN) == []
