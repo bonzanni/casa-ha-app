@@ -3,7 +3,7 @@
 A reminder IS a trigger. This module owns the parts of that which are about
 *data*: generating and recognising reminder names, deriving a schedule from a
 resolved instant plus a repeat rule, reading/appending/removing reminder
-entries in a role's ``triggers.yaml``, and answering which reminders are
+entries in a role's ``reminders.yaml``, and answering which reminders are
 overdue. It knows about files and time; it knows nothing about APScheduler or
 MCP — so ``trigger_registry`` never learns to write YAML and ``tools`` never
 learns cron.
@@ -14,8 +14,12 @@ Two design points worth keeping in view:
   is an ANNUAL trigger with a self-delete instruction stapled on. ``type:
   date`` exists to remove that trap.
 * **Presence is the ledger.** A one-shot reminder still sitting in
-  ``triggers.yaml`` with a past fire time *is* the record that delivery is
+  ``reminders.yaml`` with a past fire time *is* the record that delivery is
   owed. Delivery removes the entry. There is no second store to keep in sync.
+* **The file is separate on purpose.** ``config_sync`` resolves an edited
+  image-owned file against a changed shipped default as "image wins", so
+  reminders kept in ``triggers.yaml`` would be deleted wholesale by the first
+  update touching its default. See :func:`reminders_path`.
 """
 
 from __future__ import annotations
@@ -151,7 +155,7 @@ def derive_schedule(at: datetime, repeat: str) -> dict[str, str]:
 
 
 # ---------------------------------------------------------------------------
-# The entry store — reminder entries inside a role's triggers.yaml
+# The entry store — reminder entries inside a role's reminders.yaml
 # ---------------------------------------------------------------------------
 
 
@@ -176,7 +180,7 @@ def _load(path: str) -> dict:
     with open(path, encoding="utf-8") as fh:
         doc = load_yaml_no_aliases(fh.read()) or {}
     if not isinstance(doc, dict):
-        raise ValueError(f"{path}: triggers.yaml is not a mapping")
+        raise ValueError(f"{path}: reminders.yaml is not a mapping")
     doc.setdefault("schema_version", 1)
     if not isinstance(doc.get("triggers"), list):
         doc["triggers"] = []

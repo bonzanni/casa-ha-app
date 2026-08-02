@@ -4650,7 +4650,7 @@ async def get_schedule(args: dict) -> dict:
 # A reminder IS a trigger, so these are a narrow front door onto the machinery
 # that already exists rather than a parallel system. The bounds that keep them
 # from being a general config writer (INV-TRIG-007):
-#   * the CALLING role's own triggers.yaml, never another agent's;
+#   * the CALLING role's own reminders.yaml, never another agent's;
 #   * only entries carrying the reserved ``reminder-`` prefix;
 #   * only reminder-shaped fields.
 # ``config_git_commit``'s configurator-only guard is untouched — this is a

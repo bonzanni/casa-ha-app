@@ -181,7 +181,7 @@ class TriggerSpec:
     # offset and is meaningful only for type="date" — cron has no year field,
     # so a dated one-shot written as cron is an ANNUAL trigger in disguise.
     # ``one_shot`` makes the registry drop both the scheduler job and the
-    # triggers.yaml entry after a single fire.
+    # reminders.yaml entry after a single fire.
     at: str = ""
     one_shot: bool = False
 

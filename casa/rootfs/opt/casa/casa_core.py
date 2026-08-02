@@ -2684,7 +2684,7 @@ async def main() -> None:
             "max_instances": 1,          # no overlap of same job
         },
     )
-    # #396: when a one_shot reminder fires, its triggers.yaml entry must go
+    # #396: when a one_shot reminder fires, its reminders.yaml entry must go
     # with it — otherwise a reboot would resurrect an already-delivered
     # reminder. Injected rather than done inside the registry, which must not
     # learn to write YAML. CONFIG_DIR is used directly (rather than the
@@ -3884,7 +3884,7 @@ async def main() -> None:
     # #396 / INV-TRIG-008: the scheduler has NO persistent job store, so a
     # reminder whose fire time fell while the add-on was down was never
     # recorded and is otherwise lost outright. A one-shot reminder still
-    # present in triggers.yaml with a past time IS the record that delivery is
+    # present in reminders.yaml with a past time IS the record that delivery is
     # owed; this sweep is what redeems it.
     async def _reminder_sweep() -> None:
         from datetime import datetime

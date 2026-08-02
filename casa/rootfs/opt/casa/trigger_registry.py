@@ -124,7 +124,7 @@ class TriggerRegistry:
         self._app = app
         self._bus = bus
         # #396: invoked as (role, trigger_name) after a one_shot trigger has
-        # been dispatched, so the owning triggers.yaml entry can be removed.
+        # been dispatched, so the owning reminders.yaml entry can be removed.
         # INJECTED rather than done here — the registry must not learn to
         # write YAML. Default None keeps every existing call site working.
         self._on_one_shot_fired = on_one_shot_fired
