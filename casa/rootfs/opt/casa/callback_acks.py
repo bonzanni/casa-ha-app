@@ -136,6 +136,14 @@ class CallbackAckStore:
         records."""
         return self._revoke(lambda rec: rec.get("plugin") == plugin)
 
+    def revoke_effective(self, plugin: str, effective: str) -> list[dict[str, Any]]:
+        """Drop every ack for one (plugin, effective) callback — across any
+        declaration digest. The single-callback operator off-switch backing
+        the ``callback_ack_revoke`` tool (Task 8). Returns the removed
+        records."""
+        return self._revoke(lambda rec: rec.get("plugin") == plugin
+                            and rec.get("effective") == effective)
+
     def prune_stale(self, valid_identities: set[str]) -> list[dict[str, Any]]:
         """Opportunistic reconcile prune (spec §4): drop every ack whose
         identity is not in *valid_identities* (no installed declaration can

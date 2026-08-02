@@ -1179,6 +1179,39 @@ class CallbackSpool:
                 logger.info("callback-spool: removed orphan spool dir %r", plugin)
         return removed
 
+    def remove_plugin(self, plugin: str) -> bool:
+        """Recursively delete a plugin's ENTIRE spool dir (removal lifecycle,
+        Task 8). The explicit, immediate counterpart of the age-gated
+        :meth:`gc_orphan_dirs`: when the operator removes a plugin, its
+        in-flight authorizations are gone with it, so there is nothing to
+        preserve and no quiescence window to honour.
+
+        Guarded exactly like every dir op — an unsafe / dotted name raises
+        ``ValueError`` (never resolves against the CWD), a closed spool is a
+        no-op — and the root is fsynced afterwards so the unlink is durable.
+        ``ready.json`` lives INSIDE the plugin dir, so this retires it too;
+        the ``.index`` discovery entry keyed by the plugin's ARTIFACT PATH
+        (not derivable from the plugin name) is retired separately by the
+        reconcile's ``_pre_swap_files``. Returns True when a dir was removed.
+        """
+        if not _safe_component(plugin) or plugin.startswith("."):
+            raise ValueError(f"unsafe plugin spool name {plugin!r}")
+        with self._lock:
+            if self._closed:
+                return False
+            try:
+                shutil.rmtree(plugin, dir_fd=self._root_fd)
+            except FileNotFoundError:
+                return False
+            except OSError as exc:
+                logger.warning("callback-spool: remove_plugin %r failed: %s",
+                               plugin, exc)
+                return False
+            _fsync(self._root_fd, str(self.root))
+            logger.info("callback-spool: removed spool dir %r (plugin removed)",
+                        plugin)
+            return True
+
     def _newest_mtime(self, plugin: str) -> float | None:
         """Newest mtime anywhere in the plugin's spool tree, including the
         directories themselves (a directory's mtime moves whenever an entry is

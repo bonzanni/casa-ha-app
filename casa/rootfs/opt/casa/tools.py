@@ -7381,6 +7381,13 @@ def _regenerate_plugin_health(extra_issues: list) -> None:
     # trigger_channel_missing. current_issues() never raises.
     import trigger_reconcile
     trigger_issues = trigger_reconcile.current_issues()
+    # Release C: callback issues (callback_pending_ack / callback_no_target /
+    # callback_invalid / callback_base_url_invalid / callback_spool_error) are
+    # a RECOMPUTABLE input just like the trigger issues — derived fresh on
+    # every regeneration so an unrelated refresh can never erase them.
+    # current_issues() never raises.
+    import callback_reconcile
+    callback_issues = callback_reconcile.current_issues()
     # v0.112.0: setup-episode state (pending/failed/stale) is likewise a
     # RECOMPUTABLE input, derived fresh from the durable episode store — a
     # dropped or failed post-consent setup dispatch stays visible until it
@@ -7397,7 +7404,7 @@ def _regenerate_plugin_health(extra_issues: list) -> None:
         logger.debug("setup-episode health merge skipped", exc_info=True)
     plugin_health.write_report(
         issues=(list(res.issues) + list(extra_issues) + runtime_issues
-                + list(trigger_issues) + setup_issues),
+                + list(trigger_issues) + list(callback_issues) + setup_issues),
         warnings=list(res.warnings) + pending_warnings,
         path=_PLUGIN_HEALTH_PATH,
     )
@@ -7635,6 +7642,18 @@ async def _reload_and_verify_targets(name: str, targets: list,
     except Exception:  # noqa: BLE001
         reconcile_ok = False
         logger.warning("plugin-trigger reconcile failed", exc_info=True)
+    # Release C (I3): pair the CALLBACK reconcile at the SAME site with the
+    # SAME runtime — every one of the 5 lifecycle mutations funnels through
+    # here, so this is where an update-changed-declaration re-derives to
+    # `callback_pending_ack` (stale-digest identity → no ack), and a removal's
+    # callbacks are swept by absence. A same-declaration update leaves the
+    # overlay identical (no dark window). Non-fatal, like the trigger half.
+    try:
+        import callback_reconcile
+        await callback_reconcile.reconcile_from_runtime(runtime)
+    except Exception:  # noqa: BLE001
+        reconcile_ok = False
+        logger.warning("plugin-callback reconcile failed", exc_info=True)
     ok = (not snapshot_raced and not reload_errors
           and _postcondition_holds(verify, targets, expect=expect,
                                    name=name, runtime=runtime))
@@ -9240,6 +9259,14 @@ async def plugin_remove(args: dict) -> dict:
         seq = await _reload_and_verify_targets(
             core["name"], core["targets"], expect="absent")
         core.update(seq)
+        # Release C: the plugin is gone entirely — make its callback removal
+        # DURABLE. The paired callback reconcile inside the sequencer already
+        # swept the overlay + retired ready/index by absence; this drops the
+        # persisted operator consents (unlike a plugin_update, a REMOVAL DOES
+        # revoke — the declaration is gone, not merely re-digested) and purges
+        # the spool dir so a later reinstall starts clean instead of inheriting
+        # stale results/claims.
+        await _remove_plugin_callbacks(core["name"])
         return _result(core)
 
 
@@ -9292,6 +9319,16 @@ async def trigger_ack_revoke(args: dict) -> dict:
         except Exception:  # noqa: BLE001 — sweep above already unrouted
             logger.warning("post-revoke trigger reconcile failed",
                            exc_info=True)
+        # Release C (I3): pair the callback reconcile with matching prompt=False
+        # so the callback overlay stays consistent after a trigger revoke (a
+        # resident's grants can shift callback assignment too). Non-fatal.
+        try:
+            import callback_reconcile
+            await callback_reconcile.reconcile_from_runtime(
+                runtime, prompt=False)
+        except Exception:  # noqa: BLE001
+            logger.warning("post-revoke callback reconcile failed",
+                           exc_info=True)
         # Sol shipB-r1 P1-4: retire the plugin's per-trigger secrets from
         # the FILESYSTEM inventory (prefix glob — never from the ack
         # records this tool just deleted). Keeping them would let the NEXT
@@ -9315,6 +9352,84 @@ async def trigger_ack_revoke(args: dict) -> dict:
             "ok": True, "name": name, "revoked": len(removed),
             "unrouted": sorted(r.get("effective") or "" for r in removed),
             "secrets_retired": retired,
+        })
+
+
+async def _remove_plugin_callbacks(name: str) -> None:
+    """Durable callback teardown for a removed plugin (Task 8): revoke its
+    persisted callback consents and delete its spool dir. Best-effort — a
+    failure here never fails the removal (the overlay was already swept by
+    absence in the sequencer's callback reconcile)."""
+    try:
+        import callback_acks
+        removed = await asyncio.to_thread(
+            callback_acks.ACKS.revoke_plugin, name)
+        if removed:
+            logger.info("plugin_remove: revoked %d callback ack(s) for %s",
+                        len(removed), name)
+    except Exception:  # noqa: BLE001
+        logger.warning("plugin_remove: callback ack revoke failed (%s)",
+                       name, exc_info=True)
+    try:
+        import callback_spool
+        spool = callback_spool.get_spool()
+        if spool is not None:
+            await asyncio.to_thread(spool.remove_plugin, name)
+    except Exception:  # noqa: BLE001
+        logger.warning("plugin_remove: callback spool purge failed (%s)",
+                       name, exc_info=True)
+
+
+@tool(
+    "callback_ack_revoke",
+    "Revoke the operator's authorization-callback consent for ONE callback of "
+    "a plugin (by its effective name), and unroute its /callback/<effective> "
+    "endpoint IMMEDIATELY (it stops accepting deposits before this returns). "
+    "A later re-approval re-consents; the consent DM re-prompts on the next "
+    "plugin mutation or reload.",
+    {"type": "object",
+     "properties": {"plugin": {"type": "string"}, "name": {"type": "string"}},
+     "required": ["plugin", "name"]},
+)
+async def callback_ack_revoke(args: dict) -> dict:
+    """Release C operator off-switch — the callback sibling of
+    trigger_ack_revoke. Runs under _PLUGIN_TOOLS_LOCK; the reconcile inside is
+    the SYNCHRONOUS unroute (a compute failure fail-closes the WHOLE callback
+    overlay, so the revoked route is 404 either way — no separate direct sweep
+    is needed, unlike triggers)."""
+    async with _PLUGIN_TOOLS_LOCK:
+        import agent as agent_mod
+        import callback_acks
+        import callback_reconcile
+        plugin = args["plugin"]
+        name = args["name"]
+        # Kill any pending consent keyboard for this plugin FIRST so a stale
+        # Approve cannot re-ack past the revoke (mirrors trigger_ack_revoke).
+        CHALLENGES.cancel_matching(plugin=plugin)
+        removed = await asyncio.to_thread(
+            callback_acks.ACKS.revoke_effective, plugin, name)
+        runtime = getattr(agent_mod, "active_runtime", None)
+        # I3: run BOTH reconcilers so a shared round never keeps an open member.
+        try:
+            import trigger_reconcile
+            await trigger_reconcile.reconcile_from_runtime(runtime, prompt=False)
+        except Exception:  # noqa: BLE001
+            logger.warning("post-callback-revoke trigger reconcile failed",
+                           exc_info=True)
+        try:
+            await callback_reconcile.reconcile_from_runtime(
+                runtime, prompt=False)
+        except Exception:  # noqa: BLE001
+            logger.warning("post-callback-revoke callback reconcile failed",
+                           exc_info=True)
+        # Cancel again AFTER our reconcile — a keyboard posted by an in-flight
+        # reconcile is registered by now (prompts fire under _RECONCILE_LOCK,
+        # which our reconcile serialized behind).
+        CHALLENGES.cancel_matching(plugin=plugin)
+        await asyncio.to_thread(_regenerate_plugin_health, [])
+        return _result({
+            "ok": True, "plugin": plugin, "name": name,
+            "revoked": len(removed),
         })
 
 
@@ -10045,6 +10160,7 @@ CASA_TOOLS: tuple = (
     plugin_unassign,
     plugin_remove,
     trigger_ack_revoke,            # Release B — plugin-trigger consent off-switch
+    callback_ack_revoke,           # Release C — plugin-callback consent off-switch
     plugin_list,
     verify_plugin_state,
     verify_plugin_secrets,

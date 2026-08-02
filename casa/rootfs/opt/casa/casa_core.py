@@ -2049,6 +2049,105 @@ async def _boot_reconcile_plugin_triggers(
         logger.warning("boot plugin-trigger reconcile failed", exc_info=True)
 
 
+async def _boot_reconcile_plugin_callbacks(
+    *, trigger_registry: Any, role_configs: dict,
+) -> None:
+    """Release C boot seam (paired with :func:`_boot_reconcile_plugin_triggers`):
+    derive + route the plugin-declared authorization-callback overlay AND run
+    the spool's boot maintenance, AFTER resident triggers register and BEFORE
+    the setup-episode worker starts.
+
+    Ordering is load-bearing (Sol I1): the reconcile publishes a fully-routed
+    plugin's ready marker (and clears its ``callback_*`` health issues) BEFORE
+    ``_pse.start_worker()`` can settle a round and check ``routes_live`` — so a
+    settlement dispatch never races ahead of the marker.
+
+    Also runs, in order: (1) a boot spool recovery pass restoring claims/temps
+    stranded by a crash mid-handler, and (2) a GATED orphan GC of spool dirs
+    for plugins no longer in the registry. Both are off-loop (the lock-stall
+    ruling) and never fatal — a reconcile failure boots with an empty callback
+    overlay (fail-closed for ingress), not a dead Casa.
+    """
+    import callback_spool
+
+    # (1) Boot spool recovery — restore stranded claims/temps. boot=True: no
+    # in-flight grace is needed at boot (nothing is claimed yet). Off-loop per
+    # the lock-stall ruling (the pass holds the spool lock for a whole scan).
+    try:
+        spool = callback_spool.get_spool()
+        if spool is not None:
+            await asyncio.to_thread(spool.recovery_pass, now=time.time(),
+                                    boot=True)
+    except Exception:  # noqa: BLE001
+        logger.warning("boot callback-spool recovery failed", exc_info=True)
+
+    # (2) Route the overlay + publish markers.
+    try:
+        import callback_reconcile
+        issues = await callback_reconcile.reconcile_plugin_callbacks(
+            trigger_registry=trigger_registry, role_configs=role_configs,
+            channel_manager=None, prompt=False)
+        if issues:
+            from tools import _regenerate_plugin_health
+            await asyncio.to_thread(_regenerate_plugin_health, [])
+    except Exception:  # noqa: BLE001
+        logger.warning("boot plugin-callback reconcile failed", exc_info=True)
+
+    # (3) Gated orphan GC — remove spool dirs of plugins no longer installed.
+    # A NO-OP unless the registry loaded cleanly (a membership set from a
+    # failed load would vaporize every plugin's spool). Membership keys on
+    # registry ENTRIES, matching the spool's own contract.
+    try:
+        import plugin_registry
+        spool = callback_spool.get_spool()
+        if spool is not None:
+            snap = plugin_registry.snapshot_registry()
+            members = {e.get("name") for e in snap.entries
+                       if isinstance(e, dict) and isinstance(e.get("name"), str)}
+            await asyncio.to_thread(
+                spool.gc_orphan_dirs, registry_valid=bool(snap.valid),
+                member_plugins=members, now=time.time())
+    except Exception:  # noqa: BLE001
+        logger.warning("boot callback-spool orphan GC failed", exc_info=True)
+
+
+def _callback_and_trigger_routes_live(plugin: str) -> bool:
+    """Setup-dispatch route gate (Sol I1). A plugin's setup tool must not be
+    dispatched while EITHER its trigger OR its callback markers are dark.
+
+    The trigger-only gate is PERMISSIVE for callbacks: a plugin whose callbacks
+    are dark for a NON-consent reason (``callback_no_target`` / ``_invalid`` /
+    ``_base_url_invalid``) contributes no consent-round member, so the trigger
+    approval alone would settle the round and dispatch setup at an endpoint
+    whose callback ingress is not routed. Requiring NO outstanding ``callback_*``
+    issue (its markers are published) closes that hole. Per-plugin
+    all-or-nothing means one issue keeps the whole plugin's set dark, exactly
+    as the trigger gate treats trigger issues."""
+    import callback_reconcile as _cr
+    import trigger_reconcile as _tr
+    for issues, prefix in ((_tr.current_issues(), "trigger_"),
+                           (_cr.current_issues(), "callback_")):
+        if any(str(getattr(i, "reason_code", "")).startswith(prefix)
+               and getattr(i, "name", "") == plugin for i in issues):
+            return False
+    return True
+
+
+def _setup_ack_lookup_union(identity: str) -> str | None:
+    """Setup-round crash-recovery ack lookup (Sol I2). Trigger and callback
+    acks live in DISJOINT sha256 identity spaces, so a stranded round whose
+    open member is a CALLBACK consent only heals if the lookup unions BOTH
+    stores — a trigger-only lookup would leave it stranded forever. Returns the
+    ack's generation from whichever store owns the identity, or ``None``."""
+    import callback_acks as _ca
+    import trigger_acks as _ta
+    for store in (_ta.ACKS, _ca.ACKS):
+        rec = store.get(identity)
+        if rec and rec.get("gen"):
+            return str(rec["gen"])
+    return None
+
+
 async def notify_plugin_health(
     channel_manager: Any,
     *,
@@ -2545,6 +2644,13 @@ async def main() -> None:
         },
     )
     trigger_registry = TriggerRegistry(scheduler=scheduler, app=app, bus=bus)
+
+    # Release C: initialise the authorization-callback spool BEFORE the first
+    # callback reconcile (which reads get_spool() to publish ready/index
+    # markers) — the process-wide singleton, like the trigger registry above.
+    # Root honours CASA_CALLBACK_SPOOL_ROOT, default /data/callbacks.
+    import callback_spool
+    callback_spool.init_spool()
 
     # 8. Load agent configs by role
     from agent import Agent
@@ -3403,6 +3509,13 @@ async def main() -> None:
     await _boot_reconcile_plugin_triggers(
         trigger_registry=trigger_registry, role_configs=role_configs,
     )
+    # 13c'. Release C: paired plugin-declared authorization-callback reconcile
+    # + spool boot maintenance. Runs BEFORE _pse.start_worker() below so a
+    # routed plugin's ready marker is published before any settlement dispatch
+    # checks routes_live (Sol I1 ordering).
+    await _boot_reconcile_plugin_callbacks(
+        trigger_registry=trigger_registry, role_configs=role_configs,
+    )
 
     # 13d. v0.112.0 (elevenlabs#2): durable post-consent setup episodes —
     # wire the seams (all late-binding: the channel is resolved at call
@@ -3462,29 +3575,32 @@ async def main() -> None:
         ctx = {"chat_id": op[0]} if op is not None else {}
         await ch.send_response(text, ctx)
 
-    def _setup_ack_lookup(identity: str) -> str | None:
-        import trigger_acks as _ta
-        rec = _ta.ACKS.get(identity)
-        return str(rec["gen"]) if rec and rec.get("gen") else None
-
-    def _setup_routes_live(plugin: str) -> bool:
-        # impl r4 (Sol): the plugin's triggers are live when the fresh
-        # trigger recompute reports NO trigger_* issue for it (pending ack,
-        # missing channel, unassigned target, missing secret all unroute
-        # the plugin's whole set — per-plugin all-or-nothing).
-        import trigger_reconcile as _tr
-        return not any(
-            str(getattr(i, "reason_code", "")).startswith("trigger_")
-            and getattr(i, "name", "") == plugin
-            for i in _tr.current_issues())
-
     _pse.configure(
         dispatch=_setup_dispatch, notify_operator=_setup_notify,
         resolve_registry_entry=_setup_registry_entry,
-        ack_lookup=_setup_ack_lookup,
-        routes_live=_setup_routes_live,
+        # Sol I2: union BOTH ack stores (trigger + callback identities are
+        # disjoint) so a stranded round with a callback member heals.
+        ack_lookup=_setup_ack_lookup_union,
+        # Sol I1: gate setup dispatch on BOTH trigger AND callback markers —
+        # a callback dark for a non-consent reason contributes no round member,
+        # so the trigger gate alone would settle + dispatch with it unrouted.
+        routes_live=_callback_and_trigger_routes_live,
     )
     _pse.start_worker()
+
+    # 13d'. Release C: durable authorization-callback delivery episodes. The
+    # worker reconciles pending results against the spool, then nudges the
+    # plugin's target agent to collect them. Reuses the same late-binding
+    # dispatch/notify/registry seams as the setup worker (the callback context
+    # markers differ but the shapes match). start_worker() runs its own boot
+    # recovery of episodes stranded by a crash.
+    import callback_episodes as _cbep
+    _cbep.configure(
+        dispatch=_setup_dispatch, notify_operator=_setup_notify,
+        resolve_registry_entry=_setup_registry_entry,
+        get_spool=callback_spool.get_spool,
+    )
+    _cbep.start_worker()
 
     runner = web.AppRunner(
         app,
@@ -3648,6 +3764,60 @@ async def main() -> None:
         coalesce=True,
         max_instances=1,
         misfire_grace_time=3600,
+    )
+    # Release C (spec §7): authorization-callback spool maintenance.
+    #
+    # LOCK-STALL RULING (Task 6/7 review): the callback HTTP handler runs
+    # spool.claim/publish_result INLINE on the event loop (each is O(1) — a
+    # handful of syscalls), while sweep()/recovery_pass() hold
+    # CallbackSpool._lock for a whole per-plugin SCAN. So the SCHEDULED scans
+    # run OFF the loop via asyncio.to_thread; the handler's fast path stays
+    # inline. A scan can therefore never stall the loop, and the fast path is
+    # never needlessly moved off it. recovery_pass(boot=False) is safe to run
+    # in a thread while the loop is handling an inline claim: the in-process
+    # in-flight set + the 60 s grace (Task 4) protect a just-minted claim the
+    # scan would otherwise reap.
+    async def _callback_spool_sweep() -> None:
+        spool = callback_spool.get_spool()
+        if spool is None:
+            return
+        try:
+            await asyncio.to_thread(spool.sweep, now=time.time())
+        except Exception:  # noqa: BLE001
+            logger.warning("callback-spool sweep failed", exc_info=True)
+
+    async def _callback_spool_recovery() -> None:
+        spool = callback_spool.get_spool()
+        if spool is None:
+            return
+        try:
+            await asyncio.to_thread(spool.recovery_pass, now=time.time(),
+                                    boot=False)
+        except Exception:  # noqa: BLE001
+            logger.warning("callback-spool recovery failed", exc_info=True)
+        # Re-drive delivery for any result the recovery restored without an
+        # episode (the episode enqueue is cheap and idempotent).
+        await _cbep.recovery(spool)
+
+    scheduler.add_job(
+        _callback_spool_sweep,
+        trigger="interval",
+        id="callback_spool_sweep",
+        minutes=10,
+        replace_existing=True,
+        coalesce=True,
+        max_instances=1,
+        misfire_grace_time=600,
+    )
+    scheduler.add_job(
+        _callback_spool_recovery,
+        trigger="interval",
+        id="callback_spool_recovery",
+        minutes=5,
+        replace_existing=True,
+        coalesce=True,
+        max_instances=1,
+        misfire_grace_time=600,
     )
     scheduler.start()
 
