@@ -112,13 +112,17 @@ mid-2026). Keep it publish-ready at all times:
   guard".** It finishes in well under a minute and it is the only thing that catches
   documentation drift, so **wait for it and merge only when it is green**:
   `gh pr checks <pr> --watch --required` or, at minimum,
-  `gh run list --workflow docs.yml --branch <branch> --limit 1`. It caught v0.145.0
-  (PR #383) naming six documents whose prose the batch had invalidated; that PR was
-  squash-merged with `--admin` about a minute after opening, before the guard reported,
-  and the drift shipped. If the guard names a document whose prose is genuinely still
-  true — the claim is file-level, so a change can miss what the document quotes —
-  acknowledge it per document in a commit message rather than making a cosmetic edit:
-  `Docs-impact: architecture/tools-interface.md — none (claimed symbols unchanged)`.
+  `gh run list --workflow docs.yml --branch <branch> --limit 1`. It fired on v0.145.0
+  (PR #383), naming six documents that needed auditing — five of which did turn out to
+  need prose changes; that PR was squash-merged with `--admin` about a minute after
+  opening, before the guard reported, and the drift shipped. The guard detects
+  *potential* impact, not proven staleness: the claim is file-level, so a change can
+  easily miss what a document actually quotes. When a named document is genuinely still
+  accurate, acknowledge it per document rather than making a cosmetic edit —
+  `Docs-impact: architecture/tools-interface.md — none (claimed symbols unchanged)` —
+  **in the tip commit's message**, at column zero. A later commit voids it, exactly as
+  it voids a `scripts/attest.sh` receipt: the acknowledgement is a statement about the
+  diff as it finally stands.
 - **Branches die on merge.** GitHub auto-deletes the remote head; delete the local
   branch too. No stray branches on origin.
 - **Every release**: bump `casa/config.yaml` version + a user-facing CHANGELOG

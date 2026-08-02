@@ -45,6 +45,13 @@ jobs:
           python -m scripts.verify_docs .
           python3 scripts/coverage_ledger.py check .
 
+      - name: Docs-impact acknowledgement logic
+        # The waiver parser is the one part of this workflow that can let drift
+        # through, and it only executes on pull requests — so it would otherwise
+        # be unexercised until the PR that depends on it. The harness lifts the
+        # decision block out of THIS file and drives it over synthetic ranges.
+        run: bash tests/test_docs_impact_ack.sh
+
       - name: Generated navigation is current
         run: python -m scripts.verify_docs . --check-nav
 
@@ -159,25 +166,41 @@ jobs:
           # Per-document ON PURPOSE: one blanket waiver would let a six-document PR
           # through on a single line, and looking at each document is the whole point.
           # A reason is mandatory; the separator may be an em dash or a plain hyphen.
-          # `$base..HEAD` (two dots), not three: this wants the commits THIS pull request
-          # adds. The symmetric difference would also sweep in base-side commits, letting
-          # an acknowledgement written on main waive a document here.
+          # Acknowledgements are read from the TIP COMMIT ONLY, as a trailer at column
+          # zero. This mirrors scripts/attest.sh, whose receipts a new commit voids on
+          # purpose: an acknowledgement is a statement about the diff as it finally
+          # stands, so pushing another commit must invalidate it rather than let a line
+          # written five commits ago — possibly since reverted, cherry-picked, or merged
+          # in from elsewhere — waive a surface it never saw. Requiring column zero also
+          # stops an indented EXAMPLE inside prose (a commit that documents this very
+          # mechanism, say) from acting as a live waiver.
           : > "$RUNNER_TEMP/acked.txt"
-          git log --format=%B "$base..HEAD" \
-            | sed -n 's/^[[:space:]]*[Dd]ocs-[Ii]mpact:[[:space:]]*//p' \
+          git log -1 --format=%B HEAD \
+            | sed -n 's/^[Dd]ocs-[Ii]mpact:[[:space:]]*//p' \
             > "$RUNNER_TEMP/acks.txt"
           # Read from a FILE, never a pipe: a `while` on the right of a pipe runs in a
           # subshell, where `exit 1` would end the subshell and let the step continue.
           while IFS= read -r ack; do
             [ -n "$ack" ] || continue
             ack_doc="${ack%%[[:space:]]*}"
-            ack_reason="${ack#"$ack_doc"}"
-            # Strip the separator and surrounding space to test for a REAL reason.
-            ack_reason="$(printf '%s' "$ack_reason" \
-              | sed 's/^[[:space:]]*\(—\|--\|-\)\{0,1\}[[:space:]]*//')"
-            if [ -z "$ack_reason" ]; then
-              echo "::error::Docs-impact acknowledgement for '$ack_doc' has no reason."
-              echo "::error::Write: Docs-impact: <doc> — <why the prose is still true>"
+            ack_rest="$(printf '%s' "${ack#"$ack_doc"}" | sed 's/^[[:space:]]*//')"
+            # A separator is required, so `Docs-impact: <doc> <doc>` cannot pass by
+            # looking like a reason.
+            case "$ack_rest" in
+              "—"*|"--"*|"-"*) ;;
+              *)
+                echo "::error::Docs-impact for '$ack_doc' needs '— <reason>'."
+                exit 1 ;;
+            esac
+            ack_reason="$(printf '%s' "$ack_rest" | sed 's/^\(—\|--\|-\)[[:space:]]*//')"
+            # A REAL reason: at least three alphanumerics, so punctuation, a second
+            # separator, or a lone character cannot stand in for having thought about
+            # it; and not merely the document's own name echoed back.
+            ack_core="$(printf '%s' "$ack_reason" | tr -cd '[:alnum:]' | tr '[:upper:]' '[:lower:]')"
+            ack_docname="$(printf '%s' "$ack_doc" | tr -cd '[:alnum:]' | tr '[:upper:]' '[:lower:]')"
+            if [ "${#ack_core}" -lt 3 ] || [ "$ack_core" = "$ack_docname" ]; then
+              echo "::error::Docs-impact for '$ack_doc' has no real reason: '$ack_reason'"
+              echo "::error::Say why the prose is still true, in words."
               exit 1
             fi
             printf '%s\n' "$ack_doc" >> "$RUNNER_TEMP/acked.txt"

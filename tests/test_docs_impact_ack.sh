@@ -1,11 +1,19 @@
 #!/usr/bin/env bash
-# Behavioural harness for the `Docs-impact:` acknowledgement parser in
-# .github/workflows/docs.yml ("Docs impact on claimed surfaces").
+# Behavioural harness for the waiver logic in .github/workflows/docs.yml
+# ("Docs impact on claimed surfaces").
 #
-# The step itself only runs on GitHub, so its logic is otherwise unexercised
-# until a pull request depends on it. This extracts the acknowledgement block
-# from the workflow — the real text, never a copy that could drift — and drives
-# it over synthetic commit ranges.
+# That step is the corpus's drift gate, and its acknowledgement parser is the
+# one part of it that can let drift through deliberately — but it runs only on
+# pull requests, so without this harness it is first exercised by the very PR
+# that depends on it. Everything below drives the REAL decision block, sliced
+# out of the workflow at run time, so the harness cannot pass against a stale
+# copy of the logic.
+#
+# The slice runs from the acknowledgement collection to the end of the step,
+# and covers both halves: producing `acked.txt`, and the impacted/touched/acked
+# decision that writes `missing.txt`. Its inputs (`impacted`, `touched`,
+# `deleted`) are set per case, standing in for what the earlier half of the step
+# computes from the manifest and the diff.
 #
 # Run: bash tests/test_docs_impact_ack.sh
 set -euo pipefail
@@ -16,53 +24,64 @@ trap 'rm -rf "$work"' EXIT
 export RUNNER_TEMP="$work"
 
 fails=0
-check() {  # check <name> <expected: ok|fail> <expected-substring-or-->
-  local name="$1" expect="$2" needle="$3" rc=0 out
-  out="$(run_ack 2>&1)" || rc=$?
-  if [ "$expect" = ok ] && [ "$rc" -ne 0 ]; then
-    echo "FAIL $name: expected success, got rc=$rc"; echo "$out" | sed 's/^/    /'
-    fails=$((fails + 1)); return
-  fi
-  if [ "$expect" = fail ] && [ "$rc" -eq 0 ]; then
-    echo "FAIL $name: expected failure, got success"; echo "$out" | sed 's/^/    /'
-    fails=$((fails + 1)); return
-  fi
-  if [ "$needle" != "-" ] && ! printf '%s' "$out" | grep -qF -- "$needle"; then
-    echo "FAIL $name: output missing '$needle'"; echo "$out" | sed 's/^/    /'
-    fails=$((fails + 1)); return
-  fi
-  echo "ok   $name"
-}
+pass() { echo "ok   $1"; }
+fail() { echo "FAIL $1"; shift; [ $# -gt 0 ] && printf '%s\n' "$@" | sed 's/^/       /'; fails=$((fails + 1)); }
 
-# The acknowledgement parser, lifted verbatim from the workflow so this harness
-# cannot pass against a stale copy of the logic.
-extract_parser() {
+# The decision block, lifted verbatim. Anchored on markers that are themselves
+# load-bearing lines of the step; if an edit moves them, extraction fails loudly
+# rather than silently testing nothing.
+extract_block() {
   python3 - "$repo_root" <<'PY'
 import pathlib, sys, yaml
 root = pathlib.Path(sys.argv[1])
 wf = yaml.safe_load((root / ".github/workflows/docs.yml").read_text())
 for job in wf["jobs"].values():
     for step in job.get("steps", []):
-        if step.get("name") == "Docs impact on claimed surfaces":
-            body = step["run"]
-            start = body.index(': > "$RUNNER_TEMP/acked.txt"')
-            end = body.index('done < "$RUNNER_TEMP/acks.txt"') + len('done < "$RUNNER_TEMP/acks.txt"')
-            print(body[start:end])
-            sys.exit(0)
-raise SystemExit("acknowledgement block not found in docs.yml")
+        if step.get("name") != "Docs impact on claimed surfaces":
+            continue
+        body = step["run"]
+        start_marker = ': > "$RUNNER_TEMP/acked.txt"'
+        end_marker = "fi"
+        if start_marker not in body:
+            raise SystemExit("harness: acknowledgement block start marker not found — "
+                             "the step was restructured; update this harness")
+        block = body[body.index(start_marker):].rstrip()
+        if not block.endswith(end_marker):
+            raise SystemExit("harness: step no longer ends with the missing.txt check — "
+                             "update this harness")
+        for needle in ('"$RUNNER_TEMP/missing.txt"', 'acked.txt', '$impacted'):
+            if needle not in block:
+                raise SystemExit(f"harness: extracted block lost {needle!r} — "
+                                 "the decision moved out of the slice")
+        print(block)
+        sys.exit(0)
+raise SystemExit("harness: step 'Docs impact on claimed surfaces' not found")
 PY
 }
 
-parser="$(extract_parser)"
+block="$(extract_block)"
 
-run_ack() {
+# Drive the block with a given impacted/touched/deleted set against the repo's
+# current tip commit message.
+run_block() {  # run_block <impacted> <touched> <deleted>
   ( set -euo pipefail
     cd "$work/repo"
-    base="$(git rev-parse main)"
-    eval "$parser" )
+    : > "$RUNNER_TEMP/missing.txt"
+    impacted="$1" touched="$2" deleted="$3"
+    eval "$block" )
 }
 
-# A throwaway repo whose commit messages carry the acknowledgements.
+expect() {  # expect <name> <ok|fail> <impacted> <touched> <deleted> [needle]
+  local name="$1" want="$2" imp="$3" tch="$4" del="$5" needle="${6:--}" rc=0 out
+  out="$(run_block "$imp" "$tch" "$del" 2>&1)" || rc=$?
+  if [ "$want" = ok ] && [ "$rc" -ne 0 ]; then fail "$name (wanted pass, rc=$rc)" "$out"; return; fi
+  if [ "$want" = fail ] && [ "$rc" -eq 0 ]; then fail "$name (wanted failure)" "$out"; return; fi
+  if [ "$needle" != "-" ] && ! printf '%s' "$out" | grep -qF -- "$needle"; then
+    fail "$name (missing '$needle')" "$out"; return
+  fi
+  pass "$name"
+}
+
 git init -q "$work/repo"
 cd "$work/repo"
 # Deliberately not address-shaped: this repo's pre-commit hook refuses anything
@@ -70,62 +89,96 @@ cd "$work/repo"
 git config user.email harness; git config user.name harness
 git commit -q --allow-empty -m "base"
 git branch -M main
-git checkout -q -b pr
+tip() { git commit -q --allow-empty -m "$1"; }
+reset_pr() { git checkout -q main; git checkout -q -B pr; }
 
-commit() { git commit -q --allow-empty -m "$1"; }
+D1=architecture/telegram.md
+D2=architecture/turn-loop.md
 
-# 1. A well-formed acknowledgement is accepted and records its document.
-commit "change
+# --- the gate still bites -------------------------------------------------
+reset_pr; tip "change with no waiver"
+expect "unwaived impacted doc fails" fail "$D1" "" "" "these docs claim it but did not change"
 
-Docs-impact: architecture/tools-interface.md — none (claimed symbols unchanged)"
-check "well-formed ack accepted" ok "acknowledged for architecture/tools-interface.md"
-grep -qx "architecture/tools-interface.md" "$work/acked.txt" \
-  || { echo "FAIL: acked.txt missing the document"; fails=$((fails + 1)); }
+reset_pr; tip "change"
+expect "touched doc satisfies the gate" ok "$D1" "$D1" ""
 
-# 2. A reason is mandatory — the bare form is the one that would turn this into
-#    a rubber stamp, so it must fail loudly.
-git checkout -q main; git checkout -q -B pr
-commit "change
+# --- a well-formed waiver -------------------------------------------------
+reset_pr; tip "change
 
-Docs-impact: architecture/telegram.md"
-check "ack without a reason rejected" fail "has no reason"
+Docs-impact: $D1 — none, the claimed symbols were not modified"
+expect "reasoned waiver accepted" ok "$D1" "" "" "acknowledged for $D1"
 
-# 3. A plain-hyphen separator is accepted (not everyone types an em dash).
-git checkout -q main; git checkout -q -B pr
-commit "change
+# --- reasons that are not reasons ----------------------------------------
+reset_pr; tip "change
 
-Docs-impact: architecture/telegram.md - still accurate"
-check "hyphen separator accepted" ok "acknowledged for architecture/telegram.md"
+Docs-impact: $D1"
+expect "no separator rejected" fail "$D1" "" "" "needs"
 
-# 4. Separator alone, no words after it, is still no reason.
-git checkout -q main; git checkout -q -B pr
-commit "change
+reset_pr; tip "change
 
-Docs-impact: architecture/telegram.md —"
-check "separator with no words rejected" fail "has no reason"
+Docs-impact: $D1 —"
+expect "separator with nothing after it rejected" fail "$D1" "" "" "no real reason"
 
-# 5. Several documents need several lines — there is no blanket waiver.
-git checkout -q main; git checkout -q -B pr
-commit "change
+reset_pr; tip "change
 
-Docs-impact: architecture/telegram.md — a
-Docs-impact: architecture/turn-loop.md — b"
-check "multiple acks parse" ok "acknowledged for architecture/turn-loop.md"
-[ "$(wc -l < "$work/acked.txt")" -eq 2 ] \
-  || { echo "FAIL: expected 2 acked docs"; fails=$((fails + 1)); }
+Docs-impact: $D1 — ."
+expect "punctuation-only reason rejected" fail "$D1" "" "" "no real reason"
 
-# 6. An acknowledgement on the BASE branch must not carry over — that is the
-#    two-dot-versus-three-dot bug this range spelling exists to avoid.
+reset_pr; tip "change
+
+Docs-impact: $D1 — --"
+expect "second separator as reason rejected" fail "$D1" "" "" "no real reason"
+
+reset_pr; tip "change
+
+Docs-impact: $D1 — $D1"
+expect "doc name echoed back rejected" fail "$D1" "" "" "no real reason"
+
+reset_pr; tip "change
+
+Docs-impact: $D1 - still accurate here"
+expect "plain hyphen separator accepted" ok "$D1" "" "" "acknowledged for $D1"
+
+# --- no blanket waiver ----------------------------------------------------
+reset_pr; tip "change
+
+Docs-impact: $D1 — reason one"
+expect "one waiver does not cover a second doc" fail "$D1
+$D2" "" "" "$D2"
+
+reset_pr; tip "change
+
+Docs-impact: $D1 — reason one
+Docs-impact: $D2 — reason two"
+expect "per-document waivers cover both" ok "$D1
+$D2" "" ""
+
+# --- the waiver is a statement about the FINAL diff -----------------------
+reset_pr
+tip "change
+
+Docs-impact: $D1 — considered at the time"
+tip "a later commit that changed more"
+expect "waiver in an earlier commit does not carry" fail "$D1" "" "" "did not change"
+
 git checkout -q main
-commit "base-side waiver
+tip "base-side waiver
 
-Docs-impact: architecture/telegram.md — waived on main"
-git checkout -q -B pr
-commit "change with no waiver of its own"
-check "base-side ack does not carry" ok "-"
-[ ! -s "$work/acked.txt" ] \
-  || { echo "FAIL: base-side ack leaked into this PR"; fails=$((fails + 1)); }
+Docs-impact: $D1 — waived on main"
+git checkout -q -B pr; tip "change with no waiver of its own"
+expect "base-side waiver does not carry" fail "$D1" "" "" "did not change"
+
+# --- an indented example is prose, not a waiver ---------------------------
+reset_pr; tip "document the mechanism
+
+Write it like this:
+    Docs-impact: $D1 — some reason"
+expect "indented example is not a waiver" fail "$D1" "" "" "did not change"
+
+# --- a deleted claimant is refused outright -------------------------------
+reset_pr; tip "change"
+expect "deleting a claimant is refused" fail "$D1" "" "$D1" "deleted in the same PR"
 
 echo
-[ "$fails" -eq 0 ] && { echo "docs-impact ack: all checks passed"; exit 0; }
-echo "docs-impact ack: $fails check(s) failed"; exit 1
+[ "$fails" -eq 0 ] && { echo "docs-impact gate: all checks passed"; exit 0; }
+echo "docs-impact gate: $fails check(s) failed"; exit 1
