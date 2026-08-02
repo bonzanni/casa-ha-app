@@ -1,5 +1,28 @@
 # Changelog
 
+## [0.146.0] - 2026-08-02
+
+### Added
+
+Authorization callbacks — plugins can now receive OAuth-style browser
+redirects at a stable public URL, so a plugin that needs you to sign in to
+an outside service (a bank, Google) can complete that sign-in from your
+phone:
+
+- **A plugin declares the callback it needs at install time, and you
+  approve it once in Telegram** — the same tap-to-approve flow as a plugin
+  webhook. Nothing is wired by hand.
+- **The callback URL is stable and public.** Set `public_url` to your
+  add-on's HTTPS address (and publish the external API port through your
+  reverse proxy); the plugin shows you the exact redirect URI to register
+  with the provider, and it does not change when the plugin updates.
+- **You stay in control.** A callback is dark until you approve it, an
+  approval is withdrawn with the `callback_ack_revoke` tool, and the
+  public page reveals nothing — every visit returns the same neutral
+  "you can close this tab" response.
+- Requires `public_url`; leave it empty and the facility stays off. See
+  DOCS.md for the operator walkthrough.
+
 ## [0.145.0] - 2026-08-01
 
 ### Fixed
