@@ -136,3 +136,49 @@ class TestNameFitsTheProvenancePeerBound:
         jsonschema.validate(_doc({"name": longest, "type": "webhook"}), SCHEMA)
         origin = ingress_identity("webhook_trigger", webhook_name=longest)
         assert origin.user_peer == "webhook:" + longest
+
+
+# --- #396: point-in-time reminders (type=date, at, one_shot) ---------------
+
+
+def test_date_trigger_validates():
+    jsonschema.validate(_doc({
+        "name": "reminder-a1b2c3", "type": "date",
+        "at": "2026-08-03T08:00:00+02:00", "one_shot": True,
+        "channel": "telegram",
+        "prompt": 'Send this exact message via telegram: "Bins."'}, 1), SCHEMA)
+
+
+def test_date_trigger_requires_at():
+    with pytest.raises(jsonschema.ValidationError):
+        jsonschema.validate(_doc({
+            "name": "reminder-a1b2c3", "type": "date",
+            "channel": "telegram", "prompt": "x"}, 1), SCHEMA)
+
+
+def test_date_trigger_requires_channel():
+    with pytest.raises(jsonschema.ValidationError):
+        jsonschema.validate(_doc({
+            "name": "reminder-a1b2c3", "type": "date",
+            "at": "2026-08-03T08:00:00+02:00", "prompt": "x"}, 1), SCHEMA)
+
+
+def test_date_trigger_rejects_both_prompt_and_prompt_file():
+    with pytest.raises(jsonschema.ValidationError):
+        jsonschema.validate(_doc({
+            "name": "reminder-a1b2c3", "type": "date",
+            "at": "2026-08-03T08:00:00+02:00", "channel": "telegram",
+            "prompt": "x", "prompt_file": "prompts/x.md"}, 1), SCHEMA)
+
+
+def test_cron_trigger_may_carry_one_shot():
+    jsonschema.validate(_doc({
+        "name": "reminder-a1b2c3", "type": "cron", "schedule": "0 7 * * thu",
+        "one_shot": False, "channel": "telegram", "prompt": "x"}, 1), SCHEMA)
+
+
+def test_date_trigger_valid_under_schema_version_2():
+    jsonschema.validate(_doc({
+        "name": "reminder-a1b2c3", "type": "date",
+        "at": "2026-08-03T08:00:00+02:00", "one_shot": True,
+        "channel": "telegram", "prompt": "x"}, 2), SCHEMA)

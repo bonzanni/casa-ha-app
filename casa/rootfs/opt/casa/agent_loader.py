@@ -938,7 +938,7 @@ def _build_triggers(
     specs: list[TriggerSpec] = []
     for t in (data.get("triggers") or []):
         trig_name = t.get("name", "?")
-        if t.get("type") in ("interval", "cron"):
+        if t.get("type") in ("interval", "cron", "date"):
             prompt_text = _resolve_prose(
                 t, field="prompt", agent_dir=agent_dir,
                 source_label=f"triggers.yaml::{trig_name}",
@@ -956,6 +956,8 @@ def _build_triggers(
             prompt=prompt_text,
             auth=_normalize_webhook_auth(t, trig_name) if is_webhook else None,
             clearance=t.get("clearance", "public") if is_webhook else "public",
+            at=t.get("at", "") or "",
+            one_shot=bool(t.get("one_shot", False)),
         ))
     return specs
 

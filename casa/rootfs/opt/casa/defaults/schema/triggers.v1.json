@@ -34,9 +34,11 @@
         "required": ["name", "type"],
         "properties": {
           "name":        {"type": "string", "minLength": 1, "maxLength": 248, "pattern": "^(?!plg-)[a-zA-Z0-9_-]+$"},
-          "type":        {"type": "string", "enum": ["interval", "cron", "webhook"]},
+          "type":        {"type": "string", "enum": ["interval", "cron", "webhook", "date"]},
           "minutes":     {"type": "integer", "minimum": 1},
           "schedule":    {"type": "string", "minLength": 1},
+          "at":          {"type": "string", "minLength": 1},
+          "one_shot":    {"type": "boolean"},
           "path":        {"type": "string", "pattern": "^/.+"},
           "channel":     {"type": "string"},
           "prompt":      {"type": "string", "minLength": 1},
@@ -59,6 +61,17 @@
             "if": {"properties": {"type": {"const": "cron"}}},
             "then": {
               "required": ["schedule", "channel"],
+              "oneOf": [
+                {"required": ["prompt"], "not": {"required": ["prompt_file"]}},
+                {"required": ["prompt_file"], "not": {"required": ["prompt"]}}
+              ]
+            }
+          },
+          {
+            "$comment": "#396: a point-in-time reminder. `at` is an ISO-8601 instant WITH offset. Cron has no year field, so a dated one-shot written as cron is an ANNUAL trigger in disguise — this type is what removes that trap.",
+            "if": {"properties": {"type": {"const": "date"}}},
+            "then": {
+              "required": ["at", "channel"],
               "oneOf": [
                 {"required": ["prompt"], "not": {"required": ["prompt_file"]}},
                 {"required": ["prompt_file"], "not": {"required": ["prompt"]}}

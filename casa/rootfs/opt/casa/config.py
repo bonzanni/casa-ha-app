@@ -177,6 +177,13 @@ class TriggerSpec:
     # (never "private"); ignored for non-webhook triggers.
     auth: dict[str, Any] | None = None
     clearance: str = "public"
+    # #396: point-in-time reminders. ``at`` is an ISO-8601 instant WITH a UTC
+    # offset and is meaningful only for type="date" — cron has no year field,
+    # so a dated one-shot written as cron is an ANNUAL trigger in disguise.
+    # ``one_shot`` makes the registry drop both the scheduler job and the
+    # triggers.yaml entry after a single fire.
+    at: str = ""
+    one_shot: bool = False
 
 
 @dataclass
