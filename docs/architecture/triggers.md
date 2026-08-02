@@ -43,7 +43,17 @@ the sweep leaves it alone.
 **A recurring reminder keeps its first occurrence as an anchor.** The derived cron fields
 drive the recurrence — evaluated in the scheduler's timezone, which is what keeps a series
 firing at the same local time across a DST boundary — while the anchor becomes the
-scheduler's start date, so "every Thursday from the 20th" cannot fire on the 6th.
+scheduler's start date, so "every Thursday from the 20th" cannot fire on the 6th. A cron
+expression has minute resolution, so a sub-minute anchor is rounded *up* to the next whole
+minute and everything — schedule, anchor, and the time reported back to the user — is derived
+from the rounded value. Rounding down would be wrong twice: the truncated minute may already
+have passed, delaying the first occurrence by a whole period, and the series would fire
+seconds before the time the user was promised.
+
+**The store is the truth; the scheduler is a cache of it.** The sweep re-registers any
+reminder that has no live job, which is what heals a divergence rather than a lock — a reload
+re-registering a role from a snapshot taken before a reminder was written would otherwise
+drop a *recurring* reminder for good, since only one-shots are recoverable by delivery.
 
 **Every webhook trigger arrives on one wildcard route.** There is no route per trigger. The
 name in the path is looked up against a registry, and an unknown name is refused before any

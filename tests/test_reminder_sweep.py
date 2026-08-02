@@ -239,3 +239,82 @@ async def test_a_date_entry_missing_one_shot_is_still_swept(env):
     reminders.append_entry(env.reminders_path, entry)
 
     assert await reminders.sweep_reminders(env.runtime, NOW) == 1
+
+
+# ---------------------------------------------------------------------------
+# The sweep as a convergence loop — the store is the truth (Sol r3 #1)
+# ---------------------------------------------------------------------------
+
+
+async def test_a_recurring_reminder_without_a_job_is_reregistered(env):
+    """A reload that re-registers a role from a snapshot taken before the
+    reminder was written drops its job. Only one-shots are recoverable by
+    delivery, so without this a recurring reminder would never fire again
+    until the next restart."""
+    env.runtime.role_configs = {
+        "assistant": types.SimpleNamespace(channels=["telegram"]),
+    }
+    reminders.append_entry(env.reminders_path, {
+        "name": "reminder-rec333", "type": "cron", "schedule": "0 7 * * thu",
+        "at": "2099-08-06T07:00:00+02:00", "one_shot": False,
+        "channel": "telegram", "prompt": "Gym."})
+
+    await reminders.sweep_reminders(env.runtime, NOW)
+
+    assert env.registry.has_job("assistant", "reminder-rec333")
+
+
+async def test_a_future_one_shot_without_a_job_is_reregistered(env):
+    env.runtime.role_configs = {
+        "assistant": types.SimpleNamespace(channels=["telegram"]),
+    }
+    reminders.append_entry(env.reminders_path,
+                           _reminder("reminder-fut444", at=LATER))
+
+    await reminders.sweep_reminders(env.runtime, NOW)
+
+    assert env.registry.has_job("assistant", "reminder-fut444")
+
+
+async def test_a_past_one_shot_is_delivered_not_reregistered(env):
+    env.runtime.role_configs = {
+        "assistant": types.SimpleNamespace(channels=["telegram"]),
+    }
+    reminders.append_entry(env.reminders_path, _reminder())
+
+    assert await reminders.sweep_reminders(env.runtime, NOW) == 1
+    assert not env.registry.has_job("assistant", "reminder-old111")
+
+
+async def test_reconciliation_is_idempotent(env):
+    env.runtime.role_configs = {
+        "assistant": types.SimpleNamespace(channels=["telegram"]),
+    }
+    reminders.append_entry(env.reminders_path, {
+        "name": "reminder-rec333", "type": "cron", "schedule": "0 7 * * thu",
+        "at": "2099-08-06T07:00:00+02:00", "one_shot": False,
+        "channel": "telegram", "prompt": "Gym."})
+
+    await reminders.sweep_reminders(env.runtime, NOW)
+    await reminders.sweep_reminders(env.runtime, NOW)   # must not raise
+
+    assert env.registry.has_job("assistant", "reminder-rec333")
+
+
+async def test_an_unregisterable_entry_does_not_stop_the_others(env):
+    """An entry naming a channel the role does not declare must not abort
+    reconciliation for the rest."""
+    env.runtime.role_configs = {
+        "assistant": types.SimpleNamespace(channels=["telegram"]),
+    }
+    reminders.append_entry(env.reminders_path, {
+        "name": "reminder-bad555", "type": "cron", "schedule": "0 7 * * thu",
+        "one_shot": False, "channel": "voice", "prompt": "x"})
+    reminders.append_entry(env.reminders_path, {
+        "name": "reminder-ok6666", "type": "cron", "schedule": "0 7 * * thu",
+        "one_shot": False, "channel": "telegram", "prompt": "x"})
+
+    await reminders.sweep_reminders(env.runtime, NOW)
+
+    assert not env.registry.has_job("assistant", "reminder-bad555")
+    assert env.registry.has_job("assistant", "reminder-ok6666")

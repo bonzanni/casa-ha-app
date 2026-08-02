@@ -4765,10 +4765,15 @@ async def set_reminder(args: dict) -> dict:
         return _result({"status": "error", "kind": "register_failed",
                         "message": str(exc)})
 
+    # Report the EFFECTIVE time, not the one passed in. A recurring anchor is
+    # rounded up to a whole minute (cron has minute resolution), so echoing
+    # the caller's value would tell the user a time the reminder will not
+    # actually fire at.
+    effective = entry.get("at") or when.isoformat()
     logger.info("reminder set: role=%s name=%s at=%s repeat=%s",
-                role, name, when.isoformat(), repeat)
+                role, name, effective, repeat)
     return _result({"status": "ok", "name": name,
-                    "at": when.isoformat(), "repeat": repeat})
+                    "at": effective, "repeat": repeat})
 
 
 @tool(

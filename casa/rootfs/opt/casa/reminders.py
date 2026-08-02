@@ -27,7 +27,7 @@ from __future__ import annotations
 import logging
 import os
 import secrets
-from datetime import datetime
+from datetime import datetime, timedelta
 
 import yaml
 
@@ -130,27 +130,37 @@ def derive_schedule(at: datetime, repeat: str) -> dict[str, str]:
     if repeat == "none":
         return {"type": "date", "at": at.isoformat()}
 
-    minute, hour = at.minute, at.hour
+    # A cron expression has minute resolution and fires at second ZERO, so a
+    # sub-minute anchor cannot be honoured. Round UP to the next whole minute
+    # and derive EVERYTHING from that rounded value — schedule, anchor, and
+    # the time reported back to the caller.
+    #
+    # Rounding down was tried and is wrong twice over (round-3 review): the
+    # truncated minute may already have passed, pushing the first occurrence a
+    # whole day/week/month late, and the series would fire seconds earlier
+    # than the time the user was told. Rounding up keeps the first occurrence
+    # genuinely in the future and keeps the promise exact — at the cost of at
+    # most 59 seconds, which is the honest price of minute-resolution cron.
+    anchor = at.replace(second=0, microsecond=0)
+    if at.second or at.microsecond:
+        anchor += timedelta(minutes=1)
+
+    minute, hour = anchor.minute, anchor.hour
     if repeat == "daily":
         schedule = f"{minute} {hour} * * *"
     elif repeat == "weekdays":
         schedule = f"{minute} {hour} * * mon-fri"
     elif repeat == "weekly":
-        schedule = f"{minute} {hour} * * {_DOW_BY_WEEKDAY[at.weekday()]}"
+        schedule = f"{minute} {hour} * * {_DOW_BY_WEEKDAY[anchor.weekday()]}"
     else:  # monthly
-        schedule = f"{minute} {hour} {at.day} * *"
-    # ``at`` is retained as the ANCHOR — the first occurrence — and becomes
-    # the scheduler's start_date. Without it a "every Thursday from the 20th"
-    # reminder set on the 3rd would fire on the 6th and 13th, two occurrences
-    # the user never asked for. It does NOT drive recurrence: the cron fields
-    # above do, evaluated in the scheduler's timezone, which is what keeps the
-    # series DST-correct.
-    #
-    # Seconds are truncated because the cron expression fires at second ZERO.
-    # An anchor of 07:05:30 would put start_date 30s AFTER that day's only
-    # matching occurrence, so the scheduler would skip it and the promised
-    # first reminder would land a whole day, week or month late.
-    anchor = at.replace(second=0, microsecond=0)
+        schedule = f"{minute} {hour} {anchor.day} * *"
+    # The anchor is the FIRST occurrence and becomes the scheduler's
+    # start_date. Without it a "every Thursday from the 20th" reminder set on
+    # the 3rd would fire on the 6th and 13th, two occurrences the user never
+    # asked for. It does NOT drive recurrence: the cron fields above do,
+    # evaluated in the scheduler's timezone, which is what keeps the series
+    # DST-correct. Callers must report ``at`` back to the user, not the value
+    # they passed in — the two differ when rounding applied.
     return {"type": "cron", "schedule": schedule, "at": anchor.isoformat()}
 
 
@@ -219,6 +229,17 @@ def remove_entry(path: str, name: str) -> bool:
     doc["triggers"] = kept
     _save(path, doc)
     return True
+
+
+def all_entries(path: str) -> list[dict]:
+    """Every reminder entry in the store at *path*, or [] if unreadable."""
+    try:
+        return [e for e in _load(path)["triggers"]
+                if is_reminder_name(e.get("name", ""))]
+    except (OSError, ValueError):
+        logger.warning("reminders: cannot read %s; skipping", path,
+                       exc_info=True)
+        return []
 
 
 def past_due(path: str, now: datetime) -> list[dict]:
@@ -343,4 +364,58 @@ async def sweep_reminders(runtime, now: datetime) -> int:
                     "reminder sweep: could not remove %s after delivery; it "
                     "will be redelivered next pass", name, exc_info=True,
                 )
+
+        _reconcile_registrations(runtime, registry, role, path, now)
+
     return delivered
+
+
+def _reconcile_registrations(runtime, registry, role: str, path: str,
+                             now: datetime) -> None:
+    """Re-register any reminder in the store that has no live job.
+
+    The store is the truth; the scheduler is a cache of it. Anything that can
+    make the two diverge — a reload re-registering a role from a snapshot
+    taken before a reminder was written, a registration that failed
+    transiently — is healed here rather than needing its own lock. Without
+    this a recurring reminder lost that way would never fire again until the
+    next restart, because only one-shots are recoverable by delivery.
+    """
+    if registry is None:
+        return
+    from config import TriggerSpec
+
+    channels = list(getattr(
+        getattr(runtime, "role_configs", {}).get(role), "channels", []) or [])
+    if not channels:
+        return
+
+    for entry in all_entries(path):
+        name = entry.get("name", "")
+        if registry.has_job(role, name):
+            continue
+        if entry.get("type") == "date":
+            # A past-dated one-shot is the sweep's to deliver, not to
+            # register; a future one genuinely needs a job.
+            try:
+                if parse_at(entry.get("at", "")) <= now:
+                    continue
+            except ValueError:
+                continue
+        try:
+            registry.register_agent(role, [TriggerSpec(
+                name=name, type=entry.get("type", ""),
+                schedule=entry.get("schedule", ""), at=entry.get("at", ""),
+                one_shot=bool(entry.get("one_shot", False)),
+                channel=entry.get("channel", ""),
+                prompt=entry.get("prompt", ""),
+            )], channels)
+            logger.info(
+                "reminder sweep: re-registered %s for %s (no live job)",
+                name, role,
+            )
+        except Exception:  # noqa: BLE001 - one bad entry must not stop the rest
+            logger.warning(
+                "reminder sweep: could not re-register %s for %s",
+                name, role, exc_info=True,
+            )

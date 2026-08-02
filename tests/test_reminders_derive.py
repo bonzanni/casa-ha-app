@@ -99,17 +99,36 @@ def test_recurring_retains_its_anchor():
     assert reminders.parse_at(out["at"]) == at
 
 
-def test_recurring_anchor_truncates_seconds():
-    """Sol r2 #2: the cron expression fires at second ZERO. An anchor of
-    07:05:30 would put start_date 30s after that day's only matching
-    occurrence, so the scheduler skips it and the promised first reminder
-    lands a whole day/week/month late."""
+def test_recurring_anchor_rounds_UP_to_a_whole_minute():
+    """Round 3 (both reviewers): cron has minute resolution and fires at
+    second zero. Rounding DOWN was wrong twice over — the truncated minute may
+    already have passed (pushing the first occurrence a whole period late) and
+    the series would fire seconds earlier than the user was told. Rounding up
+    keeps the first occurrence in the future AND the promise exact."""
     at = datetime(2026, 8, 4, 7, 5, 30, 123456, tzinfo=CEST)
     out = reminders.derive_schedule(at, "daily")
-    assert out["schedule"] == "5 7 * * *"
     anchor = reminders.parse_at(out["at"])
+    assert anchor == datetime(2026, 8, 4, 7, 6, tzinfo=CEST)
     assert anchor.second == 0 and anchor.microsecond == 0
-    assert anchor == datetime(2026, 8, 4, 7, 5, tzinfo=CEST)
+    # The schedule is derived from the ROUNDED value, so the two agree.
+    assert out["schedule"] == "6 7 * * *"
+
+
+def test_a_minute_aligned_anchor_is_untouched():
+    at = datetime(2026, 8, 4, 7, 5, tzinfo=CEST)
+    out = reminders.derive_schedule(at, "daily")
+    assert out["schedule"] == "5 7 * * *"
+    assert reminders.parse_at(out["at"]) == at
+
+
+def test_rounding_up_can_roll_the_weekday_and_stay_consistent():
+    """23:59:30 on a Thursday rounds to Friday 00:00 — the derived weekday
+    must follow the rounded value, not the original."""
+    at = datetime(2026, 8, 6, 23, 59, 30, tzinfo=CEST)   # Thursday
+    out = reminders.derive_schedule(at, "weekly")
+    anchor = reminders.parse_at(out["at"])
+    assert anchor == datetime(2026, 8, 7, 0, 0, tzinfo=CEST)   # Friday
+    assert out["schedule"] == "0 0 * * fri"
 
 
 def test_one_shot_keeps_its_exact_instant():
