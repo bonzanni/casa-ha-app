@@ -50,6 +50,23 @@ ordering guarantee entirely. **A direct send bypasses it, and nothing mechanical
 one** — fallback paths exist for when no driver seam is present, and they are outside the
 ordering guarantee.
 
+**Narration seals on what landed, not on what was attempted.** Posting anything below the
+open narration message seals it — nothing edits it again — so the seal has to follow a
+*confirmed* send. A send that fails outright leaves the narration open and editable, because
+no message went below it. A send that merely times out is treated as ambiguous and seals
+anyway: the platform may have accepted the message before the response was lost, and a later
+edit landing above a message that does exist is the worse outcome. The same rule governs the
+relay-mediated path, where a discrete post runs through a caller-supplied poster: it seals
+when that poster confirms a message id, when the poster reports a compensated physical send,
+or when it is cancelled mid-flight (ambiguous, like a timeout) — but not when it fails.
+
+**The turn's first output threads to the message that triggered it.** The inbound envelope
+records a reply target that whichever output posts first this turn consumes — narration, a
+deferred reply, or an ask keyboard. It is one-shot, so later output in the same turn is not a
+reply. Consumption is tied to success: a send that fails or is cancelled restores the target
+so the next successful output still threads, and restoring never overwrites a newer target
+set by a later envelope.
+
 **A tap is authorised against the request it answers.** Callback data is versioned and
 carries the namespace and request id; resolution is bound to the operator the request was
 posted for. A tap from someone else is refused. Note that the parser still accepts a legacy
