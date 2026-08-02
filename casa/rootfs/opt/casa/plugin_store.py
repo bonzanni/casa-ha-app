@@ -579,7 +579,7 @@ def artifact_verdict(path: Path, *, name: str, repo: str, revision: str,
         manifest_triggers(manifest, manifest_name or name)
     except StoreError:
         return "triggers_invalid"
-    # Task 2 (spec §3): same upgrade-path posture for casa.callbacks — an
+    # Same upgrade-path posture for casa.callbacks — an
     # artifact published before this release could carry a malformed/
     # unsupported block the publish-time gate never saw.
     try:
@@ -900,7 +900,7 @@ def manifest_triggers(manifest: dict, plugin_name: str) -> list:
 
 
 def manifest_callbacks(manifest: dict, plugin_name: str) -> list:
-    """Guarded + STRICT ``casa.callbacks`` extraction (Task 2, spec §3),
+    """Guarded + STRICT ``casa.callbacks`` extraction, structurally
     beside ``manifest_triggers``. Absent ``casa.callbacks`` -> ``[]``. Any
     intrinsic-validation error (shape, naming, counts/lengths) is a
     plugin-author error: raises ``StoreError(reason_code="callbacks_invalid")``.
@@ -1091,7 +1091,7 @@ def validate_manifest(root: Path, expected_name: str, *,
     # Task 4: trigger effective names derive from the RUNTIME name
     # (manifest_name when owned), never the scoped registry name.
     manifest_triggers(manifest, manifest_name or expected_name)
-    # Task 2 (spec §3): a PRESENT-but-malformed casa.callbacks refuses the
+    # A PRESENT-but-malformed casa.callbacks refuses the
     # install/update outright (strict; raises callbacks_invalid). Effective
     # names derive from the RUNTIME name (manifest_name when owned), same as
     # triggers.

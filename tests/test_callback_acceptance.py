@@ -1,17 +1,17 @@
-"""Acceptance rehearsal for the authorization-callback facility (spec §13).
+"""Acceptance rehearsal for the authorization-callback facility.
 
 ONE end-to-end, unit-level (no container) walkthrough that drives the WHOLE
-facility — Tasks 1-9 — as an integrated whole:
+facility as an integrated whole:
 
 * ``plugin_callbacks`` (declaration parse + digest/identity),
 * ``callback_acks`` (persistent operator consent),
 * ``callback_reconcile`` (the overlay + ``ready.json`` / ``.index`` writer,
-  base URL via the Task 9 ``callback_urls.validated_base`` seam),
+  base URL via the ``callback_urls.validated_base`` seam),
 * ``callback_spool`` (mint / claim / publish-once / index discovery),
 * ``callback_http`` (the unauthenticated ``GET /callback/{name}`` endpoint),
 * ``callback_episodes`` (the at-least-once delivery nudge).
 
-The four scenarios are spec §13's walkthroughs:
+The four scenarios below walk through:
 
 (a) **gmail shape** — register → consent → reconcile routes + publishes
     ready/index → a consumer discovers its spool by
@@ -108,7 +108,7 @@ class _Facility:
         self.registry = TriggerRegistry(scheduler=None, app=None, bus=None)
         self.acks = CallbackAckStore(path=tmp_path / "callback_acks.json")
 
-        # The public base URL flows through the Task 9 seam so the redirect
+        # The public base URL flows through the validated-base seam so the redirect
         # URIs a consumer reads are the validated origin, not a raw string.
         monkeypatch.setattr(
             cr, "_base_url",
@@ -166,7 +166,7 @@ class _Facility:
             acks=self.acks, spool=self.spool, resolver=_resolver([plugin]),
             entries=_entries(plugin), prompt=False)
 
-    # -- the consumer's half (spec §8) --------------------------------------
+    # -- the consumer's half ---------------------------------------------
 
     def discover(self, plugin_root: Path) -> dict:
         """A consumer knows only ``realpath($CLAUDE_PLUGIN_ROOT)``; it reads
@@ -223,7 +223,7 @@ def _build_app(facility: _Facility) -> web.Application:
         spool_provider=lambda: facility.spool,
     )
     # Registration order is load-bearing: the static done route must win over
-    # the wildcard (spec §6 step 8).
+    # the wildcard.
     app.router.add_get("/callback/done", callback_http.make_done_handler())
     app.router.add_get("/callback/{name}", handler)
     return app

@@ -1,4 +1,4 @@
-"""The public ``GET /callback/{name}`` endpoint (spec §6; INV-CB-001/002/
+"""The public ``GET /callback/{name}`` endpoint (INV-CB-001/002/
 004/005/006).
 
 This is the authorization-callback facility's only unauthenticated surface,
@@ -12,7 +12,7 @@ fixed, query-less ``/callback/done``. A differentiated status, header or
 target would be an enumeration oracle: it would tell a prober which effective
 names are routed and which states are live. That is also why there is no 429:
 flood handling damps internal *emission* (below), never the response
-(spec §6 step 1; INV-CB-005). Nothing on the request path can raise past the
+(INV-CB-005). Nothing on the request path can raise past the
 outer guard, because a 500 is a differentiated response.
 
 **Nothing query-derived is logged, and nothing request-derived is rendered.**
@@ -21,7 +21,7 @@ Handler logs carry a reason enum, a cid and the *effective* name only —
 except ``unknown_name``, which logs a fixed sentinel, since the route
 component is attacker-controlled. The access logger suppresses the query for
 ``/callback/`` (see ``casa_core_middleware.QUERY_SUPPRESSED_PREFIXES``);
-Task 9 adds the matching nginx ``map`` rule for nginx's own access log. The
+setup-nginx.sh adds the matching nginx ``map`` rule for nginx's own access log. The
 two pages are static constants: zero interpolation of request data
 (INV-CB-006).
 
@@ -34,7 +34,7 @@ exception message embeds the offending bytes, i.e. the query with the code.
 ``/callback`` request line in a record's message *and its exception
 traceback* before any handler formats it. Casa wires it at app setup; the
 residual is therefore closed in-container (the outer proxy's own logs remain
-operator-configured, per §6).
+operator-configured).
 
 **Opaque relay.** Casa interprets exactly one parameter — ``state``, parsed
 strictly from the RAW query string, never the framework's decoded view, so a
@@ -84,7 +84,7 @@ DEFAULT_RATE_PER_MIN = 60
 #: is attacker-controlled and must never reach a log line.
 UNKNOWN_SENTINEL = "<unknown>"
 
-#: Outcome vocabulary (spec §6 "Log hygiene"). ``expired`` is part of the
+#: Outcome vocabulary. ``expired`` is part of the
 #: facility's vocabulary but is NOT reachable from this handler:
 #: ``CallbackSpool.claim`` refuses expired, replayed and never-minted states
 #: identically by design, so the handler sees one refusal and logs
@@ -94,7 +94,7 @@ REASONS = frozenset({
     "result_exists", "write_failed",
 })
 
-#: State grammar (spec §6 step 3) — checked against the RAW value, so a
+#: State grammar — checked against the RAW value, so a
 #: percent-escape is a rejection rather than a decode.
 STATE_MIN = 22
 STATE_MAX = 256
@@ -102,7 +102,7 @@ _STATE_CHARS = frozenset(
     "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789._~-")
 _HEX_DIGITS = frozenset("0123456789abcdefABCDEF")
 
-#: Pre-filesystem caps (spec §6 step 3). aiohttp already bounds the request
+#: Pre-filesystem caps. aiohttp already bounds the request
 #: line, but the record is written to ``/data`` and read by a plugin, so the
 #: captured size is bounded here too. A violation is a neutral refusal — no
 #: truncated record is ever stored, because a truncated credential is worse
@@ -112,7 +112,7 @@ MAX_PAIRS = 32
 MAX_KEY = 128
 MAX_VALUE = 2048
 
-#: Sent on BOTH the 303 and the done page (spec §6 step 8).
+#: Sent on BOTH the 303 and the done page.
 SECURITY_HEADERS: dict[str, str] = {
     "Cache-Control": "no-store, private",
     "Pragma": "no-cache",
@@ -219,7 +219,7 @@ def install_callback_log_redaction() -> None:
 
 
 # ---------------------------------------------------------------------------
-# query parsing (spec §6 steps 3 and 6)
+# query parsing
 # ---------------------------------------------------------------------------
 
 
@@ -244,7 +244,7 @@ def _segments(raw_query: str) -> list[str] | None:
 def _extract_state(raw_query: str) -> str | None:
     """The single ``state`` value, or ``None`` for every malformed case.
 
-    Parsed from the RAW query on purpose (spec §6 step 3): the framework's
+    Parsed from the RAW query on purpose: the framework's
     decoded view merges duplicates and percent-decodes, either of which would
     let a prober present one value to casa's charset gate and another to the
     filesystem. Requires *exactly one* ``state`` occurrence — a bare ``state``
@@ -274,7 +274,7 @@ def _extract_state(raw_query: str) -> str | None:
 
 
 def _decode_component(raw: str) -> str:
-    """Decode one key or value per spec §6 step 6.
+    """Decode one key or value of the query string.
 
     ``+`` becomes a space; a valid ``%XX`` percent-decodes to that byte; a
     malformed ``%`` sequence is left verbatim (a provider that emits one is
@@ -316,7 +316,7 @@ def _decoded_pairs(raw_query: str) -> list[list[str]]:
 
 
 # ---------------------------------------------------------------------------
-# outcome sampler (spec §6 step 1)
+# outcome sampler
 # ---------------------------------------------------------------------------
 
 
@@ -375,7 +375,7 @@ class OutcomeSampler:
 
 
 # ---------------------------------------------------------------------------
-# delivery-nudge seam (spec §7; Task 7)
+# delivery-nudge seam
 # ---------------------------------------------------------------------------
 
 
@@ -499,7 +499,7 @@ def make_callback_handler(
         received_at = float(clock())
         name = request.match_info.get("name", "")
 
-        # 1. Name lookup (spec §6 step 2). A miss is neutral — deliberately
+        # 1. Name lookup. A miss is neutral — deliberately
         #    unlike the webhook route's 404: probes must not be able to tell
         #    an unknown name from an unknown state.
         entry = trigger_registry.get_callback(name)
@@ -518,7 +518,7 @@ def make_callback_handler(
         if not isinstance(effective, str) or not effective:
             effective = name
 
-        # 2. State extraction from the raw query (spec §6 step 3).
+        # 2. State extraction from the raw query.
         raw_query = request.rel_url.raw_query_string
         state = _extract_state(raw_query)
         if state is None:
@@ -529,7 +529,7 @@ def make_callback_handler(
             logger.warning("callback: no spool wired; refusing neutrally")
             return effective, "write_failed"
 
-        # 3. Atomic claim (spec §6 steps 4-5). Replay, expired and
+        # 3. Atomic claim. Replay, expired and
         #    never-minted all lose identically inside claim().
         try:
             claim = spool.claim(plugin, callback_spool.state_hash(state),
@@ -542,7 +542,7 @@ def make_callback_handler(
         if claim is None:
             return effective, "no_pending"
 
-        # 4. Result record + publish-once (spec §6 step 6). The decode runs
+        # 4. Result record + publish-once. The decode runs
         #    only for a won claim, so a probe flood never pays for it.
         record = {
             "v": 1,
@@ -574,7 +574,7 @@ def make_callback_handler(
                                effective)
             return effective, failure
 
-        # 5. Nudge kick (spec §7) — non-durable, and never load-bearing for
+        # 5. Nudge kick — non-durable, and never load-bearing for
         #    the response: the result is already published and durable.
         try:
             _nudge(plugin, claim.state_hash)

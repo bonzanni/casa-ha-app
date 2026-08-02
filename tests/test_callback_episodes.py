@@ -1,4 +1,4 @@
-"""v0.146.0 — at-least-once idempotent delivery nudge (spec §7).
+"""v0.146.0 — at-least-once idempotent delivery nudge.
 
 Modeled on ``plugin_setup_episodes``: a durable ``(plugin, result_hash)``
 ledger, a supervised worker, crash-safe recording and boot recovery. The

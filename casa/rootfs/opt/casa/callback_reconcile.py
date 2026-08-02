@@ -1,13 +1,13 @@
-"""Release C — the authorization-callback reconciler (runtime seam).
+"""The authorization-callback reconciler (runtime seam).
 
 The ONE writer of :class:`trigger_registry.TriggerRegistry`'s CALLBACK
 overlay, and the owner of the spool's advisory files (``ready.json`` and the
-``.index`` discovery entries). Wired (Task 8) into the same call sites as the
+``.index`` discovery entries). Wired into the same call sites as the
 trigger reconciler: casa_core boot, every plugin lifecycle mutation, the
 trigger-affecting reload scopes, the consent approve path and the revoke tool.
 All entry points serialize on ``_RECONCILE_LOCK``.
 
-Semantics (spec §4/§5):
+Semantics:
 
 * **Complete desired overlay, atomic swap.** Every reconcile derives the FULL
   set of routable plugin callbacks from the CURRENT resolver snapshot and
@@ -112,7 +112,7 @@ def _default_spool() -> Any:
 def _base_url() -> str | None:
     """The public base URL the redirect URIs are built from.
 
-    Task 9: delegates to ``callback_urls.validated_base`` (full origin
+    Delegates to ``callback_urls.validated_base`` (full origin
     validation: absolute https, no userinfo/path/query/fragment, host not an
     IP literal) rather than only the bashio ``"null"``/``"None"`` guard
     casa_core uses for ``PUBLIC_URL``. ``None`` means the facility is
@@ -128,7 +128,7 @@ def _base_url() -> str | None:
 
 def _redirect_uri(base: str, effective: str) -> str:
     """The redirect URI a consumer registers with its provider — the
-    urllib-based join in ``callback_urls`` (Task 9), never string concat."""
+    urllib-based join in ``callback_urls``, never string concat."""
     import callback_urls
 
     return callback_urls.redirect_uri(base, effective)
@@ -206,7 +206,7 @@ def compute_desired(
             out.issues.append(PluginIssue(
                 name=rp.name, target=None, stage="callbacks",
                 reason_code="callback_invalid", artifact_id=rp.artifact_id))
-            # Review M1: an unparseable declaration contributes NO identities,
+            # An unparseable declaration contributes NO identities,
             # so pruning this pass would destroy the operator's consent for
             # this plugin's still-valid callbacks (all-or-nothing rejects the
             # set, it does not delete it). We cannot read the declaration, so
@@ -331,13 +331,13 @@ def _pre_swap_files(spool: Any, desired: DesiredCallbacks,
     reverse. Covers four cases with one rule: unrouted plugins, plugins that
     stay routed but can no longer be published (no base URL), routed plugins
     whose ARTIFACT PATH changed (the index key is the artifact path, so the
-    old key must retire in the same pass), and — review M2 — routed plugins
+    old key must retire in the same pass), and routed plugins
     that DROP any previously published callback: "never falsely positive" holds
     per FILE, not per overlay entry, so a marker still advertising a dropped
     callback is exactly the stale-marker case, both during the swap window and
     persistently if the post-swap rewrite then fails. Both published files
     carry the same ``callbacks`` map, so both retire together on that
-    condition (r2): a failed rewrite then leaves them ABSENT (the consumer
+    condition: a failed rewrite then leaves them ABSENT (the consumer
     reads "facility unavailable") rather than stale."""
     published = {r.plugin: r for r in desired.routed} if desired.base_url \
         else {}
@@ -370,7 +370,7 @@ def _pre_swap_files(spool: Any, desired: DesiredCallbacks,
 
 def _dropped_any(previous: set[str], keep: RoutedCallbacks) -> bool:
     """True when the desired set DROPS anything the last published files
-    advertised — whatever it adds in the same pass (r2 review).
+    advertised — whatever it adds in the same pass.
 
     A strict-subset test missed the mixed transition: rename one callback and
     add another, and the marker kept naming the dropped one. Additions are
@@ -450,7 +450,7 @@ async def reconcile_plugin_callbacks(
     spool = _default_spool() if spool is _UNSET else spool
 
     def _compute() -> "tuple[DesiredCallbacks, list[dict]]":
-        # Review M3: the union-membership compute reads plugin.json for every
+        # The union-membership compute reads plugin.json for every
         # resolved plugin, so it belongs in the SAME worker thread as the main
         # compute — never on the event loop under the reconcile lock. It still
         # runs strictly before any keyboard posts (the prompts fire below,
@@ -545,12 +545,12 @@ def _fire_consent_prompts(
 
     # SEAL the plugin's setup-round membership as the UNION of its pending
     # TRIGGER and CALLBACK consents, in one yield-free batch BEFORE any
-    # keyboard posts (Sol r2): the two reconcilers run as a pair at every call
+    # keyboard posts: the two reconcilers run as a pair at every call
     # site, and whichever prompts first must open the complete membership —
     # otherwise a fast Approve on this keyboard could settle a round whose
     # other kind has not registered yet, running the plugin's setup tool while
     # a consent is still open. ``union_pending`` (the trigger half) was
-    # computed off-loop with this pass's desired set (review M3).
+    # computed off-loop with this pass's desired set.
     nonce_by_identity = trigger_reconcile.seal_setup_rounds(
         trigger_pending=union_pending, callback_pending=pending)
 

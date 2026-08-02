@@ -1,18 +1,21 @@
-"""Task 8 — authorization-callback WIRING (boot, scheduler, reload scopes,
+"""Authorization-callback WIRING (boot, scheduler, reload scopes,
 plugin lifecycle, revoke tool, health).
 
-These pin the release-gating wiring requirements the Task-5/6/7 reviews raised:
+These pin the load-bearing wiring requirements below:
 
-* **I1** — setup dispatch must NOT fire while a plugin's callbacks are dark.
-  The trigger-only ``routes_live`` gate is permissive: a callback dark for a
-  NON-consent reason contributes no round member, so the trigger approval alone
-  settles the round. ``_callback_and_trigger_routes_live`` also requires NO
-  ``callback_*`` issue outstanding.
-* **I2** — the setup-round crash-recovery ack lookup must UNION both stores;
-  trigger and callback acks live in disjoint sha256 identity spaces.
-* **I3** — EVERY ``reconcile_from_runtime`` call site runs BOTH reconcilers.
-* **Lock-stall ruling** — the SCHEDULED spool sweep/recovery passes run off the
-  loop via ``asyncio.to_thread``; the handler's O(1) claim/publish stays inline.
+* **Route-gate completeness** — setup dispatch must NOT fire while a plugin's
+  callbacks are dark. The trigger-only ``routes_live`` gate is permissive: a
+  callback dark for a NON-consent reason contributes no round member, so the
+  trigger approval alone settles the round. ``_callback_and_trigger_routes_live``
+  also requires NO ``callback_*`` issue outstanding.
+* **Union ack lookup** — the setup-round crash-recovery ack lookup must UNION
+  both stores; trigger and callback acks live in disjoint sha256 identity
+  spaces.
+* **Paired reconcile** — EVERY ``reconcile_from_runtime`` call site runs BOTH
+  reconcilers.
+* **Lock-stall avoidance** — the SCHEDULED spool sweep/recovery passes run off
+  the loop via ``asyncio.to_thread``; the handler's O(1) claim/publish stays
+  inline.
 """
 from __future__ import annotations
 
@@ -144,7 +147,7 @@ def test_i3_every_reconcile_from_runtime_site_is_paired(relpath):
         checked += 1
         assert "trigger_reconcile" in mods and "callback_reconcile" in mods, (
             f"{relpath}:{node.name} calls reconcile_from_runtime for {mods} "
-            "but not BOTH reconcilers (I3)")
+            "but not BOTH reconcilers")
     assert checked >= 1, f"no reconcile_from_runtime site found in {relpath}"
 
 
@@ -325,7 +328,7 @@ class TestCallbackAckRevokeTool:
         payload = json.loads(res["content"][0]["text"])
         assert payload["ok"] is True
         assert payload["revoked"] == 1
-        # BOTH reconcilers ran (I3), with prompt suppressed.
+        # BOTH reconcilers ran, with prompt suppressed.
         cb_recon.assert_awaited()
         tg_recon.assert_awaited()
         assert cb_recon.await_args.kwargs.get("prompt") is False

@@ -68,9 +68,9 @@ def test_external_api_server_blocks_internal_mcp_and_hooks():
 
 
 # ---------------------------------------------------------------------------
-# INV-CB-006 (Task 9): a callback query string (?code=...&state=...) must
+# INV-CB-006: a callback query string (?code=...&state=...) must
 # never reach nginx's access log — the third surface, alongside the aiohttp
-# request-line redaction (Task 6) and log-path suppression (Task 6).
+# request-line redaction and log-path suppression.
 # ---------------------------------------------------------------------------
 
 

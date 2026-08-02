@@ -1,4 +1,4 @@
-"""Task 9 — boot wiring for the callback spool: setup-configs.sh creates
+"""Boot wiring for the callback spool: setup-configs.sh creates
 ``/data/callbacks`` at 0770 and exports ``CASA_CALLBACK_SPOOL_ROOT`` into the
 s6 container environment, mirroring the plugin-outbox block (v0.73.0) it sits
 next to. ``callback_spool.spool_root()`` already honours the env override

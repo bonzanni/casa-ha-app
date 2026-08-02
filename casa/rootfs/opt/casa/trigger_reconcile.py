@@ -283,7 +283,7 @@ async def reconcile_plugin_triggers(
             role_configs=role_configs, acks=acks, resolver=resolver,
             global_secret_ok=global_secret_ok)
         _mint_secrets(desired, Path(secrets_dir))
-        # Release C (review M3): the CALLBACK half of the union membership is
+        # The CALLBACK half of the union membership is
         # derived here, in the SAME worker thread — it reads plugin.json for
         # every resolved plugin, which must never run on the event loop under
         # the reconcile lock. It is still computed strictly before any keyboard
@@ -371,14 +371,14 @@ def _fire_consent_prompts(
     # v0.112.0 (impl r4): SEAL each plugin's setup-round membership in ONE
     # yield-free batch BEFORE any keyboard posts — a fast Approve on the
     # first keyboard can never settle a round still registering members.
-    # Release C (Sol r2): the membership is the UNION of the pending TRIGGER
+    # The membership is the UNION of the pending TRIGGER
     # and CALLBACK consents. The two reconcilers run as a pair at every call
     # site, so the callback identities are computed FIRST here and sealed into
     # the same round — otherwise an Approve landing between the trigger and
     # callback reconciles would settle a round the callback consent has not
     # joined yet, running the plugin's setup tool while a consent is open.
-    # ``callback_pending`` was derived off-loop with this pass's desired set
-    # (review M3), so nothing blocking runs between here and the keyboards.
+    # ``callback_pending`` was derived off-loop with this pass's desired set,
+    # so nothing blocking runs between here and the keyboards.
     _ack_identity = ack_identity  # module-level import (plugin_triggers)
     nonce_by_identity = seal_setup_rounds(trigger_pending=pending,
                                           callback_pending=callback_pending)

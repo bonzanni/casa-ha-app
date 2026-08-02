@@ -18,10 +18,10 @@ http {
         ''      close;
     }
 
-    # INV-CB-006 (Task 9): the third surface — a callback query string (the
+    # INV-CB-006: the third surface — a callback query string (the
     # provider's ?code=...&state=...) must never reach nginx's access log,
     # matching the redaction/suppression already applied at the aiohttp
-    # layer (Task 6). \$uri excludes the query string by definition (unlike
+    # layer. \$uri excludes the query string by definition (unlike
     # \$request or \$request_uri), so classifying purely on it is sufficient.
     map \$uri \$casa_cb_log {
         ~^/callback/ 0;
@@ -105,8 +105,8 @@ cat >> /etc/nginx/nginx.conf <<'NGINX'
         listen 18065;
         server_name _;
 
-        # See the ingress server's identical directive above (INV-CB-006,
-        # Task 9) — this is the surface that actually matters here, since
+        # See the ingress server's identical directive above (INV-CB-006)
+        # — this is the surface that actually matters here, since
         # this server is the one the callback provider's redirect reaches.
         access_log /dev/stdout combined if=$casa_cb_log;
 

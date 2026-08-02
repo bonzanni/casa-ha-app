@@ -148,7 +148,7 @@ class TriggerRegistry:
         # new-complete overlay, never a partial one. Each value:
         # ``{"role": str, "clearance": str, "auth": dict}``.
         self._plugin_overlay: dict[str, dict] = {}
-        # Release C: plugin-declared authorization callbacks are a SECOND,
+        # Plugin-declared authorization callbacks are a SECOND,
         # independent overlay keyed by effective name (also ``plg-<plugin>--
         # <declared>``, in its OWN namespace — the callback endpoint is
         # ``GET /callback/{name}``, never ``/webhook/{name}``, so a name may
@@ -320,8 +320,8 @@ class TriggerRegistry:
         self._plugin_overlay = dict(overlay)
 
     def replace_callback_overlay(self, overlay: dict[str, dict]) -> None:
-        """Atomically replace the ENTIRE authorization-callback overlay
-        (Release C) — the exact counterpart of :meth:`replace_plugin_overlay`.
+        """Atomically replace the ENTIRE authorization-callback overlay —
+        the exact counterpart of :meth:`replace_plugin_overlay`.
 
         ``overlay`` maps effective name → ``{"plugin", "declared", "path"}``.
         The callback reconciler is its ONE writer: it derives the complete

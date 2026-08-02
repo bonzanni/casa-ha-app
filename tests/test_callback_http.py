@@ -1,4 +1,4 @@
-"""The public ``GET /callback/{name}`` endpoint (spec §6; INV-CB-001/002/
+"""The public ``GET /callback/{name}`` endpoint (INV-CB-001/002/
 004/005/006).
 
 The endpoint is the facility's only unauthenticated surface, so almost every
@@ -85,7 +85,7 @@ def _build_app(*, registry=None, sampler=None, clock=None, middlewares=()):
         clock=clock or time.time,
     )
     # Registration ORDER is load-bearing: the static route must be matched
-    # before the wildcard can swallow it (spec §6 step 8).
+    # before the wildcard can swallow it.
     app.router.add_get("/callback/done", callback_http.make_done_handler())
     app.router.add_get("/callback/{name}", handler)
     return app
@@ -188,7 +188,7 @@ class TestSuccess:
         assert kicks == [(PLUGIN, callback_spool.state_hash(STATE))]
 
     async def test_nudge_seam_delegates_to_episode_kick(self, monkeypatch):
-        # Task 7 wires the seam to callback_episodes.kick: it records an
+        # The nudge seam delegates to callback_episodes.kick: it records an
         # in-memory hint and signals the worker, touching NO file (request-path
         # O(1)). _load/_save raising would prove a filesystem touch.
         import callback_episodes
@@ -462,7 +462,7 @@ class TestOpaqueRelay:
 
 
 class TestDecodeRules:
-    """Spec §6 step 6 decode rules, unit-level."""
+    """Query-component decode rules, unit-level."""
 
     @pytest.mark.parametrize("raw,expected", [
         ("plain", "plain"),
@@ -738,7 +738,7 @@ class TestLogHygiene:
         assert "/callback/x?" in payload["exc"]   # the path is kept, query gone
 
     def test_json_formatter_keeps_unrelated_exc_intact(self):
-        """Reviewer case (c): an ``aiohttp.server`` ERROR whose traceback
+        """An ``aiohttp.server`` ERROR whose traceback
         merely mentions a ``…/callback_http.py`` frame — no query — must keep
         its full ``exc`` field. The redactor's trigger is the query-bearing
         request-line shape, not the bare ``/callback`` substring."""

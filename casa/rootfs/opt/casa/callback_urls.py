@@ -1,7 +1,7 @@
-"""Task 9 — the validated public base URL the authorization-callback facility
+"""The validated public base URL the authorization-callback facility
 builds every redirect URI from.
 
-``callback_reconcile._base_url()`` (Task 5's seam) applied only the bashio
+``callback_reconcile._base_url()`` previously applied only the bashio
 ``"null"``/``"None"``/empty guard casa_core uses for ``PUBLIC_URL`` — any
 other non-empty string, including a bare IP, a URL with a path, or one
 carrying credentials, was passed straight through. A callback redirect URI is
@@ -47,7 +47,7 @@ def validated_base(env: "dict | None" = None) -> "str | None":
     * a query string or a fragment
     * any whitespace or C0/DEL control character anywhere in the value —
       e.g. a glued-in space (``"https:// example.com"``) or an embedded tab
-      (review finding, Task 9 fix round 1: checked BEFORE ``urlsplit`` runs,
+      (checked BEFORE ``urlsplit`` runs,
       since ``urlsplit`` itself silently drops bare CR/LF/TAB from its own
       parse — a check against the parsed host alone would miss exactly the
       characters that make the raw string unsafe to hand back verbatim)

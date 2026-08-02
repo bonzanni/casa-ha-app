@@ -1,4 +1,4 @@
-"""Release C — the authorization-callback reconciler.
+"""The authorization-callback reconciler.
 
 ``callback_reconcile`` is the ONE writer of the TriggerRegistry *callback*
 overlay: it derives the COMPLETE desired overlay (every resolved + assigned +
@@ -438,7 +438,7 @@ async def test_artifact_change_retires_the_old_index_key_only(tmp_path):
 async def test_dropping_one_callback_retires_the_marker_before_the_swap(
     tmp_path,
 ):
-    """Review M2: 'never falsely positive' holds per FILE. A plugin that drops
+    """'Never falsely positive' holds per FILE. A plugin that drops
     one of its callbacks would otherwise keep a ready.json advertising the
     dropped one across the swap window (and forever, if the rewrite fails)."""
     calls: list = []
@@ -459,7 +459,7 @@ async def test_dropping_one_callback_retires_the_marker_before_the_swap(
 
 
 async def test_dropping_while_adding_retires_both_markers(tmp_path):
-    """r2 review: a strict-subset test misses the MIXED transition — drop one
+    """A strict-subset test misses the MIXED transition — drop one
     callback and add another in the same pass and the old marker still named
     the dropped one. Additions are irrelevant to the property."""
     calls: list = []
@@ -849,7 +849,7 @@ async def test_prune_is_skipped_when_resolution_reported_issues(tmp_path):
 
 
 async def test_prune_is_skipped_when_a_declaration_is_unparseable(tmp_path):
-    """Review M1: an invalid declaration contributes NO identities, so pruning
+    """An invalid declaration contributes NO identities, so pruning
     that pass would destroy the operator's consent for the plugin's OTHER,
     perfectly valid callback — all-or-nothing rejects a set, it must never
     delete the acks behind it."""

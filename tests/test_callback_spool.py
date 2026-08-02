@@ -1,6 +1,6 @@
 """``callback_spool.py`` — the ``/data/callbacks`` spool protocol
-(spec §5 dirs/ready/index, §6 steps 4-6 claim/TTL/publish, §8 mint contract,
-§10 sweep/recovery; INV-CB-002).
+(dirs/ready/index layout, claim/TTL/publish, the mint contract,
+sweep/recovery; INV-CB-002).
 
 The protocol's two load-bearing properties are pinned here with real
 concurrency, not just single-threaded sequences:
@@ -204,7 +204,7 @@ def test_no_plugin_scoped_operation_can_escape_the_root_with_dotdot(spool, tmp_p
 
 
 # ---------------------------------------------------------------------------
-# mint (§8 consumer contract; the reference helper lives here)
+# mint (consumer contract; the reference helper lives here)
 # ---------------------------------------------------------------------------
 
 
@@ -225,7 +225,7 @@ def test_mint_reuse_is_a_hard_error(spool):
 
 
 # ---------------------------------------------------------------------------
-# claim (§6 step 4/5)
+# claim
 # ---------------------------------------------------------------------------
 
 
@@ -242,7 +242,7 @@ def test_claim_consumes_pending_and_preserves_mint_mtime(spool):
     assert claim.mtime == pytest.approx(now - 120, abs=0.01)
     assert not p.exists()
     assert (_claims(spool) / h).exists()
-    # rename/link preserves the MINT mtime — the single clock (spec §6 step 5)
+    # rename/link preserves the MINT mtime — the single clock
     assert (_claims(spool) / h).stat().st_mtime == pytest.approx(now - 120, abs=0.01)
 
 
@@ -480,7 +480,7 @@ def test_claim_is_exactly_once_under_two_processes(spool, tmp_path):
 
 
 # ---------------------------------------------------------------------------
-# publish_result (§6 step 6)
+# publish_result
 # ---------------------------------------------------------------------------
 
 
@@ -603,7 +603,7 @@ def test_read_side_helpers(spool):
 
 
 def test_result_mtime_is_its_final_write_time_not_the_mint_time(spool):
-    """Each TTL runs off its own file's mtime (spec §6 step 5): a long
+    """Each TTL runs off its own file's mtime: a long
     authorization flow must not expire its result on arrival."""
     now = time.time()
     p = mint(_pdir(spool), "s")
@@ -691,7 +691,7 @@ def test_a_racing_collector_never_observes_a_partial_result(spool, tmp_path):
 
 
 # ---------------------------------------------------------------------------
-# recovery_pass (§10)
+# recovery_pass
 # ---------------------------------------------------------------------------
 
 
@@ -863,7 +863,7 @@ def test_recovery_restore_does_not_clobber_a_republished_pending(spool):
 
 
 # ---------------------------------------------------------------------------
-# sweep (§10)
+# sweep
 # ---------------------------------------------------------------------------
 
 
@@ -992,7 +992,7 @@ def test_sweep_caps_results_at_256_oldest_first(spool):
 
 
 # ---------------------------------------------------------------------------
-# gc_orphan_dirs (§5, gated GC)
+# gc_orphan_dirs (gated GC)
 # ---------------------------------------------------------------------------
 
 
@@ -1071,7 +1071,7 @@ def test_gc_never_touches_the_index_dir(spool):
 
 
 # ---------------------------------------------------------------------------
-# ready.json / .index ordering helpers (§5)
+# ready.json / .index ordering helpers
 # ---------------------------------------------------------------------------
 
 

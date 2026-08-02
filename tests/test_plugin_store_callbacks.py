@@ -1,6 +1,6 @@
-"""casa.callbacks manifest extractor + bundle-inspect gate (Task 2, spec §3).
+"""casa.callbacks manifest extractor + bundle-inspect gate.
 
-`plugin_store.manifest_callbacks` mirrors `manifest_triggers`'s Release-B
+`plugin_store.manifest_callbacks` mirrors `manifest_triggers`'s
 shape: a thin, strict wrapper over `plugin_callbacks.parse_and_validate`
 that raises `StoreError(reason_code="callbacks_invalid")` on any intrinsic-
 validation error, and is wired into the same two call sites

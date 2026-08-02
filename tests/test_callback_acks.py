@@ -1,5 +1,5 @@
 """``callback_acks.py`` — the durable, fail-closed consent store for
-plugin-declared authorization callbacks (spec §4, INV-CB-003).
+plugin-declared authorization callbacks (INV-CB-003).
 
 Structural sibling of ``trigger_acks.py``: same locking, atomic
 persist-then-publish, and whole-store fail-closed load, but records are

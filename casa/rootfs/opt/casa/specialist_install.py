@@ -577,7 +577,7 @@ def resolve_dependency_closure(
 BUNDLED_SYSREQS_UNSUPPORTED = "bundled_sysreqs_unsupported"
 BUNDLED_TRIGGERS_UNSUPPORTED = "bundled_triggers_unsupported"
 ENV_NAME_COLLISION = "env_name_collision"
-# Task 2 (spec §3): unlike casa.triggers, a sourced/bundled dependency MAY
+# Unlike casa.triggers, a sourced/bundled dependency MAY
 # declare casa.callbacks — a callback grants no turn/memory access, so there
 # is no reason to extend the triggers prohibition to it. The one thing that
 # DOES need an inspect-time gate: a bundled dep's OWNED registry entry is
@@ -585,7 +585,7 @@ ENV_NAME_COLLISION = "env_name_collision"
 # comment), longer than the identifier alone. `manifest_callbacks` (via
 # `_validate_sourced_plugin_tree`'s later `validate_manifest` call) only
 # ever checks the effective name against the unscoped `identifier` (mirrors
-# triggers' Task-4 runtime-name doctrine), so a callback declaration that
+# triggers' runtime-name doctrine), so a callback declaration that
 # fits under the identifier could still overflow once scoped — catch that
 # HERE, against the scoped name, before it can ever reach the registry.
 CALLBACK_NAME_TOO_LONG = "callback_name_too_long"
@@ -801,7 +801,7 @@ def _validate_sourced_plugin_tree(
        refusal for the same underlying key): any `manifest_sysreqs` row ⇒
        `bundled_sysreqs_unsupported`; any `casa.triggers` KEY present (even
        malformed) ⇒ `bundled_triggers_unsupported`. `casa.callbacks` is NOT
-       prohibited (Task 2) — instead, any declared entry whose effective
+       prohibited — instead, any declared entry whose effective
        name computed against the SCOPED registry name (`slug.identifier`,
        longer than `identifier` alone) exceeds
        `plugin_callbacks.MAX_EFFECTIVE_LEN` ⇒ `callback_name_too_long`.
@@ -857,7 +857,7 @@ def _validate_sourced_plugin_tree(
 
     scoped = plugin_registry.scoped_name(slug, identifier)
 
-    # Task 2: casa.callbacks IS permitted for a bundled dep (unlike
+    # casa.callbacks IS permitted for a bundled dep (unlike
     # triggers), but its OWNED registry entry routes under the SCOPED name —
     # check the scoped-name effective length here, before validate_manifest
     # below (which only ever sees the unscoped identifier).

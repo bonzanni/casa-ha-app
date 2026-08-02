@@ -231,5 +231,3 @@ recovery or it can silently drop.
 - [`architecture/plugins.md`](../architecture/plugins.md)
 - [`architecture/triggers.md`](../architecture/triggers.md)
 <!-- END SOURCEMAP -->
-</content>
-</invoke>

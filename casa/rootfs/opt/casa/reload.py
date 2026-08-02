@@ -172,7 +172,7 @@ async def dispatch(
                         logger.warning(
                             "plugin-trigger reconcile after reload failed",
                             exc_info=True)
-                    # Release C (I3): pair the callback reconcile at the SAME
+                    # Pair the callback reconcile at the SAME
                     # scopes with the SAME runtime — a resident losing/gaining a
                     # role changes callback assignment (callback_no_target) just
                     # as it changes trigger routing. Independent + non-fatal.

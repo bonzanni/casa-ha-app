@@ -7381,7 +7381,7 @@ def _regenerate_plugin_health(extra_issues: list) -> None:
     # trigger_channel_missing. current_issues() never raises.
     import trigger_reconcile
     trigger_issues = trigger_reconcile.current_issues()
-    # Release C: callback issues (callback_pending_ack / callback_no_target /
+    # Callback issues (callback_pending_ack / callback_no_target /
     # callback_invalid / callback_base_url_invalid / callback_spool_error) are
     # a RECOMPUTABLE input just like the trigger issues — derived fresh on
     # every regeneration so an unrelated refresh can never erase them.
@@ -7642,7 +7642,7 @@ async def _reload_and_verify_targets(name: str, targets: list,
     except Exception:  # noqa: BLE001
         reconcile_ok = False
         logger.warning("plugin-trigger reconcile failed", exc_info=True)
-    # Release C (I3): pair the CALLBACK reconcile at the SAME site with the
+    # Pair the CALLBACK reconcile at the SAME site with the
     # SAME runtime — every one of the 5 lifecycle mutations funnels through
     # here, so this is where an update-changed-declaration re-derives to
     # `callback_pending_ack` (stale-digest identity → no ack), and a removal's
@@ -9259,7 +9259,7 @@ async def plugin_remove(args: dict) -> dict:
         seq = await _reload_and_verify_targets(
             core["name"], core["targets"], expect="absent")
         core.update(seq)
-        # Release C: the plugin is gone entirely — make its callback removal
+        # The plugin is gone entirely — make its callback removal
         # DURABLE. The paired callback reconcile inside the sequencer already
         # swept the overlay + retired ready/index by absence; this drops the
         # persisted operator consents (unlike a plugin_update, a REMOVAL DOES
@@ -9319,7 +9319,7 @@ async def trigger_ack_revoke(args: dict) -> dict:
         except Exception:  # noqa: BLE001 — sweep above already unrouted
             logger.warning("post-revoke trigger reconcile failed",
                            exc_info=True)
-        # Release C (I3): pair the callback reconcile with matching prompt=False
+        # Pair the callback reconcile with matching prompt=False
         # so the callback overlay stays consistent after a trigger revoke (a
         # resident's grants can shift callback assignment too). Non-fatal.
         try:
@@ -9356,7 +9356,7 @@ async def trigger_ack_revoke(args: dict) -> dict:
 
 
 async def _remove_plugin_callbacks(name: str) -> None:
-    """Durable callback teardown for a removed plugin (Task 8): revoke its
+    """Durable callback teardown for a removed plugin: revoke its
     persisted callback consents and delete its spool dir. Best-effort — a
     failure here never fails the removal (the overlay was already swept by
     absence in the sequencer's callback reconcile)."""
@@ -9392,7 +9392,7 @@ async def _remove_plugin_callbacks(name: str) -> None:
      "required": ["plugin", "name"]},
 )
 async def callback_ack_revoke(args: dict) -> dict:
-    """Release C operator off-switch — the callback sibling of
+    """Operator off-switch — the callback sibling of
     trigger_ack_revoke. Runs under _PLUGIN_TOOLS_LOCK; the reconcile inside is
     the SYNCHRONOUS unroute (a compute failure fail-closes the WHOLE callback
     overlay, so the revoked route is 404 either way — no separate direct sweep
@@ -10160,7 +10160,7 @@ CASA_TOOLS: tuple = (
     plugin_unassign,
     plugin_remove,
     trigger_ack_revoke,            # Release B — plugin-trigger consent off-switch
-    callback_ack_revoke,           # Release C — plugin-callback consent off-switch
+    callback_ack_revoke,           # plugin-callback consent off-switch
     plugin_list,
     verify_plugin_state,
     verify_plugin_secrets,

@@ -1,5 +1,5 @@
 """casa.callbacks manifest parse + declaration-digest consent identity
-(authorization-callback facility, Task 1)."""
+(authorization-callback facility)."""
 from __future__ import annotations
 
 import pytest

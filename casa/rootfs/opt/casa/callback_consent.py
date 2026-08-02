@@ -1,5 +1,4 @@
-"""Operator-consent DM prompts for plugin-declared authorization callbacks
-(Release C — spec §4).
+"""Operator-consent DM prompts for plugin-declared authorization callbacks.
 
 A plugin callback opens ``GET /callback/<effective>`` ONLY after the operator
 taps Approve on a DM keyboard bound to the callback's consent identity
@@ -61,7 +60,7 @@ class CallbackConsentKey:
 
 
 def render_callback_consent_message(*, plugin: str, effective: str) -> str:
-    """The verbatim consent prose (spec §4). Only the plugin name and the
+    """The verbatim consent prose. Only the plugin name and the
     effective callback name are interpolated — both grammar-validated
     identifiers, never plugin-authored prose."""
     return (

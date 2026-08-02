@@ -1,4 +1,4 @@
-"""Task 9 — ``callback_urls``: the validated public base URL + redirect-URI
+"""``callback_urls``: the validated public base URL + redirect-URI
 join used by the callback reconciler (``callback_reconcile._base_url``) and
 the ready.json payload (``callback_reconcile._redirect_uri``).
 
@@ -84,7 +84,7 @@ def test_validated_base_rejects_fragment():
 
 
 # ---------------------------------------------------------------------------
-# review fix round 1 (Low finding): a host with embedded whitespace/control
+# A host with embedded whitespace/control
 # characters was returned VERBATIM — urlsplit().hostname carries a leading
 # or interior space unchanged, and ipaddress.ip_address() on such a host
 # just raises (not-an-IP), so it fell through every existing check. A bare
@@ -165,7 +165,7 @@ def test_redirect_uri_with_port():
 
 
 # ---------------------------------------------------------------------------
-# callback_reconcile seam delegation — Task 9 tightens `_base_url()` to call
+# callback_reconcile seam delegation — `_base_url()` now calls
 # `callback_urls.validated_base()` instead of hand-rolling the guard.
 # ---------------------------------------------------------------------------
 

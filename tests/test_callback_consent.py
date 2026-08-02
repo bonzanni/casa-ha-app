@@ -1,4 +1,4 @@
-"""Release C — the callback-consent DM round and the UNION setup sealing.
+"""The callback-consent DM round and the UNION setup sealing.
 
 A plugin callback opens ``GET /callback/<effective>`` only after the operator
 taps Approve on a DM keyboard bound to the callback's consent identity
@@ -321,7 +321,7 @@ def _wire_episodes(monkeypatch, tmp_path, dispatched):
 async def test_one_union_round_settles_only_after_both_approvals(
     monkeypatch, tmp_path,
 ):
-    """Sol r2 union sealing. Approving the trigger first must NOT settle the
+    """Union sealing. Approving the trigger first must NOT settle the
     round (and must not run the plugin's setup tool) while the callback
     consent is still open."""
     import authz_grants
@@ -436,7 +436,7 @@ async def test_callback_approval_is_recorded_in_the_round(monkeypatch,
 async def test_union_membership_is_computed_off_the_event_loop(
     monkeypatch, tmp_path,
 ):
-    """Review M3: the union compute reads plugin.json for every resolved
+    """The union compute reads plugin.json for every resolved
     plugin. Both reconcilers to_thread their main compute for exactly that
     reason — the union half must ride in the SAME worker thread, never on the
     loop under the reconcile lock."""

@@ -1914,7 +1914,7 @@ def test_boot_sweep_handles_mixed_type_snapshot_keys(tmp_path: Path) -> None:
 
 
 # ---------------------------------------------------------------------------
-# Task 2 (spec §3): casa.callbacks is PERMITTED on a sourced/bundled plugin
+# casa.callbacks is PERMITTED on a sourced/bundled plugin
 # dependency (unlike casa.triggers) — regression pin for the lifted
 # prohibition — but a bundled dep's OWNED registry entry routes under the
 # SCOPED name (`slug.identifier`, plugin_callbacks.py's own "up to 73

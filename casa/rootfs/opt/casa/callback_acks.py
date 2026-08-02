@@ -1,5 +1,5 @@
 """Persistent operator-consent acks for plugin-declared authorization
-callbacks (Release C — spec §4).
+callbacks.
 
 One ack = the operator approved exactly one consent IDENTITY
 (:func:`plugin_callbacks.ack_identity` — plugin + effective callback name +
@@ -139,13 +139,13 @@ class CallbackAckStore:
     def revoke_effective(self, plugin: str, effective: str) -> list[dict[str, Any]]:
         """Drop every ack for one (plugin, effective) callback — across any
         declaration digest. The single-callback operator off-switch backing
-        the ``callback_ack_revoke`` tool (Task 8). Returns the removed
+        the ``callback_ack_revoke`` tool. Returns the removed
         records."""
         return self._revoke(lambda rec: rec.get("plugin") == plugin
                             and rec.get("effective") == effective)
 
     def prune_stale(self, valid_identities: set[str]) -> list[dict[str, Any]]:
-        """Opportunistic reconcile prune (spec §4): drop every ack whose
+        """Opportunistic reconcile prune: drop every ack whose
         identity is not in *valid_identities* (no installed declaration can
         still compute it); returns the removed records."""
         with self._lock:

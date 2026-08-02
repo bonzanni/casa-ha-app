@@ -1,6 +1,6 @@
 """The ``/data/callbacks`` spool — the authorization-callback protocol
-(spec §5 dirs/ready/index, §6 steps 4-6 claim/TTL/publish, §8 mint contract,
-§10 sweep/recovery; INV-CB-002).
+(dirs/ready/index layout, claim/TTL/publish, the mint contract,
+sweep/recovery; INV-CB-002).
 
 An unauthenticated browser redirect deposits a short-lived bearer credential
 (an OAuth authorization code) into this spool; an ephemeral consumer process
@@ -66,7 +66,7 @@ logger = logging.getLogger(__name__)
 SPOOL_ROOT_ENV = "CASA_CALLBACK_SPOOL_ROOT"
 ROOT = Path("/data/callbacks")
 
-# TTLs and allowances (spec §6/§10) — all in seconds, all measured against a
+# TTLs and allowances — all in seconds, all measured against a
 # file's OWN mtime.
 SKEW_S = 300                 # future-mtime allowance; beyond it: fail closed
 PENDING_TTL_S = 1800         # a minted state is claimable for 30 min
@@ -317,7 +317,7 @@ class SweepReport:
 
 
 # ---------------------------------------------------------------------------
-# consumer-side reference helper (spec §8)
+# consumer-side reference helper
 # ---------------------------------------------------------------------------
 
 
@@ -563,7 +563,7 @@ class CallbackSpool:
         with self._lock:
             return set(self._in_flight)
 
-    # -- claim (spec §6 steps 4-5) ------------------------------------------
+    # -- claim ----------------------------------------------------------
 
     def claim(self, plugin: str, state_hash_hex: str, *, now: float) -> Claim | None:
         """Consume ``pending/<hash>.json`` exactly once.
@@ -672,7 +672,7 @@ class CallbackSpool:
             finally:
                 os.close(pfd)
 
-    # -- publish (spec §6 step 6) -------------------------------------------
+    # -- publish --------------------------------------------------------
 
     def publish_result(self, claim: Claim, record: dict) -> bool:
         """Publish the result for *claim*, never partially visible.
@@ -843,7 +843,7 @@ class CallbackSpool:
                 return []
             return self._plugin_dirs()
 
-    # -- recovery (spec §10) ------------------------------------------------
+    # -- recovery -------------------------------------------------------
 
     def recovery_pass(self, *, now: float, boot: bool) -> RecoveryReport:
         """Converge ``.claims/`` residue left by a crash.
@@ -976,7 +976,7 @@ class CallbackSpool:
         _unlink_quiet(name, claims)
         _fsync(claims, CLAIMS_DIR)
 
-    # -- sweep (spec §10) ---------------------------------------------------
+    # -- sweep ----------------------------------------------------------
 
     def sweep(self, *, now: float) -> SweepReport:
         """TTL + future-mtime deletion across the five name classes, then the
@@ -1136,7 +1136,7 @@ class CallbackSpool:
         logger.warning("callback-spool: %s/%s exceeded %d entries — "
                        "oldest-first deletion applied", plugin, sub, cap)
 
-    # -- gated orphan-dir GC (spec §5) --------------------------------------
+    # -- gated orphan-dir GC ----------------------------------------------
 
     def gc_orphan_dirs(self, *, registry_valid: bool,
                        member_plugins: set[str], now: float) -> list[str]:
@@ -1180,8 +1180,8 @@ class CallbackSpool:
         return removed
 
     def remove_plugin(self, plugin: str) -> bool:
-        """Recursively delete a plugin's ENTIRE spool dir (removal lifecycle,
-        Task 8). The explicit, immediate counterpart of the age-gated
+        """Recursively delete a plugin's ENTIRE spool dir (removal lifecycle).
+        The explicit, immediate counterpart of the age-gated
         :meth:`gc_orphan_dirs`: when the operator removes a plugin, its
         in-flight authorizations are gone with it, so there is nothing to
         preserve and no quiescence window to honour.

@@ -37,7 +37,7 @@ printf '%s' "$DATA_DIR/plugin-outbox" \
     > /run/s6/container_environment/CASA_PLUGIN_OUTBOX_DIR
 bashio::log.info "Plugin outbox ready: $DATA_DIR/plugin-outbox"
 
-# Authorization-callback spool (Task 9): a shared /data drop-box for the
+# Authorization-callback spool: a shared /data drop-box for the
 # public /callback/ endpoint's minted-state + result files. Same restrictive
 # 0770 idiom as the plugin outbox above; CASA_CALLBACK_SPOOL_ROOT is exported
 # into the s6 container environment so casa-main sees it at boot

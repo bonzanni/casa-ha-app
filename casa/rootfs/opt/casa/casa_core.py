@@ -2052,12 +2052,12 @@ async def _boot_reconcile_plugin_triggers(
 async def _boot_reconcile_plugin_callbacks(
     *, trigger_registry: Any, role_configs: dict,
 ) -> None:
-    """Release C boot seam (paired with :func:`_boot_reconcile_plugin_triggers`):
+    """Boot seam (paired with :func:`_boot_reconcile_plugin_triggers`):
     derive + route the plugin-declared authorization-callback overlay AND run
     the spool's boot maintenance, AFTER resident triggers register and BEFORE
     the setup-episode worker starts.
 
-    Ordering is load-bearing (Sol I1): the reconcile publishes a fully-routed
+    Ordering is load-bearing: the reconcile publishes a fully-routed
     plugin's ready marker (and clears its ``callback_*`` health issues) BEFORE
     ``_pse.start_worker()`` can settle a round and check ``routes_live`` — so a
     settlement dispatch never races ahead of the marker.
@@ -2112,7 +2112,7 @@ async def _boot_reconcile_plugin_callbacks(
 
 
 def _callback_and_trigger_routes_live(plugin: str) -> bool:
-    """Setup-dispatch route gate (Sol I1). A plugin's setup tool must not be
+    """Setup-dispatch route gate. A plugin's setup tool must not be
     dispatched while EITHER its trigger OR its callback markers are dark.
 
     The trigger-only gate is PERMISSIVE for callbacks: a plugin whose callbacks
@@ -2134,7 +2134,7 @@ def _callback_and_trigger_routes_live(plugin: str) -> bool:
 
 
 def _setup_ack_lookup_union(identity: str) -> str | None:
-    """Setup-round crash-recovery ack lookup (Sol I2). Trigger and callback
+    """Setup-round crash-recovery ack lookup. Trigger and callback
     acks live in DISJOINT sha256 identity spaces, so a stranded round whose
     open member is a CALLBACK consent only heals if the lookup unions BOTH
     stores — a trigger-only lookup would leave it stranded forever. Returns the
@@ -2645,7 +2645,7 @@ async def main() -> None:
     )
     trigger_registry = TriggerRegistry(scheduler=scheduler, app=app, bus=bus)
 
-    # Release C: initialise the authorization-callback spool BEFORE the first
+    # Initialise the authorization-callback spool BEFORE the first
     # callback reconcile (which reads get_spool() to publish ready/index
     # markers) — the process-wide singleton, like the trigger registry above.
     # Root honours CASA_CALLBACK_SPOOL_ROOT, default /data/callbacks.
@@ -3424,7 +3424,7 @@ async def main() -> None:
     app.router.add_get("/", dashboard)
     app.router.add_get("/healthz", healthz)
     app.router.add_post("/webhook/{name}", webhook_handler)
-    # Authorization callbacks (spec §6). ORDER IS LOAD-BEARING: the static
+    # Authorization callbacks. ORDER IS LOAD-BEARING: the static
     # done page must be registered BEFORE the wildcard, which would otherwise
     # match "/callback/done" as a callback name and answer it with a 303 back
     # to itself. Both handlers are turn-free — no ingress identity, no
@@ -3509,10 +3509,10 @@ async def main() -> None:
     await _boot_reconcile_plugin_triggers(
         trigger_registry=trigger_registry, role_configs=role_configs,
     )
-    # 13c'. Release C: paired plugin-declared authorization-callback reconcile
+    # 13c'. Paired plugin-declared authorization-callback reconcile
     # + spool boot maintenance. Runs BEFORE _pse.start_worker() below so a
     # routed plugin's ready marker is published before any settlement dispatch
-    # checks routes_live (Sol I1 ordering).
+    # checks routes_live.
     await _boot_reconcile_plugin_callbacks(
         trigger_registry=trigger_registry, role_configs=role_configs,
     )
@@ -3578,17 +3578,17 @@ async def main() -> None:
     _pse.configure(
         dispatch=_setup_dispatch, notify_operator=_setup_notify,
         resolve_registry_entry=_setup_registry_entry,
-        # Sol I2: union BOTH ack stores (trigger + callback identities are
+        # Union BOTH ack stores (trigger + callback identities are
         # disjoint) so a stranded round with a callback member heals.
         ack_lookup=_setup_ack_lookup_union,
-        # Sol I1: gate setup dispatch on BOTH trigger AND callback markers —
+        # Gate setup dispatch on BOTH trigger AND callback markers —
         # a callback dark for a non-consent reason contributes no round member,
         # so the trigger gate alone would settle + dispatch with it unrouted.
         routes_live=_callback_and_trigger_routes_live,
     )
     _pse.start_worker()
 
-    # 13d'. Release C: durable authorization-callback delivery episodes. The
+    # 13d'. Durable authorization-callback delivery episodes. The
     # worker reconciles pending results against the spool, then nudges the
     # plugin's target agent to collect them. Reuses the same late-binding
     # dispatch/notify/registry seams as the setup worker (the callback context
@@ -3765,9 +3765,9 @@ async def main() -> None:
         max_instances=1,
         misfire_grace_time=3600,
     )
-    # Release C (spec §7): authorization-callback spool maintenance.
+    # Authorization-callback spool maintenance.
     #
-    # LOCK-STALL RULING (Task 6/7 review): the callback HTTP handler runs
+    # LOCK-STALL AVOIDANCE: the callback HTTP handler runs
     # spool.claim/publish_result INLINE on the event loop (each is O(1) — a
     # handful of syscalls), while sweep()/recovery_pass() hold
     # CallbackSpool._lock for a whole per-plugin SCAN. So the SCHEDULED scans
@@ -3775,7 +3775,7 @@ async def main() -> None:
     # inline. A scan can therefore never stall the loop, and the fast path is
     # never needlessly moved off it. recovery_pass(boot=False) is safe to run
     # in a thread while the loop is handling an inline claim: the in-process
-    # in-flight set + the 60 s grace (Task 4) protect a just-minted claim the
+    # in-flight set + the 60 s grace protect a just-minted claim the
     # scan would otherwise reap.
     async def _callback_spool_sweep() -> None:
         spool = callback_spool.get_spool()

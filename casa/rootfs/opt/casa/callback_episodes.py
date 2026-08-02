@@ -1,4 +1,4 @@
-"""At-least-once delivery nudge for authorization callbacks (v0.146.0, spec §7).
+"""At-least-once delivery nudge for authorization callbacks (v0.146.0).
 
 An authorization code dies in 30–600 s; a pull-only pickup with a long TTL is
 a live-looking corpse. So when a result lands in the spool
@@ -29,7 +29,7 @@ via assistant delegation.
   the consumer, whose "check your results" against an emptied dir collects
   nothing).
 * *settled* — a dispatched episode whose result file has become **absent or
-  expired**. Its row AND its tombstone are pruned together (Sol r3: a
+  expired**. Its row AND its tombstone are pruned together (a
   tombstone is **retained until its result is gone** — pruning it earlier would
   let the recovery scan re-enqueue a still-lingering result). A later result
   reusing the same hash therefore re-enqueues cleanly.
@@ -59,7 +59,7 @@ _SCHEMA_VERSION = 1
 _MAX_DISPATCH_ATTEMPTS = 3
 _RETRY_BACKOFF_S = (1.0, 5.0)
 
-# Wired by casa_core at boot (Task 8). All optional — absent seams degrade to
+# Wired by casa_core at boot. All optional — absent seams degrade to
 # logging, exactly like plugin_setup_episodes.
 _dispatch: Callable[[str, str, dict], Awaitable[bool]] | None = None
 _notify_operator: Callable[[str], Awaitable[None]] | None = None
@@ -83,7 +83,7 @@ def _now() -> float:
 
 def configure(*, dispatch, resolve_registry_entry, get_spool,
               notify_operator=None, sleep=asyncio.sleep) -> None:
-    """casa_core boot wiring (Task 8). Idempotent. ``get_spool()`` returns the
+    """casa_core boot wiring. Idempotent. ``get_spool()`` returns the
     process-wide :class:`callback_spool.CallbackSpool` (or ``None`` before boot
     wired it); the worker reads results through it. ``resolve_registry_entry
     (plugin)`` returns an overlay entry ``{"targets": [...]}`` (or ``None`` when
@@ -287,7 +287,7 @@ def _compose(entry: dict, plugin: str, result_hash: str) -> tuple[str | None, st
 # ---------------------------------------------------------------------------
 
 def start_worker() -> None:
-    """Boot seam (Task 8): start the supervised nudge worker. It reconciles
+    """Boot seam: start the supervised nudge worker. It reconciles
     against the spool first (boot recovery of results without an episode), then
     dispatches ``pending`` episodes."""
     global _worker_task
@@ -300,7 +300,7 @@ def start_worker() -> None:
 
 
 async def recovery(spool: Any) -> None:
-    """Boot/periodic recovery pass (spec §7): enqueue an episode for any result
+    """Boot/periodic recovery pass: enqueue an episode for any result
     lacking an episode/tombstone, and settle any whose result is gone. Never
     dispatches — that is the worker's job — so casa_core can run it before the
     worker starts. Never raises."""
