@@ -63,8 +63,10 @@ sounds safe.
 Three automated layers refuse what they can recognise, and none of them is the rule:
 
 - the pre-commit guard refuses staged paths and added lines matching generic patterns;
-- the pre-push gate sweeps the endpoint tree, every unpublished commit, their messages, and
-  runs a pinned secret scanner over both tree and history;
+- the pre-push gate sweeps the endpoint tree, every unpublished commit, their messages,
+  runs a pinned secret scanner over both tree and history, and refuses a change that
+  alters a documented surface without updating or explicitly waiving the document that
+  claims it;
 - CI repeats the generic layers on every pull request.
 
 What they cannot do is recognise a paragraph that is confidential without containing a

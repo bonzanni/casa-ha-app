@@ -22,9 +22,16 @@ make setup        # builds a WSL/Linux venv at venv_test/ + installs the git hoo
 ```
 Then:
 ```bash
-make test-unit    # fast unit tests:  pytest -m "not docker and not slow" (opt-out gate)
+make test-unit    # fast unit tests, PARALLEL + memory-caged (~25s for ~7700)
+make test-unit-serial  # same suite, one process — for debugging a failure
 make test-docker  # docker-backed unit tests
 ```
+`test-unit` runs `-n auto --maxprocesses=12 --dist loadfile`; file-scoped
+distribution keeps a module's tests on one worker, which is what the suites that
+monkeypatch module-level state require. Iterate on targeted files
+(`venv_test/bin/pytest tests/test_x.py`) and save the full suite for before the
+gate — at ~25s it is cheap, but not free, and it is not a substitute for
+thinking about which tests your change can break.
 CI runs four tiers (tier1-smoke, tier2-functional, baseline-runtime, tier3-hardening);
 tier2 is the unit gate. The gate is **opt-out** (v0.64.2): unmarked tests run by
 default; mark `docker` or `slow` to exclude (`unit` is legacy/optional). Markers
@@ -40,8 +47,17 @@ The `tests/conftest.py` auto-adds the code root to `sys.path`.
 > `tests/test_agent_process.py`). Two standing rules: (1) **never patch
 > `<module>.asyncio.sleep`** — it is the shared module attribute, not a local;
 > (2) keep running pytest under the hard cap as belt-and-suspenders, since a cap
-> kills only the runaway pytest, not the VM:
+> kills only the runaway pytest, not the VM. **`make test-unit` now applies that
+> cage automatically** — it probes that `systemd-run --user --scope` actually
+> works (in a container or a non-login session the binary exists but the user bus
+> does not) and degrades to an uncaged run rather than failing. Invoking pytest
+> directly still needs it by hand:
 > `systemd-run --user --scope -p MemoryMax=8G -p MemorySwapMax=2G venv_test/bin/pytest …`
+> Note the cage matters MORE under parallelism, not less: `RLIMIT_AS` in
+> `conftest.py` is per process, so only the cgroup bounds the workers in
+> aggregate. That limit also bounds ADDRESS SPACE, not resident memory — CPython
+> reserves far more VA than it touches, which is why the per-worker floor is
+> 6 GiB and why 2 GiB broke the suite outright.
 
 ## Release flow
 1. Branch `feat/vX.Y.Z-<desc>` off `main`.
