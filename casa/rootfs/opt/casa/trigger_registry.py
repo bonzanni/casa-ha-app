@@ -106,8 +106,8 @@ def _translate_cron_dow(field: str) -> str:
 @dataclass
 class TriggerSummary:
     name: str
-    type: str            # "interval" | "cron"
-    schedule_desc: str   # "every 30m" or the raw 5-field cron
+    type: str            # "interval" | "cron" | "date"
+    schedule_desc: str   # "every 30m", the raw 5-field cron, or "once at <ts>"
     next_fire: datetime  # tz-aware
 
 
@@ -541,6 +541,11 @@ class TriggerRegistry:
                 schedule_desc = f"every {trig.minutes}m"
             elif trig.type == "cron":
                 schedule_desc = trig.schedule
+            elif trig.type == "date":
+                # #396: MUST be listed. cancel_reminder takes the name that
+                # get_schedule reports, so a one-shot reminder omitted here is
+                # a reminder the user can neither see nor cancel.
+                schedule_desc = f"once at {trig.at}"
             else:
                 continue
             out.append(TriggerSummary(

@@ -306,3 +306,55 @@ async def test_both_tools_are_registered_on_the_mcp_surface():
     names = {getattr(t, "name", None) for t in CASA_TOOLS}
     assert "set_reminder" in names
     assert "cancel_reminder" in names
+
+
+# ---------------------------------------------------------------------------
+# get_schedule must show reminders — cancel_reminder needs the name it reports
+# ---------------------------------------------------------------------------
+
+
+async def test_get_schedule_lists_a_one_off_reminder(tmp_path, monkeypatch):
+    """End-to-end over a REAL scheduler: set a reminder, then see it in
+    get_schedule labelled as one-off, not as an interval."""
+    from datetime import datetime, timedelta, timezone
+
+    from apscheduler.schedulers.asyncio import AsyncIOScheduler
+
+    import agent as agent_mod
+    import reminders
+    from tools import get_schedule, init_tools, set_reminder
+    from trigger_registry import TriggerRegistry
+
+    agents_dir = tmp_path / "agents"
+    (agents_dir / "assistant").mkdir(parents=True)
+    _seed(agents_dir / "assistant" / "triggers.yaml")
+
+    sched = AsyncIOScheduler(timezone=timezone.utc)
+    sched.start(paused=True)
+    bus = MagicMock()
+    registry = TriggerRegistry(scheduler=sched, app=web.Application(), bus=bus)
+    runtime = types.SimpleNamespace(
+        agents_dir=str(agents_dir), bus=bus, trigger_registry=registry,
+        role_configs={"assistant": types.SimpleNamespace(
+            role="assistant", channels=["telegram"])},
+    )
+    init_tools(channel_manager=MagicMock(), bus=bus,
+               specialist_registry=MagicMock(), mcp_registry=MagicMock(),
+               trigger_registry=registry, runtime=runtime)
+    token = agent_mod.origin_var.set({"role": "assistant",
+                                      "channel": "telegram"})
+    try:
+        at = (datetime.now(timezone.utc) + timedelta(hours=2)).isoformat()
+        created = _payload(await set_reminder.handler(
+            {"at": at, "text": "Bins."}))
+        assert created["status"] == "ok"
+
+        res = await get_schedule.handler({"within_hours": 24})
+        text = res["content"][0]["text"]
+    finally:
+        agent_mod.origin_var.reset(token)
+        sched.shutdown(wait=False)
+
+    assert created["name"] in text
+    assert "one-off" in text
+    assert "interval" not in text

@@ -4629,6 +4629,10 @@ async def get_schedule(args: dict) -> dict:
         for s in summaries:
             if s.type == "cron":
                 desc = f"(cron, `{s.schedule_desc}`)"
+            elif s.type == "date":
+                # #396: a one-off reminder. Without this branch it would be
+                # mislabelled "(interval, once at …)".
+                desc = f"(one-off, {s.schedule_desc})"
             else:
                 desc = f"(interval, {s.schedule_desc})"
             lines.append(

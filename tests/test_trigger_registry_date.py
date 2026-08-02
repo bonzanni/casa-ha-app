@@ -207,3 +207,48 @@ async def test_remove_job_for_absent_job_is_false():
     sched.remove_job.side_effect = Exception("no such job")
     reg = _registry(scheduler=sched)
     assert reg.remove_job_for("assistant", "reminder-nope00") is False
+
+
+# ---------------------------------------------------------------------------
+# get_schedule visibility — a reminder you cannot see is one you cannot cancel
+# ---------------------------------------------------------------------------
+
+
+async def test_date_jobs_appear_in_list_jobs_for():
+    """A one-shot reminder must be listable: cancel_reminder takes the name
+    get_schedule reports, so an invisible reminder is an uncancellable one."""
+    from datetime import timedelta as _td
+
+    from apscheduler.schedulers.asyncio import AsyncIOScheduler
+
+    sched = AsyncIOScheduler(timezone=timezone.utc)
+    sched.start(paused=True)
+    try:
+        reg = _registry(scheduler=sched)
+        at = (datetime.now(timezone.utc) + _td(hours=2)).isoformat()
+        reg.register_agent("assistant", [_date_spec(at)], ["telegram"])
+
+        rows = reg.list_jobs_for(role="assistant", within_hours=24)
+
+        assert [r.name for r in rows] == ["reminder-a1b2c3"]
+        assert rows[0].type == "date"
+        assert rows[0].schedule_desc
+    finally:
+        sched.shutdown(wait=False)
+
+
+async def test_date_job_outside_the_window_is_not_listed():
+    from datetime import timedelta as _td
+
+    from apscheduler.schedulers.asyncio import AsyncIOScheduler
+
+    sched = AsyncIOScheduler(timezone=timezone.utc)
+    sched.start(paused=True)
+    try:
+        reg = _registry(scheduler=sched)
+        at = (datetime.now(timezone.utc) + _td(days=10)).isoformat()
+        reg.register_agent("assistant", [_date_spec(at)], ["telegram"])
+
+        assert reg.list_jobs_for(role="assistant", within_hours=24) == []
+    finally:
+        sched.shutdown(wait=False)
