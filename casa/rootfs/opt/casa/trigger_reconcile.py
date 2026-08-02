@@ -360,23 +360,17 @@ def _fire_consent_prompts(
     # v0.112.0 (impl r4): SEAL each plugin's setup-round membership in ONE
     # yield-free batch BEFORE any keyboard posts — a fast Approve on the
     # first keyboard can never settle a round still registering members.
-    import plugin_setup_episodes
+    # Release C (Sol r2): the membership is the UNION of the pending TRIGGER
+    # and CALLBACK consents. The two reconcilers run as a pair at every call
+    # site, so the callback identities are computed FIRST here and sealed into
+    # the same round — otherwise an Approve landing between the trigger and
+    # callback reconciles would settle a round the callback consent has not
+    # joined yet, running the plugin's setup tool while a consent is open.
     _ack_identity = ack_identity  # module-level import (plugin_triggers)
-    nonce_by_identity: dict[str, str] = {}
-    by_plugin: dict[tuple, list[dict]] = {}
-    for p in pending:
-        by_plugin.setdefault((p["plugin"], p["artifact_id"]), []).append(p)
-    for (plg, art), items in by_plugin.items():
-        idents = [
-            _ack_identity(plugin=plg, artifact_id=art,
-                          effective=i["effective"], target=i["target"],
-                          auth=i["auth"])
-            for i in items]
-        try:
-            nonce_by_identity.update(plugin_setup_episodes.open_round(
-                plugin=plg, artifact_id=art, identities=idents))
-        except Exception:  # noqa: BLE001 — unfenced, never blocking
-            logger.exception("setup-round open failed (plugin=%s)", plg)
+    callback_pending = _callback_pending_for_union(
+        role_configs=role_configs, resolver=resolver)
+    nonce_by_identity = seal_setup_rounds(trigger_pending=pending,
+                                          callback_pending=callback_pending)
 
     for p in pending:
         try:
@@ -392,6 +386,67 @@ def _fire_consent_prompts(
             # the mutation; pending_ack stays in health and re-prompts later.
             logger.exception("trigger consent prompt failed (plugin=%s)",
                              p.get("plugin"))
+
+
+def trigger_pending_for_union(
+    *, role_configs: dict, resolver: Any = None,
+) -> list[dict]:
+    """The pending TRIGGER consents, for the callback reconciler's union
+    sealing (the mirror of ``callback_reconcile.callback_pending_for_union``).
+    Side-effect free and never raises: a failure degrades the union to
+    callback-only membership rather than breaking callback prompting."""
+    try:
+        return compute_desired(role_configs=role_configs,
+                               resolver=resolver).pending
+    except Exception:  # noqa: BLE001
+        logger.exception("trigger union-member compute failed")
+        return []
+
+
+def _callback_pending_for_union(*, role_configs: dict,
+                                resolver: Any = None) -> list[dict]:
+    try:
+        import callback_reconcile
+        return callback_reconcile.callback_pending_for_union(
+            role_configs=role_configs, resolver=resolver)
+    except Exception:  # noqa: BLE001 — the callback half is best-effort: its
+        # own reconcile seals the union again a moment later.
+        logger.exception("callback union-member lookup failed")
+        return []
+
+
+def seal_setup_rounds(*, trigger_pending: list[dict],
+                      callback_pending: list[dict]) -> dict[str, str]:
+    """Open ONE setup round per ``(plugin, artifact_id)`` whose membership is
+    the UNION of the supplied pending trigger and callback consent identities,
+    in one yield-free batch per plugin BEFORE any keyboard posts.
+
+    Returns ``{identity: nonce}`` — each caller threads its own prompts'
+    nonces into their decision callbacks (stale-expiry fencing). Never raises:
+    a ledger failure leaves the prompts unfenced, never blocked.
+    """
+    import plugin_setup_episodes
+
+    by_plugin: dict[tuple, list[str]] = {}
+    for p in trigger_pending:
+        ident = ack_identity(
+            plugin=p["plugin"], artifact_id=p["artifact_id"],
+            effective=p["effective"], target=p["target"], auth=p["auth"])
+        by_plugin.setdefault((p["plugin"], p["artifact_id"]), []).append(ident)
+    for c in callback_pending:
+        # The callback identity is precomputed by its own compute (it binds
+        # the declaration digest, which only that module derives).
+        by_plugin.setdefault(
+            (c["plugin"], c["artifact_id"]), []).append(c["identity"])
+
+    nonce_by_identity: dict[str, str] = {}
+    for (plg, art), idents in by_plugin.items():
+        try:
+            nonce_by_identity.update(plugin_setup_episodes.open_round(
+                plugin=plg, artifact_id=art, identities=idents))
+        except Exception:  # noqa: BLE001 — unfenced, never blocking
+            logger.exception("setup-round open failed (plugin=%s)", plg)
+    return nonce_by_identity
 
 
 async def reconcile_from_runtime(runtime: Any, *, prompt: bool = True) -> list:

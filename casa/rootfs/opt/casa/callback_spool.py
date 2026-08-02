@@ -1202,3 +1202,25 @@ class CallbackSpool:
                 finally:
                     os.close(sub)
         return newest
+
+
+# ---------------------------------------------------------------------------
+# Module singleton (initialised once at boot by casa_core, like the outbox).
+# ---------------------------------------------------------------------------
+
+_SPOOL: "CallbackSpool | None" = None
+
+
+def init_spool(root: "Path | str | None" = None) -> "CallbackSpool":
+    """Create (or replace) the process-wide spool. Boot wiring only — the
+    reconciler, the HTTP handler and the sweeper all read :func:`get_spool`."""
+    global _SPOOL
+    _SPOOL = CallbackSpool(spool_root() if root is None else root)
+    logger.info("callback-spool initialised at %s", _SPOOL.root)
+    return _SPOOL
+
+
+def get_spool() -> "CallbackSpool | None":
+    """The process-wide spool, or ``None`` before boot wired one (every
+    caller degrades explicitly rather than resolving paths against the CWD)."""
+    return _SPOOL

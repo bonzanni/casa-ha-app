@@ -1,0 +1,841 @@
+"""Release C — the authorization-callback reconciler.
+
+``callback_reconcile`` is the ONE writer of the TriggerRegistry *callback*
+overlay: it derives the COMPLETE desired overlay (every resolved + assigned +
+validly-declared + acked plugin callback), swaps it atomically, maintains the
+spool's ``ready.json`` / ``.index`` files with the asymmetric ordering that
+keeps the readiness marker from ever being falsely positive, prunes stale acks
+and fires consent prompts for callbacks whose ONLY gap is the ack.
+"""
+import asyncio
+import os
+from types import SimpleNamespace
+
+import pytest
+
+import callback_reconcile as cr
+import callback_spool
+from callback_acks import CallbackAckStore
+from plugin_callbacks import ack_identity, declaration_digest
+from trigger_registry import TriggerRegistry
+
+BASE = "https://casa.example.org"
+# Captured before any test patches the seam (the autouse fixture below pins a
+# deterministic base for every other test).
+_REAL_BASE_URL = cr._base_url
+
+
+# ---------------------------------------------------------------------------
+# fixtures / doubles
+# ---------------------------------------------------------------------------
+
+
+def _manifest(names):
+    return {"name": "x", "casa": {"callbacks": [{"name": n} for n in names]}}
+
+
+def _plugin(name="gmail", artifact_id="art-1", callbacks=("authorize",),
+            path=None, manifest=None):
+    return SimpleNamespace(
+        name=name, artifact_id=artifact_id,
+        path=path if path is not None else f"/store/{name}/{artifact_id}",
+        version="1.0.0", manifest_name=name,
+        manifest=_manifest(callbacks) if manifest is None else manifest)
+
+
+def _resolver(plugins, *, valid=True, issues=()):
+    def resolve(target):
+        return SimpleNamespace(registry_valid=valid, plugins=list(plugins),
+                               issues=list(issues))
+    return resolve
+
+
+def _entries(*plugins, targets=("resident:assistant",)):
+    rows = [{"name": p.name, "artifact_id": p.artifact_id,
+             "targets": list(targets)} for p in plugins]
+
+    def provider():
+        return rows
+    return provider
+
+
+def _role_configs(**roles):
+    return {role: SimpleNamespace(channels=list(channels))
+            for role, channels in roles.items()}
+
+
+def _ack(acks, plugin="gmail", declared="authorize"):
+    effective = f"plg-{plugin}--{declared}"
+    digest = declaration_digest({"declared": declared, "effective": effective})
+    acks.record(plugin=plugin, effective=effective, declaration_digest=digest)
+    return ack_identity(plugin, effective, digest)
+
+
+def _identity(plugin="gmail", declared="authorize"):
+    effective = f"plg-{plugin}--{declared}"
+    return ack_identity(plugin, effective,
+                        declaration_digest({"declared": declared,
+                                            "effective": effective}))
+
+
+class _SpoolStub:
+    """Records the ordered file-side call sequence (the ordering contract)."""
+
+    def __init__(self, calls, *, fail=()):
+        self.calls = calls
+        self.fail = set(fail)
+
+    def _rec(self, what, *args):
+        self.calls.append((what, *args))
+        if what in self.fail:
+            raise OSError("synthetic spool failure")
+
+    def ensure_plugin_dirs(self, plugin):
+        self._rec("ensure", plugin)
+
+    def write_ready(self, plugin, payload):
+        self._rec("ready", plugin, payload)
+
+    def delete_ready(self, plugin):
+        self._rec("del_ready", plugin)
+
+    def write_index_entry(self, artifact_realpath, payload):
+        self._rec("index", artifact_realpath, payload)
+
+    def delete_index_entry(self, artifact_realpath):
+        self._rec("del_index", artifact_realpath)
+
+
+class _SpyRegistry(TriggerRegistry):
+    def __init__(self, calls=None):
+        super().__init__(scheduler=None, app=None, bus=None)
+        self._calls = calls if calls is not None else []
+
+    def replace_callback_overlay(self, overlay):
+        self._calls.append(("swap", dict(overlay)))
+        super().replace_callback_overlay(overlay)
+
+
+class _FakeTelegram:
+    chat_id = "100"
+
+    def __init__(self):
+        self.posts = []
+
+    async def post_dm_keyboard(self, *, chat_id, request_id, text, options):
+        self.posts.append((chat_id, request_id, text, tuple(options)))
+        return 55
+
+    async def edit_dm_message(self, chat_id, message_id, text):
+        return True
+
+
+class _FakeChannelManager:
+    def __init__(self, telegram=None):
+        self._telegram = telegram
+
+    def get(self, name):
+        return self._telegram if name == "telegram" else None
+
+
+async def _reconcile(registry, *, plugins, acks, spool, entries=None,
+                     role_configs=None, prompt=False, channel_manager=None,
+                     resolver=None, base_url=BASE, monkeypatch=None):
+    if monkeypatch is not None:
+        monkeypatch.setattr(cr, "_base_url", lambda: base_url)
+    return await cr.reconcile_plugin_callbacks(
+        trigger_registry=registry,
+        role_configs=role_configs or _role_configs(assistant=["telegram"]),
+        channel_manager=channel_manager, acks=acks, spool=spool,
+        resolver=resolver or _resolver(plugins),
+        entries=entries or _entries(*plugins), prompt=prompt)
+
+
+@pytest.fixture(autouse=True)
+def _pinned_base(monkeypatch):
+    """Every test states its own base explicitly; never read the real env."""
+    monkeypatch.setattr(cr, "_base_url", lambda: BASE)
+
+
+# ---------------------------------------------------------------------------
+# the gate matrix
+# ---------------------------------------------------------------------------
+
+
+async def test_valid_assigned_acked_callback_routes(tmp_path):
+    registry = _SpyRegistry()
+    acks = CallbackAckStore(path=tmp_path / "acks.json")
+    _ack(acks)
+    p = _plugin()
+    calls: list = []
+    issues = await _reconcile(registry, plugins=[p], acks=acks,
+                              spool=_SpoolStub(calls))
+    assert issues == []
+    entry = registry.get_callback("plg-gmail--authorize")
+    assert entry is not None
+    assert entry["plugin"] == "gmail"
+    assert entry["declared"] == "authorize"
+
+
+async def test_invalid_declaration_darks_the_whole_set(tmp_path):
+    """An intrinsically invalid declaration (reserved prefix) rejects the
+    plugin's WHOLE callback set — the valid, acked sibling routes nothing."""
+    registry = _SpyRegistry()
+    acks = CallbackAckStore(path=tmp_path / "acks.json")
+    _ack(acks)
+    p = _plugin(callbacks=("authorize", "plg-sneaky"))
+    issues = await _reconcile(registry, plugins=[p], acks=acks,
+                              spool=_SpoolStub([]))
+    assert [i.reason_code for i in issues] == ["callback_invalid"]
+    assert issues[0].name == "gmail"
+    assert issues[0].stage == "callbacks"
+    assert registry.get_callback("plg-gmail--authorize") is None
+
+
+async def test_unassigned_plugin_is_callback_no_target(tmp_path):
+    registry = _SpyRegistry()
+    acks = CallbackAckStore(path=tmp_path / "acks.json")
+    _ack(acks)
+    p = _plugin()
+    issues = await _reconcile(registry, plugins=[p], acks=acks,
+                              spool=_SpoolStub([]),
+                              entries=_entries(p, targets=[]))
+    assert [i.reason_code for i in issues] == ["callback_no_target"]
+    assert registry.get_callback("plg-gmail--authorize") is None
+
+
+async def test_executor_only_assignment_is_no_target(tmp_path):
+    """The delivery nudge targets a resident or a specialist; an
+    executor-only plugin could never collect the code it accepted."""
+    registry = _SpyRegistry()
+    acks = CallbackAckStore(path=tmp_path / "acks.json")
+    _ack(acks)
+    p = _plugin()
+    issues = await _reconcile(registry, plugins=[p], acks=acks,
+                              spool=_SpoolStub([]),
+                              entries=_entries(p, targets=["executor:cron"]))
+    assert [i.reason_code for i in issues] == ["callback_no_target"]
+
+
+async def test_unknown_resident_role_is_no_target(tmp_path):
+    registry = _SpyRegistry()
+    acks = CallbackAckStore(path=tmp_path / "acks.json")
+    _ack(acks)
+    p = _plugin()
+    issues = await _reconcile(registry, plugins=[p], acks=acks,
+                              spool=_SpoolStub([]),
+                              entries=_entries(p, targets=["resident:ghost"]))
+    assert [i.reason_code for i in issues] == ["callback_no_target"]
+
+
+async def test_specialist_assignment_is_a_valid_target(tmp_path):
+    registry = _SpyRegistry()
+    acks = CallbackAckStore(path=tmp_path / "acks.json")
+    _ack(acks)
+    p = _plugin()
+    issues = await _reconcile(
+        registry, plugins=[p], acks=acks, spool=_SpoolStub([]),
+        entries=_entries(p, targets=["specialist:finance"]))
+    assert issues == []
+    assert registry.get_callback("plg-gmail--authorize") is not None
+
+
+async def test_unacked_callback_is_pending_and_dark(tmp_path):
+    registry = _SpyRegistry()
+    acks = CallbackAckStore(path=tmp_path / "acks.json")
+    p = _plugin()
+    issues = await _reconcile(registry, plugins=[p], acks=acks,
+                              spool=_SpoolStub([]))
+    assert [i.reason_code for i in issues] == ["callback_pending_ack"]
+    assert registry.get_callback("plg-gmail--authorize") is None
+
+
+async def test_partial_ack_darks_the_whole_plugin(tmp_path):
+    """All-or-nothing per plugin (INV-TRIG-003's callback mirror): one
+    un-acked callback keeps the acked sibling dark too."""
+    registry = _SpyRegistry()
+    acks = CallbackAckStore(path=tmp_path / "acks.json")
+    _ack(acks, declared="authorize")
+    p = _plugin(callbacks=("authorize", "renew"))
+    issues = await _reconcile(registry, plugins=[p], acks=acks,
+                              spool=_SpoolStub([]))
+    assert [i.reason_code for i in issues] == ["callback_pending_ack"]
+    assert registry.get_callback("plg-gmail--authorize") is None
+    assert registry.get_callback("plg-gmail--renew") is None
+
+
+async def test_gate_order_no_target_outranks_pending_ack(tmp_path):
+    """An unassigned plugin reports the ASSIGNMENT gap, never a consent
+    prompt — approving a callback that still could not route is a broken
+    promise (the non-consent gap suppresses the pending list)."""
+    registry = _SpyRegistry()
+    acks = CallbackAckStore(path=tmp_path / "acks.json")
+    p = _plugin()
+    desired = cr.compute_desired(
+        role_configs=_role_configs(assistant=["telegram"]), acks=acks,
+        resolver=_resolver([p]), entries=_entries(p, targets=[]))
+    assert [i.reason_code for i in desired.issues] == ["callback_no_target"]
+    assert desired.pending == []
+
+
+async def test_plugin_without_callbacks_is_silent(tmp_path):
+    registry = _SpyRegistry()
+    acks = CallbackAckStore(path=tmp_path / "acks.json")
+    p = _plugin(manifest={"name": "x"})
+    issues = await _reconcile(registry, plugins=[p], acks=acks,
+                              spool=_SpoolStub([]))
+    assert issues == []
+
+
+async def test_one_bad_plugin_never_darks_another(tmp_path):
+    registry = _SpyRegistry()
+    acks = CallbackAckStore(path=tmp_path / "acks.json")
+    _ack(acks)
+    good = _plugin()
+    bad = _plugin(name="badone", artifact_id="art-9",
+                  callbacks=("plg-nope",))
+    issues = await _reconcile(
+        registry, plugins=[good, bad], acks=acks, spool=_SpoolStub([]),
+        entries=_entries(good, bad))
+    assert [(i.name, i.reason_code) for i in issues] == [
+        ("badone", "callback_invalid")]
+    assert registry.get_callback("plg-gmail--authorize") is not None
+
+
+# ---------------------------------------------------------------------------
+# the overlay swap
+# ---------------------------------------------------------------------------
+
+
+async def test_stale_overlay_entries_vanish_in_the_swap(tmp_path):
+    registry = _SpyRegistry()
+    registry.replace_callback_overlay({
+        "plg-gone--old": {"plugin": "gone", "declared": "old",
+                          "path": "/store/gone/art-0"}})
+    acks = CallbackAckStore(path=tmp_path / "acks.json")
+    _ack(acks)
+    p = _plugin()
+    await _reconcile(registry, plugins=[p], acks=acks, spool=_SpoolStub([]))
+    assert registry.get_callback("plg-gone--old") is None
+    assert registry.get_callback("plg-gmail--authorize") is not None
+
+
+async def test_invalid_registry_fails_closed_to_an_empty_overlay(tmp_path):
+    registry = _SpyRegistry()
+    registry.replace_callback_overlay({
+        "plg-gmail--authorize": {"plugin": "gmail", "declared": "authorize",
+                                 "path": "/store/gmail/art-1"}})
+    acks = CallbackAckStore(path=tmp_path / "acks.json")
+    _ack(acks)
+    p = _plugin()
+    issues = await _reconcile(registry, plugins=[p], acks=acks,
+                              spool=_SpoolStub([]),
+                              resolver=_resolver([p], valid=False))
+    assert issues == []          # the registry stage owns its own issues
+    assert registry.get_callback("plg-gmail--authorize") is None
+
+
+async def test_compute_failure_fails_closed_and_propagates(tmp_path):
+    registry = _SpyRegistry()
+    registry.replace_callback_overlay({
+        "plg-gmail--authorize": {"plugin": "gmail", "declared": "authorize",
+                                 "path": "/store/gmail/art-1"}})
+    acks = CallbackAckStore(path=tmp_path / "acks.json")
+
+    def _boom(target):
+        raise RuntimeError("resolver exploded")
+
+    with pytest.raises(RuntimeError):
+        await _reconcile(registry, plugins=[], acks=acks,
+                         spool=_SpoolStub([]), resolver=_boom)
+    assert registry.get_callback("plg-gmail--authorize") is None
+
+
+# ---------------------------------------------------------------------------
+# ready.json / .index — the asymmetric ordering
+# ---------------------------------------------------------------------------
+
+
+async def test_ready_and_index_written_only_after_the_swap(tmp_path):
+    calls: list = []
+    registry = _SpyRegistry(calls)
+    acks = CallbackAckStore(path=tmp_path / "acks.json")
+    _ack(acks)
+    p = _plugin()
+    await _reconcile(registry, plugins=[p], acks=acks,
+                     spool=_SpoolStub(calls))
+    kinds = [c[0] for c in calls]
+    assert kinds == ["swap", "ensure", "ready", "index"]
+    payload = calls[2][2]
+    eff = "plg-gmail--authorize"
+    assert payload == {
+        "v": 1, "base_url": BASE,
+        "callbacks": {"authorize": {
+            "effective": eff,
+            "redirect_uri": f"{BASE}/callback/{eff}"}}}
+    assert calls[3][1] == p.path
+    assert calls[3][2] == dict(payload, plugin_dir="gmail")
+
+
+async def test_ready_and_index_deleted_before_the_unrouting_swap(tmp_path):
+    calls: list = []
+    registry = _SpyRegistry(calls)
+    acks = CallbackAckStore(path=tmp_path / "acks.json")
+    _ack(acks)
+    p = _plugin()
+    await _reconcile(registry, plugins=[p], acks=acks,
+                     spool=_SpoolStub(calls))
+    calls.clear()
+    # the plugin disappears (uninstalled): marker + index die BEFORE the swap
+    await _reconcile(registry, plugins=[], acks=acks, spool=_SpoolStub(calls),
+                     entries=lambda: [])
+    assert [c[0] for c in calls] == ["del_ready", "del_index", "swap"]
+    assert calls[1][1] == p.path
+    assert registry.get_callback("plg-gmail--authorize") is None
+
+
+async def test_revoked_ack_unroutes_marker_first(tmp_path):
+    calls: list = []
+    registry = _SpyRegistry(calls)
+    acks = CallbackAckStore(path=tmp_path / "acks.json")
+    _ack(acks)
+    p = _plugin()
+    await _reconcile(registry, plugins=[p], acks=acks,
+                     spool=_SpoolStub(calls))
+    acks.revoke_plugin("gmail")
+    calls.clear()
+    await _reconcile(registry, plugins=[p], acks=acks,
+                     spool=_SpoolStub(calls))
+    assert [c[0] for c in calls][:3] == ["del_ready", "del_index", "swap"]
+    assert registry.get_callback("plg-gmail--authorize") is None
+
+
+async def test_artifact_change_retires_the_old_index_key_only(tmp_path):
+    """The index is keyed by the RESOLVED artifact path: an update must drop
+    the old key in the same pass that publishes the new one, and must not
+    delete the (unchanged) plugin-dir readiness marker."""
+    calls: list = []
+    registry = _SpyRegistry(calls)
+    acks = CallbackAckStore(path=tmp_path / "acks.json")
+    _ack(acks)
+    p1 = _plugin()
+    await _reconcile(registry, plugins=[p1], acks=acks,
+                     spool=_SpoolStub(calls))
+    calls.clear()
+    p2 = _plugin(artifact_id="art-2")
+    await _reconcile(registry, plugins=[p2], acks=acks,
+                     spool=_SpoolStub(calls))
+    assert [c[0] for c in calls] == ["del_index", "swap", "ensure", "ready",
+                                     "index"]
+    assert calls[0][1] == p1.path
+    assert calls[4][1] == p2.path
+
+
+async def test_index_key_is_the_resolved_artifact_path(tmp_path):
+    """A real spool: the entry lands under sha256(realpath(artifact root)) —
+    the one value a consumer provably knows."""
+    root = tmp_path / "spool"
+    art = tmp_path / "store" / "gmail" / "art-1"
+    art.mkdir(parents=True)
+    link = tmp_path / "linked"
+    os.symlink(art, link)
+    spool = callback_spool.CallbackSpool(root)
+    try:
+        registry = _SpyRegistry()
+        acks = CallbackAckStore(path=tmp_path / "acks.json")
+        _ack(acks)
+        p = _plugin(path=str(link))
+        await _reconcile(registry, plugins=[p], acks=acks, spool=spool)
+        key = callback_spool.index_key(str(art))
+        entry = root / callback_spool.INDEX_DIR / f"{key}.json"
+        assert entry.is_file()
+        import json
+        assert json.loads(entry.read_text())["plugin_dir"] == "gmail"
+        assert (root / "gmail" / "ready.json").is_file()
+        assert (root / "gmail" / "pending").is_dir()
+    finally:
+        spool.close()
+
+
+async def test_scoped_bundle_name_gets_its_own_spool_dir(tmp_path):
+    """Bundled plugins register as ``slug.manifest-name`` — a dotted (but not
+    dot-LEADING) name the spool accepts."""
+    root = tmp_path / "spool"
+    spool = callback_spool.CallbackSpool(root)
+    try:
+        registry = _SpyRegistry()
+        acks = CallbackAckStore(path=tmp_path / "acks.json")
+        _ack(acks, plugin="finance.gmail")
+        p = _plugin(name="finance.gmail")
+        await _reconcile(registry, plugins=[p], acks=acks, spool=spool)
+        assert registry.get_callback("plg-finance.gmail--authorize") is not None
+        assert (root / "finance.gmail" / "ready.json").is_file()
+    finally:
+        spool.close()
+
+
+async def test_spool_write_failure_surfaces_but_keeps_the_route(tmp_path):
+    calls: list = []
+    registry = _SpyRegistry(calls)
+    acks = CallbackAckStore(path=tmp_path / "acks.json")
+    _ack(acks)
+    p = _plugin()
+    issues = await _reconcile(registry, plugins=[p], acks=acks,
+                              spool=_SpoolStub(calls, fail={"ready"}))
+    assert [i.reason_code for i in issues] == ["callback_spool_error"]
+    # the overlay is the authority — an advisory-marker failure never unroutes
+    assert registry.get_callback("plg-gmail--authorize") is not None
+
+
+async def test_a_pathless_overlay_entry_never_reaches_the_index(tmp_path):
+    """The index key is sha256(realpath(path)) and realpath("") is the process
+    CWD — a malformed carried-over entry must never make the unroute delete a
+    key derived from wherever casa happens to be running."""
+    calls: list = []
+    registry = _SpyRegistry(calls)
+    registry.replace_callback_overlay({
+        "plg-gmail--authorize": {"plugin": "gmail", "declared": "authorize"}})
+    calls.clear()
+    acks = CallbackAckStore(path=tmp_path / "acks.json")
+    await _reconcile(registry, plugins=[], acks=acks, spool=_SpoolStub(calls),
+                     entries=lambda: [])
+    assert [c[0] for c in calls] == ["del_ready", "swap"]
+
+
+async def test_missing_spool_reports_one_issue_per_plugin(tmp_path):
+    """An unwired spool fails EVERY file operation — the health report gets
+    one actionable row per plugin, not one per syscall (the unroute alone
+    would otherwise contribute a marker row and an index row)."""
+    registry = _SpyRegistry()
+    registry.replace_callback_overlay({
+        "plg-gone--old": {"plugin": "gone", "declared": "old",
+                          "path": "/store/gone/art-0"}})
+    acks = CallbackAckStore(path=tmp_path / "acks.json")
+    _ack(acks)
+    p = _plugin()
+    issues = await _reconcile(registry, plugins=[p], acks=acks, spool=None,
+                              entries=_entries(p))
+    assert sorted((i.name, i.reason_code) for i in issues) == [
+        ("gmail", "callback_spool_error"), ("gone", "callback_spool_error")]
+
+
+async def test_missing_spool_still_swaps_the_overlay(tmp_path):
+    registry = _SpyRegistry()
+    acks = CallbackAckStore(path=tmp_path / "acks.json")
+    _ack(acks)
+    p = _plugin()
+    issues = await _reconcile(registry, plugins=[p], acks=acks, spool=None)
+    assert [i.reason_code for i in issues] == ["callback_spool_error"]
+    assert registry.get_callback("plg-gmail--authorize") is not None
+
+
+# ---------------------------------------------------------------------------
+# base URL
+# ---------------------------------------------------------------------------
+
+
+async def test_no_base_url_writes_no_files_and_reports_it(monkeypatch, tmp_path):
+    calls: list = []
+    registry = _SpyRegistry(calls)
+    acks = CallbackAckStore(path=tmp_path / "acks.json")
+    _ack(acks)
+    p = _plugin()
+    issues = await _reconcile(registry, plugins=[p], acks=acks,
+                              spool=_SpoolStub(calls), base_url=None,
+                              monkeypatch=monkeypatch)
+    assert [i.reason_code for i in issues] == ["callback_base_url_invalid"]
+    assert [c[0] for c in calls] == ["swap"]
+    # consent still routes the overlay — the facility is merely unavailable
+    assert registry.get_callback("plg-gmail--authorize") is not None
+
+
+async def test_base_url_loss_retires_a_previously_published_marker(
+    monkeypatch, tmp_path,
+):
+    calls: list = []
+    registry = _SpyRegistry(calls)
+    acks = CallbackAckStore(path=tmp_path / "acks.json")
+    _ack(acks)
+    p = _plugin()
+    await _reconcile(registry, plugins=[p], acks=acks,
+                     spool=_SpoolStub(calls))
+    calls.clear()
+    await _reconcile(registry, plugins=[p], acks=acks,
+                     spool=_SpoolStub(calls), base_url=None,
+                     monkeypatch=monkeypatch)
+    assert [c[0] for c in calls] == ["del_ready", "del_index", "swap"]
+
+
+@pytest.mark.parametrize("raw,expected", [
+    ("https://casa.example.org", "https://casa.example.org"),
+    ("https://casa.example.org/", "https://casa.example.org"),
+    ("  https://casa.example.org  ", "https://casa.example.org"),
+    ("null", None),
+    ("None", None),
+    ("", None),
+])
+def test_base_url_seam_reads_public_url(monkeypatch, raw, expected):
+    monkeypatch.setenv("PUBLIC_URL", raw)
+    assert _REAL_BASE_URL() == expected
+
+
+def test_base_url_seam_without_public_url(monkeypatch):
+    monkeypatch.delenv("PUBLIC_URL", raising=False)
+    assert _REAL_BASE_URL() is None
+
+
+# ---------------------------------------------------------------------------
+# the declaration digest — consent survives a routine upgrade
+# ---------------------------------------------------------------------------
+
+
+async def test_same_declaration_across_artifacts_keeps_the_ack(
+    monkeypatch, tmp_path,
+):
+    """The consent identity excludes the artifact: an upgrade that leaves the
+    declaration untouched stays routed with NO new prompt and no dark pass."""
+    import authz_grants
+    import verdict_broker
+    monkeypatch.setattr(verdict_broker, "BROKER", verdict_broker.VerdictBroker())
+    monkeypatch.setattr(authz_grants, "CHALLENGES",
+                        authz_grants.ChallengeCoordinator())
+    registry = _SpyRegistry()
+    acks = CallbackAckStore(path=tmp_path / "acks.json")
+    _ack(acks)
+    telegram = _FakeTelegram()
+    p1 = _plugin()
+    await _reconcile(registry, plugins=[p1], acks=acks, spool=_SpoolStub([]),
+                     prompt=True, channel_manager=_FakeChannelManager(telegram))
+    p2 = _plugin(artifact_id="art-2")
+    issues = await _reconcile(registry, plugins=[p2], acks=acks,
+                              spool=_SpoolStub([]), prompt=True,
+                              channel_manager=_FakeChannelManager(telegram))
+    for _ in range(8):
+        await asyncio.sleep(0)
+    assert issues == []
+    assert registry.get_callback("plg-gmail--authorize") is not None
+    assert telegram.posts == []          # never re-prompted
+    assert acks.get(_identity()) is not None
+
+
+async def test_renamed_declaration_needs_fresh_consent(monkeypatch, tmp_path):
+    import authz_grants
+    import verdict_broker
+    monkeypatch.setattr(verdict_broker, "BROKER", verdict_broker.VerdictBroker())
+    monkeypatch.setattr(authz_grants, "CHALLENGES",
+                        authz_grants.ChallengeCoordinator())
+    registry = _SpyRegistry()
+    acks = CallbackAckStore(path=tmp_path / "acks.json")
+    _ack(acks)
+    telegram = _FakeTelegram()
+    p2 = _plugin(artifact_id="art-2", callbacks=("authorise",))
+    issues = await _reconcile(registry, plugins=[p2], acks=acks,
+                              spool=_SpoolStub([]), prompt=True,
+                              channel_manager=_FakeChannelManager(telegram))
+    for _ in range(8):
+        await asyncio.sleep(0)
+    assert [i.reason_code for i in issues] == ["callback_pending_ack"]
+    assert registry.get_callback("plg-gmail--authorise") is None
+    assert len(telegram.posts) == 1
+
+
+# ---------------------------------------------------------------------------
+# stale-ack prune
+# ---------------------------------------------------------------------------
+
+
+async def test_stale_ack_is_pruned_at_reconcile(tmp_path):
+    registry = _SpyRegistry()
+    acks = CallbackAckStore(path=tmp_path / "acks.json")
+    _ack(acks)                                 # gmail/authorize — installed
+    _ack(acks, plugin="ghost", declared="old")  # nothing declares this
+    p = _plugin()
+    await _reconcile(registry, plugins=[p], acks=acks, spool=_SpoolStub([]))
+    assert acks.get(_identity()) is not None
+    assert acks.get(_identity("ghost", "old")) is None
+
+
+async def test_prune_keeps_acks_of_unassigned_and_unacked_declarations(tmp_path):
+    """Prunability is about the DECLARATION existing, not about routing: an
+    unassigned plugin's consent must survive so re-assignment needs no re-tap."""
+    registry = _SpyRegistry()
+    acks = CallbackAckStore(path=tmp_path / "acks.json")
+    _ack(acks)
+    p = _plugin()
+    await _reconcile(registry, plugins=[p], acks=acks, spool=_SpoolStub([]),
+                     entries=_entries(p, targets=[]))
+    assert acks.get(_identity()) is not None
+
+
+async def test_prune_is_skipped_when_the_registry_is_invalid(tmp_path):
+    registry = _SpyRegistry()
+    acks = CallbackAckStore(path=tmp_path / "acks.json")
+    _ack(acks)
+    await _reconcile(registry, plugins=[], acks=acks, spool=_SpoolStub([]),
+                     resolver=_resolver([], valid=False), entries=lambda: [])
+    assert acks.get(_identity()) is not None
+
+
+async def test_prune_is_skipped_when_resolution_reported_issues(tmp_path):
+    """An artifact hiccup (checksum, unreadable manifest) must never vaporize
+    consent — the prune is opportunistic and waits for a clean pass."""
+    registry = _SpyRegistry()
+    acks = CallbackAckStore(path=tmp_path / "acks.json")
+    _ack(acks)
+    from plugin_registry import PluginIssue
+    hiccup = PluginIssue(name="gmail", target=None, stage="resolve",
+                         reason_code="artifact_invalid", artifact_id="art-1")
+    await _reconcile(registry, plugins=[], acks=acks, spool=_SpoolStub([]),
+                     resolver=_resolver([], issues=[hiccup]),
+                     entries=lambda: [])
+    assert acks.get(_identity()) is not None
+
+
+async def test_prune_failure_never_breaks_the_reconcile(monkeypatch, tmp_path):
+    registry = _SpyRegistry()
+    acks = CallbackAckStore(path=tmp_path / "acks.json")
+    _ack(acks)
+
+    def _boom(valid_identities):
+        raise RuntimeError("store exploded")
+
+    monkeypatch.setattr(acks, "prune_stale", _boom)
+    p = _plugin()
+    issues = await _reconcile(registry, plugins=[p], acks=acks,
+                              spool=_SpoolStub([]))
+    assert issues == []
+    assert registry.get_callback("plg-gmail--authorize") is not None
+
+
+# ---------------------------------------------------------------------------
+# consent prompting
+# ---------------------------------------------------------------------------
+
+
+def _fresh_challenges(monkeypatch):
+    import authz_grants
+    import verdict_broker
+    broker = verdict_broker.VerdictBroker()
+    monkeypatch.setattr(verdict_broker, "BROKER", broker)
+    coord = authz_grants.ChallengeCoordinator()
+    monkeypatch.setattr(authz_grants, "CHALLENGES", coord)
+    return broker, coord
+
+
+async def test_pending_consent_fires_one_prompt(monkeypatch, tmp_path):
+    _fresh_challenges(monkeypatch)
+    registry = _SpyRegistry()
+    acks = CallbackAckStore(path=tmp_path / "acks.json")
+    telegram = _FakeTelegram()
+    p = _plugin()
+    await _reconcile(registry, plugins=[p], acks=acks, spool=_SpoolStub([]),
+                     prompt=True, channel_manager=_FakeChannelManager(telegram))
+    for _ in range(8):
+        await asyncio.sleep(0)
+    assert len(telegram.posts) == 1
+    assert "/callback/plg-gmail--authorize" in telegram.posts[0][2]
+    # a second reconcile dedupes onto the live challenge
+    await _reconcile(registry, plugins=[p], acks=acks, spool=_SpoolStub([]),
+                     prompt=True, channel_manager=_FakeChannelManager(telegram))
+    for _ in range(8):
+        await asyncio.sleep(0)
+    assert len(telegram.posts) == 1
+
+
+async def test_prompt_false_posts_nothing(monkeypatch, tmp_path):
+    _fresh_challenges(monkeypatch)
+    registry = _SpyRegistry()
+    acks = CallbackAckStore(path=tmp_path / "acks.json")
+    telegram = _FakeTelegram()
+    p = _plugin()
+    await _reconcile(registry, plugins=[p], acks=acks, spool=_SpoolStub([]),
+                     prompt=False,
+                     channel_manager=_FakeChannelManager(telegram))
+    for _ in range(8):
+        await asyncio.sleep(0)
+    assert telegram.posts == []
+
+
+async def test_no_operator_channel_leaves_pending(monkeypatch, tmp_path):
+    _fresh_challenges(monkeypatch)
+    registry = _SpyRegistry()
+    acks = CallbackAckStore(path=tmp_path / "acks.json")
+    p = _plugin()
+    issues = await _reconcile(registry, plugins=[p], acks=acks,
+                              spool=_SpoolStub([]), prompt=True,
+                              channel_manager=_FakeChannelManager(None))
+    assert [i.reason_code for i in issues] == ["callback_pending_ack"]
+
+
+# ---------------------------------------------------------------------------
+# health recomputability
+# ---------------------------------------------------------------------------
+
+
+async def test_current_issues_recomputes_from_active_runtime(
+    monkeypatch, tmp_path,
+):
+    import agent as agent_mod
+    acks = CallbackAckStore(path=tmp_path / "acks.json")
+    p = _plugin()
+    runtime = SimpleNamespace(
+        trigger_registry=_SpyRegistry(),
+        role_configs=_role_configs(assistant=["telegram"]),
+        channel_manager=None)
+    monkeypatch.setattr(agent_mod, "active_runtime", runtime)
+    monkeypatch.setattr(cr, "_default_resolver", lambda: _resolver([p]))
+    monkeypatch.setattr(cr, "_default_entries", lambda: _entries(p))
+    monkeypatch.setattr(cr, "_default_acks", lambda: acks)
+    assert [i.reason_code for i in cr.current_issues()] == [
+        "callback_pending_ack"]
+    _ack(acks)
+    assert cr.current_issues() == []
+
+
+async def test_current_issues_without_runtime_is_empty(monkeypatch):
+    import agent as agent_mod
+    monkeypatch.setattr(agent_mod, "active_runtime", None)
+    assert cr.current_issues() == []
+
+
+async def test_current_issues_never_raises(monkeypatch):
+    import agent as agent_mod
+    runtime = SimpleNamespace(role_configs=_role_configs(assistant=["x"]))
+    monkeypatch.setattr(agent_mod, "active_runtime", runtime)
+
+    def _boom():
+        raise RuntimeError("resolver exploded")
+
+    monkeypatch.setattr(cr, "_default_resolver", _boom)
+    assert cr.current_issues() == []
+
+
+# ---------------------------------------------------------------------------
+# the runtime seam
+# ---------------------------------------------------------------------------
+
+
+async def test_reconcile_from_runtime_without_registry_is_a_noop():
+    assert await cr.reconcile_from_runtime(None) == []
+    assert await cr.reconcile_from_runtime(
+        SimpleNamespace(trigger_registry=None)) == []
+
+
+async def test_reconcile_from_runtime_uses_the_runtime_registry(
+    monkeypatch, tmp_path,
+):
+    registry = _SpyRegistry()
+    acks = CallbackAckStore(path=tmp_path / "acks.json")
+    _ack(acks)
+    p = _plugin()
+    monkeypatch.setattr(cr, "_default_resolver", lambda: _resolver([p]))
+    monkeypatch.setattr(cr, "_default_entries", lambda: _entries(p))
+    monkeypatch.setattr(cr, "_default_acks", lambda: acks)
+    monkeypatch.setattr(cr, "_default_spool", lambda: _SpoolStub([]))
+    runtime = SimpleNamespace(
+        trigger_registry=registry,
+        role_configs=_role_configs(assistant=["telegram"]),
+        channel_manager=None)
+    issues = await cr.reconcile_from_runtime(runtime, prompt=False)
+    assert issues == []
+    assert registry.get_callback("plg-gmail--authorize") is not None
