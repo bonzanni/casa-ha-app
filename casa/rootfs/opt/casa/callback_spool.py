@@ -656,6 +656,11 @@ class RecoveryReport:
     restored: list[tuple[str, str]] = field(default_factory=list)
     nudges: list[tuple[str, str]] = field(default_factory=list)
     dropped: list[tuple[str, str]] = field(default_factory=list)
+    #: Claims whose flow already carries a DURABLE terminal outcome: the
+    #: deletion that outcome authorized was interrupted, and recovery
+    #: completes it instead of restoring the flow. Deliberately not folded
+    #: into ``dropped`` (which means "aged out here, outcome recorded here").
+    completed_terminal: list[tuple[str, str]] = field(default_factory=list)
     temps_cleared: int = 0
     anomalies: list[str] = field(default_factory=list)
 
@@ -811,13 +816,20 @@ def ack(plugin_dir: Path | str, state_hash_hex: str) -> bool:
     means ALREADY SETTLED (acked earlier, or the flow torn down): ``True``,
     idempotently, with nothing to witness.
 
-    After a successful rename the attempts directory is fsynced STRICTLY:
-    the ack witness must be crash-durable (spec §7), because the consumer
-    treats the flow as settled from this point — only after its own commit
-    point, the exchange result durably in its own store. ``FsyncFailed``
-    PROPAGATES: an unwitnessed ack must not be treated as settled (the
-    rename may have happened; re-acking re-witnesses). ``True`` only on
-    witness durable.
+    The attempts directory is then fsynced STRICTLY: the ack witness must be
+    crash-durable (spec §7), because the consumer treats the flow as settled
+    from this point — only after its own commit point, the exchange result
+    durably in its own store. ``FsyncFailed`` PROPAGATES: an unwitnessed ack
+    must not be treated as settled (the rename may have happened; re-acking
+    re-witnesses). ``True`` only on witness durable.
+
+    The fsync runs on the ENOENT arm too, and that is the point of re-acking
+    after a failure: a first call whose rename SUCCEEDED and whose fsync then
+    failed leaves the source absent, so the retry finds ENOENT — returning
+    True there without an fsync would report an unwitnessed rename as
+    settled, and a power loss would roll it back under a consumer that has
+    already moved on. The only unwitnessable case is the directory itself
+    being gone, which is the teardown having completed.
     """
     if not _is_hash(state_hash_hex):
         raise ValueError("malformed state hash")
@@ -832,7 +844,7 @@ def ack(plugin_dir: Path | str, state_hash_hex: str) -> bool:
                       f"{ACK_PREFIX}{state_hash_hex}",
                       src_dir_fd=dir_fd, dst_dir_fd=dir_fd)
         except FileNotFoundError:
-            return True                      # already acked / already settled
+            pass                 # already acked / settled — still witness it
         _fsync_strict(dir_fd, ATTEMPTS_DIR)
     finally:
         os.close(dir_fd)
@@ -1628,12 +1640,21 @@ class CallbackSpool:
         ``strict=False`` (default): best-effort fsyncs; True once the replace
         sequence completed. ``strict=True`` — the write-ahead-outcome
         variant: the STAGED file is fsynced strictly BEFORE the rename (a
-        failure aborts with the previous record intact), and the directory is
-        fsynced strictly AFTER it (a failure returns False although the new
-        record may already be VISIBLE — that is correct: the caller skips the
-        dependent deletion this pass, and a visible terminal record beside a
-        live artifact is the provisional state the next pass re-derives).
-        True only when fully durable.
+        failure aborts with the previous record intact), then ``attempts/``
+        and then the PLUGIN DIR that names it are fsynced strictly AFTER it
+        (a failure returns False although the new record may already be
+        VISIBLE — that is correct: the caller skips the dependent deletion
+        this pass, and a visible terminal record beside a live artifact is
+        the provisional state the next pass re-derives). True only when
+        fully durable.
+
+        The plugin-parent fsync is strict on EVERY strict call, not only the
+        one that created ``attempts/``: a v0.146 dir has no ``attempts/``
+        yet, so the creating call's best-effort parent fsync is exactly where
+        a silent failure lands — and every later call sees ``created=False``
+        and would never retry it, leaving a whole directory entry that a
+        power loss can drop while the deletions it authorized survive
+        (INV-CB-007).
 
         Never raises into callers: every failure is False plus a warning that
         names no hash (INV-CB-006)."""
@@ -1661,17 +1682,19 @@ class CallbackSpool:
                 try:
                     if created:
                         self._chmod_dir(afd, ATTEMPTS_DIR)
-                    return self._write_attempt_at(afd, f"{h}.json", rec,
-                                                  strict)
+                    return self._write_attempt_at(afd, pfd, plugin,
+                                                  f"{h}.json", rec, strict)
                 finally:
                     os.close(afd)
             finally:
                 os.close(pfd)
 
-    def _write_attempt_at(self, afd: int, name: str, rec: dict,
-                          strict: bool) -> bool:
+    def _write_attempt_at(self, afd: int, pfd: int, plugin: str, name: str,
+                          rec: dict, strict: bool) -> bool:
         """The staged-replace sequence of :meth:`write_attempt`, openat-
-        relative to the attempts dir FD. Called with ``_lock`` held."""
+        relative to the attempts dir FD (*pfd* is the plugin dir that names
+        it — the strict path proves that entry durable too). Called with
+        ``_lock`` held."""
         if not strict:
             try:
                 self._replace_json(name, afd, rec, ATTEMPTS_DIR)
@@ -1714,6 +1737,10 @@ class CallbackSpool:
             return False
         try:
             _fsync_strict(afd, ATTEMPTS_DIR)
+            # …and the entry that NAMES attempts/: on a dir created by an
+            # earlier call this is the only pass that can still prove it
+            # durable, and a crash that loses it loses every record inside.
+            _fsync_strict(pfd, plugin)
         except FsyncFailed as exc:
             # The new record may be VISIBLE but is not proven durable; the
             # caller must skip its dependent deletion this pass (a visible
@@ -2309,9 +2336,12 @@ class CallbackSpool:
 
         Then per claim: stale or future-mtime ⇒ delete; a matching published
         result ⇒ report for the delivery nudge and remove the claim (never
-        re-mint a completed flow); otherwise restore it to ``pending/`` by
-        publish-once link, keeping its mint mtime, so the crash window
-        between claim and result write does not silently eat a flow.
+        re-mint a completed flow); a flow whose attempt already carries a
+        durable terminal outcome ⇒ complete the deletion that outcome
+        authorized (never re-mint a flow whose END is on record); otherwise
+        restore it to ``pending/`` by publish-once link, keeping its mint
+        mtime, so the crash window between claim and result write does not
+        silently eat a flow.
 
         A periodic pass additionally skips in-flight hashes and claims younger
         than :data:`RESTORE_GRACE_S`; a boot pass has no live handlers by
@@ -2427,6 +2457,21 @@ class CallbackSpool:
             return
         if not boot and now - st.st_mtime < RESTORE_GRACE_S:
             return
+        # A DURABLE terminal record outranks restoration. The write-ahead
+        # rule (§5) says the record precedes the deletion it authorizes, so
+        # a valid `done` attempt beside a surviving claim means casa already
+        # recorded this flow's end and only the deletion was interrupted —
+        # typically `publish_failed` written strictly, then a crash before
+        # the handler's discard. Restoring would re-mint a state whose end
+        # is on record, reopening a terminal attempt and handing a consumed
+        # state a second life (INV-CB-002). Complete the deletion instead.
+        rec = callback_attempts.validate_attempt(
+            self.read_attempt(plugin, name).payload)
+        if rec is not None and rec["status"] == "done":
+            _unlink_quiet(name, claims)
+            _fsync(claims, CLAIMS_DIR)
+            report.completed_terminal.append((plugin, name))
+            return
         try:
             restored = _link_once(name, claims, f"{name}.json", pend)
         except OSError as exc:
@@ -2458,8 +2503,8 @@ class CallbackSpool:
         pass (``skipped_undurable``), so a crash can never destroy the
         credential-bearing artifact and the only record of why together.
         Residue that names no flow (``.part``, ``.tmp-*``, staged-replace
-        temps, unattributable names) is recorded nowhere — there is no flow to
-        record."""
+        temps, a malformed ``.collect-`` name, unattributable names) is
+        recorded nowhere — there is no flow to record."""
         report = SweepReport()
         with self._lock:
             if self._closed:
@@ -2605,20 +2650,32 @@ class CallbackSpool:
             st = _lstat_quiet(name, fd)
             if st is None:
                 continue
-            is_collect = name.startswith(COLLECT_PREFIX)
-            h = _hash_of_pending(name)
-            flow = _hash_of_collect(name) if is_collect else h
-            if (h is None and not is_collect) or not stat.S_ISREG(st.st_mode):
+            flow = _hash_of_collect(name)
+            is_collect = flow is not None
+            if not is_collect:
+                flow = _hash_of_pending(name)
+            # A ``.collect-`` name that does not PARSE names no flow — the
+            # single grammar decides, here as in enumeration. It is residue,
+            # exactly like a `.part` in pending/: aged on TEMP_TTL_S,
+            # recorded NOWHERE, and still counted toward MAX_RESULTS. Reading
+            # the bare prefix as "a collect entry" would have excluded it
+            # from MAX_RESULTS while the grammar kept it out of MAX_COLLECT,
+            # so thousands of `.collect-junk` names evaded BOTH bounds.
+            residue = flow is None and name.startswith(COLLECT_PREFIX)
+            if not stat.S_ISREG(st.st_mode) or (flow is None and not residue):
                 if flow is not None and not self._write_ahead(
                         plugin, flow, "expired", dirs=dirs, now=now,
                         claimed=True if is_collect else None):
                     report.skipped_undurable += 1
                     continue
                 _remove_entry(name, fd, st)
-                report.deleted_anomalous += 1
-                report.anomalies.append(f"{plugin}/results: {name!r}")
+                if residue:
+                    report.deleted_temps += 1
+                else:
+                    report.deleted_anomalous += 1
+                    report.anomalies.append(f"{plugin}/results: {name!r}")
                 continue
-            if self._expired(st, now, RESULT_TTL_S):
+            if self._expired(st, now, TEMP_TTL_S if residue else RESULT_TTL_S):
                 # A held entry aged out is `claimed`: the consumer renamed it
                 # but never acked, so casa cannot say whether it was read. A
                 # base-named result asserts nothing about `claimed` (None) —
@@ -2629,7 +2686,9 @@ class CallbackSpool:
                     report.skipped_undurable += 1
                     continue
                 if _unlink_quiet(name, fd):
-                    if is_collect:
+                    if residue:
+                        report.deleted_temps += 1
+                    elif is_collect:
                         report.deleted_collect += 1
                     else:
                         report.deleted_results += 1
@@ -2637,10 +2696,10 @@ class CallbackSpool:
                     self._repair_after_lost_deletion(plugin, flow, dirs=dirs,
                                                      now=now)
                 continue
-            if not is_collect:
-                live.append((st.st_mtime, name, flow))
-            elif flow is not None:
+            if is_collect:
                 held.append((st.st_mtime, name, flow))
+            else:
+                live.append((st.st_mtime, name, flow))   # flow None: residue
         # Consumer-held `.collect-*` entries are excluded from MAX_RESULTS
         # (they are already claimed work) and bounded by their OWN cap, so a
         # rename-happy consumer cannot hold unbounded credential inodes.
@@ -2691,15 +2750,31 @@ class CallbackSpool:
                    report: SweepReport, *, dirs: _ArtifactDirs, now: float,
                    open_attempts: set[str]) -> None:
         """Enforce a per-directory cap, victims chosen by the spec §9 ladder:
-        residue and attempt-less entries first, entries whose flow still has
-        an OPEN attempt last, each rank oldest-mtime-first. Cap pressure is
-        pathological by definition, and what it destroys should be what casa
-        knows least about. Every hash-named victim is recorded ``evicted``
-        write-ahead; a victim whose record will not go durable is skipped this
-        pass (the cap converges on the next one)."""
+
+        0. residue — a ``.part`` or a malformed ``.collect-`` name (``flow``
+           is None): it names no minted state, so destroying it retires
+           nothing and is recorded nowhere;
+        1. entries whose flow has no OPEN attempt (a final or attempt-less
+           flow);
+        2. entries whose flow still has an open attempt — evicted last.
+
+        mtime (then name) ranks only WITHIN a rank: ranking residue and a
+        real flow together by age alone lets a newer ``.part`` survive while
+        an older genuine flow is destroyed and recorded ``evicted``. Cap
+        pressure is pathological by definition, and what it destroys should
+        be what casa knows least about. Every hash-named victim is recorded
+        ``evicted`` write-ahead; a victim whose record will not go durable is
+        skipped this pass (the cap converges on the next one)."""
         if len(live) <= cap:
             return
-        live.sort(key=lambda item: (item[2] in open_attempts, item[0]))
+
+        def _rank(item) -> int:
+            flow = item[2]
+            if flow is None:
+                return 0
+            return 2 if flow in open_attempts else 1
+
+        live.sort(key=lambda item: (_rank(item), item[0], item[1]))
         for _mtime, name, flow in live[:len(live) - cap]:
             if flow is not None and not self._write_ahead(
                     plugin, flow, "evicted", dirs=dirs, now=now):
@@ -2712,7 +2787,8 @@ class CallbackSpool:
                                                  now=now)
         report.capped.append(f"{plugin}/{sub}")
         logger.warning("callback-spool: %s/%s exceeded %d entries — "
-                       "attempt-less-first deletion applied", plugin, sub, cap)
+                       "residue-then-attempt-less-first deletion applied",
+                       plugin, sub, cap)
 
     def _apply_collect_cap(self, plugin: str, fd: int,
                            held: list[tuple[float, str, str]],

@@ -1179,6 +1179,59 @@ def test_periodic_recovery_skips_a_claim_younger_than_the_restore_grace(spool):
     assert report.restored == [(PLUGIN, h)]
 
 
+def test_recovery_completes_the_deletion_a_durable_outcome_authorized(
+        spool, monkeypatch):
+    """Red case (Sol 1): a staging failure records ``done/publish_failed``
+    STRICTLY and returns FAILED_RECORDED — the handler may then die before
+    its discard. Boot recovery must NOT link that claim back into
+    ``pending/``: casa already recorded this flow's end, so the deletion was
+    authorized and only interrupted. Restoring re-mints a consumed state and
+    reopens a terminal attempt (INV-CB-002)."""
+    now = time.time()
+    h, claim = _claimed(spool, "failed-publish")
+    real = cs._write_new_file
+
+    def boom(name, dir_fd, data):
+        if name.startswith(cs.TEMP_PREFIX):
+            raise OSError(errno.EIO, "injected staging fault")
+        return real(name, dir_fd, data)
+
+    monkeypatch.setattr(cs, "_write_new_file", boom)
+    assert spool.publish_result(claim, _record(h)) \
+        is cs.PublishOutcome.FAILED_RECORDED
+    monkeypatch.undo()
+    assert (_claims(spool) / h).exists(), "the crash: no discard ran"
+
+    report = spool.recovery_pass(now=now, boot=True)
+
+    assert not (_pending(spool) / f"{h}.json").exists(), \
+        "a flow whose END is on record is never re-minted"
+    assert list(_claims(spool).iterdir()) == []
+    assert report.restored == [] and report.dropped == []
+    assert report.completed_terminal == [(PLUGIN, h)]
+    rec = _attempt_of(spool, h)
+    assert (rec["status"], rec["outcome"]) == ("done", "publish_failed"), \
+        "the recorded outcome is untouched — recovery only finished the job"
+
+
+def test_recovery_still_restores_a_claim_whose_attempt_is_open(spool):
+    """The converse of the arm above: only a DONE record completes the
+    deletion. An open record (the ordinary crash between claim and publish)
+    still restores the flow — a stricter rule would eat live authorizations."""
+    now = time.time()
+    h = state_hash("open-attempt")
+    _put(_claims(spool) / h, now - 300)
+    assert spool.write_attempt(PLUGIN, h, ca.new_attempt(
+        state_hash=h, minted_ts=now - 300, status="awaiting_redirect",
+        now=now)) is True
+
+    report = spool.recovery_pass(now=now, boot=True)
+
+    assert (_pending(spool) / f"{h}.json").exists()
+    assert report.restored == [(PLUGIN, h)]
+    assert report.completed_terminal == []
+
+
 def test_recovery_restore_does_not_clobber_a_republished_pending(spool):
     now = time.time()
     h = state_hash("s")
@@ -2146,6 +2199,103 @@ def test_ack_fsync_failure_propagates(spool, monkeypatch):
         cs.ack(_pdir(spool), h)
 
 
+def test_ack_retried_after_a_lost_witness_rewitnesses_the_rename(
+        spool, monkeypatch):
+    """Red case (Sol 2): the first ack's RENAME succeeds and its fsync then
+    fails, so the retry finds the source ENOENT. Returning True there with no
+    fsync reports an UNWITNESSED rename as settled — the consumer moves on
+    and a power loss rolls the rename back. The ENOENT arm must witness."""
+    now = time.time()
+    h = state_hash("ack-lost-witness")
+    assert spool.write_attempt(PLUGIN, h, _attempt_rec(h, now)) is True
+
+    real = cs._fsync_strict
+    calls = {"n": 0}
+
+    def fail_first(fd, what):
+        calls["n"] += 1
+        if calls["n"] == 1:
+            raise cs.FsyncFailed(errno.EIO, "injected")
+        return real(fd, what)
+
+    monkeypatch.setattr(cs, "_fsync_strict", fail_first)
+
+    with pytest.raises(cs.FsyncFailed):
+        cs.ack(_pdir(spool), h)
+    assert (_attempts(spool) / f".ack-{h}").exists(), "the rename DID happen"
+
+    assert cs.ack(_pdir(spool), h) is True
+
+    assert calls["n"] == 2, "the ENOENT arm fsyncs — True means witnessed"
+
+
+def test_strict_write_proves_the_plugin_parent_durable_on_every_call(
+        spool, monkeypatch):
+    """Red case (Sol 3 = Terra 1): ``attempts/`` is created on demand, so the
+    directory ENTRY that names it was fsynced best-effort by the creating
+    call only — every later call sees ``created=False`` and never retries it.
+    A silent failure there (reachable on every v0.146 upgrade) loses the whole
+    ledger across a power loss while the deletions its records authorized
+    survive. A strict write proves the parent on EVERY call, or returns
+    False."""
+    now = time.time()
+    h = state_hash("parent-durability")
+    rec = _attempt_rec(h, now)
+    assert spool.write_attempt(PLUGIN, h, rec) is True   # attempts/ exists now
+
+    real = cs._fsync_strict
+    seen: list[str] = []
+
+    def fail_parent(fd, what):
+        seen.append(what)
+        if what == PLUGIN:
+            raise cs.FsyncFailed(errno.EIO, "injected")
+        return real(fd, what)
+
+    monkeypatch.setattr(cs, "_fsync_strict", fail_parent)
+
+    assert spool.write_attempt(PLUGIN, h, ca.terminalize(rec, "expired",
+                                                         now=now),
+                               strict=True) is False
+    assert seen == ["staged attempt", cs.ATTEMPTS_DIR, PLUGIN], \
+        "staged file, then attempts/, then the dir that NAMES attempts/"
+
+
+def test_a_parent_fsync_failure_defers_the_deletion_it_would_authorize(
+        spool, monkeypatch):
+    """The same defect at its write-ahead site, on the upgrade path that
+    reaches it: a plugin dir with no ``attempts/`` yet (v0.146), a sweep that
+    creates one, and a parent fsync that fails. The expired pending must
+    SURVIVE the pass — otherwise the deletion is kept while the whole
+    directory entry can be lost (INV-CB-007) — and converge on the next."""
+    now = time.time()
+    state = "upgrade-flow"
+    h = state_hash(state)
+    p = mint(_pdir(spool), state)
+    _utime(p, now - PENDING_TTL_S - 1)
+    _attempts(spool).rmdir()                 # a pre-upgrade plugin dir
+
+    real = cs._fsync_strict
+
+    def fail_parent(fd, what):
+        if what == PLUGIN:
+            raise cs.FsyncFailed(errno.EIO, "injected")
+        return real(fd, what)
+
+    monkeypatch.setattr(cs, "_fsync_strict", fail_parent)
+
+    first = spool.sweep(now=now)
+
+    assert p.exists(), "the artifact outlives an unprovable directory entry"
+    assert first.deleted_pending == 0 and first.skipped_undurable == 1
+
+    monkeypatch.undo()
+    second = spool.sweep(now=now)
+
+    assert not p.exists() and second.deleted_pending == 1
+    assert _attempt_of(spool, h)["outcome"] == "expired"
+
+
 # ---------------------------------------------------------------------------
 # write-ahead outcomes (INV-CB-007) — casa never deletes a credential-bearing
 # artifact before the flow's terminal outcome is DURABLY on its attempt file,
@@ -2271,6 +2421,50 @@ def test_pending_cap_evicts_an_attempt_less_entry_before_an_open_one(spool):
     assert report.capped == [f"{PLUGIN}/pending"]
     rec = _attempt_of(spool, victim_h)
     assert rec["status"] == "done" and rec["outcome"] == "evicted"
+
+
+def test_malformed_collect_names_are_residue_bounded_by_the_result_cap(spool):
+    """Red case (Terra 3): the sweep read the bare ``.collect-`` PREFIX as
+    "a collect entry" (excluded from MAX_RESULTS) while only grammar-valid
+    names entered the MAX_COLLECT list — so a consumer scribbling thousands
+    of ``.collect-junk`` files evaded BOTH bounds. The single grammar
+    decides: a name that does not parse is residue — counted toward
+    MAX_RESULTS, aged on TEMP_TTL_S, and recorded NOWHERE."""
+    now = time.time()
+    for i in range(cs.MAX_RESULTS + 1):
+        _put(_results(spool) / f".collect-junk-{i}", now - 300 + i)
+    aged = _put(_results(spool) / ".collect-scribble", now - TEMP_TTL_S - 1)
+
+    report = spool.sweep(now=now)
+
+    assert not aged.exists(), "residue ages out on the residue TTL"
+    assert len(list(_results(spool).iterdir())) == cs.MAX_RESULTS, \
+        "malformed prefixed names count toward MAX_RESULTS"
+    assert report.deleted_capped == 1
+    assert report.capped == [f"{PLUGIN}/results"]
+    assert os.listdir(_attempts(spool)) == [], \
+        "a name that parses to no flow is given no flow's outcome"
+
+
+def test_the_cap_ladder_takes_residue_before_any_real_flow(spool):
+    """Red case (Sol 6, spec §9): `.part` residue and a real attempt-less
+    flow used to rank identically (mtime only), so a NEWER `.part` survived
+    while an older genuine flow was destroyed and recorded ``evicted``.
+    Residue is rank 0; mtime ranks only WITHIN a rank."""
+    now = time.time()
+    made = []
+    for i in range(cs.MAX_PENDING):
+        h = state_hash(f"ladder-{i}")
+        made.append((h, _put(_pending(spool) / f"{h}.json", now - 300 + i)))
+    part = _put(_pending(spool) / f"{state_hash('newest')}.json"
+                f"{cs.PART_SUFFIX}", now - 10)
+
+    report = spool.sweep(now=now)
+
+    assert not part.exists(), "the NEWEST residue outranks the OLDEST flow"
+    assert all(p.exists() for _h, p in made)
+    assert report.deleted_capped == 1
+    assert os.listdir(_attempts(spool)) == [], "residue is recorded NOWHERE"
 
 
 def test_a_part_file_evicted_by_the_cap_is_recorded_nowhere(spool):

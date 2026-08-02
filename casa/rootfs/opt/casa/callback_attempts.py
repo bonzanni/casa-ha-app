@@ -18,8 +18,11 @@ Three concerns, matching the design's sections:
 - **Mint envelope**: bounded fail-closed parsing of the consumer-authored
   pending payload (``parse_envelope``) — v1 ``{"v":1}`` and v2
   ``{"v":2,"meta":...}`` accepted, anything else degrades to ``None``.
-  ``meta`` is opaque: stored value-preserving, never interpreted, never
-  logged (INV-CB-009 is the caller's obligation; nothing here logs).
+  ``meta`` is opaque: stored value-preserving (a copy through the canonical
+  serializer, which is also the proof that every later writer can emit it —
+  a consumer-authored value must never escape as an exception), never
+  interpreted, never logged (INV-CB-009 is the caller's obligation; nothing
+  here logs).
 - **Nudge schedule**: result-phase offsets (0 s, 60 s, 3 m, 8 m) anchored
   on the result's publish time, then outcome-phase offsets (30 m, 2 h)
   anchored on ``ended_ts``; a total budget of 6 bus-ACCEPTED dispatches;
@@ -27,8 +30,8 @@ Three concerns, matching the design's sections:
 """
 from __future__ import annotations
 
-import copy
 import json
+import re
 
 SCHEMA_VERSION = 1
 ENVELOPE_MAX_BYTES = 4096
@@ -37,6 +40,13 @@ RESULT_PHASE_OFFSETS = (0.0, 60.0, 180.0, 480.0)   # from result publish ts
 OUTCOME_PHASE_OFFSETS = (1800.0, 7200.0)           # from ended_ts
 DEFERRAL_BASE_S = 60.0
 DEFERRAL_CAP_S = 1800.0
+#: Deferral count past which the schedule SATURATES without exponentiating.
+#: ``deferrals`` is read off a file a consumer can scribble, and
+#: ``2 ** deferrals`` for a large-but-valid integer is a memory/CPU bomb
+#: (and overflows the float multiply long before that). The cap is reached
+#: at 5 deferrals with the constants above, so saturating here is exact, not
+#: an approximation.
+DEFERRAL_MAX_SHIFT = 32
 ATTEMPT_RETENTION_S = 7 * 24 * 3600
 OUTCOMES = frozenset({"collected", "expired", "expired_unread",
                       "publish_failed", "evicted"})
@@ -47,12 +57,58 @@ _ATTEMPT_KEYS = frozenset({
     "nudges", "last_nudge_ts", "next_nudge_ts", "deferrals", "noted",
     "ended_ts",
 })
+#: The spool's name grammar for a state hash, re-stated here because this is
+#: a LEAF module (``callback_spool`` imports it, never the reverse).
+_HASH_RE = re.compile(r"^[0-9a-f]{64}$")
 
 
 def _is_ts(value) -> bool:
     """A timestamp field: numeric-not-bool, or None."""
     return value is None or (
         isinstance(value, (int, float)) and not isinstance(value, bool))
+
+
+def _canonical_text(value) -> str:
+    """*value* in the ONE canonical serialization the spool writes on disk
+    (``callback_spool.canonical_marker_bytes``, kept in sync by construction:
+    same sort/separators/escaping). Raises exactly what that writer would."""
+    return json.dumps(value, sort_keys=True, separators=(",", ":"),
+                      ensure_ascii=False)
+
+
+def _safe_meta(value):
+    """A canonically-serializable copy of the OPAQUE consumer value *value*,
+    or ``None`` when there is none.
+
+    ``meta`` is the only field of an attempt that a consumer authors, and it
+    is arbitrary JSON: a ~1 KiB body of 600 nested arrays parses well under
+    ``ENVELOPE_MAX_BYTES`` yet blows the interpreter stack in any recursive
+    Python walk (``copy.deepcopy``, which this replaces). Copying through the
+    canonical serializer is therefore both the copy AND the proof that every
+    later handler of the record — the strict attempt write, the result
+    record, a re-read and re-validate — can serialize it too. TOTAL: a value
+    that cannot survive the round trip degrades to ``None`` (spec §4's
+    "malformed envelope degrades to meta null; refusal buys nothing"), never
+    an exception escaping into a request handler or aborting a sweep pass.
+
+    Immutable scalars are returned as-is: nothing can alias or recurse."""
+    if value is None or isinstance(value, (str, bool, int, float)):
+        return value
+    try:
+        return json.loads(_canonical_text(value))
+    except (RecursionError, ValueError, TypeError):
+        return None
+
+
+def _copy_record(rec: dict) -> dict:
+    """A fresh copy of an attempt record, non-recursive by construction: the
+    twelve schema fields besides ``meta`` are scalars (a shallow ``dict`` copy
+    is a full copy of them), and ``meta`` — the one arbitrary-depth field —
+    goes through :func:`_safe_meta`. Replaces ``copy.deepcopy``, whose
+    recursion a consumer-authored ``meta`` can exhaust."""
+    out = dict(rec)
+    out["meta"] = _safe_meta(rec.get("meta"))
+    return out
 
 
 def parse_envelope(data: bytes) -> dict | None:
@@ -62,6 +118,13 @@ def parse_envelope(data: bytes) -> dict | None:
     JSON, ``v`` not in {1, 2}. A v1 envelope (or a v2 one with no ``meta``)
     yields ``{"v": <v>, "meta": None}``. Unknown envelope keys are dropped
     (forward compat) and never copied anywhere.
+
+    ``meta`` additionally passes :func:`_safe_meta`, so what leaves here is
+    always a value the canonical serializer can write: a value casa could
+    parse but not re-emit would otherwise escape as an exception from a
+    LATER handler (the attempt write, the result record) rather than as this
+    parser's ``None``. The envelope itself still parses — a meta defect
+    degrades the binding to null, it does not refuse the flow (spec §4).
     """
     try:
         if len(data) > ENVELOPE_MAX_BYTES:
@@ -72,7 +135,7 @@ def parse_envelope(data: bytes) -> dict | None:
         v = obj.get("v")
         if isinstance(v, bool) or v not in (1, 2):
             return None
-        meta = obj.get("meta") if v == 2 else None
+        meta = _safe_meta(obj.get("meta")) if v == 2 else None
         return {"v": v, "meta": meta}
     except Exception:
         return None
@@ -99,7 +162,7 @@ def new_attempt(*, state_hash: str, minted_ts: float | None,
         "status": status,
         "outcome": None,
         "claimed": bool(claimed),
-        "meta": copy.deepcopy(meta),
+        "meta": _safe_meta(meta),
         "nudges": 0,
         "last_nudge_ts": None,
         "next_nudge_ts": next_ts,
@@ -119,17 +182,33 @@ def validate_attempt(obj) -> dict | None:
     vocabularies, non-negative int counters. Never raises: a malformed
     (possibly consumer-scribbled) file must read as INVALID so the caller
     re-derives it from artifacts, never as an exception.
+
+    Type-checking each field in isolation is not enough, because the record
+    this returns becomes AUTHORITATIVE (``list_attempts``, the write-ahead
+    derivation): a record must also be internally POSSIBLE. Two consistency
+    gates, both fail-closed:
+
+    * ``state_hash`` obeys the spool's name grammar (64 lowercase hex) — a
+      record naming something that cannot be a flow is not a record;
+    * status and outcome agree, in both directions: ``outcome`` is None for
+      exactly the open statuses and set for exactly ``done``. Otherwise
+      ``{status: result_ready, outcome: collected}`` (an open record wearing
+      a terminal outcome) and ``{status: done, outcome: null}`` (a terminal
+      record with no outcome to act on) would both read as truth.
     """
     try:
         if not isinstance(obj, dict) or set(obj) != _ATTEMPT_KEYS:
             return None
         if isinstance(obj["v"], bool) or obj["v"] != SCHEMA_VERSION:
             return None
-        if not isinstance(obj["state_hash"], str):
+        if not isinstance(obj["state_hash"], str) \
+                or not _HASH_RE.match(obj["state_hash"]):
             return None
         if obj["status"] not in STATUSES:
             return None
         if obj["outcome"] is not None and obj["outcome"] not in OUTCOMES:
+            return None
+        if (obj["outcome"] in OUTCOMES) != (obj["status"] == "done"):
             return None
         for key in ("claimed", "noted"):
             if not isinstance(obj[key], bool):
@@ -141,7 +220,7 @@ def validate_attempt(obj) -> dict | None:
         for key in ("minted_ts", "last_nudge_ts", "next_nudge_ts", "ended_ts"):
             if not _is_ts(obj[key]):
                 return None
-        return copy.deepcopy(obj)
+        return _copy_record(obj)
     except Exception:
         return None
 
@@ -160,7 +239,7 @@ def terminalize(rec: dict, outcome: str, *, now: float,
     """
     if outcome not in OUTCOMES:
         raise ValueError(f"unknown outcome {outcome!r}")
-    out = copy.deepcopy(rec)
+    out = _copy_record(rec)
     if claimed is not None:
         out["claimed"] = bool(claimed)
     if rec.get("status") == "done" and rec.get("outcome") == outcome:
@@ -222,8 +301,17 @@ def next_nudge_after_reject(rec: dict, *, now: float) -> float:
     escalating capped deferral (the caller writes ``deferrals + 1``), so an
     unavailable bus yields a bounded cadence, never a floored-timeout spin.
     A malformed ``deferrals`` reads as 0.
+
+    **Saturate BEFORE exponentiating.** ``deferrals`` is read off a file a
+    consumer can scribble, and the validator's "non-negative int" is
+    satisfied by ``10**9`` — for which ``2 ** deferrals`` is a 125 MB
+    integer (and ``60.0 *`` it an ``OverflowError``) long before the ``min``
+    would have discarded it. Past ``DEFERRAL_MAX_SHIFT`` the answer IS the
+    cap, so it is returned without computing the power.
     """
     deferrals = rec.get("deferrals")
     if isinstance(deferrals, bool) or not isinstance(deferrals, int) or deferrals < 0:
         deferrals = 0
+    if deferrals >= DEFERRAL_MAX_SHIFT:
+        return now + DEFERRAL_CAP_S
     return now + min(DEFERRAL_CAP_S, DEFERRAL_BASE_S * 2 ** deferrals)

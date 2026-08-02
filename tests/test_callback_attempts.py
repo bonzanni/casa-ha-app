@@ -55,6 +55,46 @@ def test_envelope_defects_are_none():
     assert ca.parse_envelope(b'{"meta": 1}') is None     # version absent
 
 
+def _nested_envelope(depth: int) -> bytes:
+    """A VALID, well UNDER-cap v2 envelope whose meta is *depth* nested
+    arrays — ~1.2 KiB at 600, i.e. nothing a size cap can catch."""
+    return b'{"v":2,"meta":' + b"[" * depth + b"]" * depth + b"}"
+
+
+def test_deeply_nested_meta_never_escapes_as_an_exception():
+    """Red case (Sol 4): a ~1.2 KiB envelope of 600 nested arrays parses far
+    under ENVELOPE_MAX_BYTES, and every consumer of the parsed value used to
+    walk it recursively (``copy.deepcopy``) — a RecursionError escaping into
+    the request handler or aborting a whole sweep pass. The parser is TOTAL
+    and so is every record built from what it returns: meta is either a
+    canonically-serializable value or None, and NOTHING here raises."""
+    env = _nested_envelope(600)
+    assert len(env) < ca.ENVELOPE_MAX_BYTES
+
+    out = ca.parse_envelope(env)
+    assert out is not None and set(out) == {"v", "meta"}
+
+    # Every downstream builder survives the value the parser handed back...
+    rec = ca.new_attempt(state_hash=H, minted_ts=T - 5.0,
+                         status="result_ready", meta=out["meta"], now=T)
+    done = ca.terminalize(rec, "publish_failed", now=T)
+    assert done["status"] == "done"
+    # ...and so does the round trip through the exact bytes the spool writes.
+    for record in (rec, done):
+        text = json.dumps(record, sort_keys=True, separators=(",", ":"),
+                          ensure_ascii=False)
+        assert ca.validate_attempt(json.loads(text)) == record
+
+
+def test_unserializable_meta_degrades_to_null():
+    """A meta the canonical serializer cannot emit is null, never an
+    exception a LATER writer raises (spec §4: a malformed envelope degrades
+    the binding; refusal buys nothing once the state is consumed)."""
+    rec = ca.new_attempt(state_hash=H, minted_ts=None,
+                         status="awaiting_redirect", meta={1, 2}, now=T)
+    assert rec["meta"] is None
+
+
 def test_envelope_unknown_keys_dropped():
     out = ca.parse_envelope(b'{"v": 2, "meta": 1, "extra": "boo", "state": "s"}')
     assert out == {"v": 2, "meta": 1}
@@ -123,6 +163,31 @@ def test_validate_rejects_type_defects():
 def test_validate_rejects_unknown_status_and_outcome():
     assert ca.validate_attempt(dict(_good(), status="weird")) is None
     assert ca.validate_attempt(dict(_good(), outcome="weird")) is None
+
+
+def test_validate_rejects_impossible_status_outcome_pairs():
+    """Red case (Terra 2): a record whose fields all type-check can still be
+    IMPOSSIBLE, and `list_attempts` would hand it to the worker as truth.
+    Outcome is set for exactly `done` — in both directions."""
+    # An open record wearing a terminal outcome.
+    assert ca.validate_attempt(
+        dict(_good(), status="result_ready", outcome="collected")) is None
+    assert ca.validate_attempt(
+        dict(_good(), status="awaiting_redirect", outcome="expired")) is None
+    # A terminal record with no outcome to act on.
+    done = ca.terminalize(_good(), "collected", now=T)
+    assert ca.validate_attempt(dict(done, outcome=None)) is None
+    # Both consistent forms still validate.
+    assert ca.validate_attempt(done) == done
+    assert ca.validate_attempt(_good()) == _good()
+
+
+def test_validate_rejects_a_state_hash_that_is_not_the_name_grammar():
+    """Red case (Terra 2): `state_hash` is a spool NAME; a record naming
+    something that cannot be a flow is not a record."""
+    for bad in ("", "not-a-hash", H.upper(), H[:-1], H + "a", H[:-1] + "g"):
+        assert ca.validate_attempt(dict(_good(), state_hash=bad)) is None, bad
+    assert ca.validate_attempt(_good()) is not None
 
 
 def test_validate_accepts_legacy_none_minted_ts():
@@ -244,3 +309,18 @@ def test_reject_deferral_doubles_and_caps():
                               (4, 960.0), (5, 1800.0), (9, 1800.0)):
         got = ca.next_nudge_after_reject(dict(rec, deferrals=deferrals), now=n)
         assert got == n + expect, (deferrals, got)
+
+
+def test_reject_saturates_before_exponentiating():
+    """Red case (Sol 5): `deferrals` comes off a file a consumer can
+    scribble, and the validator's "non-negative int" admits enormous values.
+    Computing `2 ** deferrals` BEFORE the cap turns one of those into a
+    memory/CPU bomb — and overflows the float multiply long before that
+    (1024 already raises OverflowError). The cap is reached at 5 deferrals,
+    so saturating is exact, and the worker never exponentiates."""
+    rec = ca.new_attempt(state_hash=H, minted_ts=None,
+                         status="result_ready", now=T)
+    n = 50_000.0
+    for deferrals in (ca.DEFERRAL_MAX_SHIFT, 1024, 10 ** 8):
+        got = ca.next_nudge_after_reject(dict(rec, deferrals=deferrals), now=n)
+        assert got == n + ca.DEFERRAL_CAP_S, deferrals
