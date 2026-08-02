@@ -120,9 +120,10 @@ uniformity guarantee.
 Enforced on three surfaces: the access logger suppresses the query for the `/callback/` prefix;
 the handler interpolates no request data into its log lines or its static pages and logs the
 sentinel for an unrouted name; and an installed `logging.Filter` on the `aiohttp.server` logger
-strips the query — message *and* exception traceback — from an over-length request line that
-raises below the handler. The in-container nginx access log applies the same suppression by a
-`map` rule.
+redacts the whole request target — path and query, message *and* exception traceback — from an
+over-length request line that raises below the handler (redacting the entire target, not just the
+query, so no inner quote in the query can leave a fragment behind). The in-container nginx access
+log applies the same suppression by a `map` rule.
 
 What it does not cover — documented, tested residuals: the in-container nginx *error* path on an
 upstream failure, and the outer reverse proxy's own logs, which are operator-configured. The

@@ -48,6 +48,7 @@ the sweeper job and a consumer test alike.
 """
 from __future__ import annotations
 
+import enum
 import errno
 import hashlib
 import json
@@ -76,8 +77,10 @@ TEMP_TTL_S = 300             # `.part` / `.tmp-<hash>` residue age-sweep
 QUIESCENCE_S = 24 * 3600     # orphan-dir GC floor
 MAX_PENDING = 256            # per-plugin caps: a buggy consumer must not
 MAX_RESULTS = 256            # fill /data
-MAX_MARKER_BYTES = 1 << 20   # a ready.json / index entry read back for the
-#                              reconcile payload compare is tiny; cap the read
+MARKER_STATE_MAX_BYTES = 1 << 16   # a ready.json / index entry read back for
+#                              the reconcile payload compare is tiny (a few
+#                              hundred bytes); anything past this small cap is
+#                              INVALID, never a large read
 
 PENDING_DIR = "pending"
 RESULTS_DIR = "results"
@@ -95,7 +98,33 @@ FILE_MODE = 0o600
 _DIR_FLAGS = os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW | os.O_CLOEXEC
 _NEW_FILE_FLAGS = (os.O_CREAT | os.O_EXCL | os.O_WRONLY | os.O_NOFOLLOW
                    | os.O_CLOEXEC)
+#: Marker reads are NON-BLOCKING: O_NONBLOCK means opening a FIFO (or any other
+#: pipe/device masquerading as ready.json) returns immediately instead of
+#: blocking for a writer, so a hostile/garbage on-disk marker can never hang
+#: the reconciler; the ``S_ISREG`` gate then rejects it before any read.
+_MARKER_READ_FLAGS = (os.O_RDONLY | os.O_NONBLOCK | os.O_NOFOLLOW
+                      | os.O_CLOEXEC)
 _HASH_RE = re.compile(r"^[0-9a-f]{64}$")
+
+
+class MarkerState(enum.Enum):
+    """Three-state result of a durable-marker read (:meth:`CallbackSpool.
+    read_marker`). ABSENT (no file) and INVALID (present but non-regular /
+    unreadable / oversized / malformed) are DISTINCT: a stale-but-INVALID
+    marker must be republished, never mistaken for absent (and so left to
+    survive a failed rewrite)."""
+
+    ABSENT = "absent"
+    INVALID = "invalid"
+    PRESENT = "present"
+
+
+@dataclass(frozen=True)
+class Marker:
+    """A durable marker's on-disk state and, when PRESENT, its payload."""
+
+    state: MarkerState
+    payload: "dict | None" = None
 
 
 class SpoolClosed(RuntimeError):
@@ -244,6 +273,54 @@ def _write_new_file(name: str, dir_fd: int, data: bytes) -> None:
         _fsync(fd, "staged file")
     finally:
         os.close(fd)
+
+
+def _read_marker_at(name: str, dir_fd: int) -> Marker:
+    """Total, non-blocking, three-state marker read openat-relative to
+    *dir_fd*.
+
+    ABSENT is returned ONLY for a genuinely missing file (``ENOENT``). Every
+    other obstruction is INVALID, never conflated with absent: a symlink
+    (``O_NOFOLLOW`` ⇒ ``ELOOP``), a FIFO / socket / directory (rejected by the
+    ``S_ISREG`` gate BEFORE any ``read`` — and the open is ``O_NONBLOCK``, so a
+    FIFO cannot even block), an oversized body (bounded read), non-UTF-8, or a
+    non-object JSON value. Mirrors the fail-closed FD discipline the rest of
+    this module uses (``O_NOFOLLOW`` + ``fstat`` + ``S_ISREG``)."""
+    try:
+        fd = os.open(name, _MARKER_READ_FLAGS, dir_fd=dir_fd)
+    except FileNotFoundError:
+        return Marker(MarkerState.ABSENT)
+    except OSError:
+        return Marker(MarkerState.INVALID)   # symlink (ELOOP), ENXIO, perms, …
+    try:
+        try:
+            st = os.fstat(fd)
+        except OSError:
+            return Marker(MarkerState.INVALID)
+        if not stat.S_ISREG(st.st_mode):
+            return Marker(MarkerState.INVALID)   # FIFO/socket/dir: no read
+        chunks: list[bytes] = []
+        size = 0
+        while True:
+            try:
+                chunk = os.read(fd, 65536)
+            except OSError:
+                return Marker(MarkerState.INVALID)
+            if not chunk:
+                break
+            size += len(chunk)
+            if size > MARKER_STATE_MAX_BYTES:
+                return Marker(MarkerState.INVALID)
+            chunks.append(chunk)
+    finally:
+        os.close(fd)
+    try:
+        obj = json.loads(b"".join(chunks).decode("utf-8"))
+    except (ValueError, UnicodeDecodeError):
+        return Marker(MarkerState.INVALID)
+    if not isinstance(obj, dict):
+        return Marker(MarkerState.INVALID)
+    return Marker(MarkerState.PRESENT, obj)
 
 
 def _link_once(src: str, src_dir_fd: int, dst: str, dst_dir_fd: int) -> bool:
@@ -502,74 +579,47 @@ class CallbackSpool:
             finally:
                 os.close(pfd)
 
-    def read_ready(self, plugin: str) -> "dict | None":
-        """Parse the on-disk ``<plugin>/ready.json`` payload, or ``None`` when
-        it is absent, unreadable, oversized or not a JSON object.
+    def read_marker(self, plugin: str) -> Marker:
+        """Three-state read of ``<plugin>/ready.json`` — the reconciler's
+        durable on-disk truth.
 
-        Read-only reconcile input: the durable marker pass compares this
-        against the DESIRED payload so a still-routed plugin whose declaration
-        (a dropped callback) or redirect base changed while the process was
-        down has its stale marker retired BEFORE the overlay swap — the swap's
-        in-memory diff is empty across a restart and cannot see it — and an
-        unchanged marker is left alone rather than rewritten every pass."""
+        Returns ABSENT (no marker), INVALID (present but non-regular /
+        unreadable / oversized / malformed), or PRESENT with the payload.
+        Distinguishing INVALID from ABSENT is what lets a stale-but-unreadable
+        (e.g. oversized, or a swapped-in FIFO) marker be republished rather than
+        conflated with absent and left to survive a failed rewrite. Never
+        blocks and never raises (see :func:`_read_marker_at`)."""
         with self._lock:
             if self._closed or not _safe_component(plugin):
-                return None
+                return Marker(MarkerState.ABSENT)
             try:
                 pfd = self._plugin_fd(plugin)
+            except FileNotFoundError:
+                return Marker(MarkerState.ABSENT)   # no plugin dir = no marker
             except (OSError, ValueError):
-                return None
+                return Marker(MarkerState.INVALID)
             try:
-                return self._read_json(READY_NAME, pfd)
+                return _read_marker_at(READY_NAME, pfd)
             finally:
                 os.close(pfd)
 
-    def read_index_entry(self, artifact_realpath: str) -> "dict | None":
-        """Parse the on-disk ``.index/<key>.json`` payload for an artifact
-        path, or ``None`` (absent / unreadable / oversized / non-object). The
-        durable-marker companion of :meth:`read_ready`."""
+    def read_index_marker(self, artifact_realpath: str) -> Marker:
+        """Three-state read of ``.index/<key>.json`` for an artifact path —
+        the durable-marker companion of :meth:`read_marker` (same semantics)."""
         with self._lock:
             if self._closed:
-                return None
+                return Marker(MarkerState.ABSENT)
             try:
                 ifd = _open_dir(INDEX_DIR, self._root_fd)
+            except FileNotFoundError:
+                return Marker(MarkerState.ABSENT)   # no index dir = no entry
             except OSError:
-                return None
+                return Marker(MarkerState.INVALID)
             try:
-                return self._read_json(
+                return _read_marker_at(
                     f"{index_key(artifact_realpath)}.json", ifd)
             finally:
                 os.close(ifd)
-
-    @staticmethod
-    def _read_json(name: str, dir_fd: int) -> "dict | None":
-        """Read a small JSON object openat-relative to *dir_fd*. Total: any
-        error (missing, symlink, decode, oversize, non-object) ⇒ ``None``."""
-        try:
-            fd = os.open(name, os.O_RDONLY | os.O_NOFOLLOW | os.O_CLOEXEC,
-                         dir_fd=dir_fd)
-        except OSError:
-            return None
-        try:
-            chunks: list[bytes] = []
-            size = 0
-            while True:
-                chunk = os.read(fd, 65536)
-                if not chunk:
-                    break
-                size += len(chunk)
-                if size > MAX_MARKER_BYTES:
-                    return None
-                chunks.append(chunk)
-        except OSError:
-            return None
-        finally:
-            os.close(fd)
-        try:
-            obj = json.loads(b"".join(chunks).decode("utf-8"))
-        except (ValueError, UnicodeDecodeError):
-            return None
-        return obj if isinstance(obj, dict) else None
 
     def write_index_entry(self, artifact_realpath: str, payload: dict) -> None:
         """Publish ``.index/<sha256(realpath(artifact_root))>.json`` — how a
@@ -1331,7 +1381,7 @@ class CallbackSpool:
         ``ready.json`` lives INSIDE the plugin dir, so this retires it too;
         the ``.index`` discovery entry keyed by the plugin's ARTIFACT PATH
         (not derivable from the plugin name) is retired separately by the
-        reconcile's ``_pre_swap_files``. Returns True when a dir was removed.
+        reconcile's durable marker pass. Returns True when a dir was removed.
         """
         if not _safe_component(plugin) or plugin.startswith("."):
             raise ValueError(f"unsafe plugin spool name {plugin!r}")

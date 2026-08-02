@@ -30,17 +30,20 @@ a request line over 8190 bytes raises ``LineTooLong`` *before* the handler
 runs, and aiohttp's ``handle_error`` logs the exception at ERROR — the
 exception message embeds the offending bytes, i.e. the query with the code.
 :func:`install_callback_log_redaction` closes it: an idempotent
-``logging.Filter`` on the ``aiohttp.server`` logger strips the query from a
-request-line target in a record's message *and its exception traceback*
-before any handler formats it. The match is on the request-target SHAPE in
-REQUEST-LINE context (a bytes-literal opener or an HTTP method right before the
-``/``-target), not the literal ``/callback`` — a percent-encoded path
-(``/%63allback/…``) routes to /callback but keeps its raw encoded form in the
-pre-routing traceback, so a ``/callback``-anchored pattern would miss it.
-Requiring request-line context is what keeps the filter from eating a plain
-``/path?x=y`` inside an unrelated diagnostic, while still closing the whole
-encoding-bypass class. Casa wires it at app setup; the residual is therefore
-closed in-container (the outer proxy's own logs remain operator-configured).
+``logging.Filter`` on the ``aiohttp.server`` logger redacts the whole
+request TARGET (path AND query) of a request-line target in a record's message
+*and its exception traceback* before any handler formats it. Redacting the
+entire token — not just the query — is what makes it robust against an inner
+quote in the query, which no longer leaves a boundary to leak the tail after
+it. The match is on the request-target SHAPE in REQUEST-LINE context (a
+bytes-literal opener or an HTTP method right before the ``/``-target), not the
+literal ``/callback`` — a percent-encoded path (``/%63allback/…``) routes to
+/callback but keeps its raw encoded form in the pre-routing traceback, so a
+``/callback``-anchored pattern would miss it. Requiring request-line context is
+what keeps the filter from eating a plain ``/path?x=y`` inside an unrelated
+diagnostic, while still closing the whole encoding-bypass class. Casa wires it
+at app setup; the residual is therefore closed in-container (the outer proxy's
+own logs remain operator-configured).
 
 **Opaque relay.** Casa interprets exactly one parameter — ``state``, parsed
 strictly from the RAW query string, never the framework's decoded view, so a
@@ -164,55 +167,77 @@ p { font-size: 1.125rem; line-height: 1.6; margin: 0; }
 # aiohttp.server log redaction (INV-CB-006, the below-the-handler surface)
 # ---------------------------------------------------------------------------
 
-#: The origin-form request TARGET of an actual HTTP request line carrying a
-#: query — the only shape that can leak a callback credential onto the
-#: ``aiohttp.server`` logger. It appears in aiohttp's over-long-line error two
-#: ways, and this pattern covers both while leaving unrelated diagnostics
-#: (``/data/file?reason=…``, ``https://api/token?error=…``) untouched:
+#: The origin-form request TARGET of an actual HTTP request line — the only
+#: shape that can leak a callback credential onto the ``aiohttp.server``
+#: logger. The WHOLE target (path AND query) is redacted, not just the query:
+#: a diagnostic never needs the target's path or query, and redacting the
+#: entire token is what makes the redaction robust against an inner quote in
+#: the query (``?x='&code=…``) — there is no "stop at a quote" boundary left to
+#: leak the tail after it. The target appears two ways, and this pattern covers
+#: both while leaving unrelated diagnostics (``/data/file?reason=…``,
+#: ``https://api/token?error=…``) untouched:
 #:
 #: * the C parser (the container default) raises ``LineTooLong`` from its URL
-#:   callback with the raw target wrapped in a bytes repr and NO method —
-#:   ``bytearray(b'/callback/x?code=…')``. The ``b'`` (or ``b"``) prefix is the
-#:   request-line context here, so a query-bearing target directly after a
-#:   bytes-literal opener matches;
+#:   callback with the raw target wrapped in a Python bytes repr and NO method
+#:   — ``bytearray(b'/callback/x?code=…')``, or ``bytearray(b"…")`` when the
+#:   bytes contain a single quote (repr flips the delimiter). The opening quote
+#:   is CAPTURED so the target is consumed up to the MATCHING closing quote,
+#:   escape-aware (``\'``, ``\\``), never a mismatched inner one;
 #: * the pure-python parser embeds the whole request line, method included
 #:   (``…b'GET /callback/x?code=…'`` — or a bare ``GET /callback/x?… HTTP/1.1``),
-#:   so a method token + whitespace immediately before the target matches too.
+#:   so a method token + whitespace immediately before the target matches too,
+#:   the target ending at the first whitespace.
 #:
 #: Requiring one of those two request-line anchors — a bytes-literal opener or
-#: an HTTP method — is what keeps a bare ``/path?x=y`` sitting inside an
-#: ordinary diagnostic message (no method, no bytes repr) intact. Matching the
-#: target SHAPE rather than the literal ``/callback`` still closes the
-#: encoding-bypass class: a percent-encoded ``/%63allback/…`` keeps its raw
+#: a word-boundary HTTP method — is what keeps a bare ``/path?x=y`` sitting
+#: inside an ordinary diagnostic message (no method, no bytes repr) intact.
+#: Matching the target SHAPE rather than the literal ``/callback`` still closes
+#: the encoding-bypass class: a percent-encoded ``/%63allback/…`` keeps its raw
 #: encoded form in the pre-routing error and is redacted the same way.
 _HTTP_METHODS = "GET|POST|PUT|DELETE|HEAD|OPTIONS|PATCH|TRACE|CONNECT"
-_REQUEST_QUERY_RE = re.compile(
-    r"((?:(?:" + _HTTP_METHODS + r")\s+|b['\"])/[^\s?'\"]*)\?[^\s'\"]*")
-_REDACTED = r"\1?<redacted>"
+_REQUEST_TARGET_RE = re.compile(
+    # Bytes-repr form: b'…' / b"…" (optional embedded method); consume the
+    # target to the matching closing quote, escape-aware.
+    r"(?P<pre>b(?P<q>['\"])(?:(?:" + _HTTP_METHODS + r")[ \t]+)?)"
+    r"/(?:(?!(?P=q))[^\\]|\\.)*"
+    r"|"
+    # Bare request line: METHOD SP target (…SP HTTP/x). Word-boundary method so
+    # it does not fire inside a longer word; the target ends at whitespace.
+    r"(?P<bare>\b(?:" + _HTTP_METHODS + r")[ \t]+)"
+    r"/\S*"
+)
+
+
+def _redact_target(match: "re.Match[str]") -> str:
+    """Keep the request-line anchor, replace the whole target with a marker."""
+    anchor = match.group("pre")
+    if anchor is None:
+        anchor = match.group("bare")
+    return anchor + "<redacted>"
 
 
 class _AiohttpServerRedactor(logging.Filter):
-    """Strip a ``/callback`` query from an ``aiohttp.server`` record before
-    any handler formats it — INV-CB-006's third surface.
+    """Strip a ``/callback`` request target from an ``aiohttp.server`` record
+    before any handler formats it — INV-CB-006's third surface.
 
     aiohttp raises ``LineTooLong`` on an over-long request line *before* the
     route is matched, and ``handle_error`` logs it at ERROR with the offending
-    bytes in the exception; the query (with the code) rides the traceback, not
+    bytes in the exception; the target (with the code) rides the traceback, not
     the ``%``-message. This filter therefore redacts BOTH the formatted
     message and the exception text, and — because a logger's filters run in
     ``Logger.handle`` before ``callHandlers`` — the mutation reaches every
     handler, including root, already sanitized.
 
-    The trigger is a query-bearing origin-form target in REQUEST-LINE context
-    (:data:`_REQUEST_QUERY_RE`, which requires a bytes-literal opener or an HTTP
-    method immediately before the target), not the bare ``/callback`` substring
-    — so a percent-encoded path is covered too, while an unrelated
+    The trigger is an origin-form target in REQUEST-LINE context
+    (:data:`_REQUEST_TARGET_RE`, which requires a bytes-literal opener or an
+    HTTP method immediately before the target), not the bare ``/callback``
+    substring — so a percent-encoded path is covered too, while an unrelated
     ``aiohttp.server`` record mentioning a plain ``/data/file?reason=…`` path
     (no method, no bytes repr) does not match and keeps its ``exc_info``
-    untouched. When it DOES match, the
-    redacted traceback is pre-rendered onto ``record.exc_text`` and
-    ``exc_info`` is cleared; ``JsonFormatter`` (casa's production default) and
-    ``HumanFormatter`` both fall back to ``exc_text``, so the ``exc`` field
+    untouched. When it DOES match, the WHOLE target (path and query) is
+    replaced, the redacted traceback is pre-rendered onto ``record.exc_text``
+    and ``exc_info`` is cleared; ``JsonFormatter`` (casa's production default)
+    and ``HumanFormatter`` both fall back to ``exc_text``, so the ``exc`` field
     survives — redacted, not dropped.
     """
 
@@ -221,7 +246,7 @@ class _AiohttpServerRedactor(logging.Filter):
             message = record.getMessage()
         except Exception:  # noqa: BLE001 — a broken record must still be logged
             message = str(record.msg)
-        redacted = _REQUEST_QUERY_RE.sub(_REDACTED, message)
+        redacted = _REQUEST_TARGET_RE.sub(_redact_target, message)
         if redacted != message:
             record.msg = redacted
             record.args = ()
@@ -229,8 +254,8 @@ class _AiohttpServerRedactor(logging.Filter):
             text = record.exc_text
             if text is None and record.exc_info:
                 text = "".join(traceback.format_exception(*record.exc_info))
-            if text and _REQUEST_QUERY_RE.search(text):
-                record.exc_text = _REQUEST_QUERY_RE.sub(_REDACTED, text)
+            if text and _REQUEST_TARGET_RE.search(text):
+                record.exc_text = _REQUEST_TARGET_RE.sub(_redact_target, text)
                 record.exc_info = None
         return True
 

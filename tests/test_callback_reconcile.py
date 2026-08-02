@@ -80,11 +80,18 @@ def _identity(plugin="gmail", declared="authorize"):
 
 
 class _SpoolStub:
-    """Records the ordered file-side call sequence (the ordering contract)."""
+    """Records the ordered file-side call sequence (the ordering contract) AND
+    models the durable on-disk marker inventory the reconciler reads back — so
+    a later reconcile on the SAME stub instance sees exactly what an earlier one
+    published, which is the on-disk truth the paired transaction reconciles
+    against (the in-memory previous overlay is no longer consulted). Reuse ONE
+    stub across the reconciles of a scenario to exercise the durable path."""
 
     def __init__(self, calls, *, fail=()):
         self.calls = calls
         self.fail = set(fail)
+        self._ready: dict[str, dict] = {}      # plugin -> ready payload
+        self._index: dict[str, dict] = {}      # index key -> index payload
 
     def _rec(self, what, *args):
         self.calls.append((what, *args))
@@ -95,33 +102,42 @@ class _SpoolStub:
         self._rec("ensure", plugin)
 
     def write_ready(self, plugin, payload):
-        self._rec("ready", plugin, payload)
+        self._rec("ready", plugin, payload)     # raises here if in `fail`
+        self._ready[plugin] = payload
 
     def delete_ready(self, plugin):
         self._rec("del_ready", plugin)
+        self._ready.pop(plugin, None)
 
     def write_index_entry(self, artifact_realpath, payload):
         self._rec("index", artifact_realpath, payload)
+        self._index[callback_spool.index_key(artifact_realpath)] = payload
 
     def delete_index_entry(self, artifact_realpath):
         self._rec("del_index", artifact_realpath)
+        self._index.pop(callback_spool.index_key(artifact_realpath), None)
 
-    # The durable-inventory reconcile reads these; a call-recording stub tracks
-    # no on-disk state, so it reports an empty inventory (no orphan retirement).
+    def delete_index_key(self, key):
+        self._rec("del_index_key", key)
+        self._index.pop(key, None)
+
     def published_plugins(self):
-        return []
+        return sorted(self._ready)
 
     def index_keys(self):
-        return []
+        return sorted(self._index)
 
-    # No on-disk payload either: an absent marker is never "stale" (so no
-    # still-routed retirement) and always "needs write" (so the post-swap
-    # rewrite still records ensure/ready/index, as these ordering tests pin).
-    def read_ready(self, plugin):
-        return None
+    def read_marker(self, plugin):
+        payload = self._ready.get(plugin)
+        return callback_spool.Marker(
+            callback_spool.MarkerState.PRESENT if payload is not None
+            else callback_spool.MarkerState.ABSENT, payload)
 
-    def read_index_entry(self, artifact_realpath):
-        return None
+    def read_index_marker(self, artifact_realpath):
+        payload = self._index.get(callback_spool.index_key(artifact_realpath))
+        return callback_spool.Marker(
+            callback_spool.MarkerState.PRESENT if payload is not None
+            else callback_spool.MarkerState.ABSENT, payload)
 
 
 class _SpyRegistry(TriggerRegistry):
@@ -405,14 +421,16 @@ async def test_ready_and_index_deleted_before_the_unrouting_swap(tmp_path):
     acks = CallbackAckStore(path=tmp_path / "acks.json")
     _ack(acks)
     p = _plugin()
-    await _reconcile(registry, plugins=[p], acks=acks,
-                     spool=_SpoolStub(calls))
+    spool = _SpoolStub(calls)                      # reused: it is the on-disk truth
+    await _reconcile(registry, plugins=[p], acks=acks, spool=spool)
     calls.clear()
-    # the plugin disappears (uninstalled): marker + index die BEFORE the swap
-    await _reconcile(registry, plugins=[], acks=acks, spool=_SpoolStub(calls),
+    # the plugin disappears (uninstalled): the orphan marker + index key die
+    # BEFORE the swap, retired from the DURABLE on-disk inventory. The index is
+    # retired by its on-disk KEY (delete_index_key), never a re-hashed path.
+    await _reconcile(registry, plugins=[], acks=acks, spool=spool,
                      entries=lambda: [])
-    assert [c[0] for c in calls] == ["del_ready", "del_index", "swap"]
-    assert calls[1][1] == p.path
+    assert [c[0] for c in calls] == ["del_ready", "del_index_key", "swap"]
+    assert calls[1][1] == callback_spool.index_key(p.path)
     assert registry.get_callback("plg-gmail--authorize") is None
 
 
@@ -422,35 +440,47 @@ async def test_revoked_ack_unroutes_marker_first(tmp_path):
     acks = CallbackAckStore(path=tmp_path / "acks.json")
     _ack(acks)
     p = _plugin()
-    await _reconcile(registry, plugins=[p], acks=acks,
-                     spool=_SpoolStub(calls))
+    spool = _SpoolStub(calls)                      # reused: the on-disk truth
+    await _reconcile(registry, plugins=[p], acks=acks, spool=spool)
     acks.revoke_plugin("gmail")
     calls.clear()
-    await _reconcile(registry, plugins=[p], acks=acks,
-                     spool=_SpoolStub(calls))
-    assert [c[0] for c in calls][:3] == ["del_ready", "del_index", "swap"]
+    await _reconcile(registry, plugins=[p], acks=acks, spool=spool)
+    assert [c[0] for c in calls][:3] == ["del_ready", "del_index_key", "swap"]
     assert registry.get_callback("plg-gmail--authorize") is None
 
 
 async def test_artifact_change_retires_the_old_index_key_only(tmp_path):
     """The index is keyed by the RESOLVED artifact path: an update must drop
-    the old key in the same pass that publishes the new one, and must not
-    delete the (unchanged) plugin-dir readiness marker."""
-    calls: list = []
-    registry = _SpyRegistry(calls)
-    acks = CallbackAckStore(path=tmp_path / "acks.json")
-    _ack(acks)
-    p1 = _plugin()
-    await _reconcile(registry, plugins=[p1], acks=acks,
-                     spool=_SpoolStub(calls))
-    calls.clear()
-    p2 = _plugin(artifact_id="art-2")
-    await _reconcile(registry, plugins=[p2], acks=acks,
-                     spool=_SpoolStub(calls))
-    assert [c[0] for c in calls] == ["del_index", "swap", "ensure", "ready",
-                                     "index"]
-    assert calls[0][1] == p1.path
-    assert calls[4][1] == p2.path
+    the old key (retired from the on-disk inventory by KEY) in the same pass
+    that publishes the new one, and the readiness marker must end up serving the
+    live route. A real spool pins the on-disk outcome (the paired transaction
+    may rewrite the ready marker too — its atomicity is per-pair, not per-file
+    — so op-order is no longer the contract; the resulting files are)."""
+    root = tmp_path / "spool"
+    art1 = tmp_path / "store" / "gmail" / "art-1"
+    art2 = tmp_path / "store" / "gmail" / "art-2"
+    art1.mkdir(parents=True)
+    art2.mkdir(parents=True)
+    spool = callback_spool.CallbackSpool(root)
+    try:
+        registry = _SpyRegistry()
+        acks = CallbackAckStore(path=tmp_path / "acks.json")
+        _ack(acks)
+        await _reconcile(registry, plugins=[_plugin(path=str(art1))],
+                         acks=acks, spool=spool)
+        old_key = callback_spool.index_key(str(art1))
+        assert spool.index_keys() == [old_key]
+
+        await _reconcile(registry, plugins=[_plugin(artifact_id="art-2",
+                                                    path=str(art2))],
+                         acks=acks, spool=spool)
+
+        new_key = callback_spool.index_key(str(art2))
+        assert spool.index_keys() == [new_key]       # old key retired, new one live
+        assert "gmail" in spool.published_plugins()  # readiness marker still serves
+        assert registry.get_callback("plg-gmail--authorize") is not None
+    finally:
+        spool.close()
 
 
 async def test_dropping_one_callback_retires_the_marker_before_the_swap(
@@ -464,11 +494,12 @@ async def test_dropping_one_callback_retires_the_marker_before_the_swap(
     acks = CallbackAckStore(path=tmp_path / "acks.json")
     _ack(acks, declared="authorize")
     _ack(acks, declared="renew")
+    spool = _SpoolStub(calls)                      # reused: the on-disk truth
     p2 = _plugin(callbacks=("authorize", "renew"))
-    await _reconcile(registry, plugins=[p2], acks=acks, spool=_SpoolStub(calls))
+    await _reconcile(registry, plugins=[p2], acks=acks, spool=spool)
     calls.clear()
     p1 = _plugin(callbacks=("authorize",))
-    await _reconcile(registry, plugins=[p1], acks=acks, spool=_SpoolStub(calls))
+    await _reconcile(registry, plugins=[p1], acks=acks, spool=spool)
     # BOTH published files carry the callbacks map, so both retire first
     assert [c[0] for c in calls] == ["del_ready", "del_index", "swap",
                                      "ensure", "ready", "index"]
@@ -485,14 +516,15 @@ async def test_dropping_while_adding_retires_both_markers(tmp_path):
     acks = CallbackAckStore(path=tmp_path / "acks.json")
     _ack(acks, declared="authorize")
     _ack(acks, declared="renew")
+    spool = _SpoolStub(calls)                      # reused: the on-disk truth
     await _reconcile(registry,
                      plugins=[_plugin(callbacks=("authorize", "renew"))],
-                     acks=acks, spool=_SpoolStub(calls))
+                     acks=acks, spool=spool)
     calls.clear()
     _ack(acks, declared="refresh")
     await _reconcile(registry,
                      plugins=[_plugin(callbacks=("authorize", "refresh"))],
-                     acks=acks, spool=_SpoolStub(calls))
+                     acks=acks, spool=spool)
     assert [c[0] for c in calls] == ["del_ready", "del_index", "swap",
                                      "ensure", "ready", "index"]
     assert set(calls[4][2]["callbacks"]) == {"authorize", "refresh"}
@@ -662,36 +694,36 @@ async def test_spool_write_failure_surfaces_but_keeps_the_route(tmp_path):
     assert registry.get_callback("plg-gmail--authorize") is not None
 
 
-async def test_a_pathless_overlay_entry_never_reaches_the_index(tmp_path):
+async def test_a_pathless_routed_plugin_never_touches_the_index(tmp_path):
     """The index key is sha256(realpath(path)) and realpath("") is the process
-    CWD — a malformed carried-over entry must never make the unroute delete a
-    key derived from wherever casa happens to be running."""
+    CWD — a routed plugin with an empty resolved path must never make the
+    reconcile read, write or delete an index entry keyed off the CWD. It
+    publishes only its readiness marker; no index op is ever issued."""
     calls: list = []
     registry = _SpyRegistry(calls)
-    registry.replace_callback_overlay({
-        "plg-gmail--authorize": {"plugin": "gmail", "declared": "authorize"}})
-    calls.clear()
     acks = CallbackAckStore(path=tmp_path / "acks.json")
-    await _reconcile(registry, plugins=[], acks=acks, spool=_SpoolStub(calls),
-                     entries=lambda: [])
-    assert [c[0] for c in calls] == ["del_ready", "swap"]
+    _ack(acks)
+    p = _plugin(path="")
+    await _reconcile(registry, plugins=[p], acks=acks, spool=_SpoolStub(calls))
+    kinds = [c[0] for c in calls]
+    assert kinds == ["swap", "ensure", "ready"]      # ready only, never an index op
+    assert not any(k in ("index", "del_index", "del_index_key") for k in kinds)
 
 
 async def test_missing_spool_reports_one_issue_per_plugin(tmp_path):
-    """An unwired spool fails EVERY file operation — the health report gets
-    one actionable row per plugin, not one per syscall (the unroute alone
-    would otherwise contribute a marker row and an index row)."""
+    """An unwired spool fails EVERY file operation — the health report gets one
+    actionable row per ROUTED plugin, not one per syscall (ensure + ready +
+    index would otherwise contribute three rows for one plugin)."""
     registry = _SpyRegistry()
-    registry.replace_callback_overlay({
-        "plg-gone--old": {"plugin": "gone", "declared": "old",
-                          "path": "/store/gone/art-0"}})
     acks = CallbackAckStore(path=tmp_path / "acks.json")
+    p1 = _plugin()
+    p2 = _plugin(name="other")
     _ack(acks)
-    p = _plugin()
-    issues = await _reconcile(registry, plugins=[p], acks=acks, spool=None,
-                              entries=_entries(p))
+    _ack(acks, plugin="other")
+    issues = await _reconcile(registry, plugins=[p1, p2], acks=acks, spool=None,
+                              entries=_entries(p1, p2))
     assert sorted((i.name, i.reason_code) for i in issues) == [
-        ("gmail", "callback_spool_error"), ("gone", "callback_spool_error")]
+        ("gmail", "callback_spool_error"), ("other", "callback_spool_error")]
 
 
 async def test_missing_spool_still_swaps_the_overlay(tmp_path):
@@ -732,13 +764,12 @@ async def test_base_url_loss_retires_a_previously_published_marker(
     acks = CallbackAckStore(path=tmp_path / "acks.json")
     _ack(acks)
     p = _plugin()
-    await _reconcile(registry, plugins=[p], acks=acks,
-                     spool=_SpoolStub(calls))
+    spool = _SpoolStub(calls)                      # reused: the on-disk truth
+    await _reconcile(registry, plugins=[p], acks=acks, spool=spool)
     calls.clear()
     await _reconcile(registry, plugins=[p], acks=acks,
-                     spool=_SpoolStub(calls), base_url=None,
-                     monkeypatch=monkeypatch)
-    assert [c[0] for c in calls] == ["del_ready", "del_index", "swap"]
+                     spool=spool, base_url=None, monkeypatch=monkeypatch)
+    assert [c[0] for c in calls] == ["del_ready", "del_index_key", "swap"]
 
 
 # ---------------------------------------------------------------------------
@@ -1118,6 +1149,164 @@ async def test_registry_invalid_does_not_retire_a_differing_marker(tmp_path):
 
         assert ready.is_file() and index.is_file()
         assert ready.read_text() == before_ready   # untouched, not rewritten
+    finally:
+        spool.close()
+
+
+# ---------------------------------------------------------------------------
+# the paired marker transaction — fail-closed to absent, INVALID != absent,
+# never a half-published pair (r3 findings)
+# ---------------------------------------------------------------------------
+
+
+class _IndexWriteFails:
+    """Wrap a real spool, failing every ``.index`` write while ready.json
+    writes and all deletes/reads pass through — models write-ready-succeeds-
+    then-write-index-FAILS (the r3 Terra split)."""
+
+    def __init__(self, inner):
+        self._inner = inner
+
+    def __getattr__(self, name):
+        return getattr(self._inner, name)
+
+    def write_index_entry(self, artifact_realpath, payload):
+        raise OSError("disk full")
+
+
+async def test_write_index_failure_after_ready_leaves_neither_marker(tmp_path):
+    """r3 Terra: retire-index, then write-ready SUCCEEDS, then write-index
+    FAILS — the pass must leave BOTH markers absent (fail-closed), never the
+    old .index + new ready.json split. The prior stale pair is retired
+    pre-swap; the post-swap index failure deletes the just-written ready.json
+    too."""
+    root = tmp_path / "spool"
+    art = tmp_path / "store" / "gmail" / "art-1"
+    art.mkdir(parents=True)
+    spool = callback_spool.CallbackSpool(root)
+    try:
+        _seed_marker(spool, "gmail", art, ["authorize", "renew"])   # stale prior
+        ready, index = _marker_paths(root, "gmail", art)
+        assert ready.is_file() and index.is_file()
+
+        registry = _SpyRegistry()
+        acks = CallbackAckStore(path=tmp_path / "acks.json")
+        _ack(acks, declared="authorize")
+        p = _plugin(callbacks=("authorize",), path=str(art))
+        issues = await _reconcile(registry, plugins=[p], acks=acks,
+                                  spool=_IndexWriteFails(spool))
+
+        assert [i.reason_code for i in issues] == ["callback_spool_error"]
+        assert not ready.exists()
+        assert not index.exists()
+        assert registry.get_callback("plg-gmail--authorize") is not None
+    finally:
+        spool.close()
+
+
+async def test_fresh_publish_index_failure_leaves_neither_marker(tmp_path):
+    """The same fail-closed rule on a FIRST publish (nothing on disk): a
+    write-index failure after a successful write-ready must roll the ready.json
+    back to absent — never a lone ready marker advertising a route with no
+    discoverable redirect URI."""
+    root = tmp_path / "spool"
+    art = tmp_path / "store" / "gmail" / "art-1"
+    art.mkdir(parents=True)
+    spool = callback_spool.CallbackSpool(root)
+    try:
+        registry = _SpyRegistry()
+        acks = CallbackAckStore(path=tmp_path / "acks.json")
+        _ack(acks)
+        p = _plugin(path=str(art))
+        issues = await _reconcile(registry, plugins=[p], acks=acks,
+                                  spool=_IndexWriteFails(spool))
+        ready, index = _marker_paths(root, "gmail", art)
+        assert [i.reason_code for i in issues] == ["callback_spool_error"]
+        assert not ready.exists()
+        assert not index.exists()
+    finally:
+        spool.close()
+
+
+async def test_invalid_ready_marker_is_republished_without_hanging(tmp_path):
+    """An INVALID on-disk ready.json (a swapped-in FIFO) is NOT conflated with
+    absent: it is treated as needing republish, retired and rewritten as a
+    regular file — and the reconcile must not hang on the FIFO (the read is
+    non-blocking)."""
+    root = tmp_path / "spool"
+    art = tmp_path / "store" / "gmail" / "art-1"
+    art.mkdir(parents=True)
+    spool = callback_spool.CallbackSpool(root)
+    try:
+        registry = _SpyRegistry()
+        acks = CallbackAckStore(path=tmp_path / "acks.json")
+        _ack(acks)
+        p = _plugin(path=str(art))
+        await _reconcile(registry, plugins=[p], acks=acks, spool=spool)
+        ready, _index = _marker_paths(root, "gmail", art)
+        ready.unlink()
+        os.mkfifo(ready)                       # corrupt ready.json into a FIFO
+
+        registry2 = _SpyRegistry()             # a later boot
+        await _reconcile(registry2, plugins=[p], acks=acks, spool=spool)
+
+        assert ready.is_file()                 # republished as a regular file
+        assert set(json.loads(ready.read_text())["callbacks"]) == {"authorize"}
+        assert registry2.get_callback("plg-gmail--authorize") is not None
+    finally:
+        spool.close()
+
+
+async def test_oversized_index_marker_is_republished(tmp_path):
+    """An INVALID (oversized) on-disk index entry is republished, not left in
+    place — INVALID is never mistaken for a matching PRESENT marker."""
+    root = tmp_path / "spool"
+    art = tmp_path / "store" / "gmail" / "art-1"
+    art.mkdir(parents=True)
+    spool = callback_spool.CallbackSpool(root)
+    try:
+        registry = _SpyRegistry()
+        acks = CallbackAckStore(path=tmp_path / "acks.json")
+        _ack(acks)
+        p = _plugin(path=str(art))
+        await _reconcile(registry, plugins=[p], acks=acks, spool=spool)
+        _ready, index = _marker_paths(root, "gmail", art)
+        index.write_bytes(
+            b'{"pad":"' + b"p" * (callback_spool.MARKER_STATE_MAX_BYTES + 16)
+            + b'"}')
+
+        registry2 = _SpyRegistry()
+        await _reconcile(registry2, plugins=[p], acks=acks, spool=spool)
+
+        data = json.loads(index.read_text())   # small, valid again
+        assert data["plugin_dir"] == "gmail"
+    finally:
+        spool.close()
+
+
+async def test_half_published_pair_is_made_whole(tmp_path):
+    """A half-published pair (ready.json present, its index entry missing — a
+    crash between the two writes) is reconciled to BOTH-present: the invariant
+    is both-absent or both-present-equal, never one of each."""
+    root = tmp_path / "spool"
+    art = tmp_path / "store" / "gmail" / "art-1"
+    art.mkdir(parents=True)
+    spool = callback_spool.CallbackSpool(root)
+    try:
+        registry = _SpyRegistry()
+        acks = CallbackAckStore(path=tmp_path / "acks.json")
+        _ack(acks)
+        p = _plugin(path=str(art))
+        await _reconcile(registry, plugins=[p], acks=acks, spool=spool)
+        ready, index = _marker_paths(root, "gmail", art)
+        index.unlink()                         # lose one half of the pair
+        assert ready.is_file() and not index.exists()
+
+        registry2 = _SpyRegistry()
+        await _reconcile(registry2, plugins=[p], acks=acks, spool=spool)
+
+        assert ready.is_file() and index.is_file()
+        assert json.loads(index.read_text())["plugin_dir"] == "gmail"
     finally:
         spool.close()
 

@@ -38,6 +38,11 @@ ACKS_PATH = Path("/data/callback_acks.json")
 
 _SCHEMA_VERSION = 1
 
+#: Read cap for the store file. A well-behaved store is a few KiB; anything
+#: past this is refused wholesale (fail closed) and never slurped into memory —
+#: the read itself is bounded so a multi-GB file cannot OOM the boot.
+_MAX_ACKS_BYTES = 4 * 1024 * 1024
+
 #: The EXACT key set a stored ack record may carry. A record with any key
 #: outside this set is malformed and fails the whole store (INV-CB-003): a
 #: hand-edited / merged file that smuggled an extra field is no more
@@ -80,13 +85,35 @@ class CallbackAckStore:
         schema, any malformed record, or any key that does not equal the
         RECOMPUTED identity of its own record ⇒ NO acks at all. A truncated
         / merged / hand-edited store can never manufacture consent; the
-        operator simply re-consents. (INV-CB-003.)"""
+        operator simply re-consents. (INV-CB-003.)
+
+        TOTAL by construction: ``_load`` runs at singleton construction (boot),
+        so it must return a dict for ANY file content whatsoever and never
+        propagate. The per-field checks below fail the store closed, but a
+        catch-all wraps the whole body as belt-and-braces — ``json.loads`` on
+        deeply-nested JSON raises ``RecursionError`` (not ``ValueError``), and
+        any other content could raise deeper in validation; either would crash
+        the ACKS singleton at boot instead of failing closed."""
+        try:
+            return self._load_body()
+        except Exception:  # noqa: BLE001 — totality over the whole load
+            logger.warning(
+                "callback acks: load failed; treating as no acks", exc_info=True)
+            return {}
+
+    def _load_body(self) -> dict[str, dict[str, Any]]:
         from plugin_callbacks import ack_identity
 
         try:
-            raw = json.loads(self.path.read_text(encoding="utf-8"))
-        except (OSError, ValueError):
+            with open(self.path, "rb") as fh:
+                # Bound the read itself (not read-then-check): an oversized
+                # store must not be slurped into memory before it is refused.
+                data = fh.read(_MAX_ACKS_BYTES + 1)
+        except OSError:
             return {}
+        if len(data) > _MAX_ACKS_BYTES:
+            return {}
+        raw = json.loads(data.decode("utf-8"))
         if not isinstance(raw, dict) or raw.get("schema_version") != _SCHEMA_VERSION:
             return {}
         acks = raw.get("acks")

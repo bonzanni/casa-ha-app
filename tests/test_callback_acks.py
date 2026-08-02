@@ -240,6 +240,63 @@ def test_load_never_raises_on_adversarial_ts(tmp_path):
         assert isinstance(store._load(), dict)   # explicit: no exception
 
 
+def test_deeply_nested_json_does_not_crash_load(tmp_path):
+    """``json.loads`` on deeply-nested JSON raises ``RecursionError`` — NOT an
+    ``OSError``/``ValueError`` — so an inner-only guard would let it crash the
+    ACKS singleton at construction (boot). ``_load`` must be TOTAL: catch-all
+    fail-closed to no acks (INV-CB-003)."""
+    path = tmp_path / "acks.json"
+    path.write_text("[" * 200000, encoding="utf-8")   # trips RecursionError
+
+    store = CallbackAckStore(path=path)               # must not raise
+    assert store.get(ack_identity("elevenlabs", "eff", "digest-1")) is None
+    assert store._load() == {}
+
+
+def test_oversized_store_yields_zero_acks(tmp_path):
+    """An absurdly large store is rejected wholesale (bounded read) rather than
+    slurped into memory — fail closed to no acks."""
+    path = tmp_path / "acks.json"
+    identity = ack_identity("elevenlabs", "eff", "digest-1")
+    inner = {
+        "schema_version": 1,
+        "acks": {identity: {
+            "plugin": "elevenlabs", "effective": "eff",
+            "declaration_digest": "digest-1", "ts": 1, "gen": "g1",
+        }},
+    }
+    # Valid JSON, but padded past the cap with trailing whitespace so the file
+    # is well-formed yet oversized.
+    blob = json.dumps(inner) + (" " * (5 * 1024 * 1024))
+    path.write_text(blob, encoding="utf-8")
+
+    store = CallbackAckStore(path=path)
+    assert store.get(identity) is None
+    assert store._load() == {}
+
+
+def test_load_is_total_on_adversarial_content(tmp_path):
+    """Totality pin over the whole load (not just the ts field): deeply-nested
+    JSON, a huge-int ts, a NaN ts, and an oversized file each yield a dict from
+    ``_load`` and never propagate."""
+    path = tmp_path / "acks.json"
+    identity = ack_identity("elevenlabs", "eff", "digest-1")
+    rec = {"plugin": "elevenlabs", "effective": "eff",
+           "declaration_digest": "digest-1", "gen": "g1"}
+    cases = [
+        "[" * 200000,                                             # RecursionError
+        json.dumps({"schema_version": 1,
+                    "acks": {identity: dict(rec, ts=10 ** 1000)}}),  # huge int
+        json.dumps({"schema_version": 1,
+                    "acks": {identity: dict(rec, ts=float("nan"))}}),  # NaN
+        json.dumps({"schema_version": 1, "acks": {identity: dict(rec, ts=1)}})
+        + (" " * (5 * 1024 * 1024)),                             # oversized
+    ]
+    for blob in cases:
+        path.write_text(blob, encoding="utf-8")
+        assert isinstance(CallbackAckStore(path=path)._load(), dict)
+
+
 def test_revoke_plugin_returns_removed_and_persists(tmp_path):
     path = tmp_path / "acks.json"
     store = CallbackAckStore(path=path)

@@ -1255,3 +1255,85 @@ def test_durable_inventory_methods_are_empty_on_a_closed_spool(tmp_path):
     assert s.index_keys() == []
     with pytest.raises(cs.SpoolClosed):
         s.delete_index_key("0" * 64)
+
+
+# ---------------------------------------------------------------------------
+# three-state marker reader (read_marker / read_index_marker) — the durable
+# on-disk truth the reconciler drives its paired transaction from. ABSENT and
+# INVALID are DISTINCT: a stale-but-unreadable marker is republished, never
+# mistaken for absent.
+# ---------------------------------------------------------------------------
+
+
+def test_read_marker_absent_when_no_file(spool):
+    m = spool.read_marker(PLUGIN)
+    assert m.state is cs.MarkerState.ABSENT and m.payload is None
+    # A plugin dir that does not exist at all is ABSENT, not INVALID.
+    assert spool.read_marker("never-made").state is cs.MarkerState.ABSENT
+
+
+def test_read_marker_present_returns_payload(spool):
+    payload = {"v": 1, "base_url": "https://x.example", "callbacks": {}}
+    spool.write_ready(PLUGIN, payload)
+    m = spool.read_marker(PLUGIN)
+    assert m.state is cs.MarkerState.PRESENT
+    assert m.payload == payload
+
+
+def test_read_index_marker_roundtrip(spool, tmp_path):
+    art = tmp_path / "store" / "acme" / "art-1"
+    art.mkdir(parents=True)
+    assert spool.read_index_marker(str(art)).state is cs.MarkerState.ABSENT
+    payload = {"v": 1, "plugin_dir": PLUGIN}
+    spool.write_index_entry(str(art), payload)
+    m = spool.read_index_marker(str(art))
+    assert m.state is cs.MarkerState.PRESENT and m.payload == payload
+
+
+def test_read_marker_of_a_fifo_is_invalid_and_never_blocks(spool):
+    """A FIFO at ready.json (a swapped-in pipe) must be INVALID, and the read
+    must return IMMEDIATELY — O_NONBLOCK + the S_ISREG gate mean it is never
+    opened for a blocking read. If this hangs, the test times out."""
+    os.mkfifo(_pdir(spool) / "ready.json")
+    m = spool.read_marker(PLUGIN)
+    assert m.state is cs.MarkerState.INVALID and m.payload is None
+
+
+def test_read_marker_of_an_oversized_file_is_invalid(spool):
+    (_pdir(spool) / "ready.json").write_bytes(
+        b'{"v":1,"pad":"' + b"p" * (cs.MARKER_STATE_MAX_BYTES + 16) + b'"}')
+    assert spool.read_marker(PLUGIN).state is cs.MarkerState.INVALID
+
+
+def test_read_marker_of_garbage_json_is_invalid(spool):
+    (_pdir(spool) / "ready.json").write_text("{not valid json", encoding="utf-8")
+    assert spool.read_marker(PLUGIN).state is cs.MarkerState.INVALID
+
+
+def test_read_marker_of_a_non_object_is_invalid(spool):
+    (_pdir(spool) / "ready.json").write_text("[1, 2, 3]", encoding="utf-8")
+    assert spool.read_marker(PLUGIN).state is cs.MarkerState.INVALID
+
+
+def test_read_marker_of_a_symlink_is_invalid(spool, tmp_path):
+    """O_NOFOLLOW: a symlinked ready.json is INVALID (never followed to an
+    outside inode), not ABSENT."""
+    target = tmp_path / "outside.json"
+    target.write_text('{"v": 1}', encoding="utf-8")
+    os.symlink(target, _pdir(spool) / "ready.json")
+    assert spool.read_marker(PLUGIN).state is cs.MarkerState.INVALID
+
+
+def test_read_marker_of_a_directory_is_invalid(spool):
+    os.mkdir(_pdir(spool) / "ready.json")
+    assert spool.read_marker(PLUGIN).state is cs.MarkerState.INVALID
+
+
+def test_read_index_marker_of_a_fifo_is_invalid_and_never_blocks(spool, tmp_path):
+    art = tmp_path / "store" / "acme" / "art-1"
+    art.mkdir(parents=True)
+    spool.write_index_entry(str(art), {"v": 1})       # creates the .index dir
+    entry = Path(spool.root) / cs.INDEX_DIR / f"{index_key(str(art))}.json"
+    entry.unlink()
+    os.mkfifo(entry)
+    assert spool.read_index_marker(str(art)).state is cs.MarkerState.INVALID

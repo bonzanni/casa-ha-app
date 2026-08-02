@@ -693,6 +693,43 @@ class TestLogHygiene:
             rendered = formatter.format(record)   # includes the traceback
             assert "SECRETVALUE" not in rendered, record.name
 
+    async def test_overlong_line_with_an_inner_quote_leaks_no_code(
+            self, caplog):
+        """The inner-quote case end-to-end through a REAL server: a raw request
+        line whose query carries a single quote before the code
+        (``?x='&code=SECRETVALUE'MORESECRET…``) drives the real ``LineTooLong``
+        (whose bytes repr escapes the quote and flips its delimiter). Neither
+        the fragment before the quote nor the one after may survive on ANY
+        logger — the whole target is redacted."""
+        callback_http.install_callback_log_redaction()
+        caplog.set_level(logging.DEBUG)
+        app = _build_app(middlewares=[cid_middleware])
+        server = TestServer(app)
+        await server.start_server()
+        try:
+            reader, writer = await asyncio.open_connection(
+                server.host, server.port)
+            target = ("/%63allback/x?x='&code=SECRETVALUE'MORESECRET&pad="
+                      + "p" * 9000)
+            writer.write(
+                f"GET {target} HTTP/1.1\r\nHost: x\r\n\r\n".encode())
+            try:
+                await writer.drain()
+                await reader.read(200)
+            except Exception:  # noqa: BLE001 — the connection is dropped
+                pass
+            writer.close()
+            await asyncio.sleep(0.05)
+        finally:
+            await server.close()
+        assert any(r.name == "aiohttp.server" for r in caplog.records), \
+            "the parser error must have been logged (else the test is moot)"
+        formatter = logging.Formatter()
+        for record in caplog.records:
+            rendered = formatter.format(record)   # includes the traceback
+            assert "SECRETVALUE" not in rendered, record.name
+            assert "MORESECRET" not in rendered, record.name
+
     async def test_install_callback_log_redaction_is_idempotent(self):
         srv = logging.getLogger("aiohttp.server")
         callback_http.install_callback_log_redaction()
@@ -735,7 +772,10 @@ class TestLogHygiene:
         assert "SECRETVALUE" not in json.dumps(payload)
         assert "exc" in payload, "the exc field must survive redaction"
         assert "<redacted>" in payload["exc"]
-        assert "/callback/x?" in payload["exc"]   # the path is kept, query gone
+        # The WHOLE target is redacted (path AND query) — not just the query —
+        # so no path fragment survives either.
+        assert "/callback/x" not in payload["exc"]
+        assert "b'GET <redacted>'" in payload["exc"]
 
     def test_redactor_keeps_an_unrelated_query_path_and_exc(self):
         """A plain diagnostic carrying a query-bearing path that is NOT in
@@ -756,17 +796,34 @@ class TestLogHygiene:
 
     def test_redactor_redacts_a_bare_request_line(self):
         """A real request line embedded in a message — method + origin-form
-        target + HTTP version, no bytes repr — is redacted: the query is
-        stripped while the method, path and version survive."""
+        target + HTTP version, no bytes repr — has its WHOLE target redacted:
+        the method and version survive, the path and query do not."""
         record = logging.LogRecord(
             "aiohttp.server", logging.ERROR, __file__, 0,
             "bad request line: GET /callback/x?code=SECRET HTTP/1.1", (), None)
         callback_http._AiohttpServerRedactor().filter(record)
         msg = record.getMessage()
         assert "SECRET" not in msg
-        assert "<redacted>" in msg
-        assert "GET /callback/x?" in msg
-        assert "HTTP/1.1" in msg                       # version kept
+        assert "/callback/x" not in msg                # path gone too
+        assert "GET <redacted> HTTP/1.1" in msg        # method + version kept
+
+    def test_redactor_redacts_the_whole_target_past_an_inner_quote(self):
+        """The inner-quote leak: a target whose query carries a quote before the
+        code (``?x='&code=…``, the ``'`` rendered ``\\'`` inside the bytes repr,
+        which flips the repr delimiter to ``"``). A 'stop at a quote' redaction
+        would leave ``code=…`` behind; redacting the WHOLE target to the
+        MATCHING closing quote leaves no fragment on either side of the quote."""
+        record = logging.LogRecord(
+            "aiohttp.server", logging.ERROR, __file__, 0,
+            "Got more than 8190 bytes when reading: "
+            r"""bytearray(b"/callback/x?x=\'&code=SECRETVALUE&pad=pppp")""",
+            (), None)
+        callback_http._AiohttpServerRedactor().filter(record)
+        msg = record.getMessage()
+        assert "SECRETVALUE" not in msg
+        assert "code=" not in msg                      # nothing after the quote
+        assert "/callback/x" not in msg                # nothing before it either
+        assert 'b"<redacted>"' in msg
 
     def test_json_formatter_keeps_unrelated_exc_intact(self):
         """An ``aiohttp.server`` ERROR whose traceback

@@ -25,11 +25,15 @@ Semantics:
   its WHOLE set dark plus a ``stage="callbacks"`` ``PluginIssue`` (the mirror
   of INV-TRIG-003). A non-consent gap additionally SUPPRESSES prompting —
   approving a callback that still could not route is a broken promise.
-* **Asymmetric file ordering.** Routing swaps the overlay FIRST and only then
-  creates the readiness marker + index entry; unrouting deletes them BEFORE
-  the swap. The marker can therefore never be falsely positive, and it stays
-  advisory: the overlay alone decides what the endpoint serves, so a stale
-  marker cannot open a route.
+* **Paired marker transaction, on-disk truth.** The ``ready.json`` +
+  ``.index`` pair is published/retired as ONE fail-closed transaction driven by
+  the DURABLE on-disk inventory (not the in-memory previous overlay, which is
+  empty across a restart): retire orphans and stale/partial pairs BEFORE the
+  swap, write the routed set's pairs AFTER it, and DELETE BOTH on any write
+  failure. After any pass on a trustworthy computation each plugin's pair is
+  either both-absent or both-present-and-equal-to-desired — never stale, never
+  half-published. The marker can therefore never be falsely positive, and it
+  stays advisory: the overlay alone decides what the endpoint serves.
 * **Consent survives a routine upgrade.** The consent identity binds the
   DECLARATION digest, not the artifact — an update that leaves ``casa.callbacks``
   untouched keeps its ack (no dark window, no re-tap). Identities no longer
@@ -323,214 +327,172 @@ def _spool_issue(issues: list, plugin: str, artifact_id: str | None) -> None:
         reason_code="callback_spool_error", artifact_id=artifact_id))
 
 
-def _retire_orphaned_markers(spool: Any, desired: DesiredCallbacks) -> None:
-    """Reconcile the DURABLE on-disk marker inventory against the desired
-    routed set, retiring any published ``ready.json`` / index entry whose
-    plugin (or artifact key) the desired set no longer routes.
-
-    Why this exists alongside :func:`_pre_swap_files`: that pass compares the
-    desired set against the IN-MEMORY previous overlay, which is empty across a
-    restart — so a marker for a plugin that has since dropped out of the routed
-    set (ack lost, declaration changed, base URL invalid, removed, artifact
-    path changed) would survive a reboot and keep advertising a route the
-    overlay no longer serves. A consumer that read such a stale marker would
-    mint a state and be sent to a route the overlay 404s — a dead flow that
-    looks alive. Reading the spool's OWN published inventory makes the
-    retirement survive a restart, where the in-memory diff cannot.
-
-    A still-ROUTED plugin whose on-disk payload no longer matches the desired
-    one (a callback dropped, or the redirect base changed, while the process
-    was down) is caught here too: the in-memory diff cannot see it across a
-    restart, so its old marker would keep advertising a removed callback or an
-    obsolete redirect URI until the post-swap rewrite — and PERMANENTLY if that
-    rewrite then fails. Retiring it BEFORE the swap makes the post-swap rewrite
-    the sole writer: a failed rewrite then leaves the marker ABSENT
-    (fail-closed — the consumer reads "not approved yet, wait") rather than
-    stale. An UNCHANGED marker is left exactly as it is (no retire, no churn).
-
-    Gated on ``desired.prunable`` — the SAME double-gate the stale-ack prune
-    uses. A wholesale compute failure (invalid registry, or a resolution
-    hiccup) leaves ``prunable`` False, so this never nukes every marker (the
-    availability blast radius); a plugin simply ABSENT from a trustworthy
-    computation does have its stale marker retired. Runs BEFORE the overlay
-    swap — the same delete-before-swap ordering as the in-memory path.
-    """
-    if spool is None or not desired.prunable:
-        return
-    import callback_spool
-
-    if desired.base_url:
-        routed_by_plugin = {r.plugin: r for r in desired.routed}
-        keys = {callback_spool.index_key(r.path) for r in desired.routed}
-    else:
-        routed_by_plugin, keys = {}, set()
-    published = set(routed_by_plugin)
-    try:
-        on_disk_plugins = list(spool.published_plugins())
-    except Exception:  # noqa: BLE001 — a read failure degrades to leaving the
-        on_disk_plugins = []           # markers in place, never a reconcile crash
-    for plugin in on_disk_plugins:
-        if plugin not in published:
-            _retire_marker(spool, "delete_ready", plugin)
-    try:
-        on_disk_keys = list(spool.index_keys())
-    except Exception:  # noqa: BLE001
-        on_disk_keys = []
-    for key in on_disk_keys:
-        if key not in keys:
-            _retire_marker(spool, "delete_index_key", key)
-
-    # Still-routed but payload-changed: retire the stale pair before the swap
-    # so the post-swap rewrite is the sole writer (fail-closed on rewrite
-    # failure). Both files carry the same payload, so both retire together —
-    # keeping ready.json (keyed by plugin) and the .index entry (keyed by
-    # artifact realpath) consistent, exactly as the write path pairs them.
-    for plugin, routed in routed_by_plugin.items():
-        if _marker_is_stale(spool, desired.base_url, routed):
-            _retire_marker(spool, "delete_ready", plugin)
-            _retire_marker(spool, "delete_index_entry", routed.path)
-
-
-def _read_marker(spool: Any, op: str, arg: str) -> "dict | None":
-    """Read one on-disk marker payload, total: any failure ⇒ ``None``
-    (treated as ABSENT — the write path restores it, and an absent marker is
-    never falsely positive)."""
-    try:
-        return getattr(spool, op)(arg)
-    except Exception:  # noqa: BLE001
-        return None
-
-
-def _marker_is_stale(spool: Any, base_url: "str | None",
-                     routed: RoutedCallbacks) -> bool:
-    """True when a PRESENT on-disk marker for this still-routed plugin differs
-    from the desired payload — the retire-before-swap trigger. An ABSENT marker
-    is not stale (the post-swap write creates it); only an existing, differing
-    one must retire so a failed rewrite leaves it absent rather than stale."""
-    ready, index = _desired_marker_payloads(base_url, routed)
-    on_ready = _read_marker(spool, "read_ready", routed.plugin)
-    on_index = _read_marker(spool, "read_index_entry", routed.path)
-    return ((on_ready is not None and on_ready != ready)
-            or (on_index is not None and on_index != index))
-
-
 def _desired_marker_payloads(base_url: "str | None",
                              routed: RoutedCallbacks) -> "tuple[dict, dict]":
     """The ready.json and .index payloads the post-swap write would publish —
-    the single source both the stale-check and the skip-if-unchanged write use,
-    so the two can never drift."""
+    the single source both the pair-state compare and the write use, so the two
+    can never drift."""
     ready = _ready_payload(base_url, routed)
     return ready, dict(ready, plugin_dir=routed.plugin)
 
 
+def _read_marker(spool: Any, op: str, arg: str) -> Any:
+    """Read one on-disk marker, total: any failure ⇒ an INVALID marker (never
+    ABSENT, so an unreadable marker is republished, and never a reconcile
+    crash)."""
+    import callback_spool
+    try:
+        return getattr(spool, op)(arg)
+    except Exception:  # noqa: BLE001
+        logger.warning("callback marker read %s failed", op, exc_info=True)
+        return callback_spool.Marker(callback_spool.MarkerState.INVALID)
+
+
+def _pair_state(spool: Any, base_url: "str | None",
+                routed: RoutedCallbacks) -> "tuple[bool, bool]":
+    """Classify a routed plugin's on-disk (ready, index) pair against the
+    desired payloads. Returns ``(needs_republish, has_on_disk)``:
+
+    * ``needs_republish`` — the pair is NOT both-PRESENT-and-equal-to-desired
+      (absent, invalid, stale, or half-published). Only a pair that already
+      equals the desired one is a no-op (no churn).
+    * ``has_on_disk`` — either marker is present-or-invalid, i.e. there is
+      something to retire BEFORE the swap; a fully-ABSENT pair is a fresh
+      publish with nothing to delete first.
+
+    A pathless routed plugin (an overlay anomaly) has no index entry — its key
+    would be ``sha256(realpath(""))`` = the process CWD — so the index side is
+    skipped entirely rather than read or written from an empty path."""
+    import callback_spool
+    present = callback_spool.MarkerState.PRESENT
+    absent = callback_spool.MarkerState.ABSENT
+    ready, index = _desired_marker_payloads(base_url, routed)
+
+    on_ready = _read_marker(spool, "read_marker", routed.plugin)
+    ready_ok = on_ready.state == present and on_ready.payload == ready
+    ready_on_disk = on_ready.state != absent
+
+    if routed.path:
+        on_index = _read_marker(spool, "read_index_marker", routed.path)
+        index_ok = on_index.state == present and on_index.payload == index
+        index_on_disk = on_index.state != absent
+    else:
+        index_ok, index_on_disk = True, False   # no index for a pathless plugin
+
+    return (not (ready_ok and index_ok)), (ready_on_disk or index_on_disk)
+
+
 def _retire_marker(spool: Any, op: str, arg: str) -> None:
-    """Best-effort retirement of one orphaned marker/index entry. A failure is
-    logged, not surfaced as a per-plugin health issue: the entry is orphaned
-    (its plugin is not in the desired routed set), so there is no routed plugin
-    to attribute a ``callback_spool_error`` to, and the overlay — the sole
-    routing authority — already 404s the deposit regardless."""
+    """Best-effort retirement (idempotent delete) of one marker/index entry. A
+    failure is logged, not surfaced as a health issue: on the orphan path there
+    is no routed plugin to attribute a ``callback_spool_error`` to, and on the
+    fail-closed post-swap path the issue is already recorded by ``_guard``; the
+    overlay — the sole routing authority — 404s the deposit regardless."""
+    if spool is None:
+        return
     try:
         getattr(spool, op)(arg)
     except Exception:  # noqa: BLE001
-        logger.warning("callback orphan-marker retire %s failed", op,
-                       exc_info=True)
+        logger.warning("callback marker retire %s failed", op, exc_info=True)
 
 
-def _pre_swap_files(spool: Any, desired: DesiredCallbacks,
-                    previous: dict[str, dict]) -> None:
-    """Delete the markers/index entries of everything that is about to stop
-    being published — BEFORE the swap that unroutes it, so a crash mid-unroute
-    can only leave the route closed with the marker already gone, never the
-    reverse. Covers four cases with one rule: unrouted plugins, plugins that
-    stay routed but can no longer be published (no base URL), routed plugins
-    whose ARTIFACT PATH changed (the index key is the artifact path, so the
-    old key must retire in the same pass), and routed plugins
-    that DROP any previously published callback: "never falsely positive" holds
-    per FILE, not per overlay entry, so a marker still advertising a dropped
-    callback is exactly the stale-marker case, both during the swap window and
-    persistently if the post-swap rewrite then fails. Both published files
-    carry the same ``callbacks`` map, so both retire together on that
-    condition: a failed rewrite then leaves them ABSENT (the consumer
-    reads "facility unavailable") rather than stale."""
-    published = {r.plugin: r for r in desired.routed} if desired.base_url \
-        else {}
-    stale_pairs: set[tuple[str, str]] = set()
-    previous_effectives: dict[str, set[str]] = {}
-    for effective, entry in previous.items():
-        plugin = entry.get("plugin") or ""
-        if not plugin:
-            continue
-        stale_pairs.add((plugin, entry.get("path") or ""))
-        previous_effectives.setdefault(plugin, set()).add(effective)
-    for plugin, path in sorted(stale_pairs):
-        keep = published.get(plugin)
-        dropped = keep is not None and _dropped_any(
-            previous_effectives.get(plugin, set()), keep)
-        retire_index = path and (keep is None or keep.path != path or dropped)
-        if keep is None or dropped:
-            _guard(spool, desired, plugin,
-                   keep.artifact_id if keep is not None else None,
-                   "delete_ready", plugin)
-        if retire_index:
-            # An EMPTY path is never handed to the spool: the index key is
-            # sha256(realpath(path)), and realpath("") is the process CWD —
-            # a malformed overlay entry must not make us delete a key derived
-            # from wherever casa happens to be running.
-            _guard(spool, desired, plugin,
-                   keep.artifact_id if keep is not None else None,
-                   "delete_index_entry", path)
+def _reconcile_markers_pre_swap(
+    spool: Any, desired: DesiredCallbacks,
+) -> list[RoutedCallbacks]:
+    """Pre-swap half of the paired marker transaction, driven by the DURABLE
+    on-disk inventory (not the in-memory previous overlay, which is empty
+    across a restart). Returns the routed plugins whose pair must be written
+    after the swap.
+
+    One rule, every subcase:
+
+    * **Orphans** — a published ``ready.json`` / index key the desired routed
+      set no longer covers (plugin removed, unacked, base-URL-invalid, or an
+      artifact path that changed) — retired here. Gated on ``desired.prunable``:
+      the SAME availability double-gate the stale-ack prune uses, so a wholesale
+      bad compute (invalid registry / resolution hiccup) can never nuke a valid
+      plugin's markers.
+    * **Routed but not already exactly desired** — absent, invalid, stale, or
+      half-published (one file present, one gone): BOTH files are retired here
+      so the post-swap rewrite is the sole writer and a failed rewrite leaves
+      them ABSENT (fail-closed) rather than stale/partial. A fully-absent pair
+      is a fresh publish with nothing to delete first (no churn). NOT gated on
+      ``prunable`` — refreshing a plugin that IS in the trustworthy routed set
+      is availability-positive.
+    * **Unchanged** — a pair already equal to the desired one is left exactly as
+      it is (no retire, no rewrite).
+
+    Runs BEFORE the overlay swap so a crash mid-change leaves the route closed
+    with the marker already gone, never the reverse. With no spool wired there
+    is nothing on disk to reconcile — the routed set is returned so each plugin
+    still gets its one health issue from the (failing) post-swap writes."""
+    if spool is None:
+        return list(desired.routed) if desired.base_url else []
+    import callback_spool
+
+    if desired.base_url:
+        routed_by_plugin = {r.plugin: r for r in desired.routed}
+        desired_keys = {callback_spool.index_key(r.path)
+                        for r in desired.routed if r.path}
+    else:
+        routed_by_plugin, desired_keys = {}, set()
+
+    if desired.prunable:
+        try:
+            on_disk_plugins = list(spool.published_plugins())
+        except Exception:  # noqa: BLE001 — a read failure leaves markers in
+            on_disk_plugins = []           # place, never a reconcile crash
+        for plugin in on_disk_plugins:
+            if plugin not in routed_by_plugin:
+                _retire_marker(spool, "delete_ready", plugin)
+        try:
+            on_disk_keys = list(spool.index_keys())
+        except Exception:  # noqa: BLE001
+            on_disk_keys = []
+        for key in on_disk_keys:
+            if key not in desired_keys:
+                _retire_marker(spool, "delete_index_key", key)
+
+    republish: list[RoutedCallbacks] = []
+    for routed in routed_by_plugin.values():
+        needs, has_on_disk = _pair_state(spool, desired.base_url, routed)
+        if not needs:
+            continue                     # unchanged — no churn
+        if has_on_disk:
+            _retire_marker(spool, "delete_ready", routed.plugin)
+            if routed.path:
+                _retire_marker(spool, "delete_index_entry", routed.path)
+        republish.append(routed)
+    return republish
 
 
-def _dropped_any(previous: set[str], keep: RoutedCallbacks) -> bool:
-    """True when the desired set DROPS anything the last published files
-    advertised — whatever it adds in the same pass.
-
-    A strict-subset test missed the mixed transition: rename one callback and
-    add another, and the marker kept naming the dropped one. Additions are
-    irrelevant to the property being protected — a file naming a callback the
-    overlay no longer routes is falsely positive regardless of what else it
-    names. A pure GROWTH (nothing dropped) only ever under-advertises, which is
-    fail-closed, so it must not churn the files at all.
-    """
-    now = {cb["effective"] for cb in keep.callbacks}
-    return bool(previous - now)
-
-
-def _post_swap_files(spool: Any, desired: DesiredCallbacks) -> None:
-    """Publish the readiness marker + discovery index entry for every routed
-    plugin — only AFTER the overlay swap, so the marker can never advertise a
-    route that is not live.
-
-    A plugin whose on-disk payload ALREADY matches the desired one is skipped:
-    the marker is advisory and only reflects the base URL + callbacks map, so
-    rewriting an identical payload every reconcile is pure churn (a temp +
-    rename + fsync per pass). Anything that changed was retired before the swap
-    (:func:`_retire_orphaned_markers` / :func:`_pre_swap_files`), so a stale
-    marker is never left behind by this skip."""
+def _publish_markers_post_swap(
+    spool: Any, desired: DesiredCallbacks, republish: list[RoutedCallbacks],
+) -> None:
+    """Post-swap half: write BOTH files for each routed plugin that needs it,
+    AFTER the overlay swap so a marker can never advertise a route that is not
+    live. If EITHER write fails, DELETE BOTH (fail-closed to absent) and record
+    one ``callback_spool_error`` — a partial pair (one present, one absent or
+    stale) must NEVER survive a pass. A pathless plugin publishes ready only
+    (its index key cannot be derived from an empty path)."""
     if desired.base_url is None:
         return
-    for routed in desired.routed:
+    for routed in republish:
         ready, index = _desired_marker_payloads(desired.base_url, routed)
-        if not _marker_needs_write(spool, routed, ready, index):
-            continue
-        if not _guard(spool, desired, routed.plugin, routed.artifact_id,
-                      "ensure_plugin_dirs", routed.plugin):
-            continue
-        if not _guard(spool, desired, routed.plugin, routed.artifact_id,
-                      "write_ready", routed.plugin, ready):
-            continue
-        _guard(spool, desired, routed.plugin, routed.artifact_id,
-               "write_index_entry", routed.path, index)
-
-
-def _marker_needs_write(spool: Any, routed: RoutedCallbacks,
-                        ready: dict, index: dict) -> bool:
-    """True unless BOTH on-disk files already equal the desired payloads. An
-    absent or unreadable marker reads back as ``None`` ⇒ needs writing; a
-    matching pair is left untouched (no churn)."""
-    on_ready = _read_marker(spool, "read_ready", routed.plugin)
-    on_index = _read_marker(spool, "read_index_entry", routed.path)
-    return on_ready != ready or on_index != index
+        ok = _guard(spool, desired, routed.plugin, routed.artifact_id,
+                    "ensure_plugin_dirs", routed.plugin)
+        if ok:
+            ok = _guard(spool, desired, routed.plugin, routed.artifact_id,
+                        "write_ready", routed.plugin, ready)
+        if ok and routed.path:
+            ok = _guard(spool, desired, routed.plugin, routed.artifact_id,
+                        "write_index_entry", routed.path, index)
+        if not ok:
+            # Fail closed to ABSENT — never a half-published pair. The health
+            # issue was already recorded by the failing _guard.
+            _retire_marker(spool, "delete_ready", routed.plugin)
+            if routed.path:
+                _retire_marker(spool, "delete_index_entry", routed.path)
 
 
 def _guard(spool: Any, desired: DesiredCallbacks, plugin: str,
@@ -610,11 +572,17 @@ async def reconcile_plugin_callbacks(
             trigger_registry.replace_callback_overlay({})
             raise
 
-        previous = trigger_registry.callback_overlay_snapshot()
-        await asyncio.to_thread(_retire_orphaned_markers, spool, desired)
-        await asyncio.to_thread(_pre_swap_files, spool, desired, previous)
+        # One paired marker transaction driven by DURABLE on-disk truth: the
+        # pre-swap half retires orphans + stale/partial pairs (delete-before-
+        # swap), the post-swap half writes the routed set's pairs and fails
+        # closed to ABSENT on any write error. The in-memory previous overlay
+        # is not consulted — it is empty across a restart and would miss a
+        # stale marker (the r2/r3 finding this replaces).
+        republish = await asyncio.to_thread(
+            _reconcile_markers_pre_swap, spool, desired)
         trigger_registry.replace_callback_overlay(desired.overlay)
-        await asyncio.to_thread(_post_swap_files, spool, desired)
+        await asyncio.to_thread(
+            _publish_markers_post_swap, spool, desired, republish)
 
         if desired.prunable:
             try:
