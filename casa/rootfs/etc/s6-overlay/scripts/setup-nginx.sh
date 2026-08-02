@@ -18,10 +18,26 @@ http {
         ''      close;
     }
 
+    # INV-CB-006 (Task 9): the third surface — a callback query string (the
+    # provider's ?code=...&state=...) must never reach nginx's access log,
+    # matching the redaction/suppression already applied at the aiohttp
+    # layer (Task 6). \$uri excludes the query string by definition (unlike
+    # \$request or \$request_uri), so classifying purely on it is sufficient.
+    map \$uri \$casa_cb_log {
+        ~^/callback/ 0;
+        default     1;
+    }
+
     # --- Ingress server (HA-authenticated) ---
     server {
         listen ${INGRESS_PORT} default_server;
         server_name _;
+
+        # No access_log directive here previously meant the compiled-in
+        # nginx default (on) applied — this makes the callback suppression
+        # explicit rather than relying on \$casa_cb_log alone ever being
+        # consulted. combined is nginx's stock format.
+        access_log /dev/stdout combined if=\$casa_cb_log;
 
         # HA ingress hardening (developers.home-assistant.io): only the
         # Supervisor ingress proxy may reach this port. Deny every other
@@ -88,6 +104,11 @@ cat >> /etc/nginx/nginx.conf <<'NGINX'
     server {
         listen 18065;
         server_name _;
+
+        # See the ingress server's identical directive above (INV-CB-006,
+        # Task 9) — this is the surface that actually matters here, since
+        # this server is the one the callback provider's redirect reaches.
+        access_log /dev/stdout combined if=$casa_cb_log;
 
         # 5.7: the public hostname is not a front door for the dashboard.
         # Exact-match on / only; deeper paths fall through to the catch-all

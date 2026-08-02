@@ -65,3 +65,52 @@ def test_external_api_server_blocks_internal_mcp_and_hooks():
     # And they return 404, not proxy.
     mcp_block = external[external.index("location /mcp/ {"):]
     assert mcp_block[:mcp_block.index("}")].strip().endswith("return 404;")
+
+
+# ---------------------------------------------------------------------------
+# INV-CB-006 (Task 9): a callback query string (?code=...&state=...) must
+# never reach nginx's access log — the third surface, alongside the aiohttp
+# request-line redaction (Task 6) and log-path suppression (Task 6).
+# ---------------------------------------------------------------------------
+
+
+def test_http_block_declares_callback_log_suppression_map():
+    """The map is declared once, in the http {} context, before either
+    server block — nginx requires map at http scope to be usable inside a
+    server's access_log directive.
+
+    The ingress server sits in the unquoted (variable-expanding) heredoc, so
+    the SOURCE text escapes nginx's ``$`` as ``\\$`` — this asserts the
+    source form, not the rendered nginx.conf."""
+    text = _SCRIPT.read_text()
+    http_idx = text.index("http {")
+    map_idx = text.index(r"map \$uri \$casa_cb_log {")
+    ingress_idx = text.index("# --- Ingress server")
+    assert http_idx < map_idx < ingress_idx
+    map_block = text[map_idx:text.index("}", map_idx) + 1]
+    assert "~^/callback/ 0;" in map_block
+    assert "default     1;" in map_block or "default 1;" in map_block
+
+
+def test_ingress_server_suppresses_callback_query_from_access_log():
+    """Ingress server block: still inside the unquoted heredoc — ``\\$``."""
+    text = _SCRIPT.read_text()
+    ingress = _ingress_block(text)
+    directive = r"access_log /dev/stdout combined if=\$casa_cb_log;"
+    assert directive in ingress
+    # Must precede the proxy location so it governs every route in this
+    # server, including /terminal/.
+    assert ingress.index(directive) < ingress.index("location / {")
+
+
+def test_external_api_server_suppresses_callback_query_from_access_log():
+    """The 18065 server is the one an OAuth provider's redirect actually
+    reaches — this is the surface INV-CB-006 exists to protect. This block
+    is emitted from the QUOTED heredoc (``<<'NGINX'``), so the source form
+    has no backslash before ``$``."""
+    text = _SCRIPT.read_text()
+    ext_start = text.index("# --- External API server")
+    external = text[ext_start:]
+    directive = "access_log /dev/stdout combined if=$casa_cb_log;"
+    assert directive in external
+    assert external.index(directive) < external.index("location = / {")

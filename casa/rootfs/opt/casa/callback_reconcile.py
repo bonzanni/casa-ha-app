@@ -43,7 +43,6 @@ from __future__ import annotations
 
 import asyncio
 import logging
-import os
 from dataclasses import dataclass, field
 from typing import Any, Callable
 
@@ -113,25 +112,26 @@ def _default_spool() -> Any:
 def _base_url() -> str | None:
     """The public base URL the redirect URIs are built from.
 
-    Task 9 replaces this seam with ``callback_urls.validated_base`` (full
-    origin validation: absolute https, no userinfo/path/query/fragment, host
-    not an IP literal). Until then it applies the same bashio ``"null"``/
-    ``"None"`` guard casa_core uses for ``PUBLIC_URL``. ``None`` means the
-    facility is unavailable: consent still works, but no readiness marker or
-    index entry is written, and every routed plugin reports
-    ``callback_base_url_invalid``.
+    Task 9: delegates to ``callback_urls.validated_base`` (full origin
+    validation: absolute https, no userinfo/path/query/fragment, host not an
+    IP literal) rather than only the bashio ``"null"``/``"None"`` guard
+    casa_core uses for ``PUBLIC_URL``. ``None`` means the facility is
+    unavailable: consent still works, but no readiness marker or index entry
+    is written, and every routed plugin reports
+    ``callback_base_url_invalid``. Kept as a module-function seam (not an
+    inlined call) so tests can keep monkeypatching ``cr._base_url`` directly.
     """
-    raw = os.environ.get("PUBLIC_URL", "").strip().rstrip("/")
-    if raw in ("null", "None", ""):
-        return None
-    return raw
+    import callback_urls
+
+    return callback_urls.validated_base()
 
 
 def _redirect_uri(base: str, effective: str) -> str:
-    """The redirect URI a consumer registers with its provider. Task 9 swaps
-    this for the urllib-based join in ``callback_urls``; the shape is pinned
-    by the ready.json payload tests either way."""
-    return f"{base}/callback/{effective}"
+    """The redirect URI a consumer registers with its provider — the
+    urllib-based join in ``callback_urls`` (Task 9), never string concat."""
+    import callback_urls
+
+    return callback_urls.redirect_uri(base, effective)
 
 
 @dataclass
