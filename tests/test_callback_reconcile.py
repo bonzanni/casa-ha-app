@@ -431,6 +431,84 @@ async def test_artifact_change_retires_the_old_index_key_only(tmp_path):
     assert calls[4][1] == p2.path
 
 
+async def test_dropping_one_callback_retires_the_marker_before_the_swap(
+    tmp_path,
+):
+    """Review M2: 'never falsely positive' holds per FILE. A plugin that drops
+    one of its callbacks would otherwise keep a ready.json advertising the
+    dropped one across the swap window (and forever, if the rewrite fails)."""
+    calls: list = []
+    registry = _SpyRegistry(calls)
+    acks = CallbackAckStore(path=tmp_path / "acks.json")
+    _ack(acks, declared="authorize")
+    _ack(acks, declared="renew")
+    p2 = _plugin(callbacks=("authorize", "renew"))
+    await _reconcile(registry, plugins=[p2], acks=acks, spool=_SpoolStub(calls))
+    calls.clear()
+    p1 = _plugin(callbacks=("authorize",))
+    await _reconcile(registry, plugins=[p1], acks=acks, spool=_SpoolStub(calls))
+    assert [c[0] for c in calls] == ["del_ready", "swap", "ensure", "ready",
+                                     "index"]
+    assert set(calls[3][2]["callbacks"]) == {"authorize"}
+    assert registry.get_callback("plg-gmail--renew") is None
+
+
+async def test_a_failed_rewrite_of_a_shrunk_set_leaves_no_marker(tmp_path):
+    """The same fix's real point: when the post-swap rewrite fails, the
+    operator is left with NO marker (fail-closed, the consumer sees the
+    facility as unavailable) rather than one still advertising a callback the
+    endpoint now 404s."""
+    root = tmp_path / "spool"
+    spool = callback_spool.CallbackSpool(root)
+    try:
+        registry = _SpyRegistry()
+        acks = CallbackAckStore(path=tmp_path / "acks.json")
+        _ack(acks, declared="authorize")
+        _ack(acks, declared="renew")
+        p2 = _plugin(callbacks=("authorize", "renew"))
+        await _reconcile(registry, plugins=[p2], acks=acks, spool=spool)
+        ready = root / "gmail" / "ready.json"
+        import json
+        assert set(json.loads(ready.read_text())["callbacks"]) == {
+            "authorize", "renew"}
+
+        class _WriteFails:
+            def __init__(self, inner):
+                self._inner = inner
+
+            def __getattr__(self, name):
+                return getattr(self._inner, name)
+
+            def write_ready(self, plugin, payload):
+                raise OSError("disk full")
+
+        p1 = _plugin(callbacks=("authorize",))
+        issues = await _reconcile(registry, plugins=[p1], acks=acks,
+                                  spool=_WriteFails(spool))
+        assert [i.reason_code for i in issues] == ["callback_spool_error"]
+        assert not ready.exists()
+        assert registry.get_callback("plg-gmail--renew") is None
+    finally:
+        spool.close()
+
+
+async def test_growing_the_set_keeps_the_marker_through_the_swap(tmp_path):
+    """The opposite direction is fail-closed (the marker under-advertises), so
+    it must NOT churn the file — no delete, just the post-swap rewrite."""
+    calls: list = []
+    registry = _SpyRegistry(calls)
+    acks = CallbackAckStore(path=tmp_path / "acks.json")
+    _ack(acks, declared="authorize")
+    await _reconcile(registry, plugins=[_plugin(callbacks=("authorize",))],
+                     acks=acks, spool=_SpoolStub(calls))
+    calls.clear()
+    _ack(acks, declared="renew")
+    await _reconcile(registry,
+                     plugins=[_plugin(callbacks=("authorize", "renew"))],
+                     acks=acks, spool=_SpoolStub(calls))
+    assert [c[0] for c in calls] == ["swap", "ensure", "ready", "index"]
+
+
 async def test_index_key_is_the_resolved_artifact_path(tmp_path):
     """A real spool: the entry lands under sha256(realpath(artifact root)) —
     the one value a consumer provably knows."""
@@ -689,6 +767,45 @@ async def test_prune_is_skipped_when_resolution_reported_issues(tmp_path):
                      resolver=_resolver([], issues=[hiccup]),
                      entries=lambda: [])
     assert acks.get(_identity()) is not None
+
+
+async def test_prune_is_skipped_when_a_declaration_is_unparseable(tmp_path):
+    """Review M1: an invalid declaration contributes NO identities, so pruning
+    that pass would destroy the operator's consent for the plugin's OTHER,
+    perfectly valid callback — all-or-nothing rejects a set, it must never
+    delete the acks behind it."""
+    registry = _SpyRegistry()
+    acks = CallbackAckStore(path=tmp_path / "acks.json")
+    _ack(acks)                                   # gmail/authorize, consented
+    p = _plugin(callbacks=("authorize", "plg-sneaky"))
+    issues = await _reconcile(registry, plugins=[p], acks=acks,
+                              spool=_SpoolStub([]))
+    assert [i.reason_code for i in issues] == ["callback_invalid"]
+    assert acks.get(_identity()) is not None
+    # and the consent is still there once the author fixes the declaration
+    fixed = _plugin(callbacks=("authorize",))
+    issues = await _reconcile(registry, plugins=[fixed], acks=acks,
+                              spool=_SpoolStub([]), entries=_entries(fixed))
+    assert issues == []
+    assert registry.get_callback("plg-gmail--authorize") is not None
+
+
+async def test_one_invalid_plugin_suppresses_the_whole_prune(tmp_path):
+    """The prune is global and opportunistic: another plugin's unreadable
+    declaration is enough reason to wait for a pass that can read everything."""
+    registry = _SpyRegistry()
+    acks = CallbackAckStore(path=tmp_path / "acks.json")
+    _ack(acks, plugin="ghost", declared="old")   # genuinely stale
+    good = _plugin()
+    _ack(acks)
+    bad = _plugin(name="badone", artifact_id="art-9", callbacks=("plg-nope",))
+    await _reconcile(registry, plugins=[good, bad], acks=acks,
+                     spool=_SpoolStub([]), entries=_entries(good, bad))
+    assert acks.get(_identity("ghost", "old")) is not None
+    # the next clean pass prunes it
+    await _reconcile(registry, plugins=[good], acks=acks,
+                     spool=_SpoolStub([]), entries=_entries(good))
+    assert acks.get(_identity("ghost", "old")) is None
 
 
 async def test_prune_failure_never_breaks_the_reconcile(monkeypatch, tmp_path):

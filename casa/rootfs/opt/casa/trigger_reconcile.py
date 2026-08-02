@@ -278,16 +278,26 @@ async def reconcile_plugin_triggers(
     # so there is one source of truth for the secrets location.
     secrets_dir = SECRETS_DIR if secrets_dir is None else secrets_dir
 
-    def _compute_and_mint() -> DesiredTriggers:
+    def _compute_and_mint() -> "tuple[DesiredTriggers, list[dict]]":
         desired = compute_desired(
             role_configs=role_configs, acks=acks, resolver=resolver,
             global_secret_ok=global_secret_ok)
         _mint_secrets(desired, Path(secrets_dir))
-        return desired
+        # Release C (review M3): the CALLBACK half of the union membership is
+        # derived here, in the SAME worker thread — it reads plugin.json for
+        # every resolved plugin, which must never run on the event loop under
+        # the reconcile lock. It is still computed strictly before any keyboard
+        # posts (prompting happens below, after this returns).
+        union: list[dict] = []
+        if prompt and desired.pending:
+            union = _callback_pending_for_union(
+                role_configs=role_configs, resolver=resolver)
+        return desired, union
 
     async with _RECONCILE_LOCK:
         try:
-            desired = await asyncio.to_thread(_compute_and_mint)
+            desired, callback_pending = await asyncio.to_thread(
+                _compute_and_mint)
         except Exception:
             # Terra shipB-r1 P1-2: a compute failure must not RETAIN the old
             # overlay (a just-unassigned/revoked plugin's routes would stay
@@ -322,7 +332,8 @@ async def reconcile_plugin_triggers(
                 desired.pending, trigger_registry=trigger_registry,
                 role_configs=role_configs, channel_manager=channel_manager,
                 acks=acks, secrets_dir=secrets_dir, resolver=resolver,
-                global_secret_ok=global_secret_ok)
+                global_secret_ok=global_secret_ok,
+                callback_pending=callback_pending)
     if regen_health:
         # After the lock: the overlay + persisted ack are already live, so the
         # fresh health pass sees the routed (no-longer-pending) state.
@@ -333,7 +344,7 @@ async def reconcile_plugin_triggers(
 def _fire_consent_prompts(
     pending: list[dict], *, trigger_registry: Any, role_configs: dict,
     channel_manager: Any, acks: Any, secrets_dir: Path,
-    resolver: Any, global_secret_ok: Any,
+    resolver: Any, global_secret_ok: Any, callback_pending: list[dict],
 ) -> None:
     import authz_grants
     import trigger_consent
@@ -366,9 +377,9 @@ def _fire_consent_prompts(
     # the same round — otherwise an Approve landing between the trigger and
     # callback reconciles would settle a round the callback consent has not
     # joined yet, running the plugin's setup tool while a consent is open.
+    # ``callback_pending`` was derived off-loop with this pass's desired set
+    # (review M3), so nothing blocking runs between here and the keyboards.
     _ack_identity = ack_identity  # module-level import (plugin_triggers)
-    callback_pending = _callback_pending_for_union(
-        role_configs=role_configs, resolver=resolver)
     nonce_by_identity = seal_setup_rounds(trigger_pending=pending,
                                           callback_pending=callback_pending)
 

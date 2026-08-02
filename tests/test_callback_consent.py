@@ -433,6 +433,76 @@ async def test_callback_approval_is_recorded_in_the_round(monkeypatch,
     assert member["gen"] == acks.get(IDENTITY)["gen"]
 
 
+async def test_union_membership_is_computed_off_the_event_loop(
+    monkeypatch, tmp_path,
+):
+    """Review M3: the union compute reads plugin.json for every resolved
+    plugin. Both reconcilers to_thread their main compute for exactly that
+    reason — the union half must ride in the SAME worker thread, never on the
+    loop under the reconcile lock."""
+    import threading
+
+    import authz_grants
+    import verdict_broker
+    monkeypatch.setattr(verdict_broker, "BROKER", verdict_broker.VerdictBroker())
+    monkeypatch.setattr(authz_grants, "CHALLENGES", ChallengeCoordinator())
+    _wire_episodes(monkeypatch, tmp_path, [])
+
+    p = _both_kinds_plugin()
+    cm = _FakeChannelManager(_FakeChannel())
+    registry = TriggerRegistry(scheduler=None, app=None, bus=None)
+    role_configs = {"assistant": SimpleNamespace(channels=["webhook"])}
+
+    def _resolver(target):
+        return SimpleNamespace(registry_valid=True, plugins=[p], issues=[])
+
+    def _entries():
+        return [{"name": "gmail", "artifact_id": "art-1",
+                 "targets": ["resident:assistant"]}]
+
+    seen: dict[str, str] = {}
+
+    def _spy_callback_union(**kw):
+        seen["trigger_side"] = threading.current_thread().name
+        return []
+
+    def _spy_trigger_union(**kw):
+        seen["callback_side"] = threading.current_thread().name
+        return []
+
+    monkeypatch.setattr(cr, "callback_pending_for_union", _spy_callback_union)
+    monkeypatch.setattr(tr, "trigger_pending_for_union", _spy_trigger_union)
+    monkeypatch.setattr(cr, "_default_acks",
+                        lambda: CallbackAckStore(path=tmp_path / "cb.json"))
+    monkeypatch.setattr(cr, "_default_entries", lambda: _entries)
+    monkeypatch.setattr(cr, "_base_url", lambda: "https://casa.example.org")
+
+    class _Spool:
+        def ensure_plugin_dirs(self, plugin): pass
+        def write_ready(self, plugin, payload): pass
+        def delete_ready(self, plugin): pass
+        def write_index_entry(self, path, payload): pass
+        def delete_index_entry(self, path): pass
+
+    await tr.reconcile_plugin_triggers(
+        trigger_registry=registry, role_configs=role_configs,
+        channel_manager=cm,
+        acks=TriggerAckStore(path=tmp_path / "trig.json"),
+        secrets_dir=tmp_path / "webhook_secrets", prompt=True,
+        resolver=_resolver, global_secret_ok=lambda: True)
+    await cr.reconcile_plugin_callbacks(
+        trigger_registry=registry, role_configs=role_configs,
+        channel_manager=cm,
+        acks=CallbackAckStore(path=tmp_path / "cb.json"), spool=_Spool(),
+        resolver=_resolver, entries=_entries, prompt=True)
+    await _settle()
+
+    main = threading.main_thread().name
+    assert set(seen) == {"trigger_side", "callback_side"}
+    assert seen["trigger_side"] != main
+    assert seen["callback_side"] != main
+
+
 def test_seal_setup_rounds_unions_both_kinds(monkeypatch, tmp_path):
     import plugin_setup_episodes as pse
     monkeypatch.setattr(pse, "STORE_PATH", tmp_path / "episodes.json")

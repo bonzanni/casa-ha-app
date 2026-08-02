@@ -206,6 +206,13 @@ def compute_desired(
             out.issues.append(PluginIssue(
                 name=rp.name, target=None, stage="callbacks",
                 reason_code="callback_invalid", artifact_id=rp.artifact_id))
+            # Review M1: an unparseable declaration contributes NO identities,
+            # so pruning this pass would destroy the operator's consent for
+            # this plugin's still-valid callbacks (all-or-nothing rejects the
+            # set, it does not delete it). We cannot read the declaration, so
+            # we cannot know any ack is stale — suppress the whole prune until
+            # a pass that can.
+            out.prunable = False
             continue
         if not callbacks:
             continue
@@ -317,23 +324,32 @@ def _pre_swap_files(spool: Any, desired: DesiredCallbacks,
     """Delete the markers/index entries of everything that is about to stop
     being published — BEFORE the swap that unroutes it, so a crash mid-unroute
     can only leave the route closed with the marker already gone, never the
-    reverse. Covers three cases with one rule: unrouted plugins, plugins that
-    stay routed but can no longer be published (no base URL), and routed
-    plugins whose ARTIFACT PATH changed (the index key is the artifact path,
-    so the old key must retire in the same pass)."""
+    reverse. Covers four cases with one rule: unrouted plugins, plugins that
+    stay routed but can no longer be published (no base URL), routed plugins
+    whose ARTIFACT PATH changed (the index key is the artifact path, so the
+    old key must retire in the same pass), and — review M2 — routed plugins
+    whose set SHRANK: "never falsely positive" holds per FILE, not per overlay
+    entry, so a ready.json still advertising a dropped callback is exactly the
+    stale-marker case, both during the swap window and persistently if the
+    post-swap rewrite then fails."""
     published = {r.plugin: r for r in desired.routed} if desired.base_url \
         else {}
     stale_pairs: set[tuple[str, str]] = set()
-    for entry in previous.values():
+    previous_effectives: dict[str, set[str]] = {}
+    for effective, entry in previous.items():
         plugin = entry.get("plugin") or ""
         if not plugin:
             continue
         stale_pairs.add((plugin, entry.get("path") or ""))
+        previous_effectives.setdefault(plugin, set()).add(effective)
     for plugin, path in sorted(stale_pairs):
         keep = published.get(plugin)
         retire_index = path and (keep is None or keep.path != path)
         if keep is None:
             _guard(spool, desired, plugin, None, "delete_ready", plugin)
+        elif _shrank(previous_effectives.get(plugin, set()), keep):
+            _guard(spool, desired, plugin, keep.artifact_id,
+                   "delete_ready", plugin)
         if retire_index:
             # An EMPTY path is never handed to the spool: the index key is
             # sha256(realpath(path)), and realpath("") is the process CWD —
@@ -342,6 +358,16 @@ def _pre_swap_files(spool: Any, desired: DesiredCallbacks,
             _guard(spool, desired, plugin,
                    keep.artifact_id if keep is not None else None,
                    "delete_index_entry", path)
+
+
+def _shrank(previous: set[str], keep: RoutedCallbacks) -> bool:
+    """True when the plugin's desired effective set is a STRICT SUBSET of what
+    the last published marker advertised — the only direction that leaves a
+    falsely-positive file (a marker naming a callback the overlay no longer
+    routes). An unchanged or grown set is only ever under-advertised, which is
+    fail-closed, and re-publishing it post-swap is enough."""
+    now = {cb["effective"] for cb in keep.callbacks}
+    return bool(previous) and now < previous
 
 
 def _post_swap_files(spool: Any, desired: DesiredCallbacks) -> None:
@@ -410,11 +436,25 @@ async def reconcile_plugin_callbacks(
     acks = acks if acks is not None else _default_acks()
     spool = _default_spool() if spool is _UNSET else spool
 
+    def _compute() -> "tuple[DesiredCallbacks, list[dict]]":
+        # Review M3: the union-membership compute reads plugin.json for every
+        # resolved plugin, so it belongs in the SAME worker thread as the main
+        # compute — never on the event loop under the reconcile lock. It still
+        # runs strictly before any keyboard posts (the prompts fire below,
+        # after this returns).
+        computed = compute_desired(
+            role_configs=role_configs, acks=acks, resolver=resolver,
+            entries=entries)
+        union: list[dict] = []
+        if prompt and computed.pending:
+            import trigger_reconcile
+            union = trigger_reconcile.trigger_pending_for_union(
+                role_configs=role_configs, resolver=resolver)
+        return computed, union
+
     async with _RECONCILE_LOCK:
         try:
-            desired = await asyncio.to_thread(
-                compute_desired, role_configs=role_configs, acks=acks,
-                resolver=resolver, entries=entries)
+            desired, union_pending = await asyncio.to_thread(_compute)
         except Exception:
             # A compute failure must not RETAIN the old overlay (a
             # just-revoked plugin's callback would stay open behind a
@@ -455,7 +495,8 @@ async def reconcile_plugin_callbacks(
             _fire_consent_prompts(
                 desired.pending, trigger_registry=trigger_registry,
                 role_configs=role_configs, channel_manager=channel_manager,
-                acks=acks, spool=spool, resolver=resolver, entries=entries)
+                acks=acks, spool=spool, resolver=resolver, entries=entries,
+                union_pending=union_pending)
     if regen_health:
         await _regen_health_safe()
     return desired.issues
@@ -464,7 +505,7 @@ async def reconcile_plugin_callbacks(
 def _fire_consent_prompts(
     pending: list[dict], *, trigger_registry: Any, role_configs: dict,
     channel_manager: Any, acks: Any, spool: Any, resolver: Any,
-    entries: Any,
+    entries: Any, union_pending: list[dict],
 ) -> None:
     import authz_grants
     import callback_consent
@@ -495,11 +536,10 @@ def _fire_consent_prompts(
     # site, and whichever prompts first must open the complete membership —
     # otherwise a fast Approve on this keyboard could settle a round whose
     # other kind has not registered yet, running the plugin's setup tool while
-    # a consent is still open.
-    trigger_pending = trigger_reconcile.trigger_pending_for_union(
-        role_configs=role_configs, resolver=resolver)
+    # a consent is still open. ``union_pending`` (the trigger half) was
+    # computed off-loop with this pass's desired set (review M3).
     nonce_by_identity = trigger_reconcile.seal_setup_rounds(
-        trigger_pending=trigger_pending, callback_pending=pending)
+        trigger_pending=union_pending, callback_pending=pending)
 
     for p in pending:
         try:
