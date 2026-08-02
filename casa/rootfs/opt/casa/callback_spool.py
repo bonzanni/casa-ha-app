@@ -3212,6 +3212,20 @@ class CallbackSpool:
         return fd
 
     @staticmethod
+    def _listdir_strict(fd: int) -> "list[str] | None":
+        """Every entry name under an ALREADY-OPEN directory FD, or ``None``
+        when the listing could not be PROVED — the tri-state counterpart of
+        :func:`_listdir_quiet`, which maps every failure to ``[]``.
+
+        Reading a faulting listing as "nothing here" is fail-OPEN for the
+        callers that cannot take their answer back: a purge, and the
+        quiescence scan that licenses one."""
+        try:
+            return os.listdir(fd)
+        except OSError:
+            return None
+
+    @staticmethod
     def _names_strict(sub: str, pfd: int) -> "list[str] | None":
         """Every entry name in ``<plugin>/<sub>``, or ``None`` when the
         listing could not be PROVED.
@@ -3230,9 +3244,7 @@ class CallbackSpool:
         except OSError:
             return None
         try:
-            return os.listdir(fd)
-        except OSError:
-            return None
+            return CallbackSpool._listdir_strict(fd)
         finally:
             os.close(fd)
 
@@ -3539,9 +3551,16 @@ class CallbackSpool:
         before :meth:`remove_plugin`. Those get the same durable removal
         record (reason ``orphan_gc``) BEFORE the purge, so the retention
         promise degrades to the §10 removal exception instead of being
-        silently violated; a record that will not go durable — or an
-        inventory that could not be PROVED — SKIPS that dir this pass (it
-        stays quiescent, so the next pass retries).
+        silently violated; a record that will not go durable SKIPS that dir
+        this pass (it stays quiescent, so the next pass retries).
+
+        Every scan behind that decision is PROVING, never peeking: neither
+        the quiescence walk (:meth:`_newest_mtime`) nor the attempt inventory
+        (:meth:`_unacked_attempts`) may read a directory it could not open or
+        list as "nothing here" — an unprovable dir SKIPS this pass too. Both
+        answers license the same irreversible purge, and a faulting disk is
+        exactly when a dir looks quiescent and empty while holding live
+        credentials and unread outcomes.
         """
         if registry_valid is not True:
             return []
@@ -3554,6 +3573,17 @@ class CallbackSpool:
                     continue
                 newest = self._newest_mtime(plugin)
                 if newest is None:
+                    continue                 # the dir is gone: nothing to GC
+                if newest is _SCAN_ERROR:
+                    # Quiescence could not be PROVED (a directory or an entry
+                    # under it would not be read). An unprovable tree must not
+                    # read as an old, empty one — that is the same fail-open
+                    # the inventory below refuses, one step earlier and with
+                    # the same irreversible consequence. The dir stays as it
+                    # is, so the next pass tries again.
+                    logger.warning("callback-spool: orphan GC of %r deferred "
+                                   "— its spool tree could not be scanned",
+                                   plugin)
                     continue
                 age = now - newest
                 # Both spec conditions, kept independent on purpose: today
@@ -3657,38 +3687,63 @@ class CallbackSpool:
                         plugin)
             return True
 
-    def _newest_mtime(self, plugin: str) -> float | None:
+    def _newest_mtime(self, plugin: str) -> "float | None | object":
         """Newest mtime anywhere in the plugin's spool tree, including the
         directories themselves (a directory's mtime moves whenever an entry is
-        added or removed, which is exactly the quiescence signal)."""
+        added or removed, which is exactly the quiescence signal).
+
+        Three-valued, for the same reason the inventory scans behind the same
+        purge are (``_plugin_fd_strict``, :meth:`_names_strict`): a float when
+        the whole tree was walked; ``None`` when the plugin dir is genuinely
+        ABSENT (nothing to GC); :data:`_SCAN_ERROR` when ANY part of the walk
+        — the dir open, a listing, an entry's metadata — could not be PROVED.
+        An unprovable tree must never present as "old and empty": that is the
+        quiescence half of the fail-open a faulting inventory is, and it
+        licenses the same irreversible purge."""
+        pfd = self._plugin_fd_strict(plugin)
+        if pfd is None or pfd is _SCAN_ERROR:
+            return pfd
         try:
-            pfd = self._plugin_fd(plugin)
-        except (OSError, ValueError):
-            return None
-        try:
-            return self._newest_in(pfd, depth=3)
+            newest = self._newest_in(pfd, depth=3)
         finally:
             os.close(pfd)
+        return _SCAN_ERROR if newest is None else newest
 
-    def _newest_in(self, fd: int, depth: int) -> float:
+    def _newest_in(self, fd: int, depth: int) -> "float | None":
+        """Newest mtime at or under an open directory FD, or ``None`` when any
+        step of the walk faulted — propagated up through the recursion, never
+        swallowed at the level that met it. Only a genuine ENOENT is benign
+        (an entry that vanished mid-scan is one this pass need not age); every
+        other failure leaves an entry whose age is UNKNOWN, and an unread
+        entry could be the newest one."""
         try:
             newest = os.fstat(fd).st_mtime
         except OSError:                                  # pragma: no cover
-            return 0.0
-        for name in _listdir_quiet(fd):
-            st = _lstat_quiet(name, fd)
+            return None
+        names = self._listdir_strict(fd)
+        if names is None:
+            return None
+        for name in names:
+            st = _marker_lstat(name, fd)
             if st is None:
-                continue
+                continue                     # vanished mid-scan (ENOENT)
+            if st is _LSTAT_ERROR:
+                return None                  # this entry's age is UNKNOWN
             newest = max(newest, st.st_mtime)
             if depth > 0 and stat.S_ISDIR(st.st_mode):
                 try:
                     sub = _open_dir(name, fd)
+                except FileNotFoundError:
+                    continue                 # vanished mid-scan
                 except OSError:
-                    continue
+                    return None
                 try:
-                    newest = max(newest, self._newest_in(sub, depth - 1))
+                    deeper = self._newest_in(sub, depth - 1)
                 finally:
                     os.close(sub)
+                if deeper is None:
+                    return None
+                newest = max(newest, deeper)
         return newest
 
 

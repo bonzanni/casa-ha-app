@@ -126,7 +126,7 @@ def _canonical_text(value) -> str:
 
 def _safe_meta(value):
     """A canonically-serializable copy of the OPAQUE consumer value *value*,
-    or ``None`` when there is none.
+    or ``None`` when there is none — or when *value* is not one.
 
     ``meta`` is the only field of an attempt that a consumer authors, and it
     is arbitrary JSON: a ~1 KiB body of 600 nested arrays parses well under
@@ -139,13 +139,32 @@ def _safe_meta(value):
     "malformed envelope degrades to meta null; refusal buys nothing"), never
     an exception escaping into a request handler or aborting a sweep pass.
 
-    Immutable scalars are returned as-is: nothing can alias or recurse."""
-    if value is None or isinstance(value, (str, bool, int, float)):
-        return value
+    **Every value takes that round trip, SCALARS INCLUDED.** A scalar is
+    immutable and can neither alias nor recurse, so short-circuiting it looks
+    free — but the round trip is not only a copy, it is the serializability
+    PROOF, and ``float('nan')`` (or ``±inf``) is precisely a scalar that
+    fails it. Handing one back unexamined lets a non-finite meta type-check
+    its way into a record whose every subsequent write the ``allow_nan=False``
+    canonical writer then refuses: a bus-ACCEPTED nudge whose budget update
+    never lands leaves the attempt due forever, and INV-CB-008's bounded
+    redelivery is broken through the one field a consumer authors."""
+    if value is None:
+        return None
     try:
         return json.loads(_canonical_text(value))
     except (RecursionError, ValueError, TypeError):
         return None
+
+
+def _writable_meta(value) -> bool:
+    """True iff the canonical writer can EMIT *value* — the predicate half of
+    :func:`_safe_meta`, for the one caller that must REFUSE such a value
+    rather than quietly drop it (:func:`validate_attempt`)."""
+    try:
+        _canonical_text(value)
+    except (RecursionError, ValueError, TypeError):
+        return False
+    return True
 
 
 def _copy_record(rec: dict) -> dict:
@@ -203,6 +222,16 @@ def new_attempt(*, state_hash: str, minted_ts: float | None,
     ``awaiting_redirect`` attempt has none (nudges exist only once a
     result or terminal outcome exists). ``minted_ts`` may be None when no
     source for the mint clock survives (collect-held materialization).
+
+    Both consumer-reachable inputs are proved here, so what this returns
+    always VALIDATES: ``meta`` through :func:`_safe_meta`, and ``minted_ts``
+    through :func:`_is_ts` — the mint clock is read off an artifact
+    (``st_mtime``, or a ``minted_ts`` transport key from a result record a
+    scribbler can reach), and a NaN or unbounded one would build a record the
+    canonical writer refuses to emit at all: the flow's write-ahead outcome
+    could then never go durable, so the artifact it authorizes would never be
+    deleted. An unusable clock degrades to None, exactly like an unusable
+    ``meta``.
     """
     if status not in STATUSES:
         raise ValueError(f"unknown status {status!r}")
@@ -210,7 +239,7 @@ def new_attempt(*, state_hash: str, minted_ts: float | None,
     return {
         "v": SCHEMA_VERSION,
         "state_hash": state_hash,
-        "minted_ts": minted_ts,
+        "minted_ts": minted_ts if _is_ts(minted_ts) else None,
         "status": status,
         "outcome": None,
         "claimed": bool(claimed),
@@ -254,7 +283,18 @@ def validate_attempt(obj, *, expect_hash: str | None = None) -> dict | None:
       exactly the open statuses and set for exactly ``done``. Otherwise
       ``{status: result_ready, outcome: collected}`` (an open record wearing
       a terminal outcome) and ``{status: done, outcome: null}`` (a terminal
-      record with no outcome to act on) would both read as truth.
+      record with no outcome to act on) would both read as truth;
+    * ``meta`` is a value the canonical writer can EMIT. Here alone the rule
+      is refusal rather than :func:`_safe_meta`'s degradation, and the two
+      are not in tension: a MINT degrades (the state is consumed, the flow
+      must complete), while a STORED record that cannot be re-emitted must
+      never be authoritative — every update of it (the write-ahead outcome,
+      the nudge bookkeeping) goes out through ``allow_nan=False`` and would
+      fail, leaving an accepted dispatch whose budget never advances, i.e. a
+      flow redelivered on every pass. INVALID sends it to the re-derivation
+      worklist instead, which rebuilds it from live artifacts — with the
+      consumer's real ``meta``, since the mint envelope's own parse already
+      rejects the non-finite constants (:func:`parse_envelope`).
     """
     try:
         if not isinstance(obj, dict) or set(obj) != _ATTEMPT_KEYS:
@@ -282,6 +322,8 @@ def validate_attempt(obj, *, expect_hash: str | None = None) -> dict | None:
         for key in ("minted_ts", "last_nudge_ts", "next_nudge_ts", "ended_ts"):
             if not _is_ts(obj[key]):
                 return None
+        if not _writable_meta(obj["meta"]):
+            return None
         return _copy_record(obj)
     except Exception:
         return None

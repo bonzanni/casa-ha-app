@@ -123,6 +123,59 @@ def test_meta_with_a_non_finite_float_degrades_to_null():
     assert ca.validate_attempt(rec) == rec
 
 
+def test_envelope_scalar_non_finite_meta_degrades_to_null():
+    """Red case (re-review 2): the SCALAR arm of the same rule, and the arm a
+    consumer can actually reach without the non-standard literals.
+
+    `1e400` is ordinary JSON — no `NaN` token, so the decoder's
+    `parse_constant` hook never fires — and it decodes to `inf`. `_safe_meta`
+    handed every scalar straight back, so that `inf` became the flow's
+    binding: a value casa can parse and can NEVER re-emit
+    (`allow_nan=False`), which every later writer of the record then raises
+    on. The proof is the round trip, so a scalar takes it too, and the
+    envelope still parses — spec §4: the binding degrades, the flow does
+    not refuse."""
+    for body in (b'{"v":2,"meta":1e400}', b'{"v":2,"meta":-1e400}',
+                 b'{"v":2,"meta":[1e400]}'):
+        assert ca.parse_envelope(body) == {"v": 2, "meta": None}, body
+    # The finite neighbour is preserved exactly.
+    assert ca.parse_envelope(b'{"v":2,"meta":1e30}') == {"v": 2, "meta": 1e30}
+
+
+def test_new_attempt_scalar_non_finite_meta_degrades_to_null():
+    """The in-process half of the same hole: `meta` also arrives from a
+    result record casa reads back off disk (`_derive_from_artifacts`), whose
+    marker reader accepts the `NaN` literal the canonical writer refuses. A
+    scalar non-finite value must never become a record's binding."""
+    for bad in (float("nan"), float("inf"), float("-inf")):
+        rec = ca.new_attempt(state_hash=H, minted_ts=T - 5.0,
+                             status="result_ready", meta=bad, now=T)
+        assert rec["meta"] is None, bad
+        assert ca.validate_attempt(rec) == rec, bad
+        # terminalize agrees: the record it copies is writable too.
+        done = ca.terminalize(dict(rec, meta=bad), "expired", now=T)
+        assert done["meta"] is None, bad
+        assert ca.validate_attempt(done) == done, bad
+
+
+def test_new_attempt_unusable_mint_clock_degrades_to_null():
+    """The same shape one field over: `minted_ts` is read off an artifact —
+    an `st_mtime`, or the `minted_ts` transport key of a result record a
+    scribbler can reach — and a type-only check admits `NaN` and `10**1000`
+    alike. Either would build a record the canonical writer cannot emit AT
+    ALL, so the flow's write-ahead outcome could never go durable and the
+    artifact it authorizes would never be deleted. What `new_attempt`
+    returns always validates."""
+    for bad in (float("nan"), float("inf"), 10 ** 1000, ca.TS_ABS_MAX * 2):
+        rec = ca.new_attempt(state_hash=H, minted_ts=bad,
+                             status="result_ready", now=T)
+        assert rec["minted_ts"] is None, bad
+        assert ca.validate_attempt(rec) == rec, bad
+    # An ordinary mint clock is untouched.
+    assert ca.new_attempt(state_hash=H, minted_ts=T - 5.0,
+                          status="result_ready", now=T)["minted_ts"] == T - 5.0
+
+
 def test_envelope_unknown_keys_dropped():
     out = ca.parse_envelope(b'{"v": 2, "meta": 1, "extra": "boo", "state": "s"}')
     assert out == {"v": 2, "meta": 1}
@@ -250,6 +303,28 @@ def test_validate_rejects_non_finite_and_unbounded_clocks():
     survivor = ca.validate_attempt(dict(done, ended_ts=T))
     assert survivor is not None
     assert ca.next_nudge_after_accept(survivor, now=T) == T + 7200.0
+
+
+def test_validate_rejects_a_stored_meta_the_writer_cannot_emit():
+    """Red case (re-review 2): a STORED record is authoritative — the worker
+    nudges from it and the write-ahead outcome is derived from it — and every
+    write of it goes out through the `allow_nan=False` canonical serializer.
+    A record carrying a value that serializer REFUSES is therefore a record
+    whose updates all fail: an accepted dispatch whose `nudges`/
+    `next_nudge_ts` never advance leaves the attempt due on every pass, which
+    is INV-CB-008's bounded redelivery broken through the one field a
+    consumer authors.
+
+    So here — unlike a MINT, where the state is already consumed and §4
+    degrades the binding rather than refusing the flow — the record reads as
+    INVALID, and the caller re-derives it from the live artifacts."""
+    for bad in (float("nan"), float("inf"), float("-inf"),      # scalars
+                {"deep": [1, float("nan")]}, [float("inf")],    # nested
+                {1, 2}):                                        # unencodable
+        assert ca.validate_attempt(dict(_good(), meta=bad)) is None, bad
+    # Everything the writer CAN emit still validates, meta null included.
+    for good in (None, 0, "", False, 1e308, {"k": [1, 2.5]}):
+        assert ca.validate_attempt(dict(_good(), meta=good)) is not None, good
 
 
 def test_validate_binds_the_record_to_the_name_it_was_read_under():

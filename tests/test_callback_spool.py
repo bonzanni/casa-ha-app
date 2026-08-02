@@ -3175,6 +3175,48 @@ def test_a_record_naming_another_flow_is_invalid_and_re_derived(spool):
     assert rec["minted_ts"] == claim.mtime, "rebuilt from A's own artifacts"
 
 
+def _scribble_attempt(spool, h: str, rec: dict, plugin=PLUGIN) -> None:
+    """Write `attempts/<h>.json` the way a scribbling consumer would — with
+    json's DEFAULT `allow_nan=True`, so the file can carry the non-standard
+    `NaN`/`Infinity` literals that casa's own canonical writer refuses and
+    its marker reader nonetheless parses."""
+    (_attempts(spool, plugin) / f"{h}.json").write_text(json.dumps(rec))
+
+
+def test_a_non_finite_meta_is_invalid_and_the_nudge_budget_advances(spool):
+    """Red case (re-review 2): `_safe_meta` returned every SCALAR unexamined,
+    so a scribbled `meta: NaN` type-checked its way onto the worker's read
+    surface. The dispatch that followed was accepted by the bus — and the
+    bookkeeping write behind it was then refused by the `allow_nan=False`
+    writer, so `nudges`/`next_nudge_ts` never advanced and the attempt stayed
+    due on every pass: INV-CB-008's bounded redelivery broken through the one
+    field a consumer authors.
+
+    A record the writer cannot re-emit is INVALID instead — never truth, no
+    bookkeeping merged into it — so the re-derivation rule rebuilds it from
+    the live artifacts and the budget then ADVANCES."""
+    now = time.time()
+    h, claim = _publish(spool, "non-finite-meta")
+    _scribble_attempt(spool, h, dict(_attempt_of(spool, h),
+                                     meta=float("nan")))
+
+    assert spool.list_attempts(PLUGIN) == [], "never truth"
+    assert spool.list_invalid_attempts(PLUGIN) == [h]
+    assert spool.update_attempt_nudge(PLUGIN, h, nudges=1) is False, \
+        "no bookkeeping merges into a record no writer can emit"
+
+    report = spool.attempts_pass(now=now, boot=True)
+
+    assert report.materialized == 1
+    rec = _attempt_of(spool, h)
+    assert rec["meta"] is None and rec["minted_ts"] == claim.mtime
+    assert rec["nudges"] == 0
+    # The write the non-finite record would have blocked forever goes through.
+    assert spool.update_attempt_nudge(PLUGIN, h, nudges=1,
+                                      last_nudge_ts=now) is True
+    assert _attempt_of(spool, h)["nudges"] == 1
+
+
 def test_a_forged_identity_never_reaches_a_write_ahead_outcome(spool):
     """The same binding at the sharpest boundary: the record a DELETION
     depends on. Deriving the write-ahead outcome from a file that names
@@ -3919,6 +3961,85 @@ def test_orphan_gc_defers_a_dir_whose_inventory_is_unprovable(
     assert removed == []
     assert _pdir(spool, "ghost").is_dir(), "the dir stays for the next pass"
     assert _removal_files(spool) == []
+
+
+def test_orphan_gc_defers_a_dir_whose_artifact_listing_is_unprovable(
+        spool, monkeypatch):
+    """Red case (re-review 1): the tri-state reached the ATTEMPTS inventory
+    and stopped there. The QUIESCENCE scan behind the very same purge still
+    collapsed a faulting listing into "nothing here", so an EIO under
+    `results/` made a dir holding a LIVE credential artifact read as old and
+    empty — and the GC deleted it, with no record and nothing to re-derive
+    from. Any unprovable listing anywhere under the dir defers it."""
+    now = time.time()
+    spool.ensure_plugin_dirs("ghost")
+    h = state_hash("ghost-results-eio")
+    _put(_results(spool, "ghost") / f"{h}.json", now - 5 * DAY,
+         json.dumps(_record(h)))
+    _quiesce(_pdir(spool, "ghost"), now - 5 * DAY)
+    _fail_listing(monkeypatch, "results")
+
+    removed = spool.gc_orphan_dirs(registry_valid=True,
+                                   member_plugins={PLUGIN}, now=now)
+
+    monkeypatch.undo()
+    assert removed == []
+    assert _pdir(spool, "ghost").is_dir(), "the dir SURVIVES an unprovable scan"
+    assert (_results(spool, "ghost") / f"{h}.json").exists()
+    assert _removal_files(spool) == []
+
+    # Healthy-path control: with the fault gone the same dir IS collected —
+    # the fix defers an unprovable pass, it does not stop the GC converging.
+    assert spool.gc_orphan_dirs(registry_valid=True,
+                                member_plugins={PLUGIN}, now=now) == ["ghost"]
+    assert not _pdir(spool, "ghost").exists()
+
+
+def test_orphan_gc_defers_a_dir_whose_own_listing_is_unprovable(
+        spool, monkeypatch):
+    """The same rule at the top of the walk: the plugin dir itself is one of
+    the directories whose listing must be PROVED, not peeked at."""
+    now = time.time()
+    spool.ensure_plugin_dirs("ghost")
+    _quiesce(_pdir(spool, "ghost"), now - 5 * DAY)
+    _fail_listing(monkeypatch, "ghost")
+
+    removed = spool.gc_orphan_dirs(registry_valid=True,
+                                   member_plugins={PLUGIN}, now=now)
+
+    monkeypatch.undo()
+    assert removed == []
+    assert _pdir(spool, "ghost").is_dir()
+
+
+def test_orphan_gc_defers_a_dir_whose_entry_metadata_is_unprovable(
+        spool, monkeypatch):
+    """An entry whose metadata will not read is an entry of UNKNOWN age — and
+    an unread entry could be the NEWEST one. Skipping it (the `_lstat_quiet`
+    reading, where every error is absence) is how a dir with a fresh artifact
+    passes a 24-hour quiescence gate."""
+    now = time.time()
+    spool.ensure_plugin_dirs("ghost")
+    h = state_hash("ghost-lstat-eio")
+    _put(_results(spool, "ghost") / f"{h}.json", now - 5 * DAY,
+         json.dumps(_record(h)))
+    _quiesce(_pdir(spool, "ghost"), now - 5 * DAY)
+    real = os.lstat
+
+    def flaky(path, *, dir_fd=None):
+        if path == f"{h}.json":
+            raise OSError(errno.EIO, "injected")
+        return real(path, dir_fd=dir_fd)
+
+    monkeypatch.setattr(cs.os, "lstat", flaky)
+
+    removed = spool.gc_orphan_dirs(registry_valid=True,
+                                   member_plugins={PLUGIN}, now=now)
+
+    monkeypatch.undo()
+    assert removed == []
+    assert _pdir(spool, "ghost").is_dir()
+    assert (_results(spool, "ghost") / f"{h}.json").exists()
 
 
 def test_a_failed_orphan_gc_logs_no_callback_identifier(spool, monkeypatch,

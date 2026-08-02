@@ -210,7 +210,7 @@ streak.
 **INV-CB-009**: The consumer's `meta` is size-capped, stored and echoed value-preserving, never interpreted, and never reaches a log surface.
 
 Enforced by an envelope parser that is total and fail-closed: a read bounded at 4 KiB plus one
-byte, a UTF-8 JSON object with no non-finite constant anywhere in it, a version in `{1, 2}`,
+byte, a UTF-8 JSON object with no non-finite number anywhere in it, a version in `{1, 2}`,
 unknown keys dropped and never copied. Any defect yields a null `meta` rather than a refusal —
 by the time casa looks the state is already consumed, so refusing buys nothing. The value is
 parsed once and re-serialized in the one canonical byte form into the result and attempt records
@@ -268,10 +268,10 @@ finds nothing (INV-CB-008).
 every unsettled hash — each attempt record, open or terminal, plus every live pending, claim,
 result and consumer-held collect entry, less every hash a receipt token covers, an ack settling
 the flow and not just its ledger entry — and on a non-zero count writes a strict-durable
-`.removals` record before purging the directory. A record that will not go durable skips the
-purge, and so does an inventory that cannot be proved: a faulting listing defers rather than
-reading as an empty count. Both converge through the orphan GC, which writes the same record
-before purging a quiescent directory holding unacked attempts. The worker turns each
+`.removals` record before purging the directory. No purge proceeds on an unproven answer — a
+record that will not go durable, or a listing or metadata read that faults, defers it rather than
+reading as empty — at removal and at the orphan GC alike, which writes the same record before
+purging a quiescent directory holding unacked attempts. The worker turns each
 un-noted record into one operator note, notifying first and marking only a confirmed send, so a
 crash there costs a duplicate rather than silence (INV-CB-007).
 
