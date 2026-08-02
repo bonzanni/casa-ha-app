@@ -1211,8 +1211,21 @@ def load_agent_from_dir(
     if os.path.exists(rem_path):
         rem_data = _read_yaml(rem_path)
         _validate(rem_data, "triggers", rem_path)
-        cfg.triggers = list(cfg.triggers) + _build_triggers(
-            rem_data, agent_dir=agent_dir)
+        # Two files now feed ONE trigger list, and register_agent raises on a
+        # duplicate name — uncaught at boot (#338), i.e. a crash loop. The
+        # operator's file wins and the colliding reminder is dropped with a
+        # warning: a lost reminder is bad, a Casa that will not start is worse.
+        existing = {t.name for t in cfg.triggers}
+        for spec in _build_triggers(rem_data, agent_dir=agent_dir):
+            if spec.name in existing:
+                logger.warning(
+                    "reminders.yaml: %r collides with a trigger already "
+                    "declared in triggers.yaml — ignoring the reminder",
+                    spec.name,
+                )
+                continue
+            existing.add(spec.name)
+            cfg.triggers = list(cfg.triggers) + [spec]
 
     # hooks.yaml — optional.
     hooks_path = os.path.join(agent_dir, "hooks.yaml")
