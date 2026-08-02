@@ -390,8 +390,9 @@ async def test_consumer_dead_recovery_reenqueues_the_nudge(facility):
     callback_spool.mint(facility.plugin_dir(plugin), state)
     claim = facility.spool.claim(plugin, h, now=time.time())
     assert claim is not None
-    assert facility.spool.publish_result(claim, {"v": 1, "plugin": plugin,
-                                                 "effective": eff}) is True
+    assert facility.spool.publish_result(
+        claim, {"v": 1, "plugin": plugin, "effective": eff},
+    ) is callback_spool.PublishOutcome.PUBLISHED
     assert ce.episodes() == []           # nothing enqueued it
 
     # the recovery invariant is the backstop: it enqueues a pending episode for

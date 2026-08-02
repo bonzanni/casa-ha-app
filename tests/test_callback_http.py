@@ -370,13 +370,17 @@ class TestSpoolEffects:
             stat_before.st_ino, stat_before.st_mtime)
         assert len(list(_results_dir(spool).iterdir())) == 1
 
-    async def test_write_failure_discards_the_claim(self, spool, monkeypatch):
-        """A raising publish leaves the claim behind; the handler drops it so
-        the state stays consumed (INV-CB-002) and nothing is left for the
-        recovery pass to restore into a replayable pending."""
+    async def test_publish_raise_leaves_the_claim_for_recovery(self, spool, monkeypatch):
+        """Amendment 2 (changed contract): a RAISING publish may predate any
+        durable record, so the handler must NOT discard — the claim survives
+        for the recovery pass to restore. Only FAILED_RECORDED authorizes a
+        discard. The fake clears the in-flight key exactly as the real
+        publish's ``finally`` does even when raising."""
         callback_spool.mint(_plugin_dir(spool), STATE)
+        h = callback_spool.state_hash(STATE)
 
         def _boom(claim, record):
+            spool._in_flight.discard(claim.key)
             raise OSError(28, "no space left on device")
 
         monkeypatch.setattr(spool, "publish_result", _boom)
@@ -385,7 +389,8 @@ class TestSpoolEffects:
             r = await _get(client, f"/callback/{EFFECTIVE}?state={STATE}")
         assert r.status == 303
         claims = _plugin_dir(spool) / callback_spool.CLAIMS_DIR
-        assert list(claims.iterdir()) == []
+        assert [p.name for p in claims.iterdir()] == [h], \
+            "the claim is LEFT — an exception authorizes no discard"
         assert not _pending_path(spool, STATE).exists()
         assert list(_results_dir(spool).iterdir()) == []
         # A leaked in-flight hash would make the recovery pass skip that
@@ -410,6 +415,81 @@ class TestSpoolEffects:
             await _get(client, f"/callback/{EFFECTIVE}?state=" + "n" * 22)
             await _get(client, f"/callback/{EFFECTIVE}?state=short")
         assert list(_results_dir(spool).iterdir()) == []
+
+
+# ---------------------------------------------------------------------------
+# tri-state publish outcome wiring (amendments 1+2): only FAILED_RECORDED
+# authorizes a discard; everything else leaves the claim (or needs nothing)
+# ---------------------------------------------------------------------------
+
+
+class TestPublishOutcomeWiring:
+    """Each ``PublishOutcome`` drives exactly one handler behavior:
+    PUBLISHED ⇒ nudge kick, no discard; FAILED_RECORDED ⇒ discard exactly
+    once (the only outcome that authorizes it — the failure is durably
+    recorded); FAILED_UNRECORDED and a raising publish ⇒ NO discard (the
+    claim is left for recovery). The response is the one neutral 303 in
+    every arm (INV-CB-005)."""
+
+    async def _drive(self, spool, monkeypatch, *, outcome=None, raises=None):
+        callback_spool.mint(_plugin_dir(spool), STATE)
+        discards: list = []
+        kicks: list[tuple[str, str]] = []
+
+        def fake_publish(claim, record):
+            # The real publish clears the in-flight key in its ``finally``
+            # even when raising; the fake must mimic that contract.
+            spool._in_flight.discard(claim.key)
+            if raises is not None:
+                raise raises
+            return outcome
+
+        monkeypatch.setattr(spool, "publish_result", fake_publish)
+        monkeypatch.setattr(spool, "discard_claim",
+                            lambda claim: discards.append(claim))
+        monkeypatch.setattr(callback_http, "_nudge",
+                            lambda plugin, h: kicks.append((plugin, h)))
+        app = _build_app()
+        async with _client(app) as client:
+            r = await _get(client, f"/callback/{EFFECTIVE}?state={STATE}")
+        return r, discards, kicks
+
+    async def test_published_kicks_the_nudge_and_never_discards(
+            self, spool, monkeypatch):
+        r, discards, kicks = await self._drive(
+            spool, monkeypatch,
+            outcome=callback_spool.PublishOutcome.PUBLISHED)
+        assert r.status == 303
+        assert r.headers["Location"] == "/callback/done"
+        assert kicks == [(PLUGIN, callback_spool.state_hash(STATE))]
+        assert discards == []
+
+    async def test_failed_recorded_discards_exactly_once(
+            self, spool, monkeypatch, caplog):
+        with caplog.at_level(logging.INFO, logger="callback_http"):
+            r, discards, kicks = await self._drive(
+                spool, monkeypatch,
+                outcome=callback_spool.PublishOutcome.FAILED_RECORDED)
+        assert r.status == 303
+        assert len(discards) == 1, "a durably RECORDED failure discards"
+        assert kicks == []
+        assert any("outcome=write_failed" in rec.getMessage()
+                   for rec in caplog.records), "reason is write_failed"
+
+    async def test_failed_unrecorded_never_discards(self, spool, monkeypatch):
+        r, discards, kicks = await self._drive(
+            spool, monkeypatch,
+            outcome=callback_spool.PublishOutcome.FAILED_UNRECORDED)
+        assert r.status == 303
+        assert discards == [], "nothing durable — the claim is LEFT"
+        assert kicks == []
+
+    async def test_publish_raise_never_discards(self, spool, monkeypatch):
+        r, discards, kicks = await self._drive(
+            spool, monkeypatch, raises=OSError(28, "no space left on device"))
+        assert r.status == 303
+        assert discards == [], "an exception may predate any durable record"
+        assert kicks == []
 
 
 # ---------------------------------------------------------------------------

@@ -60,6 +60,7 @@ import re
 import shutil
 import stat
 import threading
+import time
 import uuid
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -502,6 +503,45 @@ def _read_marker_at(name: str, dir_fd: int) -> Marker:
     return Marker(MarkerState.PRESENT, obj, raw=body)
 
 
+def _read_envelope_at(name: str, dir_fd: int) -> dict | None:
+    """Bounded, fail-closed read of a consumer-authored mint envelope,
+    openat-relative to *dir_fd* (a ``pending/`` or ``.claims/`` FD).
+
+    TOTAL: any defect — missing, unopenable, non-regular (the ``S_ISREG``
+    gate runs before any read; the ``O_NONBLOCK`` open means a FIFO cannot
+    even block), a read fault, more than ``ENVELOPE_MAX_BYTES`` bytes (the
+    read stops at the cap + 1, so an oversized body is detected without
+    ever being read whole), or anything :func:`callback_attempts.
+    parse_envelope` rejects — degrades to ``None`` (meta unknown), never an
+    exception. The state was already consumed by the time this runs, so
+    refusal would buy nothing (spec §4)."""
+    try:
+        fd = os.open(name, _MARKER_READ_FLAGS, dir_fd=dir_fd)
+    except OSError:
+        return None
+    try:
+        try:
+            if not stat.S_ISREG(os.fstat(fd).st_mode):
+                return None
+        except OSError:
+            return None
+        limit = callback_attempts.ENVELOPE_MAX_BYTES + 1
+        chunks: list[bytes] = []
+        size = 0
+        while size < limit:
+            try:
+                chunk = os.read(fd, limit - size)
+            except OSError:
+                return None
+            if not chunk:
+                break
+            size += len(chunk)
+            chunks.append(chunk)
+    finally:
+        os.close(fd)
+    return callback_attempts.parse_envelope(b"".join(chunks))
+
+
 def _link_once(src: str, src_dir_fd: int, dst: str, dst_dir_fd: int) -> bool:
     """Publish-once primitive: ``link(2)`` is the atomic no-replace rename the
     stdlib does not expose (there is no ``renameat2``/``RENAME_NOREPLACE``
@@ -551,6 +591,23 @@ class Claim:
     @property
     def key(self) -> str:
         return in_flight_key(self.plugin, self.state_hash)
+
+
+class PublishOutcome(enum.Enum):
+    """Tri-state result of :meth:`CallbackSpool.publish_result` (spec §5).
+
+    Exactly three states — there is deliberately no fourth: only
+    ``FAILED_RECORDED``, a failure whose ``done/publish_failed`` outcome was
+    proven durable by a strict write, authorizes the caller to discard the
+    claim (fail-closed single-use). ``FAILED_UNRECORDED`` means nothing
+    durable was written — the caller must LEAVE the claim so the recovery
+    pass restores the flow instead of a transient fault silently eating it.
+    ``PUBLISHED`` needs nothing further from the caller but the nudge kick.
+    """
+
+    PUBLISHED = "published"
+    FAILED_RECORDED = "failed_recorded"
+    FAILED_UNRECORDED = "failed_unrecorded"
 
 
 @dataclass
@@ -1164,21 +1221,21 @@ class CallbackSpool:
         _unlink_quiet(src, pend)
         _fsync(pend, PENDING_DIR)
 
+        # Every refusal arm below LEAVES the claim entry in `.claims/` (and
+        # runs no fsync — nothing changed on disk): the request path performs
+        # no flow-retiring deletions, so an expired/future/non-regular claim
+        # is reaped by the recovery pass, which records its write-ahead
+        # outcome first (INV-CB-007). Unlinking here would destroy the flow's
+        # last artifact with no durable record of why.
         st = _lstat_quiet(h, claims)
         if st is None or not stat.S_ISREG(st.st_mode):
             # A non-regular inode can only have come from a symlinked pending
             # name (linked as the symlink itself, never followed) — refuse it.
-            _remove_entry(h, claims, st)
-            _fsync(claims, CLAIMS_DIR)
             return None
         if st.st_mtime > now + SKEW_S:
-            logger.info("callback-spool: dropping future-mtime claim (%s)", plugin)
-            _unlink_quiet(h, claims)
-            _fsync(claims, CLAIMS_DIR)
+            logger.info("callback-spool: refusing future-mtime claim (%s)", plugin)
             return None
         if now - st.st_mtime > PENDING_TTL_S:
-            _unlink_quiet(h, claims)
-            _fsync(claims, CLAIMS_DIR)
             return None
         claim = Claim(plugin=plugin, state_hash=h, mtime=st.st_mtime,
                       dir_dev=dir_st.st_dev, dir_ino=dir_st.st_ino,
@@ -1222,56 +1279,66 @@ class CallbackSpool:
 
     # -- publish --------------------------------------------------------
 
-    def publish_result(self, claim: Claim, record: dict) -> bool:
-        """Publish the result for *claim*, never partially visible.
+    def publish_result(self, claim: Claim, record: dict) -> PublishOutcome:
+        """Publish the result for *claim* — attempt-first, never partially
+        visible, with a tri-state outcome (spec §§3.1/4/5).
 
-        Exact sequence: write + fsync a private ``.claims/.tmp-<hash>`` →
-        ``link`` it into ``results/<hash>.json`` → fsync ``results/`` →
-        unlink the temp → fsync ``.claims/`` → unlink the claim → fsync
-        ``.claims/``.
+        Sequence under the lock, after the dir-identity gate (whose failure
+        is ``FAILED_UNRECORDED``): (1) three-state presence probe of the
+        claim — genuinely ABSENT (an ack-teardown or a concurrent path
+        consumed the flow) or UNKNOWN writes NOTHING and returns
+        ``FAILED_UNRECORDED``; (2) bounded read of the claim inode's mint
+        envelope (malformed ⇒ ``meta`` None — the state is already consumed,
+        refusal buys nothing); (3) the record is augmented with ``meta`` and
+        ``minted_ts`` (= the claim's preserved mint mtime; record ``v``
+        stays 1) and serialized; (4) the ``result_ready`` attempt file is
+        written BEFORE the result name can exist, so a consumer that
+        collects-and-acks the instant the result appears never acks into
+        ENOENT; (5) the record is staged in ``.claims/.tmp-<hash>``, linked
+        into ``results/<hash>.json`` (publish-once) and fsynced; the temp is
+        unlinked before the claim so a credential-bearing inode never keeps
+        a second hard link past publication.
 
-        The temp is unlinked before the claim so a credential-bearing inode
-        never keeps a second hard link past publication; a crash in that
-        window leaves a temp whose hash already has a result, which recovery
-        clears. ``EEXIST`` on the link is a hard anomaly (a result already
-        exists for this state): the claim and temp are still cleaned up and
-        the caller renders the same neutral response.
+        Outcomes:
 
-        On a *staging* failure this method returns ``False`` and deliberately
-        LEAVES the claim, so the recovery pass can restore the flow to
-        ``pending/`` rather than a transient write eating it (see
-        :meth:`_publish_locked`). Note the sole production caller —
-        ``callback_http`` — does not rely on that: on any ``False``/raise it
-        calls :meth:`discard_claim`, so the restore-to-pending branch is
-        reachable only from a crash-recovery path, never from a live handler's
-        write failure (the endpoint is unauthenticated, so a consumed state
-        stays consumed rather than reopening a replay window).
+        * ``PUBLISHED`` — the result is durable. Also returned on the
+          ``EEXIST`` anomaly (a result DOES exist for the hash): temp and
+          claim are cleaned exactly as before, the step-4 attempt stands as
+          ``result_ready``, and the flow converges through normal inference.
+        * ``FAILED_RECORDED`` — staging/link (or serializing the record)
+          failed AND the failure is durably recorded (``done/
+          publish_failed``, strict write). The claim is LEFT here: the
+          CALLER owns the discard decision, and only this outcome
+          authorizes it (state stays consumed — fail-closed single-use,
+          INV-CB-002).
+        * ``FAILED_UNRECORDED`` — nothing durable was written (closed
+          spool, identity drift, absent claim, or the attempt/outcome write
+          itself failed). The caller must LEAVE the claim so recovery
+          restores the flow to ``pending/`` rather than a transient failure
+          silently eating it.
+
+        Every arm renders the same neutral response upstream (INV-CB-005);
+        no arm logs state, hash or meta content (INV-CB-006).
         """
         with self._lock:
             try:
-                try:
-                    payload = json.dumps(record).encode("utf-8")
-                except (TypeError, ValueError):
-                    logger.warning(
-                        "callback-spool: result record is not serializable")
-                    return False
-                return self._publish_guarded(claim, payload)
+                return self._publish_guarded(claim, record)
             finally:
                 # Cleared no matter how this exits: a hash left in the set
                 # would make the periodic recovery pass skip its claim for the
                 # rest of the process's life.
                 self._in_flight.discard(claim.key)
 
-    def _publish_guarded(self, claim: Claim, payload: bytes) -> bool:
+    def _publish_guarded(self, claim: Claim, record: dict) -> PublishOutcome:
         """Open the claim's directories (fail-closed on identity drift) and
         run the publish sequence. Called with ``_lock`` held."""
         if self._closed:
-            return False
+            return PublishOutcome.FAILED_UNRECORDED
         try:
             pfd = self._plugin_fd(claim.plugin)
         except (OSError, ValueError):
             logger.warning("callback-spool: plugin dir vanished before publish")
-            return False
+            return PublishOutcome.FAILED_UNRECORDED
         try:
             st = os.fstat(pfd)
             if ((st.st_dev, st.st_ino) != (claim.dir_dev, claim.dir_ino)
@@ -1283,27 +1350,58 @@ class CallbackSpool:
                 # plugin's spool.
                 logger.warning("callback-spool: plugin dir replaced mid-flow; "
                                "refusing to publish")
-                return False
+                return PublishOutcome.FAILED_UNRECORDED
             try:
                 claims = _open_dir(CLAIMS_DIR, pfd)
             except OSError:
-                return False
+                return PublishOutcome.FAILED_UNRECORDED
             try:
                 results = _open_dir(RESULTS_DIR, pfd)
             except OSError:
                 os.close(claims)
-                return False
+                return PublishOutcome.FAILED_UNRECORDED
             try:
-                return self._publish_locked(claim, payload, claims, results)
+                return self._publish_locked(claim, record, claims, results)
             finally:
                 os.close(claims)
                 os.close(results)
         finally:
             os.close(pfd)
 
-    def _publish_locked(self, claim: Claim, payload: bytes, claims: int,
-                        results: int) -> bool:
+    def _publish_locked(self, claim: Claim, record: dict, claims: int,
+                        results: int) -> PublishOutcome:
         h = claim.state_hash
+        now = time.time()
+        # 1. Three-state presence probe. A genuinely ABSENT claim means the
+        # flow was consumed underneath us (ack-teardown won): write NOTHING —
+        # no attempt, no result — or the teardown would be un-torn. UNKNOWN
+        # is never read as absent, and never grounds to write either.
+        st = _marker_lstat(h, claims)
+        if st is None or st is _LSTAT_ERROR:
+            return PublishOutcome.FAILED_UNRECORDED
+        # 2. Mint-envelope transport (spec §4): the claim IS the pending
+        # inode, so its envelope carries the consumer's meta; any defect
+        # degrades to None.
+        envelope = _read_envelope_at(h, claims)
+        meta = envelope["meta"] if envelope else None
+        # 3. Augment + serialize FIRST: an unserializable record must fail
+        # before the attempt claims a result is coming.
+        record = dict(record, meta=meta, minted_ts=claim.mtime)
+        rec = callback_attempts.new_attempt(
+            state_hash=h, minted_ts=claim.mtime, status="result_ready",
+            meta=meta, now=now)
+        try:
+            payload = json.dumps(record).encode("utf-8")
+        except (TypeError, ValueError):
+            logger.warning(
+                "callback-spool: result record is not serializable")
+            return self._record_publish_failure(claim, rec, now)
+        # 4. Attempt BEFORE any result-side work (spec §3.1): the attempt
+        # file must be visible before the result name can ever exist.
+        if not self.write_attempt(claim.plugin, h, rec, strict=False):
+            # Nothing durable yet — leave the claim, write nothing else.
+            return PublishOutcome.FAILED_UNRECORDED
+        # 5. Stage + link + fsync, exactly the pre-attempt sequence.
         tmp, final = f"{TEMP_PREFIX}{h}", f"{h}.json"
         # A pre-existing temp is residue from a crashed attempt at THIS hash:
         # the in-flight set excludes a live writer, so reclaiming the
@@ -1315,23 +1413,22 @@ class CallbackSpool:
             logger.warning("callback-spool: result staging failed (errno %s)",
                            exc.errno)
             _unlink_quiet(tmp, claims)
-            # The claim is deliberately LEFT: recovery restores it to pending
-            # so the flow is not silently eaten by a transient write failure.
-            return False
+            return self._record_publish_failure(claim, rec, now)
         try:
             published = _link_once(tmp, claims, final, results)
         except OSError as exc:
-            # A genuine FS fault (not EEXIST): drop only the temp and LEAVE
-            # the claim, so the recovery pass restores the flow to pending
-            # instead of the transient failure silently eating it.
+            # A genuine FS fault (not EEXIST): drop only the temp.
             logger.warning("callback-spool: result publish failed (errno %s)",
                            exc.errno)
             _unlink_quiet(tmp, claims)
             _fsync(claims, CLAIMS_DIR)
-            return False
+            return self._record_publish_failure(claim, rec, now)
         if published:
             _fsync(results, RESULTS_DIR)
         else:
+            # EEXIST anomaly: a result DOES exist for this hash, so the
+            # step-4 result_ready attempt is accurate — clean up as always
+            # and let the flow converge through normal inference.
             logger.warning(
                 "callback-spool: result already exists for a claimed state "
                 "(plugin=%s) — anomaly, dropping", claim.plugin)
@@ -1339,7 +1436,19 @@ class CallbackSpool:
         _fsync(claims, CLAIMS_DIR)
         _unlink_quiet(h, claims)
         _fsync(claims, CLAIMS_DIR)
-        return published
+        return PublishOutcome.PUBLISHED
+
+    def _record_publish_failure(self, claim: Claim, rec: dict,
+                                now: float) -> PublishOutcome:
+        """Record ``done/publish_failed`` STRICTLY (spec §5): only a proven-
+        durable outcome authorizes the handler's discard, so a strict-write
+        failure downgrades to ``FAILED_UNRECORDED`` and the claim survives
+        for recovery. The claim is LEFT on both arms — the caller decides."""
+        done = callback_attempts.terminalize(rec, "publish_failed", now=now)
+        if self.write_attempt(claim.plugin, claim.state_hash, done,
+                              strict=True):
+            return PublishOutcome.FAILED_RECORDED
+        return PublishOutcome.FAILED_UNRECORDED
 
     # -- read side (delivery nudge / consumers) -----------------------------
 

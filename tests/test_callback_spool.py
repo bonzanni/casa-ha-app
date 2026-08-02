@@ -377,7 +377,12 @@ def test_claim_unknown_plugin_returns_none(spool):
     assert spool.claim("ghost", state_hash("s"), now=time.time()) is None
 
 
-def test_claim_of_expired_pending_returns_none_and_deletes(spool):
+def test_claim_of_expired_pending_returns_none_and_leaves_the_claim(spool):
+    """Changed-contract pin (amendment 4): the request path performs no
+    flow-retiring deletions. An expired state still loses (None) and its
+    pending twin is consumed by the claim link, but the `.claims/<h>` entry
+    is LEFT for the recovery pass to reap write-ahead — unlinking here would
+    destroy the flow's last artifact with no durable record of why."""
     now = time.time()
     p = mint(_pdir(spool), "s")
     _utime(p, now - PENDING_TTL_S - 1)
@@ -385,7 +390,8 @@ def test_claim_of_expired_pending_returns_none_and_deletes(spool):
 
     assert spool.claim(PLUGIN, h, now=now) is None
     assert not p.exists()
-    assert list(_claims(spool).iterdir()) == []
+    assert (_claims(spool) / h).exists(), "left for recovery, not unlinked"
+    assert spool.in_flight() == set()
 
 
 def test_claim_at_exactly_the_ttl_still_wins(spool):
@@ -396,6 +402,9 @@ def test_claim_at_exactly_the_ttl_still_wins(spool):
 
 
 def test_claim_of_future_mtime_pending_fails_closed(spool):
+    """A future-mtime state loses, and (amendment 4) its claim entry is
+    LEFT in `.claims/` for recovery's write-ahead reap — same changed
+    contract as the expired arm."""
     now = time.time()
     p = mint(_pdir(spool), "s")
     _utime(p, now + SKEW_S + 1)
@@ -403,7 +412,8 @@ def test_claim_of_future_mtime_pending_fails_closed(spool):
 
     assert spool.claim(PLUGIN, h, now=now) is None
     assert not p.exists()
-    assert list(_claims(spool).iterdir()) == []
+    assert (_claims(spool) / h).exists(), "left for recovery, not unlinked"
+    assert spool.in_flight() == set()
 
 
 def test_claim_within_the_skew_allowance_still_wins(spool):
@@ -453,7 +463,9 @@ def test_claim_of_a_symlinked_pending_never_captures_the_target(spool, tmp_path)
 
     assert secret.read_text() == "not yours"
     assert secret.stat().st_nlink == 1, "the target must not have been linked"
-    assert list(_claims(spool).iterdir()) == []
+    # Amendment 4: the refused (symlink) claim entry is LEFT for recovery's
+    # write-ahead reap; the refusal itself is what matters here.
+    assert (_claims(spool) / h).is_symlink()
 
 
 def test_claim_rejects_a_non_regular_pending_inode(spool):
@@ -464,7 +476,8 @@ def test_claim_rejects_a_non_regular_pending_inode(spool):
 
     assert spool.claim(PLUGIN, h, now=time.time()) is None
 
-    assert list(_claims(spool).iterdir()) == []
+    # Amendment 4: refused, not unlinked — recovery reaps it write-ahead.
+    assert stat.S_ISFIFO(os.lstat(_claims(spool) / h).st_mode)
 
 
 def test_a_symlinked_plugin_dir_is_never_followed(spool, tmp_path):
@@ -606,10 +619,14 @@ def test_publish_result_writes_intact_0600_record_and_clears_everything(spool):
     h, claim = _claimed(spool)
     rec = _record(h)
 
-    assert spool.publish_result(claim, rec) is True
+    assert spool.publish_result(claim, rec) is cs.PublishOutcome.PUBLISHED
 
     out = _results(spool) / f"{h}.json"
-    assert json.loads(out.read_text()) == rec
+    # The record is augmented at publish (spec §4): the caller's keys are
+    # preserved verbatim, plus meta (None for a v2 mint with no meta) and
+    # minted_ts (the claim's preserved mint mtime). Record v stays 1.
+    assert json.loads(out.read_text()) == dict(
+        rec, meta=None, minted_ts=claim.mtime)
     assert stat.S_IMODE(out.stat().st_mode) == 0o600
     assert list(_claims(spool).iterdir()) == [], "claim and temp must both be gone"
 
@@ -618,7 +635,7 @@ def test_publish_result_follows_the_exact_protocol_sequence(spool, fs_events):
     h, claim = _claimed(spool)
     del fs_events[:]  # only the publish sequence matters here
 
-    assert spool.publish_result(claim, _record(h)) is True
+    assert spool.publish_result(claim, _record(h)) is cs.PublishOutcome.PUBLISHED
 
     i_link = _idx(fs_events, ("link", f".tmp-{h}", f"{h}.json"))
     i_tmp_fsync = _idx(fs_events, ("fsync", f".claims/.tmp-{h}"))
@@ -636,23 +653,30 @@ def test_publish_result_follows_the_exact_protocol_sequence(spool, fs_events):
 
 
 def test_publish_result_when_a_result_already_exists_is_an_anomaly(spool):
+    """EEXIST on the result link: a result DOES exist for the hash, so the
+    outcome is PUBLISHED (the step-4 result_ready attempt is accurate and
+    the flow converges through inference) — while today's cleanup and the
+    never-clobber property are kept exactly."""
     h, claim = _claimed(spool)
     prior = _put(_results(spool) / f"{h}.json", time.time(), '{"prior": true}')
 
-    assert spool.publish_result(claim, _record(h)) is False
+    assert spool.publish_result(claim, _record(h)) is cs.PublishOutcome.PUBLISHED
 
     assert json.loads(prior.read_text()) == {"prior": True}, "never clobbered"
     assert list(_claims(spool).iterdir()) == [], "claim and temp removed anyway"
     assert spool.in_flight() == set()
+    att = json.loads((_attempts(spool) / f"{h}.json").read_text())
+    assert att["status"] == "result_ready", "the step-4 attempt stands"
 
 
 def test_publish_result_reclaims_a_stale_temp_left_by_a_crash(spool):
     h, claim = _claimed(spool)
     _put(_claims(spool) / f".tmp-{h}", time.time() - 5, "garbage-not-json")
 
-    assert spool.publish_result(claim, _record(h)) is True
+    assert spool.publish_result(claim, _record(h)) is cs.PublishOutcome.PUBLISHED
 
-    assert json.loads((_results(spool) / f"{h}.json").read_text()) == _record(h)
+    assert json.loads((_results(spool) / f"{h}.json").read_text()) == dict(
+        _record(h), meta=None, minted_ts=claim.mtime)
     assert list(_claims(spool).iterdir()) == []
 
 
@@ -665,7 +689,8 @@ def test_publish_result_fails_closed_when_the_plugin_dir_was_replaced(spool):
     shutil.rmtree(_pdir(spool))
     spool.ensure_plugin_dirs(PLUGIN)
 
-    assert spool.publish_result(claim, _record(h)) is False
+    assert spool.publish_result(claim, _record(h)) \
+        is cs.PublishOutcome.FAILED_UNRECORDED
     assert list(_results(spool).iterdir()) == []
 
 
@@ -681,39 +706,204 @@ def test_publish_result_fails_closed_when_the_replaced_dir_reuses_the_inode(spoo
     st = os.stat(_pdir(spool))
     reused = dataclasses.replace(claim, dir_dev=st.st_dev, dir_ino=st.st_ino)
 
-    assert spool.publish_result(reused, _record(h)) is False
+    assert spool.publish_result(reused, _record(h)) \
+        is cs.PublishOutcome.FAILED_UNRECORDED
     assert list(_results(spool).iterdir()) == []
 
 
 def test_publish_result_write_failure_leaves_the_claim_for_recovery(spool, monkeypatch):
     """A transient write failure must not silently eat the flow: the claim
     stays, the in-flight entry does NOT (or recovery would skip that claim for
-    the rest of the process's life), and the next boot pass restores it."""
+    the rest of the process's life), and the next boot pass restores it.
+
+    The boom here is UNCONDITIONAL, so it fells the step-4 attempt write
+    (its staged-replace goes through ``_write_new_file`` too) before any
+    result-side work: that is the FAILED_UNRECORDED arm — nothing durable
+    exists, so the caller must leave the claim."""
     h, claim = _claimed(spool)
 
     def boom(*a, **kw):
         raise OSError(28, "No space left on device")
 
     monkeypatch.setattr(cs, "_write_new_file", boom)
-    assert spool.publish_result(claim, _record(h)) is False
+    assert spool.publish_result(claim, _record(h)) \
+        is cs.PublishOutcome.FAILED_UNRECORDED
     monkeypatch.undo()
 
     assert (_claims(spool) / h).exists()
     assert spool.in_flight() == set()
     assert list(_results(spool).iterdir()) == []
     assert not (_claims(spool) / f".tmp-{h}").exists()
+    assert spool.read_attempt(PLUGIN, h).state is cs.MarkerState.ABSENT
 
     report = spool.recovery_pass(now=time.time(), boot=True)
     assert report.restored == [(PLUGIN, h)]
 
 
-def test_publish_result_refuses_an_unserializable_record(spool):
-    h, claim = _claimed(spool)
+def test_publish_result_records_an_unserializable_record_as_publish_failed(spool):
+    """Amendment 2: an unserializable record goes through the same strict
+    ``done/publish_failed`` recording as a staging failure — FAILED_RECORDED,
+    with the meta still extracted from the claim envelope. The claim is LEFT
+    (the HANDLER owns the discard on this outcome)."""
+    mint(_pdir(spool), "s", meta={"flow": "authz"})
+    h = state_hash("s")
+    claim = spool.claim(PLUGIN, h, now=time.time())
 
-    assert spool.publish_result(claim, {"bad": object()}) is False
+    assert spool.publish_result(claim, {"bad": {1, 2}}) \
+        is cs.PublishOutcome.FAILED_RECORDED
 
-    assert (_claims(spool) / h).exists(), "left for recovery, not eaten"
+    att = json.loads((_attempts(spool) / f"{h}.json").read_text())
+    assert (att["status"], att["outcome"]) == ("done", "publish_failed")
+    assert att["meta"] == {"flow": "authz"}, "meta still extracted"
+    assert att["minted_ts"] == claim.mtime
+    assert (_claims(spool) / h).exists(), "claim LEFT — the handler decides"
+    assert list(_results(spool).iterdir()) == []
     assert spool.in_flight() == set()
+
+
+def test_publish_result_writes_the_attempt_before_the_result_link(spool, monkeypatch):
+    """The spec §3.1 ordering pin (attempt-first publish): the instant the
+    result name becomes visible a consumer may collect and ack, so the
+    ``result_ready`` attempt file must already exist when the result link is
+    attempted — never after. The spy wraps ``_link_once`` only AFTER the
+    claim, so the one link it sees is the publish-time one."""
+    meta = {"flow": "authz", "n": 1}
+    p = mint(_pdir(spool), "s", meta=meta)
+    mint_mtime = p.stat().st_mtime
+    h = state_hash("s")
+    claim = spool.claim(PLUGIN, h, now=time.time())
+    assert claim is not None
+
+    real = cs._link_once
+    seen: dict[str, bool] = {}
+
+    def spy(src, src_dir_fd, dst, dst_dir_fd):
+        seen["attempt_exists"] = (_attempts(spool) / f"{h}.json").is_file()
+        return real(src, src_dir_fd, dst, dst_dir_fd)
+
+    monkeypatch.setattr(cs, "_link_once", spy)
+
+    assert spool.publish_result(claim, _record(h)) is cs.PublishOutcome.PUBLISHED
+
+    assert seen["attempt_exists"] is True, \
+        "the attempt must be visible BEFORE the result name can exist"
+    att = json.loads((_attempts(spool) / f"{h}.json").read_text())
+    assert att["status"] == "result_ready"
+    assert att["meta"] == meta
+    assert att["minted_ts"] == claim.mtime == mint_mtime, \
+        "minted_ts is the MINT clock, preserved through the claim"
+    rec = json.loads((_results(spool) / f"{h}.json").read_text())
+    assert rec["meta"] == meta
+    assert rec["minted_ts"] == claim.mtime
+    assert rec["v"] == 1, "the augmentation is additive; record v stays 1"
+
+
+def test_publish_result_absent_claim_is_failed_unrecorded_and_writes_nothing(spool):
+    """Step-1 presence probe: a genuinely ABSENT claim means an ack-teardown
+    (or a concurrent path) consumed the flow underneath the handler — casa
+    must write NOTHING (no attempt, no result) or the teardown would be
+    un-torn, and report FAILED_UNRECORDED."""
+    h, claim = _claimed(spool)
+    (_claims(spool) / h).unlink()
+
+    assert spool.publish_result(claim, _record(h)) \
+        is cs.PublishOutcome.FAILED_UNRECORDED
+
+    assert spool.read_attempt(PLUGIN, h).state is cs.MarkerState.ABSENT
+    assert list(_results(spool).iterdir()) == []
+    assert spool.in_flight() == set()
+
+
+def test_publish_result_staging_failure_is_recorded_publish_failed(spool, monkeypatch):
+    """A staging failure AFTER the step-4 attempt write goes through the
+    strict ``done/publish_failed`` rewrite ⇒ FAILED_RECORDED. The claim is
+    LEFT by the spool (the HANDLER owns the discard on this outcome), and no
+    result nor temp survives. The boom is targeted at the ``.claims/.tmp-``
+    temp name only, so the attempt writes (a ``.<name>.tmp-…`` staging
+    grammar) are untouched."""
+    h, claim = _claimed(spool)
+    real = cs._write_new_file
+
+    def boom(name, dir_fd, data):
+        if name.startswith(cs.TEMP_PREFIX):
+            raise OSError(errno.EIO, "injected staging fault")
+        return real(name, dir_fd, data)
+
+    monkeypatch.setattr(cs, "_write_new_file", boom)
+
+    assert spool.publish_result(claim, _record(h)) \
+        is cs.PublishOutcome.FAILED_RECORDED
+
+    att = json.loads((_attempts(spool) / f"{h}.json").read_text())
+    assert (att["status"], att["outcome"]) == ("done", "publish_failed")
+    assert att["minted_ts"] == claim.mtime
+    assert (_claims(spool) / h).exists(), "claim LEFT — the handler decides"
+    assert list(_results(spool).iterdir()) == []
+    assert not (_claims(spool) / f".tmp-{h}").exists()
+    assert spool.in_flight() == set()
+
+
+def test_publish_result_staging_and_strict_rewrite_failure_is_unrecorded(
+        spool, monkeypatch):
+    """Amendment 3: when the strict ``publish_failed`` rewrite ALSO fails,
+    nothing is proven durable ⇒ FAILED_UNRECORDED and the claim survives for
+    recovery. The attempt file may legitimately read ``result_ready`` OR
+    ``publish_failed`` (visibility without proven durability), so only the
+    claim's survival and the result's absence are asserted — never the
+    record's absence."""
+    h, claim = _claimed(spool)
+    real = cs._write_new_file
+
+    def boom(name, dir_fd, data):
+        if name.startswith(cs.TEMP_PREFIX):
+            raise OSError(errno.EIO, "injected staging fault")
+        return real(name, dir_fd, data)
+
+    def fsync_boom(fd, what):
+        raise cs.FsyncFailed(errno.EIO, "injected fsync fault")
+
+    monkeypatch.setattr(cs, "_write_new_file", boom)
+    monkeypatch.setattr(cs, "_fsync_strict", fsync_boom)
+
+    assert spool.publish_result(claim, _record(h)) \
+        is cs.PublishOutcome.FAILED_UNRECORDED
+
+    assert (_claims(spool) / h).exists(), "claim LEFT for recovery"
+    assert list(_results(spool).iterdir()) == []
+    assert spool.in_flight() == set()
+
+
+def test_publish_result_malformed_envelope_degrades_to_meta_none(spool):
+    """A claim whose inode carries a garbage envelope (a hand-written
+    pending) still publishes — the state was already consumed, refusal buys
+    nothing — with ``meta`` None in both the attempt and the record."""
+    h = state_hash("s")
+    (_pending(spool) / f"{h}.json").write_bytes(b"garbage, not json")
+    claim = spool.claim(PLUGIN, h, now=time.time())
+    assert claim is not None
+
+    assert spool.publish_result(claim, _record(h)) is cs.PublishOutcome.PUBLISHED
+
+    att = json.loads((_attempts(spool) / f"{h}.json").read_text())
+    assert att["meta"] is None
+    assert json.loads(
+        (_results(spool) / f"{h}.json").read_text())["meta"] is None
+
+
+def test_publish_result_oversized_envelope_degrades_to_meta_none(spool):
+    """The envelope read is bounded to ENVELOPE_MAX_BYTES + 1: an oversized
+    (hand-written — mint() refuses one) envelope is never read whole and
+    degrades to ``meta`` None, publishing normally."""
+    h = state_hash("s")
+    big = json.dumps({"v": 2, "meta": "x" * (ca.ENVELOPE_MAX_BYTES + 64)})
+    (_pending(spool) / f"{h}.json").write_text(big)
+    claim = spool.claim(PLUGIN, h, now=time.time())
+    assert claim is not None
+
+    assert spool.publish_result(claim, _record(h)) is cs.PublishOutcome.PUBLISHED
+
+    att = json.loads((_attempts(spool) / f"{h}.json").read_text())
+    assert att["meta"] is None
 
 
 def test_read_side_helpers(spool):
@@ -739,7 +929,7 @@ def test_result_mtime_is_its_final_write_time_not_the_mint_time(spool):
     h = state_hash("s")
     claim = spool.claim(PLUGIN, h, now=now)
 
-    assert spool.publish_result(claim, _record(h)) is True
+    assert spool.publish_result(claim, _record(h)) is cs.PublishOutcome.PUBLISHED
 
     res_mtime = (_results(spool) / f"{h}.json").stat().st_mtime
     assert res_mtime == pytest.approx(time.time(), abs=5)
@@ -753,8 +943,19 @@ def test_result_mtime_is_its_final_write_time_not_the_mint_time(spool):
 _PAD = "x" * 8_000
 
 
-def _expected_bytes(h):
-    return json.dumps({"v": 1, "h": h, "pad": _PAD}).encode("utf-8")
+def _whole_record(raw: bytes, h: str) -> bool:
+    """True iff *raw* is the COMPLETE published record: it parses (a
+    truncated JSON body cannot), and carries the exact payload the publisher
+    wrote plus the publish-time augmentation (``meta``/``minted_ts``, whose
+    minted_ts value the reader cannot know in advance)."""
+    try:
+        obj = json.loads(raw.decode("utf-8"))
+    except Exception:
+        return False
+    return (isinstance(obj, dict)
+            and obj.get("v") == 1 and obj.get("h") == h
+            and obj.get("pad") == _PAD and obj.get("meta") is None
+            and isinstance(obj.get("minted_ts"), float))
 
 
 def _publisher_child(root, states):
@@ -778,7 +979,7 @@ def _reader_child(root, states, out_path):
     bad, reads, verified = [], 0, 0
     for st in states:
         h = state_hash(st)
-        path, want = resdir / f"{h}.json", _expected_bytes(h)
+        path = resdir / f"{h}.json"
         deadline = time.time() + 30
         while time.time() < deadline:
             try:
@@ -786,7 +987,7 @@ def _reader_child(root, states, out_path):
             except OSError:
                 continue                     # not published yet — keep spinning
             reads += 1
-            if raw == want:
+            if _whole_record(raw, h):
                 verified += 1
             else:
                 bad.append(f"{h[:8]}: partial observation ({len(raw)} bytes)")
@@ -1871,16 +2072,18 @@ def test_collect_renames_then_reads_and_never_unlinks(spool):
     ack; nothing is ever unlinked here."""
     h, claim = _claimed(spool, "collect-me")
     rec = _record(h)
-    assert spool.publish_result(claim, rec) is True
+    assert spool.publish_result(claim, rec) is cs.PublishOutcome.PUBLISHED
 
     got, held = cs.collect(_pdir(spool), h)
 
-    assert got == rec
+    # publish augments the stored record with the meta/minted_ts transport keys
+    # (spec §4); everything the caller supplied survives verbatim.
+    assert {k: got[k] for k in rec} == rec
     assert not (_results(spool) / f"{h}.json").exists(), "base name gone"
     assert held.parent == _results(spool)
     assert held.name.startswith(f".collect-{h}-")
     assert held.is_file(), "held file still exists after collect returns"
-    assert json.loads(held.read_text()) == rec
+    assert json.loads(held.read_text()) == got
     assert spool.collect_held_hashes(PLUGIN) == [h], \
         "the held name satisfies the .collect-<h>-<uuid> grammar"
 
