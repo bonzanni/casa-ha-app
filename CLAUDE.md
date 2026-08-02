@@ -140,7 +140,12 @@ mid-2026). Keep it publish-ready at all times:
   it voids a `scripts/attest.sh` receipt: the acknowledgement is a statement about the
   diff as it finally stands. **Carry the line into the squash-merge message** — a
   waiver that only ever existed on a deleted branch is not the audit trail it claims to
-  be. The gate cannot check that a waiver is sincere, and deliberately does not try;
+  be. (The repo's squash default is `COMMIT_MESSAGES`, which carries it automatically;
+  passing a hand-built `--body` to `gh pr merge` overrides that, so if you do, include
+  the line.) Since 2026-08-02 `main` is PROTECTED: this guard is a required check with
+  admin enforcement and strict mode, merges must go through a pull request, and force
+  pushes and branch deletion are blocked. Disabling protection to get out of a jam is a
+  break-glass action — say so when you do it. The gate cannot check that a waiver is sincere, and deliberately does not try;
   it exists so that no batch merges without someone naming each impacted document and
   saying why, on the record.
 - **Branches die on merge.** GitHub auto-deletes the remote head; delete the local
