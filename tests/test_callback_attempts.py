@@ -175,24 +175,25 @@ def test_terminalize_claimed_override():
 # nudge schedule
 # ---------------------------------------------------------------------------
 
-def _accept(rec: dict, now: float) -> dict:
+def _accept(rec: dict, now: float, anchor_ts: float | None = None) -> dict:
     """Apply one bus-ACCEPTED dispatch the way the worker will."""
-    nxt = ca.next_nudge_after_accept(rec, now=now)
+    nxt = ca.next_nudge_after_accept(rec, now=now, anchor_ts=anchor_ts)
     return dict(rec, nudges=rec["nudges"] + 1, last_nudge_ts=now,
                 next_nudge_ts=nxt, deferrals=0)
 
 
 def test_accept_schedule_walks_offsets_then_outcome_phase():
+    # anchor = the result file's mtime (its publish time), worker-supplied.
     rec = ca.new_attempt(state_hash=H, minted_ts=None,
                          status="result_ready", now=T)
     assert rec["next_nudge_ts"] == T                       # +0 from publish
-    rec = _accept(rec, now=T)
-    assert rec["next_nudge_ts"] == T + 60.0                # +60
-    rec = _accept(rec, now=T + 60.0)
-    assert rec["next_nudge_ts"] == T + 180.0               # +3 m
-    rec = _accept(rec, now=T + 180.0)
-    assert rec["next_nudge_ts"] == T + 480.0               # +8 m
-    rec = _accept(rec, now=T + 480.0)
+    rec = _accept(rec, now=T, anchor_ts=T)
+    assert rec["next_nudge_ts"] == T + 60.0                # +60, absolute
+    rec = _accept(rec, now=T + 60.0, anchor_ts=T)
+    assert rec["next_nudge_ts"] == T + 180.0               # +3 m, absolute
+    rec = _accept(rec, now=T + 180.0, anchor_ts=T)
+    assert rec["next_nudge_ts"] == T + 480.0               # +8 m, absolute
+    rec = _accept(rec, now=T + 480.0, anchor_ts=T)
     assert rec["next_nudge_ts"] is None                    # result phase spent
 
     ended = T + 900.0                                      # sweep terminalizes
@@ -203,6 +204,28 @@ def test_accept_schedule_walks_offsets_then_outcome_phase():
     rec = _accept(rec, now=ended + 7200.0)
     assert rec["next_nudge_ts"] is None                    # budget of 6 spent
     assert rec["nudges"] == ca.MAX_NUDGES
+
+
+def test_accept_after_deferral_returns_to_anchor_cadence():
+    # A rejected-dispatch deferral moves next_nudge_ts off-grid; the next
+    # accepted dispatch must land back on the ABSOLUTE anchor cadence
+    # (anchor + 60/180/480), floored at now — never position-relative drift.
+    anchor = T
+    rec = ca.new_attempt(state_hash=H, minted_ts=None,
+                         status="result_ready", now=T)   # slot: anchor + 0
+    deferred = ca.next_nudge_after_reject(rec, now=T + 5.0)
+    assert deferred == T + 65.0                          # 60 * 2**0 deferral
+    rec = dict(rec, next_nudge_ts=deferred, deferrals=1)
+
+    # Accept before the +60 slot: back on the anchor cadence exactly.
+    early = ca.next_nudge_after_accept(rec, now=T + 30.0, anchor_ts=anchor)
+    assert early == anchor + 60.0
+    # Accept after the +60 slot has passed: floored at now, never the past.
+    late = ca.next_nudge_after_accept(rec, now=T + 65.0, anchor_ts=anchor)
+    assert late == T + 65.0
+    # Fallback (anchor unavailable mid-pass): position-relative advance.
+    fallback = ca.next_nudge_after_accept(rec, now=T + 65.0, anchor_ts=None)
+    assert fallback == deferred + 60.0
 
 
 def test_accept_pure_no_input_mutation():

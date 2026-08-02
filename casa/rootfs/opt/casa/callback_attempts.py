@@ -175,18 +175,23 @@ def terminalize(rec: dict, outcome: str, *, now: float,
     return out
 
 
-def next_nudge_after_accept(rec: dict, *, now: float) -> float | None:
+def next_nudge_after_accept(rec: dict, *, now: float,
+                            anchor_ts: float | None = None) -> float | None:
     """The next ``next_nudge_ts`` after a bus-ACCEPTED dispatch.
 
     The accept consumes one budget unit (the caller writes ``nudges + 1``);
     ``None`` when that spends the budget or the record is a terminal
-    ``collected``. Result-phase anchors on the current schedule position:
-    the next offset's delta is added to the slot just dispatched, so a
-    deferral-shifted schedule keeps its spacing. Outcome-phase anchors on
-    ``ended_ts``: the next slot strictly after the one just dispatched.
-    ``None`` also when a phase's offsets are exhausted — an open attempt
-    that spent the result-phase slots waits for terminalization to start
-    the outcome phase.
+    ``collected``. Result-phase anchors on ``anchor_ts`` — the result
+    file's mtime (its publish time), supplied by the worker — so the
+    absolute (+0, +60, +180, +480) cadence is kept even after a
+    rejected-dispatch deferral moved ``next_nudge_ts`` off-grid; the slot
+    is floored at ``now`` (never scheduled in the past). When ``anchor_ts``
+    is None (result already gone mid-pass) the fallback advances by the
+    next offset's delta from the slot just dispatched. Outcome-phase
+    anchors on ``ended_ts``: the next slot strictly after the one just
+    dispatched. ``None`` also when a phase's offsets are exhausted — an
+    open attempt that spent the result-phase slots waits for
+    terminalization to start the outcome phase.
     """
     if rec.get("status") == "done" and rec.get("outcome") == "collected":
         return None
@@ -205,6 +210,8 @@ def next_nudge_after_accept(rec: dict, *, now: float) -> float | None:
     idx = rec["nudges"]  # the result-phase position just dispatched
     if idx + 1 >= len(RESULT_PHASE_OFFSETS):
         return None
+    if anchor_ts is not None:
+        return max(now, anchor_ts + RESULT_PHASE_OFFSETS[idx + 1])
     return current + (RESULT_PHASE_OFFSETS[idx + 1] - RESULT_PHASE_OFFSETS[idx])
 
 
