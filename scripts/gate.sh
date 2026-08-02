@@ -12,7 +12,7 @@ cd "$(git rev-parse --show-toplevel)"
 
 base="${CASA_GATE_BASE:-origin/main}"
 
-echo "==> 0/6 committed state"
+echo "==> 0/7 committed state"
 if [ -n "$(git status --porcelain)" ]; then
   echo "✋ gate: working tree is dirty. Commit or stash first — the gate approves a" >&2
   echo "        commit, and a push publishes commits, not files." >&2
@@ -38,7 +38,7 @@ if [ -z "${CASA_ALLOW_NO_SUPPLEMENT:-}" ]; then
   fi
 fi
 
-echo "==> 1/6 corpus verifier"
+echo "==> 1/7 corpus verifier"
 if [ -f docs/manifest.yaml ]; then
   venv_test/bin/python -m scripts.verify_docs . --report
   venv_test/bin/python -m scripts.verify_docs . --check-nav
@@ -46,23 +46,34 @@ else
   echo "    (no corpus yet — every other check applies in full)"
 fi
 
-echo "==> 2/6 deny sweep — endpoint tree"
+echo "==> 2/7 docs-impact — claimed surfaces vs the corpus"
+if [ -f docs/manifest.yaml ]; then
+  # THE binding copy of the drift gate. CI runs the same script, but a CI check
+  # reports after a pull request exists, which leaves a red mark somebody can
+  # merge past — PR #383 is exactly that story. Here it refuses before the push,
+  # and no attestation can be produced without it.
+  scripts/docs_impact.sh "$base_sha" "$head_sha"
+else
+  echo "    (no corpus yet)"
+fi
+
+echo "==> 3/7 deny sweep — endpoint tree"
 scripts/deny-sweep.sh tree
 
-echo "==> 3/6 deny sweep — every unpublished commit, and their messages"
+echo "==> 4/7 deny sweep — every unpublished commit, and their messages"
 # The endpoint tree can be spotless while an intermediate commit carries the leak, and a
 # push publishes the objects either way. Commit messages are published with them.
 scripts/deny-sweep.sh range "$range"
 scripts/deny-sweep.sh messages "$range"
 
-echo "==> 4/6 secret scan — tree and history"
+echo "==> 5/7 secret scan — tree and history"
 scripts/run-gitleaks.sh tree
 scripts/run-gitleaks.sh range "$range"
 
-echo "==> 5/6 unit gate"
+echo "==> 6/7 unit gate"
 make test-unit
 
-echo "==> 6/6 automated receipt"
+echo "==> 7/7 automated receipt"
 # Record the exact commit SET that was swept, not just its tip, and DIGEST it into the
 # receipt. Binding only the tip let a tip gated against origin/main be pushed to a
 # destination with less history, carrying commits the review never covered. Digesting it

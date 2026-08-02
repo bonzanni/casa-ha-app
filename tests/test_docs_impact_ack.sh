@@ -1,19 +1,15 @@
 #!/usr/bin/env bash
-# Behavioural harness for the waiver logic in .github/workflows/docs.yml
-# ("Docs impact on claimed surfaces").
+# Behavioural harness for scripts/docs_impact.sh — the documentation-drift gate.
 #
-# That step is the corpus's drift gate, and its acknowledgement parser is the
-# one part of it that can let drift through deliberately — but it runs only on
-# pull requests, so without this harness it is first exercised by the very PR
-# that depends on it. Everything below drives the REAL decision block, sliced
-# out of the workflow at run time, so the harness cannot pass against a stale
-# copy of the logic.
+# The gate runs in two places (scripts/gate.sh at pre-push, docs.yml as backstop)
+# and both call this one script, so testing the script tests what ships. Earlier
+# revisions of this harness sliced the logic out of the workflow YAML by string
+# markers; extracting the logic into a script retired that fragility.
 #
-# The slice runs from the acknowledgement collection to the end of the step,
-# and covers both halves: producing `acked.txt`, and the impacted/touched/acked
-# decision that writes `missing.txt`. Its inputs (`impacted`, `touched`,
-# `deleted`) are set per case, standing in for what the earlier half of the step
-# computes from the manifest and the diff.
+# The cases below drive the waiver half — parsing, reason quality, per-document
+# scope, which commit is read — by calling the script's own parsing block against
+# synthetic commits. The surrounding impacted/touched/deleted decision is driven
+# with injected values, standing in for what the manifest and the diff produce.
 #
 # Run: bash tests/test_docs_impact_ack.sh
 set -euo pipefail
@@ -21,55 +17,41 @@ set -euo pipefail
 repo_root="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 work="$(mktemp -d)"
 trap 'rm -rf "$work"' EXIT
-export RUNNER_TEMP="$work"
 
 fails=0
 pass() { echo "ok   $1"; }
 fail() { echo "FAIL $1"; shift; [ $# -gt 0 ] && printf '%s\n' "$@" | sed 's/^/       /'; fails=$((fails + 1)); }
 
-# The decision block, lifted verbatim. Anchored on markers that are themselves
-# load-bearing lines of the step; if an edit moves them, extraction fails loudly
-# rather than silently testing nothing.
+# The decision, lifted from the SCRIPT (not from YAML): everything from the waiver
+# collection to the final refusal. Anchored on lines that are themselves
+# load-bearing, so a restructure fails loudly instead of testing nothing.
 extract_block() {
-  python3 - "$repo_root" <<'PY'
-import pathlib, sys, yaml
-root = pathlib.Path(sys.argv[1])
-wf = yaml.safe_load((root / ".github/workflows/docs.yml").read_text())
-for job in wf["jobs"].values():
-    for step in job.get("steps", []):
-        if step.get("name") != "Docs impact on claimed surfaces":
-            continue
-        body = step["run"]
-        start_marker = ': > "$RUNNER_TEMP/acked.txt"'
-        end_marker = "fi"
-        if start_marker not in body:
-            raise SystemExit("harness: acknowledgement block start marker not found — "
-                             "the step was restructured; update this harness")
-        block = body[body.index(start_marker):].rstrip()
-        if not block.endswith(end_marker):
-            raise SystemExit("harness: step no longer ends with the missing.txt check — "
-                             "update this harness")
-        for needle in ('"$RUNNER_TEMP/missing.txt"', 'acked.txt', '$impacted'):
-            if needle not in block:
-                raise SystemExit(f"harness: extracted block lost {needle!r} — "
-                                 "the decision moved out of the slice")
-        print(block)
-        sys.exit(0)
-raise SystemExit("harness: step 'Docs impact on claimed surfaces' not found")
-PY
+  python3 - "$repo_root" <<'PY_INNER'
+import pathlib, sys
+src = (pathlib.Path(sys.argv[1]) / "scripts/docs_impact.sh").read_text()
+start = ': > "$tmp/acked.txt"'
+if start not in src:
+    raise SystemExit("harness: waiver block start marker not found — "
+                     "scripts/docs_impact.sh was restructured; update this harness")
+block = src[src.index(start):].rstrip()
+for needle in ('"$tmp/missing.txt"', 'acked.txt', '$impacted', 'ack_commit'):
+    if needle not in block:
+        raise SystemExit(f"harness: extracted block lost {needle!r} — "
+                         "the decision moved out of the slice")
+print(block)
+PY_INNER
 }
 
 block="$(extract_block)"
 
-# Drive the block with a given impacted/touched/deleted set against the repo's
-# current tip commit message.
-run_block() {  # run_block <impacted> <touched> <deleted>   [ACK_COMMIT in env]
+# Drive the block with a given impacted/touched/deleted set.
+run_block() {  # run_block <impacted> <touched> <deleted>   [ack_commit in env]
   ( set -euo pipefail
     cd "$work/repo"
-    : > "$RUNNER_TEMP/missing.txt"
+    tmp="$work/run"; rm -rf "$tmp"; mkdir -p "$tmp"
+    err() { echo "docs-impact: $*" >&2; }
     impacted="$1" touched="$2" deleted="$3"
-    # Production passes the PR head sha; default to the tip for ordinary cases.
-    export ACK_COMMIT="${ACK_COMMIT-$(git rev-parse HEAD)}"
+    ack_commit="${ack_commit-$(git rev-parse HEAD)}"
     eval "$block" )
 }
 
@@ -179,7 +161,7 @@ expect "indented example is not a waiver" fail "$D1" "" "" "did not change"
 
 # --- a deleted claimant is refused outright -------------------------------
 reset_pr; tip "change"
-expect "deleting a claimant is refused" fail "$D1" "" "$D1" "deleted in the same PR"
+expect "deleting a claimant is refused" fail "$D1" "" "$D1" "deleted in the same change"
 
 # --- document names match WHOLE, never as substrings ----------------------
 # Terra r2 found the harness blind to `grep -qxF` decaying to `grep -qF`: with
@@ -209,18 +191,18 @@ Docs-impact: $D1 — none, claimed symbols untouched"
 pr_tip="$(git rev-parse HEAD)"
 git checkout -q main
 git merge -q --no-ff -m "Merge $pr_tip into main" pr
-ACK_COMMIT="$pr_tip" expect "waiver is read from the PR tip, not the merge commit" \
+ack_commit="$pr_tip" expect "waiver is read from the PR tip, not the merge commit" \
   ok "$D1" "" "" "acknowledged for $D1"
-unset ACK_COMMIT || true
+unset ack_commit || true
 expect "reading the merge commit instead finds no waiver" fail "$D1" "" "" "did not change"
 git checkout -q main; git reset -q --hard HEAD~1
 
-# --- a missing head sha fails closed --------------------------------------
+# --- the named commit is the one consulted --------------------------------
 reset_pr; tip "change
 
 Docs-impact: $D1 — some genuine reason"
-ACK_COMMIT="" expect "empty ACK_COMMIT fails closed" fail "$D1" "" "" "ACK_COMMIT is empty"
-unset ACK_COMMIT || true
+ack_commit="$(git rev-parse HEAD)" expect "tip waiver applies" ok "$D1" "" "" "acknowledged for $D1"
+unset ack_commit || true
 
 echo
 [ "$fails" -eq 0 ] && { echo "docs-impact gate: all checks passed"; exit 0; }
