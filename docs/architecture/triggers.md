@@ -17,8 +17,19 @@ they are `architecture/callbacks.md`.
 
 ## Mental model
 
-**Three trigger types exist for residents — interval, cron and webhook — and plugins may
+**Four trigger types exist for residents — interval, cron, date and webhook — and plugins may
 declare webhooks only.**
+
+**A reminder is a trigger, not a separate thing.** A resident creates one through a narrow
+writer that may only touch entries carrying a reserved name prefix in its own file;
+everything downstream — registration, firing, listing — is the ordinary trigger path. One-off
+reminders use the point-in-time `date` type, because cron has no year field and a dated
+one-shot written as cron is an *annual* trigger in disguise.
+
+**A reminder still present with a past fire time is one that is owed.** The entry is the
+record and delivery removes it, so there is no second store to keep in sync. This is what
+lets a sweep recover occurrences the process was down for — something the scheduler itself
+cannot do.
 
 **Every webhook trigger arrives on one wildcard route.** There is no route per trigger. The
 name in the path is looked up against a registry, and an unknown name is refused before any
@@ -38,7 +49,9 @@ translation exists to prevent.
 job store, so jobs live in process memory. Definitions are rebuilt from configuration at
 boot, which makes it *look* durable — but next-run times and any occurrence missed while the
 process was down are simply gone. The grace-period setting bounds lateness for a running
-process; it cannot resurrect what was never recorded.
+process; it cannot resurrect what was never recorded. Reminders are the one exception, and
+only because they do not rely on the scheduler to remember: their entry on disk is the record
+that delivery is owed, so a sweep can redeem an occurrence the scheduler never saw.
 
 **A plugin's declared webhook does not route because the plugin is installed.** Declaration
 is only intrinsic validity. Routing additionally requires the target to exist and accept
@@ -89,6 +102,33 @@ mode, header or tolerance change, does invalidate the approval.
 
 There is no window in which the overlay is half-updated. Names absent from the new set stop
 routing immediately.
+
+**INV-TRIG-006**: A one-shot trigger fires at most once — firing removes both the scheduler job and the `triggers.yaml` entry.
+
+Removal runs after the dispatch, in process, and frees the job id so the same name can be
+registered again. The red case is a `one_shot` trigger that survives its own firing: either
+the job stays in the scheduler, or the entry stays on disk and a restart resurrects an
+already-delivered reminder.
+
+What it does not cover: it does not promise the removal *succeeded*. Cleanup is deliberately
+outside the delivery path, so a failure leaves the entry for the sweep rather than raising
+back into the scheduled job.
+
+**INV-TRIG-007**: The reminder writer may only create, and the canceller only remove, entries carrying the reserved name prefix in the calling role's own file.
+
+This is the whole boundary between a resident managing its own reminders and a resident
+editing operator configuration. The red case is either tool touching a name without the
+prefix — the heartbeat, the morning briefing — or reaching another role's file. The
+privileged config-commit path keeps its own separate configurator-only guard; this is a
+narrower door beside it, not a widening of that one.
+
+**INV-TRIG-008**: A one-shot reminder whose time passed while the process was down is delivered by the next sweep rather than dropped.
+
+Presence is the record: an entry still on disk with a past fire time *is* the evidence that
+delivery is owed, which is why removal happens only after a successful send. The red case is
+an overdue entry that no sweep ever delivers. Delivery is consequently at-least-once — a
+failed removal redelivers — because a duplicate reminder is a better failure than a missing
+one.
 
 ## Failure behavior
 

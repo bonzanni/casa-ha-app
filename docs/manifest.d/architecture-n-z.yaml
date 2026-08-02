@@ -187,13 +187,16 @@
     - tests/test_agent_loader_trigger_auth.py
     - tests/test_casa_reload_triggers_resident.py
   related: [architecture/plugins.md, architecture/http-surface.md, architecture/overview.md, architecture/callbacks.md]
-  defines_invariants: [INV-TRIG-001, INV-TRIG-002, INV-TRIG-003, INV-TRIG-004, INV-TRIG-005]
+  defines_invariants: [INV-TRIG-001, INV-TRIG-002, INV-TRIG-003, INV-TRIG-004, INV-TRIG-005, INV-TRIG-006, INV-TRIG-007, INV-TRIG-008]
   invariant_tests:
     INV-TRIG-001: [tests/test_trigger_registry.py::test_interval_channel_must_be_registered_on_agent]
     INV-TRIG-002: [tests/test_pin_g4_invariants.py::test_pin_inv_trig_002_plugin_namespace_reserved_in_user_schema, tests/test_trigger_registry.py::test_duplicate_trigger_name_same_agent_rejected, tests/test_trigger_registry.py::test_cross_role_webhook_name_collision_rejected]
     INV-TRIG-003: [tests/test_plugin_triggers_reconcile.py::test_per_plugin_all_or_nothing]
     INV-TRIG-004: [tests/test_plugin_triggers_consent.py::test_tampered_identity_fails_whole_store_closed]
     INV-TRIG-005: [tests/test_plugin_triggers_overlay.py::test_replace_is_atomic_full_swap_stale_swept]
+    INV-TRIG-006: [tests/test_trigger_registry_date.py::test_firing_a_one_shot_delivers_then_removes_job_and_entry, tests/test_trigger_registry_date.py::test_firing_a_one_shot_frees_its_job_id]
+    INV-TRIG-007: [tests/test_reminder_tools.py::test_writes_only_to_the_calling_roles_own_file, tests/test_reminder_tools.py::test_cancel_refuses_a_non_reminder_name, tests/test_reminders_store.py::test_remove_refuses_a_non_reminder_name]
+    INV-TRIG-008: [tests/test_reminder_sweep.py::test_overdue_reminder_is_delivered_and_removed, tests/test_reminder_sweep.py::test_removal_failure_leaves_it_for_the_next_sweep]
 
 - doc: architecture/turn-loop.md
   summary: How one inbound message becomes one agent turn, and what bounds it.
