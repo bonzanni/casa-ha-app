@@ -577,8 +577,21 @@ def resolve_dependency_closure(
 BUNDLED_SYSREQS_UNSUPPORTED = "bundled_sysreqs_unsupported"
 BUNDLED_TRIGGERS_UNSUPPORTED = "bundled_triggers_unsupported"
 ENV_NAME_COLLISION = "env_name_collision"
+# Task 2 (spec §3): unlike casa.triggers, a sourced/bundled dependency MAY
+# declare casa.callbacks — a callback grants no turn/memory access, so there
+# is no reason to extend the triggers prohibition to it. The one thing that
+# DOES need an inspect-time gate: a bundled dep's OWNED registry entry is
+# scoped (`slug.manifest_name`, up to 73 chars — plugin_callbacks.py's own
+# comment), longer than the identifier alone. `manifest_callbacks` (via
+# `_validate_sourced_plugin_tree`'s later `validate_manifest` call) only
+# ever checks the effective name against the unscoped `identifier` (mirrors
+# triggers' Task-4 runtime-name doctrine), so a callback declaration that
+# fits under the identifier could still overflow once scoped — catch that
+# HERE, against the scoped name, before it can ever reach the registry.
+CALLBACK_NAME_TOO_LONG = "callback_name_too_long"
 _PROHIBITION_KIND_PREFIXES = (
     BUNDLED_SYSREQS_UNSUPPORTED, BUNDLED_TRIGGERS_UNSUPPORTED, ENV_NAME_COLLISION,
+    CALLBACK_NAME_TOO_LONG,
 )
 
 
@@ -787,7 +800,11 @@ def _validate_sourced_plugin_tree(
        `validate_manifest` gets a chance to raise its OWN, differently-coded,
        refusal for the same underlying key): any `manifest_sysreqs` row ⇒
        `bundled_sysreqs_unsupported`; any `casa.triggers` KEY present (even
-       malformed) ⇒ `bundled_triggers_unsupported`.
+       malformed) ⇒ `bundled_triggers_unsupported`. `casa.callbacks` is NOT
+       prohibited (Task 2) — instead, any declared entry whose effective
+       name computed against the SCOPED registry name (`slug.identifier`,
+       longer than `identifier` alone) exceeds
+       `plugin_callbacks.MAX_EFFECTIVE_LEN` ⇒ `callback_name_too_long`.
     4. `plugin_store.validate_manifest` (identity: `plugin.json::name` must
        equal `identifier`; this is also where a non-prohibited
        `apt_requirements_rejected`/`triggers_invalid`/`name_mismatch`/etc.
@@ -839,6 +856,26 @@ def _validate_sourced_plugin_tree(
                 "must not declare casa.triggers", _EMPTY_SURFACES)
 
     scoped = plugin_registry.scoped_name(slug, identifier)
+
+    # Task 2: casa.callbacks IS permitted for a bundled dep (unlike
+    # triggers), but its OWNED registry entry routes under the SCOPED name —
+    # check the scoped-name effective length here, before validate_manifest
+    # below (which only ever sees the unscoped identifier).
+    if isinstance(casa, dict) and isinstance(casa.get("callbacks"), list):
+        import plugin_callbacks
+        for entry in casa["callbacks"]:
+            if not isinstance(entry, dict):
+                continue
+            cb_name = entry.get("name")
+            if not isinstance(cb_name, str):
+                continue
+            eff = plugin_callbacks.effective_name(scoped, cb_name)
+            if len(eff) > plugin_callbacks.MAX_EFFECTIVE_LEN:
+                return (
+                    f"{CALLBACK_NAME_TOO_LONG}: bundled dependency {identifier!r} "
+                    f"callback {cb_name!r} scoped effective name {eff!r} exceeds "
+                    f"{plugin_callbacks.MAX_EFFECTIVE_LEN} chars", _EMPTY_SURFACES)
+
     try:
         plugin_store.validate_manifest(tree, scoped, manifest_name=identifier)
     except plugin_store.StoreError as exc:

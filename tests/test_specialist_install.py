@@ -1911,3 +1911,135 @@ def test_boot_sweep_handles_mixed_type_snapshot_keys(tmp_path: Path) -> None:
     assert sanitize_specialist_snapshots(specialists_dir=tmp_path / "specialists") == 1
     payload = yaml.safe_load((slug_dir / "active.prior.yaml").read_text(encoding="utf-8"))
     assert payload["config_snapshot"] == {}
+
+
+# ---------------------------------------------------------------------------
+# Task 2 (spec §3): casa.callbacks is PERMITTED on a sourced/bundled plugin
+# dependency (unlike casa.triggers) — regression pin for the lifted
+# prohibition — but a bundled dep's OWNED registry entry routes under the
+# SCOPED name (`slug.identifier`, plugin_callbacks.py's own "up to 73
+# chars" comment), longer than the bare identifier `validate_manifest`
+# checks internally. `_validate_sourced_plugin_tree` therefore carries its
+# own inspect-time gate — `CALLBACK_NAME_TOO_LONG` — that refuses BEFORE
+# the (scope-blind) generic `callbacks_invalid` path could ever see it.
+# ---------------------------------------------------------------------------
+
+try:
+    from tests.specialist_fixtures import write_bundled_plugin, write_minimal_component
+except ImportError:
+    from specialist_fixtures import write_bundled_plugin, write_minimal_component
+
+
+def _reset_plugin_registry_snapshot_for(tmp_path: Path) -> None:
+    """Mirrors tests/test_specialist_bundled_inspect.py's own reset —
+    `_manifest_name_collisions` (invoked unconditionally for any component
+    with a sourced dep) reads `plugin_registry`'s process-global cached
+    snapshot, which would otherwise carry over whatever an earlier test (in
+    this same pytest process) last pointed it at."""
+    import plugin_registry
+    plugin_registry.reload_snapshot(registry_path=tmp_path / "registry.json",
+                                    store_root=tmp_path / "store")
+
+
+def _bundled_dep_row(identifier: str, digest: str, path: str) -> dict:
+    return {
+        "kind": "plugin/implementation", "identifier": identifier, "digest": digest,
+        "source": {"type": "bundled", "path": path},
+    }
+
+
+def _add_bundled_dependency_row(manifest_path: Path, row: dict) -> None:
+    manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+    manifest["dependencies"].append(row)
+    manifest_path.write_text(json.dumps(manifest), encoding="utf-8")
+
+
+def _patch_bundled_callbacks(component_dir: Path, name: str, callbacks: list) -> str:
+    """Write `casa.callbacks` onto an already-`write_bundled_plugin`-built
+    tree and return the recomputed digest a dependency row must pin —
+    `write_bundled_plugin` (tests/specialist_fixtures.py) has no callbacks
+    parameter of its own (out of this task's file scope)."""
+    import plugin_store
+    plugin_dir = component_dir / "plugins" / name
+    manifest_path = plugin_dir / ".claude-plugin" / "plugin.json"
+    manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+    manifest.setdefault("casa", {})["callbacks"] = callbacks
+    manifest_path.write_text(json.dumps(manifest), encoding="utf-8")
+    return "sha256:" + plugin_store.content_checksum(plugin_dir)
+
+
+def _inspect_bundled(tmp_path: Path, component_dir: Path,
+                      monkeypatch: pytest.MonkeyPatch) -> "specialist_install.InspectionResult":
+    monkeypatch.setattr(specialist_install, "resolve_and_fetch",
+                        _stub_resolve_and_fetch(component_dir))
+    index = InstalledSpecialistIndex(specialists_dir=str(tmp_path / "specialists"))
+    index.load()
+    return specialist_install.inspect_specialist_repo(
+        "org/repo", "main",
+        staging_root=tmp_path / "staging",
+        installed_index=index,
+        receipts_dir=tmp_path / "receipts",
+    )
+
+
+def test_bundled_callbacks_not_prohibited(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    """Regression pin for the lifted prohibition: casa.callbacks is a PEER
+    of casa.triggers on a bundled dependency, not subject to its
+    bundled_triggers_unsupported treatment — a valid declaration must
+    resolve, and no bundled_*_unsupported kind is ever raised."""
+    _reset_plugin_registry_snapshot_for(tmp_path)
+    component_dir, manifest_path = write_minimal_component(tmp_path, slug="mtg-test")
+    write_bundled_plugin(component_dir, "mtg")
+    digest = _patch_bundled_callbacks(component_dir, "mtg", [{"name": "oauth-return"}])
+    _add_bundled_dependency_row(manifest_path, _bundled_dep_row("mtg", digest, "plugins/mtg"))
+
+    result = _inspect_bundled(tmp_path, component_dir, monkeypatch)
+
+    assert result.slug == "mtg-test"
+    row = result.plugin_resolutions[0]
+    assert row.scoped_name == "mtg-test.mtg"
+    assert row.identifier == "mtg"
+
+
+def test_bundled_callback_scoped_name_too_long_refused(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A callback whose effective name fits comfortably under the bare
+    identifier can still overflow once routed under the SCOPED registry
+    name (slug.identifier) — the inspect-time gate must catch this BEFORE
+    the artifact can ever reach the registry, coded distinctly from the
+    generic (scope-blind) callbacks_invalid."""
+    _reset_plugin_registry_snapshot_for(tmp_path)
+    slug = "s" * 30  # within specialist_component's 32-char slug cap
+    identifier = "mtg"
+    declared = "x" * 100
+    # Sanity for the fixture itself: passes under the BARE identifier.
+    assert len(f"plg-{identifier}--{declared}") <= 128
+    # But overflows once scoped (slug.identifier instead of identifier).
+    assert len(f"plg-{slug}.{identifier}--{declared}") > 128
+
+    component_dir, manifest_path = write_minimal_component(tmp_path, slug=slug)
+    write_bundled_plugin(component_dir, identifier)
+    digest = _patch_bundled_callbacks(component_dir, identifier, [{"name": declared}])
+    _add_bundled_dependency_row(
+        manifest_path, _bundled_dep_row(identifier, digest, f"plugins/{identifier}"))
+
+    with pytest.raises(SpecialistInstallError) as exc:
+        _inspect_bundled(tmp_path, component_dir, monkeypatch)
+    assert exc.value.kind == "callback_name_too_long"
+
+
+def test_bundled_callback_short_name_passes_both_scoped_and_unscoped(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Sanity companion to the overflow test above: a short declared name
+    stays well under 128 chars against BOTH the bare identifier and the
+    scoped name — the new gate must not false-positive on ordinary bundles."""
+    _reset_plugin_registry_snapshot_for(tmp_path)
+    component_dir, manifest_path = write_minimal_component(tmp_path, slug="mtg-test")
+    write_bundled_plugin(component_dir, "mtg")
+    digest = _patch_bundled_callbacks(component_dir, "mtg", [{"name": "short"}])
+    _add_bundled_dependency_row(manifest_path, _bundled_dep_row("mtg", digest, "plugins/mtg"))
+
+    result = _inspect_bundled(tmp_path, component_dir, monkeypatch)
+    assert result.slug == "mtg-test"

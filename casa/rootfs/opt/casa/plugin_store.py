@@ -579,6 +579,13 @@ def artifact_verdict(path: Path, *, name: str, repo: str, revision: str,
         manifest_triggers(manifest, manifest_name or name)
     except StoreError:
         return "triggers_invalid"
+    # Task 2 (spec §3): same upgrade-path posture for casa.callbacks — an
+    # artifact published before this release could carry a malformed/
+    # unsupported block the publish-time gate never saw.
+    try:
+        manifest_callbacks(manifest, manifest_name or name)
+    except StoreError:
+        return "callbacks_invalid"
     # #330: same upgrade-path posture for casa.setupTool (gate added
     # v0.112.0) — a pre-validator artifact with an invalid declaration used
     # to pass snapshot validation and load with automatic setup silently
@@ -892,6 +899,29 @@ def manifest_triggers(manifest: dict, plugin_name: str) -> list:
     return triggers
 
 
+def manifest_callbacks(manifest: dict, plugin_name: str) -> list:
+    """Guarded + STRICT ``casa.callbacks`` extraction (Task 2, spec §3),
+    beside ``manifest_triggers``. Absent ``casa.callbacks`` -> ``[]``. Any
+    intrinsic-validation error (shape, naming, counts/lengths) is a
+    plugin-author error: raises ``StoreError(reason_code="callbacks_invalid")``.
+
+    Needs ``plugin_name`` because the routed effective name is
+    ``plg-<plugin>--<declared>`` (mirrors ``manifest_triggers``). Each call
+    site decides the meaning of a raise — ``validate_manifest`` refuses the
+    install/update; ``artifact_verdict`` excludes the stored artifact from
+    resolution (per-plugin degradation). Returns the normalized callback
+    list. Unlike a trigger, a callback grants no turn/memory access — see
+    ``plugin_callbacks`` module docstring."""
+    import plugin_callbacks
+    callbacks, errors = plugin_callbacks.parse_and_validate(plugin_name, manifest)
+    if errors:
+        raise StoreError(
+            "casa.callbacks invalid: " + "; ".join(errors[:5]),
+            reason_code="callbacks_invalid",
+            detail={"errors": errors})
+    return callbacks
+
+
 _SETUP_TOOL_RE = re.compile(r"^setup_[a-z0-9_]{1,64}$")
 
 
@@ -1061,6 +1091,11 @@ def validate_manifest(root: Path, expected_name: str, *,
     # Task 4: trigger effective names derive from the RUNTIME name
     # (manifest_name when owned), never the scoped registry name.
     manifest_triggers(manifest, manifest_name or expected_name)
+    # Task 2 (spec §3): a PRESENT-but-malformed casa.callbacks refuses the
+    # install/update outright (strict; raises callbacks_invalid). Effective
+    # names derive from the RUNTIME name (manifest_name when owned), same as
+    # triggers.
+    manifest_callbacks(manifest, manifest_name or expected_name)
     # v0.112.0: a PRESENT-but-malformed casa.setupTool refuses the
     # install/update outright (strict; raises setup_tool_invalid).
     manifest_setup_tool(manifest)
