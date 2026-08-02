@@ -121,10 +121,17 @@ class MarkerState(enum.Enum):
 
 @dataclass(frozen=True)
 class Marker:
-    """A durable marker's on-disk state and, when PRESENT, its payload."""
+    """A durable marker's on-disk state and, when PRESENT, its payload.
+
+    ``raw`` carries the exact on-disk bytes (PRESENT only), so the reconcile
+    can compare BYTE-STRICTLY against :func:`canonical_marker_bytes` of the
+    desired payload — a reorder, a type diff, an extra key or a whitespace diff
+    all differ and are rewritten, while casa's own freshly-written marker (same
+    canonical helper) is byte-identical and so never churns."""
 
     state: MarkerState
     payload: "dict | None" = None
+    raw: "bytes | None" = None
 
 
 class SpoolClosed(RuntimeError):
@@ -136,6 +143,23 @@ class SpoolClosed(RuntimeError):
 # ---------------------------------------------------------------------------
 # names / keys
 # ---------------------------------------------------------------------------
+
+
+def canonical_marker_bytes(payload: dict) -> bytes:
+    """The ONE canonical on-disk form of a durable marker's payload — the exact
+    bytes the marker WRITER (:meth:`CallbackSpool._replace_json`, i.e.
+    ``write_ready`` / ``write_index_entry``) emits, and the exact bytes the
+    reconcile compares an on-disk marker against.
+
+    Sorted keys + the most compact separators + no ASCII-escaping, UTF-8. Because
+    writer and compare share this single helper, casa's own freshly-written
+    marker is always byte-identical to ``canonical_marker_bytes(desired)`` — a
+    steady-state pass finds it unchanged (no churn, no serialization-drift
+    footgun) while ANY on-disk drift (a key reorder, a ``true``/``1.0`` type
+    diff, an extra key, a whitespace diff) differs and is rewritten."""
+    return json.dumps(
+        payload, sort_keys=True, separators=(",", ":"), ensure_ascii=False,
+    ).encode("utf-8")
 
 
 def state_hash(state: str) -> str:
@@ -224,6 +248,34 @@ def _lstat_quiet(name: str, dir_fd: int):
         return None
 
 
+#: Sentinel for :func:`_marker_lstat`: a metadata read that FAILED (any OSError
+#: other than ENOENT), so the entry's presence is UNKNOWN — distinct from a
+#: genuine absence (``None``). Never conflated with "gone".
+_LSTAT_ERROR: object = object()
+
+
+def _marker_lstat(name: str, dir_fd: int):
+    """``lstat`` for the marker retirement/confirmation path, three-valued:
+
+    * a ``stat_result`` — the entry is PRESENT;
+    * ``None`` — the entry is genuinely ABSENT (``FileNotFoundError`` / ENOENT);
+    * :data:`_LSTAT_ERROR` — a metadata read FAILED for any other reason
+      (EACCES, EIO, ELOOP, ENOTDIR, …), so presence is UNKNOWN.
+
+    Unlike :func:`_lstat_quiet` — which maps EVERY error to ``None`` and is
+    therefore only safe where "absent-on-any-error" is a fail-SAFE best-effort
+    peek — this never reads a non-ENOENT failure as absence. A retirement that
+    cannot confirm removal must report FAILURE (so the reconciler surfaces
+    ``callback_spool_error``), never a false success that leaves a surviving
+    marker mistaken for gone."""
+    try:
+        return os.lstat(name, dir_fd=dir_fd)
+    except FileNotFoundError:
+        return None
+    except OSError:
+        return _LSTAT_ERROR
+
+
 def _listdir_quiet(dir_fd: int) -> list[str]:
     try:
         return os.listdir(dir_fd)
@@ -267,14 +319,22 @@ def _retire_marker_entry(name: str, dir_fd: int) -> bool:
     surface a False rather than treat it as absent (a stale/invalid marker that
     was NOT removed still blocks republication). Type-aware via ``_remove_entry``
     (``lstat`` + dir-vs-file), so a directory-shaped marker is ``rmtree``d rather
-    than left behind by a raw ``unlink`` that assumes a regular file. Absence is
-    re-confirmed by ``lstat`` after the removal so a benign remove/vanish race is
-    reported as success, not a spurious failure."""
-    st = _lstat_quiet(name, dir_fd)
+    than left behind by a raw ``unlink`` that assumes a regular file.
+
+    Both the pre-removal type probe and the post-removal re-confirmation use
+    :func:`_marker_lstat`, so ONLY a genuine ENOENT counts as absence: a
+    metadata failure (EACCES/EIO/…) BEFORE removal is NOT read as "already
+    gone" (it fails closed to False), and the same failure on the
+    RE-CONFIRMATION is NOT read as "now gone" (a removal whose success cannot
+    be confirmed is reported as failure, not a silent false success). A benign
+    remove/vanish race still reports success (the confirmation sees ENOENT)."""
+    st = _marker_lstat(name, dir_fd)
     if st is None:
-        return True                          # already absent
+        return True                          # genuinely absent (ENOENT)
+    if st is _LSTAT_ERROR:
+        return False                         # presence UNKNOWN — fail closed
     _remove_entry(name, dir_fd, st)
-    return _lstat_quiet(name, dir_fd) is None
+    return _marker_lstat(name, dir_fd) is None   # True only on confirmed ENOENT
 
 
 def _write_new_file(name: str, dir_fd: int, data: bytes) -> None:
@@ -333,8 +393,9 @@ def _read_marker_at(name: str, dir_fd: int) -> Marker:
             chunks.append(chunk)
     finally:
         os.close(fd)
+    body = b"".join(chunks)
     try:
-        obj = json.loads(b"".join(chunks).decode("utf-8"))
+        obj = json.loads(body.decode("utf-8"))
     except Exception:  # noqa: BLE001 — the reader is TOTAL: not just
         # ValueError/UnicodeDecodeError but e.g. a RecursionError from a
         # deeply-nested body that fits the size cap (60k opening brackets)
@@ -343,7 +404,10 @@ def _read_marker_at(name: str, dir_fd: int) -> Marker:
         return Marker(MarkerState.INVALID)
     if not isinstance(obj, dict):
         return Marker(MarkerState.INVALID)
-    return Marker(MarkerState.PRESENT, obj)
+    # Expose the RAW on-disk bytes so the reconcile can compare byte-strictly
+    # against canonical_marker_bytes(desired) — a parse-equal but not
+    # byte-identical marker (reorder/type/whitespace/extra-key) is DIFFERING.
+    return Marker(MarkerState.PRESENT, obj, raw=body)
 
 
 def _link_once(src: str, src_dir_fd: int, dst: str, dst_dir_fd: int) -> bool:
@@ -781,8 +845,11 @@ class CallbackSpool:
         """Atomic replacing publish for the two ADVISORY files (ready.json and
         an index entry): staged 0600 + fsync, then renamed over the target,
         then a directory fsync. Never used for pending/claims/results — those
-        are publish-once by ``link(2)``."""
-        data = json.dumps(payload, sort_keys=True).encode("utf-8")
+        are publish-once by ``link(2)``. Serialized through the SHARED
+        :func:`canonical_marker_bytes`, so a marker casa writes is byte-identical
+        to what the reconcile's compare treats as unchanged — no steady-state
+        churn."""
+        data = canonical_marker_bytes(payload)
         tmp = f".{name}.tmp-{os.getpid()}-{uuid.uuid4().hex}"
         _write_new_file(tmp, dir_fd, data)
         try:

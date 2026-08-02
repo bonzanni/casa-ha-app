@@ -130,17 +130,23 @@ class _SpoolStub:
     def index_keys(self):
         return sorted(self._index)
 
-    def read_marker(self, plugin):
-        payload = self._ready.get(plugin)
+    @staticmethod
+    def _marker(payload):
+        # Model the durable reader's PRESENT shape: expose the RAW canonical
+        # bytes (what a real spool writes) so the byte-strict compare works —
+        # a payload the stub stored (== what casa wrote) round-trips unchanged.
+        if payload is None:
+            return callback_spool.Marker(callback_spool.MarkerState.ABSENT)
         return callback_spool.Marker(
-            callback_spool.MarkerState.PRESENT if payload is not None
-            else callback_spool.MarkerState.ABSENT, payload)
+            callback_spool.MarkerState.PRESENT, payload,
+            raw=callback_spool.canonical_marker_bytes(payload))
+
+    def read_marker(self, plugin):
+        return self._marker(self._ready.get(plugin))
 
     def read_index_marker(self, artifact_realpath):
-        payload = self._index.get(callback_spool.index_key(artifact_realpath))
-        return callback_spool.Marker(
-            callback_spool.MarkerState.PRESENT if payload is not None
-            else callback_spool.MarkerState.ABSENT, payload)
+        return self._marker(
+            self._index.get(callback_spool.index_key(artifact_realpath)))
 
 
 class _SpyRegistry(TriggerRegistry):
@@ -1481,6 +1487,78 @@ async def test_type_corrupted_marker_is_not_read_as_unchanged(tmp_path, corrupt)
         assert type(after["v"]) is int and after["v"] == 1
         assert "extra" not in after
         assert registry2.get_callback("plg-gmail--authorize") is not None
+    finally:
+        spool.close()
+
+
+@pytest.mark.parametrize("rewrite,label", [
+    pytest.param(
+        lambda good: json.dumps(
+            {k: good[k] for k in reversed(list(good))},
+            separators=(",", ":"), ensure_ascii=False),
+        "key-reordered", id="reorder"),
+    pytest.param(
+        lambda good: json.dumps(good, sort_keys=True, indent=2,
+                                ensure_ascii=False),
+        "whitespace-padded", id="whitespace"),
+])
+async def test_byte_different_but_equal_marker_is_rewritten(
+    tmp_path, rewrite, label,
+):
+    """A marker that parses to the SAME payload but is not byte-identical to the
+    canonical form — a key reorder or a whitespace diff — must be treated as
+    DIFFERING (retired + rewritten), so after a trustworthy pass the on-disk
+    marker is byte-identical to canonical(desired)."""
+    root = tmp_path / "spool"
+    art = tmp_path / "store" / "gmail" / "art-1"
+    art.mkdir(parents=True)
+    spool = callback_spool.CallbackSpool(root)
+    try:
+        registry = _SpyRegistry()
+        acks = CallbackAckStore(path=tmp_path / "acks.json")
+        _ack(acks)
+        p = _plugin(path=str(art))
+        await _reconcile(registry, plugins=[p], acks=acks, spool=spool)
+        ready, _index = _marker_paths(root, "gmail", art)
+        good = json.loads(ready.read_text())
+        canonical = callback_spool.canonical_marker_bytes(good)
+        ready.write_text(rewrite(good), encoding="utf-8")
+        assert ready.read_bytes() != canonical               # genuinely differs
+        ino_before = ready.stat().st_ino
+
+        registry2 = _SpyRegistry()                           # a later boot
+        await _reconcile(registry2, plugins=[p], acks=acks, spool=spool)
+
+        assert ready.stat().st_ino != ino_before             # rewritten
+        assert ready.read_bytes() == canonical               # now byte-identical
+        assert registry2.get_callback("plg-gmail--authorize") is not None
+    finally:
+        spool.close()
+
+
+async def test_second_pass_does_not_churn_a_fresh_write(tmp_path):
+    """A marker casa itself just wrote is byte-identical to canonical(desired),
+    so a second immediate pass leaves inode and mtime untouched (no churn)."""
+    root = tmp_path / "spool"
+    art = tmp_path / "store" / "gmail" / "art-1"
+    art.mkdir(parents=True)
+    spool = callback_spool.CallbackSpool(root)
+    try:
+        acks = CallbackAckStore(path=tmp_path / "acks.json")
+        _ack(acks)
+        p = _plugin(path=str(art))
+        await _reconcile(_SpyRegistry(), plugins=[p], acks=acks, spool=spool)
+        ready, index = _marker_paths(root, "gmail", art)
+        ready_bytes = ready.read_bytes()
+        # The fresh write is exactly the canonical desired form.
+        assert ready_bytes == callback_spool.canonical_marker_bytes(
+            json.loads(ready_bytes))
+        st_ready, st_index = ready.stat(), index.stat()
+
+        await _reconcile(_SpyRegistry(), plugins=[p], acks=acks, spool=spool)
+        assert ready.stat().st_ino == st_ready.st_ino        # untouched
+        assert ready.stat().st_mtime == st_ready.st_mtime
+        assert index.stat().st_ino == st_index.st_ino
     finally:
         spool.close()
 

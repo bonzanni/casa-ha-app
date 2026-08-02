@@ -46,7 +46,6 @@ Semantics:
 from __future__ import annotations
 
 import asyncio
-import json
 import logging
 from dataclasses import dataclass, field
 from typing import Any, Callable
@@ -349,19 +348,21 @@ def _read_marker(spool: Any, op: str, arg: str) -> Any:
         return callback_spool.Marker(callback_spool.MarkerState.INVALID)
 
 
-def _canonical(payload: Any) -> "str | None":
-    """Canonical JSON form of a marker payload for a TYPE-STRICT compare.
+def _canonical_bytes(payload: Any) -> "bytes | None":
+    """The desired payload's canonical on-disk BYTES, via the SAME
+    :func:`callback_spool.canonical_marker_bytes` the marker writer uses.
 
-    Python ``==`` treats ``True == 1`` and ``1.0 == 1`` as equal, so a
-    type-corrupted on-disk marker (``"v": true`` / ``"v": 1.0`` where the
-    desired payload has ``"v": 1``, or an extra/reordered key) would read as
-    "unchanged" and survive under a plain ``dict ==``. Comparing canonical
-    serialized JSON instead makes any non-byte-identical payload DIFFER, so it
-    is retired and rewritten. Returns None for a non-serializable payload — an
-    on-disk marker only ever comes from ``json.loads`` so this is defensive,
-    and None never compares equal to the (always-serializable) desired form."""
+    The compare is BYTE-STRICT: an on-disk marker's raw bytes must equal this
+    to count as unchanged. That makes any drift — a key reorder, a ``true`` /
+    ``1.0`` vs ``1`` type diff (which plain ``dict ==`` would call equal), an
+    extra key, or a whitespace diff — DIFFER, so it is retired and rewritten;
+    and because writer and compare share the helper, casa's own fresh write is
+    byte-identical, so a steady-state pass never churns. Returns None for a
+    non-serializable desired payload (defensive — the desired form is always
+    serializable, and None never equals a real marker's bytes)."""
+    import callback_spool
     try:
-        return json.dumps(payload, sort_keys=True, separators=(",", ":"))
+        return callback_spool.canonical_marker_bytes(payload)
     except (TypeError, ValueError):
         return None
 
@@ -386,19 +387,21 @@ def _pair_state(spool: Any, base_url: "str | None",
     absent = callback_spool.MarkerState.ABSENT
     ready, index = _desired_marker_payloads(base_url, routed)
 
-    # Type-STRICT compare (see _canonical): a payload merely ``==`` the desired
-    # one but not byte-identical to its canonical form is NOT "unchanged".
-    desired_ready = _canonical(ready)
+    # BYTE-STRICT compare (see _canonical_bytes): an on-disk marker counts as
+    # unchanged only when its RAW bytes equal canonical(desired) — a payload
+    # merely ``==`` the desired one, or byte-different by reorder/whitespace,
+    # is NOT "unchanged".
+    desired_ready = _canonical_bytes(ready)
     on_ready = _read_marker(spool, "read_marker", routed.plugin)
     ready_ok = (on_ready.state == present and desired_ready is not None
-                and _canonical(on_ready.payload) == desired_ready)
+                and on_ready.raw == desired_ready)
     ready_on_disk = on_ready.state != absent
 
     if routed.path:
-        desired_index = _canonical(index)
+        desired_index = _canonical_bytes(index)
         on_index = _read_marker(spool, "read_index_marker", routed.path)
         index_ok = (on_index.state == present and desired_index is not None
-                    and _canonical(on_index.payload) == desired_index)
+                    and on_index.raw == desired_index)
         index_on_disk = on_index.state != absent
     else:
         index_ok, index_on_disk = True, False   # no index for a pathless plugin

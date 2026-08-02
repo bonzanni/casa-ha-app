@@ -14,6 +14,7 @@ concurrency, not just single-threaded sequences:
 Time is constructed with ``os.utime`` (never ``time.sleep``): mtime is the
 single clock, and every TTL/skew case is therefore deterministic.
 """
+import errno
 import json
 import multiprocessing
 import os
@@ -1280,6 +1281,25 @@ def test_read_marker_present_returns_payload(spool):
     assert m.payload == payload
 
 
+def test_canonical_marker_bytes_is_sorted_compact_utf8():
+    """The shared canonical form: sorted keys, most-compact separators, no
+    ASCII-escaping, UTF-8 encoded."""
+    b = cs.canonical_marker_bytes({"b": 1, "a": "é"})
+    assert b == '{"a":"é","b":1}'.encode("utf-8")
+
+
+def test_written_marker_is_byte_identical_to_canonical(spool):
+    """Writer and compare share the helper: a marker casa writes is byte-for-byte
+    canonical_marker_bytes(payload), and the reader exposes those exact raw bytes
+    — so a second immediate pass sees it unchanged (no churn)."""
+    payload = {"v": 1, "base_url": "https://x.example", "callbacks": {}}
+    spool.write_ready(PLUGIN, payload)
+    on_disk = (_pdir(spool) / "ready.json").read_bytes()
+    assert on_disk == cs.canonical_marker_bytes(payload)
+    m = spool.read_marker(PLUGIN)
+    assert m.raw == cs.canonical_marker_bytes(payload)
+
+
 def test_read_index_marker_roundtrip(spool, tmp_path):
     art = tmp_path / "store" / "acme" / "art-1"
     art.mkdir(parents=True)
@@ -1396,6 +1416,70 @@ def test_delete_ready_surfaces_a_failed_removal(spool, monkeypatch):
     monkeypatch.setattr(cs, "_remove_entry", lambda *a, **k: False)
     assert spool.delete_ready(PLUGIN) is False                # not swallowed
     assert (_pdir(spool) / "ready.json").exists()             # survived
+
+
+def _lstat_raising(errnum, *, on_call=None):
+    """Wrap the real ``os.lstat`` so a lstat of ``ready.json`` raises *errnum*
+    (on the Nth such call, if *on_call* is given; else every call)."""
+    real = os.lstat
+    seen = {"n": 0}
+
+    def flaky(path, *, dir_fd=None):
+        if path == "ready.json":
+            seen["n"] += 1
+            if on_call is None or seen["n"] == on_call:
+                raise OSError(errnum, os.strerror(errnum))
+        return real(path, dir_fd=dir_fd)
+
+    return flaky
+
+
+def test_retire_pre_removal_metadata_error_is_not_read_as_absent(
+    spool, monkeypatch,
+):
+    """A non-ENOENT failure on the PRE-removal probe (here EIO) must NOT be
+    treated as 'already absent' — retirement reports FAILURE and the marker,
+    never even removed, survives."""
+    (_pdir(spool) / "ready.json").write_text("{}")
+    monkeypatch.setattr(cs.os, "lstat", _lstat_raising(errno.EIO))
+    assert spool.delete_ready(PLUGIN) is False
+    assert (_pdir(spool) / "ready.json").exists()             # untouched
+
+
+def test_retire_confirmation_metadata_error_reports_failure(spool, monkeypatch):
+    """When the POST-removal RE-CONFIRMATION lstat raises EACCES, removal
+    success cannot be confirmed, so retirement reports FAILURE (not a silent
+    false success) — the reconcile then surfaces callback_spool_error."""
+    (_pdir(spool) / "ready.json").write_text("{}")
+    # First lstat (pre-removal probe) succeeds; the second (confirmation) raises.
+    monkeypatch.setattr(cs.os, "lstat",
+                        _lstat_raising(errno.EACCES, on_call=2))
+    assert spool.delete_ready(PLUGIN) is False
+
+
+def test_retire_confirmation_enoent_is_success(spool, monkeypatch):
+    """A real removal whose confirming lstat sees ENOENT (the entry is gone) is
+    reported as success — ENOENT is the ONLY 'absent' outcome."""
+    (_pdir(spool) / "ready.json").write_text("{}")
+    # Force the confirmation lstat to raise FileNotFoundError explicitly, even
+    # though the real removal already made it ENOENT — success either way.
+    monkeypatch.setattr(cs.os, "lstat",
+                        _lstat_raising(errno.ENOENT, on_call=2))
+    assert spool.delete_ready(PLUGIN) is True
+    assert not (_pdir(spool) / "ready.json").exists()
+
+
+def test_marker_lstat_is_three_valued(spool):
+    """Unit pin: ENOENT ⇒ None (absent), any other OSError ⇒ _LSTAT_ERROR
+    (unknown), a real entry ⇒ its stat_result (present)."""
+    pfd = os.open(_pdir(spool), os.O_RDONLY | os.O_DIRECTORY)
+    try:
+        assert cs._marker_lstat("ready.json", pfd) is None      # ENOENT
+        (_pdir(spool) / "ready.json").write_text("{}")
+        st = cs._marker_lstat("ready.json", pfd)
+        assert st is not None and st is not cs._LSTAT_ERROR      # present
+    finally:
+        os.close(pfd)
 
 
 @pytest.mark.parametrize("maker", _NON_REGULAR)
