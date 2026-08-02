@@ -108,6 +108,25 @@ mid-2026). Keep it publish-ready at all times:
   QA run (`gh run list --workflow qa.yml --branch main --limit 1`); a red main is
   stop-the-line before the next release — the e2e tiers cover what the local unit gate
   can't (see the v0.52–v0.57 red streak).
+- **One check is NOT covered by "don't wait for CI": `docs.yml` → "Corpus + publication
+  guard".** It finishes in well under a minute and it is the only thing that catches
+  documentation drift, so **wait for it and merge only when it is green**:
+  `gh pr checks <pr> --watch --required` or, at minimum,
+  `gh run list --workflow docs.yml --branch <branch> --limit 1`. It fired on v0.145.0
+  (PR #383), naming six documents that needed auditing — five of which did turn out to
+  need prose changes; that PR was squash-merged with `--admin` about a minute after
+  opening, before the guard reported, and the drift shipped. The guard detects
+  *potential* impact, not proven staleness: the claim is file-level, so a change can
+  easily miss what a document actually quotes. When a named document is genuinely still
+  accurate, acknowledge it per document rather than making a cosmetic edit —
+  `Docs-impact: architecture/tools-interface.md — none (claimed symbols unchanged)` —
+  **in the tip commit's message**, at column zero. A later commit voids it, exactly as
+  it voids a `scripts/attest.sh` receipt: the acknowledgement is a statement about the
+  diff as it finally stands. **Carry the line into the squash-merge message** — a
+  waiver that only ever existed on a deleted branch is not the audit trail it claims to
+  be. The gate cannot check that a waiver is sincere, and deliberately does not try;
+  it exists so that no batch merges without someone naming each impacted document and
+  saying why, on the record.
 - **Branches die on merge.** GitHub auto-deletes the remote head; delete the local
   branch too. No stray branches on origin.
 - **Every release**: bump `casa/config.yaml` version + a user-facing CHANGELOG
