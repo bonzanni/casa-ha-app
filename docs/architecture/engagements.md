@@ -96,8 +96,9 @@ closes the topic that was already opened; after it exists but before the driver 
 live, the compensation additionally marks the record errored and runs the driver's own
 terminal teardown. That last step matters because a driver can be *partly* live: the
 claude-code driver starts its supervised service before its final awaits, so a cancellation
-arriving late would otherwise leave a running process behind a terminal record. Each step is
-scheduled rather than awaited — a cancelled task cannot await network round-trips.
+arriving late would otherwise leave a running process behind a terminal record. The compensation as a whole is scheduled rather
+than awaited by the cancelled caller — a cancelled task cannot await network round-trips —
+and its steps then run in order inside that one background task.
 
 What it does not cover: the other non-strict registry mutations (status touches, channel
 state, counters) warn and continue if their write fails, so the no-disagreement guarantee
