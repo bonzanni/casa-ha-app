@@ -3024,10 +3024,16 @@ def test_the_attempt_cap_deletes_the_oldest_terminal_first(spool, monkeypatch):
         h = state_hash(f"cap-att-{i}")
         _terminal(spool, h, "expired", ended=now - 100 + i)
         hashes.append(h)
-    token = _put(_attempts(spool) / f".ack-{state_hash('receipt')}", now, "")
+    # A receipt the ack phase DEFERS (its flow is in flight), so the token is
+    # still there when the bounds run: what this pins is the cap ladder, which
+    # neither counts nor evicts receipts — consuming one is the other rule.
+    receipt = state_hash("receipt")
+    token = _put(_attempts(spool) / f"{cs.ACK_PREFIX}{receipt}", now, "")
+    spool._in_flight.add(cs.in_flight_key(PLUGIN, receipt))
 
-    report = spool.attempts_pass(now=now, boot=True)
+    report = spool.attempts_pass(now=now, boot=False)
 
+    assert report.acks_consumed == 0
     assert report.capped == 1
     assert spool.read_attempt(PLUGIN, hashes[0]).state is cs.MarkerState.ABSENT
     assert all(spool.read_attempt(PLUGIN, h).state is cs.MarkerState.PRESENT
@@ -3126,3 +3132,250 @@ def test_an_unknown_pending_probe_defers_both_the_rewind_and_the_inference(
 
     assert report.collected == 0 and report.reopened == 0
     assert _attempt_of(spool, h)["status"] == "result_ready"
+
+
+# ---------------------------------------------------------------------------
+# ack consumption (§7) — the consumer's receipt supersedes every record, so
+# consuming an `.ack-<h>` token retires EVERY artifact of that hash and the
+# token itself strictly LAST, only after a three-state proof that they are
+# gone. The ordering (result before the `.collect-*` enumeration) is what
+# makes a collector rename racing the teardown converge rather than strand
+# bytes, and every deferral arm (in-flight, UNKNOWN probe, failed fsync)
+# KEEPS the token — a rename is durable, so the next pass finishes the job.
+# ---------------------------------------------------------------------------
+
+
+def _unlink_spy(monkeypatch, seq, *, after=None):
+    """Record every ``_unlink_quiet`` as ``(<dir basename>, <entry name>)``.
+
+    The teardown's whole point is an ORDER, and the same entry name appears
+    in three directories (``<h>.json`` is a pending, a result and an attempt),
+    so the recorder resolves each dir FD through ``/proc/self/fd``. *after* is
+    an optional ``(dir, name) -> None`` hook fired immediately AFTER the real
+    unlink — how a racing collector is injected at an exact instant.
+    """
+    real = cs._unlink_quiet
+
+    def spy(name, dir_fd):
+        try:
+            where = os.readlink(f"/proc/self/fd/{dir_fd}")
+        except OSError:                      # pragma: no cover
+            where = ""
+        where = os.path.basename(where)
+        seq.append((where, name))
+        out = real(name, dir_fd)
+        if after is not None:
+            after(where, name)
+        return out
+
+    monkeypatch.setattr(cs, "_unlink_quiet", spy)
+
+
+def test_ack_consumption_tears_down_every_artifact_with_the_token_last(
+        spool, monkeypatch):
+    """The full-flow teardown in its normative order: pending, claim, claim
+    temp and result FIRST, then the `.collect-*` enumeration, then the attempt
+    file — and the token only after all of it is proven gone. Nothing is
+    recorded: the ack IS the record (INV-CB-007 arm (a))."""
+    now = time.time()
+    h, _claim = _publish(spool, "acked-flow")
+    hold = _results(spool) / f".collect-{h}-{'c' * 32}"
+    hold.write_text('{"code": "x"}')
+    assert cs.ack(_pdir(spool), h) is True
+    seq: list[tuple[str, str]] = []
+    _unlink_spy(monkeypatch, seq)
+
+    report = spool.attempts_pass(now=now, boot=True)
+    monkeypatch.undo()
+
+    assert report.acks_consumed == 1 and report.acks_deferred == 0
+    assert not (_results(spool) / f"{h}.json").exists() and not hold.exists()
+    assert os.listdir(_attempts(spool)) == [], "no record survives the receipt"
+    assert os.listdir(_pending(spool)) == []
+    assert os.listdir(_claims(spool)) == []
+    i_pend = seq.index(("pending", f"{h}.json"))
+    i_claim = seq.index((".claims", h))
+    i_temp = seq.index((".claims", f"{cs.TEMP_PREFIX}{h}"))
+    i_result = seq.index(("results", f"{h}.json"))
+    i_hold = seq.index(("results", hold.name))
+    i_attempt = seq.index(("attempts", f"{h}.json"))
+    i_token = seq.index(("attempts", f"{cs.ACK_PREFIX}{h}"))
+    assert i_pend < i_claim < i_temp < i_result < i_hold < i_attempt < i_token
+    assert i_token == len(seq) - 1, "the token is the LAST thing removed"
+
+
+def test_a_premature_ack_leaves_no_orphan_to_re_materialize(spool):
+    """Terra r2: a consumer that acks while the result is still live must not
+    leave an orphan — without the teardown the result would be materialized
+    into a fresh attempt and nudged forever. The artifacts die with the ack,
+    and a second pass has nothing to rebuild."""
+    now = time.time()
+    h, _claim = _publish(spool, "premature-ack")
+    assert cs.ack(_pdir(spool), h) is True
+
+    first = spool.attempts_pass(now=now, boot=True)
+
+    assert first.acks_consumed == 1
+    assert not (_results(spool) / f"{h}.json").exists()
+
+    second = spool.attempts_pass(now=now + 1, boot=True)
+
+    assert second.materialized == 0 and second.collected == 0
+    assert second.acks_consumed == 0
+    assert os.listdir(_attempts(spool)) == []
+    assert spool.read_attempt(PLUGIN, h).state is cs.MarkerState.ABSENT
+
+
+def test_an_ack_on_an_open_attempt_aborts_the_pending(spool):
+    """The consumer-abort verb: acking an `awaiting_redirect` attempt kills
+    the pending state instead of letting it expire noisily later."""
+    now = time.time()
+    state = "aborted-flow"
+    h = state_hash(state)
+    mint(_pdir(spool), state, meta={"kind": "renewal"})
+    assert spool.attempts_pass(now=now, boot=True).materialized == 1
+    assert _attempt_of(spool, h)["status"] == "awaiting_redirect"
+    assert cs.ack(_pdir(spool), h) is True
+
+    report = spool.attempts_pass(now=now, boot=True)
+
+    assert report.acks_consumed == 1
+    assert not (_pending(spool) / f"{h}.json").exists()
+    assert os.listdir(_attempts(spool)) == []
+
+
+def test_a_teardown_fsync_failure_keeps_the_token_until_it_completes(
+        spool, monkeypatch):
+    """Power-loss convergence: an unprovable teardown must never consume the
+    receipt. The artifacts may already be gone, may roll back — the durable
+    token is what guarantees the next pass finishes, so it survives every
+    failed strict fsync."""
+    now = time.time()
+    h, _claim = _publish(spool, "undurable-teardown")
+    (_results(spool) / f".collect-{h}-{'d' * 32}").write_text("{}")
+    assert cs.ack(_pdir(spool), h) is True
+    real = cs._fsync_strict
+
+    def boom(fd, what):
+        raise cs.FsyncFailed(errno.EIO, "injected")
+
+    monkeypatch.setattr(cs, "_fsync_strict", boom)
+    first = spool.attempts_pass(now=now, boot=True)
+
+    assert first.acks_consumed == 0 and first.acks_deferred == 1
+    assert (_attempts(spool) / f"{cs.ACK_PREFIX}{h}").exists()
+
+    monkeypatch.setattr(cs, "_fsync_strict", real)
+    second = spool.attempts_pass(now=now + 1, boot=True)
+
+    assert second.acks_consumed == 1 and second.acks_deferred == 0
+    assert os.listdir(_attempts(spool)) == []
+    assert os.listdir(_results(spool)) == []
+
+
+def test_an_unknown_probe_keeps_the_ack_token(spool, monkeypatch):
+    """Proved absence, not assumed absence — on the teardown's proof step
+    too: an artifact whose presence cannot be READ is never counted as gone,
+    so the token stays and the next pass re-proves it."""
+    now = time.time()
+    h, _claim = _publish(spool, "unknowable-teardown")
+    assert cs.ack(_pdir(spool), h) is True
+    real = cs._marker_lstat
+
+    def flaky(name, dir_fd):
+        try:
+            where = os.readlink(f"/proc/self/fd/{dir_fd}")
+        except OSError:                      # pragma: no cover
+            where = ""
+        if name == f"{h}.json" and where.endswith("/results"):
+            return cs._LSTAT_ERROR
+        return real(name, dir_fd)
+
+    monkeypatch.setattr(cs, "_marker_lstat", flaky)
+    first = spool.attempts_pass(now=now, boot=True)
+    monkeypatch.undo()
+
+    assert first.acks_consumed == 0 and first.acks_deferred == 1
+    assert (_attempts(spool) / f"{cs.ACK_PREFIX}{h}").exists()
+
+    second = spool.attempts_pass(now=now + 1, boot=True)
+
+    assert second.acks_consumed == 1
+    assert os.listdir(_attempts(spool)) == []
+
+
+def test_a_collector_racing_the_teardown_is_caught_by_the_enumeration(
+        spool, monkeypatch):
+    """Sol r6's ordering rule, at the instant it exists for: a consumer's
+    `collect` rename lands right after the result unlink. Because the
+    `.collect-*` enumeration runs AFTER that unlink, the bytes the rename
+    moved are seen and removed in the SAME pass — the token is consumed with
+    nothing stranded."""
+    now = time.time()
+    h, _claim = _publish(spool, "raced-teardown")
+    assert cs.ack(_pdir(spool), h) is True
+    raced = _results(spool) / f".collect-{h}-{'e' * 32}"
+    seq: list[tuple[str, str]] = []
+    fired: list[bool] = []
+
+    def after(where, name):
+        if where == "results" and name == f"{h}.json" and not fired:
+            fired.append(True)
+            raced.write_text('{"code": "x"}')
+
+    _unlink_spy(monkeypatch, seq, after=after)
+    report = spool.attempts_pass(now=now, boot=True)
+    monkeypatch.undo()
+
+    assert fired, "the race must have been injected"
+    assert report.acks_consumed == 1
+    assert not raced.exists()
+    assert os.listdir(_results(spool)) == []
+    assert os.listdir(_attempts(spool)) == []
+    assert seq.index(("results", raced.name)) \
+        > seq.index(("results", f"{h}.json"))
+
+
+def test_a_periodic_pass_defers_an_in_flight_ack_a_boot_pass_consumes_it(
+        spool):
+    """Terra r3 guard (a): a consumer can abort while a handler sits between
+    claim and publish, and that handler is building artifact state in THIS
+    process. The teardown defers — the token is durable — and the next pass
+    kills even the result the racing publisher managed to publish."""
+    now = time.time()
+    h, _claim = _publish(spool, "in-flight-ack")
+    assert cs.ack(_pdir(spool), h) is True
+    spool._in_flight.add(cs.in_flight_key(PLUGIN, h))
+
+    periodic = spool.attempts_pass(now=now, boot=False)
+
+    assert periodic.acks_consumed == 0 and periodic.acks_deferred == 0
+    assert (_attempts(spool) / f"{cs.ACK_PREFIX}{h}").exists()
+    assert (_results(spool) / f"{h}.json").exists()
+
+    at_boot = spool.attempts_pass(now=now + 1, boot=True)
+
+    assert at_boot.acks_consumed == 1
+    assert os.listdir(_results(spool)) == []
+    assert os.listdir(_attempts(spool)) == []
+
+
+def test_an_attempt_resurrected_by_a_replace_dies_with_the_token(spool):
+    """Amendment 15 / spec §7's reason for ack-by-RENAME: casa's staged
+    replace can re-create `attempts/<h>.json` after the consumer acked it.
+    An unlink-based ack would be silently undone; the token survives the
+    replace and the teardown removes the resurrected record with it."""
+    now = time.time()
+    h, claim = _publish(spool, "resurrected")
+    assert cs.ack(_pdir(spool), h) is True
+    resurrected = ca.new_attempt(state_hash=h, minted_ts=claim.mtime,
+                                 status="result_ready", now=now)
+    assert spool.write_attempt(PLUGIN, h, resurrected) is True
+    assert (_attempts(spool) / f"{h}.json").exists()
+
+    report = spool.attempts_pass(now=now, boot=True)
+
+    assert report.acks_consumed == 1
+    assert os.listdir(_attempts(spool)) == [], \
+        "the resurrected record dies with the token it could not erase"
+    assert os.listdir(_results(spool)) == []

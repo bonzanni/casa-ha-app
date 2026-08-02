@@ -684,8 +684,13 @@ class AttemptsReport:
     #: a terminal attempt beside a live artifact, or a ``result_ready`` one
     #: whose flow rewound to a live pending
     reopened: int = 0
-    #: ``.ack-<hash>`` receipt tokens consumed (Task 7's teardown)
+    #: ``.ack-<hash>`` receipt tokens consumed — every artifact of the hash
+    #: proven gone, then the token itself (spec §7)
     acks_consumed: int = 0
+    #: receipt tokens KEPT this pass: an in-flight publisher owns the hash, a
+    #: probe was UNKNOWN, or a strict fsync failed. Not a failure — the token
+    #: is durable and the next pass finishes the teardown.
+    acks_deferred: int = 0
     #: terminal attempt files retired at ``ATTEMPT_RETENTION_S``
     aged_out: int = 0
     #: attempt files removed by the ``MAX_ATTEMPTS`` ladder
@@ -2088,12 +2093,10 @@ class CallbackSpool:
                 dirs = _ArtifactDirs(pend=fds[PENDING_DIR],
                                      results=fds[RESULTS_DIR],
                                      claims=fds[CLAIMS_DIR])
-                # 1. Ack tokens. Task 7 owns ack consumption — the
-                # race-convergent full-flow teardown, which must run FIRST
-                # (a receipt supersedes every record). Deliberately a no-op
-                # here: a half-implemented teardown would delete credential-
-                # bearing artifacts without the protocol's proof step.
-                _ = report.acks_consumed
+                # 1. Ack tokens FIRST: a receipt supersedes every record, so
+                # the teardown must run before any phase can re-materialize
+                # what the receipt retires.
+                self._consume_ack_tokens(plugin, afd, dirs, boot, report)
                 valid, invalid = self._scan_attempts(plugin)
                 records = dict(valid)
                 self._materialize_attempts(plugin, dirs, records,
@@ -2134,6 +2137,122 @@ class CallbackSpool:
         except OSError:
             return None
         return any(_hash_of_collect(name) == h for name in names)
+
+    # -- ack consumption (spec §7) --------------------------------------
+
+    def _consume_ack_tokens(self, plugin: str, afd: int, dirs: _ArtifactDirs,
+                            boot: bool, report: AttemptsReport) -> None:
+        """Consume the consumer's receipts: for every ``attempts/.ack-<h>``
+        token, retire EVERY artifact of that hash and then the token itself
+        (spec §7).
+
+        The ack is the consumer's durable declaration that it has absorbed the
+        flow's outcome, so it SUPERSEDES the record: nothing here is written
+        write-ahead and no outcome is recorded (INV-CB-007 arm (a)) — the
+        deletions' sole audience has already spoken. Two edges follow from
+        that: a PREMATURE ack (result or hold still live) kills the artifacts
+        instead of leaving an orphan to be re-materialized and nudged forever,
+        and an ack on an open ``awaiting_redirect`` attempt is the consumer's
+        ABORT verb (the pending dies here rather than expiring noisily later).
+
+        A periodic pass SKIPS any in-flight hash (guard (a) of spec §7): a
+        handler between ``claim()`` and ``publish_result()`` holds no lock and
+        is still building this flow's artifact state. Deferring costs nothing —
+        the token is a rename, so it is durable, and the next pass tears down
+        even the result the racing publisher managed to publish. A boot pass
+        has no live handlers by construction, so it never defers."""
+        for h in self.list_ack_tokens(plugin):
+            if not boot and in_flight_key(plugin, h) in self._in_flight:
+                continue                     # the publisher owns it this pass
+            if not self._teardown_flow(h, afd, dirs):
+                report.acks_deferred += 1
+                continue
+            # Only now, with every artifact a CONFIRMED ENOENT: the token's
+            # job is done, so a best-effort fsync is enough — losing the
+            # token's removal to a crash only replays a teardown that finds
+            # nothing left to do.
+            if _unlink_quiet(f"{ACK_PREFIX}{h}", afd):
+                _fsync(afd, ATTEMPTS_DIR)
+                report.acks_consumed += 1
+            else:
+                report.acks_deferred += 1
+
+    def _teardown_flow(self, h: str, afd: int, dirs: _ArtifactDirs) -> bool:
+        """Run the §7 deletion sequence for *h* until every artifact of the
+        flow is PROVEN gone. True only on all-confirmed-ENOENT — the sole
+        licence to delete the receipt token.
+
+        A PRESENT artifact on the proof step means something raced the
+        teardown (a collector rename, a casa replace resurrecting the attempt
+        file), so the sequence runs once more — bounded at two, because a
+        second failure is no longer a race and the durable token is what
+        carries the work to the next pass. An UNKNOWN probe or a failed
+        strict fsync keeps the token immediately: absence is proved, never
+        assumed, and an unprovable teardown must not consume the receipt."""
+        for _round in range(2):
+            try:
+                self._teardown_once(h, afd, dirs)
+            except FsyncFailed as exc:
+                # No hash in the message (INV-CB-006).
+                logger.warning("callback-spool: ack teardown fsync failed "
+                               "(errno %s)", exc.errno)
+                return False
+            proven = self._teardown_proven(h, afd, dirs)
+            if proven is None:               # UNKNOWN — never guess
+                return False
+            if proven:
+                return True
+        return False
+
+    def _teardown_once(self, h: str, afd: int, dirs: _ArtifactDirs) -> None:
+        """One deletion sweep over every artifact class of *h*, in the ONE
+        order that converges (spec §7, Sol r6), then a strict fsync of each
+        directory it actually changed. Raises :class:`FsyncFailed`.
+
+        ``pending``/``.claims``/the claim temp/``results/<h>.json`` go FIRST,
+        and the ``.collect-<h>-*`` enumeration comes AFTER them: a collector
+        rename racing the teardown moves the result's bytes to a name only an
+        enumeration performed after that unlink can see, so nothing is
+        stranded. The attempt file goes LAST — a staged replace can resurrect
+        it right up to that point (which is why the ack is a rename, not an
+        unlink: the token no replace can erase is what brings us back here).
+        """
+        touched: dict[int, str] = {}
+
+        def drop(name: str, fd: "int | None", what: str) -> None:
+            if fd is not None and _unlink_quiet(name, fd):
+                touched[fd] = what
+
+        drop(f"{h}.json", dirs.pend, PENDING_DIR)
+        drop(h, dirs.claims, CLAIMS_DIR)
+        drop(f"{TEMP_PREFIX}{h}", dirs.claims, CLAIMS_DIR)
+        drop(f"{h}.json", dirs.results, RESULTS_DIR)
+        if dirs.results is not None:
+            for name in _listdir_quiet(dirs.results):
+                if _hash_of_collect(name) == h:
+                    drop(name, dirs.results, RESULTS_DIR)
+        drop(f"{h}.json", afd, ATTEMPTS_DIR)
+        for fd, what in touched.items():
+            # Strict: the token is deleted on the strength of these removals,
+            # so a crash must not roll one back under a consumed receipt.
+            _fsync_strict(fd, what)
+
+    def _teardown_proven(self, h: str, afd: int,
+                         dirs: _ArtifactDirs) -> "bool | None":
+        """The proof step: True when every artifact of *h* is a confirmed
+        ENOENT, False when one is PRESENT (something raced the sweep), None
+        when any probe is UNKNOWN — a directory that would not open included,
+        which is why a lost artifact FD keeps the token instead of licensing
+        its deletion."""
+        probes = (self._probe(f"{h}.json", dirs.pend),
+                  self._probe(h, dirs.claims),
+                  self._probe(f"{TEMP_PREFIX}{h}", dirs.claims),
+                  self._probe(f"{h}.json", dirs.results),
+                  self._probe_collect(h, dirs.results),
+                  self._probe(f"{h}.json", afd))
+        if any(p is None for p in probes):
+            return None
+        return not any(probes)
 
     def _flow_artifacts_live(self, h: str, dirs: _ArtifactDirs) -> bool:
         """True iff ANY artifact of the flow *h* is still on disk — the
