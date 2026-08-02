@@ -581,24 +581,40 @@ class SweepReport:
 
 
 # ---------------------------------------------------------------------------
-# consumer-side reference helper
+# consumer-side reference helpers — the executable half of the consumer
+# contract (mint / collect / ack), deliberately module-level on plain paths
+# and dir FDs, never CallbackSpool methods: a consumer imports the protocol
+# instead of re-implementing it.
 # ---------------------------------------------------------------------------
 
 
-def mint(plugin_dir: Path | str, state: str) -> Path:
+def mint(plugin_dir: Path | str, state: str, meta=None) -> Path:
     """Mint a pending state — the CONSUMER's half of the contract, kept here
     as the executable reference (and the tests' minting primitive).
+
+    The payload is the v2 envelope ``{"v": 2, "meta": <meta>}`` in the ONE
+    canonical byte form (:func:`canonical_marker_bytes`); ``meta`` is
+    whatever non-secret, JSON-serializable context the consumer needs to
+    recognize the flow in a later life — never tokens, verifiers or any
+    bearer material (its retention equals the attempt's). An envelope whose
+    canonical bytes exceed ``callback_attempts.ENVELOPE_MAX_BYTES`` is
+    refused with ``ValueError`` BEFORE any file is created — no ``.part``
+    residue on refusal.
 
     ``pending/<hash>.json.part`` is written 0600 and fsynced, then published
     once by ``link(2)``; the final name existing is a hard error (state
     reuse), never an overwrite. Returns the published path.
     """
+    envelope = canonical_marker_bytes({"v": 2, "meta": meta})
+    if len(envelope) > callback_attempts.ENVELOPE_MAX_BYTES:
+        raise ValueError(
+            "canonical mint envelope exceeds ENVELOPE_MAX_BYTES")
     h = state_hash(state)
     pending = Path(plugin_dir) / PENDING_DIR
     part, final = f"{h}.json{PART_SUFFIX}", f"{h}.json"
     dir_fd = os.open(pending, _DIR_FLAGS)
     try:
-        _write_new_file(part, dir_fd, json.dumps({"v": 1}).encode("utf-8"))
+        _write_new_file(part, dir_fd, envelope)
         if not _link_once(part, dir_fd, final, dir_fd):
             _unlink_quiet(part, dir_fd)
             raise FileExistsError(
@@ -609,6 +625,82 @@ def mint(plugin_dir: Path | str, state: str) -> Path:
     finally:
         os.close(dir_fd)
     return pending / final
+
+
+def collect(plugin_dir: Path | str, state_hash_hex: str) -> tuple[dict, Path]:
+    """Collect a published result — the CONSUMER's pickup verb.
+
+    ``results/<h>.json`` is renamed to the consumer-held name
+    ``results/.collect-<h>-<uuid>`` and read only AFTER the rename, so the
+    rename's exactly-one-winner is what arbitrates a pickup race, never a
+    read of a name a sweep could still retire. A ``FileNotFoundError``
+    propagates untouched: the attempt-first publish ordering opens a brief
+    window where the attempt is visible before the result link lands, so
+    ENOENT while the attempt still says ``result_ready`` is RETRYABLE, never
+    ackable — the retry loop is the caller's. A held file that reads back
+    non-regular, oversized or malformed raises ``ValueError`` (naming no
+    content).
+
+    Returns ``(record, held_path)``. **The consumer keeps the held file
+    until ack and NEVER unlinks it** (nothing is unlinked here either): the
+    ``.collect-*`` entry is the flow's crash journal — a successor finds it,
+    the attempt shows ``claimed: true``, and the consumer's own store is the
+    tiebreaker — and ack-teardown is what removes it, with every other
+    artifact of the hash.
+    """
+    if not _is_hash(state_hash_hex):
+        raise ValueError("malformed state hash")
+    results = Path(plugin_dir) / RESULTS_DIR
+    held = f"{COLLECT_PREFIX}{state_hash_hex}-{uuid.uuid4().hex}"
+    dir_fd = os.open(results, _DIR_FLAGS)
+    try:
+        os.rename(f"{state_hash_hex}.json", held,
+                  src_dir_fd=dir_fd, dst_dir_fd=dir_fd)
+        marker = _read_marker_at(held, dir_fd)
+    finally:
+        os.close(dir_fd)
+    if marker.state is not MarkerState.PRESENT:
+        raise ValueError("collected result is unreadable or malformed")
+    return marker.payload, results / held
+
+
+def ack(plugin_dir: Path | str, state_hash_hex: str) -> bool:
+    """Acknowledge an attempt — the CONSUMER's receipt, and its one verb
+    under ``attempts/``.
+
+    Ack = rename ``attempts/<h>.json`` → ``attempts/.ack-<h>`` — a rename,
+    not an unlink, so casa's staged-replace can never resurrect an acked
+    attempt; a pre-existing ``.ack-<h>`` is simply replaced (same flow, same
+    meaning). ENOENT — on the rename or the ``attempts/`` dir itself —
+    means ALREADY SETTLED (acked earlier, or the flow torn down): ``True``,
+    idempotently, with nothing to witness.
+
+    After a successful rename the attempts directory is fsynced STRICTLY:
+    the ack witness must be crash-durable (spec §7), because the consumer
+    treats the flow as settled from this point — only after its own commit
+    point, the exchange result durably in its own store. ``FsyncFailed``
+    PROPAGATES: an unwitnessed ack must not be treated as settled (the
+    rename may have happened; re-acking re-witnesses). ``True`` only on
+    witness durable.
+    """
+    if not _is_hash(state_hash_hex):
+        raise ValueError("malformed state hash")
+    attempts = Path(plugin_dir) / ATTEMPTS_DIR
+    try:
+        dir_fd = os.open(attempts, _DIR_FLAGS)
+    except FileNotFoundError:
+        return True                          # flow torn down — settled
+    try:
+        try:
+            os.rename(f"{state_hash_hex}.json",
+                      f"{ACK_PREFIX}{state_hash_hex}",
+                      src_dir_fd=dir_fd, dst_dir_fd=dir_fd)
+        except FileNotFoundError:
+            return True                      # already acked / already settled
+        _fsync_strict(dir_fd, ATTEMPTS_DIR)
+    finally:
+        os.close(dir_fd)
+    return True
 
 
 # ---------------------------------------------------------------------------

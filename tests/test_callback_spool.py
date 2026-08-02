@@ -277,9 +277,33 @@ def test_no_plugin_scoped_operation_can_escape_the_root_with_dotdot(spool, tmp_p
 def test_mint_publishes_pending_file_0600(spool):
     p = mint(_pdir(spool), "state-one")
     assert p == _pending(spool) / f"{state_hash('state-one')}.json"
-    assert json.loads(p.read_text()) == {"v": 1}
+    # meta=None is STILL a v2 envelope, in the exact canonical byte form
+    # (sorted keys, compact separators) casa's envelope reader re-derives.
+    assert p.read_bytes() == b'{"meta":null,"v":2}'
     assert stat.S_IMODE(p.stat().st_mode) == 0o600
     assert not list(_pending(spool).glob("*.part"))
+
+
+def test_mint_writes_the_canonical_v2_envelope_with_meta(spool):
+    """The pending payload is `{"v":2,"meta":<meta>}` serialized with the ONE
+    canonical form (`canonical_marker_bytes`): sorted keys, compact
+    separators, no ASCII-escaping — meta echoed value-preserving."""
+    meta = {"kind": "renewal", "bank": "å-banken", "session_ref": "s-1"}
+    p = mint(_pdir(spool), "state-meta", meta)
+    assert p.read_bytes() == cs.canonical_marker_bytes({"v": 2, "meta": meta})
+    assert p.read_bytes() == (
+        '{"meta":{"bank":"å-banken","kind":"renewal","session_ref":"s-1"},'
+        '"v":2}').encode("utf-8")
+
+
+def test_mint_oversized_meta_refuses_before_any_file(spool):
+    """An envelope whose canonical bytes exceed ENVELOPE_MAX_BYTES is refused
+    with ValueError BEFORE any file exists: no final name, no `.part`
+    residue in pending/."""
+    meta = {"pad": "x" * ca.ENVELOPE_MAX_BYTES}
+    with pytest.raises(ValueError):
+        mint(_pdir(spool), "state-fat", meta)
+    assert list(_pending(spool).iterdir()) == []
 
 
 def test_mint_reuse_is_a_hard_error(spool):
@@ -1833,3 +1857,87 @@ def test_attempt_apis_are_empty_on_a_closed_spool(tmp_path):
     assert s.list_invalid_attempts(PLUGIN) == []
     assert s.list_ack_tokens(PLUGIN) == []
     assert s.collect_held_hashes(PLUGIN) == []
+
+
+# ---------------------------------------------------------------------------
+# consumer reference helpers — collect / ack (the §7 pickup contract,
+# executable beside mint())
+# ---------------------------------------------------------------------------
+
+
+def test_collect_renames_then_reads_and_never_unlinks(spool):
+    """collect = rename results/<h>.json -> .collect-<h>-<uuid>, read AFTER
+    the rename. The held file SURVIVES the call — the consumer keeps it until
+    ack; nothing is ever unlinked here."""
+    h, claim = _claimed(spool, "collect-me")
+    rec = _record(h)
+    assert spool.publish_result(claim, rec) is True
+
+    got, held = cs.collect(_pdir(spool), h)
+
+    assert got == rec
+    assert not (_results(spool) / f"{h}.json").exists(), "base name gone"
+    assert held.parent == _results(spool)
+    assert held.name.startswith(f".collect-{h}-")
+    assert held.is_file(), "held file still exists after collect returns"
+    assert json.loads(held.read_text()) == rec
+    assert spool.collect_held_hashes(PLUGIN) == [h], \
+        "the held name satisfies the .collect-<h>-<uuid> grammar"
+
+
+def test_collect_of_an_absent_result_raises_filenotfound(spool):
+    """The attempt-first publish ordering opens a window where the attempt is
+    visible before the result link lands: ENOENT here is RETRYABLE, never
+    ackable — it propagates untouched to the caller's retry loop."""
+    with pytest.raises(FileNotFoundError):
+        cs.collect(_pdir(spool), state_hash("never-published"))
+
+
+def test_collect_refuses_a_malformed_hash(spool):
+    with pytest.raises(ValueError):
+        cs.collect(_pdir(spool), "not-a-hash")
+
+
+def test_ack_renames_the_attempt_to_a_durable_token(spool):
+    now = time.time()
+    h = state_hash("ack-flow")
+    assert spool.write_attempt(PLUGIN, h, _attempt_rec(h, now)) is True
+
+    assert cs.ack(_pdir(spool), h) is True
+
+    att = _attempts(spool)
+    assert (att / f".ack-{h}").exists()
+    assert not (att / f"{h}.json").exists()
+    assert spool.list_ack_tokens(PLUGIN) == [h]
+
+
+def test_ack_is_idempotent_on_enoent(spool):
+    """A second ack finds the source absent: ENOENT means already acked (or
+    already settled) — True, no error, and the token is untouched."""
+    now = time.time()
+    h = state_hash("ack-twice")
+    assert spool.write_attempt(PLUGIN, h, _attempt_rec(h, now)) is True
+    assert cs.ack(_pdir(spool), h) is True
+
+    assert cs.ack(_pdir(spool), h) is True
+
+    assert (_attempts(spool) / f".ack-{h}").exists(), "token still there"
+    # a never-written attempt is equally "already settled"
+    assert cs.ack(_pdir(spool), state_hash("never-attempted")) is True
+
+
+def test_ack_fsync_failure_propagates(spool, monkeypatch):
+    """The ack witness must be crash-durable (spec §7): an fsync failure of
+    the attempts dir RAISES to the caller — the consumer must not treat an
+    unwitnessed ack as settled. (The rename may already have happened; that
+    is fine — the next ack call re-witnesses.)"""
+    now = time.time()
+    h = state_hash("ack-unwitnessed")
+    assert spool.write_attempt(PLUGIN, h, _attempt_rec(h, now)) is True
+
+    def boom(fd, what):
+        raise cs.FsyncFailed(errno.EIO, "injected")
+
+    monkeypatch.setattr(cs, "_fsync_strict", boom)
+    with pytest.raises(cs.FsyncFailed):
+        cs.ack(_pdir(spool), h)
