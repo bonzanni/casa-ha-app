@@ -29,10 +29,28 @@ def test_pin_docs_workflow_runs_verifier_ledger_and_impact():
     # every link of that chain, which is stricter than the old check for a flag
     # in the workflow text: a comment could satisfy that, and one nearly did.
     root = WORKFLOW.parents[2]
-    assert "docs_impact.sh" in text
-    impact = (root / "scripts" / "docs_impact.sh").read_text()
-    assert "--impact" in impact
-    assert "docs_impact.sh" in (root / "scripts" / "gate.sh").read_text()
+
+    def _invokes(path, script):
+        """A real invocation, not a mention. Terra caught the first version of
+        this pinning bare substrings: both callers name the script in comments,
+        so deleting the executable line still passed. Match a line whose first
+        word is the script (optionally via `bash`), with comments excluded."""
+        for line in path.read_text().splitlines():
+            stripped = line.strip()
+            if not stripped or stripped.startswith("#"):
+                continue
+            words = stripped.split()
+            if words[0] == script or (words[0] == "bash" and len(words) > 1
+                                      and words[1] == script):
+                return True
+        return False
+
+    assert _invokes(WORKFLOW, "scripts/docs_impact.sh"), \
+        "docs.yml must CALL scripts/docs_impact.sh, not merely mention it"
+    assert _invokes(root / "scripts" / "gate.sh", "scripts/docs_impact.sh"), \
+        "gate.sh must CALL scripts/docs_impact.sh — it is the binding copy"
+    # And the script itself must still drive the verifier's impact mode.
+    assert "--impact" in (root / "scripts" / "docs_impact.sh").read_text()
     # The operating cards must keep routing agents into the corpus — pinned as
     # the substantive directive pattern, not a bare filename an unrelated
     # sentence could satisfy.

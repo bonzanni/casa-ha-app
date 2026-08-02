@@ -47,6 +47,25 @@ except ValueError:
     _cap_gb = 0.0
 if not _math.isfinite(_cap_gb):
     _cap_gb = 0.0
+# The cap is PER PROCESS, so running under xdist multiplies the total
+# allowance by the worker count — twelve workers would turn a 12 GiB backstop
+# into 144 GiB, in a repo that has twice lost the VM to a runaway pytest.
+# Divide it across the workers, with a floor, because this limit is a blunt
+# instrument: it bounds ADDRESS SPACE, not resident memory, and CPython
+# reserves far more VA than it ever touches. Real aggregate memory is bounded
+# by the systemd cage the Makefile now applies automatically; this stays a
+# per-process backstop for anyone who bypasses it.
+if _cap_gb > 0:
+    try:
+        _workers = int(_os.environ.get("PYTEST_XDIST_WORKER_COUNT", "1"))
+    except ValueError:
+        _workers = 1
+    if _workers > 1:
+        # Floor at 6 GiB: 2 GiB proved too tight (a worker hit MemoryError in
+        # the full parallel run — RLIMIT_AS bounds ADDRESS SPACE, and CPython
+        # reserves far more VA than it uses). Real aggregate memory is the
+        # cage's job, not this one's.
+        _cap_gb = max(6.0, _cap_gb / _workers)
 if _cap_gb > 0:
     try:
         _cap_bytes = int(_cap_gb * 1024**3)

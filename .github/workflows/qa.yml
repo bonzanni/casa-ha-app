@@ -44,7 +44,7 @@ jobs:
       # boot-path NameError, so it must be installed here, not just locally.
       - run: pip install -r casa/requirements.txt pytest pytest-asyncio pytest-xdist anyio pyflakes
       - name: Unit pytest (opt-out gate — everything except docker/slow)
-        run: python -m pytest tests/ -m "not docker and not slow" -n auto --dist loadfile --tb=short
+        run: python -m pytest tests/ -m "not docker and not slow" -v -n auto --maxprocesses=12 --dist loadfile --tb=short
       - name: Build image
         run: docker build -f test-local/Dockerfile.test -t casa-test .
       - name: Invoke sessions
