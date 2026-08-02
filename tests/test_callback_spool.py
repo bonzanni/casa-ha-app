@@ -171,6 +171,70 @@ def test_ensure_plugin_dirs_is_idempotent(spool):
     assert (_pending(spool) / f"{h}.json").exists()
 
 
+def test_ensure_plugin_dirs_never_rewrites_a_valid_token(spool):
+    """A VALID ``.dir-id`` is minted exactly once per directory life: any
+    later pass leaves it byte-identical (an in-flight claim's captured token
+    must stay comparable for the claim's whole life)."""
+    token_path = _pdir(spool) / ".dir-id"
+    before = token_path.read_bytes()
+    spool.ensure_plugin_dirs(PLUGIN)
+    spool.ensure_plugin_dirs(PLUGIN)
+    assert token_path.read_bytes() == before
+
+
+def test_ensure_plugin_dirs_repairs_a_malformed_token(spool):
+    """A POSITIVELY malformed token (wrong grammar/size, or dir-shaped) is
+    retired and re-minted — and an in-flight claim carrying the old token
+    then fails closed at discard/publish like any other identity drift."""
+    token_path = _pdir(spool) / ".dir-id"
+    token_path.write_text("not-a-token")
+    spool.ensure_plugin_dirs(PLUGIN)
+    minted = token_path.read_bytes()
+    assert len(minted) == 32 and minted != b"not-a-token"
+
+
+def test_ensure_plugin_dirs_reprobes_under_the_repair_lock(spool, monkeypatch):
+    """A STALE pre-lock probe (a concurrent pass minted a valid token between
+    the probe and the repair lock) must not retire that token: the repair
+    re-probes under the exclusive lock and skips when it finds a valid one
+    (red case for the round-2 review finding)."""
+    token_path = _pdir(spool) / ".dir-id"
+    before = token_path.read_bytes()
+    real = cs._classify_dir_token
+    calls = {"n": 0}
+
+    def stale_once(dir_fd):
+        calls["n"] += 1
+        if calls["n"] == 1:
+            return None                      # the stale pre-lock view
+        return real(dir_fd)
+
+    monkeypatch.setattr(cs, "_classify_dir_token", stale_once)
+    spool.ensure_plugin_dirs(PLUGIN)
+
+    assert calls["n"] >= 2, "repair must re-probe under the lock"
+    assert token_path.read_bytes() == before, "valid token must survive"
+
+
+def test_ensure_plugin_dirs_aborts_on_an_unknowable_token_state(spool, monkeypatch):
+    """A transient I/O failure mid-probe (EIO, descriptor pressure, a short
+    read) proves NOTHING about the token — the repair path must abort loudly
+    rather than retire what may be a valid, live token (red case for the
+    round-1 review finding: a repair keyed on the gate's collapsed None)."""
+    token_path = _pdir(spool) / ".dir-id"
+    before = token_path.read_bytes()
+
+    def eio(*a, **k):
+        raise OSError(errno.EIO, "injected")
+
+    monkeypatch.setattr(cs.os, "read", eio)
+    with pytest.raises(OSError):
+        spool.ensure_plugin_dirs(PLUGIN)
+    monkeypatch.undo()
+
+    assert token_path.read_bytes() == before, "token must survive the failure"
+
+
 def test_ensure_plugin_dirs_refuses_unsafe_plugin_name(spool):
     with pytest.raises(ValueError):
         spool.ensure_plugin_dirs("../escape")
@@ -410,6 +474,28 @@ def test_discard_claim_fails_closed_when_the_plugin_dir_was_replaced(spool):
     assert other.exists(), "a claim in the recreated dir is not ours to remove"
 
 
+def test_discard_claim_fails_closed_when_the_replaced_dir_reuses_the_inode(spool):
+    """ext4 hands a freed inode number straight back, so a recreated plugin
+    dir can carry the SAME ``(st_dev, st_ino)`` as the directory the claim
+    was taken from — the stat pair alone cannot prove identity (the CI
+    runners' ``/tmp`` is ext4, where this reuse is the common case, not a
+    fluke). Forge that worst case by grafting the recreated dir's stat pair
+    onto the old claim: the gate must still refuse."""
+    import dataclasses
+    import shutil
+
+    h, claim = _claimed(spool)
+    shutil.rmtree(_pdir(spool))
+    spool.ensure_plugin_dirs(PLUGIN)
+    st = os.stat(_pdir(spool))
+    reused = dataclasses.replace(claim, dir_dev=st.st_dev, dir_ino=st.st_ino)
+    other = _put(_claims(spool) / h, time.time(), '{"someone-else": true}')
+
+    spool.discard_claim(reused)
+
+    assert other.exists(), "a claim in the recreated dir is not ours to remove"
+
+
 # ---------------------------------------------------------------------------
 # claim races — two threads AND two processes (INV-CB-002)
 # ---------------------------------------------------------------------------
@@ -555,6 +641,22 @@ def test_publish_result_fails_closed_when_the_plugin_dir_was_replaced(spool):
     spool.ensure_plugin_dirs(PLUGIN)
 
     assert spool.publish_result(claim, _record(h)) is False
+    assert list(_results(spool).iterdir()) == []
+
+
+def test_publish_result_fails_closed_when_the_replaced_dir_reuses_the_inode(spool):
+    """Same worst case as the discard twin: a recreated dir carrying a
+    recycled ``(st_dev, st_ino)``. Identity must not rest on the stat pair."""
+    import dataclasses
+    import shutil
+
+    h, claim = _claimed(spool)
+    shutil.rmtree(_pdir(spool))
+    spool.ensure_plugin_dirs(PLUGIN)
+    st = os.stat(_pdir(spool))
+    reused = dataclasses.replace(claim, dir_dev=st.st_dev, dir_ino=st.st_ino)
+
+    assert spool.publish_result(reused, _record(h)) is False
     assert list(_results(spool).iterdir()) == []
 
 

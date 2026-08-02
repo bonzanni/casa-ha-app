@@ -1474,15 +1474,17 @@ async def test_type_corrupted_marker_is_not_read_as_unchanged(tmp_path, corrupt)
         await _reconcile(registry, plugins=[p], acks=acks, spool=spool)
         ready, _index = _marker_paths(root, "gmail", art)
         good = json.loads(ready.read_text())
-        ino_before = ready.stat().st_ino
         # Corrupt the on-disk payload so ONLY type/extra differs from desired.
         ready.write_text(json.dumps(corrupt(good), sort_keys=True))
 
         registry2 = _SpyRegistry()                    # a later boot
         await _reconcile(registry2, plugins=[p], acks=acks, spool=spool)
 
+        # The rewrite is proven by CONTENT, never by st_ino: the retire frees
+        # the old inode before the staging write, and ext4 hands a freed
+        # inode number straight back, so "new file ⇒ new inode" does not
+        # hold (it was exactly this proxy that broke on the ext4 CI runners).
         after = json.loads(ready.read_text())
-        assert ready.stat().st_ino != ino_before      # rewritten, not left as-is
         assert type(after["v"]) is int and after["v"] == 1
         assert "extra" not in after
         assert registry2.get_callback("plg-gmail--authorize") is not None
@@ -1523,12 +1525,14 @@ async def test_byte_different_but_equal_marker_is_rewritten(
         canonical = callback_spool.canonical_marker_bytes(good)
         ready.write_text(rewrite(good), encoding="utf-8")
         assert ready.read_bytes() != canonical               # genuinely differs
-        ino_before = ready.stat().st_ino
 
         registry2 = _SpyRegistry()                           # a later boot
         await _reconcile(registry2, plugins=[p], acks=acks, spool=spool)
 
-        assert ready.stat().st_ino != ino_before             # rewritten
+        # Byte-identity to canonical(desired) IS the rewrite proof — the
+        # pre-state genuinely differed. st_ino is not usable as a proxy: the
+        # retire frees the old inode before the staging write, and ext4
+        # recycles freed inode numbers immediately.
         assert ready.read_bytes() == canonical               # now byte-identical
         assert registry2.get_callback("plg-gmail--authorize") is not None
     finally:

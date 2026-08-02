@@ -1,5 +1,23 @@
 # Changelog
 
+## [0.146.1] - 2026-08-02
+
+### Fixed
+
+- **Callback spool: uninstall + reinstall detection no longer trusts inode
+  numbers.** Each plugin's callback spool directory now carries a random
+  identity token minted when the directory is created; an OAuth redirect
+  claimed before a plugin was removed and reinstalled is refused rather
+  than deposited into the reinstalled plugin's spool. Previously this
+  check compared the directory's inode number, which a filesystem is free
+  to recycle — on ext4 (including the QA runners) a recreated directory
+  routinely gets the same number back.
+- CI is green again on real-disk filesystems: the QA test image build was
+  missing `plugin_callbacks.py` in its bundle-build stage (the production
+  image was fixed in 0.146.0's hotfix, the test image was not), and two
+  reconcile tests asserted marker rewrites via inode numbers, which ext4
+  recycles.
+
 ## [0.146.0] - 2026-08-02
 
 ### Added
