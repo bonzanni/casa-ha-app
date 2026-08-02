@@ -11,7 +11,9 @@ last_reviewed: 2026-07-31
 What makes an agent act without a person speaking: scheduled triggers, webhook triggers,
 and the plugin-declared triggers that need an operator's approval before they route. It does
 not cover what the resulting turn does, nor webhook authentication mechanics, which belong to
-the HTTP surface.
+the HTTP surface. Plugin-declared *authorization callbacks* share this document's
+wildcard-route, overlay and durable-consent shape but produce no turn and grant no access —
+they are `architecture/callbacks.md`.
 
 ## Mental model
 
@@ -172,4 +174,5 @@ there is none today.
 - [`architecture/plugins.md`](../architecture/plugins.md)
 - [`architecture/http-surface.md`](../architecture/http-surface.md)
 - [`architecture/overview.md`](../architecture/overview.md)
+- [`architecture/callbacks.md`](../architecture/callbacks.md)
 <!-- END SOURCEMAP -->

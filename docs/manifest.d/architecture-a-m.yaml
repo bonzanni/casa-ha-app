@@ -24,6 +24,47 @@
     INV-AGENT-003: [tests/test_agent_loader.py::test_per_specialist_isolation]
     INV-AGENT-004: [tests/test_pin_g1_invariants.py::test_pin_inv_agent_004_registry_performs_no_filesystem_access]
 
+- doc: architecture/callbacks.md
+  summary: The public authorization-callback facility — the unauthenticated GET route, the mtime-clocked publish-once spool, declaration-bound consent, and the at-least-once delivery nudge.
+  when_changing: the callback route, the spool protocol, callback consent or reconciliation, the delivery nudge, or the validated redirect base URL
+  covers:
+    - casa/rootfs/opt/casa/callback_http.py::make_callback_handler
+    - casa/rootfs/opt/casa/callback_http.py::make_done_handler
+    - casa/rootfs/opt/casa/callback_http.py::install_callback_log_redaction
+    - casa/rootfs/opt/casa/callback_http.py::OutcomeSampler
+    - casa/rootfs/opt/casa/callback_spool.py::CallbackSpool
+    - casa/rootfs/opt/casa/callback_spool.py::CallbackSpool.claim
+    - casa/rootfs/opt/casa/callback_spool.py::CallbackSpool.publish_result
+    - casa/rootfs/opt/casa/callback_spool.py::mint
+    - casa/rootfs/opt/casa/callback_acks.py::CallbackAckStore
+    - casa/rootfs/opt/casa/callback_consent.py::render_callback_consent_message
+    - casa/rootfs/opt/casa/callback_reconcile.py::reconcile_plugin_callbacks
+    - casa/rootfs/opt/casa/callback_reconcile.py::compute_desired
+    - casa/rootfs/opt/casa/callback_episodes.py::kick
+    - casa/rootfs/opt/casa/callback_episodes.py::recovery
+    - casa/rootfs/opt/casa/callback_urls.py::validated_base
+    - casa/rootfs/opt/casa/callback_urls.py::redirect_uri
+    - casa/rootfs/opt/casa/plugin_callbacks.py::parse_and_validate
+    - casa/rootfs/opt/casa/plugin_callbacks.py::ack_identity
+    - casa/rootfs/opt/casa/plugin_callbacks.py::declaration_digest
+  tests:
+    - tests/test_callback_http.py
+    - tests/test_callback_spool.py
+    - tests/test_callback_acks.py
+    - tests/test_callback_reconcile.py
+    - tests/test_callback_consent.py
+    - tests/test_plugin_callbacks.py
+    - tests/test_callback_urls.py
+  related: [architecture/http-surface.md, architecture/plugins.md, architecture/triggers.md]
+  defines_invariants: [INV-CB-001, INV-CB-002, INV-CB-003, INV-CB-004, INV-CB-005, INV-CB-006]
+  invariant_tests:
+    INV-CB-001: [tests/test_callback_http.py::test_unknown_name_mutates_nothing, tests/test_callback_http.py::test_malformed_overlay_entry_is_neutral]
+    INV-CB-002: [tests/test_callback_spool.py::test_claim_twice_returns_none_the_second_time, tests/test_callback_spool.py::test_claim_is_exactly_once_under_two_processes, tests/test_callback_http.py::test_replay_never_rewrites_the_result]
+    INV-CB-003: [tests/test_callback_acks.py::test_identity_key_mismatch_yields_zero_acks_whole_store, tests/test_callback_acks.py::test_malformed_record_missing_field_yields_zero_acks, tests/test_callback_reconcile.py::test_revoked_ack_unroutes_marker_first, tests/test_plugin_callbacks.py::test_ack_identity_excludes_artifact]
+    INV-CB-004: [tests/test_callback_http.py::test_duplicate_keys_and_order_preserved, tests/test_callback_http.py::test_provider_error_is_a_result_with_wire_fidelity]
+    INV-CB-005: [tests/test_callback_http.py::test_every_cause_is_byte_identical, tests/test_callback_http.py::test_uniform_at_a_drained_sampler_bucket, tests/test_callback_http.py::test_flood_caps_emission_but_not_responses]
+    INV-CB-006: [tests/test_callback_http.py::test_no_log_record_carries_the_code, tests/test_callback_http.py::test_unknown_name_logs_the_sentinel_not_the_name, tests/test_casa_access_logger.py::test_callback_query_is_suppressed, tests/test_setup_nginx_ingress.py::test_ingress_server_suppresses_callback_query_from_access_log]
+
 - doc: architecture/concurrency-model.md
   summary: What runs concurrently — bus dequeue vs execution, session-key serialization, the lock inventory, and threaded vs loop work.
   when_changing: anything that must serialize, a new lock, bus dispatch, or blocking I/O placement
@@ -148,7 +189,7 @@
     - tests/test_webhook_auth.py::test_hmac_body_missing_header_fails
     - tests/test_webhook_origin_containment.py
     - tests/test_setup_nginx_ingress.py
-  related: [architecture/overview.md]
+  related: [architecture/overview.md, architecture/callbacks.md]
   defines_invariants: [INV-HTTP-001, INV-HTTP-002, INV-HTTP-003, INV-HTTP-004, INV-HTTP-005, INV-HTTP-006]
   invariant_tests:
     INV-HTTP-001: [tests/test_webhook_auth.py::test_hmac_body_valid, tests/test_webhook_auth.py::test_static_header_valid_and_missing, tests/test_webhook_auth.py::test_timestamped_hmac_valid_within_tolerance, tests/test_webhook_auth.py::test_unknown_mode_fails]
