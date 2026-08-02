@@ -16,6 +16,7 @@ single clock, and every TTL/skew case is therefore deterministic.
 """
 import errno
 import json
+import logging
 import multiprocessing
 import os
 import stat
@@ -2822,6 +2823,102 @@ def test_attempts_pass_infers_collected_from_five_confirmed_absences(spool):
     assert rec["next_nudge_ts"] is None, "a collected flow never nudges"
 
 
+def _trace_inference_probes(monkeypatch, seq: list, unknown=None):
+    """Record the §6 probe sequence of the INFERENCE phase alone, optionally
+    forcing one probe UNKNOWN.
+
+    Probes are named ``("<dir>", "<entry>")`` and ``("collect", "*")``; the
+    recorder is armed only while ``_infer_receipts`` runs, because the
+    re-derivation phase probes the same names earlier in the pass and the
+    order under test is the inference's."""
+    real_probe = cs.CallbackSpool._probe
+    real_collect = cs.CallbackSpool._probe_collect
+    real_infer = cs.CallbackSpool._infer_receipts
+    armed: list[bool] = []
+
+    def _where(dir_fd) -> str:
+        try:
+            return os.path.basename(os.readlink(f"/proc/self/fd/{dir_fd}"))
+        except OSError:                      # pragma: no cover
+            return ""
+
+    def probe(name, dir_fd):
+        if not armed:
+            return real_probe(name, dir_fd)
+        key = (_where(dir_fd), name)
+        seq.append(key)
+        return None if key == unknown else real_probe(name, dir_fd)
+
+    def probe_collect(h, results_fd):
+        if not armed:
+            return real_collect(h, results_fd)
+        seq.append(("collect", "*"))
+        return None if unknown == ("collect", "*") \
+            else real_collect(h, results_fd)
+
+    def infer(self, *a, **kw):
+        armed.append(True)
+        try:
+            return real_infer(self, *a, **kw)
+        finally:
+            armed.pop()
+
+    monkeypatch.setattr(cs.CallbackSpool, "_probe", staticmethod(probe))
+    monkeypatch.setattr(cs.CallbackSpool, "_probe_collect",
+                        staticmethod(probe_collect))
+    monkeypatch.setattr(cs.CallbackSpool, "_infer_receipts", infer)
+
+
+def test_the_five_probes_run_in_order_and_any_unknown_defers_at_its_place(
+        spool, monkeypatch):
+    """The normative §6 probe ORDER, and the three-state discipline of EVERY
+    probe (Sol 6 — the happy-path pin alone would survive a reordered or
+    absence-assuming inference).
+
+    Probes 1-4 are I/O and run in the spec's order, short-circuiting: forcing
+    any one UNKNOWN stops the inference exactly there — the later probes are
+    never consulted and nothing is settled, because `collected` is only ever
+    recorded from CONFIRMED absences. Probe 5 ("casa did not itself delete
+    the artifacts") is structural: an OPEN attempt IS its proof, since every
+    casa deletion writes its terminal outcome first — so a record that is
+    already `done` never reaches a probe at all."""
+    now = time.time()
+    h, _claim = _publish(spool, "probe-order")
+    os.unlink(_results(spool) / f"{h}.json")
+    order = [("results", f"{h}.json"), ("collect", "*"),
+             (".claims", h), ("pending", f"{h}.json")]
+
+    for i, target in enumerate(order):
+        seq: list = []
+        _trace_inference_probes(monkeypatch, seq, unknown=target)
+        report = spool.attempts_pass(now=now, boot=True)
+        monkeypatch.undo()
+
+        assert report.collected == 0, target
+        assert _attempt_of(spool, h)["status"] == "result_ready", target
+        assert seq == order[:i + 1], target
+
+    # Every probe confirmed absent: the flow settles, having consulted all
+    # four in order.
+    seq = []
+    _trace_inference_probes(monkeypatch, seq)
+    report = spool.attempts_pass(now=now, boot=True)
+    monkeypatch.undo()
+
+    assert report.collected == 1 and seq == order
+    assert _attempt_of(spool, h)["outcome"] == "collected"
+
+    # Probe 5: the settled record is terminal, so the arm is unreachable for
+    # it — no probe runs, and nothing is re-settled.
+    seq = []
+    _trace_inference_probes(monkeypatch, seq)
+    again = spool.attempts_pass(now=now + 1, boot=True)
+    monkeypatch.undo()
+
+    assert again.collected == 0 and seq == []
+    assert _attempt_of(spool, h)["outcome"] == "collected"
+
+
 def test_inference_is_blocked_by_a_live_claim(spool):
     """Probe 3: attempt-first publishing makes "attempt says result_ready,
     claim still live, result never linked" a real crash state — the claim's
@@ -3042,6 +3139,60 @@ def test_an_invalid_attempt_with_no_artifacts_is_retired_with_an_anomaly(
     assert report.anomalies and report.materialized == 0
     assert report.collected == 0
     assert os.listdir(_attempts(spool)) == [], "not turned into an ack token"
+
+
+def _forge_identity(spool, h: str, **fields) -> dict:
+    """Rewrite `attempts/<h>.json` so it embeds ANOTHER flow's `state_hash`
+    (plus any other field), the way a scribbling consumer or a mis-merged
+    backup would. Everything else about the record stays schema-perfect."""
+    forged = dict(_attempt_of(spool, h), **fields)
+    (_attempts(spool) / f"{h}.json").write_bytes(
+        cs.canonical_marker_bytes(forged))
+    return forged
+
+
+def test_a_record_naming_another_flow_is_invalid_and_re_derived(spool):
+    """Red case (Sol 4): the FILENAME is the flow's identity. A schema-perfect
+    `attempts/<A>.json` whose `state_hash` is B is not A's record — it is a
+    record of nothing — so it must never be readable as truth, and the worker
+    surface must never carry B's identity under A's name. It is INVALID, and
+    the re-derivation rule rebuilds A's record from A's artifacts."""
+    now = time.time()
+    h, claim = _publish(spool, "identity-bound")
+    other = state_hash("some-other-flow")
+    _forge_identity(spool, h, state_hash=other, meta={"b": "victim"})
+
+    assert spool.list_attempts(PLUGIN) == [], "never truth"
+    assert spool.list_invalid_attempts(PLUGIN) == [h]
+    assert spool.update_attempt_nudge(PLUGIN, h, nudges=1) is False, \
+        "no worker bookkeeping merges into another flow's record"
+
+    report = spool.attempts_pass(now=now, boot=True)
+
+    assert report.materialized == 1
+    rec = _attempt_of(spool, h)
+    assert rec["state_hash"] == h and rec["meta"] is None
+    assert rec["minted_ts"] == claim.mtime, "rebuilt from A's own artifacts"
+
+
+def test_a_forged_identity_never_reaches_a_write_ahead_outcome(spool):
+    """The same binding at the sharpest boundary: the record a DELETION
+    depends on. Deriving the write-ahead outcome from a file that names
+    another flow would stamp B's identity and B's binding onto the outcome
+    written under A's name — the consumer's read surface for a credential
+    casa is about to destroy."""
+    now = time.time()
+    h, _claim = _publish(spool, "forged-write-ahead")
+    other = state_hash("forged-victim")
+    _forge_identity(spool, h, state_hash=other, meta={"b": "victim"})
+    _utime(_results(spool) / f"{h}.json", now - RESULT_TTL_S - 10)
+
+    report = spool.sweep(now=now)
+
+    assert report.deleted_results == 1
+    rec = _attempt_of(spool, h)
+    assert rec["state_hash"] == h, "the outcome is recorded for THIS flow"
+    assert rec["outcome"] == "expired_unread" and rec["meta"] is None
 
 
 def test_terminal_attempts_age_out_at_the_retention_bound(spool):
@@ -3312,12 +3463,69 @@ def test_a_teardown_fsync_failure_keeps_the_token_until_it_completes(
     assert first.acks_consumed == 0 and first.acks_deferred == 1
     assert (_attempts(spool) / f"{cs.ACK_PREFIX}{h}").exists()
 
-    monkeypatch.setattr(cs, "_fsync_strict", real)
+    # The pass that DOES consume the token must witness durability itself —
+    # every artifact directory, strictly — not inherit it from the pass whose
+    # fsyncs failed. Pass 1 unlinked artifacts it could not prove durable, so
+    # a pass 2 that fsyncs only what IT changed (nothing) would delete the
+    # receipt on the strength of no witness at all (Sol 1).
+    witnessed: list[str] = []
+
+    def witness(fd, what):
+        witnessed.append(what)
+        return real(fd, what)
+
+    monkeypatch.setattr(cs, "_fsync_strict", witness)
     second = spool.attempts_pass(now=now + 1, boot=True)
 
     assert second.acks_consumed == 1 and second.acks_deferred == 0
+    assert set(witnessed) >= {cs.PENDING_DIR, cs.CLAIMS_DIR, cs.RESULTS_DIR,
+                              cs.ATTEMPTS_DIR}, \
+        "every artifact dir is proven durable BEFORE the token is consumed"
     assert os.listdir(_attempts(spool)) == []
     assert os.listdir(_results(spool)) == []
+
+
+def test_a_teardown_pass_that_changed_nothing_still_proves_its_dirs_durable(
+        spool, monkeypatch):
+    """Red case (Sol 1): the token may only be consumed on a witness that
+    covers EVERY pass's deletions, not just this one's.
+
+    Pass 1 unlinks the result and the `results/` fsync fails, so the token
+    correctly survives. Pass 2 finds the name already absent (page cache),
+    unlinks nothing — and a teardown that fsyncs only what it CHANGED
+    therefore proves nothing, sees six confirmed ENOENTs and deletes the
+    receipt. A power loss then rolls pass 1's unlink back and an unreceipted
+    credential artifact resurrects with no token left to drive its teardown.
+    While the fault persists the token must stay; when it clears, the pass
+    that consumes the token is the one that proved the directories durable."""
+    now = time.time()
+    h, _claim = _publish(spool, "unproven-earlier-pass")
+    assert cs.ack(_pdir(spool), h) is True
+    real = cs._fsync_strict
+
+    def only_results(fd, what):
+        if what == cs.RESULTS_DIR:
+            raise cs.FsyncFailed(errno.EIO, "injected")
+        return real(fd, what)
+
+    monkeypatch.setattr(cs, "_fsync_strict", only_results)
+    first = spool.attempts_pass(now=now, boot=True)
+
+    assert first.acks_consumed == 0 and first.acks_deferred == 1
+    assert not (_results(spool) / f"{h}.json").exists(), \
+        "pass 1 DID unlink — only its durability is unproven"
+
+    second = spool.attempts_pass(now=now + 1, boot=True)
+
+    assert second.acks_consumed == 0 and second.acks_deferred == 1, \
+        "a pass with nothing to unlink still re-proves every directory"
+    assert (_attempts(spool) / f"{cs.ACK_PREFIX}{h}").exists()
+
+    monkeypatch.setattr(cs, "_fsync_strict", real)
+    third = spool.attempts_pass(now=now + 2, boot=True)
+
+    assert third.acks_consumed == 1
+    assert os.listdir(_attempts(spool)) == []
 
 
 def test_an_unknown_probe_keeps_the_ack_token(spool, monkeypatch):
@@ -3508,18 +3716,113 @@ def test_remove_plugin_records_a_terminal_unacked_attempt(spool):
 
 
 def test_an_acked_attempt_is_settled_and_needs_no_record(spool):
-    """The ack SUPERSEDES the record (INV-CB-007 arm (a)): a hash whose
-    receipt token is present is settled, so a plugin holding only that purges
-    directly, with nothing to tell the operator."""
-    now = time.time()
-    h = state_hash("acked-1")
-    assert spool.write_attempt(PLUGIN, h, _attempt_rec(h, now)) is True
-    (_attempts(spool) / f"{cs.ACK_PREFIX}{h}").write_bytes(b"")
+    """The ack SUPERSEDES the record (INV-CB-007 arm (a)), and it settles the
+    FLOW rather than merely its ledger entry.
+
+    Red case (Sol 5): the artifacts of a PREMATURELY acked flow — a live
+    result and the consumer's hold — outlive the ack until the teardown pass
+    runs, and a removal can beat that pass. Subtracting the receipt tokens
+    from the attempts half only, then unioning the artifacts back in, tells
+    the operator a flow was aborted that its consumer has already absorbed.
+    The tokens come off the COMPLETE union."""
+    h, _claim = _publish(spool, "acked-1")
+    hold = _results(spool) / f".collect-{h}-{'f' * 32}"
+    hold.write_text('{"code": "x"}')
+    assert cs.ack(_pdir(spool), h) is True
+    assert (_results(spool) / f"{h}.json").exists(), \
+        "the teardown has NOT run yet — the artifacts are still there"
 
     assert spool.remove_plugin(PLUGIN) is True
 
     assert not _pdir(spool).exists()
     assert _removal_files(spool) == []
+
+
+def _fail_listing(monkeypatch, sub: str) -> None:
+    """Make ONE directory's listing fault (EIO) the way a failing disk does:
+    the directory opens, the listing does not. Scoped by the FD's resolved
+    basename so only the named artifact class is affected."""
+    real = os.listdir
+
+    def flaky(fd):
+        if isinstance(fd, int):
+            try:
+                where = os.readlink(f"/proc/self/fd/{fd}")
+            except OSError:                  # pragma: no cover
+                where = ""
+            if os.path.basename(where) == sub:
+                raise OSError(errno.EIO, "injected")
+        return real(fd)
+
+    monkeypatch.setattr(cs.os, "listdir", flaky)
+
+
+def test_remove_plugin_defers_when_an_artifact_listing_is_unprovable(
+        spool, monkeypatch):
+    """Red case (Sol 2): "no purge without a record" must not fail OPEN on a
+    scan error. A transient EIO while listing a directory that HAS live
+    artifacts maps to an empty set, the union reads as zero, and the whole
+    spool dir — credentials, ledger and all — is purged with NO removal
+    record: the one outcome the §10 exception cannot absorb. An unprovable
+    listing DEFERS instead; the orphan GC converges later."""
+    h = state_hash("unprovable-1")
+    _put(_pending(spool) / f"{h}.json", time.time())
+    _fail_listing(monkeypatch, "pending")
+
+    assert spool.remove_plugin(PLUGIN) is False
+
+    monkeypatch.undo()
+    assert _pdir(spool).is_dir(), "the plugin dir SURVIVES an unprovable scan"
+    assert (_pending(spool) / f"{h}.json").exists()
+    assert _removal_files(spool) == []
+
+    # With the fault gone the same removal proceeds, and records the flow.
+    assert spool.remove_plugin(PLUGIN) is True
+    names = _removal_files(spool)
+    assert len(names) == 1 and _read_removal(spool, names[0])["count"] == 1
+
+
+def test_remove_plugin_defers_when_the_attempt_listing_is_unprovable(
+        spool, monkeypatch):
+    """The same hole through the ledger half: a terminal unacked attempt is an
+    outcome the consumer has not read, and a listing that faults must not
+    erase it from the count that authorizes the purge."""
+    now = time.time()
+    h = state_hash("unprovable-2")
+    assert spool.write_attempt(
+        PLUGIN, h, ca.terminalize(_attempt_rec(h, now), "expired",
+                                  now=now)) is True
+    _fail_listing(monkeypatch, "attempts")
+
+    assert spool.remove_plugin(PLUGIN) is False
+
+    monkeypatch.undo()
+    assert _pdir(spool).is_dir()
+    assert _removal_files(spool) == []
+
+
+def test_a_failed_purge_logs_no_callback_identifier(spool, monkeypatch,
+                                                    caplog):
+    """Red case (Terra 2): `shutil.rmtree`'s OSError names the ENTRY it failed
+    on, and under `results/` or `attempts/` that filename IS a state hash.
+    Interpolating the raw exception puts a callback identifier on exactly the
+    log surface INV-CB-006 keeps free of them — the class and errno are all a
+    diagnostic may say."""
+    h = state_hash("leaky-purge")
+    _put(_results(spool) / f"{h}.json", time.time())
+
+    def boom(path, dir_fd=None):
+        raise OSError(errno.EACCES, "Permission denied",
+                      f"{PLUGIN}/results/{h}.json")
+
+    monkeypatch.setattr(cs.shutil, "rmtree", boom)
+    caplog.set_level(logging.WARNING)
+    assert spool.remove_plugin(PLUGIN) is False
+    monkeypatch.undo()
+
+    text = "\n".join(r.getMessage() for r in caplog.records)
+    assert h not in text, "a state hash reached a log line"
+    assert str(errno.EACCES) in text, "the errno IS what a diagnostic reports"
 
 
 def test_remove_plugin_with_nothing_unsettled_writes_no_record(spool):
@@ -3591,6 +3894,56 @@ def test_orphan_gc_skips_a_dir_whose_record_will_not_go_durable(
     assert removed == []
     assert _pdir(spool, "ghost").is_dir(), "the dir stays for the next pass"
     assert _removal_files(spool) == []
+
+
+def test_orphan_gc_defers_a_dir_whose_inventory_is_unprovable(
+        spool, monkeypatch):
+    """Sol 2's second site: the GC purges a quiescent dir that may still hold
+    terminal-unacked outcomes, so its inventory is the same licence the
+    removal's is — and the same EIO must defer it rather than read as
+    "nothing here"."""
+    now = time.time()
+    spool.ensure_plugin_dirs("ghost")
+    h = state_hash("ghost-unprovable")
+    rec = ca.terminalize(
+        ca.new_attempt(state_hash=h, minted_ts=now - 5.0,
+                       status="result_ready", now=now), "expired", now=now)
+    assert spool.write_attempt("ghost", h, rec) is True
+    _quiesce(_pdir(spool, "ghost"), now - 5 * DAY)
+    _fail_listing(monkeypatch, "attempts")
+
+    removed = spool.gc_orphan_dirs(registry_valid=True,
+                                   member_plugins={PLUGIN}, now=now)
+
+    monkeypatch.undo()
+    assert removed == []
+    assert _pdir(spool, "ghost").is_dir(), "the dir stays for the next pass"
+    assert _removal_files(spool) == []
+
+
+def test_a_failed_orphan_gc_logs_no_callback_identifier(spool, monkeypatch,
+                                                        caplog):
+    """The GC half of Terra 2: same `rmtree`, same filename-bearing OSError,
+    same rule — errno and the plugin name only (INV-CB-006)."""
+    now = time.time()
+    spool.ensure_plugin_dirs("ghost")
+    h = state_hash("ghost-leak")
+    _put(_results(spool, "ghost") / f"{h}.json", now - 5 * DAY)
+    _quiesce(_pdir(spool, "ghost"), now - 5 * DAY)
+
+    def boom(path, dir_fd=None):
+        raise OSError(errno.EIO, "I/O error", f"ghost/results/{h}.json")
+
+    monkeypatch.setattr(cs.shutil, "rmtree", boom)
+    caplog.set_level(logging.WARNING)
+    removed = spool.gc_orphan_dirs(registry_valid=True,
+                                   member_plugins={PLUGIN}, now=now)
+    monkeypatch.undo()
+
+    assert removed == []
+    text = "\n".join(r.getMessage() for r in caplog.records)
+    assert h not in text, "a state hash reached a log line"
+    assert str(errno.EIO) in text
 
 
 def test_orphan_gc_of_a_settled_dir_writes_no_record(spool):

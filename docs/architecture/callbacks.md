@@ -11,9 +11,9 @@ last_reviewed: 2026-08-02
 The facility that lets a plugin receive an external provider's browser redirect — the return
 leg of an OAuth-style authorization flow — at a public, unauthenticated `GET /callback/<name>`
 URL, deposits the result into an on-disk spool, and nudges the plugin's agent to collect it.
-It covers the public endpoint, the spool protocol, the per-flow attempt ledger kept for every
-minted state, the consent that opens a route, the reconciler that routes it, the worker that
-redelivers until receipt, and the validated base URL every redirect URI is built from. It does
+It covers the public endpoint, the spool protocol, the per-flow attempt ledger, the consent
+that opens a route, the reconciler that routes it, the worker that redelivers until receipt,
+and the validated base URL every redirect URI is built from. It does
 not cover webhook *triggers* (`architecture/triggers.md`), webhook authentication
 (`architecture/http-surface.md`), or what the collecting turn then does with the code.
 
@@ -36,9 +36,8 @@ for a callback name.
 **One response always, and nothing query-derived logged.** Success and every refusal cause
 return the *same* 303 redirect to the query-less `/callback/done` with the same headers, since a
 differentiated status, header or target would be an enumeration oracle telling a prober which
-names route and which states are live (INV-CB-005); there is deliberately no 429, because flood
-handling damps casa's internal log *emission*, never the response. The query carries the
-credential, so handler logs carry a reason enum, a correlation id and the *effective* name only,
+names route and which states are live (INV-CB-005); there is deliberately no 429. The query
+carries the credential, so handler logs carry a reason enum, a cid and the *effective* name,
 with a fixed sentinel for the attacker-controlled unrouted name (INV-CB-006).
 
 **Consent is narrower than a trigger's, and bound to the declaration, not the artifact.** What
@@ -58,8 +57,8 @@ exactly one winner however many processes race, and a replayed redirect can neve
 result. A claim also pins the *identity* of the plugin's spool directory: each carries a random
 `.dir-id` token minted at creation, and discard/publish refuse when the token no longer matches
 the one captured at claim time, so a removal + reinstall mid-flow fails closed. The token
-carries that rather than the `(st_dev, st_ino)` pair alone, which a filesystem may recycle
-straight back to the recreated directory.
+carries that rather than the `(st_dev, st_ino)` pair, which a filesystem may recycle straight
+back to the recreated directory.
 
 **One record per flow, facing both ways, and derived from the artifacts.** Beside `pending/`,
 `results/` and `.claims/`, each plugin's spool carries `attempts/<state_hash>.json` — a small,
@@ -84,8 +83,7 @@ own context — it writes `{"v": 2, "meta": <any JSON value>}`, an opaque blob c
 into the result and attempt records, and never interprets, so a successor process can recognize
 its own flow across lives — together with the mint clock as `minted_ts` (the pending file's
 mtime, preserved through the claim). `{"v": 1}` still mints, with a null `meta`. Bearer material
-does not belong in `meta`: casa cannot inspect an opaque value, so that is the consumer's
-obligation, and whatever goes in inherits the attempt's retention.
+does not belong in `meta`, and whatever goes in inherits the attempt's retention.
 
 Who owns each name in a plugin's spool (every dot-prefixed entry at the spool *root* is
 reserved — excluded from plugin enumeration, sweep and orphan GC alike, which is what the
@@ -185,16 +183,16 @@ plugin, and the abort's record is the strict-durable `.removals` entry written b
 Labels are coarse where casa cannot attribute more precisely: `expired` for anything recovery
 cannot distinguish, `expired_unread, claimed: true` for a consumer that renamed a result but
 died before its own commit point. The union a removal counts is check-then-act against a
-same-uid process holding a pre-removal directory FD, which POSIX gives no way to exclude — such
-a mint lands in an already-unrouted plugin, so only its abort notice is lost. A disk fault
+same-uid FD holder POSIX gives no way to exclude — such a mint lands in an already-unrouted
+plugin, so only its abort notice is lost. A disk fault
 taking the outcome write itself leaves no record at all.
 
 **INV-CB-008**: The delivery nudge re-fires on a durable schedule until receipt — the attempt leaving `result_ready` — or until the budget of six accepted dispatches is spent, whichever comes first, and a spent budget raises exactly one operator note.
 
 Enforced by a worker that selects from the attempt ledger rather than from a dispatch mark, so
 "the bus accepted a turn" is not terminal. Bus acceptance advances `next_nudge_ts` through the
-result-phase offsets (immediately, then +60 s, +3 min, +8 min from
-the result inode's mtime, its durable publish time) and afterwards the outcome-phase offsets
+result-phase offsets (0, +60 s, +3 min, +8 min from the
+result inode's mtime, its durable publish time) and afterwards the outcome-phase offsets
 (+30 min, +2 h from `ended_ts`), spending one budget unit each time; it never ends delivery by
 itself. A pass that exhausts its in-pass retries without an accept spends no budget and defers
 on an escalating capped delay, so an unavailable bus yields a bounded cadence, not a spin.
@@ -212,17 +210,19 @@ streak.
 **INV-CB-009**: The consumer's `meta` is size-capped, stored and echoed value-preserving, never interpreted, and never reaches a log surface.
 
 Enforced by an envelope parser that is total and fail-closed: a read bounded at 4 KiB plus one
-byte, a UTF-8 JSON object, a version in `{1, 2}`, unknown keys dropped and never copied
-anywhere. Any defect yields a null `meta` rather than a refusal — by the time casa looks the
-state is already consumed, so refusing buys nothing. The value is parsed once and re-serialized
-in the one canonical byte form into the result and attempt records (value-preserving, not
-byte-verbatim), and nothing downstream walks it, so a deeply nested blob cannot become a
-recursion fault. Parse diagnostics log an error class only, with no `exc_info` that could render
-the value, and worker and sweep diagnostics log hashes and reason enums — INV-CB-006's
-discipline extended to the attempt surface.
+byte, a UTF-8 JSON object with no non-finite constant anywhere in it, a version in `{1, 2}`,
+unknown keys dropped and never copied. Any defect yields a null `meta` rather than a refusal —
+by the time casa looks the state is already consumed, so refusing buys nothing. The value is
+parsed once and re-serialized in the one canonical byte form into the result and attempt records
+(value-preserving, not byte-verbatim); nothing downstream walks it, so a deeply nested blob
+cannot become a recursion fault. Parse diagnostics log an error class only, with no `exc_info`
+that could render the value, and worker, sweep and removal diagnostics carry a plugin name, a
+reason enum and an errno — never a hash, state, query, `meta` or raw `OSError`, whose text names
+the entry it failed on. The one hash casa composes for a human is the flow *handle* in the nudge
+text, which is not a log line — INV-CB-006's discipline extended to the attempt surface.
 
 What it does not cover: casa cannot inspect an opaque value, so "no bearer material in `meta`"
-is a consumer obligation, not an enforced property.
+is a consumer obligation, not enforced.
 
 ## Failure behavior
 
@@ -231,11 +231,11 @@ collapse to the same neutral redirect with no spool mutation; an unrouted name l
 sentinel rather than the attacker-controlled component, and the rest log `no_pending`, the spool
 refusing them identically (`expired` is the sweep's vocabulary, not the handler's).
 
-**A result write fails.** The failure is recorded on the attempt file as `done/publish_failed`
-before `publish_result` returns, and only that proven-durable record authorizes discarding the
-claim, which keeps the state consumed (single-use); a failure that could not be recorded leaves
-the claim instead, and recovery restores the flow to `pending/`. No partial result is published
-either way, and the response is still the neutral redirect (INV-CB-002, INV-CB-005, INV-CB-007).
+**A result write fails.** `done/publish_failed` is recorded before `publish_result` returns, and
+only that proven-durable record authorizes discarding the claim, which keeps the state consumed
+(single-use); a failure that could not be recorded leaves the claim, and recovery restores the
+flow to `pending/`. No partial result is published, and the response is still the neutral
+redirect (INV-CB-002, INV-CB-005, INV-CB-007).
 
 **A published result is never collected.** It is deleted at `RESULT_TTL_S` — 900 s, past the
 life of an authorization code at its provider — but not silently: the sweep records
@@ -243,8 +243,8 @@ life of an authorization code at its provider — but not silently: the sweep re
 consumer acks it or the seven-day retention bound — so a plugin that only runs tomorrow still
 learns the flow's fate.
 
-**An internal fault anywhere on the request path.** Absorbed by the outer guard into the same
-neutral redirect (INV-CB-005).
+**An internal fault on the request path.** Absorbed by the outer guard into the same neutral
+redirect (INV-CB-005).
 
 **The ack store is missing, unreadable, or malformed.** Treated as zero acks; callbacks stay
 unrouted, and the next successful `record` rewrites a valid store. It never raises into the
@@ -259,17 +259,19 @@ same as unset.
 skipped — a resolution hiccup must never vaporize consent.
 
 **A delivery nudge (`kick`) is lost to a crash.** The kick is only a hint: every pass — boot,
-the periodic recovery, the worker's own timed wake — re-derives the ledger from the artifacts
-and redelivers whatever is due, so delivery converges on the durable schedule rather than on a
-request-path signal. A repeated nudge is idempotent for a consumer whose collection against an
-emptied directory finds nothing (INV-CB-008).
+periodic recovery, the worker's timed wake — re-derives the ledger from the artifacts and
+redelivers what is due, so delivery converges on the durable schedule, not on a request-path
+signal. A repeated nudge is idempotent: the consumer's collection against an emptied directory
+finds nothing (INV-CB-008).
 
 **A plugin is removed with authorizations in flight.** Removal is abort-with-notice: casa counts
-every unsettled hash — each unacked attempt, open or terminal, plus every live pending, claim,
-result and consumer-held collect entry — and on a non-zero count writes a strict-durable
-`.removals` record before purging the directory; a record that will not go durable skips the
-purge, which is retried and converges through the orphan GC — which writes the same record
-before purging a quiescent directory that still holds unacked attempts. The worker turns each
+every unsettled hash — each attempt record, open or terminal, plus every live pending, claim,
+result and consumer-held collect entry, less every hash a receipt token covers, an ack settling
+the flow and not just its ledger entry — and on a non-zero count writes a strict-durable
+`.removals` record before purging the directory. A record that will not go durable skips the
+purge, and so does an inventory that cannot be proved: a faulting listing defers rather than
+reading as an empty count. Both converge through the orphan GC, which writes the same record
+before purging a quiescent directory holding unacked attempts. The worker turns each
 un-noted record into one operator note, notifying first and marking only a confirmed send, so a
 crash there costs a duplicate rather than silence (INV-CB-007).
 
@@ -300,17 +302,16 @@ on the return leg, and the one place a malformed value could reach a third party
 
 **Writing a consumer** means importing the protocol rather than re-implementing it:
 `callback_spool` ships `mint`, `collect` and `ack` as the executable half of the contract.
-Discover the spool through its `.index` entry, call `mint(state, meta)` to start a flow, and on
-any later life list `attempts/` (ignoring `.ack-*`) and act on what is there. A `result_ready`
-record is collected by rename and read *after* the rename; an ENOENT there is retryable and
-never ackable, since the attempt becomes visible a moment before the result link lands. Persist
-the exchange durably in the consumer's own store first, then ack — and **never unlink the held
-`.collect-*` file**, the flow's crash journal until ack-teardown removes it with every other
-artifact of the hash. A `done` record is acted on and acked the same way; acking an
-`awaiting_redirect` attempt is the abort verb, and the pending state dies then.
+Discover the spool through its `.index` entry, `mint(state, meta)` to start a flow, and on any
+later life list `attempts/` (ignoring `.ack-*`). A `result_ready` record is collected by rename
+and read *after* it; an ENOENT there is retryable and never ackable, since the attempt becomes
+visible a moment before the result link lands. Persist the exchange in the consumer's own store
+first, then ack — and **never unlink the held `.collect-*` file**, the flow's crash journal
+until ack-teardown removes it with every other artifact of the hash. A `done` record is acted on
+and acked the same way; acking an `awaiting_redirect` attempt is the abort verb.
 
 **Relying on a nudge alone for durability** is the wrong model: the guarantee lives in the
-attempt ledger every pass re-derives, not in the request-path `kick`. A new result-delivery path
+attempt ledger every pass re-derives, not in the `kick`. A new result-delivery path
 must leave an attempt file, or it can silently drop.
 
 ## Source & test map

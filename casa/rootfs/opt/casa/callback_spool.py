@@ -188,9 +188,18 @@ def canonical_marker_bytes(payload: dict) -> bytes:
     marker is always byte-identical to ``canonical_marker_bytes(desired)`` — a
     steady-state pass finds it unchanged (no churn, no serialization-drift
     footgun) while ANY on-disk drift (a key reorder, a ``true``/``1.0`` type
-    diff, an extra key, a whitespace diff) differs and is rewritten."""
+    diff, an extra key, a whitespace diff) differs and is rewritten.
+
+    ``allow_nan=False`` (in lockstep with ``callback_attempts._canonical_text``,
+    its pure-side twin): a non-finite float would otherwise be emitted as the
+    NON-STANDARD ``NaN``/``Infinity`` literal — bytes no conforming reader
+    accepts and no fail-closed validator takes back, so the record would be
+    write-only. Raising here instead is what every writer already handles
+    (``TypeError``/``ValueError`` ⇒ the write is refused, nothing is
+    published)."""
     return json.dumps(
         payload, sort_keys=True, separators=(",", ":"), ensure_ascii=False,
+        allow_nan=False,
     ).encode("utf-8")
 
 
@@ -495,6 +504,13 @@ def _write_new_file(name: str, dir_fd: int, data: bytes) -> None:
 #: same reason ``_LSTAT_ERROR`` is distinct from ENOENT: an unknowable state
 #: is never grounds for the repair path to retire a possibly-valid token.
 _TOKEN_ERROR = object()
+
+#: Sentinel for an inventory scan whose subject could not be ESTABLISHED (a
+#: directory that would not open for anything but ENOENT). Distinct from
+#: ``None`` (genuinely absent, i.e. provably nothing to settle) for the same
+#: reason the two sentinels above are: an unknowable state is never grounds
+#: for the purge it would license.
+_SCAN_ERROR: object = object()
 
 
 def _classify_dir_token(dir_fd: int):
@@ -1915,10 +1931,12 @@ class CallbackSpool:
             marker = self.read_attempt(plugin, h)
             if marker.state is not MarkerState.PRESENT:
                 return False
-            rec = callback_attempts.validate_attempt(marker.payload)
+            rec = callback_attempts.validate_attempt(marker.payload,
+                                                     expect_hash=h)
             if rec is None:
                 return False
-            merged = callback_attempts.validate_attempt(dict(rec, **fields))
+            merged = callback_attempts.validate_attempt(dict(rec, **fields),
+                                                        expect_hash=h)
             if merged is None:
                 logger.warning("callback-spool: rejected an invalid attempt "
                                "nudge update (%r)", plugin)
@@ -1964,8 +1982,13 @@ class CallbackSpool:
                         marker = _read_marker_at(name, afd)
                         if marker.state is MarkerState.ABSENT:
                             continue         # vanished mid-scan
+                        # expect_hash: the NAME is the flow's identity, so a
+                        # record embedding a different hash is INVALID and
+                        # goes to the re-derivation worklist — never onto the
+                        # worker's read surface carrying another flow's
+                        # identity.
                         rec = (callback_attempts.validate_attempt(
-                                   marker.payload)
+                                   marker.payload, expect_hash=h)
                                if marker.state is MarkerState.PRESENT
                                else None)
                         if rec is None:
@@ -2051,7 +2074,12 @@ class CallbackSpool:
         truth) is a record derived from the artifacts that survive."""
         marker = self.read_attempt(plugin, h)
         if marker.state is MarkerState.PRESENT:
-            rec = callback_attempts.validate_attempt(marker.payload)
+            # Bound to the NAME: a record claiming another flow's hash is not
+            # this flow's record, and a write-ahead outcome derived from it
+            # would carry that identity (and its ``meta``) onto the deletion
+            # this call precedes.
+            rec = callback_attempts.validate_attempt(marker.payload,
+                                                     expect_hash=h)
             if rec is not None:
                 return rec
         return self._derive_from_artifacts(
@@ -2174,7 +2202,7 @@ class CallbackSpool:
         # provisional record still knows rather than dropping it (§4). A
         # record that will not validate knows nothing: nothing is carried.
         prior = callback_attempts.validate_attempt(
-            self.read_attempt(plugin, h).payload)
+            self.read_attempt(plugin, h).payload, expect_hash=h)
         if prior is not None:
             for key in ("meta", "minted_ts"):
                 if rec[key] is None:
@@ -2378,8 +2406,8 @@ class CallbackSpool:
 
     def _teardown_once(self, h: str, afd: int, dirs: _ArtifactDirs) -> None:
         """One deletion sweep over every artifact class of *h*, in the ONE
-        order that converges (spec §7, Sol r6), then a strict fsync of each
-        directory it actually changed. Raises :class:`FsyncFailed`.
+        order that converges (spec §7, Sol r6), then a strict fsync of EVERY
+        artifact directory available this pass. Raises :class:`FsyncFailed`.
 
         ``pending``/``.claims``/the claim temp/``results/<h>.json`` go FIRST,
         and the ``.collect-<h>-*`` enumeration comes AFTER them: a collector
@@ -2388,26 +2416,42 @@ class CallbackSpool:
         stranded. The attempt file goes LAST — a staged replace can resurrect
         it right up to that point (which is why the ack is a rename, not an
         unlink: the token no replace can erase is what brings us back here).
-        """
-        touched: dict[int, str] = {}
 
-        def drop(name: str, fd: "int | None", what: str) -> None:
-            if fd is not None and _unlink_quiet(name, fd):
-                touched[fd] = what
+        **Every directory, every pass — not only the ones this pass changed
+        (Sol r7).** The token is consumed on the strength of the whole
+        teardown, not of one pass's unlinks, and the retry that finishes the
+        job is exactly the pass with nothing left to unlink: pass 1 removes
+        the result and its directory fsync FAILS (token correctly kept), then
+        pass 2 finds the name already absent from the page cache, changes
+        nothing, and would — fsyncing only what it touched — prove ENOENT and
+        delete the token having proven NOTHING durable. A power loss then
+        rolls pass 1's unlink back and resurrects an unreceipted credential
+        with no token left to drive its teardown. Re-fsyncing a directory
+        that did not change is free when it is already durable and is the
+        only way to observe that it is not."""
 
-        drop(f"{h}.json", dirs.pend, PENDING_DIR)
-        drop(h, dirs.claims, CLAIMS_DIR)
-        drop(f"{TEMP_PREFIX}{h}", dirs.claims, CLAIMS_DIR)
-        drop(f"{h}.json", dirs.results, RESULTS_DIR)
+        def drop(name: str, fd: "int | None") -> None:
+            if fd is not None:
+                _unlink_quiet(name, fd)
+
+        drop(f"{h}.json", dirs.pend)
+        drop(h, dirs.claims)
+        drop(f"{TEMP_PREFIX}{h}", dirs.claims)
+        drop(f"{h}.json", dirs.results)
         if dirs.results is not None:
             for name in _listdir_quiet(dirs.results):
                 if _hash_of_collect(name) == h:
-                    drop(name, dirs.results, RESULTS_DIR)
-        drop(f"{h}.json", afd, ATTEMPTS_DIR)
-        for fd, what in touched.items():
-            # Strict: the token is deleted on the strength of these removals,
-            # so a crash must not roll one back under a consumed receipt.
-            _fsync_strict(fd, what)
+                    drop(name, dirs.results)
+        drop(f"{h}.json", afd)
+        for fd, what in ((dirs.pend, PENDING_DIR), (dirs.claims, CLAIMS_DIR),
+                         (dirs.results, RESULTS_DIR), (afd, ATTEMPTS_DIR)):
+            # Strict: the token is deleted on the strength of these removals —
+            # this pass's and every earlier pass's — so a crash must not roll
+            # one back under a consumed receipt. A directory that would not
+            # open (``None``) is not skipped silently: the proof step's own
+            # UNKNOWN probe against that missing FD keeps the token anyway.
+            if fd is not None:
+                _fsync_strict(fd, what)
 
     def _teardown_proven(self, h: str, afd: int,
                          dirs: _ArtifactDirs) -> "bool | None":
@@ -2804,7 +2848,7 @@ class CallbackSpool:
         # is on record, reopening a terminal attempt and handing a consumed
         # state a second life (INV-CB-002). Complete the deletion instead.
         rec = callback_attempts.validate_attempt(
-            self.read_attempt(plugin, name).payload)
+            self.read_attempt(plugin, name).payload, expect_hash=name)
         if rec is not None and rec["status"] == "done":
             _unlink_quiet(name, claims)
             _fsync(claims, CLAIMS_DIR)
@@ -3167,68 +3211,147 @@ class CallbackSpool:
             self._chmod_dir(fd, REMOVALS_DIR)
         return fd
 
-    def _artifact_hashes(self, plugin: str) -> set[str]:
-        """Hashes named by *plugin*'s credential-bearing artifacts —
+    @staticmethod
+    def _names_strict(sub: str, pfd: int) -> "list[str] | None":
+        """Every entry name in ``<plugin>/<sub>``, or ``None`` when the
+        listing could not be PROVED.
+
+        The tri-state counterpart of ``_open_dir`` + :func:`_listdir_quiet`,
+        and the reason the removal inventory is not built on the latter: a
+        genuinely ABSENT directory (ENOENT) is provably empty (``[]``), while
+        EVERY other failure — EACCES, EIO, an ``opendir`` that faults, a
+        listing that faults mid-read — leaves the contents UNKNOWN. Reading
+        that as "nothing here" is fail-OPEN for the one caller that cannot
+        take it back: a purge."""
+        try:
+            fd = _open_dir(sub, pfd)
+        except FileNotFoundError:
+            return []
+        except OSError:
+            return None
+        try:
+            return os.listdir(fd)
+        except OSError:
+            return None
+        finally:
+            os.close(fd)
+
+    def _artifact_inventory(self, pfd: int) -> "set[str] | None":
+        """Hashes named by the plugin's credential-bearing artifacts —
         ``pending/`` ∪ ``.claims/`` ∪ ``results/`` (published and
-        consumer-held alike). By NAME only: casa never opens a held file.
+        consumer-held alike) — or ``None`` when any of the three listings is
+        unprovable. By NAME only: casa never opens a held file.
 
-        Best-effort per directory, exactly like :meth:`_flow_artifacts_live`:
-        a directory that will not open contributes nothing rather than
-        failing the scan."""
+        Deliberately NOT best-effort, unlike :meth:`_flow_artifacts_live`:
+        there, a lost directory costs a witness and the next pass re-examines
+        the record; here the answer licenses a purge, so an unprovable
+        directory must defer it (Sol r7)."""
+        out: set[str] = set()
+        for sub in (PENDING_DIR, CLAIMS_DIR, RESULTS_DIR):
+            names = self._names_strict(sub, pfd)
+            if names is None:
+                return None
+            for name in names:
+                if sub == CLAIMS_DIR:
+                    if _is_hash(name):
+                        out.add(name)      # a temp names no minted state
+                    continue
+                h = _hash_of_pending(name)
+                if h is None and sub == RESULTS_DIR:
+                    h = _hash_of_collect(name)
+                if h is not None:
+                    out.add(h)
+        return out
+
+    def _attempt_inventory(self, pfd: int) -> "tuple[set[str], set[str]] | None":
+        """``(recorded, acked)`` for the plugin's ``attempts/`` dir — hashes
+        that HAVE an attempt file, and hashes whose receipt token is present —
+        or ``None`` when the listing is unprovable.
+
+        Membership is by NAME, not by whether the record parses: a
+        ``<h>.json`` that will not validate (scribbled, truncated, or simply
+        unreadable this instant) is still casa's evidence that the flow
+        existed and nobody acked it. Counting only what parses would let a
+        single failed read erase a flow from the notice a removal owes its
+        operator — the same fail-open shape as an unprovable listing, one
+        entry down."""
+        names = self._names_strict(ATTEMPTS_DIR, pfd)
+        if names is None:
+            return None
+        acked = {name[len(ACK_PREFIX):] for name in names
+                 if name.startswith(ACK_PREFIX)
+                 and _is_hash(name[len(ACK_PREFIX):])}
+        recorded = {h for h in (_hash_of_pending(n) for n in names)
+                    if h is not None}
+        return recorded, acked
+
+    def _plugin_fd_strict(self, plugin: str) -> "int | None | object":
+        """The plugin dir FD for an inventory scan: an FD, ``None`` when the
+        directory is genuinely ABSENT (there is nothing to settle), or
+        :data:`_SCAN_ERROR` when it could not be opened for any other reason
+        (UNKNOWN — the caller defers)."""
+        if self._closed or not _safe_component(plugin):
+            return _SCAN_ERROR
+        try:
+            return self._plugin_fd(plugin)
+        except FileNotFoundError:
+            return None
+        except (OSError, ValueError):
+            return _SCAN_ERROR
+
+    def _unacked_attempts(self, plugin: str) -> "set[str] | None":
+        """Hashes with an attempt file and no ``.ack-<h>`` receipt — open OR
+        terminal (Sol r3): a terminal attempt nobody acked is an outcome the
+        consumer has not read yet, which is precisely what a removal is about
+        to destroy. ``None`` when the inventory could not be proved."""
         with self._lock:
-            if self._closed or not _safe_component(plugin):
+            pfd = self._plugin_fd_strict(plugin)
+            if pfd is None:
                 return set()
+            if pfd is _SCAN_ERROR:
+                return None
             try:
-                pfd = self._plugin_fd(plugin)
-            except (OSError, ValueError):
-                return set()
-            try:
-                def names(sub: str) -> list[str]:
-                    try:
-                        fd = _open_dir(sub, pfd)
-                    except OSError:
-                        return []
-                    try:
-                        return _listdir_quiet(fd)
-                    finally:
-                        os.close(fd)
-
-                out = {h for h in (_hash_of_pending(n)
-                                   for n in names(PENDING_DIR))
-                       if h is not None}
-                out |= {n for n in names(CLAIMS_DIR) if _is_hash(n)}
-                for name in names(RESULTS_DIR):
-                    h = _hash_of_pending(name) or _hash_of_collect(name)
-                    if h is not None:
-                        out.add(h)
-                return out
+                inventory = self._attempt_inventory(pfd)
             finally:
                 os.close(pfd)
+            if inventory is None:
+                return None
+            recorded, acked = inventory
+            return recorded - acked
 
-    def _unacked_attempts(self, plugin: str) -> set[str]:
-        """Hashes with a VALID attempt record and no ``.ack-<h>`` receipt —
-        open OR terminal (Sol r3): a terminal attempt nobody acked is an
-        outcome the consumer has not read yet, which is precisely what a
-        removal is about to destroy."""
-        return ({h for h, _rec in self.list_attempts(plugin)}
-                - set(self.list_ack_tokens(plugin)))
-
-    def _unsettled_hashes(self, plugin: str) -> set[str]:
+    def _unsettled_hashes(self, plugin: str) -> "set[str] | None":
         """Every flow of *plugin* with unfinished business — the union spec
-        §10 counts before a purge: unacked attempts ∪ pendings ∪ claims ∪
-        results ∪ consumer-held collects.
+        §10 counts before a purge: (attempt records ∪ pendings ∪ claims ∪
+        results ∪ consumer-held collects) MINUS the receipt tokens.
 
         The artifacts are unioned in unconditionally (not only when they
         carry an attempt file): a flow casa can still see is a flow the purge
         aborts, whether or not the ledger has caught up with it. The ack is
-        the one settling verb — a hash whose receipt token is present has
-        been absorbed by the consumer and needs no notice (INV-CB-007 arm
-        (a))."""
+        the one settling verb, and it settles the FLOW rather than merely its
+        ledger entry, so the tokens are subtracted from the COMPLETE union
+        (Sol r7): a premature ack whose result or hold is still on disk
+        (teardown has not run yet) would otherwise be counted, and the
+        operator told a flow was aborted that its consumer has already
+        absorbed (INV-CB-007 arm (a)).
+
+        ``None`` when any directory or listing could not be proved: a purge
+        is irreversible, so an unprovable inventory DEFERS it — it is never
+        read as "nothing here"."""
         with self._lock:
-            if self._closed or not _safe_component(plugin):
+            pfd = self._plugin_fd_strict(plugin)
+            if pfd is None:
                 return set()
-            return (self._unacked_attempts(plugin)
-                    | self._artifact_hashes(plugin))
+            if pfd is _SCAN_ERROR:
+                return None
+            try:
+                attempts = self._attempt_inventory(pfd)
+                artifacts = self._artifact_inventory(pfd)
+            finally:
+                os.close(pfd)
+            if attempts is None or artifacts is None:
+                return None
+            recorded, acked = attempts
+            return (recorded | artifacts) - acked
 
     def _write_removal_record(self, plugin: str, count: int, reason: str, *,
                               now: float) -> bool:
@@ -3416,8 +3539,9 @@ class CallbackSpool:
         before :meth:`remove_plugin`. Those get the same durable removal
         record (reason ``orphan_gc``) BEFORE the purge, so the retention
         promise degrades to the §10 removal exception instead of being
-        silently violated; a record that will not go durable SKIPS that dir
-        this pass (it stays quiescent, so the next pass retries).
+        silently violated; a record that will not go durable — or an
+        inventory that could not be PROVED — SKIPS that dir this pass (it
+        stays quiescent, so the next pass retries).
         """
         if registry_valid is not True:
             return []
@@ -3437,9 +3561,18 @@ class CallbackSpool:
                 # TTL change must not be able to invert that relationship.
                 if age < QUIESCENCE_S or age < PENDING_TTL_S:
                     continue
-                unacked = len(self._unacked_attempts(plugin))
+                unacked = self._unacked_attempts(plugin)
+                if unacked is None:
+                    # The inventory could not be PROVED (a listing faulted):
+                    # an empty answer here would purge a dir that may hold
+                    # unacked outcomes, with no record. The dir stays
+                    # quiescent, so the next pass tries again.
+                    logger.warning("callback-spool: orphan GC of %r deferred "
+                                   "— its attempt inventory is unprovable",
+                                   plugin)
+                    continue
                 if unacked and not self._write_removal_record(
-                        plugin, unacked, "orphan_gc", now=now):
+                        plugin, len(unacked), "orphan_gc", now=now):
                     # No record, no purge (amendment 11): the dir is still
                     # quiescent, so the next pass tries again.
                     logger.warning("callback-spool: orphan GC of %r deferred "
@@ -3448,8 +3581,11 @@ class CallbackSpool:
                 try:
                     shutil.rmtree(plugin, dir_fd=self._root_fd)
                 except OSError as exc:
-                    logger.warning("callback-spool: orphan GC of %r failed: %s",
-                                   plugin, exc)
+                    # errno only: an OSError from the tree walk carries the
+                    # ENTRY it failed on, and under results/ or attempts/
+                    # that filename IS a state hash (INV-CB-006).
+                    logger.warning("callback-spool: orphan GC of %r failed "
+                                   "(errno %s)", plugin, exc.errno)
                     continue
                 _fsync(self._root_fd, str(self.root))
                 removed.append(plugin)
@@ -3476,10 +3612,13 @@ class CallbackSpool:
         runs the §10 union of unsettled flows is counted and — when non-zero
         — recorded durably under ``.removals/``. A record that will not go
         durable SKIPS the purge and returns False: a purge with no record is
-        the one outcome INV-CB-007's removal exception cannot absorb. The
-        caller treats this as best-effort (the plugin is already unrouted)
-        and the orphan GC converges on the dir later. A zero-union removal
-        has nothing to tell anyone and purges directly.
+        the one outcome INV-CB-007's removal exception cannot absorb. So does
+        an inventory that could not be PROVED — a faulting listing must never
+        read as a zero union, which would purge exactly the credentials and
+        outcomes the record exists to account for. The caller treats both as
+        best-effort (the plugin is already unrouted) and the orphan GC
+        converges on the dir later. A zero-union removal has nothing to tell
+        anyone and purges directly.
 
         Documented residual (spec §10): the union scan is check-then-act
         against a same-uid FD holder, which is outside this facility's threat
@@ -3492,9 +3631,13 @@ class CallbackSpool:
         with self._lock:
             if self._closed:
                 return False
-            unsettled = len(self._unsettled_hashes(plugin))
+            unsettled = self._unsettled_hashes(plugin)
+            if unsettled is None:
+                logger.warning("callback-spool: purge of %r skipped — its "
+                               "unsettled inventory is unprovable", plugin)
+                return False
             if unsettled and not self._write_removal_record(
-                    plugin, unsettled, "remove", now=time.time()):
+                    plugin, len(unsettled), "remove", now=time.time()):
                 logger.warning("callback-spool: purge of %r skipped — the "
                                "removal record would not go durable", plugin)
                 return False
@@ -3503,8 +3646,11 @@ class CallbackSpool:
             except FileNotFoundError:
                 return False
             except OSError as exc:
-                logger.warning("callback-spool: remove_plugin %r failed: %s",
-                               plugin, exc)
+                # errno only (INV-CB-006): the exception text names the entry
+                # the tree walk failed on, which under results/ or attempts/
+                # is a state hash.
+                logger.warning("callback-spool: remove_plugin %r failed "
+                               "(errno %s)", plugin, exc.errno)
                 return False
             _fsync(self._root_fd, str(self.root))
             logger.info("callback-spool: removed spool dir %r (plugin removed)",

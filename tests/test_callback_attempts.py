@@ -95,6 +95,34 @@ def test_unserializable_meta_degrades_to_null():
     assert rec["meta"] is None
 
 
+def test_envelope_rejects_non_finite_json_constants():
+    """Red case (Sol 3 = Terra 1): JSON has no NaN or Infinity, but Python's
+    decoder accepts those literals by default — a 20-byte envelope well under
+    the size cap could therefore hand casa a value it can neither compute
+    with nor re-emit. The parse fails closed instead, wherever the constant
+    sits."""
+    for body in (b'{"v":2,"meta":NaN}',
+                 b'{"v":2,"meta":Infinity}',
+                 b'{"v":2,"meta":-Infinity}',
+                 b'{"v":2,"meta":{"deep":[1,NaN]}}',
+                 b'{"v":NaN}'):
+        assert ca.parse_envelope(body) is None, body
+    # The finite neighbour of every one of those still parses.
+    assert ca.parse_envelope(b'{"v":2,"meta":{"deep":[1,2.5]}}') is not None
+
+
+def test_meta_with_a_non_finite_float_degrades_to_null():
+    """The serializer half of the same rule: the canonical writer runs with
+    `allow_nan=False`, so a non-finite float cannot be written as the
+    non-standard `NaN` literal into a record no reader would take back — the
+    binding degrades to null, as every other unserializable meta does."""
+    rec = ca.new_attempt(state_hash=H, minted_ts=T - 5.0,
+                         status="result_ready",
+                         meta={"x": float("inf")}, now=T)
+    assert rec["meta"] is None
+    assert ca.validate_attempt(rec) == rec
+
+
 def test_envelope_unknown_keys_dropped():
     out = ca.parse_envelope(b'{"v": 2, "meta": 1, "extra": "boo", "state": "s"}')
     assert out == {"v": 2, "meta": 1}
@@ -188,6 +216,58 @@ def test_validate_rejects_a_state_hash_that_is_not_the_name_grammar():
     for bad in ("", "not-a-hash", H.upper(), H[:-1], H + "a", H[:-1] + "g"):
         assert ca.validate_attempt(dict(_good(), state_hash=bad)) is None, bad
     assert ca.validate_attempt(_good()) is not None
+
+
+CLOCK_KEYS = ("minted_ts", "last_nudge_ts", "next_nudge_ts", "ended_ts")
+
+
+def test_validate_rejects_non_finite_and_unbounded_clocks():
+    """Red case (Sol 3 = Terra 1): every clock field of a validated record is
+    COMPUTED with, so "a number that is not a bool" is not enough.
+
+    * `NaN` makes every comparison False: a `next_nudge_ts` of NaN is never
+      "in the future", so the nudge is due on every pass until the budget is
+      burnt, and an `ended_ts` of NaN is never older than the retention bound,
+      so the record never retires;
+    * `±Infinity` is the same class from the other side;
+    * `10**1000` type-checks as an int and then OverflowErrors the first float
+      it meets — the outcome-phase `ended_ts + offset` after each accepted
+      dispatch — so the budget update never lands and the worker can dispatch
+      indefinitely.
+
+    All of them read as INVALID, which is what makes the caller re-derive the
+    record from the artifacts."""
+    for bad in (float("nan"), float("inf"), float("-inf"),
+                10 ** 1000, -(10 ** 1000), ca.TS_ABS_MAX * 2):
+        for key in CLOCK_KEYS:
+            assert ca.validate_attempt(dict(_good(), **{key: bad})) is None, \
+                (key, bad)
+    done = ca.terminalize(_good(), "expired_unread", now=T)
+    for bad in (float("nan"), 10 ** 1000):
+        assert ca.validate_attempt(dict(done, ended_ts=bad)) is None, bad
+    # The bound is generous, not pedantic: ordinary clocks still validate,
+    # and the schedule arithmetic on what survives is plain finite float.
+    survivor = ca.validate_attempt(dict(done, ended_ts=T))
+    assert survivor is not None
+    assert ca.next_nudge_after_accept(survivor, now=T) == T + 7200.0
+
+
+def test_validate_binds_the_record_to_the_name_it_was_read_under():
+    """Red case (Sol 4): `state_hash` obeying the name GRAMMAR is not the same
+    as it being THIS flow's record. `attempts/<A>.json` containing
+    `state_hash: B` would otherwise carry B's identity (and B's `meta`)
+    through A's write-ahead outcome and onto the consumer's read surface — so
+    every authoritative read passes the name it read the file under, and a
+    mismatch is INVALID, i.e. re-derived."""
+    other = "cd" * 32
+    assert ca.validate_attempt(_good(), expect_hash=H) == _good()
+    assert ca.validate_attempt(_good(), expect_hash=other) is None
+    assert ca.validate_attempt(dict(_good(), state_hash=other),
+                               expect_hash=H) is None
+    # Unbound reads are unchanged (the grammar gate still applies).
+    assert ca.validate_attempt(dict(_good(), state_hash=other)) is not None
+    assert ca.validate_attempt(dict(_good(), state_hash="nope"),
+                               expect_hash="nope") is None
 
 
 def test_validate_accepts_legacy_none_minted_ts():

@@ -31,6 +31,7 @@ Three concerns, matching the design's sections:
 from __future__ import annotations
 
 import json
+import math
 import re
 
 SCHEMA_VERSION = 1
@@ -48,6 +49,16 @@ DEFERRAL_CAP_S = 1800.0
 #: an approximation.
 DEFERRAL_MAX_SHIFT = 32
 ATTEMPT_RETENTION_S = 7 * 24 * 3600
+#: Absolute bound, in epoch seconds, on every clock field of a VALID record.
+#: A validated record is ARITHMETIC-SAFE by contract: the schedule adds nudge
+#: offsets to ``ended_ts``, the retention bound subtracts ``ended_ts`` from
+#: ``now``, and the worker compares ``next_nudge_ts`` against a clock. An
+#: unbounded integer defeats that while type-checking perfectly — ``10**1000``
+#: is a "number", and the first float it meets raises ``OverflowError`` (an
+#: accepted dispatch whose budget update then never lands is a worker that can
+#: dispatch indefinitely). Roughly thirty million years of headroom costs
+#: nothing and keeps every such expression a plain, finite float.
+TS_ABS_MAX = 1e15
 OUTCOMES = frozenset({"collected", "expired", "expired_unread",
                       "publish_failed", "evicted"})
 STATUSES = ("awaiting_redirect", "result_ready", "done")
@@ -63,17 +74,54 @@ _HASH_RE = re.compile(r"^[0-9a-f]{64}$")
 
 
 def _is_ts(value) -> bool:
-    """A timestamp field: numeric-not-bool, or None."""
-    return value is None or (
-        isinstance(value, (int, float)) and not isinstance(value, bool))
+    """A usable timestamp field: ``None``, or a FINITE, arithmetic-safe
+    number that is not a bool.
+
+    Mirrors ``callback_acks._valid_ts`` and then goes one step further,
+    because a validated attempt record is *computed with*. Point by point:
+
+    * a ``bool`` is an ``int`` subclass and is never a clock;
+    * an ``int`` is never NaN/inf, so it needs no ``math.isfinite`` — and
+      must not be given one: ``isfinite(10**1000)`` raises ``OverflowError``
+      converting to a C double, and a validator that raises is a validator
+      that crashes a sweep instead of failing a file closed;
+    * a ``float`` goes through ``math.isfinite``, which is what rejects the
+      NaN that would make ``NaN > now`` False forever (a nudge due on every
+      pass) and the ``NaN`` ``ended_ts`` that would make the retention age
+      comparison False forever (a record that never retires);
+    * both are then bounded by :data:`TS_ABS_MAX`. The comparison is exact
+      for an ``int`` of any size (CPython compares int-to-float without
+      converting), so the bound itself can never raise.
+    """
+    if value is None:
+        return True
+    if isinstance(value, bool):
+        return False
+    if isinstance(value, int):
+        return -TS_ABS_MAX <= value <= TS_ABS_MAX
+    if isinstance(value, float):
+        return math.isfinite(value) and -TS_ABS_MAX <= value <= TS_ABS_MAX
+    return False
+
+
+def _reject_constant(name: str):
+    """``json``'s hook for its NON-STANDARD ``NaN`` / ``Infinity`` /
+    ``-Infinity`` literals. JSON has no such values; Python's decoder accepts
+    them by default, which would let a consumer-authored envelope smuggle a
+    non-finite float past a size cap and into a record. Raising here makes
+    the parse fail closed."""
+    raise ValueError(f"non-finite JSON constant {name!r}")
 
 
 def _canonical_text(value) -> str:
     """*value* in the ONE canonical serialization the spool writes on disk
     (``callback_spool.canonical_marker_bytes``, kept in sync by construction:
-    same sort/separators/escaping). Raises exactly what that writer would."""
+    same sort/separators/escaping/``allow_nan``). Raises exactly what that
+    writer would — including on a non-finite float, which ``allow_nan=False``
+    refuses rather than emitting the non-standard ``NaN`` literal that no
+    conforming JSON reader (and no fail-closed validator) would take back."""
     return json.dumps(value, sort_keys=True, separators=(",", ":"),
-                      ensure_ascii=False)
+                      ensure_ascii=False, allow_nan=False)
 
 
 def _safe_meta(value):
@@ -115,7 +163,10 @@ def parse_envelope(data: bytes) -> dict | None:
     """Bounded fail-closed envelope parse: ``None`` on ANY defect.
 
     Defects: over ``ENVELOPE_MAX_BYTES``, non-UTF-8, non-JSON, non-object
-    JSON, ``v`` not in {1, 2}. A v1 envelope (or a v2 one with no ``meta``)
+    JSON, a non-finite JSON constant anywhere in the body (``NaN`` /
+    ``Infinity`` / ``-Infinity`` — Python's decoder accepts those extensions
+    by default, and a value casa cannot re-emit must not enter a record),
+    ``v`` not in {1, 2}. A v1 envelope (or a v2 one with no ``meta``)
     yields ``{"v": <v>, "meta": None}``. Unknown envelope keys are dropped
     (forward compat) and never copied anywhere.
 
@@ -129,7 +180,8 @@ def parse_envelope(data: bytes) -> dict | None:
     try:
         if len(data) > ENVELOPE_MAX_BYTES:
             return None
-        obj = json.loads(data.decode("utf-8"))
+        obj = json.loads(data.decode("utf-8"),
+                         parse_constant=_reject_constant)
         if not isinstance(obj, dict):
             return None
         v = obj.get("v")
@@ -172,24 +224,32 @@ def new_attempt(*, state_hash: str, minted_ts: float | None,
     }
 
 
-def validate_attempt(obj) -> dict | None:
+def validate_attempt(obj, *, expect_hash: str | None = None) -> dict | None:
     """Total fail-closed validation: a copy of ``obj``, or ``None``.
 
     ``None`` unless ``obj`` is a dict with exactly the schema keys and
     every field type-checks: real bools for the flags (bool-typed ints
-    rejected), numeric-not-bool-or-None timestamps (``minted_ts`` None is
-    legal — legacy/collect-held records), status/outcome in their
-    vocabularies, non-negative int counters. Never raises: a malformed
-    (possibly consumer-scribbled) file must read as INVALID so the caller
-    re-derives it from artifacts, never as an exception.
+    rejected), finite arithmetic-safe timestamps (:func:`_is_ts`;
+    ``minted_ts`` None is legal — legacy/collect-held records),
+    status/outcome in their vocabularies, non-negative int counters. Never
+    raises: a malformed (possibly consumer-scribbled) file must read as
+    INVALID so the caller re-derives it from artifacts, never as an
+    exception.
 
     Type-checking each field in isolation is not enough, because the record
     this returns becomes AUTHORITATIVE (``list_attempts``, the write-ahead
-    derivation): a record must also be internally POSSIBLE. Two consistency
-    gates, both fail-closed:
+    derivation): a record must also be internally POSSIBLE. Three
+    consistency gates, all fail-closed:
 
     * ``state_hash`` obeys the spool's name grammar (64 lowercase hex) — a
       record naming something that cannot be a flow is not a record;
+    * ``state_hash`` EQUALS *expect_hash* when the caller supplies one. Every
+      authoritative read of an attempt comes from a file whose NAME is the
+      flow's identity, and a grammar check alone lets ``attempts/<A>.json``
+      contain ``state_hash: B`` — carrying B's identity through A's
+      write-ahead outcome and onto the consumer's read surface. Bound here
+      rather than at each call site so no reader can forget; a mismatch is
+      INVALID, so the caller re-derives A's record from A's artifacts;
     * status and outcome agree, in both directions: ``outcome`` is None for
       exactly the open statuses and set for exactly ``done``. Otherwise
       ``{status: result_ready, outcome: collected}`` (an open record wearing
@@ -203,6 +263,8 @@ def validate_attempt(obj) -> dict | None:
             return None
         if not isinstance(obj["state_hash"], str) \
                 or not _HASH_RE.match(obj["state_hash"]):
+            return None
+        if expect_hash is not None and obj["state_hash"] != expect_hash:
             return None
         if obj["status"] not in STATUSES:
             return None
