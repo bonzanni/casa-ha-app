@@ -1032,3 +1032,62 @@ async def test_claimed_but_unconfirmed_collect_converges(facility):
     assert callback_spool.ack(facility.plugin_dir(plugin), h) is True
     await facility.casa_pass()
     assert facility.artifacts(plugin, h) == set()
+
+
+# ---------------------------------------------------------------------------
+# (n) meta opacity across every log surface — INV-CB-009's "never logged" arm
+# ---------------------------------------------------------------------------
+
+
+async def test_meta_never_reaches_any_log_surface(facility, caplog):
+    """INV-CB-009 red case: a consumer's opaque ``meta`` is stored and echoed
+    but must never reach ANY log record — not the request path (INV-CB-006's
+    ground), and not the surfaces v0.147 added: the publish path, the ledger
+    passes, the sweep's write-ahead outcomes, and the delivery worker.
+
+    The sentinel rides a full lifecycle (mint → redirect → publish → ledger
+    pass → nudge → hold age-out → sweep → outcome nudge), with every record
+    from every logger swept. It is checked against the rendered message AND
+    the raw args, because a ``%``-style record hides its payload in ``args``
+    until something formats it.
+    """
+    import logging
+
+    plugin, declared = "finance", "renew"
+    eff = effective_name(plugin, declared)
+    art = facility.make_artifact(plugin, "art-1")
+    p = _plugin(name=plugin, artifact_id="art-1", path=str(art),
+                callbacks=(declared,))
+    facility.consent(plugin, declared)
+    assert await facility.reconcile(p) == []
+
+    sentinel = "M3TA-S3NT1NEL-do-not-log"
+    state = _fresh_state()
+    h = callback_spool.state_hash(state)
+    facility.mint(plugin, state, {"kind": "renewal", "ref": sentinel})
+
+    caplog.set_level(logging.DEBUG)
+    app = _build_app(facility)
+    async with TestClient(TestServer(app)) as client:
+        r = await _redirect(client, eff, state)
+    assert r.status == 303
+
+    # the ledger + delivery passes, then the hold's age-out and its
+    # write-ahead outcome, then the outcome-phase nudge
+    await facility.casa_pass()
+    await facility.worker_pass()
+    _got, held = callback_spool.collect(facility.plugin_dir(plugin), h)
+    aged = time.time() - callback_spool.RESULT_TTL_S - 10
+    os.utime(held, (aged, aged))
+    facility.sweep()
+    await facility.worker_pass(
+        ahead=callback_attempts.OUTCOME_PHASE_OFFSETS[0] + 1)
+
+    # the meta really did survive where it BELONGS — otherwise this test
+    # would pass vacuously on a facility that simply dropped it
+    assert facility.attempt(plugin, h)["meta"]["ref"] == sentinel
+
+    assert caplog.records, "the lifecycle must have logged something"
+    for record in caplog.records:
+        rendered = f"{record.getMessage()} {record.args!r}"
+        assert sentinel not in rendered, record.name

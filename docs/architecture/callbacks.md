@@ -222,9 +222,7 @@ the value, and worker and sweep diagnostics log hashes and reason enums — INV-
 discipline extended to the attempt surface.
 
 What it does not cover: casa cannot inspect an opaque value, so "no bearer material in `meta`"
-is a consumer obligation, not an enforced property. The never-logged arm holds by construction,
-no log call on these paths taking a meta-bearing argument; the caplog sweeps that pin a
-payload's absence directly are INV-CB-006's, over the request path.
+is a consumer obligation, not an enforced property.
 
 ## Failure behavior
 
