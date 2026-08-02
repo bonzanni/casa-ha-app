@@ -122,7 +122,11 @@ mid-2026). Keep it publish-ready at all times:
   `Docs-impact: architecture/tools-interface.md — none (claimed symbols unchanged)` —
   **in the tip commit's message**, at column zero. A later commit voids it, exactly as
   it voids a `scripts/attest.sh` receipt: the acknowledgement is a statement about the
-  diff as it finally stands.
+  diff as it finally stands. **Carry the line into the squash-merge message** — a
+  waiver that only ever existed on a deleted branch is not the audit trail it claims to
+  be. The gate cannot check that a waiver is sincere, and deliberately does not try;
+  it exists so that no batch merges without someone naming each impacted document and
+  saying why, on the record.
 - **Branches die on merge.** GitHub auto-deletes the remote head; delete the local
   branch too. No stray branches on origin.
 - **Every release**: bump `casa/config.yaml` version + a user-facing CHANGELOG

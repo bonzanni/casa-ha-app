@@ -103,6 +103,14 @@ jobs:
 
       - name: Docs impact on claimed surfaces
         if: github.event_name == 'pull_request'
+        env:
+          # Sol r2: on `pull_request`, actions/checkout leaves HEAD at GitHub's
+          # SYNTHETIC MERGE COMMIT, whose message is "Merge <sha> into <sha>" —
+          # reading waivers from HEAD would miss every real one and fail the
+          # gate noisily on legitimate pull requests. Name the contributor's tip
+          # explicitly. Also lets the offline harness point this at a commit of
+          # its own and prove the merge-ref case.
+          ACK_COMMIT: ${{ github.event.pull_request.head.sha }}
         run: |
           set -euo pipefail
           base="origin/${{ github.base_ref }}"
@@ -166,6 +174,18 @@ jobs:
           # Per-document ON PURPOSE: one blanket waiver would let a six-document PR
           # through on a single line, and looking at each document is the whole point.
           # A reason is mandatory; the separator may be an em dash or a plain hyphen.
+          #
+          # ACCEPTED RESIDUAL (both reviewers, rounds 1-2, deliberately not chased):
+          # this gate cannot verify that a waiver is SINCERE. `--amend --no-edit`
+          # after further edits, `git commit -C <old>`, or a reason of "abc" all
+          # satisfy the letter. No text check can do better — a determined author can
+          # equally write a false reason — so the mechanism is aimed at the failure
+          # that actually happened here: a batch merged before anyone looked, with the
+          # drift unnoticed. What it guarantees is narrow and worth having: nobody
+          # merges without naming each impacted document and writing a sentence about
+          # it, and that sentence is in the history under their name. Substance is a
+          # review question, not a CI one. Do not add a diff-digest binding scheme
+          # without evidence of a real case it would have caught.
           # Acknowledgements are read from the TIP COMMIT ONLY, as a trailer at column
           # zero. This mirrors scripts/attest.sh, whose receipts a new commit voids on
           # purpose: an acknowledgement is a statement about the diff as it finally
@@ -175,7 +195,11 @@ jobs:
           # stops an indented EXAMPLE inside prose (a commit that documents this very
           # mechanism, say) from acting as a live waiver.
           : > "$RUNNER_TEMP/acked.txt"
-          git log -1 --format=%B HEAD \
+          if [ -z "${ACK_COMMIT:-}" ]; then
+            echo "::error::ACK_COMMIT is empty — cannot identify the tip commit."
+            exit 1
+          fi
+          git log -1 --format=%B "$ACK_COMMIT" \
             | sed -n 's/^[Dd]ocs-[Ii]mpact:[[:space:]]*//p' \
             > "$RUNNER_TEMP/acks.txt"
           # Read from a FILE, never a pipe: a `while` on the right of a pipe runs in a

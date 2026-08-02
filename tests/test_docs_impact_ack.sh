@@ -63,11 +63,13 @@ block="$(extract_block)"
 
 # Drive the block with a given impacted/touched/deleted set against the repo's
 # current tip commit message.
-run_block() {  # run_block <impacted> <touched> <deleted>
+run_block() {  # run_block <impacted> <touched> <deleted>   [ACK_COMMIT in env]
   ( set -euo pipefail
     cd "$work/repo"
     : > "$RUNNER_TEMP/missing.txt"
     impacted="$1" touched="$2" deleted="$3"
+    # Production passes the PR head sha; default to the tip for ordinary cases.
+    export ACK_COMMIT="${ACK_COMMIT-$(git rev-parse HEAD)}"
     eval "$block" )
 }
 
@@ -178,6 +180,47 @@ expect "indented example is not a waiver" fail "$D1" "" "" "did not change"
 # --- a deleted claimant is refused outright -------------------------------
 reset_pr; tip "change"
 expect "deleting a claimant is refused" fail "$D1" "" "$D1" "deleted in the same PR"
+
+# --- document names match WHOLE, never as substrings ----------------------
+# Terra r2 found the harness blind to `grep -qxF` decaying to `grep -qF`: with
+# no name that contains another, substring matching passes every case. These
+# two pin it on both the waiver and the touched paths.
+# SUPER must genuinely CONTAIN SUB, or the case proves nothing: the realistic
+# form is a waiver written with the `docs/` prefix the impacted list never uses.
+SUB=architecture/memory.md
+SUPER=docs/architecture/memory.md
+case "$SUPER" in *"$SUB"*) ;; *) fail "harness bug: SUPER does not contain SUB"; esac
+reset_pr; tip "change
+
+Docs-impact: $SUPER — written with the wrong path form"
+expect "waiver naming a superstring path does not cover the document" fail "$SUB" "" "" "$SUB"
+
+reset_pr; tip "change"
+expect "touching a superstring path does not cover the document" fail "$SUB" "$SUPER" "" "$SUB"
+
+# --- the production checkout is a MERGE commit ----------------------------
+# On `pull_request`, actions/checkout leaves HEAD at GitHub's synthetic merge
+# commit, whose message carries no waiver. The step must read the contributor's
+# tip instead — the bug both reviewers caught in round 2.
+reset_pr
+tip "change
+
+Docs-impact: $D1 — none, claimed symbols untouched"
+pr_tip="$(git rev-parse HEAD)"
+git checkout -q main
+git merge -q --no-ff -m "Merge $pr_tip into main" pr
+ACK_COMMIT="$pr_tip" expect "waiver is read from the PR tip, not the merge commit" \
+  ok "$D1" "" "" "acknowledged for $D1"
+unset ACK_COMMIT || true
+expect "reading the merge commit instead finds no waiver" fail "$D1" "" "" "did not change"
+git checkout -q main; git reset -q --hard HEAD~1
+
+# --- a missing head sha fails closed --------------------------------------
+reset_pr; tip "change
+
+Docs-impact: $D1 — some genuine reason"
+ACK_COMMIT="" expect "empty ACK_COMMIT fails closed" fail "$D1" "" "" "ACK_COMMIT is empty"
+unset ACK_COMMIT || true
 
 echo
 [ "$fails" -eq 0 ] && { echo "docs-impact gate: all checks passed"; exit 0; }
