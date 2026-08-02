@@ -13,6 +13,8 @@
   doc: architecture/concurrency-model.md
 - item: casa/rootfs/opt/casa/callback_acks.py
   doc: architecture/callbacks.md
+- item: casa/rootfs/opt/casa/callback_attempts.py
+  doc: architecture/callbacks.md
 - item: casa/rootfs/opt/casa/callback_consent.py
   doc: architecture/callbacks.md
 - item: casa/rootfs/opt/casa/callback_episodes.py
