@@ -45,11 +45,19 @@ def validated_base(env: "dict | None" = None) -> "str | None":
     * a path other than empty or ``"/"`` (the latter only possible before
       the trailing-slash strip below)
     * a query string or a fragment
+    * any whitespace or C0/DEL control character anywhere in the value —
+      e.g. a glued-in space (``"https:// example.com"``) or an embedded tab
+      (review finding, Task 9 fix round 1: checked BEFORE ``urlsplit`` runs,
+      since ``urlsplit`` itself silently drops bare CR/LF/TAB from its own
+      parse — a check against the parsed host alone would miss exactly the
+      characters that make the raw string unsafe to hand back verbatim)
     """
     if env is None:
         env = os.environ
     raw = env.get("PUBLIC_URL", "").strip().rstrip("/")
     if raw in _UNSET_SENTINELS:
+        return None
+    if _has_stray_whitespace_or_control(raw):
         return None
 
     parts = urlsplit(raw)
@@ -67,6 +75,19 @@ def validated_base(env: "dict | None" = None) -> "str | None":
     if parts.query or parts.fragment:
         return None
     return raw
+
+
+def _has_stray_whitespace_or_control(value: str) -> bool:
+    """True if *value* carries any whitespace or C0/DEL control character.
+
+    A valid https origin never legitimately contains one. This must run
+    against the RAW string, not the ``urlsplit``-parsed host: CPython's
+    ``urlsplit`` (a hardening against header-injection-style URLs) silently
+    strips bare CR/LF/TAB from its own internal parse before it ever reaches
+    ``.hostname``, so a plain space survives into the parsed host but an
+    embedded tab does not — checking only the parsed host would accept the
+    tab case and return the dirty raw string verbatim anyway."""
+    return any(ch.isspace() or ord(ch) < 0x20 or ch == "\x7f" for ch in value)
 
 
 def _is_ip_literal(host: str) -> bool:

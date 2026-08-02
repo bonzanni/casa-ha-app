@@ -83,6 +83,35 @@ def test_validated_base_rejects_fragment():
         _env("https://casa.example.org#frag")) is None
 
 
+# ---------------------------------------------------------------------------
+# review fix round 1 (Low finding): a host with embedded whitespace/control
+# characters was returned VERBATIM — urlsplit().hostname carries a leading
+# or interior space unchanged, and ipaddress.ip_address() on such a host
+# just raises (not-an-IP), so it fell through every existing check. A bare
+# tab is even sneakier: CPython's urlsplit silently drops bare CR/LF/TAB
+# from its OWN parse (header-injection hardening), so the parsed host looks
+# clean even though the raw string handed back to the caller still has it.
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.parametrize("raw", [
+    "https:// example.com",       # leading space glued after //
+    "https://exa mple.com",       # interior space
+    "https://\texample.com",      # embedded tab
+    "https:///callback",          # empty host
+])
+def test_validated_base_rejects_malformed_host(raw):
+    assert callback_urls.validated_base(_env(raw)) is None
+
+
+@pytest.mark.parametrize("raw,expected", [
+    ("https://example.com", "https://example.com"),
+    ("https://sub.example.com:8443", "https://sub.example.com:8443"),
+])
+def test_validated_base_still_accepts_clean_hosts(raw, expected):
+    assert callback_urls.validated_base(_env(raw)) == expected
+
+
 @pytest.mark.parametrize("raw", [
     # host deliberately has no dot (not email-shaped) — this test is only
     # about the userinfo rejection, not the host check.
