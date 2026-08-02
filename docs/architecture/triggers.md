@@ -48,7 +48,9 @@ expression has minute resolution, so a sub-minute anchor is rounded *up* to the 
 minute and everything — schedule, anchor, and the time reported back to the user — is derived
 from the rounded value. Rounding down would be wrong twice: the truncated minute may already
 have passed, delaying the first occurrence by a whole period, and the series would fire
-seconds before the time the user was promised.
+seconds before the time the user was promised. A monthly reminder past the 28th means
+end-of-month rather than a literal day number: cron skips months a literal 29th, 30th or 31st
+is missing from, so "monthly on the 31st" would fire seven times a year rather than twelve.
 
 **The store is the truth; the scheduler is a cache of it.** The sweep re-registers any
 reminder that has no live job, which is what heals a divergence rather than a lock — a reload

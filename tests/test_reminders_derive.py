@@ -161,3 +161,37 @@ def test_existing_names_reads_the_store(tmp_path):
         "prompt": "x"})
     assert reminders.existing_names(path) == {"reminder-aaaaaaaa"}
     assert reminders.existing_names(str(tmp_path / "nope.yaml")) == set()
+
+
+def test_monthly_past_the_28th_means_end_of_month():
+    """A literal day>28 does not exist in every month and cron SKIPS the
+    months it is missing from: "monthly on the 31st" would fire only 7 times
+    a year. A reminder that misses five months is not monthly."""
+    for day in (29, 30, 31):
+        at = datetime(2026, 1, day, 9, 0, tzinfo=CEST)
+        assert reminders.derive_schedule(at, "monthly")["schedule"] == "0 9 last * *"
+
+
+def test_monthly_on_or_before_the_28th_is_literal():
+    at = datetime(2026, 1, 28, 9, 0, tzinfo=CEST)
+    assert reminders.derive_schedule(at, "monthly")["schedule"] == "0 9 28 * *"
+
+
+def test_end_of_month_schedule_actually_fires_every_month():
+    """Pin the behaviour against APScheduler itself, not just the string."""
+    from apscheduler.triggers.cron import CronTrigger
+
+    at = datetime(2026, 1, 31, 9, 0, tzinfo=CEST)
+    minute, hour, day, month, dow = (
+        reminders.derive_schedule(at, "monthly")["schedule"].split())
+    trig = CronTrigger(minute=minute, hour=hour, day=day, month=month,
+                       day_of_week=dow, timezone=CEST)
+
+    seen, now = [], datetime(2026, 1, 1, tzinfo=CEST)
+    for _ in range(6):
+        nxt = trig.get_next_fire_time(None, now)
+        seen.append(nxt.strftime("%Y-%m-%d"))
+        now = nxt + timedelta(seconds=1)
+
+    assert seen == ["2026-01-31", "2026-02-28", "2026-03-31",
+                    "2026-04-30", "2026-05-31", "2026-06-30"]

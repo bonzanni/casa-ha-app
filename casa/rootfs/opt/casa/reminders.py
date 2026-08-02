@@ -153,7 +153,16 @@ def derive_schedule(at: datetime, repeat: str) -> dict[str, str]:
     elif repeat == "weekly":
         schedule = f"{minute} {hour} * * {_DOW_BY_WEEKDAY[anchor.weekday()]}"
     else:  # monthly
-        schedule = f"{minute} {hour} {anchor.day} * *"
+        # A literal day above 28 does not exist in every month, and cron
+        # SKIPS the months it is missing from: "monthly on the 31st" fires in
+        # Jan, Mar, May, Jul, Aug, Oct, Dec and silently misses the other
+        # five. A reminder that skips five months a year is not monthly, and a
+        # missed reminder is the exact failure this feature exists to prevent
+        # — so anything past the 28th means end-of-month, which APScheduler
+        # expresses as ``last`` and which lands on the 28th/29th/30th/31st as
+        # each month requires.
+        day = "last" if anchor.day > 28 else str(anchor.day)
+        schedule = f"{minute} {hour} {day} * *"
     # The anchor is the FIRST occurrence and becomes the scheduler's
     # start_date. Without it a "every Thursday from the 20th" reminder set on
     # the 3rd would fire on the 6th and 13th, two occurrences the user never
