@@ -34,8 +34,11 @@ there only if the compilation put it there.
 same way.** A role artifact may declare its model as an operator option rather than a fixed
 value, and the checksum hashes the resolved result alongside the declaration — deliberately,
 so flipping the option produces a new identity and a new session epoch. The consequence is a
-trap: any code path that materializes a role while persisting or verifying a binding has to
-resolve that option exactly as the loader will. Materializing with no options resolves the
+trap: any code path that materializes a role for a binding that will be PERSISTED, or
+checked against one that was, has to resolve that option exactly as the loader will. (The
+export verifier is the deliberate exception: it materializes and compiles a throwaway
+binding purely to prove a bundle is self-consistent, so it resolves against no options at
+all and never persists the result.) Materializing with no options resolves the
 declared *default*, which silently produces a binding the loader can never re-derive, and the
 specialist is then dropped as a binding-activation failure on a host whose option differs
 from the default. Install, upgrade, rollback, persona override and the reconcile pass all

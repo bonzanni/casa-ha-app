@@ -50,10 +50,14 @@ ordering guarantee entirely. **A direct send bypasses it, and nothing mechanical
 one** — fallback paths exist for when no driver seam is present, and they are outside the
 ordering guarantee.
 
-**Narration seals on what landed, not on what was attempted.** Posting anything below the
-open narration message seals it — nothing edits it again — so the seal has to follow a
-*confirmed* send. A send that fails outright leaves the narration open and editable, because
-no message went below it. A send that merely times out is treated as ambiguous and seals
+**Narration seals on what landed, not on what was attempted — on the paths that were
+fixed.** Posting anything below the open narration message seals it — nothing edits it
+again — so the seal should follow a *confirmed* send. A discrete send that fails outright
+leaves the narration open and editable, because no message went below it. **Platform and
+completion notices are the documented exception**: they still seal before attempting their
+send, so a notice that fails or raises leaves narration sealed with nothing below it. That
+is pre-existing behaviour on a path whose failure is already terminal-ish, not a considered
+decision that it should differ — treat it as a known inconsistency rather than a rule. A send that merely times out is treated as ambiguous and seals
 anyway: the platform may have accepted the message before the response was lost, and a later
 edit landing above a message that does exist is the worse outcome. The same rule governs the
 relay-mediated path, where a discrete post runs through a caller-supplied poster: it seals
