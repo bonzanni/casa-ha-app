@@ -73,6 +73,37 @@ async def cid_middleware(
 from aiohttp.abc import AbstractAccessLogger  # noqa: E402 (import-by-feature)
 
 
+#: Route prefixes whose QUERY STRING must never reach the access log.
+#: ``/callback/`` carries a bearer credential (an OAuth authorization code)
+#: in the query, and the access line would persist it in the container logs
+#: for the log file's whole retention — the first of the three surfaces
+#: INV-CB-006 names (the other two are handler logs and nginx's own access
+#: log). Matched against ``request.path``, which aiohttp has already decoded,
+#: so a percent-encoded path spelling cannot dodge the prefix.
+QUERY_SUPPRESSED_PREFIXES = frozenset({"/callback/"})
+
+
+def _access_log_path(request) -> str:
+    """The request target to log: the full ``path_qs`` normally, the
+    query-free path for a query-sensitive prefix.
+
+    The two paths are read from different places on purpose. The prefix is
+    matched against ``request.path``, which aiohttp has DECODED, so a
+    percent-encoded spelling of ``/callback/`` cannot dodge the suppression.
+    What gets logged is the ENCODED ``rel_url.raw_path``: a decoded path can
+    contain a literal newline (``/callback/x%0A…`` decodes to one), and
+    writing that into an access line would let an unauthenticated caller
+    forge log records. ``path_qs`` is raw for the same reason, so this keeps
+    the two branches consistent.
+    """
+    path = getattr(request, "path", None)
+    if isinstance(path, str) and any(
+            path.startswith(prefix) for prefix in QUERY_SUPPRESSED_PREFIXES):
+        raw = getattr(getattr(request, "rel_url", None), "raw_path", None)
+        return raw if isinstance(raw, str) else path
+    return getattr(request, "path_qs", path)
+
+
 class CasaAccessLogger(AbstractAccessLogger):
     """Emit one access-log line through Casa's 5.2-H formatter.
 
@@ -98,7 +129,7 @@ class CasaAccessLogger(AbstractAccessLogger):
 
     def log(self, request, response, time) -> None:
         duration_ms = int(time * 1000)
-        path = getattr(request, "path_qs", request.path)
+        path = _access_log_path(request)
         status = getattr(response, "status", 0)
         body_length = getattr(response, "body_length", 0)
         msg = (

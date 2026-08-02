@@ -31,10 +31,14 @@ class _FakeRequest:
         method: str = "GET",
         path: str = "/healthz",
         cid: str | None = None,
+        path_only: str | None = None,
     ) -> None:
         self.method = method
         self.path_qs = path
-        self.path = path
+        # aiohttp's ``request.path`` is the query-free (decoded) path; the
+        # single-argument form keeps them equal, which is what every
+        # pre-existing test wants.
+        self.path = path_only if path_only is not None else path
         self._store: dict[str, str] = {}
         if cid is not None:
             self._store["cid"] = cid
@@ -48,8 +52,9 @@ class _FakeRequest:
 
 def _fake_request(
     method: str = "GET", path: str = "/healthz", cid: str | None = None,
+    path_only: str | None = None,
 ) -> _FakeRequest:
-    return _FakeRequest(method=method, path=path, cid=cid)
+    return _FakeRequest(method=method, path=path, cid=cid, path_only=path_only)
 
 
 def _fake_response(status: int = 200, body_length: int = 42) -> SimpleNamespace:
@@ -84,6 +89,107 @@ class TestFormat:
                    _fake_response(200, 0), 0.005)
         msg = caplog.records[0].getMessage()
         assert "path=/probe?x=1&y=2" in msg
+
+
+# ---------------------------------------------------------------------------
+# TestQuerySuppression (INV-CB-006, first of the three log surfaces)
+# ---------------------------------------------------------------------------
+
+
+class TestQuerySuppression:
+    """The access line for a query-sensitive prefix logs ``request.path``,
+    never ``path_qs``. The authorization-callback route deposits a bearer
+    credential in the query string, so an access line carrying it would
+    persist the credential in the container logs (INV-CB-006).
+    """
+
+    def test_prefix_set_is_module_level_and_frozen(self):
+        from casa_core_middleware import QUERY_SUPPRESSED_PREFIXES
+
+        assert QUERY_SUPPRESSED_PREFIXES == frozenset({"/callback/"})
+        assert isinstance(QUERY_SUPPRESSED_PREFIXES, frozenset)
+
+    def test_callback_query_is_suppressed(self, caplog):
+        logger = logging.getLogger("casa.access")
+        access = CasaAccessLogger(logger)
+        caplog.set_level(logging.INFO, logger="casa.access")
+        access.log(
+            _fake_request(
+                "GET",
+                "/callback/plg-demo--auth?code=SECRETVALUE&state=abc",
+                path_only="/callback/plg-demo--auth",
+            ),
+            _fake_response(303, 0), 0.004,
+        )
+        msg = caplog.records[0].getMessage()
+        assert "path=/callback/plg-demo--auth " in msg
+        assert "SECRETVALUE" not in msg
+        assert "?" not in msg
+
+    def test_done_page_is_also_suppressed(self, caplog):
+        logger = logging.getLogger("casa.access")
+        access = CasaAccessLogger(logger)
+        caplog.set_level(logging.INFO, logger="casa.access")
+        access.log(
+            _fake_request("GET", "/callback/done?leak=1",
+                          path_only="/callback/done"),
+            _fake_response(200, 250), 0.001,
+        )
+        msg = caplog.records[0].getMessage()
+        assert "path=/callback/done " in msg
+        assert "leak=1" not in msg
+
+    def test_non_matching_prefix_still_logs_the_query(self, caplog):
+        """The suppression is prefix-scoped: every other route keeps the
+        diagnostic value of a full request target."""
+        logger = logging.getLogger("casa.access")
+        access = CasaAccessLogger(logger)
+        caplog.set_level(logging.INFO, logger="casa.access")
+        access.log(_fake_request("GET", "/callbackish?x=1",
+                                 path_only="/callbackish"),
+                   _fake_response(200, 0), 0.001)
+        assert "path=/callbackish?x=1" in caplog.records[0].getMessage()
+
+    def test_encoded_path_is_logged_not_the_decoded_one(self, caplog):
+        """``request.path`` is DECODED, so ``/callback/x%0Aevil`` decodes to a
+        path with a literal newline — logging it would let an
+        unauthenticated caller forge access-log records. The prefix match
+        runs on the decoded path (so an encoded ``/callback/`` cannot dodge
+        suppression) but the logged value is the encoded ``raw_path``."""
+        logger = logging.getLogger("casa.access")
+        access = CasaAccessLogger(logger)
+        caplog.set_level(logging.INFO, logger="casa.access")
+        request = _fake_request(
+            "GET", "/callback/x%0AFORGED?code=SECRETVALUE",
+            path_only="/callback/x\nFORGED",
+        )
+        request.rel_url = SimpleNamespace(raw_path="/callback/x%0AFORGED")
+        access.log(request, _fake_response(303, 0), 0.001)
+        msg = caplog.records[0].getMessage()
+        assert "path=/callback/x%0AFORGED " in msg
+        assert "\n" not in msg
+        assert "SECRETVALUE" not in msg
+
+    def test_request_without_rel_url_falls_back_to_path(self, caplog):
+        logger = logging.getLogger("casa.access")
+        access = CasaAccessLogger(logger)
+        caplog.set_level(logging.INFO, logger="casa.access")
+        access.log(_fake_request("GET", "/callback/demo?code=SECRETVALUE",
+                                 path_only="/callback/demo"),
+                   _fake_response(303, 0), 0.001)
+        msg = caplog.records[0].getMessage()
+        assert "path=/callback/demo " in msg
+        assert "SECRETVALUE" not in msg
+
+    def test_request_without_path_attribute_falls_back(self, caplog):
+        """Defensive: aiohttp always supplies both, but the logger must not
+        raise if handed a stripped request-like object."""
+        logger = logging.getLogger("casa.access")
+        access = CasaAccessLogger(logger)
+        caplog.set_level(logging.INFO, logger="casa.access")
+        request = SimpleNamespace(method="GET", path_qs="/healthz?x=1")
+        access.log(request, _fake_response(), 0.001)
+        assert "path=/healthz?x=1" in caplog.records[0].getMessage()
 
 
 # ---------------------------------------------------------------------------

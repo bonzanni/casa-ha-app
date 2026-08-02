@@ -28,6 +28,7 @@ from apscheduler.schedulers.asyncio import AsyncIOScheduler
 
 from agent_loader import load_all_agents
 from authz_grants import CHALLENGES, GRANTS
+import callback_http
 from bus import BusMessage, BusShutdownError, MessageBus, MessageType
 from channel_authz import agent_allowed_on
 from channels import ChannelManager
@@ -3317,6 +3318,16 @@ async def main() -> None:
     app.router.add_get("/", dashboard)
     app.router.add_get("/healthz", healthz)
     app.router.add_post("/webhook/{name}", webhook_handler)
+    # Authorization callbacks (spec §6). ORDER IS LOAD-BEARING: the static
+    # done page must be registered BEFORE the wildcard, which would otherwise
+    # match "/callback/done" as a callback name and answer it with a 303 back
+    # to itself. Both handlers are turn-free — no ingress identity, no
+    # clearance, no provenance — because a browser redirect is not an
+    # authenticated principal; every outcome is the same neutral 303.
+    app.router.add_get("/callback/done", callback_http.make_done_handler())
+    app.router.add_get("/callback/{name}", callback_http.make_callback_handler(
+        trigger_registry=trigger_registry,
+    ))
     app.router.add_post("/invoke/{agent}", invoke_handler)
     app.router.add_post("/telegram/update", telegram_update_handler)
     # Plan 4b/3.6: public-8099 back-compat fallback handlers.
