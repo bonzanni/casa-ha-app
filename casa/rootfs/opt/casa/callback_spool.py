@@ -235,6 +235,19 @@ def _hash_of_pending(name: str) -> str | None:
     return None
 
 
+def _hash_of_collect(name: str) -> str | None:
+    """The hash a consumer-held ``.collect-<64hex>-<uuid>`` entry names, or
+    ``None`` for anything that only resembles one (a near-miss is residue, not
+    a hold). The single grammar shared by enumeration and the sweep, so a name
+    casa will not attribute to a flow is never given that flow's outcome."""
+    if not name.startswith(COLLECT_PREFIX):
+        return None
+    rest = name[len(COLLECT_PREFIX):]
+    if len(rest) >= 65 and rest[64] == "-" and _is_hash(rest[:64]):
+        return rest[:64]
+    return None
+
+
 # ---------------------------------------------------------------------------
 # low-level fd helpers
 # ---------------------------------------------------------------------------
@@ -311,6 +324,19 @@ def _marker_lstat(name: str, dir_fd: int):
         return None
     except OSError:
         return _LSTAT_ERROR
+
+
+def _regular_stat(name: str, dir_fd: "int | None"):
+    """``lstat`` of *name* when it is a REGULAR file, else ``None`` — the
+    "is this artifact usable as a derivation source" probe. A missing
+    directory FD, a vanished entry and a non-regular inode (a swapped-in
+    FIFO/symlink/directory whose content must never be read) all degrade to
+    ``None``: the derivation simply loses that source and falls through to
+    the next one."""
+    if dir_fd is None:
+        return None
+    st = _lstat_quiet(name, dir_fd)
+    return st if st is not None and stat.S_ISREG(st.st_mode) else None
 
 
 def _listdir_quiet(dir_fd: int) -> list[str]:
@@ -610,6 +636,21 @@ class PublishOutcome(enum.Enum):
     FAILED_UNRECORDED = "failed_unrecorded"
 
 
+@dataclass(frozen=True)
+class _ArtifactDirs:
+    """The three artifact-directory FDs a write-ahead derivation probes —
+    everything that can witness what a flow's hash still means on disk.
+
+    Any of them may be ``None`` (that directory would not open this pass):
+    the derivation loses that source rather than failing, because a derived
+    record with less provenance is still a record, and the deletion it
+    precedes is what must never happen unrecorded."""
+
+    pend: "int | None"
+    results: "int | None"
+    claims: "int | None"
+
+
 @dataclass
 class RecoveryReport:
     restored: list[tuple[str, str]] = field(default_factory=list)
@@ -625,8 +666,14 @@ class SweepReport:
     deleted_results: int = 0
     deleted_temps: int = 0
     deleted_collect: int = 0
+    deleted_collect_capped: int = 0
     deleted_anomalous: int = 0
     deleted_capped: int = 0
+    #: Flow-retiring deletions SKIPPED this pass because the write-ahead
+    #: outcome could not be proven durable (INV-CB-007): the artifact lives
+    #: a few minutes longer and the next pass retries. Not a deletion, so
+    #: deliberately outside ``total``.
+    skipped_undurable: int = 0
     capped: list[str] = field(default_factory=list)
     anomalies: list[str] = field(default_factory=list)
 
@@ -634,6 +681,7 @@ class SweepReport:
     def total(self) -> int:
         return (self.deleted_pending + self.deleted_results
                 + self.deleted_temps + self.deleted_collect
+                + self.deleted_collect_capped
                 + self.deleted_anomalous + self.deleted_capped)
 
 
@@ -1745,19 +1793,148 @@ class CallbackSpool:
                 except OSError:
                     return []
                 try:
-                    held: set[str] = set()
-                    for name in _listdir_quiet(results):
-                        if not name.startswith(COLLECT_PREFIX):
-                            continue
-                        rest = name[len(COLLECT_PREFIX):]
-                        if len(rest) >= 65 and rest[64] == "-" \
-                                and _is_hash(rest[:64]):
-                            held.add(rest[:64])
-                    return sorted(held)
+                    return sorted({
+                        h for h in (_hash_of_collect(name)
+                                    for name in _listdir_quiet(results))
+                        if h is not None})
                 finally:
                     os.close(results)
             finally:
                 os.close(pfd)
+
+    # -- write-ahead outcomes (INV-CB-007) ------------------------------
+
+    def _derive_attempt(self, plugin: str, h: str, *, pend_fd: "int | None",
+                        results_fd: "int | None", claims_fd: "int | None",
+                        now: float) -> dict:
+        """What casa knows about the flow named *h* — the ONE derivation every
+        write-ahead site shares (so the record a deletion depends on never
+        varies with which pass happened to reach the artifact first).
+
+        An existing, schema-VALID attempt file is the record: it carries the
+        consumer's ``meta``, the true mint clock and the worker's schedule
+        state, none of which artifacts alone can reconstruct. Only when there
+        is none (or it is malformed — a consumer-scribbled file is never
+        truth) is a record derived from the artifacts that survive."""
+        marker = self.read_attempt(plugin, h)
+        if marker.state is MarkerState.PRESENT:
+            rec = callback_attempts.validate_attempt(marker.payload)
+            if rec is not None:
+                return rec
+        return self._derive_from_artifacts(
+            plugin, h, pend_fd=pend_fd, results_fd=results_fd,
+            claims_fd=claims_fd, now=now)
+
+    def _derive_from_artifacts(self, plugin: str, h: str, *,
+                               pend_fd: "int | None",
+                               results_fd: "int | None",
+                               claims_fd: "int | None",
+                               now: float) -> dict:
+        """A fresh attempt record built from the artifacts alone (spec §3.3).
+
+        Mint clock and ``meta`` come from the first surviving source, in the
+        order the mint travels: the ``pending/`` inode's envelope (mtime = the
+        mint time), else the claim inode's (``link(2)`` preserved that mtime),
+        else the casa-authored result record's own ``meta``/``minted_ts``
+        transport keys. A flow known ONLY by a consumer-held ``.collect-*``
+        name yields ``meta``/``minted_ts`` None: that file belongs to its
+        holder and casa never opens it — it only reads the name.
+
+        Status follows the same precedence the re-derivation rule uses: a live
+        result or hold means ``result_ready`` (``claimed`` iff a hold exists),
+        anything else ``awaiting_redirect``."""
+        meta = None
+        minted_ts = None
+        sourced = False
+        st = _regular_stat(f"{h}.json", pend_fd)
+        if st is not None:
+            envelope = _read_envelope_at(f"{h}.json", pend_fd)
+            meta = envelope["meta"] if envelope else None
+            minted_ts = st.st_mtime
+            sourced = True
+        if not sourced:
+            st = _regular_stat(h, claims_fd)
+            if st is not None:
+                envelope = _read_envelope_at(h, claims_fd)
+                meta = envelope["meta"] if envelope else None
+                minted_ts = st.st_mtime
+                sourced = True
+        has_result = _regular_stat(f"{h}.json", results_fd) is not None
+        if has_result and not sourced:
+            # Casa's OWN record (not consumer-authored): the ordinary marker
+            # read, whose 64 KiB cap is ample for a callback result.
+            marker = _read_marker_at(f"{h}.json", results_fd)
+            if marker.state is MarkerState.PRESENT:
+                meta = marker.payload.get("meta")
+                ts = marker.payload.get("minted_ts")
+                minted_ts = ts if isinstance(ts, (int, float)) \
+                    and not isinstance(ts, bool) else None
+        held = self._collect_present(h, results_fd)
+        return callback_attempts.new_attempt(
+            state_hash=h, minted_ts=minted_ts,
+            status="result_ready" if (has_result or held)
+            else "awaiting_redirect",
+            meta=meta, claimed=held, now=now)
+
+    @staticmethod
+    def _collect_present(h: str, results_fd: "int | None") -> bool:
+        """True iff a conforming ``results/.collect-<h>-<uuid>`` entry exists.
+        By NAME only — the held file is the consumer's."""
+        if results_fd is None:
+            return False
+        return any(_hash_of_collect(name) == h
+                   for name in _listdir_quiet(results_fd))
+
+    def _write_ahead(self, plugin: str, h: str, outcome: str, *,
+                     dirs: _ArtifactDirs, now: float,
+                     claimed: "bool | None" = None) -> bool:
+        """Record *outcome* for the flow *h* durably, BEFORE the deletion that
+        depends on it (INV-CB-007). Returns False when the strict write could
+        not prove durability — the caller then skips its deletion this pass,
+        so a power crash can never take the credential-bearing artifact and
+        its record together."""
+        rec = self._derive_attempt(plugin, h, pend_fd=dirs.pend,
+                                   results_fd=dirs.results,
+                                   claims_fd=dirs.claims, now=now)
+        done = callback_attempts.terminalize(rec, outcome, now=now,
+                                             claimed=claimed)
+        return self.write_attempt(plugin, h, done, strict=True)
+
+    def _repair_after_lost_deletion(self, plugin: str, h: str, *,
+                                    dirs: _ArtifactDirs, now: float) -> None:
+        """The re-derivation rule at its sharpest edge (spec §6): the deletion
+        that the just-written terminal outcome authorized did NOT happen — the
+        entry was gone, typically because a consumer's ``collect`` rename won
+        the race between the record and the unlink.
+
+        The terminal label is therefore provisional. Re-probe (three-state:
+        an UNKNOWN result probe defers to the next pass rather than guessing)
+        and, when a live result or hold now witnesses the contradiction,
+        rewrite the attempt OPEN from what exists. A genuinely absent flow
+        keeps its terminal record — that is the deletion having simply been
+        completed by someone else."""
+        if dirs.results is None:
+            return
+        res = _marker_lstat(f"{h}.json", dirs.results)
+        if res is _LSTAT_ERROR:
+            return                           # UNKNOWN — never guess
+        if res is None and not self._collect_present(h, dirs.results):
+            return                           # nothing survives to contradict it
+        rec = self._derive_from_artifacts(
+            plugin, h, pend_fd=dirs.pend, results_fd=dirs.results,
+            claims_fd=dirs.claims, now=now)
+        # What survives may no longer carry the consumer's binding — a hold is
+        # a NAME, and casa never opens the file it names — so keep what the
+        # provisional record still knows rather than dropping it (§4).
+        prior = callback_attempts.validate_attempt(
+            self.read_attempt(plugin, h).payload)
+        if prior is not None:
+            for key in ("meta", "minted_ts"):
+                if rec[key] is None:
+                    rec[key] = prior[key]
+        # Not a write-ahead: no deletion depends on this rewrite, and a
+        # failure leaves the provisional label for the next pass to repair.
+        self.write_attempt(plugin, h, rec)
 
     # -- recovery -------------------------------------------------------
 
@@ -1860,16 +2037,29 @@ class CallbackSpool:
         # sits live in results/.
         res = _lstat_quiet(f"{name}.json", results)
         if res is not None and stat.S_ISREG(res.st_mode):
+            # CUSTODY TRANSFER, not a retirement: the flow continues in
+            # results/ under its own TTL, so no outcome is recorded here.
             report.nudges.append((plugin, name))
             _remove_entry(name, claims, st)
             _fsync(claims, CLAIMS_DIR)
             return
+        dirs = _ArtifactDirs(pend=pend, results=results, claims=claims)
         if not stat.S_ISREG(st.st_mode):
+            if not self._write_ahead(plugin, name, "expired", dirs=dirs,
+                                     now=now):
+                report.anomalies.append(
+                    f"{plugin}: outcome not durable — claim kept")
+                return
             _remove_entry(name, claims, st)
             _fsync(claims, CLAIMS_DIR)
             report.anomalies.append(f"{plugin}: non-regular claim entry")
             return
         if st.st_mtime > now + SKEW_S or now - st.st_mtime > PENDING_TTL_S:
+            if not self._write_ahead(plugin, name, "expired", dirs=dirs,
+                                     now=now):
+                report.anomalies.append(
+                    f"{plugin}: outcome not durable — claim kept")
+                return
             _unlink_quiet(name, claims)
             _fsync(claims, CLAIMS_DIR)
             report.dropped.append((plugin, name))
@@ -1895,10 +2085,20 @@ class CallbackSpool:
     # -- sweep ----------------------------------------------------------
 
     def sweep(self, *, now: float) -> SweepReport:
-        """TTL + future-mtime deletion across the five name classes, then the
+        """TTL + future-mtime deletion across the name classes, then the
         per-plugin caps. Bare ``.claims/<hash>`` entries are deliberately NOT
         swept: they belong to the recovery pass, and deleting a young claim
-        here would silently eat an in-flight authorization."""
+        here would silently eat an in-flight authorization.
+
+        Every deletion that RETIRES A FLOW — an expired or capped pending, an
+        expired, capped or held result, a hash-named anomaly — first records
+        the flow's terminal outcome on its attempt file, durably (INV-CB-007,
+        spec §5). A record that will not go durable skips its deletion this
+        pass (``skipped_undurable``), so a crash can never destroy the
+        credential-bearing artifact and the only record of why together.
+        Residue that names no flow (``.part``, ``.tmp-*``, staged-replace
+        temps, unattributable names) is recorded nowhere — there is no flow to
+        record."""
         report = SweepReport()
         with self._lock:
             if self._closed:
@@ -1931,22 +2131,46 @@ class CallbackSpool:
     def _sweep_plugin(self, plugin: str, pfd: int, now: float,
                       report: SweepReport) -> None:
         # The plugin dir's own level: ready.json staging residue only. Nothing
-        # else there is sweep-owned (ready.json is reconcile's, the three
+        # else there is sweep-owned (ready.json is reconcile's, the four
         # subdirs are handled below).
         if self._sweep_replace_temps(pfd, now, report):
             _fsync(pfd, plugin)
-        for sub, handler in ((PENDING_DIR, self._sweep_pending),
-                             (RESULTS_DIR, self._sweep_results),
-                             (CLAIMS_DIR, self._sweep_claims)):
+        # All four FDs are opened up front: a write-ahead outcome is derived
+        # from whatever the OTHER directories still hold, so no handler can
+        # work from its own directory alone. A directory that will not open is
+        # None rather than fatal — the remaining ones are still swept.
+        fds: dict[str, "int | None"] = {}
+        for sub in (PENDING_DIR, RESULTS_DIR, CLAIMS_DIR, ATTEMPTS_DIR):
             try:
-                fd = _open_dir(sub, pfd)
+                fds[sub] = _open_dir(sub, pfd)
             except OSError:
-                continue
-            try:
-                handler(plugin, fd, now, report)
+                fds[sub] = None
+        try:
+            dirs = _ArtifactDirs(pend=fds[PENDING_DIR],
+                                 results=fds[RESULTS_DIR],
+                                 claims=fds[CLAIMS_DIR])
+            # Read ONCE per pass: the cap ladder (spec §9) evicts entries with
+            # no open attempt before entries that still have one.
+            open_attempts = {h for h, rec in self.list_attempts(plugin)
+                             if rec["status"] != "done"}
+            for sub, handler in ((PENDING_DIR, self._sweep_pending),
+                                 (RESULTS_DIR, self._sweep_results)):
+                fd = fds[sub]
+                if fd is None:
+                    continue
+                handler(plugin, fd, now, report, dirs, open_attempts)
                 _fsync(fd, sub)
-            finally:
-                os.close(fd)
+            for sub, simple in ((CLAIMS_DIR, self._sweep_claims),
+                                (ATTEMPTS_DIR, self._sweep_attempts)):
+                fd = fds[sub]
+                if fd is None:
+                    continue
+                simple(plugin, fd, now, report)
+                _fsync(fd, sub)
+        finally:
+            for fd in fds.values():
+                if fd is not None:
+                    os.close(fd)
 
     def _sweep_replace_temps(self, fd: int, now: float,
                              report: SweepReport) -> bool:
@@ -1971,20 +2195,33 @@ class CallbackSpool:
         return st.st_mtime > now + SKEW_S or now - st.st_mtime > ttl
 
     def _sweep_pending(self, plugin: str, fd: int, now: float,
-                       report: SweepReport) -> None:
-        live: list[tuple[float, str]] = []
+                       report: SweepReport, dirs: _ArtifactDirs,
+                       open_attempts: set[str]) -> None:
+        live: list[tuple[float, str, "str | None"]] = []
         for name in _listdir_quiet(fd):
             st = _lstat_quiet(name, fd)
             if st is None:
                 continue
             is_part = name.endswith(PART_SUFFIX)
             h = _hash_of_pending(name[:-len(PART_SUFFIX)] if is_part else name)
+            # A `.part` names no minted state (the mint publishes by link, so
+            # the final name is what a flow ever was): it is residue, and
+            # residue is recorded NOWHERE — neither here nor at the cap.
+            flow = None if is_part else h
             if h is None or not stat.S_ISREG(st.st_mode):
+                if flow is not None and not self._write_ahead(
+                        plugin, flow, "expired", dirs=dirs, now=now):
+                    report.skipped_undurable += 1
+                    continue
                 _remove_entry(name, fd, st)
                 report.deleted_anomalous += 1
                 report.anomalies.append(f"{plugin}/pending: {name!r}")
                 continue
             if self._expired(st, now, TEMP_TTL_S if is_part else PENDING_TTL_S):
+                if flow is not None and not self._write_ahead(
+                        plugin, flow, "expired", dirs=dirs, now=now):
+                    report.skipped_undurable += 1
+                    continue
                 if _unlink_quiet(name, fd):
                     if is_part:
                         report.deleted_temps += 1
@@ -1994,35 +2231,84 @@ class CallbackSpool:
             # `.part` files count toward the cap: they occupy the same
             # directory and a consumer looping on a failing publish would
             # otherwise fill /data with staging files the cap never sees.
-            live.append((st.st_mtime, name))
-        self._apply_cap(plugin, PENDING_DIR, fd, live, MAX_PENDING, report)
+            live.append((st.st_mtime, name, flow))
+        self._apply_cap(plugin, PENDING_DIR, fd, live, MAX_PENDING, report,
+                        dirs=dirs, now=now, open_attempts=open_attempts)
 
     def _sweep_results(self, plugin: str, fd: int, now: float,
-                       report: SweepReport) -> None:
-        live: list[tuple[float, str]] = []
+                       report: SweepReport, dirs: _ArtifactDirs,
+                       open_attempts: set[str]) -> None:
+        live: list[tuple[float, str, "str | None"]] = []
+        held: list[tuple[float, str, str]] = []
         for name in _listdir_quiet(fd):
             st = _lstat_quiet(name, fd)
             if st is None:
                 continue
             is_collect = name.startswith(COLLECT_PREFIX)
             h = _hash_of_pending(name)
+            flow = _hash_of_collect(name) if is_collect else h
             if (h is None and not is_collect) or not stat.S_ISREG(st.st_mode):
+                if flow is not None and not self._write_ahead(
+                        plugin, flow, "expired", dirs=dirs, now=now,
+                        claimed=True if is_collect else None):
+                    report.skipped_undurable += 1
+                    continue
                 _remove_entry(name, fd, st)
                 report.deleted_anomalous += 1
                 report.anomalies.append(f"{plugin}/results: {name!r}")
                 continue
             if self._expired(st, now, RESULT_TTL_S):
+                # A held entry aged out is `claimed`: the consumer renamed it
+                # but never acked, so casa cannot say whether it was read. A
+                # base-named result asserts nothing about `claimed` (None) —
+                # the record's own flag is knowledge, never to be downgraded.
+                if flow is not None and not self._write_ahead(
+                        plugin, flow, "expired_unread", dirs=dirs, now=now,
+                        claimed=True if is_collect else None):
+                    report.skipped_undurable += 1
+                    continue
                 if _unlink_quiet(name, fd):
                     if is_collect:
                         report.deleted_collect += 1
                     else:
                         report.deleted_results += 1
+                elif flow is not None:
+                    self._repair_after_lost_deletion(plugin, flow, dirs=dirs,
+                                                     now=now)
                 continue
             if not is_collect:
-                live.append((st.st_mtime, name))
-        # Consumer-held `.collect-*` entries are excluded from the cap: they
-        # are already claimed and about to be read.
-        self._apply_cap(plugin, RESULTS_DIR, fd, live, MAX_RESULTS, report)
+                live.append((st.st_mtime, name, flow))
+            elif flow is not None:
+                held.append((st.st_mtime, name, flow))
+        # Consumer-held `.collect-*` entries are excluded from MAX_RESULTS
+        # (they are already claimed work) and bounded by their OWN cap, so a
+        # rename-happy consumer cannot hold unbounded credential inodes.
+        self._apply_cap(plugin, RESULTS_DIR, fd, live, MAX_RESULTS, report,
+                        dirs=dirs, now=now, open_attempts=open_attempts)
+        self._apply_collect_cap(plugin, fd, held, report, dirs=dirs, now=now)
+
+    def _sweep_attempts(self, plugin: str, fd: int, now: float,
+                        report: SweepReport) -> None:
+        """Grammar-aware hygiene for ``attempts/``. Only TWO names belong
+        there — ``<64hex>.json`` (casa's record) and ``.ack-<64hex>`` (the
+        consumer's receipt) — and both have their own lifecycle; everything
+        else is residue: this module's own staged-replace temps after a crash,
+        or something nothing in the protocol writes. Residue ages out on
+        ``TEMP_TTL_S`` and records NO outcome — an unattributable name names
+        no flow."""
+        for name in _listdir_quiet(fd):
+            if not _is_replace_temp(name) and (
+                    _hash_of_pending(name) is not None
+                    or (name.startswith(ACK_PREFIX)
+                        and _is_hash(name[len(ACK_PREFIX):]))):
+                continue                     # a live record or a receipt
+            st = _lstat_quiet(name, fd)
+            if st is None:
+                continue
+            if not stat.S_ISREG(st.st_mode) or self._expired(st, now,
+                                                             TEMP_TTL_S):
+                if _remove_entry(name, fd, st):
+                    report.deleted_temps += 1
 
     def _sweep_claims(self, plugin: str, fd: int, now: float,
                       report: SweepReport) -> None:
@@ -2040,17 +2326,54 @@ class CallbackSpool:
                     report.deleted_temps += 1
 
     def _apply_cap(self, plugin: str, sub: str, fd: int,
-                   live: list[tuple[float, str]], cap: int,
-                   report: SweepReport) -> None:
+                   live: list[tuple[float, str, "str | None"]], cap: int,
+                   report: SweepReport, *, dirs: _ArtifactDirs, now: float,
+                   open_attempts: set[str]) -> None:
+        """Enforce a per-directory cap, victims chosen by the spec §9 ladder:
+        residue and attempt-less entries first, entries whose flow still has
+        an OPEN attempt last, each rank oldest-mtime-first. Cap pressure is
+        pathological by definition, and what it destroys should be what casa
+        knows least about. Every hash-named victim is recorded ``evicted``
+        write-ahead; a victim whose record will not go durable is skipped this
+        pass (the cap converges on the next one)."""
         if len(live) <= cap:
             return
-        live.sort()                          # oldest mtime first
-        for _mtime, name in live[:len(live) - cap]:
+        live.sort(key=lambda item: (item[2] in open_attempts, item[0]))
+        for _mtime, name, flow in live[:len(live) - cap]:
+            if flow is not None and not self._write_ahead(
+                    plugin, flow, "evicted", dirs=dirs, now=now):
+                report.skipped_undurable += 1
+                continue
             if _unlink_quiet(name, fd):
                 report.deleted_capped += 1
+            elif flow is not None:
+                self._repair_after_lost_deletion(plugin, flow, dirs=dirs,
+                                                 now=now)
         report.capped.append(f"{plugin}/{sub}")
         logger.warning("callback-spool: %s/%s exceeded %d entries — "
-                       "oldest-first deletion applied", plugin, sub, cap)
+                       "attempt-less-first deletion applied", plugin, sub, cap)
+
+    def _apply_collect_cap(self, plugin: str, fd: int,
+                           held: list[tuple[float, str, str]],
+                           report: SweepReport, *, dirs: _ArtifactDirs,
+                           now: float) -> None:
+        """Bound the consumer-held ``.collect-*`` inodes (spec §9). Oldest
+        first — every hold is equally "claimed, unconfirmed", so age is the
+        only ranking — and each victim is recorded ``expired_unread,
+        claimed`` write-ahead, exactly as its TTL age-out would."""
+        if len(held) <= MAX_COLLECT:
+            return
+        held.sort()
+        for _mtime, name, flow in held[:len(held) - MAX_COLLECT]:
+            if not self._write_ahead(plugin, flow, "expired_unread",
+                                     dirs=dirs, now=now, claimed=True):
+                report.skipped_undurable += 1
+                continue
+            if _unlink_quiet(name, fd):
+                report.deleted_collect_capped += 1
+        report.capped.append(f"{plugin}/{RESULTS_DIR}/{COLLECT_PREFIX}*")
+        logger.warning("callback-spool: %s held %d+ collected results — "
+                       "oldest-first deletion applied", plugin, MAX_COLLECT)
 
     # -- gated orphan-dir GC ----------------------------------------------
 

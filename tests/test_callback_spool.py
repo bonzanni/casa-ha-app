@@ -2144,3 +2144,357 @@ def test_ack_fsync_failure_propagates(spool, monkeypatch):
     monkeypatch.setattr(cs, "_fsync_strict", boom)
     with pytest.raises(cs.FsyncFailed):
         cs.ack(_pdir(spool), h)
+
+
+# ---------------------------------------------------------------------------
+# write-ahead outcomes (INV-CB-007) — casa never deletes a credential-bearing
+# artifact before the flow's terminal outcome is DURABLY on its attempt file,
+# and never records an outcome for residue that names no flow.
+# ---------------------------------------------------------------------------
+
+
+def _attempt_of(spool, h, plugin=PLUGIN) -> dict:
+    """The schema-valid attempt record for *h* — the assertion helper for
+    every write-ahead site (a record that will not validate is not a record)."""
+    m = spool.read_attempt(plugin, h)
+    assert m.state is cs.MarkerState.PRESENT, "an attempt record must exist"
+    rec = ca.validate_attempt(m.payload)
+    assert rec is not None, "the record must be schema-valid"
+    return rec
+
+
+def test_expired_pending_records_expired_with_the_derived_mint(spool):
+    """The pending inode IS the derivation source: its mtime is the mint
+    clock and its v2 envelope carries the consumer's binding — both survive
+    the file that carried them."""
+    now = time.time()
+    state, meta = "expiring-flow", {"flow": "gmail", "n": 3}
+    h = state_hash(state)
+    p = mint(_pdir(spool), state, meta=meta)
+    _utime(p, now - PENDING_TTL_S - 1)
+    minted = p.stat().st_mtime
+
+    report = spool.sweep(now=now)
+
+    assert not p.exists()
+    assert report.deleted_pending == 1 and report.skipped_undurable == 0
+    rec = _attempt_of(spool, h)
+    assert rec["status"] == "done" and rec["outcome"] == "expired"
+    assert rec["ended_ts"] == now
+    assert rec["minted_ts"] == minted, "the mint clock, not the sweep clock"
+    assert rec["meta"] == meta
+    assert rec["claimed"] is False
+
+
+def test_expired_result_records_expired_unread_unclaimed(spool):
+    """A published result that nobody collected: `expired_unread`, and
+    `claimed` stays False — no rename ever happened."""
+    now = time.time()
+    h, claim = _claimed(spool, "uncollected")
+    assert spool.publish_result(claim, _record(h)) is cs.PublishOutcome.PUBLISHED
+    r = _results(spool) / f"{h}.json"
+    _utime(r, now - RESULT_TTL_S - 1)
+
+    report = spool.sweep(now=now)
+
+    assert not r.exists() and report.deleted_results == 1
+    rec = _attempt_of(spool, h)
+    assert rec["status"] == "done" and rec["outcome"] == "expired_unread"
+    assert rec["claimed"] is False
+    assert rec["minted_ts"] == claim.mtime, \
+        "the publish-time record is reused, not re-derived"
+
+
+def test_aged_collect_records_expired_unread_claimed(spool):
+    """A hold that aged out is the coarse-label residual: the consumer
+    renamed (so `claimed`) but never acked, and casa cannot say whether the
+    payload was ever read."""
+    now = time.time()
+    h = state_hash("held-flow")
+    held = _put(_results(spool) / f".collect-{h}-{'a' * 32}",
+                now - RESULT_TTL_S - 1, '{"v": 1}')
+
+    report = spool.sweep(now=now)
+
+    assert not held.exists() and report.deleted_collect == 1
+    rec = _attempt_of(spool, h)
+    assert rec["status"] == "done" and rec["outcome"] == "expired_unread"
+    assert rec["claimed"] is True
+    assert rec["minted_ts"] is None and rec["meta"] is None, \
+        "a hold is a NAME — casa never opens it, so nothing else is knowable"
+
+
+def test_collect_entries_get_their_own_cap_oldest_first(spool):
+    """A rename-happy consumer must not hold unbounded credential-bearing
+    inodes: `.collect-*` entries stay out of MAX_RESULTS and carry their own
+    cap, each eviction recorded exactly as its TTL age-out would be."""
+    now = time.time()
+    made = []
+    for i in range(cs.MAX_COLLECT + 1):
+        h = state_hash(f"held-{i}")
+        made.append((h, _put(_results(spool) / f".collect-{h}-{'a' * 32}",
+                             now - 100 + i)))
+
+    report = spool.sweep(now=now)
+
+    oldest_h, oldest_p = made[0]
+    assert not oldest_p.exists()
+    assert all(p.exists() for _h, p in made[1:])
+    assert len(list(_results(spool).iterdir())) == cs.MAX_COLLECT
+    assert report.deleted_collect_capped == 1
+    assert report.capped == [f"{PLUGIN}/results/{cs.COLLECT_PREFIX}*"]
+    rec = _attempt_of(spool, oldest_h)
+    assert rec["outcome"] == "expired_unread" and rec["claimed"] is True
+
+
+def test_pending_cap_evicts_an_attempt_less_entry_before_an_open_one(spool):
+    """The §9 ladder: cap pressure destroys what casa knows LEAST about
+    first. The oldest entry here is the one with an open attempt — plain
+    oldest-first would take it; the ladder takes the oldest attempt-less one
+    instead."""
+    now = time.time()
+    made = []
+    for i in range(cs.MAX_PENDING + 1):
+        h = state_hash(f"cap-{i}")
+        made.append((h, _put(_pending(spool) / f"{h}.json", now - 300 + i)))
+    open_h, open_p = made[0]
+    assert spool.write_attempt(PLUGIN, open_h, ca.new_attempt(
+        state_hash=open_h, minted_ts=now - 300, status="awaiting_redirect",
+        now=now))
+    victim_h, victim_p = made[1]
+
+    report = spool.sweep(now=now)
+
+    assert open_p.exists(), "an open attempt is evicted LAST"
+    assert not victim_p.exists()
+    assert report.deleted_capped == 1
+    assert report.capped == [f"{PLUGIN}/pending"]
+    rec = _attempt_of(spool, victim_h)
+    assert rec["status"] == "done" and rec["outcome"] == "evicted"
+
+
+def test_a_part_file_evicted_by_the_cap_is_recorded_nowhere(spool):
+    """Amendment-7 pin: a `.part` names no minted state (the mint publishes
+    by link, so only the final name was ever a flow) — cap-evicting one
+    creates NO attempt file and no outcome."""
+    now = time.time()
+    part_h = state_hash("residue")
+    part = _put(_pending(spool) / f"{part_h}.json{cs.PART_SUFFIX}",
+                now - TEMP_TTL_S + 10)       # oldest LIVE entry, not yet aged
+    for i in range(cs.MAX_PENDING):
+        h = state_hash(f"live-{i}")
+        _put(_pending(spool) / f"{h}.json", now - TEMP_TTL_S + 20 + i)
+
+    report = spool.sweep(now=now)
+
+    assert not part.exists(), "the oldest live entry is the cap's victim"
+    assert len(list(_pending(spool).iterdir())) == cs.MAX_PENDING
+    assert report.deleted_capped == 1
+    assert spool.read_attempt(PLUGIN, part_h).state is cs.MarkerState.ABSENT
+    assert os.listdir(_attempts(spool)) == [], "residue is recorded NOWHERE"
+
+
+def test_a_hash_named_anomaly_is_recorded_expired_before_removal(spool):
+    """Amendment-15 pin: a non-regular inode wearing a hash name still names
+    a flow, so its removal is a retirement — recorded — not residue disposal."""
+    now = time.time()
+    h = state_hash("anomalous")
+    p = _results(spool) / f"{h}.json"
+    os.mkfifo(p)
+
+    report = spool.sweep(now=now)
+
+    assert not os.path.lexists(p)
+    assert report.deleted_anomalous == 1
+    rec = _attempt_of(spool, h)
+    assert rec["status"] == "done" and rec["outcome"] == "expired"
+
+
+def test_recovery_stale_claim_drop_records_expired(spool):
+    """The claim inode is the pending inode (link preserved both mtime and
+    bytes): dropping it records the mint clock and the binding it carried."""
+    now = time.time()
+    h = state_hash("stale-claim")
+    claim = _put(_claims(spool) / h, now - PENDING_TTL_S - 1,
+                 '{"v": 2, "meta": {"x": 1}}')
+    minted = claim.stat().st_mtime
+
+    report = spool.recovery_pass(now=now, boot=True)
+
+    assert not claim.exists()
+    assert report.dropped == [(PLUGIN, h)]
+    rec = _attempt_of(spool, h)
+    assert rec["status"] == "done" and rec["outcome"] == "expired"
+    assert rec["minted_ts"] == minted and rec["meta"] == {"x": 1}
+
+
+def test_recovery_non_regular_claim_records_expired(spool):
+    now = time.time()
+    h = state_hash("weird-claim")
+    os.mkfifo(_claims(spool) / h)
+
+    spool.recovery_pass(now=now, boot=True)
+
+    assert not os.path.lexists(_claims(spool) / h)
+    assert _attempt_of(spool, h)["outcome"] == "expired"
+
+
+def test_recovery_restore_to_pending_records_no_outcome(spool):
+    """A CUSTODY TRANSFER, not a retirement: the flow continues in pending/
+    under its own TTL, so nothing terminal may be written — a terminal record
+    beside a live artifact is exactly the state the design forbids leaving."""
+    now = time.time()
+    h = state_hash("restored")
+    _put(_claims(spool) / h, now - 120)
+
+    report = spool.recovery_pass(now=now, boot=True)
+
+    assert report.restored == [(PLUGIN, h)]
+    assert (_pending(spool) / f"{h}.json").exists()
+    assert spool.read_attempt(PLUGIN, h).state is cs.MarkerState.ABSENT
+
+
+def test_recovery_result_custody_transfer_records_no_outcome(spool):
+    """Same rule on the other custody arm: a claim whose result was already
+    published hands the flow to results/, and only reports a nudge."""
+    now = time.time()
+    h = state_hash("published-claim")
+    _put(_claims(spool) / h, now - PENDING_TTL_S - 1)
+    _put(_results(spool) / f"{h}.json", now - 10)
+
+    report = spool.recovery_pass(now=now, boot=True)
+
+    assert report.nudges == [(PLUGIN, h)]
+    assert spool.read_attempt(PLUGIN, h).state is cs.MarkerState.ABSENT
+
+
+def test_an_outcome_that_will_not_go_durable_defers_its_deletion(spool,
+                                                                 monkeypatch):
+    """The write-ahead PAIR, pinned: with the strict fsync failing, the
+    expired pending SURVIVES the pass and is counted as deferred — a crash
+    can never take the credential-bearing artifact and the only record of why
+    together. With durability restored the next pass completes it.
+
+    Note what is deliberately NOT asserted: that no record is visible after
+    the failure. A strict dir-fsync failure can leave the new record visible
+    (amendment 3); what must hold is that the ARTIFACT survives and the pass
+    CONVERGES."""
+    now = time.time()
+    state = "undurable"
+    h = state_hash(state)
+    p = mint(_pdir(spool), state, meta={"flow": "x"})
+    _utime(p, now - PENDING_TTL_S - 1)
+
+    def boom(fd, what):
+        raise cs.FsyncFailed(errno.EIO, "injected")
+
+    monkeypatch.setattr(cs, "_fsync_strict", boom)
+
+    first = spool.sweep(now=now)
+
+    assert p.exists(), "the artifact outlives an unrecordable outcome"
+    assert first.deleted_pending == 0
+    assert first.skipped_undurable == 1
+
+    monkeypatch.undo()
+    second = spool.sweep(now=now)
+
+    assert not p.exists()
+    assert second.deleted_pending == 1 and second.skipped_undurable == 0
+    rec = _attempt_of(spool, h)
+    assert rec["status"] == "done" and rec["outcome"] == "expired"
+    assert rec["meta"] == {"flow": "x"}
+
+
+def test_a_result_deletion_lost_to_a_collector_reopens_the_attempt(
+        spool, monkeypatch):
+    """The consumer's collect rename wins the race between the write-ahead
+    record and the unlink. The terminal label is PROVISIONAL: the surviving
+    hold witnesses the contradiction and the attempt is rewritten open in the
+    same pass, keeping the binding the artifacts can no longer supply."""
+    now = time.time()
+    meta = {"flow": "raced"}
+    state = "raced-flow"
+    h = state_hash(state)
+    mint(_pdir(spool), state, meta=meta)
+    claim = spool.claim(PLUGIN, h, now=now)
+    assert spool.publish_result(claim, _record(h)) is cs.PublishOutcome.PUBLISHED
+    _utime(_results(spool) / f"{h}.json", now - RESULT_TTL_S - 1)
+
+    real = cs._unlink_quiet
+
+    def racing_unlink(name, dir_fd):
+        if name == f"{h}.json":
+            os.rename(name, f".collect-{h}-{'a' * 32}",
+                      src_dir_fd=dir_fd, dst_dir_fd=dir_fd)
+            return False                     # the sweep lost the race
+        return real(name, dir_fd)
+
+    monkeypatch.setattr(cs, "_unlink_quiet", racing_unlink)
+
+    spool.sweep(now=now)
+
+    rec = _attempt_of(spool, h)
+    assert rec["status"] == "result_ready", "reopened from the surviving hold"
+    assert rec["outcome"] is None and rec["claimed"] is True
+    assert rec["meta"] == meta, "the binding survives the re-derivation"
+
+
+def test_sweep_attempts_dir_retires_residue_but_not_records_or_receipts(spool):
+    """Amendment-8 hygiene: `attempts/` has exactly two legitimate name
+    classes, and both own their own lifecycle. Everything else — this
+    module's staged-replace temps after a crash, or a name nothing in the
+    protocol writes — ages out on TEMP_TTL_S with no outcome."""
+    now = time.time()
+    att = _attempts(spool)
+    h_live, h_acked = state_hash("kept"), state_hash("acked")
+    rec = _attempt_rec(h_live, now)
+    assert spool.write_attempt(PLUGIN, h_live, rec) is True
+    _utime(att / f"{h_live}.json", now - TEMP_TTL_S - 1)   # aged, still a record
+    token = _put(att / f".ack-{h_acked}", now - TEMP_TTL_S - 1, "")
+    stale_tmp = _put(att / f".{h_live}.json.tmp-99-deadbeef",
+                     now - TEMP_TTL_S - 1)
+    junk = _put(att / "scribble.txt", now - TEMP_TTL_S - 1)
+    fresh_tmp = _put(att / f".{h_live}.json.tmp-99-cafe", now - 5)
+
+    report = spool.sweep(now=now)
+
+    assert not stale_tmp.exists() and not junk.exists()
+    assert fresh_tmp.exists(), "a temp inside its window belongs to a live writer"
+    assert token.exists(), "an ack token is the consumer's receipt in flight"
+    assert _attempt_of(spool, h_live) == rec, "a valid record is untouched"
+    assert report.deleted_temps == 2
+
+
+def test_derive_attempt_of_a_collect_only_flow_never_opens_the_held_file(
+        spool, monkeypatch):
+    """The one derivation source casa may only READ THE NAME of. A flow known
+    solely by a hold materializes as `result_ready, claimed` with no mint
+    clock and no binding — and the held file is never opened."""
+    now = time.time()
+    h = state_hash("held-alone")
+    (_results(spool) / f".collect-{h}-{'a' * 32}").write_text('{"code": "x"}')
+    fds = {sub: os.open(_pdir(spool) / sub, os.O_RDONLY | os.O_DIRECTORY)
+           for sub in ("pending", "results", ".claims")}
+    opened: list[str] = []
+    real_open = os.open
+
+    def spy(path, *a, **kw):
+        opened.append(os.fspath(path) if not isinstance(path, int) else "")
+        return real_open(path, *a, **kw)
+
+    monkeypatch.setattr(cs.os, "open", spy)
+    try:
+        rec = spool._derive_attempt(PLUGIN, h, pend_fd=fds["pending"],
+                                    results_fd=fds["results"],
+                                    claims_fd=fds[".claims"], now=now)
+    finally:
+        monkeypatch.undo()
+        for fd in fds.values():
+            os.close(fd)
+
+    assert rec["status"] == "result_ready" and rec["claimed"] is True
+    assert rec["meta"] is None and rec["minted_ts"] is None
+    assert rec["outcome"] is None
+    assert not any(cs.COLLECT_PREFIX in name for name in opened), \
+        "casa never opens a consumer-held file"
