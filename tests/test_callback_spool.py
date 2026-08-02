@@ -1203,3 +1203,55 @@ def test_a_closed_spool_refuses_every_operation(tmp_path):
         s.ensure_plugin_dirs(PLUGIN)
     with pytest.raises(cs.SpoolClosed):
         s.write_ready(PLUGIN, {"v": 1})
+
+
+# ---------------------------------------------------------------------------
+# durable published-marker inventory (published_plugins / index_keys /
+# delete_index_key) — the reconciler's on-disk truth
+# ---------------------------------------------------------------------------
+
+
+def test_published_plugins_lists_only_dirs_with_a_ready_marker(spool):
+    spool.ensure_plugin_dirs("other")
+    assert spool.published_plugins() == []          # dirs exist, no markers yet
+    spool.write_ready(PLUGIN, {"v": 1})
+    assert spool.published_plugins() == [PLUGIN]     # only the marked dir
+
+
+def test_index_keys_lists_published_keys_only(spool, tmp_path):
+    art = tmp_path / "store" / "acme" / "art-1"
+    art.mkdir(parents=True)
+    assert spool.index_keys() == []
+    spool.write_index_entry(str(art), {"v": 1})
+    key = index_key(str(art))
+    assert spool.index_keys() == [key]
+
+
+def test_delete_index_key_retires_one_entry(spool, tmp_path):
+    art = tmp_path / "store" / "acme" / "art-1"
+    art.mkdir(parents=True)
+    spool.write_index_entry(str(art), {"v": 1})
+    key = index_key(str(art))
+    entry = Path(spool.root) / ".index" / f"{key}.json"
+    assert entry.is_file()
+
+    spool.delete_index_key(key)
+    assert not entry.exists()
+    assert spool.index_keys() == []
+    spool.delete_index_key(key)                      # idempotent — no raise
+
+
+def test_delete_index_key_refuses_a_non_hash_key(spool):
+    with pytest.raises(ValueError):
+        spool.delete_index_key("../escape")
+
+
+def test_durable_inventory_methods_are_empty_on_a_closed_spool(tmp_path):
+    s = CallbackSpool(tmp_path / "callbacks")
+    s.ensure_plugin_dirs(PLUGIN)
+    s.write_ready(PLUGIN, {"v": 1})
+    s.close()
+    assert s.published_plugins() == []
+    assert s.index_keys() == []
+    with pytest.raises(cs.SpoolClosed):
+        s.delete_index_key("0" * 64)

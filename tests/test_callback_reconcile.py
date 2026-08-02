@@ -105,6 +105,14 @@ class _SpoolStub:
     def delete_index_entry(self, artifact_realpath):
         self._rec("del_index", artifact_realpath)
 
+    # The durable-inventory reconcile reads these; a call-recording stub tracks
+    # no on-disk state, so it reports an empty inventory (no orphan retirement).
+    def published_plugins(self):
+        return []
+
+    def index_keys(self):
+        return []
+
 
 class _SpyRegistry(TriggerRegistry):
     def __init__(self, calls=None):
@@ -721,6 +729,152 @@ async def test_base_url_loss_retires_a_previously_published_marker(
                      spool=_SpoolStub(calls), base_url=None,
                      monkeypatch=monkeypatch)
     assert [c[0] for c in calls] == ["del_ready", "del_index", "swap"]
+
+
+# ---------------------------------------------------------------------------
+# durable marker reconcile — survives a restart (on-disk inventory, not the
+# in-memory previous overlay)
+# ---------------------------------------------------------------------------
+
+
+def _seed_prior_boot_marker(spool, plugin, art_path):
+    """Write ready.json + the index entry directly, simulating a marker
+    published by a PRIOR process (this process's in-memory overlay is empty,
+    as it is right after a restart)."""
+    spool.ensure_plugin_dirs(plugin)
+    payload = {"v": 1, "base_url": BASE, "callbacks": {}}
+    spool.write_ready(plugin, payload)
+    spool.write_index_entry(str(art_path), dict(payload, plugin_dir=plugin))
+
+
+def _marker_paths(root, plugin, art_path):
+    return (root / plugin / "ready.json",
+            root / callback_spool.INDEX_DIR /
+            f"{callback_spool.index_key(str(art_path))}.json")
+
+
+async def test_prior_boot_marker_retired_when_ack_now_absent(tmp_path):
+    """A plugin routed in a PRIOR process whose ack is now gone: the durable
+    reconcile retires ready.json AND the index entry (the in-memory previous
+    overlay is empty, so only on-disk truth catches it), and the route is not
+    served."""
+    root = tmp_path / "spool"
+    art = tmp_path / "store" / "gmail" / "art-1"
+    art.mkdir(parents=True)
+    spool = callback_spool.CallbackSpool(root)
+    try:
+        _seed_prior_boot_marker(spool, "gmail", art)
+        ready, index = _marker_paths(root, "gmail", art)
+        assert ready.is_file() and index.is_file()
+
+        registry = _SpyRegistry()               # empty overlay, like a boot
+        acks = CallbackAckStore(path=tmp_path / "acks.json")   # NO ack
+        p = _plugin(path=str(art))
+        await _reconcile(registry, plugins=[p], acks=acks, spool=spool)
+
+        assert not ready.exists()
+        assert not index.exists()
+        assert registry.get_callback("plg-gmail--authorize") is None
+        assert "gmail" not in spool.published_plugins()
+    finally:
+        spool.close()
+
+
+async def test_prior_boot_marker_retired_when_base_url_now_invalid(
+    monkeypatch, tmp_path,
+):
+    """Routed + acked, but the base URL is now invalid: nothing is publishable,
+    so a marker from a prior boot (when it was valid) is retired."""
+    root = tmp_path / "spool"
+    art = tmp_path / "store" / "gmail" / "art-1"
+    art.mkdir(parents=True)
+    spool = callback_spool.CallbackSpool(root)
+    try:
+        _seed_prior_boot_marker(spool, "gmail", art)
+        ready, index = _marker_paths(root, "gmail", art)
+
+        registry = _SpyRegistry()
+        acks = CallbackAckStore(path=tmp_path / "acks.json")
+        _ack(acks)
+        p = _plugin(path=str(art))
+        await _reconcile(registry, plugins=[p], acks=acks, spool=spool,
+                         base_url=None, monkeypatch=monkeypatch)
+
+        assert not ready.exists()
+        assert not index.exists()
+    finally:
+        spool.close()
+
+
+async def test_prior_boot_marker_retired_when_declaration_removed(tmp_path):
+    """The plugin is no longer installed (declaration gone): its orphaned
+    prior-boot marker is retired even though the in-memory overlay never
+    carried it this process."""
+    root = tmp_path / "spool"
+    art = tmp_path / "store" / "gmail" / "art-1"
+    art.mkdir(parents=True)
+    spool = callback_spool.CallbackSpool(root)
+    try:
+        _seed_prior_boot_marker(spool, "gmail", art)
+        ready, index = _marker_paths(root, "gmail", art)
+
+        registry = _SpyRegistry()
+        acks = CallbackAckStore(path=tmp_path / "acks.json")
+        await _reconcile(registry, plugins=[], acks=acks, spool=spool,
+                         entries=lambda: [])
+
+        assert not ready.exists()
+        assert not index.exists()
+    finally:
+        spool.close()
+
+
+async def test_durable_reconcile_preserves_a_still_routed_marker(tmp_path):
+    """A plugin that IS in the desired routed set keeps its marker across a
+    later reconcile with a fresh (empty) overlay."""
+    root = tmp_path / "spool"
+    art = tmp_path / "store" / "gmail" / "art-1"
+    art.mkdir(parents=True)
+    spool = callback_spool.CallbackSpool(root)
+    try:
+        registry = _SpyRegistry()
+        acks = CallbackAckStore(path=tmp_path / "acks.json")
+        _ack(acks)
+        p = _plugin(path=str(art))
+        await _reconcile(registry, plugins=[p], acks=acks, spool=spool)
+        ready, index = _marker_paths(root, "gmail", art)
+        assert ready.is_file() and index.is_file()
+
+        # A later "boot": fresh registry (empty overlay), same routed plugin.
+        registry2 = _SpyRegistry()
+        await _reconcile(registry2, plugins=[p], acks=acks, spool=spool)
+        assert ready.is_file() and index.is_file()
+        assert registry2.get_callback("plg-gmail--authorize") is not None
+    finally:
+        spool.close()
+
+
+async def test_registry_invalid_does_not_retire_durable_markers(tmp_path):
+    """Fail-closed availability: a wholesale compute failure (invalid registry
+    ⇒ prunable False) must NOT nuke a valid plugin's on-disk marker."""
+    root = tmp_path / "spool"
+    art = tmp_path / "store" / "gmail" / "art-1"
+    art.mkdir(parents=True)
+    spool = callback_spool.CallbackSpool(root)
+    try:
+        _seed_prior_boot_marker(spool, "gmail", art)
+        ready, index = _marker_paths(root, "gmail", art)
+
+        registry = _SpyRegistry()
+        acks = CallbackAckStore(path=tmp_path / "acks.json")
+        p = _plugin(path=str(art))
+        await _reconcile(registry, plugins=[p], acks=acks, spool=spool,
+                         resolver=_resolver([p], valid=False))
+
+        assert ready.is_file()
+        assert index.is_file()
+    finally:
+        spool.close()
 
 
 @pytest.mark.parametrize("raw,expected", [

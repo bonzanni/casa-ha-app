@@ -138,8 +138,9 @@ neutral redirect; the spool refuses expired, replayed and never-minted claims id
 handler logs `no_pending` for all of them (`expired` is the sweep's vocabulary, not the
 handler's).
 
-**A result write fails.** The claim is discarded for recovery rather than left half-published;
-the response is still the neutral redirect (INV-CB-002, INV-CB-005).
+**A result write fails.** The claim is discarded and the state stays consumed (single-use); no
+partial result is published, so the consumer must start a fresh authorization. The response is
+still the neutral redirect (INV-CB-002, INV-CB-005).
 
 **An internal fault anywhere on the request path.** Absorbed by the outer guard into the same
 neutral redirect — a 500 would itself be a differentiated response (INV-CB-005).

@@ -25,6 +25,7 @@ from __future__ import annotations
 
 import json
 import logging
+import math
 import threading
 import time
 import uuid
@@ -36,6 +37,13 @@ logger = logging.getLogger(__name__)
 ACKS_PATH = Path("/data/callback_acks.json")
 
 _SCHEMA_VERSION = 1
+
+#: The EXACT key set a stored ack record may carry. A record with any key
+#: outside this set is malformed and fails the whole store (INV-CB-003): a
+#: hand-edited / merged file that smuggled an extra field is no more
+#: trustworthy than one with a bad identity.
+_ACK_RECORD_KEYS = frozenset(
+    {"plugin", "effective", "declaration_digest", "gen", "ts"})
 
 
 class CallbackAckStore:
@@ -67,11 +75,22 @@ class CallbackAckStore:
         for ident, rec in acks.items():
             if not (isinstance(ident, str) and isinstance(rec, dict)):
                 return {}
+            # Exact schema: any key outside the record's declared set makes the
+            # WHOLE store untrusted (an extra field means the file was written
+            # by something other than this store).
+            if set(rec) != _ACK_RECORD_KEYS:
+                return {}
             fields = {k: rec.get(k)
                       for k in ("plugin", "effective", "declaration_digest")}
             gen = rec.get("gen")
+            ts = rec.get("ts")
             if (not all(isinstance(v, str) and v for v in fields.values())
-                    or not (isinstance(gen, str) and gen)):
+                    or not (isinstance(gen, str) and gen)
+                    # ``ts`` must be a real finite number — an int or float,
+                    # never a bool (a subclass of int) and never NaN/inf.
+                    or isinstance(ts, bool)
+                    or not isinstance(ts, (int, float))
+                    or not math.isfinite(ts)):
                 return {}
             try:
                 expected = ack_identity(**fields)

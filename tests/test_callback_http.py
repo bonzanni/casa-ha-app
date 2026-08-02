@@ -786,6 +786,47 @@ class TestLogHygiene:
         assert with_exc, "the LineTooLong record must keep an exc field"
         assert any("<redacted>" in p["exc"] for p in with_exc)
 
+    async def test_overlong_percent_encoded_callback_line_is_redacted(
+            self, spool, caplog):
+        """Encoding-bypass red case: an overlong request line to a
+        percent-encoded ``/%63allback`` path (``%63`` = 'c', decodes to
+        /callback for routing) keeps its RAW encoded target in the pre-routing
+        ``LineTooLong`` traceback, so a ``/callback``-anchored redactor misses
+        it and the code leaks. Redacting by request-target SHAPE closes it: no
+        record on ANY logger carries the code, and the ``aiohttp.server`` exc
+        field survives redacted (not dropped)."""
+        from log_cid import JsonFormatter
+
+        callback_http.install_callback_log_redaction()
+        caplog.set_level(logging.DEBUG)
+        app = _build_app(middlewares=[cid_middleware])
+        async with _client(app, access_log=True) as client:
+            try:
+                await _get(
+                    client,
+                    "/%63allback/x?code=SECRETVALUE&pad=" + "p" * 9000)
+            except Exception:  # noqa: BLE001 — the connection is dropped
+                pass
+            await asyncio.sleep(0.05)
+        server_records = [r for r in caplog.records
+                          if r.name == "aiohttp.server"]
+        assert server_records, \
+            "the parser error must have been logged (else the test is moot)"
+        formatter = logging.Formatter()
+        for record in caplog.records:
+            rendered = formatter.format(record)   # includes the traceback
+            assert "SECRETVALUE" not in rendered, record.name
+        # The exc field is still present under the production JSON formatter,
+        # redacted rather than dropped.
+        with_exc = []
+        for record in server_records:
+            payload = json.loads(JsonFormatter().format(record))
+            assert "SECRETVALUE" not in json.dumps(payload)
+            if "exc" in payload:
+                with_exc.append(payload)
+        assert with_exc, "the LineTooLong record must keep an exc field"
+        assert any("<redacted>" in p["exc"] for p in with_exc)
+
     async def test_no_log_line_carries_the_state_hash(self, spool, caplog):
         """INV-CB-006 names state, hash values and query content together."""
         callback_spool.mint(_plugin_dir(spool), STATE)

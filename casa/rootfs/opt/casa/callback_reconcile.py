@@ -323,6 +323,66 @@ def _spool_issue(issues: list, plugin: str, artifact_id: str | None) -> None:
         reason_code="callback_spool_error", artifact_id=artifact_id))
 
 
+def _retire_orphaned_markers(spool: Any, desired: DesiredCallbacks) -> None:
+    """Reconcile the DURABLE on-disk marker inventory against the desired
+    routed set, retiring any published ``ready.json`` / index entry whose
+    plugin (or artifact key) the desired set no longer routes.
+
+    Why this exists alongside :func:`_pre_swap_files`: that pass compares the
+    desired set against the IN-MEMORY previous overlay, which is empty across a
+    restart — so a marker for a plugin that has since dropped out of the routed
+    set (ack lost, declaration changed, base URL invalid, removed, artifact
+    path changed) would survive a reboot and keep advertising a route the
+    overlay no longer serves. A consumer that read such a stale marker would
+    mint a state and be sent to a route the overlay 404s — a dead flow that
+    looks alive. Reading the spool's OWN published inventory makes the
+    retirement survive a restart, where the in-memory diff cannot.
+
+    Gated on ``desired.prunable`` — the SAME double-gate the stale-ack prune
+    uses. A wholesale compute failure (invalid registry, or a resolution
+    hiccup) leaves ``prunable`` False, so this never nukes every marker (the
+    availability blast radius); a plugin simply ABSENT from a trustworthy
+    computation does have its stale marker retired. Runs BEFORE the overlay
+    swap — the same delete-before-swap ordering as the in-memory path.
+    """
+    if spool is None or not desired.prunable:
+        return
+    import callback_spool
+
+    if desired.base_url:
+        published = {r.plugin for r in desired.routed}
+        keys = {callback_spool.index_key(r.path) for r in desired.routed}
+    else:
+        published, keys = set(), set()
+    try:
+        on_disk_plugins = list(spool.published_plugins())
+    except Exception:  # noqa: BLE001 — a read failure degrades to leaving the
+        on_disk_plugins = []           # markers in place, never a reconcile crash
+    for plugin in on_disk_plugins:
+        if plugin not in published:
+            _retire_marker(spool, "delete_ready", plugin)
+    try:
+        on_disk_keys = list(spool.index_keys())
+    except Exception:  # noqa: BLE001
+        on_disk_keys = []
+    for key in on_disk_keys:
+        if key not in keys:
+            _retire_marker(spool, "delete_index_key", key)
+
+
+def _retire_marker(spool: Any, op: str, arg: str) -> None:
+    """Best-effort retirement of one orphaned marker/index entry. A failure is
+    logged, not surfaced as a per-plugin health issue: the entry is orphaned
+    (its plugin is not in the desired routed set), so there is no routed plugin
+    to attribute a ``callback_spool_error`` to, and the overlay — the sole
+    routing authority — already 404s the deposit regardless."""
+    try:
+        getattr(spool, op)(arg)
+    except Exception:  # noqa: BLE001
+        logger.warning("callback orphan-marker retire %s failed", op,
+                       exc_info=True)
+
+
 def _pre_swap_files(spool: Any, desired: DesiredCallbacks,
                     previous: dict[str, dict]) -> None:
     """Delete the markers/index entries of everything that is about to stop
@@ -480,6 +540,7 @@ async def reconcile_plugin_callbacks(
             raise
 
         previous = trigger_registry.callback_overlay_snapshot()
+        await asyncio.to_thread(_retire_orphaned_markers, spool, desired)
         await asyncio.to_thread(_pre_swap_files, spool, desired, previous)
         trigger_registry.replace_callback_overlay(desired.overlay)
         await asyncio.to_thread(_post_swap_files, spool, desired)

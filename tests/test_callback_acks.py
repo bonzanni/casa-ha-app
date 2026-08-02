@@ -132,6 +132,70 @@ def test_malformed_record_missing_field_yields_zero_acks(tmp_path):
     assert store.get(identity) is None
 
 
+def _store_with_record(path, rec):
+    identity = ack_identity("elevenlabs", "eff", "digest-1")
+    path.write_text(json.dumps({
+        "schema_version": 1,
+        "acks": {identity: rec},
+    }), encoding="utf-8")
+    return identity
+
+
+def test_non_numeric_ts_yields_zero_acks_whole_store(tmp_path):
+    """INV-CB-003: ``ts`` must be a real finite number. A string ``ts`` is a
+    malformed record and fails the WHOLE store, same as a bad identity."""
+    path = tmp_path / "acks.json"
+    identity = _store_with_record(path, {
+        "plugin": "elevenlabs", "effective": "eff",
+        "declaration_digest": "digest-1", "ts": "not-a-number", "gen": "g1",
+    })
+    assert CallbackAckStore(path=path).get(identity) is None
+
+
+def test_bool_ts_yields_zero_acks_whole_store(tmp_path):
+    """A bool is a subclass of int but is not a real timestamp — rejected."""
+    path = tmp_path / "acks.json"
+    identity = _store_with_record(path, {
+        "plugin": "elevenlabs", "effective": "eff",
+        "declaration_digest": "digest-1", "ts": True, "gen": "g1",
+    })
+    assert CallbackAckStore(path=path).get(identity) is None
+
+
+def test_extra_field_yields_zero_acks_whole_store(tmp_path):
+    """An otherwise-valid record carrying a key outside the exact set
+    {plugin, effective, declaration_digest, gen, ts} means the file was
+    written by something other than this store — the whole store fails."""
+    path = tmp_path / "acks.json"
+    identity = _store_with_record(path, {
+        "plugin": "elevenlabs", "effective": "eff",
+        "declaration_digest": "digest-1", "ts": 1, "gen": "g1",
+        "unexpected": "surprise",
+    })
+    assert CallbackAckStore(path=path).get(identity) is None
+
+
+def test_clean_record_still_loads(tmp_path):
+    """The tightened schema must not reject a well-formed record."""
+    path = tmp_path / "acks.json"
+    identity = _store_with_record(path, {
+        "plugin": "elevenlabs", "effective": "eff",
+        "declaration_digest": "digest-1", "ts": 1, "gen": "g1",
+    })
+    got = CallbackAckStore(path=path).get(identity)
+    assert got is not None and got["gen"] == "g1"
+
+
+def test_float_ts_is_accepted(tmp_path):
+    """A float ``ts`` (a legitimate ``time.time()`` shape) still loads."""
+    path = tmp_path / "acks.json"
+    identity = _store_with_record(path, {
+        "plugin": "elevenlabs", "effective": "eff",
+        "declaration_digest": "digest-1", "ts": 1.5, "gen": "g1",
+    })
+    assert CallbackAckStore(path=path).get(identity) is not None
+
+
 def test_revoke_plugin_returns_removed_and_persists(tmp_path):
     path = tmp_path / "acks.json"
     store = CallbackAckStore(path=path)

@@ -778,8 +778,10 @@ To use a plugin that needs one:
    Docker network.
 3. **Approve the callback in Telegram.** When a plugin declares a callback, Casa
    sends you a one-tap consent DM — "Plugin '<name>' wants to receive browser
-   redirects at GET /callback/…". The route stays closed (404) until you tap
-   Approve. Consent is bound to the callback's declared name, so a routine
+   redirects at GET /callback/…". Until you tap Approve the route serves the
+   same neutral response as any other and publishes no result — nothing
+   distinguishes an unapproved route from an approved one. Consent is bound to
+   the callback's declared name, so a routine
    plugin update that does not change the declaration keeps your approval; a
    rename asks again. You can withdraw it at any time, which darkens the route
    until you re-approve.

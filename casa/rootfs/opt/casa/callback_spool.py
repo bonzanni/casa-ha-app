@@ -525,6 +525,74 @@ class CallbackSpool:
             finally:
                 os.close(ifd)
 
+    def published_plugins(self) -> list[str]:
+        """Plugin dirs that currently carry a published ``ready.json`` marker —
+        the DURABLE readiness inventory the reconciler reconciles against the
+        desired routed set. Reading on-disk truth (not the in-memory previous
+        overlay, which is empty across a restart) is what lets a marker for a
+        plugin no longer routed be retired after a reboot."""
+        with self._lock:
+            if self._closed:
+                return []
+            out: list[str] = []
+            for plugin in self._plugin_dirs():
+                try:
+                    pfd = self._plugin_fd(plugin)
+                except (OSError, ValueError):
+                    continue
+                try:
+                    st = _lstat_quiet(READY_NAME, pfd)
+                    if st is not None and stat.S_ISREG(st.st_mode):
+                        out.append(plugin)
+                finally:
+                    os.close(pfd)
+            return out
+
+    def index_keys(self) -> list[str]:
+        """Discovery-index keys currently published under ``.index/`` — the
+        ``<sha256>.json`` entries (staging residue excluded), returned WITHOUT
+        the ``.json`` suffix. The reconciler retires any key the desired routed
+        set no longer covers; :meth:`delete_index_key` retires one by key."""
+        with self._lock:
+            if self._closed:
+                return []
+            try:
+                ifd = _open_dir(INDEX_DIR, self._root_fd)
+            except OSError:
+                return []
+            try:
+                out: list[str] = []
+                for name in _listdir_quiet(ifd):
+                    if _is_replace_temp(name):
+                        continue
+                    if name.endswith(".json") and _is_hash(name[:-5]):
+                        out.append(name[:-5])
+                return sorted(out)
+            finally:
+                os.close(ifd)
+
+    def delete_index_key(self, key: str) -> None:
+        """Retire one discovery-index entry by its already-computed KEY.
+
+        The durable-inventory reconcile knows the on-disk key (a sha256 hex),
+        not the artifact path it was derived from, so it cannot go through
+        :meth:`delete_index_entry` (which re-hashes a path). Guarded like every
+        index op — a non-hash key raises ``ValueError`` rather than resolving
+        outside ``.index/`` — and a closed spool raises ``SpoolClosed``."""
+        if not _is_hash(key):
+            raise ValueError(f"unsafe index key {key!r}")
+        with self._lock:
+            self._require_open()
+            try:
+                ifd = self._index_fd(create=False)
+            except OSError:
+                return
+            try:
+                _unlink_quiet(f"{key}.json", ifd)
+                _fsync(ifd, INDEX_DIR)
+            finally:
+                os.close(ifd)
+
     def _index_fd(self, *, create: bool) -> int:
         if create and self._mkdir(INDEX_DIR, self._root_fd):
             # The directory entry itself must be durable before an entry

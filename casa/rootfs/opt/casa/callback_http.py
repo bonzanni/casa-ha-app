@@ -31,10 +31,15 @@ runs, and aiohttp's ``handle_error`` logs the exception at ERROR — the
 exception message embeds the offending bytes, i.e. the query with the code.
 :func:`install_callback_log_redaction` closes it: an idempotent
 ``logging.Filter`` on the ``aiohttp.server`` logger strips the query from any
-``/callback`` request line in a record's message *and its exception
-traceback* before any handler formats it. Casa wires it at app setup; the
-residual is therefore closed in-container (the outer proxy's own logs remain
-operator-configured).
+request-line target in a record's message *and its exception traceback*
+before any handler formats it. The match is on the request-target SHAPE, not
+the literal ``/callback`` — a percent-encoded path (``/%63allback/…``) routes
+to /callback but keeps its raw encoded form in the pre-routing traceback, so a
+``/callback``-anchored pattern would miss it; an ``aiohttp.server`` error
+record never legitimately needs a request-line query, so stripping it from
+every such token closes the whole encoding-bypass class. Casa wires it at app
+setup; the residual is therefore closed in-container (the outer proxy's own
+logs remain operator-configured).
 
 **Opaque relay.** Casa interprets exactly one parameter — ``state``, parsed
 strictly from the RAW query string, never the framework's decoded view, so a
@@ -158,11 +163,18 @@ p { font-size: 1.125rem; line-height: 1.6; margin: 0; }
 # aiohttp.server log redaction (INV-CB-006, the below-the-handler surface)
 # ---------------------------------------------------------------------------
 
-#: A ``/callback`` request line with its query. Anchored on the path so a
-#: legitimate diagnostic that merely contains a ``?`` elsewhere is untouched;
-#: ``\S*`` runs to the next whitespace, which in aiohttp's ``LineTooLong``
-#: message (a ``bytearray`` repr on one line) is the end of the credential.
-_CALLBACK_QUERY_RE = re.compile(r"(/callback[^\s?]*)\?\S*")
+#: Any origin-form request target carrying a query: a ``/``-leading token up
+#: to the first ``?``, then ``\S*`` to the next whitespace — which in aiohttp's
+#: ``LineTooLong`` message (a ``bytearray`` repr on one line) is the end of the
+#: credential. Matching the request-target SHAPE rather than the literal
+#: ``/callback`` closes the whole encoding-bypass class: a percent-encoded path
+#: (``/%63allback/…``) decodes to /callback for routing but keeps its raw
+#: encoded form in the pre-routing traceback, which a ``/callback``-anchored
+#: pattern would miss. An ``aiohttp.server`` error record never legitimately
+#: needs a request-line query, so stripping it from every such token is safe;
+#: a ``/``-leading token WITHOUT a ``?`` (a bare file path in a frame) does not
+#: match and is left untouched.
+_REQUEST_QUERY_RE = re.compile(r"(/[^\s?]*)\?\S*")
 _REDACTED = r"\1?<redacted>"
 
 
@@ -178,11 +190,12 @@ class _AiohttpServerRedactor(logging.Filter):
     ``Logger.handle`` before ``callHandlers`` — the mutation reaches every
     handler, including root, already sanitized.
 
-    The trigger is the query-bearing request-line SHAPE
-    (:data:`_CALLBACK_QUERY_RE`, which requires a ``?``), not the bare
-    ``/callback`` substring: an unrelated ``aiohttp.server`` traceback whose
-    frames merely mention ``…/callback_http.py`` carries no query, does not
-    match, and keeps its ``exc_info`` untouched. When it DOES match, the
+    The trigger is the query-bearing request-target SHAPE
+    (:data:`_REQUEST_QUERY_RE`, which requires a ``?`` after a ``/``-leading
+    token), not the bare ``/callback`` substring — so a percent-encoded path is
+    covered too, while an unrelated ``aiohttp.server`` traceback whose frames
+    merely mention ``…/callback_http.py`` carries no query, does not match, and
+    keeps its ``exc_info`` untouched. When it DOES match, the
     redacted traceback is pre-rendered onto ``record.exc_text`` and
     ``exc_info`` is cleared; ``JsonFormatter`` (casa's production default) and
     ``HumanFormatter`` both fall back to ``exc_text``, so the ``exc`` field
@@ -194,7 +207,7 @@ class _AiohttpServerRedactor(logging.Filter):
             message = record.getMessage()
         except Exception:  # noqa: BLE001 — a broken record must still be logged
             message = str(record.msg)
-        redacted = _CALLBACK_QUERY_RE.sub(_REDACTED, message)
+        redacted = _REQUEST_QUERY_RE.sub(_REDACTED, message)
         if redacted != message:
             record.msg = redacted
             record.args = ()
@@ -202,8 +215,8 @@ class _AiohttpServerRedactor(logging.Filter):
             text = record.exc_text
             if text is None and record.exc_info:
                 text = "".join(traceback.format_exception(*record.exc_info))
-            if text and _CALLBACK_QUERY_RE.search(text):
-                record.exc_text = _CALLBACK_QUERY_RE.sub(_REDACTED, text)
+            if text and _REQUEST_QUERY_RE.search(text):
+                record.exc_text = _REQUEST_QUERY_RE.sub(_REDACTED, text)
                 record.exc_info = None
         return True
 

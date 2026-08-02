@@ -20,8 +20,8 @@ phone:
   approval is withdrawn with the `callback_ack_revoke` tool, and the
   public page reveals nothing — every visit returns the same neutral
   "you can close this tab" response.
-- Requires `public_url`; leave it empty and the facility stays off. See
-  DOCS.md for the operator walkthrough.
+- Requires `public_url`: without it, plugins cannot be handed a callback URL,
+  so the facility is unusable. See DOCS.md for the operator walkthrough.
 
 ## [0.145.0] - 2026-08-01
 
