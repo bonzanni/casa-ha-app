@@ -19,10 +19,25 @@ tools:
     - mcp__casa-framework__engage_executor
     - mcp__casa-framework__ask_user
     - mcp__casa-framework__get_schedule
+    - mcp__casa-framework__set_reminder
+    - mcp__casa-framework__cancel_reminder
     - mcp__casa-framework__recall_memory
     - mcp__casa-framework__send_message
     - mcp__casa-framework__send_media
-  disallowed: []
+  disallowed:
+    # #396: session-scoped schedulers. These outlive nothing — CronCreate
+    # reports "Session-only (not written to disk, dies when Claude exits)" —
+    # so a reminder set through one is silently discarded at the next
+    # restart, after the user has been told it is set. Note that tools.allowed
+    # is an AUTO-APPROVE list, not a deny list, which is how these were
+    # reachable without ever being listed. Use set_reminder instead.
+    - CronCreate
+    - CronDelete
+    - CronList
+    - ToolSearch
+    # The built-in `schedule` skill creates cloud routines against a claude.ai
+    # account a Casa install has no connection to; it fails at call time.
+    - Skill(schedule)
   permission_mode: acceptEdits
   max_turns: 20
 mcp_server_names:
