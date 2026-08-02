@@ -9,6 +9,8 @@ leaves the declaration unchanged keeps its ack.
 """
 import json
 
+import pytest
+
 from callback_acks import CallbackAckStore
 from plugin_callbacks import ack_identity
 
@@ -163,6 +165,44 @@ def test_revoke_plugin_no_match_returns_empty_and_does_not_persist(tmp_path):
 
     assert removed == []
     assert path.read_text(encoding="utf-8") == before
+
+
+def test_record_publishes_only_after_durable_write(tmp_path, monkeypatch):
+    """A failed persist must raise AND leave the in-memory view unchanged —
+    a reconcile racing the failure can never route an ack that would vanish
+    on reboot (mirrors trigger_acks.py's identical pin)."""
+    store = CallbackAckStore(path=tmp_path / "acks.json")
+
+    def _boom(path, text):
+        raise OSError("disk full")
+
+    import atomic_io
+    monkeypatch.setattr(atomic_io, "atomic_write_text", _boom)
+
+    with pytest.raises(OSError):
+        store.record("elevenlabs", "plg-elevenlabs--oauth", "digest-1")
+
+    identity = ack_identity("elevenlabs", "plg-elevenlabs--oauth", "digest-1")
+    assert store.get(identity) is None
+
+
+def test_revoke_publishes_only_after_durable_write(tmp_path, monkeypatch):
+    store = CallbackAckStore(path=tmp_path / "acks.json")
+    store.record("elevenlabs", "plg-elevenlabs--oauth", "digest-1")
+    identity = ack_identity("elevenlabs", "plg-elevenlabs--oauth", "digest-1")
+
+    def _boom(path, text):
+        raise OSError("disk full")
+
+    import atomic_io
+    monkeypatch.setattr(atomic_io, "atomic_write_text", _boom)
+
+    with pytest.raises(OSError):
+        store.revoke_plugin("elevenlabs")
+
+    # memory unchanged: the revoke did NOT half-apply (a crash would have
+    # silently resurrected it from disk otherwise)
+    assert store.get(identity) is not None
 
 
 def test_prune_stale_drops_only_identities_outside_valid_set(tmp_path):
