@@ -88,8 +88,35 @@ def test_http_block_declares_callback_log_suppression_map():
     ingress_idx = text.index("# --- Ingress server")
     assert http_idx < map_idx < ingress_idx
     map_block = text[map_idx:text.index("}", map_idx) + 1]
-    assert "~^/callback/ 0;" in map_block
-    assert "default     1;" in map_block or "default 1;" in map_block
+    # The regex must match both the bare /callback path and its sub-paths
+    # (/callback/<name>), while still excluding lookalikes such as
+    # /callbackish — an end-of-string or slash anchor after the literal,
+    # not a trailing-slash-only match.
+    assert r"~^/callback(/|\$) 0;" in map_block
+    assert "default          1;" in map_block or "default 1;" in map_block
+
+
+def test_callback_log_suppression_regex_matches_bare_and_subpaths_only():
+    """Behavioral check on the map regex (rendered form, backslash-escape
+    stripped): a bare ``/callback`` (no trailing slash — what ``GET
+    /callback?code=...&state=...`` presents as ``$uri``) and any
+    ``/callback/<name>`` sub-path must be classified into the suppressed
+    bucket, while a merely-prefixed path like ``/callbackish`` must not."""
+    import re
+
+    text = _SCRIPT.read_text()
+    map_idx = text.index(r"map \$uri \$casa_cb_log {")
+    map_block = text[map_idx:text.index("}", map_idx) + 1]
+    match = re.search(r"~\^(/callback\(/\|\\\$\))\s+0;", map_block)
+    assert match, "callback-suppression regex not found in map block"
+    # Rendered nginx.conf form: \$ -> $ once bash expands the heredoc.
+    rendered_pattern = match.group(1).replace(r"\$", "$")
+    compiled = re.compile("^" + rendered_pattern)
+    assert compiled.match("/callback")
+    assert compiled.match("/callback/google")
+    assert compiled.match("/callback/effective")
+    assert not compiled.match("/callbackish")
+    assert not compiled.match("/not-callback")
 
 
 def test_ingress_server_suppresses_callback_query_from_access_log():

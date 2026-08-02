@@ -24,8 +24,8 @@ http {
     # layer. \$uri excludes the query string by definition (unlike
     # \$request or \$request_uri), so classifying purely on it is sufficient.
     map \$uri \$casa_cb_log {
-        ~^/callback/ 0;
-        default     1;
+        ~^/callback(/|\$) 0;
+        default          1;
     }
 
     # --- Ingress server (HA-authenticated) ---
