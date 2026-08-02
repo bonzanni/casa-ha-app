@@ -46,6 +46,7 @@ Semantics:
 from __future__ import annotations
 
 import asyncio
+import json
 import logging
 from dataclasses import dataclass, field
 from typing import Any, Callable
@@ -348,6 +349,23 @@ def _read_marker(spool: Any, op: str, arg: str) -> Any:
         return callback_spool.Marker(callback_spool.MarkerState.INVALID)
 
 
+def _canonical(payload: Any) -> "str | None":
+    """Canonical JSON form of a marker payload for a TYPE-STRICT compare.
+
+    Python ``==`` treats ``True == 1`` and ``1.0 == 1`` as equal, so a
+    type-corrupted on-disk marker (``"v": true`` / ``"v": 1.0`` where the
+    desired payload has ``"v": 1``, or an extra/reordered key) would read as
+    "unchanged" and survive under a plain ``dict ==``. Comparing canonical
+    serialized JSON instead makes any non-byte-identical payload DIFFER, so it
+    is retired and rewritten. Returns None for a non-serializable payload — an
+    on-disk marker only ever comes from ``json.loads`` so this is defensive,
+    and None never compares equal to the (always-serializable) desired form."""
+    try:
+        return json.dumps(payload, sort_keys=True, separators=(",", ":"))
+    except (TypeError, ValueError):
+        return None
+
+
 def _pair_state(spool: Any, base_url: "str | None",
                 routed: RoutedCallbacks) -> "tuple[bool, bool]":
     """Classify a routed plugin's on-disk (ready, index) pair against the
@@ -368,13 +386,19 @@ def _pair_state(spool: Any, base_url: "str | None",
     absent = callback_spool.MarkerState.ABSENT
     ready, index = _desired_marker_payloads(base_url, routed)
 
+    # Type-STRICT compare (see _canonical): a payload merely ``==`` the desired
+    # one but not byte-identical to its canonical form is NOT "unchanged".
+    desired_ready = _canonical(ready)
     on_ready = _read_marker(spool, "read_marker", routed.plugin)
-    ready_ok = on_ready.state == present and on_ready.payload == ready
+    ready_ok = (on_ready.state == present and desired_ready is not None
+                and _canonical(on_ready.payload) == desired_ready)
     ready_on_disk = on_ready.state != absent
 
     if routed.path:
+        desired_index = _canonical(index)
         on_index = _read_marker(spool, "read_index_marker", routed.path)
-        index_ok = on_index.state == present and on_index.payload == index
+        index_ok = (on_index.state == present and desired_index is not None
+                    and _canonical(on_index.payload) == desired_index)
         index_on_disk = on_index.state != absent
     else:
         index_ok, index_on_disk = True, False   # no index for a pathless plugin
@@ -382,18 +406,24 @@ def _pair_state(spool: Any, base_url: "str | None",
     return (not (ready_ok and index_ok)), (ready_on_disk or index_on_disk)
 
 
-def _retire_marker(spool: Any, op: str, arg: str) -> None:
-    """Best-effort retirement (idempotent delete) of one marker/index entry. A
-    failure is logged, not surfaced as a health issue: on the orphan path there
-    is no routed plugin to attribute a ``callback_spool_error`` to, and on the
-    fail-closed post-swap path the issue is already recorded by ``_guard``; the
-    overlay — the sole routing authority — 404s the deposit regardless."""
+def _retire_marker(spool: Any, op: str, arg: str) -> bool:
+    """Type-aware retirement (idempotent delete) of one marker/index entry of
+    ANY type. Returns True when the entry is now ABSENT (removed or already
+    gone), False when a genuine removal FAILED (the entry survives) — so a
+    caller that CAN attribute the failure to a plugin surfaces it rather than
+    swallowing it into "looks absent". A raised exception is also a failure.
+
+    The overlay — the sole routing authority — 404s the deposit regardless, so
+    on the fail-closed post-swap path a False is harmless (``_guard`` already
+    recorded the write failure); it matters on the orphan path, where a
+    surviving invalid marker would otherwise block republication unseen."""
     if spool is None:
-        return
+        return True
     try:
-        getattr(spool, op)(arg)
+        return bool(getattr(spool, op)(arg))
     except Exception:  # noqa: BLE001
         logger.warning("callback marker retire %s failed", op, exc_info=True)
+        return False
 
 
 def _reconcile_markers_pre_swap(
@@ -413,12 +443,15 @@ def _reconcile_markers_pre_swap(
       bad compute (invalid registry / resolution hiccup) can never nuke a valid
       plugin's markers.
     * **Routed but not already exactly desired** — absent, invalid, stale, or
-      half-published (one file present, one gone): BOTH files are retired here
-      so the post-swap rewrite is the sole writer and a failed rewrite leaves
-      them ABSENT (fail-closed) rather than stale/partial. A fully-absent pair
-      is a fresh publish with nothing to delete first (no churn). NOT gated on
-      ``prunable`` — refreshing a plugin that IS in the trustworthy routed set
-      is availability-positive.
+      half-published (one file present, one gone): when this pass is trustworthy
+      (``prunable``) BOTH files are retired here so the post-swap rewrite is the
+      sole writer and a failed rewrite leaves them ABSENT (fail-closed) rather
+      than stale/partial. On an UNTRUSTWORTHY pass an EXISTING marker is left
+      exactly as-is (the same availability double-gate the orphan/stale-ack
+      prunes use — a transient bad compute may not vaporize or rewrite a live
+      consumer's marker). A fully-ABSENT pair is a fresh publish with nothing to
+      delete first and is written regardless of ``prunable`` (it destroys
+      nothing).
     * **Unchanged** — a pair already equal to the desired one is left exactly as
       it is (no retire, no rewrite).
 
@@ -444,13 +477,19 @@ def _reconcile_markers_pre_swap(
             on_disk_plugins = []           # place, never a reconcile crash
         for plugin in on_disk_plugins:
             if plugin not in routed_by_plugin:
-                _retire_marker(spool, "delete_ready", plugin)
+                if not _retire_marker(spool, "delete_ready", plugin):
+                    # A genuinely-failed orphan retirement is SURFACED, not
+                    # swallowed into "looks absent" — the invalid marker
+                    # survives and would otherwise block republication unseen.
+                    _spool_issue(desired.issues, plugin, None)
         try:
             on_disk_keys = list(spool.index_keys())
         except Exception:  # noqa: BLE001
             on_disk_keys = []
         for key in on_disk_keys:
             if key not in desired_keys:
+                # A failed index-key retirement is logged inside the spool;
+                # there is no routed plugin to attribute a health row to.
                 _retire_marker(spool, "delete_index_key", key)
 
     republish: list[RoutedCallbacks] = []
@@ -458,10 +497,20 @@ def _reconcile_markers_pre_swap(
         needs, has_on_disk = _pair_state(spool, desired.base_url, routed)
         if not needs:
             continue                     # unchanged — no churn
+        if has_on_disk and not desired.prunable:
+            # The availability double-gate covers the routed pair too, not just
+            # orphans: an UNTRUSTWORTHY pass (invalid registry / a resolution
+            # hiccup) must never retire OR overwrite an EXISTING on-disk marker
+            # — a transient bad compute may not vaporize/rewrite a live
+            # consumer's marker. A trustworthy pass refreshes it next. (A
+            # fully-ABSENT pair falls through: publishing it destroys nothing.)
+            continue
         if has_on_disk:
-            _retire_marker(spool, "delete_ready", routed.plugin)
-            if routed.path:
-                _retire_marker(spool, "delete_index_entry", routed.path)
+            if not _retire_marker(spool, "delete_ready", routed.plugin):
+                _spool_issue(desired.issues, routed.plugin, routed.artifact_id)
+            if routed.path and not _retire_marker(
+                    spool, "delete_index_entry", routed.path):
+                _spool_issue(desired.issues, routed.plugin, routed.artifact_id)
         republish.append(routed)
     return republish
 

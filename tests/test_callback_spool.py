@@ -1337,3 +1337,90 @@ def test_read_index_marker_of_a_fifo_is_invalid_and_never_blocks(spool, tmp_path
     entry.unlink()
     os.mkfifo(entry)
     assert spool.read_index_marker(str(art)).state is cs.MarkerState.INVALID
+
+
+def test_read_marker_of_deeply_nested_json_is_invalid_and_never_raises(spool):
+    """The three-state reader is TOTAL: a body of 60k opening brackets fits the
+    64 KiB size cap but makes ``json.loads`` raise ``RecursionError`` (not a
+    ``ValueError``) — the reader must still return INVALID, never propagate."""
+    (_pdir(spool) / "ready.json").write_bytes(b"[" * 60000)
+    m = spool.read_marker(PLUGIN)
+    assert m.state is cs.MarkerState.INVALID and m.payload is None
+
+
+# ---------------------------------------------------------------------------
+# type-safe marker retirement + total enumeration (a non-regular ready.json /
+# index entry must be ENUMERATED and RETIRED, never left to block republish)
+# ---------------------------------------------------------------------------
+
+
+def _make_dir(p):  os.mkdir(p)
+def _make_fifo(p): os.mkfifo(p)
+def _make_symlink(p): os.symlink("/nonexistent-target", p)
+
+
+_NON_REGULAR = [
+    pytest.param(_make_dir, id="dir"),
+    pytest.param(_make_fifo, id="fifo"),
+    pytest.param(_make_symlink, id="symlink"),
+]
+
+
+@pytest.mark.parametrize("maker", _NON_REGULAR)
+def test_published_plugins_enumerates_a_non_regular_ready_marker(spool, maker):
+    """An invalid ready.json (dir/FIFO/symlink) is an orphan that MUST be
+    enumerated for retirement — omitting it (the old S_ISREG gate) would leave
+    the invalid marker to survive forever and block republication."""
+    maker(_pdir(spool) / "ready.json")
+    assert spool.published_plugins() == [PLUGIN]
+
+
+@pytest.mark.parametrize("maker", _NON_REGULAR)
+def test_delete_ready_retires_a_marker_of_any_type(spool, maker):
+    """A raw unlink FAILS on a directory-shaped marker; the type-aware retire
+    removes any type and reports the entry now-absent."""
+    maker(_pdir(spool) / "ready.json")
+    assert spool.delete_ready(PLUGIN) is True
+    assert not os.path.lexists(_pdir(spool) / "ready.json")   # incl. no symlink
+    assert spool.published_plugins() == []
+
+
+def test_delete_ready_of_an_absent_marker_reports_absent(spool):
+    assert spool.delete_ready(PLUGIN) is True                 # nothing there
+
+
+def test_delete_ready_surfaces_a_failed_removal(spool, monkeypatch):
+    """A genuinely-failing removal must NOT be reported as absent — the caller
+    surfaces it rather than assuming both-absent."""
+    (_pdir(spool) / "ready.json").write_text("{}")
+    monkeypatch.setattr(cs, "_remove_entry", lambda *a, **k: False)
+    assert spool.delete_ready(PLUGIN) is False                # not swallowed
+    assert (_pdir(spool) / "ready.json").exists()             # survived
+
+
+@pytest.mark.parametrize("maker", _NON_REGULAR)
+def test_index_keys_enumerates_and_delete_retires_a_non_regular_entry(
+    spool, tmp_path, maker,
+):
+    art = tmp_path / "store" / "acme" / "art-1"
+    art.mkdir(parents=True)
+    spool.write_index_entry(str(art), {"v": 1})       # creates the .index dir
+    key = index_key(str(art))
+    entry = Path(spool.root) / cs.INDEX_DIR / f"{key}.json"
+    entry.unlink()
+    maker(entry)                                      # corrupt into a non-regular
+    assert key in spool.index_keys()                  # still enumerated
+    assert spool.delete_index_key(key) is True
+    assert not os.path.lexists(entry)
+    assert spool.index_keys() == []
+
+
+def test_delete_index_entry_retires_a_directory_shaped_entry(spool, tmp_path):
+    art = tmp_path / "store" / "acme" / "art-1"
+    art.mkdir(parents=True)
+    spool.write_index_entry(str(art), {"v": 1})
+    entry = Path(spool.root) / cs.INDEX_DIR / f"{index_key(str(art))}.json"
+    entry.unlink()
+    os.mkdir(entry)                                   # directory-shaped entry
+    assert spool.delete_index_entry(str(art)) is True
+    assert not entry.exists()

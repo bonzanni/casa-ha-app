@@ -106,8 +106,9 @@ class _SpoolStub:
         self._ready[plugin] = payload
 
     def delete_ready(self, plugin):
-        self._rec("del_ready", plugin)
+        self._rec("del_ready", plugin)          # raises here if in `fail`
         self._ready.pop(plugin, None)
+        return True                             # now absent (real-spool contract)
 
     def write_index_entry(self, artifact_realpath, payload):
         self._rec("index", artifact_realpath, payload)
@@ -116,10 +117,12 @@ class _SpoolStub:
     def delete_index_entry(self, artifact_realpath):
         self._rec("del_index", artifact_realpath)
         self._index.pop(callback_spool.index_key(artifact_realpath), None)
+        return True
 
     def delete_index_key(self, key):
         self._rec("del_index_key", key)
         self._index.pop(key, None)
+        return True
 
     def published_plugins(self):
         return sorted(self._ready)
@@ -1153,6 +1156,67 @@ async def test_registry_invalid_does_not_retire_a_differing_marker(tmp_path):
         spool.close()
 
 
+def _resolution_hiccup():
+    from plugin_registry import PluginIssue
+    return PluginIssue(name="other", target=None, stage="resolve",
+                       reason_code="artifact_invalid", artifact_id="art-x")
+
+
+async def test_resolution_issue_does_not_retire_or_rewrite_a_differing_marker(
+    tmp_path,
+):
+    """CLASS 2: an untrustworthy pass (a resolution HICCUP ⇒ ``prunable`` False)
+    with a routed plugin whose desired payload DIFFERS from its on-disk marker
+    must leave that marker UNCHANGED. The availability double-gate covers the
+    routed-pair retire/rewrite, not just orphan cleanup — a resolution hiccup
+    must never vaporize or rewrite a live consumer's marker."""
+    root = tmp_path / "spool"
+    art = tmp_path / "store" / "gmail" / "art-1"
+    art.mkdir(parents=True)
+    spool = callback_spool.CallbackSpool(root)
+    try:
+        _seed_marker(spool, "gmail", art, ["authorize", "renew"],
+                     base="https://old.casa.example.org")   # differs from desired
+        ready, index = _marker_paths(root, "gmail", art)
+        before_ready, before_index = ready.read_text(), index.read_text()
+
+        registry = _SpyRegistry()
+        acks = CallbackAckStore(path=tmp_path / "acks.json")
+        _ack(acks)
+        p = _plugin(path=str(art))
+        await _reconcile(registry, plugins=[p], acks=acks, spool=spool,
+                         resolver=_resolver([p], issues=[_resolution_hiccup()]))
+
+        assert ready.read_text() == before_ready   # untrustworthy: not rewritten
+        assert index.read_text() == before_index   # nor the index side
+        # consent + resolution of THIS plugin stand, so the overlay still routes
+        assert registry.get_callback("plg-gmail--authorize") is not None
+    finally:
+        spool.close()
+
+
+async def test_untrustworthy_pass_still_publishes_a_fresh_absent_pair(tmp_path):
+    """The double-gate blocks retire/overwrite of an EXISTING marker on an
+    untrustworthy pass, but a genuinely-ABSENT pair for a routed plugin is a
+    pure fresh publish (it destroys nothing) and is still written."""
+    root = tmp_path / "spool"
+    art = tmp_path / "store" / "gmail" / "art-1"
+    art.mkdir(parents=True)
+    spool = callback_spool.CallbackSpool(root)
+    try:
+        registry = _SpyRegistry()
+        acks = CallbackAckStore(path=tmp_path / "acks.json")
+        _ack(acks)
+        p = _plugin(path=str(art))
+        await _reconcile(registry, plugins=[p], acks=acks, spool=spool,
+                         resolver=_resolver([p], issues=[_resolution_hiccup()]))
+        ready, index = _marker_paths(root, "gmail", art)
+        assert ready.is_file() and index.is_file()   # fresh publish allowed
+        assert set(json.loads(ready.read_text())["callbacks"]) == {"authorize"}
+    finally:
+        spool.close()
+
+
 # ---------------------------------------------------------------------------
 # the paired marker transaction — fail-closed to absent, INVALID != absent,
 # never a half-published pair (r3 findings)
@@ -1307,6 +1371,143 @@ async def test_half_published_pair_is_made_whole(tmp_path):
 
         assert ready.is_file() and index.is_file()
         assert json.loads(index.read_text())["plugin_dir"] == "gmail"
+    finally:
+        spool.close()
+
+
+async def test_directory_shaped_orphan_marker_is_retired(tmp_path):
+    """CLASS 1: a NON-REGULAR (directory) ready.json for a plugin no longer
+    routed is an orphan a trustworthy pass must RETIRE — a raw unlink fails on a
+    directory and would leave it to block republication forever."""
+    root = tmp_path / "spool"
+    spool = callback_spool.CallbackSpool(root)
+    try:
+        spool.ensure_plugin_dirs("ghost")
+        os.mkdir(root / "ghost" / "ready.json")      # dir-shaped orphan marker
+        assert "ghost" in spool.published_plugins()
+
+        registry = _SpyRegistry()
+        acks = CallbackAckStore(path=tmp_path / "acks.json")
+        await _reconcile(registry, plugins=[], acks=acks, spool=spool,
+                         entries=lambda: [])          # nothing routed ⇒ pure orphan
+
+        assert "ghost" not in spool.published_plugins()
+        assert not (root / "ghost" / "ready.json").exists()
+    finally:
+        spool.close()
+
+
+async def test_directory_shaped_routed_marker_is_made_whole(tmp_path):
+    """CLASS 1: a routed plugin whose on-disk ready.json is a DIRECTORY (invalid)
+    is retired type-aware and rewritten to a regular file — never left to block
+    republication behind a raw unlink that fails on a directory."""
+    root = tmp_path / "spool"
+    art = tmp_path / "store" / "gmail" / "art-1"
+    art.mkdir(parents=True)
+    spool = callback_spool.CallbackSpool(root)
+    try:
+        spool.ensure_plugin_dirs("gmail")
+        os.mkdir(root / "gmail" / "ready.json")      # invalid, dir-shaped
+        registry = _SpyRegistry()
+        acks = CallbackAckStore(path=tmp_path / "acks.json")
+        _ack(acks)
+        p = _plugin(path=str(art))
+        await _reconcile(registry, plugins=[p], acks=acks, spool=spool)
+
+        ready = root / "gmail" / "ready.json"
+        assert ready.is_file()                        # rewritten as a regular file
+        assert set(json.loads(ready.read_text())["callbacks"]) == {"authorize"}
+        assert registry.get_callback("plg-gmail--authorize") is not None
+    finally:
+        spool.close()
+
+
+async def test_directory_shaped_orphan_index_entry_is_retired(tmp_path):
+    """CLASS 1: a NON-REGULAR (directory) ``.index`` entry for a key no longer
+    desired is enumerated and retired type-aware by a trustworthy pass."""
+    root = tmp_path / "spool"
+    art = tmp_path / "store" / "gmail" / "art-1"
+    art.mkdir(parents=True)
+    spool = callback_spool.CallbackSpool(root)
+    try:
+        spool.write_index_entry(str(art), {"v": 1})  # creates .index + the entry
+        key = callback_spool.index_key(str(art))
+        entry = root / callback_spool.INDEX_DIR / f"{key}.json"
+        entry.unlink()
+        os.mkdir(entry)                               # dir-shaped orphan index entry
+        assert key in spool.index_keys()
+
+        registry = _SpyRegistry()
+        acks = CallbackAckStore(path=tmp_path / "acks.json")
+        await _reconcile(registry, plugins=[], acks=acks, spool=spool,
+                         entries=lambda: [])
+        assert spool.index_keys() == []
+        assert not entry.exists()
+    finally:
+        spool.close()
+
+
+@pytest.mark.parametrize("corrupt", [
+    pytest.param(lambda d: {**d, "v": True}, id="true-vs-1"),
+    pytest.param(lambda d: {**d, "v": 1.0}, id="float-vs-int"),
+    pytest.param(lambda d: {**d, "extra": "x"}, id="extra-key"),
+])
+async def test_type_corrupted_marker_is_not_read_as_unchanged(tmp_path, corrupt):
+    """CLASS 3: a payload that is ``==`` the desired one but not byte-identical
+    to its canonical JSON (``True``/``1.0`` vs ``1``, or an extra key) must be
+    treated as DIFFERING — retired and rewritten — not read as 'unchanged' under
+    a plain ``dict ==``."""
+    root = tmp_path / "spool"
+    art = tmp_path / "store" / "gmail" / "art-1"
+    art.mkdir(parents=True)
+    spool = callback_spool.CallbackSpool(root)
+    try:
+        registry = _SpyRegistry()
+        acks = CallbackAckStore(path=tmp_path / "acks.json")
+        _ack(acks)
+        p = _plugin(path=str(art))
+        await _reconcile(registry, plugins=[p], acks=acks, spool=spool)
+        ready, _index = _marker_paths(root, "gmail", art)
+        good = json.loads(ready.read_text())
+        ino_before = ready.stat().st_ino
+        # Corrupt the on-disk payload so ONLY type/extra differs from desired.
+        ready.write_text(json.dumps(corrupt(good), sort_keys=True))
+
+        registry2 = _SpyRegistry()                    # a later boot
+        await _reconcile(registry2, plugins=[p], acks=acks, spool=spool)
+
+        after = json.loads(ready.read_text())
+        assert ready.stat().st_ino != ino_before      # rewritten, not left as-is
+        assert type(after["v"]) is int and after["v"] == 1
+        assert "extra" not in after
+        assert registry2.get_callback("plg-gmail--authorize") is not None
+    finally:
+        spool.close()
+
+
+async def test_byte_identical_marker_stays_unchanged_under_strict_compare(
+    tmp_path,
+):
+    """The strict compare has no false churn: a genuinely byte-identical payload
+    is still 'unchanged' — inode and mtime untouched across a later reconcile."""
+    root = tmp_path / "spool"
+    art = tmp_path / "store" / "gmail" / "art-1"
+    art.mkdir(parents=True)
+    spool = callback_spool.CallbackSpool(root)
+    try:
+        registry = _SpyRegistry()
+        acks = CallbackAckStore(path=tmp_path / "acks.json")
+        _ack(acks)
+        p = _plugin(path=str(art))
+        await _reconcile(registry, plugins=[p], acks=acks, spool=spool)
+        ready, index = _marker_paths(root, "gmail", art)
+        st_ready, st_index = ready.stat(), index.stat()
+
+        registry2 = _SpyRegistry()
+        await _reconcile(registry2, plugins=[p], acks=acks, spool=spool)
+        assert ready.stat().st_ino == st_ready.st_ino
+        assert ready.stat().st_mtime == st_ready.st_mtime
+        assert index.stat().st_ino == st_index.st_ino
     finally:
         spool.close()
 

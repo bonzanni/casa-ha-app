@@ -258,6 +258,25 @@ def _remove_entry(name: str, dir_fd: int, st) -> bool:
     return _unlink_quiet(name, dir_fd)
 
 
+def _retire_marker_entry(name: str, dir_fd: int) -> bool:
+    """Retire a durable-marker entry of ANY type (regular file, directory,
+    symlink, FIFO, …) openat-relative to *dir_fd*.
+
+    Returns True when the entry is now ABSENT — removed, or already gone — and
+    False when a genuine removal FAILED and the entry SURVIVES. The caller must
+    surface a False rather than treat it as absent (a stale/invalid marker that
+    was NOT removed still blocks republication). Type-aware via ``_remove_entry``
+    (``lstat`` + dir-vs-file), so a directory-shaped marker is ``rmtree``d rather
+    than left behind by a raw ``unlink`` that assumes a regular file. Absence is
+    re-confirmed by ``lstat`` after the removal so a benign remove/vanish race is
+    reported as success, not a spurious failure."""
+    st = _lstat_quiet(name, dir_fd)
+    if st is None:
+        return True                          # already absent
+    _remove_entry(name, dir_fd, st)
+    return _lstat_quiet(name, dir_fd) is None
+
+
 def _write_new_file(name: str, dir_fd: int, data: bytes) -> None:
     """Create *name* exclusively (0600), write it whole, fsync it. Raises on
     any failure, leaving no partially-visible final name (the caller only ever
@@ -316,7 +335,11 @@ def _read_marker_at(name: str, dir_fd: int) -> Marker:
         os.close(fd)
     try:
         obj = json.loads(b"".join(chunks).decode("utf-8"))
-    except (ValueError, UnicodeDecodeError):
+    except Exception:  # noqa: BLE001 — the reader is TOTAL: not just
+        # ValueError/UnicodeDecodeError but e.g. a RecursionError from a
+        # deeply-nested body that fits the size cap (60k opening brackets)
+        # must decode to INVALID, never escape and violate the never-raises
+        # contract the reconciler relies on.
         return Marker(MarkerState.INVALID)
     if not isinstance(obj, dict):
         return Marker(MarkerState.INVALID)
@@ -563,19 +586,28 @@ class CallbackSpool:
             finally:
                 os.close(pfd)
 
-    def delete_ready(self, plugin: str) -> None:
-        """Remove the marker and fsync its directory — done BEFORE the
-        unrouting overlay swap, so a crash mid-unroute can only leave the
-        route closed with the marker already gone (never the reverse)."""
+    def delete_ready(self, plugin: str) -> bool:
+        """Retire the marker (of ANY type) and fsync its directory — done BEFORE
+        the unrouting overlay swap, so a crash mid-unroute can only leave the
+        route closed with the marker already gone (never the reverse).
+
+        Returns True when the marker is now absent (removed, or already gone),
+        False when a genuine removal FAILED and the entry survives — surfaced by
+        the reconciler rather than mistaken for both-absent. Type-aware: a
+        directory/FIFO/symlink-shaped ``ready.json`` is removed (a raw unlink
+        would fail on a directory and leave it to block republication)."""
         with self._lock:
             self._require_open()
             try:
                 pfd = self._plugin_fd(plugin)
+            except FileNotFoundError:
+                return True                  # dir already gone — marker absent
             except OSError:
-                return                       # dir already gone — nothing to do
+                return False                 # dir unreachable — not confirmed gone
             try:
-                _unlink_quiet(READY_NAME, pfd)
+                gone = _retire_marker_entry(READY_NAME, pfd)
                 _fsync(pfd, plugin)
+                return gone
             finally:
                 os.close(pfd)
 
@@ -633,25 +665,37 @@ class CallbackSpool:
             finally:
                 os.close(ifd)
 
-    def delete_index_entry(self, artifact_realpath: str) -> None:
+    def delete_index_entry(self, artifact_realpath: str) -> bool:
+        """Retire the ``.index`` entry (of ANY type) for *artifact_realpath*.
+        Returns True when it is now absent, False when a removal genuinely
+        failed (see :meth:`delete_ready`)."""
         with self._lock:
             self._require_open()
             try:
                 ifd = self._index_fd(create=False)
+            except FileNotFoundError:
+                return True                  # no index dir — entry absent
             except OSError:
-                return
+                return False
             try:
-                _unlink_quiet(f"{index_key(artifact_realpath)}.json", ifd)
+                gone = _retire_marker_entry(
+                    f"{index_key(artifact_realpath)}.json", ifd)
                 _fsync(ifd, INDEX_DIR)
+                return gone
             finally:
                 os.close(ifd)
 
     def published_plugins(self) -> list[str]:
-        """Plugin dirs that currently carry a published ``ready.json`` marker —
+        """Plugin dirs that currently carry a ``ready.json`` marker of ANY type —
         the DURABLE readiness inventory the reconciler reconciles against the
         desired routed set. Reading on-disk truth (not the in-memory previous
         overlay, which is empty across a restart) is what lets a marker for a
-        plugin no longer routed be retired after a reboot."""
+        plugin no longer routed be retired after a reboot.
+
+        A non-regular ``ready.json`` (a swapped-in directory/FIFO/symlink) is
+        INCLUDED, not silently omitted: it is an INVALID orphan that must still
+        be enumerated so a trustworthy pass retires it — omitting it would leave
+        an invalid marker to survive forever and block republication."""
         with self._lock:
             if self._closed:
                 return []
@@ -662,8 +706,7 @@ class CallbackSpool:
                 except (OSError, ValueError):
                     continue
                 try:
-                    st = _lstat_quiet(READY_NAME, pfd)
-                    if st is not None and stat.S_ISREG(st.st_mode):
+                    if _lstat_quiet(READY_NAME, pfd) is not None:
                         out.append(plugin)
                 finally:
                     os.close(pfd)
@@ -672,8 +715,11 @@ class CallbackSpool:
     def index_keys(self) -> list[str]:
         """Discovery-index keys currently published under ``.index/`` — the
         ``<sha256>.json`` entries (staging residue excluded), returned WITHOUT
-        the ``.json`` suffix. The reconciler retires any key the desired routed
-        set no longer covers; :meth:`delete_index_key` retires one by key."""
+        the ``.json`` suffix. Enumeration is by NAME, so a non-regular entry (a
+        swapped-in directory/FIFO/symlink named ``<sha256>.json``) is included
+        too — an INVALID orphan the reconciler must still see to retire. The
+        reconciler retires any key the desired routed set no longer covers;
+        :meth:`delete_index_key` retires one by key."""
         with self._lock:
             if self._closed:
                 return []
@@ -692,8 +738,10 @@ class CallbackSpool:
             finally:
                 os.close(ifd)
 
-    def delete_index_key(self, key: str) -> None:
-        """Retire one discovery-index entry by its already-computed KEY.
+    def delete_index_key(self, key: str) -> bool:
+        """Retire one discovery-index entry (of ANY type) by its already-computed
+        KEY. Returns True when the entry is now absent, False when a removal
+        genuinely failed (see :meth:`delete_ready`).
 
         The durable-inventory reconcile knows the on-disk key (a sha256 hex),
         not the artifact path it was derived from, so it cannot go through
@@ -706,11 +754,14 @@ class CallbackSpool:
             self._require_open()
             try:
                 ifd = self._index_fd(create=False)
+            except FileNotFoundError:
+                return True                  # no index dir — entry absent
             except OSError:
-                return
+                return False
             try:
-                _unlink_quiet(f"{key}.json", ifd)
+                gone = _retire_marker_entry(f"{key}.json", ifd)
                 _fsync(ifd, INDEX_DIR)
+                return gone
             finally:
                 os.close(ifd)
 

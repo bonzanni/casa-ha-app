@@ -344,12 +344,6 @@ class TriggerRegistry:
         """Effective names currently live in the callback overlay."""
         return list(self._callback_overlay)
 
-    def callback_overlay_snapshot(self) -> dict[str, dict]:
-        """A shallow copy of the current callback overlay — the reconciler
-        reads it to learn which spool markers/index entries the PREVIOUS pass
-        published (they must be deleted BEFORE the swap that unroutes them)."""
-        return dict(self._callback_overlay)
-
     def plugin_overlay_names(self) -> list[str]:
         """Effective names currently live in the plugin overlay."""
         return list(self._plugin_overlay)
