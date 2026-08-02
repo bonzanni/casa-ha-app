@@ -22,8 +22,50 @@ def test_pin_docs_workflow_runs_verifier_ledger_and_impact():
     assert "coverage_ledger.py check" in text
     # Generated navigation is current.
     assert "--check-nav" in text
-    # The docs-impact declaration on changed paths.
-    assert "--impact" in text
+    # The docs-impact decision on changed paths. It no longer lives inline in
+    # the workflow: it is scripts/docs_impact.sh, called by BOTH the workflow
+    # and scripts/gate.sh (which is what actually binds, since a CI check
+    # reports only after a PR exists and can be merged past — PR #383). Pin
+    # every link of that chain, which is stricter than the old check for a flag
+    # in the workflow text: a comment could satisfy that, and one nearly did.
+    root = WORKFLOW.parents[2]
+
+    def _invokes(path, script):
+        """A real invocation, not a mention. Terra caught the first version of
+        this pinning bare substrings: both callers name the script in comments,
+        so deleting the executable line still passed. Match a line whose first
+        word is the script (optionally via `bash`), with comments excluded.
+
+        DIRECT invocation is deliberately the contract. Calls wrapped in `exec`,
+        `env`, a variable, or a same-line `set -x;` are not recognised and will
+        fail this test — which is fail-closed, and cheap to fix by calling the
+        script plainly. Both callers do."""
+        for line in path.read_text().splitlines():
+            stripped = line.strip()
+            if not stripped or stripped.startswith("#"):
+                continue
+            words = stripped.split()
+            if words[0] == script or (words[0] == "bash" and len(words) > 1
+                                      and words[1] == script):
+                return True
+        return False
+
+    assert _invokes(WORKFLOW, "scripts/docs_impact.sh"), \
+        "docs.yml must CALL scripts/docs_impact.sh, not merely mention it"
+    assert _invokes(root / "scripts" / "gate.sh", "scripts/docs_impact.sh"), \
+        "gate.sh must CALL scripts/docs_impact.sh — it is the binding copy"
+    # And the script itself must still DRIVE the verifier's impact mode — on a
+    # live line. Sol caught the final link of the chain still being a bare
+    # substring: commenting out the verifier pipeline left `--impact` present in
+    # prose and the test green.
+    impact_lines = [
+        ln for ln in (root / "scripts" / "docs_impact.sh").read_text().splitlines()
+        if "--impact" in ln and not ln.strip().startswith("#")
+    ]
+    assert impact_lines, (
+        "scripts/docs_impact.sh must run verify_docs --impact on a live line, "
+        "not merely mention it"
+    )
     # The operating cards must keep routing agents into the corpus — pinned as
     # the substantive directive pattern, not a bare filename an unrelated
     # sentence could satisfy.
