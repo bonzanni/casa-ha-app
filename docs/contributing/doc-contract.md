@@ -71,6 +71,17 @@ coverage ledger in both directions (every enumerated
 surface assigned to a document or excluded with a reason, no stale entries); the required
 skeleton; and that all generated navigation is current.
 
+**The pre-push gate enforces**, before anything is published rather than after a pull
+request exists: the same corpus verification, and the documentation-impact rule — a change
+touching a surface some document claims must update that document, or carry a
+per-document reasoned waiver (`Docs-impact: <doc> — <why the prose is still true>`) in the
+tip commit. CI runs the identical script as a backstop for pushes made with hooks
+uninstalled. The order matters and was learned the hard way: as a CI-only check it reported
+after the pull request existed, leaving a red mark that a fast merge could pass, and one
+did — six documents' worth of drift shipped that way. What no layer can enforce is that a
+waiver is *sincere*; that is a review question, and the waiver is recorded in the commit
+under its author's name for exactly that reason.
+
 **A reviewer enforces**: front matter and the code-wins line; the section order; present
 tense; whether a document is one-hop sufficient; whether the same rule has been restated in
 different words somewhere else; and whether any of it is true. No script can tell a correct
