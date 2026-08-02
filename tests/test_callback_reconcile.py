@@ -8,6 +8,7 @@ keeps the readiness marker from ever being falsely positive, prunes stale acks
 and fires consent prompts for callbacks whose ONLY gap is the ack.
 """
 import asyncio
+import json
 import os
 from types import SimpleNamespace
 
@@ -112,6 +113,15 @@ class _SpoolStub:
 
     def index_keys(self):
         return []
+
+    # No on-disk payload either: an absent marker is never "stale" (so no
+    # still-routed retirement) and always "needs write" (so the post-swap
+    # rewrite still records ensure/ready/index, as these ordering tests pin).
+    def read_ready(self, plugin):
+        return None
+
+    def read_index_entry(self, artifact_realpath):
+        return None
 
 
 class _SpyRegistry(TriggerRegistry):
@@ -873,6 +883,241 @@ async def test_registry_invalid_does_not_retire_durable_markers(tmp_path):
 
         assert ready.is_file()
         assert index.is_file()
+    finally:
+        spool.close()
+
+
+# ---------------------------------------------------------------------------
+# durable marker reconcile — STILL-routed but payload changed while down. The
+# in-memory swap diff is empty across a restart, so only the on-disk payload
+# compare catches a dropped callback or a changed redirect base.
+# ---------------------------------------------------------------------------
+
+
+class _WriteFails:
+    """Wrap a real spool, failing every ready.json write (a disk-full rewrite).
+    Deletes and reads pass through, so a retire-before-swap still happens and a
+    failed rewrite leaves the marker ABSENT rather than stale."""
+
+    def __init__(self, inner):
+        self._inner = inner
+
+    def __getattr__(self, name):
+        return getattr(self._inner, name)
+
+    def write_ready(self, plugin, payload):
+        raise OSError("disk full")
+
+
+def _seed_marker(spool, plugin, art_path, callbacks, base=BASE):
+    """Write a ready.json + index entry EXACTLY as a prior boot with this
+    (plugin, callbacks, base) would have — via the same payload builder the
+    reconcile writes with — so only the intended field (a dropped callback, a
+    changed base) differs from a later desired pass."""
+    routed = cr.RoutedCallbacks(
+        plugin=plugin, artifact_id="art-seed", path=str(art_path),
+        callbacks=[{"declared": d, "effective": f"plg-{plugin}--{d}"}
+                   for d in callbacks])
+    ready, index = cr._desired_marker_payloads(base, routed)
+    spool.ensure_plugin_dirs(plugin)
+    spool.write_ready(plugin, ready)
+    spool.write_index_entry(str(art_path), index)
+
+
+async def test_still_routed_dropped_callback_retired_across_restart(tmp_path):
+    """A plugin STILL routed whose prior-boot marker advertises an EXTRA,
+    now-dropped callback: the durable payload compare retires the stale marker
+    before the swap and the rewrite advertises only the live callback."""
+    root = tmp_path / "spool"
+    art = tmp_path / "store" / "gmail" / "art-1"
+    art.mkdir(parents=True)
+    spool = callback_spool.CallbackSpool(root)
+    try:
+        _seed_marker(spool, "gmail", art, ["authorize", "renew"])
+        ready, index = _marker_paths(root, "gmail", art)
+        assert set(json.loads(ready.read_text())["callbacks"]) == {
+            "authorize", "renew"}
+
+        registry = _SpyRegistry()                 # empty overlay, like a boot
+        acks = CallbackAckStore(path=tmp_path / "acks.json")
+        _ack(acks, declared="authorize")          # only authorize is live now
+        p = _plugin(callbacks=("authorize",), path=str(art))
+        await _reconcile(registry, plugins=[p], acks=acks, spool=spool)
+
+        assert set(json.loads(ready.read_text())["callbacks"]) == {"authorize"}
+        assert set(json.loads(index.read_text())["callbacks"]) == {"authorize"}
+        assert registry.get_callback("plg-gmail--authorize") is not None
+    finally:
+        spool.close()
+
+
+async def test_still_routed_stale_marker_absent_on_rewrite_failure(tmp_path):
+    """The point of retiring before the swap: when the post-swap rewrite fails,
+    the still-routed plugin's marker is left ABSENT (consumer reads 'not
+    approved yet, wait'), never STALE advertising the dropped callback."""
+    root = tmp_path / "spool"
+    art = tmp_path / "store" / "gmail" / "art-1"
+    art.mkdir(parents=True)
+    spool = callback_spool.CallbackSpool(root)
+    try:
+        _seed_marker(spool, "gmail", art, ["authorize", "renew"])
+        ready, index = _marker_paths(root, "gmail", art)
+
+        registry = _SpyRegistry()
+        acks = CallbackAckStore(path=tmp_path / "acks.json")
+        _ack(acks, declared="authorize")
+        p = _plugin(callbacks=("authorize",), path=str(art))
+        issues = await _reconcile(registry, plugins=[p], acks=acks,
+                                  spool=_WriteFails(spool))
+
+        assert [i.reason_code for i in issues] == ["callback_spool_error"]
+        assert not ready.exists()
+        assert not index.exists()
+    finally:
+        spool.close()
+
+
+async def test_still_routed_base_url_change_retires_old_redirect(tmp_path):
+    """A plugin still routed whose redirect BASE changed while down: the old
+    redirect URI is gone after the reconcile (durable payload compare, not the
+    empty in-memory diff)."""
+    root = tmp_path / "spool"
+    art = tmp_path / "store" / "gmail" / "art-1"
+    art.mkdir(parents=True)
+    old_base = "https://old.casa.example.org"
+    spool = callback_spool.CallbackSpool(root)
+    try:
+        _seed_marker(spool, "gmail", art, ["authorize"], base=old_base)
+        ready, index = _marker_paths(root, "gmail", art)
+        assert old_base in ready.read_text()
+
+        registry = _SpyRegistry()
+        acks = CallbackAckStore(path=tmp_path / "acks.json")
+        _ack(acks)
+        p = _plugin(path=str(art))
+        await _reconcile(registry, plugins=[p], acks=acks, spool=spool)
+
+        data = json.loads(ready.read_text())
+        assert data["base_url"] == BASE
+        assert old_base not in json.dumps(data)
+        assert all(cb["redirect_uri"].startswith(BASE)
+                   for cb in data["callbacks"].values())
+        assert old_base not in index.read_text()
+    finally:
+        spool.close()
+
+
+async def test_still_routed_base_url_change_absent_on_rewrite_failure(tmp_path):
+    """The base-URL-change subcase is fail-closed on a rewrite failure too: the
+    obsolete-redirect marker is retired before the swap, so a failed rewrite
+    leaves it absent rather than advertising the old redirect URI forever."""
+    root = tmp_path / "spool"
+    art = tmp_path / "store" / "gmail" / "art-1"
+    art.mkdir(parents=True)
+    spool = callback_spool.CallbackSpool(root)
+    try:
+        _seed_marker(spool, "gmail", art, ["authorize"],
+                     base="https://old.casa.example.org")
+        ready, index = _marker_paths(root, "gmail", art)
+
+        registry = _SpyRegistry()
+        acks = CallbackAckStore(path=tmp_path / "acks.json")
+        _ack(acks)
+        p = _plugin(path=str(art))
+        issues = await _reconcile(registry, plugins=[p], acks=acks,
+                                  spool=_WriteFails(spool))
+
+        assert [i.reason_code for i in issues] == ["callback_spool_error"]
+        assert not ready.exists()
+        assert not index.exists()
+    finally:
+        spool.close()
+
+
+async def test_unchanged_still_routed_marker_is_not_rewritten(tmp_path):
+    """No churn: when the on-disk payload already matches the desired one, a
+    later reconcile (fresh empty overlay, as after a restart) neither deletes
+    nor rewrites the marker — the file's inode and mtime are untouched."""
+    root = tmp_path / "spool"
+    art = tmp_path / "store" / "gmail" / "art-1"
+    art.mkdir(parents=True)
+    spool = callback_spool.CallbackSpool(root)
+    try:
+        registry = _SpyRegistry()
+        acks = CallbackAckStore(path=tmp_path / "acks.json")
+        _ack(acks)
+        p = _plugin(path=str(art))
+        await _reconcile(registry, plugins=[p], acks=acks, spool=spool)
+        ready, index = _marker_paths(root, "gmail", art)
+        st_ready, st_index = ready.stat(), index.stat()
+
+        class _Counting:
+            def __init__(self, inner):
+                self._inner = inner
+                self.writes = 0
+                self.deletes = 0
+
+            def __getattr__(self, name):
+                return getattr(self._inner, name)
+
+            def write_ready(self, *a):
+                self.writes += 1
+                return self._inner.write_ready(*a)
+
+            def write_index_entry(self, *a):
+                self.writes += 1
+                return self._inner.write_index_entry(*a)
+
+            def delete_ready(self, *a):
+                self.deletes += 1
+                return self._inner.delete_ready(*a)
+
+            def delete_index_entry(self, *a):
+                self.deletes += 1
+                return self._inner.delete_index_entry(*a)
+
+            def delete_index_key(self, *a):
+                self.deletes += 1
+                return self._inner.delete_index_key(*a)
+
+        counting = _Counting(spool)
+        registry2 = _SpyRegistry()                # fresh overlay = a restart
+        await _reconcile(registry2, plugins=[p], acks=acks, spool=counting)
+
+        assert counting.writes == 0               # no rewrite of a matching marker
+        assert counting.deletes == 0              # and no retire
+        assert ready.stat().st_ino == st_ready.st_ino
+        assert ready.stat().st_mtime == st_ready.st_mtime
+        assert index.stat().st_ino == st_index.st_ino
+        assert registry2.get_callback("plg-gmail--authorize") is not None
+    finally:
+        spool.close()
+
+
+async def test_registry_invalid_does_not_retire_a_differing_marker(tmp_path):
+    """The double-gate holds for the payload compare too: an invalid-registry
+    pass (``prunable`` False) must NOT retire even a marker whose payload
+    differs from what a valid pass would desire — a transient bad compute may
+    never delete a valid plugin's marker."""
+    root = tmp_path / "spool"
+    art = tmp_path / "store" / "gmail" / "art-1"
+    art.mkdir(parents=True)
+    spool = callback_spool.CallbackSpool(root)
+    try:
+        _seed_marker(spool, "gmail", art, ["authorize", "renew"],
+                     base="https://old.casa.example.org")
+        ready, index = _marker_paths(root, "gmail", art)
+        before_ready = ready.read_text()
+
+        registry = _SpyRegistry()
+        acks = CallbackAckStore(path=tmp_path / "acks.json")
+        _ack(acks)
+        p = _plugin(path=str(art))
+        await _reconcile(registry, plugins=[p], acks=acks, spool=spool,
+                         resolver=_resolver([p], valid=False))
+
+        assert ready.is_file() and index.is_file()
+        assert ready.read_text() == before_ready   # untouched, not rewritten
     finally:
         spool.close()
 

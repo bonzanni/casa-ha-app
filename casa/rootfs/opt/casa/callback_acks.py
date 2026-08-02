@@ -46,6 +46,27 @@ _ACK_RECORD_KEYS = frozenset(
     {"plugin", "effective", "declaration_digest", "gen", "ts"})
 
 
+def _valid_ts(ts: Any) -> bool:
+    """True iff *ts* is a real timestamp number this store may trust.
+
+    ``_load`` runs at construction (Casa boot), so this check — like every
+    other in ``_load`` — must be TOTAL: it may never raise, or a garbage
+    stored record would crash the boot instead of failing the whole store
+    closed (INV-CB-003). That rules out ``math.isfinite`` on an arbitrary
+    ``int``: a JSON integer like ``10**1000`` overflows the int→C-double
+    conversion and raises ``OverflowError``. So an ``int`` of ANY magnitude is
+    accepted without ``isfinite`` (an int cannot be NaN/inf); only a ``float``
+    is put through ``isfinite`` (to reject NaN/±inf). A ``bool`` (a subclass
+    of ``int``) and any non-number are rejected."""
+    if isinstance(ts, bool):
+        return False
+    if isinstance(ts, int):
+        return True
+    if isinstance(ts, float):
+        return math.isfinite(ts)
+    return False
+
+
 class CallbackAckStore:
     def __init__(self, path: Path = ACKS_PATH) -> None:
         self.path = Path(path)
@@ -86,11 +107,10 @@ class CallbackAckStore:
             ts = rec.get("ts")
             if (not all(isinstance(v, str) and v for v in fields.values())
                     or not (isinstance(gen, str) and gen)
-                    # ``ts`` must be a real finite number — an int or float,
-                    # never a bool (a subclass of int) and never NaN/inf.
-                    or isinstance(ts, bool)
-                    or not isinstance(ts, (int, float))
-                    or not math.isfinite(ts)):
+                    # ``ts`` must be a real number, never a bool and never
+                    # NaN/inf. Checked crash-proof (a huge int must not
+                    # OverflowError ``math.isfinite`` and take down boot).
+                    or not _valid_ts(ts)):
                 return {}
             try:
                 expected = ack_identity(**fields)

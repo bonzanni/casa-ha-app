@@ -338,6 +338,16 @@ def _retire_orphaned_markers(spool: Any, desired: DesiredCallbacks) -> None:
     looks alive. Reading the spool's OWN published inventory makes the
     retirement survive a restart, where the in-memory diff cannot.
 
+    A still-ROUTED plugin whose on-disk payload no longer matches the desired
+    one (a callback dropped, or the redirect base changed, while the process
+    was down) is caught here too: the in-memory diff cannot see it across a
+    restart, so its old marker would keep advertising a removed callback or an
+    obsolete redirect URI until the post-swap rewrite — and PERMANENTLY if that
+    rewrite then fails. Retiring it BEFORE the swap makes the post-swap rewrite
+    the sole writer: a failed rewrite then leaves the marker ABSENT
+    (fail-closed — the consumer reads "not approved yet, wait") rather than
+    stale. An UNCHANGED marker is left exactly as it is (no retire, no churn).
+
     Gated on ``desired.prunable`` — the SAME double-gate the stale-ack prune
     uses. A wholesale compute failure (invalid registry, or a resolution
     hiccup) leaves ``prunable`` False, so this never nukes every marker (the
@@ -350,10 +360,11 @@ def _retire_orphaned_markers(spool: Any, desired: DesiredCallbacks) -> None:
     import callback_spool
 
     if desired.base_url:
-        published = {r.plugin for r in desired.routed}
+        routed_by_plugin = {r.plugin: r for r in desired.routed}
         keys = {callback_spool.index_key(r.path) for r in desired.routed}
     else:
-        published, keys = set(), set()
+        routed_by_plugin, keys = {}, set()
+    published = set(routed_by_plugin)
     try:
         on_disk_plugins = list(spool.published_plugins())
     except Exception:  # noqa: BLE001 — a read failure degrades to leaving the
@@ -368,6 +379,48 @@ def _retire_orphaned_markers(spool: Any, desired: DesiredCallbacks) -> None:
     for key in on_disk_keys:
         if key not in keys:
             _retire_marker(spool, "delete_index_key", key)
+
+    # Still-routed but payload-changed: retire the stale pair before the swap
+    # so the post-swap rewrite is the sole writer (fail-closed on rewrite
+    # failure). Both files carry the same payload, so both retire together —
+    # keeping ready.json (keyed by plugin) and the .index entry (keyed by
+    # artifact realpath) consistent, exactly as the write path pairs them.
+    for plugin, routed in routed_by_plugin.items():
+        if _marker_is_stale(spool, desired.base_url, routed):
+            _retire_marker(spool, "delete_ready", plugin)
+            _retire_marker(spool, "delete_index_entry", routed.path)
+
+
+def _read_marker(spool: Any, op: str, arg: str) -> "dict | None":
+    """Read one on-disk marker payload, total: any failure ⇒ ``None``
+    (treated as ABSENT — the write path restores it, and an absent marker is
+    never falsely positive)."""
+    try:
+        return getattr(spool, op)(arg)
+    except Exception:  # noqa: BLE001
+        return None
+
+
+def _marker_is_stale(spool: Any, base_url: "str | None",
+                     routed: RoutedCallbacks) -> bool:
+    """True when a PRESENT on-disk marker for this still-routed plugin differs
+    from the desired payload — the retire-before-swap trigger. An ABSENT marker
+    is not stale (the post-swap write creates it); only an existing, differing
+    one must retire so a failed rewrite leaves it absent rather than stale."""
+    ready, index = _desired_marker_payloads(base_url, routed)
+    on_ready = _read_marker(spool, "read_ready", routed.plugin)
+    on_index = _read_marker(spool, "read_index_entry", routed.path)
+    return ((on_ready is not None and on_ready != ready)
+            or (on_index is not None and on_index != index))
+
+
+def _desired_marker_payloads(base_url: "str | None",
+                             routed: RoutedCallbacks) -> "tuple[dict, dict]":
+    """The ready.json and .index payloads the post-swap write would publish —
+    the single source both the stale-check and the skip-if-unchanged write use,
+    so the two can never drift."""
+    ready = _ready_payload(base_url, routed)
+    return ready, dict(ready, plugin_dir=routed.plugin)
 
 
 def _retire_marker(spool: Any, op: str, arg: str) -> None:
@@ -446,20 +499,38 @@ def _dropped_any(previous: set[str], keep: RoutedCallbacks) -> bool:
 def _post_swap_files(spool: Any, desired: DesiredCallbacks) -> None:
     """Publish the readiness marker + discovery index entry for every routed
     plugin — only AFTER the overlay swap, so the marker can never advertise a
-    route that is not live."""
+    route that is not live.
+
+    A plugin whose on-disk payload ALREADY matches the desired one is skipped:
+    the marker is advisory and only reflects the base URL + callbacks map, so
+    rewriting an identical payload every reconcile is pure churn (a temp +
+    rename + fsync per pass). Anything that changed was retired before the swap
+    (:func:`_retire_orphaned_markers` / :func:`_pre_swap_files`), so a stale
+    marker is never left behind by this skip."""
     if desired.base_url is None:
         return
     for routed in desired.routed:
-        payload = _ready_payload(desired.base_url, routed)
+        ready, index = _desired_marker_payloads(desired.base_url, routed)
+        if not _marker_needs_write(spool, routed, ready, index):
+            continue
         if not _guard(spool, desired, routed.plugin, routed.artifact_id,
                       "ensure_plugin_dirs", routed.plugin):
             continue
         if not _guard(spool, desired, routed.plugin, routed.artifact_id,
-                      "write_ready", routed.plugin, payload):
+                      "write_ready", routed.plugin, ready):
             continue
         _guard(spool, desired, routed.plugin, routed.artifact_id,
-               "write_index_entry", routed.path,
-               dict(payload, plugin_dir=routed.plugin))
+               "write_index_entry", routed.path, index)
+
+
+def _marker_needs_write(spool: Any, routed: RoutedCallbacks,
+                        ready: dict, index: dict) -> bool:
+    """True unless BOTH on-disk files already equal the desired payloads. An
+    absent or unreadable marker reads back as ``None`` ⇒ needs writing; a
+    matching pair is left untouched (no churn)."""
+    on_ready = _read_marker(spool, "read_ready", routed.plugin)
+    on_index = _read_marker(spool, "read_index_entry", routed.path)
+    return on_ready != ready or on_index != index
 
 
 def _guard(spool: Any, desired: DesiredCallbacks, plugin: str,

@@ -196,6 +196,50 @@ def test_float_ts_is_accepted(tmp_path):
     assert CallbackAckStore(path=path).get(identity) is not None
 
 
+def test_huge_int_ts_does_not_crash_load(tmp_path):
+    """A stored record with an absurdly large integer ``ts`` (``10**1000``)
+    must NOT crash ``_load``: ``math.isfinite`` on such an int raises
+    ``OverflowError`` (int→C-double), and ``_load`` runs at construction
+    (boot), so that would be a fail-OPEN-into-crash defeating the whole-store
+    fail-closed contract (INV-CB-003). An int of any magnitude is a valid (if
+    absurd) timestamp, so it loads rather than failing the store."""
+    path = tmp_path / "acks.json"
+    identity = _store_with_record(path, {
+        "plugin": "elevenlabs", "effective": "eff",
+        "declaration_digest": "digest-1", "ts": 10 ** 1000, "gen": "g1",
+    })
+    store = CallbackAckStore(path=path)          # must not raise
+    assert store.get(identity) is not None
+    assert store.get(identity)["ts"] == 10 ** 1000
+
+
+def test_nan_and_inf_ts_yield_zero_acks(tmp_path):
+    """A non-finite float ``ts`` (NaN / ±inf) is not a real timestamp — the
+    record fails the whole store, but the check must not raise."""
+    for bad in (float("nan"), float("inf"), float("-inf")):
+        path = tmp_path / "acks.json"
+        identity = _store_with_record(path, {
+            "plugin": "elevenlabs", "effective": "eff",
+            "declaration_digest": "digest-1", "ts": bad, "gen": "g1",
+        })
+        assert CallbackAckStore(path=path).get(identity) is None
+
+
+def test_load_never_raises_on_adversarial_ts(tmp_path):
+    """Totality pin: ``_load`` must return a dict (never propagate) for a
+    spread of hostile ``ts`` values — huge ints, non-finite floats, and
+    non-numbers alike."""
+    path = tmp_path / "acks.json"
+    for bad in (10 ** 1000, -(10 ** 1000), float("nan"), float("inf"),
+                "not-a-number", None, [1], {"x": 1}, True):
+        _store_with_record(path, {
+            "plugin": "elevenlabs", "effective": "eff",
+            "declaration_digest": "digest-1", "ts": bad, "gen": "g1",
+        })
+        store = CallbackAckStore(path=path)      # construction calls _load
+        assert isinstance(store._load(), dict)   # explicit: no exception
+
+
 def test_revoke_plugin_returns_removed_and_persists(tmp_path):
     path = tmp_path / "acks.json"
     store = CallbackAckStore(path=path)

@@ -737,6 +737,37 @@ class TestLogHygiene:
         assert "<redacted>" in payload["exc"]
         assert "/callback/x?" in payload["exc"]   # the path is kept, query gone
 
+    def test_redactor_keeps_an_unrelated_query_path_and_exc(self):
+        """A plain diagnostic carrying a query-bearing path that is NOT in
+        request-line form (no HTTP method, no bytes repr) — e.g.
+        ``/data/file?reason=permission_denied`` — must keep its query tail AND
+        its ``exc_info``. The redactor is scoped to request lines, not any
+        ``/path?x=y`` substring, so unrelated diagnostics keep observability."""
+        from log_cid import JsonFormatter
+
+        record = self._exc_record(
+            "operation failed for /data/file?reason=permission_denied")
+        callback_http._AiohttpServerRedactor().filter(record)
+        assert record.exc_info is not None            # untouched — not a request line
+        assert record.getMessage() == "Error handling request from 127.x"
+        payload = json.loads(JsonFormatter().format(record))
+        assert "reason=permission_denied" in payload["exc"]
+        assert "<redacted>" not in payload["exc"]
+
+    def test_redactor_redacts_a_bare_request_line(self):
+        """A real request line embedded in a message — method + origin-form
+        target + HTTP version, no bytes repr — is redacted: the query is
+        stripped while the method, path and version survive."""
+        record = logging.LogRecord(
+            "aiohttp.server", logging.ERROR, __file__, 0,
+            "bad request line: GET /callback/x?code=SECRET HTTP/1.1", (), None)
+        callback_http._AiohttpServerRedactor().filter(record)
+        msg = record.getMessage()
+        assert "SECRET" not in msg
+        assert "<redacted>" in msg
+        assert "GET /callback/x?" in msg
+        assert "HTTP/1.1" in msg                       # version kept
+
     def test_json_formatter_keeps_unrelated_exc_intact(self):
         """An ``aiohttp.server`` ERROR whose traceback
         merely mentions a ``…/callback_http.py`` frame — no query — must keep

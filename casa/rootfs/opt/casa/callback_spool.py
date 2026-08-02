@@ -76,6 +76,8 @@ TEMP_TTL_S = 300             # `.part` / `.tmp-<hash>` residue age-sweep
 QUIESCENCE_S = 24 * 3600     # orphan-dir GC floor
 MAX_PENDING = 256            # per-plugin caps: a buggy consumer must not
 MAX_RESULTS = 256            # fill /data
+MAX_MARKER_BYTES = 1 << 20   # a ready.json / index entry read back for the
+#                              reconcile payload compare is tiny; cap the read
 
 PENDING_DIR = "pending"
 RESULTS_DIR = "results"
@@ -499,6 +501,75 @@ class CallbackSpool:
                 _fsync(pfd, plugin)
             finally:
                 os.close(pfd)
+
+    def read_ready(self, plugin: str) -> "dict | None":
+        """Parse the on-disk ``<plugin>/ready.json`` payload, or ``None`` when
+        it is absent, unreadable, oversized or not a JSON object.
+
+        Read-only reconcile input: the durable marker pass compares this
+        against the DESIRED payload so a still-routed plugin whose declaration
+        (a dropped callback) or redirect base changed while the process was
+        down has its stale marker retired BEFORE the overlay swap — the swap's
+        in-memory diff is empty across a restart and cannot see it — and an
+        unchanged marker is left alone rather than rewritten every pass."""
+        with self._lock:
+            if self._closed or not _safe_component(plugin):
+                return None
+            try:
+                pfd = self._plugin_fd(plugin)
+            except (OSError, ValueError):
+                return None
+            try:
+                return self._read_json(READY_NAME, pfd)
+            finally:
+                os.close(pfd)
+
+    def read_index_entry(self, artifact_realpath: str) -> "dict | None":
+        """Parse the on-disk ``.index/<key>.json`` payload for an artifact
+        path, or ``None`` (absent / unreadable / oversized / non-object). The
+        durable-marker companion of :meth:`read_ready`."""
+        with self._lock:
+            if self._closed:
+                return None
+            try:
+                ifd = _open_dir(INDEX_DIR, self._root_fd)
+            except OSError:
+                return None
+            try:
+                return self._read_json(
+                    f"{index_key(artifact_realpath)}.json", ifd)
+            finally:
+                os.close(ifd)
+
+    @staticmethod
+    def _read_json(name: str, dir_fd: int) -> "dict | None":
+        """Read a small JSON object openat-relative to *dir_fd*. Total: any
+        error (missing, symlink, decode, oversize, non-object) ⇒ ``None``."""
+        try:
+            fd = os.open(name, os.O_RDONLY | os.O_NOFOLLOW | os.O_CLOEXEC,
+                         dir_fd=dir_fd)
+        except OSError:
+            return None
+        try:
+            chunks: list[bytes] = []
+            size = 0
+            while True:
+                chunk = os.read(fd, 65536)
+                if not chunk:
+                    break
+                size += len(chunk)
+                if size > MAX_MARKER_BYTES:
+                    return None
+                chunks.append(chunk)
+        except OSError:
+            return None
+        finally:
+            os.close(fd)
+        try:
+            obj = json.loads(b"".join(chunks).decode("utf-8"))
+        except (ValueError, UnicodeDecodeError):
+            return None
+        return obj if isinstance(obj, dict) else None
 
     def write_index_entry(self, artifact_realpath: str, payload: dict) -> None:
         """Publish ``.index/<sha256(realpath(artifact_root))>.json`` — how a
