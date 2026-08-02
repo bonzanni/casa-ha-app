@@ -124,6 +124,30 @@ class TestJsonFormatter:
         assert "exc" in payload
         assert "RuntimeError: boom" in payload["exc"]
 
+    def test_falls_back_to_exc_text_when_exc_info_cleared(self):
+        """A filter (e.g. ``callback_http``'s aiohttp.server redactor) may
+        PRE-RENDER a redacted traceback onto ``record.exc_text`` and clear
+        ``exc_info``. The stdlib Formatter and HumanFormatter both reuse that
+        cache; JsonFormatter must too, or the ``exc`` field vanishes entirely
+        for such records instead of being redacted."""
+        fmt = JsonFormatter()
+        rec = logging.LogRecord(
+            name="test", level=logging.ERROR, pathname=__file__,
+            lineno=1, msg="oops", args=(), exc_info=None,
+        )
+        rec.cid = "-"
+        rec.exc_text = "Traceback (most recent call last):\n  RuntimeError: x"
+        payload = json.loads(fmt.format(rec))
+        assert "exc" in payload
+        assert "RuntimeError: x" in payload["exc"]
+
+    def test_no_exc_field_without_exc_info_or_text(self):
+        fmt = JsonFormatter()
+        rec = _make_record("plain")
+        rec.cid = "-"
+        payload = json.loads(fmt.format(rec))
+        assert "exc" not in payload
+
     def test_missing_cid_attr_defaults_to_dash(self):
         # If a record slips through without CidFilter, formatter must
         # still produce a valid line (defensive — spec §7.2 fallback).

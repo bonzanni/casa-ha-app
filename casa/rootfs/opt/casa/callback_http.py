@@ -176,6 +176,16 @@ class _AiohttpServerRedactor(logging.Filter):
     message and the exception text, and — because a logger's filters run in
     ``Logger.handle`` before ``callHandlers`` — the mutation reaches every
     handler, including root, already sanitized.
+
+    The trigger is the query-bearing request-line SHAPE
+    (:data:`_CALLBACK_QUERY_RE`, which requires a ``?``), not the bare
+    ``/callback`` substring: an unrelated ``aiohttp.server`` traceback whose
+    frames merely mention ``…/callback_http.py`` carries no query, does not
+    match, and keeps its ``exc_info`` untouched. When it DOES match, the
+    redacted traceback is pre-rendered onto ``record.exc_text`` and
+    ``exc_info`` is cleared; ``JsonFormatter`` (casa's production default) and
+    ``HumanFormatter`` both fall back to ``exc_text``, so the ``exc`` field
+    survives — redacted, not dropped.
     """
 
     def filter(self, record: logging.LogRecord) -> bool:
@@ -191,10 +201,7 @@ class _AiohttpServerRedactor(logging.Filter):
             text = record.exc_text
             if text is None and record.exc_info:
                 text = "".join(traceback.format_exception(*record.exc_info))
-            if text and "/callback" in text:
-                # Pre-render the (redacted) traceback and drop the live
-                # exc_info: with exc_text set, no formatter re-renders from the
-                # unredacted exception.
+            if text and _CALLBACK_QUERY_RE.search(text):
                 record.exc_text = _CALLBACK_QUERY_RE.sub(_REDACTED, text)
                 record.exc_info = None
         return True

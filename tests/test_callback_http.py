@@ -699,6 +699,83 @@ class TestLogHygiene:
         assert redactor.filter(record) is True
         assert record.getMessage() == "connection from a-peer established"
 
+    def _exc_record(self, message: str) -> logging.LogRecord:
+        try:
+            raise ValueError(message)
+        except ValueError:
+            import sys
+            return logging.LogRecord(
+                "aiohttp.server", logging.ERROR, __file__, 0,
+                "Error handling request from 127.x", (), sys.exc_info())
+
+    def test_json_formatter_keeps_exc_redacted_not_dropped(self):
+        """The production default is ``JsonFormatter`` (LOG_FORMAT unset →
+        JSON), which attaches ``exc`` only when ``exc_info`` is truthy. The
+        redactor clears ``exc_info`` after caching ``exc_text``, so the
+        formatter MUST fall back to the cache — otherwise the whole ``exc``
+        field vanishes rather than being redacted."""
+        from log_cid import JsonFormatter
+
+        record = self._exc_record(
+            "Got more than 8190 bytes when reading: bytearray(b'GET "
+            "/callback/x?code=SECRETVALUE&pad=pppp')")
+        callback_http._AiohttpServerRedactor().filter(record)
+        assert record.exc_info is None            # cleared by the redactor
+        payload = json.loads(JsonFormatter().format(record))
+        assert "SECRETVALUE" not in json.dumps(payload)
+        assert "exc" in payload, "the exc field must survive redaction"
+        assert "<redacted>" in payload["exc"]
+        assert "/callback/x?" in payload["exc"]   # the path is kept, query gone
+
+    def test_json_formatter_keeps_unrelated_exc_intact(self):
+        """Reviewer case (c): an ``aiohttp.server`` ERROR whose traceback
+        merely mentions a ``…/callback_http.py`` frame — no query — must keep
+        its full ``exc`` field. The redactor's trigger is the query-bearing
+        request-line shape, not the bare ``/callback`` substring."""
+        from log_cid import JsonFormatter
+
+        record = self._exc_record(
+            "unrelated failure raised from /opt/casa/callback_http.py:123")
+        callback_http._AiohttpServerRedactor().filter(record)
+        assert record.exc_info is not None        # untouched — no query present
+        payload = json.loads(JsonFormatter().format(record))
+        assert "exc" in payload
+        assert "<redacted>" not in payload["exc"]
+        assert "unrelated failure" in payload["exc"]
+
+    async def test_overlong_line_redacted_through_production_json(
+            self, spool, monkeypatch, capsys):
+        """End-to-end through the REAL production pipeline: LOG_FORMAT unset
+        (JSON default), the casa root handler installed, and the LineTooLong
+        record emitted by a real server. The emitted JSON line must carry no
+        code AND still carry a redacted ``exc`` field."""
+        from log_cid import install_logging
+
+        monkeypatch.delenv("LOG_FORMAT", raising=False)   # JSON is the default
+        install_logging(level=logging.DEBUG)
+        callback_http.install_callback_log_redaction()
+        app = _build_app(middlewares=[cid_middleware])
+        async with _client(app, access_log=True) as client:
+            try:
+                await _get(
+                    client,
+                    f"/callback/{EFFECTIVE}?code=SECRETVALUE&pad="
+                    + "p" * 9000)
+            except Exception:  # noqa: BLE001 — the connection is dropped
+                pass
+            await asyncio.sleep(0.05)
+        out = capsys.readouterr().out
+        assert "SECRETVALUE" not in out
+        server_lines = [
+            json.loads(line) for line in out.splitlines()
+            if line.strip().startswith("{")
+            and json.loads(line).get("logger") == "aiohttp.server"
+        ]
+        assert server_lines, "the parser error must have reached stdout"
+        with_exc = [p for p in server_lines if "exc" in p]
+        assert with_exc, "the LineTooLong record must keep an exc field"
+        assert any("<redacted>" in p["exc"] for p in with_exc)
+
     async def test_no_log_line_carries_the_state_hash(self, spool, caplog):
         """INV-CB-006 names state, hash values and query content together."""
         callback_spool.mint(_plugin_dir(spool), STATE)
