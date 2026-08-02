@@ -46,8 +46,12 @@ save and removal are generation-checked (INV-MEM-006) — but a turn already dis
 before the reset began can still read the old session id fresh and resume it once more.
 
 "That decision" is more than a timestamp: resume requires a decodable stored entry, an exact
-role-identity match, an exact personality-binding digest, a parseable last-active time, and
-channel-specific freshness — failing any one of them means fresh, not resume.
+role-identity match, an exact personality-binding digest, a *usable* last-active time, and
+channel-specific freshness — failing any one of them means fresh, not resume. Usable is
+stricter than parseable: a stored time without a timezone parses cleanly but cannot be
+compared against the aware clock, so it is rejected as an invalid entry like any unparseable
+value. Nothing rewrites the offending entry, so a gate that treated such a value as an error
+rather than a rejection would fail the same way on every subsequent turn for that channel.
 
 **INV-TURN-002**: An error result invalidates the pool entry before the client can return to warm; an entry is never left warm after an error.
 

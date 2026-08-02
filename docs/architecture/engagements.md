@@ -89,6 +89,16 @@ Creation also compensates for a *cancelled* creator: a caller cancelled after th
 committed never receives the record, so the insert is rolled back and its removal persisted
 before the cancellation propagates — no durable active record whose driver never started.
 
+That compensation covers the record, and the launch path compensates the rest of the window
+around it, because a cancellation is delivered at whichever await happens to be pending and
+ordinary `except Exception` handlers do not see it. Before the record exists, a cancellation
+closes the topic that was already opened; after it exists but before the driver is confirmed
+live, the compensation additionally marks the record errored and runs the driver's own
+terminal teardown. That last step matters because a driver can be *partly* live: the
+claude-code driver starts its supervised service before its final awaits, so a cancellation
+arriving late would otherwise leave a running process behind a terminal record. Each step is
+scheduled rather than awaited — a cancelled task cannot await network round-trips.
+
 What it does not cover: the other non-strict registry mutations (status touches, channel
 state, counters) warn and continue if their write fails, so the no-disagreement guarantee
 belongs to creation and the finalize path specifically. And the cancellation compensation is

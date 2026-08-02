@@ -30,6 +30,24 @@ bundle is compiled when a binding activates. At turn time, if a bundle exists, i
 in the composed prompt is not automatically carried into an activated compiled prompt — it is
 there only if the compilation put it there.
 
+**A role's checksum covers the model it actually resolved to, so everyone must resolve it the
+same way.** A role artifact may declare its model as an operator option rather than a fixed
+value, and the checksum hashes the resolved result alongside the declaration — deliberately,
+so flipping the option produces a new identity and a new session epoch. The consequence is a
+trap: any code path that materializes a role while persisting or verifying a binding has to
+resolve that option exactly as the loader will. Materializing with no options resolves the
+declared *default*, which silently produces a binding the loader can never re-derive, and the
+specialist is then dropped as a binding-activation failure on a host whose option differs
+from the default. Install, upgrade, rollback, persona override and the reconcile pass all
+share one resolution helper for this reason.
+
+**Projection selection is scoped, not nested.** The shipped doctrines put each surface's
+instructions under the shared core heading, and a Markdown section's body would otherwise run
+through its subsections — so selecting the core would drag every other surface's directives
+into every projection, and repeat the chosen one. Section selection therefore excludes the
+sibling projection subtrees explicitly; the surface's own section is always selected in its
+own right, never inherited.
+
 **A persona can misdescribe its role, but cannot expand it.** Persona validation checks
 structure, required markers, sections and size against the manifest. It does not check that
 what the persona *says* about its capabilities is true. A persona cannot grant a tool; it can
