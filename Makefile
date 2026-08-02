@@ -1,6 +1,6 @@
 PY := venv_test/bin/python
 
-.PHONY: help setup test-unit test-docker test-image lint
+.PHONY: help setup test-unit test-unit-serial test-docker test-image lint
 .DEFAULT_GOAL := help
 
 help: ## Show this help
@@ -9,7 +9,15 @@ help: ## Show this help
 setup: ## One-time WSL dev setup (Linux venv + git hooks)
 	./scripts/setup-dev.sh
 
-test-unit: ## Fast unit tests (everything except docker/slow — opt-out gate)
+# -n auto --dist loadfile: 12 workers take this from ~185s to ~25s, and
+# file-scoped distribution keeps every test in a module on one worker, so the
+# module-level state a few suites monkeypatch cannot straddle processes.
+# Measured identical results over repeated runs; see test-unit-serial when a
+# failure needs readable, interleaving-free output.
+test-unit: ## Fast unit tests, parallel (everything except docker/slow)
+	$(PY) -m pytest tests/ -m "not docker and not slow" -n auto --dist loadfile --tb=short
+
+test-unit-serial: ## Same suite, one process (for debugging a failure)
 	$(PY) -m pytest tests/ -m "not docker and not slow" --tb=short
 
 test-docker: ## Docker-backed unit tests

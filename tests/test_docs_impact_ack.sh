@@ -204,6 +204,31 @@ Docs-impact: $D1 — some genuine reason"
 ack_commit="$(git rev-parse HEAD)" expect "tip waiver applies" ok "$D1" "" "" "acknowledged for $D1"
 unset ack_commit || true
 
+# --- the gate is not disabled by deleting the manifest --------------------
+# Terra+Sol: gate.sh used to call this only when docs/manifest.yaml existed at
+# HEAD, so a commit could delete the manifest, change any claimed surface, and
+# skip the check. That guard is gone; assert the caller has no such condition.
+# Scope to the docs-impact STEP: step 1/7 (the corpus verifier) legitimately
+# guards on a manifest existing, and grepping the whole file would confuse the
+# two — a false pass here is worse than no check.
+gate_step="$(sed -n '/==> 2\/7 docs-impact/,/^echo "==> 3\//p' "$repo_root/scripts/gate.sh")"
+if [ -z "$gate_step" ]; then
+  fail "could not locate the docs-impact step in gate.sh — renumbered?"
+elif printf '%s' "$gate_step" | grep -qE '^\s*if .*(manifest\.yaml|-f docs/)'; then
+  fail "gate.sh conditions the docs-impact call on a file test"
+else
+  pass "gate.sh calls docs-impact unconditionally"
+fi
+
+# --- the CI backstop covers direct pushes, not only pull requests ---------
+if grep -qE "^\s+if: github.event_name == 'pull_request'\s*$" \
+     <(sed -n '/name: Docs impact on claimed surfaces/,/^\s*run:/p' \
+         "$repo_root/.github/workflows/docs.yml"); then
+  fail "docs.yml docs-impact step is pull_request-only — a direct push skips it"
+else
+  pass "docs.yml docs-impact step also runs on push"
+fi
+
 echo
 [ "$fails" -eq 0 ] && { echo "docs-impact gate: all checks passed"; exit 0; }
 echo "docs-impact gate: $fails check(s) failed"; exit 1

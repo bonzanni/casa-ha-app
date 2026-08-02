@@ -47,15 +47,17 @@ else
 fi
 
 echo "==> 2/7 docs-impact — claimed surfaces vs the corpus"
-if [ -f docs/manifest.yaml ]; then
-  # THE binding copy of the drift gate. CI runs the same script, but a CI check
-  # reports after a pull request exists, which leaves a red mark somebody can
-  # merge past — PR #383 is exactly that story. Here it refuses before the push,
-  # and no attestation can be produced without it.
-  scripts/docs_impact.sh "$base_sha" "$head_sha"
-else
-  echo "    (no corpus yet)"
-fi
+# THE binding copy of the drift gate. CI runs the same script, but a CI check
+# reports after a pull request exists, which leaves a red mark somebody can
+# merge past — PR #383 is exactly that story. Here it refuses before the push,
+# and no attestation can be produced without it.
+#
+# UNCONDITIONAL, deliberately (Terra+Sol): guarding on a manifest at HEAD let a
+# commit DELETE the manifest, change any claimed surface, and skip the gate
+# entirely. The script carries the BASE manifest precisely so deleting a claim
+# cannot delete the obligation, and it handles a base that genuinely predates
+# the corpus on its own.
+scripts/docs_impact.sh "$base_sha" "$head_sha"
 
 echo "==> 3/7 deny sweep — endpoint tree"
 scripts/deny-sweep.sh tree

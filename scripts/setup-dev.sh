@@ -36,7 +36,7 @@ fi
 
 echo "==> 3/3 dependencies"
 venv_test/bin/python -m pip install --quiet --upgrade pip
-venv_test/bin/python -m pip install --quiet -r casa/requirements.txt pytest pytest-asyncio anyio pyflakes
+venv_test/bin/python -m pip install --quiet -r casa/requirements.txt pytest pytest-asyncio pytest-xdist anyio pyflakes
 
 cat <<'DONE'
 

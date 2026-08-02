@@ -22,8 +22,17 @@ def test_pin_docs_workflow_runs_verifier_ledger_and_impact():
     assert "coverage_ledger.py check" in text
     # Generated navigation is current.
     assert "--check-nav" in text
-    # The docs-impact declaration on changed paths.
-    assert "--impact" in text
+    # The docs-impact decision on changed paths. It no longer lives inline in
+    # the workflow: it is scripts/docs_impact.sh, called by BOTH the workflow
+    # and scripts/gate.sh (which is what actually binds, since a CI check
+    # reports only after a PR exists and can be merged past — PR #383). Pin
+    # every link of that chain, which is stricter than the old check for a flag
+    # in the workflow text: a comment could satisfy that, and one nearly did.
+    root = WORKFLOW.parents[2]
+    assert "docs_impact.sh" in text
+    impact = (root / "scripts" / "docs_impact.sh").read_text()
+    assert "--impact" in impact
+    assert "docs_impact.sh" in (root / "scripts" / "gate.sh").read_text()
     # The operating cards must keep routing agents into the corpus — pinned as
     # the substantive directive pattern, not a bare filename an unrelated
     # sentence could satisfy.

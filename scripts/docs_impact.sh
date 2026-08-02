@@ -74,7 +74,21 @@ fi
 # base-side claim — the exact obligations this exists to preserve. An empty one is
 # accepted only when the base genuinely has no manifest, which is true until the
 # corpus first lands and false forever after.
-if git cat-file -e "$base:docs/manifest.yaml" 2>/dev/null; then
+# Terra: distinguish GENUINELY ABSENT from UNREADABLE. `cat-file -e` returns
+# non-zero for both, and treating a corrupt or unfetched object as "the base has
+# no manifest" erases every base-side claim — failing open in the one case where
+# the obligations matter most. Ask the tree what exists first; only a path the
+# base does not list is absent.
+base_has_manifest=0
+if git ls-tree --name-only "$base" -- docs/manifest.yaml 2>/dev/null | grep -qx 'docs/manifest.yaml'; then
+  base_has_manifest=1
+fi
+if [ "$base_has_manifest" = 1 ]; then
+  if ! git cat-file -e "$base:docs/manifest.yaml" 2>/dev/null; then
+    err "$base lists docs/manifest.yaml but its object is unreadable."
+    err "Refusing rather than dropping every base-side claim. Try: git fetch --all"
+    exit 1
+  fi
   git show "$base:docs/manifest.yaml" > "$tmp/base-manifest.yaml"
   # #367: base-side claims live in manifest shards too. Each shard is a top-level
   # YAML list, so plain concatenation yields one valid list. `grep || true`: a base

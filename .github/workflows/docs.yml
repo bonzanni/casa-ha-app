@@ -102,13 +102,34 @@ jobs:
           fi
 
       - name: Docs impact on claimed surfaces
-        if: github.event_name == 'pull_request'
-        # Backstop only. The BINDING copy runs in scripts/gate.sh at pre-push,
-        # before anything is published; this catches a push made with hooks
-        # uninstalled or --no-verify, and anything arriving from elsewhere.
-        # `head.sha`, never HEAD: on pull_request, actions/checkout leaves HEAD
+        # Backstop. The BINDING copy runs in scripts/gate.sh at pre-push, before
+        # anything is published; this catches a push made with hooks uninstalled
+        # or --no-verify, and anything arriving from elsewhere.
+        #
+        # Runs on PUSH as well as pull_request (Terra): `main` is unprotected, so
+        # `git push --no-verify origin HEAD:main` skips the hook — and a
+        # pull_request-only step would skip the check exactly then, which is the
+        # one case the backstop exists for. On push the range is the event's
+        # before..after; the waivers are read from the pushed tip.
+        #
+        # `head.sha`, never HEAD, on a pull request: actions/checkout leaves HEAD
         # at GitHub's synthetic MERGE commit, whose message carries no waiver.
         run: |
-          scripts/docs_impact.sh \
-            "origin/${{ github.base_ref }}" \
-            "${{ github.event.pull_request.head.sha }}"
+          set -euo pipefail
+          if [ "${{ github.event_name }}" = "pull_request" ]; then
+            base="origin/${{ github.base_ref }}"
+            ack="${{ github.event.pull_request.head.sha }}"
+          else
+            before="${{ github.event.before }}"
+            # A new branch (or a force-push whose before is unreachable) has no
+            # usable predecessor: fall back to the default branch, which is the
+            # conservative choice — it can only widen the changed set.
+            if [ -z "$before" ] || [ "$before" = "0000000000000000000000000000000000000000" ] \
+               || ! git rev-parse --verify --quiet "$before" >/dev/null; then
+              base="origin/${{ github.event.repository.default_branch }}"
+            else
+              base="$before"
+            fi
+            ack="${{ github.sha }}"
+          fi
+          scripts/docs_impact.sh "$base" "$ack"
