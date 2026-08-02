@@ -85,6 +85,7 @@ READY_NAME = "ready.json"
 TEMP_PREFIX = ".tmp-"        # reserved result-temp grammar under .claims/
 COLLECT_PREFIX = ".collect-"  # consumer-held claim under results/
 PART_SUFFIX = ".part"
+REPLACE_TEMP_INFIX = ".tmp-"  # staging grammar of _replace_json: `.<name>.tmp-…`
 
 DIR_MODE = 0o770
 FILE_MODE = 0o600
@@ -148,6 +149,14 @@ def _safe_component(name: str) -> bool:
 
 def _is_hash(name: str) -> bool:
     return bool(_HASH_RE.match(name))
+
+
+def _is_replace_temp(name: str) -> bool:
+    """True for :meth:`CallbackSpool._replace_json` staging residue
+    (``.ready.json.tmp-<pid>-<uuid>``, ``.<index-key>.json.tmp-…``) — a crash
+    between staging and the rename leaves one, and nothing else would ever
+    remove it."""
+    return name.startswith(".") and REPLACE_TEMP_INFIX in name
 
 
 def _hash_of_pending(name: str) -> str | None:
@@ -393,7 +402,10 @@ class CallbackSpool:
         reconcile calls it on every pass. ``mkdir``'s mode is masked by the
         umask, so each directory's mode is pinned through its own O_NOFOLLOW
         FD afterwards."""
-        if not _safe_component(plugin):
+        # A leading dot is reserved for casa's own root-level structures
+        # (``.index``): such a directory would be created here but skipped by
+        # _plugin_dirs(), so it would never be swept, recovered or GC'd.
+        if not _safe_component(plugin) or plugin.startswith("."):
             raise ValueError(f"unsafe plugin spool name {plugin!r}")
         with self._lock:
             self._require_open()
@@ -414,11 +426,14 @@ class CallbackSpool:
             _fsync(self._root_fd, str(self.root))
 
     @staticmethod
-    def _mkdir(name: str, dir_fd: int) -> None:
+    def _mkdir(name: str, dir_fd: int) -> bool:
+        """Create *name* if absent; True when this call created it (so the
+        caller can fsync the parent exactly once, when it matters)."""
         try:
             os.mkdir(name, DIR_MODE, dir_fd=dir_fd)
+            return True
         except FileExistsError:
-            pass
+            return False
 
     @staticmethod
     def _chmod_dir(fd: int, what: str) -> None:
@@ -428,6 +443,17 @@ class CallbackSpool:
             logger.warning("callback-spool: chmod of %s failed: %s", what, exc)
 
     def _plugin_fd(self, plugin: str) -> int:
+        """Open a per-plugin spool dir relative to the pinned root.
+
+        The name guard lives HERE rather than at each entry point: this is the
+        single funnel through which every plugin-scoped operation resolves a
+        directory, so ``..`` (or any other non-component name) cannot escape
+        the pinned root through a path an individual caller forgot to
+        validate. Raises ``ValueError`` — never an ``OSError`` — so a caller's
+        "directory is missing" branch can never absorb a traversal attempt.
+        """
+        if not _safe_component(plugin):
+            raise ValueError(f"unsafe plugin spool name {plugin!r}")
         return _open_dir(plugin, self._root_fd)
 
     def _plugin_dirs(self) -> list[str]:
@@ -500,8 +526,11 @@ class CallbackSpool:
                 os.close(ifd)
 
     def _index_fd(self, *, create: bool) -> int:
-        if create:
-            self._mkdir(INDEX_DIR, self._root_fd)
+        if create and self._mkdir(INDEX_DIR, self._root_fd):
+            # The directory entry itself must be durable before an entry
+            # inside it is: otherwise a power crash can keep the index entry's
+            # inode while losing the directory that names it.
+            _fsync(self._root_fd, str(self.root))
         fd = _open_dir(INDEX_DIR, self._root_fd)
         if create:
             self._chmod_dir(fd, INDEX_DIR)
@@ -558,7 +587,7 @@ class CallbackSpool:
                 return None                  # fail closed; never raise into HTTP
             try:
                 pfd = self._plugin_fd(plugin)
-            except OSError:
+            except (OSError, ValueError):
                 return None                  # unrouted / removed plugin
             try:
                 dir_st = os.fstat(pfd)
@@ -622,7 +651,7 @@ class CallbackSpool:
                 return
             try:
                 pfd = self._plugin_fd(claim.plugin)
-            except OSError:
+            except (OSError, ValueError):
                 return
             try:
                 # Same identity gate as the publish path: after a removal +
@@ -682,7 +711,7 @@ class CallbackSpool:
             return False
         try:
             pfd = self._plugin_fd(claim.plugin)
-        except OSError:
+        except (OSError, ValueError):
             logger.warning("callback-spool: plugin dir vanished before publish")
             return False
         try:
@@ -760,7 +789,7 @@ class CallbackSpool:
                 return False
             try:
                 pfd = self._plugin_fd(plugin)
-            except OSError:
+            except (OSError, ValueError):
                 return False
             try:
                 results = _open_dir(RESULTS_DIR, pfd)
@@ -782,7 +811,7 @@ class CallbackSpool:
                 return []
             try:
                 pfd = self._plugin_fd(plugin)
-            except OSError:
+            except (OSError, ValueError):
                 return []
             try:
                 results = _open_dir(RESULTS_DIR, pfd)
@@ -831,7 +860,7 @@ class CallbackSpool:
             for plugin in self._plugin_dirs():
                 try:
                     pfd = self._plugin_fd(plugin)
-                except OSError:
+                except (OSError, ValueError):
                     continue
                 try:
                     self._recover_plugin(plugin, pfd, now, boot, report)
@@ -896,6 +925,19 @@ class CallbackSpool:
         st = _lstat_quiet(name, claims)
         if st is None:
             return
+        # A published result outranks EVERY age gate and every type anomaly on
+        # the claim side: the flow completed, only its delivery nudge may be
+        # missing, and the result's own TTL is the thing that bounds it. The
+        # claim's mtime is the MINT time, so a slow authorization (minted 31
+        # minutes ago, result written seconds before the crash) would otherwise
+        # be "stale" here and its nudge silently dropped while the credential
+        # sits live in results/.
+        res = _lstat_quiet(f"{name}.json", results)
+        if res is not None and stat.S_ISREG(res.st_mode):
+            report.nudges.append((plugin, name))
+            _remove_entry(name, claims, st)
+            _fsync(claims, CLAIMS_DIR)
+            return
         if not stat.S_ISREG(st.st_mode):
             _remove_entry(name, claims, st)
             _fsync(claims, CLAIMS_DIR)
@@ -905,14 +947,6 @@ class CallbackSpool:
             _unlink_quiet(name, claims)
             _fsync(claims, CLAIMS_DIR)
             report.dropped.append((plugin, name))
-            return
-        res = _lstat_quiet(f"{name}.json", results)
-        if res is not None:
-            # The result was published before the crash — the flow is done;
-            # only its delivery nudge may be missing.
-            report.nudges.append((plugin, name))
-            _unlink_quiet(name, claims)
-            _fsync(claims, CLAIMS_DIR)
             return
         if not boot and now - st.st_mtime < RESTORE_GRACE_S:
             return
@@ -946,16 +980,35 @@ class CallbackSpool:
             for plugin in self._plugin_dirs():
                 try:
                     pfd = self._plugin_fd(plugin)
-                except OSError:
+                except (OSError, ValueError):
                     continue
                 try:
                     self._sweep_plugin(plugin, pfd, now, report)
                 finally:
                     os.close(pfd)
+            self._sweep_index(now, report)
         return report
+
+    def _sweep_index(self, now: float, report: SweepReport) -> None:
+        """`.index/` holds reconcile-owned entries plus, after a crash, this
+        module's staging residue — only the latter is sweep-owned."""
+        try:
+            ifd = _open_dir(INDEX_DIR, self._root_fd)
+        except OSError:
+            return
+        try:
+            if self._sweep_replace_temps(ifd, now, report):
+                _fsync(ifd, INDEX_DIR)
+        finally:
+            os.close(ifd)
 
     def _sweep_plugin(self, plugin: str, pfd: int, now: float,
                       report: SweepReport) -> None:
+        # The plugin dir's own level: ready.json staging residue only. Nothing
+        # else there is sweep-owned (ready.json is reconcile's, the three
+        # subdirs are handled below).
+        if self._sweep_replace_temps(pfd, now, report):
+            _fsync(pfd, plugin)
         for sub, handler in ((PENDING_DIR, self._sweep_pending),
                              (RESULTS_DIR, self._sweep_results),
                              (CLAIMS_DIR, self._sweep_claims)):
@@ -968,6 +1021,23 @@ class CallbackSpool:
                 _fsync(fd, sub)
             finally:
                 os.close(fd)
+
+    def _sweep_replace_temps(self, fd: int, now: float,
+                             report: SweepReport) -> bool:
+        """Age-sweep `_replace_json` staging residue in *fd*. Returns True if
+        anything was removed (so the caller fsyncs)."""
+        removed = False
+        for name in _listdir_quiet(fd):
+            if not _is_replace_temp(name):
+                continue
+            st = _lstat_quiet(name, fd)
+            if st is None:
+                continue
+            if not stat.S_ISREG(st.st_mode) or self._expired(st, now, TEMP_TTL_S):
+                if _remove_entry(name, fd, st):
+                    report.deleted_temps += 1
+                    removed = True
+        return removed
 
     def _expired(self, st, now: float, ttl: float) -> bool:
         # Future beyond the skew allowance is fail-closed: a forward clock
@@ -995,8 +1065,10 @@ class CallbackSpool:
                     else:
                         report.deleted_pending += 1
                 continue
-            if not is_part:
-                live.append((st.st_mtime, name))
+            # `.part` files count toward the cap: they occupy the same
+            # directory and a consumer looping on a failing publish would
+            # otherwise fill /data with staging files the cap never sees.
+            live.append((st.st_mtime, name))
         self._apply_cap(plugin, PENDING_DIR, fd, live, MAX_PENDING, report)
 
     def _sweep_results(self, plugin: str, fd: int, now: float,
@@ -1103,7 +1175,7 @@ class CallbackSpool:
         added or removed, which is exactly the quiescence signal)."""
         try:
             pfd = self._plugin_fd(plugin)
-        except OSError:
+        except (OSError, ValueError):
             return None
         try:
             return self._newest_in(pfd, depth=3)

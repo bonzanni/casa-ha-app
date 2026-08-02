@@ -175,6 +175,34 @@ def test_ensure_plugin_dirs_refuses_unsafe_plugin_name(spool):
         spool.ensure_plugin_dirs("../escape")
 
 
+@pytest.mark.parametrize("reserved", [".index", ".hidden", ".", "..", "a/b", ""])
+def test_ensure_plugin_dirs_refuses_reserved_and_dotted_names(spool, reserved):
+    """A dot-prefixed spool dir would be created but then skipped by the
+    plugin enumeration — never swept, recovered or GC'd."""
+    with pytest.raises(ValueError):
+        spool.ensure_plugin_dirs(reserved)
+
+
+def test_no_plugin_scoped_operation_can_escape_the_root_with_dotdot(spool, tmp_path):
+    """Red case for path traversal: every plugin-scoped entry point resolves
+    its directory through the one guarded funnel, so ``..`` is refused rather
+    than resolving above the pinned root."""
+    outside = Path(spool.root).parent
+    escape = "../" + outside.name          # non-component name
+    for op in (lambda: spool.write_ready("..", {"v": 1}),
+               lambda: spool.delete_ready(".."),
+               lambda: spool.ensure_plugin_dirs(".."),
+               lambda: spool.write_ready(escape, {"v": 1}),
+               lambda: spool.delete_ready(escape)):
+        with pytest.raises(ValueError):
+            op()
+    assert spool.claim("..", state_hash("s"), now=time.time()) is None
+    assert spool.claim(escape, state_hash("s"), now=time.time()) is None
+
+    assert not (outside / "ready.json").exists()
+    assert list(outside.glob("*/ready.json")) == []
+
+
 # ---------------------------------------------------------------------------
 # mint (§8 consumer contract; the reference helper lives here)
 # ---------------------------------------------------------------------------
@@ -315,6 +343,70 @@ def test_discard_claim_removes_it_and_clears_in_flight(spool):
 
     assert list(_claims(spool).iterdir()) == []
     assert spool.in_flight() == set()
+
+
+# ---------------------------------------------------------------------------
+# hostile inodes at protocol names (the FD/type discipline)
+# ---------------------------------------------------------------------------
+
+
+def test_claim_of_a_symlinked_pending_never_captures_the_target(spool, tmp_path):
+    """``link(2)`` must not follow: a symlink planted at a pending name would
+    otherwise be hard-linked to its TARGET, pulling an arbitrary outside file
+    into the spool as a "claimed state"."""
+    secret = tmp_path / "outside-secret"
+    secret.write_text("not yours")
+    h = state_hash("s")
+    (_pending(spool) / f"{h}.json").symlink_to(secret)
+
+    assert spool.claim(PLUGIN, h, now=time.time()) is None
+
+    assert secret.read_text() == "not yours"
+    assert secret.stat().st_nlink == 1, "the target must not have been linked"
+    assert list(_claims(spool).iterdir()) == []
+
+
+def test_claim_rejects_a_non_regular_pending_inode(spool):
+    """A FIFO (or any non-regular inode) at a pending name is refused by the
+    type gate, not merely by the symlink flag."""
+    h = state_hash("s")
+    os.mkfifo(_pending(spool) / f"{h}.json")
+
+    assert spool.claim(PLUGIN, h, now=time.time()) is None
+
+    assert list(_claims(spool).iterdir()) == []
+
+
+def test_a_symlinked_plugin_dir_is_never_followed(spool, tmp_path):
+    """Directory FDs are opened ``O_NOFOLLOW``: a symlink planted at a spool
+    dir name must not redirect the protocol to a tree outside the root."""
+    outside = tmp_path / "outside-spool"
+    for sub in ("pending", "results", ".claims"):
+        (outside / sub).mkdir(parents=True)
+    mint(outside, "s")
+    h = state_hash("s")
+    (Path(spool.root) / "evil").symlink_to(outside)
+
+    assert spool.claim("evil", h, now=time.time()) is None
+
+    assert (outside / "pending" / f"{h}.json").exists(), "untouched"
+    assert list((outside / ".claims").iterdir()) == []
+
+
+def test_discard_claim_fails_closed_when_the_plugin_dir_was_replaced(spool):
+    """Same identity gate as publish: after a removal + reinstall the name
+    denotes a different directory, and a same-named claim there belongs to
+    another flow."""
+    import shutil
+
+    h, claim = _claimed(spool)
+    shutil.rmtree(_pdir(spool))
+    spool.ensure_plugin_dirs(PLUGIN)
+    other = _put(_claims(spool) / h, time.time(), '{"someone-else": true}')
+
+    spool.discard_claim(claim)
+
+    assert other.exists(), "a claim in the recreated dir is not ours to remove"
 
 
 # ---------------------------------------------------------------------------
@@ -533,7 +625,11 @@ def test_result_mtime_is_its_final_write_time_not_the_mint_time(spool):
 _PAD = "x" * 8_000
 
 
-def _publisher_child(root, states, done_path):
+def _expected_bytes(h):
+    return json.dumps({"v": 1, "h": h, "pad": _PAD}).encode("utf-8")
+
+
+def _publisher_child(root, states):
     s = CallbackSpool(root)
     for st in states:
         mint(Path(root) / PLUGIN, st)
@@ -541,51 +637,47 @@ def _publisher_child(root, states, done_path):
         claim = s.claim(PLUGIN, h, now=time.time())
         s.publish_result(claim, {"v": 1, "h": h, "pad": _PAD})
     s.close()
-    Path(done_path).write_text("1")
     os._exit(0)
 
 
-def _reader_child(root, expected, done_path, out_path):
-    """Poll results/ in a tight loop; every observation must be a complete,
-    valid record — never a short or half-written file."""
+def _reader_child(root, states, out_path):
+    """Spin on the NEXT expected result name — so every observation lands in
+    the publisher's write window for that exact file — and require the very
+    first successful read to be the complete record. Any short, empty or
+    half-written observation is a violation: a name may only appear once its
+    content is already whole."""
     resdir = Path(root) / PLUGIN / "results"
-    bad, seen, reads = [], set(), 0
-    deadline = time.time() + 30
-    while time.time() < deadline:
-        for name in os.listdir(resdir):
-            if not name.endswith(".json"):
-                continue
+    bad, reads, verified = [], 0, 0
+    for st in states:
+        h = state_hash(st)
+        path, want = resdir / f"{h}.json", _expected_bytes(h)
+        deadline = time.time() + 30
+        while time.time() < deadline:
             try:
-                raw = (resdir / name).read_bytes()
+                raw = path.read_bytes()
             except OSError:
-                continue
+                continue                     # not published yet — keep spinning
             reads += 1
-            try:
-                rec = json.loads(raw)
-            except ValueError:
-                bad.append(f"{name}: unparseable ({len(raw)} bytes)")
-                continue
-            if rec.get("pad") != _PAD or rec.get("h") != name[:-5]:
-                bad.append(f"{name}: short/incoherent record")
-                continue
-            seen.add(name)
-        if Path(done_path).exists() and len(seen) >= expected:
+            if raw == want:
+                verified += 1
+            else:
+                bad.append(f"{h[:8]}: partial observation ({len(raw)} bytes)")
             break
+        else:
+            bad.append(f"{h[:8]}: never appeared")
     Path(out_path).write_text(json.dumps({"bad": bad, "reads": reads,
-                                          "seen": len(seen)}))
+                                          "verified": verified}))
     os._exit(0)
 
 
 def test_a_racing_collector_never_observes_a_partial_result(spool, tmp_path):
     states = [f"race{i}" for i in range(200)]
-    done = tmp_path / "done"
     out = tmp_path / "reader.json"
 
     ctx = multiprocessing.get_context("fork")
     reader = ctx.Process(target=_reader_child,
-                         args=(str(spool.root), len(states), str(done), str(out)))
-    writer = ctx.Process(target=_publisher_child,
-                         args=(str(spool.root), states, str(done)))
+                         args=(str(spool.root), states, str(out)))
+    writer = ctx.Process(target=_publisher_child, args=(str(spool.root), states))
     reader.start()
     writer.start()
     writer.join(60)
@@ -594,8 +686,8 @@ def test_a_racing_collector_never_observes_a_partial_result(spool, tmp_path):
 
     report = json.loads(out.read_text())
     assert report["bad"] == []
-    assert report["seen"] == len(states)
-    assert report["reads"] >= 200, "the reader must actually have polled hard"
+    assert report["verified"] == len(states)
+    assert report["reads"] == len(states)
 
 
 # ---------------------------------------------------------------------------
@@ -653,6 +745,37 @@ def test_boot_recovery_reports_a_claim_with_a_result_for_nudge_then_removes_it(s
     assert report.restored == []
     assert list(_claims(spool).iterdir()) == []
     assert not (_pending(spool) / f"{h}.json").exists(), "never re-mint a done flow"
+
+
+def test_recovery_nudges_a_stale_claim_whose_result_was_already_published(spool):
+    """A published result outranks the claim's age. The claim's mtime is the
+    MINT time, so a slow authorization (minted 31 min ago, result written
+    seconds before the crash) would be "stale" by that clock — dropping it
+    loses the nudge while the credential sits live in results/ for its own
+    15-minute TTL."""
+    now = time.time()
+    h = state_hash("s")
+    _put(_claims(spool) / h, now - PENDING_TTL_S - 60)
+    result = _put(_results(spool) / f"{h}.json", now - 300)
+
+    report = spool.recovery_pass(now=now, boot=True)
+
+    assert report.nudges == [(PLUGIN, h)]
+    assert report.dropped == []
+    assert result.exists(), "the live result must not be stranded"
+    assert list(_claims(spool).iterdir()) == []
+
+
+def test_recovery_ignores_a_non_regular_result_when_deciding_a_nudge(spool):
+    now = time.time()
+    h = state_hash("s")
+    _put(_claims(spool) / h, now - 300)
+    os.mkfifo(_results(spool) / f"{h}.json")
+
+    report = spool.recovery_pass(now=now, boot=True)
+
+    assert report.nudges == []
+    assert report.restored == [(PLUGIN, h)], "no real result ⇒ restore the flow"
 
 
 def test_recovery_drops_a_stale_claim(spool):
@@ -821,6 +944,42 @@ def test_sweep_caps_pending_at_256_oldest_first(spool):
     assert report.capped == [f"{PLUGIN}/pending"]
 
 
+def test_sweep_counts_part_files_toward_the_pending_cap(spool):
+    """A consumer looping on a failing publish leaves `.part` files in the same
+    directory; a cap that ignored them would never bound /data."""
+    now = time.time()
+    for i in range(150):
+        _put(_pending(spool) / f"{state_hash(str(i))}.json", now - 100 + i)
+    for i in range(150):
+        _put(_pending(spool) / f"{state_hash('p' + str(i))}.json.part", now - 60)
+
+    report = spool.sweep(now=now)
+
+    assert len(list(_pending(spool).iterdir())) == 256
+    assert report.capped == [f"{PLUGIN}/pending"]
+
+
+def test_sweep_removes_stale_ready_and_index_staging_residue(spool):
+    """`_replace_json` residue from a crash between staging and the rename is
+    swept nowhere else — it would otherwise live forever."""
+    now = time.time()
+    spool.write_index_entry("/artifacts/acme", {"plugin": PLUGIN})
+    ready_tmp = _put(_pdir(spool) / ".ready.json.tmp-99-deadbeef", now - TEMP_TTL_S - 1)
+    index_tmp = _put(Path(spool.root) / ".index" / ".k.json.tmp-99-deadbeef",
+                     now - TEMP_TTL_S - 1)
+    fresh = _put(_pdir(spool) / ".ready.json.tmp-99-cafe", now - 5)
+    spool.write_ready(PLUGIN, {"v": 1})
+    entry = Path(spool.root) / ".index" / f"{index_key('/artifacts/acme')}.json"
+
+    report = spool.sweep(now=now)
+
+    assert not ready_tmp.exists() and not index_tmp.exists()
+    assert fresh.exists(), "a temp inside its age window belongs to a live writer"
+    assert (_pdir(spool) / "ready.json").exists(), "never the published marker"
+    assert entry.exists(), "never a published index entry"
+    assert report.deleted_temps == 2
+
+
 def test_sweep_caps_results_at_256_oldest_first(spool):
     now = time.time()
     for i in range(260):
@@ -968,6 +1127,17 @@ def test_index_entry_roundtrip_and_delete(spool, fs_events):
     spool.delete_index_entry(art)
     assert not entry.exists()
     assert any(e[0] == "fsync" and str(e[1]).endswith("/.index") for e in fs_events)
+
+
+def test_creating_the_index_dir_fsyncs_the_root(spool, fs_events):
+    """The directory entry must be durable before an entry inside it is —
+    otherwise a power crash can keep the entry's inode and lose the directory
+    that names it."""
+    root = os.path.realpath(spool.root)
+
+    spool.write_index_entry("/artifacts/acme", {"plugin": PLUGIN})
+
+    assert any(e[0] == "fsync" and str(e[1]) == root for e in fs_events)
 
 
 def test_delete_index_entry_is_idempotent(spool):
