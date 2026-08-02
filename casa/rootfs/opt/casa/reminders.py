@@ -202,3 +202,68 @@ def past_due(path: str, now: datetime) -> list[dict]:
         if when <= now:
             out.append(entry)
     return out
+
+
+# ---------------------------------------------------------------------------
+# The sweep — INV-TRIG-008
+# ---------------------------------------------------------------------------
+
+
+async def sweep_reminders(runtime, now: datetime) -> int:
+    """Deliver every overdue one-shot reminder and remove it. Returns the
+    number delivered.
+
+    This is the backstop for the gap ``docs/architecture/triggers.md`` names
+    outright: the scheduler is configured with no persistent job store, so an
+    occurrence whose fire time fell while the process was down was never
+    recorded anywhere and is otherwise simply lost. The misfire grace period
+    bounds lateness for a RUNNING process; it cannot resurrect what was never
+    recorded.
+
+    Delivery happens BEFORE removal, so a removal failure redelivers on the
+    next pass. That is at-least-once by choice (spec §8) — a duplicate nudge
+    is a far better failure than a missed reminder. Conversely a FAILED
+    delivery must not remove the entry: the reminder is still owed.
+    """
+    from bus import BusMessage, MessageType
+    from log_cid import new_cid
+
+    delivered = 0
+    for role in list(getattr(runtime, "role_configs", {}) or {}):
+        path = triggers_path(runtime.agents_dir, role)
+        for entry in past_due(path, now):
+            name = entry["name"]
+            logger.info(
+                "reminder sweep: delivering overdue %s for %s (due %s)",
+                name, role, entry.get("at"),
+            )
+            try:
+                await runtime.bus.send(BusMessage(
+                    type=MessageType.SCHEDULED,
+                    source="reminder-sweep",
+                    target=role,
+                    content=entry.get("prompt", ""),
+                    channel=entry.get("channel", ""),
+                    context={
+                        "chat_id": f"date-{name}",
+                        "trigger": name,
+                        "cid": new_cid(),
+                        "late": True,
+                    },
+                ))
+            except Exception:  # noqa: BLE001
+                # Still owed — leave the entry for the next pass.
+                logger.warning(
+                    "reminder sweep: delivery of %s failed; leaving it queued",
+                    name, exc_info=True,
+                )
+                continue
+            delivered += 1
+            try:
+                remove_entry(path, name)
+            except (OSError, ValueError):
+                logger.warning(
+                    "reminder sweep: could not remove %s after delivery; it "
+                    "will be redelivered next pass", name, exc_info=True,
+                )
+    return delivered

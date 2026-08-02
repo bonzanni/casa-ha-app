@@ -2684,7 +2684,23 @@ async def main() -> None:
             "max_instances": 1,          # no overlap of same job
         },
     )
-    trigger_registry = TriggerRegistry(scheduler=scheduler, app=app, bus=bus)
+    # #396: when a one_shot reminder fires, its triggers.yaml entry must go
+    # with it — otherwise a reboot would resurrect an already-delivered
+    # reminder. Injected rather than done inside the registry, which must not
+    # learn to write YAML. CONFIG_DIR is used directly (rather than the
+    # ``agents_dir`` local defined below) so this closure has no late-binding
+    # dependency on statements that run after it.
+    def _remove_fired_reminder(role: str, name: str) -> None:
+        import reminders
+        reminders.remove_entry(
+            reminders.triggers_path(os.path.join(CONFIG_DIR, "agents"), role),
+            name,
+        )
+
+    trigger_registry = TriggerRegistry(
+        scheduler=scheduler, app=app, bus=bus,
+        on_one_shot_fired=_remove_fired_reminder,
+    )
 
     # Initialise the authorization-callback spool BEFORE the first
     # callback reconcile (which reads get_spool() to publish ready/index
@@ -3864,6 +3880,38 @@ async def main() -> None:
         max_instances=1,
         misfire_grace_time=600,
     )
+
+    # #396 / INV-TRIG-008: the scheduler has NO persistent job store, so a
+    # reminder whose fire time fell while the add-on was down was never
+    # recorded and is otherwise lost outright. A one-shot reminder still
+    # present in triggers.yaml with a past time IS the record that delivery is
+    # owed; this sweep is what redeems it.
+    async def _reminder_sweep() -> None:
+        from datetime import datetime
+
+        import reminders
+        try:
+            await reminders.sweep_reminders(
+                runtime, datetime.now(resolve_tz()))
+        except Exception:  # noqa: BLE001
+            logger.warning("reminder sweep failed", exc_info=True)
+
+    scheduler.add_job(
+        _reminder_sweep,
+        trigger="interval",
+        id="reminder_sweep",
+        minutes=5,
+        replace_existing=True,
+        coalesce=True,
+        max_instances=1,
+        misfire_grace_time=600,
+    )
+
+    # Boot sweep: deliver anything owed from the downtime we just ended, now
+    # rather than up to five minutes from now. Runs before start() so it
+    # cannot race the interval job's first pass.
+    await _reminder_sweep()
+
     scheduler.start()
 
     # 15. Graceful shutdown
