@@ -97,3 +97,48 @@ def test_recurring_retains_its_anchor():
     out = reminders.derive_schedule(at, "weekly")
     assert out["schedule"] == "0 7 * * thu"
     assert reminders.parse_at(out["at"]) == at
+
+
+def test_recurring_anchor_truncates_seconds():
+    """Sol r2 #2: the cron expression fires at second ZERO. An anchor of
+    07:05:30 would put start_date 30s after that day's only matching
+    occurrence, so the scheduler skips it and the promised first reminder
+    lands a whole day/week/month late."""
+    at = datetime(2026, 8, 4, 7, 5, 30, 123456, tzinfo=CEST)
+    out = reminders.derive_schedule(at, "daily")
+    assert out["schedule"] == "5 7 * * *"
+    anchor = reminders.parse_at(out["at"])
+    assert anchor.second == 0 and anchor.microsecond == 0
+    assert anchor == datetime(2026, 8, 4, 7, 5, tzinfo=CEST)
+
+
+def test_one_shot_keeps_its_exact_instant():
+    """A date trigger is scheduled at the instant itself, not by a cron
+    expression, so its seconds must be preserved."""
+    at = datetime(2026, 8, 4, 7, 5, 30, tzinfo=CEST)
+    out = reminders.derive_schedule(at, "none")
+    assert reminders.parse_at(out["at"]) == at
+
+
+def test_new_name_avoids_names_already_taken():
+    """Sol r2 #3: a collision fails registration on a duplicate job id, and
+    the caller's rollback then deletes the PRE-EXISTING reminder too."""
+    taken = {f"reminder-{i:08x}" for i in range(50)}
+    for _ in range(100):
+        assert reminders.new_reminder_name(taken) not in taken
+
+
+def test_new_name_raises_rather_than_returning_a_collision(monkeypatch):
+    monkeypatch.setattr(reminders.secrets, "token_hex", lambda n: "deadbeef")
+    with pytest.raises(ValueError):
+        reminders.new_reminder_name({"reminder-deadbeef"})
+
+
+def test_existing_names_reads_the_store(tmp_path):
+    path = str(tmp_path / "reminders.yaml")
+    reminders.append_entry(path, {
+        "name": "reminder-aaaaaaaa", "type": "date", "one_shot": True,
+        "at": "2099-01-01T00:00:00+00:00", "channel": "telegram",
+        "prompt": "x"})
+    assert reminders.existing_names(path) == {"reminder-aaaaaaaa"}
+    assert reminders.existing_names(str(tmp_path / "nope.yaml")) == set()

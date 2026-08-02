@@ -49,9 +49,30 @@ _DOW_BY_WEEKDAY = ("mon", "tue", "wed", "thu", "fri", "sat", "sun")
 # ---------------------------------------------------------------------------
 
 
-def new_reminder_name() -> str:
-    """A fresh reminder trigger name, matching the schema's name pattern."""
-    return f"{REMINDER_PREFIX}{secrets.token_hex(3)}"
+def new_reminder_name(taken: "set[str] | None" = None) -> str:
+    """A fresh reminder trigger name, matching the schema's name pattern.
+
+    *taken* is the set of names already in use. A collision would make
+    registration fail on a duplicate job id, and the caller's rollback would
+    then delete the PRE-EXISTING reminder of the same name along with its
+    own — losing a reminder the user had already been promised. Avoiding the
+    collision outright is the fix; the widened entropy just makes retries
+    vanishingly rare.
+    """
+    taken = taken or set()
+    for _ in range(10):
+        name = f"{REMINDER_PREFIX}{secrets.token_hex(4)}"
+        if name not in taken:
+            return name
+    raise ValueError("could not generate an unused reminder name")
+
+
+def existing_names(path: str) -> set[str]:
+    """Every trigger name currently in the reminder store at *path*."""
+    try:
+        return {t.get("name", "") for t in _load(path)["triggers"]}
+    except (OSError, ValueError):
+        return set()
 
 
 def is_reminder_name(name: str) -> bool:
@@ -120,7 +141,13 @@ def derive_schedule(at: datetime, repeat: str) -> dict[str, str]:
     # the user never asked for. It does NOT drive recurrence: the cron fields
     # above do, evaluated in the scheduler's timezone, which is what keeps the
     # series DST-correct.
-    return {"type": "cron", "schedule": schedule, "at": at.isoformat()}
+    #
+    # Seconds are truncated because the cron expression fires at second ZERO.
+    # An anchor of 07:05:30 would put start_date 30s AFTER that day's only
+    # matching occurrence, so the scheduler would skip it and the promised
+    # first reminder would land a whole day, week or month late.
+    anchor = at.replace(second=0, microsecond=0)
+    return {"type": "cron", "schedule": schedule, "at": anchor.isoformat()}
 
 
 # ---------------------------------------------------------------------------

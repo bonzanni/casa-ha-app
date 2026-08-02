@@ -1,8 +1,17 @@
-"""#396 — reminders.yaml is merged into the trigger list at load time."""
+"""#396 — reminders.yaml is accepted and merged by the REAL loader.
+
+Round 2 lesson: the first version of this suite reimplemented the merge by
+calling ``_validate``/``_build_triggers`` directly. That shortcut bypassed
+``_check_file_set``, which rejects any file not on the tier allowlist — so it
+passed while ``reminders.yaml`` was still absent from that list, and the real
+system would have crash-looped on the first reminder ever set. Every test here
+now goes through ``load_agent_from_dir``.
+"""
 
 from __future__ import annotations
 
 import pathlib
+import textwrap
 
 import pytest
 import yaml
@@ -11,89 +20,108 @@ pytestmark = pytest.mark.unit
 
 DEFAULTS = pathlib.Path("casa/rootfs/opt/casa/defaults/agents/assistant")
 
-TRIGGERS = {
-    "schema_version": 1,
-    "triggers": [
-        {"name": "heartbeat", "type": "interval", "minutes": 60,
-         "channel": "telegram", "prompt": "hb"},
-    ],
-}
+
+def _helpers():
+    try:
+        from tests.test_agent_loader import _policies_file, _seed_resident
+    except ImportError:
+        from test_agent_loader import _policies_file, _seed_resident
+    return _seed_resident, _policies_file
 
 
-def _reminder(name="reminder-a1b2c3"):
+def _write(path, text):
+    pathlib.Path(path).write_text(textwrap.dedent(text), encoding="utf-8")
+
+
+def _reminder(name="reminder-a1b2c3d4"):
     return {"name": name, "type": "date", "one_shot": True,
             "at": "2099-08-03T08:00:00+02:00", "channel": "telegram",
             "prompt": 'Send this exact message via telegram: "Bins."'}
 
 
-def _agent_dir(tmp_path, reminders=None, triggers=None):
-    """A minimal resident dir carrying only the files under test."""
-    d = tmp_path / "assistant"
-    d.mkdir()
-    (d / "triggers.yaml").write_text(
-        yaml.safe_dump(triggers if triggers is not None else TRIGGERS),
-        encoding="utf-8")
+def _load(tmp_path, role="assistant", reminders=None, triggers=None):
+    from agent_loader import load_agent_from_dir
+    from policies import load_policies
+
+    seed_resident, policies_file = _helpers()
+    d = seed_resident(tmp_path / "agents", role=role)
+    if triggers is not None:
+        _write(d / "triggers.yaml", "")
+        pathlib.Path(d / "triggers.yaml").write_text(
+            yaml.safe_dump(triggers), encoding="utf-8")
     if reminders is not None:
-        (d / "reminders.yaml").write_text(
+        pathlib.Path(d / "reminders.yaml").write_text(
             yaml.safe_dump(reminders), encoding="utf-8")
-    return d
+    policies = load_policies(str(policies_file(tmp_path / "policies")))
+    return load_agent_from_dir(str(d), policies=policies)
 
 
-def _load_triggers(agent_dir):
-    """Exercise the same two-file merge load_agent_from_dir performs."""
-    import agent_loader
-
-    cfg = type("Cfg", (), {"triggers": []})()
-    trig_path = agent_dir / "triggers.yaml"
-    data = yaml.safe_load(trig_path.read_text())
-    agent_loader._validate(data, "triggers", str(trig_path))
-    cfg.triggers = agent_loader._build_triggers(data, agent_dir=str(agent_dir))
-
-    rem_path = agent_dir / "reminders.yaml"
-    if rem_path.exists():
-        rem = yaml.safe_load(rem_path.read_text())
-        agent_loader._validate(rem, "triggers", str(rem_path))
-        existing = {t.name for t in cfg.triggers}
-        for spec in agent_loader._build_triggers(rem, agent_dir=str(agent_dir)):
-            if spec.name in existing:
-                continue
-            existing.add(spec.name)
-            cfg.triggers = list(cfg.triggers) + [spec]
-    return cfg.triggers
+TRIGGERS = {
+    "schema_version": 1,
+    "triggers": [{"name": "heartbeat", "type": "interval", "minutes": 60,
+                  "channel": "telegram", "prompt": "hb"}],
+}
 
 
-def test_reminders_are_merged_into_the_trigger_list(tmp_path):
-    d = _agent_dir(tmp_path, reminders={"schema_version": 1,
-                                        "triggers": [_reminder()]})
-    names = [t.name for t in _load_triggers(d)]
-    assert names == ["heartbeat", "reminder-a1b2c3"]
+def test_a_resident_with_a_reminders_file_loads(tmp_path):
+    """P0 (both reviewers, round 2): without reminders.yaml on the tier
+    allowlist, _check_file_set rejects the whole resident the moment the first
+    reminder exists — an add-on boot crash loop, not a degraded reminder."""
+    cfg = _load(tmp_path, triggers=TRIGGERS,
+                reminders={"schema_version": 1, "triggers": [_reminder()]})
+    assert [t.name for t in cfg.triggers] == ["heartbeat", "reminder-a1b2c3d4"]
 
 
-def test_a_reminder_keeps_its_date_fields(tmp_path):
-    d = _agent_dir(tmp_path, reminders={"schema_version": 1,
-                                        "triggers": [_reminder()]})
-    spec = [t for t in _load_triggers(d) if t.name == "reminder-a1b2c3"][0]
+def test_reminder_date_fields_survive_the_real_load(tmp_path):
+    cfg = _load(tmp_path, triggers=TRIGGERS,
+                reminders={"schema_version": 1, "triggers": [_reminder()]})
+    spec = [t for t in cfg.triggers if t.name == "reminder-a1b2c3d4"][0]
     assert spec.type == "date"
     assert spec.one_shot is True
     assert spec.at == "2099-08-03T08:00:00+02:00"
     assert "Bins." in spec.prompt
 
 
+def test_reminders_load_without_any_triggers_file(tmp_path):
+    """A fresh install has no triggers.yaml edits; the first reminder must
+    still load on its own."""
+    cfg = _load(tmp_path,
+                reminders={"schema_version": 1, "triggers": [_reminder()]})
+    assert [t.name for t in cfg.triggers] == ["reminder-a1b2c3d4"]
+
+
 def test_absent_reminders_file_is_fine(tmp_path):
-    d = _agent_dir(tmp_path)
-    assert [t.name for t in _load_triggers(d)] == ["heartbeat"]
+    cfg = _load(tmp_path, triggers=TRIGGERS)
+    assert [t.name for t in cfg.triggers] == ["heartbeat"]
+
+
+def test_an_invalid_reminders_file_is_rejected(tmp_path):
+    """It must be schema-validated like any other agent file, not trusted
+    because an agent wrote it."""
+    from agent_loader import LoadError
+
+    with pytest.raises(LoadError):
+        _load(tmp_path, triggers=TRIGGERS, reminders={
+            "schema_version": 1,
+            "triggers": [{"name": "reminder-a1b2c3d4", "type": "date",
+                          "channel": "telegram", "prompt": "x"}],  # no at
+        })
 
 
 def test_a_colliding_reminder_is_dropped_not_fatal(tmp_path):
     """register_agent raises on duplicate names and boot does not catch it
-    (#338), so a collision across the two files would be a crash loop. The
-    operator's triggers.yaml wins."""
-    d = _agent_dir(tmp_path, reminders={
+    (#338), so a collision across the two files would be a crash loop."""
+    cfg = _load(tmp_path, triggers={
         "schema_version": 1,
-        "triggers": [_reminder(), _reminder()],   # same name twice
-    })
-    names = [t.name for t in _load_triggers(d)]
-    assert names == ["heartbeat", "reminder-a1b2c3"]
+        "triggers": [{"name": "reminder-a1b2c3d4", "type": "cron",
+                      "schedule": "0 7 * * *", "channel": "telegram",
+                      "prompt": "operator wrote this"}],
+    }, reminders={"schema_version": 1, "triggers": [_reminder()]})
+
+    names = [t.name for t in cfg.triggers]
+    assert names == ["reminder-a1b2c3d4"]
+    # The operator's entry is the one that survived.
+    assert cfg.triggers[0].type == "cron"
 
 
 def test_the_shipped_default_has_no_reminders_file():

@@ -4719,7 +4719,15 @@ async def set_reminder(args: dict) -> dict:
     # channel to be one this role actually declares.
     channel = "telegram" if "telegram" in channels else channels[0]
 
-    name = reminders.new_reminder_name()
+    path = reminders.reminders_path(runtime.agents_dir, role)
+    # Generate against the names already in the store. A collision would fail
+    # registration on a duplicate job id, and the rollback below would then
+    # delete the PRE-EXISTING reminder of that name along with this one.
+    try:
+        name = reminders.new_reminder_name(reminders.existing_names(path))
+    except ValueError as exc:
+        return _result({"status": "error", "kind": "name_exhausted",
+                        "message": str(exc)})
     entry = {
         "name": name,
         **fields,
@@ -4731,7 +4739,6 @@ async def set_reminder(args: dict) -> dict:
         "prompt": f'Send this exact message via {channel}: "{text}"',
     }
 
-    path = reminders.reminders_path(runtime.agents_dir, role)
     try:
         reminders.append_entry(path, entry)
     except (OSError, ValueError) as exc:

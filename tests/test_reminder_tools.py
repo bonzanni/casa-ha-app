@@ -371,3 +371,24 @@ async def test_get_schedule_lists_a_one_off_reminder(tmp_path, monkeypatch):
     assert created["name"] in text
     assert "one-off" in text
     assert "interval" not in text
+
+
+async def test_a_name_collision_cannot_destroy_an_existing_reminder(env, monkeypatch):
+    """Sol r2 #3: if the generated name collided, registration failed on the
+    duplicate job id and the rollback removed BOTH entries — losing a reminder
+    the user had already been promised."""
+    import reminders
+    from tools import set_reminder
+
+    first = _payload(await set_reminder.handler({"at": FUTURE, "text": "One."}))
+    assert first["status"] == "ok"
+
+    # Force the generator to keep proposing the name already in the store.
+    monkeypatch.setattr(reminders.secrets, "token_hex",
+                        lambda n: first["name"].removeprefix("reminder-"))
+
+    second = _payload(await set_reminder.handler({"at": FUTURE, "text": "Two."}))
+
+    assert second["status"] == "error"
+    names = [t["name"] for t in _entries(env.reminders_path)]
+    assert names == [first["name"]], "the pre-existing reminder must survive"

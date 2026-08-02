@@ -75,8 +75,12 @@ TIER_FILES: dict[str, dict[str, set[str]]] = {
     "resident": {
         "required":  {"character.yaml", "voice.yaml", "response_shape.yaml",
                       "disclosure.yaml", "runtime.yaml"},
+        # #396: reminders.yaml is AGENT-OWNED and created on demand by
+        # set_reminder. It must be listed here or _check_file_set rejects the
+        # whole resident the moment the first reminder exists — a boot crash
+        # loop, not a degraded reminder.
         "optional":  {"delegates.yaml", "executors.yaml", "triggers.yaml",
-                      "hooks.yaml", "plugins.yaml"},
+                      "reminders.yaml", "hooks.yaml", "plugins.yaml"},
         "forbidden": set(),
     },
     "specialist": {
@@ -84,7 +88,7 @@ TIER_FILES: dict[str, dict[str, set[str]]] = {
                       "runtime.yaml"},
         "optional":  {"hooks.yaml", "plugins.yaml"},
         "forbidden": {"disclosure.yaml", "delegates.yaml", "executors.yaml",
-                      "triggers.yaml"},
+                      "triggers.yaml", "reminders.yaml"},
     },
 }
 
@@ -93,7 +97,8 @@ TIER_FILES["executor"] = {
     "optional":  {"hooks.yaml", "observer.yaml", "plugins.yaml"},
     "forbidden": {"character.yaml", "runtime.yaml", "delegates.yaml",
                   "executors.yaml", "disclosure.yaml",
-                  "response_shape.yaml", "voice.yaml", "triggers.yaml"},
+                  "response_shape.yaml", "voice.yaml", "triggers.yaml",
+                  "reminders.yaml"},
 }
 
 # S-1 fix (v0.35.2): editor backup artifacts that strict-load tolerates.
@@ -167,6 +172,7 @@ _SCHEMA_BY_FILENAME: dict[str, str] = {
     "delegates.yaml":      "delegates",
     "executors.yaml":      "executors",
     "triggers.yaml":       "triggers",
+    "reminders.yaml":      "triggers",   # #396 — same schema
     "hooks.yaml":          "hooks",
     "definition.yaml":     "executor",
 }
