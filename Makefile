@@ -18,7 +18,13 @@ setup: ## One-time WSL dev setup (Linux venv + git hooks)
 # available. RLIMIT_AS in conftest bounds one process's ADDRESS SPACE; only this
 # bounds REAL memory across all workers, which is what actually killed the VM
 # twice. Degrades to running uncaged where systemd-run is absent (CI images).
-CAGE := $(shell command -v systemd-run >/dev/null 2>&1 && echo "systemd-run --user --scope -q -p MemoryMax=8G -p MemorySwapMax=2G")
+# Probe that the cage actually WORKS, not merely that the binary exists: in WSL,
+# containers and non-login SSH sessions /usr/bin/systemd-run is present while the
+# user bus is not, and prepending it there would make pytest never run at all —
+# taking the binding pre-push gate down with it. Both reviewers made this their
+# top finding, and it passes on this machine, which is exactly why it needed a
+# real probe rather than my judgement.
+CAGE := $(shell systemd-run --user --scope -q true >/dev/null 2>&1 && echo "systemd-run --user --scope -q -p MemoryMax=8G -p MemorySwapMax=2G")
 
 test-unit: ## Fast unit tests, parallel + memory-caged (except docker/slow)
 	$(CAGE) $(PY) -m pytest tests/ -m "not docker and not slow" -n auto --maxprocesses=12 --dist loadfile --tb=short

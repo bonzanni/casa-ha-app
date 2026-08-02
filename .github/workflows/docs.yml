@@ -46,10 +46,11 @@ jobs:
           python3 scripts/coverage_ledger.py check .
 
       - name: Docs-impact acknowledgement logic
-        # The waiver parser is the one part of this workflow that can let drift
-        # through, and it only executes on pull requests — so it would otherwise
-        # be unexercised until the PR that depends on it. The harness lifts the
-        # decision block out of THIS file and drives it over synthetic ranges.
+        # The waiver parser is the part of this gate that can let drift through
+        # deliberately, and it runs only on push/pull_request events — so it
+        # would otherwise be unexercised until the change that depends on it.
+        # The harness drives scripts/docs_impact.sh, which is the one copy both
+        # this workflow and scripts/gate.sh call.
         run: bash tests/test_docs_impact_ack.sh
 
       - name: Generated navigation is current
@@ -134,6 +135,16 @@ jobs:
                    "(new branch or force-push): cannot determine what changed."
               echo "::error::Re-run from a pull request, or push a normal" \
                    "fast-forward so before..after is meaningful."
+              exit 1
+            fi
+            # Sol: reachable is not enough. A non-fast-forward push — a
+            # backward reset, or an old tip still reachable via another ref —
+            # leaves `before` resolvable while `before...HEAD` (merge-base)
+            # collapses to an empty diff. Require real ancestry.
+            if ! git merge-base --is-ancestor "$before" HEAD; then
+              echo "::error::push is not a fast-forward from ${before}:" \
+                   "the changed set cannot be derived. Push a fast-forward," \
+                   "or run this from a pull request."
               exit 1
             fi
             base="$before"

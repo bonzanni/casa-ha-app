@@ -34,7 +34,12 @@ def test_pin_docs_workflow_runs_verifier_ledger_and_impact():
         """A real invocation, not a mention. Terra caught the first version of
         this pinning bare substrings: both callers name the script in comments,
         so deleting the executable line still passed. Match a line whose first
-        word is the script (optionally via `bash`), with comments excluded."""
+        word is the script (optionally via `bash`), with comments excluded.
+
+        DIRECT invocation is deliberately the contract. Calls wrapped in `exec`,
+        `env`, a variable, or a same-line `set -x;` are not recognised and will
+        fail this test — which is fail-closed, and cheap to fix by calling the
+        script plainly. Both callers do."""
         for line in path.read_text().splitlines():
             stripped = line.strip()
             if not stripped or stripped.startswith("#"):
@@ -49,8 +54,18 @@ def test_pin_docs_workflow_runs_verifier_ledger_and_impact():
         "docs.yml must CALL scripts/docs_impact.sh, not merely mention it"
     assert _invokes(root / "scripts" / "gate.sh", "scripts/docs_impact.sh"), \
         "gate.sh must CALL scripts/docs_impact.sh — it is the binding copy"
-    # And the script itself must still drive the verifier's impact mode.
-    assert "--impact" in (root / "scripts" / "docs_impact.sh").read_text()
+    # And the script itself must still DRIVE the verifier's impact mode — on a
+    # live line. Sol caught the final link of the chain still being a bare
+    # substring: commenting out the verifier pipeline left `--impact` present in
+    # prose and the test green.
+    impact_lines = [
+        ln for ln in (root / "scripts" / "docs_impact.sh").read_text().splitlines()
+        if "--impact" in ln and not ln.strip().startswith("#")
+    ]
+    assert impact_lines, (
+        "scripts/docs_impact.sh must run verify_docs --impact on a live line, "
+        "not merely mention it"
+    )
     # The operating cards must keep routing agents into the corpus — pinned as
     # the substantive directive pattern, not a bare filename an unrelated
     # sentence could satisfy.
