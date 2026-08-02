@@ -50,6 +50,7 @@ from __future__ import annotations
 
 import enum
 import errno
+import fcntl
 import hashlib
 import json
 import logging
@@ -87,6 +88,7 @@ RESULTS_DIR = "results"
 CLAIMS_DIR = ".claims"
 INDEX_DIR = ".index"
 READY_NAME = "ready.json"
+DIR_ID_NAME = ".dir-id"      # per-plugin-dir identity token (see Claim)
 TEMP_PREFIX = ".tmp-"        # reserved result-temp grammar under .claims/
 COLLECT_PREFIX = ".collect-"  # consumer-held claim under results/
 PART_SUFFIX = ".part"
@@ -105,6 +107,7 @@ _NEW_FILE_FLAGS = (os.O_CREAT | os.O_EXCL | os.O_WRONLY | os.O_NOFOLLOW
 _MARKER_READ_FLAGS = (os.O_RDONLY | os.O_NONBLOCK | os.O_NOFOLLOW
                       | os.O_CLOEXEC)
 _HASH_RE = re.compile(r"^[0-9a-f]{64}$")
+_DIR_ID_RE = re.compile(r"^[0-9a-f]{32}$")
 
 
 class MarkerState(enum.Enum):
@@ -354,6 +357,62 @@ def _write_new_file(name: str, dir_fd: int, data: bytes) -> None:
         os.close(fd)
 
 
+#: Sentinel for a token whose state could not be ESTABLISHED (an I/O failure
+#: mid-probe). Distinct from ``None`` (positively absent or malformed) for the
+#: same reason ``_LSTAT_ERROR`` is distinct from ENOENT: an unknowable state
+#: is never grounds for the repair path to retire a possibly-valid token.
+_TOKEN_ERROR = object()
+
+
+def _classify_dir_token(dir_fd: int):
+    """Three-state probe of the plugin dir's identity token (``.dir-id``):
+    a valid token string; ``None`` when the entry is POSITIVELY absent or
+    malformed (non-regular, wrong size, bad grammar — safe to repair); or
+    :data:`_TOKEN_ERROR` when an ``open``/``fstat``/``read`` failure left its
+    state unknowable (never safe to repair). A stat-pair compare alone cannot
+    carry directory identity — ext4 recycles a freed inode number
+    immediately, so a recreated directory can present the exact
+    ``(st_dev, st_ino)`` of the one it replaced."""
+    try:
+        fd = os.open(DIR_ID_NAME, _MARKER_READ_FLAGS, dir_fd=dir_fd)
+    except FileNotFoundError:
+        return None                          # positively absent
+    except OSError as exc:
+        if exc.errno == errno.ELOOP:
+            return None                      # positively a symlink — malformed
+        return _TOKEN_ERROR
+    try:
+        st = os.fstat(fd)
+        if not stat.S_ISREG(st.st_mode) or st.st_size != 32:
+            return None                      # positively malformed
+        chunks = bytearray()
+        while len(chunks) < 33:
+            piece = os.read(fd, 33 - len(chunks))
+            if not piece:
+                break
+            chunks += piece
+        # A regular 32-byte file with no legitimate concurrent writer must
+        # read back exactly 32 bytes; anything else means the probe raced
+        # something and the state is unknowable, not proven malformed.
+        if len(chunks) != 32:
+            return _TOKEN_ERROR
+    except OSError:
+        return _TOKEN_ERROR
+    finally:
+        os.close(fd)
+    token = chunks.decode("ascii", errors="replace")
+    return token if _DIR_ID_RE.match(token) else None
+
+
+def _read_dir_token(dir_fd: int) -> str | None:
+    """The GATE view of :func:`_classify_dir_token`: anything but a valid
+    token — absent, malformed or unknowable alike — is ``None``, and the
+    caller refuses. Only :meth:`CallbackSpool.ensure_plugin_dirs`'s repair
+    path needs the three-state distinction."""
+    token = _classify_dir_token(dir_fd)
+    return token if isinstance(token, str) else None
+
+
 def _read_marker_at(name: str, dir_fd: int) -> Marker:
     """Total, non-blocking, three-state marker read openat-relative to
     *dir_fd*.
@@ -439,16 +498,22 @@ def _link_once(src: str, src_dir_fd: int, dst: str, dst_dir_fd: int) -> bool:
 @dataclass(frozen=True)
 class Claim:
     """Exclusive ownership of one consumed state. ``mtime`` is the MINT time
-    (preserved through the claim link); ``dir_dev``/``dir_ino`` pin the plugin
-    spool directory this claim was taken from, so a removal + reinstall
-    between claim and publish fails closed instead of depositing a credential
-    into a different (recreated) directory."""
+    (preserved through the claim link); ``dir_token`` pins the plugin spool
+    directory this claim was taken from, so a removal + reinstall between
+    claim and publish fails closed instead of depositing a credential into a
+    different (recreated) directory. The token — a random ``.dir-id`` minted
+    when the directory is created — is what carries that identity;
+    ``dir_dev``/``dir_ino`` are kept as a second, cheaper gate, but cannot
+    carry it alone (ext4 recycles a freed inode number immediately, so a
+    recreated directory can present the exact stat pair of its
+    predecessor)."""
 
     plugin: str
     state_hash: str
     mtime: float
     dir_dev: int
     dir_ino: int
+    dir_token: str
 
     @property
     def key(self) -> str:
@@ -586,10 +651,47 @@ class CallbackSpool:
                         self._chmod_dir(sfd, sub)
                     finally:
                         os.close(sfd)
+                probe = _classify_dir_token(pfd)
+                if probe is _TOKEN_ERROR:
+                    # State unknowable (a transient I/O failure) — NEVER
+                    # grounds to retire what may be a valid, live token that
+                    # in-flight claims still carry. Abort; the next pass
+                    # re-probes.
+                    raise OSError(errno.EIO,
+                                  f"{DIR_ID_NAME} state unknowable")
+                if probe is None:
+                    self._repair_dir_token(pfd)
                 _fsync(pfd, plugin)
             finally:
                 os.close(pfd)
             _fsync(self._root_fd, str(self.root))
+
+    @staticmethod
+    def _repair_dir_token(pfd: int) -> None:
+        """Mint (or repair) the identity token, serialized cross-process by an
+        exclusive ``flock`` on the plugin dir fd and RE-probed under it — a
+        concurrent pass may have minted between the caller's probe and the
+        lock, and a VALID token is never retired (exactly-once per directory
+        life; in-flight claims carry it). A recreated directory always gets a
+        FRESH token; the token, not the recyclable inode number, is what
+        claim/discard/publish compare (see Claim.dir_token). A dir that
+        existed before the token was introduced gets one on the first pass
+        through here — claims taken before that mint fail closed, exactly
+        like any other unprovable identity."""
+        fcntl.flock(pfd, fcntl.LOCK_EX)
+        try:
+            probe = _classify_dir_token(pfd)
+            if probe is _TOKEN_ERROR:
+                raise OSError(errno.EIO,
+                              f"{DIR_ID_NAME} state unknowable")
+            if probe is None:
+                if not _retire_marker_entry(DIR_ID_NAME, pfd):
+                    raise OSError(errno.EIO,
+                                  f"invalid {DIR_ID_NAME} survives retire")
+                _write_new_file(DIR_ID_NAME, pfd,
+                                uuid.uuid4().hex.encode("ascii"))
+        finally:
+            fcntl.flock(pfd, fcntl.LOCK_UN)
 
     @staticmethod
     def _mkdir(name: str, dir_fd: int) -> bool:
@@ -898,6 +1000,9 @@ class CallbackSpool:
                 return None                  # unrouted / removed plugin
             try:
                 dir_st = os.fstat(pfd)
+                dir_token = _read_dir_token(pfd)
+                if dir_token is None:
+                    return None      # identity unprovable — refuse
                 try:
                     pend = _open_dir(PENDING_DIR, pfd)
                 except OSError:
@@ -909,7 +1014,7 @@ class CallbackSpool:
                     return None
                 try:
                     return self._claim_locked(plugin, state_hash_hex, now,
-                                              pend, claims, dir_st)
+                                              pend, claims, dir_st, dir_token)
                 finally:
                     os.close(pend)
                     os.close(claims)
@@ -917,7 +1022,7 @@ class CallbackSpool:
                 os.close(pfd)
 
     def _claim_locked(self, plugin: str, h: str, now: float, pend: int,
-                      claims: int, dir_st) -> Claim | None:
+                      claims: int, dir_st, dir_token: str) -> Claim | None:
         src = f"{h}.json"
         try:
             if not _link_once(src, pend, h, claims):
@@ -945,7 +1050,8 @@ class CallbackSpool:
             _fsync(claims, CLAIMS_DIR)
             return None
         claim = Claim(plugin=plugin, state_hash=h, mtime=st.st_mtime,
-                      dir_dev=dir_st.st_dev, dir_ino=dir_st.st_ino)
+                      dir_dev=dir_st.st_dev, dir_ino=dir_st.st_ino,
+                      dir_token=dir_token)
         self._in_flight.add(claim.key)
         return claim
 
@@ -963,9 +1069,13 @@ class CallbackSpool:
             try:
                 # Same identity gate as the publish path: after a removal +
                 # reinstall this name denotes a different directory, and the
-                # claim being dropped is not ours to delete there.
+                # claim being dropped is not ours to delete there. The token
+                # is what proves identity; the stat pair is a second gate
+                # only (an inode number is recycled, a token never).
                 st = os.fstat(pfd)
                 if (st.st_dev, st.st_ino) != (claim.dir_dev, claim.dir_ino):
+                    return
+                if _read_dir_token(pfd) != claim.dir_token:
                     return
                 try:
                     claims = _open_dir(CLAIMS_DIR, pfd)
@@ -1033,10 +1143,13 @@ class CallbackSpool:
             return False
         try:
             st = os.fstat(pfd)
-            if (st.st_dev, st.st_ino) != (claim.dir_dev, claim.dir_ino):
+            if ((st.st_dev, st.st_ino) != (claim.dir_dev, claim.dir_ino)
+                    or _read_dir_token(pfd) != claim.dir_token):
                 # Removed + recreated between claim and publish: this is a
-                # different directory inode. Fail closed rather than deposit a
-                # credential into a re-installed plugin's spool.
+                # different directory (fresh token — the stat pair alone can
+                # recur, since ext4 recycles freed inode numbers). Fail
+                # closed rather than deposit a credential into a re-installed
+                # plugin's spool.
                 logger.warning("callback-spool: plugin dir replaced mid-flow; "
                                "refusing to publish")
                 return False

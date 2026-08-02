@@ -59,7 +59,12 @@ against *itself* racing, crashing, or a swapped symlink. A pending file's mtime 
 and survives the claiming rename; each TTL runs off its own file's mtime. Publication is always
 a `link(2)` of an already-complete inode whose `EEXIST` is the atomic arbiter — the claim has
 exactly one winner however many processes race, and a replayed redirect can never rewrite a
-result.
+result. A claim also pins the *identity* of the plugin's spool directory: each directory carries
+a random `.dir-id` token minted at creation, and discard/publish refuse when the token no longer
+matches the one captured at claim time — so a plugin removal + reinstall mid-flow always fails
+closed. The token carries this rather than the directory's `(st_dev, st_ino)` pair alone,
+because a filesystem is free to hand a freed inode number straight back to the recreated
+directory.
 
 ## Contracts & invariants
 
