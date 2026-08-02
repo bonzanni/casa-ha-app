@@ -92,6 +92,16 @@ typed JSON-RPC-style error objects from the route, before any tool runs (an abse
 null value defaults to an empty object instead); a tool that raises becomes an error
 object rather than a transport failure.
 
+**Ill-typed arguments, though, reach the tool.** The route validates the request
+*envelope*, not the argument types a tool declares: the internal forwarding path does not
+enforce a tool's declared schema, so a handler receives whatever the caller sent. A
+declared `bool` can therefore arrive as a string, and Python's truthiness makes the string
+`"false"` indistinguishable from `True` to a `bool(...)` coercion. Any argument that acts
+as an authorization — a `force` that permits a destructive path, a flag that waives a
+refusal — must be type-checked in the handler and rejected as a bad request, not coerced.
+Treating the declaration as if something upstream enforced it is how a refusal becomes
+opt-out by typo.
+
 **A completion is invalid or refused.** Bad arguments, the plugin-developer release guard,
 and the unread-inbound veto all leave the engagement active; a duplicate completion is
 acknowledged as already terminal; a failed strict persist reports retryable.

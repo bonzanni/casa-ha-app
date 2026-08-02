@@ -108,6 +108,17 @@ mid-2026). Keep it publish-ready at all times:
   QA run (`gh run list --workflow qa.yml --branch main --limit 1`); a red main is
   stop-the-line before the next release — the e2e tiers cover what the local unit gate
   can't (see the v0.52–v0.57 red streak).
+- **One check is NOT covered by "don't wait for CI": `docs.yml` → "Corpus + publication
+  guard".** It finishes in well under a minute and it is the only thing that catches
+  documentation drift, so **wait for it and merge only when it is green**:
+  `gh pr checks <pr> --watch --required` or, at minimum,
+  `gh run list --workflow docs.yml --branch <branch> --limit 1`. It caught v0.145.0
+  (PR #383) naming six documents whose prose the batch had invalidated; that PR was
+  squash-merged with `--admin` about a minute after opening, before the guard reported,
+  and the drift shipped. If the guard names a document whose prose is genuinely still
+  true — the claim is file-level, so a change can miss what the document quotes —
+  acknowledge it per document in a commit message rather than making a cosmetic edit:
+  `Docs-impact: architecture/tools-interface.md — none (claimed symbols unchanged)`.
 - **Branches die on merge.** GitHub auto-deletes the remote head; delete the local
   branch too. No stray branches on origin.
 - **Every release**: bump `casa/config.yaml` version + a user-facing CHANGELOG

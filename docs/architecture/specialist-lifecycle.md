@@ -73,6 +73,13 @@ deliberately not materialized.
 Enforced by the upgrade core recording an error result without touching the running tuple,
 and by the rollback core's restoration from the retained prior.
 
+One identity detail is easy to get wrong at exactly these commit points: a role's checksum
+covers the model it *resolved to*, not just the model policy it declares. Every path here
+that materializes a role while writing or checking a binding — commit, upgrade, rollback,
+the reconcile pass — therefore has to resolve an operator-option model the way the agent
+loader will, or it persists an identity the loader can never re-derive and the specialist
+is dropped at activation. See `architecture/personality.md`.
+
 **INV-SPEC-004**: Operational materialization writes a fresh content directory and atomically retargets the slug symlink, with deletion containment-gated.
 
 Enforced in the materializer. The one-time migration of a legacy real directory has a
