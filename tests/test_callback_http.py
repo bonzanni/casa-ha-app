@@ -298,6 +298,26 @@ class TestNeutralUniformity:
                 baseline = await _get(other, "/callback/plg-nope--nope")
         assert _shape(r) == _shape(baseline)
 
+    async def test_observability_fault_does_not_differentiate(self, spool):
+        """INV-CB-005's last defence: an exception from the outcome sampler
+        (observability) must not escape into a 500 — a differentiated status
+        is an oracle. The response stays byte-identical to the reference."""
+        class _BrokenSampler:
+            def should_log(self, key):
+                raise RuntimeError("metrics backend down")
+
+        callback_spool.mint(_plugin_dir(spool), STATE)
+        broken = _build_app(sampler=_BrokenSampler())
+        good = _build_app()
+        async with _client(broken) as bad_client, _client(good) as ok_client:
+            faulted = await _get(
+                bad_client, f"/callback/{EFFECTIVE}?state={STATE}")
+            reference = await _get(
+                ok_client, "/callback/plg-nope--nope?state=" + "z" * 22)
+        assert faulted.status == 303
+        assert _shape(faulted) == _shape(reference)
+        assert faulted.headers["Location"] == "/callback/done"
+
     async def test_neutral_when_spool_absent(self, monkeypatch):
         """Before boot wires a spool, the route still answers neutrally."""
         monkeypatch.setattr(callback_spool, "_SPOOL", None)
@@ -636,6 +656,48 @@ class TestLogHygiene:
         # The escaped spelling is what lands in the line — one record, no
         # decoded newline, so no second (forged) line.
         assert "%0AFORGED" in access[0].getMessage()
+
+    async def test_overlong_request_line_leaks_no_code_on_any_logger(
+            self, spool, caplog):
+        """INV-CB-006's third surface: a request line over 8190 bytes raises
+        ``LineTooLong`` below the handler, and aiohttp's ``handle_error`` logs
+        the offending bytes (query + code) at ERROR on ``aiohttp.server``.
+        ``install_callback_log_redaction`` must scrub it before any handler
+        formats the record."""
+        callback_http.install_callback_log_redaction()
+        caplog.set_level(logging.DEBUG)
+        app = _build_app(middlewares=[cid_middleware])
+        async with _client(app, access_log=True) as client:
+            try:
+                await _get(
+                    client,
+                    f"/callback/{EFFECTIVE}?code=SECRETVALUE&pad="
+                    + "p" * 9000)
+            except Exception:  # noqa: BLE001 — the connection is dropped
+                pass
+            await asyncio.sleep(0.05)
+        assert any(r.name == "aiohttp.server" for r in caplog.records), \
+            "the parser error must have been logged (else the test is moot)"
+        formatter = logging.Formatter()
+        for record in caplog.records:
+            rendered = formatter.format(record)   # includes the traceback
+            assert "SECRETVALUE" not in rendered, record.name
+
+    async def test_install_callback_log_redaction_is_idempotent(self):
+        srv = logging.getLogger("aiohttp.server")
+        callback_http.install_callback_log_redaction()
+        callback_http.install_callback_log_redaction()
+        redactors = [f for f in srv.filters
+                     if isinstance(f, callback_http._AiohttpServerRedactor)]
+        assert len(redactors) == 1
+
+    def test_redactor_leaves_unrelated_records_untouched(self):
+        redactor = callback_http._AiohttpServerRedactor()
+        record = logging.LogRecord(
+            "aiohttp.server", logging.INFO, __file__, 0,
+            "connection from %s established", ("a-peer",), None)
+        assert redactor.filter(record) is True
+        assert record.getMessage() == "connection from a-peer established"
 
     async def test_no_log_line_carries_the_state_hash(self, spool, caplog):
         """INV-CB-006 names state, hash values and query content together."""

@@ -253,7 +253,11 @@ def compute_desired(
                 continue
             entries_for_plugin[cb["effective"]] = {
                 "plugin": rp.name, "declared": cb["declared"],
-                "path": rp.path}
+                # Carry the effective name in the value too (it is already the
+                # key): the callback handler records it in the result and logs
+                # it, and reading it from the entry keeps that on one shape
+                # instead of a routed-name fallback.
+                "effective": cb["effective"], "path": rp.path}
 
         # Per-plugin all-or-nothing: any gap unroutes the whole set.
         if plugin_pending:

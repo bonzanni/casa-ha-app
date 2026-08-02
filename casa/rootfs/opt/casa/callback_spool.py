@@ -688,6 +688,16 @@ class CallbackSpool:
         clears. ``EEXIST`` on the link is a hard anomaly (a result already
         exists for this state): the claim and temp are still cleaned up and
         the caller renders the same neutral response.
+
+        On a *staging* failure this method returns ``False`` and deliberately
+        LEAVES the claim, so the recovery pass can restore the flow to
+        ``pending/`` rather than a transient write eating it (see
+        :meth:`_publish_locked`). Note the sole production caller —
+        ``callback_http`` — does not rely on that: on any ``False``/raise it
+        calls :meth:`discard_claim`, so the restore-to-pending branch is
+        reachable only from a crash-recovery path, never from a live handler's
+        write failure (the endpoint is unauthenticated, so a consumed state
+        stays consumed rather than reopening a replay window).
         """
         with self._lock:
             try:

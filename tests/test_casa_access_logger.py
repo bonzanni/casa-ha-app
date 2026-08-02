@@ -139,6 +139,22 @@ class TestQuerySuppression:
         assert "path=/callback/done " in msg
         assert "leak=1" not in msg
 
+    def test_bare_callback_path_is_suppressed(self, caplog):
+        """``GET /callback?code=…`` 404s but still carries the credential in
+        the query; the prefix match is segment-aware so the trailing-slash-less
+        path is suppressed too."""
+        logger = logging.getLogger("casa.access")
+        access = CasaAccessLogger(logger)
+        caplog.set_level(logging.INFO, logger="casa.access")
+        access.log(
+            _fake_request("GET", "/callback?code=SECRETVALUE",
+                          path_only="/callback"),
+            _fake_response(404, 0), 0.001,
+        )
+        msg = caplog.records[0].getMessage()
+        assert "path=/callback " in msg
+        assert "SECRETVALUE" not in msg
+
     def test_non_matching_prefix_still_logs_the_query(self, caplog):
         """The suppression is prefix-scoped: every other route keeps the
         diagnostic value of a full request target."""

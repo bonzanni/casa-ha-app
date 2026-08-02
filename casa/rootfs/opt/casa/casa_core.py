@@ -3324,6 +3324,11 @@ async def main() -> None:
     # to itself. Both handlers are turn-free — no ingress identity, no
     # clearance, no provenance — because a browser redirect is not an
     # authenticated principal; every outcome is the same neutral 303.
+    # INV-CB-006: an over-long request line raises LineTooLong BELOW the
+    # handler, and aiohttp logs the offending bytes (query + code) at ERROR on
+    # the aiohttp.server logger. This filter strips the callback query from
+    # that record's message and traceback before any handler formats it.
+    callback_http.install_callback_log_redaction()
     app.router.add_get("/callback/done", callback_http.make_done_handler())
     app.router.add_get("/callback/{name}", callback_http.make_callback_handler(
         trigger_registry=trigger_registry,

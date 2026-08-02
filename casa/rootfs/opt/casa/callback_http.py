@@ -20,9 +20,21 @@ The query string carries a bearer credential (an OAuth authorization code).
 Handler logs carry a reason enum, a cid and the *effective* name only —
 except ``unknown_name``, which logs a fixed sentinel, since the route
 component is attacker-controlled. The access logger suppresses the query for
-``/callback/`` (see ``casa_core_middleware.QUERY_SUPPRESSED_PREFIXES``) and
-nginx does the same for its own access log. The two pages are static
-constants: zero interpolation of request data (INV-CB-006).
+``/callback/`` (see ``casa_core_middleware.QUERY_SUPPRESSED_PREFIXES``);
+Task 9 adds the matching nginx ``map`` rule for nginx's own access log. The
+two pages are static constants: zero interpolation of request data
+(INV-CB-006).
+
+One INV-CB-006 leak lives below aiohttp, on the ``aiohttp.server`` logger:
+a request line over 8190 bytes raises ``LineTooLong`` *before* the handler
+runs, and aiohttp's ``handle_error`` logs the exception at ERROR — the
+exception message embeds the offending bytes, i.e. the query with the code.
+:func:`install_callback_log_redaction` closes it: an idempotent
+``logging.Filter`` on the ``aiohttp.server`` logger strips the query from any
+``/callback`` request line in a record's message *and its exception
+traceback* before any handler formats it. Casa wires it at app setup; the
+residual is therefore closed in-container (the outer proxy's own logs remain
+operator-configured, per §6).
 
 **Opaque relay.** Casa interprets exactly one parameter — ``state``, parsed
 strictly from the RAW query string, never the framework's decoded view, so a
@@ -39,8 +51,10 @@ principal, and the deposit is picked up by the plugin that minted the state.
 from __future__ import annotations
 
 import logging
+import re
 import os
 import time
+import traceback
 from typing import Any, Callable
 
 from aiohttp import web
@@ -137,6 +151,63 @@ p { font-size: 1.125rem; line-height: 1.6; margin: 0; }
 </body>
 </html>
 """
+
+
+# ---------------------------------------------------------------------------
+# aiohttp.server log redaction (INV-CB-006, the below-the-handler surface)
+# ---------------------------------------------------------------------------
+
+#: A ``/callback`` request line with its query. Anchored on the path so a
+#: legitimate diagnostic that merely contains a ``?`` elsewhere is untouched;
+#: ``\S*`` runs to the next whitespace, which in aiohttp's ``LineTooLong``
+#: message (a ``bytearray`` repr on one line) is the end of the credential.
+_CALLBACK_QUERY_RE = re.compile(r"(/callback[^\s?]*)\?\S*")
+_REDACTED = r"\1?<redacted>"
+
+
+class _AiohttpServerRedactor(logging.Filter):
+    """Strip a ``/callback`` query from an ``aiohttp.server`` record before
+    any handler formats it — INV-CB-006's third surface.
+
+    aiohttp raises ``LineTooLong`` on an over-long request line *before* the
+    route is matched, and ``handle_error`` logs it at ERROR with the offending
+    bytes in the exception; the query (with the code) rides the traceback, not
+    the ``%``-message. This filter therefore redacts BOTH the formatted
+    message and the exception text, and — because a logger's filters run in
+    ``Logger.handle`` before ``callHandlers`` — the mutation reaches every
+    handler, including root, already sanitized.
+    """
+
+    def filter(self, record: logging.LogRecord) -> bool:
+        try:
+            message = record.getMessage()
+        except Exception:  # noqa: BLE001 — a broken record must still be logged
+            message = str(record.msg)
+        redacted = _CALLBACK_QUERY_RE.sub(_REDACTED, message)
+        if redacted != message:
+            record.msg = redacted
+            record.args = ()
+        if record.exc_info or record.exc_text:
+            text = record.exc_text
+            if text is None and record.exc_info:
+                text = "".join(traceback.format_exception(*record.exc_info))
+            if text and "/callback" in text:
+                # Pre-render the (redacted) traceback and drop the live
+                # exc_info: with exc_text set, no formatter re-renders from the
+                # unredacted exception.
+                record.exc_text = _CALLBACK_QUERY_RE.sub(_REDACTED, text)
+                record.exc_info = None
+        return True
+
+
+def install_callback_log_redaction() -> None:
+    """Attach :class:`_AiohttpServerRedactor` to the ``aiohttp.server`` logger
+    once. Idempotent across reloads and repeated boots — the guard inspects
+    the live filter list rather than a module flag, so a second casa app in
+    the same process (tests) shares the one filter."""
+    srv = logging.getLogger("aiohttp.server")
+    if not any(isinstance(f, _AiohttpServerRedactor) for f in srv.filters):
+        srv.addFilter(_AiohttpServerRedactor())
 
 
 # ---------------------------------------------------------------------------
@@ -429,6 +500,10 @@ def make_callback_handler(
             # `unknown_name` with the sentinel unconditionally is what makes
             # the INV-CB-006 rule mechanical.
             return UNKNOWN_SENTINEL, "unknown_name"
+        # The reconciler writes ``effective`` into the overlay entry (it is
+        # also the key), so this is the live value; the routed-name fallback
+        # stays as defense against an entry shape that predates that, since a
+        # missing effective must never surface as an empty log field.
         effective = entry.get("effective")
         if not isinstance(effective, str) or not effective:
             effective = name

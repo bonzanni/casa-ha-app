@@ -79,8 +79,23 @@ from aiohttp.abc import AbstractAccessLogger  # noqa: E402 (import-by-feature)
 #: for the log file's whole retention — the first of the three surfaces
 #: INV-CB-006 names (the other two are handler logs and nginx's own access
 #: log). Matched against ``request.path``, which aiohttp has already decoded,
-#: so a percent-encoded path spelling cannot dodge the prefix.
+#: so a percent-encoded path spelling cannot dodge the prefix. The match is
+#: SEGMENT-AWARE (see :func:`_access_log_path`): stripping the trailing slash
+#: covers the bare ``/callback`` (which 404s but still carries a query) while
+#: keeping ``/callbackish`` — a different route — unsuppressed.
 QUERY_SUPPRESSED_PREFIXES = frozenset({"/callback/"})
+
+
+def _is_suppressed_path(path: str) -> bool:
+    """Segment-aware prefix test. For each configured prefix ``P``, suppress
+    when the path is exactly ``P`` without its trailing slash (``/callback``)
+    or is under it (``/callback/…``) — but never a sibling that merely shares
+    a textual prefix (``/callbackish``)."""
+    for prefix in QUERY_SUPPRESSED_PREFIXES:
+        base = prefix.rstrip("/")
+        if path == base or path.startswith(base + "/"):
+            return True
+    return False
 
 
 def _access_log_path(request) -> str:
@@ -97,8 +112,7 @@ def _access_log_path(request) -> str:
     the two branches consistent.
     """
     path = getattr(request, "path", None)
-    if isinstance(path, str) and any(
-            path.startswith(prefix) for prefix in QUERY_SUPPRESSED_PREFIXES):
+    if isinstance(path, str) and _is_suppressed_path(path):
         raw = getattr(getattr(request, "rel_url", None), "raw_path", None)
         return raw if isinstance(raw, str) else path
     return getattr(request, "path_qs", path)

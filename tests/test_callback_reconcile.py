@@ -175,6 +175,10 @@ async def test_valid_assigned_acked_callback_routes(tmp_path):
     assert entry is not None
     assert entry["plugin"] == "gmail"
     assert entry["declared"] == "authorize"
+    # The effective name is carried in the value (it is also the key) so the
+    # callback handler reads the real value rather than a routed-name
+    # fallback (callback_http._process).
+    assert entry["effective"] == "plg-gmail--authorize"
 
 
 async def test_invalid_declaration_darks_the_whole_set(tmp_path):
