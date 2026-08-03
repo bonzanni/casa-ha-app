@@ -310,20 +310,33 @@ async def test_has_job_is_false_for_something_never_registered():
     assert reg.has_job("assistant", "reminder-nope0000") is False
 
 
-async def test_reminder_job_names_lists_only_this_roles_reminders():
+async def test_reminder_job_names_selects_by_provenance_not_name():
+    """The schema requires every date trigger to carry the reminder prefix,
+    so an operator may legitimately author one. Only specs recorded as coming
+    from the reminder store may be listed for removal."""
     from config import TriggerSpec
 
     sched = _make_scheduler()
     reg = _registry(scheduler=sched)
-    reg.register_agent("assistant", [_date_spec(_future())], ["telegram"])
+    # From the store.
+    reg.register_agent("assistant", [TriggerSpec(
+        name="reminder-ours", type="cron", schedule="0 7 * * thu",
+        channel="telegram", prompt="x", from_reminder_store=True)],
+        ["telegram"])
+    # Operator-authored, same name shape.
+    reg.register_agent("assistant", [TriggerSpec(
+        name="reminder-theirs", type="cron", schedule="0 7 * * thu",
+        channel="telegram", prompt="x")], ["telegram"])
     reg.register_agent("assistant", [TriggerSpec(
         name="heartbeat", type="interval", minutes=60,
         channel="telegram", prompt="hb")], ["telegram"])
-    reg.register_agent("butler", [_date_spec(_future(), name="reminder-b0b0b0b0")],
-                       ["telegram"])
+    # Another role's store entry.
+    reg.register_agent("butler", [TriggerSpec(
+        name="reminder-butler", type="cron", schedule="0 7 * * thu",
+        channel="telegram", prompt="x", from_reminder_store=True)],
+        ["telegram"])
 
-    got = reg.reminder_job_names("assistant", "reminder-")
-    assert got == ["reminder-a1b2c3"]
+    assert reg.reminder_job_names("assistant") == ["reminder-ours"]
 
 
 async def test_has_job_stays_true_while_the_dispatch_is_in_flight():

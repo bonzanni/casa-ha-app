@@ -4761,6 +4761,7 @@ async def set_reminder(args: dict) -> dict:
         name=name, type=entry["type"], schedule=entry.get("schedule", ""),
         at=entry.get("at", ""), one_shot=entry["one_shot"],
         channel=channel, prompt=entry["prompt"],
+        from_reminder_store=True,
     )
     try:
         runtime.trigger_registry.register_agent(role, [spec], channels)

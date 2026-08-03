@@ -59,7 +59,11 @@ disagree, and drift across a DST boundary.
 
 **The store is the truth; the scheduler is a cache of it.** The sweep reconciles in both
 directions — registering any reminder with no live job, and dropping any reminder job with no
-entry left in the store — which heals a divergence without needing a lock. A reload
+entry left in the store — which heals a divergence without needing a lock. Which jobs are
+*eligible* to be dropped is decided by recorded provenance, carried on the spec from the file
+it was loaded from — never by the name. The schema requires every point-in-time trigger to
+carry the reserved prefix, so an operator may legitimately author one in their own file, and
+matching on the name would delete it. A reload
 re-registering a role from a snapshot taken before a reminder was written would otherwise drop
 a *recurring* reminder for good, since only one-shots are recoverable by delivery; the same
 race in the other direction would leave a cancelled reminder firing forever. A consequence

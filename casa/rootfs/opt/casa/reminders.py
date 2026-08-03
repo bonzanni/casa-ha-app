@@ -217,52 +217,6 @@ def reminders_path(agents_dir: str, role: str) -> str:
     return os.path.join(agents_dir, role, "reminders.yaml")
 
 
-def operator_triggers_path(agents_dir: str, role: str) -> str:
-    """The OPERATOR's trigger file for *role* — the one this module never
-    writes to, and whose entries reverse reconciliation must never drop."""
-    return os.path.join(agents_dir, role, "triggers.yaml")
-
-
-def operator_trigger_names(agents_dir: str, role: str) -> "set[str] | None":
-    """Names declared in *role*'s operator-authored triggers.yaml.
-
-    Reverse reconciliation needs PROVENANCE, not a name pattern. The schema
-    requires a ``date`` trigger to carry the reminder prefix, so an operator
-    may legitimately author one in triggers.yaml — and dropping its job
-    because it is absent from reminders.yaml would stop it firing entirely.
-
-    Returns ``None`` when provenance is UNAVAILABLE — the file exists but
-    cannot be read or parsed. That is emphatically NOT the same as "the
-    operator declared nothing": an empty set authorises deletion, so a
-    malformed file would silently delete the operator's live triggers.
-    Callers must skip reverse deletion when this is None. A file that simply
-    does not exist IS an empty set — nothing is declared, nothing is exempt.
-    """
-    path = operator_triggers_path(agents_dir, role)
-    if not os.path.exists(path):
-        return set()
-    try:
-        # MUST mirror agent_loader._read_yaml, which substitutes ${VAR}
-        # BEFORE parsing and validating. A trigger named ``${TRIGGER_NAME}``
-        # registers under the substituted value, so reading the raw text here
-        # would see a different name, judge the live job an orphan, and delete
-        # the operator's trigger.
-        from config import _substitute_env
-
-        with open(path, encoding="utf-8") as fh:
-            doc = load_yaml_no_aliases(_substitute_env(fh.read())) or {}
-        if not isinstance(doc, dict):
-            raise ValueError(f"{path}: triggers.yaml is not a mapping")
-        return {t.get("name", "")
-                for t in (doc.get("triggers") or []) if isinstance(t, dict)}
-    except Exception:  # noqa: BLE001 - malformed YAML raises several types
-        logger.warning(
-            "reminders: cannot read operator triggers for %s; skipping "
-            "reverse reconciliation for this role", role, exc_info=True,
-        )
-        return None
-
-
 def _load(path: str) -> dict:
     if not os.path.exists(path):
         return {"schema_version": 1, "triggers": []}
@@ -476,23 +430,18 @@ def _reconcile_registrations(runtime, registry, role: str, path: str,
     # snapshot taken before the cancellation — would otherwise leave the
     # reminder firing forever, even though cancel_reminder reported success.
     live_names = {e.get("name", "") for e in entries}
-    # An operator may legitimately author a reminder-prefixed trigger in
-    # their OWN file — the schema requires the prefix on every date trigger —
-    # and dropping its job because it is absent from reminders.yaml would stop
-    # it firing at all. Provenance, not the name pattern, decides ownership.
-    operator_names = operator_trigger_names(runtime.agents_dir, role)
-    if operator_names is None:
-        # Provenance unknown — deleting now could remove a live operator
-        # trigger. Forward re-registration below still runs: it only ever
-        # ADDS, so it is safe without provenance.
+    # Only jobs the registry recorded as coming FROM THIS STORE are candidates
+    # for removal. Provenance is carried as data on the spec, not inferred
+    # from the name or by re-reading the operator's file — the schema requires
+    # every date trigger to carry the reminder prefix, so an operator may
+    # legitimately author one, and three rounds of inference each found a new
+    # way to delete a live operator trigger.
+    try:
+        registered = registry.reminder_job_names(role)
+    except Exception:  # noqa: BLE001 - older registry without the accessor
         registered = []
-    else:
-        try:
-            registered = registry.reminder_job_names(role, REMINDER_PREFIX)
-        except Exception:  # noqa: BLE001 - older registry without the accessor
-            registered = []
     for name in registered:
-        if name not in live_names and name not in operator_names:
+        if name not in live_names:
             logger.info(
                 "reminder sweep: dropping job %s for %s — no longer in the "
                 "store", name, role,
@@ -519,6 +468,7 @@ def _reconcile_registrations(runtime, registry, role: str, path: str,
                 one_shot=bool(entry.get("one_shot", False)),
                 channel=entry.get("channel", ""),
                 prompt=entry.get("prompt", ""),
+                from_reminder_store=True,
             )], channels)
             logger.info(
                 "reminder sweep: re-registered %s for %s (no live job)",

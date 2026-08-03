@@ -184,6 +184,15 @@ class TriggerSpec:
     # reminders.yaml entry after a single fire.
     at: str = ""
     one_shot: bool = False
+    # #396: True only for specs loaded from (or written to) the agent-owned
+    # reminders.yaml. Reverse reconciliation drops a job when its entry is
+    # gone from that store, and it must never touch an operator-authored
+    # trigger — but the schema REQUIRES every date trigger to carry the
+    # reminder name prefix, so the name cannot tell them apart. Three review
+    # rounds of inferring provenance by re-reading triggers.yaml each found a
+    # new way to delete a live operator trigger; carrying it as DATA from the
+    # file the spec came from removes the guesswork entirely.
+    from_reminder_store: bool = False
 
 
 @dataclass

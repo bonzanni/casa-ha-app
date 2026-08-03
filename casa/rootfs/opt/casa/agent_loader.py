@@ -940,6 +940,7 @@ def _normalize_webhook_auth(trig: dict[str, Any], trig_name: str) -> dict[str, A
 
 def _build_triggers(
     data: dict[str, Any], *, agent_dir: str,
+    from_reminder_store: bool = False,
 ) -> list[TriggerSpec]:
     specs: list[TriggerSpec] = []
     for t in (data.get("triggers") or []):
@@ -964,6 +965,7 @@ def _build_triggers(
             clearance=t.get("clearance", "public") if is_webhook else "public",
             at=t.get("at", "") or "",
             one_shot=bool(t.get("one_shot", False)),
+            from_reminder_store=from_reminder_store,
         ))
     return specs
 
@@ -1222,7 +1224,8 @@ def load_agent_from_dir(
         # operator's file wins and the colliding reminder is dropped with a
         # warning: a lost reminder is bad, a Casa that will not start is worse.
         existing = {t.name for t in cfg.triggers}
-        for spec in _build_triggers(rem_data, agent_dir=agent_dir):
+        for spec in _build_triggers(rem_data, agent_dir=agent_dir,
+                                    from_reminder_store=True):
             if spec.name in existing:
                 logger.warning(
                     "reminders.yaml: %r collides with a trigger already "

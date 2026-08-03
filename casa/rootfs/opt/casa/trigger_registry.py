@@ -374,19 +374,25 @@ class TriggerRegistry:
         """
         return self._drop_job(f"{role}:{name}")
 
-    def reminder_job_names(self, role: str, prefix: str) -> list[str]:
-        """Names of this role's registered jobs carrying *prefix* (#396).
+    def reminder_job_names(self, role: str) -> list[str]:
+        """Names of this role's jobs that came FROM THE REMINDER STORE (#396).
 
-        The sweep uses this to reconcile in BOTH directions: a reminder job
+        The sweep uses this to reconcile in both directions: a reminder job
         with no entry left in the store must go, or a cancellation that raced
         a reload — which re-registers from a snapshot taken before the
         cancellation — would leave the reminder firing forever despite the
         tool having reported success.
+
+        Selection is by the spec's recorded provenance, never by its name. The
+        schema requires every date trigger to carry the reminder prefix, so an
+        operator may legitimately author one in their own file; matching on
+        the prefix would delete it.
         """
         head = f"{role}:"
-        return [job_id[len(head):] for job_id in self._seen_job_ids
+        return [job_id[len(head):]
+                for job_id, spec in self._specs_by_job_id.items()
                 if job_id.startswith(head)
-                and job_id[len(head):].startswith(prefix)]
+                and getattr(spec, "from_reminder_store", False)]
 
     def _register_webhook(self, role: str, trig: TriggerSpec) -> None:
         # Release A: webhook triggers are served ONLY by the authenticated
