@@ -1,6 +1,6 @@
 <div align="center">
 
-<img src="casa/logo.png" alt="Casa — helpful AI for everyday life" width="356">
+<img src="assets/casa-banner.png" alt="Casa — helpful AI for everyday life" width="356">
 
 # Casa — Claude-powered agents for Home Assistant
 
