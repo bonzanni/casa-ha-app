@@ -218,6 +218,34 @@ def reminders_path(agents_dir: str, role: str) -> str:
     return os.path.join(agents_dir, role, "reminders.yaml")
 
 
+# Every field this module reads, and the type it must have. Anything else is
+# dropped at the boundary rather than crashing a consumer downstream.
+_FIELD_TYPES = {
+    "name": str, "type": str, "at": str, "schedule": str,
+    "channel": str, "prompt": str, "one_shot": bool,
+}
+
+
+def _wellformed(entry) -> bool:
+    """True if *entry* is safe for every consumer in this module."""
+    if not isinstance(entry, dict):
+        return False
+    if not isinstance(entry.get("name"), str):
+        return False
+    for field, expected in _FIELD_TYPES.items():
+        value = entry.get(field)
+        if value is None:
+            continue
+        # bool is a subclass of int; require an exact match for one_shot so a
+        # stray integer does not read as True.
+        if expected is bool:
+            if not isinstance(value, bool):
+                return False
+        elif not isinstance(value, expected):
+            return False
+    return True
+
+
 def _load(path: str) -> dict:
     """Read the store, folding every parse failure into ``ValueError``.
 
@@ -241,14 +269,17 @@ def _load(path: str) -> dict:
     doc.setdefault("schema_version", 1)
     if not isinstance(doc.get("triggers"), list):
         doc["triggers"] = []
-    # Normalize ONCE, here, so every consumer is inherently safe. Guarding
-    # per-function does not work: a pass that hardened `past_due` alone left
-    # `remove_entry` calling .get() on the same bad item, which aborted the
-    # sweep right after a delivery — so the reminder was redelivered every
-    # pass and later roles were skipped entirely. A non-mapping entry is
-    # corruption in an agent-owned file; dropping it is also what makes the
-    # file writable again.
-    kept = [e for e in doc["triggers"] if isinstance(e, dict)]
+    # Normalize ONCE, here, so every consumer is inherently safe by
+    # construction. Guarding per-function does not terminate: hardening
+    # `past_due` against a non-mapping left `remove_entry` raising on it, and
+    # hardening that left a non-string `name`, then a non-string `at`. The
+    # check below covers EVERY field this module reads, so no further variant
+    # of "malformed entry crashes a consumer" is reachable.
+    #
+    # A malformed entry is corruption in an agent-owned file — the schema
+    # validates it at load and only this module writes it — so dropping it is
+    # both safe and what makes the file writable again.
+    kept = [e for e in doc["triggers"] if _wellformed(e)]
     if len(kept) != len(doc["triggers"]):
         logger.warning(
             "reminders: %s contains %d non-mapping entr(ies); ignoring them",

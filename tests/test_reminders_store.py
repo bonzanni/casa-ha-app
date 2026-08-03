@@ -190,3 +190,41 @@ def test_a_non_mapping_entry_is_survivable_by_EVERY_reader_and_writer(tmp_path):
         "at": "2099-01-01T00:00:00+00:00", "channel": "telegram",
         "prompt": "x"})
     assert reminders.existing_names(path) == {"reminder-new222"}
+
+
+@pytest.mark.parametrize("bad", [
+    "a bare string, not a mapping",
+    ["a", "list"],
+    42,
+    None,
+    {"name": ["reminder-bad"]},                 # non-string name
+    {"name": {"a": 1}},                         # unhashable name
+    {"name": "reminder-bad", "at": 123},        # non-string at
+    {"name": "reminder-bad", "at": ["x"]},
+    {"name": "reminder-bad", "type": 7},
+    {"name": "reminder-bad", "prompt": ["x"]},  # collection prompt
+    {"name": "reminder-bad", "channel": 1},
+    {"name": "reminder-bad", "schedule": 5},
+    {"name": "reminder-bad", "one_shot": 1},    # int is not bool
+    {"type": "date", "at": "2026-01-01T00:00:00+00:00"},   # no name at all
+])
+def test_no_malformed_entry_can_crash_any_consumer(tmp_path, bad):
+    """Rounds 10 and 11 were the same class ratcheting through field types —
+    non-mapping, then non-string name, then non-string `at`. The boundary now
+    checks EVERY field this module reads, so no further variant is reachable.
+    A malformed entry must never abort the sweep: that skips later roles and
+    redelivers whatever was already sent."""
+    good = {"name": "reminder-old111", "type": "date", "one_shot": True,
+            "at": "2026-08-03T08:00:00+02:00", "channel": "telegram",
+            "prompt": "x"}
+    p = tmp_path / "reminders.yaml"
+    p.write_text(yaml.safe_dump({"schema_version": 1,
+                                 "triggers": [bad, good]}), encoding="utf-8")
+    path, now = str(p), datetime(2026, 8, 3, 12, 0, tzinfo=CEST)
+
+    assert [e["name"] for e in reminders.past_due(path, now)] == ["reminder-old111"]
+    assert [e["name"] for e in reminders.all_entries(path)] == ["reminder-old111"]
+    assert reminders.existing_names(path) == {"reminder-old111"}
+    assert reminders.remove_entry(path, "reminder-old111") is True
+    reminders.append_entry(path, dict(good, name="reminder-new222"))
+    assert reminders.existing_names(path) == {"reminder-new222"}
