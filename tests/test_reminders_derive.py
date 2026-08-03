@@ -14,9 +14,18 @@ def test_name_is_prefixed_and_unique():
     a, b = reminders.new_reminder_name(), reminders.new_reminder_name()
     assert a.startswith("reminder-") and b.startswith("reminder-")
     assert a != b
-    assert reminders.is_reminder_name(a)
-    assert not reminders.is_reminder_name("heartbeat")
-    assert not reminders.is_reminder_name("")
+
+
+def test_the_prefix_is_no_longer_an_authorization_predicate():
+    """#398 release 2 DELETED ``is_reminder_name``.
+
+    The prefix is a naming convention that makes a generated reminder legible
+    in ``get_schedule`` — it is NOT what bounds the writer, because the schema
+    permits an operator to author ``reminder-bins`` themselves. Ownership is
+    ``managed_by``. A surviving prefix predicate would be a second, unsound
+    gate that a future caller could reach for by mistake.
+    """
+    assert not hasattr(reminders, "is_reminder_name")
 
 
 def test_generated_name_matches_the_schema_name_pattern():
@@ -174,13 +183,26 @@ def test_new_name_raises_rather_than_returning_a_collision(monkeypatch):
         reminders.new_reminder_name({"reminder-deadbeef"})
 
 
-def test_existing_names_reads_the_store(tmp_path):
-    path = str(tmp_path / "reminders.yaml")
-    reminders.append_entry(path, {
+def test_existing_names_reads_the_whole_namespace(tmp_path):
+    """Generation must avoid OPERATOR names too, not just the agent's own.
+
+    ``register_agent`` raises on a duplicate name and that is uncaught at boot,
+    so a generated reminder colliding with the heartbeat would be a crash loop
+    rather than a lost reminder.
+    """
+    import yaml
+    path = str(tmp_path / "triggers.yaml")
+    with open(path, "w", encoding="utf-8") as fh:
+        yaml.safe_dump({"schema_version": 2, "triggers": [
+            {"name": "heartbeat", "type": "interval", "minutes": 60,
+             "channel": "telegram", "prompt": "hb"},
+        ]}, fh, sort_keys=False)
+    reminders.add_entry(path, {
         "name": "reminder-aaaaaaaa", "type": "date", "one_shot": True,
         "at": "2099-01-01T00:00:00+00:00", "channel": "telegram",
-        "prompt": "x"})
-    assert reminders.existing_names(path) == {"reminder-aaaaaaaa"}
+        "prompt": "x", "managed_by": "agent"})
+
+    assert reminders.existing_names(path) == {"heartbeat", "reminder-aaaaaaaa"}
     assert reminders.existing_names(str(tmp_path / "nope.yaml")) == set()
 
 

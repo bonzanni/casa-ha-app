@@ -123,10 +123,10 @@ class TriggerRegistry:
         self._scheduler = scheduler
         self._app = app
         self._bus = bus
-        # #396: invoked as (role, trigger_name) after a one_shot trigger has
-        # been dispatched, so the owning reminders.yaml entry can be removed.
-        # INJECTED rather than done here — the registry must not learn to
-        # write YAML. Default None keeps every existing call site working.
+        # #396: invoked as (role, trigger_name) after an AGENT-OWNED one_shot
+        # trigger has been dispatched, so its entry can be removed. INJECTED
+        # rather than done here — the registry must not learn to write YAML.
+        # Default None keeps every existing call site working.
         self._on_one_shot_fired = on_one_shot_fired
         self._seen_job_ids: set[str] = set()
         # #396: job ids whose _fire is RUNNING RIGHT NOW. APScheduler submits
@@ -253,14 +253,30 @@ class TriggerRegistry:
             await self._bus.send(msg)
 
             if trig.one_shot:
-                # #396 / INV-TRIG-006. Ordering is load-bearing: the bus send
+                # #396 / INV-TRIG-009. Ordering is load-bearing: the bus send
                 # has ALREADY happened, so everything below is cleanup, not
                 # part of delivery. A failure here leaves the yaml entry in
                 # place and the sweep redelivers — at-least-once by choice
                 # (spec §8), because a duplicate nudge is a far better failure
                 # than a missed reminder.
+                #
+                # _drop_job is UNCONDITIONAL: the job must go whoever owns the
+                # entry, both because a one-shot that keeps its job could fire
+                # again and because the id must be freed for re-registration.
                 self._drop_job(job_id)
-                if self._on_one_shot_fired is not None:
+                # The ENTRY removal is gated on ownership (#398 release 2).
+                # An operator may author their own dated one-shot, and deleting
+                # a line out of their triggers.yaml because it fired is not
+                # this registry's business. Consequence, accepted and stated in
+                # INV-TRIG-009: such an entry lingers inert — never
+                # re-registered, because a past-dated trigger is not registered
+                # at boot, and never swept, because it carries no managed_by.
+                if trig.managed_by != "agent":
+                    logger.info(
+                        "one-shot %s for %s is operator-owned; leaving its "
+                        "entry in place", trig.name, role,
+                    )
+                elif self._on_one_shot_fired is not None:
                     try:
                         self._on_one_shot_fired(role, trig.name)
                     except Exception:  # noqa: BLE001
@@ -374,25 +390,24 @@ class TriggerRegistry:
         """
         return self._drop_job(f"{role}:{name}")
 
-    def reminder_job_names(self, role: str) -> list[str]:
-        """Names of this role's jobs that came FROM THE REMINDER STORE (#396).
+    def agent_owned_job_names(self, role: str) -> list[str]:
+        """Names of this role's jobs the AGENT owns (``managed_by: agent``).
 
-        The sweep uses this to reconcile in both directions: a reminder job
-        with no entry left in the store must go, or a cancellation that raced
-        a reload — which re-registers from a snapshot taken before the
+        The sweep uses this to reconcile in both directions: an agent-owned job
+        with no entry left in ``triggers.yaml`` must go, or a cancellation that
+        raced a reload — which re-registers from a snapshot taken before the
         cancellation — would leave the reminder firing forever despite the
         tool having reported success.
 
-        Selection is by the spec's recorded provenance, never by its name. The
-        schema requires every date trigger to carry the reminder prefix, so an
-        operator may legitimately author one in their own file; matching on
-        the prefix would delete it.
+        Selection is by the spec's recorded ownership, never by its name. The
+        operator's triggers share the same file, and the schema permits them a
+        `reminder-`-prefixed dated one-shot of their own; matching on the
+        prefix would drop it.
         """
         head = f"{role}:"
         return [job_id[len(head):]
                 for job_id, spec in self._specs_by_job_id.items()
-                if job_id.startswith(head)
-                and getattr(spec, "from_reminder_store", False)]
+                if job_id.startswith(head) and spec.managed_by == "agent"]
 
     def _register_webhook(self, role: str, trig: TriggerSpec) -> None:
         # Release A: webhook triggers are served ONLY by the authenticated

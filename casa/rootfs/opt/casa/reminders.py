@@ -1,25 +1,68 @@
-"""Reminder entries as data (#396).
+"""Reminder entries as data (#396, folded into ``triggers.yaml`` by #398).
 
 A reminder IS a trigger. This module owns the parts of that which are about
-*data*: generating and recognising reminder names, deriving a schedule from a
-resolved instant plus a repeat rule, reading/appending/removing reminder
-entries in a role's ``reminders.yaml``, and answering which reminders are
-overdue. It knows about files and time; it knows nothing about APScheduler or
-MCP — so ``trigger_registry`` never learns to write YAML and ``tools`` never
-learns cron.
+*data*: generating reminder names, deriving a schedule from a resolved instant
+plus a repeat rule, adding/removing the agent's own entries in a role's
+``triggers.yaml``, and answering which reminders are overdue. It knows about
+files and time; it knows nothing about APScheduler or MCP — so
+``trigger_registry`` never learns to write YAML and ``tools`` never learns cron.
 
-Two design points worth keeping in view:
+Design points worth keeping in view:
 
 * **Cron has no year field.** A dated one-shot written as cron (``55 7 3 8 *``)
   is an ANNUAL trigger with a self-delete instruction stapled on. ``type:
   date`` exists to remove that trap.
-* **Presence is the ledger.** A one-shot reminder still sitting in
-  ``reminders.yaml`` with a past fire time *is* the record that delivery is
-  owed. Delivery removes the entry. There is no second store to keep in sync.
-* **The file is separate on purpose.** ``config_sync`` resolves an edited
-  image-owned file against a changed shipped default as "image wins", so
-  reminders kept in ``triggers.yaml`` would be deleted wholesale by the first
-  update touching its default. See :func:`reminders_path`.
+* **Presence is the ledger.** A one-shot reminder still sitting in the file
+  with a past fire time *is* the record that delivery is owed. Delivery removes
+  the entry. There is no second store to keep in sync.
+* **One file, ownership per entry.** Reminders live in the operator's own
+  ``triggers.yaml``. #396 kept them apart because ``config_sync`` resolved an
+  edited image-owned file against a changed shipped default as "image wins",
+  which would have deleted every pending reminder on such an update; #398
+  release 1 made that file reconcile PER ENTRY, so a locally-added name is
+  preserved and the separate file lost its only purpose.
+* **Ownership is DATA, never inferred.** An entry is the agent's iff it carries
+  ``managed_by: agent``. The schema permits an operator to author ``name:
+  reminder-bins / type: date / one_shot: true``, so neither the reserved name
+  prefix, nor the type, nor the flag identifies ownership — three review rounds
+  of inferring it each found a new way to delete a live operator trigger.
+* **:func:`remove_entry` must never refuse for a reason :func:`past_due`
+  tolerates.** The sweep delivers what ``past_due`` selects and then removes
+  it; any *check* present in one and absent from the other means the sweep can
+  deliver an entry it cannot clean up, and redelivers it every five minutes
+  forever. This is why the writer carries no whole-file duplicate-name check
+  and why removal skips schema validation: a duplicate elsewhere in the file
+  parses fine, so ``past_due`` succeeds, and a running process can hold a valid
+  snapshot while the on-disk file is invalid (``config_git_commit`` refuses such
+  a commit but leaves the working tree edited). Sharing :func:`_read_doc` is
+  what keeps their READ tolerance identical.
+
+  It does not make them *identical in every respect*, and the difference is
+  worth naming because it was mistaken for one once: reading a document and
+  re-emitting it can fail independently (see :func:`_emit`). What is guaranteed
+  is that both failure directions land inside the handled ``(OSError,
+  ValueError)`` contract, so the worst case is the ordinary at-least-once one —
+  delivered, not cleaned up, logged, and the remaining roles still swept —
+  never an aborted pass.
+
+* **A pre-existing SCHEMA defect in a sibling entry never blocks either
+  operation.** The file on disk can already be invalid while Casa runs on the
+  snapshot it booted with, and refusing then protects nothing while making
+  reminders unavailable. So creation schema-validates only the entry it is adding
+  (see :func:`_validate_candidate`), and removal validates nothing at all.
+
+  "Schema" is the operative word: a sibling can still block both operations by
+  being unreadable or un-re-emittable, because there is then no way to write the
+  file at all (see :func:`_read_doc` and :func:`_emit`). Only the *judgment* is
+  scoped to our own entry; the mechanics are necessarily whole-file.
+
+  The qualifier is exact, not hedging: the added entry is judged under the
+  document's REAL top level, because ``schema_version`` decides what is legal.
+  So a pre-existing defect in the top level itself — an unknown root key, an
+  out-of-range ``schema_version`` — does still refuse creation. That is the
+  intended boundary rather than a leak: the top level is not separable from the
+  judgment, and such a file cannot boot either way, so neither refusing nor
+  writing helps the operator.
 """
 
 from __future__ import annotations
@@ -32,7 +75,7 @@ from datetime import datetime, timedelta
 import yaml
 
 from atomic_io import atomic_write_text
-from yaml_safety import load_yaml_no_aliases
+from config import _ENV_RE
 
 logger = logging.getLogger(__name__)
 
@@ -72,20 +115,19 @@ def new_reminder_name(taken: "set[str] | None" = None) -> str:
 
 
 def existing_names(path: str) -> set[str]:
-    """Every trigger name currently in the reminder store at *path*."""
+    """EVERY trigger name in the file at *path*, whatever its owner.
+
+    Deliberately not limited to the agent's own entries: ``register_agent``
+    raises on a duplicate name and that is uncaught at boot, so a generated
+    reminder name colliding with an OPERATOR trigger would be a crash loop.
+    Generating against the whole namespace is what prevents it.
+    """
     try:
-        return {t.get("name", "") for t in _load(path)["triggers"]}
+        _, doc = _read_doc(path)
+        return {e["name"] for e in doc["triggers"]
+                if isinstance(e, dict) and isinstance(e.get("name"), str)}
     except (OSError, ValueError):
         return set()
-
-
-def is_reminder_name(name: str) -> bool:
-    """True iff *name* is one the reminder tools are allowed to touch.
-
-    This is the whole bound between "a resident managing its own reminders"
-    and "a resident editing operator configuration".
-    """
-    return bool(name) and name.startswith(REMINDER_PREFIX)
 
 
 # ---------------------------------------------------------------------------
@@ -199,30 +241,33 @@ def derive_schedule(at: datetime, repeat: str, tz=None) -> dict[str, str]:
 
 
 # ---------------------------------------------------------------------------
-# The entry store — reminder entries inside a role's reminders.yaml
+# The entry store — the agent's own entries inside a role's triggers.yaml
 # ---------------------------------------------------------------------------
 
+# The one value ``managed_by`` may carry. Absent means the entry is the
+# operator's, which is why the schema's enum is single-valued: an "operator"
+# marker would invert the default.
+OWNER_AGENT = "agent"
 
-def reminders_path(agents_dir: str, role: str) -> str:
-    """Absolute path to *role*'s reminders.yaml. Residents only.
 
-    Reminders deliberately do NOT live in ``triggers.yaml``, even though they
-    are ordinary triggers and the loader merges them into the same list.
-    ``config_sync``'s three-way reconcile treats an edited ``triggers.yaml``
-    as a conflict once the image ships a changed default and resolves it
-    "image wins" — which would silently delete every pending reminder on such
-    an update, exactly the failure this whole feature exists to prevent.
-    ``reminders.yaml`` is not in the defaults tree, so reconcile adopts it and
-    never rewrites it.
+def triggers_path(agents_dir: str, role: str) -> str:
+    """Absolute path to *role*'s triggers.yaml. Residents only.
+
+    One file (#398 release 2). Reminders are ordinary entries in the operator's
+    own trigger file, distinguished by ``managed_by: agent`` rather than by
+    living somewhere else. ``role_configs`` holds residents only, so this is
+    never called for a specialist or executor — where the file is FORBIDDEN and
+    creating one would be boot-fatal.
     """
-    return os.path.join(agents_dir, role, "reminders.yaml")
+    return os.path.join(agents_dir, role, "triggers.yaml")
 
 
-# Every field this module reads, and the type it must have. Anything else is
-# dropped at the boundary rather than crashing a consumer downstream.
+# Every field this module reads, and the type it must have. An entry failing
+# this is SKIPPED BY SELECTION but never removed from the document — see
+# _read_doc.
 _FIELD_TYPES = {
     "name": str, "type": str, "at": str, "schedule": str,
-    "channel": str, "prompt": str, "one_shot": bool,
+    "channel": str, "prompt": str, "one_shot": bool, "managed_by": str,
 }
 
 
@@ -246,95 +291,268 @@ def _wellformed(entry) -> bool:
     return True
 
 
-def _load(path: str) -> dict:
-    """Read the store, folding every parse failure into ``ValueError``.
+def _read_doc(path: str) -> "tuple[str | None, dict]":
+    """``(raw_text, document)`` for *path*, folding parse failure into
+    ``ValueError``. ``raw_text`` is ``None`` when the file does not exist.
 
-    ``load_yaml_no_aliases`` raises ``yaml.YAMLError`` or ``RecursionError``,
-    neither of which is a ``ValueError`` — and its docstring says callers are
-    expected to fold both into their own fail-closed error. Without that, a
-    malformed store would escape every ``except (OSError, ValueError)`` here
-    and abort the whole sweep, so later roles' overdue reminders would go
-    undelivered until a pass that happened to avoid the bad file.
+    This is the STRUCTURAL parse: the document that will be mutated and
+    re-emitted. It is deliberately NOT env-substituted — substituting before
+    dumping would bake resolved values into the file and destroy the operator's
+    ``${VAR}`` placeholders permanently.
+
+    It also does NOT drop malformed entries. Under #396 this file was written
+    only by this module, so dropping corruption was safe; it is now the
+    OPERATOR's file, and silently dropping an entry from the document we write
+    back would destroy their configuration. Malformed entries are skipped by
+    SELECTION instead (:func:`_wellformed`) and re-emitted untouched.
+
+    Every failure folds into ``ValueError`` because both this module's readers
+    and its writers catch exactly ``(OSError, ValueError)``: an unfolded
+    ``yaml.YAMLError`` would escape and abort the whole sweep, so later roles'
+    overdue reminders would go undelivered.
     """
     if not os.path.exists(path):
-        return {"schema_version": 1, "triggers": []}
+        # A role's first reminder creates the file. schema_version 2 is what the
+        # configurator's own add recipe writes, and it keeps #402's future
+        # tightening from being boot-fatal on a file this writer created.
+        return None, {"schema_version": 2, "triggers": []}
     with open(path, encoding="utf-8") as fh:
         text = fh.read()
     try:
-        doc = load_yaml_no_aliases(text) or {}
+        doc = yaml.safe_load(text) or {}
     except (Exception, RecursionError) as exc:  # noqa: BLE001
         raise ValueError(f"{path}: cannot parse: {exc}") from exc
     if not isinstance(doc, dict):
-        raise ValueError(f"{path}: reminders.yaml is not a mapping")
-    doc.setdefault("schema_version", 1)
+        raise ValueError(f"{path}: triggers.yaml is not a mapping")
     if not isinstance(doc.get("triggers"), list):
-        doc["triggers"] = []
-    # Normalize ONCE, here, so every consumer is inherently safe by
-    # construction. Guarding per-function does not terminate: hardening
-    # `past_due` against a non-mapping left `remove_entry` raising on it, and
-    # hardening that left a non-string `name`, then a non-string `at`. The
-    # check below covers EVERY field this module reads, so no further variant
-    # of "malformed entry crashes a consumer" is reachable.
-    #
-    # A malformed entry is corruption in an agent-owned file — the schema
-    # validates it at load and only this module writes it — so dropping it is
-    # both safe and what makes the file writable again.
-    kept = [e for e in doc["triggers"] if _wellformed(e)]
-    if len(kept) != len(doc["triggers"]):
-        logger.warning(
-            "reminders: %s contains %d non-mapping entr(ies); ignoring them",
-            path, len(doc["triggers"]) - len(kept),
-        )
-        doc["triggers"] = kept
-    return doc
+        # NOT coerced to []: against a shared file that would silently erase
+        # every operator trigger on the next write.
+        raise ValueError(f"{path}: 'triggers' is not a list")
+    return text, doc
+
+
+def _agent_owned(entry) -> bool:
+    """True iff *entry* is one the reminder tools may touch."""
+    return (isinstance(entry, dict)
+            and entry.get("managed_by") == OWNER_AGENT)
+
+
+def _emit(doc: dict, path: str) -> str:
+    """Serialize *doc*, folding an emission failure into ``ValueError``.
+
+    Parsing tolerance and EMISSION tolerance are not the same (Sol, impl r1):
+    with the pinned PyYAML, a document nested a few hundred levels deep
+    ``safe_load``s fine but makes ``safe_dump`` raise ``RecursionError`` — which
+    is a ``RuntimeError``, so it escapes every ``except (OSError, ValueError)``
+    in this module and in the sweep. Unfolded it aborted the whole sweep pass
+    after a delivery, so later roles' overdue reminders went undelivered AND the
+    delivered entry was redelivered on every subsequent pass.
+
+    Folding it here puts such a file on the ordinary at-least-once path instead:
+    the reminder is delivered, cleanup fails loudly, the entry stays, and the
+    remaining roles are still swept. Delivery is deliberately NOT withheld — a
+    duplicate nudge is a better failure than a missed reminder (spec §8).
+    """
+    try:
+        return yaml.safe_dump(doc, sort_keys=False, allow_unicode=True)
+    except (Exception, RecursionError) as exc:  # noqa: BLE001
+        raise ValueError(f"{path}: cannot be re-emitted: {exc}") from exc
 
 
 def _save(path: str, doc: dict) -> None:
-    atomic_write_text(
-        path, yaml.safe_dump(doc, sort_keys=False, allow_unicode=True),
-    )
+    atomic_write_text(path, _emit(doc, path))
 
 
-def append_entry(path: str, entry: dict) -> None:
-    """Append a reminder *entry*, leaving every other trigger untouched."""
-    if not is_reminder_name(entry.get("name", "")):
-        raise ValueError(
-            f"refusing to write a non-reminder entry: {entry.get('name')!r}"
-        )
-    doc = _load(path)
-    doc["triggers"].append(entry)
-    _save(path, doc)
+def _schema_error(doc: dict, path: str) -> "str | None":
+    """The triggers-schema complaint about *doc*, or None if it validates.
 
+    ``agent_loader._validate`` raises ``LoadError``, a direct ``Exception``
+    subclass that no caller in this module catches (Sol r2 #2), so it is folded
+    into a return value here rather than escaping past ``set_reminder``'s
+    ``(OSError, ValueError)`` handler as an unstructured crash.
 
-def remove_entry(path: str, name: str) -> bool:
-    """Remove the reminder called *name*. True if something was removed.
-
-    Refuses any name lacking the reserved prefix — this is what keeps the
-    writer from deleting operator-authored triggers.
+    Only ``LoadError`` is folded, because only ``LoadError`` is a VERDICT ABOUT
+    THE DOCUMENT. Anything else — an unreadable or malformed schema file, an
+    invalid schema — means validation could not be performed at all, and that
+    must fail closed rather than be reported as "this document is fine". A broken
+    schema would otherwise disable the one check that stops a boot-breaking file
+    being written.
     """
-    if not is_reminder_name(name):
-        raise ValueError(f"not a reminder name: {name!r}")
-    doc = _load(path)
-    kept = [t for t in doc["triggers"] if t.get("name") != name]
-    if len(kept) == len(doc["triggers"]):
-        return False
-    doc["triggers"] = kept
-    _save(path, doc)
-    return True
+    import agent_loader
+
+    try:
+        agent_loader._validate(doc, "triggers", path)
+    except agent_loader.LoadError as exc:
+        return str(exc)
+    except (Exception, RecursionError) as exc:  # noqa: BLE001
+        raise ValueError(
+            f"{path}: cannot validate against the triggers schema: {exc}"
+        ) from exc
+    return None
 
 
-def all_entries(path: str) -> "list[dict] | None":
-    """Every reminder entry in the store at *path*.
+def _resolve(text: str, path: str) -> dict:
+    """The document as the LOADER sees it: ``_substitute_env``, then parse.
 
-    Returns ``None`` when the store cannot be read — NOT an empty list. An
-    empty list means "the store is empty", which authorises reverse
-    reconciliation to drop every reminder job; a transient read error must
-    never be allowed to say that, or one bad read would unschedule every
-    recurring reminder until the next successful sweep.
+    Distinct from :func:`_read_doc`'s structural parse, which must stay
+    unsubstituted so placeholders survive the rewrite.
+    """
+    from config import _substitute_env
+
+    try:
+        return yaml.safe_load(_substitute_env(text))
+    except (Exception, RecursionError) as exc:  # noqa: BLE001
+        raise ValueError(f"{path}: does not parse: {exc}") from exc
+
+
+def _validate_candidate(candidate: str, path: str, name: str) -> None:
+    """Refuse *candidate* unless the entry named *name* validates on its own.
+
+    Validation runs through the loader's own pipeline — ``_substitute_env``,
+    parse, then the triggers schema — because a file this writer considers fine
+    but the loader rejects is a boot failure at the next restart, the one
+    outcome worse than a refused reminder.
+
+    **Only the new entry is judged**, under the document's real top level (the
+    ``schema_version`` branch changes what is legal). That is the whole rule.
+    Two earlier versions tried to be cleverer and each drew a finding:
+
+    * validating the WHOLE candidate refused a reminder because some unrelated
+      entry was already invalid — protecting nothing, since such a file already
+      fails to load, while making reminders unavailable and naming an entry the
+      user never touched. A running Casa holds the snapshot it booted with, so
+      the file on disk can already be invalid while everything works
+      (``config_git_commit`` refuses a commit failing boot-parity but leaves the
+      working tree edited).
+    * comparing the whole candidate against the whole PRIOR document then let
+      any pre-existing complaint wave through any new one — including an invalid
+      reminder, a fresh boot defect this writer introduced.
+
+    Judging the added entry alone answers the actual question directly, and it is
+    sound rather than approximate: the schema carries no cross-entry constraints
+    (no ``uniqueItems``, no ``contains``, no ``minItems``), so an entry that
+    validates in isolation cannot be what makes the document fail. Duplicate
+    names — the one genuine cross-entry hazard — are refused separately in
+    :func:`add_entry`, where the check belongs.
+    """
+    resolved = _resolve(candidate, path)
+    solo = {k: v for k, v in resolved.items() if k != "triggers"}
+    solo["triggers"] = [e for e in resolved.get("triggers") or []
+                        # Picked out of the RESOLVED document so the entry is
+                        # judged exactly as the loader will see it.
+                        if isinstance(e, dict) and e.get("name") == name]
+    problem = _schema_error(solo, path)
+    if problem is not None:
+        raise ValueError(problem)
+
+
+def add_entry(path: str, entry: dict) -> None:
+    """Add one agent-owned *entry*, leaving every other trigger untouched.
+
+    Raises ``ValueError`` (or ``OSError``) and writes NOTHING on any refusal.
+    Refusing an add is always safe: the caller reports it and the user simply
+    has no reminder. That is why the checks here are strict while
+    :func:`remove_entry`'s are not — see the module docstring.
+    """
+    name = entry.get("name")
+    if not isinstance(name, str) or not name:
+        raise ValueError(f"a reminder entry needs a name; got {name!r}")
+    if not _agent_owned(entry):
+        raise ValueError(
+            f"refusing to write {name!r} without managed_by={OWNER_AGENT!r}: "
+            f"provenance is what bounds this writer"
+        )
+    # The one placeholder the writer controls. A stored ``${VAR}`` would be
+    # substituted by the loader at boot, so the reminder would not say what the
+    # user asked for; refusing is honest and keeps the file placeholder-free.
+    for field, value in entry.items():
+        if isinstance(value, str) and _ENV_RE.search(value):
+            raise ValueError(
+                f"a reminder's {field} cannot contain a ${{...}} placeholder"
+            )
+
+    text, doc = _read_doc(path)
+    # Env interpolation is re-emitted UNQUOTED by safe_dump, and the loader
+    # substitutes into the TEXT before parsing — so a `#` in the substituted
+    # value would start a comment and silently truncate the operator's entry.
+    # No emission style avoids this (quoting turns the truncation into a
+    # boot-fatal parse error instead), and the real fix is post-parse
+    # substitution in the loader. So the writer refuses at the door rather than
+    # rewriting such a file. Decided on the RAW TEXT, hence independent of the
+    # current environment: a comparison of resolved values would pass with a
+    # benign value today and still change the entry's meaning tomorrow.
+    if text is not None and _ENV_RE.search(text):
+        raise ValueError(
+            f"{path} uses ${{...}} interpolation, which this writer cannot "
+            f"rewrite without risking the meaning of an existing trigger"
+        )
+    if name in {e["name"] for e in doc["triggers"]
+                if isinstance(e, dict) and isinstance(e.get("name"), str)}:
+        # A duplicate makes register_agent raise, uncaught at boot: a crash
+        # loop. This is the ONLY duplicate check, and it is scoped to the name
+        # being added — a whole-file check would refuse removals too, which is
+        # how a delivered reminder gets stranded (Sol r2 #1).
+        raise ValueError(f"a trigger named {name!r} already exists")
+
+    candidate = dict(doc)
+    candidate["triggers"] = list(doc["triggers"]) + [entry]
+    text_out = _emit(candidate, path)
+    _validate_candidate(text_out, path, name)
+    atomic_write_text(path, text_out)
+
+
+def remove_entry(path: str, name: str) -> str:
+    """Remove the agent-owned entry called *name*.
+
+    Returns ``"removed"``, ``"not_found"``, or ``"not_owned"`` — three outcomes
+    rather than a bool so the canceller can tell the model "that is operator
+    configuration" instead of a misleading "no such reminder", decided by the
+    one authoritative field.
+
+    Deliberately does NOT schema-validate the document and carries no
+    whole-file duplicate check: removal must never refuse for a reason
+    :func:`past_due` tolerates, or the sweep delivers an entry it cannot clean
+    up and redelivers it every five minutes forever.
+    """
+    text, doc = _read_doc(path)
+    matches = [e for e in doc["triggers"]
+               if isinstance(e, dict) and e.get("name") == name]
+    if not matches:
+        return "not_found"
+    if not any(_agent_owned(e) for e in matches):
+        return "not_owned"
+
+    if text is not None and _ENV_RE.search(text):
+        # Warn and PROCEED. Refusing here is what strands a delivered reminder.
+        logger.warning(
+            "reminders: %s uses ${...} interpolation; rewriting it to remove "
+            "%s may change an existing trigger's resolved value", path, name,
+        )
+    candidate = dict(doc)
+    candidate["triggers"] = [e for e in doc["triggers"]
+                             if not (_agent_owned(e)
+                                     and e.get("name") == name)]
+    _save(path, candidate)
+    return "removed"
+
+
+def agent_entries(path: str) -> "list[dict] | None":
+    """Every agent-owned, well-formed entry in the file at *path*.
+
+    An entry carrying the marker but failing :func:`_wellformed` is skipped —
+    consumers here read its fields by type, and it is never dropped from the
+    document itself.
+
+    Returns ``None`` when the file cannot be read — NOT an empty list. An empty
+    list means "the agent owns nothing here", which authorises reverse
+    reconciliation to drop every reminder job; a transient read error must never
+    be allowed to say that, or one bad read would unschedule every recurring
+    reminder until the next successful sweep.
     """
     try:
-        return [e for e in _load(path)["triggers"]
-                if is_reminder_name(e.get("name", ""))]
+        _, doc = _read_doc(path)
+        return [e for e in doc["triggers"]
+                if _agent_owned(e) and _wellformed(e)]
     except (OSError, ValueError):
         logger.warning("reminders: cannot read %s; skipping reconciliation",
                        path, exc_info=True)
@@ -350,20 +568,23 @@ def past_due(path: str, now: datetime) -> list[dict]:
     """
     out: list[dict] = []
     try:
-        entries = _load(path)["triggers"]
+        _, doc = _read_doc(path)
     except (OSError, ValueError):
         logger.warning("reminders: cannot read %s; skipping", path,
                        exc_info=True)
         return out
-    for entry in entries:
+    for entry in doc["triggers"]:
+        # Ownership first, and by the field alone. An operator's own dated
+        # one-shot is a shape the schema permits, and delivering theirs — or
+        # deleting it afterwards — is exactly what inference used to do.
+        if not _agent_owned(entry) or not _wellformed(entry):
+            continue
         # A date trigger is one-shot BY DEFINITION, so membership is decided
         # on the type alone. Requiring the ``one_shot`` flag here as well
         # would mean an entry that somehow lacked it was skipped at
         # registration (past) AND skipped by the sweep — silently never
         # delivered. The schema forbids that shape; this does not depend on it.
         if entry.get("type") != "date":
-            continue
-        if not is_reminder_name(entry.get("name", "")):
             continue
         try:
             when = parse_at(entry.get("at", ""))
@@ -404,7 +625,13 @@ async def sweep_reminders(runtime, now: datetime) -> int:
 
     delivered = 0
     for role in list(getattr(runtime, "role_configs", {}) or {}):
-        path = reminders_path(runtime.agents_dir, role)
+        # #398 release 2: triggers.yaml, NOT reminders.yaml. This is a change of
+        # FILE, not merely of selector: the registry deliberately leaves a
+        # past-dated date trigger unregistered for this sweep to deliver, so a
+        # sweep left on the old path would find nothing and the reminder would
+        # be silently never delivered — the exact failure #396 exists to
+        # prevent.
+        path = triggers_path(runtime.agents_dir, role)
         for entry in past_due(path, now):
             name = entry["name"]
 
@@ -457,12 +684,18 @@ async def sweep_reminders(runtime, now: datetime) -> int:
                 continue
             delivered += 1
             try:
-                remove_entry(path, name)
+                outcome = remove_entry(path, name)
             except (OSError, ValueError):
                 logger.warning(
                     "reminder sweep: could not remove %s after delivery; it "
                     "will be redelivered next pass", name, exc_info=True,
                 )
+            else:
+                if outcome != "removed":
+                    logger.warning(
+                        "reminder sweep: %s reported %s after delivery; it "
+                        "will be redelivered next pass", name, outcome,
+                    )
 
         _reconcile_registrations(runtime, registry, role, path, now)
 
@@ -471,14 +704,18 @@ async def sweep_reminders(runtime, now: datetime) -> int:
 
 def _reconcile_registrations(runtime, registry, role: str, path: str,
                              now: datetime) -> None:
-    """Re-register any reminder in the store that has no live job.
+    """Re-register any agent-owned reminder that has no live job.
 
-    The store is the truth; the scheduler is a cache of it. Anything that can
+    The file is the truth; the scheduler is a cache of it. Anything that can
     make the two diverge — a reload re-registering a role from a snapshot
     taken before a reminder was written, a registration that failed
     transiently — is healed here rather than needing its own lock. Without
     this a recurring reminder lost that way would never fire again until the
     next restart, because only one-shots are recoverable by delivery.
+
+    Both directions are bounded to ``managed_by: agent``. The operator's own
+    triggers share this file now, and neither registering nor dropping one is
+    this sweep's business.
     """
     if registry is None:
         return
@@ -489,32 +726,31 @@ def _reconcile_registrations(runtime, registry, role: str, path: str,
     if not channels:
         return
 
-    entries = all_entries(path)
+    entries = agent_entries(path)
     if entries is None:
-        # Store unreadable: neither direction is safe. Dropping would
+        # File unreadable: neither direction is safe. Dropping would
         # unschedule live reminders; registering would work from nothing.
         return
 
-    # Direction 1: a job with no entry left in the store must go. A
+    # Direction 1: an agent-owned job with no entry left must go. A
     # cancellation that raced a reload — which re-registers the role from a
     # snapshot taken before the cancellation — would otherwise leave the
     # reminder firing forever, even though cancel_reminder reported success.
     live_names = {e.get("name", "") for e in entries}
-    # Only jobs the registry recorded as coming FROM THIS STORE are candidates
-    # for removal. Provenance is carried as data on the spec, not inferred
-    # from the name or by re-reading the operator's file — the schema requires
-    # every date trigger to carry the reminder prefix, so an operator may
-    # legitimately author one, and three rounds of inference each found a new
-    # way to delete a live operator trigger.
+    # Only jobs whose spec RECORDS agent ownership are candidates for removal.
+    # Provenance is carried as data, never inferred from the name — an operator
+    # may legitimately author a `reminder-`-prefixed dated one-shot, and three
+    # rounds of inference each found a new way to delete a live operator
+    # trigger.
     try:
-        registered = registry.reminder_job_names(role)
+        registered = registry.agent_owned_job_names(role)
     except Exception:  # noqa: BLE001 - older registry without the accessor
         registered = []
     for name in registered:
         if name not in live_names:
             logger.info(
-                "reminder sweep: dropping job %s for %s — no longer in the "
-                "store", name, role,
+                "reminder sweep: dropping job %s for %s — no longer in "
+                "triggers.yaml", name, role,
             )
             registry.remove_job_for(role, name)
 
@@ -538,7 +774,7 @@ def _reconcile_registrations(runtime, registry, role: str, path: str,
                 one_shot=bool(entry.get("one_shot", False)),
                 channel=entry.get("channel", ""),
                 prompt=entry.get("prompt", ""),
-                from_reminder_store=True,
+                managed_by=OWNER_AGENT,
             )], channels)
             logger.info(
                 "reminder sweep: re-registered %s for %s (no live job)",

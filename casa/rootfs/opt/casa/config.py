@@ -164,7 +164,7 @@ class ExecutorEntry:
 @dataclass
 class TriggerSpec:
     name: str
-    type: str                                   # interval | cron | webhook
+    type: str                            # interval | cron | date | webhook
     minutes: int = 0
     schedule: str = ""
     path: str = ""
@@ -180,19 +180,31 @@ class TriggerSpec:
     # #396: point-in-time reminders. ``at`` is an ISO-8601 instant WITH a UTC
     # offset and is meaningful only for type="date" — cron has no year field,
     # so a dated one-shot written as cron is an ANNUAL trigger in disguise.
-    # ``one_shot`` makes the registry drop both the scheduler job and the
-    # reminders.yaml entry after a single fire.
+    # ``one_shot`` makes the registry drop the scheduler job after a single
+    # fire, and — only for an entry the agent owns (see ``managed_by``) — remove
+    # the triggers.yaml entry too. An operator's own dated one-shot keeps its
+    # entry, which then lingers inert (INV-TRIG-009).
     at: str = ""
     one_shot: bool = False
-    # #396: True only for specs loaded from (or written to) the agent-owned
-    # reminders.yaml. Reverse reconciliation drops a job when its entry is
-    # gone from that store, and it must never touch an operator-authored
-    # trigger — but the schema REQUIRES every date trigger to carry the
-    # reminder name prefix, so the name cannot tell them apart. Three review
-    # rounds of inferring provenance by re-reading triggers.yaml each found a
-    # new way to delete a live operator trigger; carrying it as DATA from the
-    # file the spec came from removes the guesswork entirely.
-    from_reminder_store: bool = False
+    # #398 release 2: who owns this entry. ``"agent"`` for a reminder the
+    # resident's own tools created; empty for operator configuration.
+    #
+    # Read straight off the entry's ``managed_by`` field and never inferred.
+    # Under #396 this was ``from_reminder_store``, derived from WHICH FILE the
+    # spec was loaded from — reminders lived in their own reminders.yaml
+    # because config_sync would otherwise erase a locally-added triggers.yaml
+    # entry on an update that changed the shipped default. Release 1 made that
+    # file reconcile per entry, so the separate file lost its purpose and the
+    # provenance signal had to move onto the entry itself.
+    #
+    # It must stay a field. The schema permits an operator to author
+    # ``name: reminder-bins / type: date / one_shot: true`` — so neither the
+    # reserved name prefix, nor the type, nor the flag distinguishes an agent's
+    # reminder from an operator's own dated trigger. Three review rounds of
+    # inferring provenance each found a new way to delete a live operator
+    # trigger. This bounds the reminder writer, the overdue sweep, reverse job
+    # reconciliation and the post-fire cleanup.
+    managed_by: str = ""
 
 
 @dataclass

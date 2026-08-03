@@ -75,12 +75,8 @@ TIER_FILES: dict[str, dict[str, set[str]]] = {
     "resident": {
         "required":  {"character.yaml", "voice.yaml", "response_shape.yaml",
                       "disclosure.yaml", "runtime.yaml"},
-        # #396: reminders.yaml is AGENT-OWNED and created on demand by
-        # set_reminder. It must be listed here or _check_file_set rejects the
-        # whole resident the moment the first reminder exists — a boot crash
-        # loop, not a degraded reminder.
         "optional":  {"delegates.yaml", "executors.yaml", "triggers.yaml",
-                      "reminders.yaml", "hooks.yaml", "plugins.yaml"},
+                      "hooks.yaml", "plugins.yaml"},
         "forbidden": set(),
     },
     "specialist": {
@@ -88,7 +84,7 @@ TIER_FILES: dict[str, dict[str, set[str]]] = {
                       "runtime.yaml"},
         "optional":  {"hooks.yaml", "plugins.yaml"},
         "forbidden": {"disclosure.yaml", "delegates.yaml", "executors.yaml",
-                      "triggers.yaml", "reminders.yaml"},
+                      "triggers.yaml"},
     },
 }
 
@@ -97,8 +93,7 @@ TIER_FILES["executor"] = {
     "optional":  {"hooks.yaml", "observer.yaml", "plugins.yaml"},
     "forbidden": {"character.yaml", "runtime.yaml", "delegates.yaml",
                   "executors.yaml", "disclosure.yaml",
-                  "response_shape.yaml", "voice.yaml", "triggers.yaml",
-                  "reminders.yaml"},
+                  "response_shape.yaml", "voice.yaml", "triggers.yaml"},
 }
 
 # S-1 fix (v0.35.2): editor backup artifacts that strict-load tolerates.
@@ -181,7 +176,6 @@ _SCHEMA_BY_FILENAME: dict[str, str] = {
     "delegates.yaml":      "delegates",
     "executors.yaml":      "executors",
     "triggers.yaml":       "triggers",
-    "reminders.yaml":      "triggers",   # #396 — same schema
     "hooks.yaml":          "hooks",
     "definition.yaml":     "executor",
 }
@@ -949,7 +943,6 @@ def _normalize_webhook_auth(trig: dict[str, Any], trig_name: str) -> dict[str, A
 
 def _build_triggers(
     data: dict[str, Any], *, agent_dir: str,
-    from_reminder_store: bool = False,
 ) -> list[TriggerSpec]:
     specs: list[TriggerSpec] = []
     for t in (data.get("triggers") or []):
@@ -974,7 +967,10 @@ def _build_triggers(
             clearance=t.get("clearance", "public") if is_webhook else "public",
             at=t.get("at", "") or "",
             one_shot=bool(t.get("one_shot", False)),
-            from_reminder_store=from_reminder_store,
+            # #398 release 2: read off the entry, never inferred. An operator
+            # may legitimately author a `reminder-`-prefixed dated one-shot, so
+            # the name, the type and the flag all fail to identify ownership.
+            managed_by=t.get("managed_by", "") or "",
         ))
     return specs
 
@@ -1214,36 +1210,6 @@ def load_agent_from_dir(
         trig_data = _read_yaml(trig_path)
         _validate(trig_data, "triggers", trig_path)
         cfg.triggers = _build_triggers(trig_data, agent_dir=agent_dir)
-
-    # reminders.yaml — optional, resident only, AGENT-OWNED (#396).
-    #
-    # Reminders are ordinary triggers and are appended to the same list, but
-    # they live in their own file for one specific reason: config_sync's
-    # three-way reconcile treats an edited `triggers.yaml` as a CONFLICT once
-    # the image ships a changed default, and resolves it "image wins" — which
-    # would silently delete every pending reminder on such an update. This
-    # file is not part of the defaults tree, so reconcile adopts it and never
-    # rewrites it. Validated against the same schema as triggers.yaml.
-    rem_path = os.path.join(agent_dir, "reminders.yaml")
-    if os.path.exists(rem_path):
-        rem_data = _read_yaml(rem_path)
-        _validate(rem_data, "triggers", rem_path)
-        # Two files now feed ONE trigger list, and register_agent raises on a
-        # duplicate name — uncaught at boot (#338), i.e. a crash loop. The
-        # operator's file wins and the colliding reminder is dropped with a
-        # warning: a lost reminder is bad, a Casa that will not start is worse.
-        existing = {t.name for t in cfg.triggers}
-        for spec in _build_triggers(rem_data, agent_dir=agent_dir,
-                                    from_reminder_store=True):
-            if spec.name in existing:
-                logger.warning(
-                    "reminders.yaml: %r collides with a trigger already "
-                    "declared in triggers.yaml — ignoring the reminder",
-                    spec.name,
-                )
-                continue
-            existing.add(spec.name)
-            cfg.triggers = list(cfg.triggers) + [spec]
 
     # hooks.yaml — optional.
     hooks_path = os.path.join(agent_dir, "hooks.yaml")

@@ -4649,9 +4649,11 @@ async def get_schedule(args: dict) -> dict:
 #
 # A reminder IS a trigger, so these are a narrow front door onto the machinery
 # that already exists rather than a parallel system. The bounds that keep them
-# from being a general config writer (INV-TRIG-007):
-#   * the CALLING role's own reminders.yaml, never another agent's;
-#   * only entries carrying the reserved ``reminder-`` prefix;
+# from being a general config writer (INV-TRIG-010):
+#   * the CALLING role's own triggers.yaml, never another agent's;
+#   * only entries carrying ``managed_by: agent`` — the name prefix is NOT the
+#     bound, because the schema permits an operator to author a
+#     `reminder-`-prefixed dated one-shot of their own;
 #   * only reminder-shaped fields.
 # ``config_git_commit``'s configurator-only guard is untouched — this is a
 # separate, narrower path, not a relaxation of it.
@@ -4729,10 +4731,11 @@ async def set_reminder(args: dict) -> dict:
     # channel to be one this role actually declares.
     channel = "telegram" if "telegram" in channels else channels[0]
 
-    path = reminders.reminders_path(runtime.agents_dir, role)
-    # Generate against the names already in the store. A collision would fail
-    # registration on a duplicate job id, and the rollback below would then
-    # delete the PRE-EXISTING reminder of that name along with this one.
+    path = reminders.triggers_path(runtime.agents_dir, role)
+    # Generate against EVERY name already in the file, the operator's included.
+    # A collision would fail registration on a duplicate job id, and the
+    # rollback below would then delete the PRE-EXISTING entry of that name along
+    # with this one.
     try:
         name = reminders.new_reminder_name(reminders.existing_names(path))
     except ValueError as exc:
@@ -4743,6 +4746,9 @@ async def set_reminder(args: dict) -> dict:
         **fields,
         "one_shot": repeat == "none",
         "channel": channel,
+        # Provenance as DATA, written here and nowhere else. Everything that
+        # may sweep, re-register or delete this entry keys off this field.
+        "managed_by": reminders.OWNER_AGENT,
         # Imperative on purpose: a scheduled turn may legitimately produce no
         # output, so delivery must not be left to the model's judgement. This
         # is the morning-briefing silence lesson (v0.132.0) applied.
@@ -4750,7 +4756,7 @@ async def set_reminder(args: dict) -> dict:
     }
 
     try:
-        reminders.append_entry(path, entry)
+        reminders.add_entry(path, entry)
     except (OSError, ValueError) as exc:
         return _result({"status": "error", "kind": "write_failed",
                         "message": str(exc)})
@@ -4761,7 +4767,7 @@ async def set_reminder(args: dict) -> dict:
         name=name, type=entry["type"], schedule=entry.get("schedule", ""),
         at=entry.get("at", ""), one_shot=entry["one_shot"],
         channel=channel, prompt=entry["prompt"],
-        from_reminder_store=True,
+        managed_by=reminders.OWNER_AGENT,
     )
     try:
         runtime.trigger_registry.register_agent(role, [spec], channels)
@@ -4776,10 +4782,12 @@ async def set_reminder(args: dict) -> dict:
         return _result({"status": "error", "kind": "register_failed",
                         "message": str(exc)})
 
-    # Report the EFFECTIVE time, not the one passed in. A recurring anchor is
-    # rounded up to a whole minute (cron has minute resolution), so echoing
-    # the caller's value would tell the user a time the reminder will not
-    # actually fire at.
+    # Report the EFFECTIVE time, not the one passed in. Nothing is rounded —
+    # ``validate_recurring`` REFUSES a sub-minute anchor rather than adjusting
+    # it — but a recurring anchor is re-expressed in the SCHEDULER's timezone,
+    # which renders a different wall-clock time whenever that zone and the
+    # caller's offset disagree. Echoing the caller's value would then tell the
+    # user a time the reminder does not fire at.
     effective = entry.get("at") or when.isoformat()
     logger.info("reminder set: role=%s name=%s at=%s repeat=%s",
                 role, name, effective, repeat)
@@ -4803,26 +4811,32 @@ async def cancel_reminder(args: dict) -> dict:
                         "message": "cancel_reminder called outside a turn"})
 
     name = (args.get("name") or "").strip()
-    if not reminders.is_reminder_name(name):
-        return _result({
-            "status": "error", "kind": "not_authorized",
-            "message": (f"{name!r} is not a reminder. Only reminders you set "
-                        f"can be cancelled here; other triggers are operator "
-                        f"configuration."),
-        })
+    if not name:
+        return _result({"status": "error", "kind": "invalid_argument",
+                        "message": "name is required"})
 
     runtime = _runtime
     if runtime is None:
         return _result({"status": "error", "kind": "not_initialized",
                         "message": "runtime not wired"})
 
-    path = reminders.reminders_path(runtime.agents_dir, role)
+    path = reminders.triggers_path(runtime.agents_dir, role)
+    # Authorization is the store's ``managed_by`` check, not a name pattern
+    # here: the schema permits an operator to author a `reminder-`-prefixed
+    # entry, so the prefix cannot decide what may be deleted (INV-TRIG-010).
     try:
-        removed = reminders.remove_entry(path, name)
+        outcome = reminders.remove_entry(path, name)
     except (OSError, ValueError) as exc:
         return _result({"status": "error", "kind": "write_failed",
                         "message": str(exc)})
-    if not removed:
+    if outcome == "not_owned":
+        return _result({
+            "status": "error", "kind": "not_authorized",
+            "message": (f"{name!r} is operator configuration, not a reminder "
+                        f"you set. Only your own reminders can be cancelled "
+                        f"here."),
+        })
+    if outcome != "removed":
         return _result({"status": "error", "kind": "not_found",
                         "message": f"no reminder named {name!r}"})
 
