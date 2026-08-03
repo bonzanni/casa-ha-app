@@ -264,15 +264,22 @@ def remove_entry(path: str, name: str) -> bool:
     return True
 
 
-def all_entries(path: str) -> list[dict]:
-    """Every reminder entry in the store at *path*, or [] if unreadable."""
+def all_entries(path: str) -> "list[dict] | None":
+    """Every reminder entry in the store at *path*.
+
+    Returns ``None`` when the store cannot be read — NOT an empty list. An
+    empty list means "the store is empty", which authorises reverse
+    reconciliation to drop every reminder job; a transient read error must
+    never be allowed to say that, or one bad read would unschedule every
+    recurring reminder until the next successful sweep.
+    """
     try:
         return [e for e in _load(path)["triggers"]
-                if is_reminder_name(e.get("name", ""))]
+                if isinstance(e, dict) and is_reminder_name(e.get("name", ""))]
     except (OSError, ValueError):
-        logger.warning("reminders: cannot read %s; skipping", path,
-                       exc_info=True)
-        return []
+        logger.warning("reminders: cannot read %s; skipping reconciliation",
+                       path, exc_info=True)
+        return None
 
 
 def past_due(path: str, now: datetime) -> list[dict]:
@@ -424,6 +431,10 @@ def _reconcile_registrations(runtime, registry, role: str, path: str,
         return
 
     entries = all_entries(path)
+    if entries is None:
+        # Store unreadable: neither direction is safe. Dropping would
+        # unschedule live reminders; registering would work from nothing.
+        return
 
     # Direction 1: a job with no entry left in the store must go. A
     # cancellation that raced a reload — which re-registers the role from a

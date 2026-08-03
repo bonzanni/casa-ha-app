@@ -444,3 +444,44 @@ async def test_a_malformed_operator_file_is_now_irrelevant(env):
                            _reminder("reminder-b0b0b0b0"))
 
     assert await reminders.sweep_reminders(env.runtime, NOW) == 1
+
+
+async def test_an_unreadable_store_suspends_both_reconciliation_directions(env):
+    """Sol r8: an empty list means "the store is empty", which authorises
+    dropping every reminder job. A transient read error must never say that,
+    or one bad read unschedules every recurring reminder."""
+    from config import TriggerSpec
+
+    env.runtime.role_configs = {
+        "assistant": types.SimpleNamespace(channels=["telegram"]),
+    }
+    env.registry.register_agent("assistant", [TriggerSpec(
+        name="reminder-live001", type="cron", schedule="0 7 * * thu",
+        channel="telegram", prompt="x", from_reminder_store=True)],
+        ["telegram"])
+    # A store that parses to something that is not a mapping.
+    with open(env.reminders_path, "w", encoding="utf-8") as fh:
+        fh.write("- a list, not a mapping\n")
+
+    await reminders.sweep_reminders(env.runtime, NOW)
+
+    assert env.registry.has_job("assistant", "reminder-live001")
+
+
+async def test_a_genuinely_empty_store_still_drops_orphans(env):
+    """The sentinel must not disable reverse reconciliation outright."""
+    from config import TriggerSpec
+
+    env.runtime.role_configs = {
+        "assistant": types.SimpleNamespace(channels=["telegram"]),
+    }
+    env.registry.register_agent("assistant", [TriggerSpec(
+        name="reminder-orph01", type="cron", schedule="0 7 * * thu",
+        channel="telegram", prompt="x", from_reminder_store=True)],
+        ["telegram"])
+    with open(env.reminders_path, "w", encoding="utf-8") as fh:
+        yaml.safe_dump({"schema_version": 1, "triggers": []}, fh)
+
+    await reminders.sweep_reminders(env.runtime, NOW)
+
+    assert not env.registry.has_job("assistant", "reminder-orph01")
