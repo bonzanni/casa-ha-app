@@ -81,7 +81,8 @@ configuration:
     name: Timezone
     description: >-
       IANA timezone for schedules and agent clocks (e.g. Europe/Amsterdam).
-      Unknown values fall back to Europe/Amsterdam with a warning.
+      Leave empty to use Home Assistant's own timezone, which is almost always
+      what you want. Unknown values fall back to UTC with a warning.
   engagement_reap_days:
     name: Engagement Auto-Close Days
     description: >-

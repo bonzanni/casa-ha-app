@@ -1542,7 +1542,7 @@ class Agent:
         system_parts = [base_system_prompt]
         if memory_blocks:
             system_parts.append("\n" + memory_blocks)
-        # #336: the static per-channel display claims "authenticated (Nicola)"
+        # #336: the static per-channel display claims "authenticated (operator)"
         # for telegram, which is a lie the model would act on when an
         # accept-all-mode stranger is the sender. Key the honesty off the same
         # per-sender origin clearance the recall gate uses: anything below

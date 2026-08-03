@@ -1,12 +1,19 @@
 """Single source of truth for the app's timezone.
 
-Read from ``CASA_TZ`` env var, else ``TZ`` env var (which HA OS sets),
-else Europe/Amsterdam as the final fallback. Used by APScheduler
-(so cron wall-clock means local time) and by ``Agent._process``
-(for the ``<current_time>`` block in the composed system prompt).
+Read from ``CASA_TZ`` env var, else ``TZ`` env var (which HA OS sets to
+the operator's own zone), else UTC as the final fallback. Used by
+APScheduler (so cron wall-clock means local time) and by
+``Agent._process`` (for the ``<current_time>`` block in the composed
+system prompt).
+
+The order is what makes the app locale-neutral, and it only works while
+the ``casa_tz`` option ships EMPTY: a pre-populated default would win
+over ``TZ`` on every fresh install and silently impose the packager's
+zone on operators elsewhere (Sol review). An empty option resolves to
+nothing here, so Home Assistant's own zone is used.
 
 If the resolved name is not a known IANA zone, log a warning and fall
-back to ``Europe/Amsterdam`` rather than raising. ``ZoneInfoNotFoundError``
+back to UTC rather than raising. ``ZoneInfoNotFoundError``
 is not cached by ``@lru_cache``, so without this guard a typo'd ``casa_tz``
 add-on option would crash every turn.
 """
@@ -18,7 +25,7 @@ import os
 from functools import lru_cache
 from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
-_FALLBACK_TZ = "Europe/Amsterdam"
+_FALLBACK_TZ = "UTC"
 
 logger = logging.getLogger(__name__)
 

@@ -13,15 +13,16 @@ axes: this module answers "how much may the agent disclose on this channel?",
 that one answers "who wrote this?". A shared bearer secret settles the first and
 says nothing about the second (#204).
 
-(A ``user_peer_for_channel`` helper used to live here. It defaulted to
-``"nicola"`` for any channel absent from its map, so /invoke and /webhook would
+(A ``user_peer_for_channel`` helper used to live here. It defaulted to a fixed
+operator peer for any channel absent from its map, so /invoke and /webhook would
 have inherited the operator's identity by omission. Peers are now declared per
 route, with no default.)
 
-Future voice-ID upgrade path: a recognised speaker can be promoted
-from ``voice_speaker`` to ``nicola`` at the channel layer before
-``Agent.handle_message`` — change the voice entries in
-:mod:`ingress_identity`.
+Future voice-ID upgrade path: a recognised speaker can be promoted from the
+anonymous ``voice_speaker`` to that speaker's own peer at the channel layer
+before ``Agent.handle_message`` — change the voice entries in
+:mod:`ingress_identity`. Note that the human peer namespace is boot-checked
+there, so a promoted voice peer has to be named inside it.
 """
 
 from __future__ import annotations
@@ -40,7 +41,7 @@ _CHANNEL_TRUST_TOKEN: dict[str, str] = {
 }
 
 _CHANNEL_TRUST_DISPLAY: dict[str, str] = {
-    "telegram":  "authenticated (Nicola)",
+    "telegram":  "authenticated (operator)",
     "voice":     "household-shared (speaker unauthenticated)",
     "scheduler": "internal (system-initiated)",
     "webhook":   "authenticated (shared secret)",

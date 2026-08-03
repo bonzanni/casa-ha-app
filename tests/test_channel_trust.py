@@ -30,7 +30,7 @@ class TestChannelTrust:
 class TestChannelTrustDisplay:
     def test_display_returns_human_readable(self):
         from channel_trust import channel_trust_display
-        assert channel_trust_display("telegram") == "authenticated (Nicola)"
+        assert channel_trust_display("telegram") == "authenticated (operator)"
         assert channel_trust_display("voice") == "household-shared (speaker unauthenticated)"
         assert channel_trust_display("scheduler") == "internal (system-initiated)"
         assert channel_trust_display("webhook") == "authenticated (shared secret)"
@@ -43,8 +43,8 @@ class TestChannelTrustDisplay:
 class TestUserPeerMovedOut:
     """#204: per-turn AUTHOR identity left this module for ingress_identity.
 
-    The retired ``user_peer_for_channel`` defaulted to ``"nicola"`` for any
-    channel absent from its map, so /invoke and /webhook would have recorded
+    The retired ``user_peer_for_channel`` defaulted to the operator's peer for
+    any channel absent from its map, so /invoke and /webhook would have recorded
     third-party content as authored by the operator. Peers are now declared per
     ingress ROUTE, with no default at all — trust (this module) and authorship
     (ingress_identity) are separate axes.
@@ -55,12 +55,12 @@ class TestUserPeerMovedOut:
         assert not hasattr(channel_trust, "user_peer_for_channel")
 
     def test_telegram_peer_now_comes_from_the_ingress_table(self):
-        # #336: the operator peer requires the channel's server-side
-        # operator determination; a non-operator sender gets its own peer.
+        # #336: every sender is named by its own id; the channel's server-side
+        # operator determination decides CLEARANCE, not the peer.
         from ingress_identity import ingress_identity
         assert ingress_identity(
             "telegram", sender_id="7", sender_is_operator=True,
-        ).user_peer == "nicola"
+        ).user_peer == "telegram:7"
 
     def test_voice_peer_now_comes_from_the_ingress_table(self):
         from ingress_identity import ingress_identity

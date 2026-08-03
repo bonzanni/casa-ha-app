@@ -56,7 +56,7 @@ container variable can survive an empty option elsewhere.
 | `primary_agent_model` | `PRIMARY_AGENT_MODEL` | role-slot model options → role model resolution | opus | restart |
 | `voice_agent_model` | `VOICE_AGENT_MODEL` | role-slot model options → role model resolution | haiku | restart |
 | `enable_terminal` | `ENABLE_TERMINAL` | nginx setup, ttyd service, dashboard | false | restart |
-| `casa_tz` | `CASA_TZ` | timekeeping — both scheduler wall-clock and the current-time block every agent turn sees | Europe/Amsterdam | restart |
+| `casa_tz` | `CASA_TZ` | timekeeping — both scheduler wall-clock and the current-time block every agent turn sees | empty → `TZ` (Home Assistant's zone), then UTC | restart |
 | `engagement_reap_days` | `ENGAGEMENT_REAP_DAYS` | engagement reaper | 7 (0 disables) | restart |
 | `log_level` | `LOG_LEVEL` | main startup logging; the standalone MCP service's logging | info (runtime falls back to INFO when absent/empty) | restart |
 | `specialist_max_concurrency` | `SPECIALIST_MAX_CONCURRENCY` | specialist limiter (clamped 1–20) — the *fleet-wide* cap; a separate hard-coded rule allows exactly one active delegation per scope regardless | 2 | restart |

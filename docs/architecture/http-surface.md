@@ -117,7 +117,7 @@ disabling that limiter.
 A payload that could name its own origin could claim any origin, and provenance is what
 later decides what a turn may do — see `provenance.py` for what is stripped.
 
-**INV-HTTP-005**: The ingress-identity table is validated at boot against an independently-written route contract, and any disagreement between the two is a boot failure.
+**INV-HTTP-005**: The ingress-identity table is validated at boot against an independently-written route contract, and any disagreement between the two is a boot failure — as is a route that breaks either structural rule the check applies on top of that comparison: peer-namespace containment, and the Telegram surface and the human peer strategy implying each other.
 
 Read the scope precisely, because the useful-sounding version of this is false. **The check
 compares two hand-maintained declarations with each other. It does not inspect the
@@ -130,24 +130,45 @@ What the check does enforce is worth having: both directions of set equality, so
 declaration can gain or lose a route alone, plus per-route agreement on surface,
 authentication flag and peer strategy.
 
+Two structural rules are checked *beyond* that agreement, and they exist because a
+coordinated edit to both declarations agrees with itself and so slips past the comparison.
+The first is namespace containment: a human route's peer must resolve inside the human
+namespace and every other route's must resolve outside it. The second ties the surface to
+the strategy as a biconditional — the Telegram surface and the human peer strategy imply
+each other. The second is the load-bearing one for person-vs-machine classification, and
+the reason is easy to get backwards: **the peer bounds what a turn is called, but the
+SURFACE is what decides whether it is recorded as a person.** `UserProvenance.from_origin`
+derives the speaker kind from the surface, so a route wearing surface `telegram` with a
+fixed machine peer satisfies every namespace rule and is still persisted as a user. The
+namespace guard alone prevents a machine from *claiming a person's peer*; it does not
+prevent it from being classified as one.
+
 Per request the identity function raises instead of returning anything a caller could
 mistake for "no identity" — there is no quiet fallback to an anonymous or system speaker.
-Automation ingresses are additionally prevented from resolving to an operator's identity,
-which is what stops an unattended trigger from being recorded as a person.
 
-**INV-HTTP-006**: The operator peer and private clearance on the Telegram ingress are granted per sender — only the sender whose id matches the configured operator chat id resolves to them; any other sender resolves to a namespaced per-sender peer at public clearance, and a sender-less Telegram turn raises rather than borrowing an identity.
+**INV-HTTP-006**: Every accepted Telegram sender resolves to its own namespaced peer; private clearance is granted per sender — only the sender whose id matches the configured operator chat id keeps it, any other sender is floored to public — and a sender-less Telegram turn raises rather than borrowing an identity.
 
-The route used to fix the operator peer as a constant, so with the accept-all
-configuration any Telegram user's turns were recorded under the operator's identity and
-ran at the operator's private recall clearance. The namespaced dynamic peers
-(`telegram:<id>`, like `webhook:<name>`) get the same boot-checked guarantee that no
-operator peer can live inside a caller-derived namespace.
+**No peer names the operator.** The route used to fix the operator's peer as a hardcoded
+constant, so with the accept-all configuration any Telegram user's turns were recorded
+under the operator's identity and ran at the operator's private recall clearance. #336
+fixed the clearance half per sender; the peer half was fixed by deleting the constant
+outright — the operator is `telegram:<their id>` like everyone else, and *clearance* is
+the only thing that distinguishes them. The two consequences to hold on to are that
+"who is the operator?" is now a fact about `telegram_chat_id` rather than about the
+identity module, and that the boot check can no longer compare a peer against a literal:
+it checks the **namespace** instead, in both directions — a human route must resolve
+inside `telegram:`, every other route must resolve outside it, and the human and
+`webhook:` namespaces must be prefix-disjoint so no trigger name can compose into a
+person's identity.
 
 What it does not cover: it names the *configured* operator. With `telegram_chat_id` empty
 there is no configured operator identity, so no sender — the operator included — receives
 operator attribution, and protected plugin tools are denied for every sender
 (INV-PLUG-007); a group-id configuration names no sender at all. Sender identity is
-Telegram's authentication of its user ids, not an additional Casa-side proof.
+Telegram's authentication of its user ids, not an additional Casa-side proof. Nor does
+the namespace check bound what a *peer already recorded in memory* means: peers are the
+key `content_document_id` hashes, so changing how a sender is named re-keys that sender's
+documents rather than migrating them.
 
 ## Failure behavior
 

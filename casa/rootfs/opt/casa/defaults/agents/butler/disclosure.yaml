@@ -1,7 +1,7 @@
 # casa: butler_disclosure v2
 # Tina (butler) inherits the `standard` disclosure policy. We keep the
 # deflection_patterns inherited from `standard` so she can still speak
-# naturally when Nicola asks her something private.
+# naturally when the operator asks her something private.
 schema_version: 1
 policy: standard
 overrides:

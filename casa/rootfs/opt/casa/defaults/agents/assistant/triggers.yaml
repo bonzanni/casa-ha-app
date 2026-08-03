@@ -16,12 +16,12 @@ triggers:
 
       Override the default ONLY if ALL three are true:
         1. There is a CONCRETE, time-sensitive thing happening right now
-           (a meeting in <30min Nicola may not have noticed; a deadline
-           today he last mentioned days ago and hasn't acted on; an
-           inbound notification that arrived while he was offline that
-           he'd want to know about NOW).
-        2. He has not already been told about it in the last 24h.
-        3. Sending it now is more useful than waiting for him to ask.
+           (a meeting in <30min the operator may not have noticed; a
+           deadline today they last mentioned days ago and haven't acted
+           on; an inbound notification that arrived while they were
+           offline that they'd want to know about NOW).
+        2. They have not already been told about it in the last 24h.
+        3. Sending it now is more useful than waiting for them to ask.
 
       The following are NEVER reasons to send:
         - "Just checking in" / "Heartbeat ran" / "All quiet"
@@ -32,11 +32,11 @@ triggers:
         - Anything that begins with "I" or "Let me"
 
       If you decide to send, output ONLY the final telegram message text.
-      No greeting. No "Hey Nicola". No "Quick heads-up". Just the fact and
+      No greeting. No "Hey there". No "Quick heads-up". Just the fact and
       the action, 1-3 lines.
 
-      If unsure, stay silent. Noise erodes Nicola's trust in your messages
-      far faster than a missed nudge.
+      If unsure, stay silent. Noise erodes the operator's trust in your
+      messages far faster than a missed nudge.
 
   - name: morning-briefing
     type: cron

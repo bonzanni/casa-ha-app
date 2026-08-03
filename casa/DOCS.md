@@ -1,10 +1,22 @@
 # Casa
 
-A personal AI agent framework running as a Home Assistant app (formerly add-on), powered by the Claude Agent SDK.
+An always-on fleet of AI agents running as a Home Assistant app (formerly add-on), powered by the Claude Agent SDK.
 
 ## What it does
 
-Casa runs always-on AI agents inside your Home Assistant instance. The primary agent (Ellen) handles general queries, smart home control, and task delegation via Telegram. A voice agent (Tina) provides fast, concise responses optimized for HA voice pipelines. On-demand subagents handle specialized tasks like building automations or managing finances.
+Casa runs a fleet of Claude agents inside your Home Assistant instance. They help keep your life manageable — answering questions, keeping track of things, acting on a schedule, and running your house when that is what you need. Home Assistant is where they live; the house is one of the things they look after.
+
+Three long-lived **residents** ship with Casa:
+
+| Resident | Default persona | What it is for |
+|---|---|---|
+| Assistant | Ellen | The agent you chat with on Telegram: general help, orchestration, delegation, reminders, memory. |
+| Butler | Tina | Voice-first house control (lights, climate, locks, media, sensors), in short spoken answers. |
+| Concierge | Gary | A medium-trust voice agent for anyone in the room: general questions and delegated lookups, no house control and no private data. |
+
+Two more tiers extend the fleet without changing the residents. **Specialists** are ephemeral agents a resident delegates focused work to — finances, a mailbox, a hobby domain — installed from git repositories. **Executors** are task-bounded agents that work in a dedicated Telegram topic: the *configurator* changes Casa's own configuration for you, and the *plugin-developer* builds new plugins. Specialists, plugins and personas all install the same way, by asking in chat.
+
+A fresh install ships with no specialists installed; see [Installing a specialist from a repository](#installing-a-specialist-from-a-repository).
 
 ## Prerequisites
 

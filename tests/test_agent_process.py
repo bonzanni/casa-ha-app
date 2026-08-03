@@ -555,7 +555,7 @@ async def test_system_prompt_contains_channel_context(tmp_path):
     prompt = FakeClient.captured_options.system_prompt
     assert "<channel_context>" in prompt
     assert "channel: telegram" in prompt
-    assert "trust: authenticated (Nicola)" in prompt
+    assert "trust: authenticated (operator)" in prompt
     assert "</channel_context>" in prompt
 
 

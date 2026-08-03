@@ -12,7 +12,7 @@ installs any system requirements, assigns it to targets, and reloads + verifies
 1. **Plugin name?** The plugin's own `.claude-plugin/plugin.json` `name` —
    lowercase, hyphenated. **The repo name is NOT the plugin name:** keeper
    repos follow `casa-plugin-<name>` (repo `casa-plugin-gmail` → plugin
-   `gmail`; repo `casa-plugin-lesina-invoice` → plugin `lesina-invoice`),
+   `gmail`; repo `casa-plugin-todo-list` → plugin `todo-list`),
    and a repo may host the plugin in a `subdir`. Never pass the repo
    basename as `name`. Sources of truth, in order: the plugin-developer
    completion handoff (it states the plugin name), or the repo's

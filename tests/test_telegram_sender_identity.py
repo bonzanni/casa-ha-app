@@ -1,11 +1,16 @@
 """#336: per-sender Telegram identity at the channel boundary.
 
-The `telegram_sender` peer strategy used to fix ``user_peer`` to the
-configured constant (``nicola``) for every accepted sender. With
-``telegram_chat_id`` empty ("accept all chats") that attributed any Telegram
-user's turns to the operator AND ran them at the operator's private recall
-clearance. `_handle` now resolves the identity per sender and stamps the
-reserved origin markers so the recall gate reads the per-sender clearance.
+The `telegram_sender` peer strategy used to fix ``user_peer`` to a hardcoded
+operator constant for every accepted sender. With ``telegram_chat_id`` empty
+("accept all chats") that attributed any Telegram user's turns to the operator
+AND ran them at the operator's private recall clearance. `_handle` now resolves
+the identity per sender and stamps the reserved origin markers so the recall
+gate reads the per-sender clearance.
+
+Since the operator-peer collapse, EVERY sender — the operator included — is
+named ``telegram:<id>``, and clearance is the only thing that distinguishes the
+operator. So the operator assertions below pin a derived peer, not a literal:
+a regression to any route-wide constant fails them.
 """
 
 from __future__ import annotations
@@ -74,13 +79,14 @@ def _channel(configured_chat_id: str):
 
 
 class TestOperatorSender:
-    async def test_operator_sender_is_the_operator_peer_at_private(self):
+    async def test_operator_sender_is_its_own_peer_at_private(self):
         # In the standard DM setup the configured chat id IS the operator's
-        # user id.
+        # user id. The operator is named by that id like anyone else — what
+        # marks them out is the private clearance below.
         channel, bus = _channel("7")
         await channel._handle(_fake_update(chat_id="7", user_id=7), None)
         (msg,) = await _drain(bus)
-        assert msg.trusted_user_origin.user_peer == "nicola"
+        assert msg.trusted_user_origin.user_peer == "telegram:7"
         assert msg.trusted_user_origin.server_origin.clearance == "private"
         assert msg.context["_origin_route"] == "telegram"
         assert msg.context["_origin_clearance"] == "private"
@@ -88,8 +94,8 @@ class TestOperatorSender:
 
 class TestNonOperatorSender:
     async def test_non_operator_gets_per_sender_peer_at_public(self):
-        # Pre-#336 red case: this sender resolved to user_peer "nicola"
-        # with private clearance.
+        # Pre-#336 red case: this sender resolved to the operator's constant
+        # peer with private clearance.
         channel, bus = _channel("0")
         await channel._handle(_fake_update(chat_id="42", user_id=7), None)
         (msg,) = await _drain(bus)
@@ -168,13 +174,13 @@ class TestButtonTapIdentity:
         assert msg.trusted_user_origin.server_origin.clearance == "public"
         assert msg.context["_origin_clearance"] == "public"
 
-    async def test_operator_tap_keeps_the_operator_identity(self):
+    async def test_operator_tap_keeps_the_operator_clearance(self):
         channel, bus = _channel("7")
         await channel._dispatch_button_continuation(
             chat_id=7, user_id=7, target_role="assistant",
             request_id="r1", text="yes")
         (msg,) = await _drain(bus)
-        assert msg.trusted_user_origin.user_peer == "nicola"
+        assert msg.trusted_user_origin.user_peer == "telegram:7"
         assert msg.context["_origin_clearance"] == "private"
 
     async def test_tap_provenance_is_a_user_not_the_system_speaker(self):

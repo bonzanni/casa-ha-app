@@ -41,11 +41,21 @@ class Env:
 
 
 @pytest.fixture
-def env(tmp_path, monkeypatch):
+def env(tmp_path, monkeypatch, request):
     import agent as agent_mod
     import reminders
+    from timekeeping import resolve_tz
     from tools import init_tools
     from trigger_registry import TriggerRegistry
+
+    # A derived cron entry renders its hour in the APP's timezone, so the
+    # expectations below are only meaningful against a KNOWN zone. This used to
+    # ride on the shipped default being Europe/Amsterdam; it is now empty (it
+    # defers to Home Assistant's own zone), which would make these assertions
+    # depend on the machine running them. Pin it explicitly instead.
+    monkeypatch.setenv("CASA_TZ", "Europe/Amsterdam")
+    resolve_tz.cache_clear()
+    request.addfinalizer(resolve_tz.cache_clear)
 
     agents_dir = tmp_path / "agents"
     for role in ("assistant", "butler"):

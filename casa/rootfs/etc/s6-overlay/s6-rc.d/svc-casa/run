@@ -126,8 +126,10 @@ export ENABLE_TERMINAL="$_enable_terminal"
 unset _enable_terminal
 export CASA_VERSION="$(bashio::addon.version)"
 
-# 3.3: scheduler timezone — optional; timekeeping.resolve_tz() falls back
-# to the TZ env var set by HA OS, then Europe/Amsterdam.
+# 3.3: scheduler timezone — optional, and shipped EMPTY on purpose: not
+# exporting it is what lets timekeeping.resolve_tz() fall back to the TZ env
+# var HA OS sets from the operator's own timezone (then UTC). A default value
+# here would silently override that.
 _casa_tz="$(bashio::config 'casa_tz')"
 if [ "$_casa_tz" != "null" ] && [ -n "$_casa_tz" ]; then
     export CASA_TZ="$_casa_tz"

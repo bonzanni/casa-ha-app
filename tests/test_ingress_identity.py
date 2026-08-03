@@ -10,10 +10,26 @@ instead of returning nothing — plus a boot-time check that the table covers
 every route the handlers can ask for.
 """
 
+from dataclasses import replace as dataclasses_replace
+
 import pytest
 
 
 class TestPeerSeparation:
+    def test_a_telegram_sender_and_an_automation_never_share_a_peer(self):
+        # The namespaces are disjoint by construction, so no sender id can
+        # spell an automation peer and no trigger name can spell a person's.
+        from ingress_identity import ingress_identity
+
+        sender = ingress_identity("telegram", sender_id="42").user_peer
+        automations = {
+            ingress_identity("invoke").user_peer,
+            ingress_identity(
+                "webhook_trigger", webhook_name="nightly").user_peer,
+            ingress_identity("voice_sse").user_peer,
+        }
+        assert sender not in automations
+
     def test_invoke_and_webhook_do_not_share_a_peer(self):
         # The core decision: both are HMAC-gated, but a shared bearer secret is
         # not evidence of a common author.
@@ -23,19 +39,20 @@ class TestPeerSeparation:
         webhook = ingress_identity("webhook_trigger", webhook_name="nightly")
         assert invoke.user_peer != webhook.user_peer
 
-    def test_invoke_is_never_attributed_to_the_operator(self):
-        # Trap 2: user_peer_for_channel used to default to "nicola", which
-        # would have recorded every signed call as authored by the operator.
+    def test_invoke_is_never_attributed_to_a_person(self):
+        # Trap 2: user_peer_for_channel used to default to the operator's
+        # constant peer, which would have recorded every signed call as
+        # authored by the operator.
         from ingress_identity import ingress_identity
 
         assert ingress_identity("invoke").user_peer == "invoke_caller"
 
-    def test_webhook_is_never_attributed_to_the_operator(self):
-        from ingress_identity import ingress_identity
+    def test_webhook_is_never_attributed_to_a_person(self):
+        from ingress_identity import _TELEGRAM_PEER_PREFIX, ingress_identity
 
         peer = ingress_identity("webhook_trigger", webhook_name="nightly").user_peer
         assert peer == "webhook:nightly"
-        assert "nicola" not in peer
+        assert not peer.startswith(_TELEGRAM_PEER_PREFIX)
 
     def test_each_trigger_gets_its_own_peer(self):
         from ingress_identity import ingress_identity
@@ -99,30 +116,51 @@ class TestStampedOrigins:
 
 
 class TestTelegramSenderIdentity:
-    """#336: the operator peer + private clearance are granted per-SENDER,
-    never as a route-wide constant — with telegram_chat_id empty ("accept
-    all"), any Telegram user can reach this route."""
+    """#336: identity and private clearance are granted per-SENDER, never as a
+    route-wide constant — with telegram_chat_id empty ("accept all"), any
+    Telegram user can reach this route.
 
-    def test_operator_sender_keeps_the_operator_peer_and_clearance(self):
+    The operator-peer collapse went one step further: there is no operator peer
+    literal at all. Every accepted sender is named by its own id and CLEARANCE
+    is the only difference, so these tests pin a derived peer — a regression to
+    any shared constant fails them.
+    """
+
+    def test_operator_sender_is_named_by_its_own_id_at_private_clearance(self):
         from ingress_identity import ingress_identity
 
         origin = ingress_identity(
-            "telegram", sender_id="42", sender_display_name="Nicola",
+            "telegram", sender_id="42", sender_display_name="Operator",
             sender_is_operator=True)
-        assert origin.user_peer == "nicola"
+        assert origin.user_peer == "telegram:42"
         assert origin.surface == "telegram"
         assert origin.server_origin.clearance == "private"
         assert origin.authenticated_user.stable_id == "42"
 
-    def test_non_operator_sender_gets_its_own_peer_not_the_operators(self):
-        # The pre-#336 behavior: sender 42 resolved to user_peer "nicola"
-        # with private clearance regardless of who sent the message.
+    def test_the_operator_is_not_named_by_a_shared_constant(self):
+        # The red case for the collapse: two senders, one of them the
+        # operator, must not share a peer — AND the operator must be named
+        # inside the human namespace by its own id. Inequality alone is too
+        # weak: an operator branch emitting `operator:42` would satisfy it
+        # while reintroducing a name that is not the sender's own
+        # (Terra review, INV-HTTP-006 binding).
+        from ingress_identity import _TELEGRAM_PEER_PREFIX, ingress_identity
+
+        operator = ingress_identity(
+            "telegram", sender_id="42", sender_is_operator=True)
+        other = ingress_identity("telegram", sender_id="99")
+        assert operator.user_peer != other.user_peer
+        assert operator.user_peer == _TELEGRAM_PEER_PREFIX + "42"
+        assert other.user_peer == _TELEGRAM_PEER_PREFIX + "99"
+
+    def test_non_operator_sender_gets_its_own_peer(self):
+        # The pre-#336 behavior: sender 42 resolved to the operator's constant
+        # peer with private clearance regardless of who sent the message.
         from ingress_identity import ingress_identity
 
         origin = ingress_identity(
             "telegram", sender_id="42", sender_display_name="Mallory")
         assert origin.user_peer == "telegram:42"
-        assert origin.user_peer != "nicola"
         assert origin.authenticated_user.stable_id == "42"
 
     def test_non_operator_sender_reads_at_public_clearance(self):
@@ -298,19 +336,162 @@ class TestBootValidatorEnforcesRouteContracts:
         monkeypatch.setattr(ii, "_INGRESS_IDENTITY", table)
         return ii
 
-    def test_a_webhook_repointed_at_the_operator_fails_boot(self, monkeypatch):
+    def test_a_webhook_given_a_fixed_peer_fails_boot(self, monkeypatch):
         # The single worst regression this table could suffer: every
-        # third-party webhook silently recorded as authored by Nicola.
+        # third-party webhook silently recorded as authored by one identity.
+        # Caught by the contract, which pins the per-trigger strategy.
         ii = self._broken(
             monkeypatch, "webhook_trigger",
-            peer_strategy="fixed", peer="nicola",
+            peer_strategy="fixed", peer="somebody",
         )
         with pytest.raises(ii.IngressIdentityError, match="webhook_trigger"):
             ii.validate_ingress_identity_table()
 
-    def test_voice_repointed_at_the_operator_fails_boot(self, monkeypatch):
-        ii = self._broken(monkeypatch, "voice_sse", peer="nicola")
+    def test_voice_repointed_at_another_peer_fails_boot(self, monkeypatch):
+        ii = self._broken(monkeypatch, "voice_sse", peer="telegram:42")
         with pytest.raises(ii.IngressIdentityError, match="voice_sse"):
+            ii.validate_ingress_identity_table()
+
+    def test_a_machine_route_inside_the_human_namespace_fails_boot(
+            self, monkeypatch):
+        # The namespace guard itself, exercised on a route the contract
+        # AGREES with — so nothing upstream of the guard can be what fires.
+        # A fixed peer spelled inside the human namespace means a machine
+        # caller would be persisted as a person.
+        import ingress_identity as ii
+
+        table = dict(ii._INGRESS_IDENTITY)
+        contract = dict(ii._ROUTE_CONTRACT)
+        table["matrix"] = ii.IngressIdentityPolicy(
+            surface="invoke", authenticated=True, clearance="private",
+            peer_strategy="fixed", peer="telegram:42",
+        )
+        contract["matrix"] = ("invoke", True, "fixed", "telegram:42", "automation")
+        monkeypatch.setattr(ii, "_INGRESS_IDENTITY", table)
+        monkeypatch.setattr(ii, "_ROUTE_CONTRACT", contract)
+        with pytest.raises(ii.IngressIdentityError, match="human peer namespace"):
+            ii.validate_ingress_identity_table()
+
+    def test_a_machine_route_wearing_the_telegram_surface_fails_boot(
+            self, monkeypatch):
+        # Sol review: the namespace guards bound what a peer is NAMED, but
+        # `from_origin` derives speaker_kind from the SURFACE — so this
+        # arrangement (machine peer, telegram surface) passed every other
+        # check and was still persisted as a user. Patched in BOTH the table
+        # and the contract, because they agree by construction and the
+        # contract comparison therefore cannot catch it.
+        import ingress_identity as ii
+
+        table = dict(ii._INGRESS_IDENTITY)
+        contract = dict(ii._ROUTE_CONTRACT)
+        table["invoke"] = dataclasses_replace(table["invoke"], surface="telegram")
+        contract["invoke"] = ("telegram", True, "fixed", "invoke_caller", "user")
+        monkeypatch.setattr(ii, "_INGRESS_IDENTITY", table)
+        monkeypatch.setattr(ii, "_ROUTE_CONTRACT", contract)
+        with pytest.raises(ii.IngressIdentityError, match="imply each other"):
+            ii.validate_ingress_identity_table()
+
+    def test_a_route_wearing_an_unknown_surface_fails_boot(self, monkeypatch):
+        # Terra re-review: the biconditional only separates "telegram" from
+        # everything else, but speaker_provenance classifies from its OWN
+        # automation set — so a coordinated edit introducing a surface neither
+        # module knows ("matrix") passed boot and fell through to
+        # speaker_kind="user". The Literal annotation is a hint, not a gate.
+        import ingress_identity as ii
+
+        table = dict(ii._INGRESS_IDENTITY)
+        contract = dict(ii._ROUTE_CONTRACT)
+        table["invoke"] = dataclasses_replace(table["invoke"], surface="matrix")
+        contract["invoke"] = ("matrix", True, "fixed", "invoke_caller", "automation")
+        monkeypatch.setattr(ii, "_INGRESS_IDENTITY", table)
+        monkeypatch.setattr(ii, "_ROUTE_CONTRACT", contract)
+        with pytest.raises(ii.IngressIdentityError, match="not one of"):
+            ii.validate_ingress_identity_table()
+
+    def test_a_machine_route_wearing_the_voice_surface_fails_boot(
+            self, monkeypatch):
+        # Sol re-review: this arrangement satisfied namespace containment AND
+        # the telegram biconditional — "voice" is a legitimate surface and
+        # `voice_speaker` is outside the human namespace — yet an anonymous
+        # voice speaker is classified as a PERSON, so the automation would be
+        # persisted as one. Caught by comparing against the real classifier
+        # rather than by reasoning about which surfaces look machine-like.
+        import ingress_identity as ii
+
+        table = dict(ii._INGRESS_IDENTITY)
+        contract = dict(ii._ROUTE_CONTRACT)
+        table["invoke"] = dataclasses_replace(
+            table["invoke"], surface="voice", peer="voice_speaker")
+        contract["invoke"] = ("voice", True, "fixed", "voice_speaker", "automation")
+        monkeypatch.setattr(ii, "_INGRESS_IDENTITY", table)
+        monkeypatch.setattr(ii, "_ROUTE_CONTRACT", contract)
+        with pytest.raises(ii.IngressIdentityError, match="classified as 'user'"):
+            ii.validate_ingress_identity_table()
+
+    def test_a_human_route_downgraded_to_an_automation_fails_boot(
+            self, monkeypatch):
+        # The opposite direction: a person's turns recorded as machine output
+        # loses the authorship the whole provenance model rests on.
+        import ingress_identity as ii
+
+        table = dict(ii._INGRESS_IDENTITY)
+        contract = dict(ii._ROUTE_CONTRACT)
+        table["voice_ws"] = dataclasses_replace(
+            table["voice_ws"], surface="webhook")
+        contract["voice_ws"] = ("webhook", True, "fixed", "voice_speaker", "user")
+        monkeypatch.setattr(ii, "_INGRESS_IDENTITY", table)
+        monkeypatch.setattr(ii, "_ROUTE_CONTRACT", contract)
+        with pytest.raises(
+                ii.IngressIdentityError, match="classified as 'automation'"):
+            ii.validate_ingress_identity_table()
+
+    def test_every_shipped_route_is_classified_as_its_contract_declares(self):
+        # The positive statement, so the comparisons above cannot become
+        # vacuous — and so the contract's declared kinds are not merely
+        # self-consistent but match what the classifier really does.
+        from ingress_identity import _INGRESS_IDENTITY, _ROUTE_CONTRACT, _classify
+
+        for route, policy in _INGRESS_IDENTITY.items():
+            expected_kind = _ROUTE_CONTRACT[route][4]
+            probe = (
+                "telegram:probe" if policy.peer_strategy == "telegram_sender"
+                else "webhook:probe" if policy.peer_strategy == "webhook_name"
+                else policy.peer or ""
+            )
+            assert _classify(policy, probe) == expected_kind, route
+        kinds = {route: contract[4] for route, contract in _ROUTE_CONTRACT.items()}
+        assert kinds == {
+            "telegram": "user", "voice_sse": "user", "voice_ws": "user",
+            "invoke": "automation", "webhook_trigger": "automation",
+        }
+
+    def test_a_human_route_stripped_of_its_surface_fails_boot(self, monkeypatch):
+        # The other half of the biconditional: the telegram route demoted to a
+        # fixed peer would name every sender identically AND stop being a
+        # person's surface. Caught even though table and contract agree.
+        import ingress_identity as ii
+
+        table = dict(ii._INGRESS_IDENTITY)
+        contract = dict(ii._ROUTE_CONTRACT)
+        table["telegram"] = dataclasses_replace(
+            table["telegram"], peer_strategy="fixed", peer="somebody")
+        contract["telegram"] = ("telegram", True, "fixed", "somebody", "user")
+        monkeypatch.setattr(ii, "_INGRESS_IDENTITY", table)
+        monkeypatch.setattr(ii, "_ROUTE_CONTRACT", contract)
+        with pytest.raises(ii.IngressIdentityError, match="imply each other"):
+            ii.validate_ingress_identity_table()
+
+    def test_a_human_route_outside_the_human_namespace_fails_boot(
+            self, monkeypatch):
+        # The other direction: senders named by something outside the human
+        # namespace is how the hardcoded operator constant looked. Patching
+        # only the prefix leaves _HUMAN_PEER_PREFIXES pinned to the real one,
+        # which is exactly the drift this must catch.
+        import ingress_identity as ii
+
+        monkeypatch.setattr(ii, "_TELEGRAM_PEER_PREFIX", "guest_")
+        with pytest.raises(
+                ii.IngressIdentityError, match="outside the human namespace"):
             ii.validate_ingress_identity_table()
 
     def test_a_wrong_surface_fails_boot(self, monkeypatch):
@@ -421,7 +602,7 @@ class TestContractCoversTheWholeTable:
         table = dict(ii._INGRESS_IDENTITY)
         table["matrix"] = ii.IngressIdentityPolicy(
             surface="telegram", authenticated=True, clearance="private",
-            peer_strategy="fixed", peer="nicola",
+            peer_strategy="fixed", peer="matrix_caller",
         )
         monkeypatch.setattr(ii, "_INGRESS_IDENTITY", table)
         with pytest.raises(ii.IngressIdentityError, match="matrix"):
@@ -433,32 +614,59 @@ class TestContractCoversTheWholeTable:
         assert set(_INGRESS_IDENTITY) == set(_ROUTE_CONTRACT)
 
 
-class TestOperatorPeerIsUnreachableFromTheWebhookNamespace:
-    """Re-review (Sol r2): the operator-peer guard probed one composed value
+class TestHumanPeersAreUnreachableFromTheWebhookNamespace:
+    """Re-review (Sol r2): the guard probed one composed value
     (`webhook:probe`), so it proved nothing about the namespace. Emptying the
-    prefix would let a trigger NAMED `nicola` resolve to the operator peer
-    while boot still passed."""
+    prefix would let a trigger named after a person resolve to that person's
+    peer while boot still passed.
 
-    def test_the_webhook_prefix_is_non_empty(self):
-        from ingress_identity import _WEBHOOK_PEER_PREFIX
+    Since the operator-peer collapse the property is stated as namespace
+    disjointness rather than against a literal set of operator peers — there is
+    no literal left to compare with.
+    """
+
+    def test_both_namespace_prefixes_are_non_empty(self):
+        from ingress_identity import (
+            _TELEGRAM_PEER_PREFIX,
+            _WEBHOOK_PEER_PREFIX,
+        )
 
         assert _WEBHOOK_PEER_PREFIX
+        assert _TELEGRAM_PEER_PREFIX
 
-    def test_no_operator_peer_can_live_in_the_webhook_namespace(self):
-        from ingress_identity import _OPERATOR_PEERS, _WEBHOOK_PEER_PREFIX
+    def test_the_human_and_webhook_namespaces_are_disjoint(self):
+        from ingress_identity import (
+            _HUMAN_PEER_PREFIXES,
+            _WEBHOOK_PEER_PREFIX,
+        )
 
-        for peer in _OPERATOR_PEERS:
-            assert not peer.startswith(_WEBHOOK_PEER_PREFIX)
+        for prefix in _HUMAN_PEER_PREFIXES:
+            assert not prefix.startswith(_WEBHOOK_PEER_PREFIX)
+            assert not _WEBHOOK_PEER_PREFIX.startswith(prefix)
 
-    def test_a_trigger_named_after_the_operator_is_still_not_the_operator(self):
+    def test_a_trigger_named_like_a_sender_is_still_not_that_sender(self):
+        # A trigger literally named "telegram:42" composes to
+        # "webhook:telegram:42" — outside the human namespace, so it cannot
+        # claim sender 42's memories.
         from ingress_identity import ingress_identity
 
-        assert ingress_identity(
-            "webhook_trigger", webhook_name="nicola").user_peer != "nicola"
+        trigger = ingress_identity(
+            "webhook_trigger", webhook_name="telegram:42").user_peer
+        sender = ingress_identity("telegram", sender_id="42").user_peer
+        assert trigger != sender
 
     def test_an_emptied_prefix_fails_boot(self, monkeypatch):
         import ingress_identity as ii
 
         monkeypatch.setattr(ii, "_WEBHOOK_PEER_PREFIX", "")
         with pytest.raises(ii.IngressIdentityError, match="namespace"):
+            ii.validate_ingress_identity_table()
+
+    def test_overlapping_namespaces_fail_boot(self, monkeypatch):
+        # The disjointness check itself: a webhook prefix that is a prefix of
+        # the human one would let some trigger name compose into it.
+        import ingress_identity as ii
+
+        monkeypatch.setattr(ii, "_WEBHOOK_PEER_PREFIX", "tele")
+        with pytest.raises(ii.IngressIdentityError, match="not disjoint"):
             ii.validate_ingress_identity_table()

@@ -89,8 +89,8 @@ def automation_document_id(user_peer: str, text: str) -> str:
     The digest is domain-separated by an ``automation`` prefix and the id by an
     ``m-x-`` prefix (x = eXternal), so the same ``(peer, text)`` can never
     collide with the user ``m-`` space or the agent ``m-a-`` space — an
-    automation calling itself ``nicola`` still cannot upsert over the operator's
-    own memories."""
+    automation whose peer happens to spell a person's cannot upsert over that
+    person's own memories."""
     if not user_peer:
         raise ValueError("automation_document_id requires a user_peer")
     digest = hashlib.sha256(
