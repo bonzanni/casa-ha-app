@@ -107,7 +107,16 @@ TIER_FILES["executor"] = {
 # "real" config is still in the un-suffixed files; the backups are
 # process state from in-progress edits or unclean shutdowns and must
 # not break casactl reload.
-_EDITOR_BACKUP_SUFFIXES = (".bak", ".swp", ".tmp", ".orig")
+#
+# `.casabak` is config_sync's own recovery copy, written beside the file it
+# is about to overwrite. It belongs here for the same reason: it is not
+# config, and rejecting it turns the act of PRESERVING an operator's content
+# into a load failure for the very agent that content belongs to. Found in
+# live verification of #398 — entry-level reconcile writes the sidecar on
+# every merge, where byte-level only wrote one when git was unavailable, so
+# a latent fault became a certainty. Its own boot-parity backstop then
+# reverted the merge to "repair" the tree, undoing the preservation.
+_EDITOR_BACKUP_SUFFIXES = (".bak", ".swp", ".tmp", ".orig", ".casabak")
 
 
 def _is_editor_backup(name: str) -> bool:
