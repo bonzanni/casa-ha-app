@@ -130,6 +130,12 @@ def validate_recurring(at: datetime, repeat: str, tz=None) -> None:
             f"{at.isoformat()} has seconds"
         )
     local = at.astimezone(tz) if tz is not None else at
+    if repeat == "weekdays" and local.weekday() >= 5:
+        raise ValueError(
+            "a weekdays reminder cannot start on a Saturday or Sunday: the "
+            "first occurrence would silently be the following Monday. Give "
+            "the first weekday occurrence instead."
+        )
     if repeat == "monthly" and local.day > 28:
         raise ValueError(
             f"a monthly reminder cannot fall on day {local.day}: that day is "
@@ -209,6 +215,31 @@ def reminders_path(agents_dir: str, role: str) -> str:
     never rewrites it.
     """
     return os.path.join(agents_dir, role, "reminders.yaml")
+
+
+def operator_triggers_path(agents_dir: str, role: str) -> str:
+    """The OPERATOR's trigger file for *role* — the one this module never
+    writes to, and whose entries reverse reconciliation must never drop."""
+    return os.path.join(agents_dir, role, "triggers.yaml")
+
+
+def operator_trigger_names(agents_dir: str, role: str) -> set[str]:
+    """Names declared in *role*'s operator-authored triggers.yaml.
+
+    Reverse reconciliation needs PROVENANCE, not a name pattern. The schema
+    requires a ``date`` trigger to carry the reminder prefix, so an operator
+    may legitimately author one in triggers.yaml — and dropping its job
+    because it is absent from reminders.yaml would stop it firing entirely.
+    """
+    try:
+        return {t.get("name", "")
+                for t in _load(operator_triggers_path(agents_dir, role))["triggers"]}
+    except (OSError, ValueError):
+        # Unreadable: assume every registered name might be the operator's
+        # rather than risk dropping their trigger.
+        logger.warning("reminders: cannot read operator triggers for %s", role,
+                       exc_info=True)
+        return set()
 
 
 def _load(path: str) -> dict:
@@ -424,12 +455,17 @@ def _reconcile_registrations(runtime, registry, role: str, path: str,
     # snapshot taken before the cancellation — would otherwise leave the
     # reminder firing forever, even though cancel_reminder reported success.
     live_names = {e.get("name", "") for e in entries}
+    # An operator may legitimately author a reminder-prefixed trigger in
+    # their OWN file — the schema requires the prefix on every date trigger —
+    # and dropping its job because it is absent from reminders.yaml would stop
+    # it firing at all. Provenance, not the name pattern, decides ownership.
+    operator_names = operator_trigger_names(runtime.agents_dir, role)
     try:
         registered = registry.reminder_job_names(role, REMINDER_PREFIX)
     except Exception:  # noqa: BLE001 - older registry without the accessor
         registered = []
     for name in registered:
-        if name not in live_names:
+        if name not in live_names and name not in operator_names:
             logger.info(
                 "reminder sweep: dropping job %s for %s — no longer in the "
                 "store", name, role,

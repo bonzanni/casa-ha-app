@@ -223,3 +223,25 @@ def test_weekday_also_comes_from_the_scheduler_timezone():
     at = datetime(2026, 8, 6, 22, 30, tzinfo=timezone.utc)
     out = reminders.derive_schedule(at, "weekly", ams)
     assert out["schedule"] == "30 0 * * fri"
+
+
+def test_weekdays_refuses_a_weekend_anchor():
+    """Sol r5 #2: cron cannot fire on the Saturday the caller was told about;
+    the first occurrence would silently slide to Monday."""
+    for day in (8, 9):        # 2026-08-08 Sat, 2026-08-09 Sun
+        at = datetime(2026, 8, day, 7, 0, tzinfo=CEST)
+        with pytest.raises(ValueError):
+            reminders.validate_recurring(at, "weekdays")
+
+
+def test_weekdays_accepts_a_weekday_anchor():
+    at = datetime(2026, 8, 7, 7, 0, tzinfo=CEST)      # Friday
+    reminders.validate_recurring(at, "weekdays")
+    assert reminders.derive_schedule(at, "weekdays")["schedule"] == "0 7 * * mon-fri"
+
+
+def test_a_weekend_anchor_is_fine_for_other_repeats():
+    at = datetime(2026, 8, 8, 7, 0, tzinfo=CEST)      # Saturday
+    reminders.validate_recurring(at, "weekly")
+    reminders.validate_recurring(at, "daily")
+    reminders.validate_recurring(at, "none")

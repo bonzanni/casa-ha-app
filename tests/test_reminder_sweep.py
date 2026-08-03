@@ -354,3 +354,48 @@ async def test_operator_triggers_are_never_dropped_by_reconciliation(env):
     await reminders.sweep_reminders(env.runtime, NOW)
 
     assert env.registry.has_job("assistant", "heartbeat")
+
+
+async def test_an_operator_authored_reminder_prefixed_trigger_survives(env):
+    """Round 5 (both reviewers): the schema REQUIRES a date trigger to carry
+    the reminder prefix, so an operator may legitimately author one in their
+    own triggers.yaml. Dropping its job because it is absent from
+    reminders.yaml would stop it firing entirely. Provenance, not the name
+    pattern, decides ownership."""
+    from config import TriggerSpec
+
+    env.runtime.role_configs = {
+        "assistant": types.SimpleNamespace(channels=["telegram"]),
+    }
+    # Operator declares it in THEIR file...
+    with open(env.triggers_path, "w", encoding="utf-8") as fh:
+        yaml.safe_dump({"schema_version": 1, "triggers": [
+            {"name": "heartbeat", "type": "interval", "minutes": 60,
+             "channel": "telegram", "prompt": "hb"},
+            {"name": "reminder-maintenance", "type": "cron",
+             "schedule": "0 3 * * sun", "channel": "telegram",
+             "prompt": "maintenance"}]}, fh, sort_keys=False)
+    # ...and it is registered, but has no reminders.yaml entry.
+    env.registry.register_agent("assistant", [TriggerSpec(
+        name="reminder-maintenance", type="cron", schedule="0 3 * * sun",
+        channel="telegram", prompt="maintenance")], ["telegram"])
+
+    await reminders.sweep_reminders(env.runtime, NOW)
+
+    assert env.registry.has_job("assistant", "reminder-maintenance")
+
+
+async def test_a_genuine_orphan_is_still_dropped(env):
+    """The operator exemption must not disable reverse reconciliation."""
+    from config import TriggerSpec
+
+    env.runtime.role_configs = {
+        "assistant": types.SimpleNamespace(channels=["telegram"]),
+    }
+    env.registry.register_agent("assistant", [TriggerSpec(
+        name="reminder-ghost02", type="cron", schedule="0 7 * * thu",
+        channel="telegram", prompt="x")], ["telegram"])
+
+    await reminders.sweep_reminders(env.runtime, NOW)
+
+    assert not env.registry.has_job("assistant", "reminder-ghost02")
