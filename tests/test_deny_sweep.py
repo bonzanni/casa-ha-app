@@ -343,6 +343,52 @@ def test_an_allowlisted_binary_blob_passes(tmp_path):
     assert _sweep(repo, deny, "tree").returncode == 0
 
 
+def test_range_mode_allows_REMOVING_a_binary(tmp_path):
+    """The guard exists because an ADDED binary can hide a payload from every
+    content rule. A removal publishes nothing to hide, so taking one out must not
+    be refused — and the staged branch already filtered deletions, so range mode
+    refusing them made the two halves of one guard disagree about the same change.
+    The only ways past were to keep the file, or to keep an allowlist entry naming
+    a path that no longer exists.
+
+    The binary is committed BEFORE the range base on purpose: this is the real
+    shape of a cleanup, and it is what distinguishes it from
+    ``test_range_mode_catches_content_added_then_removed`` — a blob added and
+    removed INSIDE the range is still published and must still be refused.
+    """
+    repo, deny = _repo(tmp_path)
+    hooks = repo / ".githooks"
+    hooks.mkdir(exist_ok=True)
+    (hooks / "binary-allowlist.txt").write_text("art/payload.bin\n")
+    (repo / "art").mkdir()
+    (repo / "art" / "payload.bin").write_bytes(b"\x00\x01reviewed\x00")
+    base = _commit(repo, "a.txt", "benign\n")
+
+    (repo / "art" / "payload.bin").unlink()
+    (hooks / "binary-allowlist.txt").write_text("")
+    subprocess.run(["git", "-C", str(repo), "add", "-A"], check=True)
+    subprocess.run(["git", "-C", str(repo), "commit", "-qm", "drop binary"], check=True)
+
+    result = _sweep(repo, deny, "range", f"{base}..HEAD")
+    assert result.returncode == 0, result.stderr
+    assert "no content rule can inspect" not in result.stderr
+
+
+def test_range_mode_still_refuses_an_added_binary(tmp_path):
+    """The other direction, so narrowing the guard to non-deletions cannot
+    quietly disable it."""
+    repo, deny = _repo(tmp_path)
+    base = _commit(repo, "a.txt", "benign\n")
+    (repo / "art").mkdir()
+    (repo / "art" / "payload.bin").write_bytes(b"\x00\x01secret-in-a-binary\x00")
+    subprocess.run(["git", "-C", str(repo), "add", "-A"], check=True)
+    subprocess.run(["git", "-C", str(repo), "commit", "-qm", "add binary"], check=True)
+
+    result = _sweep(repo, deny, "range", f"{base}..HEAD")
+    assert result.returncode == 1
+    assert "art/payload.bin" in result.stderr
+
+
 def test_range_mode_sees_content_introduced_by_a_merge_resolution(tmp_path):
     """`git log -p` emits no diff at all for a merge commit, so a secret created only by
     conflict resolution — and removed afterwards — was invisible to both range passes."""
