@@ -1028,6 +1028,14 @@ class TestCorrelationId:
             loop = asyncio.create_task(bus.run_agent_loop("assistant"))
             try:
                 result = await bus.request(msg, timeout=5)
+                # Snapshot INSIDE the dispatch window. `caplog.records` keeps
+                # growing until the test ends, so reading it after the
+                # `finally` below folds in teardown records — emitted with no
+                # cid bound, because cancelling the agent loop is not part of
+                # any turn. On a fast machine teardown logs nothing before the
+                # assertion; on a loaded runner it does, and the test failed
+                # for a record it was never meant to judge.
+                during_dispatch = list(caplog.records)
             finally:
                 loop.cancel()
                 with pytest.raises(asyncio.CancelledError):
@@ -1039,7 +1047,7 @@ class TestCorrelationId:
         # the cid. We scope to records from Casa modules (avoid pytest's
         # own handler records).
         relevant = [
-            r for r in caplog.records
+            r for r in during_dispatch
             if r.name in {"agent", "retry", "bus"}
         ]
         # At least one record should have been emitted — the agent log

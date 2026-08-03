@@ -223,18 +223,30 @@ def _ask_payload(**over) -> dict:
 # ---------------------------------------------------------------------------
 
 
-async def _until(cond, *, tries: int = 2000):
-    """Deterministic wait: yield to the loop until *cond* holds. A fixed
-    sleep(0.02) races the scheduler under CI load (the documented ask-gates
-    flake shape); yielding until the observable condition is true does not.
-    Scheduler-only coordination: bare yields never advance wall time, so this
-    suits conditions reached without real timers, and the bounded ``tries``
-    fails loudly (rather than hanging) if the condition never holds."""
-    for _ in range(tries):
+async def _until(cond, *, timeout: float = 5.0):
+    """Wait until *cond* holds, bounded by WALL CLOCK rather than by a count
+    of scheduler turns.
+
+    The previous version spun 2000 bare ``sleep(0)`` yields. Bare yields never
+    advance wall time, so any step that needs a real timer, a thread or an
+    executor cannot complete inside them however many turns pass — and on a
+    loaded CI runner that is exactly what happens, giving "condition never
+    became true" for a condition that was merely late rather than false. It
+    passed on a fast, idle machine and failed on a slow, busy one, which is
+    the property a deadline removes and a turn count cannot.
+
+    A short real sleep both yields and lets wall time pass, so the deadline
+    measures what the caller actually means: how long they are willing to
+    wait."""
+    loop = asyncio.get_running_loop()
+    deadline = loop.time() + timeout
+    while True:
         if cond():
             return
-        await asyncio.sleep(0)
-    raise AssertionError("condition never became true")
+        if loop.time() >= deadline:
+            raise AssertionError(
+                f"condition never became true within {timeout}s")
+        await asyncio.sleep(0.001)
 
 
 async def test_answered_settles_with_check_and_clears_keyboard(env):
