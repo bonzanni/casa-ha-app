@@ -159,6 +159,8 @@
   doc: architecture/memory.md
 - item: casa/rootfs/opt/casa/reload.py
   doc: architecture/configuration.md
+- item: casa/rootfs/opt/casa/reminders.py
+  doc: architecture/triggers.md
 - item: casa/rootfs/opt/casa/retry.py
   doc: architecture/turn-loop.md
 - item: casa/rootfs/opt/casa/role_artifact.py
@@ -320,6 +322,10 @@
 - item: tool:get_item_fields
   doc: architecture/tools-interface.md
 - item: tool:get_schedule
+  doc: architecture/tools-interface.md
+- item: tool:set_reminder
+  doc: architecture/tools-interface.md
+- item: tool:cancel_reminder
   doc: architecture/tools-interface.md
 - item: tool:list_engagement_workspaces
   doc: architecture/tools-interface.md

@@ -14,7 +14,25 @@ tools:
     - mcp__homeassistant
   # Agent/Task: Q-1 (v0.69.8) — butler must not spawn sub-agents (they bypass
   # allowed_tools + the fail-closed callback; disallowed is CLI-enforced).
-  disallowed: [Bash, Write, Edit, Agent, Task]
+  disallowed:
+    # #396: session-scoped schedulers. These outlive nothing — CronCreate
+    # reports "Session-only (not written to disk, dies when Claude exits)" —
+    # so a reminder set through one is silently discarded at the next
+    # restart, after the user has been told it is set. Note that tools.allowed
+    # is an AUTO-APPROVE list, not a deny list, which is how these were
+    # reachable without ever being listed. Use set_reminder instead.
+    - CronCreate
+    - CronDelete
+    - CronList
+    - ToolSearch
+    # The built-in `schedule` skill creates cloud routines against a claude.ai
+    # account a Casa install has no connection to; it fails at call time.
+    - Skill(schedule)
+    - Bash
+    - Write
+    - Edit
+    - Agent
+    - Task
   permission_mode: acceptEdits
   max_turns: 10
   skills: none

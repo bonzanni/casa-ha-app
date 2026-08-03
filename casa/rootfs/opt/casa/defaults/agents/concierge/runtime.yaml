@@ -10,7 +10,30 @@ tools:
   allowed:
     - WebSearch
     - mcp__casa-framework__delegate_to_agent
-  disallowed: [Bash, Write, Edit, Read, Glob, Grep, WebFetch, NotebookEdit, Agent, Task]
+  disallowed:
+    # #396: session-scoped schedulers. These outlive nothing — CronCreate
+    # reports "Session-only (not written to disk, dies when Claude exits)" —
+    # so a reminder set through one is silently discarded at the next
+    # restart, after the user has been told it is set. Note that tools.allowed
+    # is an AUTO-APPROVE list, not a deny list, which is how these were
+    # reachable without ever being listed. Use set_reminder instead.
+    - CronCreate
+    - CronDelete
+    - CronList
+    - ToolSearch
+    # The built-in `schedule` skill creates cloud routines against a claude.ai
+    # account a Casa install has no connection to; it fails at call time.
+    - Skill(schedule)
+    - Bash
+    - Write
+    - Edit
+    - Read
+    - Glob
+    - Grep
+    - WebFetch
+    - NotebookEdit
+    - Agent
+    - Task
   permission_mode: dontAsk
   max_turns: 6
 mcp_server_names:

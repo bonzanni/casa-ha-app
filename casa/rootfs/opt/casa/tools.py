@@ -4629,6 +4629,10 @@ async def get_schedule(args: dict) -> dict:
         for s in summaries:
             if s.type == "cron":
                 desc = f"(cron, `{s.schedule_desc}`)"
+            elif s.type == "date":
+                # #396: a one-off reminder. Without this branch it would be
+                # mislabelled "(interval, once at …)".
+                desc = f"(one-off, {s.schedule_desc})"
             else:
                 desc = f"(interval, {s.schedule_desc})"
             lines.append(
@@ -4638,6 +4642,200 @@ async def get_schedule(args: dict) -> dict:
         text = "\n".join(lines)
 
     return {"content": [{"type": "text", "text": text}]}
+
+
+# ---------------------------------------------------------------------------
+# set_reminder / cancel_reminder — #396
+#
+# A reminder IS a trigger, so these are a narrow front door onto the machinery
+# that already exists rather than a parallel system. The bounds that keep them
+# from being a general config writer (INV-TRIG-007):
+#   * the CALLING role's own reminders.yaml, never another agent's;
+#   * only entries carrying the reserved ``reminder-`` prefix;
+#   * only reminder-shaped fields.
+# ``config_git_commit``'s configurator-only guard is untouched — this is a
+# separate, narrower path, not a relaxation of it.
+# ---------------------------------------------------------------------------
+
+
+def _reminder_origin_role() -> str:
+    origin = _snapshot_origin()
+    return (origin or {}).get("role") or ""
+
+
+@tool(
+    "set_reminder",
+    "Set a durable reminder that survives restarts and updates. `at` is the "
+    "first (or only) occurrence as an ISO-8601 time WITH a UTC offset — "
+    "resolve it yourself from what the user said, and echo the absolute time "
+    "back to them so a misreading is caught immediately. `repeat` is one of "
+    "none (default), daily, weekdays, weekly, monthly; when the user's "
+    "request is genuinely ambiguous about repeating, ask them with tappable "
+    "buttons before calling this. A repeating reminder must land on a whole "
+    "minute, and a monthly one on day 28 or earlier — later days are missing "
+    "from some months, so ask the user for a different day rather than "
+    "guessing. Own-role only.",
+    {"at": str, "text": str, "repeat": str},
+)
+async def set_reminder(args: dict) -> dict:
+    from datetime import datetime
+
+    import reminders
+
+    role = _reminder_origin_role()
+    if not role:
+        return _result({"status": "error", "kind": "no_turn_context",
+                        "message": "set_reminder called outside a turn"})
+
+    text = (args.get("text") or "").strip()
+    if not text:
+        return _result({"status": "error", "kind": "invalid_argument",
+                        "message": "text is required"})
+
+    from timekeeping import resolve_tz
+    tz = resolve_tz()
+
+    repeat = (args.get("repeat") or "none").strip().lower()
+    try:
+        when = reminders.parse_at(args.get("at") or "")
+        # Refuse anything a cron cannot express EXACTLY rather than
+        # approximating it — an approximation makes the time the user is told
+        # differ from the time that fires.
+        reminders.validate_recurring(when, repeat, tz)
+        fields = reminders.derive_schedule(when, repeat, tz)
+    except ValueError as exc:
+        return _result({"status": "error", "kind": "invalid_argument",
+                        "message": str(exc)})
+
+    if when <= datetime.now(when.tzinfo):
+        return _result({
+            "status": "error", "kind": "invalid_argument",
+            "message": f"{args.get('at')!r} is in the past",
+        })
+
+    runtime = _runtime
+    if runtime is None:
+        return _result({"status": "error", "kind": "not_initialized",
+                        "message": "runtime not wired"})
+    cfg = getattr(runtime, "role_configs", {}).get(role)
+    if cfg is None:
+        return _result({"status": "error", "kind": "unknown_role",
+                        "message": f"no config for role {role!r}"})
+    channels = list(getattr(cfg, "channels", []) or [])
+    if not channels:
+        return _result({"status": "error", "kind": "no_channel",
+                        "message": f"role {role!r} declares no channel"})
+    # Prefer telegram when available; INV-TRIG-001 requires the trigger's
+    # channel to be one this role actually declares.
+    channel = "telegram" if "telegram" in channels else channels[0]
+
+    path = reminders.reminders_path(runtime.agents_dir, role)
+    # Generate against the names already in the store. A collision would fail
+    # registration on a duplicate job id, and the rollback below would then
+    # delete the PRE-EXISTING reminder of that name along with this one.
+    try:
+        name = reminders.new_reminder_name(reminders.existing_names(path))
+    except ValueError as exc:
+        return _result({"status": "error", "kind": "name_exhausted",
+                        "message": str(exc)})
+    entry = {
+        "name": name,
+        **fields,
+        "one_shot": repeat == "none",
+        "channel": channel,
+        # Imperative on purpose: a scheduled turn may legitimately produce no
+        # output, so delivery must not be left to the model's judgement. This
+        # is the morning-briefing silence lesson (v0.132.0) applied.
+        "prompt": f'Send this exact message via {channel}: "{text}"',
+    }
+
+    try:
+        reminders.append_entry(path, entry)
+    except (OSError, ValueError) as exc:
+        return _result({"status": "error", "kind": "write_failed",
+                        "message": str(exc)})
+
+    # Register in-process so the reminder is live NOW, not at the next boot.
+    from config import TriggerSpec
+    spec = TriggerSpec(
+        name=name, type=entry["type"], schedule=entry.get("schedule", ""),
+        at=entry.get("at", ""), one_shot=entry["one_shot"],
+        channel=channel, prompt=entry["prompt"],
+        from_reminder_store=True,
+    )
+    try:
+        runtime.trigger_registry.register_agent(role, [spec], channels)
+    except Exception as exc:  # noqa: BLE001
+        # Fail closed: a reminder recorded but never registered would look set
+        # and silently not fire until the next restart.
+        try:
+            reminders.remove_entry(path, name)
+        except (OSError, ValueError):
+            logger.warning("set_reminder: rollback failed for %s", name,
+                           exc_info=True)
+        return _result({"status": "error", "kind": "register_failed",
+                        "message": str(exc)})
+
+    # Report the EFFECTIVE time, not the one passed in. A recurring anchor is
+    # rounded up to a whole minute (cron has minute resolution), so echoing
+    # the caller's value would tell the user a time the reminder will not
+    # actually fire at.
+    effective = entry.get("at") or when.isoformat()
+    logger.info("reminder set: role=%s name=%s at=%s repeat=%s",
+                role, name, effective, repeat)
+    return _result({"status": "ok", "name": name,
+                    "at": effective, "repeat": repeat})
+
+
+@tool(
+    "cancel_reminder",
+    "Cancel a reminder you previously set, by its name as shown by "
+    "get_schedule. Own-role only, and reminders only — other scheduled "
+    "triggers are operator configuration and cannot be removed here.",
+    {"name": str},
+)
+async def cancel_reminder(args: dict) -> dict:
+    import reminders
+
+    role = _reminder_origin_role()
+    if not role:
+        return _result({"status": "error", "kind": "no_turn_context",
+                        "message": "cancel_reminder called outside a turn"})
+
+    name = (args.get("name") or "").strip()
+    if not reminders.is_reminder_name(name):
+        return _result({
+            "status": "error", "kind": "not_authorized",
+            "message": (f"{name!r} is not a reminder. Only reminders you set "
+                        f"can be cancelled here; other triggers are operator "
+                        f"configuration."),
+        })
+
+    runtime = _runtime
+    if runtime is None:
+        return _result({"status": "error", "kind": "not_initialized",
+                        "message": "runtime not wired"})
+
+    path = reminders.reminders_path(runtime.agents_dir, role)
+    try:
+        removed = reminders.remove_entry(path, name)
+    except (OSError, ValueError) as exc:
+        return _result({"status": "error", "kind": "write_failed",
+                        "message": str(exc)})
+    if not removed:
+        return _result({"status": "error", "kind": "not_found",
+                        "message": f"no reminder named {name!r}"})
+
+    # Drop the live job too, so the cancellation takes effect now. Best
+    # effort: the entry is already gone, so a boot would not resurrect it.
+    try:
+        runtime.trigger_registry.remove_job_for(role, name)
+    except Exception:  # noqa: BLE001
+        logger.warning("cancel_reminder: job removal failed for %s:%s",
+                       role, name, exc_info=True)
+
+    logger.info("reminder cancelled: role=%s name=%s", role, name)
+    return _result({"status": "ok", "name": name})
 
 
 # ---------------------------------------------------------------------------
@@ -10148,6 +10346,8 @@ CASA_TOOLS: tuple = (
     continue_voice_job,
     recall_memory,                 # §4.3 — shared-bank semantic recall (tier-clearance filtered)
     get_schedule,
+    set_reminder,                  # #396 — durable reminders
+    cancel_reminder,               # #396
     engage_executor,
     emit_completion,
     cancel_engagement,

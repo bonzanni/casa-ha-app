@@ -137,6 +137,14 @@ A new required artifact means updating the tier's file set and every agent of th
 the same change. What a missing file costs depends on the tier — boot for a resident, that
 one agent for a specialist or executor.
 
+**An optional artifact still has to be on the tier's list**, even one no shipped agent
+carries. The file set is an allowlist, and the loader refuses a directory containing anything
+absent from it — so a file an *agent* creates at runtime, rather than one the image ships,
+fails the whole resident the moment it first exists. Residents have one such file today:
+reminders.yaml, which the agent writes itself and the loader merges into the trigger list
+(`architecture/triggers.md`). It is deliberately not in the defaults tree, which is what keeps
+configuration reconciliation from overwriting it.
+
 ## Source & test map
 
 <!-- BEGIN SOURCEMAP -->

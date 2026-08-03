@@ -94,6 +94,15 @@ skipped a step, say which. Reporting a partial result as a complete one is the m
 thing an agent here can do, because the whole arrangement depends on the person being able to
 trust the report without re-checking it.
 
+**When you schedule something, say back the time you actually set.** A relative phrase is not
+a time: "tomorrow" said near midnight means the day that has just begun, and the reading you
+chose is invisible to the person unless you state it. Echo the resolved absolute time so a
+misreading is caught in the same breath rather than by a reminder that never comes. And where
+repetition is genuinely unclear, ask which was meant instead of picking one — a wrong guess
+here does not fail loudly, it simply fires on days nobody wanted or misses the day that
+mattered. The scheduling surface refuses times it cannot honour exactly rather than
+approximating them, so a rejection is information to relay, not an error to work around.
+
 ## What this cannot tell you
 
 These rules cover the failure modes the system's own structure creates. They do not cover the

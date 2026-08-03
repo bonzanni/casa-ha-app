@@ -70,7 +70,8 @@ setting by hand:
 2. **Message flow**: Incoming messages (Telegram, webhook, voice) are routed through an async message bus to the appropriate agent based on the originating channel.
 3. **Agent processing**: Each agent builds a system prompt (personality + memory context), queries the Claude Agent SDK, stores the conversation in memory, and sends the response back through the originating channel.
 4. **Home Assistant integration**: Agents interact with HA via the official HA MCP server, allowing them to control devices, read states, and create automations.
-5. **Per-agent triggers**: Each agent declares scheduled triggers (cron or interval) in its own `agents/<role>/triggers.yaml`. The TriggerRegistry registers them at boot, and fires them via the agent's normal turn loop.
+5. **Per-agent triggers**: Each agent declares scheduled triggers (cron, interval or a one-off date) in its own `agents/<role>/triggers.yaml`. The TriggerRegistry registers them at boot, and fires them via the agent's normal turn loop.
+6. **Reminders**: Ellen can set her own reminders, which are ordinary triggers written to her `triggers.yaml` — so they survive restarts and updates. One-off reminders remove themselves after firing, and any reminder whose time fell while Casa was down is delivered on the next sweep rather than lost.
 
 ## API endpoints
 
@@ -643,6 +644,8 @@ Ask Ellen for a configuration change in 1:1 chat. Examples:
 - "Change Alex's prompt to be more concise"
 - "Remove the garbage_reminder trigger"
 - "Wire Alex into your delegates"
+
+> **Reminders do not need the configurator.** Just ask Ellen directly — "remind me tomorrow before 9am to put the bins out", "remind me every Thursday at 7 to go to the gym" — and she sets it herself. She confirms the exact time, asks whether it should repeat when that is unclear, and can cancel it later.
 
 Ellen opens a topic `#[configurator] <short task>` in your engagement supergroup. The configurator reads its doctrine, asks questions as needed, edits YAMLs, commits, and reloads Casa.
 

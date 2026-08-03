@@ -13,7 +13,7 @@ from __future__ import annotations
 import logging
 from dataclasses import dataclass
 from datetime import datetime, timedelta
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, Callable
 
 from aiohttp import web
 
@@ -106,8 +106,8 @@ def _translate_cron_dow(field: str) -> str:
 @dataclass
 class TriggerSummary:
     name: str
-    type: str            # "interval" | "cron"
-    schedule_desc: str   # "every 30m" or the raw 5-field cron
+    type: str            # "interval" | "cron" | "date"
+    schedule_desc: str   # "every 30m", the raw 5-field cron, or "once at <ts>"
     next_fire: datetime  # tz-aware
 
 
@@ -118,11 +118,24 @@ class TriggerRegistry:
         scheduler: "AsyncIOScheduler",
         app: web.Application,
         bus: MessageBus,
+        on_one_shot_fired: "Callable[[str, str], None] | None" = None,
     ) -> None:
         self._scheduler = scheduler
         self._app = app
         self._bus = bus
+        # #396: invoked as (role, trigger_name) after a one_shot trigger has
+        # been dispatched, so the owning reminders.yaml entry can be removed.
+        # INJECTED rather than done here — the registry must not learn to
+        # write YAML. Default None keeps every existing call site working.
+        self._on_one_shot_fired = on_one_shot_fired
         self._seen_job_ids: set[str] = set()
+        # #396: job ids whose _fire is RUNNING RIGHT NOW. APScheduler submits
+        # a date job and then removes it from the store, so for the whole
+        # duration of the dispatch the scheduler no longer reports the job —
+        # and a sweep landing in that window would deliver the same reminder a
+        # second time. This set is what keeps ownership exclusive across the
+        # await inside _fire.
+        self._in_flight: set[str] = set()
         self._specs_by_job_id: dict[str, TriggerSpec] = {}
         # N-1 + N-2 (v0.36.0): per-boot allowlist of webhook trigger names
         # → role. The wildcard /webhook/{name} handler in casa_core consults
@@ -179,7 +192,7 @@ class TriggerRegistry:
                 )
             names_seen.add(trig.name)
 
-            if trig.type in ("interval", "cron"):
+            if trig.type in ("interval", "cron", "date"):
                 if trig.channel not in channels:
                     raise TriggerError(
                         f"agent {role!r} trigger {trig.name!r}: channel "
@@ -218,6 +231,13 @@ class TriggerRegistry:
                 "Trigger firing: agent=%s name=%s type=%s",
                 role, trig.name, trig.type,
             )
+            self._in_flight.add(job_id)
+            try:
+                await _dispatch()
+            finally:
+                self._in_flight.discard(job_id)
+
+        async def _dispatch() -> None:
             msg = BusMessage(
                 type=MessageType.SCHEDULED,
                 source="scheduler",
@@ -232,7 +252,44 @@ class TriggerRegistry:
             )
             await self._bus.send(msg)
 
-        if trig.type == "interval":
+            if trig.one_shot:
+                # #396 / INV-TRIG-006. Ordering is load-bearing: the bus send
+                # has ALREADY happened, so everything below is cleanup, not
+                # part of delivery. A failure here leaves the yaml entry in
+                # place and the sweep redelivers — at-least-once by choice
+                # (spec §8), because a duplicate nudge is a far better failure
+                # than a missed reminder.
+                self._drop_job(job_id)
+                if self._on_one_shot_fired is not None:
+                    try:
+                        self._on_one_shot_fired(role, trig.name)
+                    except Exception:  # noqa: BLE001
+                        logger.warning(
+                            "one-shot cleanup failed for %s:%s; the sweep "
+                            "will redeliver", role, trig.name, exc_info=True,
+                        )
+
+        if trig.type == "date":
+            # #396: a genuine point in time. Cron has no year field, so a
+            # dated one-shot written as cron is an ANNUAL trigger in disguise
+            # — this branch is what removes that trap.
+            import reminders
+            when = reminders.parse_at(trig.at)   # raises on naive/absent
+            if when <= datetime.now(when.tzinfo):
+                # Already overdue: the sweep owns it. Registering here would
+                # either fire instantly at boot or vanish as a misfire, and
+                # both destroy the "still present, still owed" evidence.
+                # Deliberately returns BEFORE claiming job_id, so a later
+                # re-registration of the same name is not blocked.
+                logger.info(
+                    "Reminder %s for agent %s is already past (%s); leaving "
+                    "it to the sweep", trig.name, role, trig.at,
+                )
+                return
+            self._scheduler.add_job(
+                _fire, trigger="date", run_date=when, id=job_id,
+            )
+        elif trig.type == "interval":
             self._scheduler.add_job(
                 _fire, trigger="interval", minutes=trig.minutes, id=job_id,
             )
@@ -245,15 +302,97 @@ class TriggerRegistry:
                     f"must be a 5-field string; got {trig.schedule!r}"
                 )
             minute, hour, day, month, day_of_week = fields
+            # #396: a recurring reminder carries its first occurrence in
+            # ``at``. Passing it as start_date stops the series firing BEFORE
+            # the date the user asked for — "every Thursday from the 20th"
+            # set on the 3rd would otherwise fire on the 6th and 13th.
+            # Recurrence is still driven by the cron fields, evaluated in the
+            # scheduler's timezone, so this does not affect DST correctness.
+            extra: dict = {}
+            if trig.at:
+                import reminders
+                extra["start_date"] = reminders.parse_at(trig.at)
             self._scheduler.add_job(
                 _fire, trigger="cron",
                 minute=minute, hour=hour, day=day, month=month,
                 # #343: cron 0/7=Sunday vs APScheduler 3.x 0=Monday —
                 # translate to day names (identical meaning in both).
                 day_of_week=_translate_cron_dow(day_of_week), id=job_id,
+                **extra,
             )
         self._seen_job_ids.add(job_id)
         self._specs_by_job_id[job_id] = trig
+
+    def _drop_job(self, job_id: str) -> bool:
+        """Remove a scheduled job and forget its bookkeeping.
+
+        Returns True if the scheduler actually had it. Freeing ``job_id`` from
+        ``_seen_job_ids`` matters: without it the duplicate-id guard would
+        refuse to re-register the same trigger name after a one-shot fired or
+        a reminder was cancelled.
+        """
+        removed = True
+        try:
+            self._scheduler.remove_job(job_id)
+        except Exception:  # noqa: BLE001 - already gone is success here
+            removed = False
+        self._seen_job_ids.discard(job_id)
+        self._specs_by_job_id.pop(job_id, None)
+        return removed
+
+    def has_job(self, role: str, name: str) -> bool:
+        """True if a live scheduled job exists for this role and name (#396).
+
+        The reminder sweep consults this to keep ownership exclusive: if the
+        scheduler still holds the job it WILL deliver it, so the sweep must
+        not. Without this the two race for a reminder whose time has just
+        passed and the user gets it twice.
+
+        The SCHEDULER is the authority, not ``_seen_job_ids``. APScheduler
+        drops a date job that overran its misfire grace period WITHOUT ever
+        calling the job function, which leaves our bookkeeping claiming a live
+        job that no longer exists — and the sweep would then skip that
+        reminder forever, so it would never be delivered at all.
+        """
+        job_id = f"{role}:{name}"
+        # A dispatch already in progress owns this reminder, even though the
+        # scheduler has already dropped the job.
+        if job_id in self._in_flight:
+            return True
+        if job_id not in self._seen_job_ids:
+            return False
+        try:
+            return self._scheduler.get_job(job_id) is not None
+        except Exception:  # noqa: BLE001 - no scheduler view; trust bookkeeping
+            return True
+
+    def remove_job_for(self, role: str, name: str) -> bool:
+        """Drop a live scheduled job by role and trigger name (#396).
+
+        Used by ``cancel_reminder`` so a cancellation takes effect now rather
+        than at the next boot.
+        """
+        return self._drop_job(f"{role}:{name}")
+
+    def reminder_job_names(self, role: str) -> list[str]:
+        """Names of this role's jobs that came FROM THE REMINDER STORE (#396).
+
+        The sweep uses this to reconcile in both directions: a reminder job
+        with no entry left in the store must go, or a cancellation that raced
+        a reload — which re-registers from a snapshot taken before the
+        cancellation — would leave the reminder firing forever despite the
+        tool having reported success.
+
+        Selection is by the spec's recorded provenance, never by its name. The
+        schema requires every date trigger to carry the reminder prefix, so an
+        operator may legitimately author one in their own file; matching on
+        the prefix would delete it.
+        """
+        head = f"{role}:"
+        return [job_id[len(head):]
+                for job_id, spec in self._specs_by_job_id.items()
+                if job_id.startswith(head)
+                and getattr(spec, "from_reminder_store", False)]
 
     def _register_webhook(self, role: str, trig: TriggerSpec) -> None:
         # Release A: webhook triggers are served ONLY by the authenticated
@@ -473,6 +612,11 @@ class TriggerRegistry:
                 schedule_desc = f"every {trig.minutes}m"
             elif trig.type == "cron":
                 schedule_desc = trig.schedule
+            elif trig.type == "date":
+                # #396: MUST be listed. cancel_reminder takes the name that
+                # get_schedule reports, so a one-shot reminder omitted here is
+                # a reminder the user can neither see nor cancel.
+                schedule_desc = f"once at {trig.at}"
             else:
                 continue
             out.append(TriggerSummary(

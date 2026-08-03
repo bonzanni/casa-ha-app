@@ -1,5 +1,32 @@
 # Changelog
 
+## [0.148.0] - 2026-08-03
+
+### Added
+
+Ellen can set reminders, and they last. Ask in plain language and she confirms
+the exact time she has set, so a misread is obvious straight away:
+
+- **"Remind me tomorrow before 9am to put the bins out"** now creates a real
+  reminder that survives restarts and updates. Reminders can repeat daily, on
+  weekdays, weekly or monthly; when your request is genuinely ambiguous about
+  repeating, Ellen asks which you meant before setting it.
+- **Cancel a reminder at any time**, and ask Ellen what is scheduled to see
+  the ones you have.
+- **A reminder due while Casa is restarting is no longer lost.** It arrives as
+  soon as Casa is back, marked as late, instead of silently never coming.
+- **Reminders survive Casa updates**, including updates that change the shipped
+  default schedule for your agents.
+
+### Fixed
+
+- Reminders could previously be created as session-only timers that were
+  quietly discarded at the next restart — after Ellen had told you they were
+  set. That route is closed; reminders now always take the durable path.
+- A one-off reminder for a specific date is now genuinely one-off. Dated
+  reminders used to be stored as a yearly repeat that relied on a clean-up
+  step to stop it coming back every year on the same day.
+
 ## [0.147.0] - 2026-08-02
 
 ### Changed

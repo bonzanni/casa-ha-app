@@ -17,8 +17,59 @@ they are `architecture/callbacks.md`.
 
 ## Mental model
 
-**Three trigger types exist for residents — interval, cron and webhook — and plugins may
+**Four trigger types exist for residents — interval, cron, date and webhook — and plugins may
 declare webhooks only.**
+
+**A reminder is a trigger, not a separate thing.** A resident creates one through a narrow
+writer that may only touch entries carrying a reserved name prefix; everything downstream —
+registration, firing, listing — is the ordinary trigger path. One-off reminders use the
+point-in-time `date` type, because cron has no year field and a dated one-shot written as
+cron is an *annual* trigger in disguise.
+
+**Reminders live in their own file, and that placement is load-bearing.** They are declared
+in an agent-owned `reminders.yaml` beside `triggers.yaml`, and the loader merges the two into
+one list. The separation exists because configuration reconciliation resolves an edited
+image-owned file against a changed shipped default as *image wins* — so reminders kept in
+`triggers.yaml` would be deleted wholesale by the first update that touched its default,
+which is precisely the durability this feature exists to provide. A file absent from the
+defaults tree is adopted and never rewritten.
+
+**A reminder still present with a past fire time is one that is owed.** The entry is the
+record and delivery removes it, so there is no second store to keep in sync. This is what
+lets a sweep recover occurrences the process was down for — something the scheduler itself
+cannot do. Ownership is exclusive: while a live job exists the scheduler owns delivery and
+the sweep leaves it alone.
+
+**A recurring reminder keeps its first occurrence as an anchor.** The derived cron fields
+drive the recurrence — evaluated in the scheduler's timezone, which is what keeps a series
+firing at the same local time across a DST boundary — while the anchor becomes the
+scheduler's start date, so "every Thursday from the 20th" cannot fire on the 6th.
+
+**What a cron cannot express exactly is refused, not approximated.** A repeating reminder must
+land on a whole minute, and a monthly one on the 28th or earlier — cron has minute resolution
+and skips months a literal 29th, 30th or 31st is missing from, so "monthly on the 31st" would
+fire seven times a year rather than twelve. Every approximation tried here made the time the
+user was told differ from the time that fires, so the request is rejected and the agent asks
+for something expressible instead.
+
+**Wall-clock fields are read in the scheduler's timezone**, not the caller's offset. The
+offset pins which instant is meant; the cron is evaluated in the scheduler's zone, so deriving
+the fields from a caller's offset would misschedule by the difference whenever the two
+disagree, and drift across a DST boundary.
+
+**The store is the truth; the scheduler is a cache of it.** The sweep reconciles in both
+directions — registering any reminder with no live job, and dropping any reminder job with no
+entry left in the store — which heals a divergence without needing a lock. Which jobs are
+*eligible* to be dropped is decided by recorded provenance, carried on the spec from the file
+it was loaded from — never by the name. The schema requires every point-in-time trigger to
+carry the reserved prefix, so an operator may legitimately author one in their own file, and
+matching on the name would delete it. A reload
+re-registering a role from a snapshot taken before a reminder was written would otherwise drop
+a *recurring* reminder for good, since only one-shots are recoverable by delivery; the same
+race in the other direction would leave a cancelled reminder firing forever. A consequence
+worth stating: reminders are deliberately independent of operator-trigger validity, so a
+reload that fails closed on a malformed operator cron does not disable the user's reminders,
+even though it reports that role's triggers as inactive.
 
 **Every webhook trigger arrives on one wildcard route.** There is no route per trigger. The
 name in the path is looked up against a registry, and an unknown name is refused before any
@@ -38,7 +89,9 @@ translation exists to prevent.
 job store, so jobs live in process memory. Definitions are rebuilt from configuration at
 boot, which makes it *look* durable — but next-run times and any occurrence missed while the
 process was down are simply gone. The grace-period setting bounds lateness for a running
-process; it cannot resurrect what was never recorded.
+process; it cannot resurrect what was never recorded. Reminders are the one exception, and
+only because they do not rely on the scheduler to remember: their entry on disk is the record
+that delivery is owed, so a sweep can redeem an occurrence the scheduler never saw.
 
 **A plugin's declared webhook does not route because the plugin is installed.** Declaration
 is only intrinsic validity. Routing additionally requires the target to exist and accept
@@ -89,6 +142,41 @@ mode, header or tolerance change, does invalidate the approval.
 
 There is no window in which the overlay is half-updated. Names absent from the new set stop
 routing immediately.
+
+**INV-TRIG-006**: A one-shot trigger fires at most once — firing removes both the scheduler job and the `triggers.yaml` entry.
+
+Removal runs after the dispatch, in process, and frees the job id so the same name can be
+registered again. The red case is a `one_shot` trigger that survives its own firing: either
+the job stays in the scheduler, or the entry stays on disk and a restart resurrects an
+already-delivered reminder.
+
+What it does not cover: it does not promise the removal *succeeded*. Cleanup is deliberately
+outside the delivery path, so a failure leaves the entry for the sweep rather than raising
+back into the scheduled job.
+
+**INV-TRIG-007**: The reminder writer may only create, and the canceller only remove, entries carrying the reserved name prefix in the calling role's own file.
+
+This is the whole boundary between a resident managing its own reminders and a resident
+editing operator configuration. The red case is either tool touching a name without the
+prefix — the heartbeat, the morning briefing — or reaching another role's file. The
+privileged config-commit path keeps its own separate configurator-only guard; this is a
+narrower door beside it, not a widening of that one.
+
+**INV-TRIG-008**: A one-shot reminder whose time passed while the process was down is delivered by the next sweep rather than dropped.
+
+Presence is the record: an entry still on disk with a past fire time *is* the evidence that
+delivery is owed, which is why removal happens only after a successful send. The red case is
+an overdue entry that no sweep ever delivers. Delivery is consequently at-least-once — a
+failed removal redelivers — because a duplicate reminder is a better failure than a missing
+one. The scheduler and the sweep never both deliver: the sweep skips any reminder that still
+has a live job, so the two never race for one whose time has just passed.
+
+What it does not cover — **"delivered" means placed on the bus, not received by the human.**
+The entry is removed once the turn is dispatched, so a reminder lost further down the channel
+(a Telegram send that fails while the transport is reconnecting) is not retried. This is the
+same contract every other trigger has had since the beginning, and closing it would need an
+end-to-end receipt through the whole turn pipeline rather than anything reminder-specific. It
+is a known residual, not an oversight.
 
 ## Failure behavior
 
