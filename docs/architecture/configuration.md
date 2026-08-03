@@ -50,6 +50,23 @@ schema, is *overwritten by the image* with the prior content preserved as a reco
 artifact. A live file the image does not know is adopted, not deleted. Predicting which of
 your edits survive means knowing which of the three cases each file is in.
 
+**Three files resolve per entry rather than per file, and that changes the answer for
+them.** A small explicit set — the trigger, delegate and executor lists under each agent —
+are lists of named entries for which the shipped copy is a *seed*, not the whole truth.
+For these, ownership is decided one entry at a time: a name the image ships tracks the
+image, and a name added locally is kept rather than dying alongside it. The same
+image-wins rule still settles a name both sides changed. Two consequences are worth
+knowing before relying on it. The merge runs only when the file parses into a clean list
+of uniquely-named mappings; anything else — a duplicate name, a malformed entry — falls
+back to whole-file resolution rather than guessing what was meant. And a merge that has
+something to apply rewrites the file, so comments and formatting in it are lost; a merge
+with nothing to apply leaves the bytes alone.
+
+**Deciding which strategy a file gets is a deliberate act, not a property of its shape.**
+The set is a written table, because a file being a list of objects is not what makes
+entry-level resolution safe — entries being independent of each other is, and that is a
+fact about these three files rather than about their schemas.
+
 **Some identity changes cannot be hot-swapped at all.** If a resident's identity changes, the
 reload path returns a restart-required outcome *before* mutating live state rather than
 attempting a swap.
@@ -119,6 +136,57 @@ failure. Problems are recorded rather than raised.
 What it does not cover: a recorded residual problem can still cause a later failure when
 something tries to load what was left broken.
 
+**INV-CFG-006**: In a file reconciled per entry, an entry whose name the image has never shipped is preserved, except when the image ships that name for the first time.
+
+Enforced in the reconciler's entry-level branch, which resolves each name against the
+previous image's copy rather than against the file as a whole.
+
+What it does not cover, and each case is real: the exception is the collision — a local
+entry *is* displaced when a future image claims its name, so the guarantee is not
+ownership-neutral. An entry that fails the current schema is dropped by the backstop
+below. And a file that does not parse into a clean list of uniquely-named mappings is not
+reconciled per entry at all, so nothing in it is protected. Every one of those is backed
+by a recovery copy, a report record and an operator notification, but in each the running
+configuration has lost the entry. Nor does it reach a file the reconciler *adopts*: the
+image has never shipped it, so there is nothing to reconcile it against and it is passed
+through untouched — reported if it fails its schema, since nothing here can repair it.
+
+A preserved entry can also be dropped without any schema failing: the
+post-reconciliation boot-parity pass. Two files can each satisfy their own schema and
+together stop an agent loading — a kept delegate entry against a runtime that no longer
+allows the delegate tool, a kept trigger against a runtime that no longer declares its
+channel. Per-file validation cannot see that. The boot-parity pass can, and it reverts
+**every** entry-level merge — not the guilty one, which it does not try to identify —
+restoring what whole-file resolution would have produced rather than leaving a system
+that will not start. Merges that were not the cause are reverted with it; that is the
+deliberate price of not searching for the guilty one and leaving a half-reverted tree
+behind a failed restore. Each file is preserved before it is touched — and a file that
+cannot be read or backed up is left alone rather than reverted, so the sweep is
+best-effort per file rather than atomic across them. Every revert is reported and
+notified.
+
+**INV-CFG-007**: Reconciliation never writes a config file that fails its schema.
+
+Enforced by validating the composed document before it replaces anything, and again on
+the serialized bytes. A merge that cannot be shown valid is abandoned in favour of
+whole-file resolution rather than written.
+
+What it does not cover: files reconciliation does not write. A file adopted because the
+image does not know it is never rewritten, and a file kept live because the image did not
+change it is only checked by the backstop.
+
+**INV-CFG-008**: Entry-level reconciliation only ever writes a `schema_version` that already appears among its input documents; it never synthesizes or migrates one.
+
+Enforced by composing the merged document from the live file's own top-level fields,
+falling back to the shipped default's only when the live one would make the result
+invalid.
+
+What it does not cover: it constrains the reconciler, not the writers. Different producers
+of the same file may emit different versions — the configurator writes a newer trigger
+schema version than the shipped default does — and nothing here reconciles that
+disagreement. Carrying content *across* a version is migration, which does not exist yet
+([#402](https://github.com/bonzanni/ha-casa-app/issues/402)).
+
 ## Failure behavior
 
 **The required credential option is missing.** Boot stops at validation — the earliest fatal
@@ -159,6 +227,18 @@ every consumer, because no generic mechanism exists.
 
 **A new default tree** must be added to the reconciler's list *and* to the version-control
 whitelist separately. Neither implies the other.
+
+**A new list-of-entries file** does not get entry-level reconciliation by being shaped like
+one. It must be added to the reconciler's table with its list key and the field that names
+an entry, and the question to answer first is whether its entries are genuinely
+independent — if one entry's meaning depends on its neighbours or on their order, merging
+them separately is wrong and whole-file resolution is the correct strategy.
+
+**Tightening a schema** is not a local change to that schema. There is no migration
+mechanism, so live content that fails the new shape is dropped rather than carried
+forward; files the reconciler adopts are never repaired at all and will stop the next boot;
+and any writer that emits a version literal has to move with it.
+[#402](https://github.com/bonzanni/ha-casa-app/issues/402) carries the constraints.
 
 **A new reload scope** needs its handler, a lock key, a decision about whether the full scope
 composes it, whether it participates in trigger reconciliation, and what its failure means.

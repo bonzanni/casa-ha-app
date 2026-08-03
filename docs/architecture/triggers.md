@@ -26,13 +26,17 @@ registration, firing, listing — is the ordinary trigger path. One-off reminder
 point-in-time `date` type, because cron has no year field and a dated one-shot written as
 cron is an *annual* trigger in disguise.
 
-**Reminders live in their own file, and that placement is load-bearing.** They are declared
-in an agent-owned `reminders.yaml` beside `triggers.yaml`, and the loader merges the two into
-one list. The separation exists because configuration reconciliation resolves an edited
-image-owned file against a changed shipped default as *image wins* — so reminders kept in
-`triggers.yaml` would be deleted wholesale by the first update that touched its default,
-which is precisely the durability this feature exists to provide. A file absent from the
-defaults tree is adopted and never rewritten.
+**Reminders live in their own file.** They are declared in an agent-owned
+`reminders.yaml` beside `triggers.yaml`, and the loader merges the two into one list. A
+file absent from the defaults tree is adopted by configuration reconciliation and never
+rewritten, so nothing an update ships can touch it.
+
+The separation is no longer what makes a reminder durable. `triggers.yaml` is now
+reconciled *per entry* — an entry the image never shipped is preserved rather than dying
+with the file — so a reminder written there would survive an update too
+([`architecture/configuration.md`](configuration.md)). The two files remain distinct
+because provenance is currently derived from which of them an entry was loaded from, and
+that is what bounds an agent to its own reminders rather than the operator's triggers.
 
 **A reminder still present with a past fire time is one that is owed.** The entry is the
 record and delivery removes it, so there is no second store to keep in sync. This is what

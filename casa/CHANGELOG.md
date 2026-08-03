@@ -1,5 +1,30 @@
 # Changelog
 
+## [0.149.0] - 2026-08-03
+
+### Fixed
+
+- **Triggers, delegates and executors you add yourself are no longer deleted
+  when an update also changes the version Casa ships.** These files are lists
+  of named entries, and Casa now reconciles them entry by entry: the entries
+  Casa ships still follow the update, and the ones you or an agent added are
+  kept. Previously the whole file was replaced, so a reminder or a schedule you
+  had asked for could disappear on an update with nothing to tell you. A file
+  Casa cannot read as a clean list of uniquely-named entries falls back to the
+  previous whole-file behaviour rather than guessing.
+- **A configuration file that fails validation after an update now loses only
+  the entries that are actually invalid**, instead of being reset in full.
+- **Reconciliation now always saves the previous version of any file it
+  rewrites** — as a `.casabak` file next to the original, and as a commit in
+  the configuration repository, rather than only one or the other. If neither
+  can be written it leaves the file alone and says so, instead of changing it
+  with no way back. What it changed is named file by file in the sync report
+  and in the heads-up you receive; a rewrite that only added entries and took
+  nothing away is backed up but does not notify you.
+- A configuration file Casa has never shipped, and so cannot repair, is now
+  reported when it fails its schema instead of passing silently to a boot that
+  will fail on it.
+
 ## [0.148.0] - 2026-08-03
 
 ### Added

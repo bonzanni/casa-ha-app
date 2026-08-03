@@ -1985,15 +1985,30 @@ async def notify_config_sync(
 
     if report.get("notified"):
         return
-    over = bool(report.get("conflicts") or report.get("schema_forced") or report.get("casabak"))
+    # #398: entry-level reconcile added two more ways to lose local content —
+    # an entry displaced/overridden by the merge, and an entry dropped for
+    # failing the schema. Both must reach the operator; a merge that only ADDS
+    # the image's entries must not, or the ordinary case alerts every update.
+    destructive_merges = [
+        m["path"] for m in report.get("merged", [])
+        if m.get("displaced_local") or m.get("conflicted")
+        or m.get("reinserted") or m.get("top_level_changed")
+    ]
+    over = bool(
+        report.get("conflicts") or report.get("schema_forced")
+        or report.get("casabak") or report.get("entries_dropped")
+        or destructive_merges
+    )
     if not over:
         return
 
-    paths = (
+    paths = list(dict.fromkeys(
         [c["path"] for c in report.get("conflicts", [])]
         + [c["path"] for c in report.get("schema_forced", [])]
+        + [d["path"] for d in report.get("entries_dropped", [])]
+        + destructive_merges
         + list(report.get("casabak", []))
-    )
+    ))
     ver = report.get("image_version", "the latest update")
     listed = ", ".join(paths[:8]) + ("…" if len(paths) > 8 else "")
     content = (
