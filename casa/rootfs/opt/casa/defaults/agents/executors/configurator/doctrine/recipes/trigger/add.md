@@ -57,7 +57,7 @@ Skipping step 2 leaves the trigger committed to YAML but **NOT registered** in t
 
 ## Verify the cron syntax
 
-Five fields: minute hour day month day_of_week. "0 7 * * 1-5" = 7:00 on weekdays. APScheduler uses casa_tz (default Europe/Amsterdam).
+Five fields: minute hour day month day_of_week. "0 7 * * 1-5" = 7:00 on weekdays. APScheduler uses casa_tz, which defaults to Home Assistant's own timezone.
 
 ## Webhook triggers
 

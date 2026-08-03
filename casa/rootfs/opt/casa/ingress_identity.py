@@ -18,11 +18,24 @@ They deliberately do NOT share a peer. Both are gated by an HMAC secret, and the
 2026-07-10 operator decision that "the secret IS the trust boundary" governs
 *authorization* — ``channel_trust("webhook") == "authenticated"`` is unchanged.
 Authorship is a different axis: a shared bearer secret proves possession, never
-that a particular human wrote the text. Neither peer is ever the operator's.
-Naming ``/invoke`` ``nicola`` would also alias caller-supplied text into the
-operator's Hindsight document namespace (``content_document_id`` keys on
-``user_peer``), so a caller could one day upsert over Nicola's own memories by
-echoing something he once said.
+that a particular human wrote the text. Neither peer is ever a human's. Naming
+``/invoke`` inside the ``telegram:`` namespace would alias caller-supplied text
+into a human's Hindsight document namespace (``content_document_id`` keys on
+``user_peer``), so a caller could one day upsert over the operator's own memories
+by echoing something they once said.
+
+**The operator has no peer literal.** Every accepted Telegram sender — the
+configured operator included — resolves to ``telegram:<sender id>``. What
+distinguishes the operator is CLEARANCE, not the peer string: an operator sender
+keeps the table's private clearance, any other accepted sender is floored to
+public. The route used to name the operator with a hardcoded constant, which put
+one person's name in a shipped default and made "who is the operator?" a fact
+about this module rather than about ``telegram_chat_id``. Two consequences worth
+knowing: the peer is now derived from operator-controlled configuration, so the
+boot check can no longer compare it against a literal (it checks the NAMESPACE
+instead — see :func:`validate_ingress_identity_table`), and the operator's
+Hindsight document ids moved with the peer, since ``content_document_id`` hashes
+it (a one-time re-keying, not a migration path).
 
 Both automation routes yield ``speaker_kind="automation"`` (see
 ``speaker_provenance.UserProvenance.from_origin``) — honest about being
@@ -82,12 +95,12 @@ _PEER_MAX_BYTES = 512
 
 _WEBHOOK_PEER_PREFIX = "webhook:"
 
-# #336: peer namespace for a Telegram sender who is NOT the configured
-# operator. With ``telegram_chat_id`` empty ("accept all chats"), any Telegram
-# user can reach the telegram route, so the operator peer + private clearance
-# must be granted per-SENDER — a fixed route-wide peer recorded every
-# stranger's turns under the operator's identity and ran them at the
-# operator's recall clearance.
+# #336: peer namespace for a Telegram sender. With ``telegram_chat_id`` empty
+# ("accept all chats"), any Telegram user can reach the telegram route, so
+# identity must be per-SENDER — a fixed route-wide peer recorded every
+# stranger's turns under the operator's identity and ran them at the operator's
+# recall clearance. EVERY sender is named here, the operator included: the
+# operator is distinguished by clearance, not by a peer of its own.
 _TELEGRAM_PEER_PREFIX = "telegram:"
 
 # Read-clearance for a non-operator Telegram sender. Fail-closed: accept-all
@@ -119,8 +132,12 @@ class IngressIdentityPolicy:
 
 _INGRESS_IDENTITY: dict[str, IngressIdentityPolicy] = {
     "telegram": IngressIdentityPolicy(
+        # Peer is derived per sender (``telegram:<id>``), so there is no fixed
+        # value here — the operator is identified by clearance, not by a name
+        # this table knows. ``clearance`` is the OPERATOR's; a non-operator
+        # sender is floored in ``ingress_identity``.
         surface="telegram", authenticated=True, clearance="private",
-        peer_strategy="telegram_sender", peer="nicola",
+        peer_strategy="telegram_sender", peer=None,
     ),
     "voice_sse": IngressIdentityPolicy(
         surface="voice", authenticated=True, clearance="friends",
@@ -146,28 +163,55 @@ _INGRESS_IDENTITY: dict[str, IngressIdentityPolicy] = {
 # table above so the boot check compares two statements rather than one against
 # itself. Coverage alone is not enough: review round 1 (Terra and Sol,
 # independently) showed that a table checked only for internal coherence still
-# accepts `webhook_trigger -> fixed peer "nicola"` (every third-party trigger
-# recorded as the operator) and `invoke -> surface "telegram"` (a machine
+# accepts `webhook_trigger -> fixed peer "<a human's peer>"` (every third-party
+# trigger recorded as that person) and `invoke -> surface "telegram"` (a machine
 # promoted to a person, because from_origin derives the speaker kind from the
 # surface). Both are deterministic programming defects, which is exactly what a
 # boot check is for.
-_ROUTE_CONTRACT: dict[str, tuple[str, bool, str, str | None]] = {
-    # route: (surface, authenticated, peer_strategy, expected fixed peer)
-    "telegram":        ("telegram", True, "telegram_sender", "nicola"),
-    "voice_sse":       ("voice",    True, "fixed", "voice_speaker"),
-    "voice_ws":        ("voice",    True, "fixed", "voice_speaker"),
-    "invoke":          ("invoke",   True, "fixed", "invoke_caller"),
+_ROUTE_CONTRACT: dict[str, tuple[str, bool, str, str | None, str]] = {
+    # route: (surface, authenticated, peer_strategy, expected fixed peer,
+    #         expected speaker kind)
+    #
+    # The speaker kind is the OUTCOME the route must produce once its identity
+    # has been through ``UserProvenance.from_origin`` — "is this turn recorded
+    # as a person or as a machine?". It is declared here rather than derived
+    # because deriving it would re-implement the classifier and agree with the
+    # bug (see the boot check).
+    #
+    # Peer is derived per sender, so there is no fixed value to pin — the
+    # namespace checks below carry what the literal used to.
+    "telegram":        ("telegram", True, "telegram_sender", None, "user"),
+    # Voice is deliberately a PERSON: an anonymous but trusted household
+    # speaker, not an automation.
+    "voice_sse":       ("voice",    True, "fixed", "voice_speaker", "user"),
+    "voice_ws":        ("voice",    True, "fixed", "voice_speaker", "user"),
+    "invoke":          ("invoke",   True, "fixed", "invoke_caller", "automation"),
     # Peer is derived per trigger, so there is no fixed value to pin.
-    "webhook_trigger": ("webhook",  True, "webhook_name", None),
+    "webhook_trigger": ("webhook",  True, "webhook_name", None, "automation"),
 }
 
-# Peers that name the household operator. A route that resolves to one of these
-# must be a route a HUMAN actually speaks on — never an automation surface.
-_OPERATOR_PEERS = frozenset({"nicola"})
+# The peer namespaces that name a HUMAN sender. This replaces the former
+# `_OPERATOR_PEERS` literal set: with the operator resolving to `telegram:<id>`
+# there is no constant to compare against, so the property is carried by the
+# namespace instead — "no route other than a human's may resolve a peer that
+# lives in here". That is strictly WIDER than the old check, which only
+# constrained the two automation routes: voice (`voice_speaker`, an anonymous
+# household speaker) is now covered too and may not be recorded as a Telegram
+# person either.
+_HUMAN_PEER_PREFIXES = frozenset({_TELEGRAM_PEER_PREFIX})
 
-# The routes whose turns are authored by a machine, and which therefore must
-# never resolve to an operator peer.
-_AUTOMATION_ROUTES = frozenset({"invoke", "webhook_trigger"})
+# The peer strategy that names a human. Its resolved peer must land INSIDE the
+# human namespace; every other strategy's must land outside it.
+_HUMAN_PEER_STRATEGY = "telegram_sender"
+
+# The closed set of surfaces this table may declare. The ``Literal`` annotation
+# on the field is a type hint, not a runtime gate, so a coordinated edit could
+# otherwise introduce a surface no module has been taught — and an unrecognised
+# surface is classified as a PERSON by default in
+# ``speaker_provenance.from_origin``. The boot check's speaker-kind comparison
+# would catch that too; this set exists so the failure names the real cause
+# instead of surfacing as a downstream classification mismatch.
+_APPROVED_SURFACES = frozenset({"telegram", "voice", "invoke", "webhook"})
 
 
 def _check_peer(route: str, peer: str) -> str:
@@ -200,11 +244,11 @@ def ingress_identity(
 
     ``sender_is_operator`` (#336) is the CHANNEL's server-side determination
     that this Telegram sender is the configured operator (sender id matches
-    ``telegram_chat_id``). Only an operator sender resolves to the operator
-    peer and the table's private clearance; any other sender gets a
-    per-sender ``telegram:<id>`` peer at public clearance, and a sender-less
-    telegram turn (anonymous group/channel post) fails loudly rather than
-    borrowing the operator's identity.
+    ``telegram_chat_id``). Every accepted sender gets its own
+    ``telegram:<id>`` peer; only an operator sender additionally keeps the
+    table's private clearance, any other sender is floored to public, and a
+    sender-less telegram turn (anonymous group/channel post) fails loudly
+    rather than borrowing someone else's identity.
     """
     policy = _INGRESS_IDENTITY.get(route)
     if policy is None:
@@ -243,10 +287,11 @@ def ingress_identity(
         authenticated_user = AuthenticatedUser(
             stable_id=sender_id, configured_display_name=sender_display_name,
         )
-        if sender_is_operator:
-            peer = _check_peer(route, policy.peer or "")
-        else:
-            peer = _check_peer(route, _TELEGRAM_PEER_PREFIX + sender_id)
+        # Every sender, operator included, is named by its own id — the
+        # operator has no peer literal (see the module docstring). Only the
+        # CLEARANCE differs.
+        peer = _check_peer(route, _TELEGRAM_PEER_PREFIX + sender_id)
+        if not sender_is_operator:
             # Forced, not defaulted: the ``clearance`` override parameter
             # exists for webhook triggers and must never lift a non-operator
             # Telegram sender above the fail-closed floor.
@@ -268,6 +313,30 @@ def ingress_identity(
         authenticated_user=authenticated_user,
         user_peer=peer,
     )
+
+
+def _classify(policy: IngressIdentityPolicy, peer: str) -> str:
+    """The speaker kind a route's identity actually resolves to, obtained from
+    the real classifier rather than restated here.
+
+    Imported lazily: ``speaker_provenance`` is a peer module in the import
+    graph and only the boot check needs it, so a module-level import would add
+    an edge for one caller. The probe supplies the minimum
+    ``from_origin`` requires — an automation surface must carry no
+    authenticated user, and the anonymous-voice branch is keyed on exactly that
+    being absent, so passing None models both honestly.
+    """
+    from speaker_provenance import UserProvenance
+
+    return UserProvenance.from_origin(
+        surface=policy.surface,
+        server_origin=TrustedOrigin(
+            route=policy.surface, is_authenticated=policy.authenticated,
+            clearance=policy.clearance,
+        ),
+        authenticated_user=None,
+        user_peer=peer,
+    ).speaker_kind
 
 
 def validate_ingress_identity_table() -> None:
@@ -294,10 +363,10 @@ def validate_ingress_identity_table() -> None:
             "ingress route(s) declared with no identity contract: "
             + ", ".join(sorted(uncontracted))
         )
-    # The dynamic webhook namespace must be incapable of producing an operator
+    # The dynamic webhook namespace must be incapable of producing a human's
     # peer. Probing one composed value would prove nothing about the namespace:
-    # with an empty prefix a trigger NAMED "nicola" would resolve to the
-    # operator peer itself (Sol, re-review r2).
+    # with an empty prefix a trigger NAMED after a sender's id would resolve to
+    # that person's peer itself (Sol, re-review r2).
     if not _WEBHOOK_PEER_PREFIX:
         raise IngressIdentityError(
             "the webhook peer namespace prefix must be non-empty, or a "
@@ -309,15 +378,26 @@ def validate_ingress_identity_table() -> None:
         raise IngressIdentityError(
             "the telegram peer namespace prefix must be non-empty, or a "
             "sender id could impersonate another peer")
-    for operator_peer in _OPERATOR_PEERS:
-        for prefix in (_WEBHOOK_PEER_PREFIX, _TELEGRAM_PEER_PREFIX):
-            if operator_peer.startswith(prefix):
-                raise IngressIdentityError(
-                    f"operator peer {operator_peer!r} lives inside the "
-                    f"dynamic peer namespace {prefix!r}; a caller-derived "
-                    f"name could claim it")
+    # The human and webhook namespaces must be DISJOINT, checked as prefixes
+    # rather than by probing a composed value: if either prefix began with the
+    # other, some trigger name would compose into the human namespace (or a
+    # sender id into the webhook one) while a single-value probe still passed.
+    # This is what carries the property the removed `_OPERATOR_PEERS` literal
+    # used to state, now that the operator's peer is derived from its sender id.
+    for human_prefix in _HUMAN_PEER_PREFIXES:
+        if human_prefix.startswith(_WEBHOOK_PEER_PREFIX) or (
+                _WEBHOOK_PEER_PREFIX.startswith(human_prefix)):
+            raise IngressIdentityError(
+                f"the human peer namespace {human_prefix!r} and the webhook "
+                f"namespace {_WEBHOOK_PEER_PREFIX!r} are not disjoint; a "
+                f"caller-derived name could claim a person's identity")
 
     for route, policy in _INGRESS_IDENTITY.items():
+        if policy.surface not in _APPROVED_SURFACES:
+            raise IngressIdentityError(
+                f"ingress route {route!r} declares surface {policy.surface!r}, "
+                f"which is not one of {sorted(_APPROVED_SURFACES)}; an "
+                f"unrecognised surface is classified as a person by default")
         if policy.clearance not in _CLEARANCES:
             raise IngressIdentityError(
                 f"ingress route {route!r} declares an unknown clearance "
@@ -327,7 +407,8 @@ def validate_ingress_identity_table() -> None:
                 f"ingress route {route!r} declares an unrecognized peer "
                 f"strategy {policy.peer_strategy!r}")
 
-        surface, authenticated, peer_strategy, expected_peer = _ROUTE_CONTRACT[route]
+        (surface, authenticated, peer_strategy, expected_peer,
+         expected_kind) = _ROUTE_CONTRACT[route]
         if expected_peer is not None and policy.peer != expected_peer:
             raise IngressIdentityError(
                 f"ingress route {route!r} must resolve peer "
@@ -348,14 +429,67 @@ def validate_ingress_identity_table() -> None:
 
         # Prove the strategy actually resolves to a usable peer. A dynamic
         # peer is probed with a stand-in name.
-        peer = (
-            _WEBHOOK_PEER_PREFIX + "probe"
-            if policy.peer_strategy == "webhook_name"
-            else (policy.peer or "")
-        )
+        if policy.peer_strategy == "webhook_name":
+            peer = _WEBHOOK_PEER_PREFIX + "probe"
+        elif policy.peer_strategy == _HUMAN_PEER_STRATEGY:
+            peer = _TELEGRAM_PEER_PREFIX + "probe"
+        else:
+            peer = policy.peer or ""
         _check_peer(route, peer)
-        if route in _AUTOMATION_ROUTES and peer in _OPERATOR_PEERS:
+        # Both directions, because each catches a different defect. A human
+        # route landing OUTSIDE the human namespace means senders are being
+        # named by something other than their own id — the regression this
+        # change exists to prevent coming back. A non-human route landing
+        # INSIDE it means a machine or an anonymous speaker is being recorded
+        # as a person, which is what the old operator-peer guard caught.
+        in_human_namespace = any(
+            peer.startswith(prefix) for prefix in _HUMAN_PEER_PREFIXES)
+        if policy.peer_strategy == _HUMAN_PEER_STRATEGY and not in_human_namespace:
             raise IngressIdentityError(
-                f"ingress route {route!r} resolves to the operator peer "
-                f"{peer!r}; a machine caller must never be recorded as the "
-                f"operator")
+                f"ingress route {route!r} names a human sender but resolves "
+                f"peer {peer!r} outside the human namespace "
+                f"{sorted(_HUMAN_PEER_PREFIXES)}")
+        if policy.peer_strategy != _HUMAN_PEER_STRATEGY and in_human_namespace:
+            raise IngressIdentityError(
+                f"ingress route {route!r} resolves peer {peer!r} inside the "
+                f"human peer namespace; a machine caller or an anonymous "
+                f"speaker must never be recorded as a person")
+
+        # The namespace checks above bound what a peer may be NAMED. They say
+        # nothing about whether the turn is recorded as a person, because
+        # ``UserProvenance.from_origin`` classifies on the SURFACE, not the
+        # peer — so a machine route wearing a person's surface passes all of
+        # them and is still persisted as a user.
+        #
+        # Two rounds of review found two different arrangements of exactly that
+        # shape (`invoke` wearing "telegram"; then `invoke` wearing an unknown
+        # surface, and `invoke` wearing "voice"), which is the signal that
+        # enumerating arrangements is the wrong instrument. So this does not
+        # reason about surfaces at all: it runs the route's identity through the
+        # REAL classifier and compares the resulting speaker kind with the one
+        # the contract declares. Any arrangement that misclassifies a route now
+        # fails here, including ones nobody has thought of — and re-implementing
+        # the classification locally would have reproduced the bug instead of
+        # catching it.
+        provenance_kind = _classify(policy, peer)
+        if provenance_kind != expected_kind:
+            raise IngressIdentityError(
+                f"ingress route {route!r} is classified as "
+                f"{provenance_kind!r} but its contract declares "
+                f"{expected_kind!r}; the surface decides whether a turn is "
+                f"recorded as a person, so this route would persist under the "
+                f"wrong speaker kind")
+
+        # Kept alongside the outcome check because it protects a different
+        # property: that senders are named INDIVIDUALLY. A telegram route
+        # demoted to a fixed peer still classifies as "user" — correctly — while
+        # recording every sender under one shared identity, which is the
+        # regression the operator-peer collapse exists to prevent.
+        if (policy.surface == "telegram") != (
+                policy.peer_strategy == _HUMAN_PEER_STRATEGY):
+            raise IngressIdentityError(
+                f"ingress route {route!r} declares surface "
+                f"{policy.surface!r} with peer strategy "
+                f"{policy.peer_strategy!r}; the telegram surface and the "
+                f"{_HUMAN_PEER_STRATEGY!r} strategy must imply each other, or "
+                f"senders stop being named individually")

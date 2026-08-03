@@ -14,7 +14,7 @@ Historically all three sites IGNORED that return and closed the ledger entry
 regardless. Because the broker fires the finish hook exactly ONCE
 (``verdict_broker``), a subsequent tap cannot re-drive settlement — so a single
 transient edit failure permanently left the keyboard live AND deleted the
-recovery record (exactly Nicola's stuck Q1).
+recovery record (exactly the stuck-question case observed in production).
 
 This helper bounds-retries the settle edit and reports whether the edit was
 CONFIRMED. Callers close the ledger entry ONLY on confirmation; an unconfirmed

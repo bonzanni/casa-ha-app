@@ -9,7 +9,7 @@ policies:
           - account or card numbers
           - balances
           - amounts of recent payments
-          - names of specific vendors Nicola pays
+          - names of specific vendors the operator pays
       medical:
         required_trust: authenticated
         examples:
@@ -28,7 +28,7 @@ policies:
       schedule:
         required_trust: authenticated
         examples:
-          - specific times, dates, or locations of Nicola's upcoming personal events
+          - specific times, dates, or locations of the operator's upcoming personal events
       credentials:
         required_trust: authenticated
         examples:

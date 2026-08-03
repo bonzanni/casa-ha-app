@@ -1,5 +1,54 @@
 # Changelog
 
+## [0.151.0] - 2026-08-03
+
+### Changed
+
+- **The shipped agents no longer address a specific person.** The default
+  prompts, personas, disclosure examples, response-shape rules and the morning
+  briefing described the maintainer's own household — a name, two companies, a
+  timezone. They now describe "the operator", so a fresh install starts neutral
+  and learns who you are from your own conversations and memory instead of
+  arriving with someone else's context. The morning briefing also stops naming a
+  fixed 08:00 Europe/Amsterdam slot in its prompt text; the schedule comes from
+  the trigger, where you can change it.
+- **You are now identified by your own Telegram id.** Casa used to record the
+  operator's turns under a fixed peer name compiled into the app; every accepted
+  sender — you included — is now recorded as `telegram:<your id>`, and what
+  marks you out as the operator is your read clearance, which still comes from
+  `telegram_chat_id`. Behaviour on every channel is unchanged; what changed is
+  the name written into memory provenance.
+- **Casa now follows Home Assistant's timezone by default.** The `casa_tz`
+  option shipped pre-filled with `Europe/Amsterdam` — the packager's own zone —
+  which took precedence over the timezone Home Assistant already provides, so a
+  fresh install anywhere else ran its schedules and told the time in Amsterdam
+  local time. The option now ships empty, meaning "use Home Assistant's
+  timezone", and an unrecognised value falls back to UTC instead. Set it
+  explicitly only if you want Casa on a different zone from Home Assistant.
+  Existing installs keep whatever value they already have; clear the option to
+  pick up your Home Assistant timezone.
+- **App description** updated to describe the whole fleet — assistant, butler,
+  concierge and the specialists you add — rather than only the framework.
+
+### Upgrade note
+
+**Your existing long-term memories keep their old author name.** Memory
+documents are keyed on the recorded peer, so facts stored before this release
+stay under the previous name and remain searchable, while anything stored from
+now on is filed under your Telegram id. The two never merge, so a fact you
+repeat after updating is stored a second time rather than replacing the old
+copy. Nothing is lost and nothing needs doing.
+
+**There is no reliable one-step way to start clean, and this release does not
+add one.** Clearing the memory bank is not enough on its own, because several
+things write to it on their own schedule: retiring a conversation saves it
+first — and because this release changes the shipped personas, your first
+message after updating retires the conversation you had before it — a finishing
+engagement saves its own summary, and a save that failed earlier is retried at
+the next start. Any of those can land after you have emptied the bank. If you want a clean start, stop the app before clearing and expect the
+odd item to reappear anyway; a supported "wipe memory" operation is tracked in
+[#411](https://github.com/bonzanni/ha-casa-app/issues/411).
+
 ## [0.150.0] - 2026-08-03
 
 ### Changed
