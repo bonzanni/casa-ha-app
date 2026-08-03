@@ -162,3 +162,31 @@ def test_a_non_mapping_list_item_does_not_crash_past_due(tmp_path):
     ]}), encoding="utf-8")
     got = reminders.past_due(str(p), datetime(2026, 8, 3, 12, 0, tzinfo=CEST))
     assert [e["name"] for e in got] == ["reminder-old111"]
+
+
+def test_a_non_mapping_entry_is_survivable_by_EVERY_reader_and_writer(tmp_path):
+    """Round 10 (both reviewers): guarding one function left its siblings
+    raising on the same item — past_due delivered, then remove_entry raised,
+    aborting the sweep right after a delivery, so the reminder was redelivered
+    every pass and later roles were skipped. Normalising once at the load
+    boundary is what makes every consumer safe."""
+    p = tmp_path / "reminders.yaml"
+    p.write_text(yaml.safe_dump({"schema_version": 1, "triggers": [
+        "a bare string, not a mapping",
+        {"name": "reminder-old111", "type": "date", "one_shot": True,
+         "at": "2026-08-03T08:00:00+02:00", "channel": "telegram",
+         "prompt": "x"},
+    ]}), encoding="utf-8")
+    path = str(p)
+    now = datetime(2026, 8, 3, 12, 0, tzinfo=CEST)
+
+    assert [e["name"] for e in reminders.past_due(path, now)] == ["reminder-old111"]
+    assert reminders.existing_names(path) == {"reminder-old111"}
+    assert [e["name"] for e in reminders.all_entries(path)] == ["reminder-old111"]
+    # The write paths must not raise on it either.
+    assert reminders.remove_entry(path, "reminder-old111") is True
+    reminders.append_entry(path, {
+        "name": "reminder-new222", "type": "date", "one_shot": True,
+        "at": "2099-01-01T00:00:00+00:00", "channel": "telegram",
+        "prompt": "x"})
+    assert reminders.existing_names(path) == {"reminder-new222"}

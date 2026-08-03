@@ -241,6 +241,20 @@ def _load(path: str) -> dict:
     doc.setdefault("schema_version", 1)
     if not isinstance(doc.get("triggers"), list):
         doc["triggers"] = []
+    # Normalize ONCE, here, so every consumer is inherently safe. Guarding
+    # per-function does not work: a pass that hardened `past_due` alone left
+    # `remove_entry` calling .get() on the same bad item, which aborted the
+    # sweep right after a delivery — so the reminder was redelivered every
+    # pass and later roles were skipped entirely. A non-mapping entry is
+    # corruption in an agent-owned file; dropping it is also what makes the
+    # file writable again.
+    kept = [e for e in doc["triggers"] if isinstance(e, dict)]
+    if len(kept) != len(doc["triggers"]):
+        logger.warning(
+            "reminders: %s contains %d non-mapping entr(ies); ignoring them",
+            path, len(doc["triggers"]) - len(kept),
+        )
+        doc["triggers"] = kept
     return doc
 
 
@@ -289,7 +303,7 @@ def all_entries(path: str) -> "list[dict] | None":
     """
     try:
         return [e for e in _load(path)["triggers"]
-                if isinstance(e, dict) and is_reminder_name(e.get("name", ""))]
+                if is_reminder_name(e.get("name", ""))]
     except (OSError, ValueError):
         logger.warning("reminders: cannot read %s; skipping reconciliation",
                        path, exc_info=True)
@@ -311,8 +325,6 @@ def past_due(path: str, now: datetime) -> list[dict]:
                        exc_info=True)
         return out
     for entry in entries:
-        if not isinstance(entry, dict):
-            continue
         # A date trigger is one-shot BY DEFINITION, so membership is decided
         # on the type alone. Requiring the ``one_shot`` flag here as well
         # would mean an entry that somehow lacked it was skipped at
