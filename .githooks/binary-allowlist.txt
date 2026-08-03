@@ -1,3 +1,4 @@
 .github/social-preview.png
+assets/casa-banner.png
 casa/icon.png
 casa/logo.png
