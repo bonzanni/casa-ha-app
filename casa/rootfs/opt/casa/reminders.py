@@ -186,15 +186,16 @@ def derive_schedule(at: datetime, repeat: str, tz=None) -> dict[str, str]:
         schedule = f"{minute} {hour} * * {_DOW_BY_WEEKDAY[local.weekday()]}"
     else:  # monthly
         schedule = f"{minute} {hour} {local.day} * *"
-    anchor = local
-    # The anchor is the FIRST occurrence and becomes the scheduler's
-    # start_date. Without it a "every Thursday from the 20th" reminder set on
-    # the 3rd would fire on the 6th and 13th, two occurrences the user never
-    # asked for. It does NOT drive recurrence: the cron fields above do,
-    # evaluated in the scheduler's timezone, which is what keeps the series
-    # DST-correct. Callers must report ``at`` back to the user, not the value
-    # they passed in — the two differ when rounding applied.
-    return {"type": "cron", "schedule": schedule, "at": anchor.isoformat()}
+    # ``at`` is the FIRST occurrence and becomes the scheduler's start_date.
+    # Without it, "every Thursday from the 20th" set on the 3rd would fire on
+    # the 6th and 13th — two occurrences the user never asked for. It does NOT
+    # drive recurrence: the cron fields above do, evaluated in the scheduler's
+    # timezone, which is what keeps the series DST-correct.
+    #
+    # Callers must report THIS value back to the user rather than the one they
+    # passed in: the two differ whenever the caller's offset and the
+    # scheduler's timezone render different wall-clock times.
+    return {"type": "cron", "schedule": schedule, "at": local.isoformat()}
 
 
 # ---------------------------------------------------------------------------
@@ -218,10 +219,23 @@ def reminders_path(agents_dir: str, role: str) -> str:
 
 
 def _load(path: str) -> dict:
+    """Read the store, folding every parse failure into ``ValueError``.
+
+    ``load_yaml_no_aliases`` raises ``yaml.YAMLError`` or ``RecursionError``,
+    neither of which is a ``ValueError`` — and its docstring says callers are
+    expected to fold both into their own fail-closed error. Without that, a
+    malformed store would escape every ``except (OSError, ValueError)`` here
+    and abort the whole sweep, so later roles' overdue reminders would go
+    undelivered until a pass that happened to avoid the bad file.
+    """
     if not os.path.exists(path):
         return {"schema_version": 1, "triggers": []}
     with open(path, encoding="utf-8") as fh:
-        doc = load_yaml_no_aliases(fh.read()) or {}
+        text = fh.read()
+    try:
+        doc = load_yaml_no_aliases(text) or {}
+    except (Exception, RecursionError) as exc:  # noqa: BLE001
+        raise ValueError(f"{path}: cannot parse: {exc}") from exc
     if not isinstance(doc, dict):
         raise ValueError(f"{path}: reminders.yaml is not a mapping")
     doc.setdefault("schema_version", 1)
@@ -297,6 +311,8 @@ def past_due(path: str, now: datetime) -> list[dict]:
                        exc_info=True)
         return out
     for entry in entries:
+        if not isinstance(entry, dict):
+            continue
         # A date trigger is one-shot BY DEFINITION, so membership is decided
         # on the type alone. Requiring the ``one_shot`` flag here as well
         # would mean an entry that somehow lacked it was skipped at

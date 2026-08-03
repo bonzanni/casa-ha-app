@@ -132,3 +132,33 @@ def test_reminders_path_is_a_separate_agent_owned_file():
     got = reminders.reminders_path("/config/agents", "assistant")
     assert got.endswith("/config/agents/assistant/reminders.yaml")
     assert not got.endswith("triggers.yaml")
+
+
+def test_malformed_yaml_is_folded_into_valueerror(tmp_path):
+    """load_yaml_no_aliases raises yaml.YAMLError, which is NOT a ValueError.
+    Unfolded it would escape every `except (OSError, ValueError)` here and
+    abort the whole sweep, so later roles' overdue reminders would go
+    undelivered."""
+    p = tmp_path / "reminders.yaml"
+    p.write_text("{{{ not: valid: yaml\n", encoding="utf-8")
+    assert reminders.all_entries(str(p)) is None
+    assert reminders.past_due(str(p), datetime(2026, 8, 3, 12, 0, tzinfo=CEST)) == []
+    assert reminders.existing_names(str(p)) == set()
+
+
+def test_a_yaml_alias_is_also_folded(tmp_path):
+    p = tmp_path / "reminders.yaml"
+    p.write_text("a: &x {b: 1}\ntriggers: *x\n", encoding="utf-8")
+    assert reminders.all_entries(str(p)) is None
+
+
+def test_a_non_mapping_list_item_does_not_crash_past_due(tmp_path):
+    p = tmp_path / "reminders.yaml"
+    p.write_text(yaml.safe_dump({"schema_version": 1, "triggers": [
+        "a bare string, not a mapping",
+        {"name": "reminder-old111", "type": "date", "one_shot": True,
+         "at": "2026-08-03T08:00:00+02:00", "channel": "telegram",
+         "prompt": "x"},
+    ]}), encoding="utf-8")
+    got = reminders.past_due(str(p), datetime(2026, 8, 3, 12, 0, tzinfo=CEST))
+    assert [e["name"] for e in got] == ["reminder-old111"]
