@@ -333,8 +333,20 @@ class TriggerRegistry:
         scheduler still holds the job it WILL deliver it, so the sweep must
         not. Without this the two race for a reminder whose time has just
         passed and the user gets it twice.
+
+        The SCHEDULER is the authority, not ``_seen_job_ids``. APScheduler
+        drops a date job that overran its misfire grace period WITHOUT ever
+        calling the job function, which leaves our bookkeeping claiming a live
+        job that no longer exists — and the sweep would then skip that
+        reminder forever, so it would never be delivered at all.
         """
-        return f"{role}:{name}" in self._seen_job_ids
+        job_id = f"{role}:{name}"
+        if job_id not in self._seen_job_ids:
+            return False
+        try:
+            return self._scheduler.get_job(job_id) is not None
+        except Exception:  # noqa: BLE001 - no scheduler view; trust bookkeeping
+            return True
 
     def remove_job_for(self, role: str, name: str) -> bool:
         """Drop a live scheduled job by role and trigger name (#396).
@@ -343,6 +355,20 @@ class TriggerRegistry:
         than at the next boot.
         """
         return self._drop_job(f"{role}:{name}")
+
+    def reminder_job_names(self, role: str, prefix: str) -> list[str]:
+        """Names of this role's registered jobs carrying *prefix* (#396).
+
+        The sweep uses this to reconcile in BOTH directions: a reminder job
+        with no entry left in the store must go, or a cancellation that raced
+        a reload — which re-registers from a snapshot taken before the
+        cancellation — would leave the reminder firing forever despite the
+        tool having reported success.
+        """
+        head = f"{role}:"
+        return [job_id[len(head):] for job_id in self._seen_job_ids
+                if job_id.startswith(head)
+                and job_id[len(head):].startswith(prefix)]
 
     def _register_webhook(self, role: str, trig: TriggerSpec) -> None:
         # Release A: webhook triggers are served ONLY by the authenticated

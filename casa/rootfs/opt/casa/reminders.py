@@ -113,7 +113,32 @@ def parse_at(value: str) -> datetime:
     return dt
 
 
-def derive_schedule(at: datetime, repeat: str) -> dict[str, str]:
+def validate_recurring(at: datetime, repeat: str, tz=None) -> None:
+    """Raise ValueError if *at* cannot be honoured EXACTLY as *repeat*.
+
+    Refusing beats approximating. A cron expression has minute resolution and
+    a fixed day-of-month, so a sub-minute anchor or a day that does not exist
+    in every month can only be delivered by silently changing what the user
+    asked for — and then the time they were told is not the time that fires.
+    The caller surfaces this so the agent can ask for something expressible.
+    """
+    if repeat == "none":
+        return
+    if at.second or at.microsecond:
+        raise ValueError(
+            "a repeating reminder must fall on a whole minute; "
+            f"{at.isoformat()} has seconds"
+        )
+    local = at.astimezone(tz) if tz is not None else at
+    if repeat == "monthly" and local.day > 28:
+        raise ValueError(
+            f"a monthly reminder cannot fall on day {local.day}: that day is "
+            "missing from some months, so the reminder would skip them. Use "
+            "day 28 or earlier, or ask the user for a different day."
+        )
+
+
+def derive_schedule(at: datetime, repeat: str, tz=None) -> dict[str, str]:
     """Trigger fields for *repeat* anchored at *at*.
 
     ``repeat="none"`` keeps the absolute instant — a single point in time has
@@ -130,39 +155,32 @@ def derive_schedule(at: datetime, repeat: str) -> dict[str, str]:
     if repeat == "none":
         return {"type": "date", "at": at.isoformat()}
 
-    # A cron expression has minute resolution and fires at second ZERO, so a
-    # sub-minute anchor cannot be honoured. Round UP to the next whole minute
-    # and derive EVERYTHING from that rounded value — schedule, anchor, and
-    # the time reported back to the caller.
+    # This function does NO rounding and NO clamping. Three review rounds
+    # produced a finding here every time — truncating seconds, then rounding
+    # them up, then mapping day>28 to end-of-month — each fix creating the
+    # next defect, because approximating a request silently makes the time the
+    # user was told differ from the time that fires. Anything a cron cannot
+    # express EXACTLY is refused by the caller instead (see
+    # ``validate_recurring``), so what is promised is always what happens.
     #
-    # Rounding down was tried and is wrong twice over (round-3 review): the
-    # truncated minute may already have passed, pushing the first occurrence a
-    # whole day/week/month late, and the series would fire seconds earlier
-    # than the time the user was told. Rounding up keeps the first occurrence
-    # genuinely in the future and keeps the promise exact — at the cost of at
-    # most 59 seconds, which is the honest price of minute-resolution cron.
-    anchor = at.replace(second=0, microsecond=0)
-    if at.second or at.microsecond:
-        anchor += timedelta(minutes=1)
+    # The one transformation that remains is a conversion, not an
+    # approximation: the wall-clock fields are read in the SCHEDULER's
+    # timezone. The caller's offset pins which instant is meant; the cron is
+    # evaluated in the scheduler's zone, so deriving the fields from the
+    # caller's offset would misschedule by the difference whenever the two
+    # disagree — and would drift across a DST boundary.
+    local = at.astimezone(tz) if tz is not None else at
 
-    minute, hour = anchor.minute, anchor.hour
+    minute, hour = local.minute, local.hour
     if repeat == "daily":
         schedule = f"{minute} {hour} * * *"
     elif repeat == "weekdays":
         schedule = f"{minute} {hour} * * mon-fri"
     elif repeat == "weekly":
-        schedule = f"{minute} {hour} * * {_DOW_BY_WEEKDAY[anchor.weekday()]}"
+        schedule = f"{minute} {hour} * * {_DOW_BY_WEEKDAY[local.weekday()]}"
     else:  # monthly
-        # A literal day above 28 does not exist in every month, and cron
-        # SKIPS the months it is missing from: "monthly on the 31st" fires in
-        # Jan, Mar, May, Jul, Aug, Oct, Dec and silently misses the other
-        # five. A reminder that skips five months a year is not monthly, and a
-        # missed reminder is the exact failure this feature exists to prevent
-        # — so anything past the 28th means end-of-month, which APScheduler
-        # expresses as ``last`` and which lands on the 28th/29th/30th/31st as
-        # each month requires.
-        day = "last" if anchor.day > 28 else str(anchor.day)
-        schedule = f"{minute} {hour} {day} * *"
+        schedule = f"{minute} {hour} {local.day} * *"
+    anchor = local
     # The anchor is the FIRST occurrence and becomes the scheduler's
     # start_date. Without it a "every Thursday from the 20th" reminder set on
     # the 3rd would fire on the 6th and 13th, two occurrences the user never
@@ -399,7 +417,27 @@ def _reconcile_registrations(runtime, registry, role: str, path: str,
     if not channels:
         return
 
-    for entry in all_entries(path):
+    entries = all_entries(path)
+
+    # Direction 1: a job with no entry left in the store must go. A
+    # cancellation that raced a reload — which re-registers the role from a
+    # snapshot taken before the cancellation — would otherwise leave the
+    # reminder firing forever, even though cancel_reminder reported success.
+    live_names = {e.get("name", "") for e in entries}
+    try:
+        registered = registry.reminder_job_names(role, REMINDER_PREFIX)
+    except Exception:  # noqa: BLE001 - older registry without the accessor
+        registered = []
+    for name in registered:
+        if name not in live_names:
+            logger.info(
+                "reminder sweep: dropping job %s for %s — no longer in the "
+                "store", name, role,
+            )
+            registry.remove_job_for(role, name)
+
+    # Direction 2: an entry with no job must be registered.
+    for entry in entries:
         name = entry.get("name", "")
         if registry.has_job(role, name):
             continue

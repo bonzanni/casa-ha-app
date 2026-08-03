@@ -43,19 +43,29 @@ the sweep leaves it alone.
 **A recurring reminder keeps its first occurrence as an anchor.** The derived cron fields
 drive the recurrence — evaluated in the scheduler's timezone, which is what keeps a series
 firing at the same local time across a DST boundary — while the anchor becomes the
-scheduler's start date, so "every Thursday from the 20th" cannot fire on the 6th. A cron
-expression has minute resolution, so a sub-minute anchor is rounded *up* to the next whole
-minute and everything — schedule, anchor, and the time reported back to the user — is derived
-from the rounded value. Rounding down would be wrong twice: the truncated minute may already
-have passed, delaying the first occurrence by a whole period, and the series would fire
-seconds before the time the user was promised. A monthly reminder past the 28th means
-end-of-month rather than a literal day number: cron skips months a literal 29th, 30th or 31st
-is missing from, so "monthly on the 31st" would fire seven times a year rather than twelve.
+scheduler's start date, so "every Thursday from the 20th" cannot fire on the 6th.
 
-**The store is the truth; the scheduler is a cache of it.** The sweep re-registers any
-reminder that has no live job, which is what heals a divergence rather than a lock — a reload
-re-registering a role from a snapshot taken before a reminder was written would otherwise
-drop a *recurring* reminder for good, since only one-shots are recoverable by delivery.
+**What a cron cannot express exactly is refused, not approximated.** A repeating reminder must
+land on a whole minute, and a monthly one on the 28th or earlier — cron has minute resolution
+and skips months a literal 29th, 30th or 31st is missing from, so "monthly on the 31st" would
+fire seven times a year rather than twelve. Every approximation tried here made the time the
+user was told differ from the time that fires, so the request is rejected and the agent asks
+for something expressible instead.
+
+**Wall-clock fields are read in the scheduler's timezone**, not the caller's offset. The
+offset pins which instant is meant; the cron is evaluated in the scheduler's zone, so deriving
+the fields from a caller's offset would misschedule by the difference whenever the two
+disagree, and drift across a DST boundary.
+
+**The store is the truth; the scheduler is a cache of it.** The sweep reconciles in both
+directions — registering any reminder with no live job, and dropping any reminder job with no
+entry left in the store — which heals a divergence without needing a lock. A reload
+re-registering a role from a snapshot taken before a reminder was written would otherwise drop
+a *recurring* reminder for good, since only one-shots are recoverable by delivery; the same
+race in the other direction would leave a cancelled reminder firing forever. A consequence
+worth stating: reminders are deliberately independent of operator-trigger validity, so a
+reload that fails closed on a malformed operator cron does not disable the user's reminders,
+even though it reports that role's triggers as inactive.
 
 **Every webhook trigger arrives on one wildcard route.** There is no route per trigger. The
 name in the path is looked up against a registry, and an unknown name is refused before any

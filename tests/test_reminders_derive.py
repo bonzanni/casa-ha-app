@@ -99,36 +99,57 @@ def test_recurring_retains_its_anchor():
     assert reminders.parse_at(out["at"]) == at
 
 
-def test_recurring_anchor_rounds_UP_to_a_whole_minute():
-    """Round 3 (both reviewers): cron has minute resolution and fires at
-    second zero. Rounding DOWN was wrong twice over — the truncated minute may
-    already have passed (pushing the first occurrence a whole period late) and
-    the series would fire seconds earlier than the user was told. Rounding up
-    keeps the first occurrence in the future AND the promise exact."""
-    at = datetime(2026, 8, 4, 7, 5, 30, 123456, tzinfo=CEST)
-    out = reminders.derive_schedule(at, "daily")
-    anchor = reminders.parse_at(out["at"])
-    assert anchor == datetime(2026, 8, 4, 7, 6, tzinfo=CEST)
-    assert anchor.second == 0 and anchor.microsecond == 0
-    # The schedule is derived from the ROUNDED value, so the two agree.
-    assert out["schedule"] == "6 7 * * *"
+def test_recurring_refuses_a_sub_minute_anchor():
+    """Round 5: derive_schedule no longer rounds. Three rounds of findings
+    came from approximating — truncate, then round up, then clamp — because an
+    approximation makes the time the user was told differ from the time that
+    fires. Anything cron cannot express exactly is REFUSED."""
+    at = datetime(2026, 8, 4, 7, 5, 30, tzinfo=CEST)
+    with pytest.raises(ValueError):
+        reminders.validate_recurring(at, "daily")
 
 
-def test_a_minute_aligned_anchor_is_untouched():
+def test_a_minute_aligned_anchor_is_accepted_verbatim():
     at = datetime(2026, 8, 4, 7, 5, tzinfo=CEST)
+    reminders.validate_recurring(at, "daily")
     out = reminders.derive_schedule(at, "daily")
     assert out["schedule"] == "5 7 * * *"
     assert reminders.parse_at(out["at"]) == at
 
 
-def test_rounding_up_can_roll_the_weekday_and_stay_consistent():
-    """23:59:30 on a Thursday rounds to Friday 00:00 — the derived weekday
-    must follow the rounded value, not the original."""
-    at = datetime(2026, 8, 6, 23, 59, 30, tzinfo=CEST)   # Thursday
+def test_one_shot_keeps_seconds_and_is_never_refused():
+    at = datetime(2026, 8, 4, 7, 5, 30, tzinfo=CEST)
+    reminders.validate_recurring(at, "none")      # must not raise
+    out = reminders.derive_schedule(at, "none")
+    assert reminders.parse_at(out["at"]) == at
+
+
+def test_unknown_repeat_rejected():
+    at = datetime(2026, 8, 6, 7, 0, tzinfo=CEST)
+    with pytest.raises(ValueError):
+        reminders.derive_schedule(at, "fortnightly")
+
+
+def test_parse_at_requires_an_offset():
+    with pytest.raises(ValueError):
+        reminders.parse_at("2026-08-03T08:00:00")
+
+
+def test_parse_at_rejects_garbage():
+    with pytest.raises(ValueError):
+        reminders.parse_at("next tuesday")
+    with pytest.raises(ValueError):
+        reminders.parse_at("")
+
+
+def test_recurring_retains_its_anchor():
+    """Sol r1 #3: without the anchor, "every Thursday from the 20th" set on
+    the 3rd fires on the 6th and 13th — occurrences the user never asked
+    for."""
+    at = datetime(2026, 8, 20, 7, 0, tzinfo=CEST)
     out = reminders.derive_schedule(at, "weekly")
-    anchor = reminders.parse_at(out["at"])
-    assert anchor == datetime(2026, 8, 7, 0, 0, tzinfo=CEST)   # Friday
-    assert out["schedule"] == "0 0 * * fri"
+    assert out["schedule"] == "0 7 * * thu"
+    assert reminders.parse_at(out["at"]) == at
 
 
 def test_one_shot_keeps_its_exact_instant():
@@ -163,35 +184,42 @@ def test_existing_names_reads_the_store(tmp_path):
     assert reminders.existing_names(str(tmp_path / "nope.yaml")) == set()
 
 
-def test_monthly_past_the_28th_means_end_of_month():
-    """A literal day>28 does not exist in every month and cron SKIPS the
-    months it is missing from: "monthly on the 31st" would fire only 7 times
-    a year. A reminder that misses five months is not monthly."""
+def test_monthly_past_the_28th_is_refused():
+    """A literal day above 28 is missing from some months and cron SKIPS
+    them, so "monthly on the 31st" would fire seven times a year. Mapping it
+    to end-of-month instead made the promised and actual first dates differ
+    (round-4 review). Refuse, so the agent can ask for an expressible day."""
     for day in (29, 30, 31):
         at = datetime(2026, 1, day, 9, 0, tzinfo=CEST)
-        assert reminders.derive_schedule(at, "monthly")["schedule"] == "0 9 last * *"
+        with pytest.raises(ValueError):
+            reminders.validate_recurring(at, "monthly")
 
 
-def test_monthly_on_or_before_the_28th_is_literal():
+def test_monthly_on_or_before_the_28th_is_accepted():
     at = datetime(2026, 1, 28, 9, 0, tzinfo=CEST)
+    reminders.validate_recurring(at, "monthly")
     assert reminders.derive_schedule(at, "monthly")["schedule"] == "0 9 28 * *"
 
 
-def test_end_of_month_schedule_actually_fires_every_month():
-    """Pin the behaviour against APScheduler itself, not just the string."""
-    from apscheduler.triggers.cron import CronTrigger
+def test_wall_clock_fields_come_from_the_SCHEDULER_timezone():
+    """The caller's offset pins the instant; the cron is evaluated in the
+    scheduler's zone. Deriving from the caller's offset would misschedule by
+    the difference whenever the two disagree (round-4 review)."""
+    from zoneinfo import ZoneInfo
 
-    at = datetime(2026, 1, 31, 9, 0, tzinfo=CEST)
-    minute, hour, day, month, dow = (
-        reminders.derive_schedule(at, "monthly")["schedule"].split())
-    trig = CronTrigger(minute=minute, hour=hour, day=day, month=month,
-                       day_of_week=dow, timezone=CEST)
+    ams = ZoneInfo("Europe/Amsterdam")
+    # 07:00 UTC on a summer date is 09:00 in Amsterdam.
+    at = datetime(2026, 8, 6, 7, 0, tzinfo=timezone.utc)
+    out = reminders.derive_schedule(at, "daily", ams)
+    assert out["schedule"] == "0 9 * * *"
+    assert reminders.parse_at(out["at"]).hour == 9
 
-    seen, now = [], datetime(2026, 1, 1, tzinfo=CEST)
-    for _ in range(6):
-        nxt = trig.get_next_fire_time(None, now)
-        seen.append(nxt.strftime("%Y-%m-%d"))
-        now = nxt + timedelta(seconds=1)
 
-    assert seen == ["2026-01-31", "2026-02-28", "2026-03-31",
-                    "2026-04-30", "2026-05-31", "2026-06-30"]
+def test_weekday_also_comes_from_the_scheduler_timezone():
+    from zoneinfo import ZoneInfo
+
+    ams = ZoneInfo("Europe/Amsterdam")
+    # 22:30 UTC Thursday is 00:30 FRIDAY in Amsterdam.
+    at = datetime(2026, 8, 6, 22, 30, tzinfo=timezone.utc)
+    out = reminders.derive_schedule(at, "weekly", ams)
+    assert out["schedule"] == "30 0 * * fri"

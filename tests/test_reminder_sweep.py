@@ -318,3 +318,39 @@ async def test_an_unregisterable_entry_does_not_stop_the_others(env):
 
     assert not env.registry.has_job("assistant", "reminder-bad555")
     assert env.registry.has_job("assistant", "reminder-ok6666")
+
+
+async def test_a_job_with_no_entry_left_is_dropped(env):
+    """Sol r4 #2: a cancellation that raced a reload — which re-registers the
+    role from a snapshot taken before the cancellation — would otherwise leave
+    the reminder firing forever despite cancel_reminder reporting success."""
+    from config import TriggerSpec
+
+    env.runtime.role_configs = {
+        "assistant": types.SimpleNamespace(channels=["telegram"]),
+    }
+    # A live job whose entry is NOT in the store (the stale-reload case).
+    env.registry.register_agent("assistant", [TriggerSpec(
+        name="reminder-ghost01", type="cron", schedule="0 7 * * thu",
+        channel="telegram", prompt="x")], ["telegram"])
+    assert env.registry.has_job("assistant", "reminder-ghost01")
+
+    await reminders.sweep_reminders(env.runtime, NOW)
+
+    assert not env.registry.has_job("assistant", "reminder-ghost01")
+
+
+async def test_operator_triggers_are_never_dropped_by_reconciliation(env):
+    """Only reminder-prefixed jobs are the sweep's to remove."""
+    from config import TriggerSpec
+
+    env.runtime.role_configs = {
+        "assistant": types.SimpleNamespace(channels=["telegram"]),
+    }
+    env.registry.register_agent("assistant", [TriggerSpec(
+        name="heartbeat", type="interval", minutes=60,
+        channel="telegram", prompt="hb")], ["telegram"])
+
+    await reminders.sweep_reminders(env.runtime, NOW)
+
+    assert env.registry.has_job("assistant", "heartbeat")

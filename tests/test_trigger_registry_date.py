@@ -283,3 +283,44 @@ async def test_operator_cron_without_an_anchor_passes_no_start_date():
         channel="telegram", prompt="x")], ["telegram"])
 
     assert "start_date" not in sched.add_job.call_args.kwargs
+
+
+# ---------------------------------------------------------------------------
+# has_job consults the SCHEDULER, not just our bookkeeping (Terra r4 #1)
+# ---------------------------------------------------------------------------
+
+
+async def test_has_job_is_false_once_the_scheduler_has_dropped_it():
+    """APScheduler drops a date job that overran its misfire grace period
+    WITHOUT calling the job function. If has_job trusted _seen_job_ids alone
+    it would claim a live job forever, the sweep would skip that reminder,
+    and it would never be delivered at all."""
+    sched = _make_scheduler()
+    reg = _registry(scheduler=sched)
+    reg.register_agent("assistant", [_date_spec(_future())], ["telegram"])
+    assert reg.has_job("assistant", "reminder-a1b2c3") is True
+
+    sched.get_job.return_value = None      # misfire: scheduler dropped it
+
+    assert reg.has_job("assistant", "reminder-a1b2c3") is False
+
+
+async def test_has_job_is_false_for_something_never_registered():
+    reg = _registry()
+    assert reg.has_job("assistant", "reminder-nope0000") is False
+
+
+async def test_reminder_job_names_lists_only_this_roles_reminders():
+    from config import TriggerSpec
+
+    sched = _make_scheduler()
+    reg = _registry(scheduler=sched)
+    reg.register_agent("assistant", [_date_spec(_future())], ["telegram"])
+    reg.register_agent("assistant", [TriggerSpec(
+        name="heartbeat", type="interval", minutes=60,
+        channel="telegram", prompt="hb")], ["telegram"])
+    reg.register_agent("butler", [_date_spec(_future(), name="reminder-b0b0b0b0")],
+                       ["telegram"])
+
+    got = reg.reminder_job_names("assistant", "reminder-")
+    assert got == ["reminder-a1b2c3"]

@@ -4671,7 +4671,10 @@ def _reminder_origin_role() -> str:
     "back to them so a misreading is caught immediately. `repeat` is one of "
     "none (default), daily, weekdays, weekly, monthly; when the user's "
     "request is genuinely ambiguous about repeating, ask them with tappable "
-    "buttons before calling this. Own-role only.",
+    "buttons before calling this. A repeating reminder must land on a whole "
+    "minute, and a monthly one on day 28 or earlier — later days are missing "
+    "from some months, so ask the user for a different day rather than "
+    "guessing. Own-role only.",
     {"at": str, "text": str, "repeat": str},
 )
 async def set_reminder(args: dict) -> dict:
@@ -4689,10 +4692,17 @@ async def set_reminder(args: dict) -> dict:
         return _result({"status": "error", "kind": "invalid_argument",
                         "message": "text is required"})
 
+    from timekeeping import resolve_tz
+    tz = resolve_tz()
+
     repeat = (args.get("repeat") or "none").strip().lower()
     try:
         when = reminders.parse_at(args.get("at") or "")
-        fields = reminders.derive_schedule(when, repeat)
+        # Refuse anything a cron cannot express EXACTLY rather than
+        # approximating it — an approximation makes the time the user is told
+        # differ from the time that fires.
+        reminders.validate_recurring(when, repeat, tz)
+        fields = reminders.derive_schedule(when, repeat, tz)
     except ValueError as exc:
         return _result({"status": "error", "kind": "invalid_argument",
                         "message": str(exc)})
