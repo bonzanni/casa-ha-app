@@ -399,3 +399,81 @@ async def test_a_genuine_orphan_is_still_dropped(env):
     await reminders.sweep_reminders(env.runtime, NOW)
 
     assert not env.registry.has_job("assistant", "reminder-ghost02")
+
+
+async def test_an_unreadable_operator_file_suspends_reverse_reconciliation(env):
+    """Terra r6: an empty set AUTHORISES deletion, so treating "cannot read"
+    as "nothing declared" would silently delete the operator's live triggers.
+    Provenance-unknown must suspend deletion, not enable it."""
+    from config import TriggerSpec
+
+    env.runtime.role_configs = {
+        "assistant": types.SimpleNamespace(channels=["telegram"]),
+    }
+    env.registry.register_agent("assistant", [TriggerSpec(
+        name="reminder-maintenance", type="cron", schedule="0 3 * * sun",
+        channel="telegram", prompt="maintenance")], ["telegram"])
+
+    with open(env.triggers_path, "w", encoding="utf-8") as fh:
+        fh.write("{{{ not: valid: yaml\n")
+
+    await reminders.sweep_reminders(env.runtime, NOW)
+
+    assert env.registry.has_job("assistant", "reminder-maintenance")
+
+
+async def test_a_malformed_operator_file_does_not_abort_the_sweep(env):
+    """Later roles' overdue reminders must still be delivered."""
+    env.runtime.role_configs = {
+        "assistant": types.SimpleNamespace(channels=["telegram"]),
+        "butler": types.SimpleNamespace(channels=["telegram"]),
+    }
+    with open(env.triggers_path, "w", encoding="utf-8") as fh:
+        fh.write("- this is a list, not a mapping\n")
+    reminders.append_entry(env.butler_reminders_path, _reminder("reminder-b0b0b0b0"))
+
+    assert await reminders.sweep_reminders(env.runtime, NOW) == 1
+
+
+async def test_a_missing_operator_file_is_an_empty_set_not_unknown(env):
+    """No triggers.yaml means nothing is declared, so a genuine orphan is
+    still dropped."""
+    import os
+    from config import TriggerSpec
+
+    env.runtime.role_configs = {
+        "assistant": types.SimpleNamespace(channels=["telegram"]),
+    }
+    os.remove(env.triggers_path)
+    env.registry.register_agent("assistant", [TriggerSpec(
+        name="reminder-ghost03", type="cron", schedule="0 7 * * thu",
+        channel="telegram", prompt="x")], ["telegram"])
+
+    await reminders.sweep_reminders(env.runtime, NOW)
+
+    assert not env.registry.has_job("assistant", "reminder-ghost03")
+
+
+async def test_operator_provenance_mirrors_env_substitution(env, monkeypatch):
+    """Sol r6: agent_loader substitutes ${VAR} BEFORE parsing, so a trigger
+    named ${TRIGGER_NAME} registers under the substituted value. Reading the
+    raw text here would see a different name, judge the live job an orphan,
+    and delete the operator's trigger."""
+    from config import TriggerSpec
+
+    monkeypatch.setenv("TRIGGER_NAME", "reminder-maintenance")
+    env.runtime.role_configs = {
+        "assistant": types.SimpleNamespace(channels=["telegram"]),
+    }
+    with open(env.triggers_path, "w", encoding="utf-8") as fh:
+        fh.write("schema_version: 1\ntriggers:\n"
+                 "  - name: ${TRIGGER_NAME}\n    type: cron\n"
+                 "    schedule: 0 3 * * sun\n    channel: telegram\n"
+                 "    prompt: maintenance\n")
+    env.registry.register_agent("assistant", [TriggerSpec(
+        name="reminder-maintenance", type="cron", schedule="0 3 * * sun",
+        channel="telegram", prompt="maintenance")], ["telegram"])
+
+    await reminders.sweep_reminders(env.runtime, NOW)
+
+    assert env.registry.has_job("assistant", "reminder-maintenance")

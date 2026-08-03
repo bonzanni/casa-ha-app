@@ -223,23 +223,44 @@ def operator_triggers_path(agents_dir: str, role: str) -> str:
     return os.path.join(agents_dir, role, "triggers.yaml")
 
 
-def operator_trigger_names(agents_dir: str, role: str) -> set[str]:
+def operator_trigger_names(agents_dir: str, role: str) -> "set[str] | None":
     """Names declared in *role*'s operator-authored triggers.yaml.
 
     Reverse reconciliation needs PROVENANCE, not a name pattern. The schema
     requires a ``date`` trigger to carry the reminder prefix, so an operator
     may legitimately author one in triggers.yaml — and dropping its job
     because it is absent from reminders.yaml would stop it firing entirely.
+
+    Returns ``None`` when provenance is UNAVAILABLE — the file exists but
+    cannot be read or parsed. That is emphatically NOT the same as "the
+    operator declared nothing": an empty set authorises deletion, so a
+    malformed file would silently delete the operator's live triggers.
+    Callers must skip reverse deletion when this is None. A file that simply
+    does not exist IS an empty set — nothing is declared, nothing is exempt.
     """
-    try:
-        return {t.get("name", "")
-                for t in _load(operator_triggers_path(agents_dir, role))["triggers"]}
-    except (OSError, ValueError):
-        # Unreadable: assume every registered name might be the operator's
-        # rather than risk dropping their trigger.
-        logger.warning("reminders: cannot read operator triggers for %s", role,
-                       exc_info=True)
+    path = operator_triggers_path(agents_dir, role)
+    if not os.path.exists(path):
         return set()
+    try:
+        # MUST mirror agent_loader._read_yaml, which substitutes ${VAR}
+        # BEFORE parsing and validating. A trigger named ``${TRIGGER_NAME}``
+        # registers under the substituted value, so reading the raw text here
+        # would see a different name, judge the live job an orphan, and delete
+        # the operator's trigger.
+        from config import _substitute_env
+
+        with open(path, encoding="utf-8") as fh:
+            doc = load_yaml_no_aliases(_substitute_env(fh.read())) or {}
+        if not isinstance(doc, dict):
+            raise ValueError(f"{path}: triggers.yaml is not a mapping")
+        return {t.get("name", "")
+                for t in (doc.get("triggers") or []) if isinstance(t, dict)}
+    except Exception:  # noqa: BLE001 - malformed YAML raises several types
+        logger.warning(
+            "reminders: cannot read operator triggers for %s; skipping "
+            "reverse reconciliation for this role", role, exc_info=True,
+        )
+        return None
 
 
 def _load(path: str) -> dict:
@@ -460,10 +481,16 @@ def _reconcile_registrations(runtime, registry, role: str, path: str,
     # and dropping its job because it is absent from reminders.yaml would stop
     # it firing at all. Provenance, not the name pattern, decides ownership.
     operator_names = operator_trigger_names(runtime.agents_dir, role)
-    try:
-        registered = registry.reminder_job_names(role, REMINDER_PREFIX)
-    except Exception:  # noqa: BLE001 - older registry without the accessor
+    if operator_names is None:
+        # Provenance unknown — deleting now could remove a live operator
+        # trigger. Forward re-registration below still runs: it only ever
+        # ADDS, so it is safe without provenance.
         registered = []
+    else:
+        try:
+            registered = registry.reminder_job_names(role, REMINDER_PREFIX)
+        except Exception:  # noqa: BLE001 - older registry without the accessor
+            registered = []
     for name in registered:
         if name not in live_names and name not in operator_names:
             logger.info(
