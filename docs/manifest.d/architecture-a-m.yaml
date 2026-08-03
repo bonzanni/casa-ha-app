@@ -115,13 +115,16 @@
     - tests/test_config_sync_backstop.py
     - tests/test_admin_reload_route.py
   related: [architecture/overview.md, architecture/plugins.md, architecture/agent-taxonomy.md]
-  defines_invariants: [INV-CFG-001, INV-CFG-002, INV-CFG-003, INV-CFG-004, INV-CFG-005]
+  defines_invariants: [INV-CFG-001, INV-CFG-002, INV-CFG-003, INV-CFG-004, INV-CFG-005, INV-CFG-006, INV-CFG-007, INV-CFG-008]
   invariant_tests:
     INV-CFG-001: [tests/test_pin_g4_invariants.py::test_pin_inv_cfg_001_exactly_eight_scopes_none_reading_options]
     INV-CFG-002: [tests/test_reload.py::test_full_excludes_other_scopes]
     INV-CFG-003: [tests/test_phase_a_compiler_integration.py::test_reload_refuses_hot_swap_across_identity_change, tests/test_reload.py::test_reload_triggers_two_step_laundering_is_blocked]
     INV-CFG-004: [tests/test_config_git.py::test_store_and_staging_stay_untracked]
     INV-CFG-005: [tests/test_config_sync_main.py::test_run_is_non_fatal_on_error]
+    INV-CFG-006: [tests/test_config_sync_entry_merge.py::test_issue_398_a_locally_added_entry_survives_a_changed_shipped_default, tests/test_config_sync_entry_merge.py::test_locally_added_entry_is_kept]
+    INV-CFG-007: [tests/test_config_sync_entry_merge.py::test_refuses_the_merge_when_nothing_validates]
+    INV-CFG-008: [tests/test_config_sync_entry_merge.py::test_output_carries_the_live_documents_top_level]
 
 - doc: architecture/engagements.md
   summary: Work one agent hands to another — ephemeral delegation, durable engagements, how they end, and what survives a restart.

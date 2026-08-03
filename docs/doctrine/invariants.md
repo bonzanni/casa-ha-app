@@ -26,6 +26,9 @@ Every invariant is defined in exactly one file and referenced by id elsewhere.
 | `INV-CFG-003` | A resident identity change is refused as restart-required rather than hot-swapped. | [`architecture/configuration.md`](../architecture/configuration.md) |
 | `INV-CFG-004` | Only an explicit whitelist of the config tree is version-controlled. | [`architecture/configuration.md`](../architecture/configuration.md) |
 | `INV-CFG-005` | Reconciliation of the config tree is never boot-fatal. | [`architecture/configuration.md`](../architecture/configuration.md) |
+| `INV-CFG-006` | In a file reconciled per entry, an entry whose name the image has never shipped is preserved, except when the image ships that name for the first time. | [`architecture/configuration.md`](../architecture/configuration.md) |
+| `INV-CFG-007` | Reconciliation never writes a config file that fails its schema. | [`architecture/configuration.md`](../architecture/configuration.md) |
+| `INV-CFG-008` | Entry-level reconciliation only ever writes a `schema_version` that already appears among its input documents; it never synthesizes or migrates one. | [`architecture/configuration.md`](../architecture/configuration.md) |
 | `INV-CONC-001` | The bus dequeues per role in priority order and spawns one task per message; it never serializes handler execution. | [`architecture/concurrency-model.md`](../architecture/concurrency-model.md) |
 | `INV-CONC-002` | A role has at most one live consumer task, and re-registration replaces the handler while preserving the queue. | [`architecture/concurrency-model.md`](../architecture/concurrency-model.md) |
 | `INV-CONC-003` | Turns sharing a session key serialize under the pool entry's lock, decision through publication; distinct keys are concurrent. | [`architecture/concurrency-model.md`](../architecture/concurrency-model.md) |
