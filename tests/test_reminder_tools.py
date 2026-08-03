@@ -34,9 +34,8 @@ def _seed(path):
 @dataclass
 class Env:
     agents_dir: str
-    reminders_path: str
-    butler_reminders_path: str
-    triggers_path: str
+    path: str            # assistant triggers.yaml — reminders AND operator
+    butler_path: str
     registry: object
     scheduler: object
 
@@ -60,7 +59,7 @@ def env(tmp_path, monkeypatch):
 
     def _remove_fired(role, name):
         reminders.remove_entry(
-            reminders.reminders_path(str(agents_dir), role), name)
+            reminders.triggers_path(str(agents_dir), role), name)
 
     registry = TriggerRegistry(scheduler=scheduler, app=web.Application(),
                                bus=bus, on_one_shot_fired=_remove_fired)
@@ -85,9 +84,8 @@ def env(tmp_path, monkeypatch):
     try:
         yield Env(
             agents_dir=str(agents_dir),
-            reminders_path=str(agents_dir / "assistant" / "reminders.yaml"),
-            butler_reminders_path=str(agents_dir / "butler" / "reminders.yaml"),
-            triggers_path=str(agents_dir / "assistant" / "triggers.yaml"),
+            path=str(agents_dir / "assistant" / "triggers.yaml"),
+            butler_path=str(agents_dir / "butler" / "triggers.yaml"),
             registry=registry, scheduler=scheduler,
         )
     finally:
@@ -106,6 +104,13 @@ def _find(path, name):
     return [t for t in _entries(path) if t["name"] == name][0]
 
 
+def _reminder_names(path):
+    """Only the entries the AGENT owns. The operator's share this file now, so
+    "no reminder was written" can no longer be spelled as "the file is empty"."""
+    return [t["name"] for t in _entries(path)
+            if t.get("managed_by") == "agent"]
+
+
 # ---------------------------------------------------------------------------
 # set_reminder
 # ---------------------------------------------------------------------------
@@ -119,7 +124,7 @@ async def test_one_shot_writes_a_date_entry(env):
 
     assert out["status"] == "ok"
     assert out["name"].startswith("reminder-")
-    entry = _find(env.reminders_path, out["name"])
+    entry = _find(env.path, out["name"])
     assert entry["type"] == "date"
     assert entry["one_shot"] is True
     assert entry["channel"] == "telegram"
@@ -132,7 +137,7 @@ async def test_the_prompt_is_imperative(env):
     from tools import set_reminder
 
     out = _payload(await set_reminder.handler({"at": FUTURE, "text": "Bins."}))
-    prompt = _find(env.reminders_path, out["name"])["prompt"]
+    prompt = _find(env.path, out["name"])["prompt"]
     assert prompt.lower().startswith("send this exact message")
     assert "Bins." in prompt
 
@@ -143,7 +148,7 @@ async def test_weekly_writes_a_cron_entry_with_a_day_name(env):
     out = _payload(await set_reminder.handler({
         "at": FUTURE_THURSDAY, "text": "Gym.", "repeat": "weekly"}))
 
-    entry = _find(env.reminders_path, out["name"])
+    entry = _find(env.path, out["name"])
     assert entry["type"] == "cron"
     assert entry["schedule"] == "0 7 * * thu"
     assert entry["one_shot"] is False
@@ -159,7 +164,7 @@ async def test_recurring_reminder_is_not_one_shot(env):
         out = _payload(await set_reminder.handler({
             "at": FUTURE_THURSDAY, "text": "x", "repeat": repeat}))
         assert out["status"] == "ok", repeat
-        assert _find(env.reminders_path, out["name"])["one_shot"] is False
+        assert _find(env.path, out["name"])["one_shot"] is False
 
 
 async def test_the_job_is_registered_immediately(env):
@@ -179,26 +184,42 @@ async def test_response_echoes_the_resolved_time_and_repeat(env):
     assert out["at"].startswith("2099-08-03T08:00:00")
 
 
-async def test_the_operator_trigger_file_is_never_touched(env):
-    """config_sync can overwrite triggers.yaml on an update, so reminders
-    must not live there — and set_reminder must not write to it at all."""
-    import pathlib as _pl
+async def test_the_operator_entries_are_never_disturbed(env):
+    """Inverted by #398 release 2: the reminder now goes INTO the operator's
+    own triggers.yaml, so "never touch the file" is no longer the guarantee.
+    What must hold is that every operator entry survives with its meaning and
+    its position intact — compared through the LOADER's view, which is what
+    boot actually reads."""
+    import agent_loader
     from tools import set_reminder
 
-    before = _pl.Path(env.triggers_path).read_text()
-    await set_reminder.handler({"at": FUTURE, "text": "Bins."})
+    before = agent_loader._read_yaml(env.path)["triggers"]
+    assert before == [{"name": "heartbeat", "type": "interval", "minutes": 60,
+                       "channel": "telegram", "prompt": "hb"}]
 
-    assert _pl.Path(env.triggers_path).read_text() == before
-    assert _entries(env.triggers_path)[0]["name"] == "heartbeat"
+    out = _payload(await set_reminder.handler({"at": FUTURE, "text": "Bins."}))
+
+    after = agent_loader._read_yaml(env.path)["triggers"]
+    assert after[:1] == before, "the heartbeat must be byte-identical in meaning"
+    assert [t["name"] for t in after] == ["heartbeat", out["name"]]
+
+
+async def test_the_entry_records_its_ownership(env):
+    """Provenance is written HERE and nowhere else. Without it the sweep would
+    not deliver the reminder late and cancellation could not remove it."""
+    from tools import set_reminder
+
+    out = _payload(await set_reminder.handler({"at": FUTURE, "text": "Bins."}))
+    assert _find(env.path, out["name"])["managed_by"] == "agent"
 
 
 async def test_writes_only_to_the_calling_roles_own_file(env):
-    """INV-TRIG-007: the bound that keeps this from being a general writer."""
+    """INV-TRIG-010: the bound that keeps this from being a general writer."""
     from tools import set_reminder
 
     await set_reminder.handler({"at": FUTURE, "text": "Bins."})
     assert all(not t["name"].startswith("reminder-")
-               for t in _entries(env.butler_reminders_path))
+               for t in _entries(env.butler_path))
 
 
 async def test_rejects_an_unknown_repeat(env):
@@ -207,7 +228,7 @@ async def test_rejects_an_unknown_repeat(env):
     out = _payload(await set_reminder.handler({
         "at": FUTURE, "text": "x", "repeat": "fortnightly"}))
     assert out["status"] == "error"
-    assert _entries(env.reminders_path) == []
+    assert _reminder_names(env.path) == []
 
 
 async def test_rejects_a_naive_at(env):
@@ -224,7 +245,7 @@ async def test_rejects_a_time_in_the_past(env):
     out = _payload(await set_reminder.handler({
         "at": "2000-01-01T08:00:00+02:00", "text": "x"}))
     assert out["status"] == "error"
-    assert _entries(env.reminders_path) == []
+    assert _reminder_names(env.path) == []
 
 
 async def test_rejects_empty_text(env):
@@ -243,7 +264,9 @@ async def test_registration_failure_rolls_back_the_entry(env):
     out = _payload(await set_reminder.handler({"at": FUTURE, "text": "Bins."}))
 
     assert out["status"] == "error"
-    assert _entries(env.reminders_path) == []
+    assert _reminder_names(env.path) == []
+    # The rollback must not take the operator's trigger with it.
+    assert [t["name"] for t in _entries(env.path)] == ["heartbeat"]
 
 
 async def test_refuses_outside_a_turn_context(env):
@@ -272,19 +295,24 @@ async def test_cancels_a_reminder_it_created(env):
 
     assert out["status"] == "ok"
     assert all(t["name"] != created["name"]
-               for t in _entries(env.reminders_path))
+               for t in _entries(env.path))
     env.scheduler.remove_job.assert_called_with(
         f"assistant:{created['name']}")
 
 
 async def test_cancel_refuses_a_non_reminder_name(env):
-    """INV-TRIG-007 red case: operator triggers are not the agent's to delete."""
+    """INV-TRIG-010 red case: operator triggers are not the agent's to delete.
+
+    The refusal now comes from the entry's absent ownership marker rather than
+    from its name, which is what makes it sound — the schema permits an operator
+    to author a `reminder-`-prefixed name of their own.
+    """
     from tools import cancel_reminder
 
     out = _payload(await cancel_reminder.handler({"name": "heartbeat"}))
     assert out["status"] == "error"
     assert out["kind"] == "not_authorized"
-    assert any(t["name"] == "heartbeat" for t in _entries(env.triggers_path))
+    assert any(t["name"] == "heartbeat" for t in _entries(env.path))
 
 
 async def test_cancel_unknown_reminder_reports_not_found(env):
@@ -390,5 +418,6 @@ async def test_a_name_collision_cannot_destroy_an_existing_reminder(env, monkeyp
     second = _payload(await set_reminder.handler({"at": FUTURE, "text": "Two."}))
 
     assert second["status"] == "error"
-    names = [t["name"] for t in _entries(env.reminders_path)]
-    assert names == [first["name"]], "the pre-existing reminder must survive"
+    assert _reminder_names(env.path) == [first["name"]], \
+        "the pre-existing reminder must survive"
+    assert "heartbeat" in [t["name"] for t in _entries(env.path)]

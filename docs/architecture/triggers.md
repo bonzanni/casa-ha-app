@@ -21,28 +21,66 @@ they are `architecture/callbacks.md`.
 declare webhooks only.**
 
 **A reminder is a trigger, not a separate thing.** A resident creates one through a narrow
-writer that may only touch entries carrying a reserved name prefix; everything downstream —
-registration, firing, listing — is the ordinary trigger path. One-off reminders use the
-point-in-time `date` type, because cron has no year field and a dated one-shot written as
-cron is an *annual* trigger in disguise.
+writer that may only touch entries it owns; everything downstream — registration, firing,
+listing — is the ordinary trigger path. One-off reminders use the point-in-time `date`
+type, because cron has no year field and a dated one-shot written as cron is an *annual*
+trigger in disguise.
 
-**Reminders live in their own file.** They are declared in an agent-owned
-`reminders.yaml` beside `triggers.yaml`, and the loader merges the two into one list. A
-file absent from the defaults tree is adopted by configuration reconciliation and never
-rewritten, so nothing an update ships can touch it.
+**One file, ownership per entry.** A reminder is an ordinary entry in the role's
+`triggers.yaml`, marked `managed_by: agent`. Reminders once had a file of their own,
+because reconciliation resolved an edited image-owned file against a changed shipped
+default as "image wins" and would have deleted every pending reminder on such an update.
+That file is gone: `triggers.yaml` is now reconciled *per entry*, so an entry the image has
+never shipped is preserved rather than dying with the file
+([`architecture/configuration.md`](configuration.md)).
 
-The separation is no longer what makes a reminder durable. `triggers.yaml` is now
-reconciled *per entry* — an entry the image never shipped is preserved rather than dying
-with the file — so a reminder written there would survive an update too
-([`architecture/configuration.md`](configuration.md)). The two files remain distinct
-because provenance is currently derived from which of them an entry was loaded from, and
-that is what bounds an agent to its own reminders rather than the operator's triggers.
+**Ownership is data, and is never inferred from an entry's content.** The schema permits an
+operator to write a `reminder-`-prefixed dated one-shot of their own, so neither the
+reserved name prefix, nor the `date` type, nor the `one_shot` flag distinguishes an agent's
+reminder from an operator's trigger — only the explicit field does. Everything that may
+sweep, re-register, or delete an entry keys off it. Inferring ownership from any of those
+shapes instead produced a fresh way to delete a live operator trigger every time it was
+attempted.
+
+**The file is machine-maintained, and only meaning is preserved across a rewrite.**
+Operators change triggers by asking the configurator agent, not by hand-editing; both that
+agent and per-entry reconciliation already reconstruct the file through a plain YAML dump.
+The reminder writer is a third writer of the same kind, so comments, quote styles and key
+order are not preserved — an entry's *meaning* is. One consequence has teeth: environment
+interpolation is substituted into the file's **text** before it is parsed, so a rewritten
+`${VAR}` reference can resolve differently afterwards. The writer refuses to add a reminder
+to a file containing one rather than risk it, and no shipped configuration uses them.
 
 **A reminder still present with a past fire time is one that is owed.** The entry is the
 record and delivery removes it, so there is no second store to keep in sync. This is what
 lets a sweep recover occurrences the process was down for — something the scheduler itself
 cannot do. Ownership is exclusive: while a live job exists the scheduler owns delivery and
 the sweep leaves it alone.
+
+**Removing a delivered reminder must never be blocked by something the sweep tolerates.**
+Delivery and cleanup are two steps over the same file, so any check present in the second
+and absent from the first lets the sweep deliver an entry it cannot then remove — and
+presence being the ledger, it redelivers on every pass indefinitely. Both steps therefore
+read through one function, and cleanup deliberately skips the whole-document schema check
+that creation performs: a validation failure elsewhere in the file is unrelated to the entry
+being removed. Reading a file and re-writing it can still fail *independently* — a document
+nested deeply enough parses but cannot be re-emitted — so what is actually guaranteed is
+narrower and worth stating precisely: every such failure lands inside the handled error
+contract, making the worst case the ordinary at-least-once one rather than an aborted pass.
+
+**A pre-existing schema defect in another entry never blocks either operation.** A running
+Casa holds the configuration it booted with, so the file on disk can already be invalid while
+everything works — the configurator refuses a commit that fails validation but leaves its
+edits in the working tree. Refusing to touch such a file protects nothing, since it already
+fails to load, while making reminders unavailable and naming an entry nobody asked about. So
+creation validates *the entry it is adding*, on its own; cleanup validates nothing. Judging
+the new entry alone is exact rather than approximate — the schema has no constraints that
+span entries, and the one real cross-entry hazard, a duplicate name, is refused separately.
+The entry is still judged under the file's real top level, since the schema version decides
+what is legal there, so a defect in the top level itself does refuse creation — a deliberate
+boundary, not a leak. And only the *judgment* is scoped this way: a sibling entry that cannot
+be read, or cannot be written back out, blocks both operations, because there is then no way
+to rewrite the file at all.
 
 **A recurring reminder keeps its first occurrence as an anchor.** The derived cron fields
 drive the recurrence — evaluated in the scheduler's timezone, which is what keeps a series
@@ -61,19 +99,21 @@ offset pins which instant is meant; the cron is evaluated in the scheduler's zon
 the fields from a caller's offset would misschedule by the difference whenever the two
 disagree, and drift across a DST boundary.
 
-**The store is the truth; the scheduler is a cache of it.** The sweep reconciles in both
-directions — registering any reminder with no live job, and dropping any reminder job with no
-entry left in the store — which heals a divergence without needing a lock. Which jobs are
-*eligible* to be dropped is decided by recorded provenance, carried on the spec from the file
-it was loaded from — never by the name. The schema requires every point-in-time trigger to
-carry the reserved prefix, so an operator may legitimately author one in their own file, and
-matching on the name would delete it. A reload
-re-registering a role from a snapshot taken before a reminder was written would otherwise drop
-a *recurring* reminder for good, since only one-shots are recoverable by delivery; the same
-race in the other direction would leave a cancelled reminder firing forever. A consequence
-worth stating: reminders are deliberately independent of operator-trigger validity, so a
-reload that fails closed on a malformed operator cron does not disable the user's reminders,
-even though it reports that role's triggers as inactive.
+**The file is the truth; the scheduler is a cache of it.** The sweep reconciles in both
+directions — registering any agent-owned reminder with no live job, and dropping any
+agent-owned job with no entry left — which heals a divergence without needing a lock. Both
+directions are bounded by recorded ownership, never by the name: an operator's own trigger is
+neither registered nor dropped here, and matching on the reserved prefix would drop the one
+they are allowed to author. A reload re-registering a role from a snapshot taken before a
+reminder was written would otherwise drop a *recurring* reminder for good, since only
+one-shots are recoverable by delivery; the same race in the other direction would leave a
+cancelled reminder firing forever.
+
+Sharing the operator's file makes one previously incidental property load-bearing: a
+`triggers.yaml` that cannot be read *or written back* must be contained to its own role
+rather than aborting the pass, or one bad file would strand every later role's overdue
+reminders. An unreadable file suspends *both* directions for that role — reporting it as
+empty would authorise dropping every one of its reminder jobs.
 
 **Every webhook trigger arrives on one wildcard route.** There is no route per trigger. The
 name in the path is looked up against a registry, and an unknown name is refused before any
@@ -147,30 +187,53 @@ mode, header or tolerance change, does invalidate the approval.
 There is no window in which the overlay is half-updated. Names absent from the new set stop
 routing immediately.
 
-**INV-TRIG-006**: A one-shot trigger fires at most once — firing removes both the scheduler job and the `triggers.yaml` entry.
+**INV-TRIG-009**: Firing a one-shot trigger unconditionally drops its scheduler job, and removes its `triggers.yaml` entry only when the agent owns that entry.
 
-Removal runs after the dispatch, in process, and frees the job id so the same name can be
-registered again. The red case is a `one_shot` trigger that survives its own firing: either
-the job stays in the scheduler, or the entry stays on disk and a restart resurrects an
-already-delivered reminder.
+Both steps run after the dispatch, in process. Dropping the job is unconditional — a
+one-shot that kept its job could fire again, and the id must be freed so the same name can be
+registered later. "Drops" means the removal is attempted and the trigger is forgotten either
+way: a scheduler that refuses to remove the job is treated as already-gone, so the id is
+still freed. That is deliberate, since the alternative is a name that can never be
+re-registered, but it means the guarantee is about Casa's own bookkeeping rather than about
+the scheduler's internal state. Deleting the *entry* is gated on ownership, because an operator's dated
+one-shot lives in the same file and removing their line is not the registry's business. The
+red case is either half inverted: a `one_shot` job that survives its own firing, or an
+operator's entry deleted because it fired.
 
-What it does not cover: it does not promise the removal *succeeded*. Cleanup is deliberately
-outside the delivery path, so a failure leaves the entry for the sweep rather than raising
-back into the scheduled job.
+An earlier form of this rule promised the entry was always removed. That is no longer true,
+and the difference is a deliberate outcome rather than a gap: **an operator's unmarked
+one-shot lingers inert after firing** — never re-registered, because a past-dated trigger is
+not registered at boot, and never delivered by the sweep, because it carries no ownership
+marker.
 
-**INV-TRIG-007**: The reminder writer may only create, and the canceller only remove, entries carrying the reserved name prefix in the calling role's own file.
+What it does not cover: it does not promise the entry removal *succeeded*. Cleanup is
+deliberately outside the delivery path, so a failure leaves the entry for the sweep rather
+than raising back into the scheduled job.
+
+**INV-TRIG-010**: The reminder writer may only create, and the canceller only remove, entries marked as agent-owned in the calling role's own file.
 
 This is the whole boundary between a resident managing its own reminders and a resident
-editing operator configuration. The red case is either tool touching a name without the
-prefix — the heartbeat, the morning briefing — or reaching another role's file. The
-privileged config-commit path keeps its own separate configurator-only guard; this is a
+editing operator configuration. The red case is either tool touching an entry that carries no
+ownership marker — the heartbeat, the morning briefing, or a `reminder-`-prefixed dated
+one-shot the operator wrote themselves — or reaching another role's file. Creation also
+refuses a name already present under any owner, because a duplicate name is refused at
+registration and that is uncaught at boot.
+
+An earlier form of this rule bounded both tools by the reserved *name prefix* instead. The
+prefix was never sound as an authorization predicate: the schema permits an operator to
+author a name carrying it, so it identifies a naming convention and not an owner. It survives
+only as the shape of a generated name.
+
+The privileged config-commit path keeps its own separate configurator-only guard; this is a
 narrower door beside it, not a widening of that one.
 
 **INV-TRIG-008**: A one-shot reminder whose time passed while the process was down is delivered by the next sweep rather than dropped.
 
 Presence is the record: an entry still on disk with a past fire time *is* the evidence that
 delivery is owed, which is why removal happens only after a successful send. The red case is
-an overdue entry that no sweep ever delivers. Delivery is consequently at-least-once — a
+an overdue entry that no sweep ever delivers — and the sharpest form of it is the sweep
+reading the wrong file, since a past-dated trigger is deliberately left unregistered *for*
+the sweep, so nothing else would ever deliver it. Delivery is consequently at-least-once — a
 failed removal redelivers — because a duplicate reminder is a better failure than a missing
 one. The scheduler and the sweep never both deliver: the sweep skips any reminder that still
 has a live job, so the two never race for one whose time has just passed.
@@ -214,10 +277,29 @@ the error names exactly the jobs that remain.
 **The approval store is missing or corrupt.** Treated as no approvals. Pending routes stay
 absent rather than opening.
 
+**A role's `triggers.yaml` cannot be parsed while the process is running.** The sweep skips
+that role entirely — no delivery, no reconciliation in either direction — and continues with
+the others. Setting a reminder fails with the parse error rather than rewriting a file it
+cannot read.
+
+**A reminder is delivered but its entry cannot be removed.** This state is reachable and is
+not treated as an error to be prevented: a document nested deeply enough to parse but not to
+be re-emitted is the clearest case, and a full disk is the ordinary one. The guarantee is
+*containment*, not removal — the failure is reported, the entry stays, the remaining roles are
+still swept, and the reminder is delivered again on the next pass. That is the at-least-once
+contract working as intended, because a duplicate nudge is a better failure than a missed
+reminder. What is ruled out is the failure escaping and aborting the pass, which would strand
+every later role's overdue reminders too.
+
+**The file already contains `${VAR}` interpolation.** Setting a reminder is refused, because
+re-emitting the file could change what an existing entry resolves to. Cancelling or sweeping
+one is *not* refused — it warns and proceeds, since blocking cleanup is what strands a
+delivered reminder into redelivering forever.
+
 ## Extension points
 
 **A new resident trigger type** touches the schema, the loader, registration and dispatch —
-the current set is exactly three.
+the current set is four.
 
 **A new resident webhook** needs the trigger declaration and a name outside the reserved
 plugin prefix. Declaring the webhook channel on the resident is *not* checked for webhooks —

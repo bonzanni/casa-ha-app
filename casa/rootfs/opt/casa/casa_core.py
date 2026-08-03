@@ -2699,18 +2699,26 @@ async def main() -> None:
             "max_instances": 1,          # no overlap of same job
         },
     )
-    # #396: when a one_shot reminder fires, its reminders.yaml entry must go
-    # with it — otherwise a reboot would resurrect an already-delivered
-    # reminder. Injected rather than done inside the registry, which must not
-    # learn to write YAML. CONFIG_DIR is used directly (rather than the
+    # #396: when an agent-owned one_shot reminder fires, its triggers.yaml
+    # entry must go with it — otherwise a reboot would resurrect an
+    # already-delivered reminder. Injected rather than done inside the registry,
+    # which must not learn to write YAML; the registry only calls this for
+    # entries carrying ``managed_by: agent``, so an operator's own one-shot is
+    # never deleted here. CONFIG_DIR is used directly (rather than the
     # ``agents_dir`` local defined below) so this closure has no late-binding
     # dependency on statements that run after it.
     def _remove_fired_reminder(role: str, name: str) -> None:
         import reminders
-        reminders.remove_entry(
-            reminders.reminders_path(os.path.join(CONFIG_DIR, "agents"), role),
+        outcome = reminders.remove_entry(
+            reminders.triggers_path(os.path.join(CONFIG_DIR, "agents"), role),
             name,
         )
+        if outcome != "removed":
+            # Not fatal: the sweep redelivers, which is the at-least-once
+            # choice. Logged because it means the entry is still on disk.
+            logger.warning(
+                "one-shot cleanup for %s:%s reported %s", role, name, outcome,
+            )
 
     trigger_registry = TriggerRegistry(
         scheduler=scheduler, app=app, bus=bus,
@@ -3898,8 +3906,8 @@ async def main() -> None:
 
     # #396 / INV-TRIG-008: the scheduler has NO persistent job store, so a
     # reminder whose fire time fell while the add-on was down was never
-    # recorded and is otherwise lost outright. A one-shot reminder still
-    # present in reminders.yaml with a past time IS the record that delivery is
+    # recorded and is otherwise lost outright. An agent-owned one-shot still
+    # present in triggers.yaml with a past time IS the record that delivery is
     # owed; this sweep is what redeems it.
     async def _reminder_sweep() -> None:
         from datetime import datetime

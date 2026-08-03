@@ -42,10 +42,17 @@ def _past(days=1):
     return (datetime.now(timezone.utc) - timedelta(days=days)).isoformat()
 
 
-def _date_spec(at, name="reminder-a1b2c3", one_shot=True):
+def _date_spec(at, name="reminder-a1b2c3", one_shot=True, managed_by=""):
+    """A dated one-shot. ``managed_by`` defaults to EMPTY — i.e. the operator's.
+
+    That default is deliberate: the reminder-looking name is a shape the schema
+    lets an operator author, so a test must opt IN to agent ownership rather
+    than inherit it from a name.
+    """
     from config import TriggerSpec
     return TriggerSpec(name=name, type="date", at=at, one_shot=one_shot,
-                       channel="telegram", prompt='Send this: "Bins."')
+                       channel="telegram", prompt='Send this: "Bins."',
+                       managed_by=managed_by)
 
 
 # ---------------------------------------------------------------------------
@@ -108,7 +115,7 @@ async def test_date_trigger_rejects_an_empty_at():
 
 
 # ---------------------------------------------------------------------------
-# Firing and one-shot self-removal  (INV-TRIG-006)
+# Firing and one-shot self-removal  (INV-TRIG-009)
 # ---------------------------------------------------------------------------
 
 
@@ -118,17 +125,46 @@ async def _fire_the_only_job(sched):
     await fn()
 
 
-async def test_firing_a_one_shot_delivers_then_removes_job_and_entry():
+async def test_firing_an_agent_owned_one_shot_removes_job_and_entry():
     sched, bus, seen = _make_scheduler(), _make_bus(), []
     reg = _registry(scheduler=sched, bus=bus,
                     on_one_shot_fired=lambda r, n: seen.append((r, n)))
-    reg.register_agent("assistant", [_date_spec(_future())], ["telegram"])
+    reg.register_agent("assistant", [_date_spec(_future(), managed_by="agent")],
+                       ["telegram"])
 
     await _fire_the_only_job(sched)
 
     bus.send.assert_awaited_once()
     sched.remove_job.assert_called_once_with("assistant:reminder-a1b2c3")
     assert seen == [("assistant", "reminder-a1b2c3")]
+
+
+async def test_firing_an_OPERATORS_one_shot_drops_the_job_but_not_the_entry():
+    """Trap 2, pinned. Post-fire cleanup used to select on ``one_shot`` ALONE,
+    and the entry now lives in the operator's own triggers.yaml — so an
+    operator's dated one-shot would have had its line deleted out of their file
+    by the registry.
+
+    ``_drop_job`` must stay UNCONDITIONAL (a one-shot that kept its job could
+    fire again, and the id must be freed); only the entry-removal callback is
+    gated on ownership. INV-TRIG-009 states the accepted consequence: the entry
+    lingers inert, never re-registered because a past-dated trigger is not
+    registered at boot, and never swept because it carries no ``managed_by``.
+
+    Red case: drop the ownership gate and ``seen`` is non-empty here.
+    """
+    sched, bus, seen = _make_scheduler(), _make_bus(), []
+    reg = _registry(scheduler=sched, bus=bus,
+                    on_one_shot_fired=lambda r, n: seen.append((r, n)))
+    # No managed_by — an operator-authored dated one-shot, which the schema
+    # permits with exactly this reminder-looking name.
+    reg.register_agent("assistant", [_date_spec(_future())], ["telegram"])
+
+    await _fire_the_only_job(sched)
+
+    bus.send.assert_awaited_once(), "delivery is unaffected by ownership"
+    sched.remove_job.assert_called_once_with("assistant:reminder-a1b2c3")
+    assert seen == [], "the operator's entry must NOT be removed"
 
 
 async def test_firing_a_one_shot_frees_its_job_id():
@@ -310,10 +346,10 @@ async def test_has_job_is_false_for_something_never_registered():
     assert reg.has_job("assistant", "reminder-nope0000") is False
 
 
-async def test_reminder_job_names_selects_by_provenance_not_name():
-    """The schema requires every date trigger to carry the reminder prefix,
-    so an operator may legitimately author one. Only specs recorded as coming
-    from the reminder store may be listed for removal."""
+async def test_agent_owned_job_names_selects_by_ownership_not_name():
+    """The schema permits an operator to author a `reminder-`-prefixed dated
+    one-shot of their own, and their triggers share the same file now. Only
+    specs RECORDING agent ownership may be listed for removal."""
     from config import TriggerSpec
 
     sched = _make_scheduler()
@@ -321,7 +357,7 @@ async def test_reminder_job_names_selects_by_provenance_not_name():
     # From the store.
     reg.register_agent("assistant", [TriggerSpec(
         name="reminder-ours", type="cron", schedule="0 7 * * thu",
-        channel="telegram", prompt="x", from_reminder_store=True)],
+        channel="telegram", prompt="x", managed_by="agent")],
         ["telegram"])
     # Operator-authored, same name shape.
     reg.register_agent("assistant", [TriggerSpec(
@@ -333,10 +369,10 @@ async def test_reminder_job_names_selects_by_provenance_not_name():
     # Another role's store entry.
     reg.register_agent("butler", [TriggerSpec(
         name="reminder-butler", type="cron", schedule="0 7 * * thu",
-        channel="telegram", prompt="x", from_reminder_store=True)],
+        channel="telegram", prompt="x", managed_by="agent")],
         ["telegram"])
 
-    assert reg.reminder_job_names("assistant") == ["reminder-ours"]
+    assert reg.agent_owned_job_names("assistant") == ["reminder-ours"]
 
 
 async def test_has_job_stays_true_while_the_dispatch_is_in_flight():

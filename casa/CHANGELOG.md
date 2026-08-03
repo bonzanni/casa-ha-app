@@ -1,5 +1,49 @@
 # Changelog
 
+## [0.150.0] - 2026-08-03
+
+### Changed
+
+- **Reminders are now ordinary entries in your agent's own `triggers.yaml`**,
+  marked as agent-managed, instead of living in a separate `reminders.yaml`.
+  The separate file existed only to keep an update from deleting pending
+  reminders; 0.149.0 made Casa reconcile `triggers.yaml` entry by entry, so an
+  entry you or an agent added to it now survives an update on its own and the
+  second file had no purpose left. Reminders behave exactly as before — durable
+  across restarts and updates, delivered late if Casa was down when one was
+  due, and self-removing after a one-off fires.
+- **Setting a reminder is refused if the name would clash with one of your own
+  triggers**, and the agent picks another name instead. Reminder names are
+  random, so this is rare — but now that reminders and your triggers share one
+  file, a duplicate name would stop the agent loading, so it is checked when the
+  reminder is set.
+- **Setting a reminder is also refused if your `triggers.yaml` uses `${...}`
+  environment placeholders.** Rewriting such a file can change what an existing
+  entry resolves to, so Casa declines rather than risk it. No configuration Casa
+  ships uses them. Cancelling or delivering a reminder still works normally.
+
+### Fixed
+
+- **A one-off dated trigger you wrote yourself is no longer deleted after it
+  fires.** Casa removes the entry only for reminders its own agents created;
+  yours stays in your file. Note the consequence: after firing, such an entry
+  remains but does nothing, because a trigger whose time has passed is not
+  re-registered at startup. Remove it yourself, or ask the configurator to.
+
+### Upgrade note
+
+**This release requires clearing the old reminder files before you update.**
+Casa refuses to load an agent whose directory contains a file it does not
+recognise, and `reminders.yaml` is no longer recognised — so an installation
+still holding one will fail to start. Remove `/config/agents` and reinstall, or
+delete every `agents/<role>/reminders.yaml` before updating. Any pending
+reminders are lost; set them again afterwards.
+
+The same applies in reverse: **restoring a backup taken before 0.150.0, or
+rolling back to 0.149.x and forward again, needs the same clearing.** This is
+deliberate — the alternative was carrying migration code for a file that only
+ever existed for two releases.
+
 ## [0.149.1] - 2026-08-03
 
 ### Fixed
