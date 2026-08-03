@@ -1653,3 +1653,37 @@ def test_a_raising_salvage_falls_back_to_the_force_default(tmp_path, monkeypatch
     assert (tmp_path / "live" / REL).read_text() == _SHIPPED_V1
     assert [c["path"] for c in report.schema_forced] == [REL]
     monkeypatch.setattr(config_sync, "_drop_invalid_entries", real)
+
+
+# --------------------------------------------------------------------------
+# Live-verification finding: the reconciler's own sidecar broke the loader
+# --------------------------------------------------------------------------
+
+
+def test_the_reconcilers_own_sidecar_does_not_make_an_agent_unloadable(tmp_path):
+    """The gap that let a live-only bug through.
+
+    Every other test in this file injects a FAKE `validate_repo`, so none of
+    them ever asked the real loader what it thinks of a directory the
+    reconciler has just written. It thought the `.casabak` was an unknown file
+    and refused to load the agent — so the merge's own recovery copy triggered
+    the boot-parity heal, which reverted the merge and destroyed the preserved
+    entry. The feature defeated itself the first time it ran on real data.
+
+    Asserted against `_check_file_set` directly, which is the function that
+    raises. An earlier version of this test called `validate_config_repo` and
+    filtered its errors for "casabak" — with an invalid fixture it never
+    reached the file-set check, and filtering-then-asserting-empty passes
+    vacuously, so it went green against the unfixed code.
+    """
+    import agent_loader as al
+
+    role_dir = tmp_path / "agents" / "assistant"
+    role_dir.mkdir(parents=True)
+    for name in ("character.yaml", "voice.yaml", "response_shape.yaml",
+                 "disclosure.yaml", "runtime.yaml", "triggers.yaml"):
+        (role_dir / name).write_text("schema_version: 1\n")
+    (role_dir / "triggers.yaml.casabak").write_text(_SHIPPED_V1)
+
+    # Raises LoadError("unknown file(s) in directory") without the fix.
+    al._check_file_set(str(role_dir), "resident", "assistant")

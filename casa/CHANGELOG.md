@@ -1,5 +1,17 @@
 # Changelog
 
+## [0.149.1] - 2026-08-03
+
+### Fixed
+
+- **The backup Casa saves before rewriting a configuration file no longer stops
+  the agent it belongs to from loading.** The `.casabak` recovery copy sits
+  next to the file it protects, and the strict directory check rejected it as
+  an unknown file — so on the first update that preserved anything, the agent
+  failed to load and Casa's own repair step undid the rewrite to fix the
+  directory, throwing away exactly what the backup existed to save. Found in
+  live verification of 0.149.0.
+
 ## [0.149.0] - 2026-08-03
 
 ### Fixed
