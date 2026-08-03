@@ -226,8 +226,15 @@ if [ "$mode" != "messages" ]; then
         [ -s "$candidate" ] && printf '%s\n' "$candidate" >> "$work/binaries"
       done < "$work/maybe-binary" ;;
     range)
-      # numstat prints `-	-	<path>` for a binary change.
-      { git log --numstat --format= -m "$range" 2>/dev/null || true; } \
+      # numstat prints `-	-	<path>` for a binary change. `--diff-filter=ACMR`
+      # excludes DELETIONS, matching the staged branch below: this guard exists
+      # because an added binary can hide a payload from every content rule, and
+      # a removal publishes nothing to hide. Without the filter, taking a
+      # binary OUT of the tree was refused here while the pre-commit hook —
+      # which already filtered — allowed it, so the two disagreed about the
+      # same change and the only way past was to keep the file or keep a stale
+      # allowlist entry naming it.
+      { git log --numstat --format= -m --diff-filter=ACMR "$range" 2>/dev/null || true; } \
         | awk -F'\t' '$1=="-" && $2=="-" {print $3}' | sort -u > "$work/binaries" ;;
     staged)
       { git diff --cached --numstat --diff-filter=ACMR || true; } \
