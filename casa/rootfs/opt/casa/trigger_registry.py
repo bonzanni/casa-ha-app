@@ -129,6 +129,13 @@ class TriggerRegistry:
         # write YAML. Default None keeps every existing call site working.
         self._on_one_shot_fired = on_one_shot_fired
         self._seen_job_ids: set[str] = set()
+        # #396: job ids whose _fire is RUNNING RIGHT NOW. APScheduler submits
+        # a date job and then removes it from the store, so for the whole
+        # duration of the dispatch the scheduler no longer reports the job —
+        # and a sweep landing in that window would deliver the same reminder a
+        # second time. This set is what keeps ownership exclusive across the
+        # await inside _fire.
+        self._in_flight: set[str] = set()
         self._specs_by_job_id: dict[str, TriggerSpec] = {}
         # N-1 + N-2 (v0.36.0): per-boot allowlist of webhook trigger names
         # → role. The wildcard /webhook/{name} handler in casa_core consults
@@ -224,6 +231,13 @@ class TriggerRegistry:
                 "Trigger firing: agent=%s name=%s type=%s",
                 role, trig.name, trig.type,
             )
+            self._in_flight.add(job_id)
+            try:
+                await _dispatch()
+            finally:
+                self._in_flight.discard(job_id)
+
+        async def _dispatch() -> None:
             msg = BusMessage(
                 type=MessageType.SCHEDULED,
                 source="scheduler",
@@ -341,6 +355,10 @@ class TriggerRegistry:
         reminder forever, so it would never be delivered at all.
         """
         job_id = f"{role}:{name}"
+        # A dispatch already in progress owns this reminder, even though the
+        # scheduler has already dropped the job.
+        if job_id in self._in_flight:
+            return True
         if job_id not in self._seen_job_ids:
             return False
         try:

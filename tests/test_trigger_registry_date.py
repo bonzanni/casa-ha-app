@@ -324,3 +324,46 @@ async def test_reminder_job_names_lists_only_this_roles_reminders():
 
     got = reg.reminder_job_names("assistant", "reminder-")
     assert got == ["reminder-a1b2c3"]
+
+
+async def test_has_job_stays_true_while_the_dispatch_is_in_flight():
+    """APScheduler submits a date job and THEN removes it from the store, so
+    for the whole duration of the dispatch the scheduler no longer reports it.
+    A sweep landing in that window must not deliver the reminder a second
+    time."""
+    import asyncio
+
+    sched = _make_scheduler()
+    bus = _make_bus()
+    seen = []
+
+    async def _slow_send(msg):
+        # Observe what the sweep would see mid-dispatch, exactly when
+        # APScheduler has already dropped the job.
+        sched.get_job.return_value = None
+        seen.append(reg.has_job("assistant", "reminder-a1b2c3"))
+        await asyncio.sleep(0)
+
+    bus.send = _slow_send
+    reg = _registry(scheduler=sched, bus=bus)
+    reg.register_agent("assistant", [_date_spec(_future())], ["telegram"])
+
+    await _fire_the_only_job(sched)
+
+    assert seen == [True], "the in-flight dispatch must still own the reminder"
+    # ...and once it has finished, ownership is released.
+    assert reg.has_job("assistant", "reminder-a1b2c3") is False
+
+
+async def test_in_flight_is_released_even_if_the_dispatch_raises():
+    sched = _make_scheduler()
+    bus = _make_bus()
+    bus.send = AsyncMock(side_effect=RuntimeError("bus down"))
+    reg = _registry(scheduler=sched, bus=bus)
+    reg.register_agent("assistant", [_date_spec(_future())], ["telegram"])
+
+    with pytest.raises(RuntimeError):
+        await _fire_the_only_job(sched)
+
+    sched.get_job.return_value = None
+    assert reg.has_job("assistant", "reminder-a1b2c3") is False
