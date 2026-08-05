@@ -184,6 +184,21 @@ async def dispatch(
                         logger.warning(
                             "plugin-callback reconcile after reload failed",
                             exc_info=True)
+                    # Pair the EVENT reconcile at the SAME scopes with the
+                    # SAME runtime — a resident losing/gaining a role changes
+                    # a subscriber's own delivery target (event_no_target)
+                    # just as it changes trigger/callback routing.
+                    # ``reconcile_plugin_events`` takes ``runtime`` directly
+                    # (no separate ``reconcile_from_runtime`` wrapper).
+                    # Independent + non-fatal.
+                    try:
+                        import event_reconcile
+                        await event_reconcile.reconcile_plugin_events(runtime)
+                        actions = [*actions, "plugin_events_reconciled"]
+                    except Exception:  # noqa: BLE001
+                        logger.warning(
+                            "plugin-event reconcile after reload failed",
+                            exc_info=True)
                 ms = int(time.monotonic() * 1000 - started_ms)
                 logger.info(
                     "casa_reload scope=%s role=%s ms=%d ok=True actions=%s",

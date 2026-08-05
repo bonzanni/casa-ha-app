@@ -2167,6 +2167,84 @@ async def _boot_reconcile_plugin_callbacks(
         logger.warning("boot callback-spool orphan GC failed", exc_info=True)
 
 
+async def _boot_reconcile_plugin_events(*, role_configs: dict) -> None:
+    """Boot seam (paired with :func:`_boot_reconcile_plugin_triggers` /
+    :func:`_boot_reconcile_plugin_callbacks`): derive + publish the
+    plugin-declared event-subscription routing map.
+
+    Unlike triggers/callbacks this reconciler needs no ``trigger_registry``
+    — event routing is derived purely from the plugin registry + the
+    subscriber's own role assignment (``event_reconcile.compute_desired``)
+    — and there is no spool boot-recovery / legacy-migration step to run
+    HERE: ``event_episodes.recovery(boot=True)`` (called in ``main()`` after
+    the worker's seams are configured, deliberately AFTER this function
+    returns) is what reconstructs the per-flow delivery ledger from the
+    artifacts, using the routing THIS reconcile just published — ordering
+    that pass after this one is what lets its boot-time reconstruction see
+    live routing instead of the ``ROUTING_UNAVAILABLE`` sentinel default.
+
+    Never fatal: a reconcile failure boots with event_reconcile's own
+    fail-closed sentinel published (never an authoritative empty map), not a
+    dead Casa.
+    """
+    try:
+        import event_reconcile
+        issues = await event_reconcile.reconcile_plugin_events(
+            None, role_configs=role_configs, channel_manager=None,
+            prompt=False)
+        if issues:
+            from tools import _regenerate_plugin_health
+            await asyncio.to_thread(_regenerate_plugin_health, [])
+    except Exception:  # noqa: BLE001
+        logger.warning("boot plugin-event reconcile failed", exc_info=True)
+
+
+def _event_registry_entry(subscriber: str) -> "dict | None":
+    """``event_episodes``'s ``resolve_registry_entry`` seam. Same source as
+    :func:`_setup_registry_entry` (targets + artifact id from the resolved
+    plugin + registry entry) PLUS the resolved MANIFEST dict — the worker's
+    pre-send gate recomputes the declaration digest from it
+    (``event_episodes._gate_ok``)."""
+    import plugin_registry as _pr
+    res = _pr.resolve_all()
+    rp = next((p for p in res.plugins if p.name == subscriber), None)
+    if rp is None:
+        return None
+    snap = _pr.snapshot_registry()
+    entry = next(
+        (e for e in snap.entries
+         if isinstance(e, dict) and e.get("name") == subscriber), None)
+    return {
+        "targets": list((entry or {}).get("targets") or []),
+        "artifact_id": rp.artifact_id,
+        "manifest": rp.manifest,
+    }
+
+
+def _event_installed() -> set:
+    """``event_episodes``'s ``get_installed`` seam. Fail-closed under an
+    invalid registry snapshot — mirrors the gated orphan-GC lesson at
+    :func:`_boot_reconcile_plugin_callbacks`'s step (5) /
+    ``casa_core.py:2152-2156``: a membership set derived from a failed load
+    must never look like "nothing is installed" and license the worker's
+    sweep to vaporize every subscriber's spool state.
+    :func:`_event_registry_valid` is what actually gates the worker's use
+    of this set; this function itself just never fabricates membership from
+    an invalid snapshot."""
+    import plugin_registry as _pr
+    snap = _pr.snapshot_registry()
+    if not snap.valid:
+        return set()
+    return {e.get("name") for e in snap.entries
+            if isinstance(e, dict) and isinstance(e.get("name"), str)}
+
+
+def _event_registry_valid() -> bool:
+    """``event_episodes``'s ``get_registry_valid`` seam."""
+    import plugin_registry as _pr
+    return bool(_pr.snapshot_registry().valid)
+
+
 def _callback_and_trigger_routes_live(plugin: str) -> bool:
     """Setup-dispatch route gate. A plugin's setup tool must not be
     dispatched while EITHER its trigger OR its callback markers are dark.
@@ -2731,6 +2809,12 @@ async def main() -> None:
     # Root honours CASA_CALLBACK_SPOOL_ROOT, default /data/callbacks.
     import callback_spool
     callback_spool.init_spool()
+
+    # Initialise the plugin-event spool BEFORE the first event reconcile —
+    # the process-wide singleton, mirroring the callback spool immediately
+    # above. Root honours CASA_EVENT_SPOOL_ROOT, default /data/events.
+    import event_spool
+    event_spool.init_spool()
 
     # 8. Load agent configs by role
     from agent import Agent
@@ -3596,6 +3680,13 @@ async def main() -> None:
     await _boot_reconcile_plugin_callbacks(
         trigger_registry=trigger_registry, role_configs=role_configs,
     )
+    # 13c''. Paired plugin-declared event-subscription reconcile — derives +
+    # publishes the routing map the delivery worker's fold/sweep/pre-send
+    # gate read every pass. Runs BEFORE event_episodes.recovery()/
+    # start_worker() below (see _boot_reconcile_plugin_events's own
+    # docstring) so the worker's boot recovery reconstructs the ledger
+    # against LIVE routing, never the ROUTING_UNAVAILABLE sentinel default.
+    await _boot_reconcile_plugin_events(role_configs=role_configs)
 
     # 13d. v0.112.0 (elevenlabs#2): durable post-consent setup episodes —
     # wire the seams (all late-binding: the channel is resolved at call
@@ -3682,6 +3773,33 @@ async def main() -> None:
         get_spool=callback_spool.get_spool,
     )
     _cbep.start_worker()
+
+    # 13d''. Durable plugin-event delivery. Structurally the sibling of the
+    # callback delivery wiring above — same late-binding dispatch/notify/
+    # registry-entry seams, no store of its own beyond the spool's per-flow
+    # delivery ledger — but with three ADDITIONAL live-callable closures the
+    # worker's pre-send identity gate needs (Task 8 signature): get_routed,
+    # get_installed, get_registry_valid.
+    import event_acks
+    import event_episodes as _evep
+    import event_reconcile as _evrec
+
+    _evep.configure(
+        dispatch=_setup_dispatch, notify_operator=_setup_notify,
+        resolve_registry_entry=_event_registry_entry,
+        get_routed=_evrec.get_routed,
+        get_installed=_event_installed,
+        get_registry_valid=_event_registry_valid,
+        get_acks=lambda: event_acks.ACKS,
+        get_spool=event_spool.get_spool,
+        sleep=asyncio.sleep,
+    )
+    # Boot recovery pin: MUST run before start_worker() — it reconstructs
+    # the per-flow delivery ledger from the artifacts (against the routing
+    # _boot_reconcile_plugin_events already published above) before the
+    # worker's first pass can dispatch anything.
+    await _evep.recovery(boot=True)
+    _evep.start_worker()
 
     runner = web.AppRunner(
         app,
@@ -3897,6 +4015,59 @@ async def main() -> None:
         _callback_spool_recovery,
         trigger="interval",
         id="callback_spool_recovery",
+        minutes=5,
+        replace_existing=True,
+        coalesce=True,
+        max_instances=1,
+        misfire_grace_time=600,
+    )
+
+    # Plugin-event spool maintenance. Same lock-stall-avoidance shape as the
+    # callback pair above (the spool's own scans run off the loop via
+    # asyncio.to_thread); cadence mirrors it too (sweep every 10 min,
+    # recovery every 5).
+    async def _event_spool_sweep() -> None:
+        spool = event_spool.get_spool()
+        if spool is None:
+            return
+        try:
+            routed = _evrec.to_spool_shape(_evrec.get_routed())
+            installed = _event_installed()
+            valid = _event_registry_valid()
+            await asyncio.to_thread(
+                spool.sweep, routed, installed, valid, time.time())
+        except Exception:  # noqa: BLE001
+            logger.warning("event-spool sweep failed", exc_info=True)
+
+    async def _event_spool_recovery() -> None:
+        # Liveness (Task 10): a transient reconcile-COMPUTE failure fail-
+        # closes to the ROUTING_UNAVAILABLE sentinel (event_reconcile
+        # decision 26), under which the worker does no destructive OR
+        # forward-moving work and waits on kicks alone — the next PLUGIN
+        # LIFECYCLE mutation is otherwise the only thing that would retry
+        # the compute, which could strand delivery indefinitely on a purely
+        # transient failure. Self-heal here: fire the SAME kick the
+        # pre-send gate uses on a consent mismatch, which schedules a fresh
+        # reconcile off the live runtime (a no-op, never raising, when no
+        # runtime is bound yet).
+        if _evrec.get_routed() is event_spool.ROUTING_UNAVAILABLE:
+            _evrec.kick()
+        await _evep.recovery(boot=False)
+
+    scheduler.add_job(
+        _event_spool_sweep,
+        trigger="interval",
+        id="event_spool_sweep",
+        minutes=10,
+        replace_existing=True,
+        coalesce=True,
+        max_instances=1,
+        misfire_grace_time=600,
+    )
+    scheduler.add_job(
+        _event_spool_recovery,
+        trigger="interval",
+        id="event_spool_recovery",
         minutes=5,
         replace_existing=True,
         coalesce=True,

@@ -7663,14 +7663,17 @@ def _regenerate_plugin_health(extra_issues: list) -> None:
     # current_issues() never raises.
     import callback_reconcile
     callback_issues = callback_reconcile.current_issues()
-    # #419: event-subscription issue merge is Task 10's wiring scope (it
-    # touches every OTHER caller of this function's test fixtures, not just
-    # this one) — see event_reconcile.current_issues()'s own docstring for
-    # the DICT-shaped contract Task 10 must honor (Minor-10, review round 1
-    # is satisfied by that contract + test_health_report_includes_event_
-    # issues in test_tools_ack_event.py, which proves plugin_health.
-    # write_report's dict/attribute dual accessor already handles it
-    # correctly — WITHOUT actually wiring the call here yet).
+    # #419: event-subscription issues (event_pending_ack / event_no_target /
+    # event_invalid / event_emitter_missing / event_routing_unavailable /
+    # event_spool_issue) are a RECOMPUTABLE input too, but — unlike the
+    # trigger/callback rows — plain DICTS, not PluginIssue instances (see
+    # event_reconcile.current_issues()'s own docstring for the contract).
+    # Concatenated DIRECTLY into write_report's issues= below, never through
+    # the PluginIssue-attribute-only _add()/_rediscoverable() helpers above,
+    # which would silently degrade a dict row's fields to None instead of
+    # raising. current_issues() never raises.
+    import event_reconcile
+    event_issues = event_reconcile.current_issues()
     # v0.112.0: setup-episode state (pending/failed/stale) is likewise a
     # RECOMPUTABLE input, derived fresh from the durable episode store — a
     # dropped or failed post-consent setup dispatch stays visible until it
@@ -7687,7 +7690,8 @@ def _regenerate_plugin_health(extra_issues: list) -> None:
         logger.debug("setup-episode health merge skipped", exc_info=True)
     plugin_health.write_report(
         issues=(list(res.issues) + list(extra_issues) + runtime_issues
-                + list(trigger_issues) + list(callback_issues) + setup_issues),
+                + list(trigger_issues) + list(callback_issues) + setup_issues
+                + list(event_issues)),
         warnings=list(res.warnings) + pending_warnings,
         path=_PLUGIN_HEALTH_PATH,
     )
@@ -7937,6 +7941,22 @@ async def _reload_and_verify_targets(name: str, targets: list,
     except Exception:  # noqa: BLE001
         reconcile_ok = False
         logger.warning("plugin-callback reconcile failed", exc_info=True)
+    # Pair the EVENT reconcile at the SAME site with the SAME runtime —
+    # every one of the 5 lifecycle mutations funnels through here, so this
+    # is where an update-changed-subscribe-declaration re-derives to
+    # `event_pending_ack` (stale-digest identity → no ack), a removed
+    # emitter's subscribers fall to `event_emitter_missing`, and a removed
+    # subscriber's own routes are swept by absence. Unlike trigger/callback,
+    # ``reconcile_plugin_events`` itself takes the runtime directly (no
+    # separate ``reconcile_from_runtime`` wrapper — it already pulls
+    # role_configs/channel_manager off ``runtime`` when not given). Non-fatal,
+    # like its siblings.
+    try:
+        import event_reconcile
+        await event_reconcile.reconcile_plugin_events(runtime)
+    except Exception:  # noqa: BLE001
+        reconcile_ok = False
+        logger.warning("plugin-event reconcile failed", exc_info=True)
     ok = (not snapshot_raced and not reload_errors
           and _postcondition_holds(verify, targets, expect=expect,
                                    name=name, runtime=runtime))

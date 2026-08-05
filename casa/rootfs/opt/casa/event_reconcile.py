@@ -614,7 +614,7 @@ def current_issues() -> "list[dict]":
     ``plugin_health.write_report``'s own ``fingerprint``/``_issue_dict``
     already handle either shape correctly (dict-vs-attribute dual
     accessor) — proven end-to-end by
-    ``test_health_report_includes_event_issues`` in
+    ``test_event_current_issues_shape_is_health_report_compatible`` in
     ``tests/test_tools_ack_event.py``. Wiring it in also touches every
     OTHER test that calls ``_regenerate_plugin_health`` without mocking
     this function (a stuck sentinel contributes a surprise

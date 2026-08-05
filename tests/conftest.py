@@ -390,3 +390,31 @@ def _reset_ask_validation_gates():
     yield
     _ch.ASK_GATES.clear()
     _ch._ASK_VALIDATION_OWNERS.clear()
+
+
+# ---------------------------------------------------------------------------
+# event_reconcile published-routing isolation (Task 10, plugin-events).
+# ---------------------------------------------------------------------------
+# ``event_reconcile`` keeps a process-global published routing map that
+# defaults to (and fails back to) ``event_spool.ROUTING_UNAVAILABLE`` — the
+# fail-closed sentinel that licenses no destructive worker action (decision
+# 26). Left alone across tests, that sentinel is a cross-test leak: any test
+# process that never reconciles events keeps it forever, and
+# ``tools._regenerate_plugin_health`` merging in
+# ``event_reconcile.current_issues()`` (Task 10) then surfaces a stray
+# ``event_routing_unavailable`` row into health reports for tests that have
+# nothing to do with events. Reset to an authoritative empty routing map
+# before every test; ``tests/test_event_reconcile.py`` has its OWN autouse
+# fixture that overrides this back to the sentinel per-test (it needs the
+# sentinel as ITS starting point) via ``monkeypatch``, so the two compose
+# cleanly — a conftest-level autouse fixture is instantiated before a
+# same-scope one declared in the test module.
+@pytest.fixture(autouse=True)
+def _reset_event_routing(monkeypatch):
+    try:
+        import event_reconcile
+    except Exception:  # pragma: no cover — module import is universal in tests
+        yield
+        return
+    monkeypatch.setattr(event_reconcile, "_routed", {})
+    yield
