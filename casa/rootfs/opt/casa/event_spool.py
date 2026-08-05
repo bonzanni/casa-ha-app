@@ -1576,15 +1576,7 @@ class EventSpool:
             # the per-emitter try/except below (mirrors fold_pass's
             # per-pair isolation discipline).
             if routed_unusable or registry_valid is not True:
-                for emitter in self._emitter_dirs():
-                    try:
-                        efd = self._emitter_fd(emitter)
-                    except (OSError, ValueError):
-                        continue
-                    try:
-                        self._sweep_part_temps(efd, now, report)
-                    finally:
-                        os.close(efd)
+                self._sweep_housekeeping_only(now, report)
                 return report
             installed = set(installed or ())
             to_drop: dict = {}
@@ -1597,6 +1589,8 @@ class EventSpool:
                 try:
                     try:
                         self._sweep_part_temps(efd, now, report)
+                        self._sweep_emitter_root_temps(emitter, efd, now, report)
+                        self._sweep_state_temps(efd, now, report)
                         self._sweep_emissions(emitter, efd, routed, now, report)
                         self._sweep_delivery(emitter, efd, routed, installed,
                                             now, report, to_drop, deletable)
@@ -1606,8 +1600,86 @@ class EventSpool:
                                        "failed", emitter, exc_info=True)
                 finally:
                     os.close(efd)
+            self._sweep_index_temps(now, report)
             self._drop_removed_subscribers(to_drop, deletable, now, report)
         return report
+
+    def _sweep_housekeeping_only(self, now: float, report: SweepReport) -> None:
+        """Everything sweep does under the sentinel or an invalid registry
+        (spec decision 26, Critical-2): part-TTL residue only — the SAME
+        housekeeping the full authoritative pass does first, before any of
+        its destructive phases. Never touches emission/delivery CONTENT,
+        only ``.part-``/``_replace_json`` STAGING residue (Minor-4)."""
+        for emitter in self._emitter_dirs():
+            try:
+                efd = self._emitter_fd(emitter)
+            except (OSError, ValueError):
+                continue
+            try:
+                self._sweep_part_temps(efd, now, report)
+                self._sweep_emitter_root_temps(emitter, efd, now, report)
+                self._sweep_state_temps(efd, now, report)
+            finally:
+                os.close(efd)
+        self._sweep_index_temps(now, report)
+
+    def _sweep_replace_temps(self, fd: int, now: float,
+                             report: SweepReport) -> bool:
+        """Age-sweep ``_replace_json``/``_strict_replace_at`` staging
+        residue (``.{name}{REPLACE_TEMP_INFIX}<pid>-<uuid>``) in *fd*.
+        Returns True if anything was removed (so the caller fsyncs).
+        Mirrors ``callback_spool._sweep_replace_temps`` exactly."""
+        removed = False
+        for name in _listdir_quiet(fd):
+            if not _is_replace_temp(name):
+                continue
+            st = _lstat_quiet(name, fd)
+            if st is None:
+                continue
+            if not stat.S_ISREG(st.st_mode) or self._expired(st, now, TEMP_TTL_S):
+                if _remove_entry(name, fd, st):
+                    report.deleted_temps += 1
+                    removed = True
+        return removed
+
+    def _sweep_emitter_root_temps(self, emitter: str, efd: int, now: float,
+                                  report: SweepReport) -> None:
+        """Minor-4: ``write_ready``'s ``_replace_json`` stages directly at
+        the EMITTER dir root (``ready.json`` lives there, not in a
+        subdir) — never covered by ``_sweep_part_temps`` (``emissions/``
+        only)."""
+        if self._sweep_replace_temps(efd, now, report):
+            _fsync(efd, emitter)
+
+    def _sweep_state_temps(self, efd: int, now: float,
+                           report: SweepReport) -> None:
+        """Minor-4: ``_write_state``/``_quarantine_state`` stage in
+        ``state/`` — never covered by any existing sweep phase."""
+        try:
+            sfd = _open_dir(STATE_DIR, efd)
+        except OSError:
+            return
+        try:
+            if self._sweep_replace_temps(sfd, now, report):
+                _fsync(sfd, STATE_DIR)
+        finally:
+            os.close(sfd)
+
+    def _sweep_index_temps(self, now: float, report: SweepReport) -> None:
+        """Minor-4: ``write_index_entry`` stages in ``.index/`` — never
+        covered by any existing sweep phase. Once per whole pass (the
+        index is spool-root-level, not per-emitter); a safe no-op before
+        the directory is ever created (``.index/`` is created lazily on
+        first write, mirrors ``.removals/``)."""
+        try:
+            ifd = _open_dir(INDEX_DIR, self._root_fd)
+        except OSError:
+            return
+        try:
+            if self._sweep_replace_temps(ifd, now, report):
+                _fsync(ifd, INDEX_DIR)
+        finally:
+            os.close(ifd)
 
     def _sweep_part_temps(self, efd: int, now: float, report: SweepReport) -> None:
         try:
@@ -1904,6 +1976,19 @@ class EventSpool:
 
     def _write_removal_record(self, plugin: str, entries: list, *,
                               now: float) -> bool:
+        if not _safe_component(plugin):
+            # Minor-3: `plugin` is interpolated directly into the ledger
+            # filename (`<plugin>-<uuid>.json`) below — an unsafe
+            # component (a stray "/", "..", a control character) must
+            # never reach os.open()/rename() there. Refuse and defer: the
+            # caller's own drop-gate (a durable removal record BEFORE any
+            # artifact is deleted) means skipping here simply leaves the
+            # drop for a later pass — never an invisible record and never
+            # a path escape.
+            logger.warning(
+                "event-spool: refusing a removal record for an unsafe "
+                "plugin component (%r) — drop deferred", plugin)
+            return False
         rec = {"v": REMOVAL_SCHEMA_VERSION, "plugin": plugin, "ts": float(now),
                "entries": list(entries), "noted": False, "noted_ts": None}
         try:

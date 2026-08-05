@@ -1610,6 +1610,80 @@ def test_sweep_keeps_a_fresh_part_file(spool):
     assert part.exists()
 
 
+# ---------------------------------------------------------------------------
+# replace-temp staging residue sweep — state/, .index/, emitter dir root
+# (Minor-4, mirrors callback_spool.py:2906-2925)
+# ---------------------------------------------------------------------------
+
+
+def _stale_replace_temp(dirpath: Path, base_name: str, when: float) -> Path:
+    p = dirpath / f".{base_name}{es.REPLACE_TEMP_INFIX}9999-deadbeef"
+    p.write_bytes(b"x")
+    _utime(p, when)
+    return p
+
+
+def test_sweep_removes_stale_replace_temp_at_emitter_root(spool):
+    """write_ready's _replace_json stages directly at the emitter dir
+    root (ready.json lives there, not in a subdir) — never covered by
+    _sweep_part_temps (emissions/ only)."""
+    stale = _stale_replace_temp(_edir(spool), "ready.json", 0.0)
+    report = spool.sweep({}, installed=set(), registry_valid=True,
+                         now=TEMP_TTL_S + 100)
+    assert not stale.exists()
+    assert report.deleted_temps == 1
+
+
+def test_sweep_removes_stale_replace_temp_in_state_dir(spool):
+    """_write_state/_quarantine_state stage in state/ — never covered by
+    any existing sweep phase before this fix."""
+    stale = _stale_replace_temp(_state_dir(spool), f"{EV}.json", 0.0)
+    report = spool.sweep({}, installed=set(), registry_valid=True,
+                         now=TEMP_TTL_S + 100)
+    assert not stale.exists()
+    assert report.deleted_temps == 1
+
+
+def test_sweep_removes_stale_replace_temp_in_index_dir(spool):
+    """write_index_entry stages in .index/ — never covered by any
+    existing sweep phase before this fix."""
+    spool.write_index_entry("k1", {"x": 1})       # creates .index/
+    index_dir = _edir(spool).parent / es.INDEX_DIR
+    stale = _stale_replace_temp(index_dir, "k1.json", 0.0)
+    report = spool.sweep({}, installed=set(), registry_valid=True,
+                         now=TEMP_TTL_S + 100)
+    assert not stale.exists()
+    assert report.deleted_temps == 1
+    assert spool.read_index_marker("k1").state == MarkerState.PRESENT  # untouched
+
+
+def test_sweep_keeps_fresh_replace_temps_everywhere(spool):
+    root_temp = _stale_replace_temp(_edir(spool), "ready.json", 1000.0)
+    state_temp = _stale_replace_temp(_state_dir(spool), f"{EV}.json", 1000.0)
+    spool.write_index_entry("k1", {"x": 1})
+    index_dir = _edir(spool).parent / es.INDEX_DIR
+    index_temp = _stale_replace_temp(index_dir, "k1.json", 1000.0)
+    spool.sweep({}, installed=set(), registry_valid=True, now=1000.0 + 10)
+    assert root_temp.exists() and state_temp.exists() and index_temp.exists()
+
+
+def test_sweep_housekeeping_only_still_removes_stale_replace_temps(spool):
+    """Under the sentinel/invalid-registry degraded path (Critical-2), the
+    SAME staging-residue cleanup still runs — it is non-destructive
+    housekeeping, exactly like the pre-existing .part- sweep."""
+    root_temp = _stale_replace_temp(_edir(spool), "ready.json", 0.0)
+    state_temp = _stale_replace_temp(_state_dir(spool), f"{EV}.json", 0.0)
+    spool.write_index_entry("k1", {"x": 1})
+    index_dir = _edir(spool).parent / es.INDEX_DIR
+    index_temp = _stale_replace_temp(index_dir, "k1.json", 0.0)
+
+    spool.sweep(ROUTING_UNAVAILABLE, installed=set(), registry_valid=True,
+               now=TEMP_TTL_S + 100)
+    assert not root_temp.exists()
+    assert not state_temp.exists()
+    assert not index_temp.exists()
+
+
 def test_sweep_reaps_delivery_temp_residue_with_future_mtime_fail_closed(spool):
     """Minor-6(c) pin: delivery/ staging-temp reaping must use the
     skew-aware ``_expired`` (like part-file reaping already does), not a
@@ -1867,6 +1941,23 @@ def test_removal_record_write_failure_defers_the_whole_drop(spool, monkeypatch):
     assert report2.dropped_records == 1
     assert not _delivery_path(spool, S1).exists()
     assert len(spool.list_removal_records()) == 1
+
+
+def test_write_removal_record_refuses_an_unsafe_plugin_component(spool, caplog):
+    """Minor-3 pin: `plugin` is interpolated directly into the ledger
+    filename (`<plugin>-<uuid>.json`) — an unsafe component must be
+    refused, never reach the filesystem call, and never write an
+    invisible/misplaced record."""
+    for bad in ("../escape", "a/b", ".", "..", "a\0b"):
+        with caplog.at_level(logging.WARNING, logger="event_spool"):
+            ok = spool._write_removal_record(bad, [
+                {"kind": "record", "emitter": E, "event": EV, "gen": 1}],
+                now=1000.0)
+        assert ok is False
+        assert any("unsafe plugin component" in r.message
+                   for r in caplog.records)
+    # nothing was written under any name for any of the attempts above
+    assert spool.list_removal_records() == []
 
 
 # ---------------------------------------------------------------------------
