@@ -44,6 +44,7 @@ which is keyed on what you are about to do rather than on subsystem names.
 | the callback route, the spool protocol, the attempt ledger or its ack protocol, callback consent or reconciliation, the delivery worker, or the validated redirect base URL | [`architecture/callbacks.md`](architecture/callbacks.md) |
 | the contribution rules, the verification discipline, or how documentation is kept honest | [`doctrine/working-on-casa.md`](doctrine/working-on-casa.md) |
 | the documentation rules themselves, or adding a document to the corpus | [`contributing/doc-contract.md`](contributing/doc-contract.md) |
+| the event manifest surface, the emission spool, event consent or reconciliation, the delivery worker, or the ack tools | [`architecture/plugin-events.md`](architecture/plugin-events.md) |
 | the turn lifecycle, the warm client pool, retry behaviour, or turn teardown | [`architecture/turn-loop.md`](architecture/turn-loop.md) |
 | trigger types, webhook trigger routing, plugin trigger consent, or scheduling | [`architecture/triggers.md`](architecture/triggers.md) |
 | voice transports, voice authentication, the turn budget, specialist handoff, or deferred delivery | [`architecture/voice.md`](architecture/voice.md) |

@@ -20,6 +20,7 @@ Code is the source of truth; these files are a map.
 - [architecture/overview.md](architecture/overview.md): What Casa is made of — supervised services, the three agent tiers, and where configuration enters.
 - [architecture/persistent-state.md](architecture/persistent-state.md): What the application writes to disk, how it treats a missing or corrupt file, and what that means for recovery.
 - [architecture/personality.md](architecture/personality.md): What an agent is versus how it presents — role artifacts, personas, bindings, and which prompt is actually served.
+- [architecture/plugin-events.md](architecture/plugin-events.md): Plugin-emitted domain events — casa-minted generations, per-subscriber delivery receipts, and consent-gated headless wakes.
 - [architecture/plugins.md](architecture/plugins.md): How a plugin becomes usable — registry, content-addressed store, artifact identity, and per-call authorization.
 - [architecture/specialist-lifecycle.md](architecture/specialist-lifecycle.md): Specialist install/upgrade/rollback — instance tuples, the store, consent receipts, materialization, the crash journal.
 - [architecture/telegram.md](architecture/telegram.md): How Telegram messages become turns — transports, authentication, the per-topic causal log, keyboards, and rendering.

@@ -83,6 +83,18 @@
   doc: architecture/engagements.md
 - item: casa/rootfs/opt/casa/engagement_registry.py
   doc: architecture/engagements.md
+- item: casa/rootfs/opt/casa/event_acks.py
+  doc: architecture/plugin-events.md
+- item: casa/rootfs/opt/casa/event_attempts.py
+  doc: architecture/plugin-events.md
+- item: casa/rootfs/opt/casa/event_consent.py
+  doc: architecture/plugin-events.md
+- item: casa/rootfs/opt/casa/event_episodes.py
+  doc: architecture/plugin-events.md
+- item: casa/rootfs/opt/casa/event_reconcile.py
+  doc: architecture/plugin-events.md
+- item: casa/rootfs/opt/casa/event_spool.py
+  doc: architecture/plugin-events.md
 - item: casa/rootfs/opt/casa/executor_registry.py
   doc: architecture/agent-taxonomy.md
 - item: casa/rootfs/opt/casa/explanation_store.py
@@ -129,8 +141,12 @@
   doc: architecture/callbacks.md
 - item: casa/rootfs/opt/casa/plugin_completion_guard.py
   doc: architecture/plugins.md
+- item: casa/rootfs/opt/casa/plugin_dispatch.py
+  doc: architecture/plugins.md
 - item: casa/rootfs/opt/casa/plugin_env_conf.py
   doc: architecture/plugins.md
+- item: casa/rootfs/opt/casa/plugin_events.py
+  doc: architecture/plugin-events.md
 - item: casa/rootfs/opt/casa/plugin_grants.py
   doc: architecture/plugins.md
 - item: casa/rootfs/opt/casa/plugin_health.py
@@ -291,6 +307,8 @@
   doc: architecture/overview.md
 - item: s6:user
   doc: architecture/overview.md
+- item: tool:ack_event
+  doc: architecture/plugin-events.md
 - item: tool:ask_user
   doc: architecture/tools-interface.md
 - item: tool:callback_ack_revoke
@@ -319,6 +337,8 @@
   doc: architecture/tools-interface.md
 - item: tool:engage_executor
   doc: architecture/tools-interface.md
+- item: tool:event_ack_revoke
+  doc: architecture/plugin-events.md
 - item: tool:get_item_fields
   doc: architecture/tools-interface.md
 - item: tool:get_schedule
@@ -535,6 +555,8 @@
   doc: architecture/home-assistant-control.md
 - item: env:CASA_ENGAGEMENT_TOKEN
   doc: architecture/mcp-and-tools.md
+- item: env:CASA_EVENT_ACKS_PATH
+  doc: architecture/plugin-events.md
 - item: env:CASA_FRAMEWORK_MCP_URL
   doc: architecture/mcp-and-tools.md
 - item: env:CASA_HA_MCP_URL
