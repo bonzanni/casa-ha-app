@@ -739,10 +739,10 @@ def test_crash_leaving_state_written_records_partial_then_repair_completes(spool
     _emit_n(spool, 3, start=2000.0)
     real_write = es.EventSpool._write_delivery
 
-    def boom_write(self, dfd, event, subscriber, rec):
+    def boom_write(self, efd, dfd, event, subscriber, rec):
         if subscriber == S2:
             return False                     # simulated undurable write
-        return real_write(self, dfd, event, subscriber, rec)
+        return real_write(self, efd, dfd, event, subscriber, rec)
 
     monkeypatch.setattr(es.EventSpool, "_write_delivery", boom_write)
     changed = spool.fold_pass(R(S1, S2), 3000.0)
@@ -802,11 +802,11 @@ def test_first_generation_partial_write_retains_emission_until_idle_then_refolds
     _emit(spool, when=1000.0)
     real_write = es.EventSpool._write_delivery
 
-    def boom_write(self, dfd, event, subscriber, rec):
+    def boom_write(self, efd, dfd, event, subscriber, rec):
         if subscriber == S2:
             return False              # simulated undurable write — does
             # NOT raise, so the write loop continues past it
-        return real_write(self, dfd, event, subscriber, rec)
+        return real_write(self, efd, dfd, event, subscriber, rec)
 
     monkeypatch.setattr(es.EventSpool, "_write_delivery", boom_write)
     changed = spool.fold_pass(R(S1, S2), 2000.0)
@@ -841,6 +841,53 @@ def test_first_generation_partial_write_retains_emission_until_idle_then_refolds
     assert s1_gen2["gen"] == 2
     assert s1_gen2["status"] == "pending"
     assert s1_gen2["ack_token"] != s1_gen1["ack_token"]
+
+
+def test_open_retains_emissions_when_fsync_of_a_delivery_write_fails(
+        spool, monkeypatch):
+    """Important-3 pin: OPEN's ``all_written`` gate must key on the
+    delivery record being PROVEN durable, not merely written+renamed. A
+    failing fsync (simulated directly at the ``os.fsync`` layer — the
+    best-effort path this used to go through would have logged and kept
+    going, silently reporting success) must make ``_write_delivery``
+    return False, which must in turn hold ``all_written`` False and
+    retain the folded emissions — exactly like an outright write
+    failure."""
+    _emit(spool, when=1000.0)
+    real_fsync = os.fsync
+    calls = {"i": 0}
+
+    def flaky_fsync(fd):
+        calls["i"] += 1
+        # The generation-state write (_write_state) makes exactly 3
+        # os.fsync calls on a clean success (staged file, STATE_DIR,
+        # emitter dir) — let those land, then fail every fsync from the
+        # delivery write onward.
+        if calls["i"] > 3:
+            raise OSError(5, "simulated fsync failure")
+        return real_fsync(fd)
+
+    monkeypatch.setattr(es.os, "fsync", flaky_fsync)
+    try:
+        changed = spool.fold_pass(R(S1), 2000.0)
+    finally:
+        monkeypatch.undo()
+
+    assert changed == []                       # S1's write never proven durable
+    assert _read_delivery(spool, S1) is None
+    state = _read_state(spool)
+    assert state is not None and state["gen"] == 1   # state IS durable
+    # fan-out incomplete -> the folded emission is RETAINED, never unlinked
+    # against a delivery record that was never actually proven durable.
+    assert list(_emissions_dir(spool).glob(f"{EV}--*.json"))
+
+    # fsync healthy again: idle (S1 never got a record at all) -> the
+    # SAME emission re-folds into a fresh generation (gen 2 — the
+    # already-durable gen-1 state anchor is never rolled back).
+    changed = spool.fold_pass(R(S1), 2100.0)
+    assert changed == [(E, EV, S1)]
+    assert _read_delivery(spool, S1)["gen"] == 2
+    assert list(_emissions_dir(spool).glob(f"{EV}--*.json")) == []
 
 
 def test_crash_mid_unlink_then_ack_does_not_refold(spool, monkeypatch):
@@ -1318,9 +1365,9 @@ def test_sweep_classifies_removed_when_subscriber_no_longer_installed(spool, mon
     written = []
     orig = es.EventSpool._write_delivery
 
-    def spy(self, dfd, event, subscriber, rec):
+    def spy(self, efd, dfd, event, subscriber, rec):
         written.append(dict(rec))
-        return orig(self, dfd, event, subscriber, rec)
+        return orig(self, efd, dfd, event, subscriber, rec)
 
     monkeypatch.setattr(es.EventSpool, "_write_delivery", spy)
     report = spool.sweep({}, installed=set(), registry_valid=True, now=1200.0)

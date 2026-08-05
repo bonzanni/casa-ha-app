@@ -958,15 +958,28 @@ class EventSpool:
                 out[subscriber] = rec
         return out
 
-    def _write_delivery(self, dfd: int, event: str, subscriber: str,
+    def _write_delivery(self, efd: int, dfd: int, event: str, subscriber: str,
                         rec: dict) -> bool:
+        """Strict-durable write of a delivery record (Important-3): OPEN's
+        ``all_written`` gate and REPAIR's ``fan_out_complete`` check
+        (:meth:`_fold_one_locked`) both key on this returning ``True`` ONLY
+        once the record is PROVEN durable — the folded emissions those
+        gates unlink are the record's only other copy of the wake, so a
+        write whose fsync merely logged-and-continued (the best-effort
+        ``_replace_json`` this used to go through) could report success
+        while the record was never actually fsynced, and the emissions
+        would still get deleted out from under it. Mirrors
+        :meth:`_write_state` exactly, including the double fsync (the
+        ``delivery/`` dir entry AND the emitter dir)."""
         try:
-            _replace_json(f"{event}--{subscriber}.json", dfd, rec, DELIVERY_DIR)
-            return True
-        except (OSError, TypeError, ValueError) as exc:
-            logger.warning("event-spool: delivery write failed (errno %s)",
-                           getattr(exc, "errno", None))
+            data = canonical_marker_bytes(rec)
+        except (TypeError, ValueError) as exc:
+            logger.warning(
+                "event-spool: delivery record is not serializable (%s)", exc)
             return False
+        return _strict_replace_at(
+            f"{event}--{subscriber}.json", dfd, data, parent_fd=efd,
+            what=DELIVERY_DIR, parent_what="emitter", role="delivery")
 
     def read_delivery(self, emitter: str, event: str,
                       subscriber: str) -> "dict | None":
@@ -1307,7 +1320,7 @@ class EventSpool:
                     tok = uuid.uuid4().hex
                     newrec = event_attempts.new_record(
                         emitter, event, sub, state_gen, tok, now)
-                    if self._write_delivery(dfd, event, sub, newrec):
+                    if self._write_delivery(efd, dfd, event, sub, newrec):
                         valid_records[sub] = newrec
                         changed.append((emitter, event, sub))
             # Unlink the folded emissions ONLY once this generation's
@@ -1372,7 +1385,7 @@ class EventSpool:
                     tok = uuid.uuid4().hex
                     newrec = event_attempts.new_record(
                         emitter, event, sub, new_gen, tok, now)
-                    if self._write_delivery(dfd, event, sub, newrec):
+                    if self._write_delivery(efd, dfd, event, sub, newrec):
                         changed.append((emitter, event, sub))
                     else:
                         all_written = False
@@ -1444,7 +1457,8 @@ class EventSpool:
                 except OSError:
                     return False
                 try:
-                    return self._write_delivery(dfd, event, subscriber, validated)
+                    return self._write_delivery(efd, dfd, event, subscriber,
+                                                validated)
                 finally:
                     os.close(dfd)
             finally:
@@ -1496,7 +1510,7 @@ class EventSpool:
                             return ("already_done", rec["subscriber"])
                         newrec = event_attempts.terminalize(rec, "acked", now=now)
                         if not self._write_delivery(
-                                dfd, event, rec["subscriber"], newrec):
+                                efd, dfd, event, rec["subscriber"], newrec):
                             # The record is UNCHANGED on disk (still
                             # pending, still carrying this same token) —
                             # no durable "acked" transition happened, so
@@ -1747,8 +1761,8 @@ class EventSpool:
                     outcome = ("removed" if rec["subscriber"] not in installed
                               else "revoked")
                     newrec = event_attempts.terminalize(rec, outcome, now=now)
-                    if self._write_delivery(dfd, rec["event"], rec["subscriber"],
-                                            newrec):
+                    if self._write_delivery(efd, dfd, rec["event"],
+                                            rec["subscriber"], newrec):
                         rec = newrec
                         report.terminalized += 1
                         touched = True
