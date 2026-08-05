@@ -46,6 +46,8 @@ tools:
     - mcp__casa-framework__trigger_ack_revoke
     # Release C — plugin authorization-callback consent off-switch.
     - mcp__casa-framework__callback_ack_revoke
+    # #419 — plugin-event subscription consent off-switch.
+    - mcp__casa-framework__event_ack_revoke
     - mcp__casa-framework__plugin_list
     - mcp__casa-framework__verify_plugin_state
     - mcp__casa-framework__set_plugin_env_reference

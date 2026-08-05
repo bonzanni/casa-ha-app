@@ -159,6 +159,26 @@ def test_a_dynamic_route_path_is_enumerated_not_skipped(tmp_path):
     )
 
 
+def test_env_read_via_a_module_level_string_constant_is_enumerated(tmp_path):
+    """Minor-9 pin: `SPOOL_ROOT_ENV = "CASA_EVENT_SPOOL_ROOT"` then
+    `os.environ.get(SPOOL_ROOT_ENV)` — the constant, not the literal,
+    passed at the call site — must resolve to the SAME env var name a
+    direct literal would. This is exactly the shape that let
+    env:CASA_EVENT_SPOOL_ROOT (event_spool.py) and
+    env:CASA_CALLBACK_SPOOL_ROOT (callback_spool.py) escape this
+    scanner."""
+    root = _repo(tmp_path)
+    code = root / "casa" / "rootfs" / "opt" / "casa"
+    (code / "constuser.py").write_text(
+        "import os\n"
+        'ROOT_ENV = "CASA_PROBE_INDIRECT"\n'
+        "def spool_root():\n"
+        "    return os.environ.get(ROOT_ENV)\n"
+    )
+    items = coverage_ledger.enumerate_items(root)
+    assert "env:CASA_PROBE_INDIRECT" in items
+
+
 # --- the check bites, both directions --------------------------------------------------
 
 def test_a_fully_assigned_ledger_passes(tmp_path):

@@ -12,6 +12,11 @@ tools:
     - mcp__casa-framework__get_schedule
     - mcp__casa-framework__recall_memory
     - mcp__homeassistant
+    # #419 — a headless event wake cannot ask for approval; without this
+    # every nudge would stall to budget exhaustion since ack_event could
+    # never actually run (any resident role may be an operator-assigned
+    # event-delivery target).
+    - mcp__casa-framework__ack_event
   # Agent/Task: Q-1 (v0.69.8) — butler must not spawn sub-agents (they bypass
   # allowed_tools + the fail-closed callback; disallowed is CLI-enforced).
   disallowed:

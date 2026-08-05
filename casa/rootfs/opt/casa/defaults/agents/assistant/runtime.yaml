@@ -21,6 +21,10 @@ tools:
     - mcp__casa-framework__get_schedule
     - mcp__casa-framework__set_reminder
     - mcp__casa-framework__cancel_reminder
+    # #419 — a headless event wake cannot ask for approval; without this
+    # every nudge would stall to budget exhaustion since ack_event could
+    # never actually run.
+    - mcp__casa-framework__ack_event
     - mcp__casa-framework__recall_memory
     - mcp__casa-framework__send_message
     - mcp__casa-framework__send_media

@@ -589,9 +589,22 @@ ENV_NAME_COLLISION = "env_name_collision"
 # fits under the identifier could still overflow once scoped — catch that
 # HERE, against the scoped name, before it can ever reach the registry.
 CALLBACK_NAME_TOO_LONG = "callback_name_too_long"
+# casa.emits/casa.subscribes follow the SAME carve-out as casa.callbacks — a
+# sourced/bundled dependency MAY declare either: casa.emits is inert
+# without a consented subscriber (declaring a name grants no turn or memory
+# access by itself, exactly like a callback), and casa.subscribes only ever
+# wakes the plugin on a real occurrence elsewhere, operator-consented at
+# reconcile time (mirrors plugin_triggers' consent posture, never automatic
+# on install). The one thing that DOES need an inspect-time gate, mirroring
+# CALLBACK_NAME_TOO_LONG exactly: an emitted event's effective name routes
+# under the bundled dep's SCOPED registry name (`slug.identifier`), longer
+# than the bare identifier `manifest_emits` (via `validate_manifest`) checks
+# internally — catch the overflow HERE, before it can ever reach the
+# registry.
+EVENT_NAME_TOO_LONG = "event_name_too_long"
 _PROHIBITION_KIND_PREFIXES = (
     BUNDLED_SYSREQS_UNSUPPORTED, BUNDLED_TRIGGERS_UNSUPPORTED, ENV_NAME_COLLISION,
-    CALLBACK_NAME_TOO_LONG,
+    CALLBACK_NAME_TOO_LONG, EVENT_NAME_TOO_LONG,
 )
 
 
@@ -783,7 +796,7 @@ def _validate_sourced_plugin_tree(
     staged tree (spec §1/§3.2.1, brief Step 2). Returns `("", surfaces)` when
     the tree is clean (`surfaces` populated for the consent DM — spec §3.2);
     otherwise `(detail, _EMPTY_SURFACES)` with a non-empty detail string —
-    for the four prefixes in `_PROHIBITION_KIND_PREFIXES`,
+    for the prefixes in `_PROHIBITION_KIND_PREFIXES`,
     `inspect_specialist_repo` raises that exact kind; every other non-empty
     detail flows into the generic `dependency_unavailable`.
 
@@ -800,11 +813,13 @@ def _validate_sourced_plugin_tree(
        `validate_manifest` gets a chance to raise its OWN, differently-coded,
        refusal for the same underlying key): any `manifest_sysreqs` row ⇒
        `bundled_sysreqs_unsupported`; any `casa.triggers` KEY present (even
-       malformed) ⇒ `bundled_triggers_unsupported`. `casa.callbacks` is NOT
-       prohibited — instead, any declared entry whose effective
-       name computed against the SCOPED registry name (`slug.identifier`,
-       longer than `identifier` alone) exceeds
-       `plugin_callbacks.MAX_EFFECTIVE_LEN` ⇒ `callback_name_too_long`.
+       malformed) ⇒ `bundled_triggers_unsupported`. `casa.callbacks` and
+       `casa.emits`/`casa.subscribes` are NOT prohibited — instead, any
+       declared callback/emit entry whose effective name computed against
+       the SCOPED registry name (`slug.identifier`, longer than `identifier`
+       alone) exceeds `plugin_callbacks.MAX_EFFECTIVE_LEN` /
+       `plugin_events.MAX_EFFECTIVE_LEN` ⇒ `callback_name_too_long` /
+       `event_name_too_long`.
     4. `plugin_store.validate_manifest` (identity: `plugin.json::name` must
        equal `identifier`; this is also where a non-prohibited
        `apt_requirements_rejected`/`triggers_invalid`/`name_mismatch`/etc.
@@ -875,6 +890,26 @@ def _validate_sourced_plugin_tree(
                     f"{CALLBACK_NAME_TOO_LONG}: bundled dependency {identifier!r} "
                     f"callback {cb_name!r} scoped effective name {eff!r} exceeds "
                     f"{plugin_callbacks.MAX_EFFECTIVE_LEN} chars", _EMPTY_SURFACES)
+
+    # casa.emits IS permitted for a bundled dep (same carve-out as
+    # casa.callbacks), but its OWNED registry entry routes under the SCOPED
+    # name — check the scoped-name effective length here, mirroring the
+    # callbacks gate above, before validate_manifest below (which only ever
+    # sees the unscoped identifier).
+    if isinstance(casa, dict) and isinstance(casa.get("emits"), list):
+        import plugin_events
+        for entry in casa["emits"]:
+            if not isinstance(entry, dict):
+                continue
+            ev_name = entry.get("name")
+            if not isinstance(ev_name, str):
+                continue
+            eff = plugin_events.effective_name(scoped, ev_name)
+            if len(eff) > plugin_events.MAX_EFFECTIVE_LEN:
+                return (
+                    f"{EVENT_NAME_TOO_LONG}: bundled dependency {identifier!r} "
+                    f"emit {ev_name!r} scoped effective name {eff!r} exceeds "
+                    f"{plugin_events.MAX_EFFECTIVE_LEN} chars", _EMPTY_SURFACES)
 
     try:
         plugin_store.validate_manifest(tree, scoped, manifest_name=identifier)

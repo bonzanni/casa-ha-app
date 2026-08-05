@@ -253,6 +253,32 @@ def enumerate_env_reads(repo_root: Path) -> list[str]:
         ]
         module_env = _scope_env_names(tree)
 
+        # Module-level `NAME = "literal"` string constants (e.g.
+        # `SPOOL_ROOT_ENV = "CASA_EVENT_SPOOL_ROOT"`) — a call site that
+        # passes the CONSTANT rather than the literal itself
+        # (`os.environ.get(SPOOL_ROOT_ENV)`) would otherwise escape this
+        # scanner entirely, since only `ast.Constant` first-arguments are
+        # recognized below. Single simple top-level assignment only — no
+        # attempt to trace re-assignment, conditional binding, or
+        # anything past one level of indirection.
+        module_str_consts: dict = {}
+        for node in tree.body:
+            if (
+                isinstance(node, ast.Assign)
+                and len(node.targets) == 1
+                and isinstance(node.targets[0], ast.Name)
+                and isinstance(node.value, ast.Constant)
+                and isinstance(node.value.value, str)
+            ):
+                module_str_consts[node.targets[0].id] = node.value.value
+
+        def _literal_or_const(arg: ast.AST) -> "str | None":
+            if isinstance(arg, ast.Constant) and isinstance(arg.value, str):
+                return arg.value
+            if isinstance(arg, ast.Name) and arg.id in module_str_consts:
+                return module_str_consts[arg.id]
+            return None
+
         for scope in scopes:
             env_names = (
                 module_env if scope is tree
@@ -266,12 +292,8 @@ def enumerate_env_reads(repo_root: Path) -> list[str]:
 
             for node in _walk_scope(scope):
                 if isinstance(node, ast.Call):
-                    literal = (
-                        node.args
-                        and isinstance(node.args[0], ast.Constant)
-                        and isinstance(node.args[0].value, str)
-                    )
-                    if not literal:
+                    name = node.args and _literal_or_const(node.args[0])
+                    if not name:
                         continue
                     func = node.func
                     if isinstance(func, ast.Attribute):
@@ -284,19 +306,17 @@ def enumerate_env_reads(repo_root: Path) -> list[str]:
                             and func.value.id == "os"
                         )
                         if is_env_get or is_getenv:
-                            names.add(node.args[0].value)
+                            names.add(name)
                     elif isinstance(func, ast.Name) and func.id.startswith("_env_"):
                         # Local wrappers (_env_int, _env_int_or, _env_float_or,
                         # …) take the variable name as their literal first
                         # argument.
-                        names.add(node.args[0].value)
+                        names.add(name)
                 elif isinstance(node, ast.Subscript):
-                    if (
-                        _is_env_base(node.value)
-                        and isinstance(node.slice, ast.Constant)
-                        and isinstance(node.slice.value, str)
-                    ):
-                        names.add(node.slice.value)
+                    if _is_env_base(node.value):
+                        name = _literal_or_const(node.slice)
+                        if name:
+                            names.add(name)
     return [f"env:{name}" for name in sorted(names)]
 
 

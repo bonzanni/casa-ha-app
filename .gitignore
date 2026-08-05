@@ -7,6 +7,7 @@ dist/
 build/
 .eggs/
 .claude/
+.superpowers/
 .worktrees/
 .env
 .env.smoke

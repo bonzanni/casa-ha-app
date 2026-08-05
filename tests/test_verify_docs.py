@@ -338,6 +338,37 @@ def test_a_correct_binding_passes(tmp_path):
     assert verify_docs.verify(root) == []
 
 
+def test_a_class_qualified_binding_resolves_via_ast(tmp_path):
+    """A pytest-runnable `Class::method` node id (a test nested inside a
+    class, e.g. `pytest tests/test_a.py::TestC::test_b`) must verify —
+    Python source never contains a literal '::' between a class and its
+    method, so the plain substring search the bare-function case uses can
+    never match this shape; it must resolve structurally via AST instead,
+    exactly like a `covers:` entry's dotted symbol."""
+    manifest = _inv_manifest(
+        "\n  invariant_tests:\n    INV-X-001: [tests/test_a.py::TestC::test_b]"
+    )
+    root = _corpus(tmp_path, manifest, docs=INV_DOC)
+    (root / "tests" / "test_a.py").write_text(
+        "def test_b():\n    pass\n\n\nclass TestC:\n    def test_b(self):\n        pass\n")
+    subprocess.run(["git", "-C", str(root), "add", "-A"], check=True)
+    assert verify_docs.verify(root) == []
+
+
+def test_a_class_qualified_binding_naming_a_missing_method_is_refused(tmp_path):
+    manifest = _inv_manifest(
+        "\n  invariant_tests:\n    INV-X-001: [tests/test_a.py::TestC::test_gone]"
+    )
+    root = _corpus(tmp_path, manifest, docs=INV_DOC)
+    (root / "tests" / "test_a.py").write_text(
+        "def test_b():\n    pass\n\n\nclass TestC:\n    def test_b(self):\n        pass\n")
+    subprocess.run(["git", "-C", str(root), "add", "-A"], check=True)
+    assert any(
+        "TestC::test_gone" in p and "does not resolve" in p
+        for p in verify_docs.verify(root)
+    )
+
+
 def test_the_pinning_sentinel_is_a_failure_naming_the_invariant(tmp_path):
     """The sentinel makes the missing-test backlog mechanical: the corpus is RED until
     every sentinel is replaced by a real, demonstrated-red pinning test."""

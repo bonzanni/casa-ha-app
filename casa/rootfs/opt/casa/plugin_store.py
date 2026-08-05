@@ -586,6 +586,17 @@ def artifact_verdict(path: Path, *, name: str, repo: str, revision: str,
         manifest_callbacks(manifest, manifest_name or name)
     except StoreError:
         return "callbacks_invalid"
+    # Same upgrade-path posture for casa.emits/casa.subscribes — an
+    # artifact published before this release could carry a malformed/
+    # unsupported block the publish-time gate never saw.
+    try:
+        manifest_emits(manifest, manifest_name or name)
+    except StoreError:
+        return "emits_invalid"
+    try:
+        manifest_subscribes(manifest, manifest_name or name)
+    except StoreError:
+        return "subscribes_invalid"
     # #330: same upgrade-path posture for casa.setupTool (gate added
     # v0.112.0) — a pre-validator artifact with an invalid declaration used
     # to pass snapshot validation and load with automatic setup silently
@@ -922,6 +933,52 @@ def manifest_callbacks(manifest: dict, plugin_name: str) -> list:
     return callbacks
 
 
+def manifest_emits(manifest: dict, plugin_name: str) -> list:
+    """Guarded + STRICT ``casa.emits`` extraction, structurally beside
+    ``manifest_callbacks``. Absent ``casa.emits`` -> ``[]``. Any intrinsic-
+    validation error (shape, naming, counts/lengths) is a plugin-author
+    error: raises ``StoreError(reason_code="emits_invalid")``.
+
+    Needs ``plugin_name`` because the routed effective name is
+    ``plg-<plugin>--<event>`` (mirrors ``manifest_callbacks``). Each call
+    site decides the meaning of a raise — ``validate_manifest`` refuses the
+    install/update; ``artifact_verdict`` excludes the stored artifact from
+    resolution (per-plugin degradation). Returns the normalized emit list.
+    Like a callback, an emit entry grants no turn/memory access by itself —
+    see ``plugin_events`` module docstring."""
+    import plugin_events
+    emits, errors = plugin_events.parse_and_validate_emits(plugin_name, manifest)
+    if errors:
+        raise StoreError(
+            "casa.emits invalid: " + "; ".join(errors[:5]),
+            reason_code="emits_invalid",
+            detail={"errors": errors})
+    return emits
+
+
+def manifest_subscribes(manifest: dict, plugin_name: str) -> list:
+    """Guarded + STRICT ``casa.subscribes`` extraction, structurally beside
+    ``manifest_emits``. Absent ``casa.subscribes`` -> ``[]``. Any intrinsic-
+    validation error (shape, self-reference, duplication, counts/lengths) is
+    a plugin-author error: raises ``StoreError(reason_code=
+    "subscribes_invalid")``.
+
+    Unlike an emit, ``plugin_name`` here identifies the SUBSCRIBER, not an
+    emitter — a subscribe entry names another plugin's declared event, never
+    derives an effective name of its own. Each call site decides the
+    meaning of a raise — ``validate_manifest`` refuses the install/update;
+    ``artifact_verdict`` excludes the stored artifact from resolution
+    (per-plugin degradation). Returns the normalized subscribe list."""
+    import plugin_events
+    subscribes, errors = plugin_events.parse_and_validate_subscribes(plugin_name, manifest)
+    if errors:
+        raise StoreError(
+            "casa.subscribes invalid: " + "; ".join(errors[:5]),
+            reason_code="subscribes_invalid",
+            detail={"errors": errors})
+    return subscribes
+
+
 _SETUP_TOOL_RE = re.compile(r"^setup_[a-z0-9_]{1,64}$")
 
 
@@ -1096,6 +1153,13 @@ def validate_manifest(root: Path, expected_name: str, *,
     # names derive from the RUNTIME name (manifest_name when owned), same as
     # triggers.
     manifest_callbacks(manifest, manifest_name or expected_name)
+    # A PRESENT-but-malformed casa.emits/casa.subscribes refuses the
+    # install/update outright (strict; raises emits_invalid/
+    # subscribes_invalid) — same posture as callbacks. Effective names
+    # derive from the RUNTIME name (manifest_name when owned); a subscribe's
+    # ``plugin_name`` identifies the SUBSCRIBER (see manifest_subscribes).
+    manifest_emits(manifest, manifest_name or expected_name)
+    manifest_subscribes(manifest, manifest_name or expected_name)
     # v0.112.0: a PRESENT-but-malformed casa.setupTool refuses the
     # install/update outright (strict; raises setup_tool_invalid).
     manifest_setup_tool(manifest)

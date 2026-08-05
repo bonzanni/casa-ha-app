@@ -814,6 +814,40 @@ Casa answers every callback identically whatever the load (there is no
 distinguishing error response to probe), so any throttling of abusive traffic
 belongs at the proxy.
 
+### Plugin events
+
+Some plugins react to what another installed plugin does — "notify me when
+finance records a new invoice" — entirely inside Casa, no external service
+involved. A plugin declares the events it may raise (`casa.emits`) and
+another plugin declares the ones it wants delivered to it
+(`casa.subscribes`); an event carries no data, it is a pure "something
+happened" nudge, so the receiving plugin re-checks its own state to see
+what changed.
+
+Because a delivery reaches into one of your agents (unlike a callback,
+which grants nothing), Casa asks for your approval before routing one.
+When both sides are correctly declared and installed, you get a one-tap
+consent DM — "Plugin '\<subscriber>' wants delivery of '\<event>' from
+'\<emitter>' → \<resident>". Until you tap Approve, nothing is delivered
+and plugin health names the reason. The approval is bound to the exact
+subscriber, its version, the emitter, the event, and which resident
+receives it — updating the **subscriber** plugin, or reassigning it to a
+different resident, invalidates the old approval silently and re-prompts;
+it is never carried forward. Updating the **emitter** does not re-ask, as
+long as its new version still declares the event — only the subscriber's
+own version and target selection are part of what you approved.
+
+Once approved, a delivery dispatches as a quiet, headless turn to the
+assigned resident — you will not see it in Telegram unless the resident's
+own handling of it produces a normal message. If a delivery goes
+unanswered, Casa retries on a widening schedule (immediately, then after
+5 minutes, 30 minutes, 2 hours, 6 hours, and 24 hours) before giving up
+after the sixth attempt; you get a DM either way — an operator note if it
+had nowhere to go, or a "still hasn't been handled" notice once retries are
+exhausted. `event_ack_revoke` switches a plugin's event access off
+immediately (one subscription, or all of a plugin's, depending on what you
+ask for); re-approving later re-consents.
+
 ### Disk usage
 
 The store lives on `/config` (the `addon_config` volume), so artifacts persist
