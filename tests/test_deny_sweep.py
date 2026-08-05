@@ -316,6 +316,57 @@ def test_the_public_pattern_file_carries_no_address_like_text():
         assert not re.search(r"\b\d{1,3}\.\d{1,3}\.\d{1,3}\.\d{1,3}\b", line), line
 
 
+def test_real_superpowers_path_rule_catches_the_dot_prefixed_form(tmp_path):
+    """Minor-10 pin: the internal-workflow-directory rule for `superpowers/`
+    must also catch the dot-prefixed `.superpowers/` form — a plugin's
+    scratch/state directory (e.g. `.superpowers/sdd/...`) is exactly as
+    unpublishable as the un-prefixed one, and the OLD rule
+    `(^|/)superpowers/` required its match to be immediately preceded by
+    `/` or the start of the path — `.superpowers/` has a `.` there
+    instead, so it slipped through entirely. The rule stays GENERIC (this
+    file is public): no exact private path, just the directory name."""
+    paths_rules = _sections(REAL_DENY.read_text()).get("[paths]", [])
+    superpowers_rule = next(
+        (p for p in paths_rules if "superpowers" in p), None)
+    assert superpowers_rule is not None, "no superpowers path rule found"
+    for candidate in ("superpowers/state.md", ".superpowers/sdd/plan.md",
+                      "some/dir/.superpowers/notes.md"):
+        result = subprocess.run(
+            ["grep", "-E", "-q", "--", superpowers_rule],
+            input=candidate, capture_output=True, text=True)
+        assert result.returncode == 0, (
+            f"/{superpowers_rule}/ does not match {candidate!r}")
+
+
+def test_real_gitignore_ignores_dot_superpowers(tmp_path):
+    """Minor-10's other half: .gitignore keeps `.superpowers/` out of a
+    plain `git add -A`/`git status` in the first place — belt to the
+    deny-sweep's braces above, checked against the REAL repo's own
+    .gitignore via git itself (not a string search, which would not
+    prove git actually honors the pattern). Uses a probe path directly
+    under `.superpowers/` rather than `.superpowers/sdd/…` — a live
+    session's own superpowers skill may drop an untracked, MORE SPECIFIC
+    `.superpowers/sdd/.gitignore` there, which would make git report the
+    match came from that nested file instead of proving the ROOT entry
+    this test targets."""
+    result = subprocess.run(
+        ["git", "check-ignore", "--quiet", ".superpowers/probe-file.md"],
+        cwd=ROOT, capture_output=True, text=True)
+    assert result.returncode == 0, (
+        ".superpowers/ is not git-ignored in the real repo")
+
+
+def test_real_deny_file_catches_a_committed_dot_superpowers_path(tmp_path):
+    """End-to-end companion to the regex-level pin above: a file actually
+    committed under `.superpowers/` is refused by the real sweep running
+    the real pattern file, not just a synthetic one."""
+    repo, _deny = _repo(tmp_path)
+    _commit(repo, ".superpowers/sdd/plan.md", "internal notes\n")
+    result = _sweep(repo, REAL_DENY, "tree")
+    assert result.returncode == 1
+    assert "superpowers" in result.stderr
+
+
 # --- coverage the reviewers found missing in the running guard -----------------------
 
 def test_a_binary_blob_is_refused_when_not_allowlisted(tmp_path):
