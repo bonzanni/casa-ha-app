@@ -328,6 +328,24 @@ def test_subscribe_bad_event_charset_rejected():
     assert errs
 
 
+def test_subscribe_double_dash_in_event_rejected():
+    _, errs = parse_and_validate_subscribes(
+        "p", _subs([{"plugin": "finance", "event": "a--b"}]))
+    assert any("--" in e for e in errs)
+
+
+def test_subscribe_event_leading_dash_rejected():
+    _, errs = parse_and_validate_subscribes(
+        "p", _subs([{"plugin": "finance", "event": "-x"}]))
+    assert any("start with '-'" in e for e in errs)
+
+
+def test_subscribe_event_plg_prefixed_rejected():
+    _, errs = parse_and_validate_subscribes(
+        "p", _subs([{"plugin": "finance", "event": "plg-x"}]))
+    assert errs
+
+
 # --- counts -----------------------------------------------------------
 
 def test_too_many_subscribes_rejected():
