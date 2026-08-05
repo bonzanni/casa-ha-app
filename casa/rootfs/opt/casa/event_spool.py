@@ -560,10 +560,13 @@ def _strict_replace_at(name: str, dir_fd: int, data: bytes, *, parent_fd: int,
 
 
 def _replace_json(name: str, dir_fd: int, payload: dict, what: str) -> None:
-    """Best-effort replacing publish — for the advisory ``ready.json`` /
-    index entries and for delivery-record upserts (self-healing via
-    :meth:`EventSpool.fold_pass`'s REPAIR phase covers a lost update;
-    nothing's deletion depends on a delivery write alone)."""
+    """Best-effort replacing publish — for the advisory ``ready.json`` and
+    index entries only. Delivery-record upserts do NOT go through here
+    (I3 fix): they use :meth:`EventSpool._write_delivery`'s strict-durable
+    path instead, because OPEN's ``all_written`` gate and REPAIR's
+    ``fan_out_complete`` check key on a delivery write's success meaning
+    PROVEN durable, not merely written+renamed — the folded emissions
+    those gates unlink are the record's only other copy of the wake."""
     data = canonical_marker_bytes(payload)
     tmp = f".{name}{REPLACE_TEMP_INFIX}{os.getpid()}-{uuid.uuid4().hex}"
     _write_new_file(tmp, dir_fd, data)
@@ -949,9 +952,18 @@ class EventSpool:
 
     # -- delivery-record I/O ---------------------------------------------
 
-    def _read_valid_delivery_records(self, dfd: int, emitter: str,
-                                     event: str) -> dict:
+    def _scan_delivery_records(self, dfd: int, emitter: str,
+                               event: str) -> tuple:
+        """The proving counterpart of :meth:`_read_valid_delivery_records`:
+        returns ``(valid_records, any_unreadable)``. Sol+Terra converged:
+        a transient read failure (``MarkerState.UNREADABLE`` — fd
+        pressure, ``EMFILE``/``EIO``) on a delivery file must never be
+        folded into "absent" the way a genuinely missing file is — the
+        caller (:meth:`_fold_one_locked`) needs to tell the two apart so
+        it can defer the whole pair rather than compute idle/completeness
+        off a queue it never actually saw."""
         out = {}
+        unreadable = False
         prefix = f"{event}--"
         for name in _listdir_quiet(dfd):
             if name.startswith(".") or not name.endswith(".json") \
@@ -959,6 +971,9 @@ class EventSpool:
                 continue
             subscriber = name[len(prefix):-5]
             marker = _read_marker_at(name, dfd)
+            if marker.state is MarkerState.UNREADABLE:
+                unreadable = True
+                continue
             if marker.state is not MarkerState.PRESENT:
                 continue
             rec = event_attempts.validate_record(
@@ -966,7 +981,12 @@ class EventSpool:
                 expect_subscriber=subscriber)
             if rec is not None:
                 out[subscriber] = rec
-        return out
+        return out, unreadable
+
+    def _read_valid_delivery_records(self, dfd: int, emitter: str,
+                                     event: str) -> dict:
+        records, _ = self._scan_delivery_records(dfd, emitter, event)
+        return records
 
     def _write_delivery(self, efd: int, dfd: int, event: str, subscriber: str,
                         rec: dict) -> bool:
@@ -990,6 +1010,42 @@ class EventSpool:
         return _strict_replace_at(
             f"{event}--{subscriber}.json", dfd, data, parent_fd=efd,
             what=DELIVERY_DIR, parent_what="emitter", role="delivery")
+
+    def _reprove_durable(self, dfd: int, names: "list[str]") -> bool:
+        """Sol I3 residual: ``_strict_replace_at``'s rename can land while
+        its OWN post-rename dir fsync still fails — the caller (``_write_
+        delivery``) correctly reports ``False``, but the file is fully
+        VISIBLE on disk with valid content from that moment on, and a
+        LATER pass reading it back (:meth:`_scan_delivery_records`) has no
+        way to tell that apart from a genuinely durable write. Called
+        immediately before :meth:`_fold_one_locked` unlinks folded
+        emissions on the strength of *names* (every delivery file this
+        pass counts as proof of fan-out, at either the REPAIR or the OPEN
+        site) — re-fsyncs each file AND the delivery dir itself (*dfd*,
+        once) as one last, cheap, idempotent proof immediately before that
+        destructive step. Any failure anywhere returns ``False``; the
+        caller retains the emissions this pass and retries the whole proof
+        on the next one."""
+        ok = True
+        for name in names:
+            try:
+                fd = os.open(name, _MARKER_READ_FLAGS, dir_fd=dfd)
+            except OSError:
+                ok = False
+                continue
+            try:
+                _fsync_strict(fd, f"delivery/{name} re-proof")
+            except FsyncFailed:
+                ok = False
+            finally:
+                os.close(fd)
+        if not ok:
+            return False
+        try:
+            _fsync_strict(dfd, f"{DELIVERY_DIR} re-proof")
+        except FsyncFailed:
+            return False
+        return True
 
     def read_delivery(self, emitter: str, event: str,
                       subscriber: str) -> "dict | None":
@@ -1264,7 +1320,23 @@ class EventSpool:
                 "deferred (fd pressure or a transient I/O error), no "
                 "reconstruct/open", emitter, event)
             return changed
-        valid_records = self._read_valid_delivery_records(dfd, emitter, event)
+        valid_records, delivery_unreadable = self._scan_delivery_records(
+            dfd, emitter, event)
+        if delivery_unreadable:
+            # Sol+Terra converged: a delivery file's OSError-during-read
+            # (fd pressure, EMFILE/EIO) must never fold into "absent" the
+            # way a genuinely missing record does — `valid_records` would
+            # then under-report the pending set, letting OPEN compute
+            # `idle=True` and mint a fresh generation (rotating every
+            # cohort member's token) right over an in-flight delivery
+            # this pass simply failed to SEE, not one that ever finished.
+            # Defer the WHOLE pair — no reconstruct, no repair, no open —
+            # mirroring the unreadable-STATE defer just above exactly.
+            logger.warning(
+                "event-spool: a delivery record for %r/%r was unreadable "
+                "this pass — deferred (fd pressure or a transient I/O "
+                "error), no reconstruct/repair/open", emitter, event)
+            return changed
 
         # -- RECONSTRUCT (decision 25) ------------------------------------
         state_obj = None
@@ -1350,9 +1422,26 @@ class EventSpool:
                 and valid_records[sub]["gen"] == state_gen
                 for sub in eligible)
             if fan_out_complete:
-                for u in state_obj["folded"]:
-                    if _U32HEX_RE.match(u):
-                        _unlink_quiet(f"{event}--{u}.json", emfd)
+                # Sol I3 residual: a member's record may have reached
+                # `valid_records` off a PRIOR pass's write whose rename
+                # landed but whose post-rename dir fsync failed —
+                # `_write_delivery` correctly reported that pass False,
+                # but the file is fully visible with valid content from
+                # that moment on, and nothing about reading it back here
+                # can tell the two apart. Re-prove durability right at
+                # the point the folded emissions are about to be
+                # destroyed on the strength of it; any failure retains
+                # them this pass instead.
+                names = [f"{event}--{sub}.json" for sub in eligible]
+                if self._reprove_durable(dfd, names):
+                    for u in state_obj["folded"]:
+                        if _U32HEX_RE.match(u):
+                            _unlink_quiet(f"{event}--{u}.json", emfd)
+                else:
+                    logger.warning(
+                        "event-spool: durability re-proof failed for %r/%r's "
+                        "counted delivery record(s) — folded emissions "
+                        "retained this pass", emitter, event)
 
         # -- OPEN ------------------------------------------------------
         if reconstruct_failed:
@@ -1391,12 +1480,14 @@ class EventSpool:
                         "opened_ts": now}
             if self._write_state(efd, event, new_state):
                 all_written = True
+                written_names = []
                 for sub in new_cohort:
                     tok = uuid.uuid4().hex
                     newrec = event_attempts.new_record(
                         emitter, event, sub, new_gen, tok, now)
                     if self._write_delivery(efd, dfd, event, sub, newrec):
                         changed.append((emitter, event, sub))
+                        written_names.append(f"{event}--{sub}.json")
                     else:
                         all_written = False
                 # Same completeness discipline as REPAIR's own
@@ -1407,10 +1498,21 @@ class EventSpool:
                 # caught by fold_pass's per-pair guard and simply retried
                 # whole) must not still destroy the folded emissions out
                 # from under the members who never got a record; REPAIR's
-                # own fan-out check converges this on a later pass.
+                # own fan-out check converges this on a later pass. Sol I3:
+                # even a full `all_written=True` this pass re-proves durability
+                # immediately before the unlink (see REPAIR's identical
+                # re-proof, above) — cheap, and symmetric with REPAIR's own
+                # site rather than trusting this pass's writes alone.
                 if all_written:
-                    for name, _ in folded_pairs:
-                        _unlink_quiet(name, emfd)
+                    if self._reprove_durable(dfd, written_names):
+                        for name, _ in folded_pairs:
+                            _unlink_quiet(name, emfd)
+                    else:
+                        logger.warning(
+                            "event-spool: durability re-proof failed for "
+                            "%r/%r's freshly-opened delivery record(s) — "
+                            "folded emissions retained this pass",
+                            emitter, event)
         return changed
 
     # -- conditional delivery update (mirrors update_attempt_nudge) ------
@@ -1920,8 +2022,27 @@ class EventSpool:
         already IS reconstruct+repair (and, when preconditions allow,
         open — which is the correct outcome for recovery too: an OPEN
         that was interrupted converges the same way a routine pass
-        would)."""
-        opened = self.fold_pass(routed, now)
+        would).
+
+        Terra High: this must apply the SAME gate ``event_episodes.
+        _worker_pass`` applies before ever calling ``fold_pass`` — under
+        :data:`ROUTING_UNAVAILABLE` (or a falsy non-mapping ``routed``)
+        OR ``registry_valid is not True``, fold never runs at all, only
+        provisioning (the caller's job, not this method's) and this same
+        pass's own (already-gated) ``sweep``. ``fold_pass`` alone cannot
+        provide this: it knows nothing about ``registry_valid``, only
+        about the ``routed`` sentinel, so a real-looking ``routed`` dict
+        computed while the registry snapshot was invalid would otherwise
+        still fold — the exact gap ``sweep`` already closes for its own
+        destructive phases via ``registry_valid``, restated here for
+        fold."""
+        routed_unavailable = (
+            routed is ROUTING_UNAVAILABLE
+            or (not routed and not isinstance(routed, dict)))
+        if routed_unavailable or registry_valid is not True:
+            opened = []
+        else:
+            opened = self.fold_pass(routed, now)
         swept = self.sweep(routed, installed, registry_valid, now)
         gc_removed = []
         if boot and registry_valid:
@@ -2055,7 +2176,7 @@ class EventSpool:
                           if marker.state is MarkerState.PRESENT else None)
                     if rec is None:
                         retired |= _retire_marker_entry(name, rfd)
-                        logger.warning("event-spool: unreadable removal "
+                        logger.warning("event-spool: malformed removal "
                                        "record retired")
                         continue
                     out.append((name, rec))

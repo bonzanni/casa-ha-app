@@ -649,6 +649,153 @@ def test_fold_pass_defers_rather_than_reconstructs_from_an_unreadable_state(
     assert state["gen"] == 5
 
 
+def test_fold_treats_an_unreadable_pending_delivery_as_blocking_not_absent(
+        spool, monkeypatch, caplog):
+    """Sol+Terra converged: a transient read failure (EMFILE/EIO) on a
+    PENDING delivery record must never fold into "absent" the way a
+    genuinely missing record does — that would let fold compute
+    idle=True (the unreadable record is invisible to the pending scan)
+    and OPEN a fresh generation right over an in-flight delivery this
+    pass simply failed to see, rotating its token out from under it. An
+    unreadable delivery must BLOCK the whole pair this pass: no
+    reconstruct, no repair, no open, no unlink, no state advance —
+    mirroring the existing unreadable-STATE defer exactly."""
+    _emit(spool, when=1000.0)
+    spool.fold_pass(R(S1), 1100.0)                 # gen1, S1 pending
+    path = _delivery_path(spool, S1)
+    assert path.exists()
+    _emit(spool, when=1200.0)                      # a second, queued emission
+
+    target = path.name
+    real_open = os.open
+
+    def flaky_open(name, flags, *a, **kw):
+        if name == target:
+            raise OSError(errno.EMFILE, "too many open files")
+        return real_open(name, flags, *a, **kw)
+
+    monkeypatch.setattr(es.os, "open", flaky_open)
+    try:
+        with caplog.at_level(logging.WARNING, logger="event_spool"):
+            changed = spool.fold_pass(R(S1), 1300.0)
+    finally:
+        monkeypatch.undo()
+
+    assert changed == []
+    state = _read_state(spool)
+    assert state["gen"] == 1                        # no new generation opened
+    # the queued 1200.0 emission was never folded, and gen1's already-
+    # folded emission was never re-unlinked off an unproven read
+    assert len(list(_emissions_dir(spool).glob(f"{EV}--*.json"))) == 1
+    assert sum("unreadable" in r.message for r in caplog.records) == 1  # once
+
+    # fd pressure gone: a later pass resumes normally — S1's gen1 record
+    # is still pending, so there is still nothing to fold (not idle).
+    changed = spool.fold_pass(R(S1), 1400.0)
+    assert changed == []
+    rec = _read_delivery(spool, S1)
+    assert rec is not None and rec["gen"] == 1 and rec["status"] == "pending"
+
+
+def test_repair_reproves_delivery_durability_before_unlinking_folded_emissions(
+        spool, monkeypatch):
+    """Sol I3 residual: ``_strict_replace_at``'s rename can land while its
+    OWN post-rename dir fsync still fails — ``_write_delivery`` correctly
+    reports False, but the record is fully VISIBLE on disk with valid
+    content from that moment on. A LATER pass's REPAIR completeness gate
+    must not trust that visibility alone as fan-out proof: it must
+    re-prove durability (re-fsync the file + the delivery dir)
+    immediately before unlinking the folded emissions the record is
+    meant to prove, and retain them on any re-proof failure — even a
+    PERMANENT one, indefinitely."""
+    _emit(spool, when=1000.0)
+    real_fsync = os.fsync
+    calls = {"i": 0}
+
+    def flaky_fsync(fd):
+        calls["i"] += 1
+        # _write_state's own _strict_replace_at makes 3 fsync calls
+        # (staged file, STATE_DIR, emitter dir) — let those land. Then
+        # the delivery write's staged-file fsync (#4) lands too (so the
+        # rename actually happens), but its post-rename DELIVERY_DIR
+        # fsync (#5) fails — exactly Sol I3's residual.
+        if calls["i"] == 5:
+            raise OSError(5, "simulated post-rename dir fsync failure")
+        return real_fsync(fd)
+
+    monkeypatch.setattr(es.os, "fsync", flaky_fsync)
+    try:
+        changed = spool.fold_pass(R(S1), 2000.0)
+    finally:
+        monkeypatch.undo()
+
+    assert changed == []                       # _write_delivery reported False
+    # yet the record IS fully on disk despite that False return
+    assert _delivery_path(spool, S1).exists()
+    rec_on_disk = _read_delivery(spool, S1)
+    assert rec_on_disk is not None and rec_on_disk["gen"] == 1
+    # the folded emission must still be retained — never unlinked off an
+    # unproven write within this same pass (all_written was False)
+    assert list(_emissions_dir(spool).glob(f"{EV}--*.json"))
+
+    # next pass: the record now reads back as valid gen-1 "proof" of
+    # fan-out completeness — but re-proof is what must gate the unlink,
+    # and fsync is STILL broken (permanent failure), so the emission
+    # must stay retained indefinitely, not merely once.
+    def always_broken(fd):
+        raise OSError(5, "still broken")
+
+    monkeypatch.setattr(es.os, "fsync", always_broken)
+    try:
+        changed = spool.fold_pass(R(S1), 2100.0)
+    finally:
+        monkeypatch.undo()
+    assert changed == []
+    assert list(_emissions_dir(spool).glob(f"{EV}--*.json"))   # still retained
+
+    # fsync healthy again: re-proof finally succeeds, the emission unlinks.
+    changed = spool.fold_pass(R(S1), 2200.0)
+    assert changed == []
+    assert list(_emissions_dir(spool).glob(f"{EV}--*.json")) == []
+
+
+def test_open_reproves_delivery_durability_before_unlinking_folded_emissions(
+        spool, monkeypatch):
+    """Same Sol I3 residual, pinned at the OPEN site: even a fully
+    successful ``all_written=True`` pass must re-prove durability right
+    before the unlink, symmetric with REPAIR's own site above — this pin
+    only proves the reprove step runs (and can be made to fail) at OPEN
+    too, not a distinct production scenario (OPEN's own ``all_written``
+    gate already implies each write's dir-fsync succeeded truly within
+    the SAME pass)."""
+    _emit(spool, when=1000.0)
+    real_open = os.open
+    target = f"{EV}--{S1}.json"
+
+    def flaky_open(name, flags, *a, **kw):
+        if name == target and (flags & os.O_CREAT) == 0:
+            # the re-proof step's read-only reopen of the freshly-written
+            # delivery file — never the write itself (O_CREAT).
+            raise OSError(errno.EMFILE, "too many open files")
+        return real_open(name, flags, *a, **kw)
+
+    monkeypatch.setattr(es.os, "open", flaky_open)
+    try:
+        changed = spool.fold_pass(R(S1), 2000.0)
+    finally:
+        monkeypatch.undo()
+
+    # the write itself succeeded (changed reports it) but the re-proof
+    # reopen failed, so the folded emission must be retained regardless
+    assert changed == [(E, EV, S1)]
+    assert list(_emissions_dir(spool).glob(f"{EV}--*.json"))
+
+    # fd pressure gone: the next pass's REPAIR re-proves and unlinks.
+    changed = spool.fold_pass(R(S1), 2100.0)
+    assert changed == []
+    assert list(_emissions_dir(spool).glob(f"{EV}--*.json")) == []
+
+
 # ---------------------------------------------------------------------------
 # fold_pass — crash injection between OPEN's steps
 # ---------------------------------------------------------------------------
@@ -1973,6 +2120,27 @@ def test_recovery_pass_folds_and_sweeps(spool):
     assert report.sweep is not None
     state = _read_state(spool)
     assert state["gen"] == 1
+
+
+def test_recovery_pass_gates_fold_on_registry_valid_same_as_worker(spool):
+    """Terra High: recovery must apply the SAME gate ``event_episodes.
+    _worker_pass`` applies before ever calling ``fold_pass`` — an
+    authoritative-LOOKING ``routed`` dict does not make ``fold_pass``
+    safe to call when ``registry_valid`` is False: no reconstruct, no
+    repair, no open, no unlink, no state advance."""
+    _emit(spool, when=1000.0)
+    report = spool.recovery_pass(R(S1), installed={S1}, registry_valid=False,
+                                 now=2000.0, boot=False)
+    assert report.opened == []
+    assert _read_state(spool) is None          # no state advance
+    assert list(_emissions_dir(spool).glob(f"{EV}--*.json"))  # untouched,
+    # never unlinked
+
+    # registry heals: the SAME emission finally folds normally
+    report2 = spool.recovery_pass(R(S1), installed={S1}, registry_valid=True,
+                                  now=2100.0)
+    assert report2.opened == [(E, EV, S1)]
+    assert _read_state(spool)["gen"] == 1
 
 
 def test_recovery_pass_runs_gc_only_on_boot_with_valid_registry(spool):
