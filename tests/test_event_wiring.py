@@ -138,11 +138,62 @@ class TestPeriodicJobs:
         SAME kick() the pre-send gate uses on a consent mismatch) — a
         transient compute failure otherwise waits forever for an unrelated
         lifecycle mutation to retry it."""
-        idx = _SRC.index("async def _event_spool_recovery")
-        end = _SRC.index("scheduler.add_job(", idx)
-        block = _SRC[idx:end]
-        assert "_evrec.get_routed() is event_spool.ROUTING_UNAVAILABLE" in block
-        assert "_evrec.kick()" in block
+        import ast
+
+        tree = ast.parse(_SRC)
+
+        # Find the _event_spool_recovery function (nested in main)
+        func_def = None
+        for node in ast.walk(tree):
+            if isinstance(node, ast.AsyncFunctionDef) and \
+               node.name == "_event_spool_recovery":
+                func_def = node
+                break
+
+        assert func_def is not None, \
+            "Function _event_spool_recovery not found"
+
+        # Find the If node whose test contains ROUTING_UNAVAILABLE comparison
+        sentinel_if = None
+        for stmt in func_def.body:
+            if isinstance(stmt, ast.If):
+                # Check if the test contains the ROUTING_UNAVAILABLE reference
+                test_src = ast.unparse(stmt.test) \
+                    if hasattr(ast, 'unparse') else ""
+                if "ROUTING_UNAVAILABLE" in test_src:
+                    sentinel_if = stmt
+                    break
+
+        assert sentinel_if is not None, \
+            "If statement with ROUTING_UNAVAILABLE comparison not found"
+
+        # Verify that kick() is called inside the If body
+        kick_in_if = False
+        for node in ast.walk(sentinel_if):
+            if isinstance(node, ast.Call):
+                if isinstance(node.func, ast.Attribute) and \
+                   node.func.attr == "kick":
+                    kick_in_if = True
+                    break
+
+        assert kick_in_if, "kick() call not found inside the If body"
+
+        # Verify that NO kick() call exists outside the If statement
+        kick_outside_if = False
+        for stmt in func_def.body:
+            if stmt is not sentinel_if:
+                for node in ast.walk(stmt):
+                    if isinstance(node, ast.Call):
+                        if isinstance(node.func, ast.Attribute) and \
+                           node.func.attr == "kick":
+                            kick_outside_if = True
+                            break
+                if kick_outside_if:
+                    break
+
+        assert not kick_outside_if, \
+            "kick() call found outside the If statement " \
+            "(should only be inside ROUTING_UNAVAILABLE conditional)"
 
 
 # ---------------------------------------------------------------------------
