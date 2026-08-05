@@ -80,7 +80,9 @@ _MIN_WAKE_S = 5.0
 # transaction (decision 29/36): once a revoke completes, no dispatch for
 # that pair can be admitted, because both paths hold this SAME lock across
 # their whole read-then-act critical section. Exported (no leading
-# underscore) — event_reconcile and tools.py's event_ack_revoke import it.
+# underscore) — event_reconcile imports it directly (revoke_and_unroute);
+# tools.py's event_ack_revoke reaches it only indirectly, by calling
+# revoke_and_unroute, and never imports this module itself (Minor-8).
 DISPATCH_LOCK = asyncio.Lock()
 
 # Wired by casa_core at boot. All optional — absent seams degrade to

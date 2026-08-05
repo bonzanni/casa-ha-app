@@ -543,8 +543,12 @@
   doc: architecture/voice.md
 - item: casa/rootfs/opt/casa/yaml_safety.py
   doc: architecture/persistent-state.md
+- item: env:CALLBACK_RATE_PER_MIN
+  doc: architecture/callbacks.md
 - item: env:CASA_BINDINGS_DIR
   doc: architecture/overview.md
+- item: env:CASA_CALLBACK_SPOOL_ROOT
+  doc: architecture/callbacks.md
 - item: env:CASA_CONFIG_DIR
   doc: architecture/overview.md
 - item: env:CASA_DATA_DIR
@@ -556,6 +560,8 @@
 - item: env:CASA_ENGAGEMENT_TOKEN
   doc: architecture/mcp-and-tools.md
 - item: env:CASA_EVENT_ACKS_PATH
+  doc: architecture/plugin-events.md
+- item: env:CASA_EVENT_SPOOL_ROOT
   doc: architecture/plugin-events.md
 - item: env:CASA_FRAMEWORK_MCP_URL
   doc: architecture/mcp-and-tools.md
