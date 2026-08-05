@@ -218,33 +218,32 @@ class EventAckStore:
             self._acks = candidate
             return dict(rec)
 
-    def revoke_subscriber(self, subscriber: str) -> int:
-        """Drop every ack recorded for *subscriber*; returns the count
-        removed."""
-        return len(self._revoke(lambda rec: rec.get("subscriber") == subscriber))
+    def revoke_subscriber(self, subscriber: str) -> list[dict[str, Any]]:
+        """Drop every ack recorded for *subscriber*; returns the removed
+        records."""
+        return self._revoke(lambda rec: rec.get("subscriber") == subscriber)
 
-    def revoke_pair(self, subscriber: str, emitter: str, event: str) -> int:
+    def revoke_pair(self, subscriber: str, emitter: str, event: str) -> list[dict[str, Any]]:
         """Drop every ack for one (subscriber, emitter, event) subscription —
-        across any declaration digest or target set. Returns the count
-        removed."""
-        return len(self._revoke(
+        across any declaration digest or target set. Returns the removed
+        records."""
+        return self._revoke(
             lambda rec: rec.get("subscriber") == subscriber
-            and rec.get("emitter") == emitter and rec.get("event") == event))
+            and rec.get("emitter") == emitter and rec.get("event") == event)
 
-    def prune_stale(self, valid_identities: set[str]) -> int:
+    def prune_stale(self, valid_identities: set[str]) -> list[dict[str, Any]]:
         """Opportunistic reconcile prune: drop every ack whose identity is
         not in *valid_identities* (no installed declaration can still
-        compute it); returns the count removed."""
+        compute it); returns the removed records."""
         with self._lock:
             matched = [i for i in self._acks if i not in valid_identities]
             if not matched:
-                return 0
+                return []
             candidate = dict(self._acks)
-            for i in matched:
-                candidate.pop(i)
+            removed = [candidate.pop(i) for i in matched]
             self._persist_candidate_locked(candidate)
             self._acks = candidate
-            return len(matched)
+            return removed
 
     def _revoke(self, predicate) -> list[dict[str, Any]]:
         with self._lock:

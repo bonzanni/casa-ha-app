@@ -380,7 +380,12 @@ def test_revoke_subscriber_returns_count_and_persists(tmp_path):
 
     removed = store.revoke_subscriber("finance")
 
-    assert removed == 2
+    assert len(removed) == 2
+    # Spot-check that returned records carry expected subscriber field
+    assert all(r.get("subscriber") == "finance" for r in removed)
+    # Verify both emitters are present
+    emitters = {r.get("emitter") for r in removed}
+    assert emitters == {"gmail", "outlook"}
 
     finance_gmail = _identity(subscriber="finance", emitter="gmail", digest="digest-1")
     finance_outlook = _identity(subscriber="finance", emitter="outlook", digest="digest-2")
@@ -403,7 +408,7 @@ def test_revoke_subscriber_no_match_returns_zero_and_does_not_persist(tmp_path):
 
     removed = store.revoke_subscriber("nonexistent")
 
-    assert removed == 0
+    assert len(removed) == 0
     assert path.read_text(encoding="utf-8") == before
 
 
@@ -419,7 +424,12 @@ def test_revoke_pair_drops_only_that_subscription(tmp_path):
 
     removed = store.revoke_pair("finance", "gmail", "new-mail")
 
-    assert removed == 1
+    assert len(removed) == 1
+    # Spot-check that the returned record has the expected fields
+    assert removed[0].get("emitter") == "gmail"
+    assert removed[0].get("event") == "new-mail"
+    assert removed[0].get("subscriber") == "finance"
+
     kept1 = _identity(emitter="gmail", event="invoice", digest="digest-2")
     kept2 = _identity(emitter="outlook", event="new-mail", digest="digest-3")
     dropped = _identity(emitter="gmail", event="new-mail", digest="digest-1")
@@ -480,7 +490,12 @@ def test_prune_stale_drops_only_identities_outside_valid_set(tmp_path):
 
     removed = store.prune_stale({keep_identity, other_identity})
 
-    assert removed == 1
+    assert len(removed) == 1
+    # Spot-check that the returned record has the expected fields
+    assert removed[0].get("emitter") == "outlook"
+    assert removed[0].get("event") == "new-mail"
+    assert removed[0].get("subscriber") == "finance"
+
     assert store.get(stale_identity) is None
     assert store.get(keep_identity) is not None
     assert store.get(other_identity) is not None
