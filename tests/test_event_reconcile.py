@@ -5,7 +5,6 @@ Structural sibling of ``test_callback_reconcile.py``: a pure
 fail-closed/consent-prompt/revoke behavior.
 """
 import asyncio
-import sys
 import time
 from types import SimpleNamespace
 
@@ -108,13 +107,22 @@ class _FakeChannelManager:
 
 @pytest.fixture
 def fake_event_episodes(monkeypatch):
-    """A minimal stand-in for ``event_episodes`` — Task 7's tests must not
-    depend on Task 8's implementation existing. Records kicks; exposes the
-    real lock shape (``DISPATCH_LOCK``) so ``revoke_and_unroute`` composes."""
-    mod = SimpleNamespace(DISPATCH_LOCK=asyncio.Lock(), kicks=0)
-    mod.kick_all = lambda: setattr(mod, "kicks", mod.kicks + 1)
-    monkeypatch.setitem(sys.modules, "event_episodes", mod)
-    return mod
+    """Patches the REAL ``event_episodes`` module's ``kick_all`` (call-
+    counting) while leaving ``DISPATCH_LOCK`` as the genuine object every
+    production caller shares (Important-4c, review round 1): stubbing out
+    the whole module with a fresh ``SimpleNamespace`` — as this fixture
+    used to — silently stopped exercising the ACTUAL shared lock the
+    moment Task 8's real module existed, since ``event_reconcile``'s
+    ``import event_episodes`` would resolve to the stub's own throwaway
+    ``asyncio.Lock()`` instead."""
+    import event_episodes
+    state = SimpleNamespace(kicks=0, DISPATCH_LOCK=event_episodes.DISPATCH_LOCK)
+
+    def _kick_all() -> None:
+        state.kicks += 1
+
+    monkeypatch.setattr(event_episodes, "kick_all", _kick_all)
+    return state
 
 
 # ---------------------------------------------------------------------------
@@ -224,6 +232,32 @@ def test_no_target_dark_then_heals(tmp_path):
         resolver=_resolver([emitter, subscriber]),
         entries=entries_with_finance_target)
     assert ("gmail", "mail_in") in desired2.routed
+
+
+def test_no_target_issue_once_per_subscriber_not_per_subscription(tmp_path):
+    """Minor-7 (review round 1): reachability never varies across a
+    subscriber's own subscribe entries — two subscriptions must still
+    yield exactly ONE ``event_no_target`` issue, not two."""
+    emitter_a = _rp("gmail", emits=["mail_in"])
+    emitter_b = _rp("slack", emits=["msg_in"])
+    subscriber = _rp("finance", subscribes=[
+        ("gmail", "mail_in"), ("slack", "msg_in")])
+    acks = EventAckStore(path=tmp_path / "acks.json")
+
+    def entries_no_finance_targets():
+        return [{"name": "gmail", "artifact_id": "art-1",
+                 "targets": ["resident:assistant"]},
+                {"name": "slack", "artifact_id": "art-1",
+                 "targets": ["resident:assistant"]},
+                {"name": "finance", "artifact_id": "art-1", "targets": []}]
+
+    desired = er.compute_desired(
+        role_configs=_role_configs(assistant=["telegram"]), acks=acks,
+        resolver=_resolver([emitter_a, emitter_b, subscriber]),
+        entries=entries_no_finance_targets)
+    no_target_issues = [i for i in desired.issues
+                        if i["reason_code"] == "event_no_target"]
+    assert len(no_target_issues) == 1
 
 
 def test_pending_ack_dark_then_heals(tmp_path):
@@ -382,31 +416,60 @@ async def test_reconcile_compute_failure_publishes_sentinel_and_raises(
     assert fake_event_episodes.kicks == 1
 
 
-async def test_reconcile_lock_serializes_stale_compute(fake_event_episodes):
+async def test_reconcile_lock_serializes_stale_compute(tmp_path,
+                                                        fake_event_episodes,
+                                                        monkeypatch):
+    """Two FULLY-ROUTABLE, mutually-exclusive maps (never a vacuous {} vs
+    {} — Important-4a, review round 1): the slow (issued-first) resolver
+    would route ``gmail-old``, the fast (issued-second) resolver routes
+    ``gmail-new``. The slow compute holds the lock for its ENTIRE critical
+    section (compute+swap), so the fast call cannot even START its own
+    compute until the slow one has already published — the actual
+    publication order is therefore slow-then-fast, and the final
+    ``get_routed()`` content must be the FAST (later) map, never clobbered
+    back to the stale (slow, earlier-issued) one."""
+    # A PRIVATE lock for this test: asyncio.Lock's cross-task-contention
+    # path binds to the CURRENTLY running loop on first genuine contention
+    # (asyncio internals) — reusing the process-wide singleton across two
+    # tests that BOTH create real contention on it would make the SECOND
+    # one crash with "bound to a different event loop" once pytest-asyncio
+    # hands it a fresh loop. Every OTHER test acquires the lock uncontended
+    # (no cross-task race), which never touches that binding at all.
+    monkeypatch.setattr(er, "_RECONCILE_LOCK", asyncio.Lock())
     runtime = SimpleNamespace(
         role_configs=_role_configs(assistant=["telegram"]),
         channel_manager=None)
-    older = _rp("gmail-old", emits=["e"])
-    newer = _rp("gmail-new", emits=["e"])
+
+    emitter_old = _rp("gmail-old", emits=["e"])
+    sub_old = _rp("finance-old", subscribes=[("gmail-old", "e")])
+    acks_old = EventAckStore(path=tmp_path / "acks-old.json")
+    _ack(acks_old, "finance-old", "art-1", "gmail-old", "e")
+
+    emitter_new = _rp("gmail-new", emits=["e"])
+    sub_new = _rp("finance-new", subscribes=[("gmail-new", "e")])
+    acks_new = EventAckStore(path=tmp_path / "acks-new.json")
+    _ack(acks_new, "finance-new", "art-1", "gmail-new", "e")
 
     def slow_resolver(target):
         time.sleep(0.05)
-        return SimpleNamespace(registry_valid=True, plugins=[older], issues=[])
+        return SimpleNamespace(registry_valid=True,
+                               plugins=[emitter_old, sub_old], issues=[])
 
     def fast_resolver(target):
-        return SimpleNamespace(registry_valid=True, plugins=[newer], issues=[])
+        return SimpleNamespace(registry_valid=True,
+                               plugins=[emitter_new, sub_new], issues=[])
 
     await asyncio.gather(
-        er.reconcile_plugin_events(runtime, resolver=slow_resolver,
-                                   entries=lambda: [], prompt=False),
-        er.reconcile_plugin_events(runtime, resolver=fast_resolver,
-                                   entries=lambda: [], prompt=False),
+        er.reconcile_plugin_events(
+            runtime, acks=acks_old, resolver=slow_resolver,
+            entries=_entries(emitter_old, sub_old), prompt=False),
+        er.reconcile_plugin_events(
+            runtime, acks=acks_new, resolver=fast_resolver,
+            entries=_entries(emitter_new, sub_new), prompt=False),
     )
-    # Whichever call ran SECOND under the lock published last — since the
-    # slow compute is issued first and holds the lock for its ENTIRE
-    # critical section, the fast call can only run (and publish) after it,
-    # so the final state is always the LAST one to complete under the lock,
-    # never a stale one clobbering a newer swap.
+    routed = er.get_routed()
+    assert ("gmail-new", "e") in routed
+    assert ("gmail-old", "e") not in routed
     assert fake_event_episodes.kicks == 2
 
 
@@ -443,9 +506,13 @@ async def test_reconcile_fires_deduped_consent_prompt(tmp_path, fake_event_episo
         # the outstanding keyboard (in-flight dedup lives in the shared
         # ChallengeCoordinator; calling twice must not raise/duplicate).
         await _run()
+        for _ in range(8):           # settle the coordinator's post driver(s)
+            await asyncio.sleep(0)
     finally:
         event_consent.operator_identity = orig
-    assert len(telegram.posts) >= 1
+    # EXACT count (Important-4b, review round 1): >=1 would pass even if
+    # dedup silently failed and posted twice.
+    assert len(telegram.posts) == 1
 
 
 # ---------------------------------------------------------------------------
@@ -509,6 +576,118 @@ def test_revoke_with_sentinel_routed_is_a_noop(monkeypatch):
     assert er.get_routed() is event_spool.ROUTING_UNAVAILABLE
 
 
+async def test_revoke_locks_are_the_real_shared_module_objects(
+        fake_event_episodes):
+    """Important-4c (review round 1): the revoke path must serialize on the
+    ACTUAL ``event_episodes.DISPATCH_LOCK`` object every dispatch attempt
+    shares — not a decoupled stand-in a test fixture minted. Proven two
+    ways: identity, and a live blocking behavior (holding the real lock
+    externally provably blocks a concurrent revoke)."""
+    import event_episodes
+
+    assert fake_event_episodes.DISPATCH_LOCK is event_episodes.DISPATCH_LOCK
+
+    held = asyncio.Event()
+    release = asyncio.Event()
+
+    async def _hold_lock() -> None:
+        async with event_episodes.DISPATCH_LOCK:
+            held.set()
+            await release.wait()
+
+    holder = asyncio.create_task(_hold_lock())
+    await held.wait()
+
+    revoke_task = asyncio.create_task(er.revoke_and_unroute("finance"))
+    await asyncio.sleep(0)
+    await asyncio.sleep(0)
+    assert not revoke_task.done()          # blocked on the SAME lock object
+
+    release.set()
+    await holder
+    removed = await revoke_task
+    assert removed == []
+
+
+async def test_revoke_takes_reconcile_lock_before_dispatch_lock(
+        fake_event_episodes, monkeypatch):
+    """Important-3 (review round 1): revoke_and_unroute must serialize
+    against an in-flight reconcile COMPUTE too (not just the dispatch
+    lock) — proven by holding ``_RECONCILE_LOCK`` externally and observing
+    the revoke call blocks until it releases."""
+    # Private lock — see the comment in test_reconcile_lock_serializes_
+    # stale_compute (asyncio.Lock's loop-binding on genuine contention).
+    monkeypatch.setattr(er, "_RECONCILE_LOCK", asyncio.Lock())
+    held = asyncio.Event()
+    release = asyncio.Event()
+
+    async def _hold_reconcile_lock() -> None:
+        async with er._RECONCILE_LOCK:
+            held.set()
+            await release.wait()
+
+    holder = asyncio.create_task(_hold_reconcile_lock())
+    await held.wait()
+
+    revoke_task = asyncio.create_task(er.revoke_and_unroute("finance"))
+    await asyncio.sleep(0)
+    await asyncio.sleep(0)
+    assert not revoke_task.done()
+
+    release.set()
+    await holder
+    await revoke_task
+
+
+# ---------------------------------------------------------------------------
+# Critical-1 — registry-invalid publishes the sentinel, never an authoritative {}
+# ---------------------------------------------------------------------------
+
+
+def test_compute_desired_marks_registry_invalid(monkeypatch):
+    acks = EventAckStore(path="/does/not/matter")
+    desired = er.compute_desired(
+        role_configs=_role_configs(assistant=["telegram"]), acks=acks,
+        resolver=_resolver([], valid=False), entries=lambda: [])
+    assert desired.routed == {}
+    assert desired.registry_valid is False
+
+
+async def test_reconcile_registry_invalid_publishes_sentinel_not_empty_map(
+        fake_event_episodes):
+    """A registry-invalid compute is a FAILURE TO KNOW, not a computed
+    empty — it must publish ROUTING_UNAVAILABLE (never an authoritative {},
+    which would license the worker's destructive sweep), exactly like a
+    raised compute exception, but WITHOUT raising (it is not a crash)."""
+    runtime = SimpleNamespace(
+        role_configs=_role_configs(assistant=["telegram"]),
+        channel_manager=None)
+    issues = await er.reconcile_plugin_events(
+        runtime, resolver=_resolver([], valid=False), entries=lambda: [],
+        prompt=False)
+    assert issues == []
+    assert er.get_routed() is event_spool.ROUTING_UNAVAILABLE
+    assert fake_event_episodes.kicks == 1
+
+
+async def test_reconcile_genuinely_empty_valid_compute_is_authoritative(
+        fake_event_episodes):
+    """The OTHER direction of Critical-1: a CLEAN compute that legitimately
+    finds nothing to route (a valid, empty registry) publishes the real
+    authoritative ``{}`` — never the sentinel — so the worker's destructive
+    sweep (deleting unrouted pairs' emissions) is correctly PERMITTED."""
+    runtime = SimpleNamespace(
+        role_configs=_role_configs(assistant=["telegram"]),
+        channel_manager=None)
+    issues = await er.reconcile_plugin_events(
+        runtime, resolver=_resolver([], valid=True), entries=lambda: [],
+        prompt=False)
+    assert issues == []
+    routed = er.get_routed()
+    assert routed == {}
+    assert routed is not event_spool.ROUTING_UNAVAILABLE
+
+
 # ---------------------------------------------------------------------------
 # to_spool_shape / current_issues
 # ---------------------------------------------------------------------------
@@ -526,7 +705,96 @@ def test_to_spool_shape_narrows_and_passes_sentinel():
 def test_current_issues_never_raises_without_runtime(monkeypatch):
     import agent as agent_mod
     monkeypatch.setattr(agent_mod, "active_runtime", None, raising=False)
+    # The autouse fixture publishes the SENTINEL by default; decouple that
+    # concern here (covered by its own dedicated pins below) to keep this
+    # test's narrow intent — no runtime bound ⇒ no gate issues, no raise.
+    monkeypatch.setattr(er, "_routed", {})
     assert er.current_issues() == []
+
+
+def test_current_issues_surfaces_the_sentinel(monkeypatch):
+    """Important-5c (review round 1): a stuck ROUTING_UNAVAILABLE map must
+    be visible to the operator, not just silently inert."""
+    import agent as agent_mod
+    monkeypatch.setattr(agent_mod, "active_runtime", None, raising=False)
+    monkeypatch.setattr(er, "_routed", event_spool.ROUTING_UNAVAILABLE)
+    issues = er.current_issues()
+    assert any(i["reason_code"] == "event_routing_unavailable" for i in issues)
+
+
+def test_current_issues_no_sentinel_row_when_routed(monkeypatch):
+    import agent as agent_mod
+    monkeypatch.setattr(agent_mod, "active_runtime", None, raising=False)
+    monkeypatch.setattr(er, "_routed", {})
+    issues = er.current_issues()
+    assert not any(i["reason_code"] == "event_routing_unavailable"
+                  for i in issues)
+
+
+# ---------------------------------------------------------------------------
+# adjudication-f — opportunistic stale-ack pruning, clean passes only
+# ---------------------------------------------------------------------------
+
+
+async def test_prune_stale_ack_for_uninstalled_subscriber_on_clean_pass(
+        tmp_path, fake_event_episodes):
+    emitter = _rp("gmail", emits=["mail_in"])
+    acks = EventAckStore(path=tmp_path / "acks.json")
+    _ack(acks, "finance", "art-1", "gmail", "mail_in")
+    identity = _identity("finance", "art-1", "gmail", "mail_in")
+    assert acks.get(identity) is not None
+
+    runtime = SimpleNamespace(
+        role_configs=_role_configs(assistant=["telegram"]),
+        channel_manager=None)
+    # "finance" (the subscriber) is no longer resolved AT ALL — uninstalled
+    # — and the pass is otherwise clean (no resolver issues).
+    await er.reconcile_plugin_events(
+        runtime, acks=acks, resolver=_resolver([emitter], issues=[]),
+        entries=_entries(emitter), prompt=False)
+    assert acks.get(identity) is None
+
+
+async def test_prune_suppressed_on_a_pass_with_issues(tmp_path,
+                                                       fake_event_episodes):
+    emitter = _rp("gmail", emits=["mail_in"])
+    acks = EventAckStore(path=tmp_path / "acks.json")
+    _ack(acks, "finance", "art-1", "gmail", "mail_in")
+    identity = _identity("finance", "art-1", "gmail", "mail_in")
+
+    runtime = SimpleNamespace(
+        role_configs=_role_configs(assistant=["telegram"]),
+        channel_manager=None)
+    # "finance" is likewise uninstalled, but the resolver reports an
+    # unrelated issue (e.g. a resolution hiccup on some OTHER plugin) — the
+    # whole pass must be untrusted for pruning, not just that plugin.
+    await er.reconcile_plugin_events(
+        runtime, acks=acks,
+        resolver=_resolver([emitter], issues=["unrelated-issue"]),
+        entries=_entries(emitter), prompt=False)
+    assert acks.get(identity) is not None
+
+
+async def test_prune_suppressed_when_a_subscribers_own_declaration_fails(
+        tmp_path, fake_event_episodes):
+    emitter = _rp("gmail", emits=["mail_in"])
+    subscriber = _rp("finance", manifest={
+        "name": "x", "casa": {"subscribes": "not-a-list"}})
+    acks = EventAckStore(path=tmp_path / "acks.json")
+    _ack(acks, "billing", "art-1", "gmail", "mail_in")
+    other_identity = _identity("billing", "art-1", "gmail", "mail_in")
+
+    runtime = SimpleNamespace(
+        role_configs=_role_configs(assistant=["telegram"]),
+        channel_manager=None)
+    await er.reconcile_plugin_events(
+        runtime, acks=acks,
+        resolver=_resolver([emitter, subscriber], issues=[]),
+        entries=_entries(emitter, subscriber), prompt=False)
+    # "billing" isn't even resolved (would normally be pruned on a clean
+    # pass), but "finance"'s OWN unparseable declaration must suppress
+    # pruning for the WHOLE compute.
+    assert acks.get(other_identity) is not None
 
 
 def test_current_issues_includes_spool_passthrough(monkeypatch):

@@ -7663,6 +7663,14 @@ def _regenerate_plugin_health(extra_issues: list) -> None:
     # current_issues() never raises.
     import callback_reconcile
     callback_issues = callback_reconcile.current_issues()
+    # #419: event-subscription issue merge is Task 10's wiring scope (it
+    # touches every OTHER caller of this function's test fixtures, not just
+    # this one) — see event_reconcile.current_issues()'s own docstring for
+    # the DICT-shaped contract Task 10 must honor (Minor-10, review round 1
+    # is satisfied by that contract + test_health_report_includes_event_
+    # issues in test_tools_ack_event.py, which proves plugin_health.
+    # write_report's dict/attribute dual accessor already handles it
+    # correctly — WITHOUT actually wiring the call here yet).
     # v0.112.0: setup-episode state (pending/failed/stale) is likewise a
     # RECOMPUTABLE input, derived fresh from the durable episode store — a
     # dropped or failed post-consent setup dispatch stays visible until it
@@ -9759,11 +9767,15 @@ async def event_ack_revoke(args: dict) -> dict:
         # event_reconcile's own lock, which our reconcile serialized behind).
         CHALLENGES.cancel_matching(plugin=subscriber)
         await asyncio.to_thread(_regenerate_plugin_health, [])
+        # Minor-9 (review round 1): a malformed record's emitter/event must
+        # never crash the sort with a None-vs-str comparison — map to "" so
+        # a defensive-only anomaly is merely mis-sorted, never a raise.
+        pairs = sorted({(r.get("emitter") or "", r.get("event") or "")
+                        for r in removed})
         return _result({
             "ok": True, "subscriber": subscriber,
             "revoked": len(removed),
-            "pairs": sorted({(r.get("emitter"), r.get("event"))
-                            for r in removed}),
+            "pairs": pairs,
         })
 
 

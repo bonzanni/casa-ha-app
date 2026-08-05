@@ -15,6 +15,21 @@ are mirrored here) and, on the identity side, of :mod:`trigger_consent`:
 * Deny / expiry → the subscription stays undelivered (``event_pending_ack``);
   the next lifecycle reconcile may re-prompt.
 
+**Deliberately standalone from the plugin-setup round ledger** (Critical-2,
+review round 1): unlike the trigger/callback consent flavors, event consent
+never feeds :mod:`plugin_setup_episodes`. Spec §6 never couples an event
+subscription to a plugin's setup round, and the SUBSCRIBER's own registry
+name doubling as ``plugin_setup_episodes``' round key made feeding it
+actively dangerous: a subscriber plugin that ALSO happens to have its own
+live trigger-consent round open would have an event consent's deny/expiry
+insert a bogus, unrelated member into that round (the identity spaces are
+disjoint — an event consent identity is never a round member — so the
+nonce fence that protects a real member never applies), corrupting its
+settlement and firing a wrong "trigger(s)" note; an approve could likewise
+synthesize a round and dispatch that plugin's setup tool for an unrelated
+reason. Approve/deny/expiry here only ever (a) mutate :mod:`event_acks`
+and (b) edit the DM and re-reconcile — nothing else.
+
 What the operator approves is deliberately EXPLICIT about the delivery
 target: unlike a callback (which grants no turn or memory access), a
 subscription reaches into a subscriber role — so the prompt names the
@@ -97,17 +112,13 @@ def prompt_event_consent(
     subscriber: str, artifact_id: str, emitter: str, event: str,
     digest: str, targets: "list[str]", acks: Any,
     reconcile_cb: "Callable[[], Awaitable[None]] | None" = None,
-    setup_nonce: str = "",
 ) -> Any:
     """Post (or dedupe onto) the consent keyboard for ONE event subscription.
 
     Returns the coordinator's ``ChallengeHandle``. ``acks`` is the
     :class:`event_acks.EventAckStore`; ``reconcile_cb`` re-runs the event
-    reconciler after an approve so delivery starts immediately.
-    ``setup_nonce`` is this prompt's nonce in the subscriber's UNION setup
-    round (sealed by the reconciler before any keyboard posted), so a
-    superseded keyboard's late deny/expiry can never decide a re-prompted
-    member.
+    reconciler after an approve so delivery starts immediately. Standalone
+    from any plugin-setup round — see the module docstring.
     """
     identity = ack_identity(subscriber, artifact_id, emitter, event, digest,
                             targets)
@@ -124,40 +135,9 @@ def prompt_event_consent(
         # consent that failed to persist must never start delivery.
         if idx != 0:
             return
-        rec = acks.record(subscriber, artifact_id, emitter, event, digest,
-                          targets, time.time())
+        acks.record(subscriber, artifact_id, emitter, event, digest, targets,
+                   time.time())
         meta["acked"] = True
-        # Record the approval in the setup-round ledger in this SAME yield-free
-        # step (the trigger/callback-consent discipline): a crash before the
-        # async finish hook must not strand the union round.
-        try:
-            import plugin_setup_episodes
-            plugin_setup_episodes.record_approval_sync(
-                plugin=subscriber, artifact_id=artifact_id, identity=identity,
-                gen=str((rec or {}).get("gen", "")))
-        except Exception:  # noqa: BLE001
-            logger.exception("sync setup-approval record failed (subscriber=%s)",
-                             subscriber)
-
-    async def _feed_setup_episode(approved: bool) -> None:
-        # Every TERMINAL decision (approve, deny, expiry) feeds the durable
-        # evaluator. Approvals carry the persisted ack's approval GENERATION;
-        # denials carry this keyboard's NONCE so a superseded keyboard's late
-        # expiry is ignored. Never raises into the finish hook.
-        try:
-            import plugin_setup_episodes
-            gen = ""
-            if approved:
-                try:
-                    gen = str((acks.get(identity) or {}).get("gen", ""))
-                except Exception:  # noqa: BLE001
-                    gen = ""
-            await plugin_setup_episodes.on_consent_decision(
-                plugin=subscriber, artifact_id=artifact_id, identity=identity,
-                approved=approved, approval_gen=gen, nonce=setup_nonce)
-        except Exception:  # noqa: BLE001
-            logger.exception("setup-episode feed failed (subscriber=%s)",
-                             subscriber)
 
     def _finish_factory(message_id: int, req: Any) -> Callable[[dict], Any]:
         async def _finish(outcome: dict) -> None:
@@ -169,7 +149,6 @@ def prompt_event_consent(
                     f"'{event}' from '{emitter}' was not answered; it stays "
                     "undelivered",
                 )
-                await _feed_setup_episode(approved=False)
                 return
             if outcome.get("option_index") == 0:
                 if not req.meta.get("acked"):
@@ -189,11 +168,6 @@ def prompt_event_consent(
                     f"✅ Enabled — '{subscriber}' now receives '{event}' "
                     f"from '{emitter}' ({_target_roles(targets)})",
                 )
-                # The approval is DURABLE here (the ack is persisted) — feed
-                # the setup evaluator REGARDLESS of the reconcile outcome
-                # below; gating on the reconcile would strand the round on a
-                # transient failure (the ack exists, so no re-prompt follows).
-                await _feed_setup_episode(approved=True)
                 if reconcile_cb is not None:
                     try:
                         await reconcile_cb()
@@ -207,18 +181,12 @@ def prompt_event_consent(
                             f"⚠️ Approved, but starting delivery of '{event}' "
                             "failed — run plugin_verify",
                         )
-                try:
-                    import plugin_setup_episodes
-                    plugin_setup_episodes.kick()
-                except Exception:  # noqa: BLE001
-                    pass
             else:
                 await channel.edit_dm_message(
                     chat_id, message_id,
                     f"❌ Denied — '{subscriber}' will not receive '{event}' "
                     f"from '{emitter}'",
                 )
-                await _feed_setup_episode(approved=False)
 
         return _finish
 

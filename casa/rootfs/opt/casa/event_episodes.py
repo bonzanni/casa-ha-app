@@ -58,6 +58,7 @@ import time
 from typing import Any, Awaitable, Callable
 
 import event_attempts
+import event_reconcile
 import event_spool
 import plugin_dispatch
 
@@ -188,16 +189,11 @@ def _removal_text(rec: dict) -> str:
 # drift apart in target ORDER).
 _compose = plugin_dispatch.compose
 
-
-def _to_spool_shape(routed: Any) -> Any:
-    """The spool's narrower ``dict[(emitter, event), set[subscriber]]``
-    view of the reconciler's richer per-subscriber-snapshot map — the
-    spool's own multi-file passes only ever need COHORT membership, never
-    the consent-identity snapshot (the pre-send gate is what reads that).
-    :data:`event_spool.ROUTING_UNAVAILABLE` passes through unchanged."""
-    if routed is event_spool.ROUTING_UNAVAILABLE:
-        return routed
-    return {key: set(subs.keys()) for key, subs in routed.items()}
+# The spool-shape narrowing lives in ONE place (Minor-6, review round 1):
+# ``event_reconcile.to_spool_shape`` — this used to carry its own private
+# byte-identical copy, which is exactly the kind of divergence risk the
+# module docstring warns about elsewhere in this codebase.
+_to_spool_shape = event_reconcile.to_spool_shape
 
 
 # ---------------------------------------------------------------------------
@@ -461,8 +457,7 @@ def _gate_ok(emitter: str, event: str, subscriber: str, rec: dict,
     if not isinstance(digest, str) or not isinstance(artifact_id, str) \
             or not artifact_id:
         return False
-    targets = sorted(t for t in (entry.get("targets") or [])
-                     if isinstance(t, str))
+    targets = event_reconcile.normalize_targets(entry.get("targets"))
     live_identity = ack_identity(subscriber, artifact_id, emitter, event,
                                  digest, targets)
     if live_identity != snapshot.get("ack_identity"):

@@ -103,6 +103,18 @@ def _default_acks() -> Any:
     return ACKS
 
 
+def normalize_targets(targets: Any) -> "list[str]":
+    """The ONE canonical targets sanitization feeding the consent identity
+    (Minor-8, review round 1): sorted, string-only. Shared by BOTH
+    :func:`compute_desired` (the identity computed at reconcile time) and
+    :func:`event_episodes._gate_ok` (the identity RECOMPUTED live at
+    pre-send) — a byte-for-byte divergence between two independently
+    maintained copies of "sanitize a targets list" would make the gate's
+    recompute never match a freshly-published, entirely valid snapshot: an
+    infinite defer loop indistinguishable from a genuine mismatch."""
+    return sorted(t for t in (targets or []) if isinstance(t, str))
+
+
 def to_spool_shape(routed: Any) -> Any:
     """The spool's narrower routed shape — ``dict[(emitter, event),
     set[subscriber]]`` — derived from the reconciler's published
@@ -128,6 +140,27 @@ class DesiredEvents:
     # Consent prompts to fire — only for subscriptions whose ONLY gap is the
     # ack.
     consent_needed: "list[dict]" = field(default_factory=list)
+    # False iff the resolver's registry snapshot itself was invalid — a
+    # FAILURE TO KNOW, never a computed empty (Critical-1, review round 1).
+    # ``routed`` is always {} in that case, but it must NEVER be treated as
+    # the authoritative empty map: reconcile_plugin_events publishes the
+    # ROUTING_UNAVAILABLE sentinel instead, exactly as it does for a raised
+    # compute exception, so the worker's destructive sweep never runs
+    # against a registry casa could not even read.
+    registry_valid: bool = True
+    # Adjudication-f (review round 1): every ack identity still computable
+    # from a CURRENTLY INSTALLED subscriber's declaration — the prune's
+    # keep-set. Populated for EVERY subscribe entry before any gate
+    # (self-check, emitter-check, reachable, ack) is applied, mirroring
+    # callback_reconcile's own "about the declaration existing, not about
+    # routing" discipline: a gap in ONE gate must not make the operator's
+    # still-current consent for that exact subscription look stale.
+    valid_identities: "set[str]" = field(default_factory=set)
+    # Whether this pass is trustworthy enough to prune AT ALL: False unless
+    # the resolver reported zero issues AND every subscriber's own
+    # casa.subscribes parsed — an unparseable declaration or a resolution
+    # hiccup must never make a still-current consent look stale.
+    prunable: bool = False
 
     def to_spool_shape(self) -> Any:
         return to_spool_shape(self.routed)
@@ -175,9 +208,19 @@ def compute_desired(
     out = DesiredEvents()
     all_res = resolver(None)
     if not getattr(all_res, "registry_valid", False):
-        # Fail-closed: an invalid registry routes NOTHING (its own
-        # registry-stage issues surface via the resolver / health pass).
+        # A failure to KNOW, not a computed empty (Critical-1): the caller
+        # must publish the sentinel, never this {} as an authoritative
+        # result (its own registry-stage issues surface via the resolver /
+        # health pass regardless).
+        out.registry_valid = False
         return out
+    # Opportunistic-prune availability gate (adjudication-f): a resolution
+    # hiccup on ANY plugin (registry-stage issues, not just a subscriber's
+    # own) must suppress pruning for the WHOLE pass — a membership set
+    # derived from a partially-failed resolve would drop a still-current
+    # consent. Narrowed to False below the moment any SUBSCRIBER's own
+    # declaration fails to parse.
+    out.prunable = not list(getattr(all_res, "issues", ()) or ())
 
     # Assignment authority for a SUBSCRIBER's own delivery targets, read
     # once from the same snapshot the resolver reads.
@@ -209,21 +252,36 @@ def compute_desired(
             subs = plugin_store.manifest_subscribes(rp.manifest, subscriber)
         except Exception:  # noqa: BLE001 — StoreError("subscribes_invalid"),
             # or any other read failure on a pre-published artifact: a state
-            # to SURFACE, never a reconcile crash.
+            # to SURFACE, never a reconcile crash. An unparseable
+            # declaration contributes NO identities, so pruning this pass
+            # would destroy the operator's consent for this subscriber's
+            # still-valid subscriptions — suppress the whole prune until a
+            # pass that can read it.
             out.issues.append(_issue(subscriber, "event_invalid",
                                      rp.artifact_id))
+            out.prunable = False
             continue
         if not subs:
             continue
 
-        subscriber_targets = sorted(targets_by_name.get(subscriber) or [])
+        subscriber_targets = normalize_targets(targets_by_name.get(subscriber))
         subscriber_dark = False
+        no_target_reported = False
         entries_for_subscriber: dict[tuple[str, str], dict] = {}
 
         for sub_entry in subs:
             emitter = sub_entry["plugin"]
             event = sub_entry["event"]
             digest = sub_entry["digest"]
+
+            # The prune's keep-set is about the DECLARATION existing, not
+            # about routing (adjudication-f): collected BEFORE any later
+            # gate, so a gap in ONE gate (self-check, missing emitter,
+            # unreachable, pending ack) can never make the operator's
+            # still-current consent for THIS exact subscription look stale.
+            out.valid_identities.add(ack_identity(
+                subscriber, rp.artifact_id, emitter, event, digest,
+                subscriber_targets))
 
             if _is_self_subscription(subscriber, rp.manifest_name, emitter):
                 out.issues.append(_issue(subscriber, "event_invalid",
@@ -241,8 +299,13 @@ def compute_desired(
 
             if not _reachable(targets_by_name.get(subscriber) or [],
                               live_roles):
-                out.issues.append(_issue(subscriber, "event_no_target",
-                                         rp.artifact_id))
+                # Once per SUBSCRIBER, not per subscription (Minor-7,
+                # review round 1) — reachability never varies across a
+                # subscriber's own subscribe entries.
+                if not no_target_reported:
+                    out.issues.append(_issue(subscriber, "event_no_target",
+                                             rp.artifact_id))
+                    no_target_reported = True
                 subscriber_dark = True
                 continue
 
@@ -319,23 +382,45 @@ async def revoke_and_unroute(subscriber: str, emitter: str = "",
                              event: str = "", *, acks: Any = None,
                              ) -> "list[dict]":
     """Unroute *subscriber* from the published map, THEN drop its
-    :class:`event_acks.EventAckStore` record(s) — both under the SAME
-    dispatch-admission lock the worker's pre-send gate and dispatch enqueue
-    share, so a concurrent dispatch can never be admitted between the two
-    writes (decision 29/36, Sol-r4 #2 / Sol-r5 #2). Drops every ack for
-    *subscriber* when ``emitter``/``event`` are both empty, else exactly the
-    one ``(subscriber, emitter, event)`` subscription. Returns the removed
-    ack records (:class:`event_acks.EventAckStore`'s own list[dict] shape)."""
+    :class:`event_acks.EventAckStore` record(s).
+
+    Takes ``_RECONCILE_LOCK`` (outer) THEN ``event_episodes.DISPATCH_LOCK``
+    (inner) — two locks, two reasons (Important-3, review round 1):
+    ``_routed`` has two writers (this function and
+    :func:`reconcile_plugin_events`), each previously serialized only
+    against ITS OWN kind, so a revoke racing an in-flight compute could
+    unroute-then-have-the-compute's-later-publish silently REPUBLISH the
+    just-revoked pair (the compute read the acks store before the revoke's
+    delete landed). Taking ``_RECONCILE_LOCK`` first makes a revoke and a
+    reconcile's entire compute-and-swap fully serialize — a revoke started
+    mid-compute waits for that compute's publish to complete, then
+    unroutes what it just published; a revoke started first makes the next
+    reconcile's compute observe the already-revoked ack. Either order
+    converges on the pair excluded once both complete. ``DISPATCH_LOCK``
+    (inner) is still what the worker's pre-send gate and dispatch enqueue
+    share, so a concurrent dispatch can never be admitted between the
+    unroute and the ack delete (decision 29/36, Sol-r4 #2 / Sol-r5 #2).
+    Lock graph stays deadlock-free: the worker takes only ``DISPATCH_LOCK``
+    and :func:`reconcile_plugin_events` takes only ``_RECONCILE_LOCK`` —
+    neither ever takes the other's lock, so only this function ever nests
+    them, always in the same order.
+
+    Drops every ack for *subscriber* when ``emitter``/``event`` are both
+    empty, else exactly the one ``(subscriber, emitter, event)``
+    subscription. Returns the removed ack records
+    (:class:`event_acks.EventAckStore`'s own list[dict] shape)."""
     acks = acks if acks is not None else _default_acks()
     import event_episodes
 
-    async with event_episodes.DISPATCH_LOCK:
-        _unroute_locked(subscriber, emitter, event)
-        if emitter and event:
-            removed = await asyncio.to_thread(
-                acks.revoke_pair, subscriber, emitter, event)
-        else:
-            removed = await asyncio.to_thread(acks.revoke_subscriber, subscriber)
+    async with _RECONCILE_LOCK:
+        async with event_episodes.DISPATCH_LOCK:
+            _unroute_locked(subscriber, emitter, event)
+            if emitter and event:
+                removed = await asyncio.to_thread(
+                    acks.revoke_pair, subscriber, emitter, event)
+            else:
+                removed = await asyncio.to_thread(
+                    acks.revoke_subscriber, subscriber)
     return removed
 
 
@@ -462,7 +547,33 @@ async def reconcile_plugin_events(
             _kick_worker()
             raise
 
+        if not desired.registry_valid:
+            # Same fail-closed treatment as a raised exception (Critical-1)
+            # — an invalid registry snapshot is a FAILURE TO KNOW, not a
+            # computed empty, so it must never license the destructive
+            # sweep an authoritative {} would. Unlike the exception branch
+            # this is a normal (non-crash) outcome, so it does not raise —
+            # callers read ``desired.issues`` as usual.
+            _routed = event_spool.ROUTING_UNAVAILABLE
+            _kick_worker()
+            return desired.issues
+
         _routed = desired.routed
+
+        if desired.prunable:
+            # Opportunistic prune (adjudication-f): only on a pass trusted
+            # enough to know the COMPLETE keep-set (decision mirrors
+            # callback_reconcile's own valid_identities/prunable
+            # suppression) — an ack whose identity no installed
+            # subscriber's declaration can still compute is stale.
+            try:
+                removed = await asyncio.to_thread(
+                    acks.prune_stale, desired.valid_identities)
+                if removed:
+                    logger.info("pruned %d stale event ack(s)", len(removed))
+            except Exception:  # noqa: BLE001 — an opportunistic prune must
+                # never break the reconcile; the next pass retries.
+                logger.warning("event ack prune failed", exc_info=True)
 
         if prompt and desired.consent_needed:
             _fire_consent_prompts(
@@ -480,8 +591,38 @@ def current_issues() -> "list[dict]":
     recomputed on EVERY health pass so they survive unrelated refreshes
     (mirrors ``callback_reconcile.current_issues()``). Includes the live
     ``event_spool.spool_issues()`` passthrough, remapped to this module's
-    issue-dict shape. Never raises."""
+    issue-dict shape. Never raises.
+
+    Important-5c (review round 1): while the PUBLISHED map is the
+    :data:`event_spool.ROUTING_UNAVAILABLE` sentinel, this surfaces one
+    ``event_routing_unavailable`` row — otherwise a stuck sentinel (a
+    reconcile that keeps failing, or one that has simply never run yet)
+    is invisible to the operator: no dispatch happens and no OTHER issue
+    code describes "routing is currently unknown" on its own.
+
+    Task 10 wiring note (Minor-10, review round 1): every row here is a
+    plain ``dict`` with the PluginIssue-shaped key set (``name``,
+    ``target``, ``stage``, ``reason_code``, ``artifact_id``) — never a
+    ``PluginIssue`` instance. When ``tools._regenerate_plugin_health``
+    eventually merges this in, concatenate the list DIRECTLY into
+    ``plugin_health.write_report``'s ``issues=`` (exactly like
+    ``trigger_issues``/``callback_issues`` already do) — never route it
+    through that function's ``_add``/``_rediscoverable`` helpers, which
+    read ``PluginIssue`` ATTRIBUTES only; a ``getattr(a_dict, "stage",
+    None)`` on one of these rows silently degrades to ``None`` instead of
+    raising, so a wrong integration would misfile rather than crash.
+    ``plugin_health.write_report``'s own ``fingerprint``/``_issue_dict``
+    already handle either shape correctly (dict-vs-attribute dual
+    accessor) — proven end-to-end by
+    ``test_health_report_includes_event_issues`` in
+    ``tests/test_tools_ack_event.py``. Wiring it in also touches every
+    OTHER test that calls ``_regenerate_plugin_health`` without mocking
+    this function (a stuck sentinel contributes a surprise
+    ``event_routing_unavailable`` row) — budget that audit into Task 10,
+    not this review round."""
     issues: list = []
+    if _routed is event_spool.ROUTING_UNAVAILABLE:
+        issues.append(_issue(None, "event_routing_unavailable"))
     try:
         import agent as agent_mod
 

@@ -189,6 +189,38 @@ async def test_concurrent_ack_beats_bookkeeping(wired):
     assert wired.rec() == before
 
 
+async def test_concurrent_ack_beats_bookkeeping_on_the_advance_branch(wired):
+    """The race that actually matters (Important-4e, review round 1): the
+    PREVIOUS pin acked BEFORE the pass even started, so the record was
+    never nudgeable and ``_accept`` was never reached at all — unreachable
+    in production, since due-scan only ever selects a still-pending
+    record. The real race is the ack landing AFTER due-scan selected the
+    (still pending) record and dispatch was accepted, but BEFORE the
+    accept's own ``update_delivery_nudge`` write lands — simulated here by
+    acking from WITHIN the dispatch callable itself (an agent that calls
+    ``ack_event`` before casa's own bookkeeping write completes)."""
+    rec = wired.seed()
+    token = rec["ack_token"]
+
+    async def dispatch_then_ack(role, text, context):
+        wired.dispatches.append((role, text, context))
+        ok, sub = wired.spool.ack(EMITTER, EVENT, token, now=wired.clock)
+        assert (ok, sub) == ("acked", SUBSCRIBER)
+        return True
+
+    wired.wire(dispatch=dispatch_then_ack)
+    await ee._worker_pass()
+
+    assert len(wired.dispatches) == 1        # the bus WAS offered the turn
+    after = wired.rec()
+    assert after["status"] == "done" and after["outcome"] == "acked"
+    # The accept's own conditional write was REFUSED (status no longer
+    # "pending") and skipped SILENTLY — never overwrote the ack, and never
+    # spent budget/advanced the schedule on top of it.
+    assert after["nudges"] == 0
+    assert after["last_nudge_ts"] is None
+
+
 async def test_reject_defers_and_spends_no_budget(wired):
     wired.dispatch_ok = False
     wired.seed()
@@ -519,14 +551,24 @@ async def test_gate_failure_kicks_reconcile(wired, monkeypatch):
 
 async def test_sentinel_suspends_dispatch_and_destructive_work(wired):
     wired.seed()
+    # A SECOND, still-queued (unfolded) emission — exactly what an
+    # authoritative sweep's watermark deletion would destroy for an
+    # unrouted pair, and precisely what an authoritative EMPTY map (as
+    # opposed to the sentinel) would licence deleting even for a ROUTED
+    # pair with no pending record. Important-4d (review round 1): the
+    # original test computed this and never asserted on it — a no-op
+    # sweep call would have passed silently.
+    event_spool.emit(wired.spool.root / EMITTER, EVENT)
     before_emissions = wired.spool.list_emissions(EMITTER, EVENT)
+    assert before_emissions                  # sanity: something IS queued
     wired.routed = event_spool.ROUTING_UNAVAILABLE
     await ee._worker_pass()
     assert wired.dispatches == []
-    # No fold/sweep destruction — the delivery record and any queued
-    # emissions survive untouched.
+    # No fold/sweep destruction — the delivery record and the queued
+    # emission both survive untouched, byte-for-byte.
     assert wired.rec() is not None
     assert wired.rec()["nudges"] == 0
+    assert wired.spool.list_emissions(EMITTER, EVENT) == before_emissions
     assert ee._next_due is None
 
 

@@ -3,8 +3,12 @@
 A plugin's ``casa.subscribes`` entry delivers events only after the operator
 taps Approve on a DM keyboard bound to the subscription's full consent
 identity (subscriber + subscriber artifact id + emitter + event + digest +
-sorted targets). Structural sibling of ``callback_consent`` (same ack
-persistence discipline, same setup-round feed) — mirrored here.
+sorted targets). Structural sibling of ``callback_consent`` for the ack
+persistence discipline — but, unlike trigger/callback consent, DELIBERATELY
+standalone from the plugin-setup round ledger (Critical-2, review round 1):
+see ``event_consent.py``'s module docstring for why feeding it was actively
+dangerous, and the "standalone from plugin-setup rounds" section below for
+the pins.
 """
 import asyncio
 
@@ -81,12 +85,18 @@ def _tap(broker, coord, key, idx, *, actor=100):
 
 
 def _wire_episodes(monkeypatch, tmp_path):
+    """Wire a REAL ``plugin_setup_episodes`` (used only by the standalone-
+    from-setup-rounds pins below, to drive an actual live trigger round and
+    prove an event consent decision never touches it)."""
     import plugin_setup_episodes as pse
     monkeypatch.setattr(pse, "STORE_PATH", tmp_path / "episodes.json")
     monkeypatch.setattr(pse, "_lock", None)
     monkeypatch.setattr(pse, "_kick", None)
 
+    dispatched: list = []
+
     async def _dispatch(role, instruction, ctx):
+        dispatched.append((role, instruction, ctx))
         return True
 
     async def _notify(text):
@@ -96,6 +106,7 @@ def _wire_episodes(monkeypatch, tmp_path):
         dispatch=_dispatch, notify_operator=_notify,
         resolve_registry_entry=lambda p: None,
         ack_lookup=lambda ident: None, routes_live=lambda p: True)
+    pse.dispatched = dispatched          # type: ignore[attr-defined]
     return pse
 
 
@@ -169,7 +180,6 @@ async def test_operator_identity_is_the_trigger_consent_rule(monkeypatch,
 
 async def test_approve_records_the_ack_synchronously(monkeypatch, tmp_path):
     broker, coord, channel, acks = _fresh_env(monkeypatch, tmp_path)
-    _wire_episodes(monkeypatch, tmp_path)
     order: list = []
 
     async def _reconcile():
@@ -191,7 +201,6 @@ async def test_ack_survives_a_crash_right_after_the_commit_step(
     monkeypatch, tmp_path,
 ):
     broker, coord, channel, acks = _fresh_env(monkeypatch, tmp_path)
-    _wire_episodes(monkeypatch, tmp_path)
     handle = _prompt(coord, channel, acks)
     await handle.settled_post()
     ch = coord._entries[next(iter(coord._entries))]
@@ -206,7 +215,6 @@ async def test_ack_survives_a_crash_right_after_the_commit_step(
 
 async def test_deny_leaves_it_undelivered(monkeypatch, tmp_path):
     broker, coord, channel, acks = _fresh_env(monkeypatch, tmp_path)
-    _wire_episodes(monkeypatch, tmp_path)
     fired: list = []
 
     async def _reconcile():
@@ -224,7 +232,6 @@ async def test_deny_leaves_it_undelivered(monkeypatch, tmp_path):
 
 async def test_expiry_leaves_it_undelivered(monkeypatch, tmp_path):
     broker, coord, channel, acks = _fresh_env(monkeypatch, tmp_path)
-    _wire_episodes(monkeypatch, tmp_path)
     monkeypatch.setattr(ec, "EVENT_CONSENT_TTL_S", 0.02)
     handle = _prompt(coord, channel, acks)
     await handle.settled_post()
@@ -236,7 +243,6 @@ async def test_expiry_leaves_it_undelivered(monkeypatch, tmp_path):
 
 async def test_failed_ack_write_never_starts_delivery(monkeypatch, tmp_path):
     broker, coord, channel, acks = _fresh_env(monkeypatch, tmp_path)
-    _wire_episodes(monkeypatch, tmp_path)
     fired: list = []
 
     async def _reconcile():
@@ -261,7 +267,6 @@ async def test_failed_ack_write_never_starts_delivery(monkeypatch, tmp_path):
 
 async def test_reconcile_failure_warns_but_keeps_the_ack(monkeypatch, tmp_path):
     broker, coord, channel, acks = _fresh_env(monkeypatch, tmp_path)
-    _wire_episodes(monkeypatch, tmp_path)
 
     async def _boom():
         raise RuntimeError("reconcile failed")
@@ -297,18 +302,68 @@ async def test_lifecycle_cancel_by_artifact_kills_the_keyboard(monkeypatch,
     assert acks.get(IDENTITY) is None
 
 
-async def test_callback_approval_is_recorded_in_the_round(monkeypatch,
-                                                          tmp_path):
-    """The approval must land in the setup ledger under the SUBSCRIBER as
-    ``plugin``, inside the same yield-free commit step that persists the
-    ack — the same ledger trigger/callback consent share."""
-    broker, coord, channel, acks = _fresh_env(monkeypatch, tmp_path)
+# ---------------------------------------------------------------------------
+# standalone from plugin-setup rounds (Critical-2, review round 1)
+#
+# The SUBSCRIBER's registry name doubles as ``plugin_setup_episodes``' round
+# key — feeding an event consent's terminal decision into that ledger under
+# ``plugin=subscriber`` would, for a subscriber plugin that ALSO has its own
+# live trigger-consent round open, insert the event's (entirely unrelated)
+# identity as a bogus round member: the nonce fence that protects a REAL
+# member never applies (the member starts absent, so the "member is not
+# None" guard short-circuits). A deny/expiry would then settle that round
+# with a spurious denial (killing an otherwise-fully-approved trigger round
+# and skipping its setup-tool dispatch with a wrong "trigger(s)" note); an
+# approve could likewise settle+dispatch a round that was never actually
+# ready. These pins drive a REAL, live trigger round on the SAME plugin name
+# and prove an event consent decision never touches it.
+# ---------------------------------------------------------------------------
+
+TRIGGER_IDENTITY = "a" * 64          # an unrelated TRIGGER consent identity
+
+
+async def test_expiry_and_deny_leave_a_live_setup_round_untouched(
+        monkeypatch, tmp_path):
+    pse = _wire_episodes(monkeypatch, tmp_path)
+    # A live trigger round for the SAME plugin name as the event subscriber,
+    # with its one member still OPEN (a real pending trigger approval).
+    pse.open_round(plugin=SUBSCRIBER, artifact_id=ARTIFACT_ID,
+                  identities=[TRIGGER_IDENTITY])
+    before = pse._load()["rounds"][SUBSCRIBER]
+
+    for tap_option, marker in ((1, "❌"), (None, "⌛")):     # deny, then expiry
+        broker, coord, channel, acks = _fresh_env(monkeypatch, tmp_path)
+        if tap_option is None:
+            monkeypatch.setattr(ec, "EVENT_CONSENT_TTL_S", 0.02)
+            handle = _prompt(coord, channel, acks)
+            await handle.settled_post()
+            await asyncio.sleep(0.1)
+        else:
+            handle = _prompt(coord, channel, acks)
+            await handle.settled_post()
+            _tap(broker, coord, next(iter(coord._entries)), tap_option)
+        await _settle()
+        assert any(marker in e[2] for e in channel.edits)
+
+        after = pse._load()["rounds"][SUBSCRIBER]
+        assert after == before                  # byte-identical: untouched
+        assert IDENTITY not in after["members"]  # no bogus member inserted
+        assert after["members"][TRIGGER_IDENTITY]["state"] == "open"
+        assert pse.dispatched == []              # never settled/dispatched
+
+
+async def test_approve_never_dispatches_a_setup_tool(monkeypatch, tmp_path):
     pse = _wire_episodes(monkeypatch, tmp_path)
     pse.open_round(plugin=SUBSCRIBER, artifact_id=ARTIFACT_ID,
-                  identities=[IDENTITY])
+                  identities=[TRIGGER_IDENTITY])
+    broker, coord, channel, acks = _fresh_env(monkeypatch, tmp_path)
     handle = _prompt(coord, channel, acks)
     await handle.settled_post()
     _tap(broker, coord, next(iter(coord._entries)), 0)
-    member = pse._load()["rounds"][SUBSCRIBER]["members"][IDENTITY]
-    assert member["state"] == "approved"
-    assert member["gen"] == acks.get(IDENTITY)["gen"]
+    await _settle()
+
+    assert acks.get(IDENTITY) is not None        # the event ack DID persist
+    assert pse.dispatched == []                  # but no setup tool ran
+    rnd = pse._load()["rounds"][SUBSCRIBER]
+    assert IDENTITY not in rnd["members"]
+    assert rnd["members"][TRIGGER_IDENTITY]["state"] == "open"

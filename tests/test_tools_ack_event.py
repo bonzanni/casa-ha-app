@@ -11,7 +11,6 @@ the tool.
 """
 from __future__ import annotations
 
-import asyncio
 import json
 from types import SimpleNamespace
 from unittest.mock import AsyncMock
@@ -252,9 +251,16 @@ class TestEventAckRevokeTool:
         """The ordering guarantee is owned by
         ``event_reconcile.revoke_and_unroute`` — this proves the TOOL
         actually reaches it (not a bespoke, possibly-diverging unroute of
-        its own), observable via a stub routed map."""
-        import sys
+        its own), observable via a stub routed map.
+
+        Uses the REAL ``event_episodes`` module (only ``kick_all`` is
+        stubbed) rather than substituting the whole module with a
+        throwaway ``SimpleNamespace`` (Important-4c, review round 1):
+        swapping the module would swap ``DISPATCH_LOCK`` too, silently
+        stopping this test from exercising the ACTUAL lock
+        ``revoke_and_unroute`` and the worker's pre-send gate share."""
         import agent as agent_mod
+        import event_episodes
         import event_reconcile
         import tools
 
@@ -271,9 +277,7 @@ class TestEventAckRevokeTool:
                 "subscriber": SUBSCRIBER_A, "artifact_id": "art-1",
                 "targets": ["resident:assistant"], "ack_identity": identity}}})
 
-        fake_ee = SimpleNamespace(DISPATCH_LOCK=asyncio.Lock(),
-                                  kick_all=lambda: None)
-        monkeypatch.setitem(sys.modules, "event_episodes", fake_ee)
+        monkeypatch.setattr(event_episodes, "kick_all", lambda: None)
         monkeypatch.setattr(event_reconcile, "reconcile_plugin_events",
                             AsyncMock(return_value=[]))
         monkeypatch.setattr(tools, "_regenerate_plugin_health", lambda x: None)
@@ -304,3 +308,71 @@ class TestEventAckRevokeTool:
         names = {t.name for t in tools.CASA_TOOLS}
         assert "event_ack_revoke" in names
         assert "ack_event" in names
+
+    async def test_revoke_pairs_guard_none_fields(self, monkeypatch):
+        """Minor-9 (review round 1): a malformed removed-record's
+        emitter/event must never crash the ``pairs`` sort."""
+        import agent as agent_mod
+        import event_reconcile
+        import tools
+
+        monkeypatch.setattr(
+            event_reconcile, "revoke_and_unroute",
+            AsyncMock(return_value=[
+                {"subscriber": SUBSCRIBER_A, "emitter": None, "event": None},
+                {"subscriber": SUBSCRIBER_A, "emitter": EMITTER, "event": EVENT},
+            ]))
+        monkeypatch.setattr(event_reconcile, "reconcile_plugin_events",
+                            AsyncMock(return_value=[]))
+        monkeypatch.setattr(tools, "_regenerate_plugin_health", lambda x: None)
+        monkeypatch.setattr(tools.CHALLENGES, "cancel_matching",
+                            lambda **k: None)
+        monkeypatch.setattr(agent_mod, "active_runtime", SimpleNamespace(),
+                            raising=False)
+
+        res = await tools.event_ack_revoke.handler({"subscriber": SUBSCRIBER_A})
+        payload = _payload(res)
+        assert payload["ok"] is True
+        assert payload["revoked"] == 2
+        assert ["", ""] in payload["pairs"]
+        assert [EMITTER, EVENT] in payload["pairs"]
+
+
+# ---------------------------------------------------------------------------
+# Minor-10 — event issues surface into the health report as dicts
+# ---------------------------------------------------------------------------
+
+
+def test_event_current_issues_shape_is_health_report_compatible(tmp_path):
+    """Minor-10 (review round 1): ``event_reconcile.current_issues()``
+    rows are DICTS, never ``PluginIssue`` objects — proves
+    ``plugin_health``'s ``fingerprint``/``write_report`` already handle
+    that shape correctly (dict/attribute dual accessor), so whenever
+    Task 10 wires this merge in (concatenated DIRECTLY, per
+    ``current_issues()``'s own docstring — never through
+    ``tools._regenerate_plugin_health``'s ``PluginIssue``-attribute-only
+    ``_add``/``_rediscoverable`` helpers, which would silently degrade a
+    dict row's fields to ``None`` instead of raising), the report already
+    renders it correctly end-to-end. Deliberately does NOT call
+    ``tools._regenerate_plugin_health`` — wiring the merge into that
+    function is Task 10's scope and touches every OTHER test that calls it
+    without mocking this module."""
+    import event_reconcile
+    import plugin_health
+
+    event_row = event_reconcile._issue("finance", "event_pending_ack",
+                                       "art-1")
+    assert isinstance(event_row, dict)
+
+    # fingerprint/serialization never crash and never silently degrade to
+    # a (None, None, None) row.
+    fp = plugin_health.fingerprint(event_row)
+    assert fp and isinstance(fp, str)
+
+    report = plugin_health.write_report(
+        issues=[event_row], warnings=[], path=tmp_path / "health.json",
+        registry_path=tmp_path / "registry.json")
+    assert [i["reason_code"] for i in report["issues"]] == ["event_pending_ack"]
+    assert report["issues"][0]["name"] == "finance"
+    assert report["issues"][0]["fingerprint"] == fp
+
