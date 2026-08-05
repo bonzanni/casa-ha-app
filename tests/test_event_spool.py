@@ -2040,6 +2040,29 @@ def test_delete_index_entry_of_missing_key_is_true(spool):
     assert spool.delete_index_entry("neverwritten") is True
 
 
+def test_write_index_entry_refuses_an_unsafe_key(spool):
+    """Minor-5 pin: `key` is caller-supplied and interpolated directly
+    into a path component — an unsafe one (a stray "/", "..", a null
+    byte) must be refused before it ever reaches the filesystem."""
+    for bad in ("../escape", "a/b", ".", "..", "a\0b"):
+        with pytest.raises(ValueError):
+            spool.write_index_entry(bad, {"x": 1})
+    assert spool.index_keys() == []
+
+
+def test_delete_index_entry_refuses_an_unsafe_key(spool):
+    for bad in ("../escape", "a/b", "."):
+        with pytest.raises(ValueError):
+            spool.delete_index_entry(bad)
+
+
+def test_read_index_marker_of_an_unsafe_key_is_absent_not_raise(spool):
+    """Read-only convenience: degrades to ABSENT rather than raising,
+    mirroring read_marker's own unsafe-name handling."""
+    for bad in ("../escape", "a/b", "."):
+        assert spool.read_index_marker(bad).state == MarkerState.ABSENT
+
+
 def test_list_emissions_reflects_current_files(spool):
     _emit(spool, when=1000.0)
     _emit(spool, when=1001.0)

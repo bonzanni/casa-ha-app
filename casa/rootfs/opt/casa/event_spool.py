@@ -782,6 +782,14 @@ class EventSpool:
         return fd
 
     def write_index_entry(self, key: str, payload: dict) -> None:
+        # Minor-5: `key` is caller-supplied and interpolated directly into
+        # a path component below — validated exactly like every other
+        # identity this module builds a path from (mirrors
+        # callback_spool.py:1250's discipline, adapted to this module's
+        # opaque-caller-supplied-key shape rather than a hash it mints
+        # itself).
+        if not _safe_component(key):
+            raise ValueError(f"unsafe index key {key!r}")
         with self._lock:
             self._require_open()
             ifd = self._index_fd(create=True)
@@ -792,7 +800,7 @@ class EventSpool:
 
     def read_index_marker(self, key: str) -> Marker:
         with self._lock:
-            if self._closed:
+            if self._closed or not _safe_component(key):
                 return Marker(MarkerState.ABSENT)
             try:
                 ifd = _open_dir(INDEX_DIR, self._root_fd)
@@ -806,6 +814,8 @@ class EventSpool:
                 os.close(ifd)
 
     def delete_index_entry(self, key: str) -> bool:
+        if not _safe_component(key):
+            raise ValueError(f"unsafe index key {key!r}")
         with self._lock:
             self._require_open()
             try:
