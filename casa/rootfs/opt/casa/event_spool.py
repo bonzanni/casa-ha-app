@@ -978,6 +978,59 @@ class EventSpool:
                 marker.payload, expect_emitter=emitter, expect_event=event,
                 expect_subscriber=subscriber)
 
+    def list_deliveries(self, emitter: str, event: str) -> dict:
+        """Every subscriber's current, valid delivery record for one
+        ``(emitter, event)`` pair — ``{subscriber: record}``. A read-only
+        convenience for callers (the worker's due-scan, tests) mirroring
+        :meth:`list_emissions` / ``callback_spool.list_attempts``; only
+        VALID records (a malformed file reads as absent here, exactly like
+        :meth:`read_delivery` — the fold's REPAIR/quarantine phases are what
+        act on an invalid one). Never mutates, never raises."""
+        with self._lock:
+            if self._closed:
+                return {}
+            try:
+                efd = self._emitter_fd(emitter)
+            except (OSError, ValueError):
+                return {}
+            try:
+                try:
+                    dfd = _open_dir(DELIVERY_DIR, efd)
+                except OSError:
+                    return {}
+                try:
+                    return self._read_valid_delivery_records(dfd, emitter, event)
+                finally:
+                    os.close(dfd)
+            finally:
+                os.close(efd)
+
+    def emitters(self) -> list:
+        """Every emitter directory currently on disk — read-only
+        convenience mirroring ``callback_spool.plugins``. ``[]`` on a
+        closed spool."""
+        with self._lock:
+            if self._closed:
+                return []
+            return self._emitter_dirs()
+
+    def events(self, emitter: str) -> list:
+        """Every event name with a current on-disk trace (a state file, an
+        emission, or a delivery record) for one emitter — a read-only
+        convenience wrapping the same discovery :meth:`fold_pass` uses
+        internally. ``[]`` on a closed spool or an unresolvable emitter."""
+        with self._lock:
+            if self._closed:
+                return []
+            try:
+                efd = self._emitter_fd(emitter)
+            except (OSError, ValueError):
+                return []
+            try:
+                return sorted(self._candidate_events(efd))
+            finally:
+                os.close(efd)
+
     # -- emission listing / unlink ----------------------------------------
 
     def _list_emissions_for_event(self, emfd: int, event: str) -> list:
