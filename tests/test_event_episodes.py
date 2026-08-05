@@ -105,9 +105,29 @@ class _Wired:
         async def fake_sleep(s):
             self.sleeps.append(s)
 
+        def resolve_registry_entry(name):
+            if name == SUBSCRIBER:
+                return self.entry
+            # SOL-P2b's live emitter re-check calls this SAME seam for the
+            # EMITTER side of a pair too — synthesize a manifest declaring
+            # emits for whatever event(s) the current subscriber's own
+            # casa.subscribes associates with this emitter name (good
+            # enough for the harness; a test needing a specific emitter
+            # shape overrides resolve_registry_entry directly).
+            subs = ((self.entry.get("manifest") or {}).get("casa") or {}
+                   ).get("subscribes") or []
+            events = sorted({s["event"] for s in subs
+                            if s.get("plugin") == name})
+            if not events:
+                return None
+            return {"targets": [], "artifact_id": f"emitter-art-{name}",
+                   "manifest": {"name": name,
+                                "casa": {"emits": [{"name": e}
+                                                   for e in events]}}}
+
         kwargs = dict(
             dispatch=dispatch,
-            resolve_registry_entry=lambda subscriber: self.entry,
+            resolve_registry_entry=resolve_registry_entry,
             get_routed=lambda: self.routed,
             get_installed=lambda: self.installed,
             get_registry_valid=lambda: self.registry_valid,
@@ -431,6 +451,11 @@ async def test_instruction_carries_that_records_token_same_role_isolation(wired)
         SUBSCRIBER: wired.entry,
         other: {"targets": ["resident:assistant"], "artifact_id": ARTIFACT,
                 "manifest": _manifest([(EMITTER, EVENT)])},
+        # SOL-P2b's live emitter re-check resolves EMITTER through this
+        # SAME seam — must declare casa.emits for EVENT.
+        EMITTER: {"targets": [], "artifact_id": "emitter-art",
+                  "manifest": {"name": EMITTER,
+                              "casa": {"emits": [{"name": EVENT}]}}},
     }
     wired.routed[(EMITTER, EVENT)][other] = _snapshot(
         other, ARTIFACT, EMITTER, EVENT, ["resident:assistant"])
@@ -576,6 +601,47 @@ async def test_gate_defers_on_declaration_digest_swap_same_artifact(wired,
         plugin_store, "manifest_subscribes",
         lambda manifest, subscriber: [
             {"plugin": EMITTER, "event": EVENT, "digest": "0" * 64}])
+    await ee._run_nudge(EMITTER, EVENT, SUBSCRIBER, rec)
+    assert wired.dispatches == []
+    assert wired.rec()["deferrals"] == 1
+
+
+async def test_gate_defers_when_emitter_uninstalled_mid_pass(wired):
+    """SOL-P2b pin: the EMITTER side of the pair is re-checked live too —
+    an emitter uninstalled between fold and send must refuse the send,
+    exactly like a stale subscriber-side identity does. The routed
+    snapshot itself is left completely untouched here (no reconcile has
+    run since the uninstall) — only the live resolve says "gone", proving
+    the gate does not just trust the routed map."""
+    rec = wired.seed()
+
+    def resolve(name):
+        if name == EMITTER:
+            return None            # uninstalled — cannot resolve
+        return wired.entry
+
+    wired.wire(resolve_registry_entry=resolve)
+    await ee._run_nudge(EMITTER, EVENT, SUBSCRIBER, rec)
+    assert wired.dispatches == []
+    assert wired.rec()["deferrals"] == 1
+
+
+async def test_gate_defers_when_emitter_upgrade_drops_the_declaration(wired):
+    """SOL-P2b pin, the sibling case: the emitter still resolves (still
+    installed) but its LIVE manifest no longer declares this event — a
+    routine upgrade that renamed or removed the casa.emits entry. Must
+    refuse exactly like an outright uninstall does."""
+    rec = wired.seed()
+
+    def resolve(name):
+        if name == EMITTER:
+            return {"targets": [], "artifact_id": "emitter-art-2",
+                   "manifest": {"name": EMITTER,
+                               "casa": {"emits": [
+                                   {"name": "a-different-event"}]}}}
+        return wired.entry
+
+    wired.wire(resolve_registry_entry=resolve)
     await ee._run_nudge(EMITTER, EVENT, SUBSCRIBER, rec)
     assert wired.dispatches == []
     assert wired.rec()["deferrals"] == 1

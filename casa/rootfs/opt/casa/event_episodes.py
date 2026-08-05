@@ -526,7 +526,12 @@ def _gate_ok(emitter: str, event: str, subscriber: str, rec: dict,
     identity recomputed from the LIVE resolved manifest's declaration
     digest + live artifact_id + live sorted targets must equal the routed
     snapshot's, AND that identity must still be present in the live ack
-    store. MUST be called with :data:`DISPATCH_LOCK` already held."""
+    store, AND (SOL-P2b) the EMITTER side of the pair must still resolve
+    AND still declare this exact event — the routed snapshot can survive
+    stale for a whole pass after the emitter is uninstalled or upgraded
+    to drop the declaration, since ``routed`` itself only refreshes on
+    the NEXT reconcile. MUST be called with :data:`DISPATCH_LOCK` already
+    held."""
     import plugin_store
     from plugin_events import ack_identity
 
@@ -559,6 +564,26 @@ def _gate_ok(emitter: str, event: str, subscriber: str, rec: dict,
     live_identity = ack_identity(subscriber, artifact_id, emitter, event,
                                  digest, targets)
     if live_identity != snapshot.get("ack_identity"):
+        return False
+
+    # SOL-P2b: re-resolve the EMITTER live, via the SAME registry-resolve
+    # seam the subscriber side already goes through — an unresolvable
+    # emitter (uninstalled) or one whose live manifest no longer declares
+    # this event (a routine upgrade that dropped it) must refuse the send
+    # exactly like a stale subscriber-side identity does, never dispatch
+    # against a declaration that is no longer live.
+    emitter_entry = _resolve(emitter)
+    if emitter_entry is None:
+        return False
+    emitter_manifest = emitter_entry.get("manifest")
+    if not isinstance(emitter_manifest, dict):
+        return False
+    try:
+        emits = plugin_store.manifest_emits(emitter_manifest, emitter)
+    except Exception:  # noqa: BLE001 — a live EMITTER declaration that no
+        # longer parses can never pass the gate either.
+        return False
+    if event not in {e.get("declared") for e in emits}:
         return False
 
     acks = _get_acks() if _get_acks is not None else None
