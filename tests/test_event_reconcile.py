@@ -515,6 +515,80 @@ async def test_reconcile_fires_deduped_consent_prompt(tmp_path, fake_event_episo
     assert len(telegram.posts) == 1
 
 
+async def test_role_removed_between_prompt_and_approve_never_republishes(
+        monkeypatch, tmp_path, fake_event_episodes):
+    """SOL-P2a pin: the reconcile fired when the operator taps Approve
+    must re-derive role_configs from the LIVE runtime at that moment, NOT
+    reuse the snapshot captured when the prompt was originally posted.
+    Simulates a role removed in between (a reload/reassignment): approve
+    still records the ack (that commit step is synchronous and
+    unconditional on the identity alone) but the reconcile it triggers
+    must publish NO route to the now-gone role — never resurrect one off
+    a stale role_configs closure."""
+    import verdict_broker
+    import authz_grants
+    import agent as agent_mod
+    import event_consent
+
+    broker = verdict_broker.VerdictBroker()
+    monkeypatch.setattr(verdict_broker, "BROKER", broker)
+    fresh_coord = authz_grants.ChallengeCoordinator()
+    monkeypatch.setattr(authz_grants, "CHALLENGES", fresh_coord)
+
+    emitter = _rp("gmail", emits=["mail_in"])
+    subscriber = _rp("finance", subscribes=[("gmail", "mail_in")])
+    acks = EventAckStore(path=tmp_path / "acks.json")
+    telegram = _FakeTelegram()
+    channel_manager = _FakeChannelManager(telegram)
+
+    # LIVE at PROMPT time: "assistant" exists and is reachable.
+    runtime = SimpleNamespace(
+        role_configs=_role_configs(assistant=["telegram"]),
+        channel_manager=channel_manager)
+    monkeypatch.setattr(agent_mod, "active_runtime", runtime)
+
+    orig_identity = event_consent.operator_identity
+    event_consent.operator_identity = lambda channel: (100, 200)
+    try:
+        await er.reconcile_plugin_events(
+            runtime, acks=acks, resolver=_resolver([emitter, subscriber]),
+            entries=_entries(emitter, subscriber), prompt=True)
+        for _ in range(8):        # settle the coordinator's post driver
+            await asyncio.sleep(0)
+    finally:
+        event_consent.operator_identity = orig_identity
+    assert len(telegram.posts) == 1
+
+    # Between prompt and approve: the role is REMOVED from the LIVE
+    # runtime (e.g. a reload/reassignment). The reconcile closure
+    # captured role_configs={"assistant": ...} at prompt time — it must
+    # NOT reuse that; it must observe THIS emptied live state instead.
+    runtime.role_configs = {}
+
+    key = next(iter(fresh_coord._entries))
+    ch = fresh_coord._entries[key]
+    claim = broker.claim(namespace="resident_ask", scope=ch.scope,
+                         request_id=ch.rid, option_index=0, actor_id=100)
+    assert not isinstance(claim, str), f"claim rejected: {claim}"
+    assert broker.commit(claim) is True
+    ch.req.meta["on_commit_sync"](0)
+
+    # The ack IS recorded — approve's sync commit is unconditional on the
+    # identity the operator actually saw and tapped.
+    identity = _identity("finance", "art-1", "gmail", "mail_in")
+    assert acks.get(identity) is not None
+
+    for _ in range(8):            # settle the async finish/reconcile
+        await asyncio.sleep(0)
+
+    routed = er.get_routed()
+    assert routed is not event_spool.ROUTING_UNAVAILABLE
+    # NO route to the now-gone role — a stale role_configs reuse would
+    # have republished this pair since the emitter/subscriber/ack are all
+    # otherwise perfectly valid.
+    assert "finance" not in (routed.get(("gmail", "mail_in")) or {})
+
+
 # ---------------------------------------------------------------------------
 # revoke — unroute before ack delete, both under the admission lock
 # ---------------------------------------------------------------------------

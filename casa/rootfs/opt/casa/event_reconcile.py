@@ -478,9 +478,22 @@ def _fire_consent_prompts(pending: "list[dict]", *, role_configs: dict,
     chat_id, operator_id = op
 
     async def _reconcile_again() -> None:
+        # SOL-P2a: the reconcile fired at COMMIT time (when the operator
+        # taps Approve, possibly minutes/hours after this prompt was
+        # posted) must re-derive role_configs/channel_manager from the
+        # LIVE runtime, never reuse the snapshot captured HERE at prompt
+        # time — a role removed or reassigned in between must be
+        # reflected, not silently overridden by a stale one that could
+        # republish a route to a role that no longer exists. Mirrors
+        # _kick_reconcile's live-runtime lookup exactly. `resolver`/
+        # `entries` stay as originally supplied (production callers never
+        # pass non-default ones; only tests inject fakes, which must
+        # still see their own doubles on retry).
+        import agent as agent_mod
+        live_runtime = getattr(agent_mod, "active_runtime", None)
         await reconcile_plugin_events(
-            None, role_configs=role_configs, channel_manager=channel_manager,
-            acks=acks, resolver=resolver, entries=entries, prompt=False)
+            live_runtime, acks=acks, resolver=resolver, entries=entries,
+            prompt=False)
 
     for p in pending:
         try:
