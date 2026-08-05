@@ -67,6 +67,8 @@ import uuid
 from pathlib import Path
 from typing import Any, Awaitable, Callable
 
+import plugin_dispatch
+
 logger = logging.getLogger(__name__)
 
 STORE_PATH = Path("/data/plugin-setup-episodes.json")
@@ -673,18 +675,23 @@ async def _note(text: str) -> None:
 
 
 def _compose(ep: dict, entry: dict) -> tuple[str | None, str]:
-    """Deterministic execution-target selection + the fixed Casa-authored
-    instruction. Returns ``(role, instruction)`` or ``(None, reason)``.
+    """The fixed Casa-authored setup instruction + execution-target
+    selection. Returns ``(role, instruction)`` or ``(None, reason)``.
 
     Tool binding is UNAMBIGUOUS or nothing: exactly one server-level grant
     is required — zero or several fail the episode (verify blocks such
     plugins upstream with ``setup_tool_ambiguous_server``).
 
-    Target order: ``resident:assistant`` when targeted; else the
-    lexicographically first resident; else the first specialist via
-    assistant delegation (the specialist has no channel — the instruction
-    names the EXACT specialist and tool and forbids substitution).
-    Executor-only/empty targets are refused upstream at verify.
+    Target ORDER is the shared ``plugin_dispatch.compose`` (extracted so
+    this and ``callback_episodes._compose`` can never drift apart):
+    ``resident:assistant`` when targeted; else the lexicographically first
+    resident; else the first specialist via assistant delegation.
+    Executor-only/empty targets are refused upstream at verify. The
+    resident/specialist-delegate INSTRUCTION WORDING differs from
+    ``plugin_dispatch.compose``'s generic delegate wrap (it names the exact
+    setup tool), so only the resident branches reuse ``compose``'s returned
+    instruction verbatim; the specialist branch builds its own text off the
+    same decision.
     """
     grants = sorted(entry.get("granted_tools") or [])
     if len(grants) != 1:
@@ -706,18 +713,16 @@ def _compose(ep: dict, entry: dict) -> tuple[str | None, str]:
         " Call it with no arguments, take no other action, and report the "
         "outcome briefly."
     )
-    if "assistant" in residents:
-        return "assistant", (
-            base + f"Run the setup tool `{namespaced}` now to re-point the "
-            "external service." + tail)
+    resident_text = (
+        base + f"Run the setup tool `{namespaced}` now to re-point the "
+        "external service." + tail)
+    role, instruction = plugin_dispatch.compose(entry, resident_text)
+    if role is None:
+        return None, instruction
     if residents:
-        return residents[0], (
-            base + f"Run the setup tool `{namespaced}` now to re-point the "
-            "external service." + tail)
-    if specialists:
-        sp = specialists[0]
-        return "assistant", (
-            base + f"Delegate to the specialist '{sp}' with the instruction "
-            f"to run its setup tool `{namespaced}` now — do not substitute "
-            "another agent or tool." + tail)
-    return None, "no resident or specialist target"
+        return role, instruction
+    sp = specialists[0]
+    return "assistant", (
+        base + f"Delegate to the specialist '{sp}' with the instruction "
+        f"to run its setup tool `{namespaced}` now — do not substitute "
+        "another agent or tool." + tail)

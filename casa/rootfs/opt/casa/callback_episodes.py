@@ -15,8 +15,9 @@ The turn is internal and **system-attributed** (the ``synthetic`` context
 marker, mirroring ``plugin_setup_episodes``/``_setup_dispatch``), so it needs
 no ingress-identity row; ``<hash>`` is the non-secret flow handle
 (``sha256(state)``, already the artifact filename) so a successor session can
-find and collect it. Target selection copies
-``plugin_setup_episodes._compose`` **verbatim**: ``resident:assistant`` when
+find and collect it. Target selection is the shared
+``plugin_dispatch.compose`` — the same target-order decision
+``plugin_setup_episodes._compose`` makes: ``resident:assistant`` when
 targeted, else the lexicographically-first resident, else the first specialist
 via assistant delegation.
 
@@ -61,6 +62,7 @@ from pathlib import Path
 from typing import Any, Awaitable, Callable
 
 import callback_attempts
+import plugin_dispatch
 
 logger = logging.getLogger(__name__)
 
@@ -153,30 +155,10 @@ def _message(plugin: str, h: str, rec: dict) -> str:
             f"(handle {h}) — collect it now.")
 
 
-def _compose(entry: dict, base: str) -> tuple[str | None, str]:
-    """Deterministic execution-target selection for the nudge *base* text.
-    Returns ``(role, instruction)`` or ``(None, reason)``.
-
-    Target order copies ``plugin_setup_episodes._compose`` verbatim:
-    ``resident:assistant`` when targeted; else the lexicographically first
-    resident; else the first specialist via assistant delegation (the
-    specialist has no channel — the instruction names the EXACT specialist and
-    forbids substitution)."""
-    targets = entry.get("targets") or []
-    residents = sorted(t.split(":", 1)[1] for t in targets
-                       if t.startswith("resident:"))
-    specialists = sorted(t.split(":", 1)[1] for t in targets
-                         if t.startswith("specialist:"))
-    if "assistant" in residents:
-        return "assistant", base
-    if residents:
-        return residents[0], base
-    if specialists:
-        sp = specialists[0]
-        return "assistant", (
-            f"Delegate to the specialist '{sp}' with the instruction: {base} "
-            "Do not substitute another agent.")
-    return None, "no resident or specialist target"
+# Target selection is the shared ``plugin_dispatch.compose`` (extracted so
+# this and ``plugin_setup_episodes._compose`` can never drift apart in target
+# ORDER — see plugin_dispatch.py).
+_compose = plugin_dispatch.compose
 
 
 # ---------------------------------------------------------------------------
