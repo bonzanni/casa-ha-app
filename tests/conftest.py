@@ -398,23 +398,42 @@ def _reset_ask_validation_gates():
 # ``event_reconcile`` keeps a process-global published routing map that
 # defaults to (and fails back to) ``event_spool.ROUTING_UNAVAILABLE`` — the
 # fail-closed sentinel that licenses no destructive worker action (decision
-# 26). Left alone across tests, that sentinel is a cross-test leak: any test
-# process that never reconciles events keeps it forever, and
-# ``tools._regenerate_plugin_health`` merging in
-# ``event_reconcile.current_issues()`` (Task 10) then surfaces a stray
-# ``event_routing_unavailable`` row into health reports for tests that have
-# nothing to do with events. Reset to an authoritative empty routing map
-# before every test; ``tests/test_event_reconcile.py`` has its OWN autouse
-# fixture that overrides this back to the sentinel per-test (it needs the
-# sentinel as ITS starting point) via ``monkeypatch``, so the two compose
-# cleanly — a conftest-level autouse fixture is instantiated before a
-# same-scope one declared in the test module.
+# 26). Left alone across tests, a PRIOR test that reconciled events for real
+# would leak its published map into a later, unrelated test — so this resets
+# it before every test. Minor-2: it resets to the SENTINEL, the actual
+# PRODUCTION default/fail-back value — not an authoritative ``{}``, which
+# would make ``event_reconcile.get_routed()`` look authoritatively-routeless
+# by default across the WHOLE suite (a global accidental authoritativeness
+# that could mask a real "must treat as unavailable" bug anywhere a test
+# happens to touch event-worker code without realizing it). A handful of
+# health-report tests assert an EXACT issue list/count and would otherwise
+# pick up the sentinel's own ``event_routing_unavailable`` row; those opt
+# into an authoritative empty map explicitly via the ``event_routing_ok``
+# fixture below, naming the need rather than inheriting it silently.
+# ``tests/test_event_reconcile.py`` has its OWN autouse fixture that
+# (redundantly, for clarity/independence from fixture ordering) also pins
+# the sentinel per-test via ``monkeypatch``; the two compose cleanly — a
+# conftest-level autouse fixture is instantiated before a same-scope one
+# declared in the test module.
 @pytest.fixture(autouse=True)
 def _reset_event_routing(monkeypatch):
     try:
         import event_reconcile
+        import event_spool
     except Exception:  # pragma: no cover — module import is universal in tests
         yield
         return
+    monkeypatch.setattr(event_reconcile, "_routed", event_spool.ROUTING_UNAVAILABLE)
+    yield
+
+
+@pytest.fixture
+def event_routing_ok(monkeypatch):
+    """Opt-in fixture (Minor-2) for a test whose health-report assertion is
+    an EXACT issue list/count that the sentinel's own
+    ``event_routing_unavailable`` row would otherwise pollute — publishes an
+    authoritative empty routing map instead of the sentinel
+    ``_reset_event_routing`` defaults to."""
+    import event_reconcile
     monkeypatch.setattr(event_reconcile, "_routed", {})
     yield

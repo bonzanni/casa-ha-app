@@ -420,9 +420,16 @@ def test_postcondition_present_requires_top_ready():
                                 expect="present") is False
 
 
-def test_regenerate_health_preserves_other_plugins_runtime_issue(monkeypatch):
+def test_regenerate_health_preserves_other_plugins_runtime_issue(
+        monkeypatch, event_routing_ok):
     """Sol #13: a successful mutation of B must not erase A's still-active
-    runtime issue (reload_required) from the health report."""
+    runtime issue (reload_required) from the health report.
+
+    ``event_routing_ok`` (Minor-2): this reads every issue's
+    ``.reason_code`` ATTRIBUTE, which chokes (AttributeError) on the
+    plain-dict ``event_routing_unavailable`` row the conftest's actual
+    PRODUCTION-default sentinel would otherwise contribute — opts into an
+    authoritative empty routing map instead."""
     import tools
     import plugin_health
     import plugin_registry
@@ -680,10 +687,15 @@ def _regen_harness(monkeypatch, *, entries, verify_stub, extras):
     return captured
 
 
-def test_regen_drops_transient_verify_extra_when_fresh_pass_clean(monkeypatch):
+def test_regen_drops_transient_verify_extra_when_fresh_pass_clean(
+        monkeypatch, event_routing_ok):
     """D2: a torn-read reload_required from the mutation's verify must not
     linger once the regen's OWN fresh pass of that (plugin, target) is
-    clean."""
+    clean.
+
+    ``event_routing_ok`` (Minor-2): reads every issue's ``.reason_code``
+    attribute — see test_regenerate_health_preserves_other_plugins_
+    runtime_issue's docstring for why."""
     from plugin_registry import PluginIssue
     stale = PluginIssue(name="probe", target="specialist:finance",
                         stage="verify", reason_code="reload_required")
@@ -762,11 +774,15 @@ def test_verify_uninstalled_specialist_target_dormant_not_blocking(
 
 
 def test_regen_emits_target_pending_warning_for_uninstalled_specialist(
-        monkeypatch, tmp_path):
+        monkeypatch, tmp_path, event_routing_ok):
     """#211: the health regeneration recomputes a WARNING-class
     "target_pending" row (never a blocking issue) for a registered plugin
     targeting a specialist with no agent directory yet; it self-clears once
-    the directory exists."""
+    the directory exists.
+
+    ``event_routing_ok`` (Minor-2): reads every issue's ``.reason_code``
+    attribute — see test_regenerate_health_preserves_other_plugins_
+    runtime_issue's docstring for why."""
     import agent as agent_mod
     agents_dir = tmp_path / "agents"
     (agents_dir / "specialists").mkdir(parents=True)

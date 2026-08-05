@@ -665,8 +665,12 @@ async def test_mutation_sequencer_survives_reconcile_failure(monkeypatch):
 
 
 async def test_regenerate_health_folds_recomputable_trigger_issues(
-    monkeypatch, tmp_path,
+    monkeypatch, tmp_path, event_routing_ok,
 ):
+    """``event_routing_ok`` (Minor-2): the report's issues list is asserted
+    EXACT below, which the conftest's actual PRODUCTION-default sentinel's
+    own event_routing_unavailable row would otherwise pollute — opts into
+    an authoritative empty routing map instead."""
     import plugin_registry
     import tools as tools_mod
     from plugin_registry import PluginIssue

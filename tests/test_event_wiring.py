@@ -376,18 +376,34 @@ class TestHealthMergeIncludesEventIssues:
         assert "event_reconcile.current_issues()" in src
         assert "list(event_issues)" in src
 
-    def test_previously_flagged_regression_tests_stay_green(self):
-        """Regression pin for the 4 tests a naive direct-concat broke
-        (test_verify_plugin_state.py x3, test_plugin_triggers_reconcile.py
-        x1): they all call _regenerate_plugin_health WITHOUT mocking
-        event_reconcile, so the conftest-level _reset_event_routing fixture
-        (an authoritative empty routing map, never the process-default
-        ROUTING_UNAVAILABLE sentinel) is what keeps them green. This test
-        merely proves the fixture exists and does what it claims."""
+    def test_default_event_routing_is_the_production_sentinel(self):
+        """Minor-2: the conftest-level _reset_event_routing fixture resets
+        to the ACTUAL production default/fail-back value —
+        ROUTING_UNAVAILABLE — not an authoritative empty map. An
+        authoritative {} by default across the WHOLE suite would be a
+        global accidental-authoritativeness leak: any unrelated test that
+        happens to touch event-worker code without realizing it would see
+        "routing is known and empty" instead of "routing is unknown",
+        which could mask a real must-treat-as-unavailable bug anywhere.
+        current_issues() surfaces exactly the one row the sentinel
+        licenses — event_routing_unavailable — never a silent []."""
         import event_reconcile
         import event_spool
-        # Under the autouse conftest fixture, an untouched test sees an
-        # authoritative empty map, never the sentinel.
+        assert event_reconcile.get_routed() is event_spool.ROUTING_UNAVAILABLE
+        codes = {i["reason_code"] for i in event_reconcile.current_issues()}
+        assert "event_routing_unavailable" in codes
+
+    def test_event_routing_ok_fixture_opts_into_an_authoritative_empty_map(
+            self, event_routing_ok):
+        """The opt-in counterpart: a test that NEEDS an authoritative empty
+        routing map (the 4 health-report tests this regression was first
+        found in — test_verify_plugin_state.py x3,
+        test_plugin_triggers_reconcile.py x1 — whose EXACT issues-list
+        assertions choke on the sentinel's own event_routing_unavailable
+        row) requests the `event_routing_ok` fixture explicitly, naming the
+        need rather than inheriting it silently from a global default."""
+        import event_reconcile
+        import event_spool
         assert event_reconcile.get_routed() == {}
         assert event_reconcile.get_routed() is not event_spool.ROUTING_UNAVAILABLE
         assert event_reconcile.current_issues() == []
