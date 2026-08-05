@@ -1,5 +1,15 @@
 # Changelog
 
+## [0.152.1] - 2026-08-06
+
+### Fixed
+
+- **v0.152.0 images failed to build, so the release never reached the
+  store.** The image's bundled-plugin build step could not find the new
+  plugin events module and aborted; no 0.152.0 image was published. The
+  module now ships into the build step, and this release delivers
+  everything listed under 0.152.0.
+
 ## [0.152.0] - 2026-08-05
 
 ### Added
