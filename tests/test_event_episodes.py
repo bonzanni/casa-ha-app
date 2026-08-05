@@ -519,6 +519,16 @@ async def test_specialist_only_target_never_asks_specialist_to_ack(wired):
     assert "the delegating agent, not the specialist" in text
     # and the ack call appears exactly once — only in the postscript.
     assert text.count(ack_call) == 1
+    # Internal minor #1: the delegated instruction is lexically fenced —
+    # quoted where compose relays it, and closed with an explicit marker
+    # before the assistant-directed postscript, so the postscript can
+    # never be misread as more of the specialist's own delegated text.
+    assert 'with the instruction: "Plugin' in text
+    assert '" Do not substitute another agent.' in text
+    assert text.count("— end of delegated instruction.") == 1
+    assert (text.index('" Do not substitute another agent.')
+           < text.index("— end of delegated instruction.")
+           < text.index(ack_call))
 
 
 async def test_resident_target_never_carries_the_delegation_wording(wired):
@@ -645,6 +655,35 @@ async def test_gate_defers_when_emitter_upgrade_drops_the_declaration(wired):
     await ee._run_nudge(EMITTER, EVENT, SUBSCRIBER, rec)
     assert wired.dispatches == []
     assert wired.rec()["deferrals"] == 1
+
+
+async def test_gate_resolves_subscriber_and_emitter_outside_the_dispatch_lock(
+        wired):
+    """Internal minor #3: resolving the subscriber AND the emitter — each
+    a synchronous, blocking read of a live plugin.json off disk — must
+    happen BEFORE ``DISPATCH_LOCK`` is acquired, once per dispatch
+    attempt, never while the lock is held. A resolver that asserts the
+    lock is free catches a regression that moves either resolve back
+    inside the ``async with DISPATCH_LOCK`` block."""
+    rec = wired.seed()
+    calls = []
+
+    def resolve(name):
+        assert not ee.DISPATCH_LOCK.locked(), (
+            f"resolve({name!r}) ran while DISPATCH_LOCK was held")
+        calls.append(name)
+        if name == SUBSCRIBER:
+            return wired.entry
+        return {"targets": [], "artifact_id": "emitter-art",
+               "manifest": {"name": EMITTER,
+                           "casa": {"emits": [{"name": EVENT}]}}}
+
+    wired.wire(resolve_registry_entry=resolve)
+    await ee._run_nudge(EMITTER, EVENT, SUBSCRIBER, rec)
+    assert len(wired.dispatches) == 1
+    # both sides were actually resolved (via the gate) at least once —
+    # the assertion inside `resolve` is what proves it happened lock-free.
+    assert SUBSCRIBER in calls and EMITTER in calls
 
 
 async def test_gate_failure_kicks_reconcile(wired, monkeypatch):

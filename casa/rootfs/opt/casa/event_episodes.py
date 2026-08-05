@@ -187,15 +187,24 @@ def _wake_instruction(emitter: str, event: str, subscriber: str,
     :func:`_run_nudge` appends a SEPARATE, assistant-directed instruction
     (outside the text delegated verbatim to the specialist) telling the
     delegating agent to perform the ack itself once the specialist's turn
-    completes."""
+    completes.
+
+    Internal minor #1: the ``delegate_ack=True`` text is wrapped in double
+    quotes — ``plugin_dispatch.compose`` relays it VERBATIM inside
+    ``"with the instruction: {base}"``, and :func:`_run_nudge` appends the
+    assistant-directed ack postscript immediately after compose's own
+    trailing "Do not substitute another agent." sentence. Without an
+    explicit lexical fence around the delegated text, that postscript
+    reads as one more sentence of the SAME instruction handed to the
+    specialist rather than a directive aimed at the delegating agent."""
     base = (
         f"Plugin '{emitter}' emitted the event '{event}'. This is a "
         f"headless wake for '{subscriber}': process it through your tools "
         "now; if you need operator input, record it durably through your "
         "tools and end the turn — do not ask.")
     if delegate_ack:
-        return (f"{base} Do NOT call ack_event yourself — the agent "
-                "delegating this task to you handles the ack.")
+        return (f'"{base} Do NOT call ack_event yourself — the agent '
+                'delegating this task to you handles the ack."')
     return (f"{base} When done, call "
             f"ack_event(emitter='{emitter}', event='{event}', token='{token}').")
 
@@ -205,10 +214,18 @@ def _delegated_ack_postscript(emitter: str, event: str, token: str) -> str:
     instruction (never inside the text delegated verbatim to the
     specialist, which must never be asked to call a tool it may not have)
     — directs the DELEGATING agent (always 'assistant' here) to perform
-    the ack itself once the specialist's turn is done."""
+    the ack itself once the specialist's turn is done.
+
+    Internal minor #1: opens with an explicit "— end of delegated
+    instruction." marker — the second half of the lexical fence around
+    the quoted text :func:`_wake_instruction` returns for
+    ``delegate_ack=True`` — so this postscript cannot be misread as part
+    of what gets relayed to the specialist, regardless of how the
+    surrounding sentences parse."""
     return (
-        " After the specialist's turn completes, YOU (the delegating "
-        f"agent, not the specialist) must call ack_event(emitter='{emitter}', "
+        " — end of delegated instruction. Separately, after the "
+        "specialist's turn completes, YOU (the delegating agent, not the "
+        f"specialist) must call ack_event(emitter='{emitter}', "
         f"event='{event}', token='{token}') yourself — the specialist is "
         "not guaranteed casa-framework tool access, so the ack is your "
         "responsibility, not theirs.")
@@ -522,7 +539,7 @@ def _resolve(subscriber: str) -> "dict | None":
 
 
 def _gate_ok(emitter: str, event: str, subscriber: str, rec: dict,
-            entry: dict) -> bool:
+            entry: dict, emitter_entry: "dict | None") -> bool:
     """The pre-send identity gate (decisions 27/29/30/36): the pair must
     still be in the LIVE authoritative routed map, AND the consent
     identity recomputed from the LIVE resolved manifest's declaration
@@ -532,8 +549,18 @@ def _gate_ok(emitter: str, event: str, subscriber: str, rec: dict,
     AND still declare this exact event — the routed snapshot can survive
     stale for a whole pass after the emitter is uninstalled or upgraded
     to drop the declaration, since ``routed`` itself only refreshes on
-    the NEXT reconcile. MUST be called with :data:`DISPATCH_LOCK` already
-    held."""
+    the NEXT reconcile.
+
+    *entry* and *emitter_entry* are the subscriber's and the emitter's
+    LIVE resolved registry entries — resolved by the caller ONCE per
+    dispatch attempt, BEFORE :data:`DISPATCH_LOCK` is acquired (internal
+    minor #3: ``resolve_registry_entry`` reads a plugin.json off disk,
+    synchronously, and must never block another task's dispatch/revoke
+    while holding the lock, up to :data:`_MAX_DISPATCH_ATTEMPTS` times a
+    nudge). This function itself performs no resolve I/O — only the
+    cheap live map/ack-store checks below — and MUST be called with the
+    lock already held, so a revoke can never land between the resolve
+    and the checks it grounds."""
     import plugin_store
     from plugin_events import ack_identity
 
@@ -568,13 +595,12 @@ def _gate_ok(emitter: str, event: str, subscriber: str, rec: dict,
     if live_identity != snapshot.get("ack_identity"):
         return False
 
-    # SOL-P2b: re-resolve the EMITTER live, via the SAME registry-resolve
-    # seam the subscriber side already goes through — an unresolvable
-    # emitter (uninstalled) or one whose live manifest no longer declares
-    # this event (a routine upgrade that dropped it) must refuse the send
-    # exactly like a stale subscriber-side identity does, never dispatch
-    # against a declaration that is no longer live.
-    emitter_entry = _resolve(emitter)
+    # SOL-P2b: the EMITTER side of the pair, resolved the SAME way the
+    # subscriber side is — an unresolvable emitter (uninstalled) or one
+    # whose live manifest no longer declares this event (a routine
+    # upgrade that dropped it) must refuse the send exactly like a stale
+    # subscriber-side identity does, never dispatch against a declaration
+    # that is no longer live.
     if emitter_entry is None:
         return False
     emitter_manifest = emitter_entry.get("manifest")
@@ -598,13 +624,22 @@ def _gate_ok(emitter: str, event: str, subscriber: str, rec: dict,
 
 async def _dispatch_admitted(role: str, instruction: str, context: dict,
                              emitter: str, event: str, subscriber: str,
-                             rec: dict, entry: dict) -> "bool | None":
-    """One admission attempt: the gate check AND the dispatch call, both
-    under :data:`DISPATCH_LOCK` so a revoke can never complete between
-    them. Returns ``True`` (bus accepted), ``False`` (bus rejected — retry),
-    or ``None`` (gate failed — stop retrying, defer with no budget spent)."""
+                             rec: dict) -> "bool | None":
+    """One admission attempt: resolve the subscriber AND the emitter's
+    LIVE registry entries FIRST — outside :data:`DISPATCH_LOCK` (internal
+    minor #3) — then run the gate check AND the dispatch call BOTH under
+    the lock, so a revoke can never complete between them. Re-resolving
+    both once per ATTEMPT (not once per whole nudge) preserves the
+    gate's per-attempt live-read semantics while keeping the blocking
+    resolve I/O off the lock. Returns ``True`` (bus accepted), ``False``
+    (bus rejected — retry), or ``None`` (gate failed, including an
+    unresolvable subscriber this attempt — stop retrying, defer with no
+    budget spent)."""
+    sub_entry = _resolve(subscriber)
+    emitter_entry = _resolve(emitter)
     async with DISPATCH_LOCK:
-        if not _gate_ok(emitter, event, subscriber, rec, entry):
+        if sub_entry is None or not _gate_ok(
+                emitter, event, subscriber, rec, sub_entry, emitter_entry):
             return None
         if _dispatch is None:
             return False
@@ -671,7 +706,7 @@ async def _run_nudge(emitter: str, event: str, subscriber: str,
     while tries < _MAX_DISPATCH_ATTEMPTS:
         tries += 1
         result = await _dispatch_admitted(
-            role, composed, context, emitter, event, subscriber, rec, entry)
+            role, composed, context, emitter, event, subscriber, rec)
         if result is None:
             gate_failed = True
             break

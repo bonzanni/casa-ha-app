@@ -198,24 +198,53 @@ def test_malformed_record_missing_field_yields_zero_acks(tmp_path):
     assert store.get(good_identity) is None
 
 
-def test_non_list_targets_yields_zero_acks_whole_store(tmp_path):
-    path = tmp_path / "acks.json"
-    identity = _identity()
+def _store_with_records(path, records: dict) -> None:
     path.write_text(json.dumps({
         "schema_version": 1,
-        "acks": {
-            identity: {
-                "subscriber": "finance", "artifact_id": "art-1",
-                "emitter": "gmail", "event": "new-mail", "digest": "digest-1",
-                "targets": "resident:assistant",  # not a list
-                "ts": 1, "gen": "g1",
-            },
-        },
+        "acks": records,
     }), encoding="utf-8")
+
+
+def _good_record(identity=None):
+    """A SECOND, otherwise perfectly valid record + its identity — seeded
+    alongside a deliberately bad one in every whole-store test below
+    (Internal minor #2, mirrors Important-4(b)'s existing discipline): a
+    single-record version of these tests cannot distinguish "that one bad
+    record failed to parse and was skipped" (a hypothetical ``continue``)
+    from the actual whole-store fail-closed contract (``return {}``),
+    since with only one record in the file the two read identically —
+    both would leave ``store.get(bad_identity)`` at ``None``. Only a
+    surviving SECOND record proves which one actually happened."""
+    identity = identity or _identity(
+        subscriber="other", artifact_id="art-2", emitter="outlook",
+        digest="digest-2")
+    rec = {
+        "subscriber": "other", "artifact_id": "art-2", "emitter": "outlook",
+        "event": "new-mail", "digest": "digest-2",
+        "targets": ["resident:assistant"], "ts": 2, "gen": "g2",
+    }
+    return identity, rec
+
+
+def test_non_list_targets_yields_zero_acks_whole_store(tmp_path):
+    path = tmp_path / "acks.json"
+    bad_identity = _identity()
+    good_identity, good_rec = _good_record()
+    _store_with_records(path, {
+        bad_identity: {
+            "subscriber": "finance", "artifact_id": "art-1",
+            "emitter": "gmail", "event": "new-mail", "digest": "digest-1",
+            "targets": "resident:assistant",  # not a list
+            "ts": 1, "gen": "g1",
+        },
+        good_identity: good_rec,
+    })
 
     store = EventAckStore(path=path)
 
-    assert store.get(identity) is None
+    assert store.get(bad_identity) is None
+    assert store.get(good_identity) is None    # the whole store failed
+    # closed — the good record never survives alongside the bad one.
 
 
 def _store_with_record(path, rec, identity=None):
@@ -229,22 +258,57 @@ def _store_with_record(path, rec, identity=None):
 
 def test_non_numeric_ts_yields_zero_acks_whole_store(tmp_path):
     path = tmp_path / "acks.json"
-    identity = _store_with_record(path, {
-        "subscriber": "finance", "artifact_id": "art-1", "emitter": "gmail",
-        "event": "new-mail", "digest": "digest-1",
-        "targets": ["resident:assistant"], "ts": "not-a-number", "gen": "g1",
+    bad_identity = _identity()
+    good_identity, good_rec = _good_record()
+    _store_with_records(path, {
+        bad_identity: {
+            "subscriber": "finance", "artifact_id": "art-1",
+            "emitter": "gmail", "event": "new-mail", "digest": "digest-1",
+            "targets": ["resident:assistant"], "ts": "not-a-number",
+            "gen": "g1",
+        },
+        good_identity: good_rec,
     })
-    assert EventAckStore(path=path).get(identity) is None
+    store = EventAckStore(path=path)
+    assert store.get(bad_identity) is None
+    assert store.get(good_identity) is None
 
 
 def test_bool_ts_yields_zero_acks_whole_store(tmp_path):
     path = tmp_path / "acks.json"
-    identity = _store_with_record(path, {
-        "subscriber": "finance", "artifact_id": "art-1", "emitter": "gmail",
-        "event": "new-mail", "digest": "digest-1",
-        "targets": ["resident:assistant"], "ts": True, "gen": "g1",
+    bad_identity = _identity()
+    good_identity, good_rec = _good_record()
+    _store_with_records(path, {
+        bad_identity: {
+            "subscriber": "finance", "artifact_id": "art-1",
+            "emitter": "gmail", "event": "new-mail", "digest": "digest-1",
+            "targets": ["resident:assistant"], "ts": True, "gen": "g1",
+        },
+        good_identity: good_rec,
     })
-    assert EventAckStore(path=path).get(identity) is None
+    store = EventAckStore(path=path)
+    assert store.get(bad_identity) is None
+    assert store.get(good_identity) is None
+
+
+def test_non_string_gen_yields_zero_acks_whole_store(tmp_path):
+    """Internal minor #2: no prior test exercised a malformed ``gen`` at
+    all — a non-string (or empty-string) ``gen`` must fail the whole
+    store exactly like a bad ``targets``/``ts`` does."""
+    path = tmp_path / "acks.json"
+    bad_identity = _identity()
+    good_identity, good_rec = _good_record()
+    _store_with_records(path, {
+        bad_identity: {
+            "subscriber": "finance", "artifact_id": "art-1",
+            "emitter": "gmail", "event": "new-mail", "digest": "digest-1",
+            "targets": ["resident:assistant"], "ts": 1, "gen": 123,
+        },
+        good_identity: good_rec,
+    })
+    store = EventAckStore(path=path)
+    assert store.get(bad_identity) is None
+    assert store.get(good_identity) is None
 
 
 def test_extra_field_yields_zero_acks_whole_store(tmp_path):
