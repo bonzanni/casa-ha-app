@@ -82,9 +82,9 @@ def test_envelope_rejects_non_finite_json_constants():
 
 
 def test_envelope_is_total():
+    # Never raises, whatever it is fed — including a wrong TYPE entirely
+    # (None has no len()/decode()), not just malformed bytes.
     for junk in (None, b"garbage bytes \x00\x01", b"{{{{"):
-        if junk is None:
-            continue
         assert ea.parse_envelope(junk) is None
 
 
@@ -204,6 +204,57 @@ def test_validate_rejects_non_finite_and_unbounded_clocks():
 def test_validate_is_total():
     for junk in (None, [], "x", 42, b"{}", {"v": 1}):
         assert ea.validate_record(junk) is None
+
+
+# ---------------------------------------------------------------------------
+# validate_record — local grammar restatement (emitter/event/subscriber are
+# spool PATH COMPONENTS, not free text)
+# ---------------------------------------------------------------------------
+
+def test_validate_rejects_path_traversal_shaped_identity_fields():
+    """Red-case pin (Important finding, task-3 review): emitter/event/
+    subscriber become a spool filename (``delivery/<event>--
+    <subscriber>.json``) and directory name (``/data/events/<emitter>/``)
+    once the spool exists. A charset-only "any non-empty string" check
+    would let a scribbled record with subscriber="../../../etc" validate
+    today and reach path construction later — this must be refused for
+    all three identity fields, not just subscriber."""
+    for bad in ("../x", "a/b", "../../../etc", ".", "..", "a b", "UPPER"):
+        assert ea.validate_record(dict(_good(), subscriber=bad)) is None, bad
+        assert ea.validate_record(dict(_good(), emitter=bad)) is None, bad
+    # event has its own (looser, mixed-case) charset but still refuses '/'.
+    for bad in ("../x", "a/b", "../../../etc"):
+        assert ea.validate_record(dict(_good(), event=bad)) is None, bad
+
+
+def test_validate_rejects_event_injectivity_rail_violations():
+    # Mirrors plugin_events' subscribe-side event rails exactly.
+    assert ea.validate_record(dict(_good(), event="a--b")) is None
+    assert ea.validate_record(dict(_good(), event="-x")) is None
+    assert ea.validate_record(dict(_good(), event="plg-x")) is None
+
+
+def test_validate_accepts_scoped_plugin_identity():
+    """P0 pin (mirrors plugin_events' test_scoped_emitter_accepted): a
+    bundled/specialist plugin's scoped `slug.manifest_name` identity must
+    validate for BOTH emitter and subscriber."""
+    scoped = "finance.bank-feed"
+    assert ea.validate_record(dict(_good(), emitter=scoped)) is not None
+    assert ea.validate_record(dict(_good(), subscriber=scoped)) is not None
+
+
+def test_validate_expect_identity_binding():
+    """Mirrors callback_attempts' expect_hash anti-substitution parameter:
+    a record read under one slot's name must not be trusted if its fields
+    claim a DIFFERENT slot's identity."""
+    good = _good()
+    assert ea.validate_record(good, expect_emitter=E, expect_event=EV,
+                               expect_subscriber=S) == good
+    assert ea.validate_record(good, expect_emitter="other") is None
+    assert ea.validate_record(good, expect_event="other-event") is None
+    assert ea.validate_record(good, expect_subscriber="other") is None
+    # Unbound reads (no expect_* supplied) are unchanged.
+    assert ea.validate_record(good) == good
 
 
 # ---------------------------------------------------------------------------

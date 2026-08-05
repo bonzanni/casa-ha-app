@@ -37,6 +37,7 @@ from __future__ import annotations
 
 import json
 import math
+import re
 
 SCHEMA_VERSION = 1
 ENVELOPE_MAX_BYTES = 4096
@@ -72,6 +73,49 @@ _RECORD_KEYS = frozenset({
     "status", "outcome", "nudges", "last_nudge_ts", "next_nudge_ts",
     "deferrals", "noted", "ended_ts",
 })
+
+#: The event-name grammar, RE-STATED here because this is a LEAF module
+#: (this file has no local imports — the layer that builds the spool's
+#: ``delivery/<event>--<subscriber>.json`` filenames and
+#: ``/data/events/<emitter>/`` directories, a later task, imports THIS
+#: module, never the reverse). Canonical copy: ``plugin_events._NAME_RE``
+#: plus its subscribe-side injectivity rails (no ``--``, no leading ``-``,
+#: no ``plg-`` prefix) — mirrored, not imported, exactly like
+#: ``callback_attempts._HASH_RE`` restates the spool's state-hash grammar.
+#: A validated record's ``event`` is a path COMPONENT, not free text: a
+#: charset-only check would let ``event="../../../etc"`` validate today and
+#: reach path construction once the spool exists.
+_EVENT_RE = re.compile(r"^[a-zA-Z0-9_-]+$")
+
+#: The registry plugin-name grammar, likewise re-stated (not imported) —
+#: canonical copy: ``plugin_registry.NAME_RE`` (plain) and
+#: ``plugin_registry.OWNED_NAME_RE`` (scoped ``slug.manifest_name``, for a
+#: bundled/specialist plugin's events). Both ``emitter`` and ``subscriber``
+#: are plugin identities that become a spool directory/filename component,
+#: so they take the same registry-name shape a subscribe entry's emitter
+#: reference does in ``plugin_events._valid_emitter_ref`` — including the
+#: scoped dot form (``finance.bank-feed`` must validate).
+_PLUGIN_NAME_RE = re.compile(r"^[a-z0-9][a-z0-9-]*$")
+_OWNED_PLUGIN_NAME_RE = re.compile(r"^[a-z0-9][a-z0-9-]{0,31}\.[a-z0-9][a-z0-9-]{0,39}$")
+
+
+def _valid_event(value) -> bool:
+    """The event-name grammar, plus the injectivity rails a declared/
+    subscribed event name is already held to in ``plugin_events.py``: no
+    ``--`` (reserved effective-name separator), no leading ``-``
+    (ambiguous plugin-name separator), no ``plg-`` prefix (reserved)."""
+    return (isinstance(value, str) and bool(_EVENT_RE.match(value))
+            and "--" not in value and not value.startswith("-")
+            and not value.startswith("plg-"))
+
+
+def _valid_plugin_ref(value) -> bool:
+    """The registry-name grammar for a plugin identity — accepts both the
+    plain and scoped (owned-plugin) forms. Used for both ``emitter`` and
+    ``subscriber``: either can be a scoped bundled/specialist plugin."""
+    return (isinstance(value, str)
+            and bool(_PLUGIN_NAME_RE.match(value)
+                     or _OWNED_PLUGIN_NAME_RE.match(value)))
 
 
 def _is_ts(value, *, allow_none: bool = True) -> bool:
@@ -173,20 +217,34 @@ def new_record(emitter: str, event: str, subscriber: str, gen: int,
     }
 
 
-def validate_record(obj) -> dict | None:
+def validate_record(obj, *, expect_emitter: str | None = None,
+                     expect_event: str | None = None,
+                     expect_subscriber: str | None = None) -> dict | None:
     """Total fail-closed validation: a copy of ``obj``, or ``None``.
 
     ``None`` unless ``obj`` is a dict with exactly the schema keys and
-    every field type-checks: non-empty strings for the four identity
-    fields (``emitter``/``event``/``subscriber``/``ack_token``), a
-    non-negative int for ``gen`` (a bool-typed int rejected, like every
-    other counter here), real bools for ``noted``, finite arithmetic-safe
-    timestamps (:func:`_is_ts`) with ``minted_ts`` REQUIRED (never
-    ``None`` — an event record is always minted from a live clock, unlike
-    a callback attempt's legacy allowance), status/outcome in their
-    vocabularies, non-negative int counters. Never raises: a malformed
-    (possibly scribbled) file must read as INVALID so the caller
+    every field type-checks: registry-name grammar for ``emitter`` and
+    ``subscriber`` (:func:`_valid_plugin_ref`, plain or scoped
+    ``slug.name`` form), event grammar for ``event`` (:func:`_valid_event`),
+    a non-empty string for ``ack_token`` (opaque, not a path component — no
+    grammar to restate), a non-negative int for ``gen`` (a bool-typed int
+    rejected, like every other counter here), real bools for ``noted``,
+    finite arithmetic-safe timestamps (:func:`_is_ts`) with ``minted_ts``
+    REQUIRED (never ``None`` — an event record is always minted from a live
+    clock, unlike a callback attempt's legacy allowance), status/outcome in
+    their vocabularies, non-negative int counters. Never raises: a
+    malformed (possibly scribbled) file must read as INVALID so the caller
     re-derives it from artifacts, never as an exception.
+
+    **``emitter``/``event``/``subscriber`` are validated against a LOCAL
+    grammar, not merely "any non-empty string".** These three become spool
+    path components once the spool exists (``delivery/<event>--
+    <subscriber>.json`` under an ``/data/events/<emitter>/`` directory) —
+    a charset-only check would let a scribbled record with
+    ``subscriber="../../../etc"`` validate today and reach path
+    construction later. Mirrors ``callback_attempts``' own precedent
+    (``_HASH_RE``, re-stated rather than imported because this is a leaf)
+    one field further: three identity fields instead of one.
 
     Status and outcome must agree, in both directions: ``outcome`` is
     ``None`` for exactly ``"pending"`` and set (to one of :data:`OUTCOMES`)
@@ -195,15 +253,37 @@ def validate_record(obj) -> dict | None:
     outcome: null}`` (a terminal record with no outcome to act on) would
     both read as truth — mirrors ``callback_attempts.validate_attempt``'s
     consistency gate exactly.
+
+    **Identity binding**, mirroring ``validate_attempt``'s ``expect_hash``:
+    when the caller supplies ``expect_emitter``/``expect_event``/
+    ``expect_subscriber``, a mismatch against the corresponding field is
+    INVALID. Every authoritative read of a record comes from a slot whose
+    NAME encodes its identity, and a grammar check alone would let a file
+    read under slot A carry field values naming slot B — a record in the
+    wrong slot is not a record. Bound here so no reader can forget to
+    check; an unbound read (all three ``expect_*`` left ``None``) only
+    applies the grammar gate, exactly like ``validate_attempt`` without
+    ``expect_hash``.
     """
     try:
         if not isinstance(obj, dict) or set(obj) != _RECORD_KEYS:
             return None
         if isinstance(obj["v"], bool) or obj["v"] != SCHEMA_VERSION:
             return None
-        for key in ("emitter", "event", "subscriber", "ack_token"):
-            if not isinstance(obj[key], str) or obj[key] == "":
-                return None
+        if not _valid_plugin_ref(obj["emitter"]):
+            return None
+        if expect_emitter is not None and obj["emitter"] != expect_emitter:
+            return None
+        if not _valid_event(obj["event"]):
+            return None
+        if expect_event is not None and obj["event"] != expect_event:
+            return None
+        if not _valid_plugin_ref(obj["subscriber"]):
+            return None
+        if expect_subscriber is not None and obj["subscriber"] != expect_subscriber:
+            return None
+        if not isinstance(obj["ack_token"], str) or obj["ack_token"] == "":
+            return None
         gen = obj["gen"]
         if isinstance(gen, bool) or not isinstance(gen, int) or gen < 0:
             return None
