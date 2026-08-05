@@ -491,6 +491,20 @@ def _check_invariant_tests(entry: dict, repo_root: Path, tracked: set[str]) -> l
                 continue
             if node is None:
                 continue
+            if "::" in node:
+                # A class-qualified pytest node id (`Class::method`) — a
+                # RUNNABLE anchor (`pytest {rel}::{node}` works verbatim
+                # for a test nested in a class). Python source never
+                # contains a literal "::" between a class and its
+                # method, so the plain substring search below can never
+                # match this shape; verify it structurally instead via
+                # the same AST symbol resolution `covers:` entries use.
+                if not symbol_exists(repo_root / rel, node.replace("::", ".")):
+                    problems.append(
+                        f"{doc}: {inv} names {ref!r} but {node!r} does not "
+                        f"resolve in {rel}"
+                    )
+                continue
             # A plain string search, not pytest collection: cheap, dependency-free, and
             # enough to catch a renamed or deleted test function.
             try:

@@ -450,23 +450,40 @@ def test_deroute_then_sweep_drop_then_reconsent_never_resurrects(spool):
 
 
 def test_reconstruction_rebuilds_state_at_max_record_gen_no_emission(spool):
+    """Important-4(a) pin: TWO surviving records at DIFFERENT gens — the
+    vacuous single-record version of this test could never distinguish
+    "picks the max" from a bug that picked the min, the first, or the
+    last record instead. S1 is a STALE gen-2 straggler (e.g. a member
+    already terminalized/dropped and never resurrected); S2 is the
+    CURRENT gen-4 member. Reconstruction must rebuild at gen 4 (the true
+    max) with a cohort containing ONLY the member actually AT that gen —
+    S1's stale gen-2 record must never be folded into the rebuilt
+    cohort."""
     now = 5000.0
-    rec = ea.new_record(E, EV, S1, 4, "tok-preserved", now - 100)
+    stale = ea.new_record(E, EV, S1, 2, "tok-stale", now - 500)
+    current = ea.new_record(E, EV, S2, 4, "tok-preserved", now - 100)
     spool.ensure_emitter_dirs(E)
     _write_raw(_delivery_path(spool, S1),
-              es.canonical_marker_bytes(rec).decode())
+              es.canonical_marker_bytes(stale).decode())
+    _write_raw(_delivery_path(spool, S2),
+              es.canonical_marker_bytes(current).decode())
     assert _read_state(spool) is None
 
-    changed = spool.fold_pass(R(S1), now)
+    changed = spool.fold_pass(R(S2), now)
     assert changed == []                     # nothing NEW minted — the
-    # surviving record's ladder is preserved verbatim
+    # surviving current-gen record's ladder is preserved verbatim
     state = _read_state(spool)
     assert state is not None
-    assert state["gen"] == 4
-    assert state["cohort"] == [S1]
+    assert state["gen"] == 4                 # the MAX, not the min (2)
+    assert state["cohort"] == [S2]            # only the max-gen member —
+    # S1's stale gen-2 record never joins the rebuilt cohort
     assert state["folded"] == []
-    rec_after = _read_delivery(spool, S1)
+    rec_after = _read_delivery(spool, S2)
     assert rec_after["ack_token"] == "tok-preserved"
+    # S1's stale record is untouched — reconstruction never rewrites a
+    # record it did not choose as the cohort's current member.
+    stale_after = _read_delivery(spool, S1)
+    assert stale_after["ack_token"] == "tok-stale" and stale_after["gen"] == 2
     assert rec_after["gen"] == 4
     assert rec_after["status"] == "pending"
 

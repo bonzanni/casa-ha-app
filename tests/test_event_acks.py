@@ -164,23 +164,38 @@ def test_identity_key_mismatch_yields_zero_acks_whole_store(tmp_path):
 
 
 def test_malformed_record_missing_field_yields_zero_acks(tmp_path):
+    """Important-4(b) pin: a SECOND, otherwise perfectly valid record sits
+    alongside the malformed one — the vacuous single-record version of
+    this test could never distinguish "that one bad record failed to
+    parse" from the actual whole-store fail-closed contract, since with
+    only one record in the file the two are indistinguishable. Both
+    identities must come back empty."""
     path = tmp_path / "acks.json"
-    identity = _identity()
+    bad_identity = _identity()
+    good_identity = _identity(subscriber="other", artifact_id="art-2",
+                              emitter="outlook", digest="digest-2")
     path.write_text(json.dumps({
         "schema_version": 1,
         "acks": {
-            identity: {
+            bad_identity: {
                 "subscriber": "finance", "artifact_id": "art-1",
                 "emitter": "gmail", "event": "new-mail",
                 # digest missing entirely
                 "targets": ["resident:assistant"], "ts": 1, "gen": "g1",
+            },
+            good_identity: {
+                "subscriber": "other", "artifact_id": "art-2",
+                "emitter": "outlook", "event": "new-mail",
+                "digest": "digest-2",
+                "targets": ["resident:assistant"], "ts": 2, "gen": "g2",
             },
         },
     }), encoding="utf-8")
 
     store = EventAckStore(path=path)
 
-    assert store.get(identity) is None
+    assert store.get(bad_identity) is None
+    assert store.get(good_identity) is None
 
 
 def test_non_list_targets_yields_zero_acks_whole_store(tmp_path):
