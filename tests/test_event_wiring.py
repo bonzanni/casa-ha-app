@@ -39,6 +39,7 @@ from types import SimpleNamespace
 from unittest.mock import AsyncMock
 
 import pytest
+import yaml
 
 CASA = Path(__file__).resolve().parents[1] / "casa" / "rootfs" / "opt" / "casa"
 _SRC = (CASA / "casa_core.py").read_text(encoding="utf-8")
@@ -608,6 +609,48 @@ class TestEmitterProvisioning:
             assert path.exists()
         finally:
             spool.close()
+
+
+# ---------------------------------------------------------------------------
+# ack_event tool exposure (Important-1) — every wake-dispatchable resident
+# role's tools.allowed must carry mcp__casa-framework__ack_event, or a
+# headless nudge to that role can never close its own delivery loop.
+# ---------------------------------------------------------------------------
+
+_RESIDENT_RUNTIME_PATHS = {
+    "assistant": CASA / "defaults" / "agents" / "assistant" / "runtime.yaml",
+    "butler": CASA / "defaults" / "agents" / "butler" / "runtime.yaml",
+    "concierge": CASA / "defaults" / "agents" / "concierge" / "runtime.yaml",
+}
+
+
+class TestAckEventToolParity:
+    @pytest.mark.parametrize("role", sorted(_RESIDENT_RUNTIME_PATHS))
+    def test_resident_runtime_carries_ack_event(self, role):
+        """Any resident role name is a valid `resident:<role>` delivery
+        target (plugin_dispatch.compose, callback_reconcile._reachable) —
+        an operator may assign ANY of them, not just assistant. Without
+        ack_event granted, that role's headless wake can never call it, and
+        the delivery just burns its nudge budget to exhaustion."""
+        path = _RESIDENT_RUNTIME_PATHS[role]
+        data = yaml.safe_load(path.read_text(encoding="utf-8"))
+        allowed = data["tools"]["allowed"]
+        assert "mcp__casa-framework__ack_event" in allowed, (
+            f"{role}.tools.allowed missing ack_event; got {allowed}")
+
+    def test_every_defaults_resident_runtime_is_covered_by_this_parity_check(self):
+        """Guards the parity check itself against a FOURTH resident role
+        being added later without updating _RESIDENT_RUNTIME_PATHS above —
+        walks defaults/agents/*/runtime.yaml directly rather than trusting
+        the hardcoded dict alone."""
+        agents_dir = CASA / "defaults" / "agents"
+        found = {
+            p.parent.name: p
+            for p in agents_dir.glob("*/runtime.yaml")
+            if yaml.safe_load(p.read_text(encoding="utf-8")).get("kind")
+            == "resident"
+        }
+        assert found.keys() == _RESIDENT_RUNTIME_PATHS.keys()
 
 
 # ---------------------------------------------------------------------------

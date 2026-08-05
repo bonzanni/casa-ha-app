@@ -461,6 +461,55 @@ async def test_instruction_carries_that_records_token_same_role_isolation(wired)
     assert rec_other["ack_token"] not in by_subscriber[SUBSCRIBER]
 
 
+async def test_specialist_only_target_never_asks_specialist_to_ack(wired):
+    """Important-1 pin: a specialist-only target (no resident: entry) is
+    ALWAYS delegated via assistant (plugin_dispatch.compose). Specialists
+    are operator-installed content this repo does not control and are not
+    guaranteed casa-framework tool access, so the text delegated verbatim
+    to the specialist must never ask IT to call ack_event — the delegating
+    agent (assistant) must, via a separate postscript outside that
+    delegated text."""
+    wired.entry = {"targets": ["specialist:noop"], "artifact_id": ARTIFACT,
+                   "manifest": _manifest([(EMITTER, EVENT)])}
+    # The pre-send gate recomputes the consent identity from entry's LIVE
+    # targets — the routed snapshot + ack store must agree with the new
+    # ["specialist:noop"] targets, not the fixture's default
+    # ["resident:assistant"].
+    snap = _snapshot(SUBSCRIBER, ARTIFACT, EMITTER, EVENT, ["specialist:noop"])
+    wired.routed[(EMITTER, EVENT)][SUBSCRIBER] = snap
+    wired.acks.acked.add(snap["ack_identity"])
+    rec = wired.seed()
+    await ee._worker_pass()
+
+    assert len(wired.dispatches) == 1
+    role, text, _ctx = wired.dispatches[0]
+    assert role == "assistant"
+    assert "Delegate to the specialist 'noop' with the instruction:" in text
+    # the specialist's OWN delegated task text must not carry an ack_event
+    # CALL — only the "do NOT call it yourself" refusal.
+    ack_call = f"ack_event(emitter='{EMITTER}', event='{EVENT}', token='{rec['ack_token']}')"
+    assert "Do NOT call ack_event yourself" in text
+    # ...but the postscript, directed at the delegating agent, DOES.
+    assert ack_call in text
+    assert "the delegating agent, not the specialist" in text
+    # and the ack call appears exactly once — only in the postscript.
+    assert text.count(ack_call) == 1
+
+
+async def test_resident_target_never_carries_the_delegation_wording(wired):
+    """Contrast case: a plain resident target must dispatch the ordinary
+    (non-delegated) instruction — no "Delegate to the specialist" prose, no
+    "Do NOT call ack_event" refusal, no postscript."""
+    rec = wired.seed()
+    await ee._worker_pass()
+    role, text, _ctx = wired.dispatches[0]
+    assert role == "assistant"
+    assert "Delegate to the specialist" not in text
+    assert "Do NOT call ack_event" not in text
+    assert f"ack_event(emitter='{EMITTER}', event='{EVENT}', " \
+           f"token='{rec['ack_token']}')" in text
+
+
 async def test_compose_none_defers_with_one_note(wired):
     wired.entry = {"targets": ["specialist:noop-but-empty"],
                    "artifact_id": ARTIFACT,

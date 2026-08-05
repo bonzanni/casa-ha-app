@@ -174,13 +174,56 @@ def kick_all() -> None:
 
 
 def _wake_instruction(emitter: str, event: str, subscriber: str,
-                      token: str) -> str:
-    return (
+                      token: str, *, delegate_ack: bool = False) -> str:
+    """The wake instruction. ``delegate_ack=True`` (Important-1) is for a
+    SPECIALIST-only target (``plugin_dispatch.compose`` always resolves
+    that to ``role="assistant"`` relaying a delegation instruction — the
+    specialist itself never receives ``role`` here): a specialist is
+    operator-installed content this repo does not ship or control, so it
+    is never guaranteed ``casa-framework`` tool access. The specialist's
+    own delegated task therefore does NOT ask it to call ``ack_event`` —
+    :func:`_run_nudge` appends a SEPARATE, assistant-directed instruction
+    (outside the text delegated verbatim to the specialist) telling the
+    delegating agent to perform the ack itself once the specialist's turn
+    completes."""
+    base = (
         f"Plugin '{emitter}' emitted the event '{event}'. This is a "
         f"headless wake for '{subscriber}': process it through your tools "
         "now; if you need operator input, record it durably through your "
-        "tools and end the turn — do not ask. When done, call "
-        f"ack_event(emitter='{emitter}', event='{event}', token='{token}').")
+        "tools and end the turn — do not ask.")
+    if delegate_ack:
+        return (f"{base} Do NOT call ack_event yourself — the agent "
+                "delegating this task to you handles the ack.")
+    return (f"{base} When done, call "
+            f"ack_event(emitter='{emitter}', event='{event}', token='{token}').")
+
+
+def _delegated_ack_postscript(emitter: str, event: str, token: str) -> str:
+    """Appended AFTER ``plugin_dispatch.compose`` wraps the delegation
+    instruction (never inside the text delegated verbatim to the
+    specialist, which must never be asked to call a tool it may not have)
+    — directs the DELEGATING agent (always 'assistant' here) to perform
+    the ack itself once the specialist's turn is done."""
+    return (
+        " After the specialist's turn completes, YOU (the delegating "
+        f"agent, not the specialist) must call ack_event(emitter='{emitter}', "
+        f"event='{event}', token='{token}') yourself — the specialist is "
+        "not guaranteed casa-framework tool access, so the ack is your "
+        "responsibility, not theirs.")
+
+
+def _is_specialist_only_target(entry: dict) -> bool:
+    """True when ``entry["targets"]`` names only ``specialist:*`` entries
+    (no ``resident:*`` at all) — the exact shape under which
+    ``plugin_dispatch.compose`` takes its delegation branch (always
+    ``role="assistant"``, never the specialist directly; a resident
+    target, if present, always wins first)."""
+    targets = entry.get("targets") or []
+    has_resident = any(isinstance(t, str) and t.startswith("resident:")
+                       for t in targets)
+    has_specialist = any(isinstance(t, str) and t.startswith("specialist:")
+                         for t in targets)
+    return has_specialist and not has_resident
 
 
 def _wake_context(emitter: str, event: str) -> dict:
@@ -573,9 +616,18 @@ async def _run_nudge(emitter: str, event: str, subscriber: str,
     entry = _resolve(subscriber)
     if entry is None:
         return
+    delegate_ack = _is_specialist_only_target(entry)
     instruction = _wake_instruction(emitter, event, subscriber,
-                                    rec["ack_token"])
+                                    rec["ack_token"], delegate_ack=delegate_ack)
     role, composed = _compose(entry, instruction)
+    if delegate_ack and role is not None:
+        # Important-1: the text just delegated to the specialist never asks
+        # IT to call ack_event (see _wake_instruction's delegate_ack
+        # branch) — this postscript is directed at the DELEGATING agent
+        # (role is always "assistant" for a specialist-only target) and
+        # sits OUTSIDE what plugin_dispatch.compose wrapped as the
+        # specialist's own verbatim task text.
+        composed += _delegated_ack_postscript(emitter, event, rec["ack_token"])
     context = _wake_context(emitter, event)
     if role is None:
         await _defer(emitter, event, subscriber, rec)

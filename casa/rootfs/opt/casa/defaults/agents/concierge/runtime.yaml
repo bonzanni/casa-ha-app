@@ -10,6 +10,11 @@ tools:
   allowed:
     - WebSearch
     - mcp__casa-framework__delegate_to_agent
+    # #419 — a headless event wake cannot ask for approval; without this
+    # every nudge would stall to budget exhaustion since ack_event could
+    # never actually run (any resident role may be an operator-assigned
+    # event-delivery target).
+    - mcp__casa-framework__ack_event
   disallowed:
     # #396: session-scoped schedulers. These outlive nothing — CronCreate
     # reports "Session-only (not written to disk, dies when Claude exits)" —
