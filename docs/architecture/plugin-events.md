@@ -206,9 +206,18 @@ happened.
 restarts at generation 1, indistinguishable on disk from a pair that never existed before;
 no issue is raised (an undetectable condition claims nothing it cannot prove).
 
-**A delivery record is unreadable or malformed.** Quarantined under
+**A delivery record is malformed** (read fully, content invalid). Quarantined under
 `delivery/.corrupt-<ts>-<name>` and surfaced as `event_spool_issue`; it never blocks the
 pair's idle decision, and its token is gone, so a later ack for it reads as `no_match`.
+
+**A delivery record is unreadable** — a transient read failure (fd pressure,
+`EMFILE`/`EIO`), distinct from malformed content actually seen and rejected. Fold defers
+the WHOLE pair that pass: never idle, `fan_out_complete` never true, no reconstruct/
+repair/open — an unreadable record must never fold into "absent" the way a genuinely
+missing one does, since that would let a fresh generation open right over an in-flight
+delivery this pass simply failed to see, rotating its token out from under it. Not
+quarantined either (sweep applies the same defer); normal operation resumes the moment
+the file reads back cleanly.
 
 **The ack store is missing, unreadable, or malformed.** Treated as zero acks store-wide;
 every subscription stays `event_pending_ack` until a fresh operator approval rewrites a

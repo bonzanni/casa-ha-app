@@ -527,11 +527,19 @@ async def reconcile_plugin_events(
     can never publish after a newer one already has).
 
     ``runtime`` supplies ``role_configs``/``channel_manager`` when the
-    explicit keyword overrides are not given (``runtime=None`` with
-    explicit keywords is the internal recursive-call shape used by
-    :func:`_fire_consent_prompts`'s ``reconcile_cb`` and by :func:`kick`,
-    mirroring ``callback_reconcile._reconcile_again`` capturing this call's
-    OWN inputs rather than re-reading a possibly-rebound runtime).
+    explicit keyword overrides are not given. Boot
+    (``casa_core._boot_reconcile_plugin_events``) is the one caller that
+    passes ``runtime=None`` with explicit ``role_configs``/
+    ``channel_manager`` overrides — a snapshot captured once, evaluated at
+    boot. Every OTHER caller instead passes the LIVE ``runtime``
+    positionally, re-derived from ``agent.active_runtime`` at call time
+    (SOL-P2a): :func:`kick`'s ``_kick_reconcile``, and
+    :func:`_fire_consent_prompts`'s ``reconcile_cb``, which used to
+    capture ``role_configs``/``channel_manager`` at PROMPT time the same
+    way boot does — a role removed or reassigned between the prompt and
+    the operator's tap would then be invisible to the reconcile it fires.
+    Both now read ``role_configs``/``channel_manager`` fresh off the live
+    runtime instead of a snapshot captured earlier.
 
     On a compute failure: publish the typed sentinel
     :data:`event_spool.ROUTING_UNAVAILABLE` (never an empty map — decision

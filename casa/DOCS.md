@@ -831,9 +831,11 @@ consent DM — "Plugin '\<subscriber>' wants delivery of '\<event>' from
 '\<emitter>' → \<resident>". Until you tap Approve, nothing is delivered
 and plugin health names the reason. The approval is bound to the exact
 subscriber, its version, the emitter, the event, and which resident
-receives it — any one of those changing (either plugin updates, or you
-reassign the subscriber to a different resident) invalidates the old
-approval silently and re-prompts; it is never carried forward.
+receives it — updating the **subscriber** plugin, or reassigning it to a
+different resident, invalidates the old approval silently and re-prompts;
+it is never carried forward. Updating the **emitter** does not re-ask, as
+long as its new version still declares the event — only the subscriber's
+own version and target selection are part of what you approved.
 
 Once approved, a delivery dispatches as a quiet, headless turn to the
 assigned resident — you will not see it in Telegram unless the resident's
