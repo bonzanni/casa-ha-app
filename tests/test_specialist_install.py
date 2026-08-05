@@ -2043,3 +2043,124 @@ def test_bundled_callback_short_name_passes_both_scoped_and_unscoped(
 
     result = _inspect_bundled(tmp_path, component_dir, monkeypatch)
     assert result.slug == "mtg-test"
+
+
+# ---------------------------------------------------------------------------
+# casa.emits / casa.subscribes are PERMITTED on a sourced/bundled plugin
+# dependency (unlike casa.triggers) — same carve-out as casa.callbacks. A
+# bundled dep's OWNED registry entry routes under the SCOPED name
+# (`slug.identifier`), so `_validate_sourced_plugin_tree` carries its own
+# inspect-time gate — `EVENT_NAME_TOO_LONG` — mirroring
+# `CALLBACK_NAME_TOO_LONG` exactly. `casa.triggers` on a sourced dep must
+# STILL be refused — regression pin below.
+# ---------------------------------------------------------------------------
+
+
+def _patch_bundled_events(component_dir: Path, name: str, *,
+                          emits: list | None = None,
+                          subscribes: list | None = None) -> str:
+    """Write `casa.emits`/`casa.subscribes` onto an already-
+    `write_bundled_plugin`-built tree and return the recomputed digest a
+    dependency row must pin — mirrors `_patch_bundled_callbacks`."""
+    import plugin_store
+    plugin_dir = component_dir / "plugins" / name
+    manifest_path = plugin_dir / ".claude-plugin" / "plugin.json"
+    manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+    casa = manifest.setdefault("casa", {})
+    if emits is not None:
+        casa["emits"] = emits
+    if subscribes is not None:
+        casa["subscribes"] = subscribes
+    manifest_path.write_text(json.dumps(manifest), encoding="utf-8")
+    return "sha256:" + plugin_store.content_checksum(plugin_dir)
+
+
+def test_bundled_emits_and_subscribes_not_prohibited(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Regression pin for the carve-out: casa.emits/casa.subscribes are
+    PEERS of casa.callbacks on a bundled dependency, not subject to the
+    triggers-style bundled_*_unsupported treatment — a valid declaration of
+    BOTH blocks must resolve, and no bundled_*_unsupported kind is raised."""
+    _reset_plugin_registry_snapshot_for(tmp_path)
+    component_dir, manifest_path = write_minimal_component(tmp_path, slug="mtg-test")
+    write_bundled_plugin(component_dir, "mtg")
+    digest = _patch_bundled_events(
+        component_dir, "mtg",
+        emits=[{"name": "invoice-ready"}],
+        subscribes=[{"plugin": "other", "event": "ping"}])
+    _add_bundled_dependency_row(manifest_path, _bundled_dep_row("mtg", digest, "plugins/mtg"))
+
+    result = _inspect_bundled(tmp_path, component_dir, monkeypatch)
+
+    assert result.slug == "mtg-test"
+    row = result.plugin_resolutions[0]
+    assert row.scoped_name == "mtg-test.mtg"
+    assert row.identifier == "mtg"
+
+
+def test_bundled_event_scoped_name_too_long_refused(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """An emitted event whose effective name fits comfortably under the bare
+    identifier can still overflow once routed under the SCOPED registry name
+    (slug.identifier) — the inspect-time gate must catch this BEFORE the
+    artifact can ever reach the registry, coded distinctly from the generic
+    (scope-blind) emits_invalid."""
+    import plugin_events
+
+    _reset_plugin_registry_snapshot_for(tmp_path)
+    slug = "s" * 30  # within specialist_component's 32-char slug cap
+    identifier = "mtg"
+    declared = "x" * 100
+    # Sanity for the fixture itself: passes under the BARE identifier.
+    assert len(f"plg-{identifier}--{declared}") <= plugin_events.MAX_EFFECTIVE_LEN
+    # But overflows once scoped (slug.identifier instead of identifier).
+    assert len(f"plg-{slug}.{identifier}--{declared}") > plugin_events.MAX_EFFECTIVE_LEN
+
+    component_dir, manifest_path = write_minimal_component(tmp_path, slug=slug)
+    write_bundled_plugin(component_dir, identifier)
+    digest = _patch_bundled_events(component_dir, identifier, emits=[{"name": declared}])
+    _add_bundled_dependency_row(
+        manifest_path, _bundled_dep_row(identifier, digest, f"plugins/{identifier}"))
+
+    with pytest.raises(SpecialistInstallError) as exc:
+        _inspect_bundled(tmp_path, component_dir, monkeypatch)
+    assert exc.value.kind == "event_name_too_long"
+
+
+def test_bundled_event_short_name_passes_both_scoped_and_unscoped(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Sanity companion to the overflow test above: a short declared name
+    stays well under 128 chars against BOTH the bare identifier and the
+    scoped name — the new gate must not false-positive on ordinary bundles."""
+    _reset_plugin_registry_snapshot_for(tmp_path)
+    component_dir, manifest_path = write_minimal_component(tmp_path, slug="mtg-test")
+    write_bundled_plugin(component_dir, "mtg")
+    digest = _patch_bundled_events(component_dir, "mtg", emits=[{"name": "short"}])
+    _add_bundled_dependency_row(manifest_path, _bundled_dep_row("mtg", digest, "plugins/mtg"))
+
+    result = _inspect_bundled(tmp_path, component_dir, monkeypatch)
+    assert result.slug == "mtg-test"
+
+
+def test_bundled_triggers_still_refused_alongside_events(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Regression pin: lifting the casa.triggers prohibition for
+    emits/subscribes must NOT loosen it for casa.triggers itself — a sourced
+    dependency declaring casa.triggers is still refused with
+    bundled_triggers_unsupported, even though emits/subscribes are now
+    permitted peers of callbacks."""
+    _reset_plugin_registry_snapshot_for(tmp_path)
+    component_dir, manifest_path = write_minimal_component(tmp_path, slug="mtg-test")
+    write_bundled_plugin(component_dir, "mtg", triggers=[{"name": "on-thing"}])
+    plugin_dir = component_dir / "plugins" / "mtg"
+    import plugin_store
+    digest = "sha256:" + plugin_store.content_checksum(plugin_dir)
+    _add_bundled_dependency_row(manifest_path, _bundled_dep_row("mtg", digest, "plugins/mtg"))
+
+    with pytest.raises(SpecialistInstallError) as exc:
+        _inspect_bundled(tmp_path, component_dir, monkeypatch)
+    assert exc.value.kind == "bundled_triggers_unsupported"
