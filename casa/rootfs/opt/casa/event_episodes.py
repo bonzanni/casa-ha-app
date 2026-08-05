@@ -86,6 +86,11 @@ _resolve_registry_entry: "Callable[[str], Any] | None" = None
 _get_routed: "Callable[[], Any] | None" = None
 _get_installed: "Callable[[], set] | None" = None
 _get_registry_valid: "Callable[[], bool] | None" = None
+#: Every installed plugin that currently declares ``casa.emits`` (Critical-1)
+#: — the worker's own provisioning worklist, wired from casa_core exactly
+#: like ``_get_installed``. Absent (``None``, the un-configured default)
+#: degrades to "provision nothing this pass", never an exception.
+_get_emitters: "Callable[[], set] | None" = None
 _get_acks: "Callable[[], Any] | None" = None
 _get_spool: "Callable[[], Any] | None" = None
 _notify_operator: "Callable[[str], Awaitable[None]] | None" = None
@@ -110,19 +115,23 @@ _pending_hints: "set[tuple[str, str]]" = set()
 
 
 def configure(*, dispatch, resolve_registry_entry, get_routed, get_installed,
-              get_registry_valid, get_acks, get_spool, notify_operator=None,
-              sleep=asyncio.sleep) -> None:
+              get_registry_valid, get_acks, get_spool, get_emitters=None,
+              notify_operator=None, sleep=asyncio.sleep) -> None:
     """casa_core boot wiring. Idempotent. Every argument is a LIVE
     callable, re-invoked fresh on every pass/gate check — never a snapshot
-    captured once (decisions 26/27/30)."""
+    captured once (decisions 26/27/30). ``get_emitters`` is optional
+    (defaults to ``None``, which provisions nothing) so existing callers/
+    tests that predate Critical-1's provisioning fix keep working
+    unchanged."""
     global _dispatch, _resolve_registry_entry, _get_routed, _get_installed
-    global _get_registry_valid, _get_acks, _get_spool, _notify_operator
-    global _sleep, _kick, _next_due
+    global _get_registry_valid, _get_emitters, _get_acks, _get_spool
+    global _notify_operator, _sleep, _kick, _next_due
     _dispatch = dispatch
     _resolve_registry_entry = resolve_registry_entry
     _get_routed = get_routed
     _get_installed = get_installed
     _get_registry_valid = get_registry_valid
+    _get_emitters = get_emitters
     _get_acks = get_acks
     _get_spool = get_spool
     _notify_operator = notify_operator
@@ -268,6 +277,43 @@ def start_worker() -> None:
         _kick.set()
 
 
+async def _provision_emitters(spool: Any) -> None:
+    """Create ``<emitter>/{emissions,state,delivery}`` and publish
+    ``ready.json`` for every installed plugin that currently declares
+    ``casa.emits`` (Critical-1 fix): ``ensure_emitter_dirs``/``write_ready``
+    had zero production callers before this, so a freshly-installed
+    emitter's first ``emit()`` call raised ``FileNotFoundError``. This is
+    non-destructive housekeeping (creates/repairs only — never deletes or
+    unroutes anything), so unlike fold/dispatch it is allowed to run even
+    under the :data:`event_spool.ROUTING_UNAVAILABLE` sentinel (decision 26
+    only bounds DESTRUCTIVE action). Skips an emitter already carrying a
+    valid ready marker, so a steady state costs one cheap read per pass, not
+    a full mkdir+fsync-backed republish. One bad emitter's enumeration or
+    provisioning failure never stops another's."""
+    if _get_emitters is None:
+        return
+    try:
+        emitters = set(_get_emitters() or ())
+    except Exception:  # noqa: BLE001 — a broken enumeration must not abort
+        # the pass it was only meant to prime
+        logger.exception("event-episodes emitter enumeration failed")
+        return
+    for emitter in sorted(emitters):
+        try:
+            marker = await asyncio.to_thread(spool.read_marker, emitter)
+            if marker.state is event_spool.MarkerState.PRESENT:
+                continue
+            await asyncio.to_thread(spool.ensure_emitter_dirs, emitter)
+            await asyncio.to_thread(spool.write_ready, emitter, {"v": 1})
+        except asyncio.CancelledError:
+            raise
+        except Exception:  # noqa: BLE001 — one bad emitter must never stop
+            # provisioning the rest
+            logger.exception(
+                "event-episodes emitter provisioning failed (emitter=%s)",
+                emitter)
+
+
 async def recovery(*, boot: bool = True) -> None:
     """Boot/periodic recovery pass: reconcile the fold + delivery ledger
     against the artifacts via the SAME configured closures the worker pass
@@ -280,6 +326,7 @@ async def recovery(*, boot: bool = True) -> None:
     orphan-dir GC)."""
     spool = _get_spool() if _get_spool is not None else None
     if spool is not None:
+        await _provision_emitters(spool)
         routed = (_get_routed() if _get_routed is not None
                  else event_spool.ROUTING_UNAVAILABLE)
         installed = set(_get_installed() or ()) if _get_installed is not None \
@@ -311,6 +358,8 @@ async def _worker_pass() -> None:
     if spool is None:
         _next_due = None
         return
+
+    await _provision_emitters(spool)
 
     routed = _get_routed() if _get_routed is not None \
         else event_spool.ROUTING_UNAVAILABLE

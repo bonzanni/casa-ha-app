@@ -183,12 +183,25 @@ class _Facility:
             return {"targets": list(self._targets),
                     "artifact_id": rp.artifact_id, "manifest": rp.manifest}
 
+        def _get_emitters():
+            import plugin_store
+            out = set()
+            for name, rp in self.plugins.items():
+                try:
+                    emits = plugin_store.manifest_emits(rp.manifest, name)
+                except Exception:  # noqa: BLE001
+                    continue
+                if emits:
+                    out.add(name)
+            return out
+
         ee.configure(
             dispatch=_dispatch,
             resolve_registry_entry=_resolve_registry_entry,
             get_routed=er.get_routed,
             get_installed=lambda: set(self.plugins),
             get_registry_valid=lambda: True,
+            get_emitters=_get_emitters,
             get_acks=lambda: self.acks,
             get_spool=lambda: self.spool,
             notify_operator=_notify,
@@ -200,10 +213,19 @@ class _Facility:
 
     # -- declare + consent + reconcile -----------------------------------
 
-    def declare_emitter(self, name: str, *, events: tuple, artifact_id: str) -> None:
+    def declare_emitter(self, name: str, *, events: tuple, artifact_id: str,
+                        provision: bool = True) -> None:
+        """Register an emitter's declaration. ``provision=True`` (the
+        default, used by scenarios not under Critical-1 test here) mints its
+        spool dirs immediately via a direct harness call. The positive-path
+        helper (:func:`_routed_pair`) passes ``provision=False`` and instead
+        proves PRODUCTION's own worker-driven provisioning
+        (``event_episodes._provision_emitters``, wired through
+        ``get_emitters``) does it."""
         manifest = _manifest(emits=events)
         self.plugins[name] = _rp(name, artifact_id=artifact_id, manifest=manifest)
-        self.spool.ensure_emitter_dirs(name)
+        if provision:
+            self.spool.ensure_emitter_dirs(name)
 
     def declare_subscriber(self, name: str, *, subscribes: tuple,
                            artifact_id: str) -> None:
@@ -257,8 +279,17 @@ def _extract_token(instruction: str, *, emitter: str, event: str) -> str:
 
 async def _routed_pair(facility: _Facility) -> None:
     """Declare + consent + reconcile the canonical (finance/invoice-created
-    -> reporting) pair; assert it actually routed."""
-    facility.declare_emitter(EMITTER, events=(EVENT,), artifact_id=EMITTER_ARTIFACT)
+    -> reporting) pair; assert it actually routed.
+
+    Critical-1: the emitter is declared with ``provision=False`` — no
+    harness-side ``ensure_emitter_dirs()`` call anywhere in this helper.
+    Instead, one production worker pass (the real
+    ``event_episodes._worker_pass``, wired with ``get_emitters`` exactly as
+    casa_core wires it) is what provisions the emitter's spool dirs and
+    publishes its ready marker, proving production does this rather than
+    the test harness."""
+    facility.declare_emitter(EMITTER, events=(EVENT,), artifact_id=EMITTER_ARTIFACT,
+                             provision=False)
     facility.declare_subscriber(SUBSCRIBER, subscribes=((EMITTER, EVENT),),
                                 artifact_id=SUB_ARTIFACT)
     facility.consent(SUBSCRIBER, SUB_ARTIFACT, EMITTER, EVENT)
@@ -267,6 +298,10 @@ async def _routed_pair(facility: _Facility) -> None:
     routed = er.get_routed()
     assert routed is not es.ROUTING_UNAVAILABLE
     assert SUBSCRIBER in routed.get((EMITTER, EVENT), {})
+
+    assert facility.spool.read_marker(EMITTER).state == es.MarkerState.ABSENT
+    await facility.worker_pass()
+    assert facility.spool.read_marker(EMITTER).state == es.MarkerState.PRESENT
 
 
 # ---------------------------------------------------------------------------

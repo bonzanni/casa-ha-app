@@ -2245,6 +2245,34 @@ def _event_registry_valid() -> bool:
     return bool(_pr.snapshot_registry().valid)
 
 
+def _event_emitters() -> set:
+    """``event_episodes``'s ``get_emitters`` seam (Critical-1): every
+    installed plugin that currently declares at least one ``casa.emits``
+    entry — the set the worker provisions spool dirs (and a ready marker)
+    for on every pass/recovery, closing the "ensure_emitter_dirs has zero
+    production callers" gap. Fail-closed under an invalid resolve, mirroring
+    :func:`_event_installed`: an unresolvable declaration set never looks
+    like "nobody emits" and get silently skipped forever — provisioning
+    simply retries next pass, exactly like every other seam here. A single
+    plugin's own bad ``casa.emits`` declaration is that plugin's concern
+    (surfaced elsewhere as a health issue) and never aborts enumeration for
+    the rest."""
+    import plugin_registry as _pr
+    import plugin_store
+    res = _pr.resolve_all()
+    if not getattr(res, "registry_valid", False):
+        return set()
+    out = set()
+    for rp in res.plugins:
+        try:
+            emits = plugin_store.manifest_emits(rp.manifest, rp.name)
+        except Exception:  # noqa: BLE001
+            continue
+        if emits:
+            out.add(rp.name)
+    return out
+
+
 def _callback_and_trigger_routes_live(plugin: str) -> bool:
     """Setup-dispatch route gate. A plugin's setup tool must not be
     dispatched while EITHER its trigger OR its callback markers are dark.
@@ -3790,6 +3818,7 @@ async def main() -> None:
         get_routed=_evrec.get_routed,
         get_installed=_event_installed,
         get_registry_valid=_event_registry_valid,
+        get_emitters=_event_emitters,
         get_acks=lambda: event_acks.ACKS,
         get_spool=event_spool.get_spool,
         sleep=asyncio.sleep,

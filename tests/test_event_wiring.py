@@ -464,6 +464,153 @@ class TestFailClosedRegistry:
 
 
 # ---------------------------------------------------------------------------
+# Emitter spool provisioning (Critical-1) — get_emitters wiring + the
+# worker/recovery-driven ensure_emitter_dirs/write_ready calls.
+# ---------------------------------------------------------------------------
+
+
+class TestEmitterProvisioning:
+    def test_event_emitters_reports_installed_declaring_plugins(self, monkeypatch):
+        import casa_core
+        import plugin_registry
+        finance = SimpleNamespace(
+            name="finance", artifact_id="a1", path="/store/finance/a1",
+            version="1.0.0", manifest_name="finance",
+            manifest={"name": "finance",
+                      "casa": {"emits": [{"name": "invoice-created"}]}})
+        reporting = SimpleNamespace(
+            name="reporting", artifact_id="a2", path="/store/reporting/a2",
+            version="1.0.0", manifest_name="reporting",
+            manifest={"name": "reporting", "casa": {}})
+        monkeypatch.setattr(
+            plugin_registry, "resolve_all",
+            lambda: SimpleNamespace(registry_valid=True,
+                                    plugins=[finance, reporting], issues=[]))
+        assert casa_core._event_emitters() == {"finance"}
+
+    def test_event_emitters_fails_closed_on_invalid_registry(self, monkeypatch):
+        import casa_core
+        import plugin_registry
+        monkeypatch.setattr(
+            plugin_registry, "resolve_all",
+            lambda: SimpleNamespace(registry_valid=False, plugins=[], issues=[]))
+        assert casa_core._event_emitters() == set()
+
+    def test_worker_configure_wires_get_emitters(self):
+        start = _SRC.index("_evep.configure(")
+        end = _SRC.index(")", start)
+        block = _SRC[start:end]
+        assert "get_emitters=_event_emitters" in block
+
+    def test_recovery_provisions_a_fresh_emitter_via_production_wiring(
+            self, monkeypatch, tmp_path):
+        """C1 pin: casa creates NOTHING for an emitter's spool until the
+        worker's own recovery/pass provisions it — driven through the SAME
+        casa_core closure main() wires (``_event_emitters``), never a
+        harness-side ``ensure_emitter_dirs()`` call. Proves a freshly-
+        declared emitter can ``emit()`` successfully after ONE recovery
+        pass."""
+        import asyncio
+        import event_episodes
+        import event_spool
+        import casa_core
+        import plugin_registry
+
+        manifest = {"name": "finance",
+                    "casa": {"emits": [{"name": "invoice-created"}]}}
+        rp = SimpleNamespace(
+            name="finance", artifact_id="a1", path="/store/finance/a1",
+            version="1.0.0", manifest_name="finance", manifest=manifest)
+        monkeypatch.setattr(
+            plugin_registry, "resolve_all",
+            lambda: SimpleNamespace(registry_valid=True, plugins=[rp], issues=[]))
+        monkeypatch.setattr(
+            plugin_registry, "snapshot_registry",
+            lambda: SimpleNamespace(valid=True, entries=[{"name": "finance"}]))
+
+        spool = event_spool.EventSpool(tmp_path / "events")
+        try:
+            monkeypatch.setattr(event_episodes, "_dispatch", None)
+            monkeypatch.setattr(event_episodes, "_resolve_registry_entry", None)
+            monkeypatch.setattr(event_episodes, "_get_routed",
+                                lambda: event_spool.ROUTING_UNAVAILABLE)
+            monkeypatch.setattr(event_episodes, "_get_installed",
+                                casa_core._event_installed)
+            monkeypatch.setattr(event_episodes, "_get_registry_valid",
+                                casa_core._event_registry_valid)
+            monkeypatch.setattr(event_episodes, "_get_emitters",
+                                casa_core._event_emitters)
+            monkeypatch.setattr(event_episodes, "_get_acks", None)
+            monkeypatch.setattr(event_episodes, "_get_spool", lambda: spool)
+            monkeypatch.setattr(event_episodes, "_notify_operator", None)
+
+            # Before any pass: nothing has provisioned this emitter's spool
+            # tree yet — a real emit() raises exactly as a freshly-installed
+            # plugin's would in production today (the bug this pin closes).
+            with pytest.raises(FileNotFoundError):
+                event_spool.emit(spool.root / "finance", "invoice-created")
+
+            asyncio.run(event_episodes.recovery(boot=True))
+
+            # No harness-side ensure_emitter_dirs() call anywhere above —
+            # production's own recovery pass provisioned the dirs.
+            path = event_spool.emit(spool.root / "finance", "invoice-created")
+            assert path.exists()
+            assert spool.read_marker("finance").state == \
+                event_spool.MarkerState.PRESENT
+        finally:
+            spool.close()
+
+    def test_worker_pass_provisions_a_fresh_emitter_via_production_wiring(
+            self, monkeypatch, tmp_path):
+        """Same production-wiring pin as above, but through _worker_pass()
+        (the top-of-pass provisioning, not just recovery())."""
+        import asyncio
+        import event_episodes
+        import event_spool
+        import casa_core
+        import plugin_registry
+
+        manifest = {"name": "finance",
+                    "casa": {"emits": [{"name": "invoice-created"}]}}
+        rp = SimpleNamespace(
+            name="finance", artifact_id="a1", path="/store/finance/a1",
+            version="1.0.0", manifest_name="finance", manifest=manifest)
+        monkeypatch.setattr(
+            plugin_registry, "resolve_all",
+            lambda: SimpleNamespace(registry_valid=True, plugins=[rp], issues=[]))
+        monkeypatch.setattr(
+            plugin_registry, "snapshot_registry",
+            lambda: SimpleNamespace(valid=True, entries=[{"name": "finance"}]))
+
+        spool = event_spool.EventSpool(tmp_path / "events")
+        try:
+            monkeypatch.setattr(event_episodes, "_dispatch", None)
+            monkeypatch.setattr(event_episodes, "_resolve_registry_entry", None)
+            monkeypatch.setattr(event_episodes, "_get_routed",
+                                lambda: event_spool.ROUTING_UNAVAILABLE)
+            monkeypatch.setattr(event_episodes, "_get_installed",
+                                casa_core._event_installed)
+            monkeypatch.setattr(event_episodes, "_get_registry_valid",
+                                casa_core._event_registry_valid)
+            monkeypatch.setattr(event_episodes, "_get_emitters",
+                                casa_core._event_emitters)
+            monkeypatch.setattr(event_episodes, "_get_acks", None)
+            monkeypatch.setattr(event_episodes, "_get_spool", lambda: spool)
+            monkeypatch.setattr(event_episodes, "_notify_operator", None)
+
+            with pytest.raises(FileNotFoundError):
+                event_spool.emit(spool.root / "finance", "invoice-created")
+
+            asyncio.run(event_episodes._worker_pass())
+
+            path = event_spool.emit(spool.root / "finance", "invoice-created")
+            assert path.exists()
+        finally:
+            spool.close()
+
+
+# ---------------------------------------------------------------------------
 # event_wake is casa-internal only.
 # ---------------------------------------------------------------------------
 
