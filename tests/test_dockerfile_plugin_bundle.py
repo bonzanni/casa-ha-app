@@ -3,6 +3,7 @@
 marketplace / seed machinery survives."""
 from __future__ import annotations
 
+import re
 from pathlib import Path
 
 import pytest
@@ -34,32 +35,59 @@ def test_bundle_dir_is_read_only():
     assert "chmod -R a-w /opt/casa/plugin-bundle" in _DOCKERFILE
 
 
-def test_narrow_copy_ships_text_util_for_plugin_store():
-    """v0.78.0 W1: plugin_store.py now imports text_util (stdlib-only) at
-    module scope for sanitize_segment/is_unsafe_text. The build helper runs
-    BEFORE the broad `COPY rootfs /`, so text_util.py must be in the SAME
-    narrow COPY as plugin_store.py, or the build-time import fails (only the
-    image build catches this — the unit gate runs against the full rootfs
-    checkout and can't see a missing narrow COPY)."""
-    narrow_copy = _DOCKERFILE.find(
-        "\nCOPY rootfs/opt/casa/plugin_registry.py rootfs/opt/casa/plugin_store.py")
-    assert narrow_copy != -1
-    line_end = _DOCKERFILE.index("\n", narrow_copy + 1)
-    line = _DOCKERFILE[narrow_copy:line_end]
-    assert "rootfs/opt/casa/text_util.py" in line
+def _narrow_copy_line(dockerfile: str, prefix: str) -> str:
+    """The narrow COPY of bundle-build inputs, located by its first two
+    entries (plugin_registry.py then plugin_store.py)."""
+    marker = (f"\nCOPY {prefix}plugin_registry.py {prefix}plugin_store.py")
+    start = dockerfile.find(marker)
+    assert start != -1, "bundle-stage narrow COPY line not found"
+    return dockerfile[start:dockerfile.index("\n", start + 1)]
 
 
-def test_test_harness_narrow_copy_ships_text_util_too():
-    """v0.78.0 post-merge QA red (2026-07-14): test-local/Dockerfile.test has
-    ITS OWN narrow COPY for the bundle stage and was missed by the production
-    Dockerfile fix — the QA tiers' image build failed with
-    ModuleNotFoundError: text_util while deploy.yml (production Dockerfile)
-    was green. Guard BOTH files: any stdlib-only module plugin_store imports
-    must ride BOTH narrow COPY lines."""
-    narrow_copy = _TEST_DOCKERFILE.find(
-        "\nCOPY casa/rootfs/opt/casa/plugin_registry.py "
-        "casa/rootfs/opt/casa/plugin_store.py")
-    assert narrow_copy != -1
-    line_end = _TEST_DOCKERFILE.index("\n", narrow_copy + 1)
-    line = _TEST_DOCKERFILE[narrow_copy:line_end]
-    assert "casa/rootfs/opt/casa/text_util.py" in line
+_IMPORT_RE = re.compile(
+    r"^\s*(?:import\s+(\w+)|from\s+(\w+)\s+import\s)", re.MULTILINE)
+_CASA_SRC = _REPO / "casa" / "rootfs" / "opt" / "casa"
+
+
+def _bundle_import_closure() -> set[str]:
+    """Every top-level /opt/casa module STATICALLY reachable (module-scope OR
+    lazy import) from the bundle build helper. Over-approximates on purpose:
+    a lazy import that today's build never executes still lands in the COPY,
+    so the next module someone adds fails HERE (unit gate) instead of at
+    image-build time."""
+    local = {p.stem for p in _CASA_SRC.glob("*.py")}
+    seed = _CASA_SRC / "scripts" / "build_plugin_bundle.py"
+    closure: set[str] = set()
+    frontier = [seed]
+    while frontier:
+        text = frontier.pop().read_text(encoding="utf-8")
+        for m in _IMPORT_RE.finditer(text):
+            name = m.group(1) or m.group(2)
+            if name in local and name not in closure:
+                closure.add(name)
+                frontier.append(_CASA_SRC / f"{name}.py")
+    return closure
+
+
+@pytest.mark.parametrize("dockerfile, prefix", [
+    pytest.param(_DOCKERFILE, "rootfs/opt/casa/", id="casa/Dockerfile"),
+    pytest.param(_TEST_DOCKERFILE, "casa/rootfs/opt/casa/",
+                 id="test-local/Dockerfile.test"),
+])
+def test_narrow_copy_ships_the_whole_bundle_import_closure(dockerfile, prefix):
+    """The bundle build runs BEFORE the broad `COPY rootfs /`, so every local
+    module its import graph can reach must ride the narrow COPY — only the
+    image build catches an omission (the unit gate runs against the full
+    rootfs checkout and can't see it). This shipped broken TWICE with a
+    known-string guard: v0.78.0 (text_util, then missed AGAIN in
+    Dockerfile.test — QA red 2026-07-14) and v0.152.0 (plugin_events —
+    no image published, deploy + QA red 2026-08-05). Both Dockerfiles carry
+    their own copy of the line; compute the closure instead of naming files.
+    Red case: drop any closure module (e.g. plugin_events.py) from either
+    narrow COPY line and this test fails naming it."""
+    line = _narrow_copy_line(dockerfile, prefix)
+    missing = sorted(
+        mod for mod in _bundle_import_closure()
+        if f"{prefix}{mod}.py" not in line)
+    assert not missing, (
+        f"bundle-build import closure missing from narrow COPY: {missing}")
