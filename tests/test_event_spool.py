@@ -322,31 +322,77 @@ def test_folded_remainder_folds_into_the_next_generation(spool):
 
 
 def test_removed_mid_generation_member_is_never_recreated(spool):
+    """Genuine mutation-killer for REPAIR's ``cohort & routed_subs``
+    filter: force the state to a gen ABOVE a member's own record while
+    that member is simultaneously de-routed. Only the routing
+    intersection — not the gen comparison alone — can be what excludes
+    them; if `& routed_subs` were dropped, REPAIR's `rec["gen"] <
+    state_gen` check by itself would still fire for the de-routed member
+    too, and this test would catch that."""
+    _emit(spool, when=1000.0)
+    spool.fold_pass(R(S1, S2), 1100.0)      # gen1, cohort={S1,S2}, both
+    # get a real gen1 record
+    gen1 = _read_state(spool)["gen"]
+
+    # Bump the state to a HIGHER generation directly (as a fold's own
+    # OPEN would, but without touching either delivery record) — both
+    # S1 and S2 now sit on a stale gen relative to state.
+    bumped = dict(_read_state(spool), gen=gen1 + 1)
+    _write_raw(_state_dir(spool) / f"{EV}.json",
+              es.canonical_marker_bytes(bumped).decode())
+
+    spool.fold_pass(R(S1), 1200.0)          # S2 now de-routed
+    rec1 = _read_delivery(spool, S1)
+    assert rec1["gen"] == bumped["gen"]     # routed + stale gen: backfilled
+    rec2 = _read_delivery(spool, S2)
+    assert rec2["gen"] == gen1              # de-routed + stale gen: the
+    assert rec2["status"] == "pending"      # routing filter alone excludes
+    # it — never touched, never recreated
+
+
+def test_deroute_then_sweep_drop_then_reconsent_never_resurrects(spool):
+    """The full sweep-driven non-resurrection story (Sol-r3 #2 /
+    Important-1 pin): once a member is de-routed, terminalized by sweep,
+    and its plugin is reinstalled + re-consented WITHOUT any new
+    emission, REPAIR must not mint it a fresh record — that would
+    reverse a settled terminal outcome and wake for emissions folded
+    before the current consent ever existed."""
     _emit(spool, when=1000.0)
     spool.fold_pass(R(S1, S2), 1100.0)      # gen1, cohort={S1,S2}
     assert _read_delivery(spool, S2) is not None
 
-    # S2 is de-routed mid-generation; a REPAIR pass must not touch it,
-    # nor recreate it once it is torn down.
+    # S2 is de-routed mid-generation; a REPAIR pass must not touch it.
     spool.fold_pass(R(S1), 1200.0)          # S2 no longer routed
     rec2 = _read_delivery(spool, S2)
     assert rec2 is not None and rec2["status"] == "pending"   # untouched
 
-    rec1 = _read_delivery(spool, S1)
-    spool.ack(E, EV, rec1["ack_token"], now=1300.0)
-    # sweep terminalizes S2's now-unrouted record (a later task's concern
-    # for dispatch, but sweep is what actually flips it here)
-    spool.sweep(R(S1), installed={S1, S2}, registry_valid=True, now=1400.0)
-    rec2 = _read_delivery(spool, S2)
-    assert rec2["status"] == "done" and rec2["outcome"] == "revoked"
+    # S2's plugin is uninstalled — sweep terminalizes AND drops its
+    # tombstone, durable removal record first.
+    report = spool.sweep(R(S1), installed={S1}, registry_valid=True,
+                         now=1300.0)
+    assert report.dropped_records == 1
+    assert _read_delivery(spool, S2) is None
 
-    _emit(spool, when=1500.0)
-    changed = spool.fold_pass(R(S1), 1600.0)   # idle now (S1 done via ack,
-    # S2 done via sweep) — opens gen2 WITHOUT S2
-    assert changed == [(E, EV, S1)]
+    # S2 reinstalls and re-consents — routed again, with NO new emission.
+    changed = spool.fold_pass(R(S1, S2), 1400.0)
+    assert changed == []
+    assert _read_delivery(spool, S2) is None    # never resurrected
+    state = _read_state(spool)
+    assert state["gen"] == 1                    # no new generation opened
+    # either (S1 is still pending — not idle — and there was no new
+    # emission to fold regardless)
+
+    # A LEGITIMATE re-admission only ever happens through a fresh OPEN:
+    # once S1 resolves and a new emission arrives, S2 rejoins as part of
+    # the next generation's LIVE routed cohort.
+    rec1 = _read_delivery(spool, S1)
+    spool.ack(E, EV, rec1["ack_token"], now=1500.0)
+    _emit(spool, when=1600.0)
+    changed = spool.fold_pass(R(S1, S2), 1700.0)
+    assert set(changed) == {(E, EV, S1), (E, EV, S2)}
     state = _read_state(spool)
     assert state["gen"] == 2
-    assert state["cohort"] == [S1]
+    assert state["cohort"] == sorted([S1, S2])
 
 
 # ---------------------------------------------------------------------------
@@ -437,6 +483,62 @@ def test_reconstruction_repair_excludes_a_subscriber_consented_mid_crash(spool):
     assert _read_delivery(spool, S2) is None
 
 
+def test_failed_reconstruction_write_skips_open_this_pass(spool, monkeypatch):
+    """Minor-1 pin: if the reconstructed state fails to go durable this
+    pass, ``cur_gen`` must never silently fall back to 0 — that would
+    let OPEN mint a fresh generation BELOW the surviving record's true
+    gen the instant the write fails to land."""
+    now = 5000.0
+    rec = ea.new_record(E, EV, S1, 5, "tok-x", now - 100)
+    rec = ea.terminalize(rec, "acked", now=now - 50)   # done -> idle=True,
+    # so OPEN WOULD be tempted to fire this pass if cur_gen wrongly fell
+    # back to 0
+    _write_raw(_delivery_path(spool, S1),
+              es.canonical_marker_bytes(rec).decode())
+    _emit(spool, when=now - 10)
+
+    monkeypatch.setattr(es.EventSpool, "_write_state",
+                        lambda self, efd, event, obj: False)
+    changed = spool.fold_pass(R(S1), now)
+    assert changed == []
+    assert _read_state(spool) is None          # reconstruction never landed
+    assert list(_emissions_dir(spool).glob(f"{EV}--*.json"))  # emission
+    # survives — never folded into a bogus gen 1
+
+    monkeypatch.undo()
+    changed = spool.fold_pass(R(S1), now + 10)
+    state = _read_state(spool)
+    assert state["gen"] >= 5           # reconstructed at (at least) the
+    # surviving record's gen — NEVER gen 1
+    assert state["gen"] != 1
+
+
+def test_quarantine_failure_defers_reconstruction_instead_of_overwriting(spool, monkeypatch, caplog):
+    """Minor-3 pin: when the corrupt state file cannot be moved aside,
+    the reconstructed state must never silently overwrite it (the only
+    surviving forensic evidence of the corruption) — the failure must be
+    logged and reconstruction deferred, not swallowed."""
+    now = 5000.0
+    rec = ea.new_record(E, EV, S1, 3, "tok-x", now - 10)
+    _write_raw(_delivery_path(spool, S1),
+              es.canonical_marker_bytes(rec).decode())
+    _write_raw(_state_dir(spool) / f"{EV}.json", "{not json")
+
+    monkeypatch.setattr(es.EventSpool, "_quarantine_state",
+                        lambda self, efd, event, now: False)
+    with caplog.at_level(logging.WARNING, logger="event_spool"):
+        spool.fold_pass(R(S1), now)
+    assert _read_state(spool) is None          # not overwritten this pass
+    assert (_state_dir(spool) / f"{EV}.json").read_text() == "{not json"
+    assert any("quarantine" in r.message for r in caplog.records)
+
+    monkeypatch.undo()
+    spool.fold_pass(R(S1), now + 10)
+    state = _read_state(spool)
+    assert state["gen"] == 3
+    assert list(_state_dir(spool).glob(".corrupt-*"))
+
+
 # ---------------------------------------------------------------------------
 # fold_pass — crash injection between OPEN's steps
 # ---------------------------------------------------------------------------
@@ -459,21 +561,38 @@ def _boom_after(monkeypatch, target_module, name, n):
 
 
 def test_crash_between_state_write_and_record_upserts_self_heals(spool, monkeypatch):
-    _emit_n(spool, 3, start=1000.0)
-    # The state write succeeds; the crash lands on the FIRST
-    # _write_delivery call, i.e. the record-upsert step of OPEN.
+    """REPAIR's backfill is a PARTIAL-WRITE recovery, not a from-nothing
+    mint (Important-1 fix): it only ever touches a cohort member who
+    ALREADY has a record sitting at a stale gen. So this scenario first
+    runs one full successful gen1 cycle (both subscribers acquire a real,
+    terminal gen1 record) — THEN the second open's record-write loop is
+    crashed on its very first call, which aborts the whole loop and
+    leaves BOTH subscribers still holding their old gen1 record. REPAIR
+    must backfill both of them on the next pass, from that prior history."""
+    _emit(spool, when=1000.0)
+    spool.fold_pass(R(S1, S2), 1100.0)       # gen1, cohort=[S1,S2]
+    for sub in (S1, S2):
+        rec = _read_delivery(spool, sub)
+        spool.ack(E, EV, rec["ack_token"], now=1200.0)   # both -> done
+
+    _emit_n(spool, 3, start=2000.0)
+    # The state write for gen2 succeeds; the crash lands on the FIRST
+    # _write_delivery call of the record-upsert loop, aborting it before
+    # EITHER subscriber's gen2 record is written.
     _boom_after(monkeypatch, es.EventSpool, "_write_delivery", 1)
-    changed = spool.fold_pass(R(S1, S2), 2000.0)
+    changed = spool.fold_pass(R(S1, S2), 3000.0)
     assert changed == []                     # the exception aborted this
     # pair's fold before anything was recorded as "changed"
     state = _read_state(spool)
-    assert state is not None and state["gen"] == 1   # state IS durable
+    assert state is not None and state["gen"] == 2   # state IS durable
+    assert _read_delivery(spool, S1)["gen"] == 1     # neither record was
+    assert _read_delivery(spool, S2)["gen"] == 1     # actually rewritten
 
     monkeypatch.undo()
-    changed = spool.fold_pass(R(S1, S2), 2100.0)
+    changed = spool.fold_pass(R(S1, S2), 3100.0)
     assert set(changed) == {(E, EV, S1), (E, EV, S2)}
-    assert _read_delivery(spool, S1)["gen"] == 1
-    assert _read_delivery(spool, S2)["gen"] == 1
+    assert _read_delivery(spool, S1)["gen"] == 2
+    assert _read_delivery(spool, S2)["gen"] == 2
     # folded emissions are gone once the pass completes cleanly
     assert list(_emissions_dir(spool).glob(f"{EV}--*.json")) == []
 
@@ -513,26 +632,89 @@ def test_crash_between_record_upserts_and_unlink_self_heals(spool, monkeypatch):
 
 
 def test_crash_leaving_state_written_records_partial_then_repair_completes(spool, monkeypatch):
-    _emit_n(spool, 3, start=1000.0)
+    """Same reasoning as the test above: REPAIR only backfills a member
+    who already has SOME record at a stale gen, so S2 must hold a real
+    gen1 record before the gen2 write is made to fail for it."""
+    _emit(spool, when=1000.0)
+    spool.fold_pass(R(S1, S2), 1100.0)       # gen1, cohort=[S1,S2]
+    for sub in (S1, S2):
+        rec = _read_delivery(spool, sub)
+        spool.ack(E, EV, rec["ack_token"], now=1200.0)   # both -> done
+    gen1_s2 = _read_delivery(spool, S2)
+
+    _emit_n(spool, 3, start=2000.0)
     real_write = es.EventSpool._write_delivery
-    calls = {"i": 0}
 
     def boom_write(self, dfd, event, subscriber, rec):
-        calls["i"] += 1
         if subscriber == S2:
             return False                     # simulated undurable write
         return real_write(self, dfd, event, subscriber, rec)
 
     monkeypatch.setattr(es.EventSpool, "_write_delivery", boom_write)
-    changed = spool.fold_pass(R(S1, S2), 2000.0)
+    changed = spool.fold_pass(R(S1, S2), 3000.0)
     assert (E, EV, S1) in changed
     assert (E, EV, S2) not in changed
-    assert _read_delivery(spool, S2) is None     # S2's write never landed
+    assert _read_delivery(spool, S2) == gen1_s2   # S2's write never
+    # landed — its old gen1 record survives byte-for-byte
 
     monkeypatch.undo()
-    changed = spool.fold_pass(R(S1, S2), 2100.0)   # REPAIR backfills S2
+    changed = spool.fold_pass(R(S1, S2), 3100.0)   # REPAIR backfills S2
     assert changed == [(E, EV, S2)]
-    assert _read_delivery(spool, S2)["gen"] == 1
+    assert _read_delivery(spool, S2)["gen"] == 2
+
+
+def test_fold_one_does_not_leak_fds_when_a_later_subdir_open_fails(spool, monkeypatch):
+    """Minor-2 pin: the STATE fd must be closed even when the DELIVERY
+    open that follows it fails — nested try/finally, not three bare
+    opens ahead of one shared try block."""
+    _emit(spool, when=1000.0)   # gives _candidate_events something to
+    # find via the emissions listing, so _fold_one still gets invoked
+    # despite DELIVERY_DIR failing to open.
+    orig_open_dir = es._open_dir
+
+    def boom(name, dir_fd):
+        if name == es.DELIVERY_DIR:
+            raise OSError(5, "simulated")
+        return orig_open_dir(name, dir_fd)
+
+    fd_dir = Path("/proc/self/fd")
+    before = len(os.listdir(fd_dir))
+    monkeypatch.setattr(es, "_open_dir", boom)
+    spool.fold_pass(R(S1), 2000.0)
+    monkeypatch.undo()
+    after = len(os.listdir(fd_dir))
+    assert after == before
+
+
+def test_open_only_unlinks_names_recorded_in_folded(spool):
+    """Minor-6(d) pin: an emission whose filename fails to parse a
+    u32hex token is never added to ``state.folded`` — and must therefore
+    never be unlinked either. Unlinking a name absent from ``folded``
+    would leave nothing for REPAIR's folded-unlink step to reach if a
+    crash landed between the state write and this unlink."""
+    _emit(spool, when=1000.0)
+    bogus = _emissions_dir(spool) / f"{EV}--not-8-hex.json"
+    bogus.write_bytes(b'{"v":1}')
+    _utime(bogus, 999.0)
+
+    changed = spool.fold_pass(R(S1), 2000.0)
+    assert changed == [(E, EV, S1)]
+    state = _read_state(spool)
+    assert bogus.name not in [f"{EV}--{u}.json" for u in state["folded"]]
+    assert bogus.exists()          # never unlinked — not trackable via
+    # `folded`, so an unlink here would be unrecoverable-from-disk
+
+
+def test_fold_pass_survives_a_malformed_routed_value(spool, caplog):
+    """Minor-5(b) pin: ``pair_routed``'s own computation must be inside
+    the per-pair guard — a `routed` value that is truthy but not a
+    mapping (so ``.get`` raises) must abort only that pair, never crash
+    the whole pass."""
+    _emit(spool, when=1000.0)
+    with caplog.at_level(logging.WARNING, logger="event_spool"):
+        changed = spool.fold_pass(["not", "a", "dict"], 2000.0)
+    assert changed == []
+    assert any("fold" in r.message for r in caplog.records)
 
 
 # ---------------------------------------------------------------------------
@@ -697,6 +879,30 @@ def test_stale_token_cas_after_fold_rotates_it(spool):
     assert spool.ack(E, EV, "tok-old", now=now + 10) == ("no_match", None)
     outcome, sub = spool.ack(E, EV, new_rec["ack_token"], now=now + 10)
     assert (outcome, sub) == ("acked", S1)
+
+
+def test_ack_write_failure_does_not_report_a_false_acked(spool, monkeypatch, caplog):
+    """Minor-4 pin: a token match whose durable rewrite fails must never
+    be reported as ``acked`` — the record is unchanged on disk (still
+    pending, same token), so a caller retrying the exact same ack once
+    the write succeeds must still be able to."""
+    _emit(spool, when=1000.0)
+    spool.fold_pass(R(S1), 1100.0)
+    rec = _read_delivery(spool, S1)
+    monkeypatch.setattr(es.EventSpool, "_write_delivery",
+                        lambda *a, **kw: False)
+    with caplog.at_level(logging.WARNING, logger="event_spool"):
+        outcome, sub = spool.ack(E, EV, rec["ack_token"], now=1200.0)
+    assert (outcome, sub) == ("no_match", None)
+    assert any("ack write failed" in r.message for r in caplog.records)
+
+    monkeypatch.undo()
+    after = _read_delivery(spool, S1)
+    assert after["status"] == "pending"      # unchanged — safe to retry
+    assert after["ack_token"] == rec["ack_token"]
+
+    outcome2, sub2 = spool.ack(E, EV, rec["ack_token"], now=1300.0)
+    assert (outcome2, sub2) == ("acked", S1)   # the retry succeeds
 
 
 # ---------------------------------------------------------------------------
@@ -935,6 +1141,63 @@ def test_sweep_keeps_a_fresh_part_file(spool):
     assert part.exists()
 
 
+def test_sweep_reaps_delivery_temp_residue_with_future_mtime_fail_closed(spool):
+    """Minor-6(c) pin: delivery/ staging-temp reaping must use the
+    skew-aware ``_expired`` (like part-file reaping already does), not a
+    bare ``now - mtime > TTL`` — a forward clock jump must not park a
+    residue file that regains "freshness" once the clock returns."""
+    stray = _delivery_dir(spool) / f".{EV}--{S1}.json.tmp-1234-abcd"
+    stray.write_bytes(b"x")
+    _utime(stray, 1000.0 + es.SKEW_S + 100)
+    spool.sweep({}, installed=set(), registry_valid=True, now=1000.0)
+    assert not stray.exists()
+
+
+def test_prune_reaps_removal_temp_residue_with_future_mtime_fail_closed(spool):
+    """Same pin as above, for ``.removals/`` staging residue reaped by
+    ``prune_removal_records``."""
+    removals = Path(spool.root) / ".removals"
+    removals.mkdir(exist_ok=True)
+    stray = removals / ".ghost.json.tmp-1234-abcd"
+    stray.write_bytes(b"x")
+    _utime(stray, 1000.0 + es.SKEW_S + 100)
+    spool.prune_removal_records(now=1000.0)
+    assert not stray.exists()
+
+
+def test_sweep_survives_one_emitter_raising(spool, monkeypatch, caplog):
+    """Minor-5(a) pin: an exception raised while sweeping one emitter
+    must not abort the whole pass — every OTHER emitter still gets
+    swept, and the removal-record drop step at the end still runs."""
+    spool.ensure_emitter_dirs("other")
+    p_good = _emit(spool, emitter="other", when=1000.0)
+    _emit(spool, emitter=E, when=1000.0)
+
+    orig = es.EventSpool._sweep_emissions
+
+    def boom(self, emitter, efd, routed, now, report):
+        if emitter == E:
+            raise RuntimeError("simulated")
+        return orig(self, emitter, efd, routed, now, report)
+
+    monkeypatch.setattr(es.EventSpool, "_sweep_emissions", boom)
+    with caplog.at_level(logging.WARNING, logger="event_spool"):
+        spool.sweep({}, installed=set(), registry_valid=True, now=1100.0)
+    # "other"'s pair had no routed subscriber -> watermark delete still
+    # happened despite E's sweep raising
+    assert not p_good.exists()
+    assert any("sweep of emitter" in r.message for r in caplog.records)
+
+
+def test_state_files_are_never_deleted_by_sweep(spool):
+    _emit(spool, when=1000.0)
+    spool.fold_pass(R(S1), 1100.0)
+    state_path = _state_dir(spool) / f"{EV}.json"
+    assert state_path.exists()
+    spool.sweep({}, installed=set(), registry_valid=True, now=1200.0)
+    assert state_path.exists()
+
+
 # ---------------------------------------------------------------------------
 # removal records — list / mark noted / prune
 # ---------------------------------------------------------------------------
@@ -1033,6 +1296,79 @@ def test_gc_orphan_dirs_writes_removal_record_when_inventory_nonempty(spool):
                                "gen": 1}]
 
 
+def test_gc_orphan_dirs_defers_when_delivery_listing_is_unprovable(spool, monkeypatch, caplog):
+    """Important-2 pin: an unreadable delivery listing must never be
+    mistaken for an empty (nothing-to-account-for) inventory — that
+    would license an rmtree with no removal record naming what was
+    inside. Simulate the unprovable listing directly (the real
+    filesystem gives no easy way to make a live directory's listdir
+    fail); once the "fault" clears, GC proceeds normally."""
+    _emit(spool, when=1000.0)
+    spool.fold_pass(R(S1), 1100.0)
+    _backdate_tree(_edir(spool), 0.0)
+
+    monkeypatch.setattr(es, "_listdir_strict", lambda fd: None)
+    with caplog.at_level(logging.WARNING, logger="event_spool"):
+        removed = spool.gc_orphan_dirs(registry_valid=True, member_plugins=set(),
+                                       now=QUIESCENCE_S + 10000)
+    assert removed == []
+    assert _edir(spool).exists()
+    assert spool.list_removal_records() == []
+    assert any("delivery inventory is unprovable" in r.message
+              for r in caplog.records)
+
+    monkeypatch.undo()
+    removed = spool.gc_orphan_dirs(registry_valid=True, member_plugins=set(),
+                                   now=QUIESCENCE_S + 20000)
+    assert removed == [E]
+    assert len(spool.list_removal_records()) == 1
+
+
+def test_gc_orphan_dirs_inventories_a_scribbled_delivery_file_not_silently(spool):
+    """Important-2 pin: a delivery file that exists BY NAME but never
+    validates (and was never quarantined by a sweep pass) must still be
+    accounted for in the removal record — never silently dropped from
+    the inventory just because its content doesn't parse."""
+    _write_raw(_delivery_path(spool, S1), "{not json")
+    _backdate_tree(_edir(spool), 0.0)
+    removed = spool.gc_orphan_dirs(registry_valid=True, member_plugins=set(),
+                                   now=QUIESCENCE_S + 10000)
+    assert removed == [E]
+    records = spool.list_removal_records()
+    assert len(records) == 1
+    _, rec = records[0]
+    assert rec["plugin"] == E
+    assert rec["entries"] == [{"kind": "corrupt", "file": f"{EV}--{S1}.json"}]
+
+
+# ---------------------------------------------------------------------------
+# removal-record-before-drop ordering (Important-3)
+# ---------------------------------------------------------------------------
+
+
+def test_removal_record_write_failure_defers_the_whole_drop(spool, monkeypatch):
+    """A mutation that swaps ``_drop_removed_subscribers`` to drop-then-
+    record instead of record-then-drop must be caught: force the
+    strict-durable write underneath every removal record to fail, and
+    confirm nothing physical is dropped until it succeeds."""
+    _emit(spool, when=1000.0)
+    spool.fold_pass(R(S1), 1100.0)
+
+    monkeypatch.setattr(es, "_strict_replace_at", lambda *a, **kw: False)
+    report = spool.sweep({}, installed=set(), registry_valid=True, now=1200.0)
+    assert report.removal_records_written == 0
+    assert report.dropped_records == 0
+    assert _delivery_path(spool, S1).exists()      # tombstone still there
+    assert spool.list_removal_records() == []
+
+    monkeypatch.undo()
+    report2 = spool.sweep({}, installed=set(), registry_valid=True, now=1300.0)
+    assert report2.removal_records_written == 1
+    assert report2.dropped_records == 1
+    assert not _delivery_path(spool, S1).exists()
+    assert len(spool.list_removal_records()) == 1
+
+
 # ---------------------------------------------------------------------------
 # recovery_pass composition
 # ---------------------------------------------------------------------------
@@ -1058,6 +1394,99 @@ def test_recovery_pass_runs_gc_only_on_boot_with_valid_registry(spool):
     report2 = spool.recovery_pass({}, installed=set(), registry_valid=True,
                                   now=QUIESCENCE_S + 20000, boot=True)
     assert report2.gc_removed == [E]
+
+
+# ---------------------------------------------------------------------------
+# ready / index surface + list_emissions + SpoolClosed (Minor-6(a))
+# ---------------------------------------------------------------------------
+
+
+def test_write_ready_then_read_marker_present(spool):
+    spool.write_ready(E, {"a": 1})
+    m = spool.read_marker(E)
+    assert m.state == MarkerState.PRESENT
+    assert m.payload == {"a": 1}
+
+
+def test_read_marker_absent_before_write(spool):
+    m = spool.read_marker(E)
+    assert m.state == MarkerState.ABSENT
+
+
+def test_read_marker_absent_for_unknown_emitter(spool):
+    m = spool.read_marker("nobody")
+    assert m.state == MarkerState.ABSENT
+
+
+def test_delete_ready_removes_marker(spool):
+    spool.write_ready(E, {"a": 1})
+    assert spool.delete_ready(E) is True
+    assert spool.read_marker(E).state == MarkerState.ABSENT
+
+
+def test_delete_ready_of_missing_emitter_dir_is_true(spool):
+    assert spool.delete_ready("nobody") is True
+
+
+def test_published_emitters_lists_only_ready_emitters(spool):
+    spool.ensure_emitter_dirs("other")
+    spool.write_ready(E, {})
+    assert spool.published_emitters() == [E]
+
+
+def test_index_entry_write_read_delete(spool):
+    key = "abc123"
+    spool.write_index_entry(key, {"x": 1})
+    m = spool.read_index_marker(key)
+    assert m.state == MarkerState.PRESENT and m.payload == {"x": 1}
+    assert key in spool.index_keys()
+    assert spool.delete_index_entry(key) is True
+    assert spool.read_index_marker(key).state == MarkerState.ABSENT
+    assert key not in spool.index_keys()
+
+
+def test_delete_index_entry_of_missing_key_is_true(spool):
+    assert spool.delete_index_entry("neverwritten") is True
+
+
+def test_list_emissions_reflects_current_files(spool):
+    _emit(spool, when=1000.0)
+    _emit(spool, when=1001.0)
+    names = spool.list_emissions(E, EV)
+    assert len(names) == 2
+    assert all(n.startswith(f"{EV}--") for n in names)
+
+
+def test_list_emissions_empty_for_unknown_emitter(spool):
+    assert spool.list_emissions("nobody", EV) == []
+
+
+def test_spool_closed_raises_on_ensure_emitter_dirs(spool):
+    spool.close()
+    with pytest.raises(es.SpoolClosed):
+        spool.ensure_emitter_dirs("late")
+
+
+def test_spool_closed_raises_on_write_ready(spool):
+    spool.close()
+    with pytest.raises(es.SpoolClosed):
+        spool.write_ready(E, {})
+
+
+def test_spool_closed_read_marker_degrades_to_absent(spool):
+    spool.close()
+    assert spool.read_marker(E).state == MarkerState.ABSENT
+
+
+def test_spool_closed_fold_pass_returns_empty(spool):
+    spool.close()
+    assert spool.fold_pass(R(S1), 1000.0) == []
+
+
+def test_spool_closed_sweep_returns_empty_report(spool):
+    spool.close()
+    report = spool.sweep({}, installed=set(), registry_valid=True, now=1000.0)
+    assert report.deleted_temps == 0
 
 
 # ---------------------------------------------------------------------------

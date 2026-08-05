@@ -180,7 +180,6 @@ class SweepReport:
     dropped_records: int = 0
     dropped_corrupt: int = 0
     removal_records_written: int = 0
-    anomalies: list = field(default_factory=list)
 
 
 @dataclass
@@ -373,6 +372,19 @@ def _listdir_quiet(dir_fd: int) -> list:
         return os.listdir(dir_fd)
     except OSError:
         return []
+
+
+def _listdir_strict(dir_fd: int) -> "list | None":
+    """The PROVING counterpart of :func:`_listdir_quiet`: ``None`` (never
+    ``[]``) when the listing itself fails, so a caller that licenses an
+    irreversible action off the result (:meth:`EventSpool.
+    gc_orphan_dirs`'s inventory) can tell "genuinely nothing here" apart
+    from "unreadable — do not treat as empty". Mirrors
+    ``callback_spool._listdir_strict`` exactly."""
+    try:
+        return os.listdir(dir_fd)
+    except OSError:
+        return None
 
 
 def _unlink_quiet(name: str, dir_fd: int) -> bool:
@@ -1074,8 +1086,14 @@ class EventSpool:
                 try:
                     events = self._candidate_events(efd)
                     for event in sorted(events):
-                        pair_routed = set((routed or {}).get((emitter, event)) or set())
+                        # `pair_routed`'s computation lives INSIDE the
+                        # per-pair guard, not just `_fold_one` itself — a
+                        # malformed `routed` value (anything but a dict,
+                        # e.g. a stray non-mapping truthy object) must
+                        # abort only THIS pair, never the whole pass.
                         try:
+                            pair_routed = set(
+                                (routed or {}).get((emitter, event)) or set())
                             opened.extend(self._fold_one(
                                 emitter, efd, event, pair_routed, now))
                         except Exception:  # noqa: BLE001 — one bad pair must
@@ -1083,89 +1101,158 @@ class EventSpool:
                             logger.warning(
                                 "event-spool: fold of %r/%r failed",
                                 emitter, event, exc_info=True)
+                except Exception:  # noqa: BLE001 — one bad emitter must
+                    # never abort the rest of the pass either
+                    logger.warning("event-spool: fold discovery for %r "
+                                   "failed", emitter, exc_info=True)
                 finally:
                     os.close(efd)
         return opened
 
     def _fold_one(self, emitter: str, efd: int, event: str,
                   routed_subs: set, now: float) -> list:
-        changed = []
+        # Each subdir fd is opened only once the PREVIOUS one is known
+        # good, and closed in a matching nested `finally` — a failing
+        # DELIVERY/EMISSIONS open can never leak the STATE fd opened
+        # just before it.
         sfd = _open_dir(STATE_DIR, efd)
-        dfd = _open_dir(DELIVERY_DIR, efd)
-        emfd = _open_dir(EMISSIONS_DIR, efd)
         try:
-            state_marker = self._read_state_marker(sfd, event)
-            valid_records = self._read_valid_delivery_records(dfd, emitter, event)
-
-            # -- RECONSTRUCT (decision 25) --------------------------------
-            state_obj = None
-            if state_marker.state is MarkerState.PRESENT:
-                state_obj = _validate_state(state_marker.payload, expect_event=event)
-            need_reconstruct = state_obj is None
-            if need_reconstruct and valid_records:
-                max_gen = max(r["gen"] for r in valid_records.values())
-                cohort = sorted(sub for sub, r in valid_records.items()
-                                if r["gen"] == max_gen)
-                new_state = {"v": STATE_SCHEMA_VERSION, "event": event,
-                            "gen": max_gen, "cohort": cohort, "folded": [],
-                            "opened_ts": now}
-                if state_marker.state is not MarkerState.ABSENT:
-                    self._quarantine_state(efd, event, now)
-                if self._write_state(efd, event, new_state):
-                    state_obj = new_state
-            # else (need_reconstruct and not valid_records): nothing
-            # survives to rebuild from — silent, no issue (decision 37).
-            # state_obj stays None; OPEN below mints generation 1 the
-            # ordinary way once its own preconditions are met.
-
-            # -- REPAIR (before any idle decision, decision 24) ----------
-            if state_obj is not None:
-                state_gen = state_obj["gen"]
-                cohort = set(state_obj["cohort"])
-                eligible = cohort & routed_subs
-                for sub in sorted(eligible):
-                    rec = valid_records.get(sub)
-                    if rec is None or rec["gen"] < state_gen:
-                        tok = uuid.uuid4().hex
-                        newrec = event_attempts.new_record(
-                            emitter, event, sub, state_gen, tok, now)
-                        if self._write_delivery(dfd, event, sub, newrec):
-                            valid_records[sub] = newrec
-                            changed.append((emitter, event, sub))
-                for u in state_obj["folded"]:
-                    if _U32HEX_RE.match(u):
-                        _unlink_quiet(f"{event}--{u}.json", emfd)
-
-            # -- OPEN ------------------------------------------------------
-            cur_gen = state_obj["gen"] if state_obj is not None else 0
-            emissions = self._list_emissions_for_event(emfd, event)
-            idle = not any(r["status"] == "pending"
-                          for r in valid_records.values())
-            if emissions and routed_subs and idle:
-                oldest = sorted(emissions, key=lambda t: (t[0], t[1]))[:FOLD_BATCH_MAX]
-                new_gen = cur_gen + 1
-                new_cohort = sorted(routed_subs)
-                folded_tokens = []
-                for _, name in oldest:
-                    tok = self._u32hex_of(event, name)
-                    if tok is not None:
-                        folded_tokens.append(tok)
-                new_state = {"v": STATE_SCHEMA_VERSION, "event": event,
-                            "gen": new_gen, "cohort": new_cohort,
-                            "folded": folded_tokens, "opened_ts": now}
-                if self._write_state(efd, event, new_state):
-                    for sub in new_cohort:
-                        tok = uuid.uuid4().hex
-                        newrec = event_attempts.new_record(
-                            emitter, event, sub, new_gen, tok, now)
-                        if self._write_delivery(dfd, event, sub, newrec):
-                            changed.append((emitter, event, sub))
-                    for _, name in oldest:
-                        _unlink_quiet(name, emfd)
+            dfd = _open_dir(DELIVERY_DIR, efd)
+            try:
+                emfd = _open_dir(EMISSIONS_DIR, efd)
+                try:
+                    return self._fold_one_locked(
+                        emitter, efd, sfd, dfd, emfd, event, routed_subs, now)
+                finally:
+                    os.close(emfd)
+            finally:
+                os.close(dfd)
         finally:
             os.close(sfd)
-            os.close(dfd)
-            os.close(emfd)
+
+    def _fold_one_locked(self, emitter: str, efd: int, sfd: int, dfd: int,
+                         emfd: int, event: str, routed_subs: set,
+                         now: float) -> list:
+        changed = []
+        state_marker = self._read_state_marker(sfd, event)
+        valid_records = self._read_valid_delivery_records(dfd, emitter, event)
+
+        # -- RECONSTRUCT (decision 25) ------------------------------------
+        state_obj = None
+        reconstruct_failed = False
+        if state_marker.state is MarkerState.PRESENT:
+            state_obj = _validate_state(state_marker.payload, expect_event=event)
+        need_reconstruct = state_obj is None
+        if need_reconstruct and valid_records:
+            max_gen = max(r["gen"] for r in valid_records.values())
+            cohort = sorted(sub for sub, r in valid_records.items()
+                            if r["gen"] == max_gen)
+            new_state = {"v": STATE_SCHEMA_VERSION, "event": event,
+                        "gen": max_gen, "cohort": cohort, "folded": [],
+                        "opened_ts": now}
+            quarantine_ok = True
+            if state_marker.state is not MarkerState.ABSENT:
+                quarantine_ok = self._quarantine_state(efd, event, now)
+                if not quarantine_ok:
+                    # The corrupt original could not be moved aside. Never
+                    # let the reconstructed state overwrite it silently —
+                    # that would destroy the only evidence a corruption
+                    # ever happened. Defer the whole reconstruction (and
+                    # therefore OPEN too, guarded below) to a later pass,
+                    # which re-attempts the quarantine from scratch.
+                    logger.warning(
+                        "event-spool: quarantine of corrupt state failed "
+                        "for %r/%r — reconstruction deferred this pass to "
+                        "avoid silently overwriting unrecorded evidence",
+                        emitter, event)
+            if quarantine_ok:
+                if self._write_state(efd, event, new_state):
+                    state_obj = new_state
+                else:
+                    reconstruct_failed = True
+            else:
+                reconstruct_failed = True
+        # else (need_reconstruct and not valid_records): nothing survives
+        # to rebuild from — silent, no issue (decision 37). state_obj
+        # stays None; OPEN below mints generation 1 the ordinary way once
+        # its own preconditions are met.
+
+        # -- REPAIR (before any idle decision, decision 24) --------------
+        if state_obj is not None:
+            state_gen = state_obj["gen"]
+            cohort = set(state_obj["cohort"])
+            eligible = cohort & routed_subs
+            for sub in sorted(eligible):
+                rec = valid_records.get(sub)
+                # Only an EXISTING record at a stale gen is a partial-
+                # write backfill target ("whose record gen < state gen",
+                # spec §4 — REPAIR reads a gen off a record that exists).
+                # `rec is None` for a cohort member is NOT interchangeable
+                # with "never written yet": it equally describes a member
+                # sweep already terminalized AND dropped (decision 33/38)
+                # whose subscriber has since reinstalled and re-consented.
+                # Minting a fresh PENDING record there would reverse a
+                # settled terminal outcome and wake for emissions folded
+                # before the current consent ever existed. Resurrection
+                # is never REPAIR's job — only a fresh OPEN (a real new-
+                # consent event, driven by the LIVE routed set) may
+                # re-admit a returning member.
+                if rec is not None and rec["gen"] < state_gen:
+                    tok = uuid.uuid4().hex
+                    newrec = event_attempts.new_record(
+                        emitter, event, sub, state_gen, tok, now)
+                    if self._write_delivery(dfd, event, sub, newrec):
+                        valid_records[sub] = newrec
+                        changed.append((emitter, event, sub))
+            for u in state_obj["folded"]:
+                if _U32HEX_RE.match(u):
+                    _unlink_quiet(f"{event}--{u}.json", emfd)
+
+        # -- OPEN ------------------------------------------------------
+        if reconstruct_failed:
+            # A reconstruction that could not be proven durable this pass
+            # must not let `cur_gen` silently default to 0 below — that
+            # would let OPEN mint a fresh generation BELOW the surviving
+            # records' true gen the moment the reconstruction fails to
+            # land. Skip OPEN entirely; the next pass retries
+            # reconstruction from the same (still corrupt-or-absent) disk
+            # state.
+            return changed
+        cur_gen = state_obj["gen"] if state_obj is not None else 0
+        emissions = self._list_emissions_for_event(emfd, event)
+        idle = not any(r["status"] == "pending" for r in valid_records.values())
+        if emissions and routed_subs and idle:
+            oldest = sorted(emissions, key=lambda t: (t[0], t[1]))[:FOLD_BATCH_MAX]
+            new_gen = cur_gen + 1
+            new_cohort = sorted(routed_subs)
+            # Only names with a recoverable u32hex token are ever
+            # unlinked — and ONLY those are recorded in `folded`. Keeping
+            # the two lists in lockstep means a crash between the state
+            # write and the unlink loop below leaves nothing REPAIR's
+            # folded-unlink step (above) cannot reach on a later pass; an
+            # anomalous emission name that fails to parse a token is left
+            # alone entirely (an accepted residual, same as sweep's own
+            # anomalous-name handling), never unlinked without a
+            # corresponding `folded` entry to make that unlink
+            # idempotent-from-disk.
+            folded_pairs = []
+            for _, name in oldest:
+                tok = self._u32hex_of(event, name)
+                if tok is not None:
+                    folded_pairs.append((name, tok))
+            new_state = {"v": STATE_SCHEMA_VERSION, "event": event,
+                        "gen": new_gen, "cohort": new_cohort,
+                        "folded": [tok for _, tok in folded_pairs],
+                        "opened_ts": now}
+            if self._write_state(efd, event, new_state):
+                for sub in new_cohort:
+                    tok = uuid.uuid4().hex
+                    newrec = event_attempts.new_record(
+                        emitter, event, sub, new_gen, tok, now)
+                    if self._write_delivery(dfd, event, sub, newrec):
+                        changed.append((emitter, event, sub))
+                for name, _ in folded_pairs:
+                    _unlink_quiet(name, emfd)
         return changed
 
     # -- conditional delivery update (mirrors update_attempt_nudge) ------
@@ -1273,7 +1360,22 @@ class EventSpool:
                         if rec["status"] == "done":
                             return ("already_done", rec["subscriber"])
                         newrec = event_attempts.terminalize(rec, "acked", now=now)
-                        self._write_delivery(dfd, event, rec["subscriber"], newrec)
+                        if not self._write_delivery(
+                                dfd, event, rec["subscriber"], newrec):
+                            # The record is UNCHANGED on disk (still
+                            # pending, still carrying this same token) —
+                            # no durable "acked" transition happened, so
+                            # it must never be REPORTED as one. Log and
+                            # fall back to "no_match": from the caller's
+                            # observable point of view nothing was
+                            # confirmed this call, and a retry with the
+                            # same token (nothing to invalidate it) can
+                            # still succeed once the write does.
+                            logger.warning(
+                                "event-spool: ack write failed for a "
+                                "matched pending record — no durable "
+                                "transition occurred")
+                            return ("no_match", None)
                         return ("acked", rec["subscriber"])
                     return ("no_match", None)
                 finally:
@@ -1323,10 +1425,15 @@ class EventSpool:
                 except (OSError, ValueError):
                     continue
                 try:
-                    self._sweep_part_temps(efd, now, report)
-                    self._sweep_emissions(emitter, efd, routed, now, report)
-                    self._sweep_delivery(emitter, efd, routed, installed, now,
-                                        report, to_drop, deletable)
+                    try:
+                        self._sweep_part_temps(efd, now, report)
+                        self._sweep_emissions(emitter, efd, routed, now, report)
+                        self._sweep_delivery(emitter, efd, routed, installed,
+                                            now, report, to_drop, deletable)
+                    except Exception:  # noqa: BLE001 — one bad emitter
+                        # must never abort the rest of the sweep pass
+                        logger.warning("event-spool: sweep of emitter %r "
+                                       "failed", emitter, exc_info=True)
                 finally:
                     os.close(efd)
             self._drop_removed_subscribers(to_drop, deletable, now, report)
@@ -1412,7 +1519,7 @@ class EventSpool:
             for name in sorted(_listdir_quiet(dfd)):
                 if _is_replace_temp(name):
                     st = _lstat_quiet(name, dfd)
-                    if st is not None and now - st.st_mtime > TEMP_TTL_S:
+                    if st is not None and self._expired(st, now, TEMP_TTL_S):
                         touched |= _unlink_quiet(name, dfd)
                     continue
                 if name.startswith(CORRUPT_PREFIX):
@@ -1683,7 +1790,7 @@ class EventSpool:
                 for name in sorted(_listdir_quiet(rfd)):
                     if _is_replace_temp(name):
                         st = _lstat_quiet(name, rfd)
-                        if st is not None and now - st.st_mtime > TEMP_TTL_S:
+                        if st is not None and self._expired(st, now, TEMP_TTL_S):
                             touched |= _unlink_quiet(name, rfd)
                         continue
                     if not _is_removal_name(name):
@@ -1727,15 +1834,35 @@ class EventSpool:
                 if emitter in member_plugins:
                     continue
                 newest = self._newest_mtime(emitter)
-                if newest is None or newest is _SCAN_ERROR:
+                if newest is None:
+                    continue                 # the dir is gone: nothing to GC
+                if newest is _SCAN_ERROR:
+                    # Quiescence could not be PROVED. An unprovable tree
+                    # must not read as an old, empty one — that licenses
+                    # the same irreversible purge the inventory check
+                    # below refuses, one step earlier.
+                    logger.warning(
+                        "event-spool: orphan GC of %r deferred — its "
+                        "spool tree could not be scanned", emitter)
                     continue
                 if now - newest < QUIESCENCE_S:
                     continue
                 entries = self._inventory_for_removal(emitter)
                 if entries is _SCAN_ERROR:
+                    # The delivery inventory could not be PROVED (an
+                    # unreadable listing, most importantly) — an empty
+                    # answer here would purge a dir that may still hold
+                    # unaccounted delivery records, with no removal
+                    # record naming them. Defer; the next pass retries.
+                    logger.warning(
+                        "event-spool: orphan GC of %r deferred — its "
+                        "delivery inventory is unprovable", emitter)
                     continue
                 if entries and not self._write_removal_record(
                         emitter, entries, now=now):
+                    logger.warning(
+                        "event-spool: orphan GC of %r deferred — removal "
+                        "record not durable", emitter)
                     continue
                 try:
                     shutil.rmtree(emitter, dir_fd=self._root_fd)
@@ -1749,9 +1876,23 @@ class EventSpool:
         return removed
 
     def _inventory_for_removal(self, emitter: str):
-        """Every delivery record + quarantined file under an emitter's
-        ``delivery/`` — the removal-record entries a whole-dir GC must
-        account for. :data:`_SCAN_ERROR` when any part is unprovable."""
+        """Every delivery-record NAME under an emitter's ``delivery/`` —
+        the removal-record entries a whole-dir GC must account for.
+
+        Inventoried by NAME, never by whether the content happens to
+        parse (mirrors ``callback_spool``'s ``_attempt_inventory``
+        discipline, callback_spool.py:3560-3610: membership is what a
+        name PROVES exists on disk, not what a best-effort read manages
+        to validate). A name that matches the delivery-record grammar
+        but fails to validate (unreadable, malformed, not yet
+        quarantined by a sweep pass) is inventoried as a ``corrupt``
+        entry rather than silently dropped — the whole point of this
+        scan is that nothing a `rmtree` is about to destroy goes
+        unaccounted for.
+
+        :data:`_SCAN_ERROR` when the listing itself could not be proven
+        (an ``OSError`` from ``listdir``) — an unprovable inventory must
+        never license the purge it would otherwise authorize."""
         try:
             efd = self._emitter_fd(emitter)
         except (OSError, ValueError):
@@ -1764,8 +1905,11 @@ class EventSpool:
             except OSError:
                 return _SCAN_ERROR
             try:
+                names = _listdir_strict(dfd)
+                if names is None:
+                    return _SCAN_ERROR
                 entries = []
-                for name in _listdir_quiet(dfd):
+                for name in names:
                     if _is_replace_temp(name):
                         continue
                     if name.startswith(CORRUPT_PREFIX):
@@ -1775,17 +1919,28 @@ class EventSpool:
                         continue
                     parsed = _split_effective(name[:-5])
                     if parsed is None:
+                        # a name that does not even parse — inventoried
+                        # anyway, never silently skipped
+                        entries.append({"kind": "corrupt", "file": name})
                         continue
                     event, subscriber = parsed
                     marker = _read_marker_at(name, dfd)
-                    if marker.state is not MarkerState.PRESENT:
-                        continue
-                    rec = event_attempts.validate_record(
-                        marker.payload, expect_emitter=emitter,
-                        expect_event=event, expect_subscriber=subscriber)
+                    if marker.state is MarkerState.ABSENT:
+                        continue          # vanished mid-scan: nothing to
+                        # account for, this name no longer exists
+                    rec = None
+                    if marker.state is MarkerState.PRESENT:
+                        rec = event_attempts.validate_record(
+                            marker.payload, expect_emitter=emitter,
+                            expect_event=event, expect_subscriber=subscriber)
                     if rec is not None:
                         entries.append({"kind": "record", "emitter": emitter,
                                         "event": event, "gen": rec["gen"]})
+                    else:
+                        # present BY NAME but unreadable/invalid content,
+                        # and never quarantined — inventoried as corrupt
+                        # rather than vanishing from the ledger
+                        entries.append({"kind": "corrupt", "file": name})
                 return entries
             finally:
                 os.close(dfd)
