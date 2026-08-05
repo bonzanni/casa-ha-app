@@ -80,7 +80,7 @@ _RECORD_KEYS = frozenset({
 #: ``/data/events/<emitter>/`` directories, a later task, imports THIS
 #: module, never the reverse). Canonical copy: ``plugin_events._NAME_RE``
 #: plus its subscribe-side injectivity rails (no ``--``, no leading ``-``,
-#: no ``plg-`` prefix) — mirrored, not imported, exactly like
+#: no trailing ``-``, no ``plg-`` prefix) — mirrored, not imported, exactly like
 #: ``callback_attempts._HASH_RE`` restates the spool's state-hash grammar.
 #: A validated record's ``event`` is a path COMPONENT, not free text: a
 #: charset-only check would let ``event="../../../etc"`` validate today and
@@ -103,9 +103,12 @@ def _valid_event(value) -> bool:
     """The event-name grammar, plus the injectivity rails a declared/
     subscribed event name is already held to in ``plugin_events.py``: no
     ``--`` (reserved effective-name separator), no leading ``-``
-    (ambiguous plugin-name separator), no ``plg-`` prefix (reserved)."""
+    (ambiguous plugin-name separator), no trailing ``-`` (ambiguous
+    event/token separator — ``<event>--<u32hex>.json`` misparses, Critical-3),
+    no ``plg-`` prefix (reserved)."""
     return (isinstance(value, str) and bool(_EVENT_RE.match(value))
             and "--" not in value and not value.startswith("-")
+            and not value.endswith("-")
             and not value.startswith("plg-"))
 
 

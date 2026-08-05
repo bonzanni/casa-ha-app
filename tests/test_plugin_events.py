@@ -129,6 +129,15 @@ def test_emit_declared_name_leading_dash_rejected():
     assert any("start with '-'" in e for e in errs)
 
 
+def test_emit_declared_name_trailing_dash_rejected():
+    """Critical-3 pin: a declared event name ending in '-' would misparse
+    the emission filename split (`<event>--<u32hex>.json`'s FIRST '--' no
+    longer lands where the caller expects), so the emission reads as
+    unfoldable and sweep deletes it outright."""
+    _, errs = parse_and_validate_emits("a", _emits([{"name": "x-"}]))
+    assert any("end with '-'" in e for e in errs)
+
+
 # --- counts -----------------------------------------------------------
 
 def test_too_many_emits_rejected():
@@ -338,6 +347,13 @@ def test_subscribe_event_leading_dash_rejected():
     _, errs = parse_and_validate_subscribes(
         "p", _subs([{"plugin": "finance", "event": "-x"}]))
     assert any("start with '-'" in e for e in errs)
+
+
+def test_subscribe_event_trailing_dash_rejected():
+    """Critical-3 pin — subscribe side (mirrors the emit-side rail above)."""
+    _, errs = parse_and_validate_subscribes(
+        "p", _subs([{"plugin": "finance", "event": "x-"}]))
+    assert any("end with '-'" in e for e in errs)
 
 
 def test_subscribe_event_plg_prefixed_rejected():

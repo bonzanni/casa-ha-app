@@ -162,6 +162,10 @@ def parse_and_validate_emits(
         elif name.startswith("-"):
             errs.append(f"{where}: name {name!r} may not start with '-' "
                         "(ambiguous plugin-name separator)")
+        elif name.endswith("-"):
+            errs.append(f"{where}: name {name!r} may not end with '-' "
+                        "(ambiguous event/token separator — "
+                        "`<event>--<u32hex>.json` misparses)")
         elif name.startswith("plg-"):
             errs.append(f"{where}: name may not start with the reserved 'plg-' prefix")
         else:
@@ -244,6 +248,10 @@ def parse_and_validate_subscribes(
         elif event.startswith("-"):
             errs.append(f"{where}: event {event!r} may not start with '-' "
                         "(ambiguous plugin-name separator)")
+        elif event.endswith("-"):
+            errs.append(f"{where}: event {event!r} may not end with '-' "
+                        "(ambiguous event/token separator — "
+                        "`<event>--<u32hex>.json` misparses)")
         elif event.startswith("plg-"):
             errs.append(f"{where}: event may not start with the reserved 'plg-' prefix")
 

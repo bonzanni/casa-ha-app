@@ -452,6 +452,48 @@ async def test_forged_undeclared_event_emission_is_inert(facility):
 
 
 # ---------------------------------------------------------------------------
+# (e) Critical-3 — a trailing-dash event name never reaches the spool via
+# a manifest declaration.
+# ---------------------------------------------------------------------------
+
+
+async def test_trailing_dash_declared_event_never_routes_to_the_spool(facility):
+    """Spool-level Critical-3 pin: a plugin declaring
+    ``casa.emits=[{"name": "invoice-"}]`` (trailing dash — the exact shape
+    that used to misparse `<event>--<u32hex>.json`'s filename split and get
+    swept as unfoldable) is refused at the manifest-parse layer
+    (``plugin_events.parse_and_validate_emits``/``parse_and_validate_
+    subscribes``), so ``event_reconcile``'s ``declared_events`` set never
+    includes it and no ``(emitter, event)`` pair for it is ever published
+    to the routed map this facility's real spool reads — it can never
+    reach the spool through the manifest-driven production path at all.
+    (The SUBSCRIBER's own ``casa.subscribes`` entry naming the same event
+    is rejected too — ``event_invalid``, caught even earlier than the
+    emitter-side ``event_emitter_missing`` gate.)"""
+    bad_event = "invoice-"
+    facility.declare_emitter(EMITTER, events=(bad_event,),
+                             artifact_id=EMITTER_ARTIFACT, provision=False)
+    facility.declare_subscriber(SUBSCRIBER, subscribes=((EMITTER, bad_event),),
+                                artifact_id=SUB_ARTIFACT)
+
+    # The EMITTER side, independently: its own casa.emits declaration is
+    # refused at the manifest-extraction layer (the same call
+    # event_reconcile.compute_desired makes to build `declared_events`).
+    import plugin_store
+    with pytest.raises(plugin_store.StoreError):
+        plugin_store.manifest_emits(
+            facility.plugins[EMITTER].manifest, EMITTER)
+
+    issues = await facility.reconcile()
+    codes = {i["reason_code"] for i in issues}
+    assert "event_invalid" in codes
+
+    routed = er.get_routed()
+    assert routed is not es.ROUTING_UNAVAILABLE
+    assert routed.get((EMITTER, bad_event), {}) == {}
+
+
+# ---------------------------------------------------------------------------
 # (d) INV-EV-005 — no envelope bytes, no ack token, anywhere in the logs
 # ---------------------------------------------------------------------------
 

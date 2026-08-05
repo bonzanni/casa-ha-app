@@ -234,6 +234,13 @@ def test_validate_rejects_event_injectivity_rail_violations():
     assert ea.validate_record(dict(_good(), event="plg-x")) is None
 
 
+def test_validate_rejects_trailing_dash_event_name():
+    """Critical-3 pin: a trailing '-' is just as ambiguous for the
+    `<event>--<u32hex>.json` filename split as a leading one — mirrors
+    plugin_events' emit/subscribe-side rail."""
+    assert ea.validate_record(dict(_good(), event="x-")) is None
+
+
 def test_validate_accepts_scoped_plugin_identity():
     """P0 pin (mirrors plugin_events' test_scoped_emitter_accepted): a
     bundled/specialist plugin's scoped `slug.manifest_name` identity must
