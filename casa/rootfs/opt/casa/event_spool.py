@@ -162,6 +162,16 @@ class MarkerState:
     ABSENT = "absent"
     INVALID = "invalid"
     PRESENT = "present"
+    #: Important-2: an OSError DURING the read (open/fstat/read — fd
+    #: pressure, EMFILE/ENFILE, a transient I/O error), as distinct from
+    #: INVALID (the file was fully read but its CONTENT is malformed). A
+    #: caller must never treat this the way it treats INVALID: quarantining
+    #: or reconstructing off an UNREADABLE marker would destructively act
+    #: on a file whose actual content was never even seen — it might be
+    #: perfectly healthy. The correct response is always to defer (skip
+    #: this file/pair this pass, retry next), mirroring this module's own
+    #: ``_TOKEN_ERROR``/``_SCAN_ERROR`` sentinels.
+    UNREADABLE = "unreadable"
 
 
 @dataclass(frozen=True)
@@ -464,19 +474,25 @@ def _retire_marker_entry(name: str, dir_fd: int) -> bool:
 
 
 def _read_marker_at(name: str, dir_fd: int) -> Marker:
-    """Total, non-blocking, three-state marker read openat-relative to
-    *dir_fd*. Mirrors ``callback_spool._read_marker_at`` exactly."""
+    """Total, non-blocking, FOUR-state marker read openat-relative to
+    *dir_fd*. Important-2: an ``OSError`` raised BY THE READ ITSELF (open/
+    fstat/read — fd pressure, a transient I/O error) reports
+    :data:`MarkerState.UNREADABLE`, never :data:`MarkerState.INVALID` — the
+    latter is reserved for content this function actually READ and found
+    malformed (non-regular, oversized, non-JSON, non-dict). Conflating the
+    two would let a caller's quarantine/reconstruct logic destructively act
+    on a file it never actually looked at."""
     try:
         fd = os.open(name, _MARKER_READ_FLAGS, dir_fd=dir_fd)
     except FileNotFoundError:
         return Marker(MarkerState.ABSENT)
     except OSError:
-        return Marker(MarkerState.INVALID)
+        return Marker(MarkerState.UNREADABLE)
     try:
         try:
             st = os.fstat(fd)
         except OSError:
-            return Marker(MarkerState.INVALID)
+            return Marker(MarkerState.UNREADABLE)
         if not stat.S_ISREG(st.st_mode):
             return Marker(MarkerState.INVALID)
         chunks: list = []
@@ -485,7 +501,7 @@ def _read_marker_at(name: str, dir_fd: int) -> Marker:
             try:
                 chunk = os.read(fd, 65536)
             except OSError:
-                return Marker(MarkerState.INVALID)
+                return Marker(MarkerState.UNREADABLE)
             if not chunk:
                 break
             size += len(chunk)
@@ -1212,6 +1228,19 @@ class EventSpool:
                          now: float) -> list:
         changed = []
         state_marker = self._read_state_marker(sfd, event)
+        if state_marker.state is MarkerState.UNREADABLE:
+            # Important-2: an OSError reading the state file (fd pressure,
+            # a transient I/O error) must never be treated as "state is
+            # absent/corrupt" — RECONSTRUCT below would otherwise rebuild
+            # from `valid_records` (or OPEN would mint gen 1) OVER a state
+            # file whose actual content was never even seen, silently
+            # rolling a generation backward. Defer the WHOLE pair this
+            # pass — no reconstruct, no repair, no open — and retry next.
+            logger.warning(
+                "event-spool: state read for %r/%r unreadable this pass — "
+                "deferred (fd pressure or a transient I/O error), no "
+                "reconstruct/open", emitter, event)
+            return changed
         valid_records = self._read_valid_delivery_records(dfd, emitter, event)
 
         # -- RECONSTRUCT (decision 25) ------------------------------------
@@ -1676,6 +1705,18 @@ class EventSpool:
                 marker = _read_marker_at(name, dfd)
                 if marker.state is MarkerState.ABSENT:
                     continue          # vanished mid-scan
+                if marker.state is MarkerState.UNREADABLE:
+                    # Important-2: an OSError reading this file (fd
+                    # pressure, a transient I/O error) must never be
+                    # treated as malformed content — quarantining here
+                    # would destructively rename a record whose actual
+                    # content was never even seen, and might be perfectly
+                    # healthy. Defer: skip it this pass, retry next.
+                    logger.warning(
+                        "event-spool: delivery record %r unreadable this "
+                        "pass — deferred (fd pressure or a transient I/O "
+                        "error), no quarantine", name)
+                    continue
                 rec = None
                 if parsed is not None and marker.state is MarkerState.PRESENT:
                     event, subscriber = parsed
@@ -1887,6 +1928,19 @@ class EventSpool:
                         continue
                     marker = _read_marker_at(name, rfd)
                     if marker.state is MarkerState.ABSENT:
+                        continue
+                    if marker.state is MarkerState.UNREADABLE:
+                        # Important-2: an OSError reading this file (fd
+                        # pressure, a transient I/O error) must never be
+                        # treated as malformed content — retiring
+                        # (deleting) it here would destroy a removal
+                        # record whose actual content was never even
+                        # seen, and might be perfectly healthy. Defer:
+                        # skip it this pass, retry next.
+                        logger.warning(
+                            "event-spool: removal record %r unreadable "
+                            "this pass — deferred (fd pressure or a "
+                            "transient I/O error), not retired", name)
                         continue
                     rec = (_validate_removal(marker.payload)
                           if marker.state is MarkerState.PRESENT else None)

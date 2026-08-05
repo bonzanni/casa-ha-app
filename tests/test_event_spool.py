@@ -8,6 +8,7 @@ overlap (fixtures, real-thread concurrency, ``os.utime``-driven TTL
 determinism); the fold/generation machinery has no callback analogue and
 is pinned fresh here against the reviewed spec's red-case list.
 """
+import errno
 import logging
 import os
 import threading
@@ -585,6 +586,50 @@ def test_quarantine_failure_defers_reconstruction_instead_of_overwriting(spool, 
     state = _read_state(spool)
     assert state["gen"] == 3
     assert list(_state_dir(spool).glob(".corrupt-*"))
+
+
+def test_fold_pass_defers_rather_than_reconstructs_from_an_unreadable_state(
+        spool, monkeypatch):
+    """Important-2 pin: an EMFILE-style open failure reading the STATE file
+    must defer the WHOLE pair this pass — no reconstruct, no repair, no
+    open. Treating an OSError the same as "state absent/corrupt" would
+    silently roll a healthy generation back to whatever the surviving
+    delivery records show, or worse, quarantine a state file whose content
+    was never even seen."""
+    now = 5000.0
+    rec = ea.new_record(E, EV, S1, 5, "tok-x", now - 100)
+    rec = ea.terminalize(rec, "acked", now=now - 50)
+    _write_raw(_delivery_path(spool, S1),
+              es.canonical_marker_bytes(rec).decode())
+    real_state = {"v": es.STATE_SCHEMA_VERSION, "event": EV, "gen": 5,
+                  "cohort": [S1], "folded": [], "opened_ts": now - 200}
+    _write_raw(_state_dir(spool) / f"{EV}.json",
+              es.canonical_marker_bytes(real_state).decode())
+    _emit(spool, when=now - 10)
+
+    target = f"{EV}.json"
+    real_open = os.open
+
+    def flaky_open(name, flags, *a, **kw):
+        if name == target:
+            raise OSError(errno.EMFILE, "too many open files")
+        return real_open(name, flags, *a, **kw)
+
+    monkeypatch.setattr(es.os, "open", flaky_open)
+    try:
+        changed = spool.fold_pass(R(S1), now)
+    finally:
+        monkeypatch.undo()
+
+    assert changed == []
+    # the REAL (healthy, gen-5) state file was never reconstructed over,
+    # quarantined, or otherwise touched.
+    assert (_state_dir(spool) / f"{EV}.json").exists()
+    assert list(_state_dir(spool).glob(".corrupt-*")) == []
+
+    # a later pass, fd pressure gone, reads the SAME gen-5 state back.
+    state = _read_state(spool)
+    assert state["gen"] == 5
 
 
 # ---------------------------------------------------------------------------
@@ -1197,6 +1242,42 @@ def test_sweep_quarantines_corrupt_delivery_file_and_surfaces_issue(spool):
     assert len(quarantined) == 1
     issues = spool.spool_issues()
     assert any(i["kind"] == "corrupt_delivery" for i in issues)
+
+
+def test_sweep_defers_rather_than_quarantines_an_unreadable_delivery_file(
+        spool, monkeypatch):
+    """Important-2 pin: an EMFILE-style open failure reading a delivery
+    record must leave it UNTOUCHED — never quarantined. Collapsing an
+    OSError (fd pressure, transient I/O) into the same MarkerState.INVALID
+    a malformed-content read produces would let this destructively rename
+    a record whose actual content was never even seen — it might be
+    perfectly healthy."""
+    _emit(spool, when=1000.0)
+    spool.fold_pass(R(S1), 1100.0)
+    path = _delivery_path(spool, S1)
+    assert path.exists()
+
+    target = path.name
+    real_open = os.open
+
+    def flaky_open(name, flags, *a, **kw):
+        if name == target:
+            raise OSError(errno.EMFILE, "too many open files")
+        return real_open(name, flags, *a, **kw)
+
+    monkeypatch.setattr(es.os, "open", flaky_open)
+    try:
+        report = spool.sweep(R(S1), installed={S1}, registry_valid=True,
+                             now=1200.0)
+    finally:
+        monkeypatch.undo()
+
+    assert report.quarantined_delivery == 0
+    assert path.exists()                      # untouched — no rename
+    assert list(_delivery_dir(spool).glob(".corrupt-*")) == []
+    # a later pass, fd pressure gone, reads the SAME healthy record back.
+    rec = _read_delivery(spool, S1)
+    assert rec is not None and rec["status"] == "pending"
 
 
 def test_corrupt_delivery_does_not_block_idle_and_is_unackable(spool):
