@@ -586,6 +586,35 @@ async def test_full_resume_after_recovery_when_routing_returns(wired):
     assert len(wired.dispatches) == 1
 
 
+async def test_invalid_registry_suspends_dispatch_and_destructive_work(wired):
+    """Critical-2(c) pin: an AUTHORITATIVE routed map is not enough on its
+    own — registry_valid=False must suspend dispatch/fold/destructive-sweep
+    exactly like the ROUTING_UNAVAILABLE sentinel does, even though
+    `wired.routed` here is a real (non-sentinel) mapping the whole time."""
+    wired.seed()
+    event_spool.emit(wired.spool.root / EMITTER, EVENT)
+    before_emissions = wired.spool.list_emissions(EMITTER, EVENT)
+    assert before_emissions
+    wired.registry_valid = False
+    await ee._worker_pass()
+    assert wired.dispatches == []
+    assert wired.rec() is not None
+    assert wired.rec()["nudges"] == 0
+    assert wired.spool.list_emissions(EMITTER, EVENT) == before_emissions
+    assert ee._next_due is None
+
+
+async def test_full_resume_after_recovery_when_registry_heals(wired):
+    wired.seed()
+    wired.registry_valid = False
+    await ee._worker_pass()
+    assert wired.dispatches == []
+
+    wired.registry_valid = True
+    await ee._worker_pass()
+    assert len(wired.dispatches) == 1
+
+
 async def test_worker_pass_without_a_spool_is_a_no_op(wired):
     wired.wire(get_spool=lambda: None)
     await ee._worker_pass()
@@ -599,7 +628,13 @@ async def test_worker_pass_without_a_spool_is_a_no_op(wired):
 
 async def test_removal_note_marks_the_record_on_success(wired):
     wired.seed()
+    # A subscriber whose plugin was uninstalled is never still ROUTED
+    # either (Critical-2(b): the drop path requires status=="done", so a
+    # record that stayed routed while merely falling out of `installed`
+    # must NOT be dropped while pending — only a genuinely unrouted-and-
+    # uninstalled pair terminalizes-then-drops in one pass).
     wired.installed = set()
+    wired.routed = {}
     # A single pass both (a) sweeps the now-uninstalled subscriber's
     # record into a durable removal record and (b) processes that SAME
     # removal record's notify-then-mark — both stages run inside one
@@ -617,6 +652,7 @@ async def test_removal_note_marks_the_record_on_success(wired):
 async def test_removal_note_failure_leaves_it_unnoted_and_retries(wired):
     wired.seed()
     wired.installed = set()
+    wired.routed = {}
     wired.note_error = RuntimeError("bus down")
     await ee._worker_pass()          # creates the record AND attempts the note
     assert len(wired.notes) == 1

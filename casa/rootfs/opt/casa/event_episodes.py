@@ -48,7 +48,11 @@ housekeeping only) under the sentinel, and this module additionally skips
 the fold/due-scan/dispatch stages entirely that pass — queued emissions and
 pending delivery records SURVIVE a transient reconcile-compute failure
 untouched, and dispatch resumes in full the moment routing is available
-again.
+again. ``get_registry_valid() is False`` degrades the SAME way even when
+``routed`` itself still looks like a real mapping (Critical-2c): the
+spool's sweep gates its destructive DROP/terminalize-as-removed logic on
+``registry_valid`` too, because that logic keys on ``installed``, which is
+only trustworthy while the registry snapshot is.
 """
 from __future__ import annotations
 
@@ -378,9 +382,11 @@ async def _worker_pass() -> None:
     except Exception:  # noqa: BLE001 — one bad emitter must not stop the pass
         logger.exception("event-spool sweep failed")
 
-    if routed is event_spool.ROUTING_UNAVAILABLE:
-        # No fold, no due-scan, no dispatch — the sentinel authorizes
-        # nothing destructive OR forward-moving (decision 26).
+    if routed is event_spool.ROUTING_UNAVAILABLE or not registry_valid:
+        # No fold, no due-scan, no dispatch — the sentinel (or an invalid
+        # registry snapshot, Critical-2(c): `installed` is untrustworthy
+        # under it, exactly like the spool's own sweep gate above)
+        # authorizes nothing destructive OR forward-moving (decision 26).
         _next_due = None
         return
 

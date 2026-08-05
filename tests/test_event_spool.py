@@ -1346,6 +1346,105 @@ def test_sweep_under_routing_unavailable_only_does_part_ttl(spool):
 
 
 # ---------------------------------------------------------------------------
+# sweep — registry_valid gating (Critical-2)
+# ---------------------------------------------------------------------------
+
+
+def test_sweep_under_invalid_registry_only_does_part_ttl_even_with_authoritative_routed(spool):
+    """Critical-2(a) pin: an AUTHORITATIVE (non-sentinel) routed map is not
+    enough on its own — registry_valid=False must degrade sweep exactly
+    like ROUTING_UNAVAILABLE: no watermark deletion, no terminalization, no
+    drop, no removal record. Only part-TTL housekeeping runs."""
+    _emit(spool, when=1000.0)
+    spool.fold_pass(R(S1), 1100.0)
+    part = _emissions_dir(spool) / ".part-deadbeef"
+    part.write_bytes(b"x")
+    _utime(part, 1000.0 - TEMP_TTL_S - 100)
+
+    # An authoritative EMPTY routed map (installed=set()) would normally
+    # terminalize-then-drop S1's record outright — but registry_valid=False
+    # must suppress all of that.
+    report = spool.sweep({}, installed=set(), registry_valid=False, now=2000.0)
+    assert not part.exists()                 # part-TTL housekeeping ran
+    assert report.deleted_watermark == 0
+    assert report.terminalized == 0
+    assert report.dropped_records == 0
+    assert report.removal_records_written == 0
+    rec = _read_delivery(spool, S1)
+    assert rec is not None and rec["status"] == "pending"
+
+
+def test_sweep_registry_heals_resumes_full_authoritative_behavior(spool):
+    """The other half of Critical-2(a): once registry_valid returns to
+    True, the SAME unrouted/uninstalled pair terminalizes and drops
+    normally — the degrade is transient, not sticky."""
+    _emit(spool, when=1000.0)
+    spool.fold_pass(R(S1), 1100.0)
+    # registry momentarily invalid — nothing destructive happens
+    spool.sweep({}, installed=set(), registry_valid=False, now=1200.0)
+    rec = _read_delivery(spool, S1)
+    assert rec["status"] == "pending"
+    # registry heals — the pass now proceeds exactly as it would have
+    report = spool.sweep({}, installed=set(), registry_valid=True, now=1300.0)
+    assert report.terminalized == 1
+    assert report.dropped_records == 1
+    assert _read_delivery(spool, S1) is None
+
+
+def test_sweep_never_drops_a_pending_record_the_drop_gate_requires_done(
+        spool, monkeypatch):
+    """Critical-2(b) pin: the DROP path requires ``status == "done"`` — a
+    record that is still routed this pass (so the terminalize branch never
+    runs) but whose subscriber has already fallen out of `installed` must
+    be left alone, not dropped while pending. Forces exactly that
+    inconsistent-but-real state (routed snapshot stale relative to a
+    fresher `installed`) directly, since the reconciler is not exercised
+    here."""
+    _emit(spool, when=1000.0)
+    spool.fold_pass(R(S1), 1100.0)
+    rec = _read_delivery(spool, S1)
+    assert rec["status"] == "pending"
+
+    # S1 is STILL routed (routed=R(S1)) but no longer "installed" — an
+    # inconsistency the sweep must never resolve by silently dropping a
+    # pending record.
+    report = spool.sweep(R(S1), installed=set(), registry_valid=True, now=1200.0)
+    assert report.terminalized == 0
+    assert report.dropped_records == 0
+    assert report.removal_records_written == 0
+    still = _read_delivery(spool, S1)
+    assert still is not None and still["status"] == "pending"
+    assert still == rec                       # entirely untouched
+
+
+# ---------------------------------------------------------------------------
+# fold_pass / sweep — falsy non-dict `routed` normalization (Minor-7)
+# ---------------------------------------------------------------------------
+
+
+def test_fold_pass_falsy_non_dict_routed_is_a_strict_no_op(spool, caplog):
+    """A falsy non-dict (None here) must never be silently normalized to an
+    authoritative-empty {} by the per-pair `routed or {}` fallback — it is
+    treated as unavailable (a strict no-op), exactly like the sentinel."""
+    _emit(spool, when=1000.0)
+    with caplog.at_level(logging.WARNING, logger="event_spool"):
+        changed = spool.fold_pass(None, 2000.0)
+    assert changed == []
+    assert _read_state(spool) is None            # no generation opened
+    assert any("fold" in r.message for r in caplog.records)
+
+
+def test_sweep_falsy_non_dict_routed_only_does_part_ttl(spool):
+    """Mirrors the fold_pass pin above: a falsy non-dict routed value must
+    degrade sweep to part-TTL housekeeping only, never an authoritative
+    empty map (which would delete the queued emission as unrouted)."""
+    p = _emit(spool, when=1000.0)
+    report = spool.sweep(None, installed=set(), registry_valid=True, now=1100.0)
+    assert p.exists()
+    assert report.deleted_watermark == 0
+
+
+# ---------------------------------------------------------------------------
 # part-file TTL sweep
 # ---------------------------------------------------------------------------
 

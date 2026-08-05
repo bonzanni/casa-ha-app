@@ -1138,6 +1138,19 @@ class EventSpool:
         folded-unlink, no open (Terra-r6 #2 pin)."""
         if routed is ROUTING_UNAVAILABLE:
             return []
+        if not routed and not isinstance(routed, dict):
+            # M7: a FALSY non-dict (None, 0, "", [], ...) must never be
+            # silently normalized to an authoritative-empty {} by the
+            # per-pair `routed or {}` fallback below — that would let a
+            # caller bug read as "nothing is routed right now" instead of
+            # the "routing compute is unavailable" it actually is. A
+            # TRUTHY non-mapping (e.g. a stray list) is intentionally NOT
+            # caught here — it still degrades per-pair, below (Minor-5(b)).
+            logger.warning(
+                "event-spool: fold_pass called with a falsy non-mapping "
+                "routed value (%r) — treated as unavailable, no-op",
+                routed)
+            return []
         opened = []
         with self._lock:
             if self._closed:
@@ -1484,21 +1497,42 @@ class EventSpool:
 
     def sweep(self, routed, installed: set, registry_valid: bool,
              now: float) -> SweepReport:
-        """Authoritative-or-sentinel (spec decision 26): under
-        :data:`ROUTING_UNAVAILABLE` this pass does part-TTL housekeeping
-        ONLY — no deletion, no terminalization, no removal record.
-        Authoritative passes additionally: delete every emission file of
-        a pair with no routed subscriber (the consent watermark, decision
-        23); enforce the disk-pressure valve; quarantine invalid delivery
-        files; terminalize unrouted records (retained as tombstones); and
-        DROP a subscriber's tombstoned records — durable removal record
-        first — once that subscriber's own plugin is no longer
-        installed. State files are never touched here."""
+        """Authoritative-or-degraded (spec decision 26, Critical-2): unless
+        BOTH ``routed`` is a real (sentinel-free) mapping AND
+        ``registry_valid`` is ``True``, this pass does part-TTL housekeeping
+        ONLY — no deletion, no terminalization, no removal record. A
+        ``routed`` map computed while the registry snapshot was invalid is
+        not enough on its own: the DROP/terminalize-as-removed logic below
+        keys on ``installed``, which is only trustworthy when
+        ``registry_valid`` is ``True`` — an untrustworthy ``installed``
+        would otherwise misclassify (or outright drop) every subscriber's
+        still-pending records. ``registry_valid`` therefore degrades sweep
+        exactly like the :data:`ROUTING_UNAVAILABLE` sentinel does, even
+        when ``routed`` itself looks authoritative.
+
+        Authoritative-AND-registry-valid passes additionally: delete every
+        emission file of a pair with no routed subscriber (the consent
+        watermark, decision 23); enforce the disk-pressure valve;
+        quarantine invalid delivery files; terminalize unrouted records
+        (retained as tombstones); and DROP a subscriber's tombstoned
+        records — durable removal record first, and only once that record
+        is ``status == "done"`` (never a still-``pending`` one; a pending
+        record is terminalized THEN dropped, never dropped directly) —
+        once that subscriber's own plugin is no longer installed. State
+        files are never touched here."""
         report = SweepReport()
         with self._lock:
             if self._closed:
                 return report
-            if routed is ROUTING_UNAVAILABLE:
+            routed_unusable = (
+                routed is ROUTING_UNAVAILABLE
+                or (not routed and not isinstance(routed, dict)))
+            # M7: a falsy non-dict `routed` (None, 0, "", [], ...) must
+            # never be silently treated as an authoritative-empty {} — see
+            # fold_pass's identical rail. A truthy non-mapping is left to
+            # the per-emitter try/except below (mirrors fold_pass's
+            # per-pair isolation discipline).
+            if routed_unusable or registry_valid is not True:
                 for emitter in self._emitter_dirs():
                     try:
                         efd = self._emitter_fd(emitter)
@@ -1677,7 +1711,16 @@ class EventSpool:
                         rec = newrec
                         report.terminalized += 1
                         touched = True
-                if rec["subscriber"] not in installed:
+                # Critical-2(b): the docstring's own tombstone promise — a
+                # PENDING record is never dropped directly, only
+                # terminalized first (above, when unrouted) and dropped on
+                # a LATER pass once it reads back `done`. Without this
+                # gate, a record still routed at this exact pass (so the
+                # terminalize branch above never ran) but whose subscriber
+                # already dropped out of `installed` would be deleted here
+                # while still pending — no tombstone, no ack surface, an
+                # invisible loss.
+                if rec["subscriber"] not in installed and rec["status"] == "done":
                     to_drop.setdefault(rec["subscriber"], []).append(
                         {"kind": "record", "emitter": emitter,
                          "event": rec["event"], "gen": rec["gen"]})
