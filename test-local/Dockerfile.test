@@ -60,7 +60,7 @@ RUN /opt/casa/venv/bin/pip install --no-cache-dir --force-reinstall --no-deps /t
 # COPY'd for the authenticated github.com fetch.
 COPY casa/rootfs/etc/gitconfig /etc/gitconfig
 COPY casa/rootfs/opt/casa/scripts/git-credential-casa.sh /opt/casa/scripts/git-credential-casa.sh
-COPY casa/rootfs/opt/casa/plugin_registry.py casa/rootfs/opt/casa/plugin_store.py casa/rootfs/opt/casa/plugin_triggers.py casa/rootfs/opt/casa/plugin_callbacks.py casa/rootfs/opt/casa/callback_attempts.py casa/rootfs/opt/casa/text_util.py /opt/casa/
+COPY casa/rootfs/opt/casa/plugin_registry.py casa/rootfs/opt/casa/plugin_store.py casa/rootfs/opt/casa/plugin_triggers.py casa/rootfs/opt/casa/plugin_callbacks.py casa/rootfs/opt/casa/plugin_events.py casa/rootfs/opt/casa/callback_attempts.py casa/rootfs/opt/casa/atomic_io.py casa/rootfs/opt/casa/text_util.py /opt/casa/
 COPY casa/rootfs/opt/casa/scripts/build_plugin_bundle.py /opt/casa/scripts/build_plugin_bundle.py
 COPY casa/rootfs/opt/casa/defaults/plugin-registry.json /opt/casa/defaults/plugin-registry.json
 RUN python3 /opt/casa/scripts/build_plugin_bundle.py \
