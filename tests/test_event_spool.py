@@ -674,7 +674,8 @@ def test_crash_between_record_upserts_and_unlink_self_heals(spool, monkeypatch):
 
     monkeypatch.undo()
     # next pass: not idle (S1 pending) so OPEN won't refire, but REPAIR's
-    # unconditional folded-unlink step cleans up the survivors
+    # gated folded-unlink step (gated on fan-out completeness: all eligible
+    # members hold valid records at state_gen) cleans up the survivors
     spool.fold_pass(R(S1), 2100.0)
     assert list(_emissions_dir(spool).glob(f"{EV}--*.json")) == []
 
@@ -795,6 +796,96 @@ def test_first_generation_partial_write_retains_emission_until_idle_then_refolds
     assert s1_gen2["gen"] == 2
     assert s1_gen2["status"] == "pending"
     assert s1_gen2["ack_token"] != s1_gen1["ack_token"]
+
+
+def test_crash_mid_unlink_then_ack_does_not_refold(spool, monkeypatch):
+    """Round-2 FAN-OUT-COMPLETENESS probe: REPAIR's fan-out completeness
+    gate (eligible = cohort & routed_subs, all members have records at
+    state_gen) must unlink folded emissions even when the records have been
+    acked to "done" status. A mutation adding `status=="pending"` to the
+    predicate would fail here — after acking, the records would have
+    status="done", but the fan-out is still complete (both eligible members
+    hold valid records), so the unlink must still happen."""
+    _emit(spool, when=1000.0)
+    # Crash BEFORE the folded-unlink step of OPEN: state is durable, both
+    # records are durable, but the folded emission remains on disk.
+    real_unlink = es._unlink_quiet
+    calls = {"i": 0}
+
+    def boom_unlink(name, dir_fd):
+        calls["i"] += 1
+        if calls["i"] == 1:
+            raise RuntimeError("simulated crash mid-unlink")
+        return real_unlink(name, dir_fd)
+
+    monkeypatch.setattr(es, "_unlink_quiet", boom_unlink)
+    changed = spool.fold_pass(R(S1, S2), 1100.0)
+    assert changed == []
+    assert list(_emissions_dir(spool).glob(f"{EV}--*.json"))  # still on disk
+    state = _read_state(spool)
+    assert state is not None and state["gen"] == 1
+
+    monkeypatch.undo()
+    # Ack both records to transition them from "pending" to "done".
+    for sub in (S1, S2):
+        rec = _read_delivery(spool, sub)
+        spool.ack(E, EV, rec["ack_token"], now=1200.0)
+
+    # REPAIR's completeness gate must still unlink the folded emissions: all
+    # eligible members (S1, S2) hold valid records at state_gen=1, even
+    # though they are now "done" instead of "pending". The gate unlinks, no
+    # new generation is minted (changed == []).
+    changed = spool.fold_pass(R(S1, S2), 1300.0)
+    assert changed == []
+    assert _read_state(spool)["gen"] == 1
+    assert list(_emissions_dir(spool).glob(f"{EV}--*.json")) == []
+
+
+def test_crash_mid_unlink_then_dropped_member_does_not_refold(spool, monkeypatch):
+    """Round-2 FAN-OUT-COMPLETENESS probe: REPAIR's fan-out completeness
+    gate is keyed to `eligible = cohort & routed_subs`, not just `cohort`.
+    A mutation changing `for sub in eligible` to `for sub in cohort` would
+    fail here — after S2 is de-routed and removed, eligible={S1 only}, but
+    cohort={S1,S2}. The emission must still be unlinked because all members
+    of eligible (just S1) hold valid records at state_gen."""
+    _emit(spool, when=1000.0)
+    # Crash BEFORE the folded-unlink step: state is durable, both records
+    # are durable, but the folded emission remains on disk.
+    real_unlink = es._unlink_quiet
+    calls = {"i": 0}
+
+    def boom_unlink(name, dir_fd):
+        calls["i"] += 1
+        if calls["i"] == 1:
+            raise RuntimeError("simulated crash mid-unlink")
+        return real_unlink(name, dir_fd)
+
+    monkeypatch.setattr(es, "_unlink_quiet", boom_unlink)
+    changed = spool.fold_pass(R(S1, S2), 1100.0)
+    assert changed == []
+    assert list(_emissions_dir(spool).glob(f"{EV}--*.json"))  # still on disk
+    state = _read_state(spool)
+    assert state is not None and state["gen"] == 1
+
+    monkeypatch.undo()
+    # Ack both records.
+    for sub in (S1, S2):
+        rec = _read_delivery(spool, sub)
+        spool.ack(E, EV, rec["ack_token"], now=1200.0)
+
+    # Sweep with S2 no longer in the installed set (de-route S2, remove its
+    # tombstone).
+    spool.sweep({}, installed={S1}, registry_valid=True, now=1250.0)
+
+    # REPAIR's completeness gate must still unlink: eligible={S1 only} (the
+    # intersection of cohort={S1,S2} and routed_subs={S1}), and S1 holds a
+    # valid record at state_gen=1. The fact that S2 is in cohort but not
+    # routed should not prevent the unlink. No new generation is created
+    # (changed == []).
+    changed = spool.fold_pass(R(S1), 1300.0)
+    assert changed == []
+    assert _read_state(spool)["gen"] == 1
+    assert list(_emissions_dir(spool).glob(f"{EV}--*.json")) == []
 
 
 def test_fold_one_does_not_leak_fds_when_a_later_subdir_open_fails(spool, monkeypatch):
