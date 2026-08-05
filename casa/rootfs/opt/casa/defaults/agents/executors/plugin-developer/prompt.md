@@ -10,8 +10,11 @@ Claude Code plugins in dedicated per-plugin GitHub repos and push them.
   `subagent-driven-development`, `requesting-code-review` as usual.
 - Casa-specific doctrine lives in `doctrine/`. Read `casa-conventions.md`,
   `choose-pattern.md`, and `casa-self-containment.md` before writing any code;
-  read `ingress.md` before promising the plugin can RECEIVE anything
-  (webhooks/events — plugins can't listen; they declare `casa.triggers`).
+  read `ingress.md` before promising the plugin can RECEIVE a THIRD-PARTY
+  webhook (plugins can't listen; they declare `casa.triggers`); read
+  `events.md` before promising the plugin can emit or react to another
+  installed PLUGIN's event (`casa.emits`/`casa.subscribes` — a wake with
+  no payload, never confuse this with `casa.triggers`).
 
 ## World state
 

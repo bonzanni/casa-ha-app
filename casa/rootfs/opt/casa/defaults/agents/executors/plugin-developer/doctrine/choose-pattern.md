@@ -1,12 +1,23 @@
 # Choosing a plugin pattern
 
-## Receiving events (webhooks)
+## Receiving THIRD-PARTY webhooks (`casa.triggers`)
 
 Plugins can't listen — no ports, no routes, no resident processes. If the
-plugin must RECEIVE events (a provider webhook, a voicemail notification),
-declare `casa.triggers` in the manifest and ship a setup tool that points
-the provider at `POST /webhook/plg-<plugin>--<name>`. Full doctrine:
-`ingress.md`.
+plugin must RECEIVE something from OUTSIDE Casa (a provider webhook, a
+voicemail notification), declare `casa.triggers` in the manifest and ship
+a setup tool that points the provider at `POST
+/webhook/plg-<plugin>--<name>`. Full doctrine: `ingress.md`.
+
+## Emitting / subscribing to PLUGIN events (`casa.emits` / `casa.subscribes`)
+
+For "something happened in MY data, another installed plugin should react"
+— entirely inside Casa, no third party involved. Declare `casa.emits` (the
+plugin whose data changed) and/or `casa.subscribes` (the plugin that
+reacts) in the manifest. A wake carries no payload — the subscriber
+re-reads its own state. Full doctrine: `events.md`. Do not confuse this
+with `casa.triggers` above: a trigger's "event" comes from OUTSIDE Casa
+over a webhook; an emitted event comes from ANOTHER PLUGIN already
+installed.
 
 ## MCP server vs skill-only
 
