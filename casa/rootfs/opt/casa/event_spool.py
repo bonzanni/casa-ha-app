@@ -175,6 +175,7 @@ class SweepReport:
     deleted_temps: int = 0
     deleted_watermark: int = 0
     deleted_valve: int = 0
+    deleted_unfoldable: int = 0
     quarantined_delivery: int = 0
     terminalized: int = 0
     dropped_records: int = 0
@@ -986,6 +987,16 @@ class EventSpool:
             if name.startswith(PART_PREFIX) or not name.endswith(".json") \
                     or not name.startswith(prefix):
                 continue
+            if self._u32hex_of(event, name) is None:
+                # Unfoldable by construction (this module never writes a
+                # non-u32hex suffix): never counted toward OPEN's
+                # "emissions exist" precondition, so a stray name like
+                # this can never drive a fresh generation on its own —
+                # it would otherwise keep `emissions` perpetually
+                # non-empty and open a new generation every idle pass
+                # forever. `_sweep_emissions` reaps it outright; this
+                # exclusion is what keeps it inert BETWEEN sweeps too.
+                continue
             st = _lstat_quiet(name, emfd)
             if st is None or not stat.S_ISREG(st.st_mode):
                 continue
@@ -1204,9 +1215,26 @@ class EventSpool:
                     if self._write_delivery(dfd, event, sub, newrec):
                         valid_records[sub] = newrec
                         changed.append((emitter, event, sub))
-            for u in state_obj["folded"]:
-                if _U32HEX_RE.match(u):
-                    _unlink_quiet(f"{event}--{u}.json", emfd)
+            # Unlink the folded emissions ONLY once this generation's
+            # fan-out is provably COMPLETE — every eligible member holds
+            # a record at exactly `state_gen`. A member REPAIR could
+            # never backfill (`rec is None`, the gate just above) or one
+            # whose write just failed leaves the fan-out incomplete:
+            # unlinking here regardless would permanently lose that
+            # member's wake (nothing else ever re-creates the folded
+            # emissions once gone). Retaining them instead is what lets
+            # OPEN re-fold the SAME emissions into a fresh generation the
+            # moment the pair goes idle — vacuously complete (and so
+            # unlinked) when `eligible` is empty, since nobody is left
+            # waiting on this generation at all.
+            fan_out_complete = all(
+                valid_records.get(sub) is not None
+                and valid_records[sub]["gen"] == state_gen
+                for sub in eligible)
+            if fan_out_complete:
+                for u in state_obj["folded"]:
+                    if _U32HEX_RE.match(u):
+                        _unlink_quiet(f"{event}--{u}.json", emfd)
 
         # -- OPEN ------------------------------------------------------
         if reconstruct_failed:
@@ -1225,16 +1253,15 @@ class EventSpool:
             oldest = sorted(emissions, key=lambda t: (t[0], t[1]))[:FOLD_BATCH_MAX]
             new_gen = cur_gen + 1
             new_cohort = sorted(routed_subs)
-            # Only names with a recoverable u32hex token are ever
-            # unlinked — and ONLY those are recorded in `folded`. Keeping
-            # the two lists in lockstep means a crash between the state
-            # write and the unlink loop below leaves nothing REPAIR's
-            # folded-unlink step (above) cannot reach on a later pass; an
-            # anomalous emission name that fails to parse a token is left
-            # alone entirely (an accepted residual, same as sweep's own
-            # anomalous-name handling), never unlinked without a
-            # corresponding `folded` entry to make that unlink
-            # idempotent-from-disk.
+            # `emissions` (built above) already excludes any name without
+            # a recoverable u32hex token — an unfoldable name can never
+            # reach `oldest` at all (sweep reaps it separately; NEW-2
+            # fix). The re-check here is belt-and-suspenders only: only
+            # names with a token are ever unlinked, and ONLY those are
+            # recorded in `folded`. Keeping the two lists in lockstep
+            # means a crash between the state write and the unlink loop
+            # below leaves nothing REPAIR's folded-unlink step (above)
+            # cannot reach on a later pass.
             folded_pairs = []
             for _, name in oldest:
                 tok = self._u32hex_of(event, name)
@@ -1245,14 +1272,27 @@ class EventSpool:
                         "folded": [tok for _, tok in folded_pairs],
                         "opened_ts": now}
             if self._write_state(efd, event, new_state):
+                all_written = True
                 for sub in new_cohort:
                     tok = uuid.uuid4().hex
                     newrec = event_attempts.new_record(
                         emitter, event, sub, new_gen, tok, now)
                     if self._write_delivery(dfd, event, sub, newrec):
                         changed.append((emitter, event, sub))
-                for name, _ in folded_pairs:
-                    _unlink_quiet(name, emfd)
+                    else:
+                        all_written = False
+                # Same completeness discipline as REPAIR's own
+                # folded-unlink (above): only unlink once EVERY member of
+                # the freshly-opened cohort actually got its record
+                # written this pass. An mid-loop write failure
+                # (ENOSPC/EIO, never an exception here — that path is
+                # caught by fold_pass's per-pair guard and simply retried
+                # whole) must not still destroy the folded emissions out
+                # from under the members who never got a record; REPAIR's
+                # own fan-out check converges this on a later pass.
+                if all_written:
+                    for name, _ in folded_pairs:
+                        _unlink_quiet(name, emfd)
         return changed
 
     # -- conditional delivery update (mirrors update_attempt_nudge) ------
@@ -1470,6 +1510,7 @@ class EventSpool:
         try:
             keep = []
             touched = False
+            unfoldable = 0
             for name in _listdir_quiet(emfd):
                 if name.startswith(PART_PREFIX) or not name.endswith(".json"):
                     continue
@@ -1477,9 +1518,21 @@ class EventSpool:
                 if parsed is None:
                     continue          # anomalous name — accepted residual,
                     # same-uid threat model (never written by this module)
-                event = parsed[0]
+                event, token = parsed
                 st = _lstat_quiet(name, emfd)
                 if st is None or not stat.S_ISREG(st.st_mode):
+                    continue
+                if not _U32HEX_RE.match(token):
+                    # Unfoldable by construction (this module never
+                    # writes a non-u32hex suffix) — left in place it
+                    # would keep `emissions` perpetually non-empty at
+                    # OPEN, opening (and wasting) a fresh generation
+                    # every idle pass forever. Reaped unconditionally,
+                    # regardless of routing (NEW-2 fix).
+                    if _unlink_quiet(name, emfd):
+                        report.deleted_unfoldable += 1
+                        touched = True
+                        unfoldable += 1
                     continue
                 routed_subs = routed.get((emitter, event)) or set()
                 if not routed_subs:
@@ -1491,6 +1544,11 @@ class EventSpool:
                         touched = True
                     continue
                 keep.append((st.st_mtime, name))
+            if unfoldable:
+                logger.warning(
+                    "event-spool: swept %d unfoldable emission name(s) "
+                    "for emitter %r (missing a valid u32hex token)",
+                    unfoldable, emitter)
             if len(keep) > MAX_EMISSION_FILES:
                 overflow = len(keep) - MAX_EMISSION_FILES
                 victims = sorted(keep)[:overflow]
@@ -1891,12 +1949,17 @@ class EventSpool:
         unaccounted for.
 
         :data:`_SCAN_ERROR` when the listing itself could not be proven
-        (an ``OSError`` from ``listdir``) — an unprovable inventory must
-        never license the purge it would otherwise authorize."""
+        (an ``OSError`` from ``listdir``, or from opening the emitter or
+        ``delivery/`` dir at all) — an unprovable inventory must never
+        license the purge it would otherwise authorize. Only a genuinely
+        ABSENT dir (``FileNotFoundError``) is a real ``[]`` — nothing to
+        account for."""
         try:
             efd = self._emitter_fd(emitter)
-        except (OSError, ValueError):
+        except FileNotFoundError:
             return []
+        except (OSError, ValueError):
+            return _SCAN_ERROR
         try:
             try:
                 dfd = _open_dir(DELIVERY_DIR, efd)

@@ -316,6 +316,54 @@ def test_folded_remainder_folds_into_the_next_generation(spool):
     assert list(_emissions_dir(spool).glob(f"{EV}--*.json")) == []
 
 
+def test_unfoldable_emission_name_never_drives_repeated_opens(spool, caplog):
+    """Round-2 NEW-2: a name that parses as ``<event>--<rest>`` but
+    carries no valid u32hex token can never be folded — nothing ever
+    unlinks it via ``state.folded``. Left in place it would keep
+    ``emissions`` perpetually non-empty at OPEN, opening (and wasting) a
+    fresh generation every idle pass forever with no real emission ever
+    arriving. It must never drive OPEN at all — between sweeps too — and
+    an authoritative sweep reaps it outright, in one log line."""
+    junk = _emissions_dir(spool) / f"{EV}--not-8-hex.json"
+    junk.write_bytes(b'{"v":1}')
+    _utime(junk, 999.0)
+
+    # The junk file alone must never open a generation.
+    changed = spool.fold_pass(R(S1), 1000.0)
+    assert changed == []
+    assert _read_state(spool) is None
+
+    real = _emit(spool, when=1001.0)
+    changed = spool.fold_pass(R(S1), 1100.0)
+    assert changed == [(E, EV, S1)]
+    state = _read_state(spool)
+    assert state["gen"] == 1
+    assert not real.exists()          # the real emission WAS folded
+    assert junk.exists()              # the junk one is inert to fold —
+    # never counted, never touched by fold_pass at all
+
+    # Ack + several more fold passes with no new REAL emission: gen must
+    # never advance again just because the junk file is still sitting
+    # there (previously: a fresh generation, and thus a wasted wake,
+    # every single pass — gen 2, 3, 4, 5… forever).
+    rec = _read_delivery(spool, S1)
+    spool.ack(E, EV, rec["ack_token"], now=1200.0)
+    for i in range(3):
+        spool.fold_pass(R(S1), 1300.0 + i)
+    assert _read_state(spool)["gen"] == 1
+
+    # The first authoritative sweep reaps it, with one log line.
+    with caplog.at_level(logging.WARNING, logger="event_spool"):
+        report = spool.sweep(R(S1), installed={S1}, registry_valid=True,
+                             now=1400.0)
+    assert report.deleted_unfoldable == 1
+    assert not junk.exists()
+    assert any("unfoldable" in r.message for r in caplog.records)
+
+    spool.fold_pass(R(S1), 1500.0)
+    assert _read_state(spool)["gen"] == 1
+
+
 # ---------------------------------------------------------------------------
 # fold_pass — non-resurrection (Sol-r3 #2 pin)
 # ---------------------------------------------------------------------------
@@ -661,6 +709,92 @@ def test_crash_leaving_state_written_records_partial_then_repair_completes(spool
     changed = spool.fold_pass(R(S1, S2), 3100.0)   # REPAIR backfills S2
     assert changed == [(E, EV, S2)]
     assert _read_delivery(spool, S2)["gen"] == 2
+
+
+def test_first_generation_crash_on_first_write_retains_emission_and_reheals(spool, monkeypatch):
+    """Round-2 NEW-1 probe A: a crash during the VERY FIRST fan-out (no
+    cohort member has EVER held a record for this pair) must never lose
+    the folded emission. REPAIR can never backfill a `rec is None`
+    member (Important-1, round 1), so completeness for this generation
+    can never be proven by REPAIR alone — the emission must be RETAINED,
+    not unlinked, so OPEN can re-fold it once the pair goes idle."""
+    _emit(spool, when=1000.0)
+    # The crash lands on the FIRST _write_delivery call of OPEN's own
+    # record-write loop — before EITHER cohort member gets anything.
+    _boom_after(monkeypatch, es.EventSpool, "_write_delivery", 1)
+    changed = spool.fold_pass(R(S1, S2), 2000.0)
+    assert changed == []
+    state = _read_state(spool)
+    assert state is not None and state["gen"] == 1   # state IS durable
+    assert _read_delivery(spool, S1) is None
+    assert _read_delivery(spool, S2) is None
+    assert list(_emissions_dir(spool).glob(f"{EV}--*.json"))  # RETAINED —
+    # the fan-out was never proven complete, so nothing unlinked it
+
+    monkeypatch.undo()
+    # Nobody has ANY record yet, so idle is ALREADY true: the very next
+    # pass re-folds the SAME emission into a fresh generation for BOTH
+    # cohort members.
+    changed = spool.fold_pass(R(S1, S2), 2100.0)
+    assert set(changed) == {(E, EV, S1), (E, EV, S2)}
+    state = _read_state(spool)
+    assert state["gen"] == 2
+    assert _read_delivery(spool, S1)["gen"] == 2
+    assert _read_delivery(spool, S2)["gen"] == 2
+    assert list(_emissions_dir(spool).glob(f"{EV}--*.json")) == []
+
+
+def test_first_generation_partial_write_retains_emission_until_idle_then_refolds(spool, monkeypatch):
+    """Round-2 NEW-1 probe C: S1's write lands, S2's doesn't, on the
+    FIRST-EVER generation for this pair. The emission is RETAINED (fan-
+    out incomplete — S2 has no record REPAIR could ever backfill) until
+    S1's lone pending record resolves and the pair goes genuinely idle,
+    at which point a fresh generation re-folds the SAME emission for
+    BOTH members. S1's original gen-1 record must never be resurrected —
+    the gen-2 record is a distinct, fresh mint, not a mutation of the
+    old terminal one."""
+    _emit(spool, when=1000.0)
+    real_write = es.EventSpool._write_delivery
+
+    def boom_write(self, dfd, event, subscriber, rec):
+        if subscriber == S2:
+            return False              # simulated undurable write — does
+            # NOT raise, so the write loop continues past it
+        return real_write(self, dfd, event, subscriber, rec)
+
+    monkeypatch.setattr(es.EventSpool, "_write_delivery", boom_write)
+    changed = spool.fold_pass(R(S1, S2), 2000.0)
+    assert changed == [(E, EV, S1)]
+    s1_gen1 = _read_delivery(spool, S1)
+    assert s1_gen1["gen"] == 1 and s1_gen1["status"] == "pending"
+    assert _read_delivery(spool, S2) is None
+    assert list(_emissions_dir(spool).glob(f"{EV}--*.json"))   # RETAINED
+    # — fan-out incomplete (S2 has no record at all)
+
+    monkeypatch.undo()
+    # Not idle yet (S1 still pending) -> no re-fold, nothing changes.
+    changed = spool.fold_pass(R(S1, S2), 2100.0)
+    assert changed == []
+    assert _read_state(spool)["gen"] == 1
+    assert list(_emissions_dir(spool).glob(f"{EV}--*.json"))
+
+    # S1 acks its gen-1 record -> the pair is genuinely idle (S1 done,
+    # S2 never had a record at all).
+    spool.ack(E, EV, s1_gen1["ack_token"], now=2200.0)
+    changed = spool.fold_pass(R(S1, S2), 2300.0)
+    assert set(changed) == {(E, EV, S1), (E, EV, S2)}   # S2 finally woken
+    state = _read_state(spool)
+    assert state["gen"] == 2
+    assert list(_emissions_dir(spool).glob(f"{EV}--*.json")) == []
+
+    # S1's ORIGINAL gen-1 record is untouched (it was already fully
+    # overwritten, never resurrected in place) — the new gen-2 record is
+    # a fresh, distinct mint with its own token, not the old terminal
+    # one flipped back to pending.
+    s1_gen2 = _read_delivery(spool, S1)
+    assert s1_gen2["gen"] == 2
+    assert s1_gen2["status"] == "pending"
+    assert s1_gen2["ack_token"] != s1_gen1["ack_token"]
 
 
 def test_fold_one_does_not_leak_fds_when_a_later_subdir_open_fails(spool, monkeypatch):
@@ -1339,6 +1473,37 @@ def test_gc_orphan_dirs_inventories_a_scribbled_delivery_file_not_silently(spool
     _, rec = records[0]
     assert rec["plugin"] == E
     assert rec["entries"] == [{"kind": "corrupt", "file": f"{EV}--{S1}.json"}]
+
+
+def test_inventory_for_removal_fails_closed_on_unprovable_emitter_fd(spool, monkeypatch, caplog):
+    """Round-2 Minor pin: ``_inventory_for_removal``'s OWN
+    ``_emitter_fd`` call must fail CLOSED (``_SCAN_ERROR``), symmetric
+    with the round-1 Important-2 fix — not fail-open (``[]``, shadowed
+    only by ``_newest_mtime``'s ordering happening to run first).
+    ``_newest_mtime``'s own call to ``_emitter_fd`` is left to succeed so
+    this exercises the SECOND call, ``_inventory_for_removal``'s own."""
+    _emit(spool, when=1000.0)
+    spool.fold_pass(R(S1), 1100.0)
+    _backdate_tree(_edir(spool), 0.0)
+
+    orig = es.EventSpool._emitter_fd
+    calls = {"i": 0}
+
+    def boom(self, emitter):
+        calls["i"] += 1
+        if calls["i"] > 1:          # call 1 belongs to _newest_mtime
+            raise OSError(5, "simulated")
+        return orig(self, emitter)
+
+    monkeypatch.setattr(es.EventSpool, "_emitter_fd", boom)
+    with caplog.at_level(logging.WARNING, logger="event_spool"):
+        removed = spool.gc_orphan_dirs(registry_valid=True, member_plugins=set(),
+                                       now=QUIESCENCE_S + 10000)
+    assert removed == []
+    assert _edir(spool).exists()
+    assert spool.list_removal_records() == []
+    assert any("delivery inventory is unprovable" in r.message
+              for r in caplog.records)
 
 
 # ---------------------------------------------------------------------------
