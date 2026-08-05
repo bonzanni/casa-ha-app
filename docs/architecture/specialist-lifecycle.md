@@ -134,10 +134,15 @@ secret channel (INV-SPEC-006). Sourced plugin dependencies are additionally refu
 declare system requirements or triggers of their own, or when a required environment name
 collides with another installed plugin's — otherwise-valid bundles fail with dedicated
 error kinds the dependency model alone would not predict. A sourced dependency *may*,
-however, declare `casa.callbacks` — unlike `casa.triggers`, because a callback grants no
-turn or memory access — with one inspect-time gate: its owned entry routes under the scoped
-registry name, so a callback whose *scoped* effective name would overflow the length cap is
-refused as `callback_name_too_long` before it can reach the registry (see
+however, declare `casa.callbacks` — a callback grants no turn or memory access — and it
+may likewise declare `casa.emits`/`casa.subscribes`: an emit is inert without an
+operator-consented subscriber, and a subscribe, though it *does* wake the plugin's agent,
+fires only on a real occurrence elsewhere and only behind per-subscription operator
+consent (see `architecture/plugin-events.md`). What stays categorically refused is
+`casa.triggers` — a plugin granting itself future wake-ups. Each permitted block carries
+the same inspect-time gate: the owned entry routes under the scoped registry name, so an
+effective name that would overflow the length cap under its *scoped* spelling is refused
+(`callback_name_too_long` / `event_name_too_long`) before it can reach the registry (see
 `architecture/callbacks.md`). A rejected inspection deletes
 its fetched staging tree; a successful one retains it for the commit to consume.
 

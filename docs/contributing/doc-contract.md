@@ -65,8 +65,10 @@ how a corpus rots while passing.
 and containment; the marker pair in every document; invariant define-once, reference
 resolution, and declaration accuracy; that every declared invariant carries at least one
 `invariant_tests` binding to a tracked file that is not the missing-test sentinel, with any
-named test function checked by string search (that the reference *is* a genuine, collected
-pinning test is established by the red-case discipline, not by CI); the code-derived
+named test node resolved structurally against the file — module-level functions and
+class-qualified `Class::method` identifiers both — so a binding that would not collect
+fails the build (that the reference is a genuine *pinning* test is still established by
+the red-case discipline, not by CI); the code-derived
 coverage ledger in both directions (every enumerated
 surface assigned to a document or excluded with a reason, no stale entries); the required
 skeleton; and that all generated navigation is current.

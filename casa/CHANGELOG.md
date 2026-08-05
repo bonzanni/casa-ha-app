@@ -1,5 +1,30 @@
 # Changelog
 
+## [0.152.0] - 2026-08-05
+
+### Added
+
+- **Plugins can now emit domain events that wake other plugins.** A plugin
+  may declare `casa.emits` in its manifest ("something happened in my
+  data"), and other installed plugins may declare `casa.subscribes` on it.
+  When the emitter records an occurrence, Casa wakes each subscribed
+  plugin's agent in a fresh, standalone turn — no polling, no timers, and
+  the emitter never needs to know who is listening. A burst of emissions
+  coalesces into a single wake, and the woken agent re-reads the plugin's
+  own data rather than trusting the wake itself.
+- **Every subscription needs your approval.** The first time a
+  subscription becomes routable you receive an Approve/Deny prompt naming
+  the subscriber, the emitter, the event, and the agent that will be
+  woken. Approval is bound to that exact combination: updating the
+  subscriber plugin or re-assigning it to a different agent asks again
+  (an emitter update does not, as long as it still declares the event).
+  Revoke at any time with the configurator's `event_ack_revoke`.
+- **Delivery is durable.** An unprocessed wake is redelivered on a
+  widening schedule until the agent confirms it with the new `ack_event`
+  tool — up to six attempts, then a single notice to you. Restarts never
+  lose a pending delivery, and new `event_*` health reasons surface
+  routing problems in plugin health.
+
 ## [0.151.0] - 2026-08-03
 
 ### Changed
