@@ -4853,6 +4853,69 @@ async def cancel_reminder(args: dict) -> dict:
 
 
 # ---------------------------------------------------------------------------
+# ack_event — plugin-events facility (#419)
+#
+# The receipt half of a headless event wake: the wake instruction tells the
+# agent the exact ``emitter``/``event``/``token`` to echo back here. INV-EV-005
+# (capability hygiene): the token is a bare bearer credential for exactly one
+# pending delivery — it must NEVER appear in this tool's reply, in a log
+# line, or in any operator-facing surface, so a leaked transcript or log
+# line can never be replayed to forge a receipt. Only the emitter/event
+# names (never plugin-authored prose) and, on success, the acked
+# subscriber's own registry name are ever echoed back.
+# ---------------------------------------------------------------------------
+
+
+@tool(
+    "ack_event",
+    "Acknowledge a plugin event delivery. Call this when you are done "
+    "processing a headless event wake, passing emitter, event, and token "
+    "EXACTLY as given in the wake instruction. Stops further redelivery "
+    "nudges for this one delivery.",
+    {"type": "object",
+     "properties": {"emitter": {"type": "string"}, "event": {"type": "string"},
+                    "token": {"type": "string"}},
+     "required": ["emitter", "event", "token"]},
+)
+async def ack_event(args: dict) -> dict:
+    """Maps :meth:`event_spool.EventSpool.ack`'s typed result. No mutation
+    on ``no_match`` (a stale/rotated token, an unknown pair, or a
+    quarantined record) — and the refusal names ONLY the emitter/event, per
+    INV-EV-005; the token value itself is never echoed, logged, or raised
+    into an exception message anywhere in this function."""
+    emitter = (args.get("emitter") or "").strip()
+    event = (args.get("event") or "").strip()
+    token = args.get("token")
+    if not emitter or not event:
+        return _result({"status": "error", "kind": "invalid_argument",
+                        "message": "emitter and event are required"})
+    if not isinstance(token, str) or not token:
+        return _result({"status": "error", "kind": "invalid_argument",
+                        "message": "token is required"})
+
+    import event_spool
+    spool = event_spool.get_spool()
+    if spool is None:
+        return _result({"status": "error", "kind": "not_initialized",
+                        "message": "event spool not available"})
+
+    outcome, subscriber = await asyncio.to_thread(
+        spool.ack, emitter, event, token)
+    if outcome == "acked":
+        return _result({"status": "ok", "outcome": "acked",
+                        "subscriber": subscriber,
+                        "message": f"acknowledged for {subscriber!r}"})
+    if outcome == "already_done":
+        return _result({"status": "ok", "outcome": "already_done",
+                        "message": "already acknowledged"})
+    return _result({
+        "status": "error", "kind": "no_match", "outcome": "no_match",
+        "message": (f"no pending delivery of event {event!r} from "
+                    f"emitter {emitter!r} matches that acknowledgement"),
+    })
+
+
+# ---------------------------------------------------------------------------
 # config_git_commit - Plan 3 (Tier 3 executor support)
 # ---------------------------------------------------------------------------
 
@@ -9653,6 +9716,58 @@ async def callback_ack_revoke(args: dict) -> dict:
 
 
 @tool(
+    "event_ack_revoke",
+    "Revoke the operator's event-subscription consent for a plugin — for "
+    "ONE subscription when both emitter and event are given, otherwise "
+    "every subscription the plugin holds — and unroute it IMMEDIATELY (no "
+    "further delivery nudges are admitted once this returns). A later "
+    "re-approval re-consents; the consent DM re-prompts on the next plugin "
+    "mutation or reload.",
+    {"type": "object",
+     "properties": {"subscriber": {"type": "string"},
+                    "emitter": {"type": "string"}, "event": {"type": "string"}},
+     "required": ["subscriber"]},
+)
+async def event_ack_revoke(args: dict) -> dict:
+    """Operator off-switch — the event sibling of callback_ack_revoke /
+    trigger_ack_revoke. ``event_reconcile.revoke_and_unroute`` itself does
+    the unroute-BEFORE-ack-delete transaction under the shared dispatch-
+    admission lock (event_reconcile Sol-r4 #2 / Sol-r5 #2) — this tool only
+    orders the consent-keyboard cancel and the follow-up reconcile around
+    it, mirroring its siblings."""
+    async with _PLUGIN_TOOLS_LOCK:
+        import agent as agent_mod
+        import event_reconcile
+        subscriber = args["subscriber"]
+        emitter = (args.get("emitter") or "").strip()
+        event = (args.get("event") or "").strip()
+        # Kill any pending consent keyboard for this subscriber FIRST so a
+        # stale Approve cannot re-ack past the revoke (mirrors the siblings).
+        CHALLENGES.cancel_matching(plugin=subscriber)
+        removed = await event_reconcile.revoke_and_unroute(
+            subscriber, emitter, event)
+        runtime = getattr(agent_mod, "active_runtime", None)
+        try:
+            await event_reconcile.reconcile_plugin_events(
+                runtime, prompt=False)
+        except Exception:  # noqa: BLE001 — revoke_and_unroute already
+            # unrouted synchronously; a reconcile failure never reopens it.
+            logger.warning("post-event-revoke reconcile failed",
+                           exc_info=True)
+        # Cancel again AFTER our reconcile — a keyboard posted by an
+        # in-flight reconcile is registered by now (prompts fire under
+        # event_reconcile's own lock, which our reconcile serialized behind).
+        CHALLENGES.cancel_matching(plugin=subscriber)
+        await asyncio.to_thread(_regenerate_plugin_health, [])
+        return _result({
+            "ok": True, "subscriber": subscriber,
+            "revoked": len(removed),
+            "pairs": sorted({(r.get("emitter"), r.get("event"))
+                            for r in removed}),
+        })
+
+
+@tool(
     "plugin_list",
     "List every registered plugin with its version, revision, targets, "
     "artifact presence, and seeded-default status.",
@@ -10362,6 +10477,7 @@ CASA_TOOLS: tuple = (
     get_schedule,
     set_reminder,                  # #396 — durable reminders
     cancel_reminder,               # #396
+    ack_event,                     # #419 — plugin-events delivery receipt
     engage_executor,
     emit_completion,
     cancel_engagement,
@@ -10382,6 +10498,7 @@ CASA_TOOLS: tuple = (
     plugin_remove,
     trigger_ack_revoke,            # Release B — plugin-trigger consent off-switch
     callback_ack_revoke,           # plugin-callback consent off-switch
+    event_ack_revoke,              # #419 — plugin-event consent off-switch
     plugin_list,
     verify_plugin_state,
     verify_plugin_secrets,
