@@ -19,6 +19,7 @@ from __future__ import annotations
 
 import json
 import logging
+import os
 from pathlib import Path
 
 from claude_agent_sdk import PermissionResultDeny
@@ -134,6 +135,53 @@ def required_env_vars_for_resolved(rp) -> list[str]:
     except Exception as exc:  # noqa: BLE001 — never raise into a tool/turn
         logger.debug("env-var extraction failed (%s): %s", mcp_json, exc)
         return []
+
+
+def unresolved_env_vars_for_resolved(rp, environ=None) -> list[str]:
+    """The subset of :func:`required_env_vars_for_resolved` that is NOT
+    usable in the effective environment: absent, empty, or still an
+    ``op://`` reference (boot/reload resolution failed and fell back to the
+    raw value — the same rule verify_plugin_state applies). #423/#424: the
+    CLI passes an undefined ``${VAR}`` through as the LITERAL string, so a
+    plugin loaded with unresolved vars runs against placeholder credentials
+    instead of failing; callers gate on this being empty."""
+    env = os.environ if environ is None else environ
+    unresolved = []
+    for var in required_env_vars_for_resolved(rp):
+        # ONE read per var (#424 r4): the check runs in worker threads while
+        # reload_plugin_env can pop keys — a get-then-index pair would raise
+        # KeyError mid-build instead of withholding the plugin.
+        value = env.get(var)
+        if not value or value.startswith("op://"):
+            unresolved.append(var)
+    return unresolved
+
+
+def withhold_env_unresolved(resolution, *, context: str):
+    """Filter *resolution* down to env-resolved plugins (INV-PLUG-008)
+    WITHOUT mutating the input — H7b shares a creation resolve between the
+    engagement record and the options builder, so callers must never see
+    their object shrink under them. Returns ``(resolution, withheld)`` where
+    withheld is ``[(rp, missing_vars)]``; the input object is returned
+    as-is when nothing is withheld, a ``dataclasses.replace`` copy (fresh
+    plugins list, other fields shared) otherwise. Each withheld plugin is
+    logged at WARNING with *context* naming the session build."""
+    import dataclasses
+    withheld = []
+    loadable = []
+    for rp in resolution.plugins:
+        missing = unresolved_env_vars_for_resolved(rp)
+        if missing:
+            logger.warning(
+                "plugin %s withheld from %s: required env unresolved (%s) — "
+                "wire via set_plugin_env_reference + casa_reload(plugin_env)",
+                rp.name, context, ", ".join(missing))
+            withheld.append((rp, missing))
+            continue
+        loadable.append(rp)
+    if not withheld:
+        return resolution, []
+    return dataclasses.replace(resolution, plugins=loadable), withheld
 
 
 def protected_map(resolution) -> dict[str, dict]:

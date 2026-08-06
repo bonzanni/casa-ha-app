@@ -478,6 +478,121 @@ async def test_route_gate_holds_dispatch_until_live(wired, monkeypatch):
 
 
 @pytest.mark.asyncio
+async def test_secrets_gate_holds_dispatch_until_ready(wired, monkeypatch):
+    # #423: a pending episode does not dispatch while the plugin's required
+    # env vars are unresolved — the setup tool's MCP server would spawn with
+    # literal ${VAR} placeholders. A later kick after the secrets resolve
+    # (plugin_env reload) dispatches.
+    ready = {"v": False}
+    monkeypatch.setattr(pse, "_secrets_ready", lambda plugin: ready["v"])
+    _prompt()
+    await _decide()
+    await _drain_pending(wired)
+    assert wired["dispatches"] == []
+    ep = pse.episodes()[0]
+    assert ep["status"] == "pending"
+    assert "waiting for plugin secrets" in (ep.get("last_error") or "")
+    ready["v"] = True
+    await _drain_pending(wired)                        # post-reload kick
+    assert len(wired["dispatches"]) == 1
+    assert pse.episodes()[0]["status"] == "dispatched"
+
+
+@pytest.mark.asyncio
+async def test_secrets_gate_exception_holds_pending(wired, monkeypatch):
+    # #423: a raising readiness check fails CLOSED — the episode stays
+    # pending (retried on later kicks), never dispatches into a session
+    # whose secrets state is unknown.
+    def boom(plugin):
+        raise RuntimeError("readiness check broke")
+    monkeypatch.setattr(pse, "_secrets_ready", boom)
+    _prompt()
+    await _decide()
+    await _drain_pending(wired)
+    assert wired["dispatches"] == []
+    assert pse.episodes()[0]["status"] == "pending"
+
+
+@pytest.mark.asyncio
+async def test_execution_gate_holds_until_target_can_load_plugin(wired,
+                                                                 monkeypatch):
+    # #423 r2 (Sol 1 / Terra 1): secrets resolving is not enough — the
+    # EXECUTING agent may still hold a snapshot built while the plugin was
+    # withheld (env-unresolved), and a dispatch into that session consumes
+    # the episode against a session without the tool. Hold until the target
+    # can actually load it; the agent-reload kick retries.
+    ready = {"v": False}
+    monkeypatch.setattr(pse, "_execution_ready",
+                        lambda role, plugin, artifact_id: ready["v"])
+    _prompt()
+    await _decide()
+    await _drain_pending(wired)
+    assert wired["dispatches"] == []
+    ep = pse.episodes()[0]
+    assert ep["status"] == "pending"
+    assert "waiting for target agent" in (ep.get("last_error") or "")
+    ready["v"] = True
+    await _drain_pending(wired)                        # post-agent-reload kick
+    assert len(wired["dispatches"]) == 1
+    assert pse.episodes()[0]["status"] == "dispatched"
+
+
+@pytest.mark.asyncio
+async def test_execution_gate_checks_the_executing_role(wired, monkeypatch):
+    # The gate must receive the EXECUTING role (plugin_dispatch.execution_role
+    # — the specialist on the delegation branch, not the assistant courier).
+    seen = []
+    monkeypatch.setattr(
+        pse, "_execution_ready",
+        lambda role, plugin, artifact_id:
+            seen.append((role, plugin, artifact_id)) or True)
+    _prompt()
+    await _decide()
+    await _drain_pending(wired)
+    assert seen == [("assistant", "elevenlabs", "art-1")]
+    assert len(wired["dispatches"]) == 1
+
+
+@pytest.mark.asyncio
+async def test_execution_gate_skips_specialist_branch(wired, monkeypatch):
+    # #423 r3 (Terra r2-1): specialists are NOT boot-registered runtime
+    # agents — they build options FRESH per delegation, resolving the
+    # CURRENT environment (and the specialist builder withholds
+    # env-unresolved plugins). Consulting the resident-binding seam for a
+    # specialist-only plugin would strand its episode forever.
+    wired["entry"]["targets"] = ["specialist:finance"]
+    monkeypatch.setattr(pse, "_execution_ready",
+                        lambda role, plugin, artifact_id: False)
+    _prompt()
+    await _decide()
+    await _drain_pending(wired)
+    assert len(wired["dispatches"]) == 1           # NOT held by the seam
+    assert pse.episodes()[0]["status"] == "dispatched"
+
+
+@pytest.mark.asyncio
+async def test_configure_wires_secrets_ready(wired):
+    # #423: the seam arrives through configure(), like routes_live; a
+    # configure without the kwarg resets it (no stale gate across boots).
+    pse.configure(
+        dispatch=wired_dispatch(wired), notify_operator=wired_notify(wired),
+        resolve_registry_entry=lambda plugin: wired["entry"],
+        secrets_ready=lambda plugin: False,
+    )
+    _prompt()
+    await _decide()
+    await _drain_pending(wired)
+    assert wired["dispatches"] == []
+    assert pse.episodes()[0]["status"] == "pending"
+    pse.configure(
+        dispatch=wired_dispatch(wired), notify_operator=wired_notify(wired),
+        resolve_registry_entry=lambda plugin: wired["entry"],
+    )
+    await _drain_pending(wired)                        # kwarg absent ⇒ no gate
+    assert len(wired["dispatches"]) == 1
+
+
+@pytest.mark.asyncio
 async def test_blank_feed_gen_preserves_recorded_gen(wired):
     # impl r4 (Terra): a feed whose acks.get failed (gen="") must not
     # overwrite the durably-recorded generation.

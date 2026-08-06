@@ -19,6 +19,7 @@ from plugin_grants import (
     protected_map,
     required_env_vars_for_resolved,
     sanitize_segment,
+    unresolved_env_vars_for_resolved,
 )
 from plugin_registry import ResolutionResult, ResolvedPlugin
 
@@ -107,6 +108,54 @@ def test_required_env_vars_malformed_json_degrades(tmp_path):
     rp = _artifact(tmp_path, "corrupt", servers={"srv": {}})
     (tmp_path / "corrupt" / ".mcp.json").write_text("{broken", encoding="utf-8")
     assert required_env_vars_for_resolved(rp) == []
+
+
+def test_unresolved_env_vars_flags_missing_empty_and_opref(tmp_path):
+    # #424: a var is UNRESOLVED when it is absent from the effective
+    # environment, empty, or still an op:// reference (boot/reload
+    # resolution failed and fell back to the raw value) — the same rule
+    # verify_plugin_state applies. A real value is resolved.
+    rp = _artifact(tmp_path, "gmailish", servers={"srv": {"env": {
+        "A": "${A_KEY}", "B": "${B_KEY}", "C": "${C_KEY}", "D": "${D_KEY}",
+    }}})
+    env = {"B_KEY": "", "C_KEY": "op://vault/item/field", "D_KEY": "real-value"}
+    assert unresolved_env_vars_for_resolved(rp, env) == [
+        "A_KEY", "B_KEY", "C_KEY"]
+
+
+def test_unresolved_env_vars_malformed_mcp_json_degrades_open(tmp_path):
+    # DELIBERATE fail-open (Sol 4 / Terra 2 rebuttal): an unparseable
+    # declaration yields no servers from the shared parser, so the CLI can
+    # spawn nothing from it — there is no placeholder-credential threat for
+    # this gate to block. Malformed-ness gates READINESS on the verification
+    # surface (parse_mcp_servers' malformed flag), not session admission.
+    rp = _artifact(tmp_path, "corrupt2", servers={"srv": {}})
+    (tmp_path / "corrupt2" / ".mcp.json").write_text("{broken",
+                                                     encoding="utf-8")
+    assert unresolved_env_vars_for_resolved(rp, {}) == []
+
+
+def test_unresolved_env_vars_single_read_survives_concurrent_delete(tmp_path):
+    # #424 r4 (Sol r4-3 / Terra r4-3): the check runs in a worker thread
+    # while reload_plugin_env can pop keys from os.environ — the value must
+    # be fetched ONCE, or a get-then-index pair raises KeyError mid-build.
+    class _VanishingEnv(dict):
+        def get(self, key, default=None):
+            return "present-at-first-read"
+        def __getitem__(self, key):
+            raise KeyError(key)
+
+    rp = _artifact(tmp_path, "racy", servers={"srv": {"env": {
+        "K": "${RACY_KEY}"}}})
+    assert unresolved_env_vars_for_resolved(rp, _VanishingEnv()) == []
+
+
+def test_unresolved_env_vars_all_resolved_or_none_required(tmp_path):
+    rp = _artifact(tmp_path, "wired", servers={"srv": {"env": {
+        "K": "${WIRED_KEY}"}}})
+    assert unresolved_env_vars_for_resolved(rp, {"WIRED_KEY": "v"}) == []
+    skill_only = _artifact(tmp_path, "skillonly", servers=None)
+    assert unresolved_env_vars_for_resolved(skill_only, {}) == []
 
 
 async def test_fail_closed_callback_denies_with_log(caplog):

@@ -1942,6 +1942,26 @@ class Agent:
             resolution = await asyncio.to_thread(
                 plugin_registry.resolve_for, target,
             )
+            # #424: withhold any plugin whose .mcp.json references env vars
+            # not resolved in the effective environment — the CLI passes an
+            # undefined ${VAR} through as the LITERAL string, so the plugin's
+            # MCP server would start "successfully" with placeholder
+            # credentials (observed live: an OAuth URL built with
+            # client_id=${GMAIL_CLIENT_ID}). Withheld here, BEFORE the
+            # snapshot publishes, so grants, protected_map and the recorded
+            # binding all reflect what the session actually loads — verify's
+            # FR3 binding comparison then correctly reports reload_required
+            # once the secrets are wired. Filed as an env_unresolved issue so
+            # the degraded-resolution warning below names it.
+            from plugin_grants import withhold_env_unresolved
+            resolution, withheld = await asyncio.to_thread(
+                withhold_env_unresolved, resolution,
+                context=f"{target} session")
+            for rp, _missing in withheld:
+                resolution.issues.append(plugin_registry.PluginIssue(
+                    name=rp.name, target=target, stage="env",
+                    reason_code="env_unresolved",
+                    artifact_id=rp.artifact_id))
             # D2: ONE assignment publishes resolution + binding + generation
             # together — no torn-read window, ever.
             self._plugin_snapshot = PluginBindingSnapshot(

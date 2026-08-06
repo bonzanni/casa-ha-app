@@ -72,6 +72,56 @@ def test_resident_options_use_resolver_and_record_binding(tmp_path):
     asyncio.run(run())
 
 
+def test_env_unresolved_plugin_withheld_from_options(tmp_path, monkeypatch):
+    # #424: a plugin whose .mcp.json requires env vars that are NOT resolved
+    # in the effective environment is withheld from the session build — the
+    # CLI would pass the literal ${VAR} through to the MCP server, which then
+    # runs with placeholder credentials. Withheld = not in opts.plugins, no
+    # server grant, not in the recorded binding, surfaced as a resolution
+    # issue (env_unresolved).
+    store = tmp_path / "store"
+    e = entry("probe", ["resident:assistant"])
+    mk_artifact(store, "probe", e["artifact_id"],
+                mcp_servers={"probe": {"env": {"K": "${PROBE_API_KEY}"}}})
+    reload_snapshot(registry_path=mk_registry(tmp_path, [e]), store_root=store)
+    monkeypatch.delenv("PROBE_API_KEY", raising=False)
+    a = _make_agent(tmp_path, role="assistant")
+
+    async def run():
+        opts = await a._build_options(
+            channel="telegram", channel_key="k", is_fresh=True,
+            resume_sid=None, user_text="hi")
+        assert opts.plugins == []
+        assert "mcp__plugin_probe_probe" not in opts.allowed_tools
+        assert a.active_plugin_binding == {}
+        res = await a._get_plugin_resolution()
+        assert any(i.reason_code == "env_unresolved" for i in res.issues)
+
+    asyncio.run(run())
+
+
+def test_env_resolved_plugin_loads_normally(tmp_path, monkeypatch):
+    # #424 green path: with the var resolved at session build, the plugin
+    # loads exactly as before (post plugin_env reload + agent reload).
+    store = tmp_path / "store"
+    e = entry("probe", ["resident:assistant"])
+    art = mk_artifact(store, "probe", e["artifact_id"],
+                      mcp_servers={"probe": {"env": {"K": "${PROBE_API_KEY}"}}})
+    reload_snapshot(registry_path=mk_registry(tmp_path, [e]), store_root=store)
+    monkeypatch.setenv("PROBE_API_KEY", "resolved-value")
+    a = _make_agent(tmp_path, role="assistant")
+
+    async def run():
+        opts = await a._build_options(
+            channel="telegram", channel_key="k", is_fresh=True,
+            resume_sid=None, user_text="hi")
+        assert opts.plugins == [{"type": "local", "path": str(art)}]
+        assert "mcp__plugin_probe_probe" in opts.allowed_tools
+        assert a.active_plugin_binding == {"probe": e["artifact_id"]}
+
+    asyncio.run(run())
+
+
 def test_resolution_cached_per_instance_even_when_empty(tmp_path, monkeypatch):
     reload_snapshot(registry_path=tmp_path / "absent.json",
                     store_root=tmp_path / "store")
@@ -142,6 +192,29 @@ def test_specialist_options_resolve_with_role(tmp_path, monkeypatch):
     assert opts.plugins == [{"type": "local", "path": str(art)}]
     assert "mcp__plugin_finplug_finplug" in opts.allowed_tools
     assert opts.can_use_tool is not None          # fail-closed callback
+
+
+def test_specialist_options_withhold_env_unresolved_plugin(tmp_path,
+                                                           monkeypatch):
+    # #424 r2 (Terra 2): the delegated-specialist builder is a session build
+    # like any other — an env-unresolved plugin must be withheld from its
+    # SDK plugins AND its grants, or a routine delegation starts the MCP
+    # server with the literal ${VAR} placeholder.
+    import tools as tools_mod
+    store = tmp_path / "store"
+    e = entry("finplug", ["specialist:finance"])
+    mk_artifact(store, "finplug", e["artifact_id"],
+                mcp_servers={"finplug": {"env": {"K": "${FIN_API_KEY}"}}})
+    reload_snapshot(registry_path=mk_registry(tmp_path, [e]), store_root=store)
+    monkeypatch.setattr(tools_mod, "_mcp_registry", None, raising=False)
+    monkeypatch.delenv("FIN_API_KEY", raising=False)
+    opts = tools_mod._build_specialist_options(_spec_cfg("finance"))
+    assert opts.plugins == []
+    assert "mcp__plugin_finplug_finplug" not in opts.allowed_tools
+
+    monkeypatch.setenv("FIN_API_KEY", "resolved")
+    opts = tools_mod._build_specialist_options(_spec_cfg("finance"))
+    assert len(opts.plugins) == 1                 # loads once resolved
 
 
 def test_specialist_project_scope_no_longer_dropped(tmp_path, monkeypatch):

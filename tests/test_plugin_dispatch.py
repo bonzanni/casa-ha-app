@@ -63,3 +63,49 @@ def test_executor_only_target_is_no_target():
     role, reason = pd.compose(entry, "do the thing")
     assert role is None
     assert reason == "no resident or specialist target"
+
+
+def test_execution_role_matches_compose_for_residents():
+    # #423 r2 (Terra 1): the role whose SESSION runs the tool — identical to
+    # the dispatch role on the resident branches.
+    assert pd.execution_role(
+        {"targets": ["resident:zeta", "resident:assistant"]}) == "assistant"
+    assert pd.execution_role(
+        {"targets": ["resident:zeta", "resident:aqua"]}) == "aqua"
+
+
+def test_execution_role_is_the_specialist_on_the_delegation_branch():
+    # compose dispatches to the assistant, but the SPECIALIST executes —
+    # readiness gates must check the executing session, not the courier.
+    assert pd.execution_role(
+        {"targets": ["specialist:finance"]}) == "finance"
+    assert pd.execution_role(
+        {"targets": ["specialist:zz", "specialist:finance"]}) == "finance"
+
+
+def test_execution_role_none_without_resident_or_specialist():
+    assert pd.execution_role({"targets": ["executor:something"]}) is None
+    assert pd.execution_role({}) is None
+
+
+def test_execution_ready_lazy_agent_is_ready():
+    # #423 r2 (Sol 1/Terra 1): an agent with NO published snapshot resolves
+    # the current registry+environment at its next turn (FR3), so the setup
+    # turn itself triggers a fresh, post-secrets build.
+    from types import SimpleNamespace
+    a = SimpleNamespace(plugin_binding_snapshot=None)
+    assert pd.execution_ready(a, "gmail", "art-1") is True
+
+
+def test_execution_ready_requires_matching_published_binding():
+    from types import SimpleNamespace
+    snap = SimpleNamespace(binding={"gmail": "art-1"})
+    a = SimpleNamespace(plugin_binding_snapshot=snap)
+    assert pd.execution_ready(a, "gmail", "art-1") is True
+    assert pd.execution_ready(a, "gmail", "art-2") is False
+    withheld = SimpleNamespace(plugin_binding_snapshot=SimpleNamespace(binding={}))
+    assert pd.execution_ready(withheld, "gmail", "art-1") is False
+
+
+def test_execution_ready_missing_agent_is_not_ready():
+    assert pd.execution_ready(None, "gmail", "art-1") is False

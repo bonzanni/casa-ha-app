@@ -199,6 +199,18 @@ async def dispatch(
                         logger.warning(
                             "plugin-event reconcile after reload failed",
                             exc_info=True)
+                # #423 r3 (Sol r2-3): ANY successful reload can change
+                # setup-episode readiness — plugin_env lands secrets,
+                # agent/agents/policies/full reconstruct agents (stale
+                # binding → lazy-ready). One kick here covers every scope,
+                # present and future, instead of per-handler arms; the
+                # worker re-checks its gates, so a spurious kick is a no-op.
+                # Never turns a successful reload into an error.
+                try:
+                    import plugin_setup_episodes
+                    plugin_setup_episodes.kick()
+                except Exception:  # noqa: BLE001
+                    logger.exception("post-reload setup-episode kick failed")
                 ms = int(time.monotonic() * 1000 - started_ms)
                 logger.info(
                     "casa_reload scope=%s role=%s ms=%d ok=True actions=%s",
@@ -944,6 +956,12 @@ async def reload_agent(runtime: Any, *, role: str | None = None) -> list[str]:
     except Exception:  # noqa: BLE001
         pass
 
+    # #423 r2: a setup episode held on "waiting for target agent reload"
+    # becomes dispatchable now — the wake arrives via the trigger
+    # re-registration above (trigger_reconcile kicks the setup worker on
+    # every reconcile), pinned by
+    # tests/test_reload.py::test_agent_reload_kicks_setup_episode_worker.
+
     return actions
 
 
@@ -1121,6 +1139,12 @@ async def reload_plugin_env(runtime: Any, *, role: str | None = None) -> list[st
         actions.append(f"dropped_{len(dropped)}_vars")
 
     _PLUGIN_ENV_LAST_KEYS = new_keys
+
+    # #423: the env just changed — a setup episode held pending on "waiting
+    # for plugin secrets" can now dispatch. The wake is the dispatch-level
+    # post-reload kick (r3, Sol r2-3: EVERY successful scope kicks, since
+    # agent-reconstructing scopes change readiness too), pinned by
+    # tests/test_reload.py::test_kicks_setup_episode_worker.
 
     # P4b (2026-07-18 self-containment plan): regenerate plugin health from
     # the NEW effective environment. Without this, a secrets-only repair

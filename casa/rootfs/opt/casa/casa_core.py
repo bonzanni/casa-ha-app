@@ -3774,6 +3774,36 @@ async def main() -> None:
         ctx = {"chat_id": op[0]} if op is not None else {}
         await ch.send_response(text, ctx)
 
+    def _setup_secrets_ready(plugin: str) -> bool:
+        # #423: hold a settled episode until every env var the plugin's
+        # .mcp.json references is resolved in the effective environment —
+        # the installing engagement wires secrets AFTER the consent round
+        # can settle, and a setup MCP server spawned before plugin_env
+        # reload runs with literal ${VAR} placeholders. An unresolvable
+        # plugin reads not-ready (the dispatch-time registry gate owns
+        # that path's messaging/retries).
+        import plugin_registry as _pr
+        from plugin_grants import unresolved_env_vars_for_resolved as _unres
+        res = _pr.resolve_all()
+        rp = next((p for p in res.plugins if p.name == plugin), None)
+        if rp is None:
+            return False
+        return not _unres(rp)
+
+    def _setup_execution_ready(role: str, plugin: str,
+                               artifact_id: str) -> bool:
+        # #423 r2 (Sol 1 / Terra 1): the executing agent's next session
+        # build must carry the episode's exact artifact — a binding
+        # published while the plugin was env-withheld keeps excluding it
+        # until an agent reload, and dispatching into that session consumes
+        # the episode against a session without the tool. Late-binding: the
+        # runtime registry is read at call time (same pattern as verify).
+        import agent as _agent_mod
+        import plugin_dispatch as _pd
+        runtime = getattr(_agent_mod, "active_runtime", None)
+        agents = getattr(runtime, "agents", {}) or {}
+        return _pd.execution_ready(agents.get(role), plugin, artifact_id)
+
     _pse.configure(
         dispatch=_setup_dispatch, notify_operator=_setup_notify,
         resolve_registry_entry=_setup_registry_entry,
@@ -3784,6 +3814,8 @@ async def main() -> None:
         # a callback dark for a non-consent reason contributes no round member,
         # so the trigger gate alone would settle + dispatch with it unrouted.
         routes_live=_callback_and_trigger_routes_live,
+        secrets_ready=_setup_secrets_ready,
+        execution_ready=_setup_execution_ready,
     )
     _pse.start_worker()
 

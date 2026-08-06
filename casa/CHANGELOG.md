@@ -1,5 +1,23 @@
 # Changelog
 
+## [0.153.0] - 2026-08-06
+
+### Fixed
+
+- **A plugin's automatic setup no longer runs before its secrets are
+  wired.** Approving a plugin's consent prompts while the installer was
+  still storing its credentials could launch the setup tool with
+  placeholder values — the Gmail plugin, for example, produced a sign-in
+  link Google rejects. Setup now waits until every credential the plugin
+  needs is actually available, and fires automatically the moment it is
+  (#423).
+- **Plugins with missing credentials are no longer loaded into agents.**
+  An agent could previously reach a plugin whose credentials were absent
+  and get tools that fail confusingly deep inside the external service.
+  Such a plugin is now held back from the agent — with a clear health
+  report naming the missing values — until its credentials are wired and
+  the agent reloads (#424).
+
 ## [0.152.1] - 2026-08-06
 
 ### Fixed

@@ -466,6 +466,52 @@ class TestReloadAgent:
         # role_configs updated.
         assert runtime.role_configs["ellen"] is new_cfg
 
+    async def test_agent_reload_kicks_setup_episode_worker(self, tmp_path,
+                                                           monkeypatch):
+        # #423 r2 (Sol 1 / Terra 1): the agent reload is what makes a
+        # "waiting for target agent" setup episode dispatchable — the swap
+        # must wake the worker. Today the wake arrives via the swap's
+        # trigger re-registration (trigger_reconcile kicks on every
+        # reconcile); this pins the PROPERTY, not the mechanism.
+        from reload import dispatch, register_handler, reload_agent
+        from types import SimpleNamespace
+        register_handler("agent", reload_agent)
+
+        agents_dir = tmp_path / "agents"
+        (agents_dir / "ellen").mkdir(parents=True)
+        new_cfg = SimpleNamespace(
+            role="ellen",
+            character=SimpleNamespace(name="Ellen-2", card=""),
+            triggers=[], channels=[])
+        new_agent = MagicMock()
+        new_agent.handle_message = MagicMock()
+        monkeypatch.setattr("agent_loader.load_agent_from_dir",
+                            lambda *a, **kw: new_cfg)
+        monkeypatch.setattr("policies.load_policies",
+                            lambda *a, **kw: MagicMock())
+        import reload as reload_mod
+        monkeypatch.setattr(reload_mod, "_construct_agent",
+                            lambda *a, **kw: new_agent)
+
+        import plugin_setup_episodes as pse
+        kicked = {"n": 0}
+        monkeypatch.setattr(
+            pse, "kick", lambda: kicked.__setitem__("n", kicked["n"] + 1))
+
+        runtime = _make_runtime()
+        runtime.config_dir = str(tmp_path)
+        runtime.agents_dir = str(agents_dir)
+        runtime.role_configs["ellen"] = SimpleNamespace(
+            role="ellen",
+            character=SimpleNamespace(name="Ellen", card=""))
+        old_agent = MagicMock()
+        old_agent.aclose = AsyncMock()
+        runtime.agents["ellen"] = old_agent
+
+        result = await dispatch("agent", runtime=runtime, role="ellen")
+        assert result["status"] == "ok"
+        assert kicked["n"] >= 1
+
     async def test_load_failure_leaves_runtime_untouched(self, tmp_path, monkeypatch):
         from reload import dispatch, register_handler, reload_agent
         register_handler("agent", reload_agent)
@@ -611,6 +657,46 @@ class TestReloadPluginEnv:
         assert result["status"] == "ok"
         assert os.environ["FOO"] == "bar"
         assert os.environ["BAZ"] == "RESOLVED"
+
+    async def test_kicks_setup_episode_worker(self, monkeypatch):
+        # #423: a plugin_env reload is the moment a "waiting for plugin
+        # secrets" setup episode can dispatch — the reload must kick the
+        # worker, or the episode waits for an unrelated reconcile.
+        from reload import dispatch, register_handler, reload_plugin_env
+        register_handler("plugin_env", reload_plugin_env)
+        import tools as tools_mod
+        monkeypatch.setattr(tools_mod, "_regenerate_plugin_health", lambda extra: None)
+        monkeypatch.setattr("plugin_env_conf.read_entries", lambda: {})
+
+        import plugin_setup_episodes as pse
+        kicked = {"n": 0}
+        monkeypatch.setattr(pse, "kick", lambda: kicked.__setitem__("n", kicked["n"] + 1))
+
+        runtime = _make_runtime()
+        result = await dispatch("plugin_env", runtime=runtime)
+        assert result["status"] == "ok"
+        assert kicked["n"] == 1
+
+    async def test_every_successful_reload_scope_kicks_setup_worker(
+            self, monkeypatch):
+        # #423 r3 (Sol r2-3): ANY reload can change setup-episode readiness
+        # (policies reconstructs agents; agent/agents swap bindings;
+        # plugin_env lands secrets). One dispatch-level kick covers every
+        # scope — present and future — instead of per-handler arms.
+        from reload import dispatch, register_handler
+
+        async def noop_handler(runtime, *, role=None):
+            return ["noop"]
+
+        register_handler("policies", noop_handler)
+        import plugin_setup_episodes as pse
+        kicked = {"n": 0}
+        monkeypatch.setattr(
+            pse, "kick", lambda: kicked.__setitem__("n", kicked["n"] + 1))
+        runtime = _make_runtime()
+        result = await dispatch("policies", runtime=runtime)
+        assert result["status"] == "ok"
+        assert kicked["n"] >= 1
 
     async def test_op_rotation_is_picked_up_on_reload(self, monkeypatch):
         """#345: resolve() lru-caches plaintext by the unchanged op:// reference,

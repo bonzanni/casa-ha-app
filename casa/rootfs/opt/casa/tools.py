@@ -1038,6 +1038,17 @@ def _build_specialist_options(
         _tier = (_agent_registry.tier_for_role(_role)
                  if _agent_registry is not None else None) or "specialist"
         resolution = plugin_registry.resolve_for(f"{_tier}:{_role}")
+    # #424 r2 (Terra 2): a delegated specialist's build is a session build
+    # like any other — withhold plugins whose required env vars are
+    # unresolved (INV-PLUG-008), or the delegation starts their MCP servers
+    # with literal ${VAR} placeholders. The helper filters a COPY (never the
+    # caller's resolution: H7b shares that object with the engagement
+    # record), so grants/protected_map below derive from what the session
+    # actually loads. Re-resolved fresh per delegation, so a plugin_env
+    # reload takes effect on the next delegation without further ceremony.
+    from plugin_grants import withhold_env_unresolved
+    resolution, _ = withhold_env_unresolved(
+        resolution, context=f"delegated {_role} options")
     sdk_plugins = [{"type": "local", "path": rp.path}
                    for rp in resolution.plugins]
 
@@ -2512,6 +2523,17 @@ async def _prelaunch(
                 if _agent_registry is not None else None) or "specialist"
         resolution = await asyncio.to_thread(
             plugin_registry.resolve_for, f"{tier}:{agent_name}")
+        # #424 r4 (Sol r4-1 / Terra r4-1): apply the env withhold BEFORE the
+        # missing checks — a required plugin whose secrets are unresolved
+        # would be withheld at the session build, so admitting it here
+        # launches a delegation without its declared dependency. Filtering
+        # first makes it land in missing_plugins/missing_tools (typed
+        # dependency_unavailable), and the filtered resolution flows to the
+        # record + options builder (A5/H7b: one resolve, one filter).
+        from plugin_grants import withhold_env_unresolved
+        resolution, _ = await asyncio.to_thread(
+            withhold_env_unresolved, resolution,
+            context=f"delegated {agent_name} requires gate")
         declared = declared_tools_for_resolution(resolution)
         servers = set(grants_for_resolution(resolution))  # server actually attached
         missing_plugins = _missing_required_plugins(
@@ -3612,6 +3634,15 @@ async def delegate_to_agent(args: dict) -> dict:
                 _spec_tier = (_agent_registry.tier_for_role(agent_name)
                               if _agent_registry is not None else None) or "specialist"
                 _spec_res = plugin_registry.resolve_for(f"{_spec_tier}:{agent_name}")
+            # #424 r3 (Terra r3-1 / Sol r3-2): filter ONCE, before the record
+            # is written — the record must pin what the session actually
+            # launches with, or a later resume (after the secret is wired)
+            # loads a plugin mid-engagement that the engagement never started
+            # with. The filtered result feeds BOTH the record and the options
+            # builder below (H7b), whose own filter then no-ops.
+            from plugin_grants import withhold_env_unresolved
+            _spec_res, _ = withhold_env_unresolved(
+                _spec_res, context=f"specialist {agent_name} engagement")
             _spec_arts = tuple(
                 {"name": rp.name, "artifact_id": rp.artifact_id, "path": rp.path,
                  # Task 5: recorded so a resumed session reproduces the same
