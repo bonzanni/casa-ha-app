@@ -17,7 +17,10 @@ an operator's approval. It does not cover authoring a plugin, nor the MCP protoc
 Two things are easily conflated and do different jobs. **The registry is the authority on
 what is assigned to whom.** **The store is content-addressed storage for the bytes.** A
 plugin is usable at runtime only when a valid registry entry and a valid stored artifact
-agree.
+agree — and, for resident and specialist sessions, when the environment variables its
+`.mcp.json` references are resolved in the effective environment (INV-PLUG-008): an
+undefined `${VAR}` would otherwise reach the plugin's MCP server as the literal string,
+which then runs "successfully" with placeholder credentials.
 
 **The artifact id is not a content hash.** It is computed over source coordinates —
 repository, resolved revision, subdirectory, and the registry name — and nothing else. Two
@@ -142,13 +145,64 @@ permission relay, whose keyboard is answerable by the engagement's creator rathe
 configured operator (tracked as #374); and sender identity itself is Telegram's
 authentication of its user ids, not an additional Casa-side proof.
 
+**INV-PLUG-008**: A plugin whose parseable `.mcp.json` references an environment variable that is unresolved in the effective environment is withheld from resident and specialist session builds, and its automatic setup episode does not dispatch until the secrets resolve and the executing agent can load it.
+
+References are collected from every string value of each declared server's *launch
+fields* — `command`, `args`, `url`, `headers` and `env`, the positions the CLI expands
+`${VAR}` in; tolerated unknown extension fields are not scanned — and unresolved means
+absent, empty, or still an `op://` reference (a failed secret resolution falls back to
+the raw value). Enforced at three points: both session builders — the resident/specialist
+Agent's resolution and the delegated-specialist options builder — filter the resolved
+plugin set before anything derives from it, so SDK plugins, grants, the protected map and
+(for residents) the recorded binding all reflect what the session actually loads; the
+setup-episode worker holds a settled episode until the secrets resolve, because a
+trigger-consent round can settle while the installing engagement is still wiring them; and
+for a *resident* execution target the worker additionally holds until that agent's next
+session build will carry the episode's exact artifact — a binding published while the
+plugin was withheld keeps excluding it until an agent reload, and a dispatch into that
+session would consume the one automatic setup against a session without the tool. A
+specialist execution target needs no such hold: specialists build their options fresh per
+delegation against the current environment. Every successful reload — plugin-env landing
+the secrets, or any agent-reconstructing scope — kicks the episode worker.
+
+What it does not cover: the executor path, whose options builder hands out plugin paths
+without this gate (the same asymmetry as INV-PLUG-006 — a configurator or plugin-developer
+executor must be able to work on a plugin whose secrets are not wired yet). A *malformed*
+declaration yields no requirements and passes this gate deliberately: the shared parser
+gives the CLI nothing to spawn a server from, so no placeholder-credential path exists,
+and malformed-ness is reported on the verification surface instead. The withhold decision
+is evaluated when an agent publishes its binding snapshot and refreshed by the reload
+seams, not continuously — and the check is admission control, not a fence: an environment
+mutation between an agent's check and its MCP process spawn can still produce a stale
+server, and a credential *rotation* leaves a warm session's already-spawned MCP process
+on the old value even though the binding passes the gate. Both heal through the reload
+seams, and neither is something verification can fully see: a plain-value rotation shows
+as reload-pending only until the plugin-env reload lands, and an unchanged `op://`
+reference cannot be compared at all — a warm session on a rotated credential reports
+ready. An interactive specialist engagement records the plugin set *admitted when the
+delegation was validated* (one filter feeding the requires gate where declared, the
+record, and the launch), and every later build — including resume — re-applies
+current-environment admission control; an environment change after that admission
+point — even one that RESOLVES a variable moments later — is not re-admitted into this
+engagement, and a change during the engagement can still make a build differ from the
+record. Wiring a
+secret mid-engagement does not make the plugin appear on resume when it was withheld at
+creation — a new engagement picks it up.
+
 Three runtime integration paths sit beside the install model and are easy to miss. **A
 plugin's declared setup tool is dispatched automatically — but only after its entire
-trigger-consent round approves**: the dispatch is a durable, retrying, crash-recovered
-episode, and a single denied trigger withholds it, so consent is not merely route
-authorization. **Plugin environment values live in a mode-0600 conf file** re-sourced into
-the process only by the plugin-env reload scope — deleting an entry from the file changes
-nothing until that reload runs. **Plugin media flows through a shared outbox directory**
+trigger-consent round approves, its trigger routes are live, its required environment
+resolves, and the executing agent can load it**: the dispatch is a durable, retrying,
+crash-recovered episode; a single denied trigger withholds it, so consent is not merely
+route authorization; an episode whose plugin still has unresolved environment variables
+stays pending rather than running the setup tool against a placeholder-credentialed
+server — a consent round can settle while the installing engagement is still wiring
+secrets, and every successful reload re-kicks the dispatch worker; and for a resident
+execution target it stays pending while that agent's published binding predates those
+secrets, until an agent reload makes the plugin loadable there (specialists resolve
+fresh per delegation and need no such hold). **Plugin environment values live in a mode-0600 conf
+file** re-sourced into the process only by the plugin-env reload scope — deleting an entry
+from the file changes nothing until that reload runs. **Plugin media flows through a shared outbox directory**
 (operator-relocatable by environment variable) with atomic claim semantics, size and type
 gates, and periodic orphan reaping — consumption is destructive by design.
 
@@ -177,6 +231,12 @@ only cancellation is re-raised. The hook fails closed.
 **The plugin's MCP declaration is missing or malformed.** Grants degrade to none. A missing
 declaration is not an error — a plugin with no tools is valid — but a malformed one is
 reported.
+
+**A required environment variable is unresolved.** The plugin is withheld from resident and
+specialist session builds — excluded from the SDK plugin list, its server grants, and the
+recorded binding, and surfaced as an `env_unresolved` resolution issue — and any pending
+setup episode holds. Wiring the value and running the plugin-env reload makes the plugin
+loadable; the agents that should carry it still need their own reload to rebuild sessions.
 
 ## Extension points
 

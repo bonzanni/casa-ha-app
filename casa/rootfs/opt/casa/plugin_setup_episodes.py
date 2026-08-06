@@ -94,6 +94,8 @@ _notify_operator: Callable[[str], Awaitable[None]] | None = None
 _resolve_registry_entry: Callable[[str], Any] | None = None
 _ack_lookup: Callable[[str], str | None] | None = None
 _routes_live: Callable[[str], bool] | None = None
+_secrets_ready: Callable[[str], bool] | None = None
+_execution_ready: Callable[[str, str, str], bool] | None = None
 _sleep: Callable[[float], Awaitable[None]] = asyncio.sleep
 
 _lock: asyncio.Lock | None = None
@@ -107,22 +109,35 @@ def _now() -> float:
 
 
 def configure(*, dispatch, notify_operator, resolve_registry_entry,
-              ack_lookup=None, routes_live=None,
-              sleep=asyncio.sleep) -> None:
+              ack_lookup=None, routes_live=None, secrets_ready=None,
+              execution_ready=None, sleep=asyncio.sleep) -> None:
     """casa_core boot wiring. Idempotent. ``ack_lookup(identity)`` returns
     the persisted ack's approval generation (or None) — the boot recovery
     sweep's ground truth. ``routes_live(plugin)`` reports whether the
     plugin's triggers are ROUTED (impl r4, Sol): the worker holds a pending
     episode until the route overlay is live, so the external service is
     never pointed at an unrouted endpoint; reconciles call :func:`kick` to
-    retry the gate."""
+    retry the gate. ``secrets_ready(plugin)`` (#423) reports whether every
+    env var the plugin's ``.mcp.json`` references is resolved in the
+    effective environment: the worker holds a pending episode until then,
+    so the setup tool never runs against an MCP server spawned with literal
+    ``${VAR}`` placeholders; plugin_env reloads call :func:`kick`.
+    ``execution_ready(role, plugin, artifact_id)`` (#423 r2) reports whether
+    the EXECUTING agent's next session build will carry the episode's exact
+    artifact — an agent whose published binding was built while the plugin
+    was env-withheld keeps excluding it until an agent reload, and a
+    dispatch into that session would consume the episode against a session
+    without the tool; agent reloads call :func:`kick`."""
     global _dispatch, _notify_operator, _resolve_registry_entry
-    global _ack_lookup, _routes_live, _sleep, _lock, _kick
+    global _ack_lookup, _routes_live, _secrets_ready, _execution_ready
+    global _sleep, _lock, _kick
     _dispatch = dispatch
     _notify_operator = notify_operator
     _resolve_registry_entry = resolve_registry_entry
     _ack_lookup = ack_lookup
     _routes_live = routes_live
+    _secrets_ready = secrets_ready
+    _execution_ready = execution_ready
     _sleep = sleep
     if _lock is None:
         _lock = asyncio.Lock()
@@ -631,6 +646,50 @@ async def _run_episode(ep: dict) -> bool:
             _update_episode(ep["id"],
                             last_error="waiting for live trigger route")
             return
+    # #423: dispatch only when the plugin's required env vars are resolved
+    # in the effective environment — the consent round can settle while the
+    # installing engagement is still wiring secrets, and a setup MCP server
+    # spawned before plugin_env reload runs with literal ${VAR} placeholders
+    # (observed live: an OAuth URL with client_id=${GMAIL_CLIENT_ID}). The
+    # episode stays pending; plugin_env reloads and reconciles kick a
+    # re-check. Fails CLOSED on a raising seam, like the routes gate.
+    if _secrets_ready is not None:
+        try:
+            ready = bool(_secrets_ready(plugin))
+        except Exception:  # noqa: BLE001
+            logger.exception("episode %s: secrets_ready check failed",
+                             ep["id"])
+            ready = False
+        if not ready:
+            _update_episode(ep["id"],
+                            last_error="waiting for plugin secrets")
+            return
+    # #423 r2 (Sol 1 / Terra 1): secrets resolving is necessary but not
+    # sufficient — a RESIDENT executes in a long-lived Agent that may still
+    # hold a binding snapshot built while the plugin was env-withheld, and
+    # bus acceptance marks the episode dispatched, permanently consuming the
+    # automatic setup against a session without the tool. Hold until that
+    # resident's next session build carries this exact artifact; agent
+    # reloads wake a re-check. r3 (Terra r2-1): the SPECIALIST branch is
+    # exempt — specialists are not boot-registered runtime agents; they
+    # build options fresh per delegation against the current environment
+    # (the specialist builder withholds env-unresolved plugins), so a
+    # resident-binding check would strand a specialist-only episode
+    # forever. Fails CLOSED on a raising seam.
+    if _execution_ready is not None:
+        exec_tier, exec_role = plugin_dispatch.execution_target(entry)
+        if exec_tier == "resident":
+            try:
+                exec_ok = bool(_execution_ready(exec_role, plugin,
+                                                ep["artifact_id"]))
+            except Exception:  # noqa: BLE001
+                logger.exception("episode %s: execution_ready check failed",
+                                 ep["id"])
+                exec_ok = False
+            if not exec_ok:
+                _update_episode(ep["id"],
+                                last_error="waiting for target agent reload")
+                return
     role, instruction = _compose(ep, entry)
     if role is None:
         _update_episode(ep["id"], status="failed", last_error=instruction)

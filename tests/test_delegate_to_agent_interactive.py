@@ -93,6 +93,68 @@ class TestInteractiveMode:
         driver.start.assert_awaited_once()
         assert reg.by_topic_id(555) is not None
 
+    async def test_record_excludes_env_withheld_plugin(self, tmp_path,
+                                                       monkeypatch):
+        # #424 r3 (Terra r3-1 / Sol r3-2): the engagement record must pin
+        # what the session actually LAUNCHED with. Recording the unfiltered
+        # resolution lets a later resume — after the secret is wired — load
+        # a plugin mid-engagement that the engagement never started with.
+        import agent as agent_mod
+        from engagement_registry import EngagementRegistry
+        from plugin_registry import reload_snapshot
+        from tools import delegate_to_agent, init_tools
+        try:
+            from tests.plugin_fixtures import entry, mk_artifact, mk_registry
+        except ImportError:
+            from plugin_fixtures import entry, mk_artifact, mk_registry
+
+        store = tmp_path / "store"
+        e = entry("finplug", ["specialist:finance"])
+        mk_artifact(store, "finplug", e["artifact_id"],
+                    mcp_servers={"finplug": {"env": {"K": "${FIN_REC_KEY}"}}})
+        reload_snapshot(registry_path=mk_registry(tmp_path, [e]),
+                        store_root=store)
+        monkeypatch.delenv("FIN_REC_KEY", raising=False)
+
+        reg = EngagementRegistry(tombstone_path=str(tmp_path / "e.json"),
+                                 bus=None)
+        tch = MagicMock()
+        tch.engagement_permission_ok = True
+        tch.engagement_supergroup_id = -1001
+        tch.open_engagement_topic = AsyncMock(return_value=556)
+        tch.send_to_topic = AsyncMock()
+        cm = MagicMock(); cm.get.return_value = tch
+        specialist_reg = MagicMock()
+        specialist_reg.get.return_value = _make_alex_cfg()
+        bus = MagicMock(); bus.notify = AsyncMock()
+        init_tools(
+            channel_manager=cm, bus=bus,
+            specialist_registry=specialist_reg, mcp_registry=MagicMock(),
+            trigger_registry=MagicMock(), engagement_registry=reg,
+            agent_role_map={"assistant": _make_assistant_cfg()},
+        )
+        driver = MagicMock()
+        driver.start = AsyncMock()
+        agent_mod.active_engagement_driver = driver
+
+        token = agent_mod.origin_var.set({
+            "role": "assistant", "channel": "telegram",
+            "chat_id": "c1", "cid": "x", "user_text": "hi",
+            "scope": "business",
+        })
+        try:
+            res = await delegate_to_agent.handler({
+                "agent": "finance", "task": "Plan Q2", "context": "",
+                "mode": "interactive",
+            })
+        finally:
+            agent_mod.origin_var.reset(token)
+        payload = json.loads(res["content"][0]["text"])
+        assert payload["status"] == "pending"
+        rec = reg.by_topic_id(556)
+        assert rec is not None
+        assert all(a["name"] != "finplug" for a in rec.plugin_artifacts)
+
     async def test_kind_engagement_not_configured_when_supergroup_empty(
         self, tmp_path, monkeypatch,
     ):

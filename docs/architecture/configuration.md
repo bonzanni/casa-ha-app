@@ -86,7 +86,10 @@ external `op://` secret reference at startup — the Claude OAuth token, the Tel
 token, the webhook secret and the context7 API key. Resolved values are cached for the
 process lifetime by the reference string; the plugin-environment reload scope invalidates
 that cache first, so rotating a referenced field takes effect on reload for plugin
-variables but requires a restart for the four startup options. The webhook secret is also
+variables but requires a restart for the four startup options. Every successful reload
+dispatch — not just this scope — kicks the plugin setup-episode worker, because both the
+secrets landing (this scope) and any agent-reconstructing scope can make a setup episode
+held under INV-PLUG-008 dispatchable. The webhook secret is also
 resolved by the Supervisor discovery publisher, so the companion integration signs with
 the same value the add-on verifies.
 

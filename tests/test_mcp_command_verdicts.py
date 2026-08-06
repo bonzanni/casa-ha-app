@@ -362,7 +362,13 @@ def test_verify_committed_entrypoint_ready(tmp_path):
     assert all(row["status"] == "ok" for row in r["mcp_commands"])
 
 
-def test_verify_unchecked_shape_does_not_block(tmp_path):
+def test_verify_unchecked_shape_does_not_block(tmp_path, monkeypatch):
+    # The command VERDICT stays "unchecked" and non-blocking for an
+    # env-dependent command — but since #423 r2 (Sol 5) the ${VAR} inside it
+    # is a required SECRET (the CLI expands command/args/url/headers too, and
+    # an unset var spawns a literal-placeholder command). With the var
+    # resolved, unchecked still never blocks.
+    monkeypatch.setenv("SOME_TOOL_HOME", "/opt/some-tool")
     store = tmp_path / "store"
     e = entry("probe", ["specialist:finance"])
     mk_artifact(store, "probe", e["artifact_id"], mcp_servers={
@@ -372,6 +378,22 @@ def test_verify_unchecked_shape_does_not_block(tmp_path):
     assert r["ready"] is True
     assert "mcp_command_missing" not in r["reasons"]
     assert any(row["status"] == "unchecked" for row in r["mcp_commands"])
+
+
+def test_verify_env_dependent_command_requires_the_var(tmp_path, monkeypatch):
+    # #423 r2 (Sol 5): the same shape with the var UNRESOLVED blocks
+    # readiness through the secrets channel, naming the variable.
+    monkeypatch.delenv("SOME_TOOL_HOME", raising=False)
+    store = tmp_path / "store"
+    e = entry("probe", ["specialist:finance"])
+    mk_artifact(store, "probe", e["artifact_id"], mcp_servers={
+        "s": {"command": "${SOME_TOOL_HOME}/bin/serve"}})
+    mk_registry(tmp_path, [e])
+    r = _verify(tmp_path)
+    assert r["ready"] is False
+    assert any(row["var"] == "SOME_TOOL_HOME"
+               and row["status"] == "unresolved"
+               for row in r["secrets"])
 
 
 def test_verify_reason_order_keeps_artifact_reason_first(tmp_path):

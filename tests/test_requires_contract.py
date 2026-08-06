@@ -270,6 +270,37 @@ class TestPrelaunchRequiresGate:
         assert payload["missing_plugins"] == ["mtg"]
         assert payload["missing_tools"] == []
 
+    async def test_required_plugin_with_unresolved_env_denied(
+            self, monkeypatch, tmp_path):
+        # #424 r4 (Sol r4-1 / Terra r4-1): a required plugin that RESOLVES
+        # but whose .mcp.json env vars are unresolved would be withheld at
+        # the session build — the gate must deny (typed, loud) instead of
+        # admitting a delegation that launches without its declared
+        # dependency.
+        root = tmp_path / "mtg"
+        root.mkdir()
+        (root / ".mcp.json").write_text(json.dumps({"mcpServers": {
+            "mtg": {"command": "python3",
+                    "env": {"K": "${MTG_REQ_KEY}"}}}}), encoding="utf-8")
+        monkeypatch.delenv("MTG_REQ_KEY", raising=False)
+        rp = ResolvedPlugin(name="mtg", artifact_id="art1", path=str(root),
+                            version="1.0.0", manifest={})
+        resolution = ResolutionResult(registry_valid=True, plugins=[rp])
+        requires = RequiresConfig(plugins=["mtg"], tools=[])
+        tm, agent_mod, token = _init(
+            monkeypatch, requires=requires, resolution=resolution,
+        )
+        try:
+            res = await tm.delegate_to_agent.handler({
+                "agent": "finance", "task": "t", "context": "", "mode": "sync",
+            })
+        finally:
+            agent_mod.origin_var.reset(token)
+        payload = json.loads(res["content"][0]["text"])
+        assert payload["status"] == "error"
+        assert payload["kind"] == "dependency_unavailable"
+        assert payload["missing_plugins"] == ["mtg"]
+
     async def test_declared_but_absent_tool_denied(self, monkeypatch):
         tool_name = "mcp__plugin_mtg_mtg__lookup_rule"
         requires = RequiresConfig(plugins=[], tools=[tool_name])

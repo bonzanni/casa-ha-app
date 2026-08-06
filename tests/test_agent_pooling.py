@@ -11,6 +11,7 @@ from __future__ import annotations
 
 import asyncio
 import dataclasses
+import time
 
 import pytest
 from claude_agent_sdk import (
@@ -340,8 +341,11 @@ async def test_cancelled_pooled_session_publish_drops_unpublished_generation(
     await registry._lock.acquire()
     task = asyncio.create_task(send_turn("hello"))
     try:
-        for _ in range(20):
-            await asyncio.sleep(0)
+        # Wall-clock-bounded precondition wait (deflake rule): a fixed tick
+        # count under a loaded xdist worker intermittently missed "warm".
+        deadline = time.monotonic() + 5.0
+        while time.monotonic() < deadline:
+            await asyncio.sleep(0.001)
             if (
                 scripted_factory.clients
                 and next(iter(agent._pool._entries.values())).state == "warm"

@@ -1,5 +1,12 @@
 """Parse a plugin's .mcp.json and return the set of ${VAR} references
 not in CC's built-in allowlist. Plan 4b §4.2 + §7.3 step 6.
+
+#423 r2 (Sol 5): the scan covers every string value of a server's LAUNCH
+fields — ``command``, ``args``, ``url``, ``headers`` and ``env`` — because
+the CLI expands ``${VAR}`` in all of them, and an unresolved reference in
+any of those positions reaches the spawned server as the literal
+placeholder string. Unknown extension fields are NOT scanned (r3, Sol
+r2-4): the parser tolerates them, but they are not launch configuration.
 """
 from __future__ import annotations
 
@@ -23,23 +30,41 @@ CC_BUILTIN_VARS: frozenset[str] = frozenset({
 _VAR_PATTERN = re.compile(r"\$\{([A-Z_][A-Z0-9_]*)\}")
 
 
+# #423 r3 (Sol r2-4): the CLI expands ${VAR} in the LAUNCH fields only — an
+# unknown extension key the parser tolerates (metadata etc.) is not part of
+# the launch configuration, and a reference there must not become a
+# requirement that withholds the plugin.
+_EXPANDED_FIELDS = ("command", "args", "url", "headers", "env")
+
+
+def _iter_strings(node):
+    """Every string LEAF value under *node* (dict values, list members,
+    nested arbitrarily). Dict keys are not scanned — the CLI expands
+    values, not keys."""
+    if isinstance(node, str):
+        yield node
+    elif isinstance(node, dict):
+        for val in node.values():
+            yield from _iter_strings(val)
+    elif isinstance(node, (list, tuple)):
+        for val in node:
+            yield from _iter_strings(val)
+
+
 def extract_env_vars(mcp_json_path: Path | str) -> set[str]:
     # Sol CI-review: resolve servers via the ONE shared parser so secrets are
     # extracted for BOTH the mcpServers wrapper AND the top-level shape (context7
     # ships the latter) — otherwise a top-level plugin's required secrets would be
     # silently missed and verification could report ready without them.
+    # #330's non-mapping-env tolerance is inherited: _iter_strings walks any
+    # shape without raising.
     from plugin_store import mcp_servers_map
     vars_found: set[str] = set()
     for server in mcp_servers_map(mcp_json_path).values():
-        env = (server or {}).get("env") or {}
-        # #330: the wrapper-form servers map still carries bad-env entries
-        # for grant derivation — skip them here rather than AttributeError
-        # on a non-mapping env.
-        if not isinstance(env, dict):
+        if not isinstance(server, dict):
             continue
-        for val in env.values():
-            if not isinstance(val, str):
-                continue
-            for match in _VAR_PATTERN.finditer(val):
-                vars_found.add(match.group(1))
+        for field in _EXPANDED_FIELDS:
+            for val in _iter_strings(server.get(field)):
+                for match in _VAR_PATTERN.finditer(val):
+                    vars_found.add(match.group(1))
     return vars_found - CC_BUILTIN_VARS
