@@ -37,7 +37,8 @@ import plugin_registry
 import plugin_store
 from plugin_grants import (
     CASA_OWNED_ENV_OPTIONS as _CASA_OWNED_ENV,
-    declared_tools_for_resolution, grants_for_resolution, grants_for_resolved,
+    declared_tools_for_resolution, env_remediation_hint,
+    grants_for_resolution, grants_for_resolved,
     make_fail_closed_can_use_tool, mcp_json_malformed,
     required_env_vars_for_resolved, sanitized_env_for_paths,
     sanitized_env_for_resolution,
@@ -2345,10 +2346,192 @@ def _missing_required_plugins(required: list[str], plugins) -> list[str]:
     return [p for p in required if p not in names]
 
 
+def _display_name_for_role(role: str) -> str:
+    """*role*'s persona display name, else *role* itself."""
+    cfg = _agent_role_map.get(role)
+    return (getattr(getattr(cfg, "character", None), "name", "") or "").strip() or role
+
+
+def _persona_name_for_role(role: str) -> str | None:
+    """*role*'s persona display name, or None when it has no config.
+
+    Distinct from :func:`_display_name_for_role`, whose role-id fallback is a
+    RENDERING convenience. A declared delegate with no config has no persona
+    name at all, and letting its role id act as one would let an absent
+    delegate collide with a real delegate's display name and force a false
+    ambiguity refusal (#433).
+    """
+    cfg = _agent_role_map.get(role)
+    if cfg is None:
+        return None
+    return (getattr(getattr(cfg, "character", None), "name", "") or "").strip() or None
+
+
+def _declared_name_candidates(name: str, declared) -> list[str]:
+    """#433: the DECLARED roles whose persona display name matches *name*,
+    compared case- and whitespace-insensitively (matching
+    ``AgentRegistry.name_to_role``).
+
+    Scoped to *declared* by construction: the only values this can yield are
+    roles the caller already declares, so alias resolution cannot widen the
+    authorization boundary no matter what display names exist elsewhere in
+    the deployment. That is why this does NOT use
+    ``AgentRegistry.name_to_role`` — that map is global and its
+    ``setdefault`` silently keeps the first binding on a collision, which is
+    precisely the resolution an authz boundary must not perform silently.
+    """
+    # Total over arbitrary JSON: this is reachable from the tool handler,
+    # whose `agent` argument is not guaranteed to be a string on paths that
+    # skip the schema validator. A non-string resolves to nothing.
+    if not isinstance(name, str):
+        return []
+    key = name.strip().lower()
+    if not key:
+        return []
+    return sorted(r for r in declared
+                  if (_persona_name_for_role(r) or "").lower() == key)
+
+
+def _declared_delegates_for_origin(origin: dict) -> set[str]:
+    """The roles the ORIGIN's running agent declares as delegates.
+
+    Caller identity comes only from the trusted origin, keyed on
+    ``execution_role`` so a delegated specialist is judged by its OWN
+    delegates rather than its parent's.
+    """
+    caller_role = str((origin or {}).get("execution_role")
+                      or (origin or {}).get("role", ""))
+    caller_cfg = _agent_role_map.get(caller_role) if caller_role else None
+    return {d.agent for d in (getattr(caller_cfg, "delegates", None) or [])}
+
+
+def _canonical_delegate_target(agent_name: str, origin: dict) -> str:
+    """#433: *agent_name* as a role id when it is unambiguously a declared
+    delegate's display name, else UNCHANGED.
+
+    Resolution has to happen before ``validate_voice_handoff_static``, not
+    only inside ``_prelaunch``'s ACL. That function runs FIRST — before any
+    await, so a live voice turn reserves foreground ownership before work can
+    race ahead — and applies its own exact-role-id membership test. With a
+    display name it would take ``passthrough_not_declared``, hand back no
+    reservation, and then the ACL would ACCEPT the alias and run the
+    delegation on the ordinary sync path under the voice budget: the
+    Concierge voice-handoff policy silently bypassed. That is precisely the
+    #233/#224 production failure, which is why ``mode`` became an enum.
+
+    Deliberately TOTAL and silent: every denial — undeclared, ambiguous —
+    stays the ACL's to emit, in ``_prelaunch``, in the established order.
+    This only ever rewrites a name it can resolve to exactly one declared
+    role, so re-resolving there is a no-op (an exact role id short-circuits).
+    """
+    declared = _declared_delegates_for_origin(origin)
+    if not declared or agent_name in declared:
+        return agent_name
+    candidates = _declared_name_candidates(agent_name, declared)
+    return candidates[0] if len(candidates) == 1 else agent_name
+
+
+# #434: `unresolved_env` is the first surface that shows manifest-controlled
+# tokens to the MODEL rather than only to the operator log. The extractor
+# accepts any `[A-Z_][A-Z0-9_]*`, and a malformed or hostile artifact can park
+# an uppercase-alphanumeric literal there — an AWS access key id is exactly
+# that shape — so Casa cannot tell a genuine variable name from one. It bounds
+# what a single denial can carry rather than treating the tokens as trusted.
+_MAX_REPORTED_ENV_VARS = 20
+_MAX_REPORTED_ENV_NAME_LEN = 64
+
+
+def _bounded_env_names(missing_vars) -> list[str]:
+    """Manifest-sourced env names, bounded for a model-facing payload.
+
+    Over-long tokens are dropped outright rather than truncated: a truncated
+    credential is still a credential prefix, and a name that long is not a
+    real environment variable anyway.
+    """
+    names = [v for v in missing_vars
+             if isinstance(v, str) and len(v) <= _MAX_REPORTED_ENV_NAME_LEN]
+    return names[:_MAX_REPORTED_ENV_VARS]
+
+
+def _withhold_reasons(withheld, missing_plugins: list[str],
+                      missing_tools: list[str]) -> list[dict]:
+    """#434: the env-withhold causes RELEVANT to this denial, as JSON-safe
+    dicts for the ``dependency_unavailable`` payload.
+
+    *withheld* is ``withhold_env_unresolved``'s second element,
+    ``[(resolved_plugin, missing_vars)]``. A plugin is relevant when it is
+    one of the *missing_plugins*, or when it declares one of the
+    *missing_tools* — a withheld plugin the delegate never required is not
+    this denial's business and naming it would only mislead.
+
+    The variable NAMES come from the plugin's own ``.mcp.json``, which is
+    manifest content, not a secret value; the values are never read here.
+    """
+    reasons = []
+    for rp, missing_vars in withheld or []:
+        name = plugin_registry.runtime_name(rp)
+        declares = declared_tools_for_resolution(
+            plugin_registry.ResolutionResult(
+                registry_valid=True, plugins=[rp], issues=[]))
+        if name not in missing_plugins and not (declares & set(missing_tools)):
+            continue
+        reported = _bounded_env_names(missing_vars)
+        reasons.append({
+            "plugin": name,
+            "reason": "env_unresolved",
+            "unresolved_env": reported,
+            # Built from the SAME bounded list, so the hint can never
+            # reintroduce a token the payload deliberately dropped.
+            "remediation": env_remediation_hint(reported),
+        })
+    return reasons
+
+
+def _dependency_unavailable_message(agent_name: str,
+                                    reasons: list[dict]) -> str:
+    """#434: the one human-readable field a relaying model actually quotes.
+    'launch deps unavailable' alone is what let a resident conclude the
+    specialist was unwired when its secrets simply were not set."""
+    if not reasons:
+        return f"Agent {agent_name!r} launch deps unavailable."
+    parts = [
+        f"plugin {r['plugin']!r} is withheld because required env is "
+        f"unresolved ({', '.join(r['unresolved_env'])}) — {r['remediation']}"
+        for r in reasons
+    ]
+    return (f"Agent {agent_name!r} launch deps unavailable: "
+            + "; ".join(parts) + ".")
+
+
+def _log_delegation_denial(caller_role: str, agent_name: str,
+                           kind: str) -> None:
+    """#433: make an ACL denial observable, which it previously was not — an
+    operator could not tell how often a delegation was refused over a naming
+    mismatch, on any deployment.
+
+    Deliberately a LOG LINE and not ``_specialist_telemetry.record_denial``.
+    This denial is PRE-AUTHORIZATION and ``agent_name`` is caller-supplied, so
+    keying per-role counters on it would let an unauthorized caller move
+    another role's telemetry and grow the stats dict without bound — the
+    invariant pinned by ``test_input_bounds_run_after_acl`` and
+    ``test_missing_origin_oversized_input_is_not_declared``. The requires
+    gate's ``record_denial`` is fine by contrast: it runs AFTER the ACL, on a
+    target the caller demonstrably declares.
+
+    Enumerated facts only: the caller role comes from the trusted origin, and
+    ``_known_role`` collapses an unregistered target to ``<other>`` rather
+    than echoing whatever the model actually emitted.
+    """
+    logger.warning(
+        "delegation_denied caller=%s target=%s kind=%s",
+        _known_role(caller_role), _known_role(agent_name), kind,
+    )
+
+
 async def _prelaunch(
     agent_name: str, origin: dict, mode: str,
     task_text: str = "", context_text: str = "",
-) -> tuple[Any, Any, "specialist_limits.Permit | None", dict | None]:
+) -> tuple[str, Any, Any, "specialist_limits.Permit | None", dict | None]:
     """The single unified prelaunch pipeline for delegate_to_agent (spec A4).
 
     Runs EVERY pre-launch gate, in this order, so no gate is bypassable by
@@ -2417,19 +2600,95 @@ async def _prelaunch(
     caller_role = str((origin or {}).get("execution_role")
                       or (origin or {}).get("role", ""))
     caller_cfg = _agent_role_map.get(caller_role) if caller_role else None
-    declared = {d.agent for d in (getattr(caller_cfg, "delegates", None) or [])}
+    # Same derivation the handler's pre-handoff canonicalization uses, so the
+    # two can never disagree about who the caller's delegates are (#433).
+    declared = _declared_delegates_for_origin(origin)
+    # The gate is TOTAL, independent of any caller having normalized first:
+    # the membership test below needs a HASHABLE value, so a non-string
+    # target must become one that is simply never declared rather than
+    # raising TypeError out of the authorization boundary.
+    if not isinstance(agent_name, str):
+        agent_name = ""
+
+    # #433: accept a delegate's PERSONA DISPLAY NAME as well as its role id.
+    # Casa advertises both to the model — `_render_delegates_block` names the
+    # persona and the shipped assistant prompt used to model delegation with
+    # it — and an exact-role-id-only ACL refused the name as a WIRING fault,
+    # which sent the resident and the configurator into a repair loop that
+    # could not converge (the wiring was already correct).
+    #
+    # Resolution is scoped to `declared`: the candidate set is built FROM the
+    # caller's own declarations, so every value it can yield is already
+    # inside this ACL and no display-name collision elsewhere can widen the
+    # boundary. An exact role id is matched FIRST, so a delegate whose
+    # display name happens to be another delegate's role id cannot shadow it.
+    # A name matching two declared delegates is REFUSED, not guessed —
+    # picking one silently is the failure mode this fix exists to remove.
+    if caller_cfg is not None and agent_name not in declared:
+        candidates = _declared_name_candidates(agent_name, declared)
+        if len(candidates) > 1:
+            _log_delegation_denial(caller_role, agent_name, "delegation_ambiguous_name")
+            return None, None, None, None, _result({
+                "status": "error", "kind": "delegation_ambiguous_name",
+                "candidates": candidates,
+                "message": (
+                    f"{agent_name!r} is the display name of more than one "
+                    f"delegate ({', '.join(candidates)}) — pass the role id "
+                    f"instead."),
+            })
+        if candidates:
+            # Canonical from here on: every downstream record, telemetry key
+            # and launch target uses the role id, never the display name.
+            agent_name = candidates[0]
+
     if caller_cfg is None or agent_name not in declared:
-        return None, None, None, _result({
+        _log_delegation_denial(caller_role, agent_name, "delegation_not_declared")
+        return None, None, None, None, _result({
             "status": "error", "kind": "delegation_not_declared",
+            # The caller's OWN declarations, minus any that would fail at the
+            # very NEXT gate — advertising one of those sends the model to a
+            # second dead end, which is the failure this whole change exists
+            # to remove.
+            #
+            # Derived from `_agent_role_map`, the map target resolution itself
+            # reads, at the point of use. NOT from `_agent_registry`:
+            # `init_tools` captures that once at boot and `sync_agent_role_map`
+            # refreshes only the role map, so a specialist disabled at runtime
+            # would keep being advertised as callable for the rest of the
+            # process. One source of truth, and it is the consumer's own.
+            # (Under-advertising is safe — resolution has a registry fallback,
+            # so a listed role always resolves but an unlisted one may too.)
+            "declared_delegates": [
+                {"role": r, "name": _display_name_for_role(r)}
+                for r in sorted(declared) if r in _agent_role_map
+            ],
             "message": (f"Agent {caller_role or '(unknown)'!r} does not "
                         f"declare {agent_name!r} as a delegate.")})
 
     if _specialist_registry is None:
-        return None, None, None, _result({
+        return None, None, None, None, _result({
             "status": "error",
             "kind": "not_initialized",
             "message": "specialist registry not initialized",
         })
+
+    # Field TYPES, immediately before the size bounds that assume them and in
+    # the same post-ACL position for the same reason. `args` can carry any
+    # JSON on the paths that don't run the schema validator first — the
+    # condition the `mode` and `agent` coercions already handle. Untyped,
+    # `len(task_text)` raised TypeError straight out of the gate for `7`, and
+    # `["x"]` was WORSE: it has a len(), so it sailed through the bounds check
+    # and reached the launch as a "task". Denied, never coerced — there is no
+    # sensible default for a task, and silently substituting one would run a
+    # delegation the caller never asked for.
+    for _field, _value in (("task", task_text), ("context", context_text)):
+        if not isinstance(_value, str):
+            return None, None, None, None, _result({
+                "status": "error", "kind": "invalid_argument",
+                "field": _field, "agent": agent_name,
+                "message": (f"{_field} must be a string. The tool schema "
+                            f"should have rejected this."),
+            })
 
     # Task 6 input bounds (spec §4.6): reject an oversized task/context —
     # AFTER the ACL (an unauthorized caller is already denied above, so we
@@ -2441,7 +2700,7 @@ async def _prelaunch(
     if len(task_text) > specialist_limits._MAX_TASK_CHARS:
         if _specialist_telemetry is not None:
             _specialist_telemetry.record_denial(agent_name, kind="input_too_large")
-        return None, None, None, _result({
+        return None, None, None, None, _result({
             "status": "error", "kind": "input_too_large", "field": "task",
             "agent": agent_name, "length": len(task_text),
             "limit": specialist_limits._MAX_TASK_CHARS,
@@ -2453,7 +2712,7 @@ async def _prelaunch(
     if len(context_text) > specialist_limits._MAX_CONTEXT_CHARS:
         if _specialist_telemetry is not None:
             _specialist_telemetry.record_denial(agent_name, kind="input_too_large")
-        return None, None, None, _result({
+        return None, None, None, None, _result({
             "status": "error", "kind": "input_too_large", "field": "context",
             "agent": agent_name, "length": len(context_text),
             "limit": specialist_limits._MAX_CONTEXT_CHARS,
@@ -2466,7 +2725,7 @@ async def _prelaunch(
     # Depth cap: prevent delegation chains beyond depth=1.
     current_depth = int((origin or {}).get("delegation_depth", 0))
     if current_depth >= _MAX_DELEGATION_DEPTH:
-        return None, None, None, _result({
+        return None, None, None, None, _result({
             "status": "error",
             "kind": "delegation_depth_exceeded",
             "message": (
@@ -2481,7 +2740,7 @@ async def _prelaunch(
     # connection; SSE and route-shaped tool/context spoofing fail here before
     # requires/concurrency/progress or any launch side effect.
     if channel == "voice" and mode == "interactive":
-        return None, None, None, _result({
+        return None, None, None, None, _result({
             "status": "error",
             "kind": "mode_unsupported_on_voice",
             "message": (
@@ -2491,7 +2750,7 @@ async def _prelaunch(
         })
     if (channel == "voice" and mode == "async"
             and not deferred_delivery_available(origin)):
-        return None, None, None, _background_delivery_unavailable_result(origin)
+        return None, None, None, None, _background_delivery_unavailable_result(origin)
 
     # Resolve target. Look in the merged role map (residents + specialists)
     # first; fall back to the specialist registry for back-compat with any
@@ -2501,7 +2760,7 @@ async def _prelaunch(
         if _specialist_registry is not None else None
     )
     if cfg is None:
-        return None, None, None, _result({
+        return None, None, None, None, _result({
             "status": "error",
             "kind": "unknown_agent",
             "message": f"No enabled agent named {agent_name!r}",
@@ -2512,7 +2771,7 @@ async def _prelaunch(
     # voice mode denial (not this one).
     is_resident = bool(getattr(cfg, "channels", []))
     if mode == "interactive" and is_resident:
-        return None, None, None, _result({
+        return None, None, None, None, _result({
             "status": "error",
             "kind": "interactive_not_supported",
             "message": (
@@ -2545,8 +2804,14 @@ async def _prelaunch(
         # first makes it land in missing_plugins/missing_tools (typed
         # dependency_unavailable), and the filtered resolution flows to the
         # record + options builder (A5/H7b: one resolve, one filter).
+        # #434: BIND the second element. It is the only structured home of
+        # WHY a plugin was withheld — `[(rp, missing_vars)]` — and discarding
+        # it into `_` is what left the caller able to say only "the plugin
+        # isn't available" while the cause sat spelled out in a WARNING the
+        # model cannot read. The resident could not learn that three
+        # environment variables needed wiring.
         from plugin_grants import withhold_env_unresolved
-        resolution, _ = await asyncio.to_thread(
+        resolution, withheld = await asyncio.to_thread(
             withhold_env_unresolved, resolution,
             context=f"delegated {agent_name} requires gate")
         declared = declared_tools_for_resolution(resolution)
@@ -2558,13 +2823,24 @@ async def _prelaunch(
             if t not in declared or t.rsplit("__", 1)[0] not in servers
         ]
         if missing_plugins or missing_tools or not resolution.registry_valid:
-            return None, None, None, _result({
+            reasons = _withhold_reasons(withheld, missing_plugins, missing_tools)
+            # Safe here, unlike the ACL denial (#433): this gate runs AFTER
+            # the ACL, so `agent_name` is a target the caller demonstrably
+            # declares — not an unauthenticated caller-supplied string. Same
+            # stage as the `busy` denial recorded immediately below.
+            if _specialist_telemetry is not None:
+                _specialist_telemetry.record_denial(
+                    agent_name, kind="dependency_unavailable")
+            return None, None, None, None, _result({
                 "status": "error", "kind": "dependency_unavailable",
                 "agent": agent_name,
                 "missing_plugins": missing_plugins,
                 "missing_tools": missing_tools,
                 "registry_valid": resolution.registry_valid,
-                "message": f"Agent {agent_name!r} launch deps unavailable.",
+                # Always present, empty when no cause is known, so a consumer
+                # never has to tell "no reasons" from "payload predates #434".
+                "unavailable_reasons": reasons,
+                "message": _dependency_unavailable_message(agent_name, reasons),
             })
 
     # Task 6 concurrency gate (spec §4.6): AFTER requires, BEFORE progress —
@@ -2581,7 +2857,7 @@ async def _prelaunch(
         if permit is None:
             if _specialist_telemetry is not None:
                 _specialist_telemetry.record_denial(agent_name, kind="busy")
-            return None, None, None, _result({
+            return None, None, None, None, _result({
                 "status": "error",
                 "kind": "busy",
                 "agent": agent_name,
@@ -2621,7 +2897,7 @@ async def _prelaunch(
             permit.release()
         raise
 
-    return cfg, resolution, permit, None
+    return agent_name, cfg, resolution, permit, None
 
 
 def _voice_wait_from_deadline(raw_deadline: Any, loop) -> float | None:
@@ -3492,7 +3768,15 @@ async def delegate_to_agent(args: dict) -> dict:
     # Import lazily — matches the `agent.py` origin_var ContextVar.
     import agent as agent_mod
 
-    agent_name = args.get("agent", "")
+    # TOTAL over arbitrary JSON, exactly as the `mode` coercion below is and
+    # for the same reason: `args` can carry any type on the paths that don't
+    # run the schema validator first. A non-string target must reach the
+    # ACL's uniform denial, never raise — alias resolution calls `.strip()`
+    # and the ACL's set membership needs a HASHABLE value, so a bare `7` or a
+    # `["finance"]` would otherwise escape the gate with an AttributeError or
+    # TypeError BEFORE it ran. Normalized to "" (never declared), not echoed.
+    _requested_agent = args.get("agent", "")
+    agent_name = _requested_agent if isinstance(_requested_agent, str) else ""
     task_text = args.get("task", "")
     context_text = args.get("context", "") or ""
     # #233/#224 (v0.119.0) defence in depth behind the schema enum above: an
@@ -3503,6 +3787,22 @@ async def delegate_to_agent(args: dict) -> dict:
     # TOTAL over arbitrary JSON (Sol/Terra): `args` can carry any type on the
     # paths that don't run the schema validator first, and a truthy UNHASHABLE
     # value (`["sync"]`) would raise TypeError on the membership test.
+    # AR-2: snapshot at entry — this handler awaits (channel setup,
+    # engagement/delegation dispatch) and must not read a holder that a
+    # later turn has since rewritten in place.
+    origin = _snapshot_origin()
+
+    # #433: canonicalize BEFORE the voice-handoff decision below, which does
+    # its own exact-role-id membership test. A display name reaching it would
+    # be read as "not declared", skip the handoff, and then pass the ACL —
+    # bypassing the Concierge policy exactly as #233/#224 did. Silent and
+    # total: every denial remains the ACL's, in `_prelaunch`.
+    #
+    # Also ahead of the mode coercion below, whose warning names the target:
+    # that line exists to diagnose this very bug family, so it must report
+    # the real role rather than the `<other>` an unresolved alias collapses to.
+    agent_name = _canonical_delegate_target(agent_name, origin)
+
     _requested_mode = args.get("mode", "sync") or "sync"
     mode = (_requested_mode
             if isinstance(_requested_mode, str) and _requested_mode in _KNOWN_MODES
@@ -3513,11 +3813,6 @@ async def delegate_to_agent(args: dict) -> dict:
             "'sync'; agent=%s. The tool schema should have rejected this.",
             sorted(_KNOWN_MODES), _known_role(agent_name),
         )
-
-    # AR-2: snapshot at entry — this handler awaits (channel setup,
-    # engagement/delegation dispatch) and must not read a holder that a
-    # later turn has since rewritten in place.
-    origin = _snapshot_origin()
 
     # Concierge is the sole server-authorized voice handoff role.  Do this
     # synchronously, before `_prelaunch` reaches a plugin/limiter await, so a
@@ -3553,7 +3848,10 @@ async def delegate_to_agent(args: dict) -> dict:
     # the caller owns its lifetime from here: sync/async releases via the
     # task done-callback; interactive hands it to the engagement record.
     try:
-        cfg, resolution, permit, prelaunch_error = await _prelaunch(
+        # #433: `agent_name` is REBOUND to the canonical role id — the ACL
+        # accepts a persona display name, and every downstream record,
+        # telemetry key, engagement scope and launch target must use the role.
+        agent_name, cfg, resolution, permit, prelaunch_error = await _prelaunch(
             agent_name, origin, mode, task_text, context_text)
     except BaseException:
         if handoff_reservation is not None:
@@ -4468,7 +4766,11 @@ async def continue_voice_job(args: dict) -> dict:
         "previous_result": parent.result,
     }, ensure_ascii=False, separators=(",", ":"))
 
-    cfg, resolution, permit, prelaunch_error = await _prelaunch(
+    # #433: the canonical role is discarded here — this path already passes a
+    # stored role id (`parent.specialist_role`), never a model-supplied name,
+    # so resolution is necessarily an identity and the rest of this function
+    # keys on `parent.specialist_role` directly.
+    _canonical_role, cfg, resolution, permit, prelaunch_error = await _prelaunch(
         parent.specialist_role,
         origin,
         "async",

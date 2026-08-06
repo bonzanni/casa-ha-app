@@ -177,10 +177,19 @@ def _render_delegates_block(delegates, registry) -> str:
     ]
     if not visible:
         return ""
+    # #433: the ROLE ID leads. `delegate_to_agent` is keyed on the role, and
+    # rendering the persona name first made the name the salient token — the
+    # model addressed delegates by it and the ACL refused, reporting a
+    # WIRING fault for what was only a naming mismatch. The persona name
+    # stays visible (the model still has to map "ask Tina to..." onto a
+    # role), but as the parenthetical. This converges with the
+    # specialist-side renderer, `agent_loader._render_delegates_section`,
+    # which has always emitted role ids only.
     lines = ["<delegates>"]
     for d in visible:
         name = registry.role_to_name(d.agent) if registry is not None else d.agent
-        lines.append(f"- {name} (role: {d.agent}) — {d.purpose}")
+        label = f"{d.agent} ({name})" if name != d.agent else d.agent
+        lines.append(f"- {label} — {d.purpose}")
         lines.append(f"  Delegate when: {d.when}")
     lines.append("</delegates>")
     return "\n".join(lines)

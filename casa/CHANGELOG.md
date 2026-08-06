@@ -1,5 +1,35 @@
 # Changelog
 
+## [0.156.0] - 2026-08-06
+
+### Fixed
+
+- **Asking an assistant to consult a specialist by name failed, and the
+  error blamed the wrong thing.** Casa shows each delegate as a persona —
+  "Alex", "Tina" — but delegation only accepted the underlying role id, so
+  addressing a specialist by the name Casa itself displays was refused as if
+  the specialist were not connected. Following that advice led to
+  reconfiguring something that was already correct, and the delegation still
+  failed. A display name now works, provided it matches exactly one of the
+  agents that assistant may delegate to; anything genuinely ambiguous is
+  refused and says so.
+- **A refused delegation now says what it would have accepted**, listing the
+  agents that assistant can actually reach instead of only reporting a
+  failure.
+- **"The specialist's tools are unavailable" now explains why.** When a
+  specialist cannot start because one of its plugins is missing credentials,
+  the reply names the environment variables that still need wiring and how
+  to wire them, instead of reporting only that a plugin is missing. The
+  reason was already written to the log, where the assistant could not read
+  it.
+
+### Changed
+
+- Casa now shows delegates as `role (Display Name)` rather than
+  `Display Name (role: role)`, so the value delegation actually needs comes
+  first. The assistant's built-in instructions were updated to match — they
+  previously used a persona name in the delegation example itself.
+
 ## [0.155.0] - 2026-08-06
 
 ### Fixed

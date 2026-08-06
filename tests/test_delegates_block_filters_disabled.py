@@ -55,7 +55,7 @@ def test_disabled_specialist_is_omitted_from_block():
         residents={"assistant": assistant, "butler": butler}, specialists={},
     )
     block = _render_delegates_block(assistant.delegates, reg)
-    assert "Tina (role: butler)" in block       # enabled resident still shown
+    assert "butler (Tina)" in block       # enabled resident still shown
     assert "Device control." in block
     assert "finance" not in block                # disabled -> omitted
     assert "Money matters." not in block
@@ -71,8 +71,8 @@ def test_enabled_specialist_is_still_shown():
         specialists={"finance": finance},
     )
     block = _render_delegates_block(assistant.delegates, reg)
-    assert "Tina (role: butler)" in block
-    assert "Alex (role: finance)" in block
+    assert "butler (Tina)" in block
+    assert "finance (Alex)" in block
     assert "Money matters." in block
 
 

@@ -29,7 +29,7 @@ from voice_auth_helpers import SigningVoiceClient, VOICE_TEST_SECRET
 from bus import BusMessage, MessageBus, MessageType
 from casa_core_middleware import cid_middleware
 from channels.voice.channel import VoiceChannel
-from config import AgentConfig, DelegateEntry
+from config import AgentConfig, CharacterConfig, DelegateEntry
 
 try:
     from tests.role_artifact_stub import STUB_ROLE_ARTIFACT
@@ -444,7 +444,7 @@ class TestConciergeVoiceHandoffPolicy:
 
         async def _prelaunch(agent_name, origin, mode, *args):
             prelaunch_modes.append(mode)
-            return _cfg("finance"), None, None, None
+            return "finance", _cfg("finance"), None, None, None
 
         async def _start(**kwargs):
             started.update(kwargs)
@@ -476,6 +476,68 @@ class TestConciergeVoiceHandoffPolicy:
         assert started["specialist_role"] == "finance"
         assert reservation.reserve_calls == 1
         progress.assert_not_awaited()
+
+    async def test_handoff_policy_applies_when_addressed_by_display_name(
+        self, monkeypatch,
+    ):
+        """#433 + #233/#224: `validate_voice_handoff_static` runs BEFORE
+        `_prelaunch` and does its own exact-role-id membership test. Once the
+        ACL began accepting a persona display name, a Concierge voice
+        delegation addressed as "Alex" would take that function's
+        `passthrough_not_declared` branch — no handoff, no reservation — and
+        then be ACCEPTED by the ACL and run on the ordinary sync path under
+        the voice budget. That is exactly the silent policy bypass #233/#224
+        was fixed to make impossible, so the name must be canonicalized
+        before the handoff decision, not only inside the ACL."""
+        import agent as agent_mod
+        import tools as tm
+
+        concierge = _cfg("concierge", delegates=("finance",))
+        finance = _cfg("finance")
+        finance.character = CharacterConfig(name="Alex")
+
+        reg = MagicMock()
+        reg.get.return_value = None
+        tm.init_tools(
+            channel_manager=MagicMock(), bus=MagicMock(),
+            specialist_registry=reg, mcp_registry=MagicMock(),
+            trigger_registry=MagicMock(), engagement_registry=MagicMock(),
+            agent_role_map={"concierge": concierge, "finance": finance},
+        )
+        reservation = _Reservation()
+        prelaunch_modes: list[str] = []
+        prelaunch_targets: list[str] = []
+
+        async def _prelaunch(agent_name, origin, mode, *args):
+            prelaunch_modes.append(mode)
+            prelaunch_targets.append(agent_name)
+            return "finance", _cfg("finance"), None, None, None
+
+        async def _start(**kwargs):
+            return tm._result({"status": "pending", "job_id": "job-1"})
+
+        monkeypatch.setattr(tm, "_prelaunch", _prelaunch)
+        monkeypatch.setattr(tm, "_start_voice_async_job", _start)
+        token = agent_mod.origin_var.set(_voice_origin(
+            role="concierge", execution_role="concierge",
+            voice_transport="ws", voice_route_id="entry-1",
+            origin_device_id="kitchen",
+            voice_route_capabilities=frozenset({
+                "background_jobs", "endpoint_delivery", "voice_handoff",
+            }),
+            _voice_handoff_reservation=reservation,
+            _progress_sink=AsyncMock(),
+        ))
+        try:
+            await tm.delegate_to_agent.handler({
+                "agent": "Alex", "task": "t", "context": "", "mode": "sync",
+            })
+        finally:
+            agent_mod.origin_var.reset(token)
+
+        assert prelaunch_modes == ["async"]
+        assert prelaunch_targets == ["finance"]
+        assert reservation.reserve_calls == 1
 
     @pytest.mark.parametrize("overrides", [
         {"voice_route_id": None},
@@ -548,7 +610,7 @@ class TestConciergeVoiceHandoffPolicy:
         reservation = _Reservation()
 
         async def _prelaunch(*args):
-            return _cfg("finance"), None, None, None
+            return "finance", _cfg("finance"), None, None, None
 
         async def _start(**kwargs):
             return tm._result({
@@ -652,7 +714,7 @@ class TestConciergeVoiceHandoffPolicy:
 
         async def _prelaunch(agent_name, origin, mode, *args):
             modes.append(mode)
-            return _cfg("finance"), None, None, None
+            return "finance", _cfg("finance"), None, None, None
 
         async def _start(**kwargs):
             raise AssertionError("non-Concierge voice calls must remain sync")
@@ -701,7 +763,7 @@ class TestConciergeVoiceHandoffPolicy:
             _progress_sink=progress,
         )
 
-        _, _, _, error = await tm._prelaunch("finance", origin, "async")
+        _, _, _, _, error = await tm._prelaunch("finance", origin, "async")
 
         assert error is None
         progress.assert_not_awaited()

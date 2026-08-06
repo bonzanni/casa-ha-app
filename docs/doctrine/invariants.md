@@ -43,6 +43,7 @@ Every invariant is defined in exactly one file and referenced by id elsewhere.
 | `INV-ENG-003` | A successful completion is refused while unread inbound messages or inbound reservations exist, when the driver exposes its inbound state. | [`architecture/engagements.md`](../architecture/engagements.md) |
 | `INV-ENG-004` | Ephemeral delegation stops at depth one. | [`architecture/engagements.md`](../architecture/engagements.md) |
 | `INV-ENG-005` | Once the output sequencer is terminalized, ordinary narration and unresolved sends cannot post below the completion. | [`architecture/engagements.md`](../architecture/engagements.md) |
+| `INV-ENG-006` | Accepting a delegate's display name never widens the delegation ACL. | [`architecture/engagements.md`](../architecture/engagements.md) |
 | `INV-EV-001` | Only an operator-consented, currently-reconciled route ever dispatches an event wake, and every unrouted pair's queued emissions are deleted every authoritative pass. | [`architecture/plugin-events.md`](../architecture/plugin-events.md) |
 | `INV-EV-002` | Fold mints at most one generation and one delivery ladder per idle pass, and no queued emission is ever lost to it. | [`architecture/plugin-events.md`](../architecture/plugin-events.md) |
 | `INV-EV-003` | A subscription's consent binds subscriber, subscriber artifact id, emitter, event, declaration digest and sorted delivery targets as one identity, and any change to them unroutes the pair without resurrecting it later. | [`architecture/plugin-events.md`](../architecture/plugin-events.md) |

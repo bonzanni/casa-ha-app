@@ -130,6 +130,30 @@ engagement copies the caller's origin without stamping — an interactively-enga
 runs at the caller's depth and can delegate onwards. The guarantee is "an agent reached
 through ephemeral delegation cannot delegate again", not "agent-created work cannot chain".
 
+**INV-ENG-006**: Accepting a delegate's display name never widens the delegation ACL.
+
+The delegation tool accepts either a delegate's role id or its persona display name, because
+Casa advertises both to the model. Resolution is scoped: the candidate set is built from the
+*caller's own* declared delegates, so every value it can produce is already inside the ACL.
+An exact role id is matched first, so a delegate whose display name happens to be another
+delegate's role id cannot shadow it. A name matching two declared delegates is refused with
+its own kind rather than resolved to either.
+
+The name is canonicalized **before the voice-handoff decision**, not only inside the ACL.
+That decision runs first of all — before any await, so a live voice turn reserves
+foreground ownership before work can race ahead — and applies its own exact-role-id test.
+A display name reaching it unresolved would read as "not declared", skip the handoff, and
+then be accepted by the ACL, running the delegation on the ordinary sync path under the
+voice budget: the Concierge policy silently bypassed. The pre-handoff pass is deliberately
+silent and total — it rewrites only a name it can resolve to exactly one declared role, and
+every denial stays the ACL's to emit, in the established gate order.
+
+What it does not cover: this says nothing about *global* name uniqueness. The registry's
+own `name_to_role` is a global, first-binding-wins map and is deliberately **not** what the
+ACL consults — a collision there would silently pick a winner, which is not a resolution an
+authorization boundary may perform. Nothing prevents two agents elsewhere in a deployment
+from sharing a display name; it only stops mattering at this gate.
+
 **INV-ENG-005**: Once the output sequencer is terminalized, ordinary narration and unresolved sends cannot post below the completion.
 
 Enforced by the sequencer's terminalization and its writer checks, with a dedicated path
@@ -154,6 +178,46 @@ retryable outcome — the caller is told the record is still live and to call ag
 than being handed a success for a transition that did not happen. Distinguishing the
 retryable outcome from the precondition failure matters where it is surfaced: one says
 "read your messages", the other says "try again".
+
+**A delegation names a target the caller does not declare.** Refused before any lookup, so
+the refusal cannot distinguish an agent that exists from one that does not. The payload
+enumerates the caller's *own* declared delegates as role/name pairs, filtered against the
+role map target resolution itself reads — so an advertised role resolves, and a declared
+delegate that is disabled or removed is excluded rather than offered as a retry that would
+fail as unknown at the next gate. Naming them discloses nothing the caller does not
+already hold: these are its own declarations.
+
+It is *not* guaranteed to match what that caller's rendered `<delegates>` block says.
+`AgentRegistry` is immutable and a live agent keeps the instance it was constructed with,
+so a per-role reload that renames a persona without reconstructing the caller leaves the
+caller rendering the old display name while resolution uses the new one. Role ids do not
+change under a rename, so the addressing the prompt teaches still works; it is the alias
+fallback that goes stale, degrading to the ordinary undeclared refusal for that one name.
+The enumeration is what tells apart "this delegate is not wired to me" from "wired, but
+addressed by the wrong key". The refusal is logged with the
+caller role and the target collapsed to `<other>` when unregistered; it moves **no
+per-role telemetry counter**, because the target is caller-supplied and the check runs
+before authorization.
+
+**A delegation names something that matches two declared delegates.** Refused with a
+distinct kind that lists the candidate roles, rather than picking one (INV-ENG-006).
+
+**A required plugin is withheld because its environment is unresolved.** The refusal names
+the cause, not only the absence: the payload carries per-plugin entries with the unresolved
+variable names and the remediation, and the message states them. Causes that record no
+reason — a plugin simply not assigned to the target, an invalid registry — still deny, with
+the reason list present and empty rather than absent.
+
+Read the trust boundary carefully. Environment *values* are never read — only the names a
+plugin's own `.mcp.json` references, and only whether each resolves. But those names are
+**manifest-controlled content**, and this payload is the first surface that shows them to
+the model rather than only to the operator log. The extractor accepts any
+`[A-Z_][A-Z0-9_]*`, so a malformed or hostile artifact can park an uppercase-alphanumeric
+literal in that position — an AWS access key id is exactly that shape — and Casa cannot
+tell it from a genuine variable name. So the guarantee is "no environment value", not "no
+secret": what bounds the exposure is a cap on how many names one denial reports and how
+long each may be, with over-long tokens dropped rather than truncated. A truncated
+credential is still a credential prefix.
 
 **Two callers race.** The loser is absorbed as already-terminal. No duplicate topic closure
 and no duplicate notification.

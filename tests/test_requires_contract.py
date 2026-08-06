@@ -505,6 +505,149 @@ class TestPrelaunchRequiresGate:
 
 
 @pytest.mark.asyncio
+class TestDependencyUnavailableCarriesTheReason:
+    """#434: the gate computed the withhold reason, returned it to the call
+    site and discarded it into ``_``. The caller was told WHAT was missing
+    and never WHY, so neither the resident nor an agent acting for them could
+    tell that environment variables needed wiring.
+
+    These drive the REAL ``withhold_env_unresolved`` against a real
+    ``.mcp.json`` on disk — a fake would not prove the reason survives the
+    path that actually produces it.
+    """
+
+    @staticmethod
+    def _plugin_with_unresolved_env(tmp_path, monkeypatch, *vars_):
+        """A resolved plugin whose .mcp.json references *vars_*, none set."""
+        root = tmp_path / "mtg"
+        root.mkdir()
+        (root / ".mcp.json").write_text(json.dumps({
+            "mcpServers": {"mtg": {
+                "command": "serve",
+                "env": {v: "${" + v + "}" for v in vars_},
+            }},
+        }), encoding="utf-8")
+        for v in vars_:
+            monkeypatch.delenv(v, raising=False)
+        rp = ResolvedPlugin(name="mtg", artifact_id="art1", path=str(root),
+                            version="1.0.0", manifest={})
+        return ResolutionResult(registry_valid=True, plugins=[rp])
+
+    async def _deny(self, tmp_path, monkeypatch):
+        resolution = self._plugin_with_unresolved_env(
+            tmp_path, monkeypatch, "CASA_BANKFEED_APP_ID", "CASA_BANKFEED_TOKEN")
+        tm, agent_mod, token = _init(
+            monkeypatch, requires=RequiresConfig(plugins=["mtg"], tools=[]),
+            resolution=resolution,
+        )
+        try:
+            res = await tm.delegate_to_agent.handler({
+                "agent": "finance", "task": "t", "context": "", "mode": "sync",
+            })
+        finally:
+            agent_mod.origin_var.reset(token)
+        return json.loads(res["content"][0]["text"])
+
+    async def test_payload_names_the_unresolved_variables(
+            self, tmp_path, monkeypatch):
+        payload = await self._deny(tmp_path, monkeypatch)
+        assert payload["kind"] == "dependency_unavailable"
+        assert payload["missing_plugins"] == ["mtg"]
+        assert payload["unavailable_reasons"] == [{
+            "plugin": "mtg",
+            "reason": "env_unresolved",
+            "unresolved_env": ["CASA_BANKFEED_APP_ID", "CASA_BANKFEED_TOKEN"],
+            "remediation": (
+                "wire CASA_BANKFEED_APP_ID, CASA_BANKFEED_TOKEN via "
+                "set_plugin_env_reference + casa_reload(plugin_env)"),
+        }]
+
+    async def test_message_states_the_reason_not_just_the_absence(
+            self, tmp_path, monkeypatch):
+        # The message is the field a relaying model actually quotes to the
+        # resident; "launch deps unavailable" alone is what produced the
+        # unconvergent repair loop in #433's observed incident.
+        payload = await self._deny(tmp_path, monkeypatch)
+        assert "env" in payload["message"]
+        assert "CASA_BANKFEED_APP_ID" in payload["message"]
+
+    async def test_denial_is_recorded_in_telemetry(self, tmp_path, monkeypatch):
+        # Safe HERE, unlike the ACL denial (#433): this gate runs AFTER the
+        # ACL, so the target is one the caller demonstrably declares — not an
+        # unauthenticated caller-supplied string. Matches the sibling `busy`
+        # denial recorded at the very next gate.
+        import tools as tm_mod
+        telem = MagicMock()
+        payload = None
+        tm, agent_mod, token = None, None, None
+        resolution = self._plugin_with_unresolved_env(
+            tmp_path, monkeypatch, "CASA_BANKFEED_APP_ID")
+        tm, agent_mod, token = _init(
+            monkeypatch, requires=RequiresConfig(plugins=["mtg"], tools=[]),
+            resolution=resolution,
+        )
+        monkeypatch.setattr(tm_mod, "_specialist_telemetry", telem)
+        try:
+            await tm.delegate_to_agent.handler({
+                "agent": "finance", "task": "t", "context": "", "mode": "sync",
+            })
+        finally:
+            agent_mod.origin_var.reset(token)
+        telem.record_denial.assert_called_once_with(
+            "finance", kind="dependency_unavailable")
+
+    async def test_manifest_tokens_reaching_the_model_are_bounded(
+            self, tmp_path, monkeypatch):
+        # `unresolved_env` carries tokens the PLUGIN MANIFEST controls, and
+        # this payload is the first thing that shows them to the model rather
+        # than only to the operator log. The extractor accepts any
+        # `[A-Z_][A-Z0-9_]*`, which a malformed or hostile artifact can use to
+        # park an uppercase-alphanumeric literal — an AWS access key id is
+        # exactly that shape. Casa cannot tell a real variable name from one,
+        # so it bounds what a single denial can carry instead of pretending
+        # the tokens are trustworthy.
+        many = [f"CASA_VAR_{i:03d}" for i in range(40)]
+        overlong = "A" * 300
+        resolution = self._plugin_with_unresolved_env(
+            tmp_path, monkeypatch, *many, overlong)
+        tm, agent_mod, token = _init(
+            monkeypatch, requires=RequiresConfig(plugins=["mtg"], tools=[]),
+            resolution=resolution,
+        )
+        try:
+            res = await tm.delegate_to_agent.handler({
+                "agent": "finance", "task": "t", "context": "", "mode": "sync",
+            })
+        finally:
+            agent_mod.origin_var.reset(token)
+        payload = json.loads(res["content"][0]["text"])
+        names = payload["unavailable_reasons"][0]["unresolved_env"]
+        assert len(names) <= 20
+        assert all(len(n) <= 64 for n in names)
+        assert overlong not in json.dumps(payload)
+
+    async def test_causes_other_than_env_still_deny_without_a_reason_entry(
+            self, monkeypatch):
+        # A plugin simply not assigned to the target carries no env reason.
+        # The field must be present and empty rather than absent, so a
+        # consumer never has to distinguish "no reasons" from "old payload".
+        tm, agent_mod, token = _init(
+            monkeypatch, requires=RequiresConfig(plugins=["absent"], tools=[]),
+            resolution=_resolution(),
+        )
+        try:
+            res = await tm.delegate_to_agent.handler({
+                "agent": "finance", "task": "t", "context": "", "mode": "sync",
+            })
+        finally:
+            agent_mod.origin_var.reset(token)
+        payload = json.loads(res["content"][0]["text"])
+        assert payload["kind"] == "dependency_unavailable"
+        assert payload["missing_plugins"] == ["absent"]
+        assert payload["unavailable_reasons"] == []
+
+
+@pytest.mark.asyncio
 class TestInteractiveRequiresDenial:
     async def test_denied_requires_creates_no_topic_or_engagement(
         self, monkeypatch,
