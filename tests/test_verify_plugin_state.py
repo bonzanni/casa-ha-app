@@ -1038,3 +1038,156 @@ def test_verify_disabled_specialist_does_not_mask_config_failure(
     assert row["ready"] is False                 # config problem NOT masked
     assert r["ready"] is False
     assert any(s["status"] == "unresolved" for s in r["secrets"])
+
+
+# ---------------------------------------------------------------------------
+# #429: how the two env declarations grade on the verify surface.
+#
+# Both stop WITHHOLDING the plugin (plugin_grants), but they carry opposite
+# READINESS meanings here — which is the whole reason they are two fields and
+# not one "optional" marker. A plain optional marker would have fixed the
+# genuinely-optional token while wrongly making a credential the setup tool
+# must create look optional during ordinary sessions too.
+# ---------------------------------------------------------------------------
+
+_SETUP_ENV_SERVERS = {"s": {"env": {
+    "KEY": "${CASA_PLUGIN_BANKFEED_PRIVATE_KEY}",
+    "CP": "${CASA_PLUGIN_BANKFEED_CP_TOKEN}",
+}}}
+
+
+def _setup_env_plugin(tmp_path, **casa):
+    store = tmp_path / "store"
+    e = entry("probe", ["specialist:finance"])
+    mk_artifact(store, "probe", e["artifact_id"],
+                mcp_servers=_SETUP_ENV_SERVERS,
+                extra_manifest={"casa": casa})
+    mk_registry(tmp_path, [e])
+    return _verify(tmp_path)
+
+
+def test_verify_setup_provided_var_is_unprovisioned_and_not_ready(tmp_path):
+    """A credential the plugin's own setup tool must create is NOT graded as
+    a plain missing secret — but it is still not ready. A plugin sitting on
+    empty credentials because setup never ran has to stay loud."""
+    r = _setup_env_plugin(
+        tmp_path, setupTool="setup_bank_feed",
+        setupProvides=["CASA_PLUGIN_BANKFEED_PRIVATE_KEY"])
+    row = next(s for s in r["secrets"]
+               if s["var"] == "CASA_PLUGIN_BANKFEED_PRIVATE_KEY")
+    assert row["status"] == "unprovisioned"
+    assert "setupProvides" in row["reason"]
+    assert r["ready"] is False
+    assert "setup_env_unprovisioned" in r["reasons"]
+
+
+def test_verify_optional_var_is_optional_and_does_not_block(tmp_path):
+    """An optional token that never resolves is not a defect at all."""
+    r = _setup_env_plugin(
+        tmp_path, setupTool="setup_bank_feed",
+        setupProvides=["CASA_PLUGIN_BANKFEED_PRIVATE_KEY"],
+        optionalEnv=["CASA_PLUGIN_BANKFEED_CP_TOKEN"])
+    cp = next(s for s in r["secrets"]
+              if s["var"] == "CASA_PLUGIN_BANKFEED_CP_TOKEN")
+    assert cp["status"] == "optional"
+    # Still not ready — but only because of the setup-provided one.
+    assert r["reasons"] == ["setup_env_unprovisioned"]
+
+
+def test_verify_ready_once_only_optional_vars_remain(tmp_path, monkeypatch):
+    """The self-clearing half: once the setup run lands its credential, the
+    row disappears and the plugin grades ready with the optional one still
+    absent."""
+    monkeypatch.setenv("CASA_PLUGIN_BANKFEED_PRIVATE_KEY", "-----BEGIN KEY-----")
+    r = _setup_env_plugin(
+        tmp_path, setupTool="setup_bank_feed",
+        setupProvides=["CASA_PLUGIN_BANKFEED_PRIVATE_KEY"],
+        optionalEnv=["CASA_PLUGIN_BANKFEED_CP_TOKEN"])
+    assert r["ready"] is True
+    assert {s["var"]: s["status"] for s in r["secrets"]} == {
+        "CASA_PLUGIN_BANKFEED_PRIVATE_KEY": "resolved",
+        "CASA_PLUGIN_BANKFEED_CP_TOKEN": "optional",
+    }
+
+
+def test_verify_undeclared_var_still_grades_as_a_missing_secret(tmp_path):
+    """Nothing about the declarations may soften an undeclared secret."""
+    r = _setup_env_plugin(tmp_path, setupTool="setup_bank_feed",
+                          setupProvides=["CASA_PLUGIN_BANKFEED_PRIVATE_KEY"])
+    cp = next(s for s in r["secrets"]
+              if s["var"] == "CASA_PLUGIN_BANKFEED_CP_TOKEN")
+    assert cp["status"] == "unresolved"
+    assert cp["source"] == "missing"
+
+
+def test_verify_malformed_declaration_is_visible_not_silent(tmp_path):
+    """A declaration that does not parse RELAXES a gate if read loosely, so
+    it must surface here rather than degrade to 'no declaration'."""
+    store = tmp_path / "store"
+    e = entry("probe", ["specialist:finance"])
+    mk_artifact(store, "probe", e["artifact_id"],
+                mcp_servers=_SETUP_ENV_SERVERS,
+                extra_manifest={"casa": {"setupTool": "setup_x",
+                                         "optionalEnv": "not-a-list"}})
+    mk_registry(tmp_path, [e])
+    r = _verify(tmp_path)
+    assert r["ready"] is False
+    assert "optional_env_invalid" in r["reasons"]
+
+
+def test_verify_casa_owned_var_names_the_app_option(tmp_path, monkeypatch):
+    """OP_SERVICE_ACCOUNT_TOKEN is exported by svc-casa/run from an app
+    option — a plugin-env entry cannot substitute for the unset option, so
+    the row must not send the operator to set_plugin_env_reference."""
+    # A developer shell may export the token; grade the UNSET case.
+    monkeypatch.delenv("OP_SERVICE_ACCOUNT_TOKEN", raising=False)
+    store = tmp_path / "store"
+    e = entry("probe", ["specialist:finance"])
+    mk_artifact(store, "probe", e["artifact_id"],
+                mcp_servers={"s": {"env": {"OP": "${OP_SERVICE_ACCOUNT_TOKEN}"}}})
+    mk_registry(tmp_path, [e])
+    r = _verify(tmp_path)
+    row = next(s for s in r["secrets"]
+               if s["var"] == "OP_SERVICE_ACCOUNT_TOKEN")
+    assert "onepassword_service_account_token" in row["reason"]
+    assert "plugin-env.conf" not in row["reason"]
+
+
+def test_verify_grades_a_setup_provided_var_not_named_in_mcp_json(
+        tmp_path, monkeypatch):
+    """Sol r1: the secrets rows come from `.mcp.json` ${VAR} references only.
+    A plugin whose server reads its provisioned credential from the INHERITED
+    environment produced no row — and graded READY with the credential
+    absent, which is the exact state setup_env_unprovisioned exists to make
+    loud."""
+    monkeypatch.delenv("CASA_PLUGIN_BANKFEED_APP_ID", raising=False)
+    store = tmp_path / "store"
+    e = entry("probe", ["specialist:finance"])
+    mk_artifact(store, "probe", e["artifact_id"],
+                mcp_servers={"s": {}},          # references NOTHING
+                extra_manifest={"casa": {
+                    "setupTool": "setup_bank_feed",
+                    "setupProvides": ["CASA_PLUGIN_BANKFEED_APP_ID"]}})
+    mk_registry(tmp_path, [e])
+    r = _verify(tmp_path)
+    row = next(s for s in r["secrets"]
+               if s["var"] == "CASA_PLUGIN_BANKFEED_APP_ID")
+    assert row["status"] == "unprovisioned"
+    assert r["ready"] is False
+    assert "setup_env_unprovisioned" in r["reasons"]
+
+
+def test_verify_unreferenced_setup_var_clears_once_provisioned(
+        tmp_path, monkeypatch):
+    monkeypatch.setenv("CASA_PLUGIN_BANKFEED_APP_ID", "app-123")
+    store = tmp_path / "store"
+    e = entry("probe", ["specialist:finance"])
+    mk_artifact(store, "probe", e["artifact_id"],
+                mcp_servers={"s": {}},
+                extra_manifest={"casa": {
+                    "setupTool": "setup_bank_feed",
+                    "setupProvides": ["CASA_PLUGIN_BANKFEED_APP_ID"]}})
+    mk_registry(tmp_path, [e])
+    r = _verify(tmp_path)
+    assert r["ready"] is True
+    assert r["secrets"] == []

@@ -157,6 +157,161 @@ def unresolved_env_vars_for_resolved(rp, environ=None) -> list[str]:
     return unresolved
 
 
+# #429: re-exported from plugin_store (stdlib-only, so the manifest validator
+# and this module cannot drift on which names are Casa-owned). Existing
+# callers import it from here.
+from plugin_store import CASA_OWNED_ENV_OPTIONS  # noqa: E402
+
+
+def env_remediation_hint(missing) -> str:
+    """The operator-facing repair for an unresolved-env withhold (#429).
+    Names the app OPTION for Casa-owned vars and the plugin-env path for the
+    rest, so a message can never send an operator to the wrong control."""
+    owned = [v for v in missing if v in CASA_OWNED_ENV_OPTIONS]
+    other = [v for v in missing if v not in CASA_OWNED_ENV_OPTIONS]
+    parts = []
+    if owned:
+        parts.append(
+            "set the app option(s) " + ", ".join(
+                sorted({CASA_OWNED_ENV_OPTIONS[v] for v in owned}))
+            + " and restart the app")
+    if other:
+        parts.append(
+            "wire " + ", ".join(sorted(other))
+            + " via set_plugin_env_reference + casa_reload(plugin_env)")
+    return "; ".join(parts) if parts else "no remediation known"
+
+
+def declared_absent_env_vars_for_resolved(rp) -> set[str]:
+    """The env vars this plugin's manifest declares Casa must NOT withhold it
+    for (#429): ``casa.setupProvides`` (its own setup tool creates them) and
+    ``casa.optionalEnv`` (it genuinely does not need them).
+
+    0.153.0's gate held a settled setup episode until every ``${VAR}`` in
+    ``.mcp.json`` resolved, which deadlocks any plugin whose setup tool
+    exists to PROVISION its credentials: setup cannot run until they exist,
+    and they only exist after setup runs. The plugin had no way to say so —
+    these two declarations are that way.
+
+    FAIL CLOSED on malformed metadata, matching
+    :func:`declared_tools_for_resolution`: a manifest whose declaration does
+    not parse contributes NOTHING, so the plugin keeps the strict 0.153.0
+    behaviour (withheld) instead of having a broken declaration relax its
+    gate. ``artifact_verdict`` already excludes such an artifact from
+    resolution; this is the belt for a path that somehow reaches here."""
+    from plugin_store import (
+        StoreError, manifest_optional_env, manifest_setup_provides,
+    )
+    manifest = getattr(rp, "manifest", None)
+    if not isinstance(manifest, dict):
+        return set()
+    out: set[str] = set()
+    for reader in (manifest_setup_provides, manifest_optional_env):
+        try:
+            out.update(reader(manifest))
+        except StoreError as exc:
+            logger.warning(
+                "plugin %s: %s — treating its env declaration as absent "
+                "(the plugin stays withheld until the vars resolve)",
+                getattr(rp, "name", "?"), exc)
+    return out
+
+
+def blocking_unresolved_env_vars_for_resolved(rp, environ=None) -> list[str]:
+    """:func:`unresolved_env_vars_for_resolved` MINUS the vars the manifest
+    declares as setup-provisioned or optional (#429) — the subset that must
+    actually WITHHOLD the plugin from a session build and hold its setup
+    episode. Empty means the plugin is loadable; the declared-but-absent
+    remainder is handled by :func:`sanitized_env_for_resolution` instead of
+    by exclusion, and stays visible on the verify surface."""
+    exempt = declared_absent_env_vars_for_resolved(rp)
+    return [v for v in unresolved_env_vars_for_resolved(rp, environ)
+            if v not in exempt]
+
+
+def setup_secrets_ready(resolution, plugin: str, environ=None) -> bool:
+    """Whether *plugin*'s settled setup episode may dispatch (#423, amended
+    #429). A plugin absent from *resolution* is NOT ready (the dispatch-time
+    registry gate owns that path's messaging and retries).
+
+    Lives here, beside the rule it applies, rather than inside casa_core's
+    boot closure — the gate and the session-build withhold must answer the
+    same question, and a copy in an untestable closure is how they drift."""
+    rp = next((p for p in getattr(resolution, "plugins", None) or []
+               if p.name == plugin), None)
+    if rp is None:
+        return False
+    return not blocking_unresolved_env_vars_for_resolved(rp, environ)
+
+
+def sanitized_env_for_resolution(resolution, environ=None) -> dict[str, str]:
+    """``{VAR: ""}`` for every declared-absent var (#429) that is still
+    unresolved across *resolution*'s plugins — the env overlay every session
+    builder passes as ``ClaudeAgentOptions.env``.
+
+    This is the half of the fix that keeps #423's guarantee intact: the CLI
+    expands an UNDEFINED ``${VAR}`` to the LITERAL string, so merely letting
+    an exempt plugin load would spawn its MCP server with placeholder
+    credentials — exactly the failure (an OAuth URL carrying
+    ``client_id=${GMAIL_CLIENT_ID}``) that motivated the gate. An explicit
+    empty string makes the variable genuinely absent-shaped to the server,
+    which is what a plugin awaiting its own setup run must see.
+
+    Only UNRESOLVED vars are included, so a value that is actually wired —
+    including one wired by a setup run that already happened — is never
+    overwritten with an empty string. A var left holding a raw ``op://``
+    reference (boot/reload resolution failed) counts as unresolved and IS
+    emptied: an unresolvable reference is not a credential, and handing the
+    literal to the server is the same placeholder failure in another
+    spelling. It stays visible — verify grades it off the effective
+    environment, not off this overlay.
+
+    Driven by the DECLARATION, not by the ``.mcp.json`` reference set (r2,
+    Sol): a plugin whose server reads a provisioned credential from the
+    inherited environment rather than naming it in its launch config would
+    otherwise get no binding at all, and the server would see the leftover
+    ``op://`` reference — which an idempotent setup tool can easily read as
+    "already provisioned" and skip the creation over. Every declared name is
+    plugin-owned by construction (``PLUGIN_ENV_DECLARATION_PREFIX``), so
+    binding one that the launch config never mentions is safe."""
+    env = os.environ if environ is None else environ
+    out: dict[str, str] = {}
+    for rp in getattr(resolution, "plugins", None) or []:
+        for var in declared_absent_env_vars_for_resolved(rp):
+            value = env.get(var)
+            if not value or value.startswith("op://"):
+                out[var] = ""
+    return out
+
+
+def sanitized_env_for_paths(plugin_paths, environ=None) -> dict[str, str]:
+    """:func:`sanitized_env_for_resolution` for artifact PATHS (#429).
+
+    The engagement run script attaches artifacts by path via ``--plugin-dir``
+    with no ``ResolutionResult`` in hand, so there is nothing to read the
+    declarations off. Reads each artifact's own manifest — the same file the
+    CLI loads from that path. An unreadable manifest contributes nothing (no
+    declarations ⇒ nothing bound ⇒ exactly the pre-#429 behaviour). Never
+    raises: it runs on an engagement-start path."""
+    import json
+    from plugin_registry import ResolutionResult, ResolvedPlugin
+    plugins = []
+    for path in plugin_paths or []:
+        manifest = {}
+        try:
+            manifest = json.loads(
+                (Path(path) / ".claude-plugin" / "plugin.json")
+                .read_text(encoding="utf-8"))
+        except Exception:  # noqa: BLE001 — absent/corrupt ⇒ no declarations
+            manifest = {}
+        plugins.append(ResolvedPlugin(
+            name="", artifact_id="", path=str(path), version="",
+            manifest=manifest if isinstance(manifest, dict) else {}))
+    return sanitized_env_for_resolution(
+        ResolutionResult(registry_valid=True, plugins=plugins, issues=[]),
+        environ)
+
+
 def withhold_env_unresolved(resolution, *, context: str):
     """Filter *resolution* down to env-resolved plugins (INV-PLUG-008)
     WITHOUT mutating the input — H7b shares a creation resolve between the
@@ -170,12 +325,17 @@ def withhold_env_unresolved(resolution, *, context: str):
     withheld = []
     loadable = []
     for rp in resolution.plugins:
-        missing = unresolved_env_vars_for_resolved(rp)
+        # #429: the BLOCKING subset — a var the manifest declares as
+        # setup-provisioned or optional must not withhold the plugin, or a
+        # plugin whose setup tool exists to CREATE its credentials can never
+        # be loaded to run that setup tool. Those are emptied instead, by
+        # sanitized_env_for_resolution at the session builder.
+        missing = blocking_unresolved_env_vars_for_resolved(rp)
         if missing:
             logger.warning(
-                "plugin %s withheld from %s: required env unresolved (%s) — "
-                "wire via set_plugin_env_reference + casa_reload(plugin_env)",
-                rp.name, context, ", ".join(missing))
+                "plugin %s withheld from %s: required env unresolved (%s) — %s",
+                rp.name, context, ", ".join(missing),
+                env_remediation_hint(missing))
             withheld.append((rp, missing))
             continue
         loadable.append(rp)

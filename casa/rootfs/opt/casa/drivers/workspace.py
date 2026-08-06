@@ -43,6 +43,19 @@ def engagement_log_dir(engagement_id: str, *, root: str | None = None) -> str:
 # as ``plugin_env_conf._VAR_NAME_RE``.
 _ENV_VAR_NAME_RE = re.compile(r"^[A-Z_][A-Z0-9_]*$")
 
+# #429 r2 (Terra): the template's OWN exports, which `{EXTRA_EXPORT}` is
+# interpolated AFTER — so an extra_env entry naming one silently overrides
+# it for the whole engagement. Refused HERE, at the collision point, and not
+# only in the manifest validator upstream: this is where the shadowing
+# physically happens, so every present and future caller is covered by it.
+# Keep in step with scripts/engagement_run_template.sh.
+_TEMPLATE_OWNED_ENV: frozenset[str] = frozenset({
+    "HOME",
+    "CLAUDE_CODE_DISABLE_BACKGROUND_TASKS",
+    "MCP_TOOL_TIMEOUT",
+    "CLAUDE_CODE_MAX_SUBAGENT_SPAWN_DEPTH",
+})
+
 # L-1 (v0.34.2): valid CC permission patterns we forward into
 # engagement-scoped .claude/settings.json::permissions.allow.
 # Anything else (e.g. Casa-internal tool names) is dropped with a WARNING.
@@ -203,12 +216,38 @@ def render_run_script(
 
     extra_unset_str = " ".join(extra_unset or [])
 
+    # #429 r2 (Sol): the empty-string pinning for declared-but-unresolved
+    # plugin env is derived HERE, from the plugin_dirs being attached, rather
+    # than assembled by each caller. Round 1 fixed the driver's start path and
+    # round 2 found boot reconciliation re-rendering the same service pair
+    # without it — two callers, one of them forgotten, which is what a
+    # per-caller contract buys. Deriving it where the dirs are consumed means
+    # a future third caller cannot forget. A caller-supplied extra_env wins on
+    # a key collision (nothing sets one today; declarations are namespaced).
+    if plugin_dirs:
+        try:
+            from plugin_grants import sanitized_env_for_paths
+            derived = sanitized_env_for_paths(plugin_dirs)
+        except Exception:  # noqa: BLE001 — never fail a render over this
+            logger.warning("plugin env sanitization failed for %s — rendering "
+                           "without the empty-string overlay", engagement_id,
+                           exc_info=True)
+            derived = {}
+        if derived:
+            extra_env = {**derived, **(extra_env or {})}
+
     if extra_env:
         bad = [k for k in extra_env if not _ENV_VAR_NAME_RE.match(str(k))]
         if bad:
             raise WorkspaceConfigError(
                 f"extra_env keys must match [A-Za-z_][A-Za-z0-9_]*; "
                 f"got invalid: {bad!r}"
+            )
+        owned = sorted(k for k in extra_env if k in _TEMPLATE_OWNED_ENV)
+        if owned:
+            raise WorkspaceConfigError(
+                f"extra_env may not override the run template's own exports "
+                f"(it is interpolated after them): {owned!r}"
             )
         export_lines = "\n".join(
             "export {}='{}'".format(k, str(v).replace("'", "'\\''"))

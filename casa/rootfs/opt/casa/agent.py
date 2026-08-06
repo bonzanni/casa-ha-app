@@ -26,7 +26,11 @@ from claude_agent_sdk import (
 )
 
 import plugin_registry
-from plugin_grants import grants_for_resolution, make_fail_closed_can_use_tool
+from plugin_grants import (
+    grants_for_resolution,
+    make_fail_closed_can_use_tool,
+    sanitized_env_for_resolution,
+)
 
 from bus import BusMessage, MessageBus, MessageType
 from channels import ChannelManager
@@ -1689,6 +1693,15 @@ class Agent:
             # REGISTRY, never written into the artifact's own plugin.json).
             plugins=[{"type": "local", "path": rp.path}
                      for rp in resolution.plugins],
+            # #429: the other half of the withhold relaxation. A plugin that
+            # declares casa.setupProvides/casa.optionalEnv is no longer
+            # withheld for those vars, but the CLI expands an UNDEFINED
+            # ${VAR} to the LITERAL string — so each still-unresolved
+            # declared var is pinned to "" here, and the plugin's MCP server
+            # sees a genuinely empty value instead of a placeholder
+            # credential. Never overrides a wired value (the helper emits
+            # only unresolved vars), so this is {} on a fully-wired system.
+            env=sanitized_env_for_resolution(resolution),
             # P-5b: in-casa agents have no permission relay — fail closed on
             # ungranted tools instead of hanging on CC's prompt. New closure
             # per build is fine: the pool reuses clients, not options objects.

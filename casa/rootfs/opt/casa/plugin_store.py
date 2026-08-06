@@ -605,6 +605,16 @@ def artifact_verdict(path: Path, *, name: str, repo: str, revision: str,
         manifest_setup_tool(manifest)
     except StoreError:
         return "setup_tool_invalid"
+    # #429: same upgrade-path posture for the two env declarations (gate
+    # added v0.154.0) — they relax the withholding gate, so a malformed one
+    # must exclude the artifact from resolution rather than degrade to "no
+    # declaration" and silently re-impose the deadlock (or, worse, be read
+    # loosely enough to relax the gate for a name the author never wrote).
+    for _reader in (manifest_setup_provides, manifest_optional_env):
+        try:
+            _reader(manifest)
+        except StoreError as _exc:
+            return _exc.reason_code
     return None
 
 
@@ -1005,6 +1015,142 @@ def manifest_setup_tool(manifest: dict) -> str | None:
     return raw
 
 
+# #429: the namespace a plugin may declare in. A declared name is BOUND —
+# the session builder pins it to "" while it is unresolved, and that binding
+# is process-wide for the CLI subprocess, not scoped to the declaring plugin.
+# So the question "may this plugin declare this name?" has to have a
+# STRUCTURAL answer.
+#
+# Review rounds 1 and 2 both answered it with a deny-list, and both times a
+# reviewer found a name it had missed (``MCP_TOOL_TIMEOUT``, which the
+# engagement run template exports; then ``GIT_DIR``, which would break every
+# git invocation in the session). The environment namespace is open, so an
+# enumeration of what a plugin may NOT touch cannot be finished — the second
+# miss is the evidence, not a reason for a third patch. Inverted: a declared
+# name must live under a prefix RESERVED for plugin declarations, which Casa
+# itself never exports and no runtime reads. Everything else — every Casa
+# option export, every ``CLAUDE_*``/``MCP_*`` knob, ``PATH``, ``GIT_DIR``,
+# and whatever the next one turns out to be — is outside it by construction.
+#
+# Only DECLARED names are constrained. A plugin may still reference any
+# ``${VAR}`` it likes in ``.mcp.json``; an undeclared one simply withholds
+# the plugin as it did before, binding nothing.
+PLUGIN_ENV_DECLARATION_PREFIX = "CASA_PLUGIN_"
+_ENV_VAR_RE = re.compile(r"^CASA_PLUGIN_[A-Z0-9][A-Z0-9_]{0,110}$")
+# Bounded so a malformed/hostile manifest cannot make the withhold gate walk
+# an arbitrarily long declaration on every session build.
+_MAX_ENV_DECLARATIONS = 32
+
+# #429 hardening: a declared name is BOUND — the session builder pins it to
+# "" in the CLI subprocess's environment while it is unresolved. That is
+# exactly the intent for a plugin's own credential, and exactly wrong for a
+# name the plugin does not own: before this release such a plugin was simply
+# WITHHELD, so it injected nothing; declaring the name is now the difference
+# between "absent" and "empty" for the whole session, which for a name the
+# CLI or Casa reads is a behaviour change the plugin has no business making.
+# A plugin may only declare names it owns.
+#
+# Distinct from RESERVED_PLUGIN_ENV_KEYS above, which is about a server's
+# ``env`` KEY shadowing a value the CLI injects per plugin. This is about a
+# manifest DECLARATION binding a name process-wide for the session.
+# Casa-owned env vars a PLUGIN may legitimately reference but never supply:
+# ``svc-casa/run`` exports each from the named app option. Mapped rather than
+# listed because the value is also the operator-facing remediation — telling
+# someone to ``set_plugin_env_reference OP_SERVICE_ACCOUNT_TOKEN`` is wrong
+# advice, and an ``op://`` entry would need that very token to resolve.
+# Lives here (stdlib-only) so plugin_grants and the verify surface share ONE
+# definition. NOT a deny-list: the declaration namespace is fenced by
+# PLUGIN_ENV_DECLARATION_PREFIX above, which excludes these by construction.
+CASA_OWNED_ENV_OPTIONS: dict[str, str] = {
+    "OP_SERVICE_ACCOUNT_TOKEN": "onepassword_service_account_token",
+    "ONEPASSWORD_DEFAULT_VAULT": "onepassword_default_vault",
+    "CONTEXT7_API_KEY": "context7_api_key",
+}
+
+
+def _manifest_env_list(manifest: dict, key: str, reason_code: str) -> list[str]:
+    """Shared strict reader for the two ``casa`` env-name lists (#429).
+    ABSENT → ``[]``. PRESENT-but-malformed (not a list, a non-string or
+    non-env-grammar member, a duplicate, a name the plugin does not own, or
+    over the count cap) is a plugin-author error: raises
+    ``StoreError(reason_code=...)``. Returns the declared names in manifest
+    order."""
+    casa = manifest.get("casa")
+    if not isinstance(casa, dict) or key not in casa:
+        return []
+    raw = casa.get(key)
+    if not isinstance(raw, list):
+        raise StoreError(
+            f"casa.{key} invalid: must be a list of environment-variable "
+            f"names, got {type(raw).__name__}",
+            reason_code=reason_code)
+    if len(raw) > _MAX_ENV_DECLARATIONS:
+        raise StoreError(
+            f"casa.{key} invalid: at most {_MAX_ENV_DECLARATIONS} names "
+            f"(got {len(raw)})",
+            reason_code=reason_code)
+    out: list[str] = []
+    for item in raw:
+        if not isinstance(item, str) or not _ENV_VAR_RE.fullmatch(item):
+            raise StoreError(
+                f"casa.{key} invalid: {item!r} is not declarable. A declared "
+                f"name must be {PLUGIN_ENV_DECLARATION_PREFIX}<NAME> "
+                "(upper-case ASCII, digits and underscores) — declaring a "
+                "name binds it for the whole session, so the declaration "
+                "namespace is reserved. Reference any variable you like in "
+                ".mcp.json; only DECLARED names are fenced",
+                reason_code=reason_code)
+        if item in out:
+            raise StoreError(
+                f"casa.{key} invalid: {item!r} declared twice",
+                reason_code=reason_code)
+        out.append(item)
+    return out
+
+
+def manifest_setup_provides(manifest: dict) -> list[str]:
+    """Guarded + STRICT ``casa.setupProvides`` extraction (#429): the env
+    vars the plugin's OWN ``casa.setupTool`` creates — a private key it
+    forges, an application id the registration returns. Absent → ``[]``.
+
+    These are the plugins 0.153.0's env-readiness gate deadlocked: setup
+    cannot run until the credentials exist, and the credentials only exist
+    after setup runs. A declared name is excluded from the WITHHOLDING gate
+    (:func:`plugin_grants.blocking_unresolved_env_vars_for_resolved`) so the
+    cycle breaks, and is passed to the session as an EMPTY string rather
+    than left to expand as the literal ``${VAR}`` placeholder — the failure
+    mode #423 fixed. It is NOT excluded from readiness: verify reports
+    ``setup_env_unprovisioned`` until the value actually lands, so a setup
+    tool that never ran is loud rather than silent.
+
+    Declaring this WITHOUT a ``casa.setupTool`` is refused: the field's
+    whole meaning is "my setup tool creates this", so without one it would
+    be an undeclared way to mark a credential optional (that is what
+    ``casa.optionalEnv`` is for)."""
+    provides = _manifest_env_list(manifest, "setupProvides",
+                                  "setup_provides_invalid")
+    if provides and not manifest_setup_tool(manifest):
+        raise StoreError(
+            "casa.setupProvides invalid: declared without a casa.setupTool — "
+            "the field means 'my setup tool provisions these'; use "
+            "casa.optionalEnv for genuinely optional variables",
+            reason_code="setup_provides_invalid")
+    return provides
+
+
+def manifest_optional_env(manifest: dict) -> list[str]:
+    """Guarded + STRICT ``casa.optionalEnv`` extraction (#429): env vars the
+    plugin's ``.mcp.json`` references but genuinely does not need (an
+    optional consent-platform token, a feature-flag endpoint). Absent →
+    ``[]``.
+
+    Structurally beside :func:`manifest_setup_provides` and excluded from
+    the same withholding gate with the same empty-string sanitization, but
+    with the opposite READINESS meaning: an optional var that never resolves
+    is not a defect, so it does not make verify report not-ready."""
+    return _manifest_env_list(manifest, "optionalEnv", "optional_env_invalid")
+
+
 def manifest_protected_tools(manifest: dict) -> list:
     """Guarded + STRICT casa.protectedTools extraction (A:§3.7, extended
     v0.78.0 W1), beside manifest_sysreqs. An ABSENT ``casa.protectedTools``
@@ -1163,6 +1309,10 @@ def validate_manifest(root: Path, expected_name: str, *,
     # v0.112.0: a PRESENT-but-malformed casa.setupTool refuses the
     # install/update outright (strict; raises setup_tool_invalid).
     manifest_setup_tool(manifest)
+    # #429: same for the two env declarations — they RELAX the withholding
+    # gate, so an install must never accept one Casa would have to interpret.
+    manifest_setup_provides(manifest)
+    manifest_optional_env(manifest)
     return manifest
 
 

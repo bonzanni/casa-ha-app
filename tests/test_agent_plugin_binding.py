@@ -4,6 +4,7 @@ their concrete role; executor options carry plugins but no grants/callback."""
 from __future__ import annotations
 
 import asyncio
+import json
 import threading
 import time
 from types import SimpleNamespace
@@ -541,3 +542,168 @@ def test_tier_miss_resolve_logs_warning(tmp_path, caplog):
         asyncio.run(a._get_plugin_resolution())
     assert any("tier" in rec.message and "finance" in rec.message
                for rec in caplog.records)
+
+
+# ---------------------------------------------------------------------------
+# #429: a plugin whose setup tool PROVISIONS its own credentials
+# ---------------------------------------------------------------------------
+
+_BANKFEED_MCP = {"bank-feed": {"env": {
+    "KEY": "${CASA_PLUGIN_BANKFEED_PRIVATE_KEY}",
+    "CP": "${CASA_PLUGIN_BANKFEED_CP_TOKEN}",
+    "OP": "${OP_SERVICE_ACCOUNT_TOKEN}",
+}}}
+
+_BANKFEED_CASA = {"casa": {
+    "setupTool": "setup_bank_feed",
+    "setupProvides": ["CASA_PLUGIN_BANKFEED_PRIVATE_KEY"],
+    "optionalEnv": ["CASA_PLUGIN_BANKFEED_CP_TOKEN"],
+}}
+
+
+def _bankfeed_registry(tmp_path, monkeypatch, targets):
+    import tools as tools_mod
+    store = tmp_path / "store"
+    e = entry("bank-feed", targets)
+    art = mk_artifact(store, "bank-feed", e["artifact_id"],
+                      mcp_servers=_BANKFEED_MCP,
+                      extra_manifest=_BANKFEED_CASA)
+    reload_snapshot(registry_path=mk_registry(tmp_path, [e]), store_root=store)
+    monkeypatch.setattr(tools_mod, "_mcp_registry", None, raising=False)
+    for var in ("CASA_PLUGIN_BANKFEED_PRIVATE_KEY", "CASA_PLUGIN_BANKFEED_CP_TOKEN"):
+        monkeypatch.delenv(var, raising=False)
+    # The only var the operator is genuinely expected to supply.
+    monkeypatch.setenv("OP_SERVICE_ACCOUNT_TOKEN", "ops_tok")
+    return art
+
+
+def test_specialist_options_load_the_setup_provisioning_plugin(
+        tmp_path, monkeypatch):
+    """THE #429 DEADLOCK, at the session build. 0.153.0 withheld bank-feed
+    because two of its vars were unresolved — but its setup tool exists to
+    CREATE them, so the plugin could never be loaded to run the tool that
+    would resolve the withhold. The specialist was gated off entirely."""
+    import tools as tools_mod
+    art = _bankfeed_registry(tmp_path, monkeypatch, ["specialist:finance"])
+    opts = tools_mod._build_specialist_options(_spec_cfg("finance"))
+    assert opts.plugins == [{"type": "local", "path": str(art)}]
+    assert "mcp__plugin_bank-feed_bank-feed" in opts.allowed_tools
+
+
+def test_specialist_options_pin_declared_vars_to_empty_strings(
+        tmp_path, monkeypatch):
+    """The other half: the CLI expands an UNDEFINED ${VAR} to the LITERAL
+    string, so admitting the plugin without this would spawn its MCP server
+    on placeholder credentials — the exact failure #423 fixed. An explicit
+    empty value is what a plugin awaiting its own setup run must see."""
+    import tools as tools_mod
+    _bankfeed_registry(tmp_path, monkeypatch, ["specialist:finance"])
+    opts = tools_mod._build_specialist_options(_spec_cfg("finance"))
+    assert opts.env == {"CASA_PLUGIN_BANKFEED_PRIVATE_KEY": "",
+                        "CASA_PLUGIN_BANKFEED_CP_TOKEN": ""}
+    # Never an overlay for a var that is actually wired.
+    assert "OP_SERVICE_ACCOUNT_TOKEN" not in opts.env
+
+
+def test_specialist_options_stop_pinning_once_setup_has_run(
+        tmp_path, monkeypatch):
+    import tools as tools_mod
+    _bankfeed_registry(tmp_path, monkeypatch, ["specialist:finance"])
+    monkeypatch.setenv("CASA_PLUGIN_BANKFEED_PRIVATE_KEY", "-----BEGIN KEY-----")
+    opts = tools_mod._build_specialist_options(_spec_cfg("finance"))
+    assert opts.env == {"CASA_PLUGIN_BANKFEED_CP_TOKEN": ""}
+
+
+def test_specialist_options_still_withhold_an_undeclared_missing_secret(
+        tmp_path, monkeypatch):
+    """#424 must survive #429 intact: an env var the manifest does NOT
+    declare still withholds the whole plugin, and is never quietly emptied
+    into the session instead."""
+    import tools as tools_mod
+    _bankfeed_registry(tmp_path, monkeypatch, ["specialist:finance"])
+    monkeypatch.delenv("OP_SERVICE_ACCOUNT_TOKEN", raising=False)
+    opts = tools_mod._build_specialist_options(_spec_cfg("finance"))
+    assert opts.plugins == []
+    assert opts.env == {}
+
+
+def test_specialist_options_undeclared_plugin_gets_no_env_overlay(
+        tmp_path, monkeypatch):
+    """A plugin with no declarations must produce a byte-for-byte unchanged
+    build — the overlay is {} , not a set of empty strings."""
+    import tools as tools_mod
+    store = tmp_path / "store"
+    e = entry("finplug", ["specialist:finance"])
+    mk_artifact(store, "finplug", e["artifact_id"],
+                mcp_servers={"finplug": {"env": {"K": "${FIN_API_KEY}"}}})
+    reload_snapshot(registry_path=mk_registry(tmp_path, [e]), store_root=store)
+    monkeypatch.setattr(tools_mod, "_mcp_registry", None, raising=False)
+    monkeypatch.setenv("FIN_API_KEY", "resolved")
+    opts = tools_mod._build_specialist_options(_spec_cfg("finance"))
+    assert len(opts.plugins) == 1
+    assert opts.env == {}
+
+
+def test_resident_options_load_and_pin_the_declared_vars(tmp_path, monkeypatch):
+    """The RESIDENT arm of #429. It is the arm that mattered most: a resident
+    executes in a long-lived Agent, and _setup_execution_ready holds the
+    episode until that agent's published binding carries the plugin — which a
+    withheld plugin never enters, so the deadlock could not be broken by any
+    reload."""
+    store = tmp_path / "store"
+    e = entry("bank-feed", ["resident:assistant"])
+    art = mk_artifact(store, "bank-feed", e["artifact_id"],
+                      mcp_servers=_BANKFEED_MCP,
+                      extra_manifest=_BANKFEED_CASA)
+    reload_snapshot(registry_path=mk_registry(tmp_path, [e]), store_root=store)
+    for var in ("CASA_PLUGIN_BANKFEED_PRIVATE_KEY", "CASA_PLUGIN_BANKFEED_CP_TOKEN"):
+        monkeypatch.delenv(var, raising=False)
+    monkeypatch.setenv("OP_SERVICE_ACCOUNT_TOKEN", "ops_tok")
+    a = _make_agent(tmp_path, role="assistant")
+
+    async def run():
+        opts = await a._build_options(
+            channel="telegram", channel_key="k", is_fresh=True,
+            resume_sid=None, user_text="hi")
+        assert opts.plugins == [{"type": "local", "path": str(art)}]
+        assert opts.env == {"CASA_PLUGIN_BANKFEED_PRIVATE_KEY": "",
+                            "CASA_PLUGIN_BANKFEED_CP_TOKEN": ""}
+        # In the published binding, so _setup_execution_ready can pass.
+        assert a.active_plugin_binding == {"bank-feed": e["artifact_id"]}
+
+    asyncio.run(run())
+
+
+def test_executor_resume_pins_declared_vars_from_recorded_paths(
+        tmp_path, monkeypatch):
+    """The resume path attaches recorded artifacts by PATH and builds no
+    resolution, so there is nothing to read the declarations off — without a
+    manifest read there, a resumed executor would get the literal ${VAR} the
+    fresh build carefully avoids."""
+    import tools as tools_mod
+    from unittest.mock import MagicMock
+    art_dir = tmp_path / "store" / "bank-feed" / ("a" * 64)
+    (art_dir / ".claude-plugin").mkdir(parents=True)
+    (art_dir / ".claude-plugin" / "plugin.json").write_text(
+        json.dumps({"name": "bank-feed", "version": "1.0.0",
+                    **_BANKFEED_CASA}), encoding="utf-8")
+    (art_dir / ".mcp.json").write_text(
+        json.dumps({"mcpServers": _BANKFEED_MCP}), encoding="utf-8")
+    for var in ("CASA_PLUGIN_BANKFEED_PRIVATE_KEY", "CASA_PLUGIN_BANKFEED_CP_TOKEN"):
+        monkeypatch.delenv(var, raising=False)
+    monkeypatch.setattr(tools_mod, "_mcp_registry", None, raising=False)
+    exec_reg = MagicMock()
+    exec_reg.get = MagicMock(return_value=_exec_defn())
+    tools_mod.init_tools(
+        channel_manager=MagicMock(), bus=MagicMock(),
+        specialist_registry=MagicMock(), mcp_registry=None,
+        trigger_registry=MagicMock(), engagement_registry=MagicMock(),
+        executor_registry=exec_reg,
+    )
+    eng = SimpleNamespace(
+        kind="executor", role_or_type="rec",
+        plugin_artifacts=[{"name": "bank-feed", "artifact_id": "a" * 64,
+                           "path": str(art_dir)}])
+    opts = tools_mod.build_engagement_resume_options(eng, "sess-1")
+    assert opts.env == {"CASA_PLUGIN_BANKFEED_PRIVATE_KEY": "",
+                        "CASA_PLUGIN_BANKFEED_CP_TOKEN": ""}

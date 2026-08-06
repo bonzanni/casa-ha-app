@@ -124,11 +124,12 @@
     - tests/test_plugin_registry.py
     - tests/test_plugin_store_publish.py
     - tests/test_plugin_grants.py
+    - tests/test_plugin_store_setup_env.py
     - tests/test_authz_grants.py
     - tests/test_authz_hook.py
     - tests/test_plugin_boot.py
   related: [architecture/overview.md, architecture/agent-taxonomy.md, architecture/callbacks.md]
-  defines_invariants: [INV-PLUG-001, INV-PLUG-002, INV-PLUG-003, INV-PLUG-004, INV-PLUG-005, INV-PLUG-006, INV-PLUG-007, INV-PLUG-008]
+  defines_invariants: [INV-PLUG-001, INV-PLUG-002, INV-PLUG-003, INV-PLUG-004, INV-PLUG-005, INV-PLUG-006, INV-PLUG-007, INV-PLUG-008, INV-PLUG-009]
   invariant_tests:
     INV-PLUG-001: [tests/test_plugin_registry.py::test_artifact_id_mismatch_is_per_entry_skip]
     INV-PLUG-002: [tests/test_pin_plugin_invariants.py::test_pin_inv_plug_002_checksum_drift_and_symlinked_locations]
@@ -138,6 +139,7 @@
     INV-PLUG-006: [tests/test_agent_plugin_binding.py::test_executor_options_have_plugins_but_no_grants_no_callback]
     INV-PLUG-007: [tests/test_authz_hook.py::test_non_operator_sender_is_denied_with_no_challenge, tests/test_authz_hook.py::test_non_operator_with_live_grant_consumes_nothing, tests/test_authz_hook.py::test_accept_all_mode_denies_protected_tools_for_everyone]
     INV-PLUG-008: [tests/test_agent_plugin_binding.py::test_env_unresolved_plugin_withheld_from_options, tests/test_plugin_setup_episodes.py::test_secrets_gate_holds_dispatch_until_ready]
+    INV-PLUG-009: [tests/test_agent_plugin_binding.py::test_specialist_options_load_the_setup_provisioning_plugin, tests/test_agent_plugin_binding.py::test_specialist_options_pin_declared_vars_to_empty_strings, tests/test_agent_plugin_binding.py::test_resident_options_load_and_pin_the_declared_vars, tests/test_plugin_grants.py::test_setup_secrets_ready_admits_the_deadlocked_plugin, tests/test_engagement_plugin_artifacts.py::test_run_script_pins_declared_vars_as_empty_exports, tests/test_engagement_plugin_artifacts.py::test_boot_reconciliation_render_gets_the_same_overlay]
 
 - doc: architecture/specialist-lifecycle.md
   summary: Specialist install/upgrade/rollback — instance tuples, the store, consent receipts, materialization, the crash journal.

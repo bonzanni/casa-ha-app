@@ -30,6 +30,7 @@ from settle_gate import confirmed_settle_edit
 
 logger = logging.getLogger(__name__)
 
+
 # v0.79.0 (§3 Primitive B) — durable inbound envelope spool.
 # Priority lanes: ordinary FIFO (cap 10) + redirect FIFO (cap 3), total 13.
 _ORDINARY_LANE_CAP = 10
@@ -1092,6 +1093,9 @@ class ClaudeCodeDriver(DriverProtocol):
                 # setup-configs.sh → /run/s6/container_environment/GITHUB_TOKEN, and
                 # s6-overlay merges it into every supervised service's env. Engagement
                 # subprocesses inherit it without per-engagement plumbing.
+                # #429: the declared-but-unresolved empty-string overlay is
+                # derived inside render_run_script from plugin_dirs — one
+                # owner, so this path and boot reconciliation cannot diverge.
                 extra_env: dict[str, str] = {}
                 run_script = render_run_script(
                     engagement_id=engagement.id,
