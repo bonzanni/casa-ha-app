@@ -42,14 +42,13 @@ async def test_delegation_context_block_includes_caller_and_register(monkeypatch
                 yield None
             return
 
-    reg = AgentRegistry.build(
-        residents={
-            "assistant": _make_cfg("assistant", "Ellen"),
-            "butler": _make_cfg("butler", "Tina"),
-        },
-        specialists={},
-    )
+    residents = {
+        "assistant": _make_cfg("assistant", "Ellen"),
+        "butler": _make_cfg("butler", "Tina"),
+    }
+    reg = AgentRegistry.build(residents=residents, specialists={})
     monkeypatch.setattr(tools, "_agent_registry", reg, raising=False)
+    monkeypatch.setattr(tools, "_agent_role_map", dict(residents), raising=False)
     monkeypatch.setattr(tools, "ClaudeSDKClient", _FakeClient)
 
     target_cfg = _make_cfg("butler", "Tina")
@@ -73,6 +72,60 @@ async def test_delegation_context_block_includes_caller_and_register(monkeypatch
     assert "originating_channel: telegram" in prompt
     assert "suggested_register: text" in prompt
     assert "Task: turn off the lights" in prompt
+
+
+async def test_caller_name_follows_a_rename_without_a_full_restart(monkeypatch):
+    """#436: `tools._agent_registry` is a BOOT snapshot — `sync_agent_role_map`
+    refreshes the role map beside it and never touches it — so a caller
+    renamed by a per-role reload kept introducing itself to every specialist
+    under its old name until the add-on restarted. The name must come from the
+    live map, which is also what the delegation ACL resolves against."""
+    captured_prompts: list[str] = []
+
+    async def _fake_query(self, prompt):
+        captured_prompts.append(prompt)
+
+    class _FakeClient:
+        def __init__(self, options): pass
+        async def __aenter__(self): return self
+        async def __aexit__(self, *exc): pass
+        query = _fake_query
+        async def receive_response(self):
+            if False:
+                yield None
+            return
+
+    # The boot registry still says "Ellen"; the live map says "Elle".
+    stale = AgentRegistry.build(
+        residents={"assistant": _make_cfg("assistant", "Ellen")},
+        specialists={},
+    )
+    monkeypatch.setattr(tools, "_agent_registry", stale, raising=False)
+    monkeypatch.setattr(
+        tools, "_agent_role_map",
+        {"assistant": _make_cfg("assistant", "Elle"),
+         "butler": _make_cfg("butler", "Tina")},
+        raising=False,
+    )
+    monkeypatch.setattr(tools, "ClaudeSDKClient", _FakeClient)
+
+    token = agent_mod.origin_var.set({
+        "role": "assistant", "channel": "telegram", "chat_id": "1",
+        "user_id": 1, "cid": "abc", "user_text": "x",
+        "delegation_depth": 0,
+    })
+    try:
+        await tools._run_delegated_agent(
+            _make_cfg("butler", "Tina"), "turn off the lights", "ctx",
+        )
+    finally:
+        agent_mod.origin_var.reset(token)
+
+    prompt = captured_prompts[0]
+    assert "caller_name: Elle" in prompt
+    assert "Ellen" not in prompt
+    # The body's attribution line is built from the same value.
+    assert "Context from Elle:" in prompt
 
 
 async def test_delegation_context_voice_channel_yields_voice_register(monkeypatch):

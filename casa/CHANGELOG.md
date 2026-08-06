@@ -1,5 +1,24 @@
 # Changelog
 
+## [0.157.0] - 2026-08-06
+
+### Fixed
+
+- **Renaming an agent no longer takes a restart to take effect everywhere.**
+  After renaming a persona and reloading just that agent, the other agents
+  went on displaying the old name while delegation had already switched to
+  the new one — so asking for the name Casa was still showing came back as
+  "not connected". Every agent now reads names from the same live source
+  delegation does, so what Casa displays and what Casa accepts stay in step
+  without restarting the app. A specialist is also introduced to the caller
+  under the caller's current name rather than its name at boot.
+
+### Changed
+
+- An agent that becomes reachable (or stops being reachable) while another
+  agent is mid-conversation is now offered — or withdrawn — on that agent's
+  next turn, instead of on its next restart.
+
 ## [0.156.0] - 2026-08-06
 
 ### Fixed

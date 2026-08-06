@@ -133,7 +133,15 @@ through ephemeral delegation cannot delegate again", not "agent-created work can
 **INV-ENG-006**: Accepting a delegate's display name never widens the delegation ACL.
 
 The delegation tool accepts either a delegate's role id or its persona display name, because
-Casa advertises both to the model. Resolution is scoped: the candidate set is built from the
+Casa advertises both to the model. The block renders each entry as `role (Display Name)`,
+collapsing to the bare role when an agent has no persona name distinct from it — the role
+first, because that is the value the tool is actually keyed on, and rendering the persona
+first is what taught the model to address delegates by a name the ACL then refused.
+The display name stays visible because the model still has to map "ask Tina to…" onto a
+role; it is the parenthetical rather than the lead. This is also the form the
+specialist-side renderer has always used, which emits role ids alone.
+
+Resolution is scoped: the candidate set is built from the
 *caller's own* declared delegates, so every value it can produce is already inside the ACL.
 An exact role id is matched first, so a delegate whose display name happens to be another
 delegate's role id cannot shadow it. A name matching two declared delegates is refused with
@@ -153,6 +161,44 @@ own `name_to_role` is a global, first-binding-wins map and is deliberately **not
 ACL consults — a collision there would silently pick a winner, which is not a resolution an
 authorization boundary may perform. Nothing prevents two agents elsewhere in a deployment
 from sharing a display name; it only stops mattering at this gate.
+
+**INV-ENG-007**: Every `<delegates>` block Casa builds names delegates as the ACL then resolves them.
+
+The two used to come from objects with different lifetimes. `AgentRegistry` is immutable
+and a live agent keeps the instance it was constructed with — deliberately, so that
+rebinding the runtime's registry cannot reach a running agent — while the delegation role
+map is rebuilt on every reload path. Reloading a single role therefore refreshed what
+resolution accepted and left every *other* agent rendering its boot-time snapshot: rename a
+persona and the assistant went on offering a name the ACL had stopped recognising.
+
+Prompt building now reads the live role map at the point of use, so the block, the caller
+identity a specialist is handed, and the ACL's alias resolution are one source. Membership
+follows it too: a delegate the map has dropped is not advertised, and one added since the
+caller was built is. The construction-time registry survives only as the fallback for a
+process where the tools module was never initialized — which is why the live directory
+reports that state as *absent* rather than as an empty directory, so "nobody is
+dispatchable" can never be mistaken for "nothing is wired yet".
+
+Reading it at build time is only half of it, and the half that is easy to mistake for the
+whole. Options are assembled on a **cold** pool connect; a warm client is reused without
+rebuilding them, and a per-role reload closes only the reloaded role's own pool. So the
+reload paths additionally drop the warm clients of the agents whose block would now render
+differently, which is what carries a rename into a conversation already in progress. That
+drop is scoped by an actual diff of the directory, because a cold reconnect costs seconds
+and a fresh prompt-cache prefix and most reloads change nothing anyone else advertises; and
+it is *scheduled*, never awaited, because a reload runs inside a caller's own turn and the
+invalidation waits on that turn's lock. Every reload scope that commits an agent config
+does this, including the policy cascade — which swaps every role without any per-role
+reload being requested, and which a config-sync run reaches *after* its own agents sweep.
+
+What it does not cover, and the boundary is the word *builds*. A block is a snapshot of the
+map at the moment it was assembled, and the model calls the tool later. A reload landing in
+between leaves that one turn holding a prompt older than the ACL — the alias degrades to
+the ordinary undeclared refusal, which enumerates the current delegates, and the following
+turn is consistent again. Two further gaps are older than this rule and untouched by it:
+concurrent per-role reloads can publish a briefly partial role map, because the specialist
+registry is cleared and refilled in place off-loop while another reload snapshots it; and
+*tier* lookups still read a boot-time registry global that no reload refreshes.
 
 **INV-ENG-005**: Once the output sequencer is terminalized, ordinary narration and unresolved sends cannot post below the completion.
 
@@ -187,14 +233,10 @@ delegate that is disabled or removed is excluded rather than offered as a retry 
 fail as unknown at the next gate. Naming them discloses nothing the caller does not
 already hold: these are its own declarations.
 
-It is *not* guaranteed to match what that caller's rendered `<delegates>` block says.
-`AgentRegistry` is immutable and a live agent keeps the instance it was constructed with,
-so a per-role reload that renames a persona without reconstructing the caller leaves the
-caller rendering the old display name while resolution uses the new one. Role ids do not
-change under a rename, so the addressing the prompt teaches still works; it is the alias
-fallback that goes stale, degrading to the ordinary undeclared refusal for that one name.
-The enumeration is what tells apart "this delegate is not wired to me" from "wired, but
-addressed by the wrong key". The refusal is logged with the
+Its role/name pairs match that caller's rendered `<delegates>` block, because both are
+built from the same live role map (INV-ENG-007) rather than from a per-agent snapshot that
+a per-role reload could leave behind. The enumeration is what tells apart "this delegate is
+not wired to me" from "wired, but addressed by the wrong key". The refusal is logged with the
 caller role and the target collapsed to `<other>` when unregistered; it moves **no
 per-role telemetry counter**, because the target is caller-supplied and the check runs
 before authorization.

@@ -596,6 +596,108 @@ def _schedule_agent_close(old_agent, *, runtime=None, role=None) -> None:
     task.add_done_callback(_done)
 
 
+_PROMPT_REFRESH_TASKS: set[asyncio.Task] = set()
+
+
+def _delegate_directory() -> dict[str, str] | None:
+    """The live role → display name view, or ``None`` if it cannot be READ.
+
+    An empty map is ``{}`` and a genuine diff input; an exception is ``None``
+    and is not. Collapsing the two would let one failed read diff as "every
+    role changed" and stampede a cold reconnect across every live agent —
+    strictly worse than the stale block the refresh exists to avoid.
+    """
+    try:
+        from tools import agent_display_names
+        return agent_display_names() or {}
+    except Exception:  # noqa: BLE001 — a diff input, never worth failing on
+        logger.warning("delegate directory read failed", exc_info=True)
+        return None
+
+
+def _schedule_prompt_refresh(agent: Any, role: str) -> bool:
+    """Background-drop ``agent``'s warm SDK clients so its next turn rebuilds
+    its system prompt (#436). True when a refresh was actually scheduled.
+
+    BACKGROUND is load-bearing, for the same reason as
+    :func:`_schedule_agent_close`: ``casa_reload`` runs as a casa-framework
+    tool INSIDE a warm client's turn, and ``SdkClientPool.invalidate_all``
+    awaits each entry's turn lock. Awaiting it here would deadlock the
+    reloading agent against its own in-flight turn. Scheduled, the
+    invalidation completes the moment that turn ends, and the next turn cold-
+    connects — resuming the same session, rendering a current ``<delegates>``
+    block.
+
+    Tolerates the non-Agent stand-ins used throughout the reload test suite:
+    an object with no ``invalidate_tool_surface`` is skipped.
+    """
+    invalidate = getattr(agent, "invalidate_tool_surface", None)
+    if invalidate is None:
+        return False
+    try:
+        coro = invalidate()
+    except Exception:  # noqa: BLE001 — best-effort refresh, never block reload
+        logger.warning(
+            "prompt refresh raised while scheduling for role=%s", role,
+            exc_info=True,
+        )
+        return False
+    task = asyncio.create_task(coro, name=f"delegates-prompt-refresh:{role}")
+    _PROMPT_REFRESH_TASKS.add(task)
+    task.add_done_callback(_PROMPT_REFRESH_TASKS.discard)
+    return True
+
+
+def _refresh_role_map(runtime: Any, *, context: str) -> list[str]:
+    """P-6: refresh tools' delegation role map, then (#436) drop the warm SDK
+    clients of every live agent whose ``<delegates>`` block would now render
+    differently.
+
+    The map alone is not enough. ``Agent._build_options`` runs only on a COLD
+    pool connect; a warm client is reused without rebuilding its options, and
+    a per-role reload closes only the RELOADED role's pool. Without this, an
+    agent already mid-conversation would keep sending the pre-reload prompt —
+    advertising a display name the refreshed ACL no longer accepts.
+
+    Scoped by an actual diff of the directory, not by "a reload happened":
+    per-role reloads are routine (a prompt tweak, a tools grant) and none of
+    those change what anyone else advertises. A cold reconnect costs seconds
+    and a fresh prompt-cache prefix, so only the agents that declare a role
+    whose name or presence CHANGED pay it.
+    """
+    before = _delegate_directory()
+    actions: list[str] = []
+    try:
+        from tools import sync_agent_role_map
+        sync_agent_role_map(runtime)
+        actions.append("refresh_role_map")
+    except Exception as exc:  # noqa: BLE001 — log but don't fail the caller
+        logger.warning("role-map refresh failed (%s): %s", context, exc)
+        return actions
+
+    after = _delegate_directory()
+    if before is None or after is None:
+        return actions
+    changed = {
+        r for r in set(before) | set(after) if before.get(r) != after.get(r)
+    }
+    if not changed:
+        return actions
+
+    refreshed = 0
+    for role, agent in list(getattr(runtime, "agents", {}).items()):
+        declared = {
+            d.agent
+            for d in (getattr(getattr(agent, "config", None), "delegates", None)
+                      or [])
+        }
+        if declared & changed and _schedule_prompt_refresh(agent, role):
+            refreshed += 1
+    if refreshed:
+        actions.append(f"refresh_delegates_prompt_{refreshed}_roles")
+    return actions
+
+
 def _construct_agent(*, cfg, runtime, agent_registry=None):
     """Factory wrapper so tests can monkeypatch construction.
 
@@ -836,13 +938,7 @@ async def reload_agent(runtime: Any, *, role: str | None = None) -> list[str]:
             specialists=runtime.specialist_registry.all_configs(),
         )
         actions += ["teardown_disabled_specialist", "rebuild_agent_registry"]
-        try:
-            from tools import sync_agent_role_map
-            sync_agent_role_map(runtime)
-            actions.append("refresh_role_map")
-        except Exception as exc:  # noqa: BLE001 — log but don't fail
-            logger.warning("role-map refresh failed for role=%s: %s",
-                           role, exc)
+        actions += _refresh_role_map(runtime, context=f"role={role}")
         return actions
 
     # #327(c): build the construction registry as an OVERLAY — the live
@@ -918,12 +1014,8 @@ async def reload_agent(runtime: Any, *, role: str | None = None) -> list[str]:
     # P-6: refresh tools' delegation role map. It is a boot-time snapshot;
     # without this, delegate_to_agent keeps resolving the PRE-reload
     # AgentConfig (stale tools.allowed etc.) for every fresh delegation.
-    try:
-        from tools import sync_agent_role_map
-        sync_agent_role_map(runtime)
-        actions.append("refresh_role_map")
-    except Exception as exc:  # noqa: BLE001 — log but don't fail the swap
-        logger.warning("role-map refresh failed for role=%s: %s", role, exc)
+    # #436: and refresh the prompts of whoever advertises this role.
+    actions += _refresh_role_map(runtime, context=f"role={role}")
 
     # Re-register triggers for that role only.
     try:
@@ -1070,6 +1162,15 @@ async def reload_policies(runtime: Any, *, role: str | None = None) -> list[str]
         except Exception as exc:  # noqa: BLE001 — one role's failure shouldn't kill the rest
             logger.warning("policies cascade: role=%s failed: %s", r, exc)
     actions.append(f"cascaded_to_{len(role_list)}_roles")
+
+    # #436: the cascade commits a fresh AgentConfig for every role it swaps
+    # (`runtime.role_configs[role] = new_cfg`), so a display name can change
+    # here with no `agent`/`agents` reload in sight. This scope never
+    # refreshed the delegation role map, which left the ACL and every
+    # rendered block on the pre-cascade names indefinitely. `config_sync`
+    # inherits the same hole: it cascades `agents` FIRST and `policies`
+    # second, so the sweep's own refresh runs before these swaps land.
+    actions += _refresh_role_map(runtime, context="policies cascade")
 
     return actions
 
@@ -1412,12 +1513,7 @@ async def reload_agents(runtime: Any, *, role: str | None = None) -> list[str]:
 
     # P-6: refresh tools' delegation role map (adds + evictions included) —
     # same rationale as the reload_agent hook.
-    try:
-        from tools import sync_agent_role_map
-        sync_agent_role_map(runtime)
-        actions.append("refresh_role_map")
-    except Exception as exc:  # noqa: BLE001 — log but don't fail the sweep
-        logger.warning("role-map refresh failed in agents sweep: %s", exc)
+    actions += _refresh_role_map(runtime, context="agents sweep")
 
     return actions
 
