@@ -13,13 +13,19 @@ import logging
 import pytest
 
 from plugin_grants import (
+    blocking_unresolved_env_vars_for_resolved,
+    declared_absent_env_vars_for_resolved,
+    env_remediation_hint,
     grants_for_resolved,
     grants_for_resolution,
     make_fail_closed_can_use_tool,
     protected_map,
     required_env_vars_for_resolved,
     sanitize_segment,
+    sanitized_env_for_resolution,
+    setup_secrets_ready,
     unresolved_env_vars_for_resolved,
+    withhold_env_unresolved,
 )
 from plugin_registry import ResolutionResult, ResolvedPlugin
 
@@ -350,3 +356,178 @@ def test_protected_map_no_servers_contributes_nothing(tmp_path):
 
 def test_protected_map_empty_resolution():
     assert protected_map(ResolutionResult(registry_valid=True)) == {}
+
+
+# ---------------------------------------------------------------------------
+# #429: casa.setupProvides / casa.optionalEnv — breaking the setup deadlock
+# ---------------------------------------------------------------------------
+
+_BANKFEED_SERVERS = {"bank-feed": {"command": "node", "env": {
+    "KEY": "${CASA_PLUGIN_BANKFEED_PRIVATE_KEY}",
+    "APP": "${CASA_PLUGIN_BANKFEED_APP_ID}",
+    "CP": "${CASA_PLUGIN_BANKFEED_CP_TOKEN}",
+    "OP": "${OP_SERVICE_ACCOUNT_TOKEN}",
+}}}
+
+_BANKFEED_MANIFEST = {"casa": {
+    "setupTool": "setup_bank_feed",
+    "setupProvides": ["CASA_PLUGIN_BANKFEED_PRIVATE_KEY",
+                      "CASA_PLUGIN_BANKFEED_APP_ID"],
+    "optionalEnv": ["CASA_PLUGIN_BANKFEED_CP_TOKEN"],
+}}
+
+
+def _bankfeed(tmp_path, manifest=None):
+    return _artifact(tmp_path, "bank-feed", _BANKFEED_SERVERS,
+                     manifest=_BANKFEED_MANIFEST if manifest is None
+                     else manifest)
+
+
+def test_declared_absent_unions_both_fields(tmp_path):
+    assert declared_absent_env_vars_for_resolved(_bankfeed(tmp_path)) == {
+        "CASA_PLUGIN_BANKFEED_PRIVATE_KEY", "CASA_PLUGIN_BANKFEED_APP_ID",
+        "CASA_PLUGIN_BANKFEED_CP_TOKEN"}
+
+
+def test_declared_absent_undeclared_plugin_is_empty(tmp_path):
+    rp = _artifact(tmp_path, "plain", {"srv": {"env": {"K": "${K_KEY}"}}})
+    assert declared_absent_env_vars_for_resolved(rp) == set()
+
+
+def test_declared_absent_fails_closed_on_malformed_declaration(
+        tmp_path, caplog):
+    """A declaration that does not parse must contribute NOTHING: it RELAXES
+    the withholding gate, so reading it loosely would exempt a var the author
+    never wrote. The plugin keeps the strict pre-#429 behaviour."""
+    rp = _bankfeed(tmp_path, manifest={"casa": {
+        "setupTool": "setup_bank_feed", "setupProvides": "not-a-list"}})
+    with caplog.at_level(logging.WARNING, logger="plugin_grants"):
+        assert declared_absent_env_vars_for_resolved(rp) == set()
+    assert any("bank-feed" in r.message for r in caplog.records)
+
+
+def test_declared_absent_ignores_setup_provides_without_setup_tool(tmp_path):
+    """setupProvides without a setupTool is refused by plugin_store (it would
+    be an undeclared 'optional' marker), so it exempts nothing here either."""
+    rp = _bankfeed(tmp_path, manifest={"casa": {
+        "setupProvides": ["CASA_PLUGIN_BANKFEED_PRIVATE_KEY"]}})
+    assert declared_absent_env_vars_for_resolved(rp) == set()
+
+
+def test_blocking_unresolved_excludes_declared_but_keeps_the_rest(tmp_path):
+    """THE #429 BUG: four vars unresolved, three of them declared. Only the
+    genuinely-missing operator secret may block."""
+    rp = _bankfeed(tmp_path)
+    assert unresolved_env_vars_for_resolved(rp, {}) == [
+        "CASA_PLUGIN_BANKFEED_APP_ID", "CASA_PLUGIN_BANKFEED_CP_TOKEN",
+        "CASA_PLUGIN_BANKFEED_PRIVATE_KEY", "OP_SERVICE_ACCOUNT_TOKEN"]
+    assert blocking_unresolved_env_vars_for_resolved(rp, {}) == [
+        "OP_SERVICE_ACCOUNT_TOKEN"]
+
+
+def test_blocking_unresolved_empty_once_undeclared_var_is_wired(tmp_path):
+    rp = _bankfeed(tmp_path)
+    assert blocking_unresolved_env_vars_for_resolved(
+        rp, {"OP_SERVICE_ACCOUNT_TOKEN": "ops_tok"}) == []
+
+
+def test_withhold_admits_the_setup_provisioning_plugin(tmp_path):
+    """RED before #429: withhold_env_unresolved gated on the RAW unresolved
+    set, so bank-feed was withheld from every session build and its setup
+    tool could never run to create the credentials it was withheld for."""
+    rp = _bankfeed(tmp_path)
+    res = ResolutionResult(registry_valid=True, plugins=[rp])
+    kept, withheld = withhold_env_unresolved(res, context="test")
+    assert withheld == []
+    assert [p.name for p in kept.plugins] == ["bank-feed"]
+
+
+def test_withhold_still_blocks_an_undeclared_missing_secret(tmp_path):
+    rp = _artifact(tmp_path, "gmailish",
+                   {"srv": {"env": {"K": "${GMAIL_CLIENT_ID}"}}},
+                   manifest={"casa": {"setupTool": "setup_gmail"}})
+    res = ResolutionResult(registry_valid=True, plugins=[rp])
+    kept, withheld = withhold_env_unresolved(res, context="test")
+    assert [p.name for p in kept.plugins] == []
+    assert [(p.name, m) for p, m in withheld] == [
+        ("gmailish", ["GMAIL_CLIENT_ID"])]
+
+
+def test_sanitized_env_empties_every_declared_unresolved_var(tmp_path):
+    """The other half of the fix: an UNDEFINED ${VAR} reaches the MCP server
+    as the LITERAL placeholder (#423), so every var the gate now exempts must
+    be pinned to an empty string instead."""
+    res = ResolutionResult(registry_valid=True, plugins=[_bankfeed(tmp_path)])
+    assert sanitized_env_for_resolution(res, {}) == {
+        "CASA_PLUGIN_BANKFEED_PRIVATE_KEY": "",
+        "CASA_PLUGIN_BANKFEED_APP_ID": "",
+        "CASA_PLUGIN_BANKFEED_CP_TOKEN": "",
+    }
+
+
+def test_sanitized_env_never_overwrites_a_wired_value(tmp_path):
+    """Once setup has landed a credential the overlay must not empty it."""
+    res = ResolutionResult(registry_valid=True, plugins=[_bankfeed(tmp_path)])
+    env = {"CASA_PLUGIN_BANKFEED_PRIVATE_KEY": "-----BEGIN PRIVATE KEY-----",
+           "CASA_PLUGIN_BANKFEED_APP_ID": "app-123"}
+    assert sanitized_env_for_resolution(res, env) == {
+        "CASA_PLUGIN_BANKFEED_CP_TOKEN": ""}
+
+
+def test_sanitized_env_empties_an_unresolvable_op_reference(tmp_path):
+    """A var left holding a raw op:// ref is not a credential — handing the
+    literal to the server is the placeholder failure in another spelling."""
+    res = ResolutionResult(registry_valid=True, plugins=[_bankfeed(tmp_path)])
+    env = {"CASA_PLUGIN_BANKFEED_APP_ID": "op://Casa/bank-feed/app_id"}
+    assert sanitized_env_for_resolution(res, env)["CASA_PLUGIN_BANKFEED_APP_ID"] == ""
+
+
+def test_sanitized_env_omits_undeclared_vars(tmp_path):
+    """An undeclared missing secret withholds the plugin; it must never be
+    quietly emptied instead."""
+    res = ResolutionResult(registry_valid=True, plugins=[_bankfeed(tmp_path)])
+    assert "OP_SERVICE_ACCOUNT_TOKEN" not in sanitized_env_for_resolution(
+        res, {})
+
+
+def test_sanitized_env_empty_for_a_plugin_with_no_declarations(tmp_path):
+    rp = _artifact(tmp_path, "plain", {"srv": {"env": {"K": "${K_KEY}"}}})
+    res = ResolutionResult(registry_valid=True, plugins=[rp])
+    assert sanitized_env_for_resolution(res, {}) == {}
+
+
+def test_remediation_hint_names_the_app_option_not_plugin_env():
+    """OP_SERVICE_ACCOUNT_TOKEN comes from an app option exported by
+    svc-casa/run — telling the operator to set_plugin_env_reference it is
+    wrong advice (and an op:// entry would need the token to resolve)."""
+    hint = env_remediation_hint(["OP_SERVICE_ACCOUNT_TOKEN"])
+    assert "onepassword_service_account_token" in hint
+    assert "set_plugin_env_reference" not in hint
+
+
+def test_remediation_hint_splits_owned_and_plugin_wired():
+    hint = env_remediation_hint(["OP_SERVICE_ACCOUNT_TOKEN", "SOME_API_KEY"])
+    assert "onepassword_service_account_token" in hint
+    assert "set_plugin_env_reference" in hint
+    assert "SOME_API_KEY" in hint
+
+
+def test_setup_secrets_ready_admits_the_deadlocked_plugin(tmp_path):
+    """#429 END TO END at the gate: the settled episode must dispatch once
+    only setup-provisioned/optional vars remain unresolved — otherwise setup
+    cannot run until the credentials exist, and the credentials only exist
+    after setup runs. Nothing re-kicks it: the retries fire on plugin_env and
+    agent reloads, neither of which can supply a value only setup produces."""
+    res = ResolutionResult(registry_valid=True, plugins=[_bankfeed(tmp_path)])
+    assert setup_secrets_ready(
+        res, "bank-feed", {"OP_SERVICE_ACCOUNT_TOKEN": "ops_tok"}) is True
+
+
+def test_setup_secrets_ready_still_holds_on_an_undeclared_secret(tmp_path):
+    res = ResolutionResult(registry_valid=True, plugins=[_bankfeed(tmp_path)])
+    assert setup_secrets_ready(res, "bank-feed", {}) is False
+
+
+def test_setup_secrets_ready_false_for_an_unresolvable_plugin(tmp_path):
+    res = ResolutionResult(registry_valid=True, plugins=[])
+    assert setup_secrets_ready(res, "bank-feed", {}) is False

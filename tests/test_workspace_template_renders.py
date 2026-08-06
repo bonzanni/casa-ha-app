@@ -531,3 +531,25 @@ def test_run_script_lingering_writer_no_resurrection(
     ws = tmp_path / "ws"
     assert not (ws / ".stderr.1.log").exists()       # swept, not resurrected
     assert len(list(ws.glob(".stderr.*.log"))) <= 4  # bounded total
+
+
+def test_render_run_script_refuses_to_shadow_its_own_exports():
+    """#429 r2 (Terra): {EXTRA_EXPORT} is interpolated AFTER the template's
+    own exports, so an extra_env entry naming one silently overrides it for
+    the whole engagement. Refused at the collision point, independently of
+    the manifest validator upstream — this covers every caller."""
+    import pytest as _pytest
+    from drivers.workspace import WorkspaceConfigError, render_run_script
+    with _pytest.raises(WorkspaceConfigError) as exc:
+        render_run_script(
+            engagement_id="e" * 32, permission_mode="acceptEdits",
+            extra_dirs=[], extra_env={"MCP_TOOL_TIMEOUT": ""})
+    assert "MCP_TOOL_TIMEOUT" in str(exc.value)
+
+
+def test_render_run_script_still_accepts_an_ordinary_extra_env():
+    from drivers.workspace import render_run_script
+    out = render_run_script(
+        engagement_id="e" * 32, permission_mode="acceptEdits",
+        extra_dirs=[], extra_env={"CASA_BANKFEED_EB_CP_TOKEN": ""})
+    assert "export CASA_BANKFEED_EB_CP_TOKEN=''" in out

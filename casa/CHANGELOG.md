@@ -1,5 +1,40 @@
 # Changelog
 
+## [0.154.0] - 2026-08-06
+
+### Fixed
+
+- **A plugin whose setup tool creates its own credentials can now be
+  installed.** 0.153.0 held such a plugin back until every credential it
+  references was available — which it never could be, because the setup
+  tool that creates them could not run until the plugin loaded. The
+  install sat permanently at "needs attention", and any specialist that
+  requires the plugin was unavailable with it. A plugin now declares which
+  values its own setup provisions, and Casa loads it so setup can run
+  (#429).
+
+### Added
+
+- **Two new plugin manifest fields.** `casa.setupProvides` lists the
+  variables a plugin's setup tool creates; `casa.optionalEnv` lists ones
+  the plugin genuinely does not need. Neither holds the plugin back, and
+  neither is ever handed to the plugin as a placeholder — Casa passes an
+  unset value as empty. A plugin still reports **not ready** while a
+  `setupProvides` value is missing, so a setup run that never happened
+  stays visible; an `optionalEnv` value's absence is not a problem at all.
+  Anything undeclared blocks the plugin exactly as before. Declared names use
+  a reserved `CASA_PLUGIN_` prefix: declaring a name binds it for the whole
+  session, so the namespace is fenced (only declared names are — a plugin may
+  still reference any variable in its `.mcp.json`).
+
+### Changed
+
+- **A missing credential that comes from an app option now says so.**
+  When a plugin needs `OP_SERVICE_ACCOUNT_TOKEN`,
+  `ONEPASSWORD_DEFAULT_VAULT` or `CONTEXT7_API_KEY`, Casa's message names
+  the app option to set instead of pointing at the plugin credential
+  store, which cannot supply it.
+
 ## [0.153.0] - 2026-08-06
 
 ### Fixed

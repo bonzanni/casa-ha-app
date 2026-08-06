@@ -769,6 +769,45 @@ template in the manifest:
 "Alex (finance) wants to: Delete the invoice draft for 2025-05" — the exact
 arguments still always appear below, unabridged.
 
+### Plugins that set themselves up (v0.154.0)
+
+Casa refuses to start a plugin whose `.mcp.json` needs an environment
+variable it can't resolve — otherwise the plugin's server would start
+"successfully" against a placeholder instead of a real credential. That is
+the right default when the credential is something *you* supply.
+
+Some plugins are different: their setup tool exists to **create** the
+credential — forging a private key into your vault, registering an
+application and learning its id. Waiting for those would deadlock the
+plugin, since setup can't run until they exist and they don't exist until
+setup runs. A plugin author says so in the manifest:
+
+```json
+"casa": {
+  "setupTool": "setup_bank_feed",
+  "setupProvides": ["CASA_PLUGIN_BANKFEED_PRIVATE_KEY",
+                    "CASA_PLUGIN_BANKFEED_APP_ID"],
+  "optionalEnv": ["CASA_PLUGIN_BANKFEED_CP_TOKEN"]
+}
+```
+
+- **`setupProvides`** — the setup tool creates these. The plugin loads
+  without them (Casa passes them as empty, never as a literal
+  placeholder), but `verify_plugin_state` reports it **not ready** with
+  `setup_env_unprovisioned` until the values actually land, so a setup run
+  that never happened stays visible rather than passing silently.
+- **`optionalEnv`** — the plugin genuinely doesn't need these. Their
+  absence is not a problem and doesn't affect readiness.
+
+Anything *not* declared still blocks the plugin as before. Declared names
+must use the reserved `CASA_PLUGIN_` prefix — declaring a name binds it for
+the whole session, so the namespace is fenced. (Only *declared* names are:
+a plugin may reference any variable it likes in `.mcp.json`.)
+
+If a plugin reports a Casa-owned variable missing — `OP_SERVICE_ACCOUNT_TOKEN`,
+`ONEPASSWORD_DEFAULT_VAULT`, `CONTEXT7_API_KEY` — the fix is the matching
+**app option**, not `plugin-env.conf`; the message names the option.
+
 ### Plugin authorization callbacks
 
 Some plugins connect to an external service that hands back an authorization

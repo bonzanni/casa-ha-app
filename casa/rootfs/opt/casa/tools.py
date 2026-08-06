@@ -36,9 +36,11 @@ from system_requirements.manifest import (
 import plugin_registry
 import plugin_store
 from plugin_grants import (
+    CASA_OWNED_ENV_OPTIONS as _CASA_OWNED_ENV,
     declared_tools_for_resolution, grants_for_resolution, grants_for_resolved,
     make_fail_closed_can_use_tool, mcp_json_malformed,
-    required_env_vars_for_resolved,
+    required_env_vars_for_resolved, sanitized_env_for_paths,
+    sanitized_env_for_resolution,
 )
 from authz_grants import CHALLENGES, GRANTS, normalize_role
 from delegated_memory import delegated_recall, retain_delegated
@@ -1143,6 +1145,11 @@ def _build_specialist_options(
         setting_sources=["project"],
         skills=skills,
         plugins=sdk_plugins,
+        # #429: pin every still-unresolved casa.setupProvides/optionalEnv var
+        # to "" so a plugin the withhold gate now admits cannot reach its MCP
+        # server as a literal ${VAR} placeholder (#423). Derived from the
+        # SAME filtered resolution the plugins list came from.
+        env=sanitized_env_for_resolution(resolution),
         output_format=output_format,
         stderr=(_discard_structured_stderr if output_format is not None else None),
         # P-5b: no relay exists on this path — deny ungranted tools fast
@@ -1215,12 +1222,19 @@ def _build_executor_options(
 
     if plugin_paths is not None:
         sdk_plugins = [{"type": "local", "path": p} for p in plugin_paths]
+        # #429: the resume path attaches artifacts by PATH, with no
+        # ResolutionResult to read declarations off — build the minimal
+        # stand-in the sanitizer needs (path + manifest) so a resumed
+        # executor gets the same empty-string pinning a fresh build does,
+        # instead of the literal ${VAR} the CLI would otherwise expand.
+        sanitized_env = sanitized_env_for_paths(plugin_paths)
     else:
         if resolution is None:
             resolution = plugin_registry.resolve_for(
                 f"executor:{executor_type}")
         sdk_plugins = [{"type": "local", "path": rp.path}
                        for rp in resolution.plugins]
+        sanitized_env = sanitized_env_for_resolution(resolution)
 
     # Skills via skills="all" below; strip any config-supplied "Skill"
     # (deprecated) — (f) v0.69.9.
@@ -1273,6 +1287,7 @@ def _build_executor_options(
         setting_sources=["project"],
         skills="all",  # (f) v0.69.9
         plugins=sdk_plugins,
+        env=sanitized_env,
     )
 
 
@@ -10070,12 +10085,73 @@ def _tool_verify_plugin_state(
                 "status": "unresolved",
                 "reason": "configured but not resolved in the effective environment"})
         else:
-            secrets_status.append({"var": var, "source": "missing",
-                                   "status": "unresolved",
-                                   "reason": "not in plugin-env.conf"})
+            secrets_status.append({
+                "var": var, "source": "missing", "status": "unresolved",
+                "reason": ("supplied by the app option "
+                           f"{_CASA_OWNED_ENV[var]!r}, which is unset"
+                           if var in _CASA_OWNED_ENV
+                           else "not in plugin-env.conf")})
+
+    # #429: reclassify the two DECLARED classes. Neither withholds the plugin
+    # any more (that is what deadlocked a setup tool whose job is to create
+    # its own credentials), so neither may read as a plain unresolved secret
+    # here either — but they differ in READINESS, which is the whole reason
+    # they are two fields and not one "optional" marker:
+    #   setupProvides -> "unprovisioned": still NOT ready. The setup tool has
+    #     not landed the value yet, and a plugin sitting on empty credentials
+    #     forever must stay loud, not quietly pass as configured.
+    #   optionalEnv   -> "optional": ready. The plugin declared it does not
+    #     need the value, so its absence is not a defect at all.
+    # Declarations are read STRICTLY; a malformed one leaves every row as it
+    # was (the plugin is still withheld — plugin_grants fails closed too).
+    setup_provided: set = set()
+    optional_env: set = set()
+    if checksum_valid:
+        for _reader, _sink in (
+                (plugin_store.manifest_setup_provides, setup_provided),
+                (plugin_store.manifest_optional_env, optional_env)):
+            try:
+                _sink.update(_reader(manifest))
+            except plugin_store.StoreError as exc:
+                reasons.append(exc.reason_code)
+                secrets_status.append({
+                    "var": "", "source": "manifest", "status": "unresolved",
+                    "reason": f"declaration malformed: {exc}"})
+    unprovisioned: list[str] = []
+    for row in secrets_status:
+        if row["status"] != "unresolved":
+            continue
+        if row["var"] in setup_provided:
+            row["status"] = "unprovisioned"
+            row["reason"] = ("declared in casa.setupProvides — the plugin's "
+                             "setup tool has not provisioned it yet")
+            unprovisioned.append(row["var"])
+        elif row["var"] in optional_env:
+            row["status"] = "optional"
+            row["reason"] = "declared in casa.optionalEnv — not required"
+    # Sol r1: the rows above are built from `.mcp.json` ${VAR} references
+    # only, so a setupProvides name the plugin reads from the INHERITED
+    # environment instead of naming in its launch config would produce no
+    # row at all — and the plugin would grade ready with its declared
+    # credential absent, which is precisely the state this reason exists to
+    # make loud. Grade every declared name, referenced or not. (No such row
+    # for optionalEnv: an absent optional value is not a finding.)
+    for var in sorted(setup_provided - required):
+        effective = os.environ.get(var)
+        if effective and not effective.startswith("op://"):
+            continue
+        secrets_status.append({
+            "var": var, "source": "setup", "status": "unprovisioned",
+            "reason": ("declared in casa.setupProvides — the plugin's setup "
+                       "tool has not provisioned it yet")})
+        unprovisioned.append(var)
+    if unprovisioned:
+        reasons.append("setup_env_unprovisioned")
 
     tools_ready = all(t["status"] == "ready" for t in tools_status)
-    secrets_ready = all(s["status"] == "resolved" for s in secrets_status)
+    # "optional" counts as ready; "unprovisioned" deliberately does not.
+    secrets_ready = all(s["status"] in ("resolved", "optional")
+                        for s in secrets_status)
     configured_ready = (not reasons) and tools_ready and secrets_ready
 
     runtime = getattr(agent_mod, "active_runtime", None)

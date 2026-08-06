@@ -3782,13 +3782,19 @@ async def main() -> None:
         # reload runs with literal ${VAR} placeholders. An unresolvable
         # plugin reads not-ready (the dispatch-time registry gate owns
         # that path's messaging/retries).
+        #
+        # #429: the gate asks for the BLOCKING subset only. Waiting on a var
+        # the plugin's own setup tool is supposed to CREATE is a deadlock —
+        # setup cannot run until the credential exists, and the credential
+        # only exists after setup runs — and nothing re-kicks it, because
+        # the retries fire on plugin_env and agent reloads, neither of which
+        # can supply a value only setup produces. A declared
+        # casa.setupProvides/casa.optionalEnv var is therefore not held for;
+        # the session builder pins it to "" so the setup tool still never
+        # sees a literal ${VAR}.
         import plugin_registry as _pr
-        from plugin_grants import unresolved_env_vars_for_resolved as _unres
-        res = _pr.resolve_all()
-        rp = next((p for p in res.plugins if p.name == plugin), None)
-        if rp is None:
-            return False
-        return not _unres(rp)
+        from plugin_grants import setup_secrets_ready as _ready
+        return _ready(_pr.resolve_all(), plugin)
 
     def _setup_execution_ready(role: str, plugin: str,
                                artifact_id: str) -> bool:
