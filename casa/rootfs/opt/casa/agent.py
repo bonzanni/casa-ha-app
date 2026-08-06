@@ -1694,7 +1694,7 @@ class Agent:
             plugins=[{"type": "local", "path": rp.path}
                      for rp in resolution.plugins],
             # #429: the other half of the withhold relaxation. A plugin that
-            # declares casa.setupProvides/casa.optionalEnv is no longer
+            # declares casa.setupProvides is no longer
             # withheld for those vars, but the CLI expands an UNDEFINED
             # ${VAR} to the LITERAL string — so each still-unresolved
             # declared var is pinned to "" here, and the plugin's MCP server

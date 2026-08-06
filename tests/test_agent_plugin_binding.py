@@ -550,14 +550,13 @@ def test_tier_miss_resolve_logs_warning(tmp_path, caplog):
 
 _BANKFEED_MCP = {"bank-feed": {"env": {
     "KEY": "${CASA_PLUGIN_BANKFEED_PRIVATE_KEY}",
-    "CP": "${CASA_PLUGIN_BANKFEED_CP_TOKEN}",
+    "CP": "${CASA_PLUGIN_BANKFEED_CP_TOKEN:-}",
     "OP": "${OP_SERVICE_ACCOUNT_TOKEN}",
 }}}
 
 _BANKFEED_CASA = {"casa": {
     "setupTool": "setup_bank_feed",
     "setupProvides": ["CASA_PLUGIN_BANKFEED_PRIVATE_KEY"],
-    "optionalEnv": ["CASA_PLUGIN_BANKFEED_CP_TOKEN"],
 }}
 
 
@@ -599,8 +598,7 @@ def test_specialist_options_pin_declared_vars_to_empty_strings(
     import tools as tools_mod
     _bankfeed_registry(tmp_path, monkeypatch, ["specialist:finance"])
     opts = tools_mod._build_specialist_options(_spec_cfg("finance"))
-    assert opts.env == {"CASA_PLUGIN_BANKFEED_PRIVATE_KEY": "",
-                        "CASA_PLUGIN_BANKFEED_CP_TOKEN": ""}
+    assert opts.env == {"CASA_PLUGIN_BANKFEED_PRIVATE_KEY": ""}
     # Never an overlay for a var that is actually wired.
     assert "OP_SERVICE_ACCOUNT_TOKEN" not in opts.env
 
@@ -611,7 +609,7 @@ def test_specialist_options_stop_pinning_once_setup_has_run(
     _bankfeed_registry(tmp_path, monkeypatch, ["specialist:finance"])
     monkeypatch.setenv("CASA_PLUGIN_BANKFEED_PRIVATE_KEY", "-----BEGIN KEY-----")
     opts = tools_mod._build_specialist_options(_spec_cfg("finance"))
-    assert opts.env == {"CASA_PLUGIN_BANKFEED_CP_TOKEN": ""}
+    assert opts.env == {}
 
 
 def test_specialist_options_still_withhold_an_undeclared_missing_secret(
@@ -666,8 +664,7 @@ def test_resident_options_load_and_pin_the_declared_vars(tmp_path, monkeypatch):
             channel="telegram", channel_key="k", is_fresh=True,
             resume_sid=None, user_text="hi")
         assert opts.plugins == [{"type": "local", "path": str(art)}]
-        assert opts.env == {"CASA_PLUGIN_BANKFEED_PRIVATE_KEY": "",
-                            "CASA_PLUGIN_BANKFEED_CP_TOKEN": ""}
+        assert opts.env == {"CASA_PLUGIN_BANKFEED_PRIVATE_KEY": ""}
         # In the published binding, so _setup_execution_ready can pass.
         assert a.active_plugin_binding == {"bank-feed": e["artifact_id"]}
 
@@ -705,5 +702,4 @@ def test_executor_resume_pins_declared_vars_from_recorded_paths(
         plugin_artifacts=[{"name": "bank-feed", "artifact_id": "a" * 64,
                            "path": str(art_dir)}])
     opts = tools_mod.build_engagement_resume_options(eng, "sess-1")
-    assert opts.env == {"CASA_PLUGIN_BANKFEED_PRIVATE_KEY": "",
-                        "CASA_PLUGIN_BANKFEED_CP_TOKEN": ""}
+    assert opts.env == {"CASA_PLUGIN_BANKFEED_PRIVATE_KEY": ""}

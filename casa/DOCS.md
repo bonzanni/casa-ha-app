@@ -786,23 +786,26 @@ setup runs. A plugin author says so in the manifest:
 "casa": {
   "setupTool": "setup_bank_feed",
   "setupProvides": ["CASA_PLUGIN_BANKFEED_PRIVATE_KEY",
-                    "CASA_PLUGIN_BANKFEED_APP_ID"],
-  "optionalEnv": ["CASA_PLUGIN_BANKFEED_CP_TOKEN"]
+                    "CASA_PLUGIN_BANKFEED_APP_ID"]
 }
 ```
 
-- **`setupProvides`** — the setup tool creates these. The plugin loads
-  without them (Casa passes them as empty, never as a literal
-  placeholder), but `verify_plugin_state` reports it **not ready** with
-  `setup_env_unprovisioned` until the values actually land, so a setup run
-  that never happened stays visible rather than passing silently.
-- **`optionalEnv`** — the plugin genuinely doesn't need these. Their
-  absence is not a problem and doesn't affect readiness.
+The plugin then loads without them — Casa passes them as empty, never as a
+literal placeholder — so setup can run. `verify_plugin_state` still reports
+it **not ready** with `setup_env_unprovisioned` until the values actually
+land, so a setup run that never happened stays visible rather than passing
+silently. Declared names must use the reserved `CASA_PLUGIN_` prefix:
+declaring a name binds it for the whole session, so the namespace is fenced.
 
-Anything *not* declared still blocks the plugin as before. Declared names
-must use the reserved `CASA_PLUGIN_` prefix — declaring a name binds it for
-the whole session, so the namespace is fenced. (Only *declared* names are:
-a plugin may reference any variable it likes in `.mcp.json`.)
+**A merely optional variable needs no declaration.** Write
+`${MY_TOKEN:-}` in `.mcp.json` — Claude Code substitutes the default, so
+nothing is missing and no placeholder leaks, and Casa never withholds the
+plugin for it. A default can be a real value too
+(`${MY_MODE:-production}`). Use `setupProvides` only when you want the
+not-ready reporting, which a default cannot express.
+
+Anything *not* declared and *not* defaulted still blocks the plugin as
+before.
 
 If a plugin reports a Casa-owned variable missing — `OP_SERVICE_ACCOUNT_TOKEN`,
 `ONEPASSWORD_DEFAULT_VAULT`, `CONTEXT7_API_KEY` — the fix is the matching

@@ -3789,7 +3789,7 @@ async def main() -> None:
         # only exists after setup runs — and nothing re-kicks it, because
         # the retries fire on plugin_env and agent reloads, neither of which
         # can supply a value only setup produces. A declared
-        # casa.setupProvides/casa.optionalEnv var is therefore not held for;
+        # casa.setupProvides var is therefore not held for;
         # the session builder pins it to "" so the setup tool still never
         # sees a literal ${VAR}.
         import plugin_registry as _pr

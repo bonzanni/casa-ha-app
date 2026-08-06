@@ -1629,6 +1629,12 @@ def _scan_tree_for_anti_patterns(cwd: Path) -> list[str]:
 
 _PLUGIN_ROOT_VAR = "${CLAUDE_PLUGIN_ROOT}"
 
+# #431 r2: imported, never re-derived — see the docstring on the shared
+# helper for why the two containment sites must agree by construction.
+from plugin_store import (  # noqa: E402
+    normalize_cli_provided_refs as _normalize_cli_provided_refs,
+)
+
 
 def _git_lines(cwd: Path, *args: str) -> list[str] | None:
     """Run git in ``cwd``; stdout lines on success, None on any failure."""
@@ -1706,6 +1712,14 @@ def _scan_mcp_launch_refs(cwd: Path) -> list[str]:
                     + [v for v in (env.values() if isinstance(env, dict)
                                    else ()) if isinstance(v, str)])
             for ref in refs:
+                # #431 r2 (Terra): fold the defaulted spelling of a
+                # CLI-provided variable onto the bare one FIRST. The CLI
+                # always sets these, so `${CLAUDE_PLUGIN_ROOT:-.}/../outside`
+                # resolves outside the artifact at runtime while sliding past
+                # an exact-prefix test. ONE shared normalizer with
+                # plugin_store, which had the same gap.
+                if isinstance(ref, str):
+                    ref = _normalize_cli_provided_refs(ref)
                 if not isinstance(ref, str) or _PLUGIN_ROOT_VAR not in ref:
                     continue
                 cands = _candidates(ref)
