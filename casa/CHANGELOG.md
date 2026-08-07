@@ -1,5 +1,69 @@
 # Changelog
 
+## [0.161.0] - 2026-08-07
+
+### Changed
+
+- **A plugin's setup step now has exactly one owner: Casa.** Some plugins ship a
+  setup step that points an external service at your home — writing a freshly
+  issued key into the other side's configuration, for instance. Until now that
+  step could be run either by Casa itself, once you approved the plugin's
+  permission prompt, or by an assistant acting on a note the installer left
+  behind; which of the two happened was decided the moment the plugin was
+  installed. That decision could not always be made correctly, because it
+  depended on something that had not happened yet — whether you would approve
+  the prompt, deny it, or never answer it at all. Two attempts to get it right
+  produced the opposite mistakes: a setup step that ran before the key it needed
+  existed, and one that never ran at all.
+- Casa now waits instead of guessing. It records that a plugin is owed a setup
+  run, and clears that run only once the permission position for that exact
+  version of the plugin is actually known — at once when nothing needs
+  approving, when you approve everything it declares, and not at all if you
+  decline. A cleared run still waits until it can succeed: routes live, secrets
+  resolved, the running agent able to load the plugin. Anything Casa cannot yet
+  establish leaves the run pending and visible in the plugin health report
+  rather than resolved by a guess. In practice: setup no longer runs before the
+  credential it depends on exists, an updated setup step no longer gets skipped
+  because an unrelated permission was unchanged, and declining a prompt no
+  longer produces a message asking you to run something by hand that you have no
+  way to run.
+- The setup outcome now arrives as its own message once the run happens, rather
+  than being folded into the install or update report. It carries the setup step's own
+  words, which — as of 0.160.0 — is the only account of the connection Casa will
+  vouch for.
+
+- A permission Casa cannot currently ask you about — the plugin is unassigned,
+  or its target agent lacks the right channel — now leaves the setup run pending
+  instead of being treated as a permission that isn't needed.
+
+### Fixed
+
+- If Casa could not reach you to dispatch a setup run (no Telegram chat
+  configured yet), the run was abandoned rather than retried. It now waits and
+  runs once it can reach an agent, and stays listed in the plugin health report
+  until it does.
+- A plugin declaring the same tool as both its setup step and an
+  operator-confirmed tool is now refused at verification: Casa's own setup turn
+  cannot satisfy an operator confirmation, so the combination had no way to run
+  at all.
+- Declining a plugin's permission prompt used to produce a note calling it a
+  "trigger" even when what you declined was a callback, and telling you to run
+  the setup step manually — which was not possible, since a plugin's tools are
+  only available to the agents it is assigned to. The note now names what was
+  actually declined and tells you that approving it will run the step.
+- A plugin bundled with a specialist could be installed without Casa recording
+  that it was owed a setup run at all.
+- With no chat available to prompt you in, Casa recorded nothing about a
+  plugin's pending permission until some later restart or reload — long after it
+  had already committed to who would run setup.
+
+### Documentation
+
+- `architecture/plugins.md` reached its size ceiling and was split. Everything
+  about turning an installed plugin into a usable one — the environment its
+  servers need, the setup step, and the plugin environment and media channels —
+  now lives in `architecture/plugin-runtime.md`.
+
 ## [0.160.0] - 2026-08-07
 
 ### Fixed

@@ -205,7 +205,7 @@ async def test_failed_mutation_clears_prior_preactivation_marker(monkeypatch, tm
 
 
 async def test_resolved_observability_prefers_fresh_manifest(monkeypatch):
-    """#241: setup_via_consent must be computed from the freshly-published
+    """#241: the setup declaration must be read from the freshly-published
     manifest (the artifact just activated), NOT a resolve_all() snapshot that
     can momentarily still hold the OLD artifact (no setupTool) mid-update."""
     import types
@@ -228,13 +228,15 @@ async def test_resolved_observability_prefers_fresh_manifest(monkeypatch):
     monkeypatch.setattr(pstore, "manifest_triggers",
                         lambda m, pname: (m.get("casa") or {}).get("triggers", []))
 
-    # The bug: re-deriving from the stale resolved snapshot → false.
+    # The bug: re-deriving from the stale resolved snapshot → no declaration.
     assert tools_mod._resolved_observability(
-        "elevenlabs")["setup_via_consent"] is False
-    # The fix: the freshly-published manifest is authoritative → true.
+        "elevenlabs")["setup_tool"] is None
+    # The fix: the freshly-published manifest is authoritative.
     fresh = tools_mod._resolved_observability("elevenlabs", manifest=FRESH)
     assert fresh["setup_tool"] == "setup_elevenlabs_voicemail"
-    assert fresh["setup_via_consent"] is True
+    # #451: there is no setup_via_consent any more — nothing classifies a
+    # runner at mutation time, because there is only one runner.
+    assert "setup_via_consent" not in fresh
 
 
 async def test_plugin_update_result_omits_internal_manifest(monkeypatch, tmp_path):
@@ -247,7 +249,8 @@ async def test_plugin_update_result_omits_internal_manifest(monkeypatch, tmp_pat
     payload = json.loads(r["content"][0]["text"])
     assert payload["ok"] is True
     assert "_published_manifest" not in payload
-    assert "setup_via_consent" in payload   # observability fields still present
+    assert "setup_tool" in payload          # observability fields still present
+    assert "setup_via_consent" not in payload   # #451: no runner classification
 
 
 async def test_plugin_add_ref_not_found_pre_mutation(monkeypatch, tmp_path):

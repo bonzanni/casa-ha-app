@@ -8756,7 +8756,7 @@ def _plugin_add_sync(*, name: str, repo: str, ref: str, subdir: str = "",
             "artifact_id": result.artifact_id, "version": result.version,
             "revision": result.revision, "path": result.path,
             # #241: hand the JUST-published manifest to _resolved_observability
-            # so setup_via_consent is computed from the activated artifact, not
+            # so the setup declaration is read from the activated artifact, not
             # a possibly-stale resolve_all() snapshot. Popped before the result.
             "_published_manifest": result.manifest}
 
@@ -8814,7 +8814,7 @@ def _plugin_update_sync(*, name: str, new_ref: str,
             "artifact_id": result.artifact_id, "version": result.version,
             "revision": result.revision, "path": result.path,
             "old_artifact_id": old_artifact_id,
-            # #241: see _plugin_add_sync — compute setup_via_consent from THIS
+            # #241: see _plugin_add_sync — read the setup declaration from THIS
             # freshly-published manifest, not a possibly-stale resolve_all().
             "_published_manifest": result.manifest}
 
@@ -8860,41 +8860,37 @@ def _invalidate_lifecycle(*, artifact_id: "str | None" = None,
         CHALLENGES.cancel_matching(role=role)
 
 
-def _setup_fields(manifest: dict, plugin_name: str) -> dict:
-    """setup_tool + setup_via_consent from ONE manifest (setup + triggers)."""
+def _setup_fields(manifest: dict) -> dict:
+    """The declared ``casa.setupTool`` from ONE manifest, as observability.
+
+    #451 (v0.161.0): this used to also return ``setup_via_consent``, which the
+    configurator recipes branched on to decide whether to hand setup work back
+    to an agent. That decision is gone — CASA runs a declared setup tool, and
+    nothing else does — so there is no classification left to make here. The
+    tool NAME is still worth reporting: it says what Casa now owes."""
     import plugin_store as _pstore
     try:
         setup = _pstore.manifest_setup_tool(manifest)
     except Exception:  # noqa: BLE001 — verify already refused it
         setup = None
-    has_triggers = False
-    try:
-        has_triggers = bool(_pstore.manifest_triggers(manifest, plugin_name))
-    except Exception:  # noqa: BLE001
-        pass
-    return {"setup_tool": setup, "setup_via_consent": bool(setup and has_triggers)}
+    return {"setup_tool": setup}
 
 
 def _resolved_observability(name: str, *, manifest: dict | None = None) -> dict:
     """granted_tools + required_env_vars for the freshly-activated plugin (best
     effort — reads the just-reloaded snapshot; resolve_all finds it regardless
-    of target). v0.112.0: also surfaces ``setup_tool`` + ``setup_via_consent``
-    (manifest declares ``casa.setupTool`` AND ``casa.triggers``) so the
-    configurator recipes can MECHANICALLY skip the completion hand-back for
-    plugins whose setup Casa now owns via the post-consent episode.
+    of target), plus the declared ``setup_tool``.
 
-    #241: the setup fields come from ``manifest`` — the manifest of the artifact
+    #241: the setup field comes from ``manifest`` — the manifest of the artifact
     this mutation JUST published/activated — when provided, NOT from the resolved
     snapshot. During a plugin_update, ``resolve_all()`` can momentarily still
-    carry the OLD artifact (no ``setupTool``), so re-deriving from it returned
-    ``setup_via_consent: false`` and the recipe skipped the v0.112.0 dedup. The
-    freshly-published manifest is authoritative; fall back to the resolved
-    ``rp.manifest`` only when no manifest was handed in (legacy callers)."""
+    carry the OLD artifact. The freshly-published manifest is authoritative;
+    fall back to the resolved ``rp.manifest`` only when no manifest was handed
+    in (legacy callers)."""
     for rp in plugin_registry.resolve_all().plugins:
         if rp.name == name:
             setup = _setup_fields(
-                manifest if manifest is not None else rp.manifest,
-                plugin_registry.runtime_name(rp))
+                manifest if manifest is not None else rp.manifest)
             return {"granted_tools": grants_for_resolved(rp),
                     "required_env_vars": required_env_vars_for_resolved(rp),
                     **setup}
@@ -8902,9 +8898,8 @@ def _resolved_observability(name: str, *, manifest: dict | None = None) -> dict:
     # — still surface the just-published artifact's setup contract if we have it.
     if manifest is not None:
         return {"granted_tools": [], "required_env_vars": [],
-                **_setup_fields(manifest, name)}
-    return {"granted_tools": [], "required_env_vars": [],
-            "setup_tool": None, "setup_via_consent": False}
+                **_setup_fields(manifest)}
+    return {"granted_tools": [], "required_env_vars": [], "setup_tool": None}
 
 
 @tool(
@@ -10348,6 +10343,17 @@ def _tool_verify_plugin_state(
     # several servers make the declaration unexecutable/ambiguous: blocking.
     if _setup_decl and len(granted) != 1:
         reasons.append("setup_tool_ambiguous_server")
+    # #451 r4 (Sol): a setup tool that is ALSO declared protected can never run
+    # through the automatic runner. Casa dispatches its synthetic turn with the
+    # reserved provenance marker `synthetic="plugin_setup"`, which the
+    # provenance classifier maps to `other`, and the protected-tool hook denies
+    # an `other` origin outright as an unsupported origin — before any grant
+    # lookup or operator prompt. Bus acceptance has already marked the
+    # obligation dispatched by then, so nothing retries and nothing surfaces.
+    # Since v0.161.0 Casa is the ONLY runner, the combination has no invocation
+    # path at all: blocking, exactly like an executor-only target.
+    if _setup_decl and _setup_decl in set(protected_tools):
+        reasons.append("setup_tool_protected")
 
     # Tools (system-requirements — verify_bin presence). Sol #11: check BOTH the
     # INSTALLED manifest rows AND every requirement the ARTIFACT declares, so a

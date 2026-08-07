@@ -21,6 +21,7 @@ Code is the source of truth; these files are a map.
 - [architecture/persistent-state.md](architecture/persistent-state.md): What the application writes to disk, how it treats a missing or corrupt file, and what that means for recovery.
 - [architecture/personality.md](architecture/personality.md): What an agent is versus how it presents — role artifacts, personas, bindings, and which prompt is actually served.
 - [architecture/plugin-events.md](architecture/plugin-events.md): Plugin-emitted domain events — casa-minted generations, per-subscriber delivery receipts, and consent-gated headless wakes.
+- [architecture/plugin-runtime.md](architecture/plugin-runtime.md): What stands between a validly installed plugin and a usable one — environment resolution, the single-runner setup obligation, and the env/media side channels.
 - [architecture/plugins.md](architecture/plugins.md): How a plugin becomes usable — registry, content-addressed store, artifact identity, and per-call authorization.
 - [architecture/reminders.md](architecture/reminders.md): How an agent comes to nudge someone later — entry ownership, the narrow writer, delivery, and the sweep that redeems a past-dated one-shot the process was down for.
 - [architecture/specialist-lifecycle.md](architecture/specialist-lifecycle.md): Specialist install/upgrade/rollback — instance tuples, the store, consent receipts, materialization, the crash journal.

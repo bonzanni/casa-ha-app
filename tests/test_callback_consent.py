@@ -105,6 +105,16 @@ def _tap(broker, coord, key, idx, *, actor=100):
 # ---------------------------------------------------------------------------
 
 
+
+def _released(plugin="gmail"):
+    """#451: an obligation the worker may dispatch. The obligation row now
+    EXISTS from the moment the reconciler records that Casa owes this artifact
+    a setup run, so "setup is authorized" is `gate == "released"`, not merely
+    the row's presence."""
+    import plugin_setup_episodes as pse
+    return [e for e in pse.episodes()
+            if e.get("plugin") == plugin and e.get("gate") == "released"]
+
 def test_message_is_the_verbatim_consent_prose():
     assert cc.render_callback_consent_message(
         plugin="gmail", effective=EFFECTIVE) == (
@@ -385,7 +395,7 @@ async def test_one_union_round_settles_only_after_both_approvals(
         await asyncio.sleep(0.01)
         if pse.episodes():
             break
-    assert pse.episodes() == []
+    assert _released() == []            # obligation holds: callback still open
     assert dispatched == []
 
     # 3) the callback reconcile posts the callback keyboard onto that round
@@ -410,9 +420,9 @@ async def test_one_union_round_settles_only_after_both_approvals(
     _tap(broker, coord, cb_key, 0)
     for _ in range(100):
         await asyncio.sleep(0.01)
-        if pse.episodes():
+        if _released():
             break
-    assert [e["status"] for e in pse.episodes()] == ["pending"]
+    assert [e["status"] for e in _released()] == ["pending"]
     await pse._worker_pass()
     assert len(dispatched) == 1
     assert "setup_gmail" in dispatched[0][1]
@@ -464,11 +474,11 @@ async def test_union_membership_is_computed_off_the_event_loop(
 
     def _spy_callback_union(**kw):
         seen["trigger_side"] = threading.current_thread().name
-        return []
+        return True, [], set()
 
     def _spy_trigger_union(**kw):
         seen["callback_side"] = threading.current_thread().name
-        return []
+        return True, [], set()
 
     monkeypatch.setattr(cr, "callback_pending_for_union", _spy_callback_union)
     monkeypatch.setattr(tr, "trigger_pending_for_union", _spy_trigger_union)
@@ -503,7 +513,7 @@ async def test_union_membership_is_computed_off_the_event_loop(
     assert seen["callback_side"] != main
 
 
-def test_seal_setup_rounds_unions_both_kinds(monkeypatch, tmp_path):
+def test_seal_setup_state_unions_both_kinds(monkeypatch, tmp_path):
     import plugin_setup_episodes as pse
     monkeypatch.setattr(pse, "STORE_PATH", tmp_path / "episodes.json")
     trigger_pending = [{
@@ -514,22 +524,24 @@ def test_seal_setup_rounds_unions_both_kinds(monkeypatch, tmp_path):
         "plugin": "gmail", "artifact_id": "art-1", "declared": DECLARED,
         "effective": EFFECTIVE, "declaration_digest": DIGEST,
         "identity": IDENTITY}]
-    nonces = tr.seal_setup_rounds(trigger_pending=trigger_pending,
-                                  callback_pending=callback_pending)
+    nonces = tr.seal_setup_state(trigger_pending=trigger_pending,
+                                 callback_pending=callback_pending,
+                                 pending_complete=True, candidates=[])
     members = pse._load()["rounds"]["gmail"]["members"]
     assert len(members) == 2
     assert IDENTITY in members and IDENTITY in nonces
 
 
-def test_seal_setup_rounds_survives_a_ledger_failure(monkeypatch, tmp_path):
+def test_seal_setup_state_survives_a_ledger_failure(monkeypatch, tmp_path):
     import plugin_setup_episodes as pse
 
     def _boom(**kw):
         raise RuntimeError("ledger exploded")
 
     monkeypatch.setattr(pse, "open_round", _boom)
-    assert tr.seal_setup_rounds(
-        trigger_pending=[], callback_pending=[{
+    assert tr.seal_setup_state(
+        trigger_pending=[], pending_complete=True, candidates=[],
+        callback_pending=[{
             "plugin": "gmail", "artifact_id": "art-1", "declared": DECLARED,
             "effective": EFFECTIVE, "declaration_digest": DIGEST,
             "identity": IDENTITY}]) == {}
