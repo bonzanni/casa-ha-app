@@ -1,5 +1,5 @@
 ---
-last_reviewed: 2026-08-01
+last_reviewed: 2026-08-07
 ---
 
 # Plugins
@@ -256,9 +256,11 @@ failing clearly on an empty credential.
 
 Three runtime integration paths sit beside the install model and are easy to miss. **A
 plugin's declared setup tool is dispatched automatically — but only after its entire
-trigger-consent round approves, its trigger routes are live, its required environment
-resolves, and the executing agent can load it**: the dispatch is a durable, retrying,
-crash-recovered episode; a single denied trigger withholds it, so consent is not merely
+consent round approves, its trigger routes are live, its required environment
+resolves, and the executing agent can load it**: a round's membership is the union of the
+plugin's pending *trigger* and *callback* consents, so neither kind alone describes it;
+the dispatch is a durable, retrying,
+crash-recovered episode; a single denial withholds it, so consent is not merely
 route authorization; an episode whose plugin still has unresolved environment variables
 stays pending rather than running the setup tool against a placeholder-credentialed
 server — a consent round can settle while the installing engagement is still wiring

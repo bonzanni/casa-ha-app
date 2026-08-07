@@ -1,5 +1,5 @@
 ---
-last_reviewed: 2026-07-30
+last_reviewed: 2026-08-07
 ---
 
 # System shape
@@ -69,10 +69,11 @@ than taking this sentence's word for it.
 
 **INV-SYS-002**: A role claimed by both a resident and a specialist is a boot failure, raised when the role registry is built.
 
-Scoped deliberately to those two tiers, because that is what the registry models. It is
-enforced in `_build_role_registry`; `AgentRegistry.build` itself assigns residents and then
-specialists, so it is last-write-wins and depends on that earlier check having refused the
-collision.
+Scoped deliberately to those two tiers, because that is what the registry models. Only
+`_build_role_registry` refuses the collision; `AgentRegistry.build` itself registers residents
+first and then *skips* a colliding specialist with a warning, so a collision reaching it after
+boot keeps the resident instead of raising. See `architecture/agent-taxonomy.md`
+(INV-AGENT-001) for that tie-break and its limits.
 
 ## Failure behavior
 
