@@ -293,12 +293,17 @@ async def test_round_ledger_survives_restart(wired, tmp_path, monkeypatch):
 
 @pytest.mark.asyncio
 async def test_unprompted_decision_synthesizes_round(wired):
-    # A decision with no registered prompt (store reset) is never dropped.
-    # #451: an obligation must exist for the settlement to have anything to
-    # release — the reconciler sweep records it independently of the prompt.
+    # A decision with no registered prompt (store reset) is never dropped —
+    # it synthesizes a round and is recorded. #451 r7: that round is NOT
+    # authoritative, because the reconciler never sealed it and so nothing
+    # established the plugin's consent position. The decision is kept; the
+    # obligation holds until a pass that CAN establish the position seals a
+    # verdict (see test_a_delayed_finish_cannot_resurrect_a_consumed_round).
     _owe()
     await _decide()
-    assert len(_released()) == 1
+    assert _released() == []
+    assert pse._load()["rounds"] == {}                # round consumed
+    assert pse.episodes()[0]["gate"] == "awaiting_verdict"
 
 
 @pytest.mark.asyncio

@@ -346,12 +346,13 @@ async def reconcile_plugin_triggers(
             role_configs=role_configs, resolver=pinned)
         cand_ok, cand = setup_candidates(resolver=pinned)
         candidates = cand if cand_ok else None
-        return desired, union, union_ok, candidates, peer_unknown
+        return (desired, union, union_ok, candidates, peer_unknown,
+                one_generation(pinned))
 
     async with _RECONCILE_LOCK:
         try:
             (desired, callback_pending, callback_ok, setup_cands,
-             peer_unknown) = await asyncio.to_thread(_compute_and_mint)
+             peer_unknown, one_gen) = await asyncio.to_thread(_compute_and_mint)
         except Exception:
             # Terra shipB-r1 P1-2: a compute failure must not RETAIN the old
             # overlay (a just-unassigned/revoked plugin's routes would stay
@@ -395,7 +396,8 @@ async def reconcile_plugin_triggers(
             pending_complete=callback_ok,
             candidates=setup_cands,
             unknown=(consent_position_unknown(desired.issues)
-                     | (peer_unknown or set())))
+                     | (peer_unknown or set())),
+            single_generation=one_gen)
         try:
             import plugin_setup_episodes
             plugin_setup_episodes.kick()   # a zero-member verdict releases
@@ -525,11 +527,14 @@ def setup_candidates(*, resolver: Any = None) -> tuple[bool, list[dict]]:
     failure — the caller then creates no obligations and seals no verdicts,
     leaving every existing obligation to hold until a later pass.
 
-    Reads through the SAME ``resolver`` seam as ``compute_desired``, so the
-    obligations created and the consent verdict sealed in one pass describe one
-    registry snapshot. Resolving independently here would let an artifact
-    change between the two reads and seal a verdict against the wrong
-    artifact — for which the obligation would then hold forever.
+    Reads through the SAME ``resolver`` seam as ``compute_desired`` so a pass
+    describes one registry snapshot where it can. Whether the pass ACTUALLY
+    spanned generations is not judged here: that belongs to the authority
+    predicate in :func:`seal_setup_state`, because it must suppress the
+    CONCLUSION without suppressing the debt. Suppressing the candidate list
+    itself lost setup outright — a re-consent landing during a mixed pass left a
+    terminal obligation un-re-armed, and once the ack persisted no later pass saw
+    a pending consent to re-arm from.
     """
     try:
         import plugin_store
@@ -539,21 +544,6 @@ def setup_candidates(*, resolver: Any = None) -> tuple[bool, list[dict]]:
             # An invalid registry is not an empty one: creating no obligations
             # is right, but reporting ok would seal "needs no consent" verdicts
             # for plugins we simply could not see.
-            return False, []
-        # The pinned wrapper accumulates generations AS targets resolve, so this
-        # guard only sees a complete set if the sweep runs LAST in the pass.
-        # Both reconcilers order it that way deliberately: main compute, then
-        # the peer's pending union, then this. Moving it earlier would narrow
-        # the guard silently rather than break a test.
-        gens = getattr(resolver, "generations", None)
-        if gens is not None and len(gens) > 1:
-            # The pass spans registry GENERATIONS, so the pending membership and
-            # this candidate set describe different registries. Caching per
-            # target is not the same as one snapshot. Sealing over the pair can
-            # release setup for an artifact whose consent was never approved, so
-            # report unavailable and hold; the next reconcile retries.
-            logger.info("setup-candidate sweep spans registry generations "
-                        "%s — holding this pass", sorted(gens))
             return False, []
         out: list[dict] = []
         for rp in getattr(res, "plugins", None) or ():
@@ -584,6 +574,30 @@ def setup_candidates(*, resolver: Any = None) -> tuple[bool, list[dict]]:
 _PENDING_ACK_CODES = ("trigger_pending_ack", "callback_pending_ack")
 
 
+def one_generation(resolver: Any) -> bool:
+    """Did this PINNED pass observe exactly one registry generation?
+
+    Caching per target is not the same as observing one snapshot: a reload
+    publishing a new generation between two targets yields a mixed pass, whose
+    pending membership and candidate set can describe different artifacts.
+    Sealing a verdict over that pair can release setup for an artifact whose
+    consent was never approved — so the pass may still record debts and fence
+    keyboards, but must not CONCLUDE.
+
+    Read this LAST in a pass: the pinned wrapper accumulates generations as
+    targets resolve, so an earlier read sees an incomplete set. Both reconcilers
+    order it that way (main compute, then the peer union, then the sweep, then
+    this)."""
+    gens = getattr(resolver, "generations", None)
+    if gens is None:
+        return True                      # an unpinned resolver makes no claim
+    if len(gens) > 1:
+        logger.info("pass spans registry generations %s — no setup verdict "
+                    "will be sealed", sorted(gens))
+        return False
+    return True
+
+
 def consent_position_unknown(issues: "list") -> set:
     """Plugins whose consent position cannot be established from this pass.
 
@@ -607,7 +621,8 @@ def consent_position_unknown(issues: "list") -> set:
 def seal_setup_state(*, trigger_pending: list[dict],
                      callback_pending: list[dict], pending_complete: bool,
                      candidates: "list[dict] | None",
-                     unknown: "set | None" = None) -> dict[str, str]:
+                     unknown: "set | None" = None,
+                     single_generation: bool = True) -> dict[str, str]:
     """Create the setup obligations Casa owes, and seal ONE positive consent
     verdict per ``(plugin, artifact_id)`` — in one yield-free batch per plugin
     BEFORE any keyboard posts, so a fast Approve on the first keyboard can
@@ -668,11 +683,10 @@ def seal_setup_state(*, trigger_pending: list[dict],
     #   pending_complete  both consent kinds' pending sets were computed
     #   candidates        the sweep succeeded and the pass was single-generation
     #   plugin not in unknown   no non-consent gap hides part of its position
-    generations_ok = candidates is not None
-
     def _authoritative(plugin_name: str) -> bool:
-        return bool(pending_complete and generations_ok
-                    and plugin_name not in (unknown or ()))
+        return bool(pending_complete and single_generation
+                    and plugin_name not in (unknown or ())
+                    and candidates is not None)
 
     # A candidate that awaits a verdict joins the sealing pass with (possibly)
     # zero members. One already dispatched, refused or failed with NO pending
@@ -683,11 +697,16 @@ def seal_setup_state(*, trigger_pending: list[dict],
         try:
             if plugin_setup_episodes.ensure_obligation(
                     plugin=cand["plugin"], artifact_id=cand["artifact_id"],
-                    # Only a pass that may CONCLUDE about this plugin may re-arm
-                    # it: an under-reported or partial pending set cannot be told
-                    # from a genuinely empty one.
-                    consent_pending=bool(_authoritative(cand["plugin"])
-                                         and by_plugin.get(key))):
+                    # Recording a DEBT is the conservative direction, so it is
+                    # NOT gated on the authority predicate. Gating it lost setup
+                    # for good: a re-consent observed during a non-authoritative
+                    # pass left the terminal row un-re-armed, and once the ack
+                    # persisted no later pass saw a pending consent to re-arm
+                    # from. An extra re-arm only means "setup is owed and holds"
+                    # — safe, and the tool is idempotent by contract — whereas a
+                    # missed one is unrecoverable. Under-reporting cannot cause a
+                    # spurious re-arm; it can only cause a missed one.
+                    consent_pending=bool(by_plugin.get(key))):
                 # A zero-member round is only worth opening when it can carry a
                 # verdict — a non-authoritative empty round decides nothing.
                 if _authoritative(cand["plugin"]):

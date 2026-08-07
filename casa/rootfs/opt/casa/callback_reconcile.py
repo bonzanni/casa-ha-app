@@ -621,12 +621,13 @@ async def reconcile_plugin_callbacks(
             role_configs=role_configs, resolver=pinned)
         cand_ok, cand = _setup_candidates(resolver=pinned)
         candidates = cand if cand_ok else None
-        return computed, union, union_ok, candidates, peer_unknown
+        return (computed, union, union_ok, candidates, peer_unknown,
+                _tr.one_generation(pinned))
 
     async with _RECONCILE_LOCK:
         try:
             (desired, union_pending, union_ok, setup_cands,
-             peer_unknown) = await asyncio.to_thread(_compute)
+             peer_unknown, one_gen) = await asyncio.to_thread(_compute)
         except Exception:
             # A compute failure must not RETAIN the old overlay (a
             # just-revoked plugin's callback would stay open behind a
@@ -682,7 +683,8 @@ async def reconcile_plugin_callbacks(
             pending_complete=union_ok,
             candidates=setup_cands,
             unknown=(trigger_reconcile.consent_position_unknown(desired.issues)
-                     | (peer_unknown or set())))
+                     | (peer_unknown or set())),
+            single_generation=one_gen)
         try:
             import plugin_setup_episodes
             plugin_setup_episodes.kick()   # a zero-member verdict releases

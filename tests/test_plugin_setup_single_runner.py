@@ -849,16 +849,44 @@ async def test_a_pruned_members_live_keyboard_cannot_refuse_the_obligation(env):
 
 
 @pytest.mark.asyncio
-async def test_a_denial_with_no_round_at_all_still_refuses(env):
-    """The non-member rule must not swallow a denial when the round is GONE
-    (a store reset). Dropping it there would leave a memberless round to
-    RELEASE instead — strictly worse than refusing."""
+async def test_a_decision_with_no_round_at_all_concludes_nothing(env):
+    """A decision arriving with no round is never dropped, but the round it
+    synthesizes is NOT authoritative: the reconciler never sealed it, so nothing
+    established the plugin's consent position. Both directions hold rather than
+    conclude — an approval must not release (that was the flag's escape hatch: a
+    delayed finish hook could resurrect a consumed non-authoritative round as an
+    authoritative release), and a denial must not refuse, which would attribute a
+    decision to a position Casa never read."""
     pse.ensure_obligation(plugin="gmail", artifact_id="art-1",
                           consent_pending=True)
     assert "gmail" not in pse._load()["rounds"]
     await pse.on_consent_decision(plugin="gmail", artifact_id="art-1",
                                   identity="X", approved=False, nonce="")
-    assert _obligation()["status"] == "refused"
+    assert _obligation()["gate"] == "awaiting_verdict"
+    assert _obligation()["status"] == "pending"
+    assert env.notes == []
+    assert env.dispatched == []
+
+
+@pytest.mark.asyncio
+async def test_a_delayed_finish_cannot_resurrect_a_consumed_round(env):
+    """Sol (r7), reproduced: the boot-recovery sweep consumes a
+    non-authoritative round without concluding; a DELAYED finish hook then calls
+    on_consent_decision, finds no round, synthesizes one — and, defaulting to
+    authoritative, released the obligation the sweep had just declined to."""
+    pse.ensure_obligation(plugin="gmail", artifact_id="art-1",
+                          consent_pending=True)
+    pse.open_round(plugin="gmail", artifact_id="art-1", identities=["x"],
+                   verdict=False)
+    pse.record_approval_sync(plugin="gmail", artifact_id="art-1",
+                             identity="x", gen="g1")
+    await pse._worker_pass()                       # consumes, concludes nothing
+    assert _obligation()["gate"] == "awaiting_verdict"
+    assert "gmail" not in pse._load()["rounds"]
+    await pse.on_consent_decision(plugin="gmail", artifact_id="art-1",
+                                  identity="x", approved=True,
+                                  approval_gen="g1")
+    assert _obligation()["gate"] == "awaiting_verdict", "resurrected a verdict"
     assert env.dispatched == []
 
 
@@ -898,11 +926,18 @@ async def test_a_rejected_dispatch_holds_and_lands_later(env):
     assert len(env.dispatched) == 1
 
 
-def test_a_mixed_generation_pass_seals_nothing():
-    """Sol: caching per target is not one snapshot. If a reload publishes a new
-    generation between two resolutions, the pending membership and the candidate
-    set describe different registries — and sealing over that pair can release
-    setup for an artifact whose consent was never approved."""
+def test_a_mixed_generation_pass_seals_no_verdict():
+    """Sol (r4): caching per target is not one snapshot. If a reload publishes a
+    new generation between two resolutions, the pending membership and the
+    candidate set describe different registries — and sealing over that pair can
+    release setup for an artifact whose consent was never approved.
+
+    The check lives in the AUTHORITY predicate, not in the candidate sweep
+    (Terra, r7): suppressing the candidate list lost setup outright, because a
+    re-consent landing during a mixed pass left a terminal obligation
+    un-re-armed and no later pass saw a pending consent to re-arm from. A mixed
+    pass therefore still records debts and fences keyboards; it just may not
+    conclude."""
     gens = iter([1, 2])
 
     def _drifting(target):
@@ -912,8 +947,9 @@ def test_a_mixed_generation_pass_seals_nothing():
     pinned = tr.pin_resolver(_drifting)
     pinned(None)
     pinned("resident:assistant")
-    ok, cands = tr.setup_candidates(resolver=pinned)
-    assert ok is False and cands == []
+    assert tr.one_generation(pinned) is False
+    # An unpinned resolver makes no claim either way.
+    assert tr.one_generation(lambda t: None) is True
 
 
 @pytest.mark.asyncio
@@ -1056,9 +1092,12 @@ async def test_a_cross_generation_pass_cannot_release_an_existing_obligation(env
 
 
 @pytest.mark.asyncio
-async def test_a_fencing_only_seal_never_upgrades_a_round(env):
-    """The flag is a conjunction across every seal of a round: a later
-    fencing-only pass must downgrade an authoritative round, never the reverse."""
+async def test_the_latest_seal_governs_the_rounds_authority(env):
+    """The flag answers "could the MOST RECENT pass establish this plugin's full
+    consent position?", and settlement reads it when it concludes. Making it
+    sticky (ANDed across seals) looked safer and stranded the obligation instead:
+    a downgraded round keeps its members, so it does not settle-and-consume until
+    every member is decided, and by then nothing could restore its authority."""
     pse.ensure_obligation(plugin="p", artifact_id="a1", consent_pending=True)
     pse.open_round(plugin="p", artifact_id="a1", identities=["x"],
                    verdict=True)
@@ -1068,4 +1107,91 @@ async def test_a_fencing_only_seal_never_upgrades_a_round(env):
     assert pse._load()["rounds"]["p"]["verdict"] is False
     pse.open_round(plugin="p", artifact_id="a1", identities=["x"],
                    verdict=True)
-    assert pse._load()["rounds"]["p"]["verdict"] is False   # stays down
+    assert pse._load()["rounds"]["p"]["verdict"] is True    # a cleared gap heals
+
+
+@pytest.mark.asyncio
+async def test_a_cleared_gap_eventually_releases(env):
+    """The `verdict` flag ANDs across every seal of a round and nothing upgrades
+    it — the safe direction, but it must not strand the obligation. Recovery has
+    to come from the round being CONSUMED at settlement or replaced on a new
+    artifact. The path only exists when a NON-AUTHORITATIVE round actually holds
+    members: a gapped kind (unaskable trigger) alongside a pending one (callback).
+    """
+    env.plugin = _plugin(triggers=True, callbacks=True)
+    gapped = {"v": True}
+
+    def _resolver(target):
+        return SimpleNamespace(registry_valid=True, plugins=[env.plugin],
+                               issues=[])
+
+    def _entries():
+        return [{"name": "gmail", "artifact_id": "art-1",
+                 "targets": ["resident:assistant"]}]
+
+    def _channels():
+        return {"assistant": SimpleNamespace(
+            channels=["telegram"] if gapped["v"] else ["webhook"])}
+
+    async def _pass():
+        await tr.reconcile_plugin_triggers(
+            trigger_registry=env.registry, role_configs=_channels(),
+            channel_manager=None, acks=env.trig_acks,
+            secrets_dir=env.secrets_dir, prompt=True, resolver=_resolver,
+            global_secret_ok=lambda: True)
+        await cr.reconcile_plugin_callbacks(
+            trigger_registry=env.registry, role_configs=_channels(),
+            channel_manager=None, acks=env.cb_acks, spool=env.spool,
+            resolver=_resolver, entries=_entries, prompt=True)
+        await pse._worker_pass()
+
+    await _pass()
+    rnd = pse._load()["rounds"]["gmail"]
+    assert rnd["verdict"] is False and rnd["members"]   # the stranding risk
+    _approve_callback(env)
+    await _pass()
+    assert env.dispatched == [], "the trigger is still unaskable"
+    # The operator wires the webhook channel: the gap clears.
+    gapped["v"] = False
+    await _pass()
+    _approve_trigger(env)
+    await _pass()
+    assert len(env.dispatched) == 1, "a cleared gap must not strand setup"
+
+
+@pytest.mark.asyncio
+async def test_a_reconsent_during_a_mixed_pass_is_not_lost(env):
+    """Terra (r7): re-arming used to be gated on the SAME predicate as the
+    verdict. A re-consent observed during a non-authoritative pass therefore left
+    the terminal obligation un-re-armed — and once the ack persisted, no later
+    pass saw a pending consent to re-arm from, so setup was lost permanently for
+    a freshly re-minted credential. Recording a debt is now ungated; only the
+    CONCLUSION is strict."""
+    pse.ensure_obligation(plugin="gmail", artifact_id="art-1")
+    pse._update_episode(_obligation()["id"], status="dispatched")
+    pending = [{"plugin": "gmail", "artifact_id": "art-1", "effective": "e",
+                "target": "resident:assistant", "auth": dict(TRIGGER_AUTH)}]
+    # A pass that may not conclude — but must still record that setup is owed.
+    tr.seal_setup_state(trigger_pending=pending, callback_pending=[],
+                        pending_complete=True,
+                        candidates=[{"plugin": "gmail",
+                                     "artifact_id": "art-1"}],
+                        unknown=set(), single_generation=False)
+    row = _obligation()
+    assert row["status"] == "pending", "the re-consent must re-arm the debt"
+    assert row["gen"] == 1
+    assert pse._load()["rounds"]["gmail"]["verdict"] is False
+    # The approval settles the non-authoritative round without concluding...
+    for ident in list(pse._load()["rounds"]["gmail"]["members"]):
+        await pse.on_consent_decision(plugin="gmail", artifact_id="art-1",
+                                      identity=ident, approved=True,
+                                      approval_gen="g2")
+    assert _obligation()["gate"] == "awaiting_verdict"
+    # ...and the next clean pass, with the ack now persisted, releases it.
+    tr.seal_setup_state(trigger_pending=[], callback_pending=[],
+                        pending_complete=True,
+                        candidates=[{"plugin": "gmail",
+                                     "artifact_id": "art-1"}],
+                        unknown=set(), single_generation=True)
+    await pse._worker_pass()
+    assert len(env.dispatched) == 1

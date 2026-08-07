@@ -428,7 +428,9 @@ def open_round(*, plugin: str, artifact_id: str, identities: list[str],
     cannot interleave with the locked async sections. Never raises (returns {}
     on failure: unfenced but never incorrect).
 
-    ``verdict`` is what makes this round AUTHORITATIVE for setup. A round serves
+    ``verdict`` is what makes this round AUTHORITATIVE for setup, and it is the
+    MOST RECENT seal that governs (see the assignment below for why sticky was
+    wrong). A round serves
     two jobs — it fences the consent keyboards with per-prompt nonces, and it is
     the verdict that releases a setup obligation — and those jobs do not always
     permit the same answer. When the caller cannot establish the plugin's full
@@ -457,11 +459,18 @@ def open_round(*, plugin: str, artifact_id: str, identities: list[str],
         if not isinstance(rnd, dict) or rnd.get("artifact_id") != artifact_id:
             rnd = {"artifact_id": artifact_id, "members": {}}
             data["rounds"][plugin] = rnd
-        # A round is authoritative for setup only while EVERY seal of it was.
-        # A fencing-only pass must never upgrade a round to authoritative, and
-        # must downgrade one that was: whatever it could not establish is
-        # unestablished for the round as a whole.
-        rnd["verdict"] = bool(rnd.get("verdict", True)) and bool(verdict)
+        # LAST WRITE WINS, deliberately. The flag answers "could the most recent
+        # pass establish this plugin's full consent position?", and settlement
+        # reads it at the moment it concludes — so the conclusion always rests on
+        # the freshest knowledge. ANDing it across seals instead (the first
+        # attempt) STRANDED the obligation: a round downgraded while a gap was
+        # open keeps its members, so it does not settle-and-consume until every
+        # member is decided, and by then no later pass can restore its authority.
+        # A member's approval is an ACK — ground truth about that consent — and
+        # stays valid when the unrelated gap that suppressed the verdict clears;
+        # what must never happen is CONCLUDING while the position is unknown, and
+        # that is exactly what the per-pass predicate prevents.
+        rnd["verdict"] = bool(verdict)
         nonces: dict[str, str] = {}
         for identity in identities:
             existing = rnd["members"].get(identity)
@@ -520,7 +529,9 @@ def record_approval_sync(*, plugin: str, artifact_id: str, identity: str,
             logger.info("stale approval record ignored (plugin=%s)", plugin)
             return
         if not isinstance(rnd, dict):
-            rnd = {"artifact_id": artifact_id, "members": {}}
+            # Synthesized, so NOT authoritative — see on_consent_decision.
+            rnd = {"artifact_id": artifact_id, "members": {},
+                   "verdict": False}
             data["rounds"][plugin] = rnd
         member = rnd["members"].get(identity) or {}
         member.update({"state": "approved", "gen": gen})
@@ -555,11 +566,15 @@ async def on_consent_decision(*, plugin: str, artifact_id: str,
                 return
             existing_round = isinstance(rnd, dict)
             if not existing_round:
-                # Unknown round (e.g. store reset) — synthesize so a live
-                # decision is never dropped. Conservative on purpose: a
-                # synthesized denial REFUSES, where dropping it could let a
-                # memberless round release instead.
-                rnd = {"artifact_id": artifact_id, "members": {}}
+                # Unknown round (store reset, or a round already consumed by an
+                # earlier settlement) — synthesize so a live decision is never
+                # dropped, but NEVER as authoritative. The reconciler never
+                # sealed this round, so nothing established the plugin's consent
+                # position for it; concluding from it was the flag's escape
+                # hatch, and it let a delayed finish hook RESURRECT a
+                # non-authoritative round as an authoritative release.
+                rnd = {"artifact_id": artifact_id, "members": {},
+                       "verdict": False}
                 data["rounds"][plugin] = rnd
             member = rnd["members"].get(identity)
             if not approved and existing_round and member is None:
