@@ -619,11 +619,16 @@ def seal_setup_state(*, trigger_pending: list[dict],
     needs no consent, which releases its obligation. That is deliberately
     distinct from sealing nothing, which means "no verdict yet" and holds.
 
-    ``pending_complete`` must be True — both pending computes succeeded — or
-    this seals NOTHING and returns ``{}``. An incomplete union cannot be
-    distinguished from a complete one, and either kind of seal over a subset
-    releases setup early (#451, attempt 1's mechanism). ``candidates=None``
-    (the sweep failed) likewise creates no obligations.
+    Whether a pass may draw a setup CONCLUSION about a plugin is decided by one
+    predicate over three inputs — ``pending_complete`` (both consent kinds'
+    pending sets were computed), ``candidates is not None`` (the sweep succeeded
+    and the pass was single-generation), and the plugin's absence from
+    ``unknown`` (no non-consent gap hides part of its position). A pass that
+    fails any of them still seals the round, because the consent keyboards need
+    their nonces, but seals it NON-AUTHORITATIVE: settlement consumes it and
+    leaves the obligation holding. Applying that predicate uniformly — rather
+    than as separate conditions on the zero-member and members-bearing paths —
+    is what stops a partial pass from releasing setup.
 
     Returns ``{identity: nonce}`` — each caller threads its own prompts'
     nonces into their decision callbacks (stale-expiry fencing). Never raises:
@@ -649,52 +654,58 @@ def seal_setup_state(*, trigger_pending: list[dict],
         by_plugin.setdefault(
             (c["plugin"], c["artifact_id"]), []).append(c["identity"])
 
+    # ONE predicate decides whether this pass may draw a setup conclusion about
+    # a plugin, and it is applied to EVERY round uniformly — zero-member and
+    # members-bearing alike. Assembling this decision from separate conditions at
+    # separate call sites is what three consecutive review rounds kept breaking:
+    # each round added an input, and each new combination found another gap
+    # (a zero-member seal blind to the peer kind's gap; a members-bearing seal
+    # for a plugin whose OTHER kind was unaskable; a cross-generation pass that
+    # still released a pre-existing obligation because only `candidates` was
+    # suppressed). A round the pass may not conclude from is still sealed — the
+    # keyboards need their nonces — but as NON-AUTHORITATIVE.
+    #
+    #   pending_complete  both consent kinds' pending sets were computed
+    #   candidates        the sweep succeeded and the pass was single-generation
+    #   plugin not in unknown   no non-consent gap hides part of its position
+    generations_ok = candidates is not None
+
+    def _authoritative(plugin_name: str) -> bool:
+        return bool(pending_complete and generations_ok
+                    and plugin_name not in (unknown or ()))
+
     # A candidate that awaits a verdict joins the sealing pass with (possibly)
     # zero members. One already dispatched, refused or failed with NO pending
     # consent reports False and is left alone — no verdict churn on every
     # reconcile for a plugin whose setup is long settled.
     for cand in candidates or ():
         key = (cand["plugin"], cand["artifact_id"])
-        if cand["plugin"] in (unknown or ()) and not by_plugin.get(key):
-            # A non-consent gap hides this plugin's consent position, and it has
-            # no pending identity to seal a members-bearing round with. Ensure
-            # the obligation (so the debt is recorded and visible) but seal NO
-            # verdict: it must hold until the gap clears and the position is
-            # knowable.
-            try:
-                plugin_setup_episodes.ensure_obligation(
-                    plugin=cand["plugin"], artifact_id=cand["artifact_id"])
-            except Exception:  # noqa: BLE001
-                logger.exception("setup obligation ensure failed (plugin=%s)",
-                                 cand.get("plugin"))
-            logger.info("no setup verdict sealed (plugin=%s): a non-consent "
-                        "gap hides its consent position", cand["plugin"])
-            continue
         try:
             if plugin_setup_episodes.ensure_obligation(
                     plugin=cand["plugin"], artifact_id=cand["artifact_id"],
-                    # Only a COMPLETE pending set may re-arm: an under-reported
-                    # one would leave a terminal row terminal for the wrong
-                    # reason, and an incomplete one cannot be told from it.
-                    consent_pending=bool(pending_complete
+                    # Only a pass that may CONCLUDE about this plugin may re-arm
+                    # it: an under-reported or partial pending set cannot be told
+                    # from a genuinely empty one.
+                    consent_pending=bool(_authoritative(cand["plugin"])
                                          and by_plugin.get(key))):
-                by_plugin.setdefault(key, [])
+                # A zero-member round is only worth opening when it can carry a
+                # verdict — a non-authoritative empty round decides nothing.
+                if _authoritative(cand["plugin"]):
+                    by_plugin.setdefault(key, [])
         except Exception:  # noqa: BLE001 — never break a reconcile on this
             logger.exception("setup obligation ensure failed (plugin=%s)",
                              cand.get("plugin"))
-    if not pending_complete:
-        # Sealing a verdict now would either under-report membership or assert
-        # "no consent needed" without knowing. Hold instead; the obligations
-        # created above stay pending and this runs again on the next reconcile.
-        logger.info("setup verdicts not sealed: a pending-consent compute "
-                    "failed this pass")
-        return {}
 
     nonce_by_identity: dict[str, str] = {}
     for (plg, art), idents in by_plugin.items():
+        authoritative = _authoritative(plg)
+        if not authoritative:
+            logger.info("sealing round for fencing only (plugin=%s): this pass "
+                        "cannot establish its full consent position", plg)
         try:
             nonce_by_identity.update(plugin_setup_episodes.open_round(
-                plugin=plg, artifact_id=art, identities=idents))
+                plugin=plg, artifact_id=art, identities=idents,
+                verdict=authoritative))
         except Exception:  # noqa: BLE001 — unfenced, never blocking
             logger.exception("setup-round open failed (plugin=%s)", plg)
     return nonce_by_identity

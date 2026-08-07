@@ -403,8 +403,8 @@ def ensure_obligation(*, plugin: str, artifact_id: str,
 # Round ledger
 # ---------------------------------------------------------------------------
 
-def open_round(*, plugin: str, artifact_id: str,
-               identities: list[str]) -> dict[str, str]:
+def open_round(*, plugin: str, artifact_id: str, identities: list[str],
+               verdict: bool = True) -> dict[str, str]:
     """SEAL a consent round's membership BEFORE any keyboard posts (impl
     r4): the reconciler declares the COMPLETE per-plugin batch it is about
     to prompt in ONE yield-free call, so a fast Approve on the first
@@ -428,6 +428,18 @@ def open_round(*, plugin: str, artifact_id: str,
     cannot interleave with the locked async sections. Never raises (returns {}
     on failure: unfenced but never incorrect).
 
+    ``verdict`` is what makes this round AUTHORITATIVE for setup. A round serves
+    two jobs — it fences the consent keyboards with per-prompt nonces, and it is
+    the verdict that releases a setup obligation — and those jobs do not always
+    permit the same answer. When the caller cannot establish the plugin's full
+    consent position (a non-consent gap hides part of it, the pass spanned
+    registry generations, a pending compute failed), the keyboards still need
+    their nonces but NO setup conclusion may be drawn. Such a round is sealed
+    with ``verdict=False``: settlement consumes it and leaves the obligation
+    exactly as it was, holding. One flag, set from one conjunction at the seal
+    site, replaces what were three separate call-site conditions — each of which
+    was found wrong in a different combination.
+
     v0.161.0 (#451): ``identities`` may be EMPTY, which seals a POSITIVE
     verdict that this artifact needs no consent — the reconciler's way of
     saying "released" for an ungated plugin, or for one whose consent ack
@@ -445,6 +457,11 @@ def open_round(*, plugin: str, artifact_id: str,
         if not isinstance(rnd, dict) or rnd.get("artifact_id") != artifact_id:
             rnd = {"artifact_id": artifact_id, "members": {}}
             data["rounds"][plugin] = rnd
+        # A round is authoritative for setup only while EVERY seal of it was.
+        # A fencing-only pass must never upgrade a round to authoritative, and
+        # must downgrade one that was: whatever it could not establish is
+        # unestablished for the round as a whole.
+        rnd["verdict"] = bool(rnd.get("verdict", True)) and bool(verdict)
         nonces: dict[str, str] = {}
         for identity in identities:
             existing = rnd["members"].get(identity)
@@ -644,6 +661,15 @@ def _settle_locked(data: dict, plugin: str) -> tuple[bool, list[str]]:
         return False, []
     artifact_id = rnd.get("artifact_id") or ""
     del data["rounds"][plugin]
+    if not rnd.get("verdict", True):
+        # Sealed for keyboard fencing only — the reconciler could not establish
+        # this plugin's full consent position in the pass that opened it. The
+        # decisions it collected say nothing about setup, so consume the round
+        # and leave the obligation untouched: it holds until a pass that CAN
+        # establish the position seals an authoritative verdict.
+        logger.info("non-authoritative round consumed (plugin=%s): no setup "
+                    "conclusion drawn", plugin)
+        return False, []
     row = _row_for(data, plugin, artifact_id)
     if row is None or row.get("status") != "pending":
         return False, []

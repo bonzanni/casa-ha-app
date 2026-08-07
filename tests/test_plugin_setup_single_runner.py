@@ -987,3 +987,85 @@ async def test_the_acceptance_harness_has_no_hidden_gap(env):
     for plug in (_plugin(), _plugin(triggers=True), _plugin(callbacks=True)):
         env.plugin = plug
         _assert_no_gap(env)
+
+
+# ---------------------------------------------------------------------------
+# Review round 6 findings
+# ---------------------------------------------------------------------------
+
+@pytest.mark.asyncio
+async def test_a_gap_in_one_kind_blocks_release_by_the_other(env):
+    """Both round-6 reviewers: the gap guard only suppressed sealing when the
+    plugin had NO pending identity. A plugin with an unaskable TRIGGER plus a
+    healthy pending CALLBACK therefore had a round sealed containing only the
+    callback — and approving that callback released setup, with the trigger's
+    consent position never established."""
+    env.plugin = _plugin(triggers=True, callbacks=True)
+    role_configs = {"assistant": SimpleNamespace(channels=["telegram"])}  # no webhook
+
+    def _resolver(target):
+        return SimpleNamespace(registry_valid=True, plugins=[env.plugin],
+                               issues=[])
+
+    def _entries():
+        return [{"name": "gmail", "artifact_id": "art-1",
+                 "targets": ["resident:assistant"]}]
+
+    await tr.reconcile_plugin_triggers(
+        trigger_registry=env.registry, role_configs=role_configs,
+        channel_manager=None, acks=env.trig_acks,
+        secrets_dir=env.secrets_dir, prompt=True, resolver=_resolver,
+        global_secret_ok=lambda: True)
+    await cr.reconcile_plugin_callbacks(
+        trigger_registry=env.registry, role_configs=role_configs,
+        channel_manager=None, acks=env.cb_acks, spool=env.spool,
+        resolver=_resolver, entries=_entries, prompt=True)
+    # The callback is approved; the trigger remains unaskable.
+    _approve_callback(env)
+    await pse._worker_pass()
+    assert _obligation()["gate"] == "awaiting_verdict"
+    assert env.dispatched == []
+
+
+@pytest.mark.asyncio
+async def test_a_cross_generation_pass_cannot_release_an_existing_obligation(env):
+    """Terra: suppressing only `candidates` was not enough. The pending rows were
+    still collected and the round still opened, so a pass explicitly identified
+    as cross-generation could settle and release a PRE-EXISTING obligation —
+    contradicting the guard's own "hold this pass" contract."""
+    pse.ensure_obligation(plugin="gmail", artifact_id="art-1",
+                          consent_pending=True)
+    tr.seal_setup_state(
+        trigger_pending=[{"plugin": "gmail", "artifact_id": "art-1",
+                          "effective": "e", "target": "resident:assistant",
+                          "auth": dict(TRIGGER_AUTH)}],
+        callback_pending=[], pending_complete=True,
+        candidates=None,                      # the sweep reported unavailable
+        unknown=set())
+    rnd = pse._load()["rounds"]["gmail"]
+    assert rnd["verdict"] is False, "a held pass must not seal a verdict"
+    assert rnd["members"], "...but the keyboards still get their nonces"
+    # Approving every member must NOT release it.
+    for ident in list(rnd["members"]):
+        await pse.on_consent_decision(plugin="gmail", artifact_id="art-1",
+                                      identity=ident, approved=True,
+                                      approval_gen="g1")
+    assert _obligation()["gate"] == "awaiting_verdict"
+    await pse._worker_pass()
+    assert env.dispatched == []
+
+
+@pytest.mark.asyncio
+async def test_a_fencing_only_seal_never_upgrades_a_round(env):
+    """The flag is a conjunction across every seal of a round: a later
+    fencing-only pass must downgrade an authoritative round, never the reverse."""
+    pse.ensure_obligation(plugin="p", artifact_id="a1", consent_pending=True)
+    pse.open_round(plugin="p", artifact_id="a1", identities=["x"],
+                   verdict=True)
+    assert pse._load()["rounds"]["p"]["verdict"] is True
+    pse.open_round(plugin="p", artifact_id="a1", identities=["x"],
+                   verdict=False)
+    assert pse._load()["rounds"]["p"]["verdict"] is False
+    pse.open_round(plugin="p", artifact_id="a1", identities=["x"],
+                   verdict=True)
+    assert pse._load()["rounds"]["p"]["verdict"] is False   # stays down

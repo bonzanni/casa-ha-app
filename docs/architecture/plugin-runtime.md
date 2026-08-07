@@ -225,10 +225,15 @@ variable passed to the CLI as an explicit empty string rather than a literal pla
 and verification reports not ready with reason `setup_env_unprovisioned` until the value
 lands. A setup run that never happened stays loud rather than passing as configured.
 
-**No consent verdict has been sealed for an artifact.** The obligation holds, indefinitely
-and visibly: `pending` never decays out of plugin health. This is the state when no operator
-DM is reachable to prompt with, and when a pending-consent compute failed — neither is a
-licence to dispatch.
+**No consent verdict has settled for an artifact.** The obligation holds, indefinitely and
+visibly: `pending` never decays out of plugin health. Two distinct situations reach it, and
+the difference matters when reading a store by hand. With **no operator DM reachable**, the
+verdict *is* sealed — complete, members-bearing — and simply cannot settle, because no
+keyboard was posted for the operator to answer. When a pending-consent compute failed, the
+pass spanned registry generations, or a non-consent gap hid part of the plugin's consent
+position, the round is sealed **non-authoritative** instead: the keyboards still get their
+nonces, but settlement draws no conclusion and leaves the obligation exactly as it was.
+Neither situation is a licence to dispatch.
 
 **A consent round settles with any denial.** The obligation is refused and nothing is
 dispatched; the operator gets one note naming re-consent as the way forward, not a manual
