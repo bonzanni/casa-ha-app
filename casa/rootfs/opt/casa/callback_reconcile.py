@@ -594,7 +594,7 @@ async def reconcile_plugin_callbacks(
     acks = acks if acks is not None else _default_acks()
     spool = _default_spool() if spool is _UNSET else spool
 
-    def _compute() -> "tuple[DesiredCallbacks, list[dict], bool, list[dict] | None]":
+    def _compute() -> "tuple":
         # The union-membership compute and the setup-candidate sweep read
         # plugin.json for every resolved plugin, so they belong in the SAME
         # worker thread as the main compute — never on the event loop under the
@@ -617,16 +617,16 @@ async def reconcile_plugin_callbacks(
         # prompt=False and is exactly the pass that must recover an obligation
         # missing because a crash landed between a durable registry publish and
         # its lifecycle reconcile. Only the KEYBOARDS depend on `prompt`.
-        union_ok, union = _trigger_pending_for_union(
+        union_ok, union, peer_unknown = _trigger_pending_for_union(
             role_configs=role_configs, resolver=pinned)
         cand_ok, cand = _setup_candidates(resolver=pinned)
         candidates = cand if cand_ok else None
-        return computed, union, union_ok, candidates
+        return computed, union, union_ok, candidates, peer_unknown
 
     async with _RECONCILE_LOCK:
         try:
-            (desired, union_pending, union_ok,
-             setup_cands) = await asyncio.to_thread(_compute)
+            (desired, union_pending, union_ok, setup_cands,
+             peer_unknown) = await asyncio.to_thread(_compute)
         except Exception:
             # A compute failure must not RETAIN the old overlay (a
             # just-revoked plugin's callback would stay open behind a
@@ -681,7 +681,8 @@ async def reconcile_plugin_callbacks(
             callback_pending=desired.pending,
             pending_complete=union_ok,
             candidates=setup_cands,
-            unknown=trigger_reconcile.consent_position_unknown(desired.issues))
+            unknown=(trigger_reconcile.consent_position_unknown(desired.issues)
+                     | (peer_unknown or set())))
         try:
             import plugin_setup_episodes
             plugin_setup_episodes.kick()   # a zero-member verdict releases
@@ -751,7 +752,7 @@ def _fire_consent_prompts(
 
 def _trigger_pending_for_union(
     *, role_configs: dict, resolver: Any = None,
-) -> tuple[bool, list[dict]]:
+) -> tuple[bool, list[dict], set]:
     """The peer (TRIGGER) half of the union membership, wrapped.
 
     The mirror of ``trigger_reconcile._callback_pending_for_union``. The peer
@@ -765,7 +766,7 @@ def _trigger_pending_for_union(
             role_configs=role_configs, resolver=resolver)
     except Exception:  # noqa: BLE001
         logger.exception("trigger union-member lookup failed")
-        return False, []
+        return False, [], set()
 
 
 def _setup_candidates(*, resolver: Any = None) -> tuple[bool, list[dict]]:
@@ -781,7 +782,7 @@ def _setup_candidates(*, resolver: Any = None) -> tuple[bool, list[dict]]:
 
 def callback_pending_for_union(
     *, role_configs: dict, resolver: Any = None,
-) -> tuple[bool, list[dict]]:
+) -> tuple[bool, list[dict], set]:
     """The pending CALLBACK consents, for the trigger reconciler's union
     sealing. Side-effect free and never raises; it must never break trigger
     prompting.
@@ -789,13 +790,20 @@ def callback_pending_for_union(
     Returns ``(ok, pending)``. #451: a failure reports ``ok=False`` rather than
     degrading to ``[]`` — an empty list is a claim that nothing is pending, and
     the caller uses exactly that claim to seal a positive "needs no consent"
-    verdict."""
+    verdict.
+
+    The third element is this kind's ``consent_position_unknown`` set. It travels
+    WITH the pending rows because a non-consent gap and the absent pending row it
+    causes are two views of one computation; returning only the rows let the peer
+    reconciler seal "needs no consent" while blind to this kind's gap."""
     try:
-        return True, compute_desired(role_configs=role_configs,
-                                     resolver=resolver).pending
+        import trigger_reconcile
+        d = compute_desired(role_configs=role_configs, resolver=resolver)
+        return True, d.pending, trigger_reconcile.consent_position_unknown(
+            d.issues)
     except Exception:  # noqa: BLE001
         logger.exception("callback union-member compute failed")
-        return False, []
+        return False, [], set()
 
 
 async def reconcile_from_runtime(runtime: Any, *, prompt: bool = True) -> list:

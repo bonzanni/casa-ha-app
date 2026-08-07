@@ -474,11 +474,11 @@ async def test_union_membership_is_computed_off_the_event_loop(
 
     def _spy_callback_union(**kw):
         seen["trigger_side"] = threading.current_thread().name
-        return True, []
+        return True, [], set()
 
     def _spy_trigger_union(**kw):
         seen["callback_side"] = threading.current_thread().name
-        return True, []
+        return True, [], set()
 
     monkeypatch.setattr(cr, "callback_pending_for_union", _spy_callback_union)
     monkeypatch.setattr(tr, "trigger_pending_for_union", _spy_trigger_union)

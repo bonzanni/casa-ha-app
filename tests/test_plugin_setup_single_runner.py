@@ -81,6 +81,7 @@ def env(monkeypatch, tmp_path):
         registry=TriggerRegistry(scheduler=None, app=None, bus=None),
         secrets_dir=tmp_path / "webhook_secrets",
         channel_manager=_NoChannel(),
+        spool=_Spool(),
     )
 
     async def _dispatch(role, instruction, ctx):
@@ -103,6 +104,12 @@ def env(monkeypatch, tmp_path):
     # forever. Point both defaults at these tmp stores.
     monkeypatch.setattr(tr, "_default_acks", lambda: state.trig_acks)
     monkeypatch.setattr(cr, "_default_acks", lambda: state.cb_acks)
+    # A valid public base URL. Without this the callback compute raises
+    # `callback_base_url_invalid` — a NON-CONSENT gap — for every plugin
+    # declaring a callback, which now (correctly) blocks the verdict. Before the
+    # peer-unknown fix the trigger pass sealed blind to it, so these rows passed
+    # while a gap was present: they were not testing what they claimed.
+    monkeypatch.setattr(cr, "_base_url", lambda: "https://casa.example.org")
     return state
 
 
@@ -111,13 +118,58 @@ async def _noop():
 
 
 class _Spool:
+    """Models the DURABLE marker inventory, not just the call surface: the
+    callback reconcile reads its own markers back and compares bytes, so a stub
+    returning None for a marker crashes the compute the moment the base URL is
+    valid enough to reach that stage."""
+
+    def __init__(self):
+        self._ready: dict = {}
+        self._index: dict = {}
+
     def ensure_plugin_dirs(self, plugin): pass
-    def write_ready(self, plugin, payload): pass
-    def delete_ready(self, plugin): pass
-    def write_index_entry(self, path, payload): pass
-    def delete_index_entry(self, path): pass
-    def read_marker(self, plugin): return None
-    def read_index_marker(self, path): return None
+
+    def write_ready(self, plugin, payload):
+        self._ready[plugin] = payload
+
+    def delete_ready(self, plugin):
+        self._ready.pop(plugin, None)
+        return True
+
+    def write_index_entry(self, path, payload):
+        import callback_spool
+        self._index[callback_spool.index_key(path)] = payload
+
+    def delete_index_entry(self, path):
+        import callback_spool
+        self._index.pop(callback_spool.index_key(path), None)
+        return True
+
+    def delete_index_key(self, key):
+        self._index.pop(key, None)
+        return True
+
+    def published_plugins(self):
+        return sorted(self._ready)
+
+    def index_keys(self):
+        return sorted(self._index)
+
+    @staticmethod
+    def _marker(payload):
+        import callback_spool
+        if payload is None:
+            return callback_spool.Marker(callback_spool.MarkerState.ABSENT)
+        return callback_spool.Marker(
+            callback_spool.MarkerState.PRESENT, payload,
+            raw=callback_spool.canonical_marker_bytes(payload))
+
+    def read_marker(self, plugin):
+        return self._marker(self._ready.get(plugin))
+
+    def read_index_marker(self, path):
+        import callback_spool
+        return self._marker(self._index.get(callback_spool.index_key(path)))
 
 
 
@@ -150,8 +202,6 @@ async def _reconcile(state):
         return [{"name": "gmail", "artifact_id": state.plugin.artifact_id,
                  "targets": ["resident:assistant"]}]
 
-    monkey_base = getattr(state, "base_url", "https://casa.example.org")
-    cr._base_url_override = monkey_base
     await tr.reconcile_plugin_triggers(
         trigger_registry=state.registry, role_configs=role_configs,
         channel_manager=state.channel_manager, acks=state.trig_acks,
@@ -160,8 +210,26 @@ async def _reconcile(state):
     await cr.reconcile_plugin_callbacks(
         trigger_registry=state.registry, role_configs=role_configs,
         channel_manager=state.channel_manager, acks=state.cb_acks,
-        spool=_Spool(), resolver=_resolver, entries=_entries, prompt=True)
+        spool=state.spool, resolver=_resolver, entries=_entries,
+        prompt=True)
     await pse._worker_pass()
+
+
+def _assert_no_gap(state):
+    """Guard against the harness masking a NON-CONSENT gap. These rows are about
+    the consent position; if the harness leaves a plugin gapped (an invalid base
+    URL, an unassigned target) the verdict is legitimately withheld and the row
+    stops testing what it claims. This caught exactly that: an unstubbed
+    `_base_url` left every callback plugin gapped, and the rows passed anyway
+    because the trigger pass sealed blind to the callback half."""
+    def _resolver(target):
+        return SimpleNamespace(registry_valid=True, plugins=[state.plugin],
+                               issues=[])
+
+    role_configs = {"assistant": SimpleNamespace(channels=["webhook"])}
+    _, _, unknown = tr.trigger_pending_for_union(
+        role_configs=role_configs, resolver=_resolver)
+    assert unknown == set(), f"harness leaves a trigger gap: {unknown}"
 
 
 def _obligation():
@@ -551,7 +619,7 @@ async def test_boot_creates_the_obligation_it_owes(env):
         resolver=_resolver, global_secret_ok=lambda: True)
     await cr.reconcile_plugin_callbacks(
         trigger_registry=env.registry, role_configs=role_configs,
-        channel_manager=None, acks=env.cb_acks, spool=_Spool(),
+        channel_manager=None, acks=env.cb_acks, spool=env.spool,
         resolver=_resolver, entries=_entries, prompt=False)
     assert _obligation() is not None, "boot owes this plugin a setup run"
     await pse._worker_pass()
@@ -872,3 +940,50 @@ async def test_a_non_consent_gap_never_seals_needs_no_consent(env):
     assert "gmail" not in pse._load()["rounds"], "no verdict may be sealed"
     assert _obligation()["gate"] == "awaiting_verdict"
     assert env.dispatched == []
+
+
+# ---------------------------------------------------------------------------
+# Review round 5 findings
+# ---------------------------------------------------------------------------
+
+@pytest.mark.asyncio
+async def test_a_peer_kinds_gap_also_blocks_the_verdict(env):
+    """Both round-5 reviewers: the round-4 gap guard was half-applied. Each
+    reconciler passed only its OWN issues, and the peer helper returned pending
+    rows without them — so the paired pass sealed an empty round blind to the
+    other kind's non-consent gap and released the obligation as "needs no
+    consent". The route gate normally masks the dispatch, but it is derived from
+    a recomputation that degrades to [] on failure, so a release earned this way
+    is a real hazard. The unknown set now travels WITH the pending rows."""
+    # A trigger with a non-consent gap (no webhook channel) and NO callbacks:
+    # the callback pass then has neither a pending member nor an issue of its
+    # own, so it sealed a ZERO-member round — "needs no consent" — for a plugin
+    # whose declared trigger is unapproved and merely unaskable.
+    env.plugin = _plugin(triggers=True)
+    role_configs = {"assistant": SimpleNamespace(channels=["telegram"])}
+
+    def _resolver(target):
+        return SimpleNamespace(registry_valid=True, plugins=[env.plugin],
+                               issues=[])
+
+    def _entries():
+        return [{"name": "gmail", "artifact_id": "art-1",
+                 "targets": ["resident:assistant"]}]
+
+    # The CALLBACK pass alone — its own issues are clean, so before the fix it
+    # sealed a verdict knowing nothing of the trigger's gap.
+    await cr.reconcile_plugin_callbacks(
+        trigger_registry=env.registry, role_configs=role_configs,
+        channel_manager=None, acks=env.cb_acks, spool=env.spool,
+        resolver=_resolver, entries=_entries, prompt=True)
+    await pse._worker_pass()
+    assert _obligation()["gate"] == "awaiting_verdict"
+    assert env.dispatched == []
+
+
+@pytest.mark.asyncio
+async def test_the_acceptance_harness_has_no_hidden_gap(env):
+    """The masking guard itself, on the plugin shapes the matrix uses."""
+    for plug in (_plugin(), _plugin(triggers=True), _plugin(callbacks=True)):
+        env.plugin = plug
+        _assert_no_gap(env)

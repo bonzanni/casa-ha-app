@@ -314,7 +314,7 @@ async def reconcile_plugin_triggers(
     # so there is one source of truth for the secrets location.
     secrets_dir = SECRETS_DIR if secrets_dir is None else secrets_dir
 
-    def _compute_and_mint() -> "tuple[DesiredTriggers, list[dict], bool, list[dict] | None]":
+    def _compute_and_mint() -> "tuple":
         # ONE snapshot for the whole pass (#451 r3): the pending membership and
         # the setup-candidate sweep must describe the same registry, or the
         # sealed round and the obligation can name different artifacts.
@@ -342,16 +342,16 @@ async def reconcile_plugin_triggers(
         # publish and its lifecycle reconcile — precisely when the level-
         # triggered sweep is the thing that recovers the missing obligation.
         # Only the KEYBOARDS depend on `prompt`.
-        union_ok, union = _callback_pending_for_union(
+        union_ok, union, peer_unknown = _callback_pending_for_union(
             role_configs=role_configs, resolver=pinned)
         cand_ok, cand = setup_candidates(resolver=pinned)
         candidates = cand if cand_ok else None
-        return desired, union, union_ok, candidates
+        return desired, union, union_ok, candidates, peer_unknown
 
     async with _RECONCILE_LOCK:
         try:
-            (desired, callback_pending, callback_ok,
-             setup_cands) = await asyncio.to_thread(_compute_and_mint)
+            (desired, callback_pending, callback_ok, setup_cands,
+             peer_unknown) = await asyncio.to_thread(_compute_and_mint)
         except Exception:
             # Terra shipB-r1 P1-2: a compute failure must not RETAIN the old
             # overlay (a just-unassigned/revoked plugin's routes would stay
@@ -394,7 +394,8 @@ async def reconcile_plugin_triggers(
             callback_pending=callback_pending,
             pending_complete=callback_ok,
             candidates=setup_cands,
-            unknown=consent_position_unknown(desired.issues))
+            unknown=(consent_position_unknown(desired.issues)
+                     | (peer_unknown or set())))
         try:
             import plugin_setup_episodes
             plugin_setup_episodes.kick()   # a zero-member verdict releases
@@ -466,7 +467,7 @@ def _fire_consent_prompts(
 
 def trigger_pending_for_union(
     *, role_configs: dict, resolver: Any = None,
-) -> tuple[bool, list[dict]]:
+) -> tuple[bool, list[dict], set]:
     """The pending TRIGGER consents, for the callback reconciler's union
     sealing (the mirror of ``callback_reconcile.callback_pending_for_union``).
     Side-effect free and never raises.
@@ -486,27 +487,32 @@ def trigger_pending_for_union(
     non-default store for one kind must inject BOTH, or this half reports an
     already-acked consent as still pending and the verdict it seals never
     settles.
+    The third element is the peer's :func:`consent_position_unknown` set. It
+    travels WITH the pending rows on purpose: a gap and the absence it causes are
+    two views of one computation, and returning only the rows let the peer pass
+    seal "needs no consent" while blind to this kind's non-consent gap.
     """
     try:
-        return True, compute_desired(role_configs=role_configs,
-                                     resolver=resolver).pending
+        d = compute_desired(role_configs=role_configs, resolver=resolver)
+        return True, d.pending, consent_position_unknown(d.issues)
     except Exception:  # noqa: BLE001
         logger.exception("trigger union-member compute failed")
-        return False, []
+        return False, [], set()
 
 
 def _callback_pending_for_union(
     *, role_configs: dict, resolver: Any = None,
-) -> tuple[bool, list[dict]]:
-    """``(ok, pending)`` — see :func:`trigger_pending_for_union` for why the
-    flag matters. A raising lookup reports ``ok=False``, never empty-as-none."""
+) -> tuple[bool, list[dict], set]:
+    """``(ok, pending, unknown)`` — see :func:`trigger_pending_for_union` for why
+    the flag and the unknown set matter. A raising lookup reports ``ok=False``,
+    never empty-as-none."""
     try:
         import callback_reconcile
         return callback_reconcile.callback_pending_for_union(
             role_configs=role_configs, resolver=resolver)
     except Exception:  # noqa: BLE001
         logger.exception("callback union-member lookup failed")
-        return False, []
+        return False, [], set()
 
 
 def setup_candidates(*, resolver: Any = None) -> tuple[bool, list[dict]]:
@@ -534,6 +540,11 @@ def setup_candidates(*, resolver: Any = None) -> tuple[bool, list[dict]]:
             # is right, but reporting ok would seal "needs no consent" verdicts
             # for plugins we simply could not see.
             return False, []
+        # The pinned wrapper accumulates generations AS targets resolve, so this
+        # guard only sees a complete set if the sweep runs LAST in the pass.
+        # Both reconcilers order it that way deliberately: main compute, then
+        # the peer's pending union, then this. Moving it earlier would narrow
+        # the guard silently rather than break a test.
         gens = getattr(resolver, "generations", None)
         if gens is not None and len(gens) > 1:
             # The pass spans registry GENERATIONS, so the pending membership and

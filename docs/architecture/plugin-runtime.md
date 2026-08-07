@@ -146,8 +146,9 @@ failing clearly on an empty credential.
 
 **A plugin's declared setup tool is run by Casa and by nothing else — released only by a
 positively sealed consent verdict for that exact artifact, and then only once its trigger
-routes are live, its required environment resolves, and the executing agent can load
-it**. The obligation is durable, retrying and crash-recovered; a single denial withholds
+**and callback** routes are live — the gate rejects any outstanding issue of either kind,
+per plugin and all-or-nothing — its required environment resolves, and the executing agent
+can load it**. The obligation is durable, retrying and crash-recovered; a single denial withholds
 it, so consent is not merely route authorization; an obligation whose plugin still has
 unresolved environment variables stays pending rather than running the setup tool against
 a placeholder-credentialed server — a consent round can settle while the installing
