@@ -659,3 +659,98 @@ async def test_a_malformed_row_does_not_strand_every_plugin(env):
     await _reconcile(env)
     assert len(env.dispatched) == 1
     assert _obligation() is not None
+
+
+# ---------------------------------------------------------------------------
+# Review round 3 findings
+# ---------------------------------------------------------------------------
+
+def test_one_snapshot_binds_the_pending_set_and_the_candidates():
+    """Sol: sharing a resolver CALLABLE pins nothing — each helper re-resolves.
+    `compute_desired` could see artifact A while a concurrent snapshot reload
+    published B and `setup_candidates` reported B. Rounds are keyed by PLUGIN,
+    so a `(plugin, B)` entry overwrites `(plugin, A)` and a zero-member B round
+    releases setup while B's consent is unapproved."""
+    calls = {"n": 0}
+    snaps = [
+        SimpleNamespace(registry_valid=True, plugins=[_plugin(triggers=True)],
+                        issues=[]),
+        SimpleNamespace(registry_valid=True,
+                        plugins=[_plugin(triggers=True, artifact="art-2")],
+                        issues=[]),
+    ]
+
+    def _drifting(target):
+        calls["n"] += 1
+        return snaps[min(calls["n"] - 1, len(snaps) - 1)]
+
+    pinned = tr.pin_resolver(_drifting)
+    first = pinned(None)
+    second = pinned(None)
+    assert first is second, "a pinned resolver must not re-resolve"
+    assert calls["n"] == 1
+    # A distinct target resolves once too, and is remembered.
+    pinned("resident:assistant")
+    pinned("resident:assistant")
+    assert calls["n"] == 2
+
+
+@pytest.mark.asyncio
+async def test_an_obsolete_open_member_cannot_block_settlement(env):
+    """Terra: retarget a trigger without changing the artifact. Role
+    invalidation does not cancel a TriggerConsentKey, so the OLD target's
+    member stayed open in the same-artifact round; approving the NEW target
+    could never settle it, and the old keyboard's expiry then refused the
+    obligation — with the new consent acked, nothing re-armed it."""
+    env.plugin = _plugin(triggers=True)
+    await _reconcile(env)
+    stale = _trigger_identity(env)
+    assert set(pse._load()["rounds"]["gmail"]["members"]) == {stale}
+    # The trigger is retargeted: a DIFFERENT consent identity, same artifact.
+    env.plugin.manifest["casa"]["triggers"][0]["name"] = "push2"
+    await _reconcile(env)
+    members = pse._load()["rounds"]["gmail"]["members"]
+    assert stale not in members, "an obsolete open member must be pruned"
+    assert len(members) == 1
+    # ...and the new consent alone settles the round.
+    _approve_trigger(env)
+    await _reconcile(env)
+    assert len(env.dispatched) == 1
+
+
+@pytest.mark.asyncio
+async def test_a_decided_member_is_never_pruned(env):
+    """The prune must take only STILL-OPEN members: a decided one is this
+    round's settlement so far, and dropping it would lose a denial."""
+    env.plugin = _plugin(triggers=True)
+    await _reconcile(env)
+    ident = _trigger_identity(env)
+    await pse.on_consent_decision(plugin="gmail", artifact_id="art-1",
+                                  identity=ident, approved=False, nonce="")
+    # The denial settled and consumed the round; re-seal with a DIFFERENT
+    # membership and confirm the denial's effect stands.
+    assert _obligation()["status"] == "refused"
+    pse.open_round(plugin="gmail", artifact_id="art-1",
+                   identities=["other"])
+    pse.open_round(plugin="gmail", artifact_id="art-1", identities=[])
+    assert pse._load()["rounds"]["gmail"]["members"] == {}
+    assert env.dispatched == []
+
+
+def test_pin_resolver_never_substitutes_a_default():
+    """Each reconciler has its OWN `_default_resolver`. If the pinning helper
+    fell back to the trigger module's default, a callback reconcile that relies
+    on its own seam would resolve through the wrong one — which is the same
+    module-default asymmetry as the ack stores. The caller resolves first."""
+    import inspect
+    sig = inspect.signature(tr.pin_resolver)
+    assert list(sig.parameters) == ["resolver"]
+    sentinel = SimpleNamespace(registry_valid=True, plugins=[], issues=[])
+    seen = []
+
+    def _mine(target):
+        seen.append(target)
+        return sentinel
+
+    assert tr.pin_resolver(_mine)(None) is sentinel
+    assert seen == [None]

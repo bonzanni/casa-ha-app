@@ -79,6 +79,33 @@ def _default_acks() -> Any:
     return ACKS
 
 
+def pin_resolver(resolver: "Callable[[str | None], Any]") -> Any:
+    """Wrap a resolver so every target resolves ONCE per pass, and every helper
+    in that pass sees the SAME snapshot.
+
+    Sharing a resolver *callable* does not pin anything: each call re-resolves,
+    so `compute_desired` can observe artifact A while a concurrent
+    `reload_snapshot` publishes B and :func:`setup_candidates` then reports B.
+    Sealing over a mixed pair is not a cosmetic inconsistency — rounds are keyed
+    by PLUGIN, so a `(plugin, B)` entry overwrites `(plugin, A)`, and a
+    zero-member B round then releases setup while B's consent is still
+    unapproved. Pin the pass instead.
+
+    The caller passes an ALREADY-RESOLVED resolver: this helper must never
+    substitute a default, because each reconciler has its OWN
+    ``_default_resolver`` and picking this module's would resolve the callback
+    reconciler's pass through the trigger module's seam.
+    """
+    cache: dict = {}
+
+    def _pinned(target: "str | None") -> Any:
+        if target not in cache:
+            cache[target] = resolver(target)
+        return cache[target]
+
+    return _pinned
+
+
 def _default_global_secret_ok() -> Callable[[], bool]:
     def ok() -> bool:
         if os.environ.get("WEBHOOK_SECRET", ""):
@@ -279,8 +306,13 @@ async def reconcile_plugin_triggers(
     secrets_dir = SECRETS_DIR if secrets_dir is None else secrets_dir
 
     def _compute_and_mint() -> "tuple[DesiredTriggers, list[dict], bool, list[dict] | None]":
+        # ONE snapshot for the whole pass (#451 r3): the pending membership and
+        # the setup-candidate sweep must describe the same registry, or the
+        # sealed round and the obligation can name different artifacts.
+        pinned = pin_resolver(
+            resolver if resolver is not None else _default_resolver())
         desired = compute_desired(
-            role_configs=role_configs, acks=acks, resolver=resolver,
+            role_configs=role_configs, acks=acks, resolver=pinned,
             global_secret_ok=global_secret_ok)
         _mint_secrets(desired, Path(secrets_dir))
         # The CALLBACK half of the union membership and the setup-candidate
@@ -302,8 +334,8 @@ async def reconcile_plugin_triggers(
         # triggered sweep is the thing that recovers the missing obligation.
         # Only the KEYBOARDS depend on `prompt`.
         union_ok, union = _callback_pending_for_union(
-            role_configs=role_configs, resolver=resolver)
-        cand_ok, cand = setup_candidates(resolver=resolver)
+            role_configs=role_configs, resolver=pinned)
+        cand_ok, cand = setup_candidates(resolver=pinned)
         candidates = cand if cand_ok else None
         return desired, union, union_ok, candidates
 

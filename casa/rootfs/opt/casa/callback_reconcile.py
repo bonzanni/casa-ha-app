@@ -604,16 +604,22 @@ async def reconcile_plugin_callbacks(
         # #451: the trigger half is computed whenever ``prompt`` is set, not
         # only when this pass has pending callbacks — sealing a ZERO-member
         # verdict requires knowing the trigger half is empty too.
+        # ONE snapshot for the whole pass (#451 r3) — see
+        # trigger_reconcile.pin_resolver for why sharing the callable is not
+        # enough.
+        import trigger_reconcile as _tr
+        pinned = _tr.pin_resolver(
+            resolver if resolver is not None else _default_resolver())
         computed = compute_desired(
-            role_configs=role_configs, acks=acks, resolver=resolver,
+            role_configs=role_configs, acks=acks, resolver=pinned,
             entries=entries)
         # NOT gated on ``prompt`` — see the trigger reconciler: boot runs
         # prompt=False and is exactly the pass that must recover an obligation
         # missing because a crash landed between a durable registry publish and
         # its lifecycle reconcile. Only the KEYBOARDS depend on `prompt`.
         union_ok, union = _trigger_pending_for_union(
-            role_configs=role_configs, resolver=resolver)
-        cand_ok, cand = _setup_candidates(resolver=resolver)
+            role_configs=role_configs, resolver=pinned)
+        cand_ok, cand = _setup_candidates(resolver=pinned)
         candidates = cand if cand_ok else None
         return computed, union, union_ok, candidates
 

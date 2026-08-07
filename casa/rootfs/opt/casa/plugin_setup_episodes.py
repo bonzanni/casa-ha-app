@@ -412,12 +412,21 @@ def open_round(*, plugin: str, artifact_id: str,
     members. Returns ``{identity: nonce}`` — the caller threads each nonce
     into that keyboard's decision callbacks (stale-expiry fencing).
 
-    Merges into an existing same-artifact round: listed members are
-    (re)opened with fresh nonces, other members keep their states — a
-    later reconcile batch that re-prompts a subset must not erase earlier
-    decisions. A different artifact starts a fresh round. SYNCHRONOUS +
-    yield-free — cannot interleave with the locked async sections. Never
-    raises (returns {} on failure: unfenced but never incorrect).
+    ``identities`` is the COMPLETE current membership for this plugin — the
+    caller (``trigger_reconcile.seal_setup_state``) seals nothing unless it
+    computed both consent kinds successfully. So merging into an existing
+    same-artifact round keeps every DECIDED member (they are this round's
+    settlement so far) but PRUNES a still-``open`` member that is no longer
+    pending. Without that prune an obsolete member blocks settlement forever:
+    unassign a trigger target and reassign to another without changing the
+    artifact, and the old target's member stays open (role invalidation does
+    not cancel a TriggerConsentKey), so approving the NEW target can never
+    settle the round, and the old keyboard's eventual expiry refuses the
+    obligation instead — with the new consent acked, nothing re-arms it.
+
+    A different artifact starts a fresh round. SYNCHRONOUS + yield-free —
+    cannot interleave with the locked async sections. Never raises (returns {}
+    on failure: unfenced but never incorrect).
 
     v0.161.0 (#451): ``identities`` may be EMPTY, which seals a POSITIVE
     verdict that this artifact needs no consent — the reconciler's way of
@@ -456,6 +465,16 @@ def open_round(*, plugin: str, artifact_id: str,
             nonce = uuid.uuid4().hex[:8]
             rnd["members"][identity] = {"state": "open", "nonce": nonce}
             nonces[identity] = nonce
+        listed = set(identities)
+        obsolete = [i for i, m in rnd["members"].items()
+                    if i not in listed
+                    and isinstance(m, dict) and m.get("state") == "open"]
+        for i in obsolete:
+            del rnd["members"][i]
+        if obsolete:
+            logger.info("pruned %d obsolete open member(s) from the setup "
+                        "round (plugin=%s): no longer pending", len(obsolete),
+                        plugin)
         _save(data)
         return nonces
     except Exception:  # noqa: BLE001 — prompt path must never see a raise
@@ -588,8 +607,9 @@ def _settle_locked(data: dict, plugin: str) -> tuple[bool, list[str]]:
       needs no consent, NOT an empty round to wait on;
     * any denial ⇒ ``status="refused"`` and one operator note. The operator
       declined the endpoint; provisioning it anyway would act against a
-      decision they just made. A later re-prompt re-arms the obligation
-      (:func:`_rearm_locked`), which is the way back.
+      decision they just made. While a consent for that artifact is pending
+      again the sweep re-arms the obligation (:func:`ensure_obligation`),
+      which is the way back.
 
     A round with NO obligation belongs to a plugin that declares no
     ``casa.setupTool`` — consume it silently (a denial must emit no spurious

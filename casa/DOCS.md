@@ -818,21 +818,30 @@ tool, and no agent will offer to. When a plugin declares `casa.setupTool`, Casa
 records that the plugin is owed a setup run and performs it itself, dispatching
 to one of the plugin's own target agents (its tools exist nowhere else).
 
-*When* it runs depends on what the plugin needs approved:
+Approval is what *clears* the run; it is not the only thing the run waits for.
+Casa clears it:
 
-- Nothing to approve → straight away, after the install or update.
-- A trigger or callback consent still pending → after you tap **Approve**.
-- You **Decline** → not at all. Casa says so; approving later runs it.
+- immediately, when the plugin needs nothing approved;
+- when you tap **Approve**, if it declares a trigger or callback consent — and
+  only once **every** consent it declares is approved;
+- never, if you **Decline**. Casa says so, and approving later runs it.
+
+A cleared run then waits until it can actually succeed: the plugin's webhook or
+callback routes must be live, every environment variable its server needs must
+be resolved, and the agent that will run it must already be able to load it. So
+"cleared" is usually followed by the run within seconds, but a plugin waiting on
+a secret you have not wired yet — or on a public URL that is not valid — waits
+as long as that takes.
 
 Anything Casa cannot yet establish — no chat to prompt you in, a permission
 position it could not read — leaves the run **pending** rather than guessing.
-Pending runs appear in the plugin health report and stay there until they
-happen, so a setup step that never ran is visible rather than silent.
+Every pending run appears in the plugin health report and stays there until it
+happens, whichever of these it is waiting on, so a setup step that never ran is
+visible rather than silent.
 
-You will see the setup outcome as **its own message**, shortly after the
-install or update report. It carries the setup tool's own words: Casa does not
-translate that into a verdict about whether the connection works, because it
-cannot see the other side.
+You will see the setup outcome as **its own message** once the run happens. It
+carries the setup tool's own words: Casa does not translate that into a verdict
+about whether the connection works, because it cannot see the other side.
 
 One limit worth knowing: a plugin whose setup tool is named only in its README
 or in a developer handoff, with no `casa.setupTool` in the manifest, has no

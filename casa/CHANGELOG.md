@@ -16,17 +16,19 @@
   produced the opposite mistakes: a setup step that ran before the key it needed
   existed, and one that never ran at all.
 - Casa now waits instead of guessing. It records that a plugin is owed a setup
-  run, and runs it only once the permission position for that exact version of
-  the plugin is actually known — immediately when nothing needs approving, after
-  your Approve when something does, and not at all if you decline. Anything it
-  cannot yet establish leaves the run pending and visible in the plugin health
-  report rather than resolved by a guess. In practice: setup no longer runs
-  before the credential it depends on exists, an updated setup step no longer
-  gets skipped because an unrelated permission was unchanged, and declining a
-  prompt no longer produces a message asking you to run something by hand that
-  you have no way to run.
-- The setup outcome now arrives as its own message after the install or update
-  report, rather than being folded into it. It carries the setup step's own
+  run, and clears that run only once the permission position for that exact
+  version of the plugin is actually known — at once when nothing needs
+  approving, when you approve everything it declares, and not at all if you
+  decline. A cleared run still waits until it can succeed: routes live, secrets
+  resolved, the running agent able to load the plugin. Anything Casa cannot yet
+  establish leaves the run pending and visible in the plugin health report
+  rather than resolved by a guess. In practice: setup no longer runs before the
+  credential it depends on exists, an updated setup step no longer gets skipped
+  because an unrelated permission was unchanged, and declining a prompt no
+  longer produces a message asking you to run something by hand that you have no
+  way to run.
+- The setup outcome now arrives as its own message once the run happens, rather
+  than being folded into the install or update report. It carries the setup step's own
   words, which — as of 0.160.0 — is the only account of the connection Casa will
   vouch for.
 
