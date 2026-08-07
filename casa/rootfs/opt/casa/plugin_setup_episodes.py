@@ -135,6 +135,10 @@ _MAX_RESOLVE_DEFERRALS = 10
 # unreadable state must never be counted as a DECISION — settlement requires a
 # positive "approved", it does not infer one from "neither open nor denied".
 _MEMBER_STATES = ("open", "approved", "denied")
+# The one `_compose` failure that a registry mutation can REPAIR, so it must not
+# be terminal (see _run_episode). Matched as a substring of the reason
+# `plugin_dispatch.compose` returns.
+_MUTABLE_COMPOSE_FAILURE = "no resident or specialist target"
 
 # Wired by casa_core at boot. All optional — absent seams degrade to logging.
 _dispatch: Callable[[str, str, dict], Awaitable[bool]] | None = None
@@ -1056,6 +1060,16 @@ async def _run_episode(ep: dict) -> bool:
                 return
     role, instruction = _compose(ep, entry, tool)
     if role is None:
+        if _MUTABLE_COMPOSE_FAILURE in instruction:
+            # #451 r13 (Sol): having no runnable target is an ASSIGNMENT state,
+            # not a property of the artifact — `plugin_assign` repairs it. Making
+            # it terminal stranded the obligation for good: with the hand-back
+            # gone there is no manual path, and nothing re-arms a terminal row
+            # once every consent is acked. So it HOLDS, like the route, secret,
+            # binding and dispatch-acceptance gates; assignment reloads kick a
+            # re-check. Only an artifact-intrinsic failure stays terminal.
+            _update_episode(ep["id"], last_error=f"waiting: {instruction}")
+            return
         _update_episode(ep["id"], status="failed", last_error=instruction)
         await _note(f"Plugin {plugin}: automatic setup could not run "
                     f"({instruction}). Run its setup tool manually.")

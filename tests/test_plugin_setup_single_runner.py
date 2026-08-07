@@ -1437,3 +1437,40 @@ async def test_a_transient_registry_outage_does_not_strand_a_released_run(env):
         ack_lookup=lambda i: None, routes_live=lambda p: True)
     await _reconcile(env)
     assert len(env.dispatched) == 1, "a recovered registry must not strand setup"
+
+
+# ---------------------------------------------------------------------------
+# Review round 13 finding (Sol; Terra reported none)
+# ---------------------------------------------------------------------------
+
+@pytest.mark.asyncio
+async def test_losing_every_target_holds_rather_than_failing(env):
+    """Sol: `failed` is not always artifact-intrinsic. Having no runnable target
+    is an ASSIGNMENT state that `plugin_assign` repairs — and with the hand-back
+    gone there is no manual path out of a terminal row, nor anything to re-arm it
+    once every consent is acked. So it holds, like every other environmental
+    gate."""
+    env.plugin = _plugin()
+    env.entry = dict(env.entry, targets=[])        # every target unassigned
+    await _reconcile(env)
+    row = _obligation()
+    assert row["status"] == "pending", "an assignment gap must not be terminal"
+    assert "waiting" in row["last_error"]
+    assert env.dispatched == [] and env.notes == []
+    # Reassigning repairs it, with no re-arm needed.
+    env.entry = dict(env.entry, targets=["resident:assistant"])
+    await pse._worker_pass()
+    assert len(env.dispatched) == 1
+
+
+@pytest.mark.asyncio
+async def test_an_artifact_intrinsic_failure_stays_terminal(env):
+    """The other half: an ambiguous server binding is a declaration error that no
+    registry mutation repairs, so it stays terminal and tells the operator rather
+    than retrying the same failure on every kick."""
+    env.plugin = _plugin()
+    env.entry = dict(env.entry, granted_tools=["srv_a", "srv_b"])
+    await _reconcile(env)
+    assert _obligation()["status"] == "failed"
+    assert any("could not run" in n for n in env.notes)
+    assert env.dispatched == []
