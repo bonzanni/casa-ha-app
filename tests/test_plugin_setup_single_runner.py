@@ -1290,3 +1290,77 @@ def test_a_verdict_that_cannot_be_read_is_not_authoritative():
     import inspect
     src = inspect.getsource(pse)
     assert 'get("verdict", True)' not in src, "a fail-open verdict default"
+
+
+# ---------------------------------------------------------------------------
+# Review round 10 findings
+# ---------------------------------------------------------------------------
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("verdict", ["false", "no", 1, [], {}, 0, None, "true"])
+async def test_only_the_exact_boolean_makes_a_round_authoritative(env, verdict):
+    """Both round-10 reviewers: `bool(...)` made every TRUTHY value
+    authoritative, so a persisted `"verdict": "false"` released setup. Only the
+    exact boolean the sealer writes may count."""
+    import json
+    pse.STORE_PATH.write_text(json.dumps({
+        "schema_version": 4,
+        "rounds": {"gmail": {"artifact_id": "art-1", "members": {},
+                             "verdict": verdict}},
+        "episodes": [{"id": "e1", "plugin": "gmail", "artifact_id": "art-1",
+                      "gen": 0, "status": "pending",
+                      "gate": "awaiting_verdict", "attempts": 0,
+                      "resolve_deferrals": 0, "approved_identities": [],
+                      "created_ts": 1.0, "updated_ts": 1.0}],
+    }), encoding="utf-8")
+    assert pse._load()["rounds"]["gmail"]["verdict"] is False
+    await pse._worker_pass()
+    assert _obligation()["gate"] == "awaiting_verdict"
+    assert env.dispatched == []
+
+
+@pytest.mark.asyncio
+async def test_an_unreadable_member_state_is_never_a_decision(env):
+    """Both round-10 reviewers: settlement waited only on `state == "open"`, so a
+    member with an unreadable state (`{}`) was neither open nor denied and got
+    counted as APPROVED — releasing setup for a consent nobody had answered.
+    Completeness is now positive: every member must carry a terminal decision."""
+    import json
+    pse.STORE_PATH.write_text(json.dumps({
+        "schema_version": 4,
+        "rounds": {"gmail": {"artifact_id": "art-1", "verdict": True,
+                             "members": {"id-a": {}}}},
+        "episodes": [{"id": "e1", "plugin": "gmail", "artifact_id": "art-1",
+                      "gen": 0, "status": "pending",
+                      "gate": "awaiting_verdict", "attempts": 0,
+                      "resolve_deferrals": 0, "approved_identities": [],
+                      "created_ts": 1.0, "updated_ts": 1.0}],
+    }), encoding="utf-8")
+    # Normalisation turns the unreadable state into OPEN — the self-healing,
+    # settlement-blocking direction.
+    assert (pse._load()["rounds"]["gmail"]["members"]["id-a"]["state"]
+            == "open")
+    await pse._worker_pass()
+    assert _obligation()["gate"] == "awaiting_verdict"
+    assert env.dispatched == []
+    # A genuine approval of that member then releases it.
+    await pse.on_consent_decision(plugin="gmail", artifact_id="art-1",
+                                  identity="id-a", approved=True,
+                                  approval_gen="g1")
+    assert _obligation()["gate"] == "released"
+
+
+@pytest.mark.asyncio
+async def test_settlement_requires_a_positive_approval(env):
+    """The rule stated directly: a round settles only when every member carries
+    `approved` or `denied`, never by elimination."""
+    pse.ensure_obligation(plugin="gmail", artifact_id="art-1",
+                          consent_pending=True)
+    pse.open_round(plugin="gmail", artifact_id="art-1",
+                   identities=["a", "b"], verdict=True)
+    data = pse._load()
+    data["rounds"]["gmail"]["members"]["a"] = {"state": "approved", "gen": "g1"}
+    data["rounds"]["gmail"]["members"]["b"] = {"state": "weird"}
+    pse._save(data)
+    await pse._recover_and_settle()
+    assert _obligation()["gate"] == "awaiting_verdict"

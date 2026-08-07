@@ -131,6 +131,10 @@ _HEALTH_DECAY_S = 72 * 3600.0
 # goes stale so it can't retry forever. v0.161.0: settlement no longer resolves
 # the registry at all, so this bounds only the dispatch path.
 _MAX_RESOLVE_DEFERRALS = 10
+# The only member states a round may carry. Anything else is unreadable, and an
+# unreadable state must never be counted as a DECISION — settlement requires a
+# positive "approved", it does not infer one from "neither open nor denied".
+_MEMBER_STATES = ("open", "approved", "denied")
 
 # Wired by casa_core at boot. All optional — absent seams degrade to logging.
 _dispatch: Callable[[str, str, dict], Awaitable[bool]] | None = None
@@ -269,16 +273,28 @@ def _migrate(data: dict) -> None:
                 logger.warning("dropping unreadable setup round (plugin=%r)",
                                plugin)
                 continue
-            members = {i: m for i, m in rnd["members"].items()
-                       if isinstance(i, str) and isinstance(m, dict)}
-            if len(members) != len(rnd["members"]):
-                logger.warning("dropped malformed member(s) from the setup "
-                               "round (plugin=%s)", plugin)
+            members = {}
+            for i, m in rnd["members"].items():
+                if not isinstance(i, str) or not isinstance(m, dict):
+                    logger.warning("dropped malformed member from the setup "
+                                   "round (plugin=%s)", plugin)
+                    continue
+                if m.get("state") not in _MEMBER_STATES:
+                    # An unreadable state becomes OPEN, never a decision. Open is
+                    # the self-healing direction: it blocks settlement (so no
+                    # release is inferred from it), and the reconciler either
+                    # re-seals the member with a fresh nonce if the consent is
+                    # still pending, or prunes it if it is not.
+                    logger.warning("member state %r unreadable — treating as "
+                                   "open (plugin=%s)", m.get("state"), plugin)
+                    m["state"] = "open"
+                members[i] = m
             rnd["members"] = members
             # A round whose authority cannot be read is NOT authoritative.
-            # Defaulting this to True was a fail-open: a hand-written or
-            # partially-written round would release setup with no sealed verdict.
-            rnd["verdict"] = bool(rnd.get("verdict", False))
+            # `is True` rather than `bool(...)`: coercion made every truthy value
+            # authoritative, so a persisted `"verdict": "false"` released setup.
+            # Only the exact boolean the sealer writes counts.
+            rnd["verdict"] = rnd.get("verdict") is True
             clean[plugin] = rnd
         data["rounds"] = clean
     # DROP structurally corrupt rows, on every load and at every version. The
@@ -726,11 +742,16 @@ def _settle_locked(data: dict, plugin: str) -> tuple[bool, list[str]]:
     if not isinstance(rnd, dict):
         return False, []
     members = rnd.get("members") or {}
-    if any(m.get("state") == "open" for m in members.values()):
+    # POSITIVE completeness: every member must carry a terminal decision. Waiting
+    # only on `state == "open"` inferred a decision by elimination, so a member
+    # with an unreadable state (`{}`) counted as approved and released setup for a
+    # consent nobody had answered.
+    if any(m.get("state") not in ("approved", "denied")
+           for m in members.values()):
         return False, []
     artifact_id = rnd.get("artifact_id") or ""
     del data["rounds"][plugin]
-    if not rnd.get("verdict", False):
+    if rnd.get("verdict") is not True:
         # Sealed for keyboard fencing only — the reconciler could not establish
         # this plugin's full consent position in the pass that opened it. The
         # decisions it collected say nothing about setup, so consume the round
