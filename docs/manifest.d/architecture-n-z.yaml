@@ -224,7 +224,7 @@
 
 - doc: architecture/triggers.md
   summary: What makes an agent act without a person speaking — scheduled and webhook triggers, and the consent a plugin trigger needs.
-  when_changing: trigger types, webhook trigger routing, plugin trigger consent, or scheduling
+  when_changing: trigger types, webhook trigger routing, plugin trigger consent, one-shot firing and cleanup, or scheduling
   covers:
     - casa/rootfs/opt/casa/trigger_registry.py::TriggerRegistry
     - casa/rootfs/opt/casa/trigger_registry.py::TriggerRegistry.replace_plugin_overlay
@@ -248,8 +248,8 @@
     INV-TRIG-009: [tests/test_trigger_registry_date.py::test_firing_an_agent_owned_one_shot_removes_job_and_entry, tests/test_trigger_registry_date.py::test_firing_an_OPERATORS_one_shot_drops_the_job_but_not_the_entry, tests/test_trigger_registry_date.py::test_firing_a_one_shot_frees_its_job_id]
 
 - doc: architecture/reminders.md
-  summary: How an agent comes to nudge someone later — entry ownership, the narrow writer, delivery, and the sweep that redeems an occurrence the process was down for.
-  when_changing: reminder creation or cancellation, the reminder sweep, one-shot firing, or recurrence derivation
+  summary: How an agent comes to nudge someone later — entry ownership, the narrow writer, delivery, and the sweep that redeems a past-dated one-shot the process was down for.
+  when_changing: reminder creation or cancellation, the reminder sweep, or recurrence derivation
   covers:
     - casa/rootfs/opt/casa/reminders.py
   tests:
