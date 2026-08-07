@@ -217,6 +217,15 @@ class ClaudeAgentOptions:
     # empty — masking the bug under unit tests (which use the host's real
     # SDK). See reference_mock_sdk_drift in memory for the v0.5.9 precedent.
     plugins: list[Any] = field(default_factory=list)
+    # v0.154.0 (#430): agent._build_options passes
+    # env=sanitized_env_for_resolution(...) on EVERY turn, so without this
+    # field the dataclass init raised TypeError and every turn failed —
+    # the same shape as `plugins` above, and it recurred for the same reason
+    # (unit tests use the host's REAL sdk, which has the field). The mock
+    # accepts and ignores it: it spawns no subprocess to hand an environment
+    # to. This was found four releases late, with the whole e2e tier failing
+    # at its first turn.
+    env: dict[str, Any] = field(default_factory=dict)
     # Phase 4b — Bug 4 stderr callback field. sdk_logging.with_stderr_callback
     # wraps the options struct via dataclasses.replace(options, stderr=cb);
     # the mock's frozen=False default still requires the field to exist.
