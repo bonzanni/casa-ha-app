@@ -540,27 +540,13 @@ def seal_setup_state(*, trigger_pending: list[dict],
     """
     import plugin_setup_episodes
 
+    # The pending identities come FIRST, because whether a consent is pending
+    # for an artifact is an input to the obligation decision (a terminal row
+    # plus a pending consent means setup is owed again — see
+    # ``ensure_obligation``). Membership is sealed for every pending identity
+    # regardless of whether setup is owed: the round is also what fences the
+    # consent keyboards.
     by_plugin: dict[tuple, list[str]] = {}
-    # Obligations first: a candidate that still awaits a verdict joins the
-    # sealing pass with (possibly) zero members. One already dispatched,
-    # refused or failed reports False and is left alone — no verdict churn on
-    # every reconcile for a plugin whose setup is long settled.
-    for cand in candidates or ():
-        try:
-            if plugin_setup_episodes.ensure_obligation(
-                    plugin=cand["plugin"], artifact_id=cand["artifact_id"]):
-                by_plugin.setdefault(
-                    (cand["plugin"], cand["artifact_id"]), [])
-        except Exception:  # noqa: BLE001 — never break a reconcile on this
-            logger.exception("setup obligation ensure failed (plugin=%s)",
-                             cand.get("plugin"))
-    if not pending_complete:
-        # Sealing a verdict now would either under-report membership or assert
-        # "no consent needed" without knowing. Hold instead; the obligations
-        # created above stay pending and this runs again on the next reconcile.
-        logger.info("setup verdicts not sealed: a pending-consent compute "
-                    "failed this pass")
-        return {}
     for p in trigger_pending:
         ident = ack_identity(
             plugin=p["plugin"], artifact_id=p["artifact_id"],
@@ -571,6 +557,32 @@ def seal_setup_state(*, trigger_pending: list[dict],
         # the declaration digest, which only that module derives).
         by_plugin.setdefault(
             (c["plugin"], c["artifact_id"]), []).append(c["identity"])
+
+    # A candidate that awaits a verdict joins the sealing pass with (possibly)
+    # zero members. One already dispatched, refused or failed with NO pending
+    # consent reports False and is left alone — no verdict churn on every
+    # reconcile for a plugin whose setup is long settled.
+    for cand in candidates or ():
+        key = (cand["plugin"], cand["artifact_id"])
+        try:
+            if plugin_setup_episodes.ensure_obligation(
+                    plugin=cand["plugin"], artifact_id=cand["artifact_id"],
+                    # Only a COMPLETE pending set may re-arm: an under-reported
+                    # one would leave a terminal row terminal for the wrong
+                    # reason, and an incomplete one cannot be told from it.
+                    consent_pending=bool(pending_complete
+                                         and by_plugin.get(key))):
+                by_plugin.setdefault(key, [])
+        except Exception:  # noqa: BLE001 — never break a reconcile on this
+            logger.exception("setup obligation ensure failed (plugin=%s)",
+                             cand.get("plugin"))
+    if not pending_complete:
+        # Sealing a verdict now would either under-report membership or assert
+        # "no consent needed" without knowing. Hold instead; the obligations
+        # created above stay pending and this runs again on the next reconcile.
+        logger.info("setup verdicts not sealed: a pending-consent compute "
+                    "failed this pass")
+        return {}
 
     nonce_by_identity: dict[str, str] = {}
     for (plg, art), idents in by_plugin.items():

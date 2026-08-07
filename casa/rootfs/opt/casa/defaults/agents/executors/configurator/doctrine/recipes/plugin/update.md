@@ -72,10 +72,12 @@ service at STALE credentials until its **setup tool** runs.
 
 **Casa runs it. You do not route it anywhere.** A plugin that declares
 `casa.setupTool` gets a durable per-artifact setup obligation, which Casa
-releases once any consent for that exact artifact settles — or immediately,
-when that artifact needs no consent. The `plugin_update` result reports the
-declared `setup_tool` so you can say what is queued. Emit NO `next_steps`
-entry for it, do not ask an agent to run it, and do not ask the operator to.
+releases once EVERY consent that artifact declares has been approved — or
+immediately, when it needs no consent. One declined consent withholds it (the
+setup tool is argument-free and cannot target a subset). The `plugin_update`
+result reports the declared `setup_tool` so you can say what is queued. Emit NO
+`next_steps` entry for it, do not ask an agent to run it, and do not ask the
+operator to.
 
 The operator hears the setup outcome in a separate message from whichever
 agent Casa dispatches to. Your completion `text` should say that setup is

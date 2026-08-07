@@ -85,12 +85,13 @@ runs. The operator must never need to remember a follow-up incantation.
 
 **Casa runs it. You do not route it anywhere.** A plugin that declares
 `casa.setupTool` gets a durable per-artifact setup obligation, which Casa
-releases once any consent for that exact artifact settles — or immediately,
-when that artifact needs no consent. Because plugin tools surface only on the
-plugin's target agents, never in this engagement, Casa dispatches its own turn
-to one of them; the operator hears the setup outcome in a separate message. The
-`plugin_add` result reports the declared `setup_tool` so you can say what is
-queued.
+releases once EVERY consent that artifact declares has been approved — or
+immediately, when it needs no consent. One declined consent withholds it (the
+setup tool is argument-free and cannot target a subset). Because plugin tools
+surface only on the plugin's target agents, never in this engagement, Casa
+dispatches its own turn to one of them; the operator hears the setup outcome in
+a separate message. The `plugin_add` result reports the declared `setup_tool` so
+you can say what is queued.
 
 So: emit NO `next_steps` entry for setup, do not ask an agent to run it, and
 do not ask the operator to. Your completion `text` says that setup is queued

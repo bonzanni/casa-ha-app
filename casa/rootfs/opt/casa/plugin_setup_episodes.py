@@ -33,9 +33,14 @@ So the hand-back is gone and this facility is the only runner. The model:
   it is visible in health and re-checked on every kick.
 * **A denial refuses the obligation** (``status="refused"``) and never
   dispatches — the operator declined the endpoint. The way back is mechanical:
-  a later re-prompt for the same artifact RE-ARMS it (see
-  :func:`open_round`), which is also how a re-consent that re-mints a secret
-  gets setup re-run on an unchanged artifact.
+  while a consent for that artifact is pending again the sweep RE-ARMS the row
+  (:func:`ensure_obligation`), so the operator's later Approve runs setup, as
+  the denial note promises. That is also how a re-consent which re-mints a
+  secret gets setup re-run on an unchanged artifact. ``refused`` is therefore a
+  record of the last settlement rather than a permanent barrier — Casa's
+  consent layer does not persist a denial either (an unacked consent stays
+  pending and is re-prompted), and the barrier that matters is that nothing
+  dispatches without a release.
 * **The setup tool is resolved at DISPATCH time**, live from the current
   manifest — which is why an update that changes ``casa.setupTool`` while
   leaving ``casa.callbacks`` byte-identical still runs the NEW tool (attempt
@@ -64,9 +69,14 @@ Design (Sol+Terra design round + implementation rounds 1-3, 2026-07-24):
 * **Stale-artifact fencing** (impl r2): the decision path never replaces
   an existing round with a different artifact_id — only the prompt path
   (which runs solely from a live reconcile) starts a new-artifact round.
-* **Re-consent re-arms the obligation** (v0.161.0): a fresh prompt for the
-  same artifact bumps the obligation's ``gen`` and returns it to
-  ``pending``/``awaiting_verdict``. This replaces the v0.112.0 scheme of
+* **Re-consent re-arms the obligation** (v0.161.0): a pending consent for an
+  artifact whose obligation is terminal bumps its ``gen`` and returns it to
+  ``pending``/``awaiting_verdict``. The decision is driven by the reconciler's
+  positive pending set, NOT by whether a prompt happened to mint a fresh nonce
+  — that coupling lost setup after a denial plus a restart (a promptless pass
+  opened the member, so the prompted pass deduped onto it and minted nothing)
+  and could also re-arm with no keyboard able to settle the round. This
+  replaces the v0.112.0 scheme of
   minting a new episode keyed by ``identity#gen`` plus consumed-key
   tombstones: creation is now driven solely by the LIVE registry sweep, so
   there is no replay path a tombstone would need to fence, and the row's
@@ -228,13 +238,24 @@ def _migrate(data: dict) -> None:
     ``consumed_keys`` is dropped rather than migrated: creation is now driven
     solely by the live registry sweep, so there is no replay for a tombstone to
     fence, and the row identity is ``(plugin, artifact_id)`` with ``gen``."""
-    if int(data.get("schema_version") or 0) >= _SCHEMA_VERSION:
-        data.pop("consumed_keys", None)
-        return
     data.pop("consumed_keys", None)
-    for row in data.get("episodes") or ():
-        if not isinstance(row, dict):
-            continue
+    # DROP structurally corrupt rows, on every load and at every version. The
+    # store-level guard only checks that `episodes` is a list, so one non-dict
+    # element (a partial write, a hand-edit) used to survive and then raise on
+    # the first `e.get(...)` in `_row_for` / `episodes()` / `health_issues()` —
+    # stranding EVERY plugin's setup and breaking health regeneration, with the
+    # "a corrupt store must not brick boot" recovery never reached because the
+    # store parsed fine.
+    rows = data.get("episodes")
+    if isinstance(rows, list):
+        kept = [r for r in rows if isinstance(r, dict)]
+        if len(kept) != len(rows):
+            logger.warning("dropped %d malformed setup-obligation row(s)",
+                           len(rows) - len(kept))
+        data["episodes"] = kept
+    if int(data.get("schema_version") or 0) >= _SCHEMA_VERSION:
+        return
+    for row in data["episodes"]:
         row.setdefault("gen", 0)
         row.setdefault("resolve_deferrals", 0)
         row.setdefault("approved_identities", [])
@@ -314,7 +335,8 @@ def _new_row(plugin: str, artifact_id: str, gen: int) -> dict:
     }
 
 
-def ensure_obligation(*, plugin: str, artifact_id: str) -> bool:
+def ensure_obligation(*, plugin: str, artifact_id: str,
+                      consent_pending: bool = False) -> bool:
     """Ensure a durable setup obligation exists for this EXACT artifact, and
     report whether one is now awaiting a consent verdict.
 
@@ -323,45 +345,58 @@ def ensure_obligation(*, plugin: str, artifact_id: str) -> bool:
     sites are covered without a hook of their own. A row for a DIFFERENT
     artifact is superseded (the new artifact's own verdict owns it now).
 
+    ``consent_pending`` says whether the reconciler currently sees an
+    UNACKED consent for this exact artifact. A terminal row plus a pending
+    consent means setup is owed again — the operator is about to be prompted
+    afresh, and an approval must be able to run setup — so the row is RE-ARMED
+    to ``pending`` with the next generation. That is what makes a
+    revoked-then-reapproved trigger re-run setup on an unchanged artifact,
+    whose secret is re-minted and would otherwise leave the external service
+    holding a stale credential; and it is what lets an approval after a denial
+    do what the operator note promises.
+
+    Re-arming is decided HERE, from the reconciler's positive pending set —
+    never from whether :func:`open_round` happened to mint a fresh nonce. That
+    earlier coupling failed in both directions: a promptless pass would open a
+    member and then a prompted pass would dedupe onto it, minting nothing and
+    never re-arming (setup lost after a denial + restart); while a peer
+    reconciler could re-arm and open a member with no keyboard to settle it.
+
     Returns True iff there is now a ``pending`` obligation for
-    ``artifact_id``, i.e. the caller should seal a verdict for it. A
-    ``dispatched``/``failed``/``stale``/``refused`` row returns False, so a
-    settled artifact stops generating verdict churn on every reconcile.
+    ``artifact_id``, i.e. the caller should seal a verdict for it. A terminal
+    row with no pending consent returns False, so a settled artifact stops
+    generating verdict churn on every reconcile.
 
     SYNCHRONOUS + yield-free. Never raises."""
     try:
         data = _load()
         row = _row_for(data, plugin)
         if row is not None and row.get("artifact_id") == artifact_id:
-            return row.get("status") == "pending"
+            if row.get("status") == "pending":
+                return True
+            if not consent_pending:
+                return False
+            gen = int(row.get("gen") or 0) + 1
+            fresh = _new_row(plugin, artifact_id, gen)
+            fresh["created_ts"] = row.get("created_ts") or fresh["created_ts"]
+            data["episodes"] = [e for e in data["episodes"]
+                                if e.get("plugin") != plugin]
+            data["episodes"].append(fresh)
+            _save(data)
+            logger.info("setup obligation re-armed (plugin=%s gen=%d): a "
+                        "consent for this artifact is pending again", plugin,
+                        gen)
+            return True
         # No row, or a row for a superseded artifact.
         data["episodes"] = [e for e in data["episodes"]
-                            if e.get("plugin") != plugin]
+                            if isinstance(e, dict)
+                            and e.get("plugin") != plugin]
         data["episodes"].append(_new_row(plugin, artifact_id, 0))
         _save(data)
         return True
     except Exception:  # noqa: BLE001 — the reconcile path must never see a raise
         logger.exception("setup obligation ensure failed (plugin=%s)", plugin)
         return False
-
-
-def _rearm_locked(data: dict, plugin: str, artifact_id: str) -> None:
-    """A FRESH prompt for an artifact whose obligation already reached a
-    terminal state returns it to ``pending``/``awaiting_verdict`` with the next
-    generation. This is how a re-consent gets setup re-run on an UNCHANGED
-    artifact — the case that matters is a revoked-then-reapproved trigger,
-    whose secret is re-minted, leaving the external service holding a stale
-    credential. Mutates ``data``; caller saves."""
-    row = _row_for(data, plugin, artifact_id)
-    if row is None or row.get("status") == "pending":
-        return
-    fresh = _new_row(plugin, artifact_id, int(row.get("gen") or 0) + 1)
-    fresh["created_ts"] = row.get("created_ts") or fresh["created_ts"]
-    data["episodes"] = [e for e in data["episodes"]
-                        if e.get("plugin") != plugin]
-    data["episodes"].append(fresh)
-    logger.info("setup obligation re-armed (plugin=%s gen=%d): a fresh consent "
-                "prompt for the same artifact", plugin, fresh["gen"])
 
 
 # ---------------------------------------------------------------------------
@@ -388,8 +423,13 @@ def open_round(*, plugin: str, artifact_id: str,
     verdict that this artifact needs no consent — the reconciler's way of
     saying "released" for an ungated plugin, or for one whose consent ack
     survived an update. That is deliberately distinct from the absence of a
-    round, which means "no verdict yet" and holds. Sealing at least one FRESH
-    member also RE-ARMS a terminal obligation for the same artifact."""
+    round, which means "no verdict yet" and holds.
+
+    This function does NOT re-arm a terminal obligation — that decision lives in
+    :func:`ensure_obligation`, driven by whether a consent is actually pending
+    for the artifact. Deriving it here from "did I mint a fresh nonce" was wrong
+    in both directions: a promptless pass opened the member, so the later
+    prompted pass deduped onto it and minted nothing."""
     try:
         data = _load()
         rnd = data["rounds"].get(plugin)
@@ -397,7 +437,6 @@ def open_round(*, plugin: str, artifact_id: str,
             rnd = {"artifact_id": artifact_id, "members": {}}
             data["rounds"][plugin] = rnd
         nonces: dict[str, str] = {}
-        minted = False
         for identity in identities:
             existing = rnd["members"].get(identity)
             # impl r5 (Terra): a member that is ALREADY open keeps its nonce.
@@ -417,9 +456,6 @@ def open_round(*, plugin: str, artifact_id: str,
             nonce = uuid.uuid4().hex[:8]
             rnd["members"][identity] = {"state": "open", "nonce": nonce}
             nonces[identity] = nonce
-            minted = True
-        if minted:
-            _rearm_locked(data, plugin, artifact_id)
         _save(data)
         return nonces
     except Exception:  # noqa: BLE001 — prompt path must never see a raise

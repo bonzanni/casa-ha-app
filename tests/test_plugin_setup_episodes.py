@@ -103,21 +103,27 @@ async def _drain_pending(state):
         await pse._run_episode(ep)
 
 
-def _owe(plugin="elevenlabs", artifact="art-1"):
+def _owe(plugin="elevenlabs", artifact="art-1", consent_pending=False):
     """What the reconciler sweep does first: record that Casa owes this exact
     artifact a setup run (#451). Sealing a round without this models a plugin
-    that declares no ``casa.setupTool``."""
-    return pse.ensure_obligation(plugin=plugin, artifact_id=artifact)
+    that declares no ``casa.setupTool``.
+
+    ``consent_pending`` is what the sweep passes when it can see an UNACKED
+    consent for the artifact — the input that re-arms a terminal row. The
+    helpers below set it because they are about to open a member, which is
+    precisely the state the reconciler would report as pending."""
+    return pse.ensure_obligation(plugin=plugin, artifact_id=artifact,
+                                 consent_pending=consent_pending)
 
 
 def _prompt(plugin="elevenlabs", artifact="art-1", identity="id-a"):
-    _owe(plugin, artifact)
+    _owe(plugin, artifact, consent_pending=True)
     return pse.open_round(plugin=plugin, artifact_id=artifact,
                           identities=[identity]).get(identity, "")
 
 
 def _open(identities, plugin="elevenlabs", artifact="art-1"):
-    _owe(plugin, artifact)
+    _owe(plugin, artifact, consent_pending=True)
     return pse.open_round(plugin=plugin, artifact_id=artifact,
                           identities=identities)
 

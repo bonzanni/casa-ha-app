@@ -596,3 +596,66 @@ async def test_a_late_denial_cannot_revoke_a_release(env):
         secrets_ready=lambda p: True)
     await pse._worker_pass()
     assert len(env.dispatched) == 1
+
+
+# ---------------------------------------------------------------------------
+# Review round 2 findings (Sol + Terra converged on all three)
+# ---------------------------------------------------------------------------
+
+@pytest.mark.asyncio
+async def test_approval_after_a_denial_and_a_restart_still_runs_setup(env):
+    """The denial note promises that approving the consent will run setup. This
+    pins that end to end, across a promptless pass in between.
+
+    Both round-2 reviewers predicted this was BROKEN, from opposite directions,
+    because re-arming was driven by whether `open_round` minted a fresh nonce —
+    a fact about prompting, not about consent. Their sequences do not actually
+    reach it: a row only becomes terminal by settling or dispatching, both of
+    which consume the round, so `open_round` always saw an absent member and
+    always minted. Re-arming now reads the reconciler's pending set directly,
+    which is the condition it always meant; the proxy happened to agree only
+    because of an unstated "terminal row implies no live round" invariant."""
+    env.plugin = _plugin(triggers=True)
+    await _reconcile(env)
+    ident = _trigger_identity(env)
+    await pse.on_consent_decision(plugin="gmail", artifact_id="art-1",
+                                  identity=ident, approved=False, nonce="")
+    assert _obligation()["status"] == "refused"
+    # A promptless pass — boot after a restart, or any prompt=False reload.
+    role_configs = {"assistant": SimpleNamespace(channels=["webhook"])}
+
+    def _resolver(target):
+        return SimpleNamespace(registry_valid=True, plugins=[env.plugin],
+                               issues=[])
+
+    await tr.reconcile_plugin_triggers(
+        trigger_registry=env.registry, role_configs=role_configs,
+        channel_manager=None, acks=env.trig_acks,
+        secrets_dir=env.secrets_dir, prompt=False,
+        resolver=_resolver, global_secret_ok=lambda: True)
+    # ...then the operator is re-prompted and approves.
+    await _reconcile(env)
+    _approve_trigger(env)
+    await _reconcile(env)
+    assert len(env.dispatched) == 1, "approving after a denial must run setup"
+
+
+@pytest.mark.asyncio
+async def test_a_malformed_row_does_not_strand_every_plugin(env):
+    """Sol + Terra: the store guard only checks that `episodes` is a LIST, so
+    one non-dict element parsed fine and then raised on the first `e.get(...)`
+    in `_row_for` / `episodes()` / `health_issues()`. That stranded EVERY
+    plugin's setup and broke health regeneration, and the "a corrupt store must
+    not brick boot" recovery never applied because the store was not corrupt at
+    the level it checks."""
+    import json
+    pse.STORE_PATH.write_text(json.dumps({
+        "schema_version": 4, "rounds": {},
+        "episodes": [None, "partial write", 7],
+    }), encoding="utf-8")
+    assert pse.episodes() == []
+    assert pse.health_issues() == []
+    env.plugin = _plugin()
+    await _reconcile(env)
+    assert len(env.dispatched) == 1
+    assert _obligation() is not None
