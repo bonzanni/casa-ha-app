@@ -437,7 +437,12 @@ def test_withhold_admits_the_setup_provisioning_plugin(tmp_path):
     tool could never run to create the credentials it was withheld for."""
     rp = _bankfeed(tmp_path)
     res = ResolutionResult(registry_valid=True, plugins=[rp])
-    kept, withheld = withhold_env_unresolved(res, context="test")
+    # The environment is STATED, never inherited. Read from `os.environ` this
+    # case passes on a machine with the token exported and fails in CI without
+    # it — which is exactly what happened, and main was red for two releases
+    # behind a green local suite.
+    kept, withheld = withhold_env_unresolved(
+        res, context="test", environ={"OP_SERVICE_ACCOUNT_TOKEN": "ops_tok"})
     assert withheld == []
     assert [p.name for p in kept.plugins] == ["bank-feed"]
 
@@ -447,7 +452,7 @@ def test_withhold_still_blocks_an_undeclared_missing_secret(tmp_path):
                    {"srv": {"env": {"K": "${GMAIL_CLIENT_ID}"}}},
                    manifest={"casa": {"setupTool": "setup_gmail"}})
     res = ResolutionResult(registry_valid=True, plugins=[rp])
-    kept, withheld = withhold_env_unresolved(res, context="test")
+    kept, withheld = withhold_env_unresolved(res, context="test", environ={})
     assert [p.name for p in kept.plugins] == []
     assert [(p.name, m) for p, m in withheld] == [
         ("gmailish", ["GMAIL_CLIENT_ID"])]
