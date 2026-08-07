@@ -1168,14 +1168,31 @@ def _resolution_hiccup():
                        reason_code="artifact_invalid", artifact_id="art-x")
 
 
-async def test_resolution_issue_does_not_retire_or_rewrite_a_differing_marker(
+async def test_resolution_issue_still_refreshes_a_routed_plugins_own_marker(
     tmp_path,
 ):
-    """CLASS 2: an untrustworthy pass (a resolution HICCUP ⇒ ``prunable`` False)
-    with a routed plugin whose desired payload DIFFERS from its on-disk marker
-    must leave that marker UNCHANGED. The availability double-gate covers the
-    routed-pair retire/rewrite, not just orphan cleanup — a resolution hiccup
-    must never vaporize or rewrite a live consumer's marker."""
+    """CLASS 2, INVERTED in v0.162.0 (#453). This used to assert that an
+    untrustworthy pass (a resolution HICCUP on some OTHER plugin ⇒ ``prunable``
+    False) left a routed plugin's differing marker UNCHANGED.
+
+    That was safe only while the marker was purely advisory. Once the
+    setup-dispatch gate holds on the pair matching the desired one
+    (INV-PLUG-011), "leave it stale" became a state with no exit: `prunable` is
+    registry-GLOBAL, so one unresolvable artifact anywhere froze every other
+    plugin's markers for as long as it stayed broken, and the gate then demanded
+    a pair the writer had decided never to write. No operator action on the held
+    plugin could clear it. Two independent reviewers reached it from different
+    starting points; the ordinary trigger is a plugin UPDATE, whose moved
+    artifact path leaves the index entry absent beside a byte-identical
+    `ready.json`.
+
+    The availability double-gate keeps its real job — refusing to DELETE a
+    marker on a pass that may simply have failed to see its plugin, pinned by
+    the orphan and invalid-registry cases around this one. It does not apply
+    here: a plugin in the routed set resolved cleanly in THIS pass and holds a
+    persisted ack, so the pair being written is derived from its own good
+    resolution. The stale value it replaces was not a safe one to preserve — an
+    old base URL is a redirect URI Casa no longer serves."""
     root = tmp_path / "spool"
     art = tmp_path / "store" / "gmail" / "art-1"
     art.mkdir(parents=True)
@@ -1193,8 +1210,9 @@ async def test_resolution_issue_does_not_retire_or_rewrite_a_differing_marker(
         await _reconcile(registry, plugins=[p], acks=acks, spool=spool,
                          resolver=_resolver([p], issues=[_resolution_hiccup()]))
 
-        assert ready.read_text() == before_ready   # untrustworthy: not rewritten
-        assert index.read_text() == before_index   # nor the index side
+        assert ready.read_text() != before_ready   # refreshed to desired
+        assert index.read_text() != before_index
+        assert "old.casa.example.org" not in ready.read_text()
         # consent + resolution of THIS plugin stand, so the overlay still routes
         assert registry.get_callback("plg-gmail--authorize") is not None
     finally:
@@ -1849,12 +1867,23 @@ async def test_current_issues_recomputes_from_active_runtime(
         role_configs=_role_configs(assistant=["telegram"]),
         channel_manager=None)
     monkeypatch.setattr(agent_mod, "active_runtime", runtime)
+    spool = _SpoolStub([])
     monkeypatch.setattr(cr, "_default_resolver", lambda: _resolver([p]))
     monkeypatch.setattr(cr, "_default_entries", lambda: _entries(p))
     monkeypatch.setattr(cr, "_default_acks", lambda: acks)
+    monkeypatch.setattr(cr, "_default_spool", lambda: spool)
     assert [i.reason_code for i in cr.current_issues()] == [
         "callback_pending_ack"]
     _ack(acks)
+    # #453: the ack alone no longer makes the recomputation clean. The redirect
+    # URI a setup tool registers with its provider is read out of the marker
+    # pair, and only the reconcile's post-swap half writes it — so until it
+    # does, the plugin still carries a gap and the setup gate holds.
+    assert [i.reason_code for i in cr.current_issues()] == [
+        "callback_spool_error"]
+    desired = cr.compute_desired(role_configs=runtime.role_configs, acks=acks,
+                                 resolver=_resolver([p]), entries=_entries(p))
+    cr._publish_markers_post_swap(spool, desired, desired.routed)
     assert cr.current_issues() == []
 
 

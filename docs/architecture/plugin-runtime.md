@@ -1,5 +1,5 @@
 ---
-last_reviewed: 2026-08-07
+last_reviewed: 2026-08-08
 ---
 
 # Plugin runtime attachment
@@ -8,11 +8,11 @@ last_reviewed: 2026-08-07
 
 ## Scope
 
-What stands between a validly installed plugin and a plugin an agent can actually use: the
-environment its MCP servers need, the setup tool that provisions that environment, and the
-two side channels a plugin reaches the rest of Casa through. Installation, artifact
-identity and per-call authorization are [`plugins.md`](plugins.md); trigger and callback
-consent themselves are [`triggers.md`](triggers.md) and [`callbacks.md`](callbacks.md).
+The environment a validly installed plugin's MCP servers need before an agent can use it,
+and the two side channels a plugin reaches the rest of Casa through. WHO runs the setup
+tool that provisions that environment, and what must hold before it runs, is its own
+subject: [`plugin-setup.md`](plugin-setup.md). Installation, artifact identity and
+per-call authorization are [`plugins.md`](plugins.md).
 
 ## Mental model
 
@@ -24,12 +24,12 @@ exists to *create* those credentials would then be withheld for exactly the vari
 tool would produce, so one manifest declaration converts the withhold into a loud
 not-ready state instead (INV-PLUG-009).
 
-**Setup has exactly one runner, and "not yet" is an answer it can give.** Casa runs a
-declared `casa.setupTool` itself; nothing hands that work to an agent. The runner is a
-durable per-artifact *obligation* released by a **positively sealed** consent verdict — and
-an obligation with no verdict holds rather than guessing (INV-PLUG-010). That third state
-is the whole design: the alternative, deciding at mutation time which of two runners owns
-the job, has no correct answer for a plugin whose consent the operator has not yet decided.
+Two more attachment paths are easy to miss. **Plugin environment values live in a
+mode-0600 conf file** re-sourced into the process only by the plugin-env reload scope —
+deleting an entry from the file changes nothing until that reload runs. **Plugin media
+flows through a shared outbox directory** (operator-relocatable by environment variable)
+with atomic claim semantics, size and type gates, and periodic orphan reaping —
+consumption is destructive by design.
 
 ## Contracts & invariants
 
@@ -142,76 +142,6 @@ not the same as an unset variable to every server implementation; the contract C
 offers is "never a literal `${VAR}`", and a plugin that declares these fields owns
 failing clearly on an empty credential.
 
-**INV-PLUG-010**: A plugin's declared setup tool is dispatched by Casa alone — no tool result, completion or prompt routes it to an agent — and an artifact's setup obligation dispatches only after a consent verdict has been positively sealed for that exact artifact and settled with no denial; the absence of a sealed verdict never permits a dispatch, and a verdict asserting that an artifact needs no consent is sealed only when the pending-consent computes for both trigger and callback consents succeeded.
-
-**A plugin's declared setup tool is run by Casa and by nothing else — released only by a
-positively sealed consent verdict for that exact artifact, and then only once its trigger
-**and callback** routes are live — the gate rejects any outstanding issue of either kind,
-per plugin and all-or-nothing — its required environment resolves, and the executing agent
-can load it**. The obligation is durable, retrying and crash-recovered; a single denial withholds
-it, so consent is not merely route authorization; an obligation whose plugin still has
-unresolved environment variables stays pending rather than running the setup tool against
-a placeholder-credentialed server — a consent round can settle while the installing
-engagement is still wiring secrets, and every successful reload re-kicks the dispatch
-worker; and for a resident execution target it stays pending while that agent's published
-binding predates those secrets, until an agent reload makes the plugin loadable there
-(specialists resolve fresh per delegation and need no such hold).
-
-The single-runner rule is load-bearing rather than tidy. Until v0.161.0 an agent could
-also run setup, acting on a `run_plugin_setup_tool` hand-back in the configurator's
-completion, and *which* runner acted was classified when the registry mutated. Two
-attempts to make that classification total failed adversarial review, for one reason:
-at mutation time there is no third answer. A runner must be named then and there, and
-every hole the attempts found was a case whose correct answer was **"not yet"** — a
-future operator decision, or a question about what an updated setup tool needs that
-nothing in the manifest answers. So the second runner is gone, and the remaining one
-expresses "not yet" as *hold*: the obligation stays pending, stays visible in plugin
-health (where `pending` never decays), and is re-checked on every reconcile.
-
-What releases it is a **positive** statement, never an absence. The reconciler — the only
-component that computes the consent requirement, and one that runs at every lifecycle
-site — seals one round per `(plugin, artifact_id)` whose membership is the union of the
-plugin's pending *trigger* and *callback* consents, so neither kind alone describes it.
-That membership may be **empty**, which asserts that this artifact needs no consent and
-releases the obligation; that is deliberately distinct from no round at all, which means
-no verdict yet. Reading absence as permission is the concrete defect the first attempt
-shipped: it would dispatch before the reconcile had opened the round.
-
-An empty membership is sealed only where the consent position is genuinely *knowable*. A
-declared trigger or callback carrying a **non-consent** gap — an unassigned target, a role
-without the `webhook` channel, a missing global secret, an invalid public base URL — is
-omitted from the pending rows altogether, so reading that omission as "needs none" would
-assert precisely what the plugin contradicts. Such a plugin's obligation is recorded and
-holds, unsealed, until the gap clears. The route gate would also stop the dispatch, but a
-verdict is the one thing this design requires to be true rather than merely harmless.
-
-For the same reason
-a zero-member verdict is sealed only when the pending computes for *both* consent kinds
-succeeded — a compute that degrades a failure to "nothing pending" cannot be
-distinguished from one that means it — and sealing happens before the
-operator-reachability gate, so an unreachable DM yields a members-bearing verdict that
-correctly holds instead of no verdict at all.
-
-The obligation is created level-triggered by that same sweep, for every resolved plugin
-declaring `casa.setupTool`, keyed by the current `artifact_id`. That covers all three
-artifact-publishing paths — `plugin_add`, `plugin_update`, and a specialist's bundled
-plugins — without a hook at any of them. The setup tool itself is resolved at dispatch
-time from the current manifest, so an update that changes `casa.setupTool` while leaving
-`casa.callbacks` byte-identical still runs the new tool without binding the setup
-contract into a consent identity. A denial marks the obligation refused rather than
-dispatching; a later re-prompt for the same artifact re-arms it, which is also how a
-re-consent that re-mints a secret gets setup re-run on an unchanged artifact. A plugin
-that names a setup tool only in a producer handoff or a README, with no `casa.setupTool`,
-has no supported automatic path before v1.0 — nobody runs it, and the configurator says
-so rather than guessing a tool name.
-
-Two more attachment paths are easy to miss. **Plugin environment values live in a
-mode-0600 conf file** re-sourced into the process only by the plugin-env reload scope —
-deleting an entry from the file changes nothing until that reload runs. **Plugin media
-flows through a shared outbox directory** (operator-relocatable by environment variable)
-with atomic claim semantics, size and type gates, and periodic orphan reaping —
-consumption is destructive by design.
-
 ## Failure behavior
 
 **A required environment variable is unresolved.** The plugin is withheld from resident and
@@ -225,40 +155,7 @@ variable passed to the CLI as an explicit empty string rather than a literal pla
 and verification reports not ready with reason `setup_env_unprovisioned` until the value
 lands. A setup run that never happened stays loud rather than passing as configured.
 
-**No consent verdict has settled for an artifact.** The obligation holds, indefinitely and
-visibly: `pending` never decays out of plugin health. Two distinct situations reach it, and
-the difference matters when reading a store by hand. With **no operator DM reachable**, the
-verdict *is* sealed — complete, members-bearing — and simply cannot settle, because no
-keyboard was posted for the operator to answer. When a pending-consent compute failed, the
-pass spanned registry generations, or a non-consent gap hid part of the plugin's consent
-position, the round is sealed **non-authoritative** instead: the keyboards still get their
-nonces, but settlement draws no conclusion and leaves the obligation exactly as it was.
-Neither situation is a licence to dispatch.
-
-**A consent round settles with any denial.** The obligation is refused and nothing is
-dispatched; the operator gets one note naming re-consent as the way forward, not a manual
-run they have no tool call for. A later re-prompt for the same artifact re-arms it.
-
-**The registry cannot be resolved at dispatch time.** The obligation stays released and
-retries on later kicks, bounded; past that bound it goes stale with an operator note, since
-a plugin that never resolves is a plugin that is gone. Settlement itself never resolves the
-registry, so a release can never be lost this way.
-
-**The plugin's server binding is ambiguous.** An obligation whose plugin does not resolve
-to exactly one server grant fails with that reason rather than guessing a namespace;
-verification blocks such plugins upstream.
-
-**The dispatch is accepted but the tool fails.** Delivery is what the obligation
-guarantees, not execution: `dispatched` means the bus accepted the turn, and the executing
-agent reports the tool's own outcome to the operator. Casa makes no claim of its own about
-whether the integration works — it cannot see the external side (INV-TOOL-005).
-
 ## Extension points
-
-**Declaring a setup tool** means adding `casa.setupTool` to the manifest. It must be
-argument-free and idempotent, `setup_`-prefixed, and its plugin must target at least one
-resident or specialist — an executor-only target has no invocation path and is refused at
-verification. Nothing else is needed: the reconciler sweep finds it and Casa owes the run.
 
 **Declaring that setup provisions a variable** means listing it in `casa.setupProvides`.
 The name is then fenced for the whole session, so the declaration namespace is reserved;
@@ -266,9 +163,6 @@ declaring it without a `casa.setupTool` is refused, because the field means "my 
 provisions these". For a genuinely optional variable use `${VAR:-}` in `.mcp.json` instead
 and let the CLI's own default expansion cover it.
 
-**Changing what releases an obligation** means changing what the reconciler seals, not what
-the worker infers. The worker deliberately holds on anything it cannot read as a positive
-verdict; adding an inference there would reintroduce the defect this design removed.
 
 ## Source & test map
 
@@ -276,24 +170,17 @@ verdict; adding an inference there would reintroduce the defect this design remo
 <!-- generated by scripts/verify_docs.py --write-nav; do not hand-edit -->
 
 **Source**
-- `casa/rootfs/opt/casa/plugin_setup_episodes.py::ensure_obligation`
-- `casa/rootfs/opt/casa/plugin_setup_episodes.py::open_round`
-- `casa/rootfs/opt/casa/trigger_reconcile.py::seal_setup_state`
-- `casa/rootfs/opt/casa/trigger_reconcile.py::setup_candidates`
 - `casa/rootfs/opt/casa/plugin_store.py::manifest_setup_provides`
 - `casa/rootfs/opt/casa/plugin_env_conf.py`
 - `casa/rootfs/opt/casa/plugin_outbox.py`
 
 **Tests**
-- `tests/test_plugin_setup_single_runner.py`
-- `tests/test_plugin_setup_episodes.py`
 - `tests/test_plugin_store_setup_env.py`
 - `tests/test_plugin_env_conf.py`
 - `tests/test_plugin_outbox.py`
 
 **Related**
+- [`architecture/plugin-setup.md`](../architecture/plugin-setup.md)
 - [`architecture/plugins.md`](../architecture/plugins.md)
-- [`architecture/triggers.md`](../architecture/triggers.md)
-- [`architecture/callbacks.md`](../architecture/callbacks.md)
 - [`architecture/configuration.md`](../architecture/configuration.md)
 <!-- END SOURCEMAP -->

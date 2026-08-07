@@ -37,7 +37,7 @@ which is keyed on what you are about to do rather than on subsystem names.
 | job persistence, restart recovery, or how a deferred answer reaches a device | [`architecture/jobs-and-delivery.md`](architecture/jobs-and-delivery.md) |
 | logging, correlation ids, redaction, or a health surface | [`architecture/observability.md`](architecture/observability.md) |
 | personas, bindings, prompt composition, or the binding digest | [`architecture/personality.md`](architecture/personality.md) |
-| plugin environment resolution or withholding, the setup tool's dispatch or its consent gating, the plugin env conf file, or the plugin media outbox | [`architecture/plugin-runtime.md`](architecture/plugin-runtime.md) |
+| plugin environment resolution or withholding, the plugin env conf file, or the plugin media outbox | [`architecture/plugin-runtime.md`](architecture/plugin-runtime.md) |
 | plugin installation, artifact identity, protected tools, or authorization grants | [`architecture/plugins.md`](architecture/plugins.md) |
 | recall behaviour, sensitivity tiers, provenance on a stored fact, or session persistence | [`architecture/memory.md`](architecture/memory.md) |
 | reminder creation or cancellation, the reminder sweep, or recurrence derivation | [`architecture/reminders.md`](architecture/reminders.md) |
@@ -47,6 +47,7 @@ which is keyed on what you are about to do rather than on subsystem names.
 | the contribution rules, the verification discipline, or how documentation is kept honest | [`doctrine/working-on-casa.md`](doctrine/working-on-casa.md) |
 | the documentation rules themselves, or adding a document to the corpus | [`contributing/doc-contract.md`](contributing/doc-contract.md) |
 | the event manifest surface, the emission spool, event consent or reconciliation, the delivery worker, or the ack tools | [`architecture/plugin-events.md`](architecture/plugin-events.md) |
+| the setup tool's dispatch, its consent gating, or the route gate a setup obligation passes through | [`architecture/plugin-setup.md`](architecture/plugin-setup.md) |
 | the turn lifecycle, the warm client pool, retry behaviour, or turn teardown | [`architecture/turn-loop.md`](architecture/turn-loop.md) |
 | trigger types, webhook trigger routing, plugin trigger consent, one-shot firing and cleanup, or scheduling | [`architecture/triggers.md`](architecture/triggers.md) |
 | voice transports, voice authentication, the turn budget, specialist handoff, or deferred delivery | [`architecture/voice.md`](architecture/voice.md) |

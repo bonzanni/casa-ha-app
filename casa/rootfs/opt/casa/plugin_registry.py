@@ -548,8 +548,7 @@ def _resolve_entry(entry: dict, snap: "_Snapshot", target: str | None,
     ), None, warning
 
 
-def _resolve(target: str | None) -> ResolutionResult:
-    snap = _current()
+def _resolve_from(snap: "_Snapshot", target: str | None) -> ResolutionResult:
     reg = snap.registry
     if not reg.valid:
         return ResolutionResult(registry_valid=False,
@@ -578,9 +577,48 @@ def _resolve(target: str | None) -> ResolutionResult:
     return result
 
 
+def _resolve(target: str | None) -> ResolutionResult:
+    return _resolve_from(_current(), target)
+
+
 def resolve_for(target: str) -> ResolutionResult:
     return _resolve(target)
 
 
 def resolve_all() -> ResolutionResult:
     return _resolve(None)
+
+
+def pinned_resolver():
+    """A resolver bound to ONE snapshot, for callers whose correctness depends
+    on every read describing the same registry (#454).
+
+    ``resolve_all`` / ``resolve_for`` each re-read the published snapshot, so a
+    caller that resolves several targets in one pass — the trigger, callback and
+    event reconcilers all do — can have a ``reload_snapshot`` land between two of
+    them. The pass then composes generation A's manifests with generation B's
+    assignment authority, and the overlay it swaps in can publish a route
+    generation B removed. Binding the snapshot once removes the window rather
+    than detecting it afterwards; the generation guard downstream stays as the
+    safety net for any pass built on an unpinned seam.
+
+    The returned callable carries:
+
+    * ``generation`` — the pinned snapshot's monotonic generation;
+    * ``entries()`` — that snapshot's registry entries, so the assignment
+      authority the callback and event reconcilers read through their own
+      ``entries`` seam rides the SAME pin (it used to be an independent
+      ``snapshot_registry()`` read, pinned to nothing at all).
+
+    The snapshot is captured HERE, when the pass begins — not lazily on first
+    use, which would reintroduce the window for a pass that resolves nothing
+    before reading ``entries()``.
+    """
+    snap = _current()
+
+    def resolve(target: "str | None" = None) -> ResolutionResult:
+        return _resolve_from(snap, target)
+
+    resolve.generation = snap.generation           # type: ignore[attr-defined]
+    resolve.entries = lambda: list(snap.registry.entries)  # type: ignore[attr-defined]
+    return resolve

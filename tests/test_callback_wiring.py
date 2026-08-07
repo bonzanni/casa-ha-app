@@ -40,14 +40,20 @@ def _issue(name, reason_code):
 # ---------------------------------------------------------------------------
 
 class TestI1RoutesLiveGate:
-    def _wire(self, monkeypatch, *, trigger, callback):
+    def _wire(self, monkeypatch, *, trigger, callback,
+              trigger_ok=True, callback_ok=True):
+        # #453: the gate reads ``issue_state`` — ``(ok, issues)`` — not
+        # ``current_issues``. The flag is the point: an empty list is the
+        # positive claim "no gap", and a recomputation that could not run
+        # produces the same empty list, so the gate must be able to tell them
+        # apart. ``current_issues`` remains the health-report accessor.
         import casa_core
         import trigger_reconcile
         import callback_reconcile
-        monkeypatch.setattr(trigger_reconcile, "current_issues",
-                            lambda: list(trigger))
-        monkeypatch.setattr(callback_reconcile, "current_issues",
-                            lambda: list(callback))
+        monkeypatch.setattr(trigger_reconcile, "issue_state",
+                            lambda resolver=None: (trigger_ok, list(trigger)))
+        monkeypatch.setattr(callback_reconcile, "issue_state",
+                            lambda resolver=None: (callback_ok, list(callback)))
         return casa_core._callback_and_trigger_routes_live
 
     def test_live_when_no_issue(self, monkeypatch):
@@ -79,6 +85,16 @@ class TestI1RoutesLiveGate:
             monkeypatch, trigger=[_issue("other", "trigger_pending_ack")],
             callback=[_issue("other", "callback_no_target")])
         assert gate("gmail") is True
+
+    @pytest.mark.parametrize("half", ["trigger_ok", "callback_ok"])
+    def test_dark_when_a_half_could_not_be_computed(self, monkeypatch, half):
+        """Either half reporting "I could not evaluate this" keeps the plugin
+        dark. Without the flag both halves degraded a crash — or a runtime that
+        is not up yet — to an empty list, which is indistinguishable from
+        "nothing is wrong" and opens the gate."""
+        gate = self._wire(monkeypatch, trigger=[], callback=[],
+                          **{half: False})
+        assert gate("gmail") is False
 
 
 # ---------------------------------------------------------------------------

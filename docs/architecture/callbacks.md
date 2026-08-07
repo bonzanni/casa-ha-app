@@ -109,7 +109,9 @@ and, on a miss, returns the neutral redirect without touching the spool. The ove
 authority on what the endpoint serves — the spool's advisory `ready.json` marker cannot open a
 route on its own.
 
-What it does not cover: ingress routing only, not the credential's fate once deposited.
+What it does not cover: ingress routing only, not the credential's fate once deposited. The
+marker is advisory here but load-bearing for setup dispatch, which holds until the pair on
+disk equals the desired one (INV-PLUG-011).
 
 **INV-CB-002**: A pending state is consumed at most once — the claim-by-rename is the consumption point — and a replayed redirect never rewrites or duplicates a result.
 

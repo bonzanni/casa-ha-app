@@ -194,14 +194,22 @@ def prompt_trigger_consent(
                     f"✅ Enabled — POST /webhook/{effective} now "
                     f"routes to {role}",
                 )
-                # v0.112.0 (impl r2): the approval is DURABLE here (ack
-                # persisted + secret minted) — feed the setup evaluator
-                # REGARDLESS of the reconcile outcome below. Gating on the
-                # reconcile stranded the round forever on a transient
-                # reconcile failure (the ack exists, so the trigger is never
-                # re-prompted and the member would stay open). Setup wires
-                # the EXTERNAL side against the minted secret; Casa's route
-                # overlay healing is a separate, surfaced concern.
+                # v0.112.0 (impl r2): the DECISION is durable here — the ack
+                # is persisted (the yield-free commit step above) — so feed
+                # the setup evaluator REGARDLESS of the reconcile outcome
+                # below. Gating on the reconcile stranded the round forever on
+                # a transient reconcile failure (the ack exists, so the trigger
+                # is never re-prompted and the member would stay open).
+                #
+                # #453: what is durable here is the ack and NOTHING ELSE. The
+                # per-trigger secret is minted by ``reconcile_cb`` below, and
+                # settling the round kicks the setup worker — which can wake
+                # before that mint lands. The ordering is safe because the
+                # dispatch gate reads the APPLIED state (an unminted or
+                # previous-generation secret is a `trigger_secret_missing` gap
+                # in ``trigger_reconcile.current_issues``), so setup HOLDS
+                # until the mint it needs exists rather than racing it. Casa's
+                # route overlay healing remains a separate, surfaced concern.
                 await _feed_setup_episode(approved=True)
                 if reconcile_cb is not None:
                     try:

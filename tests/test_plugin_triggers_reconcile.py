@@ -579,11 +579,22 @@ async def test_current_issues_recomputes_from_active_runtime(
     monkeypatch.setattr(agent_mod, "active_runtime", runtime)
     monkeypatch.setattr(tr, "_default_resolver", lambda: resolver)
     monkeypatch.setattr(tr, "_default_acks", lambda: acks)
+    monkeypatch.setattr(tr, "SECRETS_DIR", tmp_path / "webhook_secrets")
     issues = tr.current_issues()
     assert [i.reason_code for i in issues] == ["trigger_pending_ack"]
-    # acking makes the SAME recomputation come back clean
     _ack(acks)
     monkeypatch.setattr(tr, "_default_global_secret_ok", lambda: (lambda: True))
+    # #453: the ack alone no longer makes the recomputation clean. The secret
+    # this consent identity needs is minted by the RECONCILE, and a setup tool
+    # dispatched before that mint would provision the provider against a
+    # credential Casa is about to write — so it stays a gap until it exists.
+    assert [i.reason_code for i in tr.current_issues()] == [
+        "trigger_secret_missing"]
+    desired = tr.compute_desired(
+        role_configs=runtime.role_configs, acks=acks, resolver=resolver,
+        global_secret_ok=lambda: True)
+    tr._mint_secrets(desired, tmp_path / "webhook_secrets")
+    # ...and once it does, the SAME recomputation comes back clean.
     assert tr.current_issues() == []
 
 
@@ -900,9 +911,20 @@ def _wire_revoke_env(monkeypatch, tmp_path, *, acked=True):
         _ack(acks)
     p = _plugin()
     resolver = _resolver({None: [p], "resident:assistant": [p]})
-    monkeypatch.setattr(plugin_registry, "resolve_all", lambda: resolver(None))
-    monkeypatch.setattr(plugin_registry, "resolve_for",
-                        lambda t: resolver(t))
+    # #454: the reconcilers resolve through their own module seam, which now
+    # returns a SNAPSHOT-PINNED resolver rather than calling
+    # plugin_registry.resolve_all/resolve_for per target. Patching those two
+    # functions no longer reaches the pass, so the fake registry is injected at
+    # the seam the reconciler actually uses. BOTH seams: the revoke tool runs
+    # the callback reconcile as a pair with the trigger one, and patching only
+    # the trigger module would quietly resolve that half against the real,
+    # empty snapshot instead of this fake registry.
+    import callback_reconcile as cr_mod
+    monkeypatch.setattr(tr, "_default_resolver", lambda: resolver)
+    monkeypatch.setattr(cr_mod, "_default_resolver", lambda: resolver)
+    monkeypatch.setattr(cr_mod, "_default_entries", lambda: (lambda: [
+        {"name": "elevenlabs", "artifact_id": "art-1",
+         "targets": ["resident:assistant"]}]))
     runtime = SimpleNamespace(
         trigger_registry=registry,
         role_configs=_role_configs(assistant=["webhook"]),
@@ -1071,19 +1093,21 @@ async def test_revoke_kills_keyboard_posted_by_inflight_reconcile(
     runtime.channel_manager = _FakeChannelManager(telegram)
 
     # make the FIRST resolve block until released (the in-flight reconcile
-    # sits inside compute, holding _RECONCILE_LOCK, while the revoke runs)
-    import plugin_registry
+    # sits inside compute, holding _RECONCILE_LOCK, while the revoke runs).
+    # #454: wrap the RECONCILER's resolver seam — the pass no longer calls
+    # plugin_registry.resolve_all per target, it resolves one pinned snapshot
+    # through this seam, so this is where the interleave has to be introduced.
     gate = threading.Event()
     blocked_once = threading.Event()
-    real_resolve_all = plugin_registry.resolve_all
+    real_resolver = tr._default_resolver()
 
-    def _blocking_resolve_all():
+    def _blocking(target=None):
         if not blocked_once.is_set():
             blocked_once.set()
             gate.wait(timeout=5)
-        return real_resolve_all()
+        return real_resolver(target)
 
-    monkeypatch.setattr(plugin_registry, "resolve_all", _blocking_resolve_all)
+    monkeypatch.setattr(tr, "_default_resolver", lambda: _blocking)
 
     inflight = asyncio.create_task(tr.reconcile_from_runtime(runtime))
     for _ in range(20):

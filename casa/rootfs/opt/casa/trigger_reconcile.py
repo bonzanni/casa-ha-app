@@ -63,14 +63,15 @@ _PER_TRIGGER_SECRET_MODES = ("static_header", "timestamped_hmac")
 
 
 def _default_resolver() -> Callable[[str | None], Any]:
+    """ONE registry snapshot for the whole pass (#454).
+
+    Built fresh per pass — every call site resolves this immediately before
+    computing — so the pin covers exactly one pass and never staleness beyond
+    it. See ``plugin_registry.pinned_resolver`` for why the per-target re-read
+    it replaces could compose two generations into one overlay."""
     import plugin_registry
 
-    def resolve(target: "str | None") -> Any:
-        if target is None:
-            return plugin_registry.resolve_all()
-        return plugin_registry.resolve_for(target)
-
-    return resolve
+    return plugin_registry.pinned_resolver()
 
 
 def _default_acks() -> Any:
@@ -106,12 +107,23 @@ def pin_resolver(resolver: "Callable[[str | None], Any]") -> Any:
             gens.add(int(getattr(res, "generation", 0) or 0))
         return cache[target]
 
-    # Caching per target is NOT the same as observing one snapshot: a reload
-    # publishing a new generation between two targets still yields a mixed pass.
-    # Record the generations so a consumer whose correctness depends on ONE
-    # registry can refuse to act (see :func:`setup_candidates`) rather than
-    # compose two.
+    # Caching per target is NOT the same as observing one snapshot: an UNPINNED
+    # resolver publishing a new generation between two targets still yields a
+    # mixed pass. Record the generations so a consumer whose correctness depends
+    # on ONE registry can refuse to act (see :func:`one_generation`) rather than
+    # compose two. Since #454 the module defaults are snapshot-pinned, so a
+    # production pass cannot drift here; this stays as the safety net for an
+    # injected seam that carries no snapshot of its own.
     _pinned.generations = gens          # type: ignore[attr-defined]
+    # #454: carry the underlying pin's registry ENTRIES accessor through. The
+    # callback and event reconcilers read assignment authority through that
+    # seam, and it must describe the same snapshot this pass resolves against.
+    _entries = getattr(resolver, "entries", None)
+    if callable(_entries):
+        _pinned.entries = _entries      # type: ignore[attr-defined]
+    # ...and its generation, so a reader asking a provably-pinned pass which
+    # registry it describes does not get None from the wrapper.
+    _pinned.generation = getattr(resolver, "generation", None)  # type: ignore[attr-defined]
     return _pinned
 
 
@@ -238,6 +250,76 @@ def compute_desired(
     return out
 
 
+def _secret_backed(desired: DesiredTriggers) -> "list[tuple[str, dict]]":
+    """The overlay entries backed by a casa-minted PER-TRIGGER secret file.
+
+    One definition shared by the writer (:func:`_mint_secrets`) and the reader
+    (:func:`verify_minted_secrets`) — they must agree on which routes have a
+    secret to check, or the gate would either hold on a ``hmac_body`` trigger
+    forever or wave through one whose file is missing."""
+    return [(eff, entry) for eff, entry in desired.overlay.items()
+            if entry["auth"].get("mode") in _PER_TRIGGER_SECRET_MODES]
+
+
+def _fail_close_plugins(desired: DesiredTriggers, plugins: set[str]) -> None:
+    """Drop every route of ``plugins`` from the overlay — the per-plugin
+    all-or-nothing rule, applied after the compute."""
+    if plugins:
+        desired.overlay = {
+            eff: entry for eff, entry in desired.overlay.items()
+            if entry.get("plugin") not in plugins}
+
+
+def verify_minted_secrets(desired: DesiredTriggers, secrets_dir: Path) -> None:
+    """Fail-close every routed plugin whose per-trigger secret is not ALREADY
+    minted under the consent identity this pass computed (#453).
+
+    Read-only *against the filesystem* — it mints nothing — but it does drop the
+    unbacked plugins from ``desired.overlay``, exactly as :func:`_mint_secrets`
+    does on a mint failure, so a caller that swapped this overlay in would not
+    route an unbacked name.
+
+    The mirror of :func:`_mint_secrets`, for the consumers that
+    RE-DERIVE the desired state without applying it — :func:`current_issues`,
+    and through it the plugin-health report and
+    ``casa_core._callback_and_trigger_routes_live``, the setup-dispatch gate.
+
+    Why the gate needs this at all: ``compute_desired`` is a derivation over
+    consent, assignment and declarations. The secret a plugin's setup tool reads
+    is produced by the reconcile's APPLY half, two steps later than the consent
+    approval that settles the setup round — the ack persists and the round
+    settles in one yield-free step, the mint happens in the reconcile the finish
+    hook awaits afterwards. A gate derived from consent alone therefore reported
+    "live" while the file was absent (a first approval), still bound to the
+    PREVIOUS approval generation (a re-approval after a revoke, which rekeys),
+    or lazily minted unbound by the webhook handler and about to be replaced.
+    Setup would then wire the external service to a credential Casa is about to
+    change — the exact failure setup exists to prevent.
+
+    Holding is the safe direction and it is not a dead end: ``_mint_secrets``
+    runs on EVERY pass with no availability gate of its own, so the gap closes
+    on the next reconcile. That property is load-bearing rather than incidental
+    — a gate may only demand an artifact the writer will actually write — and
+    the callback half needed a fix to acquire it (see
+    ``callback_reconcile._reconcile_markers_pre_swap``).
+    """
+    import webhook_auth
+    from plugin_registry import PluginIssue
+
+    unbacked: set[str] = set()
+    for eff, entry in _secret_backed(desired):
+        if webhook_auth.secret_bound_to_identity(
+                eff, identity=entry.get("identity", ""),
+                secrets_dir=Path(secrets_dir)):
+            continue
+        unbacked.add(entry.get("plugin", ""))
+        desired.issues.append(PluginIssue(
+            name=entry.get("plugin", ""), target=f"resident:{entry['role']}",
+            stage="triggers", reason_code="trigger_secret_missing",
+            artifact_id=None))
+    _fail_close_plugins(desired, unbacked)
+
+
 def _mint_secrets(desired: DesiredTriggers, secrets_dir: Path) -> None:
     """Eagerly mint casa-owned per-trigger secrets for the routed set; a mint
     failure fail-closes the OWNING PLUGIN's whole set (all-or-nothing)."""
@@ -245,9 +327,7 @@ def _mint_secrets(desired: DesiredTriggers, secrets_dir: Path) -> None:
     from plugin_registry import PluginIssue
 
     failed_plugins: set[str] = set()
-    for eff, entry in desired.overlay.items():
-        if entry["auth"].get("mode") not in _PER_TRIGGER_SECRET_MODES:
-            continue
+    for eff, entry in _secret_backed(desired):
         try:
             # Identity-bound (Terra shipB-r2): a surviving secret minted
             # under a DIFFERENT consent identity is rekeyed here — the old
@@ -273,10 +353,7 @@ def _mint_secrets(desired: DesiredTriggers, secrets_dir: Path) -> None:
             log_redact.register_secret(got.decode("utf-8", "replace"))
         except Exception:  # noqa: BLE001 — redaction is best-effort
             pass
-    if failed_plugins:
-        desired.overlay = {
-            eff: entry for eff, entry in desired.overlay.items()
-            if entry.get("plugin") not in failed_plugins}
+    _fail_close_plugins(desired, failed_plugins)
 
 
 async def _regen_health_safe() -> None:
@@ -741,21 +818,59 @@ async def reconcile_from_runtime(runtime: Any, *, prompt: bool = True) -> list:
         prompt=prompt)
 
 
-def current_issues() -> list:
-    """Fresh, side-effect-free trigger issues for health regeneration —
-    recomputed on EVERY ``_regenerate_plugin_health`` pass so they survive
-    unrelated refreshes. Never raises (health must always regenerate)."""
+def issue_state(resolver: Any = None) -> "tuple[bool, list]":
+    """``(ok, issues)`` — the trigger gaps, and whether they could be computed
+    AT ALL.
+
+    Two halves, and #453 is about the second: the DERIVED gaps (consent,
+    assignment, channel, global secret) come from :func:`compute_desired`, and
+    the APPLIED ones — is the per-trigger secret this consent identity needs
+    actually on disk — from :func:`verify_minted_secrets`. Only the reconcile
+    mints, so a recomputation that skipped the second half described a route as
+    fully live during the window between an approval and the mint that backs it.
+
+    The ``ok`` flag is load-bearing for the SETUP GATE and is the same shape the
+    rest of this design insists on: an empty issue list is the positive claim
+    "this plugin has no gap", and it is exactly the value that opens the gate.
+    Degrading a crash — or a runtime that is not up yet — to ``[]`` therefore
+    reads as "every plugin is fully live", turning the one check that must fail
+    closed into one that fails open. Health has the opposite need and keeps the
+    degraded list (:func:`current_issues`): losing a row there hides a problem,
+    while inventing one cries wolf.
+
+    ``resolver`` lets a caller supply ONE pinned registry resolution so a
+    decision spanning both reconcilers describes a single generation (#454).
+
+    Residual, named rather than implied away: ``ok`` reports whether the
+    computation RAN, not whether it saw every plugin. An invalid registry — and
+    a single artifact that fails to resolve — yields an empty result with no
+    issues, so a plugin absent from the computation reads as "no gap". The
+    setup worker resolves its own registry entry three-state BEFORE reaching the
+    gate and defers on both, so it is unreachable there today; that shield is a
+    separate read, not a property of this function."""
     try:
         import agent as agent_mod
 
         runtime = getattr(agent_mod, "active_runtime", None)
         if runtime is None:
-            return []
+            return False, []
         role_configs = getattr(runtime, "role_configs", None)
         if not role_configs:
-            return []
-        return compute_desired(role_configs=role_configs).issues
+            return False, []
+        desired = compute_desired(role_configs=role_configs, resolver=resolver)
+        verify_minted_secrets(desired, SECRETS_DIR)
+        return True, desired.issues
     except Exception:  # noqa: BLE001 — a trigger-compute crash must never
         # take down the whole health pass; log and degrade to no extras.
         logger.exception("trigger issue recompute failed")
-        return []
+        return False, []
+
+
+def current_issues() -> list:
+    """Fresh, side-effect-free trigger issues for health regeneration —
+    recomputed on EVERY ``_regenerate_plugin_health`` pass so they survive
+    unrelated refreshes. Never raises (health must always regenerate); a
+    failure degrades to no extras. The setup gate uses :func:`issue_state`
+    instead, because for that consumer "could not compute" must not read as
+    "nothing is wrong"."""
+    return issue_state()[1]

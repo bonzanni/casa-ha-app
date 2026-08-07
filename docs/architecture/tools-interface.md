@@ -115,7 +115,7 @@ invariant applies to Casa's own claims.
 What it does not cover: **which** runner executes the setup tool — because there is no longer a
 choice to make. Casa runs a declared `casa.setupTool` and nothing else does; a mutation result
 reports the declared tool but routes nothing, and no completion or prompt hands it to an agent.
-See [`plugin-runtime.md`](plugin-runtime.md) (INV-PLUG-010) for what releases the run. That
+See [`plugin-setup.md`](plugin-setup.md) (INV-PLUG-010) for what releases the run. That
 matters to this invariant for a reason beyond tidiness: a hand-back the plugin did not need used
 to cause an unnecessary run, and idempotence means repeat calls converge on the same state, not
 that a call is side-effect-free — an unnecessary run can rewrite the provider's configuration,
