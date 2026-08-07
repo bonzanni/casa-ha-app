@@ -1947,11 +1947,13 @@ async def _run_delegated_agent(
     }
 
     # Resolve caller display name; fall back to role.
+    # #436: from the LIVE role map, not `_agent_registry` — that global is a
+    # BOOT snapshot which `sync_agent_role_map` does not touch, so a renamed
+    # caller kept introducing itself to every specialist under its old name
+    # for the rest of the process's life. Same defect as the stale
+    # `<delegates>` block, same cure: one live source.
     caller_role = str(parent.get("role", "")) or "(unknown)"
-    caller_name = (
-        _agent_registry.role_to_name(caller_role)
-        if _agent_registry is not None else caller_role
-    )
+    caller_name = _display_name_for_role(caller_role)
     originating_channel = str(parent.get("channel", "")) or "(unknown)"
     suggested_register = "voice" if originating_channel == "voice" else "text"
 
@@ -2350,6 +2352,40 @@ def _display_name_for_role(role: str) -> str:
     """*role*'s persona display name, else *role* itself."""
     cfg = _agent_role_map.get(role)
     return (getattr(getattr(cfg, "character", None), "name", "") or "").strip() or role
+
+
+def agent_display_names() -> dict[str, str] | None:
+    """#436: role → persona display name for every CURRENTLY dispatchable
+    agent, for the ``<delegates>`` renderer in ``agent.py``.
+
+    Built from ``_agent_role_map``, which ``sync_agent_role_map`` rebuilds on
+    every reload path and which ``_canonical_delegate_target`` resolves a
+    caller-supplied display name against. Rendering the block from the SAME
+    map is what stops the name Casa advertises from drifting away from the
+    name Casa accepts — the two used to come from different objects with
+    different lifetimes (an ``AgentRegistry`` snapshot pinned at the agent's
+    construction vs. this map), so a per-role reload that renamed a persona
+    desynchronised them until the caller was reconstructed.
+
+    ``None`` when the map is EMPTY, so the caller keeps trusting its own
+    construction-time registry rather than concluding that nothing is
+    dispatchable. Note what this cannot express: an empty map after
+    ``init_tools`` is indistinguishable from never having been initialized at
+    all. Boot always registers at least the assistant, so in a running
+    deployment the empty map is the uninitialized case; the ambiguity is real
+    only for callers that initialize tools with no roles, which is a test
+    shape rather than a deployment.
+    """
+    # `sync_agent_role_map` replaces the map wholesale — it builds `merged`
+    # locally and rebinds at the end — and neither it nor this function
+    # awaits, so on the single-threaded loop a caller sees a complete pre- or
+    # post-reload map and never a half-built one.
+    if not _agent_role_map:
+        return None
+    # Names come from `_display_name_for_role`, the SAME derivation the ACL's
+    # alias resolution uses. Reimplementing the fallback here would recreate
+    # the very divergence this function exists to close.
+    return {role: _display_name_for_role(role) for role in _agent_role_map}
 
 
 def _persona_name_for_role(role: str) -> str | None:

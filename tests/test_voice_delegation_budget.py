@@ -896,17 +896,28 @@ class TestVoiceDeadline:
 
         tm, reg = _init_tools_for_voice()
 
+        launched = False
+
         async def _slow(
             cfg, task_text, context_text, resolution=None, output_format=None,
         ):
+            nonlocal launched
+            launched = True
             await asyncio.sleep(10)  # cooperatively cancellable
             return _voice_output(tm, "too late")
 
         monkeypatch.setattr(tm, "_run_delegated_agent", _slow)
 
-        # voice_wait_s = min(remaining - reserve, 60) ≈ 0.05s of real budget.
+        # #437: voice_wait_s = min(remaining - reserve, 60) — this is REAL wall
+        # clock, and `make test-unit` runs 12-way parallel. At the original
+        # 0.05s any scheduling hiccup over 50ms pushed the budget past zero
+        # before the handler reached `asyncio.wait`, diverting it to a
+        # pre-launch short-circuit; the test still saw `deadline_exceeded`, so
+        # it flipped on `register_delegation.assert_awaited()` instead of on
+        # anything it meant to assert. The stub sleeps 10s, so 0.5s exercises
+        # exactly the same post-launch teardown with 10x the headroom.
         deadline = (asyncio.get_running_loop().time()
-                    + tm._VOICE_FALLBACK_RESERVE_S + 0.05)
+                    + tm._VOICE_FALLBACK_RESERVE_S + 0.5)
         token = agent_mod.origin_var.set(_voice_origin(voice_deadline=deadline))
         try:
             res = await asyncio.wait_for(
@@ -921,6 +932,13 @@ class TestVoiceDeadline:
 
         payload = json.loads(res["content"][0]["text"])
         assert payload["kind"] == "deadline_exceeded"
+        # #437: assert the path, not just the verdict. Both pre-launch
+        # short-circuits also return `deadline_exceeded`, and the
+        # post-register one also cancels a registered record — so without
+        # this, a budget that expired early would pass as if the post-launch
+        # teardown had run. The specialist actually starting is what
+        # distinguishes them.
+        assert launched is True
         # This path DID launch, so teardown cancels the registered delegation.
         reg.register_delegation.assert_awaited()
         reg.cancel_delegation.assert_awaited()

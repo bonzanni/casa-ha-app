@@ -158,23 +158,61 @@ def _attribution_label(hit, *, clearance: str | None) -> str:
 OnTokenCallback = Callable[[str], Awaitable[None]]
 
 
-def _render_delegates_block(delegates, registry) -> str:
+def _live_agent_directory() -> dict[str, str] | None:
+    """Live role → persona display name, or ``None`` when tools is not
+    initialized (see :func:`tools.agent_display_names`).
+
+    Deferred import: ``tools`` imports ``agent`` for the origin ContextVar, so
+    this cannot be a module-level import. It matches the other tools imports
+    in this module, which are all function-local for the same reason.
+    """
+    from tools import agent_display_names
+    return agent_display_names()
+
+
+def _render_delegates_block(delegates, registry, *, live_names=None) -> str:
     """Render the <delegates> system-prompt block.
 
     Empty string when ``delegates`` is empty so callers can append
     unconditionally without polluting the prompt.
+
+    #436: ``live_names`` — role → display name for every currently
+    dispatchable agent — is AUTHORITATIVE for both membership and name when
+    supplied. ``registry`` is the construction-time ``AgentRegistry``, and
+    that object is immutable: a live Agent keeps the instance it was built
+    with (``reload._construct_agent``), deliberately, so that a later
+    ``runtime.agent_registry`` rebind cannot reach a running agent. Reloading
+    a single role therefore refreshed the delegation role map while leaving
+    every OTHER agent advertising its boot-time snapshot — renaming a persona
+    left the assistant offering a name the resolver no longer accepted, which
+    is #433's `delegation_not_declared` all over again for that one name.
+    Deriving the advertised name and the accepted name from one live map at
+    the point of USE makes that disagreement unrepresentable.
+
+    ``registry`` remains the fallback for callers with no initialized tools
+    module (unit tests; boot before ``init_tools``), which is why
+    :func:`tools.agent_display_names` reports an empty map as ``None`` rather
+    than as an empty directory — see its docstring for what that conflates.
     """
     if not delegates:
         return ""
+
     # A delegates.yaml entry may point at a specialist that is now disabled
     # (enabled: false) or removed. Such an agent is NOT callable — the
     # delegate_to_agent tool rejects it with unknown_agent — so do not advertise
-    # it. The registry holds exactly residents + ENABLED specialists; filter on
-    # that. (No registry → back-compat: render every declared delegate.)
-    visible = [
-        d for d in delegates
-        if registry is None or registry.is_known(d.agent)
-    ]
+    # it. Both sources hold exactly residents + ENABLED specialists; filter on
+    # that. (Neither → back-compat: render every declared delegate.)
+    def _known(role: str) -> bool:
+        if live_names is not None:
+            return role in live_names
+        return registry is None or registry.is_known(role)
+
+    def _display_name(role: str) -> str:
+        if live_names is not None:
+            return live_names.get(role, role)
+        return registry.role_to_name(role) if registry is not None else role
+
+    visible = [d for d in delegates if _known(d.agent)]
     if not visible:
         return ""
     # #433: the ROLE ID leads. `delegate_to_agent` is keyed on the role, and
@@ -187,7 +225,7 @@ def _render_delegates_block(delegates, registry) -> str:
     # which has always emitted role ids only.
     lines = ["<delegates>"]
     for d in visible:
-        name = registry.role_to_name(d.agent) if registry is not None else d.agent
+        name = _display_name(d.agent)
         label = f"{d.agent} ({name})" if name != d.agent else d.agent
         lines.append(f"- {label} — {d.purpose}")
         lines.append(f"  Delegate when: {d.when}")
@@ -1574,8 +1612,13 @@ class Agent:
             "</channel_context>"
         )
         # <delegates> block — renders cfg.delegates with display names.
+        # #436: names come from the LIVE role map, not this agent's
+        # construction-time registry, so a per-role reload that renamed a
+        # delegate cannot leave this agent advertising a name delegation
+        # would refuse.
         delegates_block = _render_delegates_block(
             self.config.delegates, self._agent_registry,
+            live_names=_live_agent_directory(),
         )
         if delegates_block:
             system_parts.append("\n" + delegates_block)
