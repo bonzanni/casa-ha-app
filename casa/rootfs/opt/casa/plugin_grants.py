@@ -314,7 +314,7 @@ def sanitized_env_for_paths(plugin_paths, environ=None) -> dict[str, str]:
         environ)
 
 
-def withhold_env_unresolved(resolution, *, context: str):
+def withhold_env_unresolved(resolution, *, context: str, environ=None):
     """Filter *resolution* down to env-resolved plugins (INV-PLUG-008)
     WITHOUT mutating the input — H7b shares a creation resolve between the
     engagement record and the options builder, so callers must never see
@@ -322,7 +322,14 @@ def withhold_env_unresolved(resolution, *, context: str):
     withheld is ``[(rp, missing_vars)]``; the input object is returned
     as-is when nothing is withheld, a ``dataclasses.replace`` copy (fresh
     plugins list, other fields shared) otherwise. Each withheld plugin is
-    logged at WARNING with *context* naming the session build."""
+    logged at WARNING with *context* naming the session build.
+
+    *environ* defaults to ``os.environ``, matching every other helper here.
+    The seam is not decoration: without it this was the one gate whose verdict
+    a test could not state, so its cases read the AMBIENT environment and
+    passed on a developer machine with the variable exported while failing in
+    CI without it — main was red for two releases behind a green local suite.
+    """
     import dataclasses
     withheld = []
     loadable = []
@@ -332,7 +339,7 @@ def withhold_env_unresolved(resolution, *, context: str):
         # plugin whose setup tool exists to CREATE its credentials can never
         # be loaded to run that setup tool. Those are emptied instead, by
         # sanitized_env_for_resolution at the session builder.
-        missing = blocking_unresolved_env_vars_for_resolved(rp)
+        missing = blocking_unresolved_env_vars_for_resolved(rp, environ)
         if missing:
             logger.warning(
                 "plugin %s withheld from %s: required env unresolved (%s) — %s",
