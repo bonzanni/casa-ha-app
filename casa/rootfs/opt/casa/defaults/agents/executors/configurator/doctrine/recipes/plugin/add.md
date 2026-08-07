@@ -74,16 +74,7 @@ specialist is never going to declare it, the plugin simply stays pending —
 that is a valid end state, not an error). Report the outcome and
 `emit_completion(...)`.
 
-## Setup-tool hand-back — MANDATORY when the plugin ships one
-
-**Mechanical skip (v0.112.0):** when the `plugin_add` result carries
-`setup_via_consent: true` (the manifest declares BOTH `casa.setupTool` and
-`casa.triggers`), do NOT hand back — Casa's durable post-consent episode
-runs the setup tool automatically once the operator's consent settles,
-whether the Approve tap lands during or after this engagement. Say so in
-the completion text. The hand-back below remains ONLY for a setup tool
-without a consent gate (`setup_tool` set, `setup_via_consent: false`) or a
-legacy plugin that names its tool solely in the handoff.
+## Setup is Casa's, not yours to route
 
 Some plugins ship an MCP **setup tool** (naming convention `setup_*`, e.g.
 `setup_elevenlabs_voicemail`) that (re)points an external service at Casa —
@@ -92,43 +83,34 @@ caller's config. Install and consent re-approval mint FRESH secrets, so the
 external side holds no usable credential from this install until that tool
 runs. The operator must never need to remember a follow-up incantation.
 
-You cannot run it yourself: plugin tools surface only on the plugin's
-target agents, never in this engagement. Hand it back instead:
+**Casa runs it. You do not route it anywhere.** A plugin that declares
+`casa.setupTool` gets a durable per-artifact setup obligation, which Casa
+releases once any consent for that exact artifact settles — or immediately,
+when that artifact needs no consent. Because plugin tools surface only on the
+plugin's target agents, never in this engagement, Casa dispatches its own turn
+to one of them; the operator hears the setup outcome in a separate message. The
+`plugin_add` result reports the declared `setup_tool` so you can say what is
+queued.
 
-1. **Detect.** The plugin-developer completion handoff is the authoritative
-   source when this install follows one (it names the setup tool). Otherwise
-   check the plugin's manifest `description`/README, or Grep the published
-   artifact (`/config/plugins/store/<name>/<artifact-id>/`) server source
-   for an MCP tool named `setup_*`. If you cannot establish that a setup
-   tool exists, hand back nothing — NEVER guess a tool name.
-2. **Hand back.** Your `emit_completion` MUST then carry ONE `next_steps`
-   entry PER setup tool:
-   `{"action": "run_plugin_setup_tool", "plugin": "<registry name>",
-   "tool": "<setup-tool name>", "targets": [<plugin targets>],
-   "consent_pending": <bool>}`,
-   and the completion `text` must state that the setup tool still needs to run,
-   and that its own result is what to go on. Make no claim of your own about
-   whether the integration works, in either direction (#443) — Casa cannot see
-   the external side. A plugin holding a durable credential outside the replaced
-   artifact may already be serving, and announcing a fault that does not exist
-   makes the operator authorize something that needed no authorizing, which
-   costs the same trust as missing a real one. Do not over-read the tool's
-   result either: the authoring contract requires idempotent provisioning and
-   does NOT require the tool to test what it provisioned (see the
-   plugin-developer `ingress.md`), so relay what it returned rather than
-   restating it as a verdict on the connection. Set `consent_pending: true`
-   only when a plugin-declared consent (trigger or callback) is still awaiting
-   the operator's ack at completion time (normally false — the Approve tap
-   resumes this engagement before you get here).
+So: emit NO `next_steps` entry for setup, do not ask an agent to run it, and
+do not ask the operator to. Your completion `text` says that setup is queued
+and that its own result is what to go on. Make no claim of your
+own about whether the integration works, in either direction (#443) — Casa
+cannot see the external side, and announcing a fault that does not exist makes
+the operator authorize something that needed no authorizing, which costs the
+same trust as missing a real one. Do not over-read the tool's result either:
+the authoring contract requires idempotent provisioning and does NOT require
+the tool to test what it provisioned (see the plugin-developer `ingress.md`).
 
-Setup tools in this contract are **argument-free and idempotent** (that is
-the plugin-developer authoring doctrine); a tool that demands arguments is
-not a valid hand-back target — report it in `text` instead of emitting the
-next-step. Wiring is global to the plugin, so it runs ONCE, not per target.
-The engager runs the tool immediately on receiving the completion — no
-operator ask; the install/consent that started this engagement already
-authorizes the wiring. Plugins without a setup tool: `next_steps` stays
-empty as usual.
+Do not hunt for a tool name. A plugin whose setup tool is named only in a
+producer handoff or a README — with no `casa.setupTool` in the manifest — has
+**no supported automatic path** before v1.0. Say plainly in `text` that the
+plugin declares no setup hook, so its provisioning step (if any) is unrun;
+never guess a name and never invent a hand-back to compensate.
+
+Setup tools in this contract are **argument-free and idempotent** (that is the
+plugin-developer authoring doctrine). Wiring is global to the plugin, so Casa
+runs it ONCE, not per target.
 
 A plugin registry entry a specialist's install/upgrade OWNS (registry name
 `<slug>.<name>`) can never be managed through this recipe or `remove.md` /

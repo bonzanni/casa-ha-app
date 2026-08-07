@@ -278,26 +278,37 @@ async def reconcile_plugin_triggers(
     # so there is one source of truth for the secrets location.
     secrets_dir = SECRETS_DIR if secrets_dir is None else secrets_dir
 
-    def _compute_and_mint() -> "tuple[DesiredTriggers, list[dict]]":
+    def _compute_and_mint() -> "tuple[DesiredTriggers, list[dict], bool, list[dict] | None]":
         desired = compute_desired(
             role_configs=role_configs, acks=acks, resolver=resolver,
             global_secret_ok=global_secret_ok)
         _mint_secrets(desired, Path(secrets_dir))
-        # The CALLBACK half of the union membership is
-        # derived here, in the SAME worker thread — it reads plugin.json for
-        # every resolved plugin, which must never run on the event loop under
-        # the reconcile lock. It is still computed strictly before any keyboard
-        # posts (prompting happens below, after this returns).
+        # The CALLBACK half of the union membership and the setup-candidate
+        # sweep are derived here, in the SAME worker thread — both read
+        # plugin.json for every resolved plugin, which must never run on the
+        # event loop under the reconcile lock. Both are computed strictly
+        # before any keyboard posts (sealing and prompting happen below, after
+        # this returns).
+        #
+        # #451: the callback half is computed whenever ``prompt`` is set, NOT
+        # only when this pass has pending triggers. Sealing a ZERO-member
+        # verdict — the positive statement that an artifact needs no consent —
+        # requires knowing that the callback half is empty too, and a plugin
+        # can have a pending callback consent while no trigger consent pends.
         union: list[dict] = []
-        if prompt and desired.pending:
-            union = _callback_pending_for_union(
+        union_ok = True
+        candidates: "list[dict] | None" = None
+        if prompt:
+            union_ok, union = _callback_pending_for_union(
                 role_configs=role_configs, resolver=resolver)
-        return desired, union
+            cand_ok, cand = setup_candidates(resolver=resolver)
+            candidates = cand if cand_ok else None
+        return desired, union, union_ok, candidates
 
     async with _RECONCILE_LOCK:
         try:
-            desired, callback_pending = await asyncio.to_thread(
-                _compute_and_mint)
+            (desired, callback_pending, callback_ok,
+             setup_cands) = await asyncio.to_thread(_compute_and_mint)
         except Exception:
             # Terra shipB-r1 P1-2: a compute failure must not RETAIN the old
             # overlay (a just-unassigned/revoked plugin's routes would stay
@@ -327,13 +338,32 @@ async def reconcile_plugin_triggers(
         # provably catches every keyboard an in-flight reconcile posted.
         # register_challenge is synchronous (the Telegram post happens on
         # an owned background driver), so this adds no IO under the lock.
-        if prompt and desired.pending:
-            _fire_consent_prompts(
-                desired.pending, trigger_registry=trigger_registry,
-                role_configs=role_configs, channel_manager=channel_manager,
-                acks=acks, secrets_dir=secrets_dir, resolver=resolver,
-                global_secret_ok=global_secret_ok,
-                callback_pending=callback_pending)
+        if prompt:
+            # #451: SEAL BEFORE the operator-reachability gate. Sealing used to
+            # live inside _fire_consent_prompts, AFTER its `channel is None` /
+            # `op is None` early returns — so with no DM reachable nothing was
+            # sealed at all, and a round could first seal on a later ordinary
+            # reload, long after a mutation had already reported which runner
+            # owned setup. Sealing here means an unreachable operator yields a
+            # members-bearing verdict and the obligation correctly HOLDS.
+            nonce_by_identity = seal_setup_state(
+                trigger_pending=desired.pending,
+                callback_pending=callback_pending,
+                pending_complete=callback_ok,
+                candidates=setup_cands)
+            try:
+                import plugin_setup_episodes
+                plugin_setup_episodes.kick()   # a zero-member verdict releases
+            except Exception:  # noqa: BLE001
+                pass
+            if desired.pending:
+                _fire_consent_prompts(
+                    desired.pending, trigger_registry=trigger_registry,
+                    role_configs=role_configs,
+                    channel_manager=channel_manager,
+                    acks=acks, secrets_dir=secrets_dir, resolver=resolver,
+                    global_secret_ok=global_secret_ok,
+                    nonce_by_identity=nonce_by_identity)
     if regen_health:
         # After the lock: the overlay + persisted ack are already live, so the
         # fresh health pass sees the routed (no-longer-pending) state.
@@ -344,7 +374,7 @@ async def reconcile_plugin_triggers(
 def _fire_consent_prompts(
     pending: list[dict], *, trigger_registry: Any, role_configs: dict,
     channel_manager: Any, acks: Any, secrets_dir: Path,
-    resolver: Any, global_secret_ok: Any, callback_pending: list[dict],
+    resolver: Any, global_secret_ok: Any, nonce_by_identity: dict[str, str],
 ) -> None:
     import authz_grants
     import trigger_consent
@@ -368,20 +398,11 @@ def _fire_consent_prompts(
             secrets_dir=secrets_dir, prompt=False, resolver=resolver,
             global_secret_ok=global_secret_ok, regen_health=True)
 
-    # v0.112.0 (impl r4): SEAL each plugin's setup-round membership in ONE
-    # yield-free batch BEFORE any keyboard posts — a fast Approve on the
-    # first keyboard can never settle a round still registering members.
-    # The membership is the UNION of the pending TRIGGER
-    # and CALLBACK consents. The two reconcilers run as a pair at every call
-    # site, so the callback identities are computed FIRST here and sealed into
-    # the same round — otherwise an Approve landing between the trigger and
-    # callback reconciles would settle a round the callback consent has not
-    # joined yet, running the plugin's setup tool while a consent is open.
-    # ``callback_pending`` was derived off-loop with this pass's desired set,
-    # so nothing blocking runs between here and the keyboards.
+    # The setup-round membership was SEALED by the caller, before this
+    # function's reachability gate (#451) and therefore before any keyboard
+    # posts — a fast Approve on the first keyboard can never settle a round
+    # still registering members.
     _ack_identity = ack_identity  # module-level import (plugin_triggers)
-    nonce_by_identity = seal_setup_rounds(trigger_pending=pending,
-                                          callback_pending=callback_pending)
 
     for p in pending:
         try:
@@ -401,36 +422,115 @@ def _fire_consent_prompts(
 
 def trigger_pending_for_union(
     *, role_configs: dict, resolver: Any = None,
-) -> list[dict]:
+) -> tuple[bool, list[dict]]:
     """The pending TRIGGER consents, for the callback reconciler's union
     sealing (the mirror of ``callback_reconcile.callback_pending_for_union``).
-    Side-effect free and never raises: a failure degrades the union to
-    callback-only membership rather than breaking callback prompting."""
+    Side-effect free and never raises.
+
+    Returns ``(ok, pending)``. #451: the success flag is LOAD-BEARING — this
+    used to degrade a failure to ``[]``, which is indistinguishable from
+    "genuinely nothing pending". Under-reporting pending consents would let a
+    verdict be sealed over a subset (a fast Approve then settles a round the
+    other consent never joined), and would let a ZERO-member verdict — a
+    positive statement that an artifact needs no consent — be sealed when the
+    truth is unknown. The caller seals nothing unless both halves report ok.
+
+    NOTE the ack store: this reads the module DEFAULT (``compute_desired``
+    resolves ``_default_acks`` when none is passed), because the caller is the
+    OTHER reconciler and does not hold this kind's store. Correct in
+    production, where the default IS the live store — but a caller injecting a
+    non-default store for one kind must inject BOTH, or this half reports an
+    already-acked consent as still pending and the verdict it seals never
+    settles.
+    """
     try:
-        return compute_desired(role_configs=role_configs,
-                               resolver=resolver).pending
+        return True, compute_desired(role_configs=role_configs,
+                                     resolver=resolver).pending
     except Exception:  # noqa: BLE001
         logger.exception("trigger union-member compute failed")
-        return []
+        return False, []
 
 
-def _callback_pending_for_union(*, role_configs: dict,
-                                resolver: Any = None) -> list[dict]:
+def _callback_pending_for_union(
+    *, role_configs: dict, resolver: Any = None,
+) -> tuple[bool, list[dict]]:
+    """``(ok, pending)`` — see :func:`trigger_pending_for_union` for why the
+    flag matters. A raising lookup reports ``ok=False``, never empty-as-none."""
     try:
         import callback_reconcile
         return callback_reconcile.callback_pending_for_union(
             role_configs=role_configs, resolver=resolver)
-    except Exception:  # noqa: BLE001 — the callback half is best-effort: its
-        # own reconcile seals the union again a moment later.
+    except Exception:  # noqa: BLE001
         logger.exception("callback union-member lookup failed")
-        return []
+        return False, []
 
 
-def seal_setup_rounds(*, trigger_pending: list[dict],
-                      callback_pending: list[dict]) -> dict[str, str]:
-    """Open ONE setup round per ``(plugin, artifact_id)`` whose membership is
-    the UNION of the supplied pending trigger and callback consent identities,
-    in one yield-free batch per plugin BEFORE any keyboard posts.
+def setup_candidates(*, resolver: Any = None) -> tuple[bool, list[dict]]:
+    """Every resolved plugin declaring ``casa.setupTool``, as
+    ``(ok, [{"plugin", "artifact_id"}])`` (#451).
+
+    These are the plugins Casa owes a setup run for. Reads plugin.json for
+    every resolved plugin, so it runs in the reconcile's WORKER THREAD, never
+    on the event loop under the reconcile lock. ``ok=False`` on any sweep
+    failure — the caller then creates no obligations and seals no verdicts,
+    leaving every existing obligation to hold until a later pass.
+
+    Reads through the SAME ``resolver`` seam as ``compute_desired``, so the
+    obligations created and the consent verdict sealed in one pass describe one
+    registry snapshot. Resolving independently here would let an artifact
+    change between the two reads and seal a verdict against the wrong
+    artifact — for which the obligation would then hold forever.
+    """
+    try:
+        import plugin_store
+        resolver = resolver if resolver is not None else _default_resolver()
+        res = resolver(None)
+        if not getattr(res, "registry_valid", False):
+            # An invalid registry is not an empty one: creating no obligations
+            # is right, but reporting ok would seal "needs no consent" verdicts
+            # for plugins we simply could not see.
+            return False, []
+        out: list[dict] = []
+        for rp in getattr(res, "plugins", None) or ():
+            try:
+                setup = plugin_store.manifest_setup_tool(rp.manifest)
+            except Exception:  # noqa: BLE001 — verify already refused it; a
+                # malformed declaration is not a candidate.
+                continue
+            if setup:
+                # rp.name — the REGISTRY name, matching the ledger key used by
+                # the pending rows, by callback identities and by
+                # casa_core's _resolve_registry_entry seam. runtime_name
+                # (manifest_name for an owned plugin) would key a
+                # specialist-bundled plugin's obligation differently from its
+                # consent verdict, and it would never release.
+                out.append({"plugin": rp.name,
+                            "artifact_id": rp.artifact_id})
+        return True, out
+    except Exception:  # noqa: BLE001
+        logger.exception("setup-candidate sweep failed")
+        return False, []
+
+
+def seal_setup_state(*, trigger_pending: list[dict],
+                     callback_pending: list[dict], pending_complete: bool,
+                     candidates: "list[dict] | None") -> dict[str, str]:
+    """Create the setup obligations Casa owes, and seal ONE positive consent
+    verdict per ``(plugin, artifact_id)`` — in one yield-free batch per plugin
+    BEFORE any keyboard posts, so a fast Approve on the first keyboard can
+    never settle a round still registering its other members.
+
+    Membership is the UNION of the supplied pending trigger and callback
+    consent identities. A plugin that owes setup and has NO pending consent is
+    sealed with an EMPTY membership: a positive statement that this artifact
+    needs no consent, which releases its obligation. That is deliberately
+    distinct from sealing nothing, which means "no verdict yet" and holds.
+
+    ``pending_complete`` must be True — both pending computes succeeded — or
+    this seals NOTHING and returns ``{}``. An incomplete union cannot be
+    distinguished from a complete one, and either kind of seal over a subset
+    releases setup early (#451, attempt 1's mechanism). ``candidates=None``
+    (the sweep failed) likewise creates no obligations.
 
     Returns ``{identity: nonce}`` — each caller threads its own prompts'
     nonces into their decision callbacks (stale-expiry fencing). Never raises:
@@ -439,6 +539,26 @@ def seal_setup_rounds(*, trigger_pending: list[dict],
     import plugin_setup_episodes
 
     by_plugin: dict[tuple, list[str]] = {}
+    # Obligations first: a candidate that still awaits a verdict joins the
+    # sealing pass with (possibly) zero members. One already dispatched,
+    # refused or failed reports False and is left alone — no verdict churn on
+    # every reconcile for a plugin whose setup is long settled.
+    for cand in candidates or ():
+        try:
+            if plugin_setup_episodes.ensure_obligation(
+                    plugin=cand["plugin"], artifact_id=cand["artifact_id"]):
+                by_plugin.setdefault(
+                    (cand["plugin"], cand["artifact_id"]), [])
+        except Exception:  # noqa: BLE001 — never break a reconcile on this
+            logger.exception("setup obligation ensure failed (plugin=%s)",
+                             cand.get("plugin"))
+    if not pending_complete:
+        # Sealing a verdict now would either under-report membership or assert
+        # "no consent needed" without knowing. Hold instead; the obligations
+        # created above stay pending and this runs again on the next reconcile.
+        logger.info("setup verdicts not sealed: a pending-consent compute "
+                    "failed this pass")
+        return {}
     for p in trigger_pending:
         ident = ack_identity(
             plugin=p["plugin"], artifact_id=p["artifact_id"],

@@ -52,11 +52,10 @@ canonical order), say so factually in the text — e.g.
 `"Committed SHA abc123, soft-reloaded triggers for assistant."` — so
 Ellen's narration to the operator is accurate.
 
-`next_steps` is almost always empty for the configurator. The one standing
-exception is the plugin setup-tool hand-back (`recipes/plugin/add.md` /
-`update.md`): a freshly installed or updated plugin that ships a `setup_*`
-MCP tool MUST be handed back via
-`next_steps=[{"action": "run_plugin_setup_tool", ...}]`.
+`next_steps` is empty for the configurator. In particular a plugin's `setup_*`
+MCP tool is NEVER handed back — Casa owns a declared `casa.setupTool` and runs
+it itself (`recipes/plugin/add.md` / `update.md`). Report in `text` that setup
+is queued; routing it to an agent would give one job two runners.
 
 ## Status semantics
 

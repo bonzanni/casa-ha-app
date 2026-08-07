@@ -103,14 +103,32 @@ async def _drain_pending(state):
         await pse._run_episode(ep)
 
 
+def _owe(plugin="elevenlabs", artifact="art-1"):
+    """What the reconciler sweep does first: record that Casa owes this exact
+    artifact a setup run (#451). Sealing a round without this models a plugin
+    that declares no ``casa.setupTool``."""
+    return pse.ensure_obligation(plugin=plugin, artifact_id=artifact)
+
+
 def _prompt(plugin="elevenlabs", artifact="art-1", identity="id-a"):
+    _owe(plugin, artifact)
     return pse.open_round(plugin=plugin, artifact_id=artifact,
                           identities=[identity]).get(identity, "")
 
 
 def _open(identities, plugin="elevenlabs", artifact="art-1"):
+    _owe(plugin, artifact)
     return pse.open_round(plugin=plugin, artifact_id=artifact,
                           identities=identities)
+
+
+def _released(plugin="elevenlabs"):
+    """The obligations the worker may now dispatch — the post-#451 shape of
+    what ``episodes("pending")`` used to mean (a round that settled and minted
+    an episode). An obligation still holding for a verdict is `pending` too,
+    so tests that mean "setup is authorized" must say so explicitly."""
+    return [e for e in pse.episodes("pending")
+            if e.get("gate") == "released" and e.get("plugin") == plugin]
 
 
 async def _decide(plugin="elevenlabs", artifact="art-1", identity="id-a",
@@ -141,9 +159,9 @@ async def test_single_prompt_approve_settles(wired):
 async def test_round_waits_for_all_members(wired):
     _open(["id-a", "id-b"])
     await _decide(identity="id-a")
-    assert pse.episodes() == []           # id-b still open
+    assert _released() == []              # id-b still open — obligation holds
     await _decide(identity="id-b", gen="g2")
-    eps = pse.episodes("pending")
+    eps = _released()
     assert len(eps) == 1
     assert eps[0]["approved_identities"] == ["id-a#g1", "id-b#g2"]
 
@@ -155,18 +173,20 @@ async def test_mixed_round_settles_without_dispatch(wired):
     # must NOT run the plugin-wide setup tool — operator note instead.
     _open(["id-a", "id-b"])
     await _decide(identity="id-a", approved=True)
-    assert pse.episodes() == []
+    assert _released() == []
     await _decide(identity="id-b", approved=False)
-    assert pse.episodes() == []
-    assert any("NOT run automatically" in n for n in wired["notes"])
+    assert _released() == []
+    assert pse.episodes()[0]["status"] == "refused"
+    assert any("was NOT run" in n for n in wired["notes"])
 
 
 @pytest.mark.asyncio
 async def test_deny_only_round_notes_and_skips(wired):
     _prompt()
     await _decide(approved=False)
-    assert pse.episodes() == []
-    assert any("NOT run automatically" in n for n in wired["notes"])
+    assert _released() == []
+    assert pse.episodes()[0]["status"] == "refused"
+    assert any("was NOT run" in n for n in wired["notes"])
 
 
 @pytest.mark.asyncio
@@ -177,9 +197,9 @@ async def test_reprompt_reopens_member(wired):
     await _decide(identity="id-b", approved=False)   # expired
     _prompt(identity="id-b")                          # re-prompted (merge)
     await _decide(identity="id-a", approved=True)
-    assert pse.episodes() == []                       # id-b open again
+    assert _released() == []                          # id-b open again
     await _decide(identity="id-b", approved=True, gen="g9")
-    assert len(pse.episodes("pending")) == 1
+    assert len(_released()) == 1
 
 
 @pytest.mark.asyncio
@@ -268,8 +288,11 @@ async def test_round_ledger_survives_restart(wired, tmp_path, monkeypatch):
 @pytest.mark.asyncio
 async def test_unprompted_decision_synthesizes_round(wired):
     # A decision with no registered prompt (store reset) is never dropped.
+    # #451: an obligation must exist for the settlement to have anything to
+    # release — the reconciler sweep records it independently of the prompt.
+    _owe()
     await _decide()
-    assert len(pse.episodes("pending")) == 1
+    assert len(_released()) == 1
 
 
 @pytest.mark.asyncio
@@ -293,9 +316,9 @@ async def test_stale_artifact_decision_ignored(wired):
     await _decide(artifact="art-OLD", identity="id-old", approved=False)
     rounds = pse._load()["rounds"]
     assert rounds["elevenlabs"]["artifact_id"] == "art-1"   # round intact
-    assert pse.episodes() == []
+    assert _released() == []
     await _decide(artifact="art-1", identity="id-new", approved=True)
-    eps = pse.episodes("pending")
+    eps = _released()
     assert len(eps) == 1
     assert eps[0]["approved_identities"] == ["id-new#g1"]
 
@@ -320,8 +343,12 @@ async def test_consumed_key_replay_never_recreates(wired):
 
 @pytest.mark.asyncio
 async def test_settlement_without_setup_tool_is_noop(wired):
+    # #451: "no setup tool" is now expressed by the reconciler recording NO
+    # obligation for the plugin (the candidate sweep skips it), so settlement
+    # has nothing to release. open_round still runs — its nonces fence the
+    # consent keyboards regardless of whether setup is owed.
     wired["entry"] = dict(wired["entry"], setup_tool=None)
-    _prompt(plugin="gmail", artifact="art-9", identity="id-x")
+    pse.open_round(plugin="gmail", artifact_id="art-9", identities=["id-x"])
     await _decide(plugin="gmail", artifact="art-9", identity="id-x")
     assert pse.episodes() == []
 
@@ -441,7 +468,7 @@ async def test_sealed_batch_never_settles_partially(wired):
     # a fast approve on the first cannot settle a partial round.
     _open(["id-a", "id-b"])
     await _decide(identity="id-a", approved=True)
-    assert pse.episodes() == []                        # sealed: waits for b
+    assert _released() == []                           # sealed: waits for b
     await _decide(identity="id-b", approved=True, gen="g2")
     assert len(pse.episodes("pending")) == 1
 
@@ -616,7 +643,7 @@ async def test_open_round_preserves_open_member_nonce(wired):
     assert n1 == n2
     # the retained keyboard's expiry (carrying n1) must decide the member
     await _decide(identity="id-a", approved=False, nonce=n1)
-    assert any("NOT run automatically" in n for n in wired["notes"])
+    assert any("was NOT run" in n for n in wired["notes"])
 
 
 @pytest.mark.asyncio
@@ -635,8 +662,10 @@ async def test_open_round_fresh_nonce_after_decision(wired):
 async def test_legacy_plugin_denial_is_silent(wired):
     # impl r6 (Terra): a plugin with NO casa.setupTool must settle silently
     # on the deny path too — no spurious "setup tool NOT run" note.
+    # #451: expressed by the reconciler recording NO obligation for it.
     wired["entry"] = dict(wired["entry"], setup_tool=None)
-    _open(["id-a", "id-b"], plugin="gmail")
+    pse.open_round(plugin="gmail", artifact_id="art-1",
+                   identities=["id-a", "id-b"])
     await _decide(plugin="gmail", identity="id-a", approved=True)
     await _decide(plugin="gmail", identity="id-b", approved=False)
     assert pse.episodes() == []
@@ -644,45 +673,46 @@ async def test_legacy_plugin_denial_is_silent(wired):
 
 
 @pytest.mark.asyncio
-async def test_unavailable_resolution_retains_round_then_recovers(wired):
-    # impl r7 (Sol): if the registry resolver is UNAVAILABLE at final
-    # approval, the decided round is RETAINED (not silently consumed) and
-    # re-settles on a later kick once the plugin resolves — a declared
-    # plugin's setup is never permanently lost.
-    calls = {"n": 0}
-
-    def flaky(plugin):
-        calls["n"] += 1
-        return None if calls["n"] == 1 else wired["entry"]  # 1st fails
-
+async def test_release_survives_an_unavailable_registry(wired):
+    # impl r7 (Sol) pinned that a registry UNAVAILABLE at final approval must
+    # not lose a declared plugin's setup. #451 makes that structural rather
+    # than a retry: settlement no longer consults the registry at all, so the
+    # obligation is RELEASED regardless and only the DISPATCH defers.
     pse.configure(
         dispatch=wired_dispatch(wired), notify_operator=wired_notify(wired),
-        resolve_registry_entry=flaky, ack_lookup=lambda i: None)
+        resolve_registry_entry=lambda p: None,        # unavailable
+        ack_lookup=lambda i: None)
     _prompt()
-    await _decide()                                   # resolver returns None
-    assert pse.episodes() == []                       # NOT consumed
-    rnd = pse._load()["rounds"]["elevenlabs"]
-    assert rnd["settle_deferrals"] == 1               # retained + counted
-    await pse._recover_and_settle()                   # later kick, now resolves
-    eps = pse.episodes("pending")
-    assert len(eps) == 1
-    assert eps[0]["approved_identities"] == ["id-a#g1"]
+    await _decide()
+    assert len(_released()) == 1                       # released, not lost
+    assert pse._load()["rounds"] == {}                 # round consumed
+    assert wired["dispatches"] == []                   # but nothing dispatched
+    # once the registry resolves, the SAME released obligation dispatches.
+    pse.configure(
+        dispatch=wired_dispatch(wired), notify_operator=wired_notify(wired),
+        resolve_registry_entry=lambda p: wired["entry"],
+        ack_lookup=lambda i: None)
+    await pse._worker_pass()
+    assert pse.episodes()[0]["status"] == "dispatched"
 
 
 @pytest.mark.asyncio
-async def test_persistently_unresolvable_round_dropped(wired, monkeypatch):
-    # a plugin uninstalled after consent never resolves — the round must not
-    # accumulate forever; it drops after _MAX_SETTLE_DEFERRALS.
-    monkeypatch.setattr(pse, "_MAX_SETTLE_DEFERRALS", 3)
+async def test_persistently_unresolvable_obligation_dropped(wired, monkeypatch):
+    # a plugin uninstalled after consent never resolves. #451 moves the bound
+    # from settlement (which no longer resolves) to DISPATCH: the round is
+    # consumed once, the obligation released, and the released obligation goes
+    # stale after _MAX_RESOLVE_DEFERRALS rather than retrying forever.
+    monkeypatch.setattr(pse, "_MAX_RESOLVE_DEFERRALS", 3)
     pse.configure(
         dispatch=wired_dispatch(wired), notify_operator=wired_notify(wired),
         resolve_registry_entry=lambda p: None, ack_lookup=lambda i: None)
     _prompt()
     await _decide()
     for _ in range(5):
-        await pse._recover_and_settle()
-    assert pse._load()["rounds"] == {}                # dropped, bounded
-    assert pse.episodes() == []
+        await pse._worker_pass()
+    assert pse._load()["rounds"] == {}                # consumed, not retained
+    assert pse.episodes()[0]["status"] == "stale"     # bounded
+    assert wired["dispatches"] == []
 
 
 @pytest.mark.asyncio
@@ -713,7 +743,7 @@ async def test_run_episode_unavailable_resolution_retries_not_stale(wired):
 
 @pytest.mark.asyncio
 async def test_run_episode_persistent_unresolve_goes_stale_bounded(wired, monkeypatch):
-    monkeypatch.setattr(pse, "_MAX_SETTLE_DEFERRALS", 3)
+    monkeypatch.setattr(pse, "_MAX_RESOLVE_DEFERRALS", 3)
     _prompt()
     await _decide()
     pse.configure(
@@ -769,41 +799,17 @@ async def test_schedule_retry_kicks_after_delay(wired, monkeypatch):
 
 
 @pytest.mark.asyncio
-async def test_settlement_deferral_signals_retry_via_worker_pass(wired):
-    # impl r10 (both): a round deferred on transient unavailability — with NO
-    # pending episode yet — must still drive a retry. A worker pass whose
-    # settle stays unavailable returns True (schedules the delayed self-kick);
-    # a later pass that resolves settles + dispatches and returns False.
+async def test_settlement_never_defers_on_an_unavailable_registry(wired):
+    # #451: impl r10 added a settlement-path retry because settlement resolved
+    # the registry and could defer with no pending episode to drive recovery.
+    # Settlement no longer resolves anything, so there is nothing to defer —
+    # the round is consumed exactly once and the obligation released.
     pse.configure(
         dispatch=wired_dispatch(wired), notify_operator=wired_notify(wired),
         resolve_registry_entry=lambda p: None,        # stays unavailable
         ack_lookup=lambda i: None)
     _prompt()
-    await _decide()                                   # settle deferred (None)
-    assert pse.episodes() == []
-    assert pse._load()["rounds"]["elevenlabs"]["settle_deferrals"] == 1
-    # a worker pass while STILL unavailable: re-settle defers → retry_wanted
-    # True (this is the settlement-path signal, with zero pending episodes).
-    assert await pse._worker_pass() is True
-    assert pse.episodes() == []
-    # now the registry resolves → next pass settles, dispatches, no deferral.
-    pse.configure(
-        dispatch=wired_dispatch(wired), notify_operator=wired_notify(wired),
-        resolve_registry_entry=lambda p: wired["entry"], ack_lookup=lambda i: None)
-    assert await pse._worker_pass() is False
-    assert pse.episodes()[0]["status"] == "dispatched"
-
-
-@pytest.mark.asyncio
-async def test_settlement_deferral_schedules_retry_from_decision(wired, monkeypatch):
-    # the on_consent_decision path also schedules the delayed self-kick when
-    # its settlement defers (no worker pass involved).
-    scheduled = {"n": 0}
-    monkeypatch.setattr(pse, "_schedule_retry",
-                        lambda d: scheduled.__setitem__("n", scheduled["n"] + 1))
-    pse.configure(
-        dispatch=wired_dispatch(wired), notify_operator=wired_notify(wired),
-        resolve_registry_entry=lambda p: None)        # always unavailable
-    _prompt()
     await _decide()
-    assert scheduled["n"] == 1
+    assert pse._load()["rounds"] == {}
+    assert "settle_deferrals" not in json.dumps(pse._load())
+    assert len(_released()) == 1

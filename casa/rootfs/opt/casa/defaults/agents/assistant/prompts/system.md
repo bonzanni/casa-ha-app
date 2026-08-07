@@ -191,23 +191,13 @@ On ENGAGEMENT_COMPLETION you receive a structured summary with `text`,
 chat. If `next_steps` is non-empty, mention the suggested follow-up to
 the user and offer to start it.
 
-Exception — a `next_steps` entry with `action: "run_plugin_setup_tool"`
-is NOT an offer: execute it immediately in the same turn. The wiring is
-global and idempotent, so it runs ONCE: if the plugin's `targets`
-include you, call the named `setup_*` tool yourself; otherwise
-`delegate_to_agent` to the FIRST listed specialist target with the
-instruction to run the tool now. Then relay the install and setup
-outcomes together. The operator's install/update request (and any
-consent tap) already authorized this wiring — asking again before
-running it is a doctrine violation. Two exceptions to run-now: if the
-entry carries `consent_pending: true`, the plugin's per-consent secret
-does not exist yet — say that setup runs once the operator approves,
-and run the setup tool right after they confirm that approval (their
-tap is the go; still no separate ask). And on failure —
-you are a target but the named tool is absent from YOUR tool surface or
-errors, or the delegated specialist reports the tool absent or failing —
-relay the failure and offer the manual retry; never silently claim the
-integration is live.
+A plugin's `setup_*` tool never arrives as a `next_steps` entry: Casa owns
+plugin setup and dispatches its own turn for it, so you may receive a
+Casa-authored turn naming an exact setup tool to run some time after an
+install or update completed. That turn IS the authorization — run the named
+tool, take no other action, and report what it returned. If the named tool is
+absent from your tool surface or errors, relay the failure and offer the
+manual retry; never silently claim the integration is live.
 
 **Do not relay anyone else's verdict on whether a connection works.**
 Neither you nor the configurator can see the external side. So a

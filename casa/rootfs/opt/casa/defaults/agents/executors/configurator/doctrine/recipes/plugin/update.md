@@ -64,28 +64,28 @@ up the new code on their next launch.
 **No separate casa_reload is needed on the happy path** — `plugin_update`
 reloads + verifies internally. Report the outcome and `emit_completion(...)`.
 
-## Setup-tool hand-back — MANDATORY when the plugin ships one
+## Setup is Casa's, not yours to route
 
-**Mechanical skip (v0.112.0):** when the `plugin_update` result carries
-`setup_via_consent: true`, do NOT hand back — the re-consent Approve runs
-the setup tool automatically via Casa's durable post-consent episode. Say
-so in the completion text. Hand back only when `setup_tool` is set with
-`setup_via_consent: false`, or for a legacy handoff-only declaration.
+An update re-mints per-trigger secrets (consent re-approval rotates them), so
+a plugin whose credential is artifact-bound is left pointing the external
+service at STALE credentials until its **setup tool** runs.
 
-An update re-mints per-trigger secrets (consent re-approval rotates them),
-so a plugin whose credential is artifact-bound is left pointing the external
-service at STALE credentials until its **setup tool** (naming convention
-`setup_*`) runs. You cannot run it yourself (plugin tools surface only on the
-plugin's target agents). Detect it exactly as in `recipes/plugin/add.md` (the
-producer handoff is authoritative when present; else manifest
-description/README, or Grep the published artifact for a `setup_*` MCP tool —
-never guess a name), and when one exists your `emit_completion` MUST carry one
-`next_steps` entry per setup tool:
-`{"action": "run_plugin_setup_tool", "plugin": "<registry name>", "tool":
-"<setup-tool name>", "targets": [<plugin targets>], "consent_pending":
-<bool>}`. The same contract rules as `add.md` apply: argument-free +
-idempotent tools only, wiring runs ONCE (not per target), and the engager
-runs it immediately — no operator ask.
+**Casa runs it. You do not route it anywhere.** A plugin that declares
+`casa.setupTool` gets a durable per-artifact setup obligation, which Casa
+releases once any consent for that exact artifact settles — or immediately,
+when that artifact needs no consent. The `plugin_update` result reports the
+declared `setup_tool` so you can say what is queued. Emit NO `next_steps`
+entry for it, do not ask an agent to run it, and do not ask the operator to.
+
+The operator hears the setup outcome in a separate message from whichever
+agent Casa dispatches to. Your completion `text` should say that setup is
+queued and that the setup tool's own result is what to go on.
+
+A plugin whose setup tool is named only in a producer handoff or a README —
+with no `casa.setupTool` in the manifest — has **no supported automatic
+path** before v1.0. Do not hunt for the tool name and do not invent a
+hand-back: say plainly in `text` that the plugin declares no setup hook, so
+its provisioning step (if any) is unrun.
 
 **Make no claim about the integration's state, in either direction (#443).**
 Casa does not know it. Not every plugin's credential is artifact-bound: one

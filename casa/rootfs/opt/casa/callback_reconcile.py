@@ -594,25 +594,33 @@ async def reconcile_plugin_callbacks(
     acks = acks if acks is not None else _default_acks()
     spool = _default_spool() if spool is _UNSET else spool
 
-    def _compute() -> "tuple[DesiredCallbacks, list[dict]]":
-        # The union-membership compute reads plugin.json for every
-        # resolved plugin, so it belongs in the SAME worker thread as the main
-        # compute — never on the event loop under the reconcile lock. It still
-        # runs strictly before any keyboard posts (the prompts fire below,
-        # after this returns).
+    def _compute() -> "tuple[DesiredCallbacks, list[dict], bool, list[dict] | None]":
+        # The union-membership compute and the setup-candidate sweep read
+        # plugin.json for every resolved plugin, so they belong in the SAME
+        # worker thread as the main compute — never on the event loop under the
+        # reconcile lock. Both still run strictly before any keyboard posts
+        # (sealing and prompting fire below, after this returns).
+        #
+        # #451: the trigger half is computed whenever ``prompt`` is set, not
+        # only when this pass has pending callbacks — sealing a ZERO-member
+        # verdict requires knowing the trigger half is empty too.
         computed = compute_desired(
             role_configs=role_configs, acks=acks, resolver=resolver,
             entries=entries)
         union: list[dict] = []
-        if prompt and computed.pending:
-            import trigger_reconcile
-            union = trigger_reconcile.trigger_pending_for_union(
+        union_ok = True
+        candidates: "list[dict] | None" = None
+        if prompt:
+            union_ok, union = _trigger_pending_for_union(
                 role_configs=role_configs, resolver=resolver)
-        return computed, union
+            cand_ok, cand = _setup_candidates(resolver=resolver)
+            candidates = cand if cand_ok else None
+        return computed, union, union_ok, candidates
 
     async with _RECONCILE_LOCK:
         try:
-            desired, union_pending = await asyncio.to_thread(_compute)
+            (desired, union_pending, union_ok,
+             setup_cands) = await asyncio.to_thread(_compute)
         except Exception:
             # A compute failure must not RETAIN the old overlay (a
             # just-revoked plugin's callback would stay open behind a
@@ -656,12 +664,29 @@ async def reconcile_plugin_callbacks(
         # keyboard registration is then ordered BEFORE any later reconcile can
         # acquire the lock, so a revoke's final cancel_matching(plugin=…)
         # provably catches every keyboard an in-flight reconcile posted.
-        if prompt and desired.pending:
-            _fire_consent_prompts(
-                desired.pending, trigger_registry=trigger_registry,
-                role_configs=role_configs, channel_manager=channel_manager,
-                acks=acks, spool=spool, resolver=resolver, entries=entries,
-                union_pending=union_pending)
+        if prompt:
+            # #451: seal BEFORE the operator-reachability gate inside
+            # _fire_consent_prompts — with no DM reachable nothing used to be
+            # sealed at all, leaving a mutation's routing decision to be
+            # contradicted by a round that first sealed on a later reload.
+            import trigger_reconcile
+            nonce_by_identity = trigger_reconcile.seal_setup_state(
+                trigger_pending=union_pending,
+                callback_pending=desired.pending,
+                pending_complete=union_ok,
+                candidates=setup_cands)
+            try:
+                import plugin_setup_episodes
+                plugin_setup_episodes.kick()   # a zero-member verdict releases
+            except Exception:  # noqa: BLE001
+                pass
+            if desired.pending:
+                _fire_consent_prompts(
+                    desired.pending, trigger_registry=trigger_registry,
+                    role_configs=role_configs,
+                    channel_manager=channel_manager,
+                    acks=acks, spool=spool, resolver=resolver,
+                    entries=entries, nonce_by_identity=nonce_by_identity)
     if regen_health:
         await _regen_health_safe()
     return desired.issues
@@ -670,11 +695,10 @@ async def reconcile_plugin_callbacks(
 def _fire_consent_prompts(
     pending: list[dict], *, trigger_registry: Any, role_configs: dict,
     channel_manager: Any, acks: Any, spool: Any, resolver: Any,
-    entries: Any, union_pending: list[dict],
+    entries: Any, nonce_by_identity: dict[str, str],
 ) -> None:
     import authz_grants
     import callback_consent
-    import trigger_reconcile
 
     channel = channel_manager.get("telegram") if channel_manager else None
     if channel is None:
@@ -695,17 +719,13 @@ def _fire_consent_prompts(
             resolver=resolver, entries=entries, prompt=False,
             regen_health=True)
 
-    # SEAL the plugin's setup-round membership as the UNION of its pending
-    # TRIGGER and CALLBACK consents, in one yield-free batch BEFORE any
-    # keyboard posts: the two reconcilers run as a pair at every call
-    # site, and whichever prompts first must open the complete membership —
-    # otherwise a fast Approve on this keyboard could settle a round whose
-    # other kind has not registered yet, running the plugin's setup tool while
-    # a consent is still open. ``union_pending`` (the trigger half) was
-    # computed off-loop with this pass's desired set.
-    nonce_by_identity = trigger_reconcile.seal_setup_rounds(
-        trigger_pending=union_pending, callback_pending=pending)
-
+    # The setup-round membership — the UNION of this plugin's pending TRIGGER
+    # and CALLBACK consents — was SEALED by the caller, before this function's
+    # reachability gate (#451) and therefore before any keyboard posts. The two
+    # reconcilers run as a pair at every call site, and whichever prompts first
+    # opens the complete membership: otherwise a fast Approve on this keyboard
+    # could settle a round whose other kind has not registered yet, running the
+    # plugin's setup tool while a consent is still open.
     for p in pending:
         try:
             callback_consent.prompt_callback_consent(
@@ -722,19 +742,53 @@ def _fire_consent_prompts(
                              p.get("plugin"))
 
 
+def _trigger_pending_for_union(
+    *, role_configs: dict, resolver: Any = None,
+) -> tuple[bool, list[dict]]:
+    """The peer (TRIGGER) half of the union membership, wrapped.
+
+    The mirror of ``trigger_reconcile._callback_pending_for_union``. The peer
+    is documented never to raise, but the wrap is what makes that safe to rely
+    on: an escaping exception here would abort the whole callback reconcile,
+    which fails the callback overlay CLOSED and 404s every live callback. A
+    peer failure must degrade to "seal no verdict this pass" instead."""
+    try:
+        import trigger_reconcile
+        return trigger_reconcile.trigger_pending_for_union(
+            role_configs=role_configs, resolver=resolver)
+    except Exception:  # noqa: BLE001
+        logger.exception("trigger union-member lookup failed")
+        return False, []
+
+
+def _setup_candidates(*, resolver: Any = None) -> tuple[bool, list[dict]]:
+    """The setup-obligation candidate sweep, wrapped — see
+    :func:`_trigger_pending_for_union` for why the wrap is load-bearing."""
+    try:
+        import trigger_reconcile
+        return trigger_reconcile.setup_candidates(resolver=resolver)
+    except Exception:  # noqa: BLE001
+        logger.exception("setup-candidate lookup failed")
+        return False, []
+
+
 def callback_pending_for_union(
     *, role_configs: dict, resolver: Any = None,
-) -> list[dict]:
+) -> tuple[bool, list[dict]]:
     """The pending CALLBACK consents, for the trigger reconciler's union
-    sealing. Side-effect free and never raises: a failure here degrades the
-    union to trigger-only membership (the callback reconcile that follows
-    seals its own), it must never break trigger prompting."""
+    sealing. Side-effect free and never raises; it must never break trigger
+    prompting.
+
+    Returns ``(ok, pending)``. #451: a failure reports ``ok=False`` rather than
+    degrading to ``[]`` — an empty list is a claim that nothing is pending, and
+    the caller uses exactly that claim to seal a positive "needs no consent"
+    verdict."""
     try:
-        return compute_desired(role_configs=role_configs,
-                               resolver=resolver).pending
+        return True, compute_desired(role_configs=role_configs,
+                                     resolver=resolver).pending
     except Exception:  # noqa: BLE001
         logger.exception("callback union-member compute failed")
-        return []
+        return False, []
 
 
 async def reconcile_from_runtime(runtime: Any, *, prompt: bool = True) -> list:
