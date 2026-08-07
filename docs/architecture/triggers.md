@@ -46,10 +46,18 @@ attempted.
 Operators change triggers by asking the configurator agent, not by hand-editing; both that
 agent and per-entry reconciliation already reconstruct the file through a plain YAML dump.
 The reminder writer is a third writer of the same kind, so comments, quote styles and key
-order are not preserved — an entry's *meaning* is. One consequence has teeth: environment
-interpolation is substituted into the file's **text** before it is parsed, so a rewritten
-`${VAR}` reference can resolve differently afterwards. The writer refuses to add a reminder
-to a file containing one rather than risk it, and no shipped configuration uses them.
+order are not preserved — an entry's *meaning* is. Environment interpolation is the one
+exception, and it is worth understanding why it survives the fix that was supposed to
+remove it. A `${VAR}` reference no longer has its value lexed into the document
+(INV-CFG-009), so a rewrite can no longer truncate or break one. But *quoting* is what
+tells the loader that a scalar consisting only of a reference is text, and quote style is
+exactly what a rewrite does not preserve: a field authored as `prompt: "${DETAIL}"` is the
+string it holds, while the same field re-emitted unquoted has that value read back as
+YAML. The writer therefore still refuses to add a reminder to a file with such a field —
+one whose reference is the whole value and is declared text, by quoting or by tag. Only
+that, since a reference with text around it is a string either way, a plain lone one is
+read back as a value both before and after, and one in a comment reaches no loader at all.
+No shipped configuration uses references.
 
 **A reminder still present with a past fire time is one that is owed.** The entry is the
 record and delivery removes it, so there is no second store to keep in sync. This is what
@@ -291,10 +299,11 @@ contract working as intended, because a duplicate nudge is a better failure than
 reminder. What is ruled out is the failure escaping and aborting the pass, which would strand
 every later role's overdue reminders too.
 
-**The file already contains `${VAR}` interpolation.** Setting a reminder is refused, because
-re-emitting the file could change what an existing entry resolves to. Cancelling or sweeping
-one is *not* refused — it warns and proceeds, since blocking cleanup is what strands a
-delivered reminder into redelivering forever.
+**A field in the file is a `${VAR}` reference, whole and declared text.** Setting a reminder
+is refused, because re-emitting the file drops the quoting or tag that field's meaning
+depends on. No other use of a reference is refused.
+Cancelling or sweeping one is *not* refused — it warns and proceeds, since blocking cleanup
+is what strands a delivered reminder into redelivering forever.
 
 ## Extension points
 

@@ -115,7 +115,7 @@
     - tests/test_config_sync_backstop.py
     - tests/test_admin_reload_route.py
   related: [architecture/overview.md, architecture/plugins.md, architecture/agent-taxonomy.md]
-  defines_invariants: [INV-CFG-001, INV-CFG-002, INV-CFG-003, INV-CFG-004, INV-CFG-005, INV-CFG-006, INV-CFG-007, INV-CFG-008]
+  defines_invariants: [INV-CFG-001, INV-CFG-002, INV-CFG-003, INV-CFG-004, INV-CFG-005, INV-CFG-006, INV-CFG-007, INV-CFG-008, INV-CFG-009]
   invariant_tests:
     INV-CFG-001: [tests/test_pin_g4_invariants.py::test_pin_inv_cfg_001_exactly_eight_scopes_none_reading_options]
     INV-CFG-002: [tests/test_reload.py::test_full_excludes_other_scopes]
@@ -125,6 +125,7 @@
     INV-CFG-006: [tests/test_config_sync_entry_merge.py::test_issue_398_a_locally_added_entry_survives_a_changed_shipped_default, tests/test_config_sync_entry_merge.py::test_locally_added_entry_is_kept]
     INV-CFG-007: [tests/test_config_sync_entry_merge.py::test_refuses_the_merge_when_nothing_validates]
     INV-CFG-008: [tests/test_config_sync_entry_merge.py::test_output_carries_the_live_documents_top_level]
+    INV-CFG-009: [tests/test_agent_loader_env_substitution.py::test_a_placeholder_value_survives_whatever_punctuation_it_contains, tests/test_agent_loader_env_substitution.py::test_a_hostile_value_can_no_longer_stop_the_file_loading, tests/test_agent_loader_env_substitution.py::test_a_QUOTED_placeholder_is_text_whatever_the_value_looks_like, tests/test_agent_loader_env_substitution.py::test_a_PLAIN_lone_placeholder_keeps_its_value_s_type, tests/test_agent_loader_env_substitution.py::test_a_PLAIN_lone_placeholder_means_what_its_text_means_as_YAML]
 
 - doc: architecture/engagements.md
   summary: Work one agent hands to another — ephemeral delegation, durable engagements, how they end, and what survives a restart.

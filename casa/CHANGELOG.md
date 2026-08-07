@@ -1,5 +1,50 @@
 # Changelog
 
+## [0.158.0] - 2026-08-07
+
+### Fixed
+
+- **A trigger or reminder you added no longer disappears when an update also
+  changes the shipped ones — even in a file that uses YAML anchors.** Casa
+  reconciles `triggers.yaml` entry by entry so your own entries survive an
+  update, but a file using an anchor or alias (`&name` / `*name`) was excluded
+  from that and resolved whole-file instead, taking every locally-added entry
+  with it — reported as a conflict, but reported is not the same as kept, and
+  a lost entry is a trigger that stops firing or a reminder that is never
+  delivered. An anchored file is now
+  reconciled entry by entry, and the shipped change is applied rather than
+  skipped. (Two alias shapes stay on whole-file resolution, because everything
+  downstream would have to walk them forever: one that refers to itself, and
+  one that expands to an astronomical size.)
+- **An environment variable's punctuation can no longer change — or break — an
+  agent configuration file.** A `${VAR}` reference was substituted into a
+  file's text before it was read as YAML, so a value containing `#`, a quote
+  character or a newline could silently truncate the setting it appeared in or
+  stop the file loading altogether — which for a resident agent stops Casa
+  starting. A reference is now resolved after the file has been read, so a
+  variable's contents can no longer alter the file around it. **Quote a
+  reference — `prompt: "${DETAIL}"` — and its value now arrives exactly as it
+  is, whatever it contains.** An unquoted reference standing alone still means
+  whatever its text means as YAML, so quoting is the way to ask for text.
+
+### Changed
+
+- A configuration file must now be valid YAML before any `${VAR}` reference is
+  read, and a handful of hand-authored forms change with it. A reference
+  standing in for a whole unquoted setting still supplies a number, a true/false
+  flag or a list as before. What no longer works: one written where YAML itself
+  needs quoting (unquoted inside `[...]`), and one under an explicit type tag
+  (`!!int ${VAR}`) — both are now reported as a file error instead of depending
+  on the environment. No shipped configuration uses references at all.
+- A `triggers.yaml`, `delegates.yaml` or `executors.yaml` with a field whose
+  whole value is a `${VAR}` reference written as text — quoted, or carrying
+  YAML's string tag — is no longer reconciled entry by entry. Rewriting such a
+  file cannot preserve the quoting or tag that field's meaning now depends on,
+  so it takes whole-file resolution instead — which reports a conflict and keeps
+  a recovery copy, rather than quietly changing what an entry says. A reference
+  used any other way — inside a longer value, unquoted, or in a comment —
+  reconciles as before.
+
 ## [0.157.0] - 2026-08-06
 
 ### Fixed

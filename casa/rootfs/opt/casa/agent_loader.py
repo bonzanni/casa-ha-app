@@ -33,6 +33,7 @@ from config import (
     TriggerSpec,
     TTSConfig,
     VoiceConfig,
+    load_yaml_with_env,
     resolve_model,
     _substitute_env,
 )
@@ -582,14 +583,40 @@ def validate_config_repo(
 # --- File reader -----------------------------------------------------------
 
 
+def parse_yaml_text(text: str, source: str) -> dict[str, Any]:
+    """Parse *text* as the loader does: the parse decides the shape, ``${VAR}``
+    is resolved as each scalar is built.
+
+    The order is the point (#409). Substituting into the text and parsing
+    afterwards hands the parser whatever the variable contains, so a value with
+    a ``#``, a quote or a newline silently changes the document or stops it
+    loading — for a resident, stopping boot. See ``config._EnvSafeLoader``,
+    which also explains why a quoted placeholder is the form that gets the
+    guarantee.
+
+    Exposed rather than private because everything that must agree with the
+    loader about what a file MEANS has to run this exact pipeline: the
+    entry-level reconciler's text validator and the reminder writer both kept
+    their own ``_substitute_env``-then-parse copy, which is the bug.
+
+    Every failure folds into ``LoadError``, not just ``yaml.YAMLError``: PyYAML's
+    own constructors raise plain ``ValueError``/``KeyError`` for an explicitly
+    tagged scalar they cannot build (``at: !!int nope``, or a ``!!timestamp``
+    naming month 99), and a document nested past the parser's own limit raises
+    ``RecursionError``. Every caller here catches ``LoadError``; none of them
+    catches those, so leaving them unfolded means an unreadable file aborts
+    whatever pass is running — at boot, the process.
+    """
+    try:
+        return load_yaml_with_env(text) or {}
+    except (Exception, RecursionError) as exc:  # noqa: BLE001 — see above
+        raise LoadError(f"{source}: YAML parse error: {exc}") from exc
+
+
 def _read_yaml(path: str) -> dict[str, Any]:
     with open(path, "r", encoding="utf-8") as fh:
         text = fh.read()
-    text = _substitute_env(text)
-    try:
-        return yaml.safe_load(text) or {}
-    except yaml.YAMLError as exc:
-        raise LoadError(f"{path}: YAML parse error: {exc}") from exc
+    return parse_yaml_text(text, path)
 
 
 def _declared_kind(runtime_data: dict[str, Any], source: str) -> str:
