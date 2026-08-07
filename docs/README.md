@@ -39,6 +39,7 @@ which is keyed on what you are about to do rather than on subsystem names.
 | personas, bindings, prompt composition, or the binding digest | [`architecture/personality.md`](architecture/personality.md) |
 | plugin installation, artifact identity, protected tools, or authorization grants | [`architecture/plugins.md`](architecture/plugins.md) |
 | recall behaviour, sensitivity tiers, provenance on a stored fact, or session persistence | [`architecture/memory.md`](architecture/memory.md) |
+| reminder creation or cancellation, the reminder sweep, one-shot firing, or recurrence derivation | [`architecture/reminders.md`](architecture/reminders.md) |
 | specialist install identity, consent, materialization, or bundle-transaction recovery | [`architecture/specialist-lifecycle.md`](architecture/specialist-lifecycle.md) |
 | the HA facade, HA tool exposure, or anything about what an agent may control | [`architecture/home-assistant-control.md`](architecture/home-assistant-control.md) |
 | the callback route, the spool protocol, the attempt ledger or its ack protocol, callback consent or reconciliation, the delivery worker, or the validated redirect base URL | [`architecture/callbacks.md`](architecture/callbacks.md) |

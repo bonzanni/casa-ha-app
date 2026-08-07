@@ -176,7 +176,7 @@
 - item: casa/rootfs/opt/casa/reload.py
   doc: architecture/configuration.md
 - item: casa/rootfs/opt/casa/reminders.py
-  doc: architecture/triggers.md
+  doc: architecture/reminders.md
 - item: casa/rootfs/opt/casa/retry.py
   doc: architecture/turn-loop.md
 - item: casa/rootfs/opt/casa/role_artifact.py
