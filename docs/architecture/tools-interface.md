@@ -1,5 +1,5 @@
 ---
-last_reviewed: 2026-07-31
+last_reviewed: 2026-08-07
 ---
 
 # The tool interface
@@ -84,6 +84,44 @@ rather than compensating. The next reload — or an explicit verify — is the r
 What it does not cover: it makes no promise about *when* the runtime converges, only that
 the registry's word is already given.
 
+**INV-TOOL-005**: No plugin-mutation result, completion hand-back or shipped prompt states whether a plugin's integration is live — neither that it is, nor that it is not.
+
+Casa cannot see the external side of an integration. It knows whether it re-minted a secret
+and whether a setup tool has been handed back — neither of which establishes that the service
+is or is not reachable. A plugin's credential need not be artifact-bound at all: one gated by
+`casa.callbacks` keeps its consent ack across an update (the ack binds the *declaration*, not
+the artifact) and holds its credential outside the replaced artifact, so it is commonly
+serving throughout an update Casa has just performed.
+
+Enforced in the shipped prose: `recipes/plugin/add.md` and `update.md` tell the engager to say
+only that the setup tool still needs to run and that its own result is what to go on, and the
+assistant's prompt forbids relaying another party's verdict about a connection. Before this,
+`update.md` instructed the engager to report that "the update succeeded but the integration is
+dead" whenever the setup tool was not Casa-run — which, for a callback-gated plugin, was every
+update. A Gmail that was serving throughout was announced as down and the operator was asked
+to re-authorize it (#443).
+
+The failure is symmetric and that is why the rule is two-sided: announcing a fault that does
+not exist costs the operator the same trust as missing one that does. An unfounded "it's
+fine" is the same defect as an unfounded "it's dead".
+
+**The setup tool's result is not automatically a liveness verdict either**, and the prompts say
+so rather than deferring to it as though it were. Its authoring contract is idempotent
+*provisioning* — argument-free, re-runnable, `setup_`-prefixed — and it is not *required* to
+test what it provisioned. A given tool may check more; only its own output says. So the rule is
+to relay what it returned rather than restate it as a verdict, which is the same discipline the
+invariant applies to Casa's own claims.
+
+What it does not cover: **which** runner executes the setup tool. That routing is still derived
+from `casa.triggers` alone, so a callback-gated plugin still receives a hand-back it does not
+need (#451). That is no longer a false alarm, but it is not free either: idempotence means
+repeat calls converge on the same state, not that a call is side-effect-free — an unnecessary
+run can rewrite the provider's configuration, spend rate budget, or briefly interrupt delivery,
+and what it costs depends on the plugin. This invariant is also pinned as *wording*: the tests
+assert each shipped surface carries the prohibition and has not reverted to a
+previously-shipped phrasing, which is not the same as proving no new phrasing can express the
+claim.
+
 ## Failure behavior
 
 **A malformed request.** Invalid JSON, a missing or unknown name, a non-object request,
@@ -150,6 +188,7 @@ that distinction is the contract.
 - `tests/test_internal_handlers.py`
 - `tests/test_plugin_tools.py`
 - `tests/test_emit_completion_tool.py`
+- `tests/test_assistant_prompts.py`
 
 **Related**
 - [`architecture/mcp-and-tools.md`](../architecture/mcp-and-tools.md)

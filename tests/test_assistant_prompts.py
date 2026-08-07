@@ -398,3 +398,104 @@ def test_system_prompt_forbids_engage_executor_context_bleed(system_md_text):
         "system prompt must forbid bleeding prior conversation context "
         "into engage_executor's task arg."
     )
+
+
+# ---------------------------------------------------------------------------
+# INV-TOOL-005 (#443) — no shipped prompt asserts an integration's liveness
+# ---------------------------------------------------------------------------
+
+def _shipped_setup_prompts() -> list[Path]:
+    """Every bundled prompt/doctrine file that speaks about the plugin
+    setup-tool hand-back — the three surfaces the #443 incident traversed."""
+    root = Path(__file__).resolve().parent.parent
+    base = root / "casa/rootfs/opt/casa/defaults/agents"
+    paths = [
+        base / "assistant/prompts/system.md",
+        base / "executors/configurator/doctrine/recipes/plugin/add.md",
+        base / "executors/configurator/doctrine/recipes/plugin/update.md",
+    ]
+    # A renamed or moved file must fail these tests LOUDLY rather than let them
+    # pass over nothing (a vacuous guard is worse than no guard).
+    missing = [p for p in paths if not p.is_file()]
+    assert not missing, f"setup-prompt surfaces moved: {missing}"
+    return paths
+
+
+# The EXPLICIT prohibition each surface must carry. This is the load-bearing
+# assertion: a phrase deny-list cannot fence an open namespace of ways to say
+# "the integration is down" (a reviewer's "the service is unavailable until
+# setup completes" defeats any such list), so what is pinned is that the
+# instruction NOT to make the claim is present and reaches the model at all.
+_REQUIRED_PROHIBITION = {
+    "system.md": "Do not relay anyone else's verdict on whether a connection works",
+    "add.md": "Make no claim of your own about whether the integration works, in either direction",
+    "update.md": "Make no claim about the integration's state, in either direction",
+}
+
+# Known-bad wordings, kept as a secondary belt: each shipped in one of these
+# files before this release, so a revert to any of them is caught by name. This
+# list is NOT the guarantee — see above.
+_FORBIDDEN_LIVENESS_CLAIMS = [
+    "the integration is dead",
+    "the integration is down",
+    "the integration is not live",
+    "integration is NOT live",
+    "the integration goes live after",
+]
+
+
+@pytest.mark.parametrize("path", _shipped_setup_prompts(),
+                         ids=lambda p: p.name)
+def test_shipped_setup_prompt_carries_the_liveness_prohibition(path):
+    """#443 RED CASE: the incident was a shipped prompt telling an agent to
+    announce an integration dead — for a Gmail that was serving throughout.
+
+    INV-TOOL-005 lives entirely in shipped prose, so these tests ARE its
+    enforcement — there is no code path to assert against. Deleting the
+    prohibition from any of these three surfaces fails here.
+    """
+    collapsed = _collapse_ws(path.read_text(encoding="utf-8"))
+    required = _REQUIRED_PROHIBITION[path.name]
+    assert required in collapsed, (
+        f"{path.name} no longer instructs the agent to make no liveness claim "
+        f"(expected: {required!r}). Casa cannot see the external side, and a "
+        f"setup tool is not required to test what it provisioned "
+        f"(INV-TOOL-005, #443)."
+    )
+
+
+@pytest.mark.parametrize("path", _shipped_setup_prompts(),
+                         ids=lambda p: p.name)
+def test_no_shipped_prompt_reverts_to_a_known_liveness_claim(path):
+    """The secondary belt: the exact wordings that shipped before this release
+    must not come back. Not exhaustive by construction."""
+    collapsed = _collapse_ws(path.read_text(encoding="utf-8")).lower()
+    offenders = [c for c in _FORBIDDEN_LIVENESS_CLAIMS
+                 if c.lower() in collapsed]
+    assert not offenders, (
+        f"{path.name} asserts integration liveness Casa cannot observe: "
+        f"{offenders} (INV-TOOL-005, #443)."
+    )
+
+
+def test_setup_handback_prompts_defer_to_the_tools_own_result():
+    """The positive half: the recipes must point the engager at the TOOL's own
+    result rather than at a verdict of Casa's — and must not overstate what that
+    result covers, since provisioning is all the authoring contract requires."""
+    add = _collapse_ws(_shipped_setup_prompts()[1].read_text(encoding="utf-8"))
+    upd = _collapse_ws(_shipped_setup_prompts()[2].read_text(encoding="utf-8"))
+    assert "its own result is what to go on" in add
+    assert "its own result is what to go on" in upd
+    # ...and must NOT promise the tool reports liveness: the contract requires
+    # provisioning and does not REQUIRE a probe (Sol r3), which is not the same
+    # as claiming no tool ever probes (Terra/Sol r4).
+    assert "does NOT require the tool to test what it provisioned" in add
+    assert "not *required* to test what it provisioned" in upd
+
+
+def test_assistant_refuses_to_relay_a_connection_verdict():
+    """The assistant is where the false claim reached the operator, so its
+    prompt must forbid relaying another party's verdict outright."""
+    collapsed = _collapse_ws(_system_md_path().read_text(encoding="utf-8"))
+    assert ("Do not relay anyone else's verdict on whether a connection works"
+            in collapsed)

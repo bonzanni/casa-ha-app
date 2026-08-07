@@ -1,5 +1,28 @@
 # Changelog
 
+## [0.160.0] - 2026-08-07
+
+### Fixed
+
+- **Casa no longer tells you an integration is broken when it cannot see it.**
+  After updating a plugin, Casa reported that the integration was dead until a
+  setup step ran. That is not something Casa can know: a plugin's credential
+  often survives an update untouched, and the connection keeps working
+  throughout. Gmail was announced as down while it was still serving mail, and
+  the operator was asked to re-authorize something that needed no
+  re-authorizing. Completion messages now say only that the setup step still
+  needs to run, and the assistant no longer passes on anyone else's verdict
+  about a connection. An unfounded "it's fine" is treated as the same mistake as
+  an unfounded "it's dead". That extends to the setup step's own report: it is
+  required to configure the connection, not to test it, so Casa treats "setup
+  succeeded" as covering the connection only when that step actually says so.
+
+### Documentation
+
+- Corrected the description of what happens when a resident agent and a
+  specialist claim the same name after startup: both places that rebuild the
+  name index keep the resident, and the documentation had said they disagreed.
+
 ## [0.159.0] - 2026-08-07
 
 ### Fixed

@@ -73,18 +73,33 @@ so in the completion text. Hand back only when `setup_tool` is set with
 `setup_via_consent: false`, or for a legacy handoff-only declaration.
 
 An update re-mints per-trigger secrets (consent re-approval rotates them),
-so a plugin that ships an MCP **setup tool** (naming convention `setup_*`)
-is left pointing the external service at STALE credentials until that tool
-runs — the update "succeeded" but the integration is dead. You cannot run
-it yourself (plugin tools surface only on the plugin's target agents).
-Detect it exactly as in `recipes/plugin/add.md` (the producer handoff is
-authoritative when present; else manifest description/README, or Grep the
-published artifact for a `setup_*` MCP tool — never guess a name), and
-when one exists your `emit_completion` MUST carry one `next_steps` entry
-per setup tool:
+so a plugin whose credential is artifact-bound is left pointing the external
+service at STALE credentials until its **setup tool** (naming convention
+`setup_*`) runs. You cannot run it yourself (plugin tools surface only on the
+plugin's target agents). Detect it exactly as in `recipes/plugin/add.md` (the
+producer handoff is authoritative when present; else manifest
+description/README, or Grep the published artifact for a `setup_*` MCP tool —
+never guess a name), and when one exists your `emit_completion` MUST carry one
+`next_steps` entry per setup tool:
 `{"action": "run_plugin_setup_tool", "plugin": "<registry name>", "tool":
 "<setup-tool name>", "targets": [<plugin targets>], "consent_pending":
-<bool>}` and say in `text` that the integration is not live until setup
-runs. The same contract rules as `add.md` apply: argument-free +
+<bool>}`. The same contract rules as `add.md` apply: argument-free +
 idempotent tools only, wiring runs ONCE (not per target), and the engager
 runs it immediately — no operator ask.
+
+**Make no claim about the integration's state, in either direction (#443).**
+Casa does not know it. Not every plugin's credential is artifact-bound: one
+gated by `casa.callbacks` keeps its consent ack across an update (that ack binds
+the declaration, not the artifact) and holds its credential outside the replaced
+artifact, so it is very often still serving throughout. Casa cannot tell which
+from the outside, and announcing a fault that does not exist is as bad as
+missing one — it makes the operator authorize something that needed no
+authorizing. So in `text` say only that the setup tool still needs to run and
+that its own result is what to go on.
+
+Do not promise more of that result than it carries. The setup tool's contract is
+idempotent **provisioning** — argument-free, re-runnable, `setup_`-prefixed (see
+the plugin-developer `ingress.md`) — and it is not *required* to test what it
+provisioned. Some tools may check more than that; only the tool's own output
+says. So report what it returns, and do not translate it into a verdict on the
+connection.

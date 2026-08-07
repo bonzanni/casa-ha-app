@@ -1,5 +1,5 @@
 ---
-last_reviewed: 2026-07-31
+last_reviewed: 2026-08-07
 ---
 
 # Agent taxonomy and the registry
@@ -42,15 +42,17 @@ belongs to, what it is called, and whether it exists at all.
 
 **INV-AGENT-001**: A role claimed by both a resident and a specialist is refused at boot, when the role registry is built.
 
-Enforced in `_build_role_registry`, which raises naming the duplicated role. This check is
-load-bearing precisely because `AgentRegistry.build` is not: it assigns residents and then
-specialists into one mapping, so a collision that got past the check would silently resolve
-to the specialist rather than raise.
+Enforced in `_build_role_registry`, which raises naming the duplicated role. That is the only
+place a collision is *refused*.
 
 What it does not cover: reload. The reload paths rebuild through `AgentRegistry.build` and
-the delegation role map directly, and both *tolerate* a collision — with opposite winners:
-the registry mapping resolves to the specialist, the delegation map warns and keeps the
-resident. A collision introduced after boot degrades inconsistently instead of failing.
+the delegation role map directly, and both *tolerate* a collision rather than raise — a
+reload must not brick on something boot would have rejected. They agree on the outcome:
+`AgentRegistry.build` registers residents first and skips any specialist whose role is
+already taken, and `tools.sync_agent_role_map` does the same, each logging
+`role %r exists in both tiers — resident entry wins`. So a collision introduced after boot
+degrades consistently, with the resident kept everywhere — but it degrades silently, visible
+only as those two warnings.
 
 **INV-AGENT-002**: For residents and specialists, `_check_file_set` refuses a missing required file, a forbidden file, or an unrecognised one. The executor path implements its own weaker check and does not refuse unrecognised files.
 

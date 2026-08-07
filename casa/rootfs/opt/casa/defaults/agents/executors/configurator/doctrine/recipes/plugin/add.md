@@ -88,10 +88,9 @@ legacy plugin that names its tool solely in the handoff.
 Some plugins ship an MCP **setup tool** (naming convention `setup_*`, e.g.
 `setup_elevenlabs_voicemail`) that (re)points an external service at Casa —
 typically writing a freshly-minted per-trigger secret into the external
-caller's config. Install/update and consent re-approval mint FRESH secrets,
-so until the setup tool runs the external side still holds stale credentials
-and the integration is dead — even though this install "succeeded". The
-operator must never need to remember a follow-up incantation.
+caller's config. Install and consent re-approval mint FRESH secrets, so the
+external side holds no usable credential from this install until that tool
+runs. The operator must never need to remember a follow-up incantation.
 
 You cannot run it yourself: plugin tools surface only on the plugin's
 target agents, never in this engagement. Hand it back instead:
@@ -107,11 +106,20 @@ target agents, never in this engagement. Hand it back instead:
    `{"action": "run_plugin_setup_tool", "plugin": "<registry name>",
    "tool": "<setup-tool name>", "targets": [<plugin targets>],
    "consent_pending": <bool>}`,
-   and the completion `text` must state that the integration is NOT live
-   until the setup tool has run. Set `consent_pending: true` only when a
-   plugin-declared trigger is still awaiting the operator's consent ack at
-   completion time (normally false — the Approve tap resumes this
-   engagement before you get here).
+   and the completion `text` must state that the setup tool still needs to run,
+   and that its own result is what to go on. Make no claim of your own about
+   whether the integration works, in either direction (#443) — Casa cannot see
+   the external side. A plugin holding a durable credential outside the replaced
+   artifact may already be serving, and announcing a fault that does not exist
+   makes the operator authorize something that needed no authorizing, which
+   costs the same trust as missing a real one. Do not over-read the tool's
+   result either: the authoring contract requires idempotent provisioning and
+   does NOT require the tool to test what it provisioned (see the
+   plugin-developer `ingress.md`), so relay what it returned rather than
+   restating it as a verdict on the connection. Set `consent_pending: true`
+   only when a plugin-declared consent (trigger or callback) is still awaiting
+   the operator's ack at completion time (normally false — the Approve tap
+   resumes this engagement before you get here).
 
 Setup tools in this contract are **argument-free and idempotent** (that is
 the plugin-developer authoring doctrine); a tool that demands arguments is
