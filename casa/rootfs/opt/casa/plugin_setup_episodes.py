@@ -202,17 +202,49 @@ def _load() -> dict:
                 or not isinstance(data.get("episodes"), list)):
             raise ValueError("malformed store")
         data.setdefault("rounds", {})
-        # v0.161.0: a v3 store's "consumed_keys" is inert — creation is driven
-        # by the live registry sweep, so there is no replay to fence. Dropped
-        # rather than migrated; a v3 row simply lacks "gate", and
-        # _needs_verdict treats a gate-less row as awaiting one (fail-safe:
-        # it holds until the next reconcile seals a verdict).
-        data.pop("consumed_keys", None)
+        _migrate(data)
         return data
     except Exception:  # noqa: BLE001 — a corrupt store must not brick boot
         logger.exception("plugin-setup-episodes store unreadable — resetting")
         return {"schema_version": _SCHEMA_VERSION, "rounds": {},
                 "episodes": []}
+
+
+def _migrate(data: dict) -> None:
+    """Bring a pre-v4 store up to the current row shape, in memory (the next
+    :func:`_save` persists it). Idempotent.
+
+    A v3 row was created ONLY by settlement, and only once every member of its
+    consent round had APPROVED — so in v4 terms its existence WAS the release.
+    It must therefore migrate to ``gate="released"``, not to
+    ``awaiting_verdict``: the round that would have released it is long
+    consumed and will never be sealed again, so a gate-less row would hold
+    forever — visible in health as ``setup_episode_pending`` and never acting,
+    while ``ensure_obligation`` declines to create a replacement because a
+    pending row for that artifact already exists. The automatic setup would be
+    silently lost across the upgrade, in exactly the window where it was
+    approved but not yet dispatched.
+
+    ``consumed_keys`` is dropped rather than migrated: creation is now driven
+    solely by the live registry sweep, so there is no replay for a tombstone to
+    fence, and the row identity is ``(plugin, artifact_id)`` with ``gen``."""
+    if int(data.get("schema_version") or 0) >= _SCHEMA_VERSION:
+        data.pop("consumed_keys", None)
+        return
+    data.pop("consumed_keys", None)
+    for row in data.get("episodes") or ():
+        if not isinstance(row, dict):
+            continue
+        row.setdefault("gen", 0)
+        row.setdefault("resolve_deferrals", 0)
+        row.setdefault("approved_identities", [])
+        if "gate" not in row:
+            row["gate"] = "released"
+        # `key` and `setup_tool` are vestigial in v4 — the row is keyed by
+        # (plugin, artifact_id) and the tool is resolved at dispatch.
+        row.pop("key", None)
+        row.pop("setup_tool", None)
+    data["schema_version"] = _SCHEMA_VERSION
 
 
 def _save(data: dict) -> None:

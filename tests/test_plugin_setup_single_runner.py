@@ -453,3 +453,51 @@ def test_asyncio_is_imported_for_the_module_contract():
     """Guard against the import drifting away — _reconcile awaits real work."""
     assert asyncio is not None
 
+
+
+# ---------------------------------------------------------------------------
+# Upgrade: a v3 store must not lose an already-approved setup run
+# ---------------------------------------------------------------------------
+
+@pytest.mark.asyncio
+async def test_a_v3_pending_episode_still_dispatches_after_upgrade(env):
+    """A v3 row existed ONLY because settlement had already released it (all
+    members approved). It carries no `gate`, so treating a gate-less row as
+    awaiting a verdict would hold it forever: the round that would release it
+    is long consumed, and `ensure_obligation` declines to create a replacement
+    while a pending row for that artifact exists. The approved-but-undispatched
+    window would silently lose its automatic setup across the upgrade."""
+    import json
+    pse.STORE_PATH.write_text(json.dumps({
+        "schema_version": 3,
+        "rounds": {},
+        "consumed_keys": ["deadbeef"],
+        "episodes": [{
+            "id": "old1", "key": "deadbeef", "plugin": "gmail",
+            "artifact_id": "art-1", "setup_tool": "setup_gmail",
+            "approved_identities": ["i#g1"], "status": "pending",
+            "attempts": 0, "created_ts": 1.0, "updated_ts": 1.0}],
+    }), encoding="utf-8")
+    await pse._worker_pass()
+    assert len(env.dispatched) == 1
+    row = _obligation()
+    assert row["status"] == "dispatched"
+    assert row["gen"] == 0
+    assert "key" not in row and "setup_tool" not in row   # vestigial in v4
+    assert pse._load()["schema_version"] == 4
+    assert "consumed_keys" not in pse._load()
+
+
+@pytest.mark.asyncio
+async def test_a_v3_refused_style_row_is_not_resurrected(env):
+    """Migration must not turn a TERMINAL v3 row into a dispatchable one."""
+    import json
+    pse.STORE_PATH.write_text(json.dumps({
+        "schema_version": 3, "rounds": {}, "episodes": [{
+            "id": "old2", "plugin": "gmail", "artifact_id": "art-1",
+            "setup_tool": "setup_gmail", "status": "dispatched",
+            "attempts": 1, "created_ts": 1.0, "updated_ts": 1.0}],
+    }), encoding="utf-8")
+    await pse._worker_pass()
+    assert env.dispatched == []
+    assert _obligation()["status"] == "dispatched"

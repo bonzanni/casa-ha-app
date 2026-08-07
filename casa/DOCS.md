@@ -811,6 +811,34 @@ If a plugin reports a Casa-owned variable missing — `OP_SERVICE_ACCOUNT_TOKEN`
 `ONEPASSWORD_DEFAULT_VAULT`, `CONTEXT7_API_KEY` — the fix is the matching
 **app option**, not `plugin-env.conf`; the message names the option.
 
+### Who runs the setup tool (v0.161.0)
+
+**Casa does, and only Casa.** You never need to ask an agent to run a setup
+tool, and no agent will offer to. When a plugin declares `casa.setupTool`, Casa
+records that the plugin is owed a setup run and performs it itself, dispatching
+to one of the plugin's own target agents (its tools exist nowhere else).
+
+*When* it runs depends on what the plugin needs approved:
+
+- Nothing to approve → straight away, after the install or update.
+- A trigger or callback consent still pending → after you tap **Approve**.
+- You **Decline** → not at all. Casa says so; approving later runs it.
+
+Anything Casa cannot yet establish — no chat to prompt you in, a permission
+position it could not read — leaves the run **pending** rather than guessing.
+Pending runs appear in the plugin health report and stay there until they
+happen, so a setup step that never ran is visible rather than silent.
+
+You will see the setup outcome as **its own message**, shortly after the
+install or update report. It carries the setup tool's own words: Casa does not
+translate that into a verdict about whether the connection works, because it
+cannot see the other side.
+
+One limit worth knowing: a plugin whose setup tool is named only in its README
+or in a developer handoff, with no `casa.setupTool` in the manifest, has no
+automatic path — nothing runs it. Casa will say the plugin declares no setup
+hook rather than guess a tool name.
+
 ### Plugin authorization callbacks
 
 Some plugins connect to an external service that hands back an authorization
