@@ -159,6 +159,67 @@ fail-open transport contract is unchanged (an unreachable bridge still allows); 
 co-resident root process can read a sibling's credential file (see the mental model;
 tracked as #365).
 
+**INV-MCP-007**: A hook policy parameter of the wrong type fails the build of that policy, and an authenticated hook resolution naming an executor the per-executor policy map does not represent is refused rather than answered from the default-configured policies.
+
+The hooks schema leaves per-policy parameters open, so a mistyped value is schema-valid and
+reaches the policy factory intact. The scope parameters are lists of path prefixes and every
+consumer iterates them — and a string is iterable. A `writable: /config` written without the
+list dash therefore expanded character by character into a prefix set containing a bare `/`,
+which prefix-matches every absolute path: the scope guard admitted precisely the writes it
+was configured to refuse. A wrong type now raises out of the factory, where an unrecognised
+parameter *name* already did, and the executor fails closed at load rather than enforcing a
+widened scope at runtime. The rule is deliberately uniform across every parameter in the
+registry, including where coercion would have been available and harmless-looking: the
+boolean gating resident deletion is required to be a boolean, because truthiness is not a
+type check in either direction — a falsy non-boolean would silently disable the guard and a
+truthy one silently enable it — and the commit-size limit is required to be a whole number
+rather than coerced, because a coercion is a guess at what the author meant.
+
+The second clause is what makes the first one worth having, and it is the harder half.
+Refusing to build is not by itself a refusal to run: the HTTP hook path builds its
+per-executor policy map separately, and the resolver falls back **per policy** to the
+default-configured map, whose `casa_config_guard` forbids no write path at all. So an
+executor simply *missing* from that map enforced less than the operator wrote — the same
+fail-open shape, one layer out.
+
+The rule is stated at the point of use rather than as a list of failure modes, because
+that list turned out not to be enumerable. Three attempts at it each closed one arm and
+left another: the file fails to build on the second read; the file fails to *load*, so the
+registry publishes no definition and nothing iterating loaded executors names it at all;
+the whole executor directory fails to scan, so no type name survives to be marked as
+having failed. Each is a different way to be absent, and the fallback treated absence as
+consent. So absence is now the refusal: an authenticated request naming an executor the
+map does not represent is denied, whatever made it missing. The corollary is that an
+executor which legitimately declares no parameters must be represented **positively** — it
+is, by an explicit marker — since otherwise "known, and needs nothing" and "never loaded"
+are the same silence. The separately-wired permission relay is not in the per-executor
+map, so a broken configuration still leaves the executor able to ask rather than only to
+fail.
+
+Denial is the answer only when there is nothing better. Two cases have something better
+and take it: an executor whose *document* failed to build gets a deny-all map naming that
+reason, and a *reload* keeps the known-good pre-reload policy set — built from the last
+file that did load — in preference to both the defaults and deny-all, because evicting it
+would take live engagements down over an edit that was never accepted. So the guarantee is
+about what is *never* answered from the defaults, not that every failure ends in a denial.
+
+The reload preference is per executor type, and it is driven by *evidence* that a type
+failed, which is a narrower thing than the type having failed. An executor root that
+raises on being read aborts the reload before any rebuild, and the whole known-good map
+survives. But a root that is merely absent scans successfully and reports nothing: no
+definitions, and no failures either. Every previously known type then looks genuinely
+removed rather than unproven, its entry is dropped, and its guarded calls are refused from
+then on. The pre-reload callbacks still existed and were still good — what was missing was
+any evidence to tell "gone" apart from "unproven". Refusing is the fail-closed side of
+that ambiguity and is the deliberate choice, but it is a real cost: a configuration
+directory that goes missing under a running Casa stops guarded work for live engagements
+until it comes back.
+
+What it does not cover: a well-typed but wrong value. A list of prefixes that is simply too
+broad builds and enforces exactly what it says — this rule constrains the shape of a
+parameter, never its meaning. Nor does it cover an *unauthenticated* resolution, which
+selects no executor parameters at all and is governed by INV-MCP-006.
+
 ## Failure behavior
 
 **An unknown tool name.** Resolution fails and the call is refused; nothing is invoked.

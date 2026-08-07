@@ -1571,8 +1571,15 @@ async def reload_executors(
             # definition says the builder should have produced an entry
             # (claude_code + hooks_path) but none arrived (builder skip).
             failed = set(getattr(registry, "failed_types", set()) or set())
+            # #442 r2 (Sol P1): the builder now installs a marked deny-all map
+            # for an executor that failed to load or build, so such a type IS
+            # present in ``fresh`` — which would skip the preservation below
+            # and replace a KNOWN-GOOD pre-reload set with deny-all, taking
+            # live engagements down. Deny-all is the right answer only when
+            # there is nothing better; a pre-reload set is something better.
+            from hooks import DenyAllPolicyMap
             for t, entry in list(shared_map.items()):
-                if t in fresh:
+                if t in fresh and not isinstance(fresh[t], DenyAllPolicyMap):
                     continue
                 defn = registry.definition_any(t)
                 build_expected = (

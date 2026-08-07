@@ -1164,8 +1164,12 @@ def _build_executor_cc_hook_policies(executor_registry) -> dict:
     Built at boot AND rebuilt in place by ``reload.reload_executors`` (#340 —
     the resolve handlers capture the dict instance stashed on
     ``runtime.executor_cc_policies``, so reload mutates that same object).
-    A per-executor parse failure is logged and skipped so that executor simply
-    falls back to the default callbacks.
+    #442: a per-executor parse failure is NOT skipped — skipping fell that
+    executor back to the default callbacks, which enforce less than any
+    declaration it could have made. It gets a marked deny-all map instead.
+    An executor that legitimately declares no parameters is recorded
+    positively, so the resolver can tell it apart from one that never loaded
+    (see the resolver's missing-entry refusal in ``internal_handlers``).
 
     #315: iterates ``list_types_any()``/``definition_any()`` — boot replay
     resumes existing brief-bearing engagements of DISABLED executors, and
@@ -1174,12 +1178,18 @@ def _build_executor_cc_hook_policies(executor_registry) -> dict:
     workspace Read/Write/Edit).
     """
     from agent_loader import read_hooks_document
-    from hooks import build_policy_callbacks_from_hooks_yaml
+    from hooks import UsesDefaultPolicies, build_policy_callbacks_from_hooks_yaml
 
     out: dict = {}
     for t in executor_registry.list_types_any():
         defn = executor_registry.definition_any(t)
         if defn is None or defn.driver != "claude_code" or not defn.hooks_path:
+            # #442 r3: say "known, and declares nothing" POSITIVELY. The
+            # resolver refuses an executor its map does not represent, and an
+            # absence is what every failure mode looks like too — so a
+            # legitimate no-parameters executor has to be distinguishable
+            # from one that never loaded.
+            out[t] = UsesDefaultPolicies()
             continue
         try:
             # Sol r1-2: the SAME env-substituting reader load-time validation
@@ -1188,11 +1198,40 @@ def _build_executor_cc_hook_policies(executor_registry) -> dict:
             data = read_hooks_document(defn.hooks_path)
             out[t] = build_policy_callbacks_from_hooks_yaml(data)
         except Exception as exc:  # noqa: BLE001
-            logger.warning(
-                "executor %r hooks.yaml param build failed: %s — using defaults",
-                t, exc,
+            # #442 r2 (Sol/Terra P1): omitting the executor is NOT neutral —
+            # the resolver then answers from the default-configured map, per
+            # POLICY, and casa_config_guard's default forbids no write path at
+            # all. A document that fails to build would therefore enforce LESS
+            # than the operator declared, which is the same fail-open shape
+            # #442 exists to close. Deny everything for this executor instead
+            # until the file is fixed. (Reload keeps the pre-reload callbacks
+            # instead — there a KNOWN-GOOD set exists; at boot there is none.)
+            logger.error(
+                "executor %r hooks.yaml param build failed: %s — denying every "
+                "guarded call for it (defaults would enforce less)", t, exc,
             )
+            out[t] = _deny_all_cc_policies(t, exc)
     return out
+
+
+def _deny_all_cc_policies(executor_type: str, exc: object) -> dict:
+    """A ``{policy: (matcher, callback)}`` map whose every callback denies.
+
+    Covers exactly the HOOK_POLICIES names, so the separately-wired
+    ``engagement_permission_relay`` / ``engagement_buttons_reminder`` still
+    fall through to their live defaults — the executor can still surface a
+    permission request, it just cannot pass a guard.
+    """
+    from hooks import DenyAllPolicyMap, HOOK_POLICIES, make_always_deny_hook
+
+    reason = (
+        f"executor {executor_type!r} declares a hooks.yaml that could not be "
+        f"built ({exc}); every guarded tool call is denied until it is fixed."
+    )
+    return DenyAllPolicyMap(
+        (name, (entry["matcher"], make_always_deny_hook(reason)))
+        for name, entry in HOOK_POLICIES.items()
+    )
 
 
 def _bus_loop_targets(agents: dict) -> list[str]:

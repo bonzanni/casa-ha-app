@@ -250,6 +250,13 @@ class ClaudeAgentOptions:
     tools: Any = None
     strict_mcp_config: bool = False
     settings: str | None = None
+    # v0.127.0: tools._build_specialist_options passes output_format (plus the
+    # matching structured-stderr callback) on EVERY in-casa specialist build.
+    # Missing here since it was introduced — found in v0.159.0 by
+    # tests/test_mock_sdk_parity.py, the static sweep added for #447, not by
+    # any e2e run. FOURTH instance of this drift; see `env` and `plugins`
+    # above. The mock accepts and ignores it: it spawns no CLI to format.
+    output_format: str | None = None
 
 
 class ClaudeSDKClient:

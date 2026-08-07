@@ -1,5 +1,40 @@
 # Changelog
 
+## [0.159.0] - 2026-08-07
+
+### Fixed
+
+- **A mistyped safety setting in an agent's hook configuration is now refused
+  instead of quietly letting everything through.** The path restrictions that
+  keep an agent writing only where it is allowed are written as a list. Written
+  without the list dash — `writable: /config` instead of `writable:` on its own
+  line — the setting was read one character at a time, and one of those
+  characters was `/`, which matches every path on the system. The restriction
+  that was meant to narrow what the agent could touch was, in that state,
+  allowing all of it. A setting of the wrong type is now rejected when the agent
+  loads, so the agent refuses to start with a broken guard rather than running
+  with an open one. The same now holds for the other hook settings — the on/off
+  switch protecting resident agents from deletion takes a yes/no value and
+  nothing else, and the commit-size limit takes a whole number rather than
+  quietly making sense of whatever it is given.
+- **An agent whose hook configuration did not load no longer falls back to
+  weaker protection.** Whenever one of these files failed — it could not be
+  read, it did not load, or the whole directory it lives in could not be
+  scanned — the agent carried on under Casa's built-in defaults, which for the
+  guard protecting Casa's own state directories forbid nothing at all. Guarded
+  actions for such an agent are now refused outright rather than checked
+  against a weaker rule than the one that was written. A configuration that
+  was working before a failed edit is still kept, so fixing a file does not
+  require interrupting work already under way.
+
+### Changed
+
+- Casa's own test suite now checks that its offline test double accepts every
+  option the application passes to the Claude Agent SDK. The check immediately
+  found one that had been missing since v0.127.0. This is internal only — no
+  user-visible behaviour changes — but it closes a gap that had repeatedly let
+  the end-to-end tests go silently blind.
+
 ## [0.158.0] - 2026-08-07
 
 ### Fixed

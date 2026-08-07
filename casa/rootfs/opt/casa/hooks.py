@@ -558,6 +558,108 @@ class UnknownPolicyError(Exception):
     """Raised when a hooks.yaml policy or parameter is not recognised."""
 
 
+class UsesDefaultPolicies(dict):
+    """Marker: this executor is known, and declares no hook parameters.
+
+    #442 r3: the resolver refuses an authenticated request naming an executor
+    its map does not represent, so "no parameters" must be said out loud
+    rather than expressed as an absence — an absence is exactly what every
+    failure mode also looks like.
+    """
+
+
+class DenyAllPolicyMap(dict):
+    """A ``{policy: (matcher, callback)}`` map whose every callback denies.
+
+    #442 r2: a marker type, so a consumer can tell "this executor's declared
+    policies could not be built or loaded" apart from an ordinary built map.
+    ``reload`` needs that distinction — a KNOWN-GOOD pre-reload set beats
+    deny-all, while deny-all beats falling back to the broader defaults.
+    """
+
+
+def make_always_deny_hook(reason: str) -> HookCallback:
+    """Return a PreToolUse hook that denies every call it matches.
+
+    #442 r2: used where a policy set could not be BUILT. Omitting the
+    executor's entry there is not neutral — the HTTP resolver falls back to
+    the default-configured policies, which for ``casa_config_guard`` forbid
+    no write path at all, so a refused declaration would enforce LESS than
+    the operator wrote.
+    """
+    async def _hook(
+        input_data: dict[str, Any],
+        tool_use_id: str | None,
+        context: dict[str, Any],
+    ) -> dict[str, Any]:
+        return _deny(reason)
+
+    return _hook
+
+
+def _require_prefix_list(
+    policy: str, param: str, value: Any,
+) -> list[str] | None:
+    """Return ``value`` as a list of path prefixes, or raise.
+
+    #442: the hooks schema leaves per-policy parameters open
+    (``additionalProperties``), so a mistyped value reaches the factory
+    intact. A bare string is iterable, and every consumer here iterates —
+    ``writable: /config`` (no list dash) became the prefix set
+    ``['/', 'c', 'o', 'n', ...]``, whose lone ``/`` prefix-matches every
+    absolute path. The guard then failed OPEN: it admitted precisely the
+    writes it was configured to refuse. A type error must fail the BUILD,
+    where ``UnknownPolicyError`` already fail-closes the executor at load
+    (see ``agent_loader._resolve_hooks_file``), never enforcement.
+    """
+    if value is None:
+        return None
+    if not isinstance(value, list):
+        raise UnknownPolicyError(
+            f"{policy}: {param} must be a list of path prefixes, got "
+            f"{type(value).__name__} ({value!r})"
+        )
+    bad = [p for p in value if not isinstance(p, str)]
+    if bad:
+        raise UnknownPolicyError(
+            f"{policy}: every {param} entry must be a string; got "
+            f"{bad!r}"
+        )
+    return value
+
+
+def _require_int(policy: str, param: str, value: Any) -> int:
+    """Return ``value`` as an int, or raise (#442 r2).
+
+    ``int(...)`` coerces rather than checks: it turned ``true`` into the
+    limit 1 and ``"5"`` into 5. Neither fails open, but a coercion is a
+    guess at what the author meant, and INV-MCP-007 is the stronger, simpler
+    rule — a parameter of the wrong type never builds. ``bool`` is excluded
+    explicitly because it is a subclass of ``int``.
+    """
+    if isinstance(value, bool) or not isinstance(value, int):
+        raise UnknownPolicyError(
+            f"{policy}: {param} must be a whole number, got "
+            f"{type(value).__name__} ({value!r})"
+        )
+    return value
+
+
+def _require_bool(policy: str, param: str, value: Any) -> bool:
+    """Return ``value`` as a bool, or raise (#442).
+
+    Truthiness is not a type check: a falsy non-bool (``0``, ``[]``, ``""``)
+    silently DISABLES the guard it gates, and a truthy one (``"false"``,
+    ``"no"``) silently enables it against the author's intent.
+    """
+    if not isinstance(value, bool):
+        raise UnknownPolicyError(
+            f"{policy}: {param} must be true or false, got "
+            f"{type(value).__name__} ({value!r})"
+        )
+    return value
+
+
 def make_path_scope_hook_v2(
     *,
     writable: list[str] | None = None,
@@ -570,8 +672,19 @@ def make_path_scope_hook_v2(
     Read/Write/Edit. Anything outside the allowed set denies;
     exact-match or prefix-match.
     """
-    writable = [_normalize_path(p) for p in (writable or [])]
-    readable = [_normalize_path(p) for p in (readable or [])]
+    # #442: type-check BEFORE the comprehension — a bare string would
+    # otherwise expand per character into a '/' prefix that matches
+    # everything.
+    writable = [
+        _normalize_path(p)
+        for p in (_require_prefix_list("path_scope", "writable", writable)
+                  or [])
+    ]
+    readable = [
+        _normalize_path(p)
+        for p in (_require_prefix_list("path_scope", "readable", readable)
+                  or [])
+    ]
 
     async def _hook(
         input_data: dict[str, Any],
@@ -690,7 +803,17 @@ def make_casa_config_guard_hook(
     forbid_delete_residents: bool = True,
 ) -> HookCallback:
     """Return a PreToolUse hook that guards Casa-specific destructive ops."""
-    forbid_write = [_normalize_path(p) for p in (forbid_write_paths or [])]
+    # #442: see _require_prefix_list — a bare string fails this guard OPEN.
+    forbid_write = [
+        _normalize_path(p)
+        for p in (_require_prefix_list(
+            "casa_config_guard", "forbid_write_paths", forbid_write_paths)
+            or [])
+    ]
+    forbid_delete_residents = _require_bool(
+        "casa_config_guard", "forbid_delete_residents",
+        forbid_delete_residents,
+    )
 
     async def _hook(
         input_data: dict[str, Any],
@@ -2229,7 +2352,8 @@ def _managed_component_guard_factory(**kwargs: Any) -> HookCallback:
 
 
 def _commit_size_guard_factory(**kwargs: Any) -> HookCallback:
-    max_files = int(kwargs.pop("max_files", 20))
+    max_files = _require_int(
+        "commit_size_guard", "max_files", kwargs.pop("max_files", 20))
     if kwargs:
         raise UnknownPolicyError(
             f"commit_size_guard: unknown parameter(s) {list(kwargs)}; "

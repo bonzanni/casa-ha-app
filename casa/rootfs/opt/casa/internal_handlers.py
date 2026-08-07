@@ -230,8 +230,15 @@ def _make_internal_hooks_resolve_handler(
     (an authenticated id contradicting a cwd engagement claim is refused).
     It prefers the authenticated executor's parameterised callback for the
     policy and falls back to the default `hook_policies` callback for
-    unauthenticated requests / unknown executors / unknown policies, and it
-    threads ``{"casa_engagement_id": <id-or-None>}`` to the callback as the
+    unauthenticated requests and unknown policies. #442 r3: an AUTHENTICATED
+    request naming an executor the per-executor map does not represent is
+    **refused** for any policy in ``HOOK_POLICIES`` — falling back there would
+    enforce the defaults, whose ``casa_config_guard`` forbids no write path at
+    all, in place of what the operator declared. The relay and buttons
+    reminder are wired separately and have no factory, so they are absent from
+    every per-executor map by construction and still fall back: a broken
+    configuration can still ask, it just cannot pass a guard. It threads
+    ``{"casa_engagement_id": <id-or-None>}`` to the callback as the
     authenticated-identity context. Both kwargs default to None so existing
     call sites (and tests) keep the original behaviour.
     """
@@ -363,12 +370,46 @@ def _make_internal_hooks_resolve_handler(
         # (carrying its hooks.yaml params); since #366 the engagement resolves
         # ONLY from the authenticated credential, never from the cwd claim.
         entry = None
-        if executor_hook_policies and auth_rec is not None:
-            entry = (
-                executor_hook_policies.get(
-                    getattr(auth_rec, "role_or_type", "")
-                ) or {}
-            ).get(policy_name)
+        if executor_hook_policies is not None and auth_rec is not None:
+            # #442 r3: absence is NOT "use the defaults". Three review rounds
+            # each found a different way for an executor to go missing from
+            # this map — its hooks.yaml failed to build, it failed to LOAD so
+            # the registry published nothing, the whole executor directory
+            # failed to scan so no type name survived to be marked failed —
+            # and every one of them fell through, per policy, to defaults
+            # whose casa_config_guard forbids no write path at all. The list
+            # of ways to go missing is not enumerable at the builder, so the
+            # decision lives here, where it is used: an authenticated
+            # engagement naming an executor this map does not represent is
+            # refused. A legitimate no-parameters executor is represented
+            # positively (hooks.UsesDefaultPolicies) and still falls back.
+            from hooks import HOOK_POLICIES
+            role_or_type = getattr(auth_rec, "role_or_type", "")
+            declared = executor_hook_policies.get(role_or_type)
+            # r4 (both reviewers): scope the refusal to the GUARD policies.
+            # engagement_permission_relay and engagement_buttons_reminder have
+            # no factory and are wired separately with live dependencies, so
+            # they are absent from every per-executor map by construction —
+            # including the deny-all one. Refusing them here would make a
+            # broken configuration unable to ASK as well as unable to act,
+            # and asking is not an enforcement decision.
+            if declared is None and policy_name in HOOK_POLICIES:
+                logger.error(
+                    "internal /hooks/resolve: executor %r has no hook-policy "
+                    "entry — refusing rather than enforcing the defaults",
+                    role_or_type,
+                )
+                return web.json_response(
+                    {"hookSpecificOutput": {
+                        "hookEventName": "PreToolUse",
+                        "permissionDecision": "deny",
+                        "permissionDecisionReason":
+                            "hook enforcement is unavailable for executor "
+                            f"{role_or_type!r} (its configuration did not "
+                            "load); the tool was not run",
+                    }},
+                )
+            entry = (declared or {}).get(policy_name)
         if entry is None:
             entry = hook_policies.get(policy_name)
         if entry is None:
