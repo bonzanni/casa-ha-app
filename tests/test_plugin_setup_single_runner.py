@@ -754,3 +754,121 @@ def test_pin_resolver_never_substitutes_a_default():
 
     assert tr.pin_resolver(_mine)(None) is sentinel
     assert seen == [None]
+
+
+@pytest.mark.asyncio
+async def test_a_pruned_members_live_keyboard_cannot_refuse_the_obligation(env):
+    """The round-3 prune opened this: a member can be pruned while its keyboard
+    is still LIVE (the consent stops being reported pending for a non-ack
+    reason — its target lost the webhook channel, say). That keyboard's expiry
+    then arrived for a non-member, where the nonce fence cannot apply because
+    there is no member to compare against — so it was recorded, settled the
+    round on a denial nobody made, and refused the obligation with a spurious
+    "you declined" note. Racing the release: in production the zero-member
+    verdict usually releases first, but the kick is asynchronous."""
+    pse.ensure_obligation(plugin="gmail", artifact_id="art-1",
+                          consent_pending=True)
+    nonces = pse.open_round(plugin="gmail", artifact_id="art-1",
+                            identities=["X"])
+    pse.open_round(plugin="gmail", artifact_id="art-1", identities=[])
+    assert pse._load()["rounds"]["gmail"]["members"] == {}
+    await pse.on_consent_decision(plugin="gmail", artifact_id="art-1",
+                                  identity="X", approved=False,
+                                  nonce=nonces["X"])
+    row = _obligation()
+    assert row["status"] != "refused"
+    assert env.notes == [], "no spurious declined note"
+
+
+@pytest.mark.asyncio
+async def test_a_denial_with_no_round_at_all_still_refuses(env):
+    """The non-member rule must not swallow a denial when the round is GONE
+    (a store reset). Dropping it there would leave a memberless round to
+    RELEASE instead — strictly worse than refusing."""
+    pse.ensure_obligation(plugin="gmail", artifact_id="art-1",
+                          consent_pending=True)
+    assert "gmail" not in pse._load()["rounds"]
+    await pse.on_consent_decision(plugin="gmail", artifact_id="art-1",
+                                  identity="X", approved=False, nonce="")
+    assert _obligation()["status"] == "refused"
+    assert env.dispatched == []
+
+
+# ---------------------------------------------------------------------------
+# Review round 4 findings
+# ---------------------------------------------------------------------------
+
+@pytest.mark.asyncio
+async def test_a_rejected_dispatch_holds_and_lands_later(env):
+    """Sol: `_setup_dispatch` returns False when no operator DM is reachable.
+    Three attempts then marked the obligation `failed` — terminal. With the
+    hand-back gone there is no second runner, and nothing re-arms a terminal row
+    without a pending consent, so an ungated plugin's setup was lost for good
+    even after Telegram was configured."""
+    rejecting = SimpleNamespace(n=0)
+
+    async def _reject(role, instruction, ctx):
+        rejecting.n += 1
+        return False
+
+    pse.configure(
+        dispatch=_reject, notify_operator=_swallow(env),
+        resolve_registry_entry=lambda p: env.entry,
+        ack_lookup=lambda i: None, routes_live=lambda p: True)
+    env.plugin = _plugin()
+    await _reconcile(env)
+    row = _obligation()
+    assert row["status"] == "pending" and row["gate"] == "released"
+    assert rejecting.n == 3                            # burst still bounded
+    assert [i["kind"] for i in pse.health_issues()] == ["setup_episode_pending"]
+    # Telegram is configured later; the same obligation lands.
+    pse.configure(
+        dispatch=_recording(env), notify_operator=_swallow(env),
+        resolve_registry_entry=lambda p: env.entry,
+        ack_lookup=lambda i: None, routes_live=lambda p: True)
+    await pse._worker_pass()
+    assert len(env.dispatched) == 1
+
+
+def test_a_mixed_generation_pass_seals_nothing():
+    """Sol: caching per target is not one snapshot. If a reload publishes a new
+    generation between two resolutions, the pending membership and the candidate
+    set describe different registries — and sealing over that pair can release
+    setup for an artifact whose consent was never approved."""
+    gens = iter([1, 2])
+
+    def _drifting(target):
+        return SimpleNamespace(registry_valid=True, plugins=[], issues=[],
+                               generation=next(gens))
+
+    pinned = tr.pin_resolver(_drifting)
+    pinned(None)
+    pinned("resident:assistant")
+    ok, cands = tr.setup_candidates(resolver=pinned)
+    assert ok is False and cands == []
+
+
+@pytest.mark.asyncio
+async def test_a_non_consent_gap_never_seals_needs_no_consent(env):
+    """Terra: a declared trigger with a NON-consent gap (its target has no
+    webhook channel) is omitted from `desired.pending` entirely. A zero-member
+    round would then assert "this artifact needs no consent" — false, since the
+    plugin declares one that is unapproved and merely unaskable right now. The
+    route gate would stop today's dispatch, but the VERDICT would be a lie, and
+    a positive verdict is the one thing this design rests on."""
+    env.plugin = _plugin(triggers=True)
+    role_configs = {"assistant": SimpleNamespace(channels=[])}  # no webhook
+
+    def _resolver(target):
+        return SimpleNamespace(registry_valid=True, plugins=[env.plugin],
+                               issues=[])
+
+    await tr.reconcile_plugin_triggers(
+        trigger_registry=env.registry, role_configs=role_configs,
+        channel_manager=None, acks=env.trig_acks,
+        secrets_dir=env.secrets_dir, prompt=True,
+        resolver=_resolver, global_secret_ok=lambda: True)
+    await pse._worker_pass()
+    assert "gmail" not in pse._load()["rounds"], "no verdict may be sealed"
+    assert _obligation()["gate"] == "awaiting_verdict"
+    assert env.dispatched == []

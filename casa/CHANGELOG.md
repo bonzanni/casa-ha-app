@@ -32,8 +32,20 @@
   words, which — as of 0.160.0 — is the only account of the connection Casa will
   vouch for.
 
+- A permission Casa cannot currently ask you about — the plugin is unassigned,
+  or its target agent lacks the right channel — now leaves the setup run pending
+  instead of being treated as a permission that isn't needed.
+
 ### Fixed
 
+- If Casa could not reach you to dispatch a setup run (no Telegram chat
+  configured yet), the run was abandoned rather than retried. It now waits and
+  runs once it can reach an agent, and stays listed in the plugin health report
+  until it does.
+- A plugin declaring the same tool as both its setup step and an
+  operator-confirmed tool is now refused at verification: Casa's own setup turn
+  cannot satisfy an operator confirmation, so the combination had no way to run
+  at all.
 - Declining a plugin's permission prompt used to produce a note calling it a
   "trigger" even when what you declined was a callback, and telling you to run
   the setup step manually — which was not possible, since a plugin's tools are

@@ -536,12 +536,31 @@ async def on_consent_decision(*, plugin: str, artifact_id: str,
                     "current round is %s)", plugin, artifact_id,
                     rnd.get("artifact_id"))
                 return
-            if not isinstance(rnd, dict):
+            existing_round = isinstance(rnd, dict)
+            if not existing_round:
                 # Unknown round (e.g. store reset) — synthesize so a live
-                # decision is never dropped.
+                # decision is never dropped. Conservative on purpose: a
+                # synthesized denial REFUSES, where dropping it could let a
+                # memberless round release instead.
                 rnd = {"artifact_id": artifact_id, "members": {}}
                 data["rounds"][plugin] = rnd
             member = rnd["members"].get(identity)
+            if not approved and existing_round and member is None:
+                # NOT this round's business. The reconciler's sealed membership
+                # is authoritative about what the round is waiting on, and it
+                # does not list this identity — so a deny/expiry arriving for it
+                # comes from a keyboard the reconciler has already stopped
+                # counting (its member was pruned as no longer pending, e.g. the
+                # trigger's target lost its channel while the keyboard was
+                # live). Recording it would add a member the round never had,
+                # settle on a denial nobody made about a consent no longer
+                # pending, and refuse the obligation with a spurious "you
+                # declined" note. The nonce fence cannot catch this: it requires
+                # a member to compare against.
+                logger.info(
+                    "deny/expiry for a non-member ignored (plugin=%s): the "
+                    "sealed round does not list this consent", plugin)
+                return
             if approved:
                 m = member or {}
                 m["state"] = "approved"
@@ -927,11 +946,20 @@ async def _run_episode(ep: dict) -> bool:
         # the operator (disclosed: delivery, not result correlation).
         _update_episode(ep["id"], status="dispatched", attempts=attempts)
     else:
-        _update_episode(ep["id"], status="failed", attempts=attempts,
-                        last_error="dispatch not accepted")
-        await _note(f"Plugin {plugin}: automatic setup dispatch failed — "
-                    f"ask the agent to run its setup tool "
-                    f"({tool}) manually.")
+        # #451 r4 (Sol): a rejected dispatch HOLDS; it is not terminal. Bus
+        # rejection is transient by nature — the commonest cause is that no
+        # operator DM is reachable yet (``_setup_dispatch`` returns False when
+        # ``operator_identity`` is unavailable), which resolves when Telegram is
+        # configured, possibly days later. Marking it ``failed`` made it
+        # terminal, and with the hand-back gone there is no second runner to
+        # compensate: `ensure_obligation` will not re-arm a terminal row without
+        # a pending consent, so an ungated plugin's setup was lost for good. The
+        # attempts counter still bounds the retry burst WITHIN a pass; the row
+        # stays `pending` and every later kick tries again, visible in health
+        # (where `pending` never decays) until it lands.
+        _update_episode(ep["id"], attempts=0,
+                        last_error="waiting to reach a target agent "
+                        f"(last: {attempts} dispatch attempt(s) not accepted)")
 
 
 async def _note(text: str) -> None:

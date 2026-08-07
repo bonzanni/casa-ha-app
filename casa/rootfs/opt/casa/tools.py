@@ -10343,6 +10343,17 @@ def _tool_verify_plugin_state(
     # several servers make the declaration unexecutable/ambiguous: blocking.
     if _setup_decl and len(granted) != 1:
         reasons.append("setup_tool_ambiguous_server")
+    # #451 r4 (Sol): a setup tool that is ALSO declared protected can never run
+    # through the automatic runner. Casa dispatches its synthetic turn with the
+    # reserved provenance marker `synthetic="plugin_setup"`, which the
+    # provenance classifier maps to `other`, and the protected-tool hook denies
+    # an `other` origin outright as an unsupported origin — before any grant
+    # lookup or operator prompt. Bus acceptance has already marked the
+    # obligation dispatched by then, so nothing retries and nothing surfaces.
+    # Since v0.161.0 Casa is the ONLY runner, the combination has no invocation
+    # path at all: blocking, exactly like an executor-only target.
+    if _setup_decl and _setup_decl in set(protected_tools):
+        reasons.append("setup_tool_protected")
 
     # Tools (system-requirements — verify_bin presence). Sol #11: check BOTH the
     # INSTALLED manifest rows AND every requirement the ARTIFACT declares, so a

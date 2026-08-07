@@ -97,12 +97,21 @@ def pin_resolver(resolver: "Callable[[str | None], Any]") -> Any:
     reconciler's pass through the trigger module's seam.
     """
     cache: dict = {}
+    gens: set = set()
 
     def _pinned(target: "str | None") -> Any:
         if target not in cache:
-            cache[target] = resolver(target)
+            res = resolver(target)
+            cache[target] = res
+            gens.add(int(getattr(res, "generation", 0) or 0))
         return cache[target]
 
+    # Caching per target is NOT the same as observing one snapshot: a reload
+    # publishing a new generation between two targets still yields a mixed pass.
+    # Record the generations so a consumer whose correctness depends on ONE
+    # registry can refuse to act (see :func:`setup_candidates`) rather than
+    # compose two.
+    _pinned.generations = gens          # type: ignore[attr-defined]
     return _pinned
 
 
@@ -384,7 +393,8 @@ async def reconcile_plugin_triggers(
             trigger_pending=desired.pending,
             callback_pending=callback_pending,
             pending_complete=callback_ok,
-            candidates=setup_cands)
+            candidates=setup_cands,
+            unknown=consent_position_unknown(desired.issues))
         try:
             import plugin_setup_episodes
             plugin_setup_episodes.kick()   # a zero-member verdict releases
@@ -524,6 +534,16 @@ def setup_candidates(*, resolver: Any = None) -> tuple[bool, list[dict]]:
             # is right, but reporting ok would seal "needs no consent" verdicts
             # for plugins we simply could not see.
             return False, []
+        gens = getattr(resolver, "generations", None)
+        if gens is not None and len(gens) > 1:
+            # The pass spans registry GENERATIONS, so the pending membership and
+            # this candidate set describe different registries. Caching per
+            # target is not the same as one snapshot. Sealing over the pair can
+            # release setup for an artifact whose consent was never approved, so
+            # report unavailable and hold; the next reconcile retries.
+            logger.info("setup-candidate sweep spans registry generations "
+                        "%s — holding this pass", sorted(gens))
+            return False, []
         out: list[dict] = []
         for rp in getattr(res, "plugins", None) or ():
             try:
@@ -546,9 +566,37 @@ def setup_candidates(*, resolver: Any = None) -> tuple[bool, list[dict]]:
         return False, []
 
 
+# Issue reason codes that mean "this consent IS the gap" — i.e. the plugin's
+# consent position is known and it is `pending`. Every OTHER trigger/callback
+# issue is a NON-CONSENT gap, which suppresses the pending row entirely and so
+# must never be read as "needs no consent" (#451 r4).
+_PENDING_ACK_CODES = ("trigger_pending_ack", "callback_pending_ack")
+
+
+def consent_position_unknown(issues: "list") -> set:
+    """Plugins whose consent position cannot be established from this pass.
+
+    A declared trigger or callback with a NON-CONSENT gap — no webhook channel
+    on its target, an unassigned target, a missing global secret, an invalid
+    declaration, an invalid public base URL — is omitted from the reconciler's
+    ``pending`` rows altogether. Sealing a ZERO-member verdict for such a plugin
+    would assert "this artifact needs no consent" when in fact it declares one
+    that is unapproved and merely unaskable right now. The route gate would stop
+    the dispatch today, but the verdict itself would be false, and a verdict is
+    the one thing this design requires to be positive."""
+    out = set()
+    for i in issues or ():
+        code = str(getattr(i, "reason_code", "") or "")
+        name = getattr(i, "name", None)
+        if name and code and code not in _PENDING_ACK_CODES:
+            out.add(name)
+    return out
+
+
 def seal_setup_state(*, trigger_pending: list[dict],
                      callback_pending: list[dict], pending_complete: bool,
-                     candidates: "list[dict] | None") -> dict[str, str]:
+                     candidates: "list[dict] | None",
+                     unknown: "set | None" = None) -> dict[str, str]:
     """Create the setup obligations Casa owes, and seal ONE positive consent
     verdict per ``(plugin, artifact_id)`` — in one yield-free batch per plugin
     BEFORE any keyboard posts, so a fast Approve on the first keyboard can
@@ -596,6 +644,21 @@ def seal_setup_state(*, trigger_pending: list[dict],
     # reconcile for a plugin whose setup is long settled.
     for cand in candidates or ():
         key = (cand["plugin"], cand["artifact_id"])
+        if cand["plugin"] in (unknown or ()) and not by_plugin.get(key):
+            # A non-consent gap hides this plugin's consent position, and it has
+            # no pending identity to seal a members-bearing round with. Ensure
+            # the obligation (so the debt is recorded and visible) but seal NO
+            # verdict: it must hold until the gap clears and the position is
+            # knowable.
+            try:
+                plugin_setup_episodes.ensure_obligation(
+                    plugin=cand["plugin"], artifact_id=cand["artifact_id"])
+            except Exception:  # noqa: BLE001
+                logger.exception("setup obligation ensure failed (plugin=%s)",
+                                 cand.get("plugin"))
+            logger.info("no setup verdict sealed (plugin=%s): a non-consent "
+                        "gap hides its consent position", cand["plugin"])
+            continue
         try:
             if plugin_setup_episodes.ensure_obligation(
                     plugin=cand["plugin"], artifact_id=cand["artifact_id"],

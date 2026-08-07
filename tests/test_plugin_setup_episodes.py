@@ -429,14 +429,26 @@ async def test_stale_artifact_never_fires(wired):
 
 
 @pytest.mark.asyncio
-async def test_dispatch_failure_retries_then_notes(wired):
+async def test_dispatch_failure_retries_then_holds(wired):
+    # #451 r4 (Sol): a rejected dispatch HOLDS rather than going terminal. Bus
+    # rejection is transient — most often no operator DM is reachable yet — and
+    # with the hand-back gone there is no second runner to compensate, so a
+    # terminal `failed` lost an ungated plugin's setup for good (nothing
+    # re-arms a terminal row without a pending consent). The burst is still
+    # bounded WITHIN the pass; the row stays actionable in health.
     wired["dispatch_ok"] = False
     _prompt()
     await _decide()
     await _drain_pending(wired)
     assert len(wired["dispatches"]) == 3              # bounded retries
-    assert pse.episodes()[0]["status"] == "failed"
-    assert any("manually" in n for n in wired["notes"])
+    row = pse.episodes()[0]
+    assert row["status"] == "pending" and row["gate"] == "released"
+    assert "not accepted" in row["last_error"]
+    assert wired["notes"] == []                       # nothing to tell yet
+    # ...and it lands on a later kick once dispatch works.
+    wired["dispatch_ok"] = True
+    await _drain_pending(wired)
+    assert pse.episodes()[0]["status"] == "dispatched"
 
 
 @pytest.mark.asyncio
@@ -455,10 +467,13 @@ async def test_boot_redispatch_of_pending_episode(wired):
 
 @pytest.mark.asyncio
 async def test_health_issues_surface_and_decay(wired, monkeypatch):
-    wired["dispatch_ok"] = False
+    # A genuinely terminal outcome decays; a HOLD does not (a dispatch that has
+    # not landed stays actionable indefinitely — see
+    # test_dispatch_failure_retries_then_holds).
     _prompt()
     await _decide()
-    await _drain_pending(wired)
+    pse._update_episode(pse.episodes()[0]["id"], status="failed",
+                        last_error="ambiguous server binding")
     rows = pse.health_issues()
     assert rows and rows[0]["kind"] == "setup_episode_failed"
     # decay: age the failure past the window → no longer surfaced

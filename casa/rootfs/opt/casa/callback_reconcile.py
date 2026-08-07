@@ -680,7 +680,8 @@ async def reconcile_plugin_callbacks(
             trigger_pending=union_pending,
             callback_pending=desired.pending,
             pending_complete=union_ok,
-            candidates=setup_cands)
+            candidates=setup_cands,
+            unknown=trigger_reconcile.consent_position_unknown(desired.issues))
         try:
             import plugin_setup_episodes
             plugin_setup_episodes.kick()   # a zero-member verdict releases

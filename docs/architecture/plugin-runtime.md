@@ -174,7 +174,17 @@ plugin's pending *trigger* and *callback* consents, so neither kind alone descri
 That membership may be **empty**, which asserts that this artifact needs no consent and
 releases the obligation; that is deliberately distinct from no round at all, which means
 no verdict yet. Reading absence as permission is the concrete defect the first attempt
-shipped: it would dispatch before the reconcile had opened the round. For the same reason
+shipped: it would dispatch before the reconcile had opened the round.
+
+An empty membership is sealed only where the consent position is genuinely *knowable*. A
+declared trigger or callback carrying a **non-consent** gap — an unassigned target, a role
+without the `webhook` channel, a missing global secret, an invalid public base URL — is
+omitted from the pending rows altogether, so reading that omission as "needs none" would
+assert precisely what the plugin contradicts. Such a plugin's obligation is recorded and
+holds, unsealed, until the gap clears. The route gate would also stop the dispatch, but a
+verdict is the one thing this design requires to be true rather than merely harmless.
+
+For the same reason
 a zero-member verdict is sealed only when the pending computes for *both* consent kinds
 succeeded — a compute that degrades a failure to "nothing pending" cannot be
 distinguished from one that means it — and sealing happens before the

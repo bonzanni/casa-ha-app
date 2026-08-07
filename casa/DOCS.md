@@ -821,7 +821,7 @@ to one of the plugin's own target agents (its tools exist nowhere else).
 Approval is what *clears* the run; it is not the only thing the run waits for.
 Casa clears it:
 
-- immediately, when the plugin needs nothing approved;
+- immediately, when Casa can establish the plugin needs nothing approved;
 - when you tap **Approve**, if it declares a trigger or callback consent — and
   only once **every** consent it declares is approved;
 - never, if you **Decline**. Casa says so, and approving later runs it.
@@ -833,8 +833,10 @@ be resolved, and the agent that will run it must already be able to load it. So
 a secret you have not wired yet — or on a public URL that is not valid — waits
 as long as that takes.
 
-Anything Casa cannot yet establish — no chat to prompt you in, a permission
-position it could not read — leaves the run **pending** rather than guessing.
+Anything Casa cannot yet establish — no chat to prompt you in, or a permission
+it cannot currently ask about because the plugin is unassigned or its target
+lacks the right channel — leaves the run **pending** rather than guessing. An
+unaskable permission is never treated as one that isn't needed.
 Every pending run appears in the plugin health report and stays there until it
 happens, whichever of these it is waiting on, so a setup step that never ran is
 visible rather than silent.

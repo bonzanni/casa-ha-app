@@ -86,8 +86,10 @@ runs. The operator must never need to remember a follow-up incantation.
 **Casa runs it. You do not route it anywhere.** A plugin that declares
 `casa.setupTool` gets a durable per-artifact setup obligation, which Casa
 releases once EVERY consent that artifact declares has been approved — or
-immediately, when it needs no consent. One declined consent withholds it (the
-setup tool is argument-free and cannot target a subset). Because plugin tools
+immediately, when Casa can establish it needs none. One declined consent
+withholds it (the setup tool is argument-free and cannot target a subset), and a
+consent Casa cannot currently ask about — an unassigned target, a role without
+the webhook channel — leaves the run pending rather than counting as none. Because plugin tools
 surface only on the plugin's target agents, never in this engagement, Casa
 dispatches its own turn to one of them; the operator hears the setup outcome in
 a separate message. The `plugin_add` result reports the declared `setup_tool` so
