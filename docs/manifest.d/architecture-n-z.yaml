@@ -224,7 +224,7 @@
 
 - doc: architecture/triggers.md
   summary: What makes an agent act without a person speaking — scheduled and webhook triggers, and the consent a plugin trigger needs.
-  when_changing: trigger types, webhook trigger routing, plugin trigger consent, or scheduling
+  when_changing: trigger types, webhook trigger routing, plugin trigger consent, one-shot firing and cleanup, or scheduling
   covers:
     - casa/rootfs/opt/casa/trigger_registry.py::TriggerRegistry
     - casa/rootfs/opt/casa/trigger_registry.py::TriggerRegistry.replace_plugin_overlay
@@ -237,16 +237,30 @@
     - tests/test_trigger_consent.py
     - tests/test_agent_loader_trigger_auth.py
     - tests/test_casa_reload_triggers_resident.py
-  related: [architecture/plugins.md, architecture/http-surface.md, architecture/overview.md, architecture/callbacks.md]
-  defines_invariants: [INV-TRIG-001, INV-TRIG-002, INV-TRIG-003, INV-TRIG-004, INV-TRIG-005, INV-TRIG-008, INV-TRIG-009, INV-TRIG-010]
+  related: [architecture/plugins.md, architecture/http-surface.md, architecture/overview.md, architecture/callbacks.md, architecture/reminders.md]
+  defines_invariants: [INV-TRIG-001, INV-TRIG-002, INV-TRIG-003, INV-TRIG-004, INV-TRIG-005, INV-TRIG-009]
   invariant_tests:
     INV-TRIG-001: [tests/test_trigger_registry.py::test_interval_channel_must_be_registered_on_agent]
     INV-TRIG-002: [tests/test_pin_g4_invariants.py::test_pin_inv_trig_002_plugin_namespace_reserved_in_user_schema, tests/test_trigger_registry.py::test_duplicate_trigger_name_same_agent_rejected, tests/test_trigger_registry.py::test_cross_role_webhook_name_collision_rejected]
     INV-TRIG-003: [tests/test_plugin_triggers_reconcile.py::test_per_plugin_all_or_nothing]
     INV-TRIG-004: [tests/test_plugin_triggers_consent.py::test_tampered_identity_fails_whole_store_closed]
     INV-TRIG-005: [tests/test_plugin_triggers_overlay.py::test_replace_is_atomic_full_swap_stale_swept]
-    INV-TRIG-008: [tests/test_reminder_sweep.py::test_overdue_reminder_is_delivered_and_removed, tests/test_reminder_sweep.py::test_removal_failure_leaves_it_for_the_next_sweep, tests/test_reminder_sweep.py::test_the_sweep_reads_the_operators_trigger_file]
     INV-TRIG-009: [tests/test_trigger_registry_date.py::test_firing_an_agent_owned_one_shot_removes_job_and_entry, tests/test_trigger_registry_date.py::test_firing_an_OPERATORS_one_shot_drops_the_job_but_not_the_entry, tests/test_trigger_registry_date.py::test_firing_a_one_shot_frees_its_job_id]
+
+- doc: architecture/reminders.md
+  summary: How an agent comes to nudge someone later — entry ownership, the narrow writer, delivery, and the sweep that redeems a past-dated one-shot the process was down for.
+  when_changing: reminder creation or cancellation, the reminder sweep, or recurrence derivation
+  covers:
+    - casa/rootfs/opt/casa/reminders.py
+  tests:
+    - tests/test_reminders_store.py
+    - tests/test_reminder_tools.py
+    - tests/test_reminder_sweep.py
+    - tests/test_trigger_registry_date.py
+  related: [architecture/triggers.md, architecture/configuration.md, architecture/tools-interface.md]
+  defines_invariants: [INV-TRIG-008, INV-TRIG-010]
+  invariant_tests:
+    INV-TRIG-008: [tests/test_reminder_sweep.py::test_overdue_reminder_is_delivered_and_removed, tests/test_reminder_sweep.py::test_removal_failure_leaves_it_for_the_next_sweep, tests/test_reminder_sweep.py::test_the_sweep_reads_the_operators_trigger_file]
     INV-TRIG-010: [tests/test_reminder_tools.py::test_writes_only_to_the_calling_roles_own_file, tests/test_reminder_tools.py::test_cancel_refuses_a_non_reminder_name, tests/test_reminders_store.py::test_an_operator_LOOKALIKE_is_not_owned, tests/test_reminders_store.py::test_it_refuses_a_duplicate_of_an_OPERATOR_name]
 
 - doc: architecture/turn-loop.md

@@ -22,6 +22,7 @@ Code is the source of truth; these files are a map.
 - [architecture/personality.md](architecture/personality.md): What an agent is versus how it presents — role artifacts, personas, bindings, and which prompt is actually served.
 - [architecture/plugin-events.md](architecture/plugin-events.md): Plugin-emitted domain events — casa-minted generations, per-subscriber delivery receipts, and consent-gated headless wakes.
 - [architecture/plugins.md](architecture/plugins.md): How a plugin becomes usable — registry, content-addressed store, artifact identity, and per-call authorization.
+- [architecture/reminders.md](architecture/reminders.md): How an agent comes to nudge someone later — entry ownership, the narrow writer, delivery, and the sweep that redeems a past-dated one-shot the process was down for.
 - [architecture/specialist-lifecycle.md](architecture/specialist-lifecycle.md): Specialist install/upgrade/rollback — instance tuples, the store, consent receipts, materialization, the crash journal.
 - [architecture/telegram.md](architecture/telegram.md): How Telegram messages become turns — transports, authentication, the per-topic causal log, keyboards, and rendering.
 - [architecture/tools-interface.md](architecture/tools-interface.md): The mutation interface — the one tool registry, result envelopes, and which failures roll back versus report.
