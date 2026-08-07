@@ -24,9 +24,13 @@ from typing import Callable
 import yaml
 
 from atomic_io import atomic_write_text
-from yaml_safety import load_yaml_no_aliases
+from config import _ENV_RE, text_has_lone_placeholder
 
 logger = logging.getLogger("config_sync")
+
+# Whether a merge-eligible file may be rewritten at all: see
+# ``config.text_has_lone_placeholder``, which is shared with the reminder writer
+# so the two cannot disagree about what a rewrite can damage.
 
 # In-scope trees, relative to each of the three roots. schema/ keeps its
 # own always-overwrite handling in setup-configs.sh and is out of scope here.
@@ -69,6 +73,114 @@ def _merge_spec(rel: str) -> tuple[str, str] | None:
     return MERGE_ELIGIBLE.get((parts[0], parts[-1]))
 
 
+class _Unparseable:
+    """Sentinel for "this text is not a YAML document at all".
+
+    A distinct value rather than ``None`` because the comparison below asks
+    whether two texts MEAN the same thing, and two failures to parse are not
+    evidence that they do — see :func:`_same_document`.
+    """
+    __slots__ = ()
+
+    def __repr__(self) -> str:            # pragma: no cover — diagnostics only
+        return "<unparseable>"
+
+
+_UNPARSEABLE = _Unparseable()
+
+
+def _parse(text: str):
+    """Parse *text* the way the components that CONSUME these files do
+    (``agent_loader._read_yaml``, ``reminders._read_doc``): plain
+    ``yaml.safe_load``, aliases and all. Returns ``_UNPARSEABLE`` instead of
+    raising, since every caller here runs inside boot-critical, non-fatal
+    reconciliation.
+
+    Not ``yaml_safety.load_yaml_no_aliases``: that loader exists for content
+    whose whole trust model is that it never aliases (persona packs, role
+    artifacts, which are parsed nowhere else). Using it on files the loader
+    then parses permissively made this module disagree with the loader about
+    what is on disk, which is #408 in one sentence.
+
+    Admitting aliases means admitting the two documents an alias can build that
+    a tree cannot, so both are refused here rather than met further in: a
+    document that aliases one of its own ancestors is CYCLIC, and every step
+    after this one walks it (``==`` between entries, ``safe_dump``, jsonschema)
+    and would recurse until it raised; one that aliases a shared subtree
+    repeatedly EXPANDS, and can be tiny on disk yet astronomically large walked
+    (``&a1 [*a0, *a0]`` chained thirty deep is ~2^30 leaves). Refusing is the
+    fallback this gate already has for every other irregularity — the file
+    takes byte-level resolution, exactly as it did before #408 — and it is why
+    ordinary shared anchors, the case #408 is about, stay cheap to accept.
+    """
+    try:
+        doc = yaml.safe_load(text)
+    except (Exception, RecursionError):  # noqa: BLE001 — never raise here
+        return _UNPARSEABLE
+    return doc if _walkable(doc) else _UNPARSEABLE
+
+
+# Generous enough that no authored config approaches it, small enough that the
+# walk below is bounded work: an expansion attack overshoots it by orders of
+# magnitude, not by a factor.
+_MAX_EXPANDED_NODES = 100_000
+
+
+def _walkable(doc) -> bool:
+    """Whether *doc* is acyclic and does not expand past ``_MAX_EXPANDED_NODES``.
+
+    Counts REVISITS deliberately — a shared subtree is counted once per
+    reference, because that is what every downstream walk pays for it. It counts
+    SCALARS for the same reason: an alias can share a wide list of scalars as
+    readily as a nested one, and charging only for containers let four hundred
+    aliases to a four-hundred-scalar list through at a hundred and sixty
+    thousand visits. The container set is every one ``SafeLoader`` can build,
+    not the two that are obvious: ``!!omap`` and ``!!pairs`` build their entries
+    as TUPLES and ``!!set`` builds a set, and a cycle hidden inside a tuple is
+    still a cycle every later walk has to follow. (A set cannot hold a cycle —
+    its members must be hashable — but it is walked for the budget, since
+    charging one node for ten thousand members is the same blind spot.)
+    """
+    budget = _MAX_EXPANDED_NODES
+    on_path: set[int] = set()
+    stack: list[tuple[object, bool]] = [(doc, False)]
+    while stack:
+        node, leaving = stack.pop()
+        if leaving:
+            on_path.discard(id(node))
+            continue
+        budget -= 1
+        if budget < 0:
+            return False
+        if not isinstance(node, (dict, list, tuple, set, frozenset)):
+            continue
+        if id(node) in on_path:
+            return False                     # aliases an ancestor → cyclic
+        on_path.add(id(node))
+        stack.append((node, True))
+        for value in (node.values() if isinstance(node, dict) else node):
+            stack.append((value, False))
+    return True
+
+
+def _same_document(a: str, b: str) -> bool:
+    """Whether *a* and *b* are the same document, ignoring formatting.
+
+    A text that does not parse is the same as NOTHING, not even another text
+    that does not parse. Folding both sides to a shared "could not parse" value
+    made them compare equal, which the caller reads as "nothing to apply": it
+    then writes nothing while the baseline still advances to the new image, so
+    the next boot sees baseline and image already agreeing and never reconciles
+    the file again. That turns a visible loss into a silently skipped, never
+    retried shipped change (#408).
+    """
+    doc_a = _parse(a)
+    doc_b = _parse(b)
+    if doc_a is _UNPARSEABLE or doc_b is _UNPARSEABLE:
+        return False
+    return doc_a == doc_b
+
+
 @dataclass
 class EntryDoc:
     """A merge-eligible document split into the parts reconcile treats
@@ -90,13 +202,34 @@ def _entry_doc(text: str, list_key: str, identity_key: str) -> EntryDoc | None:
 
     Never raises. ``reconcile()`` runs at boot and is contractually non-fatal
     (INV-CFG-005), so a malformed config file must not escape as an exception —
-    ``load_yaml_no_aliases`` can raise ``yaml.YAMLError`` OR ``RecursionError``,
-    and both fold into None here (the same contract ``reminders._load``
-    documents).
+    parsing can raise ``yaml.YAMLError`` OR ``RecursionError``, and both fold
+    into None here (the same contract ``reminders._load`` documents).
+
+    Parsed with ``_parse``, which admits YAML aliases, because the question
+    this gate answers is "can this file be reconciled per entry?" and the file
+    is one ``agent_loader`` will parse with plain ``yaml.safe_load`` moments
+    later. Refusing an anchored document here bought no safety — the alias is
+    expanded downstream regardless — and cost the operator the entry-level
+    protection, silently, on the one file where losing an entry means a
+    reminder that is never delivered (#408).
     """
-    try:
-        doc = load_yaml_no_aliases(text)
-    except (Exception, RecursionError):  # noqa: BLE001 — gate must not raise
+    if text_has_lone_placeholder(text):
+        # A scalar that is nothing but `${VAR}` makes the file unmergeable,
+        # decided on the TEXT and so independent of today's environment. This
+        # module parses without resolving — it REWRITES these files, and
+        # resolving first would bake the environment into one permanently — so
+        # it re-emits through `safe_dump`, which does not preserve quote style.
+        # Quoting is what tells the loader such a scalar is text (#409), so a
+        # rewrite retypes a locally-added entry authored as
+        # `prompt: "${DETAIL}"` the moment the value looks like a number or a
+        # flag; per-entry validation then judges that entry invalid and DROPS
+        # it — the exact loss entry-level reconcile exists to prevent. Refusing
+        # hands the file to byte-level resolution, which is loud: a snapshot, a
+        # conflict record and an operator notification. Same door, same reason,
+        # same predicate as `reminders.add_entry`.
+        return None
+    doc = _parse(text)
+    if doc is _UNPARSEABLE:
         return None
     if not isinstance(doc, dict):
         return None
@@ -330,20 +463,13 @@ def _merge_file(*, rel: str, defaults_dir: Path, baseline_dir: Path,
     result = MergeResult(outcome=outcome, dropped=dropped,
                          prior_text=live_text,
                          top_level_changed=chosen_top != live.top_level)
-    if _yaml_or_none(text) == _yaml_or_none(live_text):
+    if _same_document(text, live_text):
         return result                        # nothing to apply → leave bytes
     result.text = text
     # Converged on the default → copy its BYTES, so an install with no local
     # entries stays byte-identical to what byte-level reconcile produced.
-    result.copy_default = _yaml_or_none(text) == _yaml_or_none(new_text)
+    result.copy_default = _same_document(text, new_text)
     return result
-
-
-def _yaml_or_none(text: str):
-    try:
-        return load_yaml_no_aliases(text)
-    except (Exception, RecursionError):  # noqa: BLE001
-        return None
 
 
 @dataclass
@@ -1064,9 +1190,20 @@ def reconcile(*, defaults_dir, config_dir, baseline_dir,
     _mirror_baseline(defaults_dir, baseline_dir,
                      hold=[m["path"] for m in report.merge_refused])
 
+    # Every arm that WROTE ANYTHING under /config belongs here, and the
+    # sidecars count: `.casabak` files live under agents/**, which the tracking
+    # whitelist admits. `merged` and `entries_dropped` were missing, so a pass
+    # whose only change was an entry-level merge committed the PRE-sync snapshot
+    # and then left the merged file uncommitted in /config/.git indefinitely;
+    # so were the recovery-copy arms, so a pass that took a sidecar and then
+    # FAILED its write left that sidecar uncommitted the same way. Either way
+    # the next pre-sync snapshot eventually sweeps the leftovers up under a
+    # message about a different reconcile.
     changed = bool(
         report.updated or report.deleted or report.conflicts
         or report.schema_forced or report.post_sync_healed
+        or report.merged or report.entries_dropped
+        or report.casabak or report.merge_backup or report.merge_refused
     )
     if changed and git.available:
         git.snapshot(f"casa-sync: default reconcile {image_version}")
@@ -1201,13 +1338,12 @@ def _make_text_validator(config_dir) -> Callable[[str, str], str | None]:
     (INV-CFG-007), and a file validator can only answer for bytes already on
     disk.
 
-    It validates TEXT rather than an already-parsed document, and applies
-    ``_substitute_env`` first, because that is exactly what ``_read_yaml``
-    does. Validating the raw parsed document instead would let the two
-    validators disagree — a file using ``${VAR}`` for a non-string field
-    parses to a string before substitution and to the substituted value
-    after — and a merge that passed one check only to fail the other would be
-    written and then immediately salvaged again by the backstop.
+    It validates TEXT rather than an already-parsed document, and runs it
+    through ``agent_loader.parse_yaml_text`` — the loader's own pipeline,
+    parse-then-substitute — rather than parsing it here. Validating the
+    unsubstituted document instead would let the two validators disagree about
+    a file using ``${VAR}``, and a merge that passed one check only to fail the
+    other would be written and then immediately salvaged again by the backstop.
 
     Returns an error string when invalid, else None; a path with no schema
     validates trivially, exactly as the file validator does.
@@ -1222,7 +1358,7 @@ def _make_text_validator(config_dir) -> Callable[[str, str], str | None]:
             return None
         schema_name, version = binding
         try:
-            doc = yaml.safe_load(al._substitute_env(text)) or {}
+            doc = al.parse_yaml_text(text, str(config_dir / rel))
         except Exception:  # noqa: BLE001 — unparseable is simply invalid here
             return "document did not parse"
         try:

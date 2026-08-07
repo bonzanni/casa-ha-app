@@ -374,15 +374,28 @@ class TestRemoveEntry:
 
 
 class TestEnvPlaceholderDoor:
-    """``_substitute_env`` runs on the file's TEXT before parsing, and
-    ``safe_dump`` re-emits a placeholder-bearing string UNQUOTED — so a ``#``
-    in the substituted value starts a comment and truncates the operator's
-    value. No emission style avoids it (quoting turns the truncation into a
-    boot-fatal parse error), so the writer refuses at the door instead.
+    """``safe_dump`` re-emits a lone-placeholder string UNQUOTED, and the writer
+    cannot rewrite such a file without risking an existing entry.
 
-    The check is on the RAW TEXT, hence environment-INDEPENDENT. Sol r1 killed
-    the alternative — comparing resolved values — because it passes with a
-    benign value today and the rewritten file still changes meaning tomorrow.
+    #409 changed WHY, and it is worth stating because that issue expected this
+    door to close with it. It no longer truncates: resolution happens inside the
+    YAML constructor, so the value is not re-lexed into the document. What
+    survives is that QUOTING decides whether a scalar that is NOTHING BUT a
+    placeholder is text — quoted it is a string whatever it holds, plain it has
+    its value read back — and a rewrite cannot preserve a style it can no longer
+    see. An entry authored as `prompt: "${DETAIL}"` therefore still changes
+    meaning once a rewrite drops the quotes and the value looks like a number, a
+    flag or a list. The hazard is narrower; it is not gone.
+
+    Narrower in both directions, and the door has to match it exactly, because
+    refusing has a cost of its own — a reminder the user asked for and did not
+    get. `Send ${DETAIL}` is a string under every quoting style, and a `${VAR}`
+    in a comment reaches no loader at all; neither can be retyped by a rewrite,
+    so neither is refused.
+
+    The check is on the TEXT, hence environment-INDEPENDENT. Sol r1 killed the
+    alternative — comparing resolved values — because it passes with a benign
+    value today and the rewritten file still changes meaning tomorrow.
     """
 
     # Written as LITERAL TEXT, with the quotes an operator would have authored.
@@ -395,12 +408,15 @@ class TestEnvPlaceholderDoor:
         '    type: cron\n'
         '    schedule: "0 8 * * *"\n'
         '    channel: telegram\n'
-        '    prompt: "Send ${DETAIL}"\n'
+        '    prompt: "${DETAIL}"\n'
     )
 
-    def _authored(self, tmp_path, extra=""):
+    def _authored(self, tmp_path, extra="", prompt=None):
         p = tmp_path / "triggers.yaml"
-        p.write_text(self.AUTHORED + extra, encoding="utf-8")
+        text = self.AUTHORED
+        if prompt is not None:
+            text = text.replace('prompt: "${DETAIL}"\n', f"prompt: {prompt}\n")
+        p.write_text(text + extra, encoding="utf-8")
         return str(p)
 
     def test_add_refuses_and_leaves_the_file_alone(self, tmp_path, monkeypatch):
@@ -413,28 +429,61 @@ class TestEnvPlaceholderDoor:
 
         assert pathlib.Path(path).read_bytes() == before
 
+    @pytest.mark.parametrize("label,prompt,extra", [
+        ("embedded in a larger scalar", '"Send ${DETAIL}"', ""),
+        ("embedded, unquoted", "Send ${DETAIL}", ""),
+        ("lone but PLAIN", "${DETAIL}", ""),
+        ("only in a comment", '"put the bins out"',
+         "# an example of the form: ${DETAIL}\n"),
+        ("not the loader's pattern", '"${NOT-A-VAR}"', ""),
+    ])
+    def test_the_door_does_not_close_on_what_a_rewrite_cannot_damage(
+            self, label, prompt, extra, tmp_path, monkeypatch):
+        """Refusing costs the user a reminder, so the door must be exact.
+
+        None of these can be retyped by a rewrite: a placeholder with text
+        around it is a string under every quoting style, a PLAIN lone one is
+        read back as a value both before and after (a dump re-emits it plain),
+        a comment reaches no loader, and `${NOT-A-VAR}` is not a placeholder.
+        """
+        monkeypatch.setenv("DETAIL", "true")
+        path = self._authored(tmp_path, extra=extra, prompt=prompt)
+        reminders.add_entry(path, _mine())
+        assert "reminder-a1b2c3d4" in _names(path), label
+
     def test_the_refusal_does_not_depend_on_the_current_value(
             self, tmp_path, monkeypatch):
         """Sol r1's red case. With a benign value a resolved-value comparison
-        would PASS and write the prompt unquoted; the damage appears only once
-        the value later contains a ``#``. This proves the door closes on the
+        would PASS and write the entry; the damage appears only once the value
+        later looks like a number or a flag. This proves the door closes on the
         text, before any value is consulted."""
         monkeypatch.delenv("DETAIL", raising=False)
         path = self._authored(tmp_path)
         with pytest.raises(ValueError, match="interpolation"):
             reminders.add_entry(path, _mine())
 
-        # And the hazard the door prevents is real. With the value that makes it
-        # bite, the AUTHORED file resolves correctly while a safe_dump rewrite
-        # of the very same data silently truncates it.
-        monkeypatch.setenv("DETAIL", "bins # tonight")
+    def test_the_hazard_the_door_prevents_is_real(self, tmp_path, monkeypatch):
+        """Shown through the CURRENT loader, not the one this door was written
+        against. A value containing `#` no longer truncates — that half is fixed
+        (#409). What remains: the authored file QUOTES the lone placeholder, so
+        it is the string "true"; a `safe_dump` rewrite of the very same data
+        drops the quotes, and the same entry then means the boolean True, which
+        fails the prompt's string schema."""
         import agent_loader
-        from config import _substitute_env
+        monkeypatch.setenv("DETAIL", "bins # tonight")
+        path = self._authored(tmp_path, prompt='"Send ${DETAIL}"')
         assert agent_loader._read_yaml(path)["triggers"][0]["prompt"] == \
-            "Send bins # tonight", "quoted in the authored file"
-        rewritten = yaml.safe_dump(_read(path), sort_keys=False)
-        assert yaml.safe_load(_substitute_env(rewritten))["triggers"][0][
-            "prompt"] == "Send bins", "unquoted by safe_dump — TRUNCATED"
+            "Send bins # tonight", "no longer truncated at the #"
+
+        monkeypatch.setenv("DETAIL", "true")
+        lone = self._authored(tmp_path)
+        assert agent_loader._read_yaml(lone)["triggers"][0]["prompt"] == \
+            "true", "quoted in the authored file — text"
+        rewritten = tmp_path / "rewritten.yaml"
+        rewritten.write_text(yaml.safe_dump(_read(lone), sort_keys=False),
+                             encoding="utf-8")
+        assert agent_loader._read_yaml(str(rewritten))["triggers"][0][
+            "prompt"] is True, "unquoted by safe_dump — RETYPED"
 
     def test_remove_PROCEEDS_rather_than_stranding_a_reminder(
             self, tmp_path, monkeypatch):

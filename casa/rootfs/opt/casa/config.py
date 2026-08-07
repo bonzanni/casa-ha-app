@@ -14,6 +14,8 @@ import re
 from dataclasses import dataclass, field
 from typing import TYPE_CHECKING, Any
 
+import yaml
+
 if TYPE_CHECKING:
     from persona_pack import PersonaPack
     from role_artifact import RoleArtifactSource
@@ -61,13 +63,217 @@ _ENV_RE = re.compile(r"\$\{([A-Za-z_][A-Za-z0-9_]*)}")
 
 
 def _substitute_env(text: str) -> str:
-    """Replace ``${VAR_NAME}`` placeholders with environment variable values."""
+    """Replace ``${VAR_NAME}`` placeholders with environment variable values.
+
+    A placeholder whose variable is unset is left in place — that is what makes
+    ``resolve_model`` above able to treat it as a DEFERRED value.
+    """
 
     def _replacer(match: re.Match) -> str:
         var = match.group(1)
         return os.environ.get(var, match.group(0))
 
     return _ENV_RE.sub(_replacer, text)
+
+
+class _EnvSafeLoader(yaml.SafeLoader):
+    """``SafeLoader`` that resolves ``${VAR}`` as each scalar is CONSTRUCTED.
+
+    Substituting into a YAML file's *text* and parsing afterwards re-lexes the
+    substituted VALUE as part of the document, so whatever the variable happens
+    to contain decides what the document means: a ``#`` truncates the scalar at
+    a comment, a quote character ends it early and usually breaks the parse
+    outright, a newline splits it. For a resident agent a file that fails to
+    parse stops boot, so an environment variable's punctuation could stop Casa
+    starting (#409).
+
+    Resolving at construction time removes that, because the document's shape is
+    already decided: the parser has finished lexing, every field and entry
+    boundary is fixed, and a variable's contents can no longer move a field,
+    truncate its neighbour or fail the parse.
+
+    It is done HERE, in the constructor, rather than by walking the finished
+    document, because this is the last point at which the scalar's own STYLE is
+    still known — and in YAML the style is what says whether the author meant
+    text. So the rule is YAML's own, applied to one scalar instead of to the
+    file:
+
+    * **Quoted, or tagged ``!!str``** (``prompt: "${DETAIL}"``) — a string.
+      Quoting is how YAML says "this is text", and it is what an author reaches
+      for when a value might contain punctuation. This is the form that gets
+      #409's guarantee: the value arrives exactly as it is, whatever it holds.
+      A placeholder under any OTHER tag never reaches this function — PyYAML
+      dispatches on the tag and builds it itself, so ``k: !!int ${V}`` fails on
+      the unresolved text. That is a load error rather than a silent value, and
+      nothing shipped writes one.
+    * **Embedded in other text** (``prompt: Send ${DETAIL}``) — a string too. It
+      always was one; a placeholder with text around it was never the whole
+      scalar.
+    * **Plain and alone** (``minutes: ${MINUTES}``) — the resolved text means
+      what that text means as YAML read ON ITS OWN, which is substantially what
+      it has always meant here. "On its own" is the one qualifier: the read-back
+      is a separate parse, so a value that is itself a YAML alias cannot reach an
+      anchor defined elsewhere in the file, and reads as text instead.
+
+    That last case is deliberately NOT filtered by what the read-back turns out
+    to be. Three review rounds each rejected a different filter — "always a
+    string" stringified a list and made ``path_scope`` iterate CHARACTERS, so a
+    lone ``/`` prefix matched every absolute path and the guard failed OPEN;
+    "anything but a string" lost the file's quoting and retyped ``"true"`` to
+    ``True``; an allowlist of "safe" types excluded ``!!set`` and reopened the
+    very fail-open the first round had closed. Each filter was a judgment about
+    what an operator "meant", and each grew a new hole. There is no judgment
+    left: an unquoted scalar means what YAML says it means, and an author who
+    wants text says so by quoting.
+
+    The one thing the read-back does that plain YAML would not is fall back to
+    the literal string when the value is not a valid YAML document on its own.
+    That is not a type judgment — it is the same reading YAML gives any text it
+    cannot parse as anything else — and it is what stops PyYAML's constructors,
+    which raise more than ``YAMLError`` (an implausible date raises
+    ``ValueError`` from the timestamp constructor), from taking the process down.
+    """
+
+    def compose_scalar_node(self, anchor):
+        # ``event.tag`` is None (or "!") exactly when the document did NOT name
+        # a tag. Recorded before the event is consumed, because the finished
+        # node cannot tell an authored ``!!str`` from a resolved one — and an
+        # explicit tag is a stronger statement of intent than quoting is.
+        explicit = self.peek_event().tag not in (None, "!")
+        node = super().compose_scalar_node(anchor)
+        node.env_explicit_tag = explicit
+        return node
+
+
+def _construct_env_scalar(loader: _EnvSafeLoader, node):
+    value = loader.construct_scalar(node)
+    resolved = _substitute_env(value)
+    if resolved == value:
+        # No placeholder, or the variable is unset — the latter deliberately
+        # leaves ``${VAR}`` in place so ``resolve_model`` can treat it as a
+        # DEFERRED value and ``validate_config_repo`` stays env-independent.
+        return value
+    if (node.style is not None
+            or getattr(node, "env_explicit_tag", False)
+            or not _ENV_RE.fullmatch(value.strip())):
+        return resolved                      # quoted, tagged, or embedded → text
+    try:
+        return yaml.safe_load(resolved)      # plain: it means what it means
+    except (Exception, RecursionError):      # noqa: BLE001 — see class docstring
+        return resolved                      # not YAML on its own → it is text
+
+
+_EnvSafeLoader.add_constructor(
+    "tag:yaml.org,2002:str", _construct_env_scalar)
+
+
+# YAML's string type, and the handle prefixes a document gets without asking.
+# A tag is RESOLVED rather than pattern-matched below, because the same type has
+# arbitrarily many spellings — `!!str`, the verbatim `!<tag:yaml.org,2002:str>`,
+# and any handle a `%TAG` directive cares to define — and a spelling missing
+# from a list is a MISS, which is the expensive direction.
+_STR_TAG = "tag:yaml.org,2002:str"
+_DEFAULT_TAG_HANDLES = {"!": "!", "!!": "tag:yaml.org,2002:"}
+
+
+def text_has_lone_placeholder(text: str) -> bool:
+    """Whether *text* holds a scalar a rewrite could change the MEANING of.
+
+    The question every component that REWRITES one of these files has to ask
+    before it does. A rewrite re-emits through a plain YAML dump, which does not
+    preserve quote style or tags — and those are what make a placeholder text
+    (see :class:`_EnvSafeLoader`). Refusing to rewrite is the answer; knowing
+    exactly when to refuse is this.
+
+    Exactly one shape qualifies: a scalar that is **nothing but** a placeholder
+    **and** is declared text by its source — quoted in any style, or carrying
+    YAML's string tag however that tag is spelled. Every other shape survives a
+    rewrite unchanged, and each was a false refusal first — which is not the
+    cheap direction, because refusing costs a file its entry-level
+    reconciliation (image-wins, destroying every locally-added entry) or costs
+    the user a reminder they asked for:
+
+    * a placeholder in a COMMENT reaches no loader at all, and comments are not
+      tokens;
+    * one EMBEDDED in a larger scalar (``Send ${DETAIL}``) is a string under
+      every style, because it could never have been read back as a value;
+    * one that is not the loader's pattern (``${NOT-A-VAR}``) is never resolved;
+    * a PLAIN lone placeholder (``minutes: ${MINUTES}``) is read back as a value
+      both before and after the rewrite — a dump re-emits it plain, so nothing
+      about it changes.
+
+    Only the declared-text lone form means one thing before a rewrite and
+    another after, and it is the loader's own ``fullmatch``-plus-style branch
+    read backwards.
+
+    It reads TOKENS, not the constructed document, and is therefore exact about
+    what the text says and conservative about what survives building it: a
+    declared-text placeholder that construction then discards — the losing side
+    of a merge key, an overridden duplicate key — is still reported, and costs
+    that file its entry-level reconciliation. Chasing that would mean tracking
+    which scalars survive construction, which is a second model of YAML's
+    semantics living next to PyYAML's; the conservatism is the cheaper error,
+    and it is bounded to configuration that is already dead.
+
+    Fails CLOSED on unscannable text (True) for the same reason: a file this
+    cannot tokenise is one no caller should be rewriting either.
+    """
+    try:
+        handles = dict(_DEFAULT_TAG_HANDLES)
+        pending_tag = None
+        for token in yaml.scan(text):
+            if isinstance(token, yaml.tokens.DirectiveToken):
+                if token.name == "TAG":
+                    handle, prefix = token.value
+                    handles[handle] = prefix
+                continue
+            if isinstance(token, yaml.tokens.TagToken):
+                pending_tag = token.value
+                continue
+            if isinstance(token, yaml.tokens.AnchorToken):
+                # A tag and an anchor may be written in EITHER order before the
+                # scalar they belong to, so an anchor must not discard the tag
+                # that preceded it.
+                continue
+            if isinstance(token, yaml.tokens.ScalarToken):
+                declared_text = not token.plain or (
+                    pending_tag is not None
+                    and _resolve_tag(pending_tag, handles) == _STR_TAG)
+                # No ``.strip()`` here, unlike the loader's own fullmatch: a
+                # quoted value with padding is one YAML must KEEP quoted, so a
+                # rewrite cannot drop its quotes and cannot change its meaning.
+                if declared_text and _ENV_RE.fullmatch(token.value):
+                    return True
+            pending_tag = None
+        return False
+    except (Exception, RecursionError):  # noqa: BLE001 — never raise at boot
+        return True
+
+
+def _resolve_tag(tag, handles: dict) -> str:
+    """A scanned ``(handle, suffix)`` tag as its full URI, as the parser sees it.
+
+    A verbatim tag (``!<...>``) arrives with no handle and is already whole; a
+    handled one is its prefix plus its suffix, where the prefix is a default or
+    whatever a ``%TAG`` directive bound it to.
+    """
+    handle, suffix = tag
+    if handle is None:
+        return suffix
+    return handles.get(handle, handle) + suffix
+
+
+def load_yaml_with_env(text: str):
+    """Parse *text*, resolving ``${VAR}`` per scalar. See :class:`_EnvSafeLoader`.
+
+    Raises whatever parsing *text* raises — ``yaml.YAMLError`` for malformed
+    input, but also the ``ValueError``/``KeyError`` PyYAML's own constructors
+    raise for an explicitly tagged scalar they cannot build (``!!int nope``).
+    Callers fold ALL of it into their own error type; see
+    ``agent_loader.parse_yaml_text``, which is the only caller that should
+    exist.
+    """
+    return yaml.load(text, Loader=_EnvSafeLoader)
 
 
 # ---------------------------------------------------------------------------

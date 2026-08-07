@@ -109,7 +109,6 @@ def test_entry_doc_keeps_every_top_level_field_but_the_list():
 @pytest.mark.parametrize("label,text", [
     ("unparseable yaml", "triggers: [unclosed\n"),
     ("tab indentation", "triggers:\n\t- name: x\n"),
-    ("yaml alias", "a: &x {name: n}\ntriggers: [*x]\n"),
     ("top level not a mapping", "- just\n- a\n- list\n"),
     ("top level is a scalar", "42\n"),
     ("empty document", ""),
@@ -135,6 +134,275 @@ def test_entry_doc_refuses_on_any_irregularity(label, text):
     already tested.
     """
     assert config_sync._entry_doc(text, "triggers", "name") is None, label
+
+
+# The canonical legitimate use of a YAML anchor: two webhook triggers sharing
+# one auth block. The anchor is on a MAPPING deliberately — `safe_dump` never
+# aliases a scalar, so an anchored string would be re-emitted alias-free and
+# would not exercise the second half of #408 at all.
+_ANCHORED = """schema_version: 1
+triggers:
+  - name: heartbeat
+    type: interval
+    minutes: 60
+    channel: telegram
+    prompt: old shipped prompt
+  - name: doorbell
+    type: webhook
+    path: /hook/doorbell
+    channel: telegram
+    prompt: someone is at the door
+    auth: &shared_auth
+      mode: timestamped_hmac
+      tolerance_secs: 300
+  - name: postbox
+    type: webhook
+    path: /hook/postbox
+    channel: telegram
+    prompt: the post has arrived
+    auth: *shared_auth
+"""
+
+
+def test_entry_doc_accepts_a_document_using_yaml_anchors(tmp_path):
+    """#408. An anchor/alias is ordinary YAML that `agent_loader` loads without
+    complaint, so refusing it HERE did not make the file safer — it only cost
+    the operator entry-level reconciliation on the one file where losing an
+    entry means a reminder that is never delivered."""
+    doc = config_sync._entry_doc(_ANCHORED, "triggers", "name")
+    assert doc is not None
+    assert list(doc.entries) == ["heartbeat", "doorbell", "postbox"]
+    # The alias resolved to the anchored value, exactly as the loader sees it.
+    assert doc.entries["postbox"]["auth"]["mode"] == "timestamped_hmac"
+
+
+def test_an_anchored_file_keeps_local_entries_and_gets_the_shipped_change(
+        tmp_path):
+    """#408, BOTH halves — and the second is why one assertion is not enough.
+
+    Fixing only the shape gate would leave the "did anything change?"
+    comparison parsing with the alias-refusing loader: both sides come back as
+    the same "could not parse" value, the merge reads as "nothing to apply",
+    and the shipped change is never written while the baseline still advances
+    to the new image. The next boot then sees baseline and image agreeing and
+    never reconciles the file again, so the change is lost PERMANENTLY rather
+    than retried. A test asserting only that the local entry survived passes in
+    exactly that failure mode.
+    """
+    _write(tmp_path / "baseline", REL, _SHIPPED_V1)
+    _write(tmp_path / "live", REL, _ANCHORED)
+    _write(tmp_path / "defaults", REL, _SHIPPED_V2)
+
+    report = _reconcile(tmp_path)
+
+    doc = config_sync._entry_doc(
+        (tmp_path / "live" / REL).read_text(), "triggers", "name")
+    assert doc is not None
+    assert "doorbell" in doc.entries, "the local entry was destroyed"
+    assert doc.entries["postbox"]["auth"]["tolerance_secs"] == 300
+    assert doc.entries["heartbeat"]["prompt"] == "IMPROVED shipped prompt", (
+        "the shipped change was skipped")
+    assert [m["path"] for m in report.merged] == [REL]
+    # The baseline advanced — which is only safe BECAUSE the change was applied.
+    assert (tmp_path / "baseline" / REL).read_text() == _SHIPPED_V2
+
+
+_CYCLIC = "schema_version: 1\ntriggers:\n  - &e {name: x, self: *e}\n"
+
+# `&a1 [*a0, *a0]` chained doubles the expanded node count each level: 30
+# levels is ~2^30 leaves from a few hundred bytes on disk.
+_EXPANDING = ("schema_version: 1\n_a0: &a0 []\n"
+              + "".join(f"_a{i}: &a{i} [*a{i-1}, *a{i-1}]\n"
+                        for i in range(1, 31))
+              + "triggers:\n  - {name: x, auth: *a30}\n")
+
+
+# The same cycle behind an `!!omap`, whose entries SafeLoader builds as tuples.
+# A walk that recognises only dicts and lists reads the tuple as a scalar and
+# never sees what is inside it.
+_CYCLIC_OMAP = ("schema_version: 1\ntriggers:\n"
+                "  - name: x\n    auth: &a !!omap [{k: *a}]\n")
+
+
+@pytest.mark.parametrize("label,text", [
+    ("aliases an ancestor", _CYCLIC),
+    ("aliases an ancestor through an !!omap tuple", _CYCLIC_OMAP),
+    ("expands astronomically", _EXPANDING),
+])
+def test_admitting_aliases_does_not_admit_the_two_documents_a_tree_cannot_be(
+        label, text):
+    """Accepting anchors means accepting what an alias can build that a tree
+    cannot, so both are refused at the gate rather than met further in.
+
+    A document aliasing one of its own ancestors is walked by everything after
+    this point — `==` between entries, `safe_dump`, jsonschema — and each would
+    recurse until it raised, aborting the whole reconciliation pass and with it
+    every later file. One aliasing a shared subtree repeatedly is tiny on disk
+    and astronomically large once walked. Refusing is the fallback this gate
+    already has for every other irregularity: the file takes byte-level
+    resolution, exactly as it did before #408.
+    """
+    assert config_sync._parse(text) is config_sync._UNPARSEABLE, label
+    assert config_sync._entry_doc(text, "triggers", "name") is None, label
+    assert not config_sync._same_document(text, text), label
+
+
+def test_an_ordinary_shared_anchor_is_still_accepted():
+    """The refusal above must not swallow the case #408 exists for: an anchor
+    shared by two entries is a tree walk of a handful of nodes."""
+    assert config_sync._entry_doc(_ANCHORED, "triggers", "name") is not None
+    assert config_sync._same_document(_ANCHORED, _ANCHORED)
+
+
+_WITH_PLACEHOLDER = _SHIPPED_V1_TEXT = (
+    "schema_version: 1\ntriggers:\n"
+    "  - name: heartbeat\n    type: interval\n    minutes: 60\n"
+    "    channel: telegram\n    prompt: old shipped prompt\n"
+    "  - name: garbage-reminder\n    type: cron\n    schedule: \"0 20 * * 2\"\n"
+    "    channel: telegram\n    prompt: \"${DETAIL}\"\n")
+
+
+def test_a_file_using_a_placeholder_is_not_merged_at_all(tmp_path, monkeypatch):
+    """A `${VAR}` anywhere in the file takes it off the entry-level path.
+
+    This module parses WITHOUT resolving — it rewrites these files, and
+    resolving first would bake today's environment into one permanently — so it
+    re-emits through `safe_dump`, which does not preserve quote style. Quoting
+    is what tells the loader a placeholder is text (#409), so a rewrite retypes
+    a locally-added entry authored as `prompt: "${DETAIL}"` the moment the value
+    looks like a number or a flag; per-entry validation then judges that entry
+    invalid and DROPS it — the exact loss this whole mechanism exists to
+    prevent. Refusing hands the file to byte-level resolution instead, which is
+    loud: recovery copy, conflict record, operator notification.
+
+    The value is what makes it bite, and the refusal is decided on the RAW TEXT
+    so it does not depend on today's environment.
+    """
+    monkeypatch.setenv("DETAIL", "true")
+    _write(tmp_path / "baseline", REL, _SHIPPED_V1)
+    _write(tmp_path / "live", REL, _WITH_PLACEHOLDER)
+    _write(tmp_path / "defaults", REL, _SHIPPED_V2)
+
+    assert config_sync._entry_doc(_WITH_PLACEHOLDER, "triggers", "name") is None
+    report = _reconcile(tmp_path)
+    assert report.merged == []
+    assert report.entries_dropped == [], "an entry must not be silently dropped"
+    assert [c["path"] for c in report.conflicts] == [REL]
+    # Recoverable: byte-level resolution takes the pre-sync snapshot first, and
+    # the conflict is on the record rather than an entry vanishing quietly.
+    assert report.pre_sync_sha
+
+
+@pytest.mark.parametrize("label,text", [
+    ("in a comment", "# template: ${NAME}\n" + _SHIPPED_V1_TEXT.replace(
+        '"${DETAIL}"', "put the bins out")),
+    ("embedded in a larger scalar", _SHIPPED_V1_TEXT.replace(
+        '"${DETAIL}"', '"Send ${DETAIL}"')),
+    ("embedded, unquoted", _SHIPPED_V1_TEXT.replace(
+        '"${DETAIL}"', "Send ${DETAIL}")),
+    ("lone but PLAIN", _SHIPPED_V1_TEXT.replace('"${DETAIL}"', "${DETAIL}")),
+    ("not a placeholder", _SHIPPED_V1_TEXT.replace(
+        '"${DETAIL}"', '"literal ${not-a-var}"')),
+    ("not a placeholder either", _SHIPPED_V1_TEXT.replace(
+        '"${DETAIL}"', '"${NAME-default}"')),
+])
+def test_the_placeholder_door_closes_only_on_what_a_rewrite_can_damage(
+        label, text):
+    """The refusal has to be PRECISE, because refusing is not the cheap
+    direction: it sends the file to byte-level resolution, which is image-wins,
+    and that destroys every locally-added entry — far more than the single
+    retyped entry the door exists to protect.
+
+    Only a lone placeholder DECLARED TEXT — quoted, or carrying YAML's string
+    tag — loses anything to a rewrite. A comment reaches no loader; an embedded
+    placeholder is a string under every style; a plain lone one is read back as
+    a value both before and after, because a dump re-emits it plain; and
+    `${NOT-A-VAR}` is never resolved at all.
+    """
+    assert config_sync._entry_doc(text, "triggers", "name") is not None, label
+
+
+@pytest.mark.parametrize("label,prompt", [
+    ("quoted", '"${DETAIL}"'),
+    ("tagged as text", "!!str ${DETAIL}"),
+])
+def test_the_placeholder_door_closes_on_every_way_of_declaring_text(
+        label, prompt):
+    """Quoting is not the only way an author says "this is text", and a
+    rewrite drops a tag exactly as it drops quotes."""
+    text = _SHIPPED_V1_TEXT.replace('"${DETAIL}"', prompt)
+    assert config_sync._entry_doc(text, "triggers", "name") is None, label
+
+
+def test_a_merge_only_pass_commits_what_it_wrote(tmp_path):
+    """The post-reconcile snapshot arm has to name every arm that WROTE.
+
+    `merged` and `entries_dropped` were missing from it, so a pass whose only
+    change was an entry-level merge committed the PRE-sync snapshot and then
+    left the merged file uncommitted in /config/.git indefinitely — until some
+    later pass swept it up under a message about a different reconcile.
+    """
+    _write(tmp_path / "baseline", REL, _SHIPPED_V1)
+    _write(tmp_path / "live", REL, _SHIPPED_V1 + _LOCAL_ADDITION)
+    _write(tmp_path / "defaults", REL, _SHIPPED_V2)
+    git = _FakeGit()
+
+    report = _reconcile(tmp_path, git=git)
+
+    assert len(report.merged) == 1 and not report.updated
+    assert git.snapshots[-1] == "casa-sync: default reconcile v0.149.0"
+
+
+def test_a_pass_that_only_wrote_a_RECOVERY_COPY_still_commits_it(tmp_path,
+                                                                 monkeypatch):
+    """A sidecar is a write too, and `.casabak` files live under `agents/**`,
+    which the tracking whitelist admits.
+
+    The merge takes its recovery copy BEFORE attempting the file write, so a
+    write that then fails leaves a sidecar and nothing else — and with the
+    recovery arms missing from the snapshot condition, that sidecar stayed
+    uncommitted until some later pass swept it up under another reconcile's
+    message.
+    """
+    _write(tmp_path / "baseline", REL, _SHIPPED_V1)
+    _write(tmp_path / "live", REL, _SHIPPED_V1 + _LOCAL_ADDITION)
+    _write(tmp_path / "defaults", REL, _SHIPPED_V2)
+    git = _FakeGit()
+
+    real = config_sync.atomic_write_text
+
+    def failing(path, text, *a, **kw):
+        if str(path).endswith(REL):
+            raise OSError("disk full")
+        return real(path, text, *a, **kw)
+
+    monkeypatch.setattr(config_sync, "atomic_write_text", failing)
+    report = _reconcile(tmp_path, git=git)
+
+    assert report.merge_refused and not report.merged
+    assert git.snapshots[-1] == "casa-sync: default reconcile v0.149.0"
+
+
+def test_a_cyclic_live_file_falls_back_to_whole_file_resolution(tmp_path):
+    """End to end: the refusal reaches `reconcile()` as a byte-level pass that
+    completes, rather than as a `RecursionError` that aborts it."""
+    _write(tmp_path / "baseline", REL, _SHIPPED_V1)
+    _write(tmp_path / "live", REL, _CYCLIC)
+    _write(tmp_path / "defaults", REL, _SHIPPED_V2)
+    report = _reconcile(tmp_path)
+    assert report.merged == []
+    assert (tmp_path / "live" / REL).read_text() == _SHIPPED_V2
+    assert [c["path"] for c in report.conflicts] == [REL]
+
+
+def test_texts_that_do_not_parse_are_never_the_same_document():
+    """The silent-skip generator, pinned at its source. "Neither side parsed"
+    is not evidence that the two mean the same thing, and treating it as such
+    is what makes a merge write nothing while reporting success."""
+    assert config_sync._same_document("a: 1\n", "a:  1\n")     # same meaning
+    assert not config_sync._same_document("a: [\n", "b: [\n")  # both broken
+    assert not config_sync._same_document("a: [\n", "a: [\n")  # identical, broken
+    assert not config_sync._same_document("a: 1\n", "b: [\n")
 
 
 def test_entry_doc_never_raises_on_pathological_input():
@@ -450,7 +718,7 @@ def test_falls_back_to_the_defaults_top_level_when_live_top_level_fails(tmp_path
     seen = []
 
     def validate_text(rel, text):
-        doc = config_sync._yaml_or_none(text)
+        doc = config_sync._parse(text)
         seen.append(doc["schema_version"])
         return "bad" if doc["schema_version"] == 2 else None
 
@@ -470,7 +738,7 @@ def test_falls_back_to_the_defaults_top_level_when_live_top_level_fails(tmp_path
 
 def test_entries_failing_under_both_top_levels_are_dropped_and_named(tmp_path):
     def validate_text(rel, text):
-        doc = config_sync._yaml_or_none(text)
+        doc = config_sync._parse(text)
         names = [t["name"] for t in doc["triggers"]]
         return "bad entry" if "mine" in names else None
 
@@ -698,7 +966,7 @@ def test_path_b_a_tightening_costs_only_the_entries_that_fail_it(tmp_path):
         return "invalid" if rel == REL else None
 
     def validate_text(rel, text):
-        doc = config_sync._yaml_or_none(text) or {}
+        doc = config_sync._parse(text) or {}
         names = [t.get("name") for t in doc.get("triggers", [])]
         return "invalid" if "bad-entry" in names else None
 
@@ -727,7 +995,7 @@ def test_backstop_drop_preserves_the_prior_file(tmp_path):
         validate_text=lambda rel, text: (
             "invalid" if "bad-entry" in
             [t.get("name") for t in
-             (config_sync._yaml_or_none(text) or {}).get("triggers", [])]
+             (config_sync._parse(text) or {}).get("triggers", [])]
             else None))
     bak = tmp_path / "live" / (REL + ".casabak")
     assert bak.read_text() == live
@@ -811,7 +1079,7 @@ def test_replacing_the_live_top_level_is_preserved_and_reported(tmp_path):
 
     # Only the default's top level validates, so the merge falls back to it.
     def validate_text(rel, text):
-        doc = config_sync._yaml_or_none(text) or {}
+        doc = config_sync._parse(text) or {}
         return "bad" if doc.get("schema_version") == 2 else None
 
     report = _reconcile(tmp_path, git=git, validate_text=validate_text)
@@ -930,7 +1198,7 @@ def test_an_empty_baseline_leaves_only_default_less_files_unvalidated(tmp_path):
         validate_text=lambda r, text: (
             "invalid" if "garbage-reminder" in
             [t.get("name") for t in
-             (config_sync._yaml_or_none(text) or {}).get("triggers", [])]
+             (config_sync._parse(text) or {}).get("triggers", [])]
             else None))
 
     # Has a default → the backstop reached it and salvaged what it could.
@@ -1064,7 +1332,7 @@ def test_salvage_never_drops_an_entry_the_image_ships(tmp_path):
 
     # The image's new entry is the one that fails; the local one is fine.
     def validate_text(rel, text):
-        doc = config_sync._yaml_or_none(text) or {}
+        doc = config_sync._parse(text) or {}
         names = [t.get("name") for t in doc.get("triggers", [])]
         return "invalid" if "shipped-webhook" in names else None
 
@@ -1088,7 +1356,7 @@ def test_backstop_salvage_never_drops_an_entry_the_image_ships(tmp_path):
     _write(tmp_path / "defaults", REL, shipped)
 
     def validate_text(rel, text):
-        doc = config_sync._yaml_or_none(text) or {}
+        doc = config_sync._parse(text) or {}
         names = [t.get("name") for t in doc.get("triggers", [])]
         return "invalid" if "shipped-bad" in names else None
 
@@ -1255,7 +1523,7 @@ def test_a_salvage_write_failure_is_contained_like_a_merge_write(tmp_path,
         validate_text=lambda r, t: (
             "invalid" if "bad" in
             [e.get("name") for e in
-             (config_sync._yaml_or_none(t) or {}).get("triggers", [])]
+             (config_sync._parse(t) or {}).get("triggers", [])]
             else None))
 
     assert (tmp_path / "live" / REL).read_text() == live
@@ -1275,7 +1543,7 @@ def test_a_top_level_override_reaches_the_report_even_without_a_sidecar(tmp_path
     report = _reconcile(
         tmp_path,
         validate_text=lambda r, t: (
-            "bad" if (config_sync._yaml_or_none(t) or {}).get(
+            "bad" if (config_sync._parse(t) or {}).get(
                 "schema_version") == 2 else None))
 
     assert report.merged[0]["top_level_changed"] is True
@@ -1315,7 +1583,7 @@ def test_a_merge_that_leaves_the_tree_boot_invalid_is_reverted(tmp_path):
 
     def validate_repo():
         # Fails while the live file still has delegates; clean once reverted.
-        doc = config_sync._yaml_or_none(
+        doc = config_sync._parse(
             (tmp_path / "live" / rel).read_text()) or {}
         return errors if doc.get("delegates") else []
 
@@ -1348,7 +1616,7 @@ def test_a_no_op_merge_is_preserved_before_the_heal_reverts_it(tmp_path):
     _write(tmp_path / "defaults", rel, "schema_version: 1\ndelegates: []\n")
 
     def validate_repo():
-        doc = config_sync._yaml_or_none(
+        doc = config_sync._parse(
             (tmp_path / "live" / rel).read_text()) or {}
         return ["agent 'assistant': broken"] if doc.get("delegates") else []
 
@@ -1374,7 +1642,7 @@ def test_the_heal_reverts_any_merged_file_not_just_delegates(tmp_path):
     _write(tmp_path / "defaults", REL, _SHIPPED_V2)
 
     def validate_repo():
-        doc = config_sync._yaml_or_none(
+        doc = config_sync._parse(
             (tmp_path / "live" / REL).read_text()) or {}
         names = [t.get("name") for t in doc.get("triggers", [])]
         return (["agent 'assistant': trigger channel is not declared"]
@@ -1416,7 +1684,7 @@ def test_the_heal_reverts_every_merge_including_unimplicated_ones(tmp_path):
                                                         "purpose: NEW"))
 
     def validate_repo():
-        doc = config_sync._yaml_or_none(
+        doc = config_sync._parse(
             (tmp_path / "live" / culprit).read_text()) or {}
         names = [d.get("agent") for d in doc.get("delegates", [])]
         return ["boom"] if "mine" in names else []
@@ -1472,7 +1740,7 @@ def test_a_committed_revert_is_reported_as_destructive(tmp_path):
     _write(tmp_path / "defaults", REL, _SHIPPED_V2)
 
     def validate_repo():
-        doc = config_sync._yaml_or_none(
+        doc = config_sync._parse(
             (tmp_path / "live" / REL).read_text()) or {}
         names = [t.get("name") for t in doc.get("triggers", [])]
         return ["boom"] if "garbage-reminder" in names else []
@@ -1687,3 +1955,11 @@ def test_the_reconcilers_own_sidecar_does_not_make_an_agent_unloadable(tmp_path)
 
     # Raises LoadError("unknown file(s) in directory") without the fix.
     al._check_file_set(str(role_dir), "resident", "assistant")
+
+
+def test_the_placeholder_gate_uses_the_LOADER_S_OWN_pattern():
+    """Not a restated copy. A second pattern is one edit away from disagreeing
+    with the loader about what a placeholder is, and disagreeing in the miss
+    direction costs an operator an entry silently."""
+    import config
+    assert config_sync._ENV_RE is config._ENV_RE

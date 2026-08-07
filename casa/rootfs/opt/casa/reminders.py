@@ -75,7 +75,7 @@ from datetime import datetime, timedelta
 import yaml
 
 from atomic_io import atomic_write_text
-from config import _ENV_RE
+from config import _ENV_RE, text_has_lone_placeholder
 
 logger = logging.getLogger(__name__)
 
@@ -392,15 +392,21 @@ def _schema_error(doc: dict, path: str) -> "str | None":
 
 
 def _resolve(text: str, path: str) -> dict:
-    """The document as the LOADER sees it: ``_substitute_env``, then parse.
+    """The document as the LOADER sees it, through the LOADER'S OWN function.
+
+    Not a second copy of the loader's pipeline: this module used to substitute
+    into the text and parse the result, which is what the loader did until #409
+    moved resolution into the YAML constructor. Two copies of "what the loader
+    sees" disagree the moment one of them changes, and this one decides whether
+    an entry is safe to write — so it calls the real thing.
 
     Distinct from :func:`_read_doc`'s structural parse, which must stay
-    unsubstituted so placeholders survive the rewrite.
+    unresolved so placeholders survive the rewrite.
     """
-    from config import _substitute_env
+    import agent_loader
 
     try:
-        return yaml.safe_load(_substitute_env(text))
+        return agent_loader.parse_yaml_text(text, path)
     except (Exception, RecursionError) as exc:  # noqa: BLE001
         raise ValueError(f"{path}: does not parse: {exc}") from exc
 
@@ -472,16 +478,18 @@ def add_entry(path: str, entry: dict) -> None:
             )
 
     text, doc = _read_doc(path)
-    # Env interpolation is re-emitted UNQUOTED by safe_dump, and the loader
-    # substitutes into the TEXT before parsing — so a `#` in the substituted
-    # value would start a comment and silently truncate the operator's entry.
-    # No emission style avoids this (quoting turns the truncation into a
-    # boot-fatal parse error instead), and the real fix is post-parse
-    # substitution in the loader. So the writer refuses at the door rather than
-    # rewriting such a file. Decided on the RAW TEXT, hence independent of the
+    # A scalar that is nothing but `${VAR}` is re-emitted UNQUOTED by safe_dump,
+    # and QUOTING is what tells the loader such a scalar is text (#409): quoted
+    # it is a string whatever it holds, plain it has its value read back. So an
+    # entry authored as `prompt: "${DETAIL}"` means something different once a
+    # rewrite drops the quotes and the value looks like a number, a flag or a
+    # list. #409 expected this door to close with it; it does not, because the
+    # hazard was never only truncation — it is that a rewrite cannot preserve a
+    # style it can no longer see. Decided on the TEXT, hence independent of the
     # current environment: a comparison of resolved values would pass with a
-    # benign value today and still change the entry's meaning tomorrow.
-    if text is not None and _ENV_RE.search(text):
+    # benign value today and still change the entry's meaning tomorrow. The
+    # predicate is shared with config_sync, which rewrites the same files.
+    if text is not None and text_has_lone_placeholder(text):
         raise ValueError(
             f"{path} uses ${{...}} interpolation, which this writer cannot "
             f"rewrite without risking the meaning of an existing trigger"
@@ -522,7 +530,7 @@ def remove_entry(path: str, name: str) -> str:
     if not any(_agent_owned(e) for e in matches):
         return "not_owned"
 
-    if text is not None and _ENV_RE.search(text):
+    if text is not None and text_has_lone_placeholder(text):
         # Warn and PROCEED. Refusing here is what strands a delivered reminder.
         logger.warning(
             "reminders: %s uses ${...} interpolation; rewriting it to remove "
