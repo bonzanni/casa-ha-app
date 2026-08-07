@@ -239,18 +239,48 @@ def _migrate(data: dict) -> None:
     solely by the live registry sweep, so there is no replay for a tombstone to
     fence, and the row identity is ``(plugin, artifact_id)`` with ``gen``."""
     data.pop("consumed_keys", None)
-    # The rounds CONTAINER must be a mapping. `setdefault` only supplies a
-    # missing key — a parseable `"rounds": []` survived it, and then every
-    # `data["rounds"].get(...)` / `.keys()` raised inside a swallowing except.
-    # Nothing recovered: the malformed shape persisted across loads, no round
-    # could be sealed, and EVERY plugin's obligation was owed forever with no
-    # way to become runnable. Same family as the malformed-row guard below;
-    # hardening only the rows left the container.
-    if not isinstance(data.get("rounds"), dict):
-        if data.get("rounds") is not None:
+    # Normalise the WHOLE round structure, every level, on every load.
+    #
+    # Three consecutive review rounds found this one level deeper each time —
+    # malformed episode rows, then the `rounds` container, then an individual
+    # round's `members`. Every instance had the same two failure modes: an
+    # attribute access raising inside a swallowing `except` (so nothing repaired
+    # the shape, it persisted across loads, and EVERY plugin's settlement sweep
+    # aborted), or a missing key defaulting permissively (a round with no
+    # `verdict` read as AUTHORITATIVE and released an obligation the reconciler
+    # never sealed). So this validates the shape structurally rather than
+    # guarding each access site.
+    #
+    # A round that cannot be read is DROPPED, not repaired: it establishes
+    # nothing, and the reconciler seals a fresh one on the next pass. Dropping is
+    # also the fail-closed direction — a dropped round means "no verdict yet".
+    rounds = data.get("rounds")
+    if not isinstance(rounds, dict):
+        if rounds is not None:
             logger.warning("setup-round container was %s, not a mapping — "
-                           "resetting it", type(data.get("rounds")).__name__)
+                           "resetting it", type(rounds).__name__)
         data["rounds"] = {}
+    else:
+        clean: dict = {}
+        for plugin, rnd in rounds.items():
+            if (not isinstance(plugin, str) or not isinstance(rnd, dict)
+                    or not isinstance(rnd.get("artifact_id"), str)
+                    or not isinstance(rnd.get("members"), dict)):
+                logger.warning("dropping unreadable setup round (plugin=%r)",
+                               plugin)
+                continue
+            members = {i: m for i, m in rnd["members"].items()
+                       if isinstance(i, str) and isinstance(m, dict)}
+            if len(members) != len(rnd["members"]):
+                logger.warning("dropped malformed member(s) from the setup "
+                               "round (plugin=%s)", plugin)
+            rnd["members"] = members
+            # A round whose authority cannot be read is NOT authoritative.
+            # Defaulting this to True was a fail-open: a hand-written or
+            # partially-written round would release setup with no sealed verdict.
+            rnd["verdict"] = bool(rnd.get("verdict", False))
+            clean[plugin] = rnd
+        data["rounds"] = clean
     # DROP structurally corrupt rows, on every load and at every version. The
     # store-level guard only checks that `episodes` is a list, so one non-dict
     # element (a partial write, a hand-edit) used to survive and then raise on
@@ -700,7 +730,7 @@ def _settle_locked(data: dict, plugin: str) -> tuple[bool, list[str]]:
         return False, []
     artifact_id = rnd.get("artifact_id") or ""
     del data["rounds"][plugin]
-    if not rnd.get("verdict", True):
+    if not rnd.get("verdict", False):
         # Sealed for keyboard fencing only — the reconciler could not establish
         # this plugin's full consent position in the pass that opened it. The
         # decisions it collected say nothing about setup, so consume the round

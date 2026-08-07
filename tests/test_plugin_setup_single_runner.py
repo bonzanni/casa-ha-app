@@ -1246,3 +1246,47 @@ async def test_a_revoke_during_the_dispatch_window_is_not_lost(env):
     pse.open_round(plugin="gmail", artifact_id="art-1", identities=[])
     await pse._recover_and_settle()
     assert _obligation()["gate"] == "released"
+
+
+# ---------------------------------------------------------------------------
+# Review round 9 findings
+# ---------------------------------------------------------------------------
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("bad_round", [
+    {"artifact_id": "art-1"},                            # no members, no verdict
+    {"artifact_id": "art-1", "members": []},             # members not a mapping
+    {"artifact_id": "art-1", "members": {"x": "nope"}},  # member not a mapping
+    {"members": {}},                                     # no artifact_id
+    ["not", "a", "round"],                               # not a mapping at all
+])
+async def test_an_unreadable_round_is_dropped_not_obeyed(env, bad_round):
+    """Both round-9 reviewers, and the third consecutive round on store shape —
+    one level deeper each time (rows, then the container, then a round's
+    `members`). Two failure modes, both present here: an attribute access raising
+    inside a swallowing except, so nothing repaired the shape and EVERY plugin's
+    settlement sweep aborted; and a missing key defaulting permissively, so a
+    round with no `verdict` read as AUTHORITATIVE and released an obligation the
+    reconciler never sealed."""
+    import json
+    pse.STORE_PATH.write_text(json.dumps({
+        "schema_version": 4, "rounds": {"gmail": bad_round}, "episodes": [],
+    }), encoding="utf-8")
+    assert pse._load()["rounds"].get("gmail") in (None, {
+        "artifact_id": "art-1", "members": {}, "verdict": False})
+    # A trigger plugin must still reach a correct verdict from here.
+    env.plugin = _plugin(triggers=True)
+    await _reconcile(env)
+    assert env.dispatched == [], "released with no sealed verdict"
+    assert _obligation()["gate"] == "awaiting_verdict"
+    _approve_trigger(env)
+    await _reconcile(env)
+    assert len(env.dispatched) == 1
+
+
+def test_a_verdict_that_cannot_be_read_is_not_authoritative():
+    """The flag's default must be CLOSED at every read: a partially-written or
+    hand-edited round must not release setup."""
+    import inspect
+    src = inspect.getsource(pse)
+    assert 'get("verdict", True)' not in src, "a fail-open verdict default"
