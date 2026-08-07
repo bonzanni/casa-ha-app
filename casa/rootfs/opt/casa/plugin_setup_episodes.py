@@ -273,12 +273,21 @@ def _migrate(data: dict) -> None:
                 logger.warning("dropping unreadable setup round (plugin=%r)",
                                plugin)
                 continue
+            # A member that cannot be read makes the WHOLE round unreadable.
+            # Dropping just the member (the first attempt) was worse than
+            # useless: it PRESERVED the round's authority while deleting its
+            # membership, turning a members-bearing round into an authoritative
+            # ZERO-member one — which is the positive assertion "this artifact
+            # needs no consent", and released setup with nothing approved.
+            # Normalisation must not manufacture a verdict; drop the round and
+            # let the reconciler seal a fresh one from live state.
+            if any(not isinstance(i, str) or not isinstance(m, dict)
+                   for i, m in rnd["members"].items()):
+                logger.warning("dropping setup round with an unreadable member "
+                               "(plugin=%s)", plugin)
+                continue
             members = {}
             for i, m in rnd["members"].items():
-                if not isinstance(i, str) or not isinstance(m, dict):
-                    logger.warning("dropped malformed member from the setup "
-                                   "round (plugin=%s)", plugin)
-                    continue
                 if m.get("state") not in _MEMBER_STATES:
                     # An unreadable state becomes OPEN, never a decision. Open is
                     # the self-healing direction: it blocks settlement (so no

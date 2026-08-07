@@ -1364,3 +1364,44 @@ async def test_settlement_requires_a_positive_approval(env):
     pse._save(data)
     await pse._recover_and_settle()
     assert _obligation()["gate"] == "awaiting_verdict"
+
+
+# ---------------------------------------------------------------------------
+# Review round 11 finding (Sol; Terra reported none)
+# ---------------------------------------------------------------------------
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("members", [
+    {"consent-A": []},                       # member not a mapping
+    {"consent-A": {"state": "open"}, "consent-B": "nope"},
+    # A non-string identity is unreachable through the JSON store (object keys
+    # are always strings), so it is guarded in code but not parametrised here.
+])
+async def test_dropping_a_member_must_not_manufacture_a_verdict(env, members):
+    """Sol: normalisation itself created the unsafe value. Dropping a malformed
+    MEMBER while preserving the round's authority turned a members-bearing round
+    into an authoritative ZERO-member one — which is the positive assertion "this
+    artifact needs no consent" — and released setup with nothing approved. An
+    unreadable member now makes the whole round unreadable, and it is dropped."""
+    import json
+    pse.STORE_PATH.write_text(json.dumps({
+        "schema_version": 4,
+        "rounds": {"gmail": {"artifact_id": "art-1", "verdict": True,
+                             "members": members}},
+        "episodes": [{"id": "e1", "plugin": "gmail", "artifact_id": "art-1",
+                      "gen": 0, "status": "pending",
+                      "gate": "awaiting_verdict", "attempts": 0,
+                      "resolve_deferrals": 0, "approved_identities": [],
+                      "created_ts": 1.0, "updated_ts": 1.0}],
+    }), encoding="utf-8")
+    assert "gmail" not in pse._load()["rounds"]
+    await pse._worker_pass()
+    assert _obligation()["gate"] == "awaiting_verdict"
+    assert env.dispatched == []
+    # The reconciler then seals a fresh, faithful round from live state.
+    env.plugin = _plugin(triggers=True)
+    await _reconcile(env)
+    assert env.dispatched == []
+    _approve_trigger(env)
+    await _reconcile(env)
+    assert len(env.dispatched) == 1
