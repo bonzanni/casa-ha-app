@@ -444,6 +444,16 @@ def ensure_obligation(*, plugin: str, artifact_id: str,
             if row.get("status") == "pending" and not stale_release:
                 # Already owed and unconcluded — nothing to reset.
                 return True
+            # A `stale` row means the DISPATCH path exhausted its bounded retries
+            # without resolving the plugin, and concluded it was gone. This call
+            # refutes that: it comes from the reconciler sweep, which only asks
+            # about a plugin it just RESOLVED and which still declares
+            # `casa.setupTool`. Re-arm regardless of whether a consent is pending
+            # — a transient registry outage during the dispatch window would
+            # otherwise strand an already-released obligation for good, because
+            # by then every consent is acked and no pending signal remains.
+            if row.get("status") == "stale":
+                consent_pending = True
             if not consent_pending:
                 return True if stale_release else False
             # Either terminal, or RELEASED under a verdict that a newly pending

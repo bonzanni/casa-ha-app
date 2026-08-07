@@ -1405,3 +1405,35 @@ async def test_dropping_a_member_must_not_manufacture_a_verdict(env, members):
     _approve_trigger(env)
     await _reconcile(env)
     assert len(env.dispatched) == 1
+
+
+# ---------------------------------------------------------------------------
+# Review round 12 finding (Terra; Sol reported none)
+# ---------------------------------------------------------------------------
+
+@pytest.mark.asyncio
+async def test_a_transient_registry_outage_does_not_strand_a_released_run(env):
+    """Terra: the dispatch path gives up after a bounded number of unresolved
+    retries and marks the obligation `stale`, concluding the plugin is gone. A
+    transient outage during the dispatch window therefore stranded an ALREADY
+    RELEASED obligation permanently — by then every consent is acked, so no
+    pending signal remained to re-arm from. The reconciler seeing the plugin
+    again REFUTES the staleness, so that sighting re-arms it."""
+    pse.configure(
+        dispatch=_recording(env), notify_operator=_swallow(env),
+        resolve_registry_entry=lambda p: None,        # registry unavailable
+        ack_lookup=lambda i: None, routes_live=lambda p: True)
+    env.plugin = _plugin()
+    await _reconcile(env)
+    assert _obligation()["gate"] == "released"
+    for _ in range(pse._MAX_RESOLVE_DEFERRALS + 1):
+        await pse._worker_pass()
+    assert _obligation()["status"] == "stale"
+    assert env.dispatched == []
+    # The registry recovers. No consent is pending — every ack persisted.
+    pse.configure(
+        dispatch=_recording(env), notify_operator=_swallow(env),
+        resolve_registry_entry=lambda p: env.entry,
+        ack_lookup=lambda i: None, routes_live=lambda p: True)
+    await _reconcile(env)
+    assert len(env.dispatched) == 1, "a recovered registry must not strand setup"
