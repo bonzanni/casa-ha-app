@@ -108,27 +108,42 @@
     INV-EV-006: [tests/test_event_wiring.py::TestEventWakeMarkerUnreachable::test_synthetic_key_is_reserved, tests/test_event_wiring.py::TestEventWakeMarkerUnreachable::test_event_wake_value_is_stripped_from_external_context, tests/test_event_wiring.py::TestAskUserRejectsEventDispatchedTurn::test_ask_user_rejects_event_wake_origin]
 
 - doc: architecture/plugin-runtime.md
-  summary: What stands between a validly installed plugin and a usable one — environment resolution, the single-runner setup obligation, and the env/media side channels.
-  when_changing: plugin environment resolution or withholding, the setup tool's dispatch or its consent gating, the plugin env conf file, or the plugin media outbox
+  summary: The environment a plugin's MCP servers need before an agent can use it, plus the env-conf and media side channels.
+  when_changing: plugin environment resolution or withholding, the plugin env conf file, or the plugin media outbox
+  covers:
+    - casa/rootfs/opt/casa/plugin_store.py::manifest_setup_provides
+    - casa/rootfs/opt/casa/plugin_env_conf.py
+    - casa/rootfs/opt/casa/plugin_outbox.py
+  tests:
+    - tests/test_plugin_store_setup_env.py
+    - tests/test_plugin_env_conf.py
+    - tests/test_plugin_outbox.py
+  related: [architecture/plugin-setup.md, architecture/plugins.md, architecture/configuration.md]
+  defines_invariants: [INV-PLUG-008, INV-PLUG-009]
+  invariant_tests:
+    INV-PLUG-008: [tests/test_agent_plugin_binding.py::test_env_unresolved_plugin_withheld_from_options, tests/test_plugin_setup_episodes.py::test_secrets_gate_holds_dispatch_until_ready]
+    INV-PLUG-009: [tests/test_agent_plugin_binding.py::test_specialist_options_load_the_setup_provisioning_plugin, tests/test_agent_plugin_binding.py::test_specialist_options_pin_declared_vars_to_empty_strings, tests/test_agent_plugin_binding.py::test_resident_options_load_and_pin_the_declared_vars, tests/test_plugin_grants.py::test_setup_secrets_ready_admits_the_deadlocked_plugin, tests/test_engagement_plugin_artifacts.py::test_run_script_pins_declared_vars_as_empty_exports, tests/test_engagement_plugin_artifacts.py::test_boot_reconciliation_render_gets_the_same_overlay]
+
+- doc: architecture/plugin-setup.md
+  summary: Who runs a plugin's declared setup tool — the single-runner obligation, the consent verdict that releases it, and the applied-state gate it passes through.
+  when_changing: the setup tool's dispatch, its consent gating, or the route gate a setup obligation passes through
   covers:
     - casa/rootfs/opt/casa/plugin_setup_episodes.py::ensure_obligation
     - casa/rootfs/opt/casa/plugin_setup_episodes.py::open_round
     - casa/rootfs/opt/casa/trigger_reconcile.py::seal_setup_state
     - casa/rootfs/opt/casa/trigger_reconcile.py::setup_candidates
-    - casa/rootfs/opt/casa/plugin_store.py::manifest_setup_provides
-    - casa/rootfs/opt/casa/plugin_env_conf.py
-    - casa/rootfs/opt/casa/plugin_outbox.py
+    - casa/rootfs/opt/casa/trigger_reconcile.py::verify_minted_secrets
+    - casa/rootfs/opt/casa/callback_reconcile.py::verify_published_markers
+    - casa/rootfs/opt/casa/plugin_registry.py::pinned_resolver
+    - casa/rootfs/opt/casa/webhook_auth.py::secret_bound_to_identity
   tests:
     - tests/test_plugin_setup_single_runner.py
     - tests/test_plugin_setup_episodes.py
-    - tests/test_plugin_store_setup_env.py
-    - tests/test_plugin_env_conf.py
-    - tests/test_plugin_outbox.py
-  related: [architecture/plugins.md, architecture/triggers.md, architecture/callbacks.md, architecture/configuration.md]
-  defines_invariants: [INV-PLUG-008, INV-PLUG-009, INV-PLUG-010]
+    - tests/test_plugin_reconcile_pass_integrity.py
+  related: [architecture/plugin-runtime.md, architecture/plugins.md, architecture/triggers.md, architecture/callbacks.md]
+  defines_invariants: [INV-PLUG-010, INV-PLUG-011]
   invariant_tests:
-    INV-PLUG-008: [tests/test_agent_plugin_binding.py::test_env_unresolved_plugin_withheld_from_options, tests/test_plugin_setup_episodes.py::test_secrets_gate_holds_dispatch_until_ready]
-    INV-PLUG-009: [tests/test_agent_plugin_binding.py::test_specialist_options_load_the_setup_provisioning_plugin, tests/test_agent_plugin_binding.py::test_specialist_options_pin_declared_vars_to_empty_strings, tests/test_agent_plugin_binding.py::test_resident_options_load_and_pin_the_declared_vars, tests/test_plugin_grants.py::test_setup_secrets_ready_admits_the_deadlocked_plugin, tests/test_engagement_plugin_artifacts.py::test_run_script_pins_declared_vars_as_empty_exports, tests/test_engagement_plugin_artifacts.py::test_boot_reconciliation_render_gets_the_same_overlay]
+    INV-PLUG-011: [tests/test_plugin_reconcile_pass_integrity.py::test_setup_holds_until_the_secret_it_needs_exists, tests/test_plugin_reconcile_pass_integrity.py::test_an_unminted_per_trigger_secret_is_a_gap, tests/test_plugin_reconcile_pass_integrity.py::test_a_secret_bound_to_the_previous_approval_is_a_gap, tests/test_plugin_reconcile_pass_integrity.py::test_a_handler_minted_unbound_secret_is_a_gap, tests/test_plugin_reconcile_pass_integrity.py::test_current_issues_reports_the_unbacked_route, tests/test_plugin_reconcile_pass_integrity.py::test_an_unpublished_callback_marker_is_a_gap, tests/test_plugin_reconcile_pass_integrity.py::test_a_stale_callback_marker_is_a_gap, tests/test_plugin_reconcile_pass_integrity.py::test_a_routed_pair_is_republished_even_on_an_untrustworthy_pass, tests/test_plugin_reconcile_pass_integrity.py::test_a_recomputation_that_could_not_run_keeps_the_plugin_dark]
     INV-PLUG-010: [tests/test_plugin_setup_single_runner.py::test_absence_of_a_round_is_never_a_permission, tests/test_plugin_setup_single_runner.py::test_no_shipped_doctrine_routes_setup_to_an_agent, tests/test_plugin_setup_single_runner.py::test_a_failed_pending_compute_holds_rather_than_choosing, tests/test_plugin_setup_single_runner.py::test_unreachable_operator_holds_rather_than_choosing, tests/test_plugin_setup_single_runner.py::test_denied_consent_refuses_and_a_reprompt_rearms]
 
 - doc: architecture/plugins.md

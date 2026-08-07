@@ -1,5 +1,37 @@
 # Changelog
 
+## [0.162.0] - 2026-08-07
+
+### Fixed
+
+- **A plugin's setup step no longer runs against a credential Casa is about to
+  replace.** Approving a plugin's permission prompt and creating the secret that
+  approval authorizes are two separate moments: the approval is recorded
+  immediately, while the webhook secret — and the address a plugin gives its
+  provider to send you back to — are written a moment later. Casa decided the
+  setup step could run from the approval alone, so on a first approval it could
+  start before the secret existed, and on a re-approval after a revoke it could
+  hand out the previous secret seconds before that file was rewritten. Either
+  way the external service ended up pointed at something that no longer worked,
+  with nothing to say so. Casa now checks for the real thing — the secret
+  actually on disk, minted for this approval, and the published address — and
+  simply waits when it is not there yet. The wait is short and self-clearing,
+  and the plugin health report shows it while it lasts.
+- **A plugin whose files could not be read no longer freezes every other
+  plugin's setup.** Casa republishes the small discovery file a plugin's setup
+  step reads whenever that plugin itself is healthy, instead of holding it back
+  because some unrelated plugin in the list was unreadable. Left as it was, the
+  new wait above would have had no way out: Casa would have waited for a file it
+  had already decided not to write, and the only escape would have been
+  repairing a different plugin entirely.
+- **A plugin registry reload arriving mid-reconcile can no longer produce
+  contradictory routing.** Working out which plugin endpoints should be open
+  involved several separate reads of the plugin registry, so a change landing
+  between two of them could mix an old list of plugins with new assignments —
+  briefly opening an endpoint for a plugin that had just been unassigned or
+  removed. Each pass now reads the registry once and answers every question from
+  that one reading.
+
 ## [0.161.0] - 2026-08-07
 
 ### Changed

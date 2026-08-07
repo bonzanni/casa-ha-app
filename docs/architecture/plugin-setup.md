@@ -1,0 +1,231 @@
+---
+last_reviewed: 2026-08-08
+---
+
+# The plugin setup obligation
+
+> Code is the source of truth. This file is a map; when it and the code disagree, the code wins.
+
+## Scope
+
+Who runs a plugin's declared setup tool, and what has to be true before it runs. The
+environment that tool provisions, and the two side channels a plugin reaches Casa
+through, are [`plugin-runtime.md`](plugin-runtime.md); the consents this obligation waits
+on are [`triggers.md`](triggers.md) and [`callbacks.md`](callbacks.md); installation and
+artifact identity are [`plugins.md`](plugins.md).
+
+## Mental model
+
+**Setup has exactly one runner, and "not yet" is an answer it can give.** Casa runs a
+declared `casa.setupTool` itself; nothing hands that work to an agent. The runner is a
+durable per-artifact *obligation* released by a **positively sealed** consent verdict — and
+an obligation with no verdict holds rather than guessing (INV-PLUG-010). That third state
+is the whole design: the alternative, deciding at mutation time which of two runners owns
+the job, has no correct answer for a plugin whose consent the operator has not yet decided.
+
+**A consent decision and the artifacts it authorizes land at different moments, so the
+dispatch gate reads the artifacts.** Approval persists an acknowledgement and settles the
+round in one step; the per-trigger webhook secret and the callback discovery markers are
+written by the *reconcile* that follows. A gate derived from consent alone therefore
+described a route as fully live during the window in between — and a setup tool's whole
+job is to hand those artifacts to an external provider. So the gate recomputes the applied
+state at the moment it decides (INV-PLUG-011), and holds until what the setup tool will
+read actually exists.
+
+**A reconcile pass describes one registry snapshot.** Each pass pins a single registry
+resolution and serves every read from it — the plugins and their manifests, each target's
+assignment authority, the registry entries the callback and event reconcilers use, and the
+setup-candidate sweep. A pass that resolved each of those separately could compose one
+generation's manifests with another's assignment authority and publish a route the newer
+generation had removed.
+
+## Contracts & invariants
+
+**INV-PLUG-010**: A plugin's declared setup tool is dispatched by Casa alone — no tool result, completion or prompt routes it to an agent — and an artifact's setup obligation dispatches only after a consent verdict has been positively sealed for that exact artifact and settled with no denial; the absence of a sealed verdict never permits a dispatch, and a verdict asserting that an artifact needs no consent is sealed only when the pending-consent computes for both trigger and callback consents succeeded.
+
+**A plugin's declared setup tool is run by Casa and by nothing else — released only by a
+positively sealed consent verdict for that exact artifact, and then only once its trigger
+**and callback** routes are live — the gate rejects any outstanding issue of either kind,
+per plugin and all-or-nothing — its required environment resolves, and the executing agent
+can load it**. The obligation is durable, retrying and crash-recovered; a single denial withholds
+it, so consent is not merely route authorization; an obligation whose plugin still has
+unresolved environment variables stays pending rather than running the setup tool against
+a placeholder-credentialed server — a consent round can settle while the installing
+engagement is still wiring secrets, and every successful reload re-kicks the dispatch
+worker; and for a resident execution target it stays pending while that agent's published
+binding predates those secrets, until an agent reload makes the plugin loadable there
+(specialists resolve fresh per delegation and need no such hold).
+
+The single-runner rule is load-bearing rather than tidy. Until v0.161.0 an agent could
+also run setup, acting on a `run_plugin_setup_tool` hand-back in the configurator's
+completion, and *which* runner acted was classified when the registry mutated. Two
+attempts to make that classification total failed adversarial review, for one reason:
+at mutation time there is no third answer. A runner must be named then and there, and
+every hole the attempts found was a case whose correct answer was **"not yet"** — a
+future operator decision, or a question about what an updated setup tool needs that
+nothing in the manifest answers. So the second runner is gone, and the remaining one
+expresses "not yet" as *hold*: the obligation stays pending, stays visible in plugin
+health (where `pending` never decays), and is re-checked on every reconcile.
+
+What releases it is a **positive** statement, never an absence. The reconciler — the only
+component that computes the consent requirement, and one that runs at every lifecycle
+site — seals one round per `(plugin, artifact_id)` whose membership is the union of the
+plugin's pending *trigger* and *callback* consents, so neither kind alone describes it.
+That membership may be **empty**, which asserts that this artifact needs no consent and
+releases the obligation; that is deliberately distinct from no round at all, which means
+no verdict yet. Reading absence as permission is the concrete defect the first attempt
+shipped: it would dispatch before the reconcile had opened the round.
+
+An empty membership is sealed only where the consent position is genuinely *knowable*. A
+declared trigger or callback carrying a **non-consent** gap — an unassigned target, a role
+without the `webhook` channel, a missing global secret, an invalid public base URL — is
+omitted from the pending rows altogether, so reading that omission as "needs none" would
+assert precisely what the plugin contradicts. Such a plugin's obligation is recorded and
+holds, unsealed, until the gap clears. The route gate would also stop the dispatch, but a
+verdict is the one thing this design requires to be true rather than merely harmless.
+
+For the same reason
+a zero-member verdict is sealed only when the pending computes for *both* consent kinds
+succeeded — a compute that degrades a failure to "nothing pending" cannot be
+distinguished from one that means it — and sealing happens before the
+operator-reachability gate, so an unreachable DM yields a members-bearing verdict that
+correctly holds instead of no verdict at all.
+
+The obligation is created level-triggered by that same sweep, for every resolved plugin
+declaring `casa.setupTool`, keyed by the current `artifact_id`. That covers all three
+artifact-publishing paths — `plugin_add`, `plugin_update`, and a specialist's bundled
+plugins — without a hook at any of them. The setup tool itself is resolved at dispatch
+time from the current manifest, so an update that changes `casa.setupTool` while leaving
+`casa.callbacks` byte-identical still runs the new tool without binding the setup
+contract into a consent identity. A denial marks the obligation refused rather than
+dispatching; a later re-prompt for the same artifact re-arms it, which is also how a
+re-consent that re-mints a secret gets setup re-run on an unchanged artifact. A plugin
+that names a setup tool only in a producer handoff or a README, with no `casa.setupTool`,
+has no supported automatic path before v1.0 — nobody runs it, and the configurator says
+so rather than guessing a tool name.
+
+**INV-PLUG-011**: The setup-dispatch route gate recomputes the applied state at the moment it decides — a per-trigger webhook secret must already be minted under the consent identity the recomputation derives, and a routed plugin's callback marker pair must already equal the desired one — so an artifact the reconcile has not yet written keeps the obligation holding.
+
+The gate the obligation passes through is a *recomputation*, not a cached verdict: it
+re-derives every plugin's trigger and callback gaps from the live approval stores and
+registry, and refuses on any outstanding issue of either kind, per plugin and
+all-or-nothing. Recomputation is what makes it honest across restarts and unrelated health
+refreshes — but derivation alone knows only about consent, assignment and declarations,
+and the two artifacts a setup tool actually hands to a provider are written by the apply
+half of a reconcile.
+
+The window that opens is small and the damage is not. On a first approval the secret has
+never been minted; on a *re-approval after a revoke* the file on disk is still bound to the
+previous approval generation, which the next mint rekeys; and the webhook handler mints
+lazily and unbound for an unrouted name, which a reconcile also replaces. In each case a
+setup run dispatched from the derived state alone would provision the external service
+against a credential — or a redirect URI — Casa is about to change, which is the exact
+failure automatic setup exists to prevent. Both checks therefore read the durable artifact:
+the secret's identity sidecar must name the consent identity this pass computed, and the
+marker pair is compared byte-strictly against the pair the reconcile would publish.
+
+Holding is not a dead end, and making that true took a second look: the gate may only
+demand an artifact the reconcile will actually write. The trigger side mints on every pass,
+so it self-heals. The callback side did not — the marker writer declined to rewrite an
+existing-but-different pair whenever the pass was *untrustworthy*, and that flag is
+registry-global, so one unresolvable artifact anywhere froze every other plugin's markers
+for as long as it stayed broken. Against an advisory marker that was survivable; against a
+gate it is a hold with no exit, reached by an ordinary plugin update. The
+availability gate now covers only what it was for — refusing to *delete* a marker on a pass
+that may simply have failed to see its plugin — while a plugin in the routed set, which
+resolved cleanly in that very pass and holds a persisted ack, has its own pair refreshed.
+Every reconcile then kicks the dispatch worker, and the obligation stays `pending` and
+visible in plugin health throughout, exactly like the environment and binding holds above.
+
+What it does not cover: the **global** webhook secret behind `hmac_body`. That mode has no
+per-trigger file, so there is no applied artifact to compare — the check is that a secret is
+configured, not that the one the request handler captured at boot matches it. A plugin using
+only `hmac_body` can therefore pass this gate and be provisioned against a route that
+refuses every request, which is the same derived-versus-applied gap one level up. The two
+checks here are also a *recomputation*, not a transaction: a pass landing inside a
+reconcile's marker rewrite sees the pair briefly absent, which costs one spurious health row
+or one spurious hold, both cleared by the next pass.
+
+Nor does it cover a plugin the recomputation never *saw*. The gate asks whether any issue
+names the plugin, and an invalid registry — or a single artifact that fails to resolve —
+produces an empty result with no issues at all, which reads as "no gap". The setup worker
+resolves its own registry entry three-state before reaching the gate and defers on both, so
+this is unreachable today; but that shield is a separate, earlier read rather than a
+property of the gate, which is the same composed-from-moving-reads shape one level up.
+
+## Failure behavior
+
+**No consent verdict has settled for an artifact.** The obligation holds, indefinitely and
+visibly: `pending` never decays out of plugin health. Two distinct situations reach it, and
+the difference matters when reading a store by hand. With **no operator DM reachable**, the
+verdict *is* sealed — complete, members-bearing — and simply cannot settle, because no
+keyboard was posted for the operator to answer. When a pending-consent compute failed, the
+pass spanned registry generations, or a non-consent gap hid part of the plugin's consent
+position, the round is sealed **non-authoritative** instead: the keyboards still get their
+nonces, but settlement draws no conclusion and leaves the obligation exactly as it was.
+Neither situation is a licence to dispatch. The generation case survives as a guard rather
+than an expected state — a pass built on the pinned registry resolution cannot span two —
+and it still fires for any pass whose resolver is supplied from outside.
+
+**The secret or marker a released obligation needs is not on disk yet.** The gate holds and
+records what it is waiting for; the obligation stays `pending` and released, and the next
+reconcile's mint or marker publish closes it (INV-PLUG-011). The same hold covers a mint
+that keeps failing — an unwritable state directory, say — which is visible as a trigger
+issue rather than as a setup run against a credential that does not exist.
+
+**A consent round settles with any denial.** The obligation is refused and nothing is
+dispatched; the operator gets one note naming re-consent as the way forward, not a manual
+run they have no tool call for. A later re-prompt for the same artifact re-arms it.
+
+**The registry cannot be resolved at dispatch time.** The obligation stays released and
+retries on later kicks, bounded; past that bound it goes stale with an operator note, since
+a plugin that never resolves is a plugin that is gone. Settlement itself never resolves the
+registry, so a release can never be lost this way.
+
+**The plugin's server binding is ambiguous.** An obligation whose plugin does not resolve
+to exactly one server grant fails with that reason rather than guessing a namespace;
+verification blocks such plugins upstream.
+
+**The dispatch is accepted but the tool fails.** Delivery is what the obligation
+guarantees, not execution: `dispatched` means the bus accepted the turn, and the executing
+agent reports the tool's own outcome to the operator. Casa makes no claim of its own about
+whether the integration works — it cannot see the external side (INV-TOOL-005).
+
+## Extension points
+
+**Declaring a setup tool** means adding `casa.setupTool` to the manifest. It must be
+argument-free and idempotent, `setup_`-prefixed, and its plugin must target at least one
+resident or specialist — an executor-only target has no invocation path and is refused at
+verification. Nothing else is needed: the reconciler sweep finds it and Casa owes the run.
+
+**Changing what releases an obligation** means changing what the reconciler seals, not what
+the worker infers. The worker deliberately holds on anything it cannot read as a positive
+verdict; adding an inference there would reintroduce the defect this design removed.
+
+
+## Source & test map
+
+<!-- BEGIN SOURCEMAP -->
+<!-- generated by scripts/verify_docs.py --write-nav; do not hand-edit -->
+
+**Source**
+- `casa/rootfs/opt/casa/plugin_setup_episodes.py::ensure_obligation`
+- `casa/rootfs/opt/casa/plugin_setup_episodes.py::open_round`
+- `casa/rootfs/opt/casa/trigger_reconcile.py::seal_setup_state`
+- `casa/rootfs/opt/casa/trigger_reconcile.py::setup_candidates`
+- `casa/rootfs/opt/casa/trigger_reconcile.py::verify_minted_secrets`
+- `casa/rootfs/opt/casa/callback_reconcile.py::verify_published_markers`
+- `casa/rootfs/opt/casa/plugin_registry.py::pinned_resolver`
+- `casa/rootfs/opt/casa/webhook_auth.py::secret_bound_to_identity`
+
+**Tests**
+- `tests/test_plugin_setup_single_runner.py`
+- `tests/test_plugin_setup_episodes.py`
+- `tests/test_plugin_reconcile_pass_integrity.py`
+
+**Related**
+- [`architecture/plugin-runtime.md`](../architecture/plugin-runtime.md)
+- [`architecture/plugins.md`](../architecture/plugins.md)
+- [`architecture/triggers.md`](../architecture/triggers.md)
+- [`architecture/callbacks.md`](../architecture/callbacks.md)
+<!-- END SOURCEMAP -->

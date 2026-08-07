@@ -300,6 +300,31 @@ def _write_ident(name: str, identity: str, secrets_dir: Path) -> bool:
         return False
 
 
+def secret_bound_to_identity(
+    name: str, *, identity: str, secrets_dir: Path,
+) -> bool:
+    """Is a live casa-owned secret for ``name`` ALREADY minted under
+    ``identity``? The read-only mirror of the reuse test inside
+    :func:`ensure_secret_for_identity` (#453).
+
+    False for every state that mint would treat as needing work: no secret at
+    all (nothing minted yet), a secret whose ``.ident`` sidecar names a
+    different consent identity (a re-approval after a revoke rekeys), and an
+    unbound one (the webhook handler's lazy mint, or a crash mid-bind) — all of
+    which the next reconcile REPLACES. A consumer that read the file first
+    would provision an external service against a credential Casa is about to
+    change, so this is the predicate the setup gate needs, not "a file
+    exists". Total: any read failure is False."""
+    secrets_dir = Path(secrets_dir)
+    try:
+        if _read_final(name, "casa", secrets_dir) is None:
+            return False
+        return _ident_path(name, secrets_dir).read_text(
+            encoding="ascii").strip() == identity
+    except (OSError, UnicodeDecodeError):
+        return False
+
+
 def ensure_secret_for_identity(
     name: str, *, identity: str, secrets_dir: Path,
 ) -> bytes | None:

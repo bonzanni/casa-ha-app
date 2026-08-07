@@ -76,25 +76,37 @@ _routed: Any = event_spool.ROUTING_UNAVAILABLE
 
 
 def _default_resolver() -> Callable[["str | None"], Any]:
+    """ONE registry snapshot for the whole pass (#454) — see
+    ``plugin_registry.pinned_resolver``."""
     import plugin_registry
 
-    def resolve(target: "str | None") -> Any:
-        if target is None:
-            return plugin_registry.resolve_all()
-        return plugin_registry.resolve_for(target)
-
-    return resolve
+    return plugin_registry.pinned_resolver()
 
 
 def _default_entries() -> Callable[[], list[dict]]:
     """The registry ENTRIES seam — assignment authority for a subscriber's
-    own delivery targets. Mirrors ``callback_reconcile._default_entries``."""
+    own delivery targets. Mirrors ``callback_reconcile._default_entries``.
+
+    The LAST-RESORT source only: a pass whose resolver is snapshot-pinned reads
+    its entries off that pin instead (:func:`_entries_for`), because a separate
+    ``snapshot_registry()`` read is pinned to nothing and can hand the pass a
+    different generation's assignment authority (#454)."""
     import plugin_registry
 
     def entries() -> list[dict]:
         return list(plugin_registry.snapshot_registry().entries)
 
     return entries
+
+
+def _entries_for(resolver: Any) -> Callable[[], list[dict]]:
+    """The registry entries of the RESOLVER's own snapshot when it has one.
+
+    Resolve the resolver first, then ask it for its entries: the two reads are
+    then provably one generation. Falls back to the unpinned default for an
+    injected seam that carries no snapshot of its own."""
+    ents = getattr(resolver, "entries", None)
+    return ents if callable(ents) else _default_entries()
 
 
 def _default_acks() -> Any:
@@ -203,7 +215,7 @@ def compute_desired(
 
     acks = acks if acks is not None else _default_acks()
     resolver = resolver if resolver is not None else _default_resolver()
-    entries = entries if entries is not None else _default_entries()
+    entries = entries if entries is not None else _entries_for(resolver)
 
     out = DesiredEvents()
     all_res = resolver(None)

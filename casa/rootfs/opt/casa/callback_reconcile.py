@@ -75,14 +75,11 @@ _SPECIALIST_PREFIX = "specialist:"
 
 
 def _default_resolver() -> Callable[[str | None], Any]:
+    """ONE registry snapshot for the whole pass (#454) — see
+    ``plugin_registry.pinned_resolver``."""
     import plugin_registry
 
-    def resolve(target: "str | None") -> Any:
-        if target is None:
-            return plugin_registry.resolve_all()
-        return plugin_registry.resolve_for(target)
-
-    return resolve
+    return plugin_registry.pinned_resolver()
 
 
 def _default_entries() -> Callable[[], list[dict]]:
@@ -91,13 +88,30 @@ def _default_entries() -> Callable[[], list[dict]]:
     A resolved plugin carries no targets, and the callback gate is "assigned
     to at least one role" (any resident/specialist, not one scoped target), so
     the entries of the same snapshot the resolver reads are the natural
-    source. Keeping it a seam keeps the compute pure and testable."""
+    source. Keeping it a seam keeps the compute pure and testable.
+
+    This is the LAST-RESORT source only. #454: "the same snapshot the resolver
+    reads" was an aspiration, not a fact — this read the live snapshot
+    independently, so a reload between the two handed the pass one generation's
+    manifests and another's assignment authority. A pinned resolver now supplies
+    its own entries (:func:`_entries_for`); this remains for an injected seam
+    that carries none."""
     import plugin_registry
 
     def entries() -> list[dict]:
         return list(plugin_registry.snapshot_registry().entries)
 
     return entries
+
+
+def _entries_for(resolver: Any) -> Callable[[], list[dict]]:
+    """The registry entries of the RESOLVER's own snapshot when it has one.
+
+    Resolve the resolver first, then ask it for its entries: the two reads are
+    then provably one generation. Falls back to the unpinned default for an
+    injected seam that carries no snapshot of its own."""
+    ents = getattr(resolver, "entries", None)
+    return ents if callable(ents) else _default_entries()
 
 
 def _default_acks() -> Any:
@@ -176,7 +190,7 @@ def compute_desired(
 
     acks = acks if acks is not None else _default_acks()
     resolver = resolver if resolver is not None else _default_resolver()
-    entries = entries if entries is not None else _default_entries()
+    entries = entries if entries is not None else _entries_for(resolver)
 
     out = DesiredCallbacks(base_url=_base_url())
     all_res = resolver(None)
@@ -446,15 +460,19 @@ def _reconcile_markers_pre_swap(
       bad compute (invalid registry / resolution hiccup) can never nuke a valid
       plugin's markers.
     * **Routed but not already exactly desired** — absent, invalid, stale, or
-      half-published (one file present, one gone): when this pass is trustworthy
-      (``prunable``) BOTH files are retired here so the post-swap rewrite is the
-      sole writer and a failed rewrite leaves them ABSENT (fail-closed) rather
-      than stale/partial. On an UNTRUSTWORTHY pass an EXISTING marker is left
-      exactly as-is (the same availability double-gate the orphan/stale-ack
-      prunes use — a transient bad compute may not vaporize or rewrite a live
-      consumer's marker). A fully-ABSENT pair is a fresh publish with nothing to
-      delete first and is written regardless of ``prunable`` (it destroys
-      nothing).
+      half-published (one file present, one gone): BOTH files are retired here
+      so the post-swap rewrite is the sole writer and a failed rewrite leaves
+      them ABSENT (fail-closed) rather than stale/partial. This happens on
+      EVERY pass, trustworthy or not — ``prunable`` does NOT gate it (#453).
+      A plugin reaches this branch only by being in THIS pass's routed set,
+      which means it resolved cleanly here and holds a persisted ack, so its
+      desired pair is derived from its own good resolution and rewriting it
+      destroys nothing. Gating it made an unrelated broken artifact — the flag
+      is registry-GLOBAL — freeze every other plugin's markers indefinitely,
+      which since the setup gate reads the pair is a hold with no exit. Do not
+      restore the condition here; it belongs to the orphan retirement above,
+      where the conclusion being protected against is "absent from desired",
+      the one a bad compute really can get wrong.
     * **Unchanged** — a pair already equal to the desired one is left exactly as
       it is (no retire, no rewrite).
 
@@ -500,14 +518,21 @@ def _reconcile_markers_pre_swap(
         needs, has_on_disk = _pair_state(spool, desired.base_url, routed)
         if not needs:
             continue                     # unchanged — no churn
-        if has_on_disk and not desired.prunable:
-            # The availability double-gate covers the routed pair too, not just
-            # orphans: an UNTRUSTWORTHY pass (invalid registry / a resolution
-            # hiccup) must never retire OR overwrite an EXISTING on-disk marker
-            # — a transient bad compute may not vaporize/rewrite a live
-            # consumer's marker. A trustworthy pass refreshes it next. (A
-            # fully-ABSENT pair falls through: publishing it destroys nothing.)
-            continue
+        # #453: the availability double-gate does NOT cover the routed pair —
+        # it guards the ORPHAN retirement above, where a bad compute's wrong
+        # "absent from desired" conclusion destroys a live consumer's marker.
+        # A plugin reaching this loop is in THIS pass's routed set: it resolved
+        # cleanly here and carries a persisted ack, so its desired pair is
+        # derived from its own good resolution and rewriting it destroys
+        # nothing. Gating it on `prunable` — which is registry-GLOBAL, set by
+        # ANY plugin's resolve issue — made an unrelated broken artifact freeze
+        # every other plugin's markers for as long as it stayed broken. That
+        # was survivable while the pair was merely advisory; it is not now that
+        # the setup gate holds on it, because the state it produces has no exit:
+        # the reader demands a pair the writer has decided never to write, and
+        # no operator action on the held plugin clears it. The ordinary trigger
+        # is a plugin UPDATE — the artifact path moves, so the index entry goes
+        # absent while a byte-identical `ready.json` keeps `has_on_disk` true.
         if has_on_disk:
             if not _retire_marker(spool, "delete_ready", routed.plugin):
                 _spool_issue(desired.issues, routed.plugin, routed.artifact_id)
@@ -545,6 +570,43 @@ def _publish_markers_post_swap(
             _retire_marker(spool, "delete_ready", routed.plugin)
             if routed.path:
                 _retire_marker(spool, "delete_index_entry", routed.path)
+
+
+def verify_published_markers(desired: DesiredCallbacks, spool: Any) -> None:
+    """Record a gap for every routed plugin whose on-disk marker pair does not
+    ALREADY equal the pair this pass would publish (#453).
+
+    The read-only mirror of :func:`_publish_markers_post_swap`, for the
+    consumers that RE-DERIVE the desired state without applying it —
+    :func:`current_issues`, and through it the plugin-health report and
+    ``casa_core._callback_and_trigger_routes_live``, the setup-dispatch gate.
+
+    The trigger half of #453 stated for callbacks: ``compute_desired`` derives
+    consent and assignment, but the ``ready.json`` + ``.index`` pair is written
+    by the APPLY half, after the consent approval that settles the setup round.
+    The redirect URI a plugin's setup tool registers with its provider is read
+    out of that pair, so a gate blind to it dispatched setup with nothing (or a
+    previous artifact's pair) on disk. ``callback_spool_error`` is the existing
+    code for "the consumer cannot discover its redirect URI", which is exactly
+    this state; per-plugin all-or-nothing, so one row is enough.
+
+    Byte-strict, via the SAME :func:`_pair_state` the reconcile's own
+    pre-swap compare uses — a marker that merely resembles the desired one is
+    not the one the consumer would read. An unwired spool is a gap for every
+    routed plugin, matching what the reconcile's own writes would surface.
+    """
+    if desired.base_url is None:
+        # Nothing is publishable at all, and every routed plugin already
+        # carries `callback_base_url_invalid` from the compute.
+        return
+    for routed in desired.routed:
+        if spool is None:
+            _spool_issue(desired.issues, routed.plugin, routed.artifact_id)
+            continue
+        needs_republish, _has_on_disk = _pair_state(
+            spool, desired.base_url, routed)
+        if needs_republish:
+            _spool_issue(desired.issues, routed.plugin, routed.artifact_id)
 
 
 def _guard(spool: Any, desired: DesiredCallbacks, plugin: str,
@@ -819,21 +881,46 @@ async def reconcile_from_runtime(runtime: Any, *, prompt: bool = True) -> list:
         prompt=prompt)
 
 
-def current_issues() -> list:
-    """Fresh, side-effect-free callback issues for health regeneration —
-    recomputed on EVERY ``_regenerate_plugin_health`` pass so they survive
-    unrelated refreshes. Never raises (health must always regenerate)."""
+def issue_state(resolver: Any = None) -> "tuple[bool, list]":
+    """``(ok, issues)`` — the callback gaps, and whether they could be computed
+    AT ALL. The mirror of ``trigger_reconcile.issue_state``, which carries the
+    full reasoning for why the flag exists.
+
+    Two halves (#453): the DERIVED gaps from :func:`compute_desired`, and the
+    APPLIED one — is the marker pair the consumer reads its redirect URI from
+    actually published — from :func:`verify_published_markers`. Only the
+    reconcile publishes, so a recomputation that skipped the second half
+    described a callback as fully live during the window between an approval and
+    the write that backs it.
+
+    Residual, named rather than implied away: ``ok`` reports whether the
+    computation RAN, not whether it saw every plugin. An invalid registry — and
+    a single artifact that fails to resolve — yields an empty result with no
+    issues, so a plugin absent from the computation reads as "no gap". The
+    setup worker resolves its own registry entry three-state BEFORE reaching the
+    gate and defers on both, so it is unreachable there today; that shield is a
+    separate read, not a property of this function."""
     try:
         import agent as agent_mod
 
         runtime = getattr(agent_mod, "active_runtime", None)
         if runtime is None:
-            return []
+            return False, []
         role_configs = getattr(runtime, "role_configs", None)
         if not role_configs:
-            return []
-        return compute_desired(role_configs=role_configs).issues
+            return False, []
+        desired = compute_desired(role_configs=role_configs, resolver=resolver)
+        verify_published_markers(desired, _default_spool())
+        return True, desired.issues
     except Exception:  # noqa: BLE001 — a callback-compute crash must never
         # take down the whole health pass; log and degrade to no extras.
         logger.exception("callback issue recompute failed")
-        return []
+        return False, []
+
+
+def current_issues() -> list:
+    """Fresh, side-effect-free callback issues for health regeneration —
+    recomputed on EVERY ``_regenerate_plugin_health`` pass so they survive
+    unrelated refreshes. Never raises (health must always regenerate). The
+    setup gate uses :func:`issue_state` instead — see its docstring."""
+    return issue_state()[1]

@@ -69,6 +69,17 @@ Until all of those hold, the name is not in the overlay and the route returns no
 **Approval is all-or-nothing per plugin.** If one declared trigger fails any check, none of
 that plugin's triggers route. Partial routing is deliberately not offered.
 
+**Approval and the secret it authorizes land at different moments.** The acknowledgement
+persists in the operator's tap; the per-trigger secret is minted by the reconcile that
+follows. Routing is unaffected — the overlay swaps in the same reconcile — but anything
+deciding whether a plugin's ingress is *usable by an external service*, the setup-tool
+dispatch gate above all, has to read the minted secret rather than infer it from the
+approval (INV-PLUG-011 in [`plugin-setup.md`](plugin-setup.md)).
+
+**One reconcile pass sees one registry snapshot.** The plugins, their manifests and each
+target's assignment authority are served from a single pinned resolution, so a registry
+reload landing mid-pass cannot make the overlay compose two generations.
+
 ## Contracts & invariants
 
 **INV-TRIG-001**: A resident's scheduled trigger registers only if the resident declares the channel it names.

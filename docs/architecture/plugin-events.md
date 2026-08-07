@@ -43,7 +43,10 @@ emitter, event, declaration digest, sorted delivery targets)` as one identity
 (`ack_identity`). A plugin upgrade or a retargeted assignment mints a new identity, so
 neither can silently carry an old consent forward; the emitter's own artifact id is
 deliberately excluded, so an emitter-side upgrade never forces re-consent on its
-subscribers.
+subscribers. Because that identity composes a manifest declaration with the delivery
+targets the registry assigns, the reconcile pass reads both from one pinned registry
+snapshot — the same rule the trigger and callback reconcilers follow
+([`plugin-setup.md`](plugin-setup.md)).
 
 **Delivery is LLM-mediated through casa's own `ack_event` tool — a deliberate trade-off,
 bounded by level-triggering.** There is no file-protocol ack a subscriber process claims

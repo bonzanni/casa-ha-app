@@ -1006,13 +1006,44 @@ async def _run_episode(ep: dict) -> bool:
     # episode stays pending; every reconcile kicks the worker to re-check.
     if _routes_live is not None:
         try:
-            live = bool(_routes_live(plugin))
+            # #453: OFF THE EVENT LOOP. The gate re-derives both reconcilers'
+            # issue sets and now also reads the durable artifacts behind them —
+            # the per-trigger secret sidecars, and the callback marker pair
+            # under the spool's process-wide lock, which the reconcile holds
+            # across fsyncs from a worker thread. The reconcilers put these very
+            # reads behind `to_thread` for that reason; this was the one caller
+            # that did them inline.
+            live = bool(await asyncio.to_thread(_routes_live, plugin))
         except Exception:  # noqa: BLE001
             logger.exception("episode %s: routes_live check failed", ep["id"])
             live = False
         if not live:
             _update_episode(ep["id"],
                             last_error="waiting for live trigger route")
+            return
+        # ...and RE-ESTABLISH the supersession check the await above broke.
+        # Everything from `_resolve_entry` to the dispatch used to be yield-free,
+        # which is what made "a superseded artifact must never fire" true rather
+        # than likely. Moving this gate off the event loop inserted the first
+        # yield into that window — and the awaited work is not short (two
+        # registry resolutions plus the secret and marker reads), so a
+        # `plugin_update` completing inside it left this episode dispatching the
+        # OLD artifact's setup tool against the provider, from a captured
+        # `entry`. The resident binding check downstream does not catch it (the
+        # published binding still names the old artifact until a reload) and a
+        # specialist target has no such check at all.
+        resolved_ok, entry = _resolve_entry(plugin)
+        if not resolved_ok or entry.get("artifact_id") != ep["artifact_id"]:
+            # Deliberately NOT terminal here: re-run the whole ladder from the
+            # top on the next kick, where the three-state resolution decides
+            # between "unavailable, retry" and "confirmed supersession, stale".
+            _update_episode(ep["id"],
+                            last_error="artifact changed during the route check")
+            return True  # deferred — caller schedules a delayed self-kick
+        tool = entry.get("setup_tool")
+        if not tool:
+            _update_episode(ep["id"], status="failed",
+                            last_error="plugin no longer declares a setup tool")
             return
     # #423: dispatch only when the plugin's required env vars are resolved
     # in the effective environment — the consent round can settle while the

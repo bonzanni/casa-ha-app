@@ -2323,11 +2323,28 @@ def _callback_and_trigger_routes_live(plugin: str) -> bool:
     whose callback ingress is not routed. Requiring NO outstanding ``callback_*``
     issue (its markers are published) closes that hole. Per-plugin
     all-or-nothing means one issue keeps the whole plugin's set dark, exactly
-    as the trigger gate treats trigger issues."""
+    as the trigger gate treats trigger issues.
+
+    Both halves report ``(ok, issues)`` and a NOT-ok half keeps the plugin dark
+    (#453). An empty issue list is the positive claim "no gap"; a recomputation
+    that could not run at all produces the same empty list, so reading it as a
+    verdict is how the one check that must fail closed would fail open.
+
+    ONE pinned registry resolution serves both halves (#454): the gate is a
+    single decision, and composing a trigger position read from one registry
+    generation with a callback position read from another is the same defect
+    inside the gate that the reconcilers fixed inside a pass. Blocking I/O —
+    this reads the secret sidecars and the marker pair — so callers on the event
+    loop must run it in a thread.
+    """
     import callback_reconcile as _cr
+    import plugin_registry as _pr
     import trigger_reconcile as _tr
-    for issues, prefix in ((_tr.current_issues(), "trigger_"),
-                           (_cr.current_issues(), "callback_")):
+    pinned = _pr.pinned_resolver()
+    for (ok, issues), prefix in ((_tr.issue_state(pinned), "trigger_"),
+                                 (_cr.issue_state(pinned), "callback_")):
+        if not ok:
+            return False
         if any(str(getattr(i, "reason_code", "")).startswith(prefix)
                and getattr(i, "name", "") == plugin for i in issues):
             return False
