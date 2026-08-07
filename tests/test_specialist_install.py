@@ -2164,3 +2164,107 @@ def test_bundled_triggers_still_refused_alongside_events(
     with pytest.raises(SpecialistInstallError) as exc:
         _inspect_bundled(tmp_path, component_dir, monkeypatch)
     assert exc.value.kind == "bundled_triggers_unsupported"
+
+
+# ---------------------------------------------------------------------------
+# #431: the .mcp.json ${VAR} carve-out must cover BOTH documented expansion
+# forms. It used to match only the bare form, so a `${VAR:-default}` left
+# `${` in the leaf and tripped the forbidden-marker gate — a BUNDLED plugin
+# was refused at install for syntax a standalone plugin may use freely.
+# ---------------------------------------------------------------------------
+
+def _leaf_rejected(leaf: str) -> bool:
+    """True iff *leaf* trips the real gate. Calls the PRODUCTION function
+    rather than re-deriving its predicate: the first version of this helper
+    reimplemented the carve-out, and silently stopped mirroring the gate the
+    moment the gate changed shape."""
+    import specialist_install as si
+    try:
+        si._walk_reject_markers_in_json(leaf)
+    except ValueError:
+        return True
+    return False
+
+
+@pytest.mark.parametrize("leaf", [
+    "${CLAUDE_PLUGIN_ROOT}/server/main.py",   # the bare form, as before
+    "${MY_SECRET}",
+    "${MY_OPTIONAL_TOKEN:-}",                 # empty default
+    "${BANKFEED_EB_ENVIRONMENT:-sandbox}",    # real default
+    "${API_BASE:-https://api.example.com/v1}",
+])
+def test_documented_expansion_forms_survive_the_marker_gate(leaf):
+    assert not _leaf_rejected(leaf)
+
+
+@pytest.mark.parametrize("leaf", [
+    "${VAR:-<script>}",        # the carve-out must not swallow an HTML open
+    "${VAR:-{{evil}}}",        # ...nor a Jinja marker
+    "${VAR:-{%raw%}}",
+    "a bare ${ on its own",
+    "{{template}}",
+    "!include secrets.yaml",
+])
+def test_the_carve_out_cannot_smuggle_a_marker_past_the_gate(leaf):
+    """The carve-out DELETES what it matches before the scan runs, so the
+    default body is a conservative charset — anything it admits is something
+    the marker scan can no longer see."""
+    assert _leaf_rejected(leaf)
+
+
+@pytest.mark.parametrize("leaf", [
+    "<${CASA_NEVER_SET:-script}>",          # realizes to <script>
+    "!${CASA_NEVER_SET:-include} secrets.yaml",
+    "<${CASA_NEVER_SET:-platform_frame}>",
+])
+def test_a_marker_split_across_the_expansion_is_still_caught(leaf):
+    """r1 (Sol): DELETING the expansion let a marker be assembled from the
+    text AROUND it — neither half is a marker on its own, so no charset
+    restriction inside the default could catch it. The gate scans the
+    REALIZED string, which is closed under this by construction."""
+    assert _leaf_rejected(leaf)
+
+
+@pytest.mark.parametrize("leaf", [
+    "${API_URL:-https://api.example.com/v1?mode=read&x=1}",
+    "${HOME_DIR:-~/.cache/thing}",
+    "${GREETING:-hello there}",
+])
+def test_realistic_defaults_are_not_collateral(leaf):
+    """The realized-form scan is also strictly MORE permissive than the
+    charset attempt it replaced, which rejected ordinary URL defaults."""
+    assert not _leaf_rejected(leaf)
+
+
+def test_env_name_collision_sees_defaulted_refs_on_both_sides(monkeypatch,
+                                                              tmp_path):
+    """#431: a collision is about which names are CLAIMED, not which must
+    resolve. Reading either side with the requirement set would let a
+    `${VAR:-}` hide the clash — the incoming tree's side was fixed first and
+    the INSTALLED side was still bare-form."""
+    import json as _json
+    from types import SimpleNamespace
+
+    import plugin_registry
+    import specialist_install as si
+
+    installed = tmp_path / "installed"
+    installed.mkdir()
+    (installed / ".mcp.json").write_text(_json.dumps({"mcpServers": {"s": {
+        "command": "node",
+        # The installed plugin claims the name via the DEFAULTED form.
+        "env": {"K": "${SHARED_NAME:-}"}}}}), encoding="utf-8")
+
+    monkeypatch.setattr(plugin_registry, "owned_entries_for",
+                        lambda *_a, **_k: [])
+    monkeypatch.setattr(plugin_registry, "snapshot_registry", lambda: None)
+    monkeypatch.setattr(
+        plugin_registry, "resolve_all",
+        lambda: SimpleNamespace(plugins=[
+            SimpleNamespace(name="other", path=str(installed))]))
+
+    # The incoming tree requires the same name, bare.
+    assert si._env_name_conflicts({"SHARED_NAME"}, exclude_owner="slug") == [
+        "SHARED_NAME"]
+    # Sanity: an unrelated name is not a conflict.
+    assert si._env_name_conflicts({"OTHER_NAME"}, exclude_owner="slug") == []

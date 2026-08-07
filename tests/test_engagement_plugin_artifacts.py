@@ -77,7 +77,7 @@ def _declaring_artifact(tmp_path, *, casa, refs=True):
         _json.dumps({"name": "bank-feed", "version": "1.0.0", "casa": casa}),
         encoding="utf-8")
     env = ({"KEY": "${CASA_PLUGIN_BANKFEED_PRIVATE_KEY}",
-            "CP": "${CASA_PLUGIN_BANKFEED_CP_TOKEN}"} if refs else {})
+            "CP": "${CASA_PLUGIN_BANKFEED_CP_TOKEN:-}"} if refs else {})
     (root / ".mcp.json").write_text(_json.dumps({"mcpServers": {"bank-feed": {
         "command": "node", "env": env}}}), encoding="utf-8")
     return root
@@ -86,7 +86,6 @@ def _declaring_artifact(tmp_path, *, casa, refs=True):
 _BANKFEED_CASA = {
     "setupTool": "setup_bank_feed",
     "setupProvides": ["CASA_PLUGIN_BANKFEED_PRIVATE_KEY"],
-    "optionalEnv": ["CASA_PLUGIN_BANKFEED_CP_TOKEN"],
 }
 
 
@@ -98,8 +97,7 @@ def _clear(monkeypatch):
 
 def test_run_script_pins_declared_vars_as_empty_exports(tmp_path, monkeypatch):
     """Without this a declared-but-unresolved ${VAR} reaches the MCP server as
-    the literal placeholder — and an optionalEnv declaration makes verify
-    report the plugin READY, so the leak would be invisible."""
+    the literal placeholder."""
     from drivers.workspace import render_run_script
     _clear(monkeypatch)
     root = _declaring_artifact(tmp_path, casa=_BANKFEED_CASA)
@@ -107,7 +105,7 @@ def test_run_script_pins_declared_vars_as_empty_exports(tmp_path, monkeypatch):
         engagement_id="e" * 32, permission_mode="acceptEdits", extra_dirs=[],
         plugin_dirs=[str(root)])
     assert "export CASA_PLUGIN_BANKFEED_PRIVATE_KEY=\'\'" in out
-    assert "export CASA_PLUGIN_BANKFEED_CP_TOKEN=\'\'" in out
+    assert "CASA_PLUGIN_BANKFEED_CP_TOKEN" not in out
 
 
 def test_run_script_pins_a_declared_var_the_launch_config_never_names(
@@ -136,7 +134,7 @@ def test_run_script_leaves_a_wired_value_alone(tmp_path, monkeypatch):
         engagement_id="e" * 32, permission_mode="acceptEdits", extra_dirs=[],
         plugin_dirs=[str(root)])
     assert "CASA_PLUGIN_BANKFEED_PRIVATE_KEY" not in out
-    assert "export CASA_PLUGIN_BANKFEED_CP_TOKEN=\'\'" in out
+    assert "CASA_PLUGIN_BANKFEED_CP_TOKEN" not in out
 
 
 def test_run_script_no_overlay_without_declarations(tmp_path, monkeypatch):

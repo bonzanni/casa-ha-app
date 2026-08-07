@@ -408,3 +408,62 @@ def test_verify_reason_order_keeps_artifact_reason_first(tmp_path):
     r = _verify(tmp_path)
     assert r["ready"] is False
     assert r["reasons"][0] in ("artifact_invalid", "corrupt_artifact")
+
+
+# ---------------------------------------------------------------------------
+# #431 r1: the var-reference scanner these verdicts use was, in v0.154.0,
+# SHADOWED by a same-named declaration-grammar constant defined later in
+# plugin_store. Every lookup resolved to the wrong pattern, so no `${VAR}`
+# was ever detected — a var-dependent command was probed as a literal path
+# and reported `mcp_command_missing`, which REFUSES a bundled install.
+# ---------------------------------------------------------------------------
+
+def test_ref_scanner_is_not_shadowed_by_the_declaration_grammar():
+    """The regression itself, at the smallest possible scope."""
+    import plugin_store
+    assert plugin_store._MCP_REF_VAR_RE.search("${FOO}")
+    assert plugin_store._MCP_REF_VAR_RE.search("${FOO:-bar}")
+    # The declaration grammar is a DIFFERENT name and must not match a
+    # reference (it grades bare declared names, not `${...}` syntax).
+    assert not plugin_store._DECLARABLE_ENV_NAME_RE.fullmatch("${FOO}")
+    assert plugin_store._DECLARABLE_ENV_NAME_RE.fullmatch("CASA_PLUGIN_FOO")
+
+
+@pytest.mark.parametrize("command", ["${MCP_BIN}", "${MCP_BIN:-node}"])
+def test_var_dependent_command_is_unchecked_never_missing(tmp_path, command):
+    """Both documented expansion forms are unresolvable here by design — the
+    value is only known at spawn time — so they report `unchecked` and never
+    block. Reporting `missing` would refuse the plugin's bundled install."""
+    import json as _json
+    import plugin_store
+    root = tmp_path / "art"
+    root.mkdir()
+    mcp = root / ".mcp.json"
+    mcp.write_text(_json.dumps({"mcpServers": {"s": {"command": command}}}),
+                   encoding="utf-8")
+    rows = plugin_store.mcp_command_verdicts(mcp, root, _which=lambda _c: None)
+    assert [r["status"] for r in rows] == ["unchecked"]
+
+
+@pytest.mark.parametrize("arg,expect", [
+    # r1 (Sol): the CLI ALWAYS sets these, so a default is meaningless — but
+    # the defaulted spelling used to skip the exact-prefix containment check
+    # and resolve OUTSIDE the checksummed artifact at runtime.
+    ("${CLAUDE_PLUGIN_ROOT:-.}/../elsewhere/server.py", "missing"),
+    ("${CLAUDE_PLUGIN_ROOT:-.}/nope.py", "missing"),
+    ("${CLAUDE_PLUGIN_ROOT}/server/ok.py", "ok"),
+    ("${CLAUDE_PLUGIN_ROOT:-.}/server/ok.py", "ok"),
+])
+def test_defaulted_plugin_root_is_held_to_containment(tmp_path, arg, expect):
+    import json as _json
+    import plugin_store
+    root = tmp_path / "art"
+    (root / "server").mkdir(parents=True)
+    (root / "server" / "ok.py").write_text("x", encoding="utf-8")
+    mcp = root / ".mcp.json"
+    mcp.write_text(_json.dumps({"mcpServers": {"s": {
+        "command": "python3", "args": [arg]}}}), encoding="utf-8")
+    rows = plugin_store.mcp_command_verdicts(
+        mcp, root, _which=lambda _c: "/usr/bin/python3")
+    arg_rows = [r for r in rows if r["ref"] != "python3"]
+    assert [r["status"] for r in arg_rows] == [expect]

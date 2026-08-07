@@ -613,7 +613,10 @@ def _env_name_conflicts(tree_env_names: "set[str]", *, exclude_owner: str) -> "l
     preflight"; brief Step 7). `tree_env_names` are the `${VAR}` references a
     sourced plugin's OWN `.mcp.json` requires (plugin_env_extractor —
     ownership-blind, NOT plugin_env_conf, which stores VALUES not per-plugin
-    ownership). The installed-side inventory is the same extraction run over
+    ownership). #431: BOTH reference forms count on BOTH sides — a collision
+    is about which names are claimed, not which must resolve, and reading one
+    side with the requirement set would let a `${VAR:-}` on EITHER side hide
+    the clash. The installed-side inventory is the same extraction run over
     every OTHER validated installed artifact's `.mcp.json`
     (`plugin_registry.resolve_all().plugins`), excluding entries owned by
     `exclude_owner` (the slug's own set, being replaced on upgrade — its own
@@ -633,7 +636,8 @@ def _env_name_conflicts(tree_env_names: "set[str]", *, exclude_owner: str) -> "l
     for rp in plugin_registry.resolve_all().plugins:
         if rp.name in owned_names:
             continue
-        installed_names |= plugin_env_extractor.extract_env_vars(Path(rp.path) / ".mcp.json")
+        installed_names |= plugin_env_extractor.extract_referenced_env_vars(
+            Path(rp.path) / ".mcp.json")
     return sorted(tree_env_names & installed_names)
 
 
@@ -705,7 +709,31 @@ class _PluginSurfaces:
 _EMPTY_SURFACES = _PluginSurfaces()
 
 
-_MCP_JSON_VAR_RE = re.compile(r"\$\{[A-Za-z_][A-Za-z0-9_]*\}")
+# #431: the ``.mcp.json`` expansion carve-out, covering BOTH documented
+# forms — ``${VAR}`` and ``${VAR:-default}``. It used to match only the bare
+# form, so a defaulted reference left ``${`` in the leaf and tripped the
+# forbidden-marker gate: a BUNDLED plugin was refused at install for syntax a
+# standalone plugin may use freely. That asymmetry was the bug.
+_MCP_JSON_VAR_RE = re.compile(
+    r"\$\{[A-Za-z_][A-Za-z0-9_]*(?::-(?P<default>[^{}]*))?\}")
+
+
+def _realize_mcp_expansions(text: str) -> str:
+    """The string as the CLI will actually produce it, for marker scanning.
+
+    A bare ``${VAR}`` is DELETED: its value comes from the environment at
+    spawn time, so the plugin author does not control it and cannot smuggle
+    anything through it. A ``${VAR:-default}`` is REPLACED BY ITS DEFAULT,
+    because that text IS author-controlled and is what the CLI substitutes
+    when the variable is unset.
+
+    Substituting rather than deleting is the whole point (r1, Sol): deleting
+    the expansion lets a marker be assembled from the text AROUND it —
+    ``"<${NEVER_SET:-script}>"`` scans as ``<>`` and passes, then expands to
+    ``<script>`` at runtime. Restricting which characters may appear inside
+    the default cannot fix that, because neither half is a marker on its own.
+    Scanning the realized form is closed under this by construction."""
+    return _MCP_JSON_VAR_RE.sub(lambda m: m.group("default") or "", text)
 
 
 def _walk_reject_markers_in_json(value: object) -> None:
@@ -715,7 +743,7 @@ def _walk_reject_markers_in_json(value: object) -> None:
     `_reject_forbidden_markers_in_json` for why both pieces (parsed-leaf, not
     raw-text; `${VAR}`-stripped, not blanket) are required together."""
     if isinstance(value, str):
-        if contains_forbidden_marker(_MCP_JSON_VAR_RE.sub("", value)):
+        if contains_forbidden_marker(_realize_mcp_expansions(value)):
             raise ValueError("template, include, HTML, or delimiter detected")
     elif isinstance(value, dict):
         for key, item in value.items():
@@ -768,7 +796,7 @@ def _reject_forbidden_markers_in_json(text: str) -> None:
     try:
         parsed = json.loads(text)
     except ValueError:
-        reject_forbidden_markers(_MCP_JSON_VAR_RE.sub("", text))
+        reject_forbidden_markers(_realize_mcp_expansions(text))
         return
     _walk_reject_markers_in_json(parsed)
 
@@ -937,7 +965,12 @@ def _validate_sourced_plugin_tree(
         return ("mcp_command_missing: " + "; ".join(
             f"{v['server']}:{v['ref']} ({v.get('reason', '')})" for v in missing), _EMPTY_SURFACES)
 
-    tree_env_names = plugin_env_extractor.extract_env_vars(mcp_json_path)
+    # #431: BOTH reference forms here — the consent enumeration and the
+    # collision preflight are about which names the tree touches, not which
+    # must resolve. Using the requirement set would let a bundled plugin
+    # reuse a name another plugin owns by writing ``${VAR:-}``.
+    tree_env_names = plugin_env_extractor.extract_referenced_env_vars(
+        mcp_json_path)
     conflicts = _env_name_conflicts(tree_env_names, exclude_owner=slug)
     if conflicts:
         return f"{ENV_NAME_COLLISION}: colliding env name(s): " + ", ".join(conflicts), _EMPTY_SURFACES

@@ -1045,9 +1045,9 @@ def test_verify_disabled_specialist_does_not_mask_config_failure(
 #
 # Both stop WITHHOLDING the plugin (plugin_grants), but they carry opposite
 # READINESS meanings here — which is the whole reason they are two fields and
-# not one "optional" marker. A plain optional marker would have fixed the
-# genuinely-optional token while wrongly making a credential the setup tool
-# must create look optional during ordinary sessions too.
+# The declaration exists ONLY for the readiness signal: a genuinely optional
+# variable needs no declaration, because `${VAR:-}` in .mcp.json expands to
+# empty and is invisible to the extractor (#431).
 # ---------------------------------------------------------------------------
 
 _SETUP_ENV_SERVERS = {"s": {"env": {
@@ -1081,32 +1081,18 @@ def test_verify_setup_provided_var_is_unprovisioned_and_not_ready(tmp_path):
     assert "setup_env_unprovisioned" in r["reasons"]
 
 
-def test_verify_optional_var_is_optional_and_does_not_block(tmp_path):
-    """An optional token that never resolves is not a defect at all."""
-    r = _setup_env_plugin(
-        tmp_path, setupTool="setup_bank_feed",
-        setupProvides=["CASA_PLUGIN_BANKFEED_PRIVATE_KEY"],
-        optionalEnv=["CASA_PLUGIN_BANKFEED_CP_TOKEN"])
-    cp = next(s for s in r["secrets"]
-              if s["var"] == "CASA_PLUGIN_BANKFEED_CP_TOKEN")
-    assert cp["status"] == "optional"
-    # Still not ready — but only because of the setup-provided one.
-    assert r["reasons"] == ["setup_env_unprovisioned"]
-
-
-def test_verify_ready_once_only_optional_vars_remain(tmp_path, monkeypatch):
-    """The self-clearing half: once the setup run lands its credential, the
-    row disappears and the plugin grades ready with the optional one still
-    absent."""
+def test_verify_ready_once_the_setup_credential_lands(tmp_path, monkeypatch):
+    """The self-clearing half: once the setup run lands its credential the
+    unprovisioned row disappears and the plugin grades ready."""
     monkeypatch.setenv("CASA_PLUGIN_BANKFEED_PRIVATE_KEY", "-----BEGIN KEY-----")
+    monkeypatch.setenv("CASA_PLUGIN_BANKFEED_CP_TOKEN", "cp-tok")
     r = _setup_env_plugin(
         tmp_path, setupTool="setup_bank_feed",
-        setupProvides=["CASA_PLUGIN_BANKFEED_PRIVATE_KEY"],
-        optionalEnv=["CASA_PLUGIN_BANKFEED_CP_TOKEN"])
+        setupProvides=["CASA_PLUGIN_BANKFEED_PRIVATE_KEY"])
     assert r["ready"] is True
     assert {s["var"]: s["status"] for s in r["secrets"]} == {
         "CASA_PLUGIN_BANKFEED_PRIVATE_KEY": "resolved",
-        "CASA_PLUGIN_BANKFEED_CP_TOKEN": "optional",
+        "CASA_PLUGIN_BANKFEED_CP_TOKEN": "resolved",
     }
 
 
@@ -1128,11 +1114,11 @@ def test_verify_malformed_declaration_is_visible_not_silent(tmp_path):
     mk_artifact(store, "probe", e["artifact_id"],
                 mcp_servers=_SETUP_ENV_SERVERS,
                 extra_manifest={"casa": {"setupTool": "setup_x",
-                                         "optionalEnv": "not-a-list"}})
+                                         "setupProvides": "not-a-list"}})
     mk_registry(tmp_path, [e])
     r = _verify(tmp_path)
     assert r["ready"] is False
-    assert "optional_env_invalid" in r["reasons"]
+    assert "setup_provides_invalid" in r["reasons"]
 
 
 def test_verify_casa_owned_var_names_the_app_option(tmp_path, monkeypatch):

@@ -184,14 +184,20 @@ def env_remediation_hint(missing) -> str:
 
 def declared_absent_env_vars_for_resolved(rp) -> set[str]:
     """The env vars this plugin's manifest declares Casa must NOT withhold it
-    for (#429): ``casa.setupProvides`` (its own setup tool creates them) and
-    ``casa.optionalEnv`` (it genuinely does not need them).
+    for (#429): ``casa.setupProvides`` — the ones the plugin's OWN setup tool
+    creates.
 
     0.153.0's gate held a settled setup episode until every ``${VAR}`` in
-    ``.mcp.json`` resolved, which deadlocks any plugin whose setup tool
-    exists to PROVISION its credentials: setup cannot run until they exist,
-    and they only exist after setup runs. The plugin had no way to say so —
-    these two declarations are that way.
+    ``.mcp.json`` resolved, which deadlocks any plugin whose setup tool exists
+    to PROVISION its credentials: setup cannot run until they exist, and they
+    only exist after setup runs. The plugin had no way to say so — this
+    declaration is that way.
+
+    A genuinely OPTIONAL variable needs no declaration and is not one of
+    these (#431): ``${VAR:-}`` in ``.mcp.json`` already expands to empty and
+    is invisible to the extractor, so it neither withholds nor leaks a
+    placeholder. What a default cannot express is readiness, which is the
+    only reason ``setupProvides`` exists as a declaration at all.
 
     FAIL CLOSED on malformed metadata, matching
     :func:`declared_tools_for_resolution`: a manifest whose declaration does
@@ -199,22 +205,18 @@ def declared_absent_env_vars_for_resolved(rp) -> set[str]:
     behaviour (withheld) instead of having a broken declaration relax its
     gate. ``artifact_verdict`` already excludes such an artifact from
     resolution; this is the belt for a path that somehow reaches here."""
-    from plugin_store import (
-        StoreError, manifest_optional_env, manifest_setup_provides,
-    )
+    from plugin_store import StoreError, manifest_setup_provides
     manifest = getattr(rp, "manifest", None)
     if not isinstance(manifest, dict):
         return set()
-    out: set[str] = set()
-    for reader in (manifest_setup_provides, manifest_optional_env):
-        try:
-            out.update(reader(manifest))
-        except StoreError as exc:
-            logger.warning(
-                "plugin %s: %s — treating its env declaration as absent "
-                "(the plugin stays withheld until the vars resolve)",
-                getattr(rp, "name", "?"), exc)
-    return out
+    try:
+        return set(manifest_setup_provides(manifest))
+    except StoreError as exc:
+        logger.warning(
+            "plugin %s: %s — treating its env declaration as absent "
+            "(the plugin stays withheld until the vars resolve)",
+            getattr(rp, "name", "?"), exc)
+        return set()
 
 
 def blocking_unresolved_env_vars_for_resolved(rp, environ=None) -> list[str]:

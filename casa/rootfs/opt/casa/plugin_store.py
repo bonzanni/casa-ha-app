@@ -328,7 +328,17 @@ def mcp_servers_map(mcp_json_path: Path) -> dict:
     return parse_mcp_servers(mcp_json_path)[0]
 
 
-_ENV_VAR_RE = re.compile(r"\$\{([A-Z_][A-Z0-9_]*)\}")
+# #431 r1: BOTH documented expansion forms, so a ``${VAR:-default}`` in a
+# command/arg is classified "unchecked" like any other var-dependent
+# reference instead of being probed as a literal path and reported missing.
+# NAMED DISTINCTLY from the declaration grammar further down: the two were
+# both called ``_ENV_VAR_RE``, and the later module-level binding SHADOWED
+# this one — every lookup here resolved to the declaration pattern, so no
+# ``${VAR}`` was ever detected and a plugin with a variable in its command
+# or args was wrongly reported ``mcp_command_missing`` (which refuses a
+# bundled install). Shipped in v0.154.0; pinned by
+# tests/test_mcp_command_verdicts.py.
+_MCP_REF_VAR_RE = re.compile(r"\$\{([A-Z_][A-Z0-9_]*)(?::-[^{}]*)?\}")
 _PLUGIN_ROOT_VAR = "${CLAUDE_PLUGIN_ROOT}"
 _PLUGIN_DATA_VAR = "${CLAUDE_PLUGIN_DATA}"
 
@@ -359,6 +369,31 @@ def reserved_env_violations(mcp_json_path: Path) -> list[str]:
                     "native value (self-reference yields the literal "
                     "placeholder)")
     return violations
+
+
+# #431 r1 (Sol): the CLI ALWAYS provides these, so a default on one is
+# meaningless — but writing ``${CLAUDE_PLUGIN_ROOT:-.}/../elsewhere`` would
+# slip past the exact-prefix containment check below and resolve outside the
+# checksummed artifact at runtime, when the variable is in fact set. Fold the
+# defaulted spelling back onto the bare one BEFORE any containment reasoning,
+# so both forms are held to the same rule.
+_CLI_PROVIDED_DEFAULTED_RE = re.compile(
+    r"\$\{(CLAUDE_PLUGIN_ROOT|CLAUDE_PLUGIN_DATA):-[^{}]*\}")
+
+
+def normalize_cli_provided_refs(text: str) -> str:
+    """Fold ``${CLAUDE_PLUGIN_ROOT:-…}`` / ``${CLAUDE_PLUGIN_DATA:-…}`` onto
+    their bare spelling. SHARED, not duplicated: every place that reasons
+    about artifact containment by testing for the exact ``${CLAUDE_PLUGIN_
+    ROOT}`` prefix must apply this first, or the defaulted spelling walks
+    past it. Two such places exist — this module's ``mcp_command_verdicts``
+    and the pre-push launch-ref guard in ``hooks._scan_mcp_launch_refs`` —
+    and the second was found only after the first was fixed (r2, Terra), so
+    they read from ONE definition rather than each keeping a copy."""
+    return _CLI_PROVIDED_DEFAULTED_RE.sub(r"${\1}", text)
+
+
+_normalize_cli_provided = normalize_cli_provided_refs   # module-local alias
 
 
 def mcp_command_verdicts(mcp_json_path: Path, plugin_root: Path | str,
@@ -409,7 +444,7 @@ def mcp_command_verdicts(mcp_json_path: Path, plugin_root: Path | str,
     def _check_root_path(server: str, ref: str, candidate: str,
                          *, require_exec: bool) -> None:
         resolved = candidate.replace(_PLUGIN_ROOT_VAR, root)
-        if _ENV_VAR_RE.search(resolved):
+        if _MCP_REF_VAR_RE.search(resolved):
             return  # env-dependent — cannot judge, never block
         if _escapes_root(resolved):
             _row(server, ref, "missing",
@@ -432,6 +467,7 @@ def mcp_command_verdicts(mcp_json_path: Path, plugin_root: Path | str,
             _row(server, ref, "missing", f"{resolved} does not exist")
 
     def _check_command(server: str, command: str) -> None:
+        command = _normalize_cli_provided(command)
         if command.strip() != command or " " in command or "\t" in command:
             _row(server, command, "unchecked",
                  "shell-form command (single executable token only)")
@@ -447,7 +483,7 @@ def mcp_command_verdicts(mcp_json_path: Path, plugin_root: Path | str,
             _row(server, command, "unchecked",
                  "non-prefix ${CLAUDE_PLUGIN_ROOT} use")
             return
-        leftover = _ENV_VAR_RE.search(command)
+        leftover = _MCP_REF_VAR_RE.search(command)
         if leftover:
             _row(server, command, "unchecked",
                  f"env-dependent command (${{{leftover.group(1)}}})")
@@ -484,12 +520,16 @@ def mcp_command_verdicts(mcp_json_path: Path, plugin_root: Path | str,
         _check_command(name, command)
         args = cfg.get("args")
         for arg in (args if isinstance(args, list) else []):
+            # #431 r1 (Sol): normalize FIRST — a defaulted spelling of a
+            # CLI-provided variable must not slip past containment.
+            arg = _normalize_cli_provided(arg) if isinstance(arg, str) else arg
             if not isinstance(arg, str) or _PLUGIN_ROOT_VAR not in arg:
                 continue
             for cand in _path_candidates(arg):
                 _check_root_path(name, arg, cand, require_exec=False)
         env = cfg.get("env")
         for key, val in (env.items() if isinstance(env, dict) else ()):
+            val = _normalize_cli_provided(val) if isinstance(val, str) else val
             if not isinstance(val, str) or _PLUGIN_ROOT_VAR not in val:
                 continue
             for cand in _path_candidates(val):
@@ -605,16 +645,15 @@ def artifact_verdict(path: Path, *, name: str, repo: str, revision: str,
         manifest_setup_tool(manifest)
     except StoreError:
         return "setup_tool_invalid"
-    # #429: same upgrade-path posture for the two env declarations (gate
-    # added v0.154.0) — they relax the withholding gate, so a malformed one
-    # must exclude the artifact from resolution rather than degrade to "no
+    # #429: same upgrade-path posture for casa.setupProvides (gate added
+    # v0.154.0) — it relaxes the withholding gate, so a malformed one must
+    # exclude the artifact from resolution rather than degrade to "no
     # declaration" and silently re-impose the deadlock (or, worse, be read
     # loosely enough to relax the gate for a name the author never wrote).
-    for _reader in (manifest_setup_provides, manifest_optional_env):
-        try:
-            _reader(manifest)
-        except StoreError as _exc:
-            return _exc.reason_code
+    try:
+        manifest_setup_provides(manifest)
+    except StoreError as _exc:
+        return _exc.reason_code
     return None
 
 
@@ -1036,23 +1075,12 @@ def manifest_setup_tool(manifest: dict) -> str | None:
 # ``${VAR}`` it likes in ``.mcp.json``; an undeclared one simply withholds
 # the plugin as it did before, binding nothing.
 PLUGIN_ENV_DECLARATION_PREFIX = "CASA_PLUGIN_"
-_ENV_VAR_RE = re.compile(r"^CASA_PLUGIN_[A-Z0-9][A-Z0-9_]{0,110}$")
+_DECLARABLE_ENV_NAME_RE = re.compile(
+    r"^CASA_PLUGIN_[A-Z0-9][A-Z0-9_]{0,110}$")
 # Bounded so a malformed/hostile manifest cannot make the withhold gate walk
 # an arbitrarily long declaration on every session build.
 _MAX_ENV_DECLARATIONS = 32
 
-# #429 hardening: a declared name is BOUND — the session builder pins it to
-# "" in the CLI subprocess's environment while it is unresolved. That is
-# exactly the intent for a plugin's own credential, and exactly wrong for a
-# name the plugin does not own: before this release such a plugin was simply
-# WITHHELD, so it injected nothing; declaring the name is now the difference
-# between "absent" and "empty" for the whole session, which for a name the
-# CLI or Casa reads is a behaviour change the plugin has no business making.
-# A plugin may only declare names it owns.
-#
-# Distinct from RESERVED_PLUGIN_ENV_KEYS above, which is about a server's
-# ``env`` KEY shadowing a value the CLI injects per plugin. This is about a
-# manifest DECLARATION binding a name process-wide for the session.
 # Casa-owned env vars a PLUGIN may legitimately reference but never supply:
 # ``svc-casa/run`` exports each from the named app option. Mapped rather than
 # listed because the value is also the operator-facing remediation — telling
@@ -1068,46 +1096,6 @@ CASA_OWNED_ENV_OPTIONS: dict[str, str] = {
 }
 
 
-def _manifest_env_list(manifest: dict, key: str, reason_code: str) -> list[str]:
-    """Shared strict reader for the two ``casa`` env-name lists (#429).
-    ABSENT → ``[]``. PRESENT-but-malformed (not a list, a non-string or
-    non-env-grammar member, a duplicate, a name the plugin does not own, or
-    over the count cap) is a plugin-author error: raises
-    ``StoreError(reason_code=...)``. Returns the declared names in manifest
-    order."""
-    casa = manifest.get("casa")
-    if not isinstance(casa, dict) or key not in casa:
-        return []
-    raw = casa.get(key)
-    if not isinstance(raw, list):
-        raise StoreError(
-            f"casa.{key} invalid: must be a list of environment-variable "
-            f"names, got {type(raw).__name__}",
-            reason_code=reason_code)
-    if len(raw) > _MAX_ENV_DECLARATIONS:
-        raise StoreError(
-            f"casa.{key} invalid: at most {_MAX_ENV_DECLARATIONS} names "
-            f"(got {len(raw)})",
-            reason_code=reason_code)
-    out: list[str] = []
-    for item in raw:
-        if not isinstance(item, str) or not _ENV_VAR_RE.fullmatch(item):
-            raise StoreError(
-                f"casa.{key} invalid: {item!r} is not declarable. A declared "
-                f"name must be {PLUGIN_ENV_DECLARATION_PREFIX}<NAME> "
-                "(upper-case ASCII, digits and underscores) — declaring a "
-                "name binds it for the whole session, so the declaration "
-                "namespace is reserved. Reference any variable you like in "
-                ".mcp.json; only DECLARED names are fenced",
-                reason_code=reason_code)
-        if item in out:
-            raise StoreError(
-                f"casa.{key} invalid: {item!r} declared twice",
-                reason_code=reason_code)
-        out.append(item)
-    return out
-
-
 def manifest_setup_provides(manifest: dict) -> list[str]:
     """Guarded + STRICT ``casa.setupProvides`` extraction (#429): the env
     vars the plugin's OWN ``casa.setupTool`` creates — a private key it
@@ -1119,36 +1107,63 @@ def manifest_setup_provides(manifest: dict) -> list[str]:
     (:func:`plugin_grants.blocking_unresolved_env_vars_for_resolved`) so the
     cycle breaks, and is passed to the session as an EMPTY string rather
     than left to expand as the literal ``${VAR}`` placeholder — the failure
-    mode #423 fixed. It is NOT excluded from readiness: verify reports
-    ``setup_env_unprovisioned`` until the value actually lands, so a setup
-    tool that never ran is loud rather than silent.
+    mode #423 fixed.
 
-    Declaring this WITHOUT a ``casa.setupTool`` is refused: the field's
-    whole meaning is "my setup tool creates this", so without one it would
-    be an undeclared way to mark a credential optional (that is what
-    ``casa.optionalEnv`` is for)."""
-    provides = _manifest_env_list(manifest, "setupProvides",
-                                  "setup_provides_invalid")
-    if provides and not manifest_setup_tool(manifest):
+    What it is NOT is a way to say "optional". It is deliberately the ONLY
+    declaration Casa offers (#431): ``${VAR:-}`` in ``.mcp.json`` already
+    covers a genuinely optional variable — the CLI expands it to empty and
+    Casa's extractor does not match that form, so it neither withholds nor
+    leaks a placeholder, with no declaration and no reserved name. What a
+    default cannot express is READINESS, and that is exactly what this
+    field carries: verify reports ``setup_env_unprovisioned`` until the
+    value actually lands, so a setup tool that never ran stays loud instead
+    of the plugin passing as configured on empty credentials.
+
+    Declaring this WITHOUT a ``casa.setupTool`` is therefore refused: with
+    no setup tool there is nothing to be unprovisioned by, and the field
+    would just be a roundabout ``${VAR:-}``.
+
+    PRESENT-but-malformed (not a list, a non-string or non-env-grammar
+    member, a name outside the reserved declaration namespace, a duplicate,
+    or over the count cap) is a plugin-author error: raises
+    ``StoreError(reason_code="setup_provides_invalid")``."""
+    casa = manifest.get("casa")
+    if not isinstance(casa, dict) or "setupProvides" not in casa:
+        return []
+    raw = casa.get("setupProvides")
+    if not isinstance(raw, list):
+        raise StoreError(
+            "casa.setupProvides invalid: must be a list of environment-"
+            f"variable names, got {type(raw).__name__}",
+            reason_code="setup_provides_invalid")
+    if len(raw) > _MAX_ENV_DECLARATIONS:
+        raise StoreError(
+            f"casa.setupProvides invalid: at most {_MAX_ENV_DECLARATIONS} "
+            f"names (got {len(raw)})",
+            reason_code="setup_provides_invalid")
+    out: list[str] = []
+    for item in raw:
+        if not isinstance(item, str) or not _DECLARABLE_ENV_NAME_RE.fullmatch(item):
+            raise StoreError(
+                f"casa.setupProvides invalid: {item!r} is not declarable. A "
+                f"declared name must be {PLUGIN_ENV_DECLARATION_PREFIX}<NAME> "
+                "(upper-case ASCII, digits and underscores) — declaring a "
+                "name binds it for the whole session, so the declaration "
+                "namespace is reserved. Reference any variable you like in "
+                ".mcp.json; only DECLARED names are fenced",
+                reason_code="setup_provides_invalid")
+        if item in out:
+            raise StoreError(
+                f"casa.setupProvides invalid: {item!r} declared twice",
+                reason_code="setup_provides_invalid")
+        out.append(item)
+    if out and not manifest_setup_tool(manifest):
         raise StoreError(
             "casa.setupProvides invalid: declared without a casa.setupTool — "
-            "the field means 'my setup tool provisions these'; use "
-            "casa.optionalEnv for genuinely optional variables",
+            "the field means 'my setup tool provisions these'. For a "
+            "genuinely optional variable use ${VAR:-} in .mcp.json instead",
             reason_code="setup_provides_invalid")
-    return provides
-
-
-def manifest_optional_env(manifest: dict) -> list[str]:
-    """Guarded + STRICT ``casa.optionalEnv`` extraction (#429): env vars the
-    plugin's ``.mcp.json`` references but genuinely does not need (an
-    optional consent-platform token, a feature-flag endpoint). Absent →
-    ``[]``.
-
-    Structurally beside :func:`manifest_setup_provides` and excluded from
-    the same withholding gate with the same empty-string sanitization, but
-    with the opposite READINESS meaning: an optional var that never resolves
-    is not a defect, so it does not make verify report not-ready."""
-    return _manifest_env_list(manifest, "optionalEnv", "optional_env_invalid")
+    return out
 
 
 def manifest_protected_tools(manifest: dict) -> list:
@@ -1309,10 +1324,9 @@ def validate_manifest(root: Path, expected_name: str, *,
     # v0.112.0: a PRESENT-but-malformed casa.setupTool refuses the
     # install/update outright (strict; raises setup_tool_invalid).
     manifest_setup_tool(manifest)
-    # #429: same for the two env declarations — they RELAX the withholding
-    # gate, so an install must never accept one Casa would have to interpret.
+    # #429: same for casa.setupProvides — it RELAXES the withholding gate,
+    # so an install must never accept one Casa would have to interpret.
     manifest_setup_provides(manifest)
-    manifest_optional_env(manifest)
     return manifest
 
 

@@ -359,13 +359,13 @@ def test_protected_map_empty_resolution():
 
 
 # ---------------------------------------------------------------------------
-# #429: casa.setupProvides / casa.optionalEnv — breaking the setup deadlock
+# #429: casa.setupProvides — breaking the setup-provisioning deadlock
 # ---------------------------------------------------------------------------
 
 _BANKFEED_SERVERS = {"bank-feed": {"command": "node", "env": {
     "KEY": "${CASA_PLUGIN_BANKFEED_PRIVATE_KEY}",
     "APP": "${CASA_PLUGIN_BANKFEED_APP_ID}",
-    "CP": "${CASA_PLUGIN_BANKFEED_CP_TOKEN}",
+    "CP": "${CASA_PLUGIN_BANKFEED_CP_TOKEN:-}",   # #431: never extracted
     "OP": "${OP_SERVICE_ACCOUNT_TOKEN}",
 }}}
 
@@ -373,7 +373,6 @@ _BANKFEED_MANIFEST = {"casa": {
     "setupTool": "setup_bank_feed",
     "setupProvides": ["CASA_PLUGIN_BANKFEED_PRIVATE_KEY",
                       "CASA_PLUGIN_BANKFEED_APP_ID"],
-    "optionalEnv": ["CASA_PLUGIN_BANKFEED_CP_TOKEN"],
 }}
 
 
@@ -385,8 +384,7 @@ def _bankfeed(tmp_path, manifest=None):
 
 def test_declared_absent_unions_both_fields(tmp_path):
     assert declared_absent_env_vars_for_resolved(_bankfeed(tmp_path)) == {
-        "CASA_PLUGIN_BANKFEED_PRIVATE_KEY", "CASA_PLUGIN_BANKFEED_APP_ID",
-        "CASA_PLUGIN_BANKFEED_CP_TOKEN"}
+        "CASA_PLUGIN_BANKFEED_PRIVATE_KEY", "CASA_PLUGIN_BANKFEED_APP_ID"}
 
 
 def test_declared_absent_undeclared_plugin_is_empty(tmp_path):
@@ -418,8 +416,10 @@ def test_blocking_unresolved_excludes_declared_but_keeps_the_rest(tmp_path):
     """THE #429 BUG: four vars unresolved, three of them declared. Only the
     genuinely-missing operator secret may block."""
     rp = _bankfeed(tmp_path)
+    # The CP token is a ${VAR:-} reference, so the extractor never sees it
+    # at all (#431) — no declaration needed and nothing to withhold for.
     assert unresolved_env_vars_for_resolved(rp, {}) == [
-        "CASA_PLUGIN_BANKFEED_APP_ID", "CASA_PLUGIN_BANKFEED_CP_TOKEN",
+        "CASA_PLUGIN_BANKFEED_APP_ID",
         "CASA_PLUGIN_BANKFEED_PRIVATE_KEY", "OP_SERVICE_ACCOUNT_TOKEN"]
     assert blocking_unresolved_env_vars_for_resolved(rp, {}) == [
         "OP_SERVICE_ACCOUNT_TOKEN"]
@@ -461,7 +461,6 @@ def test_sanitized_env_empties_every_declared_unresolved_var(tmp_path):
     assert sanitized_env_for_resolution(res, {}) == {
         "CASA_PLUGIN_BANKFEED_PRIVATE_KEY": "",
         "CASA_PLUGIN_BANKFEED_APP_ID": "",
-        "CASA_PLUGIN_BANKFEED_CP_TOKEN": "",
     }
 
 
@@ -470,8 +469,7 @@ def test_sanitized_env_never_overwrites_a_wired_value(tmp_path):
     res = ResolutionResult(registry_valid=True, plugins=[_bankfeed(tmp_path)])
     env = {"CASA_PLUGIN_BANKFEED_PRIVATE_KEY": "-----BEGIN PRIVATE KEY-----",
            "CASA_PLUGIN_BANKFEED_APP_ID": "app-123"}
-    assert sanitized_env_for_resolution(res, env) == {
-        "CASA_PLUGIN_BANKFEED_CP_TOKEN": ""}
+    assert sanitized_env_for_resolution(res, env) == {}
 
 
 def test_sanitized_env_empties_an_unresolvable_op_reference(tmp_path):

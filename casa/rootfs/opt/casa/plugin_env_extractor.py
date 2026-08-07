@@ -27,7 +27,16 @@ CC_BUILTIN_VARS: frozenset[str] = frozenset({
     "PWD",
 })
 
+# The bare form ONLY — a reference Casa must withhold the plugin for.
 _VAR_PATTERN = re.compile(r"\$\{([A-Z_][A-Z0-9_]*)\}")
+# #431: both documented forms. ``${VAR:-default}`` is NOT a requirement (the
+# CLI substitutes the default, so nothing is missing and no placeholder can
+# leak) — but it IS a reference, and the surfaces that answer "which env
+# names does this tree touch?" must see it: the install-consent enumeration
+# and the cross-plugin ENV_NAME_COLLISION preflight. Keeping them on the
+# bare-form pattern would let a bundled plugin quietly reuse a name another
+# plugin owns simply by writing the defaulted form.
+_ANY_VAR_PATTERN = re.compile(r"\$\{([A-Z_][A-Z0-9_]*)(?::-[^{}]*)?\}")
 
 
 # #423 r3 (Sol r2-4): the CLI expands ${VAR} in the LAUNCH fields only — an
@@ -51,7 +60,7 @@ def _iter_strings(node):
             yield from _iter_strings(val)
 
 
-def extract_env_vars(mcp_json_path: Path | str) -> set[str]:
+def _extract(mcp_json_path: Path | str, pattern) -> set[str]:
     # Sol CI-review: resolve servers via the ONE shared parser so secrets are
     # extracted for BOTH the mcpServers wrapper AND the top-level shape (context7
     # ships the latter) — otherwise a top-level plugin's required secrets would be
@@ -65,6 +74,20 @@ def extract_env_vars(mcp_json_path: Path | str) -> set[str]:
             continue
         for field in _EXPANDED_FIELDS:
             for val in _iter_strings(server.get(field)):
-                for match in _VAR_PATTERN.finditer(val):
+                for match in pattern.finditer(val):
                     vars_found.add(match.group(1))
     return vars_found - CC_BUILTIN_VARS
+
+
+def extract_env_vars(mcp_json_path: Path | str) -> set[str]:
+    """The REQUIRED references — bare ``${VAR}`` only. This is what the
+    withhold gate and the verify secrets rows consume: a ``${VAR:-default}``
+    is satisfied by its own default, so withholding for it would be wrong."""
+    return _extract(mcp_json_path, _VAR_PATTERN)
+
+
+def extract_referenced_env_vars(mcp_json_path: Path | str) -> set[str]:
+    """EVERY referenced name, both forms (#431) — for the surfaces that ask
+    "which env names does this tree touch?" rather than "what must resolve":
+    the install-consent enumeration and the cross-plugin collision preflight."""
+    return _extract(mcp_json_path, _ANY_VAR_PATTERN)

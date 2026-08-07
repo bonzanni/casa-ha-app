@@ -190,7 +190,7 @@ record. Wiring a
 secret mid-engagement does not make the plugin appear on resume when it was withheld at
 creation — a new engagement picks it up.
 
-**INV-PLUG-009**: An environment variable a plugin's manifest declares in `casa.setupProvides` or `casa.optionalEnv` does not withhold that plugin, and while it is unresolved the session build passes it to the CLI as an explicit empty string rather than letting the reference expand to a literal placeholder.
+**INV-PLUG-009**: An environment variable a plugin's manifest declares in `casa.setupProvides` does not withhold that plugin, and while it is unresolved the session build passes it to the CLI as an explicit empty string rather than letting the reference expand to a literal placeholder.
 
 Without this, INV-PLUG-008 is a deadlock for an entire class of plugin: one whose setup
 tool exists to *create* its credentials — forging a private key into the vault, registering
@@ -199,13 +199,20 @@ withheld for exactly the variables the tool would produce, and nothing re-kicks 
 gate retries on plugin-env and agent reloads, neither of which can supply a value only
 setup makes). The specialist that requires such a plugin is gated off with it.
 
-The two fields differ in **readiness**, which is why one "optional" marker would not do.
-`casa.setupProvides` says *my setup tool provisions this*: it stops the withhold, but the
-plugin still verifies **not ready** with reason `setup_env_unprovisioned` until the value
+`casa.setupProvides` is the ONLY such declaration, and its value is **readiness**, not the
+withhold exemption. It says *my setup tool provisions this*: the plugin loads so setup can
+run, but still verifies **not ready** with reason `setup_env_unprovisioned` until the value
 actually lands, so a setup run that never happened stays loud rather than passing as
-configured. `casa.optionalEnv` says *I do not need this*: its absence is not a defect and
-does not affect readiness at all. Declaring `setupProvides` without a `casa.setupTool` is
-refused — it would be an undeclared way to mark a credential optional. Both are read
+configured on empty credentials. Declaring it without a `casa.setupTool` is refused —
+there would be nothing to be unprovisioned by.
+
+A merely *optional* variable needs no declaration at all, and Casa deliberately offers none
+(#431): `${VAR:-}` is documented Claude Code syntax, the CLI substitutes the default, and
+the requirement extractor does not match that form — so it neither withholds nor leaks a
+placeholder, with no manifest field and no reserved name. It is also strictly more
+expressive, since a default may be a real value rather than only empty. What a default
+cannot express is readiness, which is precisely why `setupProvides` survives as the one
+declaration. Both are read
 strictly on both artifact-verification paths (install-time validation and resolution-time
 verdict), because a declaration that relaxes a gate must never be guessed at; a malformed
 one excludes the artifact from resolution, and the runtime readers fail closed to "no
@@ -236,9 +243,7 @@ CLI via `--plugin-dir` and so sits outside the option builders entirely. The run
 overlay is derived inside the renderer from the plugin directories being attached rather
 than assembled by each caller — the driver's start path and boot reconciliation both
 render that same service pair, and a per-caller contract is how one of them gets
-forgotten. The run-script path matters more than it looks: an `optionalEnv` declaration
-makes the plugin verify **ready**, so a leak there would be invisible on the verification
-surface.
+forgotten.
 
 What it does not cover: the exemption is not phase-scoped. An exempt plugin loads in
 *ordinary* sessions too, on empty credentials, not only in the session that runs its

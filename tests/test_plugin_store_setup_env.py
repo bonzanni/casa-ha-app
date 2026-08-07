@@ -1,13 +1,14 @@
-"""#429: ``casa.setupProvides`` / ``casa.optionalEnv`` — the two manifest
-declarations that let a plugin say which of its ``.mcp.json`` env references
-Casa must not withhold it for.
+"""#429/#431: ``casa.setupProvides`` — the ONE manifest declaration that lets
+a plugin say which of its ``.mcp.json`` env references Casa must not withhold
+it for.
 
-Both RELAX the env-readiness gate, so both are read STRICTLY on every
+It RELAXES the env-readiness gate, so it is read STRICTLY on every
 artifact-verification path (install-time ``validate_manifest`` and
-resolution-time ``artifact_verdict``), exactly like ``casa.setupTool``:
-a declaration Casa would have to interpret is refused rather than guessed
-at. The gate/session-build behaviour they drive lives in
-tests/test_plugin_grants.py.
+resolution-time ``artifact_verdict``), exactly like ``casa.setupTool``: a
+declaration Casa would have to interpret is refused rather than guessed at.
+A merely OPTIONAL variable needs no declaration — ``${VAR:-}`` in .mcp.json
+covers it (#431) — so the only reason to declare is the readiness reporting.
+The gate/session-build behaviour lives in tests/test_plugin_grants.py.
 """
 from __future__ import annotations
 
@@ -22,7 +23,6 @@ from plugin_store import (
     METADATA_FILENAME,
     StoreError,
     content_checksum,
-    manifest_optional_env,
     manifest_setup_provides,
 )
 
@@ -53,9 +53,8 @@ def test_setup_provides_returns_declared_names_in_order():
 
 def test_setup_provides_without_setup_tool_is_refused():
     """The field means 'my setup tool provisions these'. Without a setupTool
-    it would be an undeclared way to mark a credential optional — which is
-    what casa.optionalEnv is for, and which carries a different readiness
-    meaning on the verify surface."""
+    there is nothing to be unprovisioned by, so it would just be a roundabout
+    ``${VAR:-}``."""
     with pytest.raises(StoreError) as exc:
         manifest_setup_provides(_manifest(setupProvides=["CASA_PLUGIN_A_KEY"]))
     assert exc.value.reason_code == "setup_provides_invalid"
@@ -91,31 +90,6 @@ def test_setup_provides_count_is_capped():
 
 
 # ---------------------------------------------------------------------------
-# manifest_optional_env
-# ---------------------------------------------------------------------------
-
-def test_optional_env_absent_is_empty():
-    assert manifest_optional_env({}) == []
-    assert manifest_optional_env({"casa": {}}) == []
-
-
-def test_optional_env_needs_no_setup_tool():
-    """Unlike setupProvides, an optional variable is meaningful on a plugin
-    with no setup tool at all."""
-    assert manifest_optional_env(
-        _manifest(optionalEnv=["CASA_PLUGIN_BANKFEED_CP_TOKEN"])) == [
-            "CASA_PLUGIN_BANKFEED_CP_TOKEN"]
-
-
-@pytest.mark.parametrize("value", ["CASA_PLUGIN_A", {"A": 1}, ["lower"], [7],
-                                   ["CASA_PLUGIN_D", "CASA_PLUGIN_D"]])
-def test_optional_env_malformed_raises(value):
-    with pytest.raises(StoreError) as exc:
-        manifest_optional_env(_manifest(optionalEnv=value))
-    assert exc.value.reason_code == "optional_env_invalid"
-
-
-# ---------------------------------------------------------------------------
 # Both validation paths
 # ---------------------------------------------------------------------------
 
@@ -123,11 +97,11 @@ def test_validate_manifest_refuses_a_malformed_declaration(tmp_path):
     root = tmp_path / "src"
     (root / ".claude-plugin").mkdir(parents=True)
     (root / ".claude-plugin" / "plugin.json").write_text(
-        json.dumps(_manifest(setupTool="setup_x", optionalEnv="nope")),
+        json.dumps(_manifest(setupTool="setup_x", setupProvides="nope")),
         encoding="utf-8")
     with pytest.raises(StoreError) as exc:
         plugin_store.validate_manifest(root, expected_name="p")
-    assert exc.value.reason_code == "optional_env_invalid"
+    assert exc.value.reason_code == "setup_provides_invalid"
 
 
 def _published_with_rewritten_manifest(tmp_path, manifest: dict) -> Path:
@@ -170,19 +144,18 @@ def test_artifact_verdict_rechecks_setup_provides(tmp_path):
         subdir="", artifact_id=artifact_id) == "setup_provides_invalid"
 
 
-def test_artifact_verdict_rechecks_optional_env(tmp_path):
+def test_artifact_verdict_rechecks_a_non_list_declaration(tmp_path):
     art, artifact_id = _published_with_rewritten_manifest(
-        tmp_path, _manifest(optionalEnv={"A": 1}))
+        tmp_path, _manifest(setupTool="setup_x", setupProvides={"A": 1}))
     assert plugin_store.artifact_verdict(
         art, name="p", repo="o/r", revision="git:" + "a" * 40,
-        subdir="", artifact_id=artifact_id) == "optional_env_invalid"
+        subdir="", artifact_id=artifact_id) == "setup_provides_invalid"
 
 
 def test_artifact_verdict_accepts_a_well_formed_declaration(tmp_path):
     art, artifact_id = _published_with_rewritten_manifest(
         tmp_path, _manifest(setupTool="setup_bank_feed",
-                            setupProvides=["CASA_PLUGIN_BANKFEED_APP_ID"],
-                            optionalEnv=["CASA_PLUGIN_BANKFEED_CP_TOKEN"]))
+                            setupProvides=["CASA_PLUGIN_BANKFEED_APP_ID"]))
     assert plugin_store.artifact_verdict(
         art, name="p", repo="o/r", revision="git:" + "a" * 40,
         subdir="", artifact_id=artifact_id) is None
@@ -215,18 +188,17 @@ def test_artifact_verdict_accepts_a_well_formed_declaration(tmp_path):
 ])
 def test_only_the_reserved_declaration_namespace_is_declarable(name):
     with pytest.raises(StoreError) as exc:
-        manifest_optional_env(_manifest(optionalEnv=[name]))
-    assert exc.value.reason_code == "optional_env_invalid"
-    with pytest.raises(StoreError):
         manifest_setup_provides(
             _manifest(setupTool="setup_x", setupProvides=[name]))
+    assert exc.value.reason_code == "setup_provides_invalid"
 
 
 def test_a_reserved_namespace_name_is_accepted():
-    assert manifest_optional_env(
-        _manifest(optionalEnv=["CASA_PLUGIN_BANKFEED_CP_TOKEN",
-                               "CASA_PLUGIN_X"])) == [
-        "CASA_PLUGIN_BANKFEED_CP_TOKEN", "CASA_PLUGIN_X"]
+    assert manifest_setup_provides(
+        _manifest(setupTool="setup_x",
+                  setupProvides=["CASA_PLUGIN_BANKFEED_PRIVATE_KEY",
+                                 "CASA_PLUGIN_X"])) == [
+        "CASA_PLUGIN_BANKFEED_PRIVATE_KEY", "CASA_PLUGIN_X"]
 
 
 def test_referencing_an_undeclarable_name_is_still_allowed(tmp_path):

@@ -1,5 +1,41 @@
 # Changelog
 
+## [0.155.0] - 2026-08-06
+
+### Fixed
+
+- **A bundled plugin could not use a default value in its MCP config.**
+  `${VAR:-default}` is standard Claude Code syntax, but Casa's install check
+  mistook it for a template marker and refused the whole component — while
+  the same syntax was fine in a directly-installed plugin. It now works in
+  both, and Casa checks what the value will actually expand to, so a marker
+  cannot be smuggled past the check by splitting it around the default.
+- **A plugin whose start command referenced an environment variable could be
+  wrongly rejected as missing.** Introduced in 0.154.0. Such a command is
+  only resolvable when the plugin actually starts, so it is reported as
+  unchecked again rather than blocking the install.
+- **A plugin could point outside its own verified files** by writing a
+  default on a variable Casa itself supplies. Both spellings are now held to
+  the same containment rule.
+
+### Changed
+
+- **`casa.optionalEnv` has been removed**, one release after it was added.
+  Use `${MY_TOKEN:-}` in `.mcp.json` instead for a variable the plugin does
+  not need: Claude Code substitutes the default, so nothing is missing and no
+  placeholder reaches the plugin, and the default can be a real value rather
+  than only empty. That was always the simpler answer; it just did not work
+  in a bundled plugin until the fix above. `casa.setupProvides` stays — it is
+  the only way to say "my setup tool provisions this", which keeps the plugin
+  reported as not-ready until the value lands.
+
+  **If you declared `casa.optionalEnv` in 0.154.0**, replace it: the field is
+  now ignored, so the variables it covered would hold your plugin back again.
+  0.154.0 was published the same day and no released plugin declares it, so
+  this is expected to affect nobody — but check if you were quick.
+- A plugin's install-consent screen and the duplicate-name check now list
+  every environment variable its config mentions, including defaulted ones.
+
 ## [0.154.0] - 2026-08-06
 
 ### Fixed
