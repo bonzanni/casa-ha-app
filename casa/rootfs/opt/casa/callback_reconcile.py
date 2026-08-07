@@ -607,14 +607,14 @@ async def reconcile_plugin_callbacks(
         computed = compute_desired(
             role_configs=role_configs, acks=acks, resolver=resolver,
             entries=entries)
-        union: list[dict] = []
-        union_ok = True
-        candidates: "list[dict] | None" = None
-        if prompt:
-            union_ok, union = _trigger_pending_for_union(
-                role_configs=role_configs, resolver=resolver)
-            cand_ok, cand = _setup_candidates(resolver=resolver)
-            candidates = cand if cand_ok else None
+        # NOT gated on ``prompt`` — see the trigger reconciler: boot runs
+        # prompt=False and is exactly the pass that must recover an obligation
+        # missing because a crash landed between a durable registry publish and
+        # its lifecycle reconcile. Only the KEYBOARDS depend on `prompt`.
+        union_ok, union = _trigger_pending_for_union(
+            role_configs=role_configs, resolver=resolver)
+        cand_ok, cand = _setup_candidates(resolver=resolver)
+        candidates = cand if cand_ok else None
         return computed, union, union_ok, candidates
 
     async with _RECONCILE_LOCK:
@@ -664,29 +664,29 @@ async def reconcile_plugin_callbacks(
         # keyboard registration is then ordered BEFORE any later reconcile can
         # acquire the lock, so a revoke's final cancel_matching(plugin=…)
         # provably catches every keyboard an in-flight reconcile posted.
-        if prompt:
-            # #451: seal BEFORE the operator-reachability gate inside
-            # _fire_consent_prompts — with no DM reachable nothing used to be
-            # sealed at all, leaving a mutation's routing decision to be
-            # contradicted by a round that first sealed on a later reload.
-            import trigger_reconcile
-            nonce_by_identity = trigger_reconcile.seal_setup_state(
-                trigger_pending=union_pending,
-                callback_pending=desired.pending,
-                pending_complete=union_ok,
-                candidates=setup_cands)
-            try:
-                import plugin_setup_episodes
-                plugin_setup_episodes.kick()   # a zero-member verdict releases
-            except Exception:  # noqa: BLE001
-                pass
-            if desired.pending:
-                _fire_consent_prompts(
-                    desired.pending, trigger_registry=trigger_registry,
-                    role_configs=role_configs,
-                    channel_manager=channel_manager,
-                    acks=acks, spool=spool, resolver=resolver,
-                    entries=entries, nonce_by_identity=nonce_by_identity)
+        # #451: seal BEFORE the operator-reachability gate inside
+        # _fire_consent_prompts, and on EVERY pass — with no DM reachable
+        # nothing used to be sealed at all, leaving a mutation's routing
+        # decision to be contradicted by a round that first sealed on a later
+        # reload.
+        import trigger_reconcile
+        nonce_by_identity = trigger_reconcile.seal_setup_state(
+            trigger_pending=union_pending,
+            callback_pending=desired.pending,
+            pending_complete=union_ok,
+            candidates=setup_cands)
+        try:
+            import plugin_setup_episodes
+            plugin_setup_episodes.kick()   # a zero-member verdict releases
+        except Exception:  # noqa: BLE001
+            pass
+        if prompt and desired.pending:
+            _fire_consent_prompts(
+                desired.pending, trigger_registry=trigger_registry,
+                role_configs=role_configs,
+                channel_manager=channel_manager,
+                acks=acks, spool=spool, resolver=resolver,
+                entries=entries, nonce_by_identity=nonce_by_identity)
     if regen_health:
         await _regen_health_safe()
     return desired.issues

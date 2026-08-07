@@ -574,6 +574,18 @@ def _settle_locked(data: dict, plugin: str) -> tuple[bool, list[str]]:
         return False, []
     denied = [i for i, m in members.items() if m.get("state") == "denied"]
     if denied:
+        if row.get("gate") == "released":
+            # A denial may only withhold a release, never REVOKE one already
+            # earned. The nonce fence protects a live member, but it cannot
+            # fence a decision whose round is GONE: a late deny/expiry from a
+            # superseded keyboard synthesizes a fresh round in
+            # `on_consent_decision`, where the member is absent and the fence
+            # is skipped by construction. Refusing here would strand the
+            # obligation for good — its ack exists, so no re-prompt re-arms it.
+            logger.info(
+                "late denial ignored (plugin=%s): the obligation for this "
+                "artifact was already released by a settled round", plugin)
+            return False, []
         row.update({"status": "refused", "updated_ts": _now(),
                     "last_error": f"{len(denied)} unapproved consent(s)"})
         return False, [

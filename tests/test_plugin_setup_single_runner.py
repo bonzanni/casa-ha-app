@@ -120,6 +120,24 @@ class _Spool:
     def read_index_marker(self, path): return None
 
 
+
+def _recording(state):
+    async def _dispatch(role, instruction, ctx):
+        state.dispatched.append((role, instruction, ctx))
+        return True
+    return _dispatch
+
+
+def _swallow(state):
+    async def _notify(text):
+        state.notes.append(text)
+    return _notify
+
+
+async def _unreachable(*a, **kw):
+    raise AssertionError("dispatch must not happen while setup is held")
+
+
 async def _reconcile(state):
     """What every lifecycle site does: run BOTH reconcilers as a pair."""
     role_configs = {"assistant": SimpleNamespace(channels=["webhook"])}
@@ -501,3 +519,80 @@ async def test_a_v3_refused_style_row_is_not_resurrected(env):
     await pse._worker_pass()
     assert env.dispatched == []
     assert _obligation()["status"] == "dispatched"
+
+
+# ---------------------------------------------------------------------------
+# Review round 1 findings (Sol + Terra)
+# ---------------------------------------------------------------------------
+
+@pytest.mark.asyncio
+async def test_boot_creates_the_obligation_it_owes(env):
+    """Both reviewers, independently: the sweep used to be gated on `prompt`,
+    and BOTH boot reconcilers pass prompt=False. So a crash between a durable
+    registry publish and its lifecycle reconcile left the obligation
+    uncreated — no pending row, nothing in health, setup never run — which is
+    exactly the recovery the level-triggered design claims to provide."""
+    env.plugin = _plugin()                             # setupTool, no consent
+    role_configs = {"assistant": SimpleNamespace(channels=["webhook"])}
+
+    def _resolver(target):
+        return SimpleNamespace(registry_valid=True, plugins=[env.plugin],
+                               issues=[])
+
+    def _entries():
+        return [{"name": "gmail", "artifact_id": "art-1",
+                 "targets": ["resident:assistant"]}]
+
+    # The boot pass, exactly as casa_core makes it: no channel, prompt=False.
+    await tr.reconcile_plugin_triggers(
+        trigger_registry=env.registry, role_configs=role_configs,
+        channel_manager=None, acks=env.trig_acks,
+        secrets_dir=env.secrets_dir, prompt=False,
+        resolver=_resolver, global_secret_ok=lambda: True)
+    await cr.reconcile_plugin_callbacks(
+        trigger_registry=env.registry, role_configs=role_configs,
+        channel_manager=None, acks=env.cb_acks, spool=_Spool(),
+        resolver=_resolver, entries=_entries, prompt=False)
+    assert _obligation() is not None, "boot owes this plugin a setup run"
+    await pse._worker_pass()
+    assert len(env.dispatched) == 1
+
+
+@pytest.mark.asyncio
+async def test_a_late_denial_cannot_revoke_a_release(env):
+    """Sol: the nonce fence protects a LIVE member, but a late deny/expiry
+    whose round is already consumed synthesizes a fresh round in which the
+    member is absent — so the fence is skipped by construction and the denial
+    used to refuse an obligation a settled round had already released. Nothing
+    then re-arms it: the ack exists, so no re-prompt ever comes."""
+    # The window that matters is RELEASED BUT NOT YET DISPATCHED — Sol's
+    # scenario holds it on an unresolved environment variable. A row that
+    # already dispatched is out of `pending` and was never at risk.
+    pse.configure(
+        dispatch=lambda r, i, c: _unreachable(),
+        notify_operator=_swallow(env), resolve_registry_entry=lambda p: env.entry,
+        ack_lookup=lambda i: None, routes_live=lambda p: True,
+        secrets_ready=lambda p: False)                  # held here
+    env.plugin = _plugin(triggers=True)
+    await _reconcile(env)
+    ident = _trigger_identity(env)
+    _approve_trigger(env)
+    await _reconcile(env)
+    assert env.dispatched == []                        # held, not dispatched
+    row = _obligation()
+    assert row["status"] == "pending" and row["gate"] == "released"
+    assert pse._load()["rounds"] == {}                 # round consumed
+    # The superseded keyboard's expiry finally lands, with no member to fence.
+    await pse.on_consent_decision(plugin="gmail", artifact_id="art-1",
+                                  identity=ident, approved=False, nonce="dead")
+    row = _obligation()
+    assert row["status"] != "refused", "a late denial revoked an earned release"
+    assert row["gate"] == "released"
+    # ...and once the environment resolves, setup still runs.
+    pse.configure(
+        dispatch=_recording(env), notify_operator=_swallow(env),
+        resolve_registry_entry=lambda p: env.entry,
+        ack_lookup=lambda i: None, routes_live=lambda p: True,
+        secrets_ready=lambda p: True)
+    await pse._worker_pass()
+    assert len(env.dispatched) == 1

@@ -295,14 +295,16 @@ async def reconcile_plugin_triggers(
         # verdict — the positive statement that an artifact needs no consent —
         # requires knowing that the callback half is empty too, and a plugin
         # can have a pending callback consent while no trigger consent pends.
-        union: list[dict] = []
-        union_ok = True
-        candidates: "list[dict] | None" = None
-        if prompt:
-            union_ok, union = _callback_pending_for_union(
-                role_configs=role_configs, resolver=resolver)
-            cand_ok, cand = setup_candidates(resolver=resolver)
-            candidates = cand if cand_ok else None
+        # NOT gated on ``prompt``: the obligation sweep and the verdict sealing
+        # must run on every reconcile, including the prompt=False BOOT pass.
+        # Boot is the only pass that follows a crash between a durable registry
+        # publish and its lifecycle reconcile — precisely when the level-
+        # triggered sweep is the thing that recovers the missing obligation.
+        # Only the KEYBOARDS depend on `prompt`.
+        union_ok, union = _callback_pending_for_union(
+            role_configs=role_configs, resolver=resolver)
+        cand_ok, cand = setup_candidates(resolver=resolver)
+        candidates = cand if cand_ok else None
         return desired, union, union_ok, candidates
 
     async with _RECONCILE_LOCK:
@@ -338,32 +340,32 @@ async def reconcile_plugin_triggers(
         # provably catches every keyboard an in-flight reconcile posted.
         # register_challenge is synchronous (the Telegram post happens on
         # an owned background driver), so this adds no IO under the lock.
-        if prompt:
-            # #451: SEAL BEFORE the operator-reachability gate. Sealing used to
-            # live inside _fire_consent_prompts, AFTER its `channel is None` /
-            # `op is None` early returns — so with no DM reachable nothing was
-            # sealed at all, and a round could first seal on a later ordinary
-            # reload, long after a mutation had already reported which runner
-            # owned setup. Sealing here means an unreachable operator yields a
-            # members-bearing verdict and the obligation correctly HOLDS.
-            nonce_by_identity = seal_setup_state(
-                trigger_pending=desired.pending,
-                callback_pending=callback_pending,
-                pending_complete=callback_ok,
-                candidates=setup_cands)
-            try:
-                import plugin_setup_episodes
-                plugin_setup_episodes.kick()   # a zero-member verdict releases
-            except Exception:  # noqa: BLE001
-                pass
-            if desired.pending:
-                _fire_consent_prompts(
-                    desired.pending, trigger_registry=trigger_registry,
-                    role_configs=role_configs,
-                    channel_manager=channel_manager,
-                    acks=acks, secrets_dir=secrets_dir, resolver=resolver,
-                    global_secret_ok=global_secret_ok,
-                    nonce_by_identity=nonce_by_identity)
+        # #451: SEAL BEFORE the operator-reachability gate, and on EVERY pass
+        # including prompt=False. Sealing used to live inside
+        # _fire_consent_prompts, AFTER its `channel is None` / `op is None`
+        # early returns — so with no DM reachable nothing was sealed at all,
+        # and a round could first seal on a later ordinary reload, long after a
+        # mutation had already reported which runner owned setup. Sealing here
+        # means an unreachable operator yields a members-bearing verdict and
+        # the obligation correctly HOLDS.
+        nonce_by_identity = seal_setup_state(
+            trigger_pending=desired.pending,
+            callback_pending=callback_pending,
+            pending_complete=callback_ok,
+            candidates=setup_cands)
+        try:
+            import plugin_setup_episodes
+            plugin_setup_episodes.kick()   # a zero-member verdict releases
+        except Exception:  # noqa: BLE001
+            pass
+        if prompt and desired.pending:
+            _fire_consent_prompts(
+                desired.pending, trigger_registry=trigger_registry,
+                role_configs=role_configs,
+                channel_manager=channel_manager,
+                acks=acks, secrets_dir=secrets_dir, resolver=resolver,
+                global_secret_ok=global_secret_ok,
+                nonce_by_identity=nonce_by_identity)
     if regen_health:
         # After the lock: the overlay + persisted ack are already live, so the
         # fresh health pass sees the routed (no-longer-pending) state.
