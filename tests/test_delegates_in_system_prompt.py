@@ -26,7 +26,7 @@ def _cfg(role: str, name: str, *, delegates=None) -> AgentConfig:
     )
 
 
-def test_delegates_block_renders_with_name_and_role():
+def test_delegates_block_leads_with_the_role_id():
     assistant_cfg = _cfg(
         "assistant", "Ellen",
         delegates=[
@@ -52,9 +52,16 @@ def test_delegates_block_renders_with_name_and_role():
     block = _render_delegates_block(assistant_cfg.delegates, reg)
     assert "<delegates>" in block
     assert "</delegates>" in block
-    assert "Tina (role: butler)" in block
-    assert "Alex (role: finance)" in block
+    # #433: the ROLE ID leads, because it is the value `delegate_to_agent`
+    # is keyed on. Rendering the persona name first made it the salient
+    # token and the model addressed delegates by it. The name is still shown
+    # — the model must map "ask Tina to..." onto a role — but as the
+    # parenthetical, converging with the specialist-side renderer
+    # (`agent_loader._render_delegates_section`), which emits role ids only.
+    assert "butler (Tina)" in block
+    assert "finance (Alex)" in block
     assert "Device control." in block
+    assert "(role:" not in block
 
 
 def test_delegates_block_omitted_when_no_delegates():

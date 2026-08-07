@@ -77,7 +77,7 @@ class TestHandlerCoercion:
 
         async def _fake_prelaunch(agent_name, origin, mode, task_text, context_text):
             seen["mode"] = mode
-            return None, None, None, tools_mod._result({"status": "error"})
+            return agent_name, None, None, None, tools_mod._result({"status": "error"})
 
         with pytest.MonkeyPatch.context() as mp:
             mp.setattr(tools_mod, "_prelaunch", _fake_prelaunch)

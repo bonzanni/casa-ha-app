@@ -353,7 +353,7 @@ async def test_channel_handoff_commits_real_job_before_cancelling_outer_request(
         assert origin["_voice_handoff_reservation"].held is True
         gate_entered.set()
         await release_gate.wait()
-        return _specialist_cfg("judge", "Judge"), None, None, None
+        return "judge", _specialist_cfg("judge", "Judge"), None, None, None
 
     async def _concierge(msg):
         reservation = msg.context["_voice_handoff_reservation"]
