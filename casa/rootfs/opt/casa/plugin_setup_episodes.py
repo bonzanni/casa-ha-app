@@ -239,6 +239,18 @@ def _migrate(data: dict) -> None:
     solely by the live registry sweep, so there is no replay for a tombstone to
     fence, and the row identity is ``(plugin, artifact_id)`` with ``gen``."""
     data.pop("consumed_keys", None)
+    # The rounds CONTAINER must be a mapping. `setdefault` only supplies a
+    # missing key — a parseable `"rounds": []` survived it, and then every
+    # `data["rounds"].get(...)` / `.keys()` raised inside a swallowing except.
+    # Nothing recovered: the malformed shape persisted across loads, no round
+    # could be sealed, and EVERY plugin's obligation was owed forever with no
+    # way to become runnable. Same family as the malformed-row guard below;
+    # hardening only the rows left the container.
+    if not isinstance(data.get("rounds"), dict):
+        if data.get("rounds") is not None:
+            logger.warning("setup-round container was %s, not a mapping — "
+                           "resetting it", type(data.get("rounds")).__name__)
+        data["rounds"] = {}
     # DROP structurally corrupt rows, on every load and at every version. The
     # store-level guard only checks that `episodes` is a list, so one non-dict
     # element (a partial write, a hand-edit) used to survive and then raise on
@@ -372,10 +384,22 @@ def ensure_obligation(*, plugin: str, artifact_id: str,
         data = _load()
         row = _row_for(data, plugin)
         if row is not None and row.get("artifact_id") == artifact_id:
-            if row.get("status") == "pending":
+            stale_release = (row.get("status") == "pending"
+                             and row.get("gate") == "released")
+            if row.get("status") == "pending" and not stale_release:
+                # Already owed and unconcluded — nothing to reset.
                 return True
             if not consent_pending:
-                return False
+                return True if stale_release else False
+            # Either terminal, or RELEASED under a verdict that a newly pending
+            # consent has made stale. The released case matters during the
+            # dispatch window: the row is still `pending` while `_run_episode`
+            # awaits the bus, so a revoke landing there used to hit the
+            # early-return above and never re-arm — the settled re-approval then
+            # found a `dispatched` row and declined, leaving the RE-MINTED secret
+            # unprovisioned while the accepted turn had provisioned the old one.
+            # Re-arming mints a new id, so the in-flight dispatch's own
+            # `_update_episode` becomes a no-op against the superseded row.
             gen = int(row.get("gen") or 0) + 1
             fresh = _new_row(plugin, artifact_id, gen)
             fresh["created_ts"] = row.get("created_ts") or fresh["created_ts"]

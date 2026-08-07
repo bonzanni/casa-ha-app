@@ -1195,3 +1195,54 @@ async def test_a_reconsent_during_a_mixed_pass_is_not_lost(env):
                         unknown=set(), single_generation=True)
     await pse._worker_pass()
     assert len(env.dispatched) == 1
+
+
+# ---------------------------------------------------------------------------
+# Review round 8 findings
+# ---------------------------------------------------------------------------
+
+@pytest.mark.asyncio
+async def test_a_malformed_rounds_container_does_not_strand_setup(env):
+    """Both round-8 reviewers: `_load` used `setdefault` on `rounds`, which only
+    supplies a MISSING key — a parseable `"rounds": []` survived it, and then
+    every `data["rounds"].get(...)` / `.keys()` raised inside a swallowing
+    except. Nothing recovered: the shape persisted across loads, no round could
+    be sealed, and EVERY plugin's obligation was owed forever with no way to
+    become runnable. Round 2 hardened the rows and left the container."""
+    import json
+    pse.STORE_PATH.write_text(json.dumps({
+        "schema_version": 4, "rounds": [], "episodes": [],
+    }), encoding="utf-8")
+    assert pse._load()["rounds"] == {}
+    env.plugin = _plugin()
+    await _reconcile(env)
+    assert len(env.dispatched) == 1
+    assert _obligation()["status"] == "dispatched"
+
+
+@pytest.mark.asyncio
+async def test_a_revoke_during_the_dispatch_window_is_not_lost(env):
+    """Terra: an obligation stays `pending` while `_run_episode` awaits the bus.
+    A revoke landing in that window hit `ensure_obligation`'s pending
+    early-return and never re-armed, so the settled RE-approval found a
+    `dispatched` row and declined — leaving the re-minted secret unprovisioned
+    while the already-accepted turn had provisioned the old one."""
+    pse.ensure_obligation(plugin="gmail", artifact_id="art-1")
+    pse.open_round(plugin="gmail", artifact_id="art-1", identities=[])
+    await pse._recover_and_settle()
+    row = _obligation()
+    assert row["status"] == "pending" and row["gate"] == "released"
+    old_id = row["id"]
+    # The revoke's reconcile: the consent is pending again for this artifact.
+    assert pse.ensure_obligation(plugin="gmail", artifact_id="art-1",
+                                 consent_pending=True) is True
+    row = _obligation()
+    assert row["gate"] == "awaiting_verdict", "a stale release must re-arm"
+    assert row["gen"] == 1 and row["id"] != old_id
+    # The in-flight dispatch's own bookkeeping must not touch the new generation.
+    pse._update_episode(old_id, status="dispatched")
+    assert _obligation()["status"] == "pending"
+    # ...and the re-approval releases the NEW generation.
+    pse.open_round(plugin="gmail", artifact_id="art-1", identities=[])
+    await pse._recover_and_settle()
+    assert _obligation()["gate"] == "released"
