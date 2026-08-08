@@ -41,7 +41,7 @@ import logging
 import os
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Any, Callable
+from typing import Any, Callable, NamedTuple
 
 import plugin_triggers
 from plugin_triggers import ack_identity
@@ -148,6 +148,14 @@ class DesiredTriggers:
     # Consent prompts to fire — only for triggers whose ONLY gap is the ack
     # (approving a trigger that still could not route is a broken promise).
     pending: list[dict] = field(default_factory=list)
+    # #457: the plugins this computation actually SAW — every name in the
+    # pinned resolution, whether or not it declares a trigger. A consumer that
+    # reads "no issue names this plugin" as "this plugin has no gap" needs the
+    # positive half too: an invalid registry, or one artifact that fails to
+    # resolve, drops a plugin out of the iteration entirely and no issue row can
+    # ever name it. Empty under an invalid registry, which is what makes the
+    # fail-closed return above readable as such by a gate.
+    observed: set[str] = field(default_factory=set)
 
 
 def compute_desired(
@@ -170,6 +178,7 @@ def compute_desired(
         # Fail-closed: an invalid registry routes NO plugin ingress (its own
         # registry-stage issues surface via the resolver / health pass).
         return out
+    out.observed = {rp.name for rp in all_res.plugins}
 
     # Assignment authority (target-scoped): plugin p may route to
     # resident:<role> only when resolve_for("resident:<role>") includes it.
@@ -818,9 +827,22 @@ async def reconcile_from_runtime(runtime: Any, *, prompt: bool = True) -> list:
         prompt=prompt)
 
 
-def issue_state(resolver: Any = None) -> "tuple[bool, list]":
-    """``(ok, issues)`` — the trigger gaps, and whether they could be computed
-    AT ALL.
+class IssueState(NamedTuple):
+    """``(ok, issues, observed)`` — see :func:`issue_state`.
+
+    A NamedTuple rather than a plain tuple so ``observed`` could be added
+    without silently changing what an existing ``state[1]`` means, and so a
+    consumer reads ``state.observed`` instead of positionally.
+    """
+
+    ok: bool
+    issues: list
+    observed: "set[str]"
+
+
+def issue_state(resolver: Any = None) -> "IssueState":
+    """``(ok, issues, observed)`` — the trigger gaps, whether they could be
+    computed AT ALL, and which plugins the computation actually saw.
 
     Two halves, and #453 is about the second: the DERIVED gaps (consent,
     assignment, channel, global secret) come from :func:`compute_desired`, and
@@ -841,29 +863,29 @@ def issue_state(resolver: Any = None) -> "tuple[bool, list]":
     ``resolver`` lets a caller supply ONE pinned registry resolution so a
     decision spanning both reconcilers describes a single generation (#454).
 
-    Residual, named rather than implied away: ``ok`` reports whether the
-    computation RAN, not whether it saw every plugin. An invalid registry — and
-    a single artifact that fails to resolve — yields an empty result with no
-    issues, so a plugin absent from the computation reads as "no gap". The
-    setup worker resolves its own registry entry three-state BEFORE reaching the
-    gate and defers on both, so it is unreachable there today; that shield is a
-    separate read, not a property of this function."""
+    ``observed`` closes the last way the empty list could lie (#457). ``ok``
+    reports whether the computation RAN, not whether it saw every plugin: an
+    invalid registry — and a single artifact that fails to resolve — yields an
+    empty result with no issues, so a plugin absent from the computation read as
+    "no gap". Absence is not consent, so the positive claim is now carried
+    explicitly: a gate must require the plugin to be IN ``observed`` before
+    reading the absence of an issue as a verdict about it."""
     try:
         import agent as agent_mod
 
         runtime = getattr(agent_mod, "active_runtime", None)
         if runtime is None:
-            return False, []
+            return IssueState(False, [], set())
         role_configs = getattr(runtime, "role_configs", None)
         if not role_configs:
-            return False, []
+            return IssueState(False, [], set())
         desired = compute_desired(role_configs=role_configs, resolver=resolver)
         verify_minted_secrets(desired, SECRETS_DIR)
-        return True, desired.issues
+        return IssueState(True, desired.issues, desired.observed)
     except Exception:  # noqa: BLE001 — a trigger-compute crash must never
         # take down the whole health pass; log and degrade to no extras.
         logger.exception("trigger issue recompute failed")
-        return False, []
+        return IssueState(False, [], set())
 
 
 def current_issues() -> list:

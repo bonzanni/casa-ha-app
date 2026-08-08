@@ -198,8 +198,18 @@ def sync_agent_role_map(runtime: Any) -> None:
     live run 2026-07-11). Overlapping roles keep the resident entry and
     warn instead of raising: a reload must not brick on a collision
     boot would have rejected.
+
+    #439: the TIER registry is refreshed here too. ``_agent_registry`` was
+    captured once by :func:`init_tools` and never re-synced, while every reload
+    path rebuilds ``runtime.agent_registry`` immediately before calling this —
+    so ``tier_for_role`` answered from the boot snapshot for the life of the
+    process. A role added after boot is simply absent from it, and the
+    ``or "specialist"`` fallback then resolves a RESIDENT's plugin assignment
+    against ``specialist:<role>``: the delegation launches without the plugins
+    that role is actually assigned. Adopting the runtime's own registry can
+    never be staler than what this held before.
     """
-    global _agent_role_map  # noqa: PLW0603
+    global _agent_role_map, _agent_registry  # noqa: PLW0603
     residents = dict(getattr(runtime, "role_configs", {}) or {})
     registry = getattr(runtime, "specialist_registry", None)
     specialists = dict(registry.all_configs()) if registry is not None else {}
@@ -213,6 +223,11 @@ def sync_agent_role_map(runtime: Any) -> None:
             continue
         merged[name] = cfg
     _agent_role_map = merged
+    fresh_registry = getattr(runtime, "agent_registry", None)
+    if fresh_registry is not None:
+        # Only ever REPLACE with a real registry: a runtime stand-in without one
+        # (the reload test suite has several) must not blank the boot capture.
+        _agent_registry = fresh_registry
 
 
 @tool(
@@ -1221,6 +1236,18 @@ def _build_executor_options(
                for e in (hooks_cfg.pre_tool_use or [])):
         resolved_hooks["PreToolUse"].append(managed_component_guard_matcher())
 
+    # #403: agents/<role>/triggers.yaml has a SECOND writer — the resident's
+    # own reminder tools, inside this process. An executor's Read→Edit spans
+    # model thinking time in another process, so a reminder set in that window
+    # is silently discarded. Code-mandatory for the same reason as the guard
+    # above, and load-bearing rather than defence-in-depth: this is the only
+    # thing routing the edit to config_trigger_upsert / config_trigger_delete,
+    # which perform it here, on the loop, where nothing can interleave.
+    from hooks import trigger_file_write_guard_matcher
+    if not any(e.get("policy") == "trigger_file_write_guard"
+               for e in (hooks_cfg.pre_tool_use or [])):
+        resolved_hooks["PreToolUse"].append(trigger_file_write_guard_matcher())
+
     if plugin_paths is not None:
         sdk_plugins = [{"type": "local", "path": p} for p in plugin_paths]
         # #429: the resume path attaches artifacts by PATH, with no
@@ -1947,11 +1974,13 @@ async def _run_delegated_agent(
     }
 
     # Resolve caller display name; fall back to role.
-    # #436: from the LIVE role map, not `_agent_registry` — that global is a
-    # BOOT snapshot which `sync_agent_role_map` does not touch, so a renamed
-    # caller kept introducing itself to every specialist under its old name
-    # for the rest of the process's life. Same defect as the stale
-    # `<delegates>` block, same cure: one live source.
+    # #436: from the LIVE role map, not `_agent_registry`, which carried a BOOT
+    # snapshot of the display names — so a renamed caller kept introducing
+    # itself to every specialist under its old name for the rest of the
+    # process's life. Same defect as the stale `<delegates>` block, same cure:
+    # one live source. (#439 now re-syncs `_agent_registry` on every reload too,
+    # but the role map remains the one authority for names — a KnownAgent's
+    # `name` is a copy taken at build time, and the map holds the config.)
     caller_role = str(parent.get("role", "")) or "(unknown)"
     caller_name = _display_name_for_role(caller_role)
     originating_channel = str(parent.get("channel", "")) or "(unknown)"
@@ -2687,11 +2716,10 @@ async def _prelaunch(
             # to remove.
             #
             # Derived from `_agent_role_map`, the map target resolution itself
-            # reads, at the point of use. NOT from `_agent_registry`:
-            # `init_tools` captures that once at boot and `sync_agent_role_map`
-            # refreshes only the role map, so a specialist disabled at runtime
-            # would keep being advertised as callable for the rest of the
-            # process. One source of truth, and it is the consumer's own.
+            # reads, at the point of use — one source of truth, and it is the
+            # consumer's own. NOT from `_agent_registry`, which is a separate
+            # store answering a different question (tier); reading membership
+            # from it would let the two disagree about who is callable.
             # (Under-advertising is safe — resolution has a registry fallback,
             # so a listed role always resolves but an unlisted one may too.)
             "declared_delegates": [
@@ -7512,6 +7540,174 @@ async def cancel_engagement(args: dict) -> dict:
 
 
 # ---------------------------------------------------------------------------
+# config_trigger_upsert / config_trigger_delete — the configurator's ONE way
+# to change agents/<role>/triggers.yaml (#403)
+# ---------------------------------------------------------------------------
+#
+# That file has a second writer: the resident's own reminder tools, running in
+# THIS process on THIS loop. The configurator runs in a separate CLI child
+# process, so its Read→Edit spans model thinking time and no lock may be held
+# across it; a reminder set inside that window was silently discarded by the
+# stale rewrite, and `git add -A` committed the loss. Hand-editing is now denied
+# by `hooks.trigger_file_write_guard`, and the change is made HERE instead —
+# where the whole read-modify-write is a single synchronous step on the loop and
+# cannot interleave with the reminder writer at all.
+#
+# Ownership is preserved in both directions: these refuse an entry carrying
+# `managed_by: agent` (the resident's reminders), exactly as the reminder tools
+# refuse everything else.
+
+
+# The trigger fields, mirroring defaults/schema/triggers.v1.json. Declared
+# explicitly rather than as a free-form object so the model gets a typed
+# surface — and so a key the schema would reject as `additionalProperties`
+# never reaches the writer in the first place.
+_TRIGGER_ENTRY_FIELDS = {
+    "name": {"type": "string"},
+    "type": {"type": "string",
+             "enum": ["interval", "cron", "webhook", "date"]},
+    "minutes": {"type": "integer"},
+    "schedule": {"type": "string"},
+    "at": {"type": "string"},
+    "one_shot": {"type": "boolean"},
+    # Legacy `schema_version: 1` documents only. There a webhook trigger
+    # REQUIRES `path`; v2 removed it (the trigger name is the endpoint) and
+    # forbids it. Omitting the field from this surface left a v1 file with no
+    # supported route at all — the hand edit is denied and the tool could not
+    # express what the schema demands. Present here, refused by the schema on a
+    # v2 document, which is the correct answer rather than a dead end.
+    "path": {"type": "string"},
+    "channel": {"type": "string"},
+    "prompt": {"type": "string"},
+    "prompt_file": {"type": "string"},
+    "clearance": {"type": "string",
+                  "enum": ["public", "friends", "family"]},
+    "auth": {"type": "object", "properties": {
+        "mode": {"type": "string",
+                 "enum": ["hmac_body", "static_header", "timestamped_hmac"]},
+        "header": {"type": "string"},
+        "tolerance_secs": {"type": "integer"},
+        "secret_owner": {"type": "string", "enum": ["casa", "provider"]}}},
+}
+
+
+def _resident_triggers_path(role: str) -> "tuple[str | None, dict | None]":
+    """``(path, error_result)`` for *role*'s trigger file.
+
+    Residents only: ``triggers.yaml`` is FORBIDDEN for a specialist or an
+    executor and creating one there is boot-fatal, so an unknown or non-resident
+    role is refused rather than written."""
+    import agent as agent_mod
+    runtime = getattr(agent_mod, "active_runtime", None)
+    if runtime is None:
+        return None, _result({
+            "status": "error", "kind": "not_initialized",
+            "message": "CasaRuntime not bound - boot ordering bug"})
+    if role not in (getattr(runtime, "role_configs", None) or {}):
+        return None, _result({
+            "status": "error", "kind": "unknown_role",
+            "message": (
+                f"{role!r} is not a resident. Triggers belong to residents "
+                f"only — a specialist or executor must not have a "
+                f"triggers.yaml at all. Known residents: "
+                f"{sorted(getattr(runtime, 'role_configs', None) or {})}"),
+        })
+    import reminders
+    return reminders.triggers_path(runtime.agents_dir, role), None
+
+
+@tool(
+    "config_trigger_upsert",
+    "Add a trigger to a resident's triggers.yaml, or replace the existing "
+    "trigger of the same name (keeping its position). Validates the entry "
+    "against the triggers schema and leaves every other entry untouched — this "
+    "is the ONLY way to write that file; hand-editing it is denied, because a "
+    "resident's reminder tools write the same file from another writer and a "
+    "hand edit silently discards whatever landed since you read it. Does NOT "
+    "commit or reload: follow with config_git_commit + casa_reload_triggers. "
+    "Restricted to the configurator executor role.",
+    {"type": "object",
+     "properties": {"role": {"type": "string"}, **_TRIGGER_ENTRY_FIELDS},
+     "required": ["role", "name", "type"]},
+)
+async def config_trigger_upsert(args: dict) -> dict:
+    caller = _effective_caller_role()
+    if caller not in _PRIVILEGED_CONFIG_ROLES:
+        return _refuse_unprivileged("config_trigger_upsert", caller)
+
+    role = str(args.get("role") or "")
+    path, err = _resident_triggers_path(role)
+    if err is not None:
+        return err
+
+    entry = {k: args[k] for k in _TRIGGER_ENTRY_FIELDS if k in args}
+    import reminders
+    try:
+        # Synchronous ON THE LOOP, deliberately: this is a small read, a
+        # judgement and one atomic replace, and running it in a thread would
+        # reintroduce exactly the interleaving with the reminder writer that
+        # routing the edit through Casa exists to remove.
+        outcome = reminders.upsert_entry(path, entry)
+    except (OSError, ValueError) as exc:
+        return _result({"status": "error", "kind": "trigger_write_refused",
+                        "message": str(exc)})
+    return _result({
+        "status": "ok", "outcome": outcome, "role": role, "name": entry["name"],
+        "message": (f"{entry['name']} {outcome} in {role}/triggers.yaml — now "
+                    f"commit and reload: config_git_commit then "
+                    f"casa_reload_triggers(role={role!r})"),
+    })
+
+
+@tool(
+    "config_trigger_delete",
+    "Remove one trigger from a resident's triggers.yaml by name, leaving every "
+    "other entry untouched. Refuses a reminder the resident owns "
+    "(managed_by: agent) — ask the resident to cancel that one. This is the "
+    "ONLY way to change that file; hand-editing it is denied. Does NOT commit "
+    "or reload: follow with config_git_commit + casa_reload_triggers. "
+    "Restricted to the configurator executor role.",
+    {"role": str, "name": str},
+)
+async def config_trigger_delete(args: dict) -> dict:
+    caller = _effective_caller_role()
+    if caller not in _PRIVILEGED_CONFIG_ROLES:
+        return _refuse_unprivileged("config_trigger_delete", caller)
+
+    role = str(args.get("role") or "")
+    name = str(args.get("name") or "")
+    if not name:
+        return _result({"status": "error", "kind": "name_required",
+                        "message": "config_trigger_delete requires 'name'"})
+    path, err = _resident_triggers_path(role)
+    if err is not None:
+        return err
+
+    import reminders
+    try:
+        outcome = reminders.delete_entry(path, name)
+    except (OSError, ValueError) as exc:
+        return _result({"status": "error", "kind": "trigger_write_refused",
+                        "message": str(exc)})
+    if outcome == "not_found":
+        return _result({"status": "error", "kind": "not_found",
+                        "message": f"{role} has no trigger named {name!r}"})
+    if outcome == "not_owned":
+        return _result({
+            "status": "error", "kind": "not_owned",
+            "message": (f"{name!r} is a reminder {role} set for itself "
+                        f"(managed_by: agent). Ask {role} to cancel it — this "
+                        f"tool must not touch the resident's own entries."),
+        })
+    return _result({
+        "status": "ok", "outcome": "removed", "role": role, "name": name,
+        "message": (f"{name} removed from {role}/triggers.yaml — now commit "
+                    f"and reload: config_git_commit then "
+                    f"casa_reload_triggers(role={role!r})"),
+    })
+
+
+# ---------------------------------------------------------------------------
 # casa_reload_triggers - back-compat shim for Plan 3 soft-reload (now via dispatch)
 # ---------------------------------------------------------------------------
 
@@ -10957,6 +11153,8 @@ CASA_TOOLS: tuple = (
     casa_reload,
     casa_restart_supervised,            # NEW — Task D.2
     casa_reload_triggers,
+    config_trigger_upsert,          # #403 — the ONE writer path for
+    config_trigger_delete,          #        agents/<role>/triggers.yaml
     list_engagement_workspaces,
     delete_engagement_workspace,
     peek_engagement_workspace,

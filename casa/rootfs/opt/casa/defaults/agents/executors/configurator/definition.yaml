@@ -30,6 +30,13 @@ tools:
     - mcp__casa-framework__config_git_commit
     - mcp__casa-framework__casa_reload
     - mcp__casa-framework__casa_reload_triggers
+    # #403 — the ONE way to change agents/<role>/triggers.yaml. That file
+    # has a second writer (the resident's own reminder tools, in the Casa
+    # process), and a hand edit from this CLI child process silently
+    # discards whatever landed since the Read. hooks.trigger_file_write_guard
+    # denies the hand edit; these two are the replacement.
+    - mcp__casa-framework__config_trigger_upsert
+    - mcp__casa-framework__config_trigger_delete
     - mcp__casa-framework__casa_restart_supervised
     - mcp__casa-framework__query_engager
     - mcp__casa-framework__emit_completion

@@ -125,12 +125,21 @@ class SpecialistRegistry:
         the reconciled overlay root (``casa_core.py``); tests and every
         other pre-existing caller omit it and get the unchanged image-only
         behavior.
+
+        #439: the scan builds into LOCAL containers and publishes them by
+        rebinding, so no reader ever observes a partially-filled registry. This
+        runs on a worker thread (``asyncio.to_thread``) while the event loop is
+        free to serve another role's reload, and ``reload.dispatch`` serializes
+        only on a per-``agent:<role>`` key — so a concurrent
+        ``tools.sync_agent_role_map`` snapshots ``all_configs()`` right here. The
+        old clear-then-refill made that snapshot the *delegation authority*
+        missing specialists that are perfectly healthy on disk: ``delegate_to_agent``
+        refuses them as unknown and, since v0.157.0, the ``<delegates>`` block
+        renders from the same map and silently drops them. Building locally makes
+        every snapshot a whole generation.
         """
         from agent_loader import LoadError, load_all_specialists
 
-        self._configs.clear()
-        self._disabled_names.clear()
-        self._load_failures = []
         try:
             found, failed = load_all_specialists(self._dir, roles_dir=roles_dir)
         except LoadError as exc:
@@ -138,21 +147,25 @@ class SpecialistRegistry:
             logger.error("Specialist load failed at collection level: %s", exc)
             found, failed = {}, [("(collection)", str(exc))]
 
+        configs: dict[str, AgentConfig] = {}
+        disabled: set[str] = set()
+        failures: list[tuple[str, str]] = []
+
         for name, err in failed:
             logger.error(
                 "Specialist %r failed to load: %s; other specialists continue",
                 name, err,
             )
-            self._load_failures.append((name, err))
+            failures.append((name, err))
 
         for role, cfg in found.items():
             if not self._validate_tier2_shape(cfg, role):
                 continue
             if not cfg.enabled:
                 logger.info("Specialist %r bundled but disabled", role)
-                self._disabled_names.add(role)
+                disabled.add(role)
                 continue
-            self._configs[role] = cfg
+            configs[role] = cfg
             logger.info("Specialist %r loaded (model=%s)", role, cfg.model)
             # D-2 (v0.69.7): emit the same Layer-5 capability line residents
             # log in Agent.__init__ — specialists never build an Agent (they
@@ -172,11 +185,21 @@ class SpecialistRegistry:
                 logger.warning("agent_capabilities log failed for specialist role=%s",
                                getattr(cfg, "role", "?"), exc_info=True)
 
+        # PUBLISH — the single point where this scan becomes visible. Residual,
+        # stated rather than implied away: these are three separate stores, so a
+        # reader that consults two of them across the rebinds can see two
+        # different generations. What it can no longer see is HALF of one, which
+        # is the defect: every accessor here reads exactly one store, and each
+        # store is now published whole.
+        self._load_failures = failures
+        self._disabled_names = disabled
+        self._configs = configs
+
         logger.info(
             "Specialists: enabled=%s disabled=%s failed=%s",
-            sorted(self._configs.keys()),
-            sorted(self._disabled_names),
-            sorted(n for n, _ in self._load_failures),
+            sorted(configs.keys()),
+            sorted(disabled),
+            sorted(n for n, _ in failures),
         )
 
     def load_failures(self) -> list[tuple[str, str]]:

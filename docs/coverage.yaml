@@ -327,6 +327,10 @@
   doc: architecture/tools-interface.md
 - item: tool:config_git_commit
   doc: architecture/tools-interface.md
+- item: tool:config_trigger_upsert
+  doc: architecture/triggers.md
+- item: tool:config_trigger_delete
+  doc: architecture/triggers.md
 - item: tool:continue_voice_job
   doc: architecture/tools-interface.md
 - item: tool:delegate_to_agent

@@ -1,5 +1,35 @@
 # Changelog
 
+## [0.163.0] - 2026-08-08
+
+### Fixed
+
+- **A reminder is no longer silently thrown away when the configurator is
+  editing the same agent's schedule.** Reminders live in the same file as the
+  agent's other triggers, and the configurator edits that file from a separate
+  process — so if you asked your assistant to remind you about something while
+  a configuration change was in progress, the configurator could write the file
+  back without it. You were told the reminder was set, it quietly was not, and
+  nothing reported the loss. Trigger changes now go through Casa itself, which
+  makes the change in one step and leaves everything else in the file alone; an
+  agent editing that file by hand is refused and pointed at the proper route.
+  Your own edits to the file are unaffected.
+- **A plugin's setup step no longer starts on the strength of Casa not having
+  looked.** The check that decides whether a plugin's endpoints are live asked
+  "is anything wrong with this plugin?" — and answered "no" in two situations
+  where the plugin had not been examined at all, because the plugin registry was
+  unreadable or that one plugin's files could not be read. In the first of those
+  no plugin's endpoints work at all. The check now requires having actually seen
+  the plugin before treating silence as good news, and otherwise waits.
+- **A newly renamed or newly added agent can no longer disappear from another
+  agent's list of who it can hand work to.** Reloading one agent while another
+  was being rescanned could briefly publish a list missing agents that were
+  perfectly fine, so a hand-off would be refused as unknown until the next
+  reload. The rescan is now published in one piece. Relatedly, an agent added
+  after start-up could be launched without the plugins it is assigned, because
+  Casa was still reading a start-up-time snapshot to decide what kind of agent
+  it was; that snapshot is now refreshed with everything else.
+
 ## [0.162.0] - 2026-08-07
 
 ### Fixed

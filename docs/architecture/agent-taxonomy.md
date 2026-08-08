@@ -38,6 +38,24 @@ failure is a boot failure" would be wrong for two of the three tiers.
 The registry is the read side: a small, already-validated index answering what tier a role
 belongs to, what it is called, and whether it exists at all.
 
+**A rescan is never observable half-done, and the tier index a delegation reads is never a
+boot fossil.** Both follow from the same rule and each got there the hard way. The specialist
+scan runs on a worker thread while the loop stays free to reload another role, and reloads
+serialize only per role — so a concurrent role-map sync snapshots the specialist configs
+mid-scan. Clearing the map and refilling it made that snapshot the *delegation authority*
+missing specialists that are perfectly healthy on disk: refused as unknown, and dropped from
+the prompt block rendered from the same map. The scan therefore builds into local containers
+and publishes by rebinding, so every snapshot is a whole generation. Separately, the tier
+index the delegation session build reads is re-adopted from the runtime on every role-map
+sync rather than captured once at boot — a role added after boot was absent from the boot
+index, and the fallback then resolved a *resident's* plugin assignment against
+`specialist:<role>`, launching the delegation without the plugins that role is assigned.
+
+Residual, stated rather than implied away: the three specialist stores (enabled configs,
+disabled names, load failures) are published by three rebinds, so a reader consulting two of
+them across the publish can see two whole generations. What it can no longer see is half of
+one, which was the defect.
+
 ## Contracts & invariants
 
 **INV-AGENT-001**: A role claimed by both a resident and a specialist is refused at boot, when the role registry is built.

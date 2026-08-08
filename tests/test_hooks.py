@@ -802,3 +802,283 @@ async def test_settings_guard_allows_unrelated_bash():
     hook = make_agent_home_settings_guard()
     data = {"tool_name": "Bash", "tool_input": {"command": "ls -la /tmp > out.txt"}}
     assert await hook(data, "t", CTX) == {}
+
+
+# ------------------------------------------------------------------
+# trigger_file_write_guard (#403)
+# ------------------------------------------------------------------
+
+
+class TestTriggerFileWriteGuard:
+    """`agents/<role>/triggers.yaml` has a second writer — the resident's own
+    reminder tools, inside the Casa process. An agent's Read→Edit happens in a
+    separate CLI child process and spans model thinking time, so a reminder set
+    in that window is silently discarded by the stale rewrite. No lock can fence
+    that; the only fix is to route the edit through Casa, which means the direct
+    write must be refused here.
+    """
+
+    def _guard(self):
+        from hooks import make_trigger_file_write_guard
+        return make_trigger_file_write_guard()
+
+    async def _run(self, tool_name, tool_input, cwd="/config"):
+        return await self._guard()({"tool_name": tool_name, "cwd": cwd,
+                                    "tool_input": tool_input}, "tid", CTX)
+
+    @pytest.mark.parametrize("tool,key", [
+        ("Write", "file_path"), ("Edit", "file_path"),
+        ("MultiEdit", "file_path"), ("NotebookEdit", "notebook_path"),
+    ])
+    async def test_denies_every_write_capable_primitive(self, tool, key):
+        """A matcher that routes only Write|Edit lets MultiEdit/NotebookEdit
+        bypass entirely — the settings guard learned this the same way."""
+        out = await self._run(tool, {key: "/config/agents/butler/triggers.yaml"})
+        assert _decision(out) == "deny"
+        assert "config_trigger_upsert" in (
+            out["hookSpecificOutput"]["permissionDecisionReason"])
+
+    async def test_denies_the_relative_spelling(self):
+        # Executors run with cwd=/config, so a relative path names the same file.
+        out = await self._run("Edit", {"file_path": "agents/butler/triggers.yaml"})
+        assert _decision(out) == "deny"
+
+    async def test_denies_a_traversal_spelling(self):
+        out = await self._run("Write", {
+            "file_path": "/config/policies/../agents/butler/triggers.yaml"})
+        assert _decision(out) == "deny"
+
+    async def test_allows_reading_it(self):
+        """An agent must still be able to SEE the file it is asking Casa to
+        change — the recipes tell it to."""
+        assert await self._run(
+            "Read", {"file_path": "/config/agents/butler/triggers.yaml"}) == {}
+
+    async def test_allows_other_files_in_the_same_directory(self):
+        for name in ("delegates.yaml", "runtime.yaml", "character.yaml"):
+            assert await self._run(
+                "Edit", {"file_path": f"/config/agents/butler/{name}"}) == {}
+
+    async def test_ignores_a_specialists_trigger_file(self):
+        """Not a resident's file — the loader forbids one there outright, and
+        that tree is already managed state denied by managed_component_guard.
+        Claiming it here would put two guards on one path and neither on the
+        reason."""
+        assert await self._run("Edit", {
+            "file_path": "/config/agents/specialists/finance/triggers.yaml"}) == {}
+
+    async def test_denies_a_bash_write_form(self):
+        """Residents and the plugin-developer executor carry broad Bash, and
+        path_scope does not match Bash at all."""
+        out = await self._run("Bash", {
+            "command": "printf 'x' > /config/agents/butler/triggers.yaml"})
+        assert _decision(out) == "deny"
+
+    async def test_allows_a_bash_read_form(self):
+        assert await self._run("Bash", {
+            "command": "cat /config/agents/butler/triggers.yaml"}) == {}
+
+    async def test_denies_a_bash_copy_back(self):
+        """The concrete loss Sol constructed: copy the file out, wait, copy the
+        stale copy back."""
+        out = await self._run("Bash", {
+            "command": ("cp /data/engagements/x/triggers.yaml "
+                        "/config/agents/butler/triggers.yaml")})
+        assert _decision(out) == "deny"
+
+    async def test_denies_when_the_path_cannot_be_resolved(self, monkeypatch):
+        import hooks
+        def boom(_p):
+            raise OSError("loop")
+        monkeypatch.setattr(hooks.os.path, "realpath", boom)
+        out = await self._run("Edit", {"file_path": "/config/agents/x/other.yaml"})
+        assert _decision(out) == "deny"
+
+    async def test_denies_on_an_internal_error(self, monkeypatch):
+        import hooks
+        monkeypatch.setattr(hooks, "_normalize_path",
+                            lambda _p: (_ for _ in ()).throw(RuntimeError("x")))
+        out = await self._run("Edit", {"file_path": "/config/agents/b/triggers.yaml"})
+        assert _decision(out) == "deny"
+        assert "internal error" in (
+            out["hookSpecificOutput"]["permissionDecisionReason"])
+
+    async def test_registered_policy_matcher_routes_every_write_primitive(self):
+        from hooks import HOOK_POLICIES
+        matcher = HOOK_POLICIES["trigger_file_write_guard"]["matcher"]
+        for tool in ("Write", "Edit", "MultiEdit", "NotebookEdit", "Bash"):
+            assert tool in matcher
+
+    async def test_guard_is_code_mandatory_for_executors_and_residents(self):
+        """hooks.yaml is a config-editable pointer, so a yaml-only policy can be
+        shed by an edit the configurator is entitled to make. This guard is the
+        only thing standing between an agent and a silent lost reminder."""
+        import ast
+        import inspect
+        import agent as agent_mod
+        import tools as tools_mod
+        for mod in (agent_mod, tools_mod):
+            src = inspect.getsource(mod)
+            assert "trigger_file_write_guard_matcher()" in src, mod.__name__
+            ast.parse(src)
+
+
+class TestTriggerFileWriteGuardBypasses:
+    """Three review rounds, five distinct bypasses, all of the same shape:
+    deciding from the command text WHICH path a shell writes to. Round 3 deleted
+    that judgment rather than closing the fifth spelling — a shell computes its
+    destination at runtime, so the question has no answer, and each round's fix
+    was only ever the previous round's spelling.
+
+    Every historical bypass is pinned here. They are not regression tests for
+    five separate bugs; they are the evidence that the coarse rule replacing the
+    judgment covers what five sharpenings did not.
+    """
+
+    def _guard(self):
+        from hooks import make_trigger_file_write_guard
+        return make_trigger_file_write_guard()
+
+    async def _run(self, tool_name, tool_input, cwd="/config"):
+        return await self._guard()({"tool_name": tool_name, "cwd": cwd,
+                                    "tool_input": tool_input}, "tid", CTX)
+
+    async def test_relative_path_resolves_against_the_SESSION_cwd(self):
+        """r1, Sol. Residents run from their agent home, NOT /config, so a fixed
+        /config base made this resolve to a path that does not exist and read as
+        allowed — while bash resolved it to the real trigger file."""
+        out = await self._run(
+            "Edit", {"file_path": "../../agents/assistant/triggers.yaml"},
+            cwd="/config/agent-home/assistant")
+        assert _decision(out) == "deny"
+
+    async def test_an_executor_relative_path_still_resolves(self):
+        """The same change must not break the /config-relative spelling an
+        executor actually uses."""
+        out = await self._run("Edit", {"file_path": "agents/butler/triggers.yaml"})
+        assert _decision(out) == "deny"
+
+    async def test_a_relative_path_with_no_reported_cwd_fails_CLOSED(self):
+        """r2, Terra. `cwd` is a REQUIRED field of the SDK hook input, so its
+        absence means the payload did not come from the CLI. EVERY relative path
+        denies then, not just one whose basename matches: a relative symlink
+        names nothing recognisable and still resolves to the file."""
+        for raw in ("../../agents/a/triggers.yaml", "link.yaml"):
+            out = await self._guard()(
+                {"tool_name": "Edit", "tool_input": {"file_path": raw}},
+                "tid", CTX)
+            assert _decision(out) == "deny", raw
+
+    @pytest.mark.parametrize("command", [
+        # r1, Terra — a bare basename after a cd: neither shared token regex
+        # sees it (one starts at '/', the other needs a managed root first).
+        "cd /config/agents/butler && printf x > triggers.yaml",
+        # r1, Sol — quote splicing on a verb operand.
+        'cp /tmp/stale /config/agents/a/triggers"."yaml',
+        # r1, Sol — an opaque interpreter body has no shell word whose
+        # BASENAME is the file; the path is an argument to a function call.
+        "python3 -c \"open('triggers.yaml','w').write('x')\"",
+        # r2, Terra — quote splicing on a REDIRECT target, which the previous
+        # round's collector stopped at the quote and never saw.
+        'cd /config/agents/butler && printf x > triggers.""yaml',
+        "cd /config/agents/butler && printf x >'triggers.yaml'",
+        # r2, Terra — a runtime expansion the previous round accepted as a
+        # "provably absolute, provably elsewhere" path. Only bash expands it.
+        "cd /config/agents/butler && printf x > /$PWD/triggers.yaml",
+        # r2, Sol — WRAPPED write verbs. A denylist of write programs cannot
+        # hold: a wrapper puts any program in argv[0], which is why the write
+        # question was replaced by a read-only ALLOWLIST.
+        "cd /config/agents/butler && command cp /tmp/x triggers.yaml",
+        "cd /config/agents/butler && env cp /tmp/x triggers.yaml",
+        'cd /config/agents/butler && bash -c "cp /tmp/x triggers.yaml"',
+        # r2, Sol — a symlinked destination plus a splice, which defeated the
+        # realpath-aware token scan and then read as "provably elsewhere".
+        'cp /tmp/x /tmp/link-to-agent-dir/triggers"."yaml',
+        # r3, Sol — a substitution makes argv[0] a lie about what runs.
+        "echo $(cp /tmp/x /config/agents/b/triggers.yaml)",
+        "echo `cp /tmp/x /config/agents/b/triggers.yaml`",
+        "cat <(cp /tmp/x /config/agents/b/triggers.yaml)",
+        # r3, Sol — allowlisted "readers" that write. The allowlist is only as
+        # good as its audit, which is the price of it being the safe direction.
+        "xxd /tmp/x /config/agents/b/triggers.yaml",
+        "xxd -r /tmp/payload.hex /config/agents/b/triggers.yaml",
+        "rg --pre=tee '^.' /config/agents/b/triggers.yaml",
+        "file -C -m /config/agents/b/triggers.yaml",
+        # r3, Terra — a PATH-QUALIFIED program never inherits the reputation of
+        # the bare name: an agent can write an executable called `cat`.
+        "/data/engagements/e1/cat /config/agents/b/triggers.yaml",
+        # git is allowlisted by SUBCOMMAND, reusing the managed guard's own
+        # audited read-only set — the write subcommands still deny.
+        "git apply /tmp/p.patch triggers.yaml",
+        "git checkout HEAD -- agents/b/triggers.yaml",
+        # Not reported, and covered by the same rule: the name in a variable,
+        # in-place editors, and find's action predicates.
+        "t=triggers.yaml; cd /config/agents/b && printf x > $t",
+        "sed -i s/a/b/ /config/agents/butler/triggers.yaml",
+        "find /config/agents -name triggers.yaml -delete",
+        "cd agents/butler && cp /tmp/stale triggers.yaml",
+        "cd agents/butler && cat /tmp/x >> triggers.yaml",
+        "cd agents/butler && cat /tmp/x | tee triggers.yaml",
+    ])
+    async def test_every_historical_bash_bypass_is_closed(self, command):
+        out = await self._run("Bash", {"command": command})
+        assert _decision(out) == "deny", command
+
+    async def test_reads_still_pass(self):
+        """The coarse rule is over-broad by design, but not so broad that it
+        blinds the agent: the recipes tell it to read the file first. A benign
+        `2>/dev/null` is stripped before the redirect test, so the ordinary
+        verification forms are not mistaken for writes."""
+        for cmd in ("cat /config/agents/butler/triggers.yaml",
+                    "cd agents/butler && cat triggers.yaml",
+                    "grep -n name agents/butler/triggers.yaml",
+                    "cat /config/agents/butler/triggers.yaml 2>/dev/null",
+                    "head -20 agents/butler/triggers.yaml | grep name",
+                    "ls -la /config/agents/butler/",
+                    # r3, Terra — plugin-developer's ordinary git workflow on an
+                    # unrelated triggers.yaml. A file tool cannot produce a
+                    # diff, so refusing this had no equivalent.
+                    "git diff -- triggers.yaml",
+                    "git log --oneline -- agents/butler/triggers.yaml"):
+            assert await self._run("Bash", {"command": cmd}) == {}, cmd
+
+    async def test_the_shell_residual_is_KNOWN_and_not_claimed(self):
+        """#460, and the reason INV-TRIG-011 covers only the file-tool half.
+        Bash names this file to itself and something else to any tokenizer, and
+        ANSI-C quoting can encode any character — so the Bash branch is a
+        backstop for the accidental form, never a boundary. Pinned as a stated
+        outcome rather than left as a surprise: if this ever starts denying,
+        the residual has shrunk and the docs should say so."""
+        out = await self._run("Bash", {
+            "command": "cp /tmp/s /config/agents/b/tri$''ggers.yaml"})
+        assert out == {}
+
+    async def test_an_unrecognised_read_verb_fails_CLOSED(self):
+        """The allowlist is what makes the write side unenumerable-but-covered,
+        and its cost is stated rather than discovered: a read this small set
+        does not name is refused. `sed -n p` reads; `sed -i` writes; the guard
+        cannot tell, so it does not try."""
+        out = await self._run("Bash", {
+            "command": "sed -n p /config/agents/butler/triggers.yaml"})
+        assert _decision(out) == "deny"
+
+    async def test_an_unrelated_write_passes(self):
+        assert await self._run("Bash", {"command": "echo x > /tmp/y"}) == {}
+
+    async def test_the_file_tools_stay_precise(self):
+        """Only the Bash half went coarse. A file tool's path is a literal and
+        is resolved exactly, so an unrelated triggers.yaml is still editable —
+        which is also the documented way through the Bash refusal."""
+        out = await self._run("Edit", {"file_path": "plug/triggers.yaml"},
+                              cwd="/data/engagements/e1")
+        assert out == {}
+
+    async def test_a_shell_write_to_ANY_trigger_file_is_refused(self):
+        """The cost of deleting the destination judgment, pinned as a
+        deliberate outcome rather than left to be discovered: a shell write to a
+        file of that name is refused wherever it lives. The file tools are the
+        way through."""
+        out = await self._run(
+            "Bash", {"command": "printf x > /data/engagements/e1/triggers.yaml"},
+            cwd="/data/engagements/e1")
+        assert _decision(out) == "deny"

@@ -127,3 +127,66 @@ def test_cross_tier_collision_tie_break_agrees_across_both_structures(
     assert len(warned) == 2
     assert any("AgentRegistry.build" in m for m in warned)
     assert any("sync_agent_role_map" in m for m in warned)
+
+
+# ---------------------------------------------------------------------------
+# #439 — the tier authority tools reads must not stay a boot snapshot
+# ---------------------------------------------------------------------------
+
+
+def test_sync_adopts_the_runtimes_current_agent_registry(monkeypatch):
+    """``tools._agent_registry`` answers ``tier_for_role``, which picks the
+    plugin-assignment TARGET (``resident:<role>`` vs ``specialist:<role>``) for
+    a delegation's session build (``tools.py`` ``_build_specialist_options`` /
+    ``_prelaunch``).
+
+    It used to be captured once by ``init_tools`` and never re-synced, while
+    every reload path rebuilds ``runtime.agent_registry`` immediately before
+    calling this. A role added after boot is simply absent from the boot
+    snapshot, and the ``or "specialist"`` fallback then resolves a RESIDENT's
+    plugins against ``specialist:<role>`` — the delegation launches without the
+    plugins that role is actually assigned, for the life of the process.
+    """
+    import tools as tools_mod
+
+    monkeypatch.setattr(tools_mod, "_agent_role_map",
+                        dict(tools_mod._agent_role_map))
+    boot = AgentRegistry.build(residents={}, specialists={})
+    monkeypatch.setattr(tools_mod, "_agent_registry", boot)
+
+    residents = {"butler": _cfg("butler", "Tina")}
+    fresh = AgentRegistry.build(residents=residents, specialists={})
+    runtime = type("_RT", (), {
+        "role_configs": residents,
+        "specialist_registry": type("_SR", (), {
+            "all_configs": lambda self: {}})(),
+        "agent_registry": fresh,
+    })()
+
+    assert boot.tier_for_role("butler") is None      # the stale answer
+    tools_mod.sync_agent_role_map(runtime)
+    assert tools_mod._agent_registry is fresh
+    assert tools_mod._agent_registry.tier_for_role("butler") == "resident"
+
+
+def test_sync_keeps_the_previous_registry_when_the_runtime_carries_none(
+    monkeypatch,
+):
+    """A runtime stand-in without an ``agent_registry`` must not BLANK the
+    capture — losing it would send every tier lookup to the ``or "specialist"``
+    fallback, which is strictly worse than a stale answer."""
+    import tools as tools_mod
+
+    monkeypatch.setattr(tools_mod, "_agent_role_map",
+                        dict(tools_mod._agent_role_map))
+    boot = AgentRegistry.build(residents={"butler": _cfg("butler", "Tina")},
+                               specialists={})
+    monkeypatch.setattr(tools_mod, "_agent_registry", boot)
+
+    runtime = type("_RT", (), {
+        "role_configs": {},
+        "specialist_registry": type("_SR", (), {
+            "all_configs": lambda self: {}})(),
+    })()
+    tools_mod.sync_agent_role_map(runtime)
+    assert tools_mod._agent_registry is boot

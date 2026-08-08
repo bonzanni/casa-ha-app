@@ -51,6 +51,12 @@ from dataclasses import dataclass, field
 from typing import Any, Callable
 
 import plugin_callbacks
+# ONE shape for both halves of the setup gate (#457): the gate reads a trigger
+# state and a callback state and must apply the identical rule to each, so they
+# share the type rather than each declaring their own. Safe at module level —
+# ``trigger_reconcile`` imports this module only from inside a function, so
+# there is no import cycle in either direction.
+from trigger_reconcile import IssueState
 
 logger = logging.getLogger(__name__)
 
@@ -176,6 +182,10 @@ class DesiredCallbacks:
     valid_identities: set[str] = field(default_factory=set)
     prunable: bool = False
     base_url: "str | None" = None
+    # #457: the plugins this computation actually SAW — the mirror of
+    # ``trigger_reconcile.DesiredTriggers.observed``, which carries the full
+    # reasoning. Empty under an invalid registry.
+    observed: set[str] = field(default_factory=set)
 
 
 def compute_desired(
@@ -200,6 +210,7 @@ def compute_desired(
         # nothing is pruned — a membership set derived from a failed load
         # would drop every consent.
         return out
+    out.observed = {rp.name for rp in all_res.plugins}
     # Opportunistic prune only on a CLEAN pass: an artifact checksum hiccup or
     # an unreadable manifest drops that plugin from the resolution, and
     # treating its absence as "the declaration is gone" would silently discard
@@ -881,10 +892,11 @@ async def reconcile_from_runtime(runtime: Any, *, prompt: bool = True) -> list:
         prompt=prompt)
 
 
-def issue_state(resolver: Any = None) -> "tuple[bool, list]":
-    """``(ok, issues)`` — the callback gaps, and whether they could be computed
-    AT ALL. The mirror of ``trigger_reconcile.issue_state``, which carries the
-    full reasoning for why the flag exists.
+def issue_state(resolver: Any = None) -> "IssueState":
+    """``(ok, issues, observed)`` — the callback gaps, whether they could be
+    computed AT ALL, and which plugins the computation actually saw. The mirror
+    of ``trigger_reconcile.issue_state``, which carries the full reasoning for
+    why both the flag and the observed set exist.
 
     Two halves (#453): the DERIVED gaps from :func:`compute_desired`, and the
     APPLIED one — is the marker pair the consumer reads its redirect URI from
@@ -893,29 +905,27 @@ def issue_state(resolver: Any = None) -> "tuple[bool, list]":
     described a callback as fully live during the window between an approval and
     the write that backs it.
 
-    Residual, named rather than implied away: ``ok`` reports whether the
-    computation RAN, not whether it saw every plugin. An invalid registry — and
-    a single artifact that fails to resolve — yields an empty result with no
-    issues, so a plugin absent from the computation reads as "no gap". The
-    setup worker resolves its own registry entry three-state BEFORE reaching the
-    gate and defers on both, so it is unreachable there today; that shield is a
-    separate read, not a property of this function."""
+    ``observed`` closes the last way the empty list could lie (#457): ``ok``
+    reports whether the computation RAN, not whether it saw every plugin, so a
+    plugin an invalid registry — or one unresolvable artifact — dropped out of
+    the iteration read as "no gap". A gate must require the plugin to be IN
+    ``observed`` before reading the absence of an issue as a verdict about it."""
     try:
         import agent as agent_mod
 
         runtime = getattr(agent_mod, "active_runtime", None)
         if runtime is None:
-            return False, []
+            return IssueState(False, [], set())
         role_configs = getattr(runtime, "role_configs", None)
         if not role_configs:
-            return False, []
+            return IssueState(False, [], set())
         desired = compute_desired(role_configs=role_configs, resolver=resolver)
         verify_published_markers(desired, _default_spool())
-        return True, desired.issues
+        return IssueState(True, desired.issues, desired.observed)
     except Exception:  # noqa: BLE001 — a callback-compute crash must never
         # take down the whole health pass; log and degrade to no extras.
         logger.exception("callback issue recompute failed")
-        return False, []
+        return IssueState(False, [], set())
 
 
 def current_issues() -> list:

@@ -104,7 +104,7 @@ that names a setup tool only in a producer handoff or a README, with no `casa.se
 has no supported automatic path before v1.0 — nobody runs it, and the configurator says
 so rather than guessing a tool name.
 
-**INV-PLUG-011**: The setup-dispatch route gate recomputes the applied state at the moment it decides — a per-trigger webhook secret must already be minted under the consent identity the recomputation derives, and a routed plugin's callback marker pair must already equal the desired one — so an artifact the reconcile has not yet written keeps the obligation holding.
+**INV-PLUG-011**: The setup-dispatch route gate recomputes the applied state at the moment it decides — a per-trigger webhook secret must already be minted under the consent identity the recomputation derives, and a routed plugin's callback marker pair must already equal the desired one — so an artifact the reconcile has not yet written keeps the obligation holding; and it opens only for a plugin each recomputation reports having actually seen, never merely for one no issue happens to name.
 
 The gate the obligation passes through is a *recomputation*, not a cached verdict: it
 re-derives every plugin's trigger and callback gaps from the live approval stores and
@@ -146,12 +146,17 @@ checks here are also a *recomputation*, not a transaction: a pass landing inside
 reconcile's marker rewrite sees the pair briefly absent, which costs one spurious health row
 or one spurious hold, both cleared by the next pass.
 
-Nor does it cover a plugin the recomputation never *saw*. The gate asks whether any issue
-names the plugin, and an invalid registry — or a single artifact that fails to resolve —
-produces an empty result with no issues at all, which reads as "no gap". The setup worker
-resolves its own registry entry three-state before reaching the gate and defers on both, so
-this is unreachable today; but that shield is a separate, earlier read rather than a
-property of the gate, which is the same composed-from-moving-reads shape one level up.
+It does now cover a plugin the recomputation never *saw*, and getting there took naming the
+shape twice. The gate asked whether any issue named the plugin — and an invalid registry, or
+a single artifact that fails to resolve, produces a *successful* computation with no issues
+at all, which reads as "no gap" for a plugin it never looked at. In the first of those states
+the reconcile that follows swaps in an empty overlay, so every plugin webhook 404s while the
+gate reports every plugin live. The setup worker's own three-state resolution of the registry
+entry did defer on both, but that was a separate, earlier read — a shield, not a property of
+the gate, and the same composed-from-moving-reads shape one level up. So each recomputation
+now reports the set of plugins it actually iterated, and the gate requires membership in it
+POSITIVELY before reading the absence of an issue as a verdict (INV-PLUG-011). Absence is not
+consent, and this was the last place in this design that treated it as such.
 
 ## Failure behavior
 
