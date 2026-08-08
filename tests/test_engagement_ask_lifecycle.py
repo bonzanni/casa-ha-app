@@ -14,6 +14,7 @@ import json
 from typing import Any
 
 import pytest
+from broker_helpers import deliver
 from aiohttp import web
 
 import agent as agent_mod
@@ -257,7 +258,7 @@ async def test_answered_settles_with_check_and_clears_keyboard(env):
     await _until(lambda: (env["broker"].get_meta(
         namespace="engagement_ask", scope=eid, request_id="a1") or {}).get(
         "message_id") is not None)
-    assert env["broker"].deliver(
+    assert deliver(env["broker"], 
         namespace="engagement_ask", scope=eid, request_id="a1",
         option_index=1, actor_id=555) == "delivered"
     resp = await asyncio.wait_for(task, timeout=1.0)
@@ -308,7 +309,7 @@ async def test_canonical_qnumber_prepends_verbatim(env):
     assert posted_q == "Q1: Q7: Which DB?\n\n1. A\n2. B"
     # open_questions ledger + summary accessor agree with the message.
     assert env["reg"].open_question_numbers(eid) == [1]
-    env["broker"].deliver(
+    deliver(env["broker"], 
         namespace="engagement_ask", scope=eid, request_id="c1",
         option_index=0, actor_id=555)
     await asyncio.wait_for(task, timeout=1.0)
@@ -710,7 +711,7 @@ async def test_button_ask_reattach_race_preserves_static_metadata(env, monkeypat
     # A tap is accepted — it resolves the ask to "answered" (the meta the
     # inline-callback handler validates against — topic_id/operator_id/options —
     # is all present, so the tap is not rejected).
-    assert env["broker"].deliver(
+    assert deliver(env["broker"], 
         namespace="engagement_ask", scope=eid, request_id="race-1",
         option_index=0, actor_id=555) == "delivered"
     resp = await asyncio.wait_for(first, timeout=1.0)
@@ -762,7 +763,7 @@ async def test_reattach_without_local_owner_creates_request_with_full_metadata(e
     assert meta.get("operator_id") == 555
     assert meta.get("options") == ["A", "B"]
 
-    assert env["broker"].deliver(
+    assert deliver(env["broker"], 
         namespace="engagement_ask", scope=eid, request_id="orphan-1",
         option_index=0, actor_id=555) == "delivered"
     resp = await asyncio.wait_for(task, timeout=1.0)

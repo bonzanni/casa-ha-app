@@ -157,6 +157,27 @@ class TestOperatorDetermination:
         assert not channel._sender_is_operator(types.SimpleNamespace(id=77))
         assert not channel._sender_is_operator(None)
 
+    def test_operator_user_id_accessor_single_home(self):
+        """#374: operator_user_id() answers "who is the configured operator"
+        under exactly the _user_id_is_operator rules — a positive DM chat id
+        IS the operator's user id; empty (accept-all), a group id (negative),
+        and a non-numeric value all name NOBODY (None, fail-closed)."""
+        channel, _ = _channel("7")
+        assert channel.operator_user_id() == 7
+        for configured in ("", "  ", "-100123", "0", "not-a-number"):
+            channel, _ = _channel(configured)
+            assert channel.operator_user_id() is None, configured
+
+    def test_operator_user_id_never_disagrees_with_sender_rule(self):
+        """Sol r1 S1 red case: a non-canonical numeric configuration ("007")
+        must not name an operator here that _user_id_is_operator rejects —
+        otherwise a sender classified non-operator at ingress could approve
+        gated tools. The accessor answers None unless the exact string rule
+        would also accept the id."""
+        channel, _ = _channel("007")
+        assert not channel._user_id_is_operator(7)
+        assert channel.operator_user_id() is None
+
 
 class TestButtonTapIdentity:
     """Sol r2: a tap is a turn — it must carry the tapper's identity, not just

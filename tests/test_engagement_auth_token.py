@@ -482,9 +482,11 @@ class TestChannelRoutesRejectForgedIdentity:
             body = await resp.json()
         assert body == {"ok": False, "error": "engagement_auth_failed"}
 
-    async def test_permission_verdict_forged_id_is_rejected(self):
-        # An approval forgery: delivering an "allow" into another
-        # engagement's broker scope.
+    async def test_permission_verdict_route_removed(self):
+        # #469: the approval-forgery surface is gone entirely — even a
+        # correctly-authenticated engagement token gets a 404, because a
+        # verdict must come from the operator's tap, not from any holder of
+        # an engagement credential.
         app, _, _ = _channel_app()
         async with TestClient(TestServer(app)) as client:
             resp = await client.post(
@@ -493,8 +495,7 @@ class TestChannelRoutesRejectForgedIdentity:
                       "request_id": "r-1", "verdict": "allow",
                       "engagement_token": "tok-forged"},
             )
-            body = await resp.json()
-        assert body == {"ok": False, "error": "engagement_auth_failed"}
+        assert resp.status == 404
 
     async def test_update_state_forged_id_is_rejected(self):
         app, tg, _ = _channel_app()

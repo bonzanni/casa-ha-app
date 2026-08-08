@@ -6763,14 +6763,6 @@ async def _finalize_engagement(
                 engagement.id[:8], exc,
             )
 
-    # Drop the permission-verdict queue for this engagement (leak guard).
-    # Lazy import matches this function's existing style and avoids cycles.
-    try:
-        from channels.channel_handlers import PERMISSION_QUEUES
-        PERMISSION_QUEUES.pop(engagement.id, None)
-    except Exception:  # noqa: BLE001
-        pass
-
     # 4. NOTIFY Ellen (via existing DelegationComplete-shaped pathway)
     if _bus is not None:
         target_role = engagement.origin.get("role") or "assistant"

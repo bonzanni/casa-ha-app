@@ -24,6 +24,7 @@ import asyncio
 from unittest.mock import AsyncMock, MagicMock
 
 import pytest
+from broker_helpers import deliver
 from aiohttp import web
 from aiohttp.test_utils import TestClient, TestServer
 
@@ -60,6 +61,7 @@ async def test_non_allow_listed_round_trip(_fresh_broker):
     registry = MagicMock()
     registry.get = MagicMock(return_value=_Rec(tools_allowed=()))
     telegram = MagicMock()
+    telegram.operator_user_id = MagicMock(return_value=1)
     telegram.update_topic_state = AsyncMock()
     telegram.post_perm_keyboard = AsyncMock(return_value=555)
     telegram.edit_perm_keyboard_outcome = AsyncMock()
@@ -81,7 +83,7 @@ async def test_non_allow_listed_round_trip(_fresh_broker):
         # call channel_handlers._make_permission_verdict makes.
         async def feed_verdict():
             await asyncio.sleep(0.1)
-            assert _fresh_broker.deliver(
+            assert deliver(_fresh_broker, 
                 namespace="permission", scope=eid, request_id="tuid_e2e",
                 option_index=0, actor_id=1,
             ) == "delivered"
@@ -119,6 +121,7 @@ async def test_deny_round_trip(_fresh_broker):
     registry = MagicMock()
     registry.get = MagicMock(return_value=_Rec(tools_allowed=()))
     telegram = MagicMock()
+    telegram.operator_user_id = MagicMock(return_value=1)
     telegram.update_topic_state = AsyncMock()
     telegram.post_perm_keyboard = AsyncMock(return_value=556)
     telegram.edit_perm_keyboard_outcome = AsyncMock()
@@ -138,7 +141,7 @@ async def test_deny_round_trip(_fresh_broker):
     async with TestServer(app) as srv, TestClient(srv) as client:
         async def feed_verdict():
             await asyncio.sleep(0.1)
-            assert _fresh_broker.deliver(
+            assert deliver(_fresh_broker, 
                 namespace="permission", scope=eid, request_id="tuid_deny",
                 option_index=1, actor_id=1,
             ) == "delivered"

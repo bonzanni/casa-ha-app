@@ -199,19 +199,29 @@ class VerdictBroker:
     def _on_timeout(self, key: Key) -> None:
         self._finish(key, {"outcome": "no_answer"})
 
-    # -- delivery / claim / commit ---------------------------------------
+    # -- claim / commit ----------------------------------------------------
 
-    def deliver(
-        self, *, namespace: str, scope: str, request_id: str,
-        option_index: int, actor_id: int | None,
-    ) -> str:
-        claim = self.claim(
-            namespace=namespace, scope=scope, request_id=request_id,
-            option_index=option_index, actor_id=actor_id,
+    @staticmethod
+    def _actor_is_bound(req: PendingRequest, actor_id: int | None) -> bool:
+        """#469/#374: is *actor_id* the identity this request was bound to at
+        registration (``meta["operator_id"]``)?
+
+        Fail-closed on BOTH sides: the bound identity must be a positive int
+        (a request registered without one — or with ``None``, the deliberate
+        nobody-may-answer binding — is claimable by NO actor), and the actor
+        must be that exact int (``bool`` is excluded: it is an ``int``
+        subclass and ``True == 1`` would let a truthy flag impersonate user
+        id 1). Absence is not consent — a register site that forgets the
+        binding gets an unanswerable request, never an open one.
+        """
+        expected = req.meta.get("operator_id")
+        if not isinstance(expected, int) or isinstance(expected, bool) or expected <= 0:
+            return False
+        return (
+            isinstance(actor_id, int)
+            and not isinstance(actor_id, bool)
+            and actor_id == expected
         )
-        if isinstance(claim, str):
-            return claim
-        return "delivered" if self.commit(claim) else "stale"
 
     def claim(
         self, *, namespace: str, scope: str, request_id: str,
@@ -221,6 +231,13 @@ class VerdictBroker:
         key: Key = (namespace, scope, request_id)
         req = self._live.get(key)
         if req is not None:
+            # #469: the broker is the enforcement home for verdict authority —
+            # actor binding is checked HERE, not only at the Telegram tap, so
+            # no future delivery path can resolve a live request with an
+            # unbound actor. Checked BEFORE the duplicate branch: a forbidden
+            # actor learns nothing about claim state.
+            if not self._actor_is_bound(req, actor_id):
+                return "forbidden"
             if req._claimed is not None:
                 return "duplicate"
             token = object()

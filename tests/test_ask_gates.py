@@ -26,6 +26,7 @@ import json
 from types import SimpleNamespace
 
 import pytest
+from broker_helpers import deliver
 from aiohttp import web
 
 import agent as agent_mod
@@ -208,7 +209,7 @@ async def _drive_button(wired, task, rid, *, hash=_BTN_HASH, option_index=0):
     # misses it and the task times out (Sol, r2).
     await _wait_armed(wired, rid)
     await wired["seq"].post_for_block(ASK_TOOL, hash)
-    assert wired["broker"].deliver(
+    assert deliver(wired["broker"], 
         namespace="engagement_ask", scope=wired["rec"].id, request_id=rid,
         option_index=option_index, actor_id=555) == "delivered"
     resp = await asyncio.wait_for(task, timeout=1.0)
@@ -345,9 +346,9 @@ class TestReplyGate:
         eid = wired["rec"].id
         req, _ = wired["broker"].register(
             namespace="engagement_ask", scope=eid, request_id="q1",
-            timeout_s=60, meta={})
+            timeout_s=60, meta={"operator_id": 555})
         # Tap answers it → broker scope empties.
-        wired["broker"].deliver(
+        deliver(wired["broker"], 
             namespace="engagement_ask", scope=eid, request_id="q1",
             option_index=0, actor_id=555)
         resp = await wired["send"](_FakeRequest(
@@ -416,7 +417,7 @@ class TestStackingGate:
         await asyncio.sleep(0.02)
         # Drive the winner's relay-deferred keyboard post, then tap.
         await wired["seq"].post_for_block(ASK_TOOL, _BTN_HASH)
-        wired["broker"].deliver(
+        deliver(wired["broker"], 
             namespace="engagement_ask", scope=eid, request_id=winner_rid,
             option_index=0, actor_id=555)
         winner = pending.pop()
@@ -671,7 +672,7 @@ class TestMarkerCancellationWedge:
         await wired["seq"].post_for_block(ASK_TOOL, _BTN_HASH)
         assert wired["broker"].pending(
             namespace="engagement_ask", scope=eid) == ["cy"]
-        wired["broker"].deliver(
+        deliver(wired["broker"], 
             namespace="engagement_ask", scope=eid, request_id="cy",
             option_index=0, actor_id=555)
         await asyncio.wait_for(t2, timeout=1.0)

@@ -1050,22 +1050,19 @@ def _wire_engagement_permission_relay(
     """Inject engagement_permission_relay into a built cc_hook_policies dict.
 
     v0.37.2 (C-1): the relay needs live ``engagement_registry`` +
-    ``telegram_channel`` + per-engagement ``PERMISSION_QUEUES`` (shared with
-    the Telegram callback producer in ``channel_handlers``), so it can't be
-    wired via the parameter-free factory pattern used by HOOK_POLICIES.
-    Inject it directly into the built ``(matcher, callback)`` dict instead.
+    ``telegram_channel``, so it can't be wired via the parameter-free
+    factory pattern used by HOOK_POLICIES. Inject it directly into the
+    built ``(matcher, callback)`` dict instead.
 
     Mutates and returns ``cc_hook_policies`` for caller convenience.
     """
     from hooks import make_engagement_permission_relay
-    from channels.channel_handlers import PERMISSION_QUEUES
 
     cc_hook_policies["engagement_permission_relay"] = (
         r".*",
         make_engagement_permission_relay(
             engagement_registry=engagement_registry,
             telegram_channel=telegram_channel,
-            queues=PERMISSION_QUEUES,
         ),
     )
     return cc_hook_policies

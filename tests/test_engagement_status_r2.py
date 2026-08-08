@@ -16,6 +16,7 @@ import json
 from contextlib import asynccontextmanager
 
 import pytest
+from broker_helpers import deliver
 from aiohttp import web
 
 pytestmark = pytest.mark.asyncio
@@ -322,7 +323,7 @@ async def test_fast_tap_during_registration_never_stuck_waiting(
     # Deliver a tap ASAP — racing the registration window.
     await asyncio.sleep(0)
     for _ in range(50):
-        if fresh.deliver(namespace="engagement_ask", scope=eid,
+        if deliver(fresh, namespace="engagement_ask", scope=eid,
                          request_id="fast-1", option_index=0,
                          actor_id=555) == "delivered":
             break

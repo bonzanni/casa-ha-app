@@ -568,7 +568,7 @@ async def test_role_removed_between_prompt_and_approve_never_republishes(
     key = next(iter(fresh_coord._entries))
     ch = fresh_coord._entries[key]
     claim = broker.claim(namespace="resident_ask", scope=ch.scope,
-                         request_id=ch.rid, option_index=0, actor_id=100)
+                         request_id=ch.rid, option_index=0, actor_id=200)
     assert not isinstance(claim, str), f"claim rejected: {claim}"
     assert broker.commit(claim) is True
     ch.req.meta["on_commit_sync"](0)

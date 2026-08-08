@@ -21,6 +21,7 @@ import asyncio
 import json
 
 import pytest
+from broker_helpers import deliver
 from aiohttp import web
 
 import agent as agent_mod
@@ -153,7 +154,7 @@ async def test_ask_keyboard_posts_after_preceding_narration(wired):
     await seq.post_for_block(ASK_TOOL, h)
 
     # Operator taps.
-    assert wired["broker"].deliver(
+    assert deliver(wired["broker"], 
         namespace="engagement_ask", scope=eid, request_id="a1",
         option_index=0, actor_id=555) == "delivered"
     resp = await asyncio.wait_for(task, timeout=1.0)
@@ -193,7 +194,7 @@ async def test_button_ask_retry_reattaches_no_second_keyboard(wired):
 
     # Now the relay reaches the ask block → the keyboard posts exactly ONCE.
     await seq.post_for_block(ASK_TOOL, h)
-    assert wired["broker"].deliver(
+    assert deliver(wired["broker"], 
         namespace="engagement_ask", scope=eid, request_id="dup",
         option_index=0, actor_id=555) == "delivered"
     r1 = await asyncio.wait_for(t1, timeout=1.0)

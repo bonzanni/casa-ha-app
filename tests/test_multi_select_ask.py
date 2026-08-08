@@ -37,7 +37,8 @@ from verdict_broker import VerdictBroker
 def _reg_multi(broker, *, scope="e", rid="r", timeout_s=60.0):
     req, created = broker.register(
         namespace="engagement_ask", scope=scope, request_id=rid,
-        timeout_s=timeout_s, meta={"options": ["A", "B", "C"]},
+        timeout_s=timeout_s,
+        meta={"options": ["A", "B", "C"], "operator_id": 7},
     )
     assert created
     return req
@@ -66,7 +67,7 @@ class TestBrokerToggle:
         b = VerdictBroker()
         req = _reg_multi(b)
         claim = b.claim(namespace="engagement_ask", scope="e", request_id="r",
-                        option_index=0, actor_id=1)
+                        option_index=0, actor_id=7)
         assert not isinstance(claim, str)
         assert b.toggle_selection(
             namespace="engagement_ask", scope="e", request_id="r", idx=1) is None
@@ -86,7 +87,7 @@ class TestBrokerToggle:
         assert b.is_live_unclaimed(
             namespace="engagement_ask", scope="e", request_id="r") is True
         b.claim(namespace="engagement_ask", scope="e", request_id="r",
-                option_index=0, actor_id=1)
+                option_index=0, actor_id=7)
         assert b.is_live_unclaimed(
             namespace="engagement_ask", scope="e", request_id="r") is False
 

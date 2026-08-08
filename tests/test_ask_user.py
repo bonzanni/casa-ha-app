@@ -16,6 +16,7 @@ from pathlib import Path
 from unittest.mock import AsyncMock, MagicMock
 
 import pytest
+from broker_helpers import deliver
 import yaml
 
 import verdict_broker
@@ -457,7 +458,7 @@ class TestFinishHookShape:
         _res, payload, ch = await _ask(monkeypatch, channel=channel)
         rid = payload["request_id"]
 
-        assert _fresh_broker.deliver(
+        assert deliver(_fresh_broker, 
             namespace="resident_ask", scope="dm:500", request_id=rid,
             option_index=0, actor_id=999,
         ) == "delivered"
@@ -486,7 +487,7 @@ class TestFinishHookShape:
         _res, payload, ch = await _ask(monkeypatch, channel=channel)
         rid = payload["request_id"]
 
-        _fresh_broker.deliver(
+        deliver(_fresh_broker, 
             namespace="resident_ask", scope="dm:500", request_id=rid,
             option_index=1, actor_id=999,
         )
@@ -591,7 +592,7 @@ class TestDmReadableButtons:
                   "options": ["Personal Gmail", "Work Outlook"]},
         )
         rid = payload["request_id"]
-        assert _fresh_broker.deliver(
+        assert deliver(_fresh_broker, 
             namespace="resident_ask", scope="dm:500", request_id=rid,
             option_index=0, actor_id=999,
         ) == "delivered"

@@ -29,6 +29,7 @@ from typing import Any
 from unittest.mock import AsyncMock, MagicMock
 
 import pytest
+from broker_helpers import deliver
 from aiohttp import web
 from aiohttp.test_utils import TestClient, TestServer
 
@@ -203,7 +204,7 @@ async def test_ask_answered_edits_answered(app_with_ask) -> None:
             "/internal/channel/ask", json=_payload(request_id="rid-1"),
         ))
         await asyncio.sleep(0.05)
-        assert broker.deliver(
+        assert deliver(broker, 
             namespace="engagement_ask", scope="eng-1", request_id="rid-1",
             option_index=1, actor_id=999,
         ) == "delivered"
@@ -235,7 +236,7 @@ async def test_ask_calls_advance_interaction_state_first_contact(
             "/internal/channel/ask", json=_payload(request_id="rid-fc"),
         ))
         await asyncio.sleep(0.05)
-        assert broker.deliver(
+        assert deliver(broker, 
             namespace="engagement_ask", scope="eng-1", request_id="rid-fc",
             option_index=0, actor_id=999,
         ) == "delivered"
@@ -278,7 +279,7 @@ async def test_ask_only_creator_posts_one_keyboard(app_with_ask) -> None:
             "/internal/channel/ask", json=_payload(request_id="rid-x"),
         ))
         await asyncio.sleep(0.05)
-        assert broker.deliver(
+        assert deliver(broker, 
             namespace="engagement_ask", scope="eng-1", request_id="rid-x",
             option_index=0, actor_id=999,
         ) == "delivered"
@@ -371,7 +372,7 @@ async def test_ask_accepts_long_question_and_label(app_with_ask) -> None:
                 options=[long_label, "B"]),
         ))
         await asyncio.sleep(0.05)
-        assert broker.deliver(
+        assert deliver(broker, 
             namespace="engagement_ask", scope="eng-1", request_id="rid-long",
             option_index=0, actor_id=999,
         ) == "delivered"
@@ -550,7 +551,7 @@ async def test_ask_cancelled_during_post_completes_setup_one_keyboard(
     # no second post.
     task2 = asyncio.create_task(handler(_FakeRequest(payload)))
     await asyncio.sleep(0.02)
-    assert broker.deliver(
+    assert deliver(broker, 
         namespace="engagement_ask", scope="eng-1", request_id="rid-6",
         option_index=0, actor_id=999,
     ) == "delivered"
@@ -591,7 +592,7 @@ async def test_ask_disconnect_leaves_pending_for_reattach(
 
     task2 = asyncio.create_task(handler(_FakeRequest(payload)))
     await asyncio.sleep(0.02)
-    assert broker.deliver(
+    assert deliver(broker, 
         namespace="engagement_ask", scope="eng-1", request_id="rid-7",
         option_index=0, actor_id=999,
     ) == "delivered"
@@ -621,7 +622,7 @@ async def test_ask_broker_finish_hook_edits_answered_not_handler_not_callback(
     with pytest.raises(asyncio.CancelledError):
         await task
 
-    assert broker.deliver(
+    assert deliver(broker, 
         namespace="engagement_ask", scope="eng-1", request_id="rid-fh",
         option_index=0, actor_id=999,
     ) == "delivered"

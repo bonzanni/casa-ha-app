@@ -36,6 +36,7 @@ import asyncio
 import json
 
 import pytest
+from broker_helpers import deliver
 from aiohttp import web
 
 import agent as agent_mod
@@ -228,7 +229,7 @@ async def _drive_answer(wired, payload, option_index):
         wired["broker"],
         ("engagement_ask", wired["rec"].id, payload["request_id"]),
     )
-    assert wired["broker"].deliver(
+    assert deliver(wired["broker"], 
         namespace="engagement_ask", scope=wired["rec"].id,
         request_id=payload["request_id"], option_index=option_index,
         actor_id=555) == "delivered"

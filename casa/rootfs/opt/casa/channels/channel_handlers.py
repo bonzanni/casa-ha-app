@@ -23,7 +23,6 @@ import inspect
 import logging
 import math
 import time
-from collections import defaultdict
 from typing import Any, Awaitable, Callable
 
 from aiohttp import web
@@ -35,25 +34,6 @@ from text_util import utf16_len
 logger = logging.getLogger(__name__)
 
 Handler = Callable[[web.Request], Awaitable[web.StreamResponse]]
-
-
-# ---------------------------------------------------------------------------
-# Module-level state — permission verdict queue (DEPRECATED, v0.75.0)
-# ---------------------------------------------------------------------------
-#
-# v0.75.0 (W5/Sol B3,B4): _make_permission_verdict now delivers straight into
-# verdict_broker.BROKER — the long-poll consumer (_make_permission_pending)
-# this queue used to feed was removed. _PERMISSION_QUEUES is kept
-# accepted-and-ignored for one release (hooks.make_engagement_permission_relay
-# still accepts a now-unused ``queues=`` kwarg; _finalize_engagement still
-# pops the per-engagement entry as a no-op leak guard) — delete once every
-# call site has dropped the parameter.
-
-_PERMISSION_QUEUES: dict[str, asyncio.Queue] = defaultdict(asyncio.Queue)
-
-# v0.37.2 (C-1): public alias for consumers outside this module (deprecated
-# alongside _PERMISSION_QUEUES above).
-PERMISSION_QUEUES = _PERMISSION_QUEUES
 
 
 # ---------------------------------------------------------------------------
@@ -631,73 +611,6 @@ def _make_post_inline_keyboard(
             return web.json_response({"ok": False, "error": "send_failed"})
 
         return web.json_response({"ok": True, "message_id": msg_id})
-
-    return handler
-
-
-def _make_permission_verdict(engagement_registry: Any) -> Handler:
-    """POST /internal/channel/permission_verdict — casa-main → channel server.
-
-    v0.75.0 (W5/Sol B3,B4): CallbackQueryHandler posts here when an operator
-    taps the U1 inline-keyboard verdict button. Delivers the verdict directly
-    into ``verdict_broker.BROKER`` (namespace ``"permission"``, scope =
-    engagement_id) — the ``engagement_permission_relay`` hook awaits that
-    same broker request, so this is a pure hand-off with no queue in between.
-
-    Body shape: ``{engagement_id, request_id, verdict, operator_id?}``.
-    Response: ``{"ok": True, "result": <broker deliver() outcome>}`` or a
-    known failure ``{"ok": False, "error": <code>}``.
-
-    ``result`` is one of ``"delivered"`` (this tap won the live request),
-    ``"stale"`` (no live request — timed out/cancelled/already resolved), or
-    ``"duplicate"`` (a winning tap already claimed this request).
-
-    Error codes: ``bad_json``, ``missing_engagement_id``, ``missing_request_id``,
-    ``missing_verdict``, ``unknown_engagement``.
-    """
-
-    async def handler(request: web.Request) -> web.Response:
-        from verdict_broker import BROKER
-
-        try:
-            body = await request.json()
-        except Exception:
-            return web.json_response({"ok": False, "error": "bad_json"})
-        if not isinstance(body, dict):
-            return web.json_response({"ok": False, "error": "bad_json"})
-
-        eng_id = body.get("engagement_id")
-        if not eng_id:
-            return web.json_response(
-                {"ok": False, "error": "missing_engagement_id"},
-            )
-        request_id = body.get("request_id")
-        if not request_id:
-            return web.json_response(
-                {"ok": False, "error": "missing_request_id"},
-            )
-        verdict = body.get("verdict")
-        if verdict not in ("allow", "deny"):
-            return web.json_response(
-                {"ok": False, "error": "missing_verdict"},
-            )
-        rec = engagement_registry.get(eng_id)
-        if rec is None or getattr(rec, "status", None) not in ("active", "idle"):
-            return web.json_response(
-                {"ok": False, "error": "unknown_engagement"},
-            )
-        # #335: a verdict delivered into another engagement's broker scope is
-        # an approval forgery — the id claim must be authenticated.
-        auth_err = _engagement_auth_error(engagement_registry, eng_id, body)
-        if auth_err is not None:
-            return web.json_response({"ok": False, "error": auth_err})
-
-        option_index = 0 if verdict == "allow" else 1
-        result = BROKER.deliver(
-            namespace="permission", scope=eng_id, request_id=request_id,
-            option_index=option_index, actor_id=body.get("operator_id"),
-        )
-        return web.json_response({"ok": True, "result": result})
 
     return handler
 
@@ -2895,9 +2808,13 @@ def _make_channel_handlers(
     """Return a path → handler dict for /internal/channel/* POSTs.
 
     Phase 1: ``send_to_topic``.
-    Phase 2: ``post_inline_keyboard`` (Task 19), ``permission_verdict`` (Task 21),
-    ``update_state`` (Task 23).
+    Phase 2: ``post_inline_keyboard`` (Task 19), ``update_state`` (Task 23).
     v0.75.0 (W5): ``ask`` / ``ask_cancel`` (Task 3).
+    #469: ``permission_verdict`` was REMOVED — permission verdicts have no
+    internal writer. The operator's Telegram tap delivers in-process
+    (``telegram._on_inline_callback`` → ``BROKER.claim``); an internal POST
+    route here authenticated only the engagement's own token, which let an
+    executor approve its own gated tool call.
     v0.75.0 (W1): ``record_reply`` hook threads reply() texts to the
     claude_code driver's live topic-stream relay de-dup.
     Phase 2+ will extend with ``set_progress``, ``typing``, etc. — see spec §A.3.
@@ -2910,9 +2827,6 @@ def _make_channel_handlers(
         ),
         "/internal/channel/post_inline_keyboard": _make_post_inline_keyboard(
             telegram_channel=telegram_channel,
-            engagement_registry=engagement_registry,
-        ),
-        "/internal/channel/permission_verdict": _make_permission_verdict(
             engagement_registry=engagement_registry,
         ),
         "/internal/channel/update_state": _make_update_state(
@@ -2936,7 +2850,7 @@ def _make_channel_get_handlers(
 
     v0.75.0 (W5/Sol B3,B4): the ``permission_pending`` long-poll (Task 21)
     was removed — verdicts now flow through ``verdict_broker.BROKER``
-    directly (see ``_make_permission_verdict``), no queue/poll needed. Kept
+    directly via the in-process Telegram callback, no queue/poll needed. Kept
     as an (empty, for now) factory so ``casa_core``'s generic
     ``router.add_get`` loop over this dict needs no changes when a real GET
     handler is added here in the future.

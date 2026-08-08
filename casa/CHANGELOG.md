@@ -1,5 +1,30 @@
 # Changelog
 
+## [0.168.0] - 2026-08-08
+
+### Security
+
+- **Permission approvals inside engagements are now bound to the configured
+  operator on every path.** Approving a tool that is not on an engagement's
+  allow-list is authorization, and only the configured operator (your
+  `telegram_chat_id`) holds it: the approval keyboard now binds to the
+  configured operator rather than whoever started the engagement, and the
+  broker that resolves the verdict rejects any answer from a different
+  identity — fail-closed, so a request with no bound operator is answerable by
+  nobody. The internal `permission_verdict` endpoint was removed entirely: it
+  authenticated only the engagement's own credential, which let an engagement
+  process approve its own pending permission request without the operator ever
+  seeing it. With no operator configured ("accept all chats"), a gated tool is
+  now denied immediately instead of holding the engagement on an unanswerable
+  keyboard. In-engagement *questions* (`ask`) are unchanged and stay answerable
+  by the engagement's creator — answering a question is interaction, not
+  authorization.
+
+### Removed
+
+- The long-deprecated in-process permission verdict queue (superseded by the
+  verdict broker in v0.75.0) is fully deleted.
+
 ## [0.167.0] - 2026-08-08
 
 ### Changed

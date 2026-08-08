@@ -444,17 +444,11 @@ def channel_full_app_factory():
     """Build an aiohttp app with BOTH POST handlers from _make_channel_handlers
     AND the (now empty — v0.75.0 removed permission_pending) GET handlers
     from _make_channel_get_handlers.
-
-    Also resets the module-level _PERMISSION_QUEUES (deprecated,
-    accepted-and-ignored — kept one release) so tests don't bleed state.
     """
     from channels.channel_handlers import (
         _make_channel_handlers,
         _make_channel_get_handlers,
-        _PERMISSION_QUEUES,
     )
-
-    _PERMISSION_QUEUES.clear()
 
     def make(channel=None, registry=None):
         ch = channel or _FakeChannel()
@@ -471,7 +465,6 @@ def channel_full_app_factory():
         return app, ch, reg
 
     yield make
-    _PERMISSION_QUEUES.clear()
 
 
 @pytest.fixture
@@ -489,7 +482,7 @@ def _fresh_broker(monkeypatch):
 
 async def test_get_channel_handlers_no_longer_registers_permission_pending() -> None:
     """v0.75.0: the queue+long-poll indirection is retired — verdicts flow
-    straight into verdict_broker.BROKER.deliver from the POST handler."""
+    through the in-process Telegram callback claim/commit (the POST route itself was removed in #469)."""
     from channels.channel_handlers import _make_channel_get_handlers
 
     handlers = _make_channel_get_handlers(engagement_registry=_FakeRegistry())
@@ -497,16 +490,35 @@ async def test_get_channel_handlers_no_longer_registers_permission_pending() -> 
     assert handlers == {}
 
 
-async def test_permission_verdict_allow_delivers_to_broker(
+async def test_permission_verdict_route_gone() -> None:
+    """#469 pinning: permission verdicts have NO internal writer. The route
+    authenticated only the engagement's own token, so an executor holding its
+    workspace credential could POST an allow for its own pending gated tool
+    call — a silent self-approval. The only remaining verdict writer is the
+    in-process Telegram callback (operator-tap-authenticated claim/commit)."""
+    from channels import channel_handlers as ch
+    from channels.channel_handlers import _make_channel_handlers
+
+    handlers = _make_channel_handlers(
+        telegram_channel=_FakeChannel(), engagement_registry=_FakeRegistry(),
+    )
+    assert "/internal/channel/permission_verdict" not in handlers
+    assert not hasattr(ch, "_make_permission_verdict")
+
+
+async def test_permission_verdict_post_is_404(
     channel_full_app_factory, _fresh_broker,
 ) -> None:
+    """#469 red case: the exact self-approval POST an executor engagement
+    could forge (own engagement id + own token + own tool_use_id-derived
+    request_id) must not resolve the pending permission request."""
     reg = _FakeRegistry()
     reg.set_record("eng-1", _FakeRecord("eng-1", topic_id=42, status="active"))
     app, _ch, _reg = channel_full_app_factory(registry=reg)
 
     req, created = _fresh_broker.register(
         namespace="permission", scope="eng-1", request_id="rid-001",
-        timeout_s=5.0,
+        timeout_s=5.0, meta={"operator_id": 999},
     )
     assert created is True
 
@@ -517,120 +529,11 @@ async def test_permission_verdict_allow_delivers_to_broker(
                   "engagement_token": "tok-eng-1",
                   "verdict": "allow", "operator_id": 999},
         )
-        body = await resp.json()
-    assert body == {"ok": True, "result": "delivered"}
-
-    outcome = await asyncio.wait_for(_fresh_broker.await_result(req), 0.1)
-    assert outcome == {"outcome": "answered", "option_index": 0,
-                       "actor_id": 999}
-
-
-async def test_permission_verdict_deny_delivers_to_broker(
-    channel_full_app_factory, _fresh_broker,
-) -> None:
-    reg = _FakeRegistry()
-    reg.set_record("eng-1", _FakeRecord("eng-1", topic_id=42, status="active"))
-    app, _ch, _reg = channel_full_app_factory(registry=reg)
-
-    req, _created = _fresh_broker.register(
-        namespace="permission", scope="eng-1", request_id="rid-002",
-        timeout_s=5.0,
-    )
-
-    async with TestClient(TestServer(app)) as client:
-        resp = await client.post(
-            "/internal/channel/permission_verdict",
-            json={"engagement_id": "eng-1", "request_id": "rid-002",
-                  "engagement_token": "tok-eng-1",
-                  "verdict": "deny", "operator_id": 7},
-        )
-        body = await resp.json()
-    assert body == {"ok": True, "result": "delivered"}
-
-    outcome = await asyncio.wait_for(_fresh_broker.await_result(req), 0.1)
-    assert outcome["option_index"] == 1
-
-
-async def test_permission_verdict_no_live_request_returns_stale(
-    channel_full_app_factory, _fresh_broker,
-) -> None:
-    """No matching BROKER request (timed out/cancelled/never registered) —
-    deliver() reports 'stale', the HTTP call still succeeds (ok=True)."""
-    reg = _FakeRegistry()
-    reg.set_record("eng-1", _FakeRecord("eng-1", topic_id=42, status="active"))
-    app, _ch, _reg = channel_full_app_factory(registry=reg)
-
-    async with TestClient(TestServer(app)) as client:
-        resp = await client.post(
-            "/internal/channel/permission_verdict",
-            json={"engagement_id": "eng-1", "request_id": "no-such-rid",
-                  "engagement_token": "tok-eng-1",
-                  "verdict": "allow", "operator_id": 999},
-        )
-        body = await resp.json()
-    assert body == {"ok": True, "result": "stale"}
-
-
-async def test_permission_verdict_unknown_engagement_returns_error(
-    channel_full_app_factory,
-) -> None:
-    reg = _FakeRegistry()
-    reg.set_record("eng-1", None)  # so registry.get("eng-1") returns None
-    app, _ch, _reg = channel_full_app_factory(registry=reg)
-    async with TestClient(TestServer(app)) as client:
-        resp = await client.post(
-            "/internal/channel/permission_verdict",
-            json={"engagement_id": "eng-1", "request_id": "rid-001",
-                  "engagement_token": "tok-eng-1",
-                  "verdict": "allow", "operator_id": 999},
-        )
-        assert (await resp.json()) == {
-            "ok": False, "error": "unknown_engagement",
-        }
-
-
-async def test_permission_verdict_terminal_engagement_returns_error(
-    channel_full_app_factory, _fresh_broker,
-) -> None:
-    """L5 leak guard: a late verdict tap for an engagement that has already
-    finalized (status no longer active/idle) must be refused — and must
-    NOT deliver into the broker even if a live request happens to exist
-    under that (now-stale) engagement id."""
-    reg = _FakeRegistry()
-    reg.set_record("eng-1", _FakeRecord("eng-1", topic_id=42, status="completed"))
-    app, _ch, _reg = channel_full_app_factory(registry=reg)
-
-    req, _created = _fresh_broker.register(
-        namespace="permission", scope="eng-1", request_id="rid-001",
-        timeout_s=5.0,
-    )
-
-    async with TestClient(TestServer(app)) as client:
-        resp = await client.post(
-            "/internal/channel/permission_verdict",
-            json={"engagement_id": "eng-1", "request_id": "rid-001",
-                  "engagement_token": "tok-eng-1",
-                  "verdict": "allow", "operator_id": 999},
-        )
-        assert (await resp.json()) == {
-            "ok": False, "error": "unknown_engagement",
-        }
+        assert resp.status == 404
     # Never delivered: the request is still live/unresolved.
     assert _fresh_broker.pending(namespace="permission", scope="eng-1") == [
         "rid-001",
     ]
-
-
-async def test_permission_verdict_bad_json_returns_error(
-    channel_full_app_factory,
-) -> None:
-    app, _ch, _reg = channel_full_app_factory()
-    async with TestClient(TestServer(app)) as client:
-        resp = await client.post(
-            "/internal/channel/permission_verdict",
-            data="not json", headers={"Content-Type": "application/json"},
-        )
-        assert (await resp.json()) == {"ok": False, "error": "bad_json"}
 
 
 # ---------------------------------------------------------------------------
