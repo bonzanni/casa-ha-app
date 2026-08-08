@@ -76,9 +76,13 @@ async def test_unix_runner_serves_tools_call_via_unix_socket() -> None:
     from casa_core import start_internal_unix_runner
     with tempfile.TemporaryDirectory() as td:
         sock = os.path.join(td, "internal.sock")
+        # A pure transport test: does the socket route /tools/call to the
+        # handler and return its JSON? Use the terminal-exempt emit_completion
+        # so the v0.166.0 grant-gate lets an unbound call through — the grant
+        # policy itself is pinned in test_bridge_tools_allowed_gate.py.
         runner = await start_internal_unix_runner(
             socket_path=sock,
-            tool_dispatch={"ok": _ok_tool},
+            tool_dispatch={"emit_completion": _ok_tool},
             engagement_registry=_FakeReg(),
             hook_policies={},
         )
@@ -87,7 +91,8 @@ async def test_unix_runner_serves_tools_call_via_unix_socket() -> None:
             async with aiohttp.ClientSession(connector=connector) as sess:
                 async with sess.post(
                     "http://unix/internal/tools/call",
-                    json={"name": "ok", "arguments": {}, "engagement_id": None},
+                    json={"name": "emit_completion", "arguments": {},
+                          "engagement_id": None},
                 ) as resp:
                     assert resp.status == 200
                     body = await resp.json()

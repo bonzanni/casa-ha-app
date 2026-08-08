@@ -66,31 +66,55 @@ def test_pin_inv_trig_002_plugin_namespace_reserved_in_user_schema():
     assert triggers[0]["effective"] == "plg-p--x"
 
 
-async def test_pin_inv_mcp_001_internal_dispatch_ignores_agent_allowlist():
-    """INV-MCP-001: internal tool dispatch resolves against the full map and
-    consults no per-agent allowlist — an engagement declaring zero allowed
-    tools still dispatches.
+async def test_pin_inv_mcp_001_internal_dispatch_enforces_engagement_grant():
+    """INV-MCP-001 (v0.166.0, inverted): internal tool dispatch enforces the
+    authenticated engagement's grant — an engagement that does not grant a tool
+    cannot invoke it over the bridge, and an unbound call fails closed.
 
-    Red case demonstrated: adding an `allowed_tools` membership check to the
-    internal tools-call handler fails this test.
+    The old invariant (dispatch ignores the allowlist, "enforcement happens
+    before dispatch") rested on INV-MCP-002 — that only the trusted CLI reaches
+    the socket. That is false for a broad-Bash executor: its own root shell can
+    read the workspace token and POST the socket directly, bypassing the
+    CLI-side allowlist. So enforcement moved to dispatch.
+
+    Red case demonstrated: removing the grant check from the internal
+    tools-call handler makes the ungranted call below dispatch, failing this
+    test.
     """
     async def privileged(_arguments):
         return {"content": [{"type": "text", "text": "ran"}]}
 
-    record = type("Record", (), {
-        "status": "active", "allowed_tools": [],
-        "auth_token": "tok-e1",  # #335: id claims bind only with the token
-    })()
-    registry = type("Registry", (), {"get": lambda self, _id: record})()
-    app = web.Application()
-    app.router.add_post(
-        "/internal/tools/call",
-        _make_internal_tools_call_handler(
-            tool_dispatch={"privileged": privileged},
-            engagement_registry=registry,
-        ),
-    )
-    async with TestClient(TestServer(app)) as client:
+    def _record(tools_allowed):
+        return type("Record", (), {
+            "status": "active", "kind": "executor",
+            "tools_allowed": tools_allowed,
+            "auth_token": "tok-e1",  # #335: id claims bind only with the token
+        })()
+
+    def _app(record):
+        registry = type("Registry", (), {"get": lambda self, _id: record})()
+        app = web.Application()
+        app.router.add_post(
+            "/internal/tools/call",
+            _make_internal_tools_call_handler(
+                tool_dispatch={"privileged": privileged},
+                engagement_registry=registry,
+            ),
+        )
+        return app
+
+    # Not granted → rejected, tool never runs.
+    async with TestClient(TestServer(_app(_record(())))) as client:
+        response = await client.post("/internal/tools/call", json={
+            "name": "privileged", "arguments": {}, "engagement_id": "e1",
+            "engagement_token": "tok-e1",
+        })
+        payload = await response.json()
+    assert "tool_not_granted" in payload["error"]["message"]
+
+    # Granted → dispatches.
+    granted = ("mcp__casa-framework__privileged",)
+    async with TestClient(TestServer(_app(_record(granted)))) as client:
         response = await client.post("/internal/tools/call", json={
             "name": "privileged", "arguments": {}, "engagement_id": "e1",
             "engagement_token": "tok-e1",

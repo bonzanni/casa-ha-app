@@ -35,6 +35,11 @@ class _FakeRecord:
         self.status = status
         self.auth_token = auth_token
         self.topic_id = topic_id
+        # v0.166.0: the bridge grant-gate dispatches only tools the engagement
+        # is granted, so a record used to prove a valid token BINDS must grant
+        # the `spy` tool these tests dispatch.
+        self.kind = "executor"
+        self.tools_allowed = ("mcp__casa-framework__spy",)
 
 
 class _FakeRegistry:
@@ -170,9 +175,12 @@ class TestToolsCallRejectsForgedIdentity:
             body = await resp.json()
         assert json.loads(body["content"][0]["text"]) == {"eng": "mine"}
 
-    async def test_unknown_id_still_runs_unbound(self):
-        # Unchanged semantics: a stale/aged-out id is not an auth failure —
-        # the tool runs without engagement context and answers honestly.
+    async def test_unknown_id_is_unbound_and_rejected_fail_closed(self):
+        # v0.166.0: a stale/aged-out id is still not an AUTH failure, but it
+        # leaves the call UNBOUND, and the bridge grant-gate now fails closed
+        # for an unbound call to a non-terminal tool — an executor's own root
+        # shell could otherwise omit the id to dispatch anything. The tool is
+        # never invoked.
         reg = _FakeRegistry()
         app = _make_app(reg)
         async with TestClient(TestServer(app)) as client:
@@ -182,7 +190,8 @@ class TestToolsCallRejectsForgedIdentity:
                       "engagement_id": "no-such"},
             )
             body = await resp.json()
-        assert json.loads(body["content"][0]["text"]) == {"eng": None}
+        assert "tool_not_granted" in body["error"]["message"]
+        assert _TOOL_CALLS == []
 
     async def test_terminal_binding_allowlist_still_requires_the_token(self):
         # The emit_completion terminal-binding exemption (v0.74.2) must not

@@ -1,5 +1,19 @@
 # Changelog
 
+## [0.166.0] - 2026-08-08
+
+### Security
+
+- **The internal tool bridge now enforces each engagement's own tool grant.**
+  An engagement (specialist or executor) invoking a Casa framework tool over the
+  internal bridge is now checked against the exact set of tools it was granted,
+  and a call that carries no valid engagement identity is refused rather than
+  run. Previously the bridge authenticated the caller but did not re-check the
+  grant at dispatch, relying on the calling process to stay within its
+  allowlist. Enforcement now happens where the tool is dispatched, so it holds
+  regardless of how the request was constructed. Lifecycle completion is
+  unaffected.
+
 ## [0.165.0] - 2026-08-08
 
 ### Fixed
