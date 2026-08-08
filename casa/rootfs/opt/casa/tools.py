@@ -5168,7 +5168,10 @@ async def set_reminder(args: dict) -> dict:
     }
 
     try:
-        reminders.add_entry(path, entry)
+        # Off the loop: the mutator takes trigger_write_lock.PASS_LOCK, which
+        # a config_sync pass may hold, so acquiring it here would stall the
+        # loop (#458).
+        await asyncio.to_thread(reminders.add_entry, path, entry)
     except (OSError, ValueError) as exc:
         return _result({"status": "error", "kind": "write_failed",
                         "message": str(exc)})
@@ -5184,15 +5187,29 @@ async def set_reminder(args: dict) -> dict:
     try:
         runtime.trigger_registry.register_agent(role, [spec], channels)
     except Exception as exc:  # noqa: BLE001
-        # Fail closed: a reminder recorded but never registered would look set
-        # and silently not fire until the next restart.
+        # The write now lands off the loop (#458), so a sweep's
+        # `_reconcile_registrations` — "the file is the truth; the scheduler a
+        # cache of it" — can register this very entry from the file in the gap
+        # before we do, making our own register raise "already scheduled". That
+        # is not a failure: the reminder is written AND live. Only roll back
+        # when no job exists, i.e. the registration genuinely did not happen.
         try:
-            reminders.remove_entry(path, name)
-        except (OSError, ValueError):
-            logger.warning("set_reminder: rollback failed for %s", name,
-                           exc_info=True)
-        return _result({"status": "error", "kind": "register_failed",
-                        "message": str(exc)})
+            already_live = runtime.trigger_registry.has_job(role, name)
+        except Exception:  # noqa: BLE001 — treat an unusable registry as not-live
+            already_live = False
+        if already_live:
+            logger.info("reminder set: %s already registered by a concurrent "
+                        "reconcile; keeping it", name)
+        else:
+            # Fail closed: a reminder recorded but never registered would look
+            # set and silently not fire until the next restart.
+            try:
+                await asyncio.to_thread(reminders.remove_entry, path, name)
+            except (OSError, ValueError):
+                logger.warning("set_reminder: rollback failed for %s", name,
+                               exc_info=True)
+            return _result({"status": "error", "kind": "register_failed",
+                            "message": str(exc)})
 
     # Report the EFFECTIVE time, not the one passed in. Nothing is rounded —
     # ``validate_recurring`` REFUSES a sub-minute anchor rather than adjusting
@@ -5237,7 +5254,7 @@ async def cancel_reminder(args: dict) -> dict:
     # here: the schema permits an operator to author a `reminder-`-prefixed
     # entry, so the prefix cannot decide what may be deleted (INV-TRIG-010).
     try:
-        outcome = reminders.remove_entry(path, name)
+        outcome = await asyncio.to_thread(reminders.remove_entry, path, name)
     except (OSError, ValueError) as exc:
         return _result({"status": "error", "kind": "write_failed",
                         "message": str(exc)})
@@ -7643,11 +7660,14 @@ async def config_trigger_upsert(args: dict) -> dict:
     entry = {k: args[k] for k in _TRIGGER_ENTRY_FIELDS if k in args}
     import reminders
     try:
-        # Synchronous ON THE LOOP, deliberately: this is a small read, a
-        # judgement and one atomic replace, and running it in a thread would
-        # reintroduce exactly the interleaving with the reminder writer that
-        # routing the edit through Casa exists to remove.
-        outcome = reminders.upsert_entry(path, entry)
+        # Off the loop, under trigger_write_lock.PASS_LOCK (#458). This edit
+        # used to run synchronously on the loop precisely so it could not
+        # interleave with the reminder writer (#403); the shared lock now gives
+        # that serialization directly — across the reminder writer AND the
+        # config_sync pass — so the write no longer has to hold the loop to be
+        # safe, and must not, since the lock a pass holds would otherwise stall
+        # it.
+        outcome = await asyncio.to_thread(reminders.upsert_entry, path, entry)
     except (OSError, ValueError) as exc:
         return _result({"status": "error", "kind": "trigger_write_refused",
                         "message": str(exc)})
@@ -7685,7 +7705,9 @@ async def config_trigger_delete(args: dict) -> dict:
 
     import reminders
     try:
-        outcome = reminders.delete_entry(path, name)
+        # Off the loop, under trigger_write_lock.PASS_LOCK — see
+        # config_trigger_upsert for why (#458 / #403).
+        outcome = await asyncio.to_thread(reminders.delete_entry, path, name)
     except (OSError, ValueError) as exc:
         return _result({"status": "error", "kind": "trigger_write_refused",
                         "message": str(exc)})

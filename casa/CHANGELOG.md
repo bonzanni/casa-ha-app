@@ -1,5 +1,18 @@
 # Changelog
 
+## [0.165.0] - 2026-08-08
+
+### Fixed
+
+- **A reminder set while Casa was reloading its configuration could vanish
+  silently.** The config reconciler rewrites a resident's trigger file on a
+  background thread; a reminder saved in the instant between the reconciler
+  reading that file and writing it back was overwritten and lost, with nothing
+  to recover it from. Every writer of a trigger file — the reminder tools, the
+  configurator's trigger edits, and the reconciler's whole pass — is now
+  serialized under a single lock, so a reminder is always saved either before
+  or after a reconcile, never into the gap. (#458)
+
 ## [0.164.0] - 2026-08-08
 
 ### Removed

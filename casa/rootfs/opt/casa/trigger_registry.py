@@ -11,6 +11,7 @@ only understood assistant-level scheduling.
 from __future__ import annotations
 
 import logging
+import inspect
 from dataclasses import dataclass
 from datetime import datetime, timedelta
 from typing import TYPE_CHECKING, Callable
@@ -118,7 +119,7 @@ class TriggerRegistry:
         scheduler: "AsyncIOScheduler",
         app: web.Application,
         bus: MessageBus,
-        on_one_shot_fired: "Callable[[str, str], None] | None" = None,
+        on_one_shot_fired: "Callable[[str, str], object] | None" = None,
     ) -> None:
         self._scheduler = scheduler
         self._app = app
@@ -278,7 +279,14 @@ class TriggerRegistry:
                     )
                 elif self._on_one_shot_fired is not None:
                     try:
-                        self._on_one_shot_fired(role, trig.name)
+                        # May be sync (tests inject plain callables) or a
+                        # coroutine function: the shipped cleanup writes
+                        # triggers.yaml under trigger_write_lock.PASS_LOCK on a
+                        # worker thread (#458), so it returns an awaitable that
+                        # must be awaited here rather than dropped.
+                        _res = self._on_one_shot_fired(role, trig.name)
+                        if inspect.isawaitable(_res):
+                            await _res
                     except Exception:  # noqa: BLE001
                         logger.warning(
                             "one-shot cleanup failed for %s:%s; the sweep "

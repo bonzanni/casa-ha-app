@@ -208,25 +208,52 @@ class TestDelete:
         assert out["kind"] == "not_authorized"
 
 
-async def test_the_tools_do_not_yield_between_read_and_write():
-    """The serialization IS the fix. If the handler awaited anything between
-    reading the document and writing it — a `to_thread`, say — the reminder
-    writer could land in between on the same loop, and routing the edit through
-    Casa would buy nothing at all."""
-    import ast
-    import inspect
-    import tools as tools_mod
+async def test_configurator_writers_serialize_under_the_pass_lock():
+    """The serialization IS the fix. #403 got it by keeping the whole
+    read-modify-write a single synchronous step on the loop, so nothing could
+    land between the read and the write. #458 replaced that with
+    ``trigger_write_lock.PASS_LOCK``, held by every writer of ``triggers.yaml``
+    AND by the whole ``config_sync`` pass: a strictly stronger guarantee, and
+    the reason the tools now hand the mutator to a worker thread instead of
+    holding the loop. This pins the property the old "no awaits" assertion
+    protected — no other writer can land between this one's read and write —
+    against the mechanism now responsible for it.
+    """
+    import os
+    import tempfile
+    import threading
 
-    src = inspect.getsource(tools_mod)
-    tree = ast.parse(src)
-    for node in ast.walk(tree):
-        if (isinstance(node, ast.AsyncFunctionDef)
-                and node.name in ("config_trigger_upsert",
-                                  "config_trigger_delete")):
-            awaits = [n for n in ast.walk(node) if isinstance(n, ast.Await)]
-            assert not awaits, (
-                f"{node.name} awaits — the read-modify-write must be one "
-                f"synchronous step on the loop")
+    import reminders
+    import trigger_write_lock
+
+    for fn, arg in (
+        (reminders.upsert_entry, {"name": "reminder-cccccc", "type": "date",
+                                  "at": "2099-01-01T08:00:00+00:00",
+                                  "one_shot": True, "channel": "telegram",
+                                  "prompt": "x", "managed_by": "agent"}),
+        (reminders.delete_entry, "reminder-cccccc"),
+    ):
+        tmp = os.path.join(tempfile.mkdtemp(), "triggers.yaml")
+        with open(tmp, "w", encoding="utf-8") as fh:
+            fh.write("schema_version: 2\ntriggers: []\n")
+        done = threading.Event()
+
+        def _call(fn=fn, arg=arg, tmp=tmp) -> None:
+            try:
+                fn(tmp, arg)
+            except Exception:  # noqa: BLE001 — delete on an absent name is fine
+                pass
+            done.set()
+
+        with trigger_write_lock.PASS_LOCK:
+            t = threading.Thread(target=_call, daemon=True)
+            t.start()
+            assert not done.wait(timeout=1.0), (
+                f"{fn.__name__} completed while PASS_LOCK was held — it does "
+                f"not take the lock, so a config_sync pass can clobber its write"
+            )
+        assert done.wait(timeout=5.0)
+        t.join(timeout=5.0)
 
 
 class TestLegacySchemaV1:
