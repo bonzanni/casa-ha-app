@@ -37,6 +37,7 @@ import asyncio
 import json
 
 import pytest
+from broker_helpers import deliver
 from aiohttp import web
 from unittest.mock import AsyncMock, MagicMock
 
@@ -298,7 +299,7 @@ async def test_body_identical_across_post_persist_and_settle(
     }
     task = asyncio.ensure_future(ask(_FakeRequest(payload)))
     await asyncio.sleep(0.02)
-    assert fresh.deliver(
+    assert deliver(fresh, 
         namespace="engagement_ask", scope=eid, request_id="a1",
         option_index=0, actor_id=555) == "delivered"
     resp = await asyncio.wait_for(task, timeout=1.0)

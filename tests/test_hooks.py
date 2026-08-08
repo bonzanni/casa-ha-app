@@ -616,19 +616,18 @@ class TestEngagementPermissionRelayWired:
         assert matcher == r".*"
         assert callable(cb)
 
-    def test_wiring_uses_shared_permission_queues(self):
-        """v0.75.0 (W5/Sol B3,B4): the operator verdict now flows through
-        ``verdict_broker.BROKER``, not this queue dict — the relay accepts
-        ``queues=`` as a deprecated, accepted-and-ignored kwarg (see
-        ``channel_handlers.PERMISSION_QUEUES`` docstring) so mid-migration
-        callers don't crash. This just pins the public alias to the same
-        underlying dict until every wiring site drops the parameter."""
-        from channels.channel_handlers import (
-            PERMISSION_QUEUES,
-            _PERMISSION_QUEUES,
-        )
+    def test_deprecated_permission_queue_surface_gone(self):
+        """#469 rode along on the v0.75.0 deprecation note: the queue dict
+        and the relay's accepted-and-ignored ``queues=`` kwarg are deleted —
+        the operator verdict flows only through ``verdict_broker.BROKER``."""
+        import inspect
+        from channels import channel_handlers
+        from hooks import make_engagement_permission_relay
 
-        assert PERMISSION_QUEUES is _PERMISSION_QUEUES
+        assert not hasattr(channel_handlers, "PERMISSION_QUEUES")
+        assert not hasattr(channel_handlers, "_PERMISSION_QUEUES")
+        params = inspect.signature(make_engagement_permission_relay).parameters
+        assert "queues" not in params
 
 
 class TestEngagementButtonsReminderWired:

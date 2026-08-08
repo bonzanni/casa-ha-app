@@ -7,6 +7,7 @@ from __future__ import annotations
 
 import asyncio
 import pytest
+from broker_helpers import deliver
 import verdict_broker
 from verdict_broker import VerdictBroker
 
@@ -16,9 +17,9 @@ pytestmark = [pytest.mark.asyncio, pytest.mark.unit]
 async def test_register_deliver_await_roundtrip():
     b = VerdictBroker()
     req, created = b.register(namespace="engagement_ask", scope="e1",
-                              request_id="r1", timeout_s=5)
+                              request_id="r1", timeout_s=5, meta={"operator_id": 42})
     assert created is True
-    assert b.deliver(namespace="engagement_ask", scope="e1",
+    assert deliver(b, namespace="engagement_ask", scope="e1",
                      request_id="r1", option_index=2, actor_id=42) == "delivered"
     assert await b.await_result(req) == {
         "outcome": "answered", "option_index": 2, "actor_id": 42}
@@ -27,9 +28,9 @@ async def test_register_deliver_await_roundtrip():
 async def test_reattach_same_live_key_returns_existing_not_created():
     b = VerdictBroker()
     r1, c1 = b.register(namespace="engagement_ask", scope="e1",
-                        request_id="r1", timeout_s=5)
+                        request_id="r1", timeout_s=5, meta={"operator_id": 7})
     r2, c2 = b.register(namespace="engagement_ask", scope="e1",
-                        request_id="r1", timeout_s=5)
+                        request_id="r1", timeout_s=5, meta={"operator_id": 7})
     assert c1 is True and c2 is False and r1 is r2
 
 
@@ -37,12 +38,12 @@ async def test_reattach_after_completion_reads_tombstone():
     """B2: a retry whose HTTP response was lost still gets the real answer."""
     b = VerdictBroker()
     req, _ = b.register(namespace="engagement_ask", scope="e1",
-                        request_id="r1", timeout_s=5)
-    b.deliver(namespace="engagement_ask", scope="e1", request_id="r1",
+                        request_id="r1", timeout_s=5, meta={"operator_id": 7})
+    deliver(b, namespace="engagement_ask", scope="e1", request_id="r1",
               option_index=1, actor_id=7)
     await b.await_result(req)                       # completes → retired
     req2, created = b.register(namespace="engagement_ask", scope="e1",
-                               request_id="r1", timeout_s=5)
+                               request_id="r1", timeout_s=5, meta={"operator_id": 1})
     assert created is False
     assert (await b.await_result(req2))["option_index"] == 1
 
@@ -55,36 +56,36 @@ async def test_multiple_same_id_reattach_through_window(monkeypatch):
     monkeypatch.setattr(verdict_broker, "_RETIRE_S", 0.2)
     b = VerdictBroker()
     r1, c1 = b.register(namespace="permission", scope="e1",
-                        request_id="r1", timeout_s=5)
+                        request_id="r1", timeout_s=5, meta={"operator_id": 1})
     assert c1 is True
-    b.deliver(namespace="permission", scope="e1", request_id="r1",
+    deliver(b, namespace="permission", scope="e1", request_id="r1",
               option_index=0, actor_id=1)                    # retire r1
     await b.await_result(r1)
     for _ in range(3):                                       # 3 reattaches
         rr, created = b.register(namespace="permission", scope="e1",
-                                 request_id="r1", timeout_s=5)
+                                 request_id="r1", timeout_s=5, meta={"operator_id": 1})
         assert created is False
         assert (await b.await_result(rr))["option_index"] == 0
-        assert b.deliver(namespace="permission", scope="e1", request_id="r1",
+        assert deliver(b, namespace="permission", scope="e1", request_id="r1",
                          option_index=9, actor_id=1) == "duplicate"
         await asyncio.sleep(0.03)
     r3, c3 = b.register(namespace="permission", scope="e1",
-                        request_id="r3", timeout_s=5)         # fresh distinct key
+                        request_id="r3", timeout_s=5, meta={"operator_id": 1})         # fresh distinct key
     assert c3 is True
     await asyncio.sleep(0.25)                                # r1 tombstone expires
-    assert b.deliver(namespace="permission", scope="e1", request_id="r3",
+    assert deliver(b, namespace="permission", scope="e1", request_id="r3",
                      option_index=1, actor_id=1) == "delivered"   # r3 untouched
-    assert b.deliver(namespace="permission", scope="e1", request_id="r1",
+    assert deliver(b, namespace="permission", scope="e1", request_id="r1",
                      option_index=0, actor_id=1) == "stale"       # r1 now gone
 
 
 async def test_duplicate_then_stale():
     b = VerdictBroker()
     req, _ = b.register(namespace="engagement_ask", scope="e1",
-                        request_id="r1", timeout_s=5)
-    assert b.deliver(namespace="engagement_ask", scope="e1", request_id="r1",
+                        request_id="r1", timeout_s=5, meta={"operator_id": 1})
+    assert deliver(b, namespace="engagement_ask", scope="e1", request_id="r1",
                      option_index=0, actor_id=1) == "delivered"
-    assert b.deliver(namespace="engagement_ask", scope="e1", request_id="r1",
+    assert deliver(b, namespace="engagement_ask", scope="e1", request_id="r1",
                      option_index=1, actor_id=1) == "duplicate"
 
 
@@ -92,25 +93,25 @@ async def test_stale_after_retirement(monkeypatch):
     monkeypatch.setattr(verdict_broker, "_RETIRE_S", 0)
     b = VerdictBroker()
     req, _ = b.register(namespace="engagement_ask", scope="e1",
-                        request_id="r1", timeout_s=5)
-    b.deliver(namespace="engagement_ask", scope="e1", request_id="r1",
+                        request_id="r1", timeout_s=5, meta={"operator_id": 1})
+    deliver(b, namespace="engagement_ask", scope="e1", request_id="r1",
               option_index=0, actor_id=1)
     await b.await_result(req)
     await asyncio.sleep(0)                            # let retirement pop run
-    assert b.deliver(namespace="engagement_ask", scope="e1", request_id="r1",
+    assert deliver(b, namespace="engagement_ask", scope="e1", request_id="r1",
                      option_index=0, actor_id=1) == "stale"
 
 
 async def test_unknown_key_is_stale():
     b = VerdictBroker()
-    assert b.deliver(namespace="engagement_ask", scope="e1",
+    assert deliver(b, namespace="engagement_ask", scope="e1",
                      request_id="ghost", option_index=0, actor_id=1) == "stale"
 
 
 async def test_timeout_no_answer_and_gone_from_pending():
     b = VerdictBroker()
     req, _ = b.register(namespace="engagement_ask", scope="e1",
-                        request_id="r1", timeout_s=0.05)
+                        request_id="r1", timeout_s=0.05, meta={"operator_id": 7})
     assert b.pending(namespace="engagement_ask", scope="e1") == ["r1"]
     assert await b.await_result(req) == {"outcome": "no_answer"}
     assert b.pending(namespace="engagement_ask", scope="e1") == []
@@ -119,12 +120,12 @@ async def test_timeout_no_answer_and_gone_from_pending():
 async def test_no_theft_across_namespaces_same_scope():
     b = VerdictBroker()
     perm, _ = b.register(namespace="permission", scope="e1",
-                         request_id="p1", timeout_s=5)
+                         request_id="p1", timeout_s=5, meta={"operator_id": 7})
     ask, _ = b.register(namespace="engagement_ask", scope="e1",
-                        request_id="a1", timeout_s=5)
-    b.deliver(namespace="engagement_ask", scope="e1", request_id="a1",
+                        request_id="a1", timeout_s=5, meta={"operator_id": 7})
+    deliver(b, namespace="engagement_ask", scope="e1", request_id="a1",
               option_index=1, actor_id=7)
-    b.deliver(namespace="permission", scope="e1", request_id="p1",
+    deliver(b, namespace="permission", scope="e1", request_id="p1",
               option_index=0, actor_id=7)
     assert (await b.await_result(ask))["option_index"] == 1
     assert (await b.await_result(perm))["option_index"] == 0
@@ -134,12 +135,12 @@ async def test_two_asks_out_of_order_same_namespace():
     """S1: both under engagement_ask, distinct rids."""
     b = VerdictBroker()
     r1, _ = b.register(namespace="engagement_ask", scope="e1",
-                       request_id="r1", timeout_s=5)
+                       request_id="r1", timeout_s=5, meta={"operator_id": 1})
     r2, _ = b.register(namespace="engagement_ask", scope="e1",
-                       request_id="r2", timeout_s=5)
-    b.deliver(namespace="engagement_ask", scope="e1", request_id="r2",
+                       request_id="r2", timeout_s=5, meta={"operator_id": 1})
+    deliver(b, namespace="engagement_ask", scope="e1", request_id="r2",
               option_index=1, actor_id=1)
-    b.deliver(namespace="engagement_ask", scope="e1", request_id="r1",
+    deliver(b, namespace="engagement_ask", scope="e1", request_id="r1",
               option_index=0, actor_id=1)
     assert (await b.await_result(r2))["option_index"] == 1
     assert (await b.await_result(r1))["option_index"] == 0
@@ -148,10 +149,10 @@ async def test_two_asks_out_of_order_same_namespace():
 async def test_cancel_scope_and_supersede():
     b = VerdictBroker()
     r1, _ = b.register(namespace="resident_ask", scope="c1",
-                       request_id="r1", timeout_s=5, detached=True)
+                       request_id="r1", timeout_s=5, detached=True, meta={"operator_id": 9})
     r2, created = b.register(namespace="resident_ask", scope="c1",
                              request_id="r2", timeout_s=5, detached=True,
-                             supersede=True)
+                             supersede=True, meta={"operator_id": 9})
     assert created is True
     assert (await b.await_result(r1))["outcome"] == "cancelled"     # superseded
     assert b.cancel_scope(namespace="resident_ask", scope="c1",
@@ -162,7 +163,7 @@ async def test_cancel_scope_and_supersede():
 async def test_logical_cancel():
     b = VerdictBroker()
     req, _ = b.register(namespace="permission", scope="e1",
-                        request_id="r1", timeout_s=5)
+                        request_id="r1", timeout_s=5, meta={"operator_id": 9})
     assert b.cancel(namespace="permission", scope="e1", request_id="r1",
                     reason="caller_cancelled") is True
     assert (await b.await_result(req))["outcome"] == "cancelled"
@@ -175,7 +176,7 @@ async def test_cancel_all_then_drain_hooks(monkeypatch):
     b = VerdictBroker()
     edited = []
     req, _ = b.register(namespace="permission", scope="e1",
-                        request_id="r1", timeout_s=60)
+                        request_id="r1", timeout_s=60, meta={"operator_id": 9})
     async def _hook(outcome):
         edited.append(outcome["outcome"])
     b.set_finish_hook(req, _hook)
@@ -188,7 +189,7 @@ async def test_cancel_all_then_drain_hooks(monkeypatch):
 async def test_detached_expires_on_ttl():
     b = VerdictBroker()
     b.register(namespace="resident_ask", scope="c1", request_id="r1",
-               timeout_s=0.05, detached=True)
+               timeout_s=0.05, detached=True, meta={"operator_id": 9})
     assert b.pending(namespace="resident_ask", scope="c1") == ["r1"]
     await asyncio.sleep(0.12)
     assert b.pending(namespace="resident_ask", scope="c1") == []
@@ -199,17 +200,17 @@ async def test_shield_survives_awaiter_cancellation_then_delivers():
     shared future — a reattach still gets the answer."""
     b = VerdictBroker()
     req, _ = b.register(namespace="engagement_ask", scope="e1",
-                        request_id="r1", timeout_s=5)
+                        request_id="r1", timeout_s=5, meta={"operator_id": 9})
     waiter = asyncio.create_task(b.await_result(req))
     await asyncio.sleep(0)
     waiter.cancel()                                  # simulate HTTP disconnect
     with pytest.raises(asyncio.CancelledError):
         await waiter
     assert b.pending(namespace="engagement_ask", scope="e1") == ["r1"]  # live
-    b.deliver(namespace="engagement_ask", scope="e1", request_id="r1",
+    deliver(b, namespace="engagement_ask", scope="e1", request_id="r1",
               option_index=1, actor_id=9)
     req2, created = b.register(namespace="engagement_ask", scope="e1",
-                               request_id="r1", timeout_s=5)
+                               request_id="r1", timeout_s=5, meta={"operator_id": 1})
     assert created is False
     assert (await b.await_result(req2))["option_index"] == 1
 
@@ -219,9 +220,9 @@ async def test_retired_timeout_tap_is_stale_not_duplicate(monkeypatch):
     monkeypatch.setattr(verdict_broker, "_RETIRE_S", 5)
     b = VerdictBroker()
     req, _ = b.register(namespace="engagement_ask", scope="e1",
-                        request_id="r1", timeout_s=0.05)
+                        request_id="r1", timeout_s=0.05, meta={"operator_id": 1})
     await b.await_result(req)                         # no_answer → retired
-    assert b.deliver(namespace="engagement_ask", scope="e1", request_id="r1",
+    assert deliver(b, namespace="engagement_ask", scope="e1", request_id="r1",
                      option_index=0, actor_id=1) == "stale"
 
 
@@ -232,7 +233,7 @@ async def test_get_meta_available_live_and_retired(monkeypatch):
                         request_id="r1", timeout_s=5, meta={"options": ["A", "B"]})
     assert b.get_meta(namespace="engagement_ask", scope="e1",
                       request_id="r1") == {"options": ["A", "B"]}
-    b.deliver(namespace="engagement_ask", scope="e1", request_id="r1",
+    deliver(b, namespace="engagement_ask", scope="e1", request_id="r1",
               option_index=0, actor_id=1)
     await b.await_result(req)                         # retired, meta retained
     assert b.get_meta(namespace="engagement_ask", scope="e1",
@@ -245,10 +246,10 @@ async def test_unregister_resolves_concurrent_reattacher_and_reregisters_fresh()
     and a later same-id register is genuinely fresh (created=True)."""
     b = VerdictBroker()
     req, _ = b.register(namespace="engagement_ask", scope="e1", request_id="r1",
-                        timeout_s=5)
+                        timeout_s=5, meta={"operator_id": 1})
     # a second handler reattaches and is already awaiting the shared future
     req2, created2 = b.register(namespace="engagement_ask", scope="e1",
-                                request_id="r1", timeout_s=5)
+                                request_id="r1", timeout_s=5, meta={"operator_id": 1})
     assert created2 is False
     waiter = asyncio.create_task(b.await_result(req2))
     await asyncio.sleep(0)
@@ -257,7 +258,7 @@ async def test_unregister_resolves_concurrent_reattacher_and_reregisters_fresh()
     assert (await b.await_result(req))["outcome"] == "delivery_failed"
     assert b.pending(namespace="engagement_ask", scope="e1") == []
     _, created = b.register(namespace="engagement_ask", scope="e1",
-                            request_id="r1", timeout_s=5)
+                            request_id="r1", timeout_s=5, meta={"operator_id": 1})
     assert created is True                                        # no tombstone
 
 
@@ -268,8 +269,8 @@ async def test_set_finish_hook_fires_when_request_already_completed():
     b = VerdictBroker()
     seen = []
     req, _ = b.register(namespace="engagement_ask", scope="e1",
-                        request_id="r1", timeout_s=5)
-    b.deliver(namespace="engagement_ask", scope="e1", request_id="r1",
+                        request_id="r1", timeout_s=5, meta={"operator_id": 1})
+    deliver(b, namespace="engagement_ask", scope="e1", request_id="r1",
               option_index=0, actor_id=1)                        # completes first
     async def _hook(outcome):
         seen.append(outcome)
@@ -289,19 +290,19 @@ async def test_claim_does_not_resolve_until_commit_and_stale_after_retire(monkey
     monkeypatch.setattr(verdict_broker, "_RETIRE_S", 5)
     b = VerdictBroker()
     req, _ = b.register(namespace="engagement_ask", scope="e1",
-                        request_id="r1", timeout_s=5)
+                        request_id="r1", timeout_s=5, meta={"operator_id": 7})
     claim = b.claim(namespace="engagement_ask", scope="e1", request_id="r1",
                     option_index=1, actor_id=7)
     assert not isinstance(claim, str)                 # won the live request
     assert not req._future.done()                     # NOT resolved yet
     assert b.claim(namespace="engagement_ask", scope="e1", request_id="r1",
-                   option_index=0, actor_id=8) == "duplicate"   # concurrent tap
+                   option_index=0, actor_id=7) == "duplicate"   # concurrent tap
     assert b.commit(claim) is True
     assert (await b.await_result(req))["option_index"] == 1
     assert b.commit(claim) is False                   # r6-B1: double commit → no-op
     # a fresh timed-out request → claim is stale, no side effect
     req2, _ = b.register(namespace="engagement_ask", scope="e2",
-                         request_id="r2", timeout_s=0.05)
+                         request_id="r2", timeout_s=0.05, meta={"operator_id": 7})
     await b.await_result(req2)                         # no_answer → retired
     assert b.claim(namespace="engagement_ask", scope="e2", request_id="r2",
                    option_index=0, actor_id=7) == "stale"
@@ -314,7 +315,7 @@ async def test_claim_stops_timer_and_commit_false_after_teardown(monkeypatch):
     monkeypatch.setattr(verdict_broker, "_RETIRE_S", 5)
     b = VerdictBroker()
     req, _ = b.register(namespace="engagement_ask", scope="e1",
-                        request_id="r1", timeout_s=0.05)   # short timeout
+                        request_id="r1", timeout_s=0.05, meta={"operator_id": 7})   # short timeout
     claim = b.claim(namespace="engagement_ask", scope="e1", request_id="r1",
                     option_index=0, actor_id=7)
     assert not isinstance(claim, str)
@@ -332,7 +333,7 @@ async def test_abort_claim_rearm_preserves_absolute_deadline():
     immediately if the deadline already passed during the claim window."""
     b = VerdictBroker()
     req, _ = b.register(namespace="engagement_ask", scope="e1",
-                        request_id="r1", timeout_s=0.2)
+                        request_id="r1", timeout_s=0.2, meta={"operator_id": 7})
     claim = b.claim(namespace="engagement_ask", scope="e1", request_id="r1",
                     option_index=0, actor_id=7)
     await asyncio.sleep(0.1)                           # burn half the budget claimed
@@ -345,7 +346,7 @@ async def test_abort_claim_rearm_preserves_absolute_deadline():
     assert (await b.await_result(req))["outcome"] == "no_answer"
     # near-deadline: claim, hold past the deadline, abort → IMMEDIATE no_answer
     req2, _ = b.register(namespace="engagement_ask", scope="e2",
-                         request_id="r2", timeout_s=0.05)
+                         request_id="r2", timeout_s=0.05, meta={"operator_id": 7})
     claim2 = b.claim(namespace="engagement_ask", scope="e2", request_id="r2",
                      option_index=0, actor_id=7)
     await asyncio.sleep(0.1)                           # deadline passed while claimed
@@ -368,7 +369,7 @@ async def test_drain_awaits_setup_tasks_then_hooks():
         async def _hook(outcome): edited.append(outcome["outcome"])
         return _hook
     req, _ = b.register(namespace="engagement_ask", scope="e1",
-                        request_id="r1", timeout_s=60)
+                        request_id="r1", timeout_s=60, meta={"operator_id": 1})
     ensure = asyncio.create_task(b.ensure_posted(req, _post, _finish))
     await asyncio.sleep(0)
     b.cancel_scope(namespace="engagement_ask", scope="e1", reason="engagement_terminal")
@@ -385,9 +386,9 @@ async def test_drain_isolates_raising_hook_and_waits_blocked_one():
     b = VerdictBroker()
     done, gate = [], asyncio.Event()
     r1, _ = b.register(namespace="engagement_ask", scope="e1",
-                       request_id="a", timeout_s=60)
+                       request_id="a", timeout_s=60, meta={"operator_id": 1})
     r2, _ = b.register(namespace="engagement_ask", scope="e1",
-                       request_id="b", timeout_s=60)
+                       request_id="b", timeout_s=60, meta={"operator_id": 1})
     async def _boom(outcome): raise RuntimeError("edit failed")
     async def _slow(outcome):
         await gate.wait(); done.append("slow")
@@ -461,7 +462,7 @@ async def test_retired_reattach_never_reposts(monkeypatch):
         async def _hook(outcome): pass
         return _hook
     for i, finisher in enumerate((
-        lambda ns, sc, rid: b.deliver(namespace=ns, scope=sc, request_id=rid,
+        lambda ns, sc, rid: deliver(b, namespace=ns, scope=sc, request_id=rid,
                                       option_index=0, actor_id=1),   # answered
         lambda ns, sc, rid: None,                                    # no_answer (timeout)
         lambda ns, sc, rid: b.cancel(namespace=ns, scope=sc, request_id=rid,
@@ -469,13 +470,13 @@ async def test_retired_reattach_never_reposts(monkeypatch):
     )):
         sc = f"e{i}"
         req, created = b.register(namespace="engagement_ask", scope=sc,
-                                  request_id="r", timeout_s=0.05)
+                                  request_id="r", timeout_s=0.05, meta={"operator_id": 1})
         assert created
         await b.ensure_posted(req, _post, _finish)
         finisher("engagement_ask", sc, "r")
         await b.await_result(req)                       # retire (answer/timeout/cancel)
         req2, created2 = b.register(namespace="engagement_ask", scope=sc,
-                                    request_id="r", timeout_s=0.05)
+                                    request_id="r", timeout_s=0.05, meta={"operator_id": 1})
         assert created2 is False                        # tombstone reattach
         await b.ensure_posted(req2, _post, _finish)     # must NO-OP
     assert posts == [1, 1, 1]                           # exactly one post per ask
@@ -487,7 +488,7 @@ async def test_finish_hook_fires_once_even_if_awaiter_cancelled():
     b = VerdictBroker()
     seen = []
     req, _ = b.register(namespace="engagement_ask", scope="e1",
-                        request_id="r1", timeout_s=5)
+                        request_id="r1", timeout_s=5, meta={"operator_id": 1})
     async def _hook(outcome):
         seen.append(outcome)
     b.set_finish_hook(req, _hook)
@@ -496,7 +497,99 @@ async def test_finish_hook_fires_once_even_if_awaiter_cancelled():
     waiter.cancel()
     with pytest.raises(asyncio.CancelledError):
         await waiter
-    b.deliver(namespace="engagement_ask", scope="e1", request_id="r1",
+    deliver(b, namespace="engagement_ask", scope="e1", request_id="r1",
               option_index=0, actor_id=1)
     await asyncio.sleep(0)                            # let the hook task run
     assert len(seen) == 1 and seen[0]["outcome"] == "answered"
+
+
+# ---------------------------------------------------------------------------
+# #469 — fail-closed actor binding: the broker is the enforcement home
+# ---------------------------------------------------------------------------
+
+
+async def test_deliver_removed_from_production_surface():
+    """#469 pinning: the one-shot deliver() sugar is gone — its only caller
+    was the removed /internal/channel/permission_verdict route. Resolution
+    goes through claim()/commit(), which enforce the actor binding."""
+    assert not hasattr(VerdictBroker, "deliver")
+
+
+async def test_claim_forbidden_on_actor_mismatch():
+    b = VerdictBroker()
+    req, _ = b.register(namespace="permission", scope="e1", request_id="r1",
+                        timeout_s=5, meta={"operator_id": 42})
+    assert b.claim(namespace="permission", scope="e1", request_id="r1",
+                   option_index=0, actor_id=43) == "forbidden"
+    assert not req._future.done()  # still live, still awaitable
+    assert b.pending(namespace="permission", scope="e1") == ["r1"]
+
+
+async def test_claim_forbidden_when_no_operator_bound():
+    """Absence is not consent: a request registered WITHOUT an operator_id
+    binding (or with None — the deliberate nobody-may-answer binding) is
+    claimable by NO actor."""
+    b = VerdictBroker()
+    b.register(namespace="permission", scope="e1", request_id="r1",
+               timeout_s=5)
+    assert b.claim(namespace="permission", scope="e1", request_id="r1",
+                   option_index=0, actor_id=42) == "forbidden"
+    b.register(namespace="permission", scope="e1", request_id="r2",
+               timeout_s=5, meta={"operator_id": None})
+    assert b.claim(namespace="permission", scope="e1", request_id="r2",
+                   option_index=0, actor_id=42) == "forbidden"
+
+
+async def test_claim_forbidden_on_none_or_bool_actor():
+    """None never matches; bool is an int subclass (True == 1) and must not
+    impersonate user id 1."""
+    b = VerdictBroker()
+    b.register(namespace="permission", scope="e1", request_id="r1",
+               timeout_s=5, meta={"operator_id": 1})
+    assert b.claim(namespace="permission", scope="e1", request_id="r1",
+                   option_index=0, actor_id=None) == "forbidden"
+    assert b.claim(namespace="permission", scope="e1", request_id="r1",
+                   option_index=0, actor_id=True) == "forbidden"
+    b.register(namespace="permission", scope="e1", request_id="r2",
+               timeout_s=5, meta={"operator_id": True})
+    assert b.claim(namespace="permission", scope="e1", request_id="r2",
+                   option_index=0, actor_id=1) == "forbidden"
+
+
+async def test_claim_forbidden_checked_before_duplicate():
+    """A forbidden actor learns nothing about claim state — mismatch reports
+    'forbidden' whether or not a winning claim exists."""
+    b = VerdictBroker()
+    b.register(namespace="permission", scope="e1", request_id="r1",
+               timeout_s=5, meta={"operator_id": 42})
+    winning = b.claim(namespace="permission", scope="e1", request_id="r1",
+                      option_index=0, actor_id=42)
+    assert not isinstance(winning, str)
+    assert b.claim(namespace="permission", scope="e1", request_id="r1",
+                   option_index=0, actor_id=43) == "forbidden"
+    assert b.commit(winning) is True
+
+
+async def test_retired_outcome_needs_no_actor_recheck(monkeypatch):
+    """A tombstone claim reports duplicate/stale exactly as before — the
+    outcome was already authorized when it was committed; a late tap never
+    re-authorizes anything."""
+    b = VerdictBroker()
+    b.register(namespace="permission", scope="e1", request_id="r1",
+               timeout_s=5, meta={"operator_id": 42})
+    assert deliver(b, namespace="permission", scope="e1", request_id="r1",
+                   option_index=0, actor_id=42) == "delivered"
+    # Wrong actor on the retired key: 'duplicate', not 'forbidden' — no
+    # state change either way, and no live request to protect.
+    assert b.claim(namespace="permission", scope="e1", request_id="r1",
+                   option_index=0, actor_id=43) == "duplicate"
+
+
+async def test_bound_actor_roundtrip_still_works():
+    b = VerdictBroker()
+    req, _ = b.register(namespace="engagement_ask", scope="e1",
+                        request_id="r1", timeout_s=5,
+                        meta={"operator_id": 42, "options": ["A", "B"]})
+    assert deliver(b, namespace="engagement_ask", scope="e1",
+                   request_id="r1", option_index=1, actor_id=42) == "delivered"
+    assert (await b.await_result(req))["option_index"] == 1

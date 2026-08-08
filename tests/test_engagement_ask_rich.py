@@ -22,6 +22,7 @@ import json
 from unittest.mock import AsyncMock, MagicMock
 
 import pytest
+from broker_helpers import deliver
 from telegram import InlineKeyboardMarkup, MessageEntity
 from telegram.error import BadRequest
 
@@ -281,7 +282,7 @@ async def test_single_select_settle_edit_renders_rich(real_env):
                       and real_env["broker"].is_live_unclaimed(
                           namespace="engagement_ask", scope=eid,
                           request_id="s1"))
-    assert real_env["broker"].deliver(
+    assert deliver(real_env["broker"], 
         namespace="engagement_ask", scope=eid, request_id="s1",
         option_index=0, actor_id=555) == "delivered"
     await asyncio.wait_for(task, timeout=1.0)

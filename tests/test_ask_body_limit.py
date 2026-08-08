@@ -43,6 +43,7 @@ import asyncio
 import json
 
 import pytest
+from broker_helpers import deliver
 
 import agent as agent_mod
 import verdict_broker
@@ -314,7 +315,7 @@ async def test_near_boundary_single_select_body_passes(
     task = asyncio.ensure_future(ask(_FakeRequest(payload)))
     await asyncio.sleep(0.02)
     assert len(ch.options_keyboards) == 1
-    assert broker.deliver(
+    assert deliver(broker, 
         namespace="engagement_ask", scope=rec.id, request_id="r3",
         option_index=0, actor_id=555) == "delivered"
     resp = await asyncio.wait_for(task, timeout=1.0)

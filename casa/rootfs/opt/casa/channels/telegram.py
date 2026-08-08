@@ -1221,6 +1221,24 @@ class TelegramChannel(Channel):
         """``_user_id_is_operator`` for a Telegram ``User`` object."""
         return user is not None and self._user_id_is_operator(user.id)
 
+    def operator_user_id(self) -> int | None:
+        """The configured operator's Telegram user id, or ``None`` when no
+        operator identity exists (#374).
+
+        Derived from ``telegram_chat_id`` under exactly the
+        ``_user_id_is_operator`` rules (the single home of the operator
+        rule): empty (accept-all) ⇒ ``None``; a group id (negative) or any
+        non-positive/non-numeric value can never be a user id ⇒ ``None``.
+        Callers binding an approval surface treat ``None`` fail-closed —
+        NOBODY is the operator.
+        """
+        configured = str(self.chat_id or "").strip()
+        try:
+            user_id = int(configured)
+        except ValueError:
+            return None
+        return user_id if user_id > 0 else None
+
     def _origin_clearance_for_user_id(self, user_id) -> str:
         """The per-sender read clearance stamped on a telegram turn (#336)."""
         return (
@@ -2093,7 +2111,8 @@ class TelegramChannel(Channel):
             # Non-winning: a late tap on an already-retired keyboard never
             # authorizes anything (no state change).
             await _safe_answer(
-                cq, {"duplicate": "already answered", "stale": "expired"}[claim],
+                cq, {"duplicate": "already answered", "stale": "expired",
+                     "forbidden": "not for you"}[claim],
             )
             return
 
@@ -2297,7 +2316,8 @@ class TelegramChannel(Channel):
                 option_index=idx, actor_id=cq.from_user.id,
             )
             if isinstance(claim, str):
-                toast = {"duplicate": "already answered", "stale": "expired"}[claim]
+                toast = {"duplicate": "already answered", "stale": "expired",
+                         "forbidden": "not for you"}[claim]
                 return
             committed = BROKER.commit(claim)
             if committed:

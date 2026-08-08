@@ -99,8 +99,12 @@ establishes only that the sender knows the shared secret.
 
 **INV-TG-002**: A callback can resolve a request only from the operator that request is bound to.
 
-Enforced when the callback arrives, before the broker claim. A missing or mismatched user is
-refused with a best-effort acknowledgement.
+Enforced twice, deliberately. When the callback arrives, before the broker claim, a missing
+or mismatched user is refused with a best-effort acknowledgement. And inside the broker
+claim itself, which rejects any actor that does not match the identity the request was bound
+to at registration — fail-closed on both sides, so a request registered without a bound
+identity is claimable by nobody, and a future delivery path cannot forget the check. There
+is no other verdict writer: the internal socket carries no verdict route.
 
 What it does not cover: topic commands are authorised separately and to different rules —
 some are originator-only and at least one is open to topic participants. Do not generalise

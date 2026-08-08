@@ -7,6 +7,7 @@ from __future__ import annotations
 import asyncio
 
 import pytest
+from broker_helpers import deliver
 
 import verdict_broker
 from verdict_broker import VerdictBroker
@@ -53,13 +54,17 @@ class _FakeRegistry:
 
 class _FakeTelegramChannel:
     def __init__(self, *, next_message_id=555, post_raises=None,
-                 post_returns_none=False):
+                 post_returns_none=False, operator_id=999):
         self.state_calls = []
         self.keyboard_calls = []
         self.edit_calls = []
         self._next_message_id = next_message_id
         self._post_raises = post_raises
         self._post_returns_none = post_returns_none
+        self._operator_id = operator_id
+
+    def operator_user_id(self):
+        return self._operator_id
 
     async def update_topic_state(self, *, engagement_id, new_state):
         self.state_calls.append((engagement_id, new_state))
@@ -307,10 +312,65 @@ class TestPermissionModeShortCircuit:
         assert "did not respond" in _reason(result)
 
 
+class TestOperatorBinding:
+    """#374/#469: the keyboard's answerer is the CONFIGURED operator, not the
+    engagement creator; no configured operator means an immediate deny."""
+
+    async def test_binds_configured_operator_not_creator(self, _fresh_broker):
+        """#374 red case: creator 111 started the engagement, but the
+        configured operator is 999 — the broker request must bind 999, so a
+        tap from the creator can never win the claim."""
+        from hooks import make_engagement_permission_relay
+        eid = "a1" * 16
+        reg = _FakeRegistry({eid: _FakeRecord(origin={"user_id": 111})})
+        tg = _FakeTelegramChannel(operator_id=999)
+        hook = make_engagement_permission_relay(
+            engagement_registry=reg, telegram_channel=tg, timeout_s=2.0,
+        )
+        task = asyncio.create_task(hook(
+            {"tool_name": "Bash", "tool_input": {"command": "x"},
+             "cwd": f"/data/engagements/{eid}", "tool_use_id": "tuse_op"},
+            None, {"casa_engagement_id": eid},
+        ))
+        await asyncio.sleep(0.05)
+        meta = _fresh_broker.get_meta(
+            namespace="permission", scope=eid, request_id="tuse_op")
+        assert meta["operator_id"] == 999
+        # The creator's tap is forbidden; the configured operator's wins.
+        assert _fresh_broker.claim(
+            namespace="permission", scope=eid, request_id="tuse_op",
+            option_index=0, actor_id=111) == "forbidden"
+        assert deliver(_fresh_broker,
+            namespace="permission", scope=eid, request_id="tuse_op",
+            option_index=0, actor_id=999) == "delivered"
+        assert await asyncio.wait_for(task, timeout=1.0) == {}
+
+    async def test_no_configured_operator_denies_without_keyboard(self):
+        """Accept-all mode (#336: nobody is the operator) — the relay denies
+        deterministically and immediately: no keyboard, no broker request, no
+        timeout_s hold on the engagement."""
+        import verdict_broker as vb
+        from hooks import make_engagement_permission_relay
+        eid = "b2" * 16
+        reg = _FakeRegistry({eid: _FakeRecord()})
+        tg = _FakeTelegramChannel(operator_id=None)
+        hook = make_engagement_permission_relay(
+            engagement_registry=reg, telegram_channel=tg, timeout_s=600.0,
+        )
+        result = await asyncio.wait_for(hook(
+            {"tool_name": "Bash", "tool_input": {"command": "x"},
+             "cwd": f"/data/engagements/{eid}", "tool_use_id": "tuse_nop"},
+            None, {"casa_engagement_id": eid},
+        ), timeout=1.0)
+        assert _decision(result) == "deny"
+        assert "no configured operator" in _reason(result)
+        assert tg.keyboard_calls == []
+        assert vb.BROKER.pending(namespace="permission", scope=eid) == []
+
+
 class TestBrokerVerdictRelay:
     """v0.75.0: the relay registers on verdict_broker.BROKER and awaits the
-    result — operator taps (or a direct BROKER.deliver, as the migrated
-    channel_handlers._make_permission_verdict now does) resolve it."""
+    result — the operator's Telegram tap (claim+commit) resolves it."""
 
     async def test_allow_via_broker(self, _fresh_broker):
         from hooks import make_engagement_permission_relay
@@ -328,7 +388,7 @@ class TestBrokerVerdictRelay:
             None, {"casa_engagement_id": eid},
         ))
         await asyncio.sleep(0.05)  # let the hook register + post
-        assert _fresh_broker.deliver(
+        assert deliver(_fresh_broker, 
             namespace="permission", scope=eid, request_id="tuse_12345",
             option_index=0, actor_id=999,
         ) == "delivered"
@@ -356,7 +416,7 @@ class TestBrokerVerdictRelay:
             None, {"casa_engagement_id": eid},
         ))
         await asyncio.sleep(0.05)
-        assert _fresh_broker.deliver(
+        assert deliver(_fresh_broker, 
             namespace="permission", scope=eid, request_id="tuse_xyz",
             option_index=1, actor_id=999,
         ) == "delivered"
@@ -534,9 +594,9 @@ class TestBrokerVerdictRelay:
             None, {"casa_engagement_id": eid},
         ))
         await asyncio.sleep(0.05)
-        assert _fresh_broker.deliver(
+        assert deliver(_fresh_broker, 
             namespace="permission", scope=eid, request_id="perm-1",
-            option_index=0, actor_id=1,
+            option_index=0, actor_id=999,
         ) == "delivered"
         await asyncio.wait_for(task, timeout=1.0)
 
@@ -557,6 +617,8 @@ class TestKeyboardFailure:
         class _BrokenTg:
             def __init__(self):
                 self.state_calls = []
+            def operator_user_id(self):
+                return 999
             async def update_topic_state(self, *, engagement_id, new_state):
                 self.state_calls.append((engagement_id, new_state))
             async def post_perm_keyboard(self, **kw):
@@ -654,9 +716,9 @@ class TestPermissionRetryReattach:
         assert seq.registry.by_request_id("rid-retry") is not None
 
         # Resolve so both hook invocations finish.
-        assert _fresh_broker.deliver(
+        assert deliver(_fresh_broker, 
             namespace="permission", scope=eid, request_id="rid-retry",
-            option_index=0, actor_id=1) == "delivered"
+            option_index=0, actor_id=999) == "delivered"
         await asyncio.wait_for(asyncio.gather(t1, t2), timeout=1.0)
         assert posts == []  # still never eager-posted
 

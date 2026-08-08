@@ -12,6 +12,7 @@ import asyncio
 from unittest.mock import AsyncMock, MagicMock
 
 import pytest
+from broker_helpers import deliver
 
 from bus import MessageType
 from session_registry import build_session_key
@@ -240,7 +241,7 @@ class TestBrokerShutdownOrdering:
         order: list[str] = []
         req, _ = broker.register(
             namespace="resident_ask", scope="dm:500", request_id="rid-drain",
-            timeout_s=30.0,
+            timeout_s=30.0, meta={"operator_id": 999},
         )
 
         async def _finish(outcome):
@@ -250,7 +251,7 @@ class TestBrokerShutdownOrdering:
 
         broker.set_finish_hook(req, _finish)
         # Commit synchronously -> schedules (does NOT await) the finish hook.
-        assert broker.deliver(
+        assert deliver(broker, 
             namespace="resident_ask", scope="dm:500", request_id="rid-drain",
             option_index=0, actor_id=999,
         ) == "delivered"

@@ -3017,27 +3017,28 @@ def make_engagement_permission_relay(
     *,
     engagement_registry: Any,
     telegram_channel: Any,
-    queues: dict | None = None,
     timeout_s: float = 600.0,
 ) -> HookCallback:
     """Build the PreToolUse hook that relays non-allow-listed tool calls
     through the engagement's Telegram inline-keyboard, via the
     Casa-owned ``verdict_broker`` (W5/Sol B3,B4).
 
+    #374/#469: the keyboard's answerer is the CONFIGURED OPERATOR
+    (``telegram_channel.operator_user_id()``), not the engagement creator —
+    approving a non-allow-listed tool is authorization, and only the
+    operator holds that authority (#368 doctrine). No configured operator
+    (accept-all mode, or a group id) ⇒ immediate deterministic deny, no
+    keyboard: posting a button nobody may tap would only hold the
+    engagement until timeout.
+
     Args:
         engagement_registry: registry exposing ``.get(engagement_id) -> record | None``.
-        telegram_channel: object with async ``update_topic_state(*, engagement_id, new_state)``,
+        telegram_channel: object with ``operator_user_id() -> int | None``, async
+            ``update_topic_state(*, engagement_id, new_state)``,
             ``post_perm_keyboard(*, engagement_id, request_id, tool_name, tool_input) -> int | None``,
             and ``edit_perm_keyboard_outcome(*, topic_id, message_id, outcome)``.
-        queues: DEPRECATED — accepted-and-ignored (one release, v0.75.0). The
-            operator verdict now flows through ``verdict_broker.BROKER``
-            (namespace ``"permission"``), delivered by
-            ``channel_handlers._make_permission_verdict``. Kept as a no-op
-            kwarg so callers mid-migration don't crash on an unexpected
-            keyword; remove once every wiring site has dropped it.
         timeout_s: how long to wait for the operator before treating as deny.
     """
-    del queues  # deprecated, accepted-and-ignored (see docstring)
 
     async def _hook(
         input_data: dict[str, Any],
@@ -3082,6 +3083,16 @@ def make_engagement_permission_relay(
 
         # Not allow-listed — post inline keyboard and await operator verdict
         # via the broker.
+        # #374: the approver is the configured operator. None (accept-all
+        # mode, group id, or a channel that cannot say) ⇒ deny NOW: under the
+        # broker's fail-closed claim contract no tap could ever win, so a
+        # keyboard would only hold the engagement until timeout.
+        operator_id = telegram_channel.operator_user_id()
+        if operator_id is None:
+            return _deny(
+                "no configured operator to approve this tool "
+                "(set telegram_chat_id)"
+            )
         cc_tool_use_id = input_data.get("tool_use_id") or ""
         rid = cc_tool_use_id[:_RID_MAX_LEN] or uuid.uuid4().hex
         tool_name = input_data.get("tool_name", "")
@@ -3092,21 +3103,22 @@ def make_engagement_permission_relay(
         )
         from verdict_broker import BROKER
 
-        req, created = BROKER.register(
+        # STATIC meta seeded ATOMICALLY at registration (F1 Sol r3 pattern —
+        # whichever party wins a same-request_id create race installs the
+        # complete metadata; register() only seeds meta on creation).
+        # message_id + finish_hook are set by the broker-owned setup task
+        # (r8-B3).
+        req, _created = BROKER.register(
             namespace="permission", scope=eng_id, request_id=rid,
             timeout_s=timeout_s,
+            meta={
+                "options": ["allow", "deny"],
+                "topic_id": rec.topic_id,
+                "operator_id": operator_id,
+            },
         )
         outcome: dict[str, Any] = {}
         try:  # r7-B3: whole lifecycle guarded — restore 'active' on any exit
-            if created:
-                # STATIC meta BEFORE posting so a fast tap never sees
-                # incomplete metadata (r3-B3). message_id + finish_hook are
-                # set by the broker-owned setup task (r8-B3).
-                req.meta.update({
-                    "options": ["allow", "deny"],
-                    "topic_id": rec.topic_id,
-                    "operator_id": rec.origin.get("user_id"),
-                })
 
             # The keyboard post — a broker-owned SHIELDED setup task (r8-B3):
             # cancelling THIS hook never interrupts an in-flight Telegram post
