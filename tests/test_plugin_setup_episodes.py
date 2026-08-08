@@ -238,7 +238,7 @@ async def test_sync_approval_record_plus_boot_recovery(wired, monkeypatch):
         dispatch=lambda *a: None, notify_operator=None,
         resolve_registry_entry=lambda plugin: wired["entry"],
         ack_lookup=lambda identity: "g7")
-    await pse._boot_recover()
+    await pse._recover_and_settle()
     eps = pse.episodes("pending")
     assert len(eps) == 1
     assert eps[0]["approved_identities"] == ["id-a#g7"]
@@ -254,7 +254,7 @@ async def test_boot_recovery_approves_open_member_from_ack(wired, monkeypatch):
         dispatch=lambda *a: None, notify_operator=None,
         resolve_registry_entry=lambda plugin: wired["entry"],
         ack_lookup=lambda identity: "g8")
-    await pse._boot_recover()
+    await pse._recover_and_settle()
     eps = pse.episodes("pending")
     assert len(eps) == 1
     assert eps[0]["approved_identities"] == ["id-a#g8"]

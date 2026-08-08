@@ -226,7 +226,7 @@ class ToolEnv:
 
 @pytest.fixture
 async def tool_env(tmp_path, monkeypatch):
-    registry = JobRegistry(tmp_path / "jobs.json", tmp_path / "delegations.json")
+    registry = JobRegistry(tmp_path / "jobs.json")
     await registry.load()
     specialist_registry = SpecialistRegistry(
         str(tmp_path / "specialists"), job_registry=registry,

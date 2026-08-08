@@ -595,10 +595,9 @@ class TestEngagementPermissionRelayWired:
     """v0.37.2 (C-1): the relay policy is wired into casa_core's built
     cc_hook_policies dict via ``_wire_engagement_permission_relay``.
 
-    The wiring helper is invoked from ``casa_core.main()`` at two sites
-    (public-8099 fallback + internal-socket). The smoke verifies the
-    helper produces a dict entry shaped correctly: name +
-    ``.*`` matcher + an awaitable callback.
+    The wiring helper is invoked from ``casa_core.main()`` on the
+    internal-socket path. The smoke verifies the helper produces a dict
+    entry shaped correctly: name + ``.*`` matcher + an awaitable callback.
     """
 
     def test_policy_registered_under_correct_name_and_matcher(self):
@@ -635,8 +634,8 @@ class TestEngagementPermissionRelayWired:
 class TestEngagementButtonsReminderWired:
     """R4 (v0.89.0, buttons-always): the engagement_buttons_reminder policy is
     wired into casa_core's built cc_hook_policies dict via
-    ``_wire_engagement_buttons_reminder`` at the same two sites as the
-    permission relay (public-8099 fallback + internal socket)."""
+    ``_wire_engagement_buttons_reminder`` at the same site as the
+    permission relay (the internal-socket path)."""
 
     async def test_policy_registered_under_skill_matcher(self):
         # async to satisfy the module-level asyncio pytestmark (the assertion

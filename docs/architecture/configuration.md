@@ -299,8 +299,9 @@ several outcomes.
 and an explicit export or read wherever it is consumed. Nothing picks up an option
 automatically.
 
-**Removing an option** additionally requires appending its key to the boot script's
-deprecated-key list, or a stored value lingers and the host keeps warning about it.
+**Removing an option** leaves its stored value behind: the host warns about the unknown
+key at boot until the stored options are cleaned by hand, and Casa itself ignores it.
+Pre-1.0 that is accepted — there is no boot-time pruning of removed keys.
 
 **Making an option hot-reloadable** is not a small change: it means a new scope and rebuilding
 every consumer, because no generic mechanism exists.

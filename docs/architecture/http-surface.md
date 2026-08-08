@@ -20,10 +20,11 @@ Routes are registered on **two separate applications**, and which one a route la
 decides who can call it.
 
 The **public app** carries the externally-reachable routes: a dashboard, a health endpoint,
-agent invocation, the Telegram update sink, a hook-resolution endpoint, an MCP endpoint,
-conditionally-registered voice routes, and inbound webhooks — which are a *single wildcard
-route* backed by a dynamically-maintained trigger allowlist, not per-trigger route
-registrations. This document does not enumerate the routes; the registration block is the
+agent invocation, the Telegram update sink, conditionally-registered voice routes, and
+inbound webhooks — which are a *single wildcard route* backed by a dynamically-maintained
+trigger allowlist, not per-trigger route registrations. (MCP and hook resolution are not
+on this app: they are served by the standalone loopback bridge `svc-casa-mcp`, which
+belongs to `architecture/mcp-and-tools.md`.) This document does not enumerate the routes; the registration block is the
 authority and it changes.
 
 The **internal app** carries routes intended for other processes in the container to call —
@@ -51,13 +52,13 @@ Authentication is **per route**, not ambient. There is no boundary that authenti
 everything arriving on the public app, so the question for any route is which check *it*
 performs — and several routes perform none.
 
-**The routes with no application-layer check are the ones to understand first.** An MCP
-endpoint and a hook-resolution endpoint accept unauthenticated requests at the backend and
-are protected only by being 404'd on the external listener. They remain reachable over
-ingress and from loopback. An engagement-identity *claim* on either is credential-verified
-(INV-MCP-004, INV-MCP-006), but the routes themselves demand nothing to be called. A new
-route registered near them inherits no protection from that arrangement; it inherits only
-its own absence of a check.
+**The routes with no application-layer check are the ones to understand first.** The MCP
+and hook-resolution endpoints live on the loopback-only `svc-casa-mcp` bridge, not on this
+app — an engagement-identity *claim* on them is credential-verified (INV-MCP-004,
+INV-MCP-006), but the routes themselves demand nothing to be called and are contained by
+the container wall alone. The external nginx listener still 404s the `/mcp/` and `/hooks/`
+prefixes as defense in depth. A new route performing no check inherits no protection from
+any of this; it inherits only its own absence of a check.
 
 ## Contracts & invariants
 

@@ -33,11 +33,6 @@ def test_old_dir_level_seed_block_removed() -> None:
     assert "seed_agent_dir()" not in src, "stale seed_agent_dir helper still present"
 
 
-def test_c1_relay_migration_retained() -> None:
-    src = SETUP.read_text(encoding="utf-8")
-    assert "c1-relay-migration: begin" in src, "c1-relay migration must be retained"
-
-
 def test_model_env_exported_before_config_sync() -> None:
     """D1: config_sync's boot-parity validation resolves ${PRIMARY_AGENT_MODEL}
     / ${VOICE_AGENT_MODEL}, so both must be exported (env-parity with

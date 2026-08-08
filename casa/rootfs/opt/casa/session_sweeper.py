@@ -23,10 +23,7 @@ import logging
 from datetime import datetime, timedelta, timezone
 from typing import Callable
 
-# _is_uuid_scope lives in session_registry (spec A2) so the boot migration
-# can classify the RAW pre-hash scope too; re-exported here for callers
-# (e.g. agent.py) that historically imported it from this module.
-from session_registry import SessionRegistry, _is_uuid_scope
+from session_registry import SessionRegistry
 from session_saver import freshness_window
 
 logger = logging.getLogger(__name__)
@@ -162,7 +159,7 @@ class SessionSweeper:
 
         async with self._registry._lock:
             for key, entry in self._registry._data.items():
-                channel, _, scope_id = key.partition("-")
+                channel, _, _remainder = key.partition("-")
                 last_active = _parse_last_active(entry.get("last_active"))
 
                 if last_active is None:
@@ -171,17 +168,13 @@ class SessionSweeper:
 
                 # A2: v2 keys are channel-role-scope hashes — the raw
                 # remainder is never uuid-shaped, so the webhook-one-shot
-                # classification can no longer be re-derived from the key.
-                # register() persists it explicitly as scope_class instead
-                # (falls back to the legacy key-shape check for any
-                # un-migrated v1 entry still on disk).
-                scope_class = entry.get("scope_class")
-                if scope_class is not None:
-                    is_webhook_oneshot = scope_class == "webhook_oneshot"
-                else:
-                    is_webhook_oneshot = (
-                        channel == "webhook" and _is_uuid_scope(scope_id)
-                    )
+                # classification cannot be re-derived from the key.
+                # register() persists it explicitly as scope_class; an
+                # entry without the field (register() drops a None) is an
+                # ordinary session and gets the normal TTL.
+                is_webhook_oneshot = (
+                    entry.get("scope_class") == "webhook_oneshot"
+                )
                 if is_webhook_oneshot:
                     ttl = self._webhook_ttl
                 else:

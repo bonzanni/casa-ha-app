@@ -618,11 +618,11 @@ async def test_worker_pass_without_a_spool_is_a_no_op(wired):
     assert ce._next_due is None
 
 
-def test_legacy_store_path_is_the_migration_seam():
-    """The retired v0.146 store: a constant only — nothing in the worker
-    reads or writes it, and the boot migration deletes exactly this path."""
-    assert ce.LEGACY_STORE_PATH.name == "callback-episodes.json"
+def test_worker_owns_no_episode_store():
+    """The v0.146 episode store is fully retired — the worker module keeps
+    no store path and none of the old store API."""
     assert not hasattr(ce, "STORE_PATH")
+    assert not hasattr(ce, "LEGACY_STORE_PATH")
     for gone in ("_load", "_save", "episodes", "_enqueue_locked",
                  "_reconcile_locked", "_mark_dispatched", "_update_episode",
                  "_any_tombstone", "_has_key", "_empty"):

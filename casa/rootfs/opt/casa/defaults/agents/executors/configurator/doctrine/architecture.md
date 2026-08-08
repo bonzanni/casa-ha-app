@@ -140,12 +140,9 @@ This means:
   restart (addon update, in-container respawn). Mid-restart tool calls
   return JSON-RPC `-32000 casa_temporarily_unavailable` (a recoverable
   error the model handles), not a connection drop.
-- Casa-main's public port 8099 still serves `/mcp/casa-framework` and
-  `/hooks/resolve` as a back-compat fallback for pre-v0.14.0 workspaces;
-  these routes will be removed in v0.14.2 or later.
-- New engagement workspaces have `.mcp.json` pointing at port 8100;
-  pre-v0.14.0 workspaces still point at 8099 and continue to function
-  via the fallback.
+- Engagement workspaces have `.mcp.json` pointing at port 8100; boot
+  replay rewrites the file (and cycles the engagement service) whenever
+  the baked credential or URL differs from the record.
 
 You (Configurator) do NOT need to touch any of this — workspace
 provisioning + hook proxying are framework concerns. If a user asks why

@@ -1,7 +1,6 @@
 # casa/rootfs/opt/casa/internal_handlers.py
 """Internal HTTP handlers -- bound to the casa-main Unix socket
-(/run/casa/internal.sock) and consumed in-process by the public-8099
-back-compat fallback.
+(/run/casa/internal.sock), consumed by svc-casa-mcp.
 
 Body shape (no JSON-RPC envelope, no header dependency):
 
@@ -212,7 +211,6 @@ def _make_internal_hooks_resolve_handler(
     hook_policies: dict[str, tuple[str, HookCallback]],
     executor_hook_policies: dict | None = None,
     engagement_registry=None,
-    identity_from_headers: bool = False,
 ):
     """Build the aiohttp POST handler for /internal/hooks/resolve.
 
@@ -288,30 +286,15 @@ def _make_internal_hooks_resolve_handler(
 
         # #366: authenticate any engagement-identity claim BEFORE deriving
         # anything from it. Identity arrives as body fields injected from the
-        # X-Casa-Engagement-Id/Token headers (svc-casa-mcp and the public-8099
-        # twin both rebuild the body from headers; hook_proxy.sh reads the
-        # credential from its OWN workspace .mcp.json). The payload's cwd is
-        # caller-supplied text: it is never an identity source, only a
-        # cross-check. Contract mirrors /internal/tools/call (#335):
+        # X-Casa-Engagement-Id/Token headers (svc-casa-mcp rebuilds the body
+        # from headers; hook_proxy.sh reads the credential from its OWN
+        # workspace .mcp.json). The payload's cwd is caller-supplied text: it
+        # is never an identity source, only a cross-check. Contract mirrors
+        # /internal/tools/call (#335):
         #   known id + valid token  -> authenticated (identity threaded below)
         #   known id + bad/missing  -> explicit REJECT, callback never runs
         #   unknown id / no id      -> unauthenticated (default policies;
         #                              identity-consuming callbacks fail closed)
-        if identity_from_headers:
-            # #366: public-8099 twin — the credential comes ONLY from the
-            # header pair (the same one the MCP twin reads; hook_proxy.sh
-            # sends it on both routes). Overwrite ANY body-borne identity so
-            # a caller cannot smuggle the internal body shape past the
-            # header contract. The Unix-socket route keeps body fields — its
-            # only writer is svc-casa-mcp, which itself rebuilds from headers.
-            body = {
-                **body,
-                "engagement_id":
-                    request.headers.get("X-Casa-Engagement-Id"),
-                "engagement_token":
-                    request.headers.get("X-Casa-Engagement-Token"),
-            }
-
         eng_id_claim = body.get("engagement_id")
         auth_rec = None
         auth_eng_id = None

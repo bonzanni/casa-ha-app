@@ -41,7 +41,7 @@ def test_reload_agents_passes_roles_dir_so_an_installed_specialist_reloads(tmp_p
     index = InstalledSpecialistIndex(specialists_dir=str(specialists_dir))
     index.load()
 
-    job_registry = JobRegistry(str(tmp_path / "jobs.json"), str(tmp_path / "delegations.json"))
+    job_registry = JobRegistry(str(tmp_path / "jobs.json"))
     registry = SpecialistRegistry(
         str(agents_specialists_dir), job_registry=job_registry)
     # BEFORE the fix: registry.load() with no roles_dir sees NOTHING (mtg's

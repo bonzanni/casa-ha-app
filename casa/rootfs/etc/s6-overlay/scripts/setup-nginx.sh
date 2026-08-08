@@ -117,14 +117,15 @@ cat >> /etc/nginx/nginx.conf <<'NGINX'
             return 404;
         }
 
-        # v0.97.0 SECURITY: the internal MCP + hooks fallback endpoints on
-        # 8099 (/mcp/casa-framework, /hooks/resolve) are UNAUTHENTICATED —
-        # they exist for in-container workspace subprocesses that reach 8099
-        # over loopback, NOT for external callers. Exposing them publicly let
-        # an attacker POST a JSON-RPC tools/call for recall_memory (returns
-        # PRIVATE memory) or plugin_add (arbitrary plugin install), bypassing
-        # webhook auth + origin containment entirely. Never proxy them on the
-        # public port; loopback (127.0.0.1:8099) access is unaffected.
+        # v0.97.0 SECURITY, retained as defense in depth: the MCP + hooks
+        # endpoints (/mcp/casa-framework, /hooks/resolve) are UNAUTHENTICATED
+        # and exist for in-container workspace subprocesses only (served by
+        # svc-casa-mcp on loopback 8100 since v0.164.0 — no longer registered
+        # on the 8099 app at all). When they were proxied publicly, an
+        # attacker could POST a JSON-RPC tools/call for recall_memory
+        # (returns PRIVATE memory) or plugin_add (arbitrary plugin install),
+        # bypassing webhook auth + origin containment entirely. Keep these
+        # 404s so a future re-registration on 8099 stays unexposed.
         location /mcp/ {
             return 404;
         }

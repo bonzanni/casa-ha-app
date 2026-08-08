@@ -39,7 +39,6 @@
     - casa/rootfs/opt/casa/specialist_limits.py::SpecialistLimiter
   tests:
     - tests/test_run_script_env.py
-    - tests/test_setup_configs_deprecated_options_prune.py
   related: [architecture/configuration.md, architecture/overview.md]
 
 - doc: doctrine/publishing.md

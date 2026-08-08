@@ -1826,7 +1826,7 @@ def _specialist_display_name(cfg: Any, role: str) -> str:
 def _job_actor_from_origin(origin: dict | None) -> JobActor | None:
     if not isinstance(origin, dict) or origin.get("channel") != "voice":
         return None
-    scope_id = origin.get("chat_id") or origin.get("scope_id")
+    scope_id = origin.get("chat_id")
     if not isinstance(scope_id, (str, int)) or not str(scope_id):
         return None
     raw_user_id = origin.get("user_id")
@@ -3246,7 +3246,7 @@ def _new_voice_job(
         specialist_display_name=_specialist_display_name(cfg, specialist_role),
         creator_peer="voice",
         creator_user_id=(None if raw_user_id is None else str(raw_user_id)),
-        scope_id=str(origin.get("chat_id") or origin.get("scope_id") or ""),
+        scope_id=str(origin.get("chat_id") or ""),
         origin_route_id=str(origin["voice_route_id"]),
         origin_device_id=str(origin["origin_device_id"]),
         # What this endpoint said it can receive (#233/#224). Delivery

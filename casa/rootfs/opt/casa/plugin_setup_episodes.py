@@ -58,7 +58,7 @@ Design (Sol+Terra design round + implementation rounds 1-3, 2026-07-24):
 * **Crash-safe approval recording** (impl r3): approvals are recorded
   SYNCHRONOUSLY inside the consent ack commit callback
   (:func:`record_approval_sync` — same yield-free step that persists the
-  ack), and a BOOT RECOVERY SWEEP (:func:`_boot_recover`, first act of the
+  ack), and a BOOT RECOVERY SWEEP (:func:`_recover_and_settle`, first act of the
   worker) marks any still-open member whose identity has a persisted ack
   as approved with that ack's generation — a crash anywhere between ack
   persistence and settlement recovers on restart.
@@ -219,8 +219,14 @@ def _load() -> dict:
         if (not isinstance(data, dict)
                 or not isinstance(data.get("episodes"), list)):
             raise ValueError("malformed store")
+        # Fail-closed on any other stored version (there is no migration
+        # machinery pre-1.0): reset to empty and let the reconciler re-seal
+        # rounds and re-derive obligations from live registry state.
+        if int(data.get("schema_version") or 0) != _SCHEMA_VERSION:
+            raise ValueError(
+                f"unsupported schema_version {data.get('schema_version')!r}")
         data.setdefault("rounds", {})
-        _migrate(data)
+        _normalize(data)
         return data
     except Exception:  # noqa: BLE001 — a corrupt store must not brick boot
         logger.exception("plugin-setup-episodes store unreadable — resetting")
@@ -228,25 +234,10 @@ def _load() -> dict:
                 "episodes": []}
 
 
-def _migrate(data: dict) -> None:
-    """Bring a pre-v4 store up to the current row shape, in memory (the next
-    :func:`_save` persists it). Idempotent.
-
-    A v3 row was created ONLY by settlement, and only once every member of its
-    consent round had APPROVED — so in v4 terms its existence WAS the release.
-    It must therefore migrate to ``gate="released"``, not to
-    ``awaiting_verdict``: the round that would have released it is long
-    consumed and will never be sealed again, so a gate-less row would hold
-    forever — visible in health as ``setup_episode_pending`` and never acting,
-    while ``ensure_obligation`` declines to create a replacement because a
-    pending row for that artifact already exists. The automatic setup would be
-    silently lost across the upgrade, in exactly the window where it was
-    approved but not yet dispatched.
-
-    ``consumed_keys`` is dropped rather than migrated: creation is now driven
-    solely by the live registry sweep, so there is no replay for a tombstone to
-    fence, and the row identity is ``(plugin, artifact_id)`` with ``gen``."""
-    data.pop("consumed_keys", None)
+def _normalize(data: dict) -> None:
+    """Repair a structurally corrupt store in memory (the next :func:`_save`
+    persists it). Corruption defense, not version migration — idempotent and
+    version-independent."""
     # Normalise the WHOLE round structure, every level, on every load.
     #
     # Three consecutive review rounds found this one level deeper each time —
@@ -324,19 +315,6 @@ def _migrate(data: dict) -> None:
             logger.warning("dropped %d malformed setup-obligation row(s)",
                            len(rows) - len(kept))
         data["episodes"] = kept
-    if int(data.get("schema_version") or 0) >= _SCHEMA_VERSION:
-        return
-    for row in data["episodes"]:
-        row.setdefault("gen", 0)
-        row.setdefault("resolve_deferrals", 0)
-        row.setdefault("approved_identities", [])
-        if "gate" not in row:
-            row["gate"] = "released"
-        # `key` and `setup_tool` are vestigial in v4 — the row is keyed by
-        # (plugin, artifact_id) and the tool is resolved at dispatch.
-        row.pop("key", None)
-        row.pop("setup_tool", None)
-    data["schema_version"] = _SCHEMA_VERSION
 
 
 def _save(data: dict) -> None:
@@ -859,8 +837,6 @@ async def _recover_and_settle() -> None:
         _kick.set()
 
 
-# Back-compat alias (tests call the boot sweep by its original name).
-_boot_recover = _recover_and_settle
 
 
 # ---------------------------------------------------------------------------

@@ -1,5 +1,7 @@
 #!/usr/bin/env bash
-# Plan 4a D-block: claude_code driver lifecycle (D-1..D-12).
+# Plan 4a D-block: claude_code driver lifecycle (D-1..D-6, D-8, D-11..D-12).
+# D-7's hook probe is superseded by D-12 (same assertions, current response
+# shape, against svc-casa-mcp:8100).
 # Tier-3 hardening: timing-sensitive + restart-survival assertions.
 # Requires CASA_USE_MOCK_CLAUDE=1 (mock CLI overlay).
 set -euo pipefail
@@ -85,7 +87,7 @@ async def main():
     drv = ClaudeCodeDriver(
         engagements_root="/data/engagements",
         send_to_topic=lambda *a, **kw: _noop(),
-        casa_framework_mcp_url="http://127.0.0.1:8080/mcp/casa-framework",
+        casa_framework_mcp_url="http://127.0.0.1:8100/mcp/casa-framework",
     )
 
     # Minimal ExecutorDefinition fixture for the engagement_D e2e (label is incidental, no on-disk executor matches)
@@ -146,7 +148,7 @@ async def main():
     drv = ClaudeCodeDriver(
         engagements_root="/data/engagements",
         send_to_topic=lambda *a, **kw: _noop(),
-        casa_framework_mcp_url="http://127.0.0.1:8080/mcp/casa-framework",
+        casa_framework_mcp_url="http://127.0.0.1:8100/mcp/casa-framework",
     )
     defn = ExecutorDefinition(
         type="test-fixture-driver", description="hello test driver harness xx",
@@ -193,7 +195,7 @@ async def main():
     drv = ClaudeCodeDriver(
         engagements_root="/data/engagements",
         send_to_topic=lambda *a, **kw: _noop(),
-        casa_framework_mcp_url="http://127.0.0.1:8080/mcp/casa-framework",
+        casa_framework_mcp_url="http://127.0.0.1:8100/mcp/casa-framework",
     )
     defn = ExecutorDefinition(
         type="test-fixture-driver", description="hello test driver harness xx",
@@ -250,7 +252,7 @@ async def main():
     drv = ClaudeCodeDriver(
         engagements_root="/data/engagements",
         send_to_topic=lambda *a, **kw: _noop(),
-        casa_framework_mcp_url="http://127.0.0.1:8080/mcp/casa-framework",
+        casa_framework_mcp_url="http://127.0.0.1:8100/mcp/casa-framework",
     )
     defn = ExecutorDefinition(
         type="test-fixture-driver", description="hello test driver harness xx",
@@ -305,7 +307,7 @@ async def main():
     drv = ClaudeCodeDriver(
         engagements_root="/data/engagements",
         send_to_topic=lambda *a, **kw: _noop(),
-        casa_framework_mcp_url="http://127.0.0.1:8080/mcp/casa-framework",
+        casa_framework_mcp_url="http://127.0.0.1:8100/mcp/casa-framework",
     )
     defn = ExecutorDefinition(
         type="test-fixture-driver", description="hello test driver harness xx",
@@ -360,7 +362,8 @@ sys.path.insert(0, "/opt/casa")
 
 async def main():
     # This harness needs the real Casa MCP server reachable. We use the
-    # in-container loopback at http://127.0.0.1:8080/mcp/casa-framework.
+    # in-container loopback at http://127.0.0.1:8100/mcp/casa-framework
+    # (svc-casa-mcp, the only server for these routes).
     # casa_core initializes it during container boot, so the endpoint is up.
     from engagement_registry import EngagementRegistry
     from drivers.claude_code_driver import ClaudeCodeDriver
@@ -375,7 +378,7 @@ async def main():
     drv = ClaudeCodeDriver(
         engagements_root="/data/engagements",
         send_to_topic=lambda *a, **kw: _noop(),
-        casa_framework_mcp_url="http://127.0.0.1:8080/mcp/casa-framework",
+        casa_framework_mcp_url="http://127.0.0.1:8100/mcp/casa-framework",
     )
     defn = ExecutorDefinition(
         type="test-fixture-driver", description="hello test driver harness xx",
@@ -414,50 +417,6 @@ PY
 )"
 pass "D-6 mcp: emit_completion via MCP round-trip → registry completed"
 
-run_harness "D-7 hook-block" "$(cat <<'PY'
-import asyncio, pathlib, sys, json, urllib.request
-sys.path.insert(0, "/opt/casa")
-
-async def main():
-    # Register a policy that always blocks Write.
-    from hooks import HOOK_POLICIES
-    HOOK_POLICIES["always_block_write"] = lambda p: (
-        {"decision": "block", "reason": "always_block_write policy"}
-        if (p.get("tool_name") == "Write" or p.get("tool") == "Write")
-        else {"decision": "allow"}
-    )
-
-    # POST directly to /hooks/resolve to verify the endpoint is alive and
-    # returns block for our registered policy.
-    req = urllib.request.Request(
-        "http://127.0.0.1:8080/hooks/resolve",
-        data=json.dumps({"policy": "always_block_write",
-                         "payload": {"tool_name": "Write"}}).encode(),
-        headers={"Content-Type": "application/json"},
-        method="POST",
-    )
-    with urllib.request.urlopen(req, timeout=5) as resp:
-        body = json.loads(resp.read())
-    assert body["decision"] == "block", f"expected block, got {body}"
-
-    # Also verify unknown policy → block
-    req2 = urllib.request.Request(
-        "http://127.0.0.1:8080/hooks/resolve",
-        data=json.dumps({"policy": "nonexistent", "payload": {}}).encode(),
-        headers={"Content-Type": "application/json"},
-        method="POST",
-    )
-    with urllib.request.urlopen(req2, timeout=5) as resp:
-        body2 = json.loads(resp.read())
-    assert body2["decision"] == "block"
-    assert "unknown" in body2["reason"].lower()
-    print("OK")
-
-asyncio.run(main())
-PY
-)"
-pass "D-7 hook-block: PreToolUse policy denies Write via /hooks/resolve"
-
 run_harness "D-8 restart-survival" "$(cat <<'PY'
 import asyncio, pathlib, sys, subprocess, time
 sys.path.insert(0, "/opt/casa")
@@ -471,7 +430,7 @@ async def main():
     drv = ClaudeCodeDriver(
         engagements_root="/data/engagements",
         send_to_topic=lambda *a, **kw: _noop(),
-        casa_framework_mcp_url="http://127.0.0.1:8080/mcp/casa-framework",
+        casa_framework_mcp_url="http://127.0.0.1:8100/mcp/casa-framework",
     )
     defn = ExecutorDefinition(
         type="test-fixture-driver", description="hello test driver harness xx",
@@ -525,116 +484,11 @@ PY
 pass "D-8 restart-survival: engagement PID unchanged across svc-casa restart"
 
 # ---------------------------------------------------------------------------
-# D-9 — MCP HTTP bridge round-trip: direct curl to /mcp/casa-framework
-# ---------------------------------------------------------------------------
-# POSTs initialize/tools/list/tools/call round-trips against the 8099
-# fallback bridge. The tools/call probe carries NO engagement identity —
-# since #335 an id claim additionally needs the per-engagement
-# X-Casa-Engagement-Token (read from the workspace .mcp.json), so the
-# unauthenticated probe pins the not_in_engagement path only.
-run_harness "D-9 mcp-bridge" "$(cat <<'PY'
-import json, os, subprocess, time, urllib.request, urllib.error
-
-def http(method, body=None, headers=None):
-    req = urllib.request.Request(
-        "http://127.0.0.1:8099/mcp/casa-framework",
-        data=(json.dumps(body).encode() if body is not None else None),
-        headers={"Content-Type": "application/json", **(headers or {})},
-        method=method,
-    )
-    try:
-        with urllib.request.urlopen(req, timeout=5) as r:
-            return r.status, r.read().decode()
-    except urllib.error.HTTPError as e:
-        return e.code, e.read().decode()
-
-# 1. initialize
-status, body = http("POST", {"jsonrpc": "2.0", "id": 1, "method": "initialize"})
-assert status == 200, (status, body)
-init = json.loads(body)["result"]
-assert init["serverInfo"]["name"] == "casa-framework", init
-
-# 2. tools/list must include emit_completion
-status, body = http("POST", {"jsonrpc": "2.0", "id": 2, "method": "tools/list"})
-tools = {t["name"] for t in json.loads(body)["result"]["tools"]}
-assert "emit_completion" in tools, tools
-assert "list_engagement_workspaces" in tools, tools
-
-# 3. GET returns 405
-status, _ = http("GET")
-assert status == 405, status
-
-# 4. tools/call on emit_completion WITHOUT header returns not_in_engagement
-status, body = http("POST", {
-    "jsonrpc": "2.0", "id": 3, "method": "tools/call",
-    "params": {"name": "emit_completion",
-               "arguments": {"text": "no engagement", "artifacts": [],
-                             "next_steps": [], "status": "ok"}},
-})
-assert status == 200, (status, body)
-result_text = json.loads(body)["result"]["content"][0]["text"]
-assert "not_in_engagement" in result_text, result_text
-
-print("D-9 mcp-bridge: all round-trips passed", flush=True)
-PY
-)"
-pass "D-9 mcp-bridge: initialize/tools/list/tools/call all work end-to-end"
-
-# ---------------------------------------------------------------------------
-# D-10 — Real /hooks/resolve enforcement: block_dangerous_bash denies rm -rf
-# ---------------------------------------------------------------------------
-# Direct POST to /hooks/resolve with the hook_proxy.sh body shape.
-# The handler must resolve HOOK_POLICIES["block_dangerous_bash"], call the
-# real async callback, and return a CC-native deny envelope.
-run_harness "D-10 hook-deny" "$(cat <<'PY'
-import json, urllib.request
-
-def resolve(policy, payload):
-    req = urllib.request.Request(
-        "http://127.0.0.1:8099/hooks/resolve",
-        data=json.dumps({"policy": policy, "payload": payload}).encode(),
-        headers={"Content-Type": "application/json"},
-        method="POST",
-    )
-    with urllib.request.urlopen(req, timeout=5) as r:
-        return r.status, json.loads(r.read().decode())
-
-# 1. dangerous bash -> deny
-status, body = resolve(
-    "block_dangerous_bash",
-    {"tool_name": "Bash", "tool_input": {"command": "rm -rf /data"}},
-)
-assert status == 200, (status, body)
-out = body["hookSpecificOutput"]
-assert out["permissionDecision"] == "deny", body
-assert "rm" in out["permissionDecisionReason"].lower()
-
-# 2. benign bash -> allow (empty body)
-status, body = resolve(
-    "block_dangerous_bash",
-    {"tool_name": "Bash", "tool_input": {"command": "echo hello"}},
-)
-assert status == 200, (status, body)
-assert body == {}, f"benign bash should return empty (allow); got {body}"
-
-# 3. unknown policy -> deny (200)
-status, body = resolve("nope_nope", {"tool_name": "Bash"})
-assert status == 200, (status, body)
-assert body["hookSpecificOutput"]["permissionDecision"] == "deny", body
-
-print("D-10 hook-deny: dangerous denied, benign allowed, unknown denied", flush=True)
-PY
-)"
-pass "D-10 hook-deny: real /hooks/resolve gates PreToolUse correctly"
-
-# ---------------------------------------------------------------------------
 # D-11 — svc-casa-mcp MCP HTTP round-trip on port 8100 (Plan 4b/3.6)
 # ---------------------------------------------------------------------------
-# Same exercise as D-9 (initialize, tools/list, GET 405, tools/call without
-# engagement_id) but against the new standalone svc-casa-mcp listener instead
-# of casa-main's public 8099. The svc forwards every call to casa-main over
-# the Unix socket at /run/casa/internal.sock; the response shape must match
-# what D-9 saw on 8099.
+# initialize, tools/list, GET 405, and tools/call without engagement_id,
+# against the standalone svc-casa-mcp listener. The svc forwards every call
+# to casa-main over the Unix socket at /run/casa/internal.sock.
 run_harness "D-11 svc-mcp" "$(cat <<'PY'
 import json, urllib.request, urllib.error
 
@@ -687,9 +541,9 @@ pass "D-11 svc-mcp: initialize/tools/list/tools/call all work via svc-casa-mcp"
 # ---------------------------------------------------------------------------
 # D-12 — svc-casa-mcp /hooks/resolve enforcement on port 8100 (Plan 4b/3.6)
 # ---------------------------------------------------------------------------
-# Same exercise as D-10 (block_dangerous_bash deny + allow + unknown-policy
-# deny) but against svc-casa-mcp:8100 instead of casa-main:8099. Validates
-# the hook-decision pass-through forwarder in svc_casa_mcp.py.
+# block_dangerous_bash deny + allow + unknown-policy deny against
+# svc-casa-mcp:8100. Validates the hook-decision pass-through forwarder in
+# svc_casa_mcp.py.
 run_harness "D-12 svc-hook-deny" "$(cat <<'PY'
 import json, urllib.request
 
@@ -727,6 +581,7 @@ assert body == {}, f"benign bash should return empty (allow); got {body}"
 status, body = resolve("nope_nope", {"tool_name": "Bash"})
 assert status == 200, (status, body)
 assert body["hookSpecificOutput"]["permissionDecision"] == "deny", body
+assert "unknown" in body["hookSpecificOutput"]["permissionDecisionReason"].lower(), body
 
 # 4. #366: an UNKNOWN engagement credential pair must not 500 — the request
 # proceeds unauthenticated (default policies still apply; identity-consuming

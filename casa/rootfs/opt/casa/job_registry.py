@@ -187,7 +187,6 @@ class JobRegistry:
     def __init__(
         self,
         path: str | os.PathLike[str],
-        legacy_tombstone_path: str | os.PathLike[str],
         *,
         clock: Callable[[], float] = time.time,
         reconciliation_retry_interval: float = 5.0,
@@ -200,7 +199,6 @@ class JobRegistry:
         if not math.isfinite(result_ttl) or result_ttl <= 0:
             raise ValueError("result_ttl_seconds must be positive")
         self._path = os.fspath(path)
-        self._legacy_tombstone_path = os.fspath(legacy_tombstone_path)
         self._clock = clock
         self._jobs: dict[str, VoiceJob] = {}
         self._delivery_sequence = 0
@@ -226,17 +224,12 @@ class JobRegistry:
             str, set[asyncio.Future[None]]
         ] = {}
 
-        # IDs migrated from the old tombstone during this process's first
-        # load.  recover_after_restart consumes this list for Telegram's
-        # compatibility notification path; it is never a second lifecycle.
-        self._migrated_on_load: list[str] = []
-
     @property
     def path(self) -> str:
         return self._path
 
     async def load(self) -> None:
-        """Load the durable snapshot, migrating legacy tombstones once."""
+        """Load the durable snapshot."""
         async with self._lock:
             if self._loaded:
                 return
@@ -248,49 +241,16 @@ class JobRegistry:
             else:
                 jobs = {}
 
-            migrated: dict[str, VoiceJob] = {}
-            migrated_ids: list[str] = []
-            consume_legacy = False
-            legacy_exists = os.path.exists(self._legacy_tombstone_path)
-            if legacy_exists:
-                migrated, migrated_ids, consume_legacy = await asyncio.to_thread(
-                    self._read_legacy_jobs,
-                    max((job.delivery_sequence for job in jobs.values()), default=0),
-                    jobs,
-                )
-                jobs.update(migrated)
-
-            write_snapshot = not snapshot_exists or bool(migrated)
-
             def publish_load() -> None:
                 self._jobs = jobs
                 self._delivery_sequence = max(
                     (job.delivery_sequence for job in jobs.values()), default=0,
                 )
-                # Telegram recovery is driven exclusively by the durable
-                # pending bit. This process-local bridge remains only for
-                # migrated voice rows, whose READY delivery is authoritative.
-                self._migrated_on_load = [
-                    job_id for job_id in migrated_ids
-                    if (job_id in jobs
-                        and not jobs[job_id].orphan_notification_pending)
-                ]
                 self._loaded = True
 
-            if write_snapshot or consume_legacy:
+            if not snapshot_exists:
                 async def commit_load() -> None:
-                    if write_snapshot:
-                        # Persist converted rows after any existing jobs and
-                        # before touching the legacy file. A failed write
-                        # therefore cannot lose the only recovery copy.
-                        await self._write_snapshot_locked(jobs)
-                    if consume_legacy:
-                        await asyncio.to_thread(
-                            atomic_write_json,
-                            self._legacy_tombstone_path,
-                            [],
-                            indent=2,
-                        )
+                    await self._write_snapshot_locked(jobs)
                     publish_load()
 
                 await self._finish_atomic_commit(commit_load())
@@ -1097,7 +1057,6 @@ class JobRegistry:
                 job.id for job in self.all()
                 if job.orphan_notification_pending
             ]
-            recovered_ids.extend(self._migrated_on_load)
             candidate = dict(self._jobs)
             changed = False
             next_sequence = self._delivery_sequence
@@ -1146,11 +1105,7 @@ class JobRegistry:
                     changed = True
 
             if changed:
-                await self._commit_snapshot_locked(
-                    candidate, after_publish=self._migrated_on_load.clear,
-                )
-            else:
-                self._migrated_on_load.clear()
+                await self._commit_snapshot_locked(candidate)
 
             seen: set[str] = set()
             return [
@@ -1199,111 +1154,6 @@ class JobRegistry:
     def _read_json(self, path: str) -> Any:
         with open(path, "r", encoding="utf-8") as fh:
             return json.load(fh)
-
-    def _read_legacy_jobs(
-        self,
-        starting_sequence: int,
-        existing: Mapping[str, VoiceJob],
-    ) -> tuple[dict[str, VoiceJob], list[str], bool]:
-        try:
-            raw = self._read_json(self._legacy_tombstone_path)
-        except (OSError, json.JSONDecodeError) as exc:
-            logger.error(
-                "Legacy delegation tombstone corrupt or unreadable (%s): %s",
-                self._legacy_tombstone_path, exc,
-            )
-            return {}, [], True
-        if not isinstance(raw, list):
-            logger.error(
-                "Legacy delegation tombstone %s is not a JSON array",
-                self._legacy_tombstone_path,
-            )
-            return {}, [], True
-
-        jobs: dict[str, VoiceJob] = {}
-        migrated_ids: list[str] = []
-        sequence = starting_sequence
-        now = self._now()
-        for row in raw:
-            try:
-                job_id = str(row["id"])
-                agent = str(row["agent"])
-                started_at = float(row.get("started_at", 0.0))
-                origin = dict(row.get("origin") or {})
-            except (KeyError, TypeError, ValueError) as exc:
-                logger.warning("Skipping malformed legacy delegation: %s", exc)
-                continue
-            if job_id in existing or job_id in jobs:
-                prior = existing.get(job_id)
-                if (prior is not None
-                        and prior.execution_state is ExecutionState.ORPHANED
-                        and prior.failure is not None
-                        and prior.failure.kind == "restart_orphan"):
-                    # Handles a crash after jobs.json replace but before legacy
-                    # truncation: do not duplicate the record, but do surface
-                    # the recovered failure during this successful boot.
-                    if (prior.creator_peer == "telegram"
-                            and not prior.orphan_notification_pending):
-                        # Backfills a pre-field snapshot caught in that crash
-                        # window before consuming its remaining tombstone.
-                        jobs[job_id] = replace(
-                            prior, orphan_notification_pending=True,
-                        )
-                    migrated_ids.append(job_id)
-                else:
-                    logger.warning(
-                        "Skipping legacy delegation with duplicate id %s", job_id,
-                    )
-                continue
-            sequence += 1
-            route_id = origin.get("cid") or origin.get("route_id")
-            device_id = origin.get("device_id") or origin.get("origin_device_id")
-            has_voice_route = bool(route_id and device_id)
-            job = VoiceJob(
-                id=job_id,
-                parent_job_id=None,
-                # This tombstone predates typed speaker provenance entirely
-                # (the pre-durable-job delegations.json format) — an honest
-                # unattributed system snapshot for both, never a persona
-                # fabricated from the bare role/agent strings below.
-                creating_speaker=SpeakerProvenance(speaker_kind="system"),
-                executing_speaker=SpeakerProvenance(speaker_kind="system"),
-                creating_role=str(origin.get("role") or "assistant"),
-                specialist_role=agent,
-                specialist_display_name=agent,
-                creator_peer=str(origin.get("channel") or ""),
-                creator_user_id=self._optional_str(origin.get("user_id")),
-                scope_id=str(origin.get("chat_id") or origin.get("scope_id") or ""),
-                origin_route_id=self._optional_str(route_id),
-                origin_device_id=self._optional_str(device_id),
-                task=str(origin.get("user_text") or ""),
-                context="",
-                created_at=started_at,
-                started_at=started_at,
-                terminal_at=now,
-                expires_at=None,
-                execution_state=ExecutionState.ORPHANED,
-                delivery_state=(
-                    DeliveryState.READY if has_voice_route else DeliveryState.NONE
-                ),
-                result=None,
-                failure=JobFailure("restart_orphan", "Lost on restart"),
-                awaiting_input=False,
-                continuable_until=None,
-                delivery_sequence=sequence,
-                delivery_attempt_id=None,
-                lease_until=None,
-                cancel_pending=False,
-                orphan_notification_pending=(
-                    str(origin.get("channel") or "") == "telegram"
-                ),
-            )
-            jobs[job_id] = replace(
-                job,
-                expires_at=now + self._terminal_result_ttl_seconds(job),
-            )
-            migrated_ids.append(job_id)
-        return jobs, migrated_ids, bool(raw)
 
     def _decode_snapshot(self, raw: Any) -> dict[str, VoiceJob]:
         if not isinstance(raw, list):

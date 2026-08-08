@@ -220,34 +220,6 @@ class TestToolsCallRejectsForgedIdentity:
         assert json.loads(body["content"][0]["text"]) == {"eng": "done-1"}
 
 
-class TestPublicFallbackParity:
-    async def test_dispatch_twin_rejects_forged_identity(self):
-        from casa_core import _dispatch_internal_tools_call
-        reg = _FakeRegistry()
-        reg.add(_FakeRecord("victim-engagement"))
-        result = await _dispatch_internal_tools_call(
-            body={"name": "spy", "arguments": {},
-                  "engagement_id": "victim-engagement",
-                  "engagement_token": "tok-forged"},
-            tool_dispatch={"spy": _spy_tool},
-            engagement_registry=reg,
-        )
-        assert result["error"]["code"] == -32003
-        assert _TOOL_CALLS == []
-
-    async def test_dispatch_twin_binds_with_valid_token(self):
-        from casa_core import _dispatch_internal_tools_call
-        reg = _FakeRegistry()
-        reg.add(_FakeRecord("mine"))
-        result = await _dispatch_internal_tools_call(
-            body={"name": "spy", "arguments": {},
-                  "engagement_id": "mine", "engagement_token": "tok-secret"},
-            tool_dispatch={"spy": _spy_tool},
-            engagement_registry=reg,
-        )
-        assert json.loads(result["content"][0]["text"]) == {"eng": "mine"}
-
-
 # ---------------------------------------------------------------------------
 # Registry — token lifecycle
 # ---------------------------------------------------------------------------

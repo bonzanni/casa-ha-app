@@ -31,12 +31,12 @@ denying regardless of mode.
 The consequence is worth stating plainly: **the allowlist is a constraint on the agent, not a
 boundary at the tool.** Anything able to reach full-map dispatch directly is not constrained
 by it. There are two such reaching points, not one: the internal endpoint (a
-permission-restricted Unix socket), and fallback MCP and hook-resolution routes on the main
-loopback application for in-container workspace subprocesses. The second is where "the
-boundary is the container" needs care: the external nginx listener refuses those paths, but
-the Home Assistant ingress listener proxies them — so an HA-authenticated ingress caller
-outside the container can reach full-map dispatch. The boundary around it is HA's own
-authentication, not the container wall.
+permission-restricted Unix socket), and the standalone MCP bridge for in-container workspace
+subprocesses (`svc-casa-mcp`, loopback port 8100), which forwards every call to that same
+socket. Both live inside the container: the bridge's listener binds loopback only and
+neither nginx listener proxies to it (the external listener additionally 404s the `/mcp/`
+and `/hooks/` prefixes as defense in depth), so the boundary around full-map dispatch is
+the container wall plus the socket's permissions.
 
 Individual tools may still refuse individual operations. Those are tool-local gates, not a
 universal authorization check.
@@ -48,9 +48,8 @@ token minted at record creation and provisioned into that engagement's own works
 alone is deliberately treated as public information (it appears in the workspace MCP
 configuration, in logs, and on shared loopback endpoints): a known id with a missing or
 mismatched token is rejected outright rather than downgraded to an unauthenticated call, on
-the paths that resolve the record for tool authority — the internal socket handler, the
-in-process fallback twin, and the engagement-channel routes that act on a record's topic and
-questions. An id the registry does not know still dispatches unbound, so a stale workspace
+the paths that resolve the record for tool authority — the internal socket handler and the
+engagement-channel routes that act on a record's topic and questions. An id the registry does not know still dispatches unbound, so a stale workspace
 gets an honest `not_in_engagement` from the tool rather than an authentication error.
 
 **What the token does not contain, stated plainly.** It raises the bar from "know an id" to
@@ -112,10 +111,10 @@ treated specially.
 This is the boundary that actually contains the property above. If reasoning about who can
 call a tool, reason about who can reach that socket.
 
-What it does not cover: the *fallback* full-map routes on the main loopback application.
-Those are refused by the external nginx listener but proxied by the HA ingress listener, so
-they are contained by Home Assistant's authentication rather than by this socket boundary
-(see the mental model).
+What it does not cover: the `svc-casa-mcp` bridge on loopback port 8100, which forwards
+into this socket for workspace subprocesses. Its listener is loopback-bound and neither
+nginx listener proxies to it, so it sits inside the same container boundary rather than
+punching through it (see the mental model).
 
 **INV-MCP-003**: The two surfaces expose different tool sets — role-filtered on the SDK side, the full static set over HTTP.
 
@@ -146,9 +145,9 @@ What it does not cover: a caller with shell access reads the file directly — t
 **INV-MCP-006**: Hook resolution binds an engagement only via the per-engagement credential — a known id with a missing or mismatched token is refused, an unauthenticated request selects no executor hook parameters and reaches no identity-consuming hook policy, and an authenticated identity contradicting the payload's working-directory claim is refused.
 
 The same verification function as INV-MCP-004, on the hook route. The shim sends the
-credential pair from its own workspace `.mcp.json` as headers; the bridge and the public
-fallback rebuild the forwarded body from those headers alone, so a body-borne identity
-claim cannot bypass them. The resolver threads the authenticated identity to the policy
+credential pair from its own workspace `.mcp.json` as headers; the bridge rebuilds the
+forwarded body from those headers alone, so a body-borne identity claim cannot bypass
+it. The resolver threads the authenticated identity to the policy
 callback in-process; the permission relay and the buttons reminder act only on that
 identity, which is what stops a forged working directory from posting a permission
 keyboard into another engagement's topic or borrowing another executor's hook parameters.

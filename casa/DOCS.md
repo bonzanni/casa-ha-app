@@ -1166,13 +1166,6 @@ model can handle), not a connection drop.
 - New engagement workspaces' hook proxy script POSTs to
   `http://127.0.0.1:8100/hooks/resolve`.
 
-**Back-compat for pre-v0.14.0 workspaces.** Casa-main's public listener
-on port 8099 still serves `/mcp/casa-framework` and `/hooks/resolve`
-as a fallback. Pre-v0.14.0 workspaces (whose `.mcp.json` was baked at
-provisioning time with the 8099 URL) continue to function until they
-cycle out (manual cancel + re-engage, or 7-day workspace retention
-sweep). The fallback is removed in v0.14.2 or later.
-
 **Operational env-var overrides.**
 - `CASA_FRAMEWORK_MCP_URL` — overrides the default URL that gets baked
   into newly-provisioned workspaces' `.mcp.json`. Leave unset for the

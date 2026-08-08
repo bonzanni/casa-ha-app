@@ -100,11 +100,11 @@ class SpecialistRegistry:
         if job_registry is None:
             if tombstone_path is None:
                 raise TypeError("job_registry or tombstone_path is required")
-            # Backward-compatible construction for tests and older embedders.
-            # Production injects the one boot-loaded registry explicitly.
+            # Convenience construction for tests and embedders: derive the
+            # jobs.json home from the given path. Production injects the one
+            # boot-loaded registry explicitly.
             job_registry = JobRegistry(
                 os.path.join(os.path.dirname(tombstone_path), "jobs.json"),
-                tombstone_path,
             )
         self._job_registry = job_registry
 
@@ -304,11 +304,10 @@ class SpecialistRegistry:
             specialist_display_name=record.agent,
             creator_peer=str(origin.get("channel") or ""),
             creator_user_id=self._optional_str(origin.get("user_id")),
-            scope_id=str(origin.get("chat_id") or origin.get("scope_id") or ""),
-            origin_route_id=self._optional_str(
-                origin.get("cid") or origin.get("route_id")),
+            scope_id=str(origin.get("chat_id") or ""),
+            origin_route_id=self._optional_str(origin.get("cid")),
             origin_device_id=self._optional_str(
-                origin.get("device_id") or origin.get("origin_device_id")),
+                origin.get("origin_device_id")),
             task=str(origin.get("user_text") or ""),
             context="",
             created_at=float(record.started_at),

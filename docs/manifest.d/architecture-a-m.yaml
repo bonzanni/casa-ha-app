@@ -59,7 +59,6 @@
     - tests/test_callback_spool.py
     - tests/test_callback_attempts.py
     - tests/test_callback_episodes.py
-    - tests/test_callback_migration.py
     - tests/test_callback_acks.py
     - tests/test_callback_reconcile.py
     - tests/test_callback_consent.py

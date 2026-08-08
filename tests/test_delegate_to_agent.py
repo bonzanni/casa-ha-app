@@ -883,7 +883,7 @@ class TestVoiceStructuredResult:
         assert job.expires_at == pytest.approx(job.terminal_at + 600)
         assert job.continuable_until == job.expires_at
 
-        reloaded = JobRegistry(tmp_path / "jobs.json", tombstone_path)
+        reloaded = JobRegistry(tmp_path / "jobs.json")
         await reloaded.load()
         assert reloaded.get(job.id) == job
 
@@ -1060,7 +1060,7 @@ class TestVoiceStructuredResult:
         assert job.execution_state is ExecutionState.CANCELLED
         assert job.failure is not None
 
-        reloaded = JobRegistry(tmp_path / "jobs.json", tombstone_path)
+        reloaded = JobRegistry(tmp_path / "jobs.json")
         await reloaded.load()
         assert reloaded.get(job.id) == job
 

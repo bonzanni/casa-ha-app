@@ -115,7 +115,7 @@ class TestEvictionPolicy:
 
         assert reg.get("telegram-x") is not None
 
-    async def test_webhook_uuid_scope_uses_short_ttl(self, tmp_path):
+    async def test_scope_class_marker_uses_short_ttl(self, tmp_path):
         path = str(tmp_path / "sessions.json")
         reg = SessionRegistry(path)
         now = datetime(2026, 4, 18, tzinfo=timezone.utc)
@@ -125,6 +125,9 @@ class TestEvictionPolicy:
             reg, f"webhook-{one_shot}", "sdk-uuid",
             now - timedelta(days=2),
         )
+        # The short TTL is granted by the persisted scope_class marker that
+        # register() stamps on a one-shot — never re-derived from the key.
+        reg._data[f"webhook-{one_shot}"]["scope_class"] = "webhook_oneshot"
 
         sweeper = SessionSweeper(
             registry=reg,
@@ -137,13 +140,11 @@ class TestEvictionPolicy:
 
         assert reg.get(f"webhook-{one_shot}") is None
 
-    async def test_sweep_extracts_channel_from_hyphen_key(self, tmp_path):
-        """Post v0.17.1 the registry key shape is {channel}-{scope_id}; the
-        sweeper must partition on '-' to read the channel correctly when
-        classifying webhook-vs-session TTL.
+    async def test_absent_scope_class_gets_the_standard_ttl(self, tmp_path):
+        """register() drops a None scope_class, so every ordinary session
+        entry lacks the field — the sweeper must give those the STANDARD
+        TTL, never infer the short webhook TTL from the key shape.
         """
-        # Fabricate a registry with one expired webhook UUID-scope entry
-        # written under the new hyphen shape.
         old_iso = (
             datetime.now(timezone.utc) - timedelta(days=2)
         ).isoformat()
@@ -164,7 +165,7 @@ class TestEvictionPolicy:
         await sweeper._sweep_once()
         assert reg.get(
             "webhook-12345678-1234-1234-1234-123456789012"
-        ) is None  # evicted under webhook TTL
+        ) is not None  # standard TTL: 2 days old survives 30-day TTL
 
     async def test_webhook_non_uuid_scope_uses_standard_ttl(self, tmp_path):
         """A webhook entry with a deliberately-pinned non-UUID chat_id is NOT

@@ -99,9 +99,9 @@ def normalize_stale_mid_entry(entry: Any) -> dict[str, Any]:
     """v0.84.0 (round-4 §D6): a ``stale_mids`` entry is ``{"mid": int, "kind":
     str}`` with ``kind ∈ {"reanchored", "plain"}`` — ``reanchored`` renders the
     marker-only moved copy, ``plain`` keeps today's full-body+suffix rendering.
-    Pre-round-4 rows (including legacy bare-integer entries) carry no ``kind``
-    at all — absent-tolerant here, defaulting to ``"plain"`` (their existing
-    rendering). Both the registry's own mutators (``stage_stale_mid``/
+    An entry missing ``kind`` (or a corrupt non-dict entry) defaults to
+    ``"plain"`` rather than raising — corruption tolerance, fail-safe to the
+    existing rendering. Both the registry's own mutators (``stage_stale_mid``/
     ``unstage_stale_mid``) and ``claude_code_driver``'s stale-settle paths
     (``_settle_ledger_entry`` + boot reconcile) normalize through this one
     function so every reader agrees on the shape regardless of on-disk

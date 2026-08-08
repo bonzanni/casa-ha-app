@@ -82,10 +82,6 @@ def set_entry(var_name: str, value: str) -> None:
     fd = os.open(PLUGIN_ENV_CONF_PATH, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
     with os.fdopen(fd, "w", encoding="utf-8") as fh:
         fh.write("".join(lines))
-    try:
-        os.chmod(PLUGIN_ENV_CONF_PATH, 0o600)  # belt-and-braces: repairs a legacy 0644 file
-    except PermissionError:
-        pass  # non-root in tests
 
 
 def remove_entry(var_name: str) -> bool:
