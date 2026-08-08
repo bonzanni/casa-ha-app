@@ -58,18 +58,12 @@ from __future__ import annotations
 import asyncio
 import logging
 import time
-from pathlib import Path
 from typing import Any, Awaitable, Callable
 
 import callback_attempts
 import plugin_dispatch
 
 logger = logging.getLogger(__name__)
-
-#: The retired v0.146 episode store. Nothing here reads or writes it — it is
-#: the name the boot migration deletes (a testable seam), kept in this module
-#: because this module is what owned the file.
-LEGACY_STORE_PATH = Path("/data/callback-episodes.json")
 
 _MAX_DISPATCH_ATTEMPTS = 3
 _RETRY_BACKOFF_S = (1.0, 5.0)

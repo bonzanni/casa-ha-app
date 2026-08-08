@@ -81,9 +81,9 @@ The `tests/conftest.py` auto-adds the code root to `sys.path`.
 3. Commit `release: vX.Y.Z (<summary>)`, push, open a PR, **squash-merge** once CI is green.
 4. Merging to main auto-publishes the GHCR images and creates the `vX.Y.Z` tag +
    GitHub Release from the changelog entry (`deploy.yml`) — no manual tagging.
-- **Removing an app option?** Also append its key to `DEPRECATED_OPTION_KEYS` in
-  `casa/rootfs/etc/s6-overlay/scripts/setup-configs.sh` (the `deprecated-options-prune`
-  block) so the stale stored value is deleted on boot and HA stops warning.
+- **Removing an app option?** The stored value stays behind and draws a boot
+  WARN from HA until the stored options are cleaned by hand (Casa ignores
+  unknown keys). Pre-1.0 that is accepted; clean the one prod install manually.
 
 ## Environment (WSL)
 - Develop on **WSL2 on the native ext4 filesystem** (not `/mnt/c`) — needed for perf and

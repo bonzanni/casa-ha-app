@@ -72,16 +72,6 @@ def _schema_keys() -> set[str]:
     return keys
 
 
-def _deprecated_keys() -> set[str]:
-    src = SETUP_CONFIGS.read_text(encoding="utf-8")
-    line = next(
-        line for line in src.splitlines()
-        if line.startswith("DEPRECATED_OPTION_KEYS=")
-    )
-    _, _, value = line.partition("=")
-    return set(value.strip().strip('"').split())
-
-
 @pytest.mark.parametrize("fixture", FIXTURES, ids=lambda p: p.name)
 def test_fixture_keys_all_exist_in_schema(fixture: Path) -> None:
     """No fixture may carry an option config.yaml no longer declares."""
@@ -96,34 +86,18 @@ def test_fixture_keys_all_exist_in_schema(fixture: Path) -> None:
     )
 
 
-@pytest.mark.parametrize("fixture", FIXTURES, ids=lambda p: p.name)
-def test_fixture_keys_are_not_deprecated(fixture: Path) -> None:
-    """Belt and braces: catch a key that is deprecated *and* still in schema.
-
-    The schema check above would miss a removal that deleted the key from
-    DEPRECATED_OPTION_KEYS' perspective only. Asserting both directions means
-    the next option removal fails here rather than rotting silently.
-    """
-    fixture_keys = _load_fixture(fixture)
-    deprecated = _deprecated_keys()
-    stale = sorted(fixture_keys & deprecated)
-    assert not stale, (
-        f"{fixture.relative_to(REPO_ROOT)} carries option(s) listed in "
-        f"DEPRECATED_OPTION_KEYS: {stale}."
-    )
-
-
-def test_harness_env_export_has_no_deprecated_options() -> None:
+def test_harness_env_export_reads_only_declared_options() -> None:
     """The harness env-export must not read options the add-on removed.
 
-    Narrow by design: only the `jq -r '.<key>'` reads in 03-export-env.sh, so
-    prose naming a removed option stays legal.
+    Every option key 03-export-env.sh reads must still be declared in
+    config.yaml's schema. Narrow by design: only the `jq -r '.<key>'` reads
+    are checked, so prose naming a removed option stays legal.
     """
     export_env = (
         REPO_ROOT / "test-local" / "init-overrides" / "03-export-env.sh"
     )
     src = export_env.read_text(encoding="utf-8")
-    deprecated = _deprecated_keys()
+    schema = _schema_keys()
 
     read_keys = set(re.findall(r"jq -r ['\"]\.([A-Za-z_][A-Za-z0-9_]*)", src))
     assert read_keys, (
@@ -144,8 +118,9 @@ def test_harness_env_export_has_no_deprecated_options() -> None:
     assert loop_keys, "the `for key in …` loop parsed to no option names"
     read_keys |= loop_keys
 
-    stale = sorted(read_keys & deprecated)
+    stale = sorted(read_keys - schema)
     assert not stale, (
-        f"test-local/init-overrides/03-export-env.sh still reads removed "
-        f"option(s): {stale}. The real svc-casa/run no longer exports them."
+        f"test-local/init-overrides/03-export-env.sh reads option(s) absent "
+        f"from casa/config.yaml's schema: {stale}. The real svc-casa/run no "
+        "longer exports them."
     )

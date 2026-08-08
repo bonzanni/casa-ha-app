@@ -59,7 +59,6 @@ def actor_for_job():
 async def loaded_registry(tmp_path, job=None, *, now=100.0):
     registry = JobRegistry(
         tmp_path / "jobs.json",
-        tmp_path / "delegations.json",
         clock=lambda: now,
     )
     await registry.load()
@@ -114,10 +113,10 @@ async def playing_registry(tmp_path, *, now=100.0):
 
 
 async def test_create_is_atomic_and_survives_reload(tmp_path):
-    registry = JobRegistry(tmp_path / "jobs.json", tmp_path / "delegations.json")
+    registry = JobRegistry(tmp_path / "jobs.json")
     await registry.load()
     await registry.create(make_job())
-    reloaded = JobRegistry(tmp_path / "jobs.json", tmp_path / "delegations.json")
+    reloaded = JobRegistry(tmp_path / "jobs.json")
     await reloaded.load()
     assert reloaded.get("job-1") == make_job()
 
@@ -135,7 +134,7 @@ async def test_handoff_latch_round_trips_and_receipt_is_idempotent(tmp_path):
     with pytest.raises(JobTransitionError):
         await registry.acknowledge_handoff("job-1", "other-handoff")
 
-    reloaded = JobRegistry(tmp_path / "jobs.json", tmp_path / "delegations.json")
+    reloaded = JobRegistry(tmp_path / "jobs.json")
     await reloaded.load()
     assert reloaded.get("job-1") == received
 
@@ -147,7 +146,7 @@ async def test_legacy_snapshot_defaults_handoff_latch_to_none(tmp_path):
     snapshot[0].pop("handoff_state", None)
     (tmp_path / "jobs.json").write_text(json.dumps(snapshot))
 
-    reloaded = JobRegistry(tmp_path / "jobs.json", tmp_path / "delegations.json")
+    reloaded = JobRegistry(tmp_path / "jobs.json")
     await reloaded.load()
     job = reloaded.get("job-1")
     assert job.handoff_id is None
@@ -182,7 +181,7 @@ async def test_multiple_terminal_jobs_survive_reload_in_delivery_order(tmp_path)
     await registry.finish("job-1", "first answer")
     await registry.fail("job-2", JobFailure("specialist_error", "second failed"))
 
-    reloaded = JobRegistry(tmp_path / "jobs.json", tmp_path / "delegations.json")
+    reloaded = JobRegistry(tmp_path / "jobs.json")
     await reloaded.load()
     assert [job.id for job in reloaded.all()] == ["job-1", "job-2"]
     assert reloaded.get("job-1").execution_state is ExecutionState.SUCCEEDED
@@ -217,7 +216,7 @@ async def test_finish_voice_result_persists_clarification_contract_and_ttl(
     assert finished.continuable_until == 800.0
 
     reloaded = JobRegistry(
-        tmp_path / "jobs.json", tmp_path / "delegations.json",
+        tmp_path / "jobs.json",
         clock=lambda: 200.0,
     )
     await reloaded.load()
@@ -268,7 +267,7 @@ async def test_finish_voice_result_write_failure_is_atomic(tmp_path, monkeypatch
 
     assert registry.get("job-1") == before
     reloaded = JobRegistry(
-        tmp_path / "jobs.json", tmp_path / "delegations.json",
+        tmp_path / "jobs.json",
         clock=lambda: 300.0,
     )
     await reloaded.load()
@@ -426,7 +425,7 @@ async def test_cancel_during_persist_still_signals_and_reaps_owned_task(
         assert cancel_event.is_set()
 
         reloaded = JobRegistry(
-            tmp_path / "jobs.json", tmp_path / "delegations.json",
+            tmp_path / "jobs.json",
         )
         await reloaded.load()
         assert reloaded.get("job-1").cancel_pending is True
@@ -588,8 +587,7 @@ async def test_expire_due_applies_result_delivery_ttl(tmp_path):
 
 async def test_snapshot_without_control_identity_keeps_legacy_scope_auth(tmp_path):
     path = tmp_path / "jobs.json"
-    legacy = tmp_path / "delegations.json"
-    registry = JobRegistry(path, legacy)
+    registry = JobRegistry(path)
     await registry.load()
     await registry.create(make_job())
     await registry.close()
@@ -597,7 +595,7 @@ async def test_snapshot_without_control_identity_keeps_legacy_scope_auth(tmp_pat
     rows[0].pop("job_control_id", None)
     path.write_text(json.dumps(rows), encoding="utf-8")
 
-    reloaded = JobRegistry(path, legacy)
+    reloaded = JobRegistry(path)
     await reloaded.load()
     assert reloaded.get("job-1").job_control_id is None
     with pytest.raises(JobAuthorizationError):
@@ -611,169 +609,13 @@ async def test_snapshot_without_control_identity_keeps_legacy_scope_auth(tmp_pat
     assert result.status == "stopping"
 
 
-async def test_load_migrates_legacy_tombstone_once(tmp_path):
-    legacy = tmp_path / "delegations.json"
-    legacy.write_text(json.dumps([{
-        "id": "old-1",
-        "agent": "finance",
-        "started_at": 42.0,
-        "origin": {
-            "role": "assistant",
-            "channel": "telegram",
-            "chat_id": "chat-7",
-            "cid": "route-9",
-        },
-    }]), encoding="utf-8")
-
-    registry = JobRegistry(tmp_path / "jobs.json", legacy, clock=lambda: 100.0)
-    await registry.load()
-    job = registry.get("old-1")
-    assert job.execution_state is ExecutionState.ORPHANED
-    assert job.failure == JobFailure(kind="restart_orphan", message="Lost on restart")
-    assert job.creating_role == "assistant"
-    assert job.specialist_role == "finance"
-    assert job.scope_id == "chat-7"
-    assert job.origin_route_id == "route-9"
-    assert job.orphan_notification_pending is True
-    assert json.loads(legacy.read_text(encoding="utf-8")) == []
-
-    reloaded = JobRegistry(tmp_path / "jobs.json", legacy, clock=lambda: 101.0)
-    await reloaded.load()
-    assert [job.id for job in reloaded.all()] == ["old-1"]
-
-
-async def test_legacy_migration_appends_after_existing_delivery_sequence(tmp_path):
-    jobs_path = tmp_path / "jobs.json"
-    legacy = tmp_path / "delegations.json"
-    seeded = JobRegistry(jobs_path, legacy, clock=lambda: 90.0)
-    await seeded.load()
-    await seeded.create(make_job(
-        execution_state=ExecutionState.SUCCEEDED,
-        delivery_state=DeliveryState.READY,
-        terminal_at=80.0,
-        result="answer",
-        delivery_sequence=7,
-    ))
-    legacy.write_text(json.dumps([
-        {
-            "id": "old-2", "agent": "finance", "started_at": 42.0,
-            "origin": {"channel": "telegram", "chat_id": "chat-2"},
-        },
-        {
-            "id": "old-3", "agent": "weather", "started_at": 43.0,
-            "origin": {"channel": "telegram", "chat_id": "chat-3"},
-        },
-    ]), encoding="utf-8")
-
-    registry = JobRegistry(jobs_path, legacy, clock=lambda: 100.0)
-    await registry.load()
-    assert registry.get("old-2").delivery_sequence == 8
-    assert registry.get("old-3").delivery_sequence == 9
-    assert registry.get("old-2").orphan_notification_pending is True
-    assert registry.get("old-3").orphan_notification_pending is True
-    assert [job.id for job in registry.all()] == ["job-1", "old-2", "old-3"]
-    assert json.loads(legacy.read_text(encoding="utf-8")) == []
-
-
-async def test_cancel_during_migration_waits_for_publish_and_consume_under_lock(
-    tmp_path, monkeypatch,
-):
-    import job_registry as job_registry_module
-
-    jobs_path = tmp_path / "jobs.json"
-    legacy = tmp_path / "delegations.json"
-    legacy.write_text(json.dumps([{
-        "id": "old-1", "agent": "finance", "started_at": 42.0,
-        "origin": {"channel": "telegram", "chat_id": "chat-1"},
-    }]), encoding="utf-8")
-    replaced = threading.Event()
-    release_writer = threading.Event()
-    real_write = job_registry_module.atomic_write_json
-
-    def blocked_after_jobs_replace(path, *args, **kwargs):
-        real_write(path, *args, **kwargs)
-        if str(path) == str(jobs_path):
-            replaced.set()
-            assert release_writer.wait(timeout=5)
-
-    monkeypatch.setattr(job_registry_module, "atomic_write_json", blocked_after_jobs_replace)
-    registry = JobRegistry(jobs_path, legacy, clock=lambda: 100.0)
-    loading = asyncio.create_task(registry.load())
-    assert await asyncio.to_thread(replaced.wait, 5)
-    loading.cancel()
-
-    observed = {}
-    entered = asyncio.Event()
-
-    async def observe_next_writer_view():
-        async with registry._lock:
-            observed["memory"] = registry.get("old-1") is not None
-            observed["disk"] = [
-                row["id"]
-                for row in json.loads(jobs_path.read_text(encoding="utf-8"))
-            ]
-            observed["legacy"] = json.loads(legacy.read_text(encoding="utf-8"))
-            entered.set()
-
-    observer = asyncio.create_task(observe_next_writer_view())
-    try:
-        await asyncio.sleep(0)
-        assert not entered.is_set(), "migration lock released before publication"
-    finally:
-        release_writer.set()
-
-    with pytest.raises(asyncio.CancelledError):
-        await loading
-    await observer
-    assert observed == {"memory": True, "disk": ["old-1"], "legacy": []}
-
-
-async def test_empty_consumed_legacy_tombstone_is_not_rewritten(tmp_path, monkeypatch):
-    import job_registry as job_registry_module
-
-    jobs_path = tmp_path / "jobs.json"
-    legacy = tmp_path / "delegations.json"
-    legacy.write_text("[]\n", encoding="utf-8")
-    seeded = JobRegistry(jobs_path, legacy)
-    await seeded.load()
-
-    calls = []
-    real_write = job_registry_module.atomic_write_json
-
-    def record_write(path, *args, **kwargs):
-        calls.append(str(path))
-        return real_write(path, *args, **kwargs)
-
-    monkeypatch.setattr(job_registry_module, "atomic_write_json", record_write)
-    reloaded = JobRegistry(jobs_path, legacy)
-    await reloaded.load()
-    assert str(legacy) not in calls
-
-
-@pytest.mark.parametrize("legacy_payload", ["{not json", '{"not": "a list"}'])
-async def test_corrupt_legacy_tombstone_is_logged_and_truncated(
-    tmp_path, caplog, legacy_payload,
-):
-    import logging
-
-    legacy = tmp_path / "delegations.json"
-    legacy.write_text(legacy_payload, encoding="utf-8")
-    registry = JobRegistry(tmp_path / "jobs.json", legacy)
-    with caplog.at_level(logging.ERROR):
-        await registry.load()
-    assert registry.all() == []
-    assert json.loads(legacy.read_text(encoding="utf-8")) == []
-    assert any("legacy delegation tombstone" in row.message.lower()
-               for row in caplog.records)
-
-
 async def test_atomic_replace_failure_preserves_prior_snapshot_and_memory(
     tmp_path, monkeypatch,
 ):
     import atomic_io
 
     jobs_path = tmp_path / "jobs.json"
-    registry = JobRegistry(jobs_path, tmp_path / "delegations.json")
+    registry = JobRegistry(jobs_path)
     await registry.load()
     await registry.create(make_job())
     prior = json.loads(jobs_path.read_text(encoding="utf-8"))
@@ -895,7 +737,6 @@ async def test_compensate_unbound_continuation_does_not_restore_expired_parent(
     now = [120.0]
     registry = JobRegistry(
         tmp_path / "jobs.json",
-        tmp_path / "delegations.json",
         clock=lambda: now[0],
     )
     await registry.load()
@@ -1007,7 +848,6 @@ async def test_failure_reconciliation_eventually_terminalizes_live_job(
 ):
     registry = JobRegistry(
         tmp_path / "jobs.json",
-        tmp_path / "delegations.json",
         clock=lambda: 120.0,
         reconciliation_retry_interval=0.01,
     )
@@ -1047,7 +887,6 @@ async def test_failure_reconciliation_eventually_terminalizes_live_job(
 async def test_close_cancels_and_drains_sleeping_reconciliation(tmp_path):
     registry = JobRegistry(
         tmp_path / "jobs.json",
-        tmp_path / "delegations.json",
         reconciliation_retry_interval=3600.0,
     )
     await registry.load()
@@ -1070,7 +909,6 @@ async def test_persistent_reconciliation_failure_stays_restart_recoverable(
     attempted = asyncio.Event()
     registry = JobRegistry(
         tmp_path / "jobs.json",
-        tmp_path / "delegations.json",
         clock=lambda: 120.0,
         reconciliation_retry_interval=0.01,
     )
@@ -1094,7 +932,6 @@ async def test_persistent_reconciliation_failure_stays_restart_recoverable(
 
     restarted = JobRegistry(
         tmp_path / "jobs.json",
-        tmp_path / "delegations.json",
         clock=lambda: 121.0,
     )
     await restarted.load()
@@ -1105,8 +942,7 @@ async def test_persistent_reconciliation_failure_stays_restart_recoverable(
 
 async def test_telegram_orphan_notification_retries_until_durable_ack(tmp_path):
     jobs_path = tmp_path / "jobs.json"
-    legacy = tmp_path / "delegations.json"
-    first = JobRegistry(jobs_path, legacy, clock=lambda: 120.0)
+    first = JobRegistry(jobs_path, clock=lambda: 120.0)
     await first.load()
     await first.create(make_job(
         creator_peer="telegram",
@@ -1121,14 +957,14 @@ async def test_telegram_orphan_notification_retries_until_durable_ack(tmp_path):
     assert [job.id for job in boot_one] == ["job-1"]
     assert first.get("job-1").orphan_notification_pending is True
 
-    second = JobRegistry(jobs_path, legacy, clock=lambda: 121.0)
+    second = JobRegistry(jobs_path, clock=lambda: 121.0)
     await second.load()
     boot_two = await second.recover_after_restart()
     assert [job.id for job in boot_two] == ["job-1"]
     await second.ack_orphan_notification("job-1")
     assert second.get("job-1").orphan_notification_pending is False
 
-    third = JobRegistry(jobs_path, legacy, clock=lambda: 122.0)
+    third = JobRegistry(jobs_path, clock=lambda: 122.0)
     await third.load()
     assert await third.recover_after_restart() == []
 
@@ -1140,7 +976,7 @@ async def test_snapshot_without_orphan_ack_field_decodes_as_not_pending(tmp_path
     snapshot[0].pop("orphan_notification_pending", None)
     jobs_path.write_text(json.dumps(snapshot), encoding="utf-8")
 
-    reloaded = JobRegistry(jobs_path, tmp_path / "delegations.json")
+    reloaded = JobRegistry(jobs_path)
     await reloaded.load()
     assert reloaded.get("job-1").orphan_notification_pending is False
 
@@ -1204,7 +1040,7 @@ async def test_recovered_orphan_failure_isolated_before_later_success(
     assert secret not in caplog.text
 
     reloaded = JobRegistry(
-        tmp_path / "jobs.json", tmp_path / "delegations.json",
+        tmp_path / "jobs.json",
     )
     await reloaded.load()
     assert reloaded.get("job-fail").orphan_notification_pending is True
@@ -1247,7 +1083,6 @@ async def test_restart_retains_delivery_attempt_for_one_full_lease(
     now = [100.0]
     registry = JobRegistry(
         tmp_path / "jobs.json",
-        tmp_path / "delegations.json",
         clock=lambda: now[0],
     )
     await registry.load()
@@ -1285,14 +1120,14 @@ EXECUTOR_SPEAKER = SpeakerProvenance(
 
 
 async def test_voice_job_round_trip_preserves_both_speaker_snapshots(tmp_path):
-    registry = JobRegistry(tmp_path / "jobs.json", tmp_path / "delegations.json")
+    registry = JobRegistry(tmp_path / "jobs.json")
     await registry.load()
     job = make_job(
         creating_speaker=CALLER_SPEAKER, executing_speaker=EXECUTOR_SPEAKER,
     )
     await registry.create(job)
 
-    reloaded = JobRegistry(tmp_path / "jobs.json", tmp_path / "delegations.json")
+    reloaded = JobRegistry(tmp_path / "jobs.json")
     await reloaded.load()
     restored = reloaded.get("job-1")
     assert restored.creating_speaker == CALLER_SPEAKER
@@ -1337,7 +1172,7 @@ async def test_continuation_child_keeps_its_own_speaker_snapshots(tmp_path):
     assert stored.creating_speaker == CALLER_SPEAKER
     assert stored.executing_speaker == current_executor
 
-    reloaded = JobRegistry(tmp_path / "jobs.json", tmp_path / "delegations.json")
+    reloaded = JobRegistry(tmp_path / "jobs.json")
     await reloaded.load()
     assert reloaded.get("job-2").creating_speaker == CALLER_SPEAKER
     assert reloaded.get("job-2").executing_speaker == current_executor
@@ -1355,7 +1190,7 @@ async def test_pre_task_12_legacy_record_decodes_to_a_system_speaker(tmp_path):
     snapshot[0].pop("executing_speaker", None)
     (tmp_path / "jobs.json").write_text(json.dumps(snapshot))
 
-    reloaded = JobRegistry(tmp_path / "jobs.json", tmp_path / "delegations.json")
+    reloaded = JobRegistry(tmp_path / "jobs.json")
     await reloaded.load()
     job = reloaded.get("job-1")
     assert job.creating_speaker == SpeakerProvenance(speaker_kind="system")
@@ -1501,7 +1336,6 @@ async def test_completion_reconciliation_eventually_terminalizes_live_job(
     a registry-owned retry, mirroring the failure-reconciliation owner."""
     registry = JobRegistry(
         tmp_path / "jobs.json",
-        tmp_path / "delegations.json",
         clock=lambda: 120.0,
         reconciliation_retry_interval=0.01,
     )
@@ -1540,7 +1374,6 @@ async def test_cancel_reconciliation_eventually_terminalizes_live_job(tmp_path):
     leaves the job RUNNING — the registry-owned retry cancels it."""
     registry = JobRegistry(
         tmp_path / "jobs.json",
-        tmp_path / "delegations.json",
         clock=lambda: 120.0,
         reconciliation_retry_interval=0.01,
     )

@@ -306,6 +306,24 @@ def workspace_mcp_token(ws_dir: str) -> str | None:
     return token if isinstance(token, str) and token else None
 
 
+def workspace_mcp_url(ws_dir: str) -> str | None:
+    """The casa-framework URL currently baked into ``<ws>/.mcp.json``.
+
+    ``None`` when the file is absent, unreadable, or malformed. Boot replay
+    compares this against the current ``casa_framework_mcp_url`` so a
+    workspace whose baked URL has drifted from the served endpoint is
+    rewritten (and its CLI cycled) exactly like a changed credential —
+    the URL is part of the workspace's identity, not an artifact to trust.
+    """
+    try:
+        cfg = json.loads(
+            (Path(ws_dir) / ".mcp.json").read_text(encoding="utf-8"))
+        url = cfg["mcpServers"]["casa-framework"]["url"]
+    except (OSError, ValueError, KeyError, TypeError):
+        return None
+    return url if isinstance(url, str) and url else None
+
+
 def write_workspace_mcp_json(
     ws_dir: str,
     *,

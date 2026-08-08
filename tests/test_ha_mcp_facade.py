@@ -392,8 +392,13 @@ async def test_live_context_domain_is_never_forwarded_upstream():
             {"domain": "light"},
         )
         assert upstream.calls == [("GetLiveContext", {})]
+        # The payload is passed through verbatim — casa does not filter
+        # GetLiveContext output (the pre-#223 flat-dict domain filter is
+        # gone); the domain argument only scopes the (never-forwarded)
+        # request intent.
         assert json.loads(result["content"][0]["text"]) == {
             "light.kitchen": "on",
+            "climate.office": "idle",
         }
     finally:
         await facade.aclose()
@@ -437,7 +442,7 @@ async def test_live_context_success_result_envelope_passes_through(caplog):
         assert "domain: light" in payload["result"]
         # Truthful, distinct log so a future contract change is observable;
         # the old buggy "output_count=0" line must not appear.
-        assert "filter passthrough" in caplog.text
+        assert "live-context passthrough" in caplog.text
         assert "shape=success_result" in caplog.text
         assert "output_count=0" not in caplog.text
     finally:

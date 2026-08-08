@@ -231,9 +231,7 @@ def render_install_consent_message(inspection: Any) -> str:
     # per-dependency `getattr` field names before that type existed — this
     # replaces it with the real field set: identifier/scoped_name/
     # manifest_name/version/source_type/content_digest/mcp_servers/
-    # protected_tools/env_names). `getattr(..., ())` keeps this rendering
-    # unchanged (empty section) for any legacy inspection object that
-    # predates the field.
+    # protected_tools/env_names).
     #
     # Fix-round-1 (consent-review CRITICAL, spec §3.2): the DM must show
     # "scoped name, manifest name, version, MCP servers/commands, protected
@@ -241,7 +239,7 @@ def render_install_consent_message(inspection: Any) -> str:
     # close that gap; each is omitted entirely when empty (nothing to
     # approve in that category) rather than rendered as a bare label.
     plugin_blocks: list[str] = []
-    for row in getattr(inspection, "plugin_resolutions", ()) or ():
+    for row in inspection.plugin_resolutions or ():
         lines = [
             f"  Bundled plugin {row.scoped_name}:",
             f"    manifest name: {row.manifest_name}",
@@ -279,9 +277,8 @@ def prompt_specialist_install_consent(
 ) -> Any:
     # Task 7: thread `receipt_digest` (Task 8's bundled-plugin receipt digest)
     # into the identity so a bundled-plugin closure change forces
-    # re-approval; `getattr(..., "")` keeps this call working against a
-    # legacy inspection object that predates the field.
-    receipt_digest = getattr(inspection, "receipt_digest", "")
+    # re-approval.
+    receipt_digest = inspection.receipt_digest
     identity = install_consent_identity(
         component_id=inspection.component_id, version=inspection.version,
         root_digest=inspection.root_digest, slug=inspection.slug,

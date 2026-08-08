@@ -85,7 +85,7 @@ async def test_voice_job_completion_never_reenters_gary(
 
     monkeypatch.setattr(tools, "_run_delegated_agent", _run)
 
-    registry = JobRegistry(tmp_path / "jobs.json", tmp_path / "delegations.json")
+    registry = JobRegistry(tmp_path / "jobs.json")
     await registry.load()
     specialists = SpecialistRegistry(
         str(tmp_path / "specialists"), job_registry=registry,

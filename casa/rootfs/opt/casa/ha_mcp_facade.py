@@ -291,9 +291,9 @@ class HomeAssistantFacade:
             elapsed,
         )
         payload = _sdk_result(result)
-        if name != LIVE_CONTEXT_TOOL or not arguments.get("domain"):
-            return payload
-        return _filter_live_context(payload, arguments["domain"])
+        if name == LIVE_CONTEXT_TOOL and arguments.get("domain"):
+            _log_live_context_shape(payload)
+        return payload
 
     async def _call_upstream(
         self,
@@ -427,67 +427,31 @@ def _sdk_result(result: Any) -> dict[str, Any]:
     return payload
 
 
-def _filter_live_context(
-    payload: dict[str, Any],
-    domain: str,
-) -> dict[str, Any]:
-    filtered_content = [dict(item) for item in payload["content"]]
-    input_count = 0
-    output_count = 0
-    object_count = 0
+def _log_live_context_shape(payload: dict[str, Any]) -> None:
+    """GetLiveContext observability only — never mutates the payload.
 
-    for item in filtered_content:
-        if item.get("type") != "text":
+    The current HA contract returns a curated envelope
+    ``{"success": bool, "result": "<text overview>"}`` whose ``result``
+    string already lists only Assist-exposed entities scoped to what the
+    caller asked for, so there is nothing for casa to filter (issue #223
+    established that filtering that envelope by top-level key drops the
+    whole overview). The shape= field keeps a future contract change
+    observable in the logs."""
+    content = payload.get("content") or []
+    shape = "unrecognized"
+    for item in content:
+        if not isinstance(item, dict) or item.get("type") != "text":
             continue
         try:
             decoded = json.loads(item["text"])
         except (KeyError, TypeError, json.JSONDecodeError):
-            logger.info(
-                "Home Assistant live-context filter unchanged: "
-                "content_count=%d error_kind=json_parse",
-                len(filtered_content),
-            )
-            return payload
-        if not isinstance(decoded, dict):
-            logger.info(
-                "Home Assistant live-context filter unchanged: "
-                "content_count=%d error_kind=json_shape",
-                len(filtered_content),
-            )
-            return payload
-
-        if isinstance(decoded.get("result"), str):
-            # Current HA GetLiveContext contract: a curated envelope
-            # {"success": bool, "result": "<text overview>"} whose `result`
-            # string already lists only Assist-exposed entities scoped to what
-            # the caller asked for. The legacy top-level-key domain filter must
-            # NOT run here — every top-level key ("success", "result") fails the
-            # `key.partition(".")[0] == domain` test, so it would drop the whole
-            # overview and Tina would see zero devices (issue #223). Pass the
-            # payload through unchanged; the distinct log keeps a future
-            # contract change observable.
-            logger.info(
-                "Home Assistant live-context filter passthrough: "
-                "content_count=%d shape=success_result",
-                len(filtered_content),
-            )
-            return payload
-
-        selected = {
-            key: value
-            for key, value in decoded.items()
-            if key.partition(".")[0] == domain
-        }
-        item["text"] = json.dumps(selected)
-        input_count += len(decoded)
-        output_count += len(selected)
-        object_count += 1
-
+            shape = "json_parse_error"
+            break
+        if isinstance(decoded, dict) and isinstance(
+                decoded.get("result"), str):
+            shape = "success_result"
+        break
     logger.info(
-        "Home Assistant live-context filter applied: "
-        "object_count=%d input_count=%d output_count=%d",
-        object_count,
-        input_count,
-        output_count,
+        "Home Assistant live-context passthrough: content_count=%d shape=%s",
+        len(content), shape,
     )
-    return {**payload, "content": filtered_content}

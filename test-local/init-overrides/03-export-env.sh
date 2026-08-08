@@ -17,8 +17,8 @@ rm -f "${S6_ENV}/WEBHOOK_SECRET"
 
 # Export each option as an s6 container env var.
 # v0.125.0 (#228) removed telegram_delivery_mode, honcho_api_url and
-# honcho_api_key; they are in DEPRECATED_OPTION_KEYS and no longer in
-# config.yaml's schema, so exporting them was dead weight (#262).
+# honcho_api_key from config.yaml's schema, so exporting them was dead
+# weight (#262).
 for key in public_url telegram_bot_token telegram_chat_id telegram_transport \
            webhook_secret enable_terminal \
            primary_agent_model voice_agent_model; do
@@ -37,8 +37,8 @@ if [ -n "$val" ]; then
 fi
 
 # scope_threshold -> CASA_SCOPE_THRESHOLD was removed here in #262: the option
-# is gone from config.yaml's schema and listed in DEPRECATED_OPTION_KEYS, and
-# the real svc-casa/run no longer exports it either.
+# is gone from config.yaml's schema and the real svc-casa/run no longer
+# exports it either.
 
 # Engagement supergroup (0 = disabled; always export so consumers can check).
 val=$(jq -r '.telegram_engagement_supergroup_id // 0' "$OPTIONS")

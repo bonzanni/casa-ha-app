@@ -224,222 +224,6 @@ async def start_internal_unix_runner(
     return runner
 
 
-# ---------------------------------------------------------------------------
-# Plan 4b/3.6: public-8099 back-compat fallback handlers
-#
-# These wrap the new internal_handlers in JSON-RPC envelope code (for
-# /mcp/casa-framework) and adapt the body shape (for /hooks/resolve).
-# Behavior is byte-identical to v0.13.1 — the wrappers exist so that
-# pre-v0.14.0 workspaces (whose .mcp.json points at port 8099) keep
-# working through the v0.14.x migration window. svc-casa-mcp on port
-# 8100 is the canonical path for new workspaces.
-# ---------------------------------------------------------------------------
-
-
-def _make_public_mcp_fallback_handler(
-    *,
-    tools: list,
-    tool_dispatch: dict,
-    engagement_registry,
-):
-    """Public-8099 /mcp/casa-framework JSON-RPC handler.
-
-    Parses JSON-RPC envelope, dispatches via the same internal handler
-    that the Unix socket exposes (in-process call), wraps the result
-    back into a JSON-RPC envelope.
-    """
-    from mcp_envelope import (
-        PROTOCOL_VERSION, VERSION,
-        _jsonrpc_error, _jsonrpc_ok, _tool_schema,
-    )
-
-    # Pre-compute the static tools/list response (snapshot at boot).
-    tool_schemas = [_tool_schema(t) for t in tools]
-
-    async def handler(request: web.Request) -> web.Response:
-        try:
-            msg = await request.json()
-        except Exception:
-            return _jsonrpc_error(None, -32700, "Parse error")
-
-        if not isinstance(msg, dict):
-            return _jsonrpc_error(None, -32600, "Invalid Request")
-
-        method = msg.get("method")
-        req_id = msg.get("id")
-        # #380: any non-object params — truthy OR falsy ([], "", 0, false)
-        # — earns a typed error; only an absent/null params defaults to {}.
-        # The old `or {}` coerced falsy non-objects into a silent empty
-        # call and truthy ones raised at params.get() → HTTP 500.
-        params = msg.get("params")
-        if params is None:
-            params = {}
-        if not isinstance(params, dict):
-            return _jsonrpc_error(
-                req_id, -32602, "params must be an object")
-
-        if method == "notifications/initialized":
-            return web.Response(status=202)
-
-        if method == "initialize":
-            return _jsonrpc_ok(req_id, {
-                "protocolVersion": PROTOCOL_VERSION,
-                "capabilities": {"tools": {}},
-                "serverInfo": {"name": "casa-framework", "version": VERSION},
-            })
-
-        if method == "tools/list":
-            return _jsonrpc_ok(req_id, {"tools": tool_schemas})
-
-        if method == "ping":
-            return _jsonrpc_ok(req_id, {})
-
-        if method == "tools/call":
-            # Translate JSON-RPC params + X-Casa-Engagement-Id/-Token headers
-            # into the internal-handler body shape, then dispatch in-process.
-            # #335: the token header is what actually authenticates the id
-            # claim (verified against the record in the dispatcher).
-            name = params.get("name")
-            # #380: pass arguments through un-coerced (None → {} only) so
-            # the dispatcher's non-object gate sees falsy non-objects too.
-            arguments = params.get("arguments")
-            if arguments is None:
-                arguments = {}
-            eng_id = request.headers.get("X-Casa-Engagement-Id")
-            inner_body = {
-                "name": name,
-                "arguments": arguments,
-                "engagement_id": eng_id,
-                "engagement_token": request.headers.get(
-                    "X-Casa-Engagement-Token"),
-            }
-            result = await _dispatch_internal_tools_call(
-                body=inner_body,
-                tool_dispatch=tool_dispatch,
-                engagement_registry=engagement_registry,
-            )
-            if "error" in result:
-                err = result["error"]
-                return _jsonrpc_error(req_id, err["code"], err["message"])
-            return _jsonrpc_ok(req_id, result)
-
-        return _jsonrpc_error(req_id, -32601, f"Method not found: {method}")
-
-    return handler
-
-
-def _make_public_hooks_fallback_handler(
-    *,
-    hook_policies: dict,
-    executor_hook_policies: dict | None = None,
-    engagement_registry=None,
-):
-    """Public-8099 /hooks/resolve handler.
-
-    Same body shape as the internal handler ({"policy": ..., "payload": ...}).
-    H3 (v0.53.0): forwards the per-executor hook policies + engagement
-    registry so parameterised callbacks apply on this path too. #366: on this
-    PUBLIC route the engagement credential is read from the
-    X-Casa-Engagement-Id/Token headers only (``identity_from_headers``) —
-    body-borne identity fields are overwritten, mirroring svc-casa-mcp's
-    body rebuild on the 8100 route.
-    """
-    from internal_handlers import _make_internal_hooks_resolve_handler
-    return _make_internal_hooks_resolve_handler(
-        hook_policies=hook_policies,
-        executor_hook_policies=executor_hook_policies,
-        engagement_registry=engagement_registry,
-        identity_from_headers=True,
-    )
-
-
-def _make_public_mcp_get_405_handler():
-    """GET /mcp/casa-framework -> 405 Method Not Allowed (mirrors v0.13.1)."""
-    async def handler(_request: web.Request) -> web.Response:
-        return web.Response(
-            status=405, text="Method Not Allowed\n",
-            headers={"Allow": "POST"},
-        )
-    return handler
-
-
-async def _dispatch_internal_tools_call(
-    *,
-    body: dict,
-    tool_dispatch: dict,
-    engagement_registry,
-) -> dict:
-    """In-process equivalent of POST /internal/tools/call. Returns the
-    bare dict the internal handler would have returned in its response
-    body — used by the public-8099 JSON-RPC fallback to avoid an HTTP
-    round-trip to ourselves.
-
-    Kept separate from _make_internal_tools_call_handler so the public
-    fallback doesn't need to synthesize an aiohttp web.Request.
-    """
-    name = body.get("name")
-    # #380: any non-object arguments — truthy or falsy — is refused with a
-    # typed error rather than forwarded (truthy) or silently coerced to an
-    # empty call (falsy: [], "", 0, false). Absent/null defaults to {}.
-    arguments = body.get("arguments")
-    if arguments is None:
-        arguments = {}
-    eng_id = body.get("engagement_id")
-
-    if not isinstance(name, str):
-        return {"error": {"code": -32602, "message": "missing name"}}
-    if not isinstance(arguments, dict):
-        return {"error": {"code": -32602,
-                          "message": "arguments must be an object"}}
-
-    fn = tool_dispatch.get(name)
-    if fn is None:
-        return {"error": {"code": -32602,
-                          "message": f"Unknown tool: {name}"}}
-
-    # v0.74.2: terminal binding for the emit_completion idempotency path —
-    # mirrors internal_handlers (see _TERMINAL_BINDING_TOOLS there).
-    # #335: same token gate as the internal handler — an id claim without the
-    # record's auth token is an explicit reject, never an unauthenticated
-    # fallthrough.
-    from internal_handlers import _TERMINAL_BINDING_TOOLS, engagement_auth_ok
-    engagement = None
-    if eng_id:
-        try:
-            rec = engagement_registry.get(eng_id)
-        except Exception:  # noqa: BLE001
-            rec = None
-        if rec is not None:
-            if not engagement_auth_ok(rec, body.get("engagement_token")):
-                logger.warning(
-                    "public /mcp/casa-framework fallback: rejected engagement "
-                    "id claim for %s (tool=%r): missing/invalid engagement "
-                    "token", str(eng_id)[:8], name,
-                )
-                return {"error": {"code": -32003,
-                                  "message": "engagement_auth_failed: "
-                                             "invalid engagement token"}}
-            if (getattr(rec, "status", None) == "active"
-                    or name in _TERMINAL_BINDING_TOOLS):
-                engagement = rec
-
-    from tools import engagement_var
-    token = engagement_var.set(engagement)
-    try:
-        result = await fn(arguments)
-    except Exception as exc:  # noqa: BLE001
-        logger.warning(
-            "public /mcp/casa-framework fallback: tool %r raised: %s",
-            name, exc,
-        )
-        return {"error": {"code": -32001,
-                          "message": f"Tool {name!r} raised: {exc}"}}
-    finally:
-        engagement_var.reset(token)
-
-    return result
-
-
 # ------------------------------------------------------------------
 # Health endpoint
 # ------------------------------------------------------------------
@@ -471,7 +255,7 @@ async def replay_undergoing_engagements(
     from drivers import s6_rc
     from drivers.workspace import (
         refresh_claude_md, render_log_run_script, render_run_script,
-        workspace_mcp_token, write_workspace_mcp_json,
+        workspace_mcp_token, workspace_mcp_url, write_workspace_mcp_json,
     )
 
     undergoing = [
@@ -766,18 +550,28 @@ async def replay_undergoing_engagements(
                 # down here, once the new file is durable, so that start brings
                 # it back up reading the new one. The unchanged case (every
                 # ordinary restart) writes nothing and cycles nothing.
+                #
+                # v0.164.0 (Terra, plan r1): the baked casa-framework URL is
+                # part of the same identity — a workspace whose .mcp.json
+                # points anywhere but the served endpoint (e.g. a pre-v0.14.0
+                # 8099 URL, whose public fallback routes are gone) would keep
+                # a matching token and never be repaired by the token check
+                # alone. Level-triggered: compare both, rewrite on either.
                 _ws_dir = os.path.join(engagements_root, rec.id)
+                _current_mcp_url = getattr(
+                    driver, "_casa_framework_mcp_url",
+                    "http://127.0.0.1:8100/mcp/casa-framework",
+                )
                 if (os.path.isdir(_ws_dir)
-                        and workspace_mcp_token(_ws_dir) != rec.auth_token):
+                        and (workspace_mcp_token(_ws_dir) != rec.auth_token
+                             or workspace_mcp_url(_ws_dir)
+                             != _current_mcp_url)):
                     try:
                         write_workspace_mcp_json(
                             _ws_dir,
                             engagement_id=rec.id,
                             engagement_auth_token=rec.auth_token,
-                            casa_framework_mcp_url=getattr(
-                                driver, "_casa_framework_mcp_url",
-                                "http://127.0.0.1:8100/mcp/casa-framework",
-                            ),
+                            casa_framework_mcp_url=_current_mcp_url,
                         )
                     except Exception as exc:  # noqa: BLE001 — fail-closed
                         await _refuse_brief_resume(
@@ -2118,22 +1912,11 @@ async def _boot_reconcile_plugin_callbacks(
 
     Also runs, in order: (1) a boot spool recovery pass restoring claims/temps
     stranded by a crash mid-handler, (2) a boot attempts pass materializing the
-    per-flow ledger from the artifact union, (3) the v0.146→v0.147 retirement
-    of the legacy episode store, (4) the overlay reconcile, and (5) a GATED
-    orphan GC of spool dirs for plugins no longer in the registry. All are
-    off-loop (the lock-stall ruling) and never fatal — a reconcile failure
-    boots with an empty callback overlay (fail-closed for ingress), not a
-    dead Casa.
-
-    Steps (2) before (3) is the migration order and it is load-bearing (spec
-    §12): the attempts pass materializes a record for EVERY hash in
-    ``pending ∪ results ∪ .claims ∪ .collect-*``, including the consumer-held
-    ``.collect-*`` names a v0.146 flow can be sitting in at upgrade time.
-    Deleting the old store first would drop those flows on the floor, because
-    after the delete nothing but the artifact union names them. Once the union
-    is materialized the store carries no state the ledger lacks (only the old
-    dispatch marks are lost — worst case one duplicate nudge, which is
-    idempotent), so it is safe to unlink.
+    per-flow ledger from the artifact union, (3) the overlay reconcile, and
+    (4) a GATED orphan GC of spool dirs for plugins no longer in the registry.
+    All are off-loop (the lock-stall ruling) and never fatal — a reconcile
+    failure boots with an empty callback overlay (fail-closed for ingress),
+    not a dead Casa.
     """
     import callback_spool
 
@@ -2149,9 +1932,7 @@ async def _boot_reconcile_plugin_callbacks(
         logger.warning("boot callback-spool recovery failed", exc_info=True)
 
     # (2) Boot attempts pass — materialize the ledger from the artifact union
-    # (spec §3.3). MUST precede the legacy-store deletion below: on the first
-    # post-upgrade boot this is what gives pre-upgrade flows — including
-    # `.collect-*`-held ones — an attempt record.
+    # (spec §3.3).
     try:
         spool = callback_spool.get_spool()
         if spool is not None:
@@ -2160,23 +1941,7 @@ async def _boot_reconcile_plugin_callbacks(
     except Exception:  # noqa: BLE001
         logger.warning("boot callback-attempts pass failed", exc_info=True)
 
-    # (3) Retire the v0.146 episode store. Nothing reads it any more; the
-    # ledger materialized in (2) is the durable truth. One INFO line names the
-    # PATH only (INV-CB-006: no hashes, no plugin names, no state). A failed
-    # unlink is not fatal — the next boot retries, and a surviving store file
-    # is inert.
-    try:
-        import callback_episodes as _cbep_migrate
-        legacy = _cbep_migrate.LEGACY_STORE_PATH
-        if legacy.exists():
-            legacy.unlink()
-            logger.info("callback migration: retired legacy episode store %s",
-                        legacy)
-    except Exception:  # noqa: BLE001
-        logger.warning("boot callback legacy-store retirement failed",
-                       exc_info=True)
-
-    # (4) Route the overlay + publish markers.
+    # (3) Route the overlay + publish markers.
     try:
         import callback_reconcile
         issues = await callback_reconcile.reconcile_plugin_callbacks(
@@ -2188,7 +1953,7 @@ async def _boot_reconcile_plugin_callbacks(
     except Exception:  # noqa: BLE001
         logger.warning("boot plugin-callback reconcile failed", exc_info=True)
 
-    # (5) Gated orphan GC — remove spool dirs of plugins no longer installed.
+    # (4) Gated orphan GC — remove spool dirs of plugins no longer installed.
     # A NO-OP unless the registry loaded cleanly (a membership set from a
     # failed load would vaporize every plugin's spool). Membership keys on
     # registry ENTRIES, matching the spool's own contract.
@@ -2735,14 +2500,14 @@ async def main() -> None:
     # 4. Session registry + TTL sweeper (spec 5.2 §6)
     sessions_path = os.path.join(DATA_DIR, "sessions.json")
     session_registry = SessionRegistry(sessions_path)
-    # A2: one-shot boot migration off the v1 {channel}-{scope} key schema —
-    # idempotent (already-v2 entries are left alone), so safe to run on
-    # every boot. Only persists when something actually changed.
-    _migration_stats = session_registry.migrate_to_v2()
-    if _migration_stats["migrated"] or _migration_stats["dropped"]:
+    # Release A / Layer 4: purge every persisted webhook session at boot —
+    # a stored webhook session's origin route is unknowable after restart.
+    # Only persists when something actually changed.
+    _purged_webhook_sessions = session_registry.purge_webhook_sessions()
+    if _purged_webhook_sessions:
         logger.info(
-            "session_registry v2 migration: migrated=%d dropped=%d",
-            _migration_stats["migrated"], _migration_stats["dropped"],
+            "session_registry: purged %d persisted webhook session(s) at boot",
+            _purged_webhook_sessions,
         )
         await session_registry.save()
     session_sweeper = SessionSweeper(
@@ -2802,11 +2567,10 @@ async def main() -> None:
     from job_registry import JobRegistry
 
     # One durable owner for both delegated execution and voice-delivery state.
-    # Load/migrate and recover before constructing the compatibility facade so
-    # no second lifecycle table can observe or publish a divergent state.
+    # Load and recover before constructing the compatibility facade so no
+    # second lifecycle table can observe or publish a divergent state.
     job_registry = JobRegistry(
         os.path.join(DATA_DIR, "jobs.json"),
-        os.path.join(DATA_DIR, "delegations.json"),
         result_ttl_seconds=voice_delivery_config.delivery_ttl_s,
     )
     await job_registry.load()
@@ -3323,9 +3087,8 @@ async def main() -> None:
     # Plan 4a: claude_code driver. Shares send_to_topic with in_casa.
     from drivers.claude_code_driver import ClaudeCodeDriver
 
-    # Plan 4b/3.6: point new workspaces at svc-casa-mcp on port 8100.
-    # Pre-v0.14.0 workspaces still hit casa-main's public 8099 (back-compat
-    # fallback registered in this same file); see DOCS.md for migration.
+    # Plan 4b/3.6: workspaces reach the casa-framework MCP via svc-casa-mcp
+    # on port 8100.
     _casa_framework_mcp_url = os.environ.get(
         "CASA_FRAMEWORK_MCP_URL",
         "http://127.0.0.1:8100/mcp/casa-framework",
@@ -3709,54 +3472,14 @@ async def main() -> None:
     ))
     app.router.add_post("/invoke/{agent}", invoke_handler)
     app.router.add_post("/telegram/update", telegram_update_handler)
-    # Plan 4b/3.6: public-8099 back-compat fallback handlers.
-    # New workspaces point at svc-casa-mcp on 127.0.0.1:8100; this block
-    # keeps 8099 serving the same routes for pre-v0.14.0 workspaces still
-    # pointing here. Removed in v0.14.2 or later (one-release migration).
-    from hooks import HOOK_POLICIES as _HOOK_POLICIES
-    _cc_hook_policies = _build_cc_hook_policies(_HOOK_POLICIES)
-    # v0.37.2 (C-1): engagement_permission_relay needs live deps that the
-    # parameter-free factory pattern can't supply; inject via the helper.
-    _wire_engagement_permission_relay(
-        _cc_hook_policies,
-        engagement_registry=engagement_registry,
-        telegram_channel=telegram_channel,
-    )
-    # R4 (v0.89.0): buttons-always PreToolUse(Skill) salience backstop.
-    _wire_engagement_buttons_reminder(
-        _cc_hook_policies,
-        engagement_registry=engagement_registry,
-    )
-    # H3 (v0.53.0): per-executor hooks.yaml params for the HTTP hook path.
+    # H3 (v0.53.0): per-executor hooks.yaml params for the hook resolve path.
     _executor_cc_policies = _build_executor_cc_hook_policies(executor_registry)
-    # #340: stash the SAME instance both resolve handlers capture on the
-    # runtime, so reload_executors can refresh it in place (clear+update) —
+    # #340: stash the SAME instance the internal resolve handler captures on
+    # the runtime, so reload_executors can refresh it in place (clear+update) —
     # without this, the map stays frozen at boot: a reloaded-in executor
     # falls back to deny-all defaults and a tightened policy keeps enforcing
     # the old broader callbacks until restart.
     runtime.executor_cc_policies = _executor_cc_policies
-    app.router.add_post(
-        "/hooks/resolve",
-        _make_public_hooks_fallback_handler(
-            hook_policies=_cc_hook_policies,
-            executor_hook_policies=_executor_cc_policies,
-            engagement_registry=engagement_registry,
-        ),
-    )
-
-    from tools import CASA_TOOLS
-    _public_tool_dispatch = {t.name: t.handler for t in CASA_TOOLS}
-    app.router.add_post(
-        "/mcp/casa-framework",
-        _make_public_mcp_fallback_handler(
-            tools=list(CASA_TOOLS),
-            tool_dispatch=_public_tool_dispatch,
-            engagement_registry=engagement_registry,
-        ),
-    )
-    app.router.add_get(
-        "/mcp/casa-framework", _make_public_mcp_get_405_handler(),
-    )
 
     # 13b. Per-agent trigger registration. Registry + scheduler were
     # constructed earlier (needed by init_tools for get_schedule).
@@ -3960,12 +3683,11 @@ async def main() -> None:
     logger.info("HTTP server listening on 127.0.0.1:8099")
 
     # Plan 4b/3.6: second AppRunner for the Unix-socket internal API
-    # consumed by svc-casa-mcp. The same internal handlers are reused
-    # in-process by the public-8099 fallback (route registrations above).
+    # consumed by svc-casa-mcp.
     from hooks import HOOK_POLICIES as _HOOK_POLICIES_FOR_INTERNAL
     _internal_hook_policies = _build_cc_hook_policies(_HOOK_POLICIES_FOR_INTERNAL)
-    # v0.37.2 (C-1): mirror the public-8099 wiring on the internal-socket
-    # path consumed by svc-casa-mcp.
+    # v0.37.2 (C-1): engagement_permission_relay needs live deps that the
+    # parameter-free factory pattern can't supply; inject via the helper.
     _wire_engagement_permission_relay(
         _internal_hook_policies,
         engagement_registry=engagement_registry,

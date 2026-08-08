@@ -147,24 +147,11 @@ class TestResumeAuthorityRoleBound:
         assert reg.get(key)["agent"] == resident_role_id("butler")
 
 
-class TestMigration:
-    async def test_migrate_moves_text_drops_voice_and_agentless(self, tmp_path):
-        from session_registry import SessionRegistry, build_scoped_session_key
-        path = tmp_path / "sessions.json"
-        path.write_text(json.dumps({
-            "telegram-12345": {"agent": "assistant", "sdk_session_id": "a", "last_active": "2026-07-14T00:00:00+00:00"},
-            "voice-devbox":   {"agent": "butler",    "sdk_session_id": "b", "last_active": "2026-07-14T00:00:00+00:00"},
-            "webhook-uuid":   {"sdk_session_id": "c", "last_active": "2026-07-14T00:00:00+00:00"},  # agentless
-        }))
-        reg = SessionRegistry(str(path))
-        assert reg.migrate_to_v2() == {"migrated": 1, "dropped": 2}
-        assert reg.get(build_scoped_session_key("telegram", "assistant", "12345"))["sdk_session_id"] == "a"
-        assert all("-v2-" in k for k in reg.all_entries())
-
-    async def test_migrate_idempotent_leaves_v2_data_byte_identical(self, tmp_path):
-        # MINOR-1 (review): idempotence must be proven against POPULATED v2
-        # data, not an empty registry — a re-run must return zero counts AND
-        # leave every already-v2 entry byte-identical.
+class TestBootWebhookPurge:
+    async def test_purge_is_idempotent_and_leaves_v2_data_byte_identical(self, tmp_path):
+        # Idempotence proven against POPULATED v2 data, not an empty
+        # registry — a re-run must return zero AND leave every non-webhook
+        # entry byte-identical.
         from session_registry import SessionRegistry, build_scoped_session_key
         path = tmp_path / "sessions.json"; path.write_text("{}")
         reg = SessionRegistry(str(path))
@@ -174,32 +161,31 @@ class TestMigration:
             "last_active": "2026-07-14T00:00:00+00:00",
         }
         before = copy.deepcopy(reg._data)
-        assert reg.migrate_to_v2() == {"migrated": 0, "dropped": 0}
-        assert reg.migrate_to_v2() == {"migrated": 0, "dropped": 0}
+        assert reg.purge_webhook_sessions() == 0
+        assert reg.purge_webhook_sessions() == 0
         assert reg._data == before
         assert list(reg._data) == [v2key]        # key unchanged, not re-hashed
 
-    async def test_migrate_purges_all_webhook_entries(self, tmp_path):
-        # Release A / Layer 4: webhook session entries (v1 AND already-v2) are
-        # PURGED at migration — their origin route (invoke vs webhook_trigger)
-        # is unknowable, so they must never be resumed or treated as trusted.
+    async def test_purges_all_webhook_entries(self, tmp_path):
+        # Release A / Layer 4: persisted webhook session entries (any key
+        # shape) are PURGED at boot — their origin route (invoke vs
+        # webhook_trigger) is unknowable, so they must never be resumed or
+        # treated as trusted. Non-webhook entries are untouched.
         from session_registry import SessionRegistry, build_scoped_session_key
         path = tmp_path / "sessions.json"; path.write_text("{}")
         reg = SessionRegistry(str(path))
         v2_webhook = build_scoped_session_key("webhook", "assistant", "some-uuid")
         reg._data = {
-            "webhook-legacyuuid": {"agent": "assistant", "sdk_session_id": "a",
-                                   "last_active": "2026-07-14T00:00:00+00:00"},
+            "webhook-stray": {"agent": "assistant", "sdk_session_id": "a",
+                              "last_active": "2026-07-14T00:00:00+00:00"},
             v2_webhook: {"agent": "assistant", "sdk_session_id": "b",
                          "last_active": "2026-07-14T00:00:00+00:00"},
             "telegram-999": {"agent": "assistant", "sdk_session_id": "c",
                              "last_active": "2026-07-14T00:00:00+00:00"},
         }
-        result = reg.migrate_to_v2()
+        assert reg.purge_webhook_sessions() == 2
         assert not any(k.startswith("webhook-") for k in reg.all_entries())
-        assert reg.get(build_scoped_session_key(
-            "telegram", "assistant", "999"))["sdk_session_id"] == "c"
-        assert result["dropped"] >= 2  # both webhook entries dropped
+        assert reg._data["telegram-999"]["sdk_session_id"] == "c"
 
 
 class TestVoicePoolRoleKeyed:
@@ -239,14 +225,11 @@ class TestWebhookOneshotScopeClassSurvivesV2:
         await sweeper._sweep_once()
         assert reg.get(key) is None, "v2 webhook one-shot must be evicted under the SHORT webhook TTL"
 
-    async def test_migrated_v1_webhook_oneshot_is_purged(self, tmp_path):
-        # Release A / Layer 4 (SUPERSEDES the old webhook_oneshot-migration
-        # behavior): a pre-upgrade v1 webhook-<uuid> entry is DROPPED at
-        # migration rather than carried forward, because its origin route is
-        # unknowable. Purging is strictly safer than the previous short-TTL
-        # carry-forward (the session is gone, not merely short-lived). NEW
-        # webhook one-shots still get scope_class at register() time and the
-        # short webhook TTL — see test_v2_webhook_oneshot_still_gets_webhook_ttl.
+    async def test_stored_webhook_entry_is_purged_at_boot(self, tmp_path):
+        # Release A / Layer 4: ANY persisted webhook entry is DROPPED at
+        # boot, because its origin route is unknowable. NEW webhook
+        # one-shots still get scope_class at register() time and the short
+        # webhook TTL — see test_v2_webhook_oneshot_still_gets_webhook_ttl.
         from session_registry import SessionRegistry, build_scoped_session_key
 
         reg = SessionRegistry(str(tmp_path / "sessions.json"))
@@ -255,7 +238,7 @@ class TestWebhookOneshotScopeClassSurvivesV2:
         reg._data[f"webhook-{uuid_scope}"] = {
             "agent": "assistant", "sdk_session_id": "sid-1", "last_active": aged,
         }
-        assert reg.migrate_to_v2() == {"migrated": 0, "dropped": 1}
+        assert reg.purge_webhook_sessions() == 1
         v2key = build_scoped_session_key("webhook", "assistant", uuid_scope)
         assert reg.get(v2key) is None
         assert not any(k.startswith("webhook-") for k in reg.all_entries())

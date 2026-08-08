@@ -1,12 +1,10 @@
 # casa/rootfs/opt/casa/mcp_envelope.py
 """JSON-RPC 2.0 envelope helpers + tool schema translation.
 
-Pure helpers — no casa-state imports. Consumed by:
-- svc_casa_mcp.py (the standalone MCP service on 127.0.0.1:8100)
-- casa_core.py (the public-8099 back-compat fallback handlers)
+Pure helpers — no casa-state imports. Consumed by svc_casa_mcp.py
+(the standalone MCP service on 127.0.0.1:8100).
 
-Extracted from mcp_bridge.py (v0.13.1) so both consumers can share it
-without circular imports.
+Extracted from mcp_bridge.py (v0.13.1).
 """
 
 from __future__ import annotations

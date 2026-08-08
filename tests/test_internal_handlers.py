@@ -373,30 +373,6 @@ async def test_tools_call_terminal_engagement_binds_for_emit_completion() -> Non
         assert text == {"eng": "fin-2"}
 
 
-async def test_public_fallback_terminal_binding_matches_internal() -> None:
-    """casa_core._dispatch_internal_tools_call mirrors the internal handler:
-    terminal binding for emit_completion only."""
-    from casa_core import _dispatch_internal_tools_call
-    reg = _FakeRegistry()
-    rec = _FakeRecord(eng_id="fin-3", status="completed")
-    reg.add(rec)
-    out = await _dispatch_internal_tools_call(
-        body={"name": "emit_completion", "arguments": {},
-              "engagement_id": "fin-3",
-              "engagement_token": rec.auth_token},
-        tool_dispatch={"emit_completion": _engagement_aware_tool,
-                       "eng": _engagement_aware_tool},
-        engagement_registry=reg,
-    )
-    assert json.loads(out["content"][0]["text"]) == {"eng": "fin-3"}
-    out2 = await _dispatch_internal_tools_call(
-        body={"name": "eng", "arguments": {}, "engagement_id": "fin-3",
-              "engagement_token": rec.auth_token},
-        tool_dispatch={"emit_completion": _engagement_aware_tool,
-                       "eng": _engagement_aware_tool},
-        engagement_registry=reg,
-    )
-    assert json.loads(out2["content"][0]["text"]) == {"eng": None}
 def test_pin_inv_tool_001_result_marks_errors_only_for_error_status():
     """Pins INV-TOOL-001: _result infers the outer MCP error only from
     status=="error" or ok is False; other statuses ride as successes.

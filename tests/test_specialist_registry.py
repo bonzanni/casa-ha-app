@@ -257,9 +257,7 @@ class TestDurableJobFacade:
         from job_registry import ExecutionState, JobRegistry
         from specialist_registry import DelegationRecord, SpecialistRegistry
 
-        jobs = JobRegistry(
-            tmp_path / "jobs.json", tmp_path / "delegations.json",
-        )
+        jobs = JobRegistry(tmp_path / "jobs.json")
         await jobs.load()
         reg = SpecialistRegistry(
             str(tmp_path / "specialists"), job_registry=jobs,
@@ -279,27 +277,32 @@ class TestDurableJobFacade:
         assert jobs.get("d-1").execution_state is ExecutionState.SUCCEEDED
         assert not reg.has_delegation("d-1")
 
-        reloaded = JobRegistry(
-            tmp_path / "jobs.json", tmp_path / "delegations.json",
-        )
+        reloaded = JobRegistry(tmp_path / "jobs.json")
         await reloaded.load()
         assert reloaded.get("d-1").execution_state is ExecutionState.SUCCEEDED
 
     async def test_orphan_compatibility_view_reads_durable_jobs_only(
         self, tmp_path,
     ):
-        import json
-
         from job_registry import JobRegistry
-        from specialist_registry import SpecialistRegistry
+        from specialist_registry import (
+            DelegationRecord, SpecialistRegistry,
+        )
 
-        legacy = tmp_path / "delegations.json"
-        legacy.write_text(json.dumps([{
-            "id": "orphan-1", "agent": "finance", "started_at": 100.0,
-            "origin": {"role": "assistant", "channel": "telegram",
-                       "chat_id": "chat-1", "cid": "route-1"},
-        }]), encoding="utf-8")
-        jobs = JobRegistry(tmp_path / "jobs.json", legacy)
+        seeded = JobRegistry(tmp_path / "jobs.json")
+        await seeded.load()
+        seeded_reg = SpecialistRegistry(
+            str(tmp_path / "specialists"), job_registry=seeded,
+        )
+        await seeded_reg.register_delegation(DelegationRecord(
+            id="orphan-1", agent="finance", started_at=100.0,
+            origin={"role": "assistant", "channel": "telegram",
+                    "chat_id": "chat-1", "cid": "route-1"},
+        ))
+
+        # A restart orphans the still-running row; the facade view reads it
+        # from the durable snapshot alone.
+        jobs = JobRegistry(tmp_path / "jobs.json")
         await jobs.load()
         await jobs.recover_after_restart()
         reg = SpecialistRegistry(
@@ -307,8 +310,6 @@ class TestDurableJobFacade:
         )
 
         assert [record.id for record in reg.orphans_from_disk()] == ["orphan-1"]
-        # The facade never rereads or mutates the legacy file.
-        assert json.loads(legacy.read_text(encoding="utf-8")) == []
 
 
 class TestDelegationLifecycle:
@@ -383,8 +384,7 @@ class TestDelegationLifecycle:
         from specialist_registry import DelegationRecord, SpecialistRegistry
 
         jobs_path = tmp_path / "jobs.json"
-        legacy_path = tmp_path / "delegations.json"
-        jobs = JobRegistry(jobs_path, legacy_path)
+        jobs = JobRegistry(jobs_path)
         await jobs.load()
         reg = SpecialistRegistry(
             str(tmp_path / "specialists"), job_registry=jobs,
@@ -412,7 +412,7 @@ class TestDelegationLifecycle:
             ExecutionState.SUCCEEDED, ExecutionState.FAILED,
         }
 
-        reloaded = JobRegistry(jobs_path, legacy_path)
+        reloaded = JobRegistry(jobs_path)
         await reloaded.load()
         persisted = reloaded.get("d-race")
         assert persisted.execution_state is terminal.execution_state

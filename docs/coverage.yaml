@@ -419,22 +419,16 @@
   doc: architecture/callbacks.md
 - item: route:casa/rootfs/opt/casa/casa_core.py:GET:/healthz
   doc: architecture/observability.md
-- item: route:casa/rootfs/opt/casa/casa_core.py:GET:/mcp/casa-framework
-  doc: architecture/mcp-and-tools.md
 - item: route:casa/rootfs/opt/casa/casa_core.py:GET:path
   doc: architecture/mcp-and-tools.md
 - item: route:casa/rootfs/opt/casa/casa_core.py:POST:/admin/reload
   doc: architecture/configuration.md
-- item: route:casa/rootfs/opt/casa/casa_core.py:POST:/hooks/resolve
-  doc: architecture/mcp-and-tools.md
 - item: route:casa/rootfs/opt/casa/casa_core.py:POST:/internal/hooks/resolve
   doc: architecture/mcp-and-tools.md
 - item: route:casa/rootfs/opt/casa/casa_core.py:POST:/internal/tools/call
   doc: architecture/mcp-and-tools.md
 - item: route:casa/rootfs/opt/casa/casa_core.py:POST:/invoke/{agent}
   doc: architecture/http-surface.md
-- item: route:casa/rootfs/opt/casa/casa_core.py:POST:/mcp/casa-framework
-  doc: architecture/mcp-and-tools.md
 - item: route:casa/rootfs/opt/casa/casa_core.py:POST:/telegram/update
   doc: architecture/telegram.md
 - item: route:casa/rootfs/opt/casa/casa_core.py:POST:/webhook/{name}

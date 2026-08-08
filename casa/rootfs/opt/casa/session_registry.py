@@ -30,7 +30,6 @@ _UNCONDITIONAL = object()
 # v2 scoped-key schema (spec A2): channel-role-scope identity, collision-safe
 # across residents sharing a device/channel. See build_scoped_session_key.
 SESSION_KEY_SCHEMA_V2 = "v2"
-_LEGACY_CHANNELS = ("telegram", "webhook", "voice")
 
 
 def _is_uuid_scope(scope_id: str) -> bool:
@@ -39,11 +38,9 @@ def _is_uuid_scope(scope_id: str) -> bool:
     Distinguishes a webhook one-shot (random chat_id fabricated by
     `build_invoke_message`) from a deliberately-pinned webhook session
     (e.g. `webhook-ha-automation-daily`). Only the former qualifies for
-    the short `webhook_session_ttl_days` (spec A2). Lives here (not in
-    session_sweeper) so BOTH the sweeper AND :meth:`SessionRegistry.migrate_to_v2`
-    can classify the RAW pre-hash scope without an import cycle — a v2
-    key's hashed remainder is never uuid-shaped, so the classification
-    must be made before hashing and persisted as ``scope_class``."""
+    the short `webhook_session_ttl_days` (spec A2). The classification
+    is made on the RAW pre-hash scope (a v2 key's hashed remainder is
+    never uuid-shaped) and persisted as ``scope_class`` at register()."""
     try:
         uuid.UUID(scope_id)
         return True
@@ -223,47 +220,22 @@ class SessionRegistry:
             self._data[channel_key] = entry
             await self._save_locked()
 
-    def migrate_to_v2(self) -> dict[str, int]:
-        """One-shot boot migration (spec A2) from v1 ``{channel}-{scope}``
-        keys to role-scoped v2 keys. Telegram/webhook entries that carry a
-        stored ``agent`` migrate to :func:`build_scoped_session_key`; legacy
-        ``voice-*`` entries and any agent-less entry are DROPPED (their
-        session is simply invalidated once — the next turn starts fresh).
-        Idempotent: already-v2 keys are left untouched. Synchronous — the
-        caller is expected to ``await save()`` afterwards if anything
-        changed; this runs once at boot before concurrent access begins.
-
-        A webhook entry whose RAW pre-hash scope is uuid-shaped is a
-        one-shot; its ``scope_class`` MUST be stamped here because the v2
-        key's hash is never uuid-shaped, so the sweeper could no longer
-        re-derive the short webhook TTL from the migrated key — and a
-        one-shot never re-registers to acquire it later (spec A2)."""
-        migrated = dropped = 0
+    def purge_webhook_sessions(self) -> int:
+        """Release A / Layer 4: PURGE every persisted webhook session entry
+        at boot, returning how many were dropped. A restarted process cannot
+        know a stored webhook session's origin route (operator-signed
+        ``invoke`` vs untrusted ``webhook_trigger``), so it must never be
+        resumed or treated as trusted; fresh dispatches start clean. (New
+        webhook one-shots still acquire scope_class + the short TTL at
+        register().) Synchronous — the caller is expected to ``await save()``
+        afterwards if anything changed; this runs once at boot before
+        concurrent access begins."""
+        dropped = 0
         for key in list(self._data):
-            # Release A / Layer 4: PURGE every webhook session entry — v1
-            # (``webhook-<scope>``) AND already-v2 (``webhook-v2-<hash>``) —
-            # BEFORE the v2 early-continue below. A pre-upgrade webhook session's
-            # origin route (operator-signed ``invoke`` vs untrusted
-            # ``webhook_trigger``) is unknowable, so it must never be resumed or
-            # treated as trusted; fresh dispatches start clean. (New webhook
-            # one-shots still acquire scope_class + the short TTL at register().)
             if key.startswith("webhook-"):
                 self._data.pop(key)
                 dropped += 1
-                continue
-            parts = key.split("-", 2)
-            if len(parts) >= 2 and parts[1] == SESSION_KEY_SCHEMA_V2:
-                continue  # already v2
-            entry = self._data.pop(key)
-            channel = next((c for c in _LEGACY_CHANNELS if key.startswith(f"{c}-")), None)
-            agent = entry.get("agent")
-            if channel is None or channel == "voice" or not agent:
-                dropped += 1
-                continue
-            scope = key[len(channel) + 1:]
-            self._data[build_scoped_session_key(channel, agent, scope)] = entry
-            migrated += 1
-        return {"migrated": migrated, "dropped": dropped}
+        return dropped
 
     def get(self, channel_key: str) -> dict[str, Any] | None:
         """Return the entry for *channel_key*, or ``None``."""

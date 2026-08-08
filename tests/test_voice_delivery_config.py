@@ -133,27 +133,6 @@ def test_addon_no_longer_declares_the_voice_delivery_options():
         assert option not in translations["configuration"]
 
 
-def test_removed_options_are_pruned_from_stored_config_on_boot():
-    """Every key removed here must be pruned, or Home Assistant logs
-    "Option '<key>' does not exist in the schema" on every boot of an
-    upgraded install (the rule stated in config.yaml itself)."""
-    setup = (
-        Path(__file__).resolve().parent.parent / "casa" / "rootfs"
-        / "etc" / "s6-overlay" / "scripts" / "setup-configs.sh"
-    ).read_text(encoding="utf-8")
-    line = next(
-        l for l in setup.splitlines() if l.startswith("DEPRECATED_OPTION_KEYS=")
-    )
-
-    for option in (
-        "telegram_delivery_mode", "telegram_rich_text", "webhook_auth_enabled",
-        "sdk_client_pool", "tina_ha_facade_enabled",
-        "voice_turn_budget_seconds", "voice_route_freshness_seconds",
-        "voice_job_delivery_ttl_seconds", "voice_job_route_cap",
-    ):
-        assert option in line
-
-
 def _accepted_job(
     *,
     creator_peer: str = "voice",
@@ -196,7 +175,6 @@ def _accepted_job(
 async def test_configured_result_ttl_reaches_durable_job_expiry(tmp_path):
     registry = JobRegistry(
         tmp_path / "jobs.json",
-        tmp_path / "delegations.json",
         clock=lambda: 100.0,
         result_ttl_seconds=900,
     )
@@ -214,7 +192,6 @@ async def test_configured_result_ttl_caps_specialist_requested_delivery_ttl(
 ):
     registry = JobRegistry(
         tmp_path / "jobs.json",
-        tmp_path / "delegations.json",
         clock=lambda: 100.0,
         result_ttl_seconds=300,
     )
@@ -232,7 +209,6 @@ async def test_configured_result_ttl_caps_specialist_requested_delivery_ttl(
 async def test_configured_result_ttl_preserves_shorter_specialist_expiry(tmp_path):
     registry = JobRegistry(
         tmp_path / "jobs.json",
-        tmp_path / "delegations.json",
         clock=lambda: 100.0,
         result_ttl_seconds=300,
     )
@@ -274,7 +250,6 @@ async def test_voice_ttl_does_not_shorten_non_voice_terminal_retention(
 ):
     registry = JobRegistry(
         tmp_path / "jobs.json",
-        tmp_path / "delegations.json",
         clock=lambda: 100.0,
         result_ttl_seconds=300,
     )
@@ -307,7 +282,6 @@ async def test_configured_voice_ttl_reaches_voice_terminal_paths(
 ):
     registry = JobRegistry(
         tmp_path / "jobs.json",
-        tmp_path / "delegations.json",
         clock=lambda: 100.0,
         result_ttl_seconds=300,
     )

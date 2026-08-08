@@ -102,7 +102,6 @@ path that rereads the manifest.
 
 **Tests**
 - `tests/test_run_script_env.py`
-- `tests/test_setup_configs_deprecated_options_prune.py`
 
 **Related**
 - [`architecture/configuration.md`](../architecture/configuration.md)

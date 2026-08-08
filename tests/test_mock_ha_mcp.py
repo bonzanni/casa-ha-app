@@ -129,9 +129,14 @@ class TestMockHaMcp(AioHTTPTestCase):
                 "name": "GetLiveContext",
                 "arguments": {},
             }]
+            # The facade passes GetLiveContext output through verbatim —
+            # the pre-#223 flat-dict domain filter is gone.
             assert json.loads(result.content[0].text) == {
                 "lights.kitchen": "on",
                 "lights.bedroom": "off",
+                "climate.living_room": {
+                    "temperature": 21.0, "target": 22.0,
+                },
             }
         finally:
             await facade.aclose()

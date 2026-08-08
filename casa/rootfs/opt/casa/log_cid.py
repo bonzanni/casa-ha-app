@@ -220,13 +220,6 @@ def install_logging(
         _casa_record_factory._wrapped = orig_factory  # type: ignore[attr-defined]
         logging.setLogRecordFactory(_casa_record_factory)
 
-    # Legacy cleanup: earlier iterations attached CidFilter /
-    # RedactingFilter to the root logger. Strip those so idempotent
-    # re-installs stay clean even after older deployments.
-    for f in list(root.filters):
-        if getattr(f, "_casa_owned", False):
-            root.removeFilter(f)
-
     handler = logging.StreamHandler(stream if stream is not None else sys.stdout)
     handler._casa_owned = True  # type: ignore[attr-defined]
     handler.addFilter(RedactingFilter())

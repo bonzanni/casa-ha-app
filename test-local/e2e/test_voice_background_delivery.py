@@ -347,9 +347,7 @@ class _Stack:
 async def stack(tmp_path, monkeypatch):
     assert HA_STUB_EXPORTS == _conftest.HA_STUB_EXPORTS
     result = _Stack()
-    result.registry = JobRegistry(
-        tmp_path / "jobs.json", tmp_path / "delegations.json",
-    )
+    result.registry = JobRegistry(tmp_path / "jobs.json")
     await result.registry.load()
     result.specialists = SpecialistRegistry(
         str(tmp_path / "specialists"), job_registry=result.registry,

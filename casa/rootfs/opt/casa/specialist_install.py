@@ -1559,14 +1559,14 @@ def _assert_receipt_matches_inspection(
     if receipt is None:
         return
     if (receipt.receipt_id != inspection.receipt_id
-            or receipt.receipt_digest != getattr(inspection, "receipt_digest", "")
+            or receipt.receipt_digest != inspection.receipt_digest
             or receipt.slug != inspection.slug):
         raise SpecialistInstallError(
             "receipt_mismatch",
             "supplied receipt does not match the approved inspection "
             "(id/digest/slug)")
     insp_rows = {(r.identifier, r.content_digest)
-                 for r in getattr(inspection, "plugin_resolutions", ()) or ()}
+                 for r in inspection.plugin_resolutions or ()}
     receipt_rows = {(r.identifier, r.content_digest) for r in receipt.plugins}
     if insp_rows != receipt_rows:
         raise SpecialistInstallError(
@@ -1648,12 +1648,11 @@ def commit_specialist_install(
     _assert_receipt_matches_inspection(receipt, inspection)
 
     # Task 8 seam (Task 7 P0): thread the trusted-source receipt digest into
-    # the consent identity — `getattr` keeps this call working against a
-    # hand-built/legacy InspectionResult that predates the field (default "").
+    # the consent identity.
     identity = install_consent_identity(
         component_id=inspection.component_id, version=inspection.version,
         root_digest=inspection.root_digest, slug=inspection.slug,
-        receipt_digest=getattr(inspection, "receipt_digest", ""),
+        receipt_digest=inspection.receipt_digest,
     )
     if not acks.is_acked(identity):
         raise SpecialistInstallError(
@@ -2137,7 +2136,7 @@ def upgrade_specialist(
             consent_identity=install_consent_identity(
                 component_id=inspection.component_id, version=inspection.version,
                 root_digest=inspection.root_digest, slug=inspection.slug,
-                receipt_digest=getattr(inspection, "receipt_digest", "")),
+                receipt_digest=inspection.receipt_digest),
             target_root=component_root_string(
                 component_id=inspection.component_id, version=inspection.version,
                 component_checksum=inspection.root_digest),
@@ -2253,7 +2252,7 @@ def _upgrade_core(
     identity = install_consent_identity(
         component_id=inspection.component_id, version=inspection.version,
         root_digest=inspection.root_digest, slug=inspection.slug,
-        receipt_digest=getattr(inspection, "receipt_digest", ""))
+        receipt_digest=inspection.receipt_digest)
     if not acks.is_acked(identity):
         raise SpecialistInstallError("consent_missing", "no recorded operator approval for the upgrade")
 

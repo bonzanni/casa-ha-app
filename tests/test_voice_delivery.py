@@ -132,7 +132,6 @@ async def delivery(tmp_path):
     now = [100.0]
     registry = JobRegistry(
         tmp_path / "jobs.json",
-        tmp_path / "delegations.json",
         clock=lambda: now[0],
     )
     await registry.load()
@@ -165,7 +164,7 @@ def _frame(frame_type: str, offer: dict, **changes) -> dict:
 async def test_handoff_reoffer_is_route_scoped_and_receipt_stops_replay(
     tmp_path,
 ):
-    registry = JobRegistry(tmp_path / "jobs.json", tmp_path / "delegations.json")
+    registry = JobRegistry(tmp_path / "jobs.json")
     await registry.load()
     await registry.create(_ready_job(
         "job-1", sequence=1, device="kitchen",
@@ -205,7 +204,6 @@ async def test_shared_writer_interleaves_utterances_and_delivery_protocol(
     now = [100.0]
     jobs = JobRegistry(
         tmp_path / "jobs.json",
-        tmp_path / "delegations.json",
         clock=lambda: now[0],
     )
     await jobs.load()
@@ -491,7 +489,6 @@ async def test_recently_disconnected_route_accepts_then_waits_and_reoffers(
 
     registry = JobRegistry(
         tmp_path / "jobs.json",
-        tmp_path / "delegations.json",
         clock=lambda: now[0],
     )
     await registry.load()
@@ -542,7 +539,6 @@ async def test_result_ttl_expiring_across_restart_never_emits_ready_frame(
     now = [100.0]
     first = JobRegistry(
         tmp_path / "jobs.json",
-        tmp_path / "delegations.json",
         clock=lambda: now[0],
     )
     await first.load()
@@ -556,7 +552,6 @@ async def test_result_ttl_expiring_across_restart_never_emits_ready_frame(
     now[0] = 161.0
     restarted = JobRegistry(
         tmp_path / "jobs.json",
-        tmp_path / "delegations.json",
         clock=lambda: now[0],
     )
     await restarted.load()
