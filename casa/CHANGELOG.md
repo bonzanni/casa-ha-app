@@ -1,5 +1,20 @@
 # Changelog
 
+## [0.167.0] - 2026-08-08
+
+### Changed
+
+- **Operator-gated plugin tools now work inside interactive specialist
+  engagements.** Previously a plugin could not have both an engagement topic and
+  an operator-confirmed (protected) destructive tool: a protected call made
+  inside an engagement was refused outright, before any approval prompt. It now
+  routes through the same operator authorization keyboard your 1:1 chat uses —
+  the approval is bound to that exact call *and* to that specific engagement, so
+  an approval granted in one engagement can never authorize a matching call in
+  another, and approving resumes the engagement automatically. Engagements that
+  cannot reach the configured operator (or are not an active interactive
+  specialist) still refuse the call, fail-closed.
+
 ## [0.166.0] - 2026-08-08
 
 ### Security

@@ -33,7 +33,7 @@ import authz_grants
 from authz_grants import (
     AuthzDeps, ChallengeCoordinator, GrantKey, GrantStore,
     canonical_args_hash, make_resident_authz_hook,
-    _DENY_ENGAGEMENT, _DENY_UNSUPPORTED_ORIGIN, _DENY_ROLE_MISMATCH,
+    _DENY_ENGAGEMENT_UNAVAILABLE, _DENY_UNSUPPORTED_ORIGIN, _DENY_ROLE_MISMATCH,
     _DENY_UNRENDERABLE, _DENY_PENDING, _DENY_DELIVERY_FAILED, _DENY_INACTIVE,
     _DENY_POSTED, _DENY_INTERNAL, _DENY_NOT_OPERATOR,
 )
@@ -69,16 +69,40 @@ def _origin(**overrides) -> dict:
     return base
 
 
-class _OriginCtx:
-    """Set agent.origin_var (+ optionally tools.engagement_var) for the block."""
+def _engagement(**overrides):
+    """A realistic in_casa SPECIALIST engagement record (#400): an active
+    specialist with a topic and an operator DM in its own origin. The authz hook
+    only ``getattr``s these fields, so a SimpleNamespace is a faithful double."""
+    base = dict(
+        id="eng-abc123", kind="specialist", status="active", topic_id=7,
+        role_or_type="finance",
+        origin={"user_id": 100, "chat_id": "42"},
+    )
+    base.update(overrides)
+    return SimpleNamespace(**base)
 
-    def __init__(self, origin: dict | None, *, engaged: bool = False):
+
+class _OriginCtx:
+    """Set agent.origin_var (+ optionally tools.engagement_var) for the block.
+
+    ``engaged=True`` binds a BARE Mock (a non-specialist engagement record — the
+    #400 fail-closed case). Pass ``engagement=<record>`` to bind a specific
+    record (e.g. ``_engagement()`` for the authorizable specialist path)."""
+
+    def __init__(self, origin: dict | None, *, engaged: bool = False,
+                 engagement=None):
         self._origin = origin
         self._engaged = engaged
+        self._engagement = engagement
 
     def __enter__(self):
         self._otok = agent_mod.origin_var.set(self._origin)
-        eng = Mock(name="EngagementRecord") if self._engaged else None
+        if self._engagement is not None:
+            eng = self._engagement
+        elif self._engaged:
+            eng = Mock(name="EngagementRecord")
+        else:
+            eng = None
         self._etok = tools_mod.engagement_var.set(eng)
         return self
 
@@ -109,10 +133,11 @@ def _deny_reason(out):
 
 
 def _expected_key(tool_input, *, role="finance", operator_id=100, chat_id=42,
-                  artifact=ARTIFACT, tool=TOOL) -> GrantKey:
+                  artifact=ARTIFACT, tool=TOOL, engagement_id="") -> GrantKey:
     return GrantKey(operator_id=operator_id, chat_id=chat_id,
                     enforcement_role=role, artifact_id=artifact,
-                    tool_name=tool, args_hash=canonical_args_hash(tool_input))
+                    tool_name=tool, args_hash=canonical_args_hash(tool_input),
+                    engagement_id=engagement_id)
 
 
 # ---------------------------------------------------------------------------
@@ -125,6 +150,7 @@ class _FakeChannel:
         self.posts: list = []
         self.edits: list = []
         self.dispatches: list = []
+        self.eng_dispatches: list = []
         self.post_result: int | None = 55
         self.post_raises = False
         self.post_gate: asyncio.Event | None = None
@@ -151,6 +177,10 @@ class _FakeChannel:
 
     async def _dispatch_button_continuation(self, **kw):
         self.dispatches.append(kw)
+        return self.dispatch_result
+
+    async def _dispatch_engagement_continuation(self, **kw):
+        self.eng_dispatches.append(kw)
         return self.dispatch_result
 
 
@@ -213,17 +243,18 @@ class TestPassthrough:
 
 
 class TestProvenanceGates:
-    async def test_engagement_denies_without_challenge_no_role_assert(self):
-        """execution=engagement ⇒ deny WITHOUT a challenge, and NO closure-role
-        assertion even when execution_role mismatches the hook's role."""
+    async def test_non_specialist_engagement_denies_unavailable(self):
+        """#400: an engagement record that is NOT an authorizable active
+        specialist (here a bare Mock, kind != "specialist") denies with the
+        unavailable reason and NO challenge — and with NO closure-role assertion
+        even when execution_role mismatches the hook's role."""
         channel = _FakeChannel()
         deps = AuthzDeps(channel=channel, grants=_ExplodingStore(),
                          challenges=_ExplodingCoord())
         hook = _mk_hook(role="finance", deps=deps)
-        # engaged, AND execution_role != role — must still deny cleanly.
         with _OriginCtx(_origin(execution_role="butler"), engaged=True):
             out = await _call(hook)
-        assert _deny_reason(out) == _DENY_ENGAGEMENT
+        assert _deny_reason(out) == _DENY_ENGAGEMENT_UNAVAILABLE
         assert channel.posts == []  # no challenge
 
     async def test_other_transport_denies_without_challenge(self):
@@ -934,3 +965,135 @@ class TestDisplayNameFactoryWiring:
             _spec_cfg("finance"), resolution=resolution)  # no .character
         deps = _authz_hook(opts)._casa_authz_deps_factory()
         assert deps is not None and deps.display_name is None
+
+
+# ===========================================================================
+# #400 — engagement-backed authorization (interactive specialist engagements)
+# ===========================================================================
+
+
+class TestEngagementBackedAuthz:
+    """#400: an operator-gated plugin tool on an INTERACTIVE SPECIALIST
+    engagement routes through the DM authorization challenge, bound to THIS
+    engagement — instead of being hard-denied. Identity comes from the live
+    engagement record (tools.engagement_var), NOT the caller-supplied turn
+    origin (which for an engagement is not a DM)."""
+
+    async def test_active_specialist_engagement_posts_challenge(
+        self, monkeypatch,
+    ):
+        """No grant ⇒ a DM keyboard is posted to the operator (from the record's
+        origin) and the call denied with the retry contract."""
+        broker, coord, channel = _fresh_coord(monkeypatch)
+        deps = AuthzDeps(channel=channel, grants=GrantStore(), challenges=coord)
+        hook = _mk_hook(deps=deps)
+        # NB: the turn origin here is deliberately NOT a DM — identity must come
+        # from the engagement record, whose origin carries the operator DM.
+        with _OriginCtx(_origin(message_type="other", source="internal"),
+                        engagement=_engagement()):
+            out = await _call(hook)
+        assert _deny_reason(out) == _DENY_POSTED
+        assert len(channel.posts) == 1
+        # posted to the operator DM chat from the RECORD origin (42), not the
+        # turn origin.
+        assert channel.posts[0][0] == 42
+
+    async def test_engagement_bound_grant_allows(self, monkeypatch):
+        """A grant minted under the engagement-bound key allows the retried
+        call without a fresh challenge."""
+        broker, coord, channel = _fresh_coord(monkeypatch)
+        store = GrantStore()
+        ti = {"amount": 10}
+        store.mint(_expected_key(ti, engagement_id="eng-abc123"))
+        deps = AuthzDeps(channel=channel, grants=store, challenges=coord)
+        hook = _mk_hook(deps=deps)
+        with _OriginCtx(_origin(message_type="other", source="internal"),
+                        engagement=_engagement()):
+            out = await _call(hook, tool_input=ti)
+        assert out == {}
+        assert channel.posts == []
+
+    async def test_grant_from_other_engagement_not_consumable(self, monkeypatch):
+        """The engagement-bound key means an approval minted inside engagement
+        A cannot satisfy the SAME (operator, chat, role, artifact, tool, args)
+        call inside a DIFFERENT engagement B — B re-challenges."""
+        broker, coord, channel = _fresh_coord(monkeypatch)
+        store = GrantStore()
+        ti = {"amount": 10}
+        # grant minted for engagement A
+        store.mint(_expected_key(ti, engagement_id="eng-AAA"))
+        deps = AuthzDeps(channel=channel, grants=store, challenges=coord)
+        hook = _mk_hook(deps=deps)
+        # the SAME call arriving inside engagement B
+        with _OriginCtx(_origin(message_type="other", source="internal"),
+                        engagement=_engagement(id="eng-BBB")):
+            out = await _call(hook, tool_input=ti)
+        assert _deny_reason(out) == _DENY_POSTED  # not consumed ⇒ re-challenge
+        assert len(channel.posts) == 1
+
+    async def test_dm_grant_not_consumable_by_engagement(self, monkeypatch):
+        """A grant minted on the DM/direct path (engagement_id="") cannot be
+        consumed by an engagement call (engagement_id set) — the two key spaces
+        never alias."""
+        broker, coord, channel = _fresh_coord(monkeypatch)
+        store = GrantStore()
+        ti = {"amount": 10}
+        store.mint(_expected_key(ti))  # DM grant, engagement_id=""
+        deps = AuthzDeps(channel=channel, grants=store, challenges=coord)
+        hook = _mk_hook(deps=deps)
+        with _OriginCtx(_origin(message_type="other", source="internal"),
+                        engagement=_engagement()):
+            out = await _call(hook, tool_input=ti)
+        assert _deny_reason(out) == _DENY_POSTED
+        assert store.consume(_expected_key(ti)) is True  # DM grant untouched
+
+    async def test_non_operator_engagement_denies_no_challenge(self, monkeypatch):
+        """#368 on the engagement path: if the record's operator is not the
+        configured operator (accept-all mode, or a stranger), deny with NO
+        challenge and NO post."""
+        channel = _FakeChannel()
+        channel.operator_ok = False
+        deps = AuthzDeps(channel=channel, grants=_ExplodingStore(),
+                         challenges=_ExplodingCoord())
+        hook = _mk_hook(deps=deps)
+        with _OriginCtx(_origin(message_type="other", source="internal"),
+                        engagement=_engagement()):
+            out = await _call(hook)
+        assert _deny_reason(out) == _DENY_NOT_OPERATOR
+        assert channel.posts == []
+
+    @pytest.mark.parametrize("rec_kwargs", [
+        dict(status="idle"),
+        dict(status="completed"),
+        dict(kind="executor"),
+        dict(topic_id=None),
+        dict(origin={"chat_id": "42"}),       # no user_id
+        dict(origin={"user_id": 100}),        # no chat_id
+        dict(origin={}),                      # no operator ids at all
+        dict(id=""),                          # id-less record (would alias the
+                                              # DM key space + misroute resume)
+    ])
+    async def test_unauthorizable_engagement_records_fail_closed(
+        self, rec_kwargs,
+    ):
+        """Every non-authorizable specialist-engagement record shape denies with
+        the unavailable reason, touches NO store/coordinator, and posts nothing.
+        (An _ExplodingStore/_ExplodingCoord prove the tail is never reached.)"""
+        channel = _FakeChannel()
+        deps = AuthzDeps(channel=channel, grants=_ExplodingStore(),
+                         challenges=_ExplodingCoord())
+        hook = _mk_hook(deps=deps)
+        with _OriginCtx(_origin(message_type="other", source="internal"),
+                        engagement=_engagement(**rec_kwargs)):
+            out = await _call(hook)
+        assert _deny_reason(out) == _DENY_ENGAGEMENT_UNAVAILABLE
+        assert channel.posts == []
+
+    async def test_engagement_no_channel_denies_unavailable(self):
+        """deps_factory None (no DM reachable) on the engagement path ⇒ the
+        engagement-unavailable deny (not the DM path's unsupported-origin)."""
+        hook = _mk_hook(deps_factory=lambda: None)
+        with _OriginCtx(_origin(message_type="other", source="internal"),
+                        engagement=_engagement()):
+            out = await _call(hook)
+        assert _deny_reason(out) == _DENY_ENGAGEMENT_UNAVAILABLE

@@ -707,6 +707,7 @@ class _FakeChannel:
         self.posts: list = []
         self.edits: list = []
         self.dispatches: list = []
+        self.eng_dispatches: list = []
         self.post_result: int | None = 55
         self.post_raises = False
         self.post_gate: asyncio.Event | None = None
@@ -737,6 +738,13 @@ class _FakeChannel:
                  request_id=request_id, text=text)
         )
         self.log.append(("dispatch", text))
+        return self.dispatch_result
+
+    async def _dispatch_engagement_continuation(self, *, engagement_id, text):
+        # #400: the engagement-resume seam the authz finish hook uses for an
+        # engagement-origin challenge (in place of _dispatch_button_continuation).
+        self.eng_dispatches.append(dict(engagement_id=engagement_id, text=text))
+        self.log.append(("eng_dispatch", text))
         return self.dispatch_result
 
 
@@ -774,15 +782,18 @@ def _fresh_env(monkeypatch, *, ttl=None, log=None):
 def _create(coord, channel, key=None, *, chat_id=100, operator_id=7,
             target_role="finance-full", tool_name="invoice_reset",
             canonical_json='{"amount":10,"id":"INV-1"}',
-            enforcement_role="finance", summary=None, display_name=None):
+            enforcement_role="finance", summary=None, display_name=None,
+            engagement_id=""):
     if key is None:
         key = _key(chat_id=chat_id, enforcement_role=enforcement_role,
-                   tool_name=tool_name, args_hash=canonical_args_hash({"x": 1}))
+                   tool_name=tool_name, args_hash=canonical_args_hash({"x": 1}),
+                   engagement_id=engagement_id)
     handle = coord.get_or_create(
         key, chat_id=chat_id, operator_id=operator_id, target_role=target_role,
         tool_name=tool_name, canonical_json=canonical_json,
         enforcement_role=enforcement_role, channel=channel,
         summary=summary, display_name=display_name,
+        engagement_id=engagement_id,
     )
     return key, handle
 
@@ -1038,6 +1049,66 @@ class TestAuthzFinishHook:
         assert canonical in channel.dispatches[0]["text"]
         assert "[authorization approved]" in channel.dispatches[0]["text"]
         assert "finance" in channel.dispatches[0]["text"]  # enforcement_role
+
+    async def test_engagement_approve_resumes_engagement_not_bus_role(
+        self, monkeypatch,
+    ):
+        """#400: a challenge created with engagement_id resumes the ENGAGEMENT
+        (via _dispatch_engagement_continuation) on approval — NOT the resident
+        bus-role button continuation — carrying the same verbatim approval text,
+        and mints the engagement-bound key."""
+        import authz_grants
+        log: list = []
+        monkeypatch.setattr(authz_grants, "GRANTS", _SpyGrants(log))
+        broker, coord, channel = _fresh_env(monkeypatch, log=log)
+        canonical = '{"amount":10,"id":"INV-1"}'
+        eng_key = _key(
+            chat_id=100, enforcement_role="finance", tool_name="invoice_reset",
+            args_hash=canonical_args_hash({"x": 1}), engagement_id="eng-123",
+        )
+        key, handle = _create(
+            coord, channel, eng_key, canonical_json=canonical,
+            engagement_id="eng-123",
+        )
+        assert await handle.settled_post() == "posted"
+        ch = coord._entries[key]
+        _tap(broker, ch, 0)
+        await _settle()
+
+        # resumed the engagement, NEVER the bus-role continuation
+        assert channel.dispatches == []
+        assert len(channel.eng_dispatches) == 1
+        assert channel.eng_dispatches[0]["engagement_id"] == "eng-123"
+        assert canonical in channel.eng_dispatches[0]["text"]
+        assert "[authorization approved]" in channel.eng_dispatches[0]["text"]
+        # minted the exact engagement-bound key
+        assert log[0][0] == "mint" and log[0][1] == eng_key
+        assert log[0][1].engagement_id == "eng-123"
+
+    async def test_engagement_deny_resumes_engagement_no_mint(self, monkeypatch):
+        """#400: denying an engagement-origin challenge resumes the engagement
+        with the denial text and mints NOTHING."""
+        import authz_grants
+        log: list = []
+        monkeypatch.setattr(authz_grants, "GRANTS", _SpyGrants(log))
+        broker, coord, channel = _fresh_env(monkeypatch, log=log)
+        eng_key = _key(
+            chat_id=100, enforcement_role="finance", tool_name="invoice_reset",
+            args_hash=canonical_args_hash({"x": 1}), engagement_id="eng-9",
+        )
+        key, handle = _create(
+            coord, channel, eng_key, engagement_id="eng-9",
+        )
+        await handle.settled_post()
+        ch = coord._entries[key]
+        _tap(broker, ch, 1)
+        await _settle()
+
+        assert "mint" not in [e[0] for e in log]
+        assert channel.dispatches == []
+        assert len(channel.eng_dispatches) == 1
+        assert channel.eng_dispatches[0]["engagement_id"] == "eng-9"
+        assert "[authorization denied]" in channel.eng_dispatches[0]["text"]
 
     async def test_deny_no_mint_edit_then_dispatch(self, monkeypatch):
         import authz_grants

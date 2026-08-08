@@ -1886,6 +1886,39 @@ class TelegramChannel(Channel):
             await reg.update_user_turn(rec.id, _time.time())
         return True
 
+    async def _dispatch_engagement_continuation(
+        self, *, engagement_id: str, text: str,
+    ) -> bool:
+        """#400: resume a SPECIALIST ENGAGEMENT after an operator authorized (or
+        denied) a protected plugin tool over the DM authorization keyboard.
+
+        The authz finish hook (``authz_grants._make_finish_hook``) calls this
+        instead of ``_dispatch_button_continuation`` when the challenge was
+        engagement-origin. It looks up the record by id and hands the
+        ``[authorization approved|denied]`` turn to the SAME
+        ``deliver_system_turn`` seam the post-consent auto-resume uses (#217) —
+        which acquires the per-topic lock, runs the shared ``_resume_and_ready``
+        gate (fail-closed on a terminal / unresumable / idle-reaped engagement),
+        and spawns the turn as a tracked background task so this callback never
+        blocks for the turn's duration.
+
+        Returns ``True`` when the turn was handed off, ``False`` when the
+        engagement is unknown (the finish hook then surfaces a delivery-failed
+        note on the DM keyboard). A record that resolves but is non-deliverable
+        is handled inside ``deliver_system_turn`` (it logs + returns), which is
+        still a successful hand-off from this seam's perspective — the grant was
+        minted and the operator saw the approval; a re-nudge resumes it."""
+        reg = self._engagement_registry
+        rec = reg.get(engagement_id) if reg is not None else None
+        if rec is None:
+            logger.info(
+                "authz continuation: engagement %s unknown — cannot resume",
+                str(engagement_id)[:8],
+            )
+            return False
+        await self.deliver_system_turn(rec, text)
+        return True
+
     async def deliver_system_turn(self, rec, text: str) -> None:
         """Resume-if-suspended (under the per-topic lock), then deliver a
         synthetic system-authored turn to engagement ``rec`` — the seam a
