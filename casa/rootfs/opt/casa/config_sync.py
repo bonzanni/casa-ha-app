@@ -23,6 +23,7 @@ from typing import Callable
 
 import yaml
 
+import trigger_write_lock
 from atomic_io import atomic_write_text
 from config import _ENV_RE, text_has_lone_placeholder
 
@@ -1015,7 +1016,32 @@ def reconcile(*, defaults_dir, config_dir, baseline_dir,
     every file keeps byte-level resolution: the merge must never write a
     document it cannot first show to be valid (INV-CFG-007), so no validator
     means no merge rather than an unchecked one.
+
+    The whole pass is held under ``trigger_write_lock.PASS_LOCK`` (#458): a
+    reminder written on the event loop between this pass's read and write of a
+    role ``triggers.yaml`` would otherwise be discarded, and is unrecoverable
+    because the pre-sync git snapshot / ``.casabak`` predate it. The lock is one
+    per process and covers every write site in every phase of the pass — the
+    two reconcile loops and ``_post_sync_validate_and_heal`` — so a reminder
+    mutator (which takes the same lock) can only run before or after the pass,
+    never inside it. Reminder mutators are invoked off the loop via
+    ``asyncio.to_thread``, so a held pass waits a worker thread, not the loop.
     """
+    with trigger_write_lock.PASS_LOCK:
+        return _reconcile_impl(
+            defaults_dir=defaults_dir, config_dir=config_dir,
+            baseline_dir=baseline_dir, image_version=image_version, git=git,
+            validate=validate, validate_repo=validate_repo,
+            validate_text=validate_text,
+        )
+
+
+def _reconcile_impl(*, defaults_dir, config_dir, baseline_dir,
+                    image_version: str, git,
+                    validate: Callable[[str], str | None],
+                    validate_repo: Callable[[], list[str]] | None = None,
+                    validate_text: Callable[[str, str], str | None] | None = None,
+                    ) -> SyncReport:
     defaults_dir = Path(defaults_dir)
     config_dir = Path(config_dir)
     baseline_dir = Path(baseline_dir)

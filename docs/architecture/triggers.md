@@ -87,11 +87,13 @@ configurator runs in a separate CLI child process: it reads the file, decides, a
 back — an interval that spans model thinking time, and one no lock may be held across. A
 reminder set inside it was discarded by the stale rewrite, silently, and the commit that
 followed staged the loss. So an agent does not write that file at all. The file tools are
-refused for that path and the change is made *inside* Casa, on its event loop, in one
-synchronous read-modify-write that interleaves with the reminder writer not at all.
+refused for that path and the change is made *inside* Casa, in a read-modify-write held under
+`trigger_write_lock.PASS_LOCK` so it cannot interleave with the reminder writer.
 
-This is a bound on agents, not on writers: the operator edits their own file freely, and the
-config reconciler still rewrites it from a worker thread without coordination (#458).
+This is a bound on agents, not on writers: the operator edits their own file freely. The
+config reconciler rewrites it from a worker thread too, and once did so without coordination;
+#458 closed that by holding the same `PASS_LOCK` across the whole reconcile pass, so the
+reconciler and the in-Casa writers now serialize against each other rather than racing.
 
 ## Contracts & invariants
 
@@ -129,13 +131,18 @@ normalized auth policy. **Clearance is not in it** — a clearance change on a t
 under the old approval without renewed consent. Everything in the tuple, including any auth
 mode, header or tolerance change, does invalidate the approval.
 
-**INV-TRIG-011**: An agent's file-tool write whose path *resolves* to a resident's `triggers.yaml` is refused, and the typed tools that replace it perform their whole read-modify-write synchronously on the event loop.
+**INV-TRIG-011**: An agent's file-tool write whose path *resolves* to a resident's `triggers.yaml` is refused, and every writer of that file — the typed tools, the reminder tools, and the config reconciler's whole pass — serializes its read-modify-write under one process lock.
 
 Two halves, and both are load-bearing. A code-mandatory PreToolUse guard — carried by every
 executor *and* every resident, since the shipped assistant has broad shell access — refuses
-the write, and the typed replacement does the whole read, judgement and write without an
-`await`, so no reminder write can land in the middle of one. Doing that work in a thread
-would give back exactly what the guard bought.
+the write. The typed replacement then makes the change *inside* Casa, and the read, judgement
+and write are held under `trigger_write_lock.PASS_LOCK`, which the `config_sync` reconciler
+also holds across its entire pass (#458): a reminder or configurator write can only land
+before or after a pass, never in the middle of the reconciler's own read-decide-write, and
+vice versa. The lock is what buys the serialization — earlier the tools bought it by refusing
+to `await` and holding the event loop, but that left the reconciler, which runs on a worker
+thread, uncoordinated; the shared lock covers all three writers and is taken off the loop via
+`asyncio.to_thread`, so a held pass waits a worker thread rather than stalling the loop.
 
 **The two tool families the guard covers are not equally decidable, and it asks each of them
 a different question.** A `Write`/`Edit`/`MultiEdit`/`NotebookEdit` path is a literal:

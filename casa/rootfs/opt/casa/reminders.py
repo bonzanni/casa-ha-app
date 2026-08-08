@@ -80,14 +80,18 @@ Design points worth keeping in view:
   and they refuse it, in the entry submitted AND in the entry being replaced —
   and identical in how they judge what they write.
 
-  The bound is "no agent", not "no writer", and the difference is the residual:
-  ``config_sync`` rewrites this file too, from a worker thread, and is not
-  serialized against this module (#458). The operator's own editor is likewise
-  unbound, deliberately — the guard binds agents, not the human.
+  The bound is "no agent", not "no writer". ``config_sync`` rewrites this file
+  too, from a worker thread; #458 closed the window in which its stale rewrite
+  could discard a reminder written here meanwhile, by serializing both under
+  ``trigger_write_lock.PASS_LOCK`` (see :func:`_under_pass_lock`). The
+  operator's own editor is still unbound, deliberately — the guard binds
+  agents, not the human.
 """
 
 from __future__ import annotations
 
+import asyncio
+import functools
 import logging
 import os
 import secrets
@@ -95,8 +99,28 @@ from datetime import datetime, timedelta
 
 import yaml
 
+import trigger_write_lock
 from atomic_io import atomic_write_text
 from config import _ENV_RE, text_has_lone_placeholder
+
+
+def _under_pass_lock(fn):
+    """Hold ``trigger_write_lock.PASS_LOCK`` for the whole read → write of a
+    ``triggers.yaml`` mutator (#458).
+
+    ``config_sync`` holds the same lock across its entire reconcile pass, so a
+    decorated mutator can only run before or after the pass — never between the
+    pass's read and its write, which is where a reminder was silently lost. The
+    lock BLOCKS, so a caller on the event loop MUST invoke the mutator via
+    ``asyncio.to_thread`` (never directly), or a running pass would stall the
+    loop; off-loop callers (boot, tests) may call directly.
+    """
+    @functools.wraps(fn)
+    def _wrapped(*args, **kwargs):
+        with trigger_write_lock.PASS_LOCK:
+            return fn(*args, **kwargs)
+    return _wrapped
+
 
 logger = logging.getLogger(__name__)
 
@@ -473,6 +497,7 @@ def _validate_candidate(candidate: str, path: str, name: str) -> None:
         raise ValueError(problem)
 
 
+@_under_pass_lock
 def add_entry(path: str, entry: dict) -> None:
     """Add one agent-owned *entry*, leaving every other trigger untouched.
 
@@ -530,6 +555,7 @@ def add_entry(path: str, entry: dict) -> None:
     atomic_write_text(path, text_out)
 
 
+@_under_pass_lock
 def remove_entry(path: str, name: str) -> str:
     """Remove the agent-owned entry called *name*.
 
@@ -593,6 +619,7 @@ def _refuse_placeholder_rewrite(text: "str | None", path: str, verb: str) -> Non
         )
 
 
+@_under_pass_lock
 def upsert_entry(path: str, entry: dict) -> str:
     """Add *entry*, or replace the existing entry of the same ``name``.
 
@@ -675,6 +702,7 @@ def upsert_entry(path: str, entry: dict) -> str:
     return outcome
 
 
+@_under_pass_lock
 def delete_entry(path: str, name: str) -> str:
     """Remove the non-agent-owned entry called *name*.
 
@@ -852,7 +880,10 @@ async def sweep_reminders(runtime, now: datetime) -> int:
                 continue
             delivered += 1
             try:
-                outcome = remove_entry(path, name)
+                # Off the loop: remove_entry takes trigger_write_lock.PASS_LOCK,
+                # which a config_sync pass may hold, and this sweep runs on the
+                # scheduler loop — a blocking acquire here would stall it (#458).
+                outcome = await asyncio.to_thread(remove_entry, path, name)
             except (OSError, ValueError):
                 logger.warning(
                     "reminder sweep: could not remove %s after delivery; it "

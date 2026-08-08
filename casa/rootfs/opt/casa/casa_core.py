@@ -2653,9 +2653,13 @@ async def main() -> None:
     # never deleted here. CONFIG_DIR is used directly (rather than the
     # ``agents_dir`` local defined below) so this closure has no late-binding
     # dependency on statements that run after it.
-    def _remove_fired_reminder(role: str, name: str) -> None:
+    async def _remove_fired_reminder(role: str, name: str) -> None:
         import reminders
-        outcome = reminders.remove_entry(
+        # Off the loop: remove_entry takes trigger_write_lock.PASS_LOCK, which a
+        # config_sync pass may hold, and this runs inside the scheduler's _fire
+        # coroutine — a blocking acquire here would stall the loop (#458).
+        outcome = await asyncio.to_thread(
+            reminders.remove_entry,
             reminders.triggers_path(os.path.join(CONFIG_DIR, "agents"), role),
             name,
         )

@@ -279,6 +279,28 @@ async def test_registration_failure_rolls_back_the_entry(env):
     assert [t["name"] for t in _entries(env.path)] == ["heartbeat"]
 
 
+async def test_concurrent_reconcile_registration_is_not_a_failure(env):
+    """#458 follow-up: the write lands off the loop, so a sweep's
+    `_reconcile_registrations` can register this entry from the file before the
+    tool does, making the tool's own register raise "already scheduled". The
+    reminder is written AND live, so the tool must report success and keep the
+    entry — not roll it back on a spurious error."""
+    from tools import set_reminder
+
+    # register_agent raises (as a duplicate would) but the job IS live — the
+    # exact end-state a concurrent reconcile leaves.
+    env.scheduler.add_job.side_effect = RuntimeError("already scheduled")
+    env.registry.has_job = lambda role, name: True
+
+    out = _payload(await set_reminder.handler({"at": FUTURE, "text": "Bins."}))
+
+    assert out["status"] == "ok"
+    # The entry must survive — it is live, and dropping it would strand a
+    # reminder that will fire.
+    names = [t["name"] for t in _entries(env.path)]
+    assert "heartbeat" in names and len(names) == 2
+
+
 async def test_refuses_outside_a_turn_context(env):
     import agent as agent_mod
     from tools import set_reminder
