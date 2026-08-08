@@ -5,11 +5,19 @@
 1. **Which trigger?** Confirm by name.
 2. **Confirm:** stops firing immediately after reload.
 
-## Edit the YAML
+## Remove the trigger — `config_trigger_delete`, never a hand edit
 
-Remove the entry from agents/<role>/triggers.yaml. If last, leave `triggers: []`.
+**You cannot Edit or Write `agents/<role>/triggers.yaml`. The hook denies it**
+— see add.md for why.
 
-Optionally delete agents/<role>/prompts/<trigger-name>.md if unused.
+    config_trigger_delete(role="<role>", name="<trigger_name>")
+
+It leaves every other entry untouched (including the empty `triggers: []` case)
+and refuses a reminder the resident owns (`managed_by: agent`) — those are the
+resident's to cancel, not yours.
+
+Optionally delete agents/<role>/prompts/<trigger-name>.md if unused — that one
+IS an ordinary edit.
 
 ## Reload — MANDATORY before emit_completion
 

@@ -41,19 +41,26 @@ def _issue(name, reason_code):
 
 class TestI1RoutesLiveGate:
     def _wire(self, monkeypatch, *, trigger, callback,
-              trigger_ok=True, callback_ok=True):
-        # #453: the gate reads ``issue_state`` — ``(ok, issues)`` — not
-        # ``current_issues``. The flag is the point: an empty list is the
+              trigger_ok=True, callback_ok=True,
+              trigger_seen=("gmail", "other"), callback_seen=("gmail", "other")):
+        # #453: the gate reads ``issue_state`` — ``(ok, issues, observed)`` —
+        # not ``current_issues``. The flag is the point: an empty list is the
         # positive claim "no gap", and a recomputation that could not run
         # produces the same empty list, so the gate must be able to tell them
-        # apart. ``current_issues`` remains the health-report accessor.
+        # apart. #457 added the third field for the other way an empty list
+        # lies: a plugin the computation never SAW. ``current_issues`` remains
+        # the health-report accessor.
         import casa_core
         import trigger_reconcile
         import callback_reconcile
-        monkeypatch.setattr(trigger_reconcile, "issue_state",
-                            lambda resolver=None: (trigger_ok, list(trigger)))
-        monkeypatch.setattr(callback_reconcile, "issue_state",
-                            lambda resolver=None: (callback_ok, list(callback)))
+        monkeypatch.setattr(
+            trigger_reconcile, "issue_state",
+            lambda resolver=None: trigger_reconcile.IssueState(
+                trigger_ok, list(trigger), set(trigger_seen)))
+        monkeypatch.setattr(
+            callback_reconcile, "issue_state",
+            lambda resolver=None: callback_reconcile.IssueState(
+                callback_ok, list(callback), set(callback_seen)))
         return casa_core._callback_and_trigger_routes_live
 
     def test_live_when_no_issue(self, monkeypatch):
@@ -95,6 +102,91 @@ class TestI1RoutesLiveGate:
         gate = self._wire(monkeypatch, trigger=[], callback=[],
                           **{half: False})
         assert gate("gmail") is False
+
+    @pytest.mark.parametrize("half", ["trigger_seen", "callback_seen"])
+    def test_dark_when_a_half_never_saw_the_plugin(self, monkeypatch, half):
+        """#457. A successful, issue-free recomputation that the plugin is
+        simply ABSENT from must not read as "this plugin has no gap".
+
+        Two states produce exactly that: an invalid registry, where both
+        reconcilers return an empty result by design (and the pass that follows
+        swaps in an EMPTY overlay, so every plugin webhook 404s), and one
+        artifact that fails to resolve, which becomes a ``stage="resolve"``
+        issue in place of the plugin — named by no ``trigger_*``/``callback_*``
+        row the gate matches on. ``ok`` is True in both: the computation RAN.
+        Presence must therefore be established POSITIVELY."""
+        gate = self._wire(monkeypatch, trigger=[], callback=[],
+                          **{half: ("other",)})
+        assert gate("gmail") is False
+
+    def test_live_requires_presence_in_BOTH_halves(self, monkeypatch):
+        """The positive claim is per half, exactly as the issue check is: a
+        plugin the trigger pass saw and the callback pass did not is still
+        dark."""
+        gate = self._wire(monkeypatch, trigger=[], callback=[],
+                          trigger_seen=("gmail",), callback_seen=("gmail",))
+        assert gate("gmail") is True
+
+
+class TestI1ObservedIsProduced:
+    """The gate's ``observed`` half is only as good as what the reconcilers
+    actually report, so pin the producers too — a gate reading a field nothing
+    fills is a gate that denies everything."""
+
+    def _resolver(self, *, valid, names):
+        from types import SimpleNamespace
+
+        def resolve(target=None):
+            return SimpleNamespace(
+                registry_valid=valid, generation=1, issues=[], warnings=[],
+                plugins=[SimpleNamespace(name=n, artifact_id=f"art-{n}",
+                                         path=f"/p/{n}", version="1",
+                                         manifest={}, manifest_name=n)
+                         for n in names])
+        resolve.entries = lambda: [{"name": n, "targets": ["resident:butler"]}
+                                   for n in names]
+        resolve.generation = 1
+        return resolve
+
+    def test_trigger_compute_reports_every_resolved_plugin(self):
+        import trigger_reconcile as tr
+        desired = tr.compute_desired(
+            role_configs={"butler": SimpleNamespace(channels=["webhook"])},
+            acks={}, resolver=self._resolver(valid=True, names=["a", "b"]),
+            global_secret_ok=lambda: True)
+        # Neither declares a trigger, so neither raises an issue — and that is
+        # exactly the state the gate used to read as "no gap" for a plugin it
+        # had never seen.
+        assert desired.issues == []
+        assert desired.observed == {"a", "b"}
+
+    def test_trigger_compute_observes_nothing_on_invalid_registry(self):
+        import trigger_reconcile as tr
+        desired = tr.compute_desired(
+            role_configs={"butler": SimpleNamespace(channels=["webhook"])},
+            acks={}, resolver=self._resolver(valid=False, names=["a"]),
+            global_secret_ok=lambda: True)
+        assert desired.issues == []
+        assert desired.observed == set()
+
+    def test_callback_compute_reports_every_resolved_plugin(self, monkeypatch):
+        import callback_reconcile as cr
+        import plugin_store
+        monkeypatch.setattr(plugin_store, "manifest_callbacks",
+                            lambda manifest, name: [])
+        desired = cr.compute_desired(
+            role_configs={"butler": object()}, acks={},
+            resolver=self._resolver(valid=True, names=["a", "b"]))
+        assert desired.issues == []
+        assert desired.observed == {"a", "b"}
+
+    def test_callback_compute_observes_nothing_on_invalid_registry(self):
+        import callback_reconcile as cr
+        desired = cr.compute_desired(
+            role_configs={"butler": object()}, acks={},
+            resolver=self._resolver(valid=False, names=["a"]))
+        assert desired.issues == []
+        assert desired.observed == set()
 
 
 # ---------------------------------------------------------------------------

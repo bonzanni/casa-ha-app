@@ -659,3 +659,125 @@ class TestAgentEntries:
         """Absent is a genuine "the agent owns nothing here", which must still
         authorise dropping orphaned jobs. Only an unreadable file is None."""
         assert reminders.agent_entries(str(tmp_path / "nope.yaml")) == []
+
+
+# ---------------------------------------------------------------------------
+# #403 — the general mutators the configurator's trigger edits go through
+# ---------------------------------------------------------------------------
+
+
+AGENT_REMINDER = {"name": "reminder-abc", "type": "date", "one_shot": True,
+                  "at": LATER, "channel": "telegram", "prompt": "bins",
+                  "managed_by": "agent"}
+
+WEBHOOK = {"name": "paypal", "type": "webhook", "clearance": "public",
+           "auth": {"mode": "hmac_body"}}
+
+
+class TestUpsertEntry:
+    def test_adds_a_new_entry_and_keeps_the_others(self, tmp_path):
+        path = _write(tmp_path, [HEARTBEAT, AGENT_REMINDER], version=2)
+        assert reminders.upsert_entry(path, dict(WEBHOOK)) == "added"
+        names = [e["name"] for e in _read(path)["triggers"]]
+        assert names == ["heartbeat", "reminder-abc", "paypal"]
+
+    def test_replaces_in_place(self, tmp_path):
+        """Order is not semantically load-bearing, but the diff the operator
+        reads is: an update that moved the entry to the end would show as a
+        delete plus an add in the config repo's history."""
+        path = _write(tmp_path, [HEARTBEAT, WEBHOOK, AGENT_REMINDER], version=2)
+        changed = dict(HEARTBEAT, minutes=15)
+        assert reminders.upsert_entry(path, changed) == "replaced"
+        doc = _read(path)
+        assert [e["name"] for e in doc["triggers"]] == [
+            "heartbeat", "paypal", "reminder-abc"]
+        assert doc["triggers"][0]["minutes"] == 15
+
+    def test_refuses_to_write_the_agent_marker(self, tmp_path):
+        path = _write(tmp_path, [], version=2)
+        with pytest.raises(ValueError, match="managed_by"):
+            reminders.upsert_entry(path, dict(AGENT_REMINDER))
+        assert _read(path)["triggers"] == []
+
+    def test_refuses_to_replace_an_agent_owned_entry(self, tmp_path):
+        """The ownership bound is on the STORED entry, not only on the one
+        submitted — otherwise an upsert naming a reminder erases it without any
+        interleaving at all, which is the very loss this change exists to
+        stop."""
+        path = _write(tmp_path, [AGENT_REMINDER], version=2)
+        impostor = {"name": "reminder-abc", "type": "interval", "minutes": 5,
+                    "channel": "telegram", "prompt": "mine now"}
+        with pytest.raises(ValueError, match="resident owns"):
+            reminders.upsert_entry(path, impostor)
+        assert _read(path)["triggers"] == [AGENT_REMINDER]
+
+    def test_refuses_when_the_name_is_already_duplicated(self, tmp_path):
+        path = _write(tmp_path, [HEARTBEAT, dict(HEARTBEAT)], version=2)
+        with pytest.raises(ValueError, match="cannot boot"):
+            reminders.upsert_entry(path, dict(HEARTBEAT, minutes=9))
+        assert len(_read(path)["triggers"]) == 2
+
+    def test_refuses_an_entry_the_schema_rejects_and_writes_nothing(
+        self, tmp_path,
+    ):
+        path = _write(tmp_path, [HEARTBEAT], version=2)
+        before = _read(path)
+        with pytest.raises(ValueError):
+            # cron without a schedule
+            reminders.upsert_entry(path, {"name": "bad", "type": "cron",
+                                          "channel": "telegram",
+                                          "prompt": "x"})
+        assert _read(path) == before
+
+    def test_refuses_a_lone_placeholder_but_allows_an_embedded_one(
+        self, tmp_path,
+    ):
+        """Only the LONE form is unwritable: safe_dump re-emits it unquoted,
+        and quoting is what tells the loader such a scalar is text (#409). An
+        embedded placeholder has surrounding text and reads back as a string,
+        so refusing it would ban legitimate operator configuration."""
+        path = _write(tmp_path, [], version=2)
+        with pytest.raises(ValueError, match="exactly a"):
+            reminders.upsert_entry(path, {"name": "a", "type": "cron",
+                                          "schedule": "0 7 * * *",
+                                          "channel": "telegram",
+                                          "prompt": "${DETAIL}"})
+        assert reminders.upsert_entry(
+            path, {"name": "a", "type": "cron", "schedule": "0 7 * * *",
+                   "channel": "telegram", "prompt": "say ${DETAIL} now"}
+        ) == "added"
+
+    def test_refuses_to_rewrite_a_file_holding_a_lone_placeholder(
+        self, tmp_path,
+    ):
+        path = tmp_path / "triggers.yaml"
+        path.write_text(
+            'schema_version: 2\n'
+            'triggers:\n'
+            '  - name: heartbeat\n'
+            '    type: interval\n'
+            '    minutes: 60\n'
+            '    channel: telegram\n'
+            '    prompt: "${HB}"\n', encoding="utf-8")
+        with pytest.raises(ValueError, match="interpolation"):
+            reminders.upsert_entry(str(path), dict(WEBHOOK))
+
+
+class TestDeleteEntry:
+    def test_removes_an_operator_entry(self, tmp_path):
+        path = _write(tmp_path, [HEARTBEAT, WEBHOOK, AGENT_REMINDER],
+                      version=2)
+        assert reminders.delete_entry(path, "paypal") == "removed"
+        assert [e["name"] for e in _read(path)["triggers"]] == [
+            "heartbeat", "reminder-abc"]
+
+    def test_reports_not_found(self, tmp_path):
+        path = _write(tmp_path, [HEARTBEAT], version=2)
+        assert reminders.delete_entry(path, "nope") == "not_found"
+
+    def test_refuses_an_agent_owned_entry(self, tmp_path):
+        """"That is the resident's reminder" is a different answer from "no
+        such trigger", and the caller relays it to the operator."""
+        path = _write(tmp_path, [AGENT_REMINDER], version=2)
+        assert reminders.delete_entry(path, "reminder-abc") == "not_owned"
+        assert _read(path)["triggers"] == [AGENT_REMINDER]

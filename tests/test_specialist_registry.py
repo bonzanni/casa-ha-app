@@ -785,3 +785,83 @@ async def test_one_malformed_installed_tuple_does_not_abort_the_index_load(tmp_p
     assert damaged.last_activation_error
     # The slug stays reserved: a fresh install cannot silently overwrite it.
     assert "damaged" in index.all_collision_slugs()
+
+
+# ---------------------------------------------------------------------------
+# #439 — a rescan must never be observable half-done
+# ---------------------------------------------------------------------------
+
+
+class TestLoadPublishesAtomically:
+    """``load()`` runs in a worker thread (``asyncio.to_thread``) while the
+    event loop is free to serve ANOTHER role's reload, and ``reload.dispatch``
+    serializes only on a per-``agent:<role>`` key — so a concurrent
+    ``tools.sync_agent_role_map`` snapshots ``all_configs()`` mid-scan.
+
+    The clear-then-refill this replaced made that snapshot the delegation
+    authority missing specialists that are perfectly healthy on disk:
+    ``delegate_to_agent`` refuses them as unknown, and since v0.157.0 the
+    ``<delegates>`` block renders from the same map and silently drops them.
+    """
+
+    def _registry(self, tmp_path, monkeypatch, *roles):
+        from specialist_registry import SpecialistRegistry
+
+        specialists = tmp_path / "specialists"
+        specialists.mkdir()
+        for role in roles:
+            _seed_specialist_dir(specialists, role, enabled=True)
+        _use_synthetic_roles_dir(monkeypatch, tmp_path, *roles)
+        return SpecialistRegistry(str(specialists),
+                                  tombstone_path=str(tmp_path / "del.json"))
+
+    async def test_snapshot_during_a_rescan_is_never_partial(
+        self, tmp_path, monkeypatch,
+    ):
+        reg = self._registry(tmp_path, monkeypatch, "finance", "chef")
+        reg.load()
+        assert set(reg.all_configs()) == {"finance", "chef"}
+
+        # Probe from INSIDE the scan's per-specialist loop — the exact window
+        # a concurrent role-map sync lands in. Calling the two in sequence
+        # would prove nothing.
+        seen: list[set] = []
+        original = reg._validate_tier2_shape
+
+        def probe(cfg, role):
+            seen.append(set(reg.all_configs()))
+            return original(cfg, role)
+
+        monkeypatch.setattr(reg, "_validate_tier2_shape", probe)
+        reg.load()
+
+        assert seen, "the probe never ran — the scan found no specialist"
+        assert all(s == {"finance", "chef"} for s in seen), (
+            f"a mid-scan snapshot saw a partial registry: {seen}")
+        assert set(reg.all_configs()) == {"finance", "chef"}
+
+    async def test_a_failing_rescan_does_not_empty_the_live_registry_early(
+        self, tmp_path, monkeypatch,
+    ):
+        """A collection-level failure degrades to an empty result — but the
+        live map must hold the PREVIOUS generation until that verdict is
+        published, not be cleared the moment the scan starts."""
+        import agent_loader
+
+        reg = self._registry(tmp_path, monkeypatch, "finance")
+        reg.load()
+        assert set(reg.all_configs()) == {"finance"}
+
+        during: list[set] = []
+
+        def boom(*_args, **_kwargs):
+            during.append(set(reg.all_configs()))
+            raise agent_loader.LoadError("specialists/ is not a directory")
+
+        monkeypatch.setattr(agent_loader, "load_all_specialists", boom)
+        reg.load()
+
+        assert during == [{"finance"}]
+        # ...and the published verdict IS the empty one.
+        assert reg.all_configs() == {}
+        assert [n for n, _ in reg.load_failures()] == ["(collection)"]

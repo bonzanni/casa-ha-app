@@ -63,6 +63,27 @@ Design points worth keeping in view:
   intended boundary rather than a leak: the top level is not separable from the
   judgment, and such a file cannot boot either way, so neither refusing nor
   writing helps the operator.
+
+* **No AGENT writes this file except through here** (#403). This module began
+  as the reminder writer, and the document layer it grew — read, judge, re-emit,
+  refuse — is what any writer of that file needs. It now serves the
+  configurator's trigger edits too, through :func:`upsert_entry` /
+  :func:`delete_entry`, because the alternative was fatal: the configurator runs
+  in a SEPARATE CLI process, so its read-modify-write spans model thinking time
+  and no lock may be held across that. A reminder set inside that window was
+  discarded by the stale rewrite, silently, and ``config_git_commit``'s
+  ``git add -A`` committed the loss. Routing the edit here makes it a single
+  synchronous step on Casa's loop, where it interleaves with the reminder writer
+  not at all; ``hooks.trigger_file_write_guard`` denies the hand edit that used
+  to be the recipe. The general mutators are strictly weaker than the reminder
+  ones in what they may TOUCH — a ``managed_by: agent`` entry is the resident's
+  and they refuse it, in the entry submitted AND in the entry being replaced —
+  and identical in how they judge what they write.
+
+  The bound is "no agent", not "no writer", and the difference is the residual:
+  ``config_sync`` rewrites this file too, from a worker thread, and is not
+  serialized against this module (#458). The operator's own editor is likewise
+  unbound, deliberately — the guard binds agents, not the human.
 """
 
 from __future__ import annotations
@@ -540,6 +561,145 @@ def remove_entry(path: str, name: str) -> str:
     candidate["triggers"] = [e for e in doc["triggers"]
                              if not (_agent_owned(e)
                                      and e.get("name") == name)]
+    _save(path, candidate)
+    return "removed"
+
+
+# ---------------------------------------------------------------------------
+# The general entry mutators — the configurator's trigger edits (#403)
+# ---------------------------------------------------------------------------
+#
+# Same document layer, opposite ownership bound: these refuse an
+# ``managed_by: agent`` entry, where the reminder writer above requires one.
+# Between them, every entry in the file has exactly one writer that may touch
+# it, and both of them run in this process.
+
+
+def _refuse_placeholder_rewrite(text: "str | None", path: str, verb: str) -> None:
+    """Refuse when re-emitting *path* would strip a lone-``${VAR}`` quote.
+
+    The reminder writer's own refusal, reused verbatim — see :func:`add_entry`
+    for why a rewrite cannot preserve a style it can no longer see. Unlike
+    :func:`remove_entry`, which warns and PROCEEDS because a stranded delivered
+    reminder redelivers forever, these refuse in both directions: nothing here
+    is owed to anyone, and the operator can still edit such a file by hand. The
+    ``PreToolUse`` guard binds executors, not the human.
+    """
+    if text is not None and text_has_lone_placeholder(text):
+        raise ValueError(
+            f"{path} uses ${{...}} interpolation, which this writer cannot "
+            f"rewrite without risking the meaning of an existing trigger; "
+            f"{verb} it by hand instead"
+        )
+
+
+def upsert_entry(path: str, entry: dict) -> str:
+    """Add *entry*, or replace the existing entry of the same ``name``.
+
+    Returns ``"added"`` or ``"replaced"``. Raises ``ValueError`` (or
+    ``OSError``) and writes NOTHING on any refusal — refusing is always safe
+    here, exactly as it is for :func:`add_entry`: the caller reports it and the
+    operator's configuration is untouched.
+
+    The replaced entry keeps its POSITION in the document. Order is not
+    semantically load-bearing, but a diff the operator reads is, and an update
+    that silently moved the entry to the end would make every trigger edit look
+    like a delete plus an add in the config repo's history.
+    """
+    name = entry.get("name")
+    if not isinstance(name, str) or not name:
+        raise ValueError(f"a trigger entry needs a name; got {name!r}")
+    if _agent_owned(entry):
+        raise ValueError(
+            f"refusing to write {name!r} with managed_by={OWNER_AGENT!r}: that "
+            f"provenance marks an entry the resident's own reminder tools own, "
+            f"and only they may write one"
+        )
+    for field, value in entry.items():
+        # `_ENV_RE.fullmatch(value.strip())` is the loader's OWN test for the
+        # form whose meaning depends on quoting (config.py:158) — the same
+        # predicate, not a second copy of the idea.
+        if isinstance(value, str) and _ENV_RE.fullmatch(value.strip()):
+            # NOT add_entry's blanket ${...} refusal (Sol + Terra both said so,
+            # and they are right): interpolation is legitimate operator
+            # configuration, and only ONE form is unwritable here. safe_dump
+            # re-emits a scalar that is nothing but ${VAR} UNQUOTED, and quoting
+            # is what tells the loader such a scalar is text (#409) — so the
+            # value's meaning would depend on what the variable happens to hold.
+            # An EMBEDDED placeholder has surrounding text, dumps plain, and
+            # reads back as the string it is.
+            #
+            # add_entry keeps the wider refusal for a different reason: a
+            # REMINDER must say what the user asked for, so a placeholder there
+            # is wrong even when it round-trips.
+            raise ValueError(
+                f"a trigger's {field} cannot be exactly a ${{...}} placeholder "
+                f"when written through this tool — re-emitting it would drop "
+                f"the quoting that makes it text. Embed it in surrounding "
+                f"text, or edit the file by hand."
+            )
+
+    text, doc = _read_doc(path)
+    _refuse_placeholder_rewrite(text, path, "edit")
+
+    matches = [i for i, e in enumerate(doc["triggers"])
+               if isinstance(e, dict) and e.get("name") == name]
+    if len(matches) > 1:
+        # register_agent raises on a duplicate, uncaught at boot: a crash loop.
+        # The file is ALREADY in that state; silently collapsing the duplicates
+        # would hide it behind a successful edit.
+        raise ValueError(
+            f"{path} already contains {len(matches)} triggers named {name!r}; "
+            f"that file cannot boot — resolve the duplicate by hand first"
+        )
+    if matches and _agent_owned(doc["triggers"][matches[0]]):
+        raise ValueError(
+            f"{name!r} is a reminder the resident owns (managed_by="
+            f"{OWNER_AGENT!r}); ask the resident to change or cancel it"
+        )
+
+    candidate = dict(doc)
+    entries = list(doc["triggers"])
+    if matches:
+        entries[matches[0]] = entry
+        outcome = "replaced"
+    else:
+        entries.append(entry)
+        outcome = "added"
+    candidate["triggers"] = entries
+    text_out = _emit(candidate, path)
+    # Judge the WRITTEN entry alone, under the document's real top level —
+    # see _validate_candidate for the two cleverer versions this replaced.
+    _validate_candidate(text_out, path, name)
+    atomic_write_text(path, text_out)
+    return outcome
+
+
+def delete_entry(path: str, name: str) -> str:
+    """Remove the non-agent-owned entry called *name*.
+
+    ``"removed"``, ``"not_found"``, or ``"not_owned"`` — the same three-outcome
+    shape as :func:`remove_entry`, with ownership inverted: an entry carrying
+    ``managed_by: agent`` is the resident's, and the answer is "ask the resident
+    to cancel it", not a misleading success.
+
+    Deliberately does NOT schema-validate, for the same reason removal never
+    does: a pre-existing defect elsewhere in the file must not make an entry
+    undeletable.
+    """
+    text, doc = _read_doc(path)
+    matches = [e for e in doc["triggers"]
+               if isinstance(e, dict) and e.get("name") == name]
+    if not matches:
+        return "not_found"
+    if any(_agent_owned(e) for e in matches):
+        return "not_owned"
+    _refuse_placeholder_rewrite(text, path, "edit")
+    candidate = dict(doc)
+    candidate["triggers"] = [
+        e for e in doc["triggers"]
+        if not (isinstance(e, dict) and e.get("name") == name
+                and not _agent_owned(e))]
     _save(path, candidate)
     return "removed"
 

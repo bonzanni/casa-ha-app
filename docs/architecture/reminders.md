@@ -151,6 +151,12 @@ only as the shape of a generated name.
 The privileged config-commit path keeps its own separate configurator-only guard; this is a
 narrower door beside it, not a widening of that one.
 
+The configurator's trigger edits now come through the same module, by a second pair of
+doors bounded the opposite way: they refuse an entry marked agent-owned, in the submitted
+entry *and* in the entry they would replace. That is not a convenience — the configurator
+runs in a separate process, and its hand edit of this file discarded reminders silently
+(INV-TRIG-011 in [`architecture/triggers.md`](triggers.md)).
+
 One-shot firing itself — dropping the scheduler job, and removing the entry only when the
 agent owns it — is INV-TRIG-009, and it lives with the registry that implements it
 ([`architecture/triggers.md`](triggers.md)): it governs every one-shot trigger, including

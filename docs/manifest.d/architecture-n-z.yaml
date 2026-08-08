@@ -143,7 +143,7 @@
   related: [architecture/plugin-runtime.md, architecture/plugins.md, architecture/triggers.md, architecture/callbacks.md]
   defines_invariants: [INV-PLUG-010, INV-PLUG-011]
   invariant_tests:
-    INV-PLUG-011: [tests/test_plugin_reconcile_pass_integrity.py::test_setup_holds_until_the_secret_it_needs_exists, tests/test_plugin_reconcile_pass_integrity.py::test_an_unminted_per_trigger_secret_is_a_gap, tests/test_plugin_reconcile_pass_integrity.py::test_a_secret_bound_to_the_previous_approval_is_a_gap, tests/test_plugin_reconcile_pass_integrity.py::test_a_handler_minted_unbound_secret_is_a_gap, tests/test_plugin_reconcile_pass_integrity.py::test_current_issues_reports_the_unbacked_route, tests/test_plugin_reconcile_pass_integrity.py::test_an_unpublished_callback_marker_is_a_gap, tests/test_plugin_reconcile_pass_integrity.py::test_a_stale_callback_marker_is_a_gap, tests/test_plugin_reconcile_pass_integrity.py::test_a_routed_pair_is_republished_even_on_an_untrustworthy_pass, tests/test_plugin_reconcile_pass_integrity.py::test_a_recomputation_that_could_not_run_keeps_the_plugin_dark]
+    INV-PLUG-011: [tests/test_plugin_reconcile_pass_integrity.py::test_setup_holds_until_the_secret_it_needs_exists, tests/test_plugin_reconcile_pass_integrity.py::test_an_unminted_per_trigger_secret_is_a_gap, tests/test_plugin_reconcile_pass_integrity.py::test_a_secret_bound_to_the_previous_approval_is_a_gap, tests/test_plugin_reconcile_pass_integrity.py::test_a_handler_minted_unbound_secret_is_a_gap, tests/test_plugin_reconcile_pass_integrity.py::test_current_issues_reports_the_unbacked_route, tests/test_plugin_reconcile_pass_integrity.py::test_an_unpublished_callback_marker_is_a_gap, tests/test_plugin_reconcile_pass_integrity.py::test_a_stale_callback_marker_is_a_gap, tests/test_plugin_reconcile_pass_integrity.py::test_a_routed_pair_is_republished_even_on_an_untrustworthy_pass, tests/test_plugin_reconcile_pass_integrity.py::test_a_recomputation_that_could_not_run_keeps_the_plugin_dark, tests/test_callback_wiring.py::TestI1RoutesLiveGate::test_dark_when_a_half_never_saw_the_plugin, tests/test_callback_wiring.py::TestI1ObservedIsProduced::test_trigger_compute_observes_nothing_on_invalid_registry, tests/test_callback_wiring.py::TestI1ObservedIsProduced::test_callback_compute_observes_nothing_on_invalid_registry]
     INV-PLUG-010: [tests/test_plugin_setup_single_runner.py::test_absence_of_a_round_is_never_a_permission, tests/test_plugin_setup_single_runner.py::test_no_shipped_doctrine_routes_setup_to_an_agent, tests/test_plugin_setup_single_runner.py::test_a_failed_pending_compute_holds_rather_than_choosing, tests/test_plugin_setup_single_runner.py::test_unreachable_operator_holds_rather_than_choosing, tests/test_plugin_setup_single_runner.py::test_denied_consent_refuses_and_a_reprompt_rearms]
 
 - doc: architecture/plugins.md
@@ -270,13 +270,17 @@
     - casa/rootfs/opt/casa/trigger_acks.py::TriggerAckStore
     - casa/rootfs/opt/casa/plugin_triggers.py::parse_and_validate
     - casa/rootfs/opt/casa/casa_core.py::_make_webhook_handler
+    - casa/rootfs/opt/casa/tools.py::config_trigger_upsert
+    - casa/rootfs/opt/casa/tools.py::config_trigger_delete
+    - casa/rootfs/opt/casa/hooks.py::make_trigger_file_write_guard
   tests:
     - tests/test_config_triggers_schema.py
     - tests/test_trigger_consent.py
     - tests/test_agent_loader_trigger_auth.py
     - tests/test_casa_reload_triggers_resident.py
+    - tests/test_config_trigger_tools.py
   related: [architecture/plugins.md, architecture/http-surface.md, architecture/overview.md, architecture/callbacks.md, architecture/reminders.md]
-  defines_invariants: [INV-TRIG-001, INV-TRIG-002, INV-TRIG-003, INV-TRIG-004, INV-TRIG-005, INV-TRIG-009]
+  defines_invariants: [INV-TRIG-001, INV-TRIG-002, INV-TRIG-003, INV-TRIG-004, INV-TRIG-005, INV-TRIG-009, INV-TRIG-011]
   invariant_tests:
     INV-TRIG-001: [tests/test_trigger_registry.py::test_interval_channel_must_be_registered_on_agent]
     INV-TRIG-002: [tests/test_pin_g4_invariants.py::test_pin_inv_trig_002_plugin_namespace_reserved_in_user_schema, tests/test_trigger_registry.py::test_duplicate_trigger_name_same_agent_rejected, tests/test_trigger_registry.py::test_cross_role_webhook_name_collision_rejected]
@@ -284,6 +288,7 @@
     INV-TRIG-004: [tests/test_plugin_triggers_consent.py::test_tampered_identity_fails_whole_store_closed]
     INV-TRIG-005: [tests/test_plugin_triggers_overlay.py::test_replace_is_atomic_full_swap_stale_swept]
     INV-TRIG-009: [tests/test_trigger_registry_date.py::test_firing_an_agent_owned_one_shot_removes_job_and_entry, tests/test_trigger_registry_date.py::test_firing_an_OPERATORS_one_shot_drops_the_job_but_not_the_entry, tests/test_trigger_registry_date.py::test_firing_a_one_shot_frees_its_job_id]
+    INV-TRIG-011: [tests/test_hooks.py::TestTriggerFileWriteGuard::test_denies_every_write_capable_primitive, tests/test_hooks.py::TestTriggerFileWriteGuard::test_denies_a_bash_write_form, tests/test_hooks.py::TestTriggerFileWriteGuard::test_guard_is_code_mandatory_for_executors_and_residents, tests/test_hooks.py::TestTriggerFileWriteGuardBypasses::test_relative_path_resolves_against_the_SESSION_cwd, tests/test_hooks.py::TestTriggerFileWriteGuardBypasses::test_a_relative_path_with_no_reported_cwd_fails_CLOSED, tests/test_hooks.py::TestTriggerFileWriteGuardBypasses::test_every_historical_bash_bypass_is_closed, tests/test_hooks.py::TestTriggerFileWriteGuardBypasses::test_reads_still_pass, tests/test_hooks.py::TestTriggerFileWriteGuardBypasses::test_the_file_tools_stay_precise, tests/test_config_trigger_tools.py::test_the_tools_do_not_yield_between_read_and_write]
 
 - doc: architecture/reminders.md
   summary: How an agent comes to nudge someone later — entry ownership, the narrow writer, delivery, and the sweep that redeems a past-dated one-shot the process was down for.

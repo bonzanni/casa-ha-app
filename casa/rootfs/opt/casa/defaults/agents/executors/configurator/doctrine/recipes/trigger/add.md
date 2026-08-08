@@ -17,29 +17,41 @@ Triggers are per-agent scheduled or webhook-driven events. Residents only (speci
 6. **Prompt?** (interval/cron only) One imperative sentence.
 7. **Webhook auth?** (webhook only) how does the caller authenticate — see below.
 
-## Files to touch
+## Write the trigger — `config_trigger_upsert`, never a hand edit
 
-### Add to agents/<role>/triggers.yaml
+**You cannot Edit or Write `agents/<role>/triggers.yaml`. The hook denies it.**
+That file has a second writer — the resident's own reminder tools, running
+inside Casa — and a hand edit from here silently throws away any reminder the
+resident set since you read the file. `config_trigger_upsert` makes the change
+inside Casa, leaving every other entry exactly as it was.
 
-    schema_version: 2
-    triggers:
-      # interval / cron
-      - name: <trigger_name>
-        type: interval | cron
-        minutes: <N>          # interval only
-        schedule: "<cron>"    # cron only
-        channel: <telegram|voice>
-        prompt: <one-line imperative>
-      # webhook — served ONLY at POST /webhook/<name> (no `path` field; it was
-      # removed in v0.97.0). The agent must declare the `webhook` channel.
-      - name: <trigger_name>
-        type: webhook
-        clearance: public       # public|friends|family — memory tiers this
-                                # webhook's turns may recall (NEVER private).
-        auth:
-          mode: static_header   # hmac_body | static_header | timestamped_hmac
-          header: X-API-Key     # static_header / timestamped_hmac
-          tolerance_secs: 300   # timestamped_hmac only
+    # interval / cron
+    config_trigger_upsert(
+        role="<role>",
+        name="<trigger_name>",
+        type="interval",           # or "cron"
+        minutes=<N>,               # interval only
+        schedule="<cron>",         # cron only
+        channel="<telegram|voice>",
+        prompt="<one-line imperative>")
+
+    # webhook — served ONLY at POST /webhook/<name> (no `path` field; it was
+    # removed in v0.97.0). The agent must declare the `webhook` channel.
+    config_trigger_upsert(
+        role="<role>",
+        name="<trigger_name>",
+        type="webhook",
+        clearance="public",        # public|friends|family — memory tiers this
+                                   # webhook's turns may recall (NEVER private).
+        auth={"mode": "static_header",   # hmac_body|static_header|timestamped_hmac
+              "header": "X-API-Key",     # static_header / timestamped_hmac
+              "tolerance_secs": 300})    # timestamped_hmac only
+
+Read the file first if you need to see what is already there — reads are fine.
+The tool validates the entry against the triggers schema and refuses without
+writing anything, so a rejection leaves the operator's config untouched. It
+refuses a name the resident owns (`managed_by: agent` — those are its
+reminders); ask the resident to change one of those instead.
 
 ### Add agents/<role>/prompts/<trigger_name>.md (cron/interval only)
 

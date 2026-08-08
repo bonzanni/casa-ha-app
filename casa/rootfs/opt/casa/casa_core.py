@@ -2325,10 +2325,25 @@ def _callback_and_trigger_routes_live(plugin: str) -> bool:
     all-or-nothing means one issue keeps the whole plugin's set dark, exactly
     as the trigger gate treats trigger issues.
 
-    Both halves report ``(ok, issues)`` and a NOT-ok half keeps the plugin dark
-    (#453). An empty issue list is the positive claim "no gap"; a recomputation
-    that could not run at all produces the same empty list, so reading it as a
-    verdict is how the one check that must fail closed would fail open.
+    Both halves report ``(ok, issues, observed)`` and a NOT-ok half keeps the
+    plugin dark (#453). An empty issue list is the positive claim "no gap"; a
+    recomputation that could not run at all produces the same empty list, so
+    reading it as a verdict is how the one check that must fail closed would
+    fail open.
+
+    ``ok`` alone is not enough, because it reports that the computation RAN, not
+    that it SAW this plugin (#457). Two states produce a successful, issue-free
+    computation a plugin is simply absent from: an invalid registry, where both
+    reconcilers return an empty result by design (and the pass that follows swaps
+    in an EMPTY overlay, so every plugin webhook 404s), and a single artifact
+    that fails to resolve, which becomes a ``stage="resolve"`` issue in place of
+    the plugin — named by no ``trigger_*``/``callback_*`` row the gate matches
+    on. Both read as "this plugin has no gap" for a plugin the recomputation
+    never looked at. So membership in ``observed`` is required POSITIVELY, and
+    absence of an issue is only read as a verdict about a plugin the computation
+    actually iterated. The setup worker's own three-state registry resolution
+    still runs earlier and still defers — but it is a separate, unpinned read,
+    so it was a shield rather than a property of this gate.
 
     ONE pinned registry resolution serves both halves (#454): the gate is a
     single decision, and composing a trigger position read from one registry
@@ -2341,12 +2356,17 @@ def _callback_and_trigger_routes_live(plugin: str) -> bool:
     import plugin_registry as _pr
     import trigger_reconcile as _tr
     pinned = _pr.pinned_resolver()
-    for (ok, issues), prefix in ((_tr.issue_state(pinned), "trigger_"),
-                                 (_cr.issue_state(pinned), "callback_")):
-        if not ok:
+    for state, prefix in ((_tr.issue_state(pinned), "trigger_"),
+                          (_cr.issue_state(pinned), "callback_")):
+        if not state.ok:
+            return False
+        if plugin not in state.observed:
+            logger.info(
+                "setup route gate: plugin %s absent from the %s recomputation "
+                "— holding", plugin, prefix.rstrip("_"))
             return False
         if any(str(getattr(i, "reason_code", "")).startswith(prefix)
-               and getattr(i, "name", "") == plugin for i in issues):
+               and getattr(i, "name", "") == plugin for i in state.issues):
             return False
     return True
 

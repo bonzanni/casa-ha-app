@@ -1652,9 +1652,17 @@ class Agent:
         #    isn't mutated across turns.
         from hooks import agent_home_settings_guard_matcher
         hooks = dict(self._resolved_hooks)
+        # #403: residents carry the trigger-file guard too. A resident with
+        # broad Bash (the shipped assistant has it) writing its OWN
+        # triggers.yaml is the same lost-update shape as the configurator's —
+        # its reminder tools write that file from Casa's loop, and a shell
+        # redirect from the CLI child cannot be serialized against them. Both
+        # paths lead to config_trigger_upsert / set_reminder instead.
+        from hooks import trigger_file_write_guard_matcher
         hooks["PreToolUse"] = [
             *hooks.get("PreToolUse", []),
             agent_home_settings_guard_matcher(),
+            trigger_file_write_guard_matcher(),
         ]
 
         # Unified plugin architecture: the resolver turns this agent's

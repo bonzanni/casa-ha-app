@@ -1062,6 +1062,77 @@ _MANAGED_RESOLVE_DENY = (
 )
 
 
+_TRIGGER_FILE_NAME = "triggers.yaml"
+
+_TRIGGER_WRITE_DENY = (
+    "trigger_file_write_guard: {tool} blocked — {path!r} is a resident's "
+    "trigger file, and it has a second writer: the resident's own reminder "
+    "tools, inside the Casa process. Editing it from here silently discards "
+    "any reminder written since you read it. Use "
+    "config_trigger_upsert(role=..., name=..., type=..., ...) to add or "
+    "replace one trigger, or config_trigger_delete(role=..., name=...) to "
+    "remove one; both leave every other entry's content unchanged. Then commit "
+    "and casa_reload_triggers as usual. If you are a resident rather than the "
+    "configurator, this file is not yours to edit at all: set_reminder and "
+    "cancel_reminder manage your own reminders in it, and everything else in "
+    "it is the operator's."
+)
+
+_TRIGGER_RESOLVE_DENY = (
+    "trigger_file_write_guard: {tool} blocked — could not resolve {path!r} "
+    "(realpath error); failing closed. Use config_trigger_upsert / "
+    "config_trigger_delete for a resident's triggers.yaml."
+)
+
+_TRIGGER_UNRESOLVABLE_DENY = (
+    "trigger_file_write_guard: {tool} blocked — {path!r} is a relative path and "
+    "this call reported no working directory, so where it lands cannot be "
+    "established; failing closed. Give an absolute path, or use "
+    "config_trigger_upsert / config_trigger_delete for a resident's "
+    "triggers.yaml."
+)
+
+_TRIGGER_INTERNAL_DENY = (
+    "trigger_file_write_guard: internal error — failing closed; the call was "
+    "not executed."
+)
+
+
+def _is_resident_trigger_file(norm: str) -> bool:
+    """True iff ``norm`` (already normalized, absolute) names
+    ``/config/agents/<role>/triggers.yaml`` for a single ``<role>`` segment.
+
+    Scoped to that ONE depth on purpose. ``/config/agents/specialists/x/
+    triggers.yaml`` is not a resident's file — the loader forbids the file
+    there outright — and it is already managed state, denied by
+    ``managed_component_guard``.
+    """
+    p = PurePosixPath(norm)
+    if p.name != _TRIGGER_FILE_NAME:
+        return False
+    parent = p.parent
+    return (str(parent.parent) == _RESIDENT_ROOT
+            and parent.name not in ("", "specialists"))
+
+
+def _trigger_file_real_hit(norm: str) -> "str | None":
+    """``"hit"``, ``"resolve_error"`` or ``None`` — this guard's slice of the
+    one classifier. Delegating to :func:`_managed_real_hit` is what buys the
+    lexical-then-symlink resolution (a symlink from a writable area defeats the
+    lexical test; realpath alone misses a not-yet-existing path whose lexical
+    form is already the target) without a second copy of it.
+
+    Another kind of hit is NOT this guard's business and reads as ``None``:
+    ``/config/plugins/x/triggers.yaml`` is managed state, and the guard that
+    owns managed state says so in its own words."""
+    hit = _managed_real_hit(norm)
+    if hit is None:
+        return None
+    if hit[0] == "resolve_error":
+        return "resolve_error"
+    return "hit" if hit[0] == "trigger_file" else None
+
+
 def _managed_prefix_route(norm: str) -> tuple[str, str] | None:
     """Return ``(prefix, route)`` for the managed prefix containing ``norm``,
     or ``None``. ``norm`` must already be ``_normalize_path``-normalized."""
@@ -1086,6 +1157,16 @@ def _managed_path_hit(norm: str) -> tuple[str, str, str] | None:
     if (norm.startswith(_RESIDENT_ROOT + "/")
             and PurePosixPath(norm).name == "hooks.yaml"):
         return ("hooks_yaml", norm, "")
+    # #403: a resident's triggers.yaml is not managed component state — it is
+    # the OPERATOR's file — but it IS a file no agent may write, for a
+    # different reason: the resident's reminder tools write it from inside
+    # Casa. It joins this classifier rather than getting a second one so the
+    # normalize-then-realpath resolution is written once; the KIND is distinct,
+    # so each guard says WHY in its own words. Only the file-tool paths reach
+    # here — `trigger_file_write_guard`'s Bash half deliberately resolves
+    # nothing (see it for why).
+    if _is_resident_trigger_file(norm):
+        return ("trigger_file", norm, "")
     return None
 
 
@@ -1573,6 +1654,10 @@ def make_managed_component_guard() -> HookCallback:
                     if kind == "resolve_error":
                         return _deny(_MANAGED_RESOLVE_DENY.format(
                             tool=tool_name, path=raw))
+                    if kind == "trigger_file":
+                        # Shares the classifier, not the reason (#403).
+                        return _deny(_TRIGGER_WRITE_DENY.format(
+                            tool=tool_name, path=raw))
                     return _deny(
                         f"managed_component_guard: {tool_name} blocked — "
                         f"{raw!r} is managed component state; hand-editing "
@@ -1590,6 +1675,9 @@ def make_managed_component_guard() -> HookCallback:
                     if write_shape or _managed_inline_interpreter(command):
                         if kind == "hooks_yaml":
                             return _deny(_MANAGED_HOOKS_YAML_DENY.format(
+                                tool="Bash", path=subject))
+                        if kind == "trigger_file":
+                            return _deny(_TRIGGER_WRITE_DENY.format(
                                 tool="Bash", path=subject))
                         verb = ("writes into" if write_shape
                                 else "runs inline interpreter code against")
@@ -1624,6 +1712,259 @@ def managed_component_guard_matcher():
     definition/hooks-file manipulation can remove this guard."""
     from claude_agent_sdk import HookMatcher
     policy = HOOK_POLICIES["managed_component_guard"]
+    return HookMatcher(
+        matcher=policy["matcher"],
+        hooks=[policy["factory"]()],
+    )
+
+
+# ---------------------------------------------------------------------------
+# trigger_file_write_guard (#403) — agents/<role>/triggers.yaml has TWO writers
+# ---------------------------------------------------------------------------
+#
+# The other one is the resident's own reminder tools, which read-modify-write
+# the whole document inside the Casa process. An executor is a separate CLI
+# child process, so its Read→Edit spans model thinking time: a reminder set in
+# that window is silently discarded by the stale rewrite, and config_git_commit's
+# `git add -A` commits the loss. No lock can fence that — the only fix is one
+# writer, so the edit is denied here and routed to config_trigger_upsert /
+# config_trigger_delete, which perform it in-process on the loop.
+#
+# triggers.yaml is the OPERATOR's file — hand-editable by the operator and
+# readable by every agent — so this is a separate policy from
+# managed_component_guard rather than a widening of it. They share the path
+# classifier and each denies in its own words; what is forbidden is an AGENT
+# writing it.
+
+# Shell quoting characters, stripped from the WHOLE command before it is
+# searched for the filename. `triggers"."yaml` is one word to bash and a
+# different word to a naive parser (Sol r1-2); the concatenation is invisible
+# unless the quotes come off first.
+_SHELL_QUOTE_CHARS = str.maketrans("", "", "'\"\\")
+
+def _command_mentions_a_trigger_file(command: str) -> bool:
+    """True iff *command*'s text names ``triggers.yaml``, with shell quoting
+    removed from the WHOLE command first.
+
+    Stripping the quotes globally rather than per token is what makes the
+    splice forms one case instead of many: ``triggers.""yaml``,
+    ``triggers"."yaml``, ``\'triggers.yaml\'`` and ``tri\'\'ggers.yaml`` all
+    reduce to the same text, and a redirect target, a verb operand and an
+    interpreter body are no longer different parsing problems.
+    """
+    return _TRIGGER_FILE_NAME in command.translate(_SHELL_QUOTE_CHARS)
+
+
+# Commands that read a file and cannot write one. An ALLOWLIST, and that is the
+# whole point: the write side is an open namespace — a denylist of write verbs
+# still missed `command cp`, `env cp` and `bash -c "cp …"`, because a wrapper
+# can put any program in argv[0]. Anything not named here
+# is treated as a write, so an unfamiliar verb costs a refusal rather than a
+# lost reminder. Kept small on purpose: it only has to cover what the recipes
+# actually tell an agent to do with this file, which is look at it.
+# Deliberately ABSENT: `sed` (`-i` edits in place), `awk`/`yq`/`jq` (all can
+# write), every interpreter, and `find` (`-delete`, `-exec`).
+# Round 3 pruned three of these after Sol demonstrated each writing a file:
+# `xxd infile OUTFILE` takes a second operand, `rg --pre=<prog>` executes an
+# arbitrary preprocessor (`--pre=tee` rewrites the file it is reading), and
+# `file -C` compiles a magic database. An allowlist is only as good as its
+# audit, which is the price of it being the safe direction.
+_TRIGGER_READ_ONLY_VERBS = frozenset({
+    "cat", "head", "tail", "wc", "nl", "od",
+    "grep", "egrep", "fgrep", "zgrep",
+    "ls", "stat", "readlink", "realpath", "basename", "dirname",
+    "cmp", "md5sum", "sha1sum", "sha256sum", "cksum",
+    "cd", "pwd", "echo", "printf", "true", "test", "[",
+})
+
+# Any substitution makes a segment's argv[0] a lie about what runs:
+# `echo $(cp /tmp/x triggers.yaml)` is headed by an allowlisted program and
+# writes the file (Sol r3-2). None of the reads above needs one, so their
+# presence simply ends the read-only claim.
+_SUBSTITUTION_RE = re.compile(r"\$\(|`|<\(|>\(")
+
+
+def _provably_read_only(command: str) -> bool:
+    """True only when every segment of *command* is a recognised read-only
+    program AND the command contains no redirect.
+
+    The inverse of the question the previous three rounds asked. "Does this
+    write" is undecidable over an open set of programs and spellings; "is every
+    program here one of these twenty, and is there no `>`" is decidable over a
+    closed one. Unknown reads as a write, which is the fail-closed direction.
+
+    Benign redirects (`2>/dev/null`, `>&2`) are stripped first, so the ordinary
+    verification forms are not mistaken for writes — the same courtesy the
+    managed classifier extends. A command substitution, backtick or process
+    substitution anywhere ends the claim outright: it makes argv[0] a lie about
+    what runs, and no read this set covers needs one.
+    """
+    if _SUBSTITUTION_RE.search(command):
+        return False
+    scan = _MANAGED_BENIGN_REDIRECT_RE.sub(" ", command)
+    if _MANAGED_REDIRECT_RE.search(scan):
+        return False
+    segments = _split_pipeline(command)
+    if not segments:
+        return False
+    for argv in segments:
+        if not argv:
+            return False
+        prog = argv[0]
+        if "/" in prog:
+            # A PATH-QUALIFIED program is never allowlisted. The set names
+            # programs, not files, and `/data/engagements/e1/cat` is an
+            # executable an agent wrote itself (Terra r3-2) — basename matching
+            # alone would let it inherit `cat`'s reputation. This does not close
+            # the class (a shadowing `cat` earlier in PATH still runs), which is
+            # part of why the Bash half is a backstop and not a boundary (#460).
+            return False
+        if prog == "git":
+            # `git` earns an exception because the read/write split for it is
+            # already decided, audited and tested next door: the managed
+            # guard's `_MANAGED_GIT_READONLY_SUBCMDS` allowlist plus its
+            # option handling. Without it `git diff -- triggers.yaml` — a normal
+            # plugin-developer action on an unrelated file — is refused with no
+            # equivalent (Terra r3-3), since a file tool cannot produce a diff.
+            if _argv_managed_write(argv):
+                return False
+            continue
+        if prog not in _TRIGGER_READ_ONLY_VERBS:
+            return False
+    return True
+
+
+def make_trigger_file_write_guard() -> HookCallback:
+    """Deny an agent's direct write of a resident's ``triggers.yaml``.
+
+    **Write/Edit/MultiEdit/NotebookEdit is decidable for a path that RESOLVES,
+    and this half is sound for exactly that.** A hard link is the same inode
+    under another name and ``realpath`` reports the alias; a symlink retargeted
+    between this check and the write is a race no pre-tool hook can close. Both
+    are #460's family, not defects here.
+    The path is a literal, resolved against the SESSION's own working directory
+    — residents run from their agent home, not from ``/config``, so a fixed
+    ``/config`` base made `../../agents/<role>/triggers.yaml` resolve to
+    something that does not exist and read as allowed (Sol r1-1). Then
+    normalized and symlink-resolved; a realpath ``OSError`` denies.
+
+    **Bash asks two deliberately coarse questions, because the precise ones have
+    no answer.** Four review rounds tried to decide, from the command text,
+    WHICH path a shell writes to and WHETHER it writes. Each round closed the
+    previous round's spelling and the next found another — a bare basename after
+    a ``cd``, a quote-spliced name, an opaque interpreter body, a redirect target
+    whose quotes the parser stopped at, a ``$PWD`` only bash expands,
+    ``command cp`` / ``env cp`` / ``bash -c "cp …"`` past a write-verb list.
+    That is not a run of bugs; both questions range over open sets — a shell
+    computes its destination at runtime, and a wrapper can put any program in
+    argv[0]. So both judgments are gone, and what is left is decidable over
+    CLOSED sets:
+
+    * does the command text name ``triggers.yaml`` at all, with shell quoting
+      stripped from the whole command first (so every splice form is one case);
+    * is it *provably read-only* — no substitution of any kind, no redirect,
+      and every pipeline segment a program named WITHOUT a path in
+      :data:`_TRIGGER_READ_ONLY_VERBS`, with ``git`` admitted by subcommand
+      through the managed guard's own audited read-only set.
+
+    Named and not provably read-only ⇒ deny. Unknown reads as a write, which is
+    the fail-closed direction and the reason this is an allowlist: the write side
+    cannot be enumerated, the read side can, and it only has to cover what the
+    recipes tell an agent to do with this file — look at it.
+
+    Deliberately over-broad, and the breadth is the cheap direction: a shell
+    write to ANY file of that name is refused wherever it lives, and an
+    unrecognised read verb is refused too. The way through is the file tools,
+    whose paths are literal and resolved exactly, or the typed
+    ``config_trigger_*`` tools for a resident's own file.
+
+    **The Bash half is a backstop, NOT a boundary, and nothing should be built
+    on it.** Four review rounds produced seventeen bypasses; the last one that
+    cannot be closed is bash's own quoting: ``tri$\'\'ggers.yaml`` and a
+    backslash-newline continuation both name the file to the shell while naming
+    something else to any parser, and ANSI-C quoting can encode any character.
+    Nor is the read allowlist truly closed while an agent can put its own ``cat``
+    earlier in ``PATH``.
+    A script file, or a path assembled from parts, does not name it at all.
+    So this half catches the *accidental* form — the one a model following an
+    old recipe would actually type — and claims nothing more; INV-TRIG-011 is
+    scoped to the file-tool half for exactly that reason. The real boundary for
+    an agent with broad shell access is filesystem enforcement or not having a
+    shell over ``/config/agents`` (#460); this is the same residual
+    ``make_agent_home_settings_guard`` records for ``settings.json``.
+    """
+    async def _hook(
+        input_data: dict[str, Any],
+        tool_use_id: str | None,
+        context: dict[str, Any],
+    ) -> dict[str, Any]:
+        try:
+            tool_name = input_data.get("tool_name", "")
+            # The session's real cwd. Executors run from /config; residents run
+            # from their agent home. Never assume one of them.
+            reported_cwd = input_data.get("cwd")
+            cwd = str(reported_cwd or "/config")
+            if tool_name in ("Write", "Edit", "MultiEdit", "NotebookEdit"):
+                ti = input_data.get("tool_input", {})
+                raw = ti.get("file_path") or ti.get("notebook_path") or ""
+                if not reported_cwd and not raw.startswith("/"):
+                    # `cwd` is a REQUIRED field of the SDK's hook input, so its
+                    # absence means the payload did not come from the CLI.
+                    # Without it a relative path cannot be resolved AT ALL, and
+                    # the /config fallback below would resolve a resident's
+                    # `../../agents/<role>/triggers.yaml` to a path that does not
+                    # exist and read as allowed. Every relative path denies, not
+                    # just one whose basename matches: a relative SYMLINK names
+                    # nothing recognisable and still resolves to the file
+                    # (Terra r2-3). Naming it absolutely is the way through.
+                    return _deny(_TRIGGER_UNRESOLVABLE_DENY.format(
+                        tool=tool_name, path=raw))
+                norm = _normalize_path(
+                    raw if raw.startswith("/") else cwd.rstrip("/") + "/" + raw)
+                hit = _trigger_file_real_hit(norm)
+                if hit == "resolve_error":
+                    return _deny(_TRIGGER_RESOLVE_DENY.format(
+                        tool=tool_name, path=raw))
+                if hit == "hit":
+                    return _deny(_TRIGGER_WRITE_DENY.format(
+                        tool=tool_name, path=raw))
+            elif tool_name == "Bash":
+                command = input_data.get("tool_input", {}).get("command", "")
+                if (_command_mentions_a_trigger_file(command)
+                        and not _provably_read_only(command)):
+                    return _deny(_TRIGGER_WRITE_DENY.format(
+                        tool="Bash", path=_TRIGGER_FILE_NAME))
+            return {}
+        except asyncio.CancelledError:
+            raise
+        except Exception:  # noqa: BLE001 — fail closed, never let it escape
+            _logger.exception(
+                "trigger_file_write_guard internal error — denying")
+            return _deny(_TRIGGER_INTERNAL_DENY)
+
+    return _hook
+
+
+def _trigger_file_write_guard_factory(**kwargs: Any) -> HookCallback:
+    if kwargs:
+        raise UnknownPolicyError(
+            f"trigger_file_write_guard: unknown parameter(s) {list(kwargs)}; "
+            f"it takes none"
+        )
+    return make_trigger_file_write_guard()
+
+
+def trigger_file_write_guard_matcher():
+    """A ``HookMatcher`` wrapping :func:`make_trigger_file_write_guard`,
+    injected CODE-SIDE into every executor session (``tools``) AND every
+    resident's (``agent``) for the same reason
+    :func:`managed_component_guard_matcher` is: ``hooks_file:`` is a
+    config-editable pointer, so a yaml-only policy can be shed by an edit the
+    configurator is otherwise entitled to make. Residents are included because
+    the shipped assistant carries broad shell access and its own reminder tools
+    write the very file this covers."""
+    from claude_agent_sdk import HookMatcher
+    policy = HOOK_POLICIES["trigger_file_write_guard"]
     return HookMatcher(
         matcher=policy["matcher"],
         hooks=[policy["factory"]()],
@@ -2382,6 +2723,13 @@ HOOK_POLICIES: dict[str, dict[str, Any]] = {
     "commit_size_guard": {
         "matcher": "Write|Edit",
         "factory": _commit_size_guard_factory,
+    },
+    "trigger_file_write_guard": {
+        # Every write-capable primitive, not just the two obvious ones — the
+        # settings guard learned this the same way (Sol round-3 B3a): a matcher
+        # that does not ROUTE MultiEdit/NotebookEdit lets those bypass entirely.
+        "matcher": "Write|Edit|MultiEdit|NotebookEdit|Bash",
+        "factory": _trigger_file_write_guard_factory,
     },
     "self_containment_guard": {
         "matcher": "Bash",

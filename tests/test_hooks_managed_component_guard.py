@@ -73,7 +73,10 @@ async def test_write_edit_denied_under_managed_prefix(
 
 @pytest.mark.parametrize("path", [
     # NOT managed: ordinary resident config the configurator legitimately edits.
-    "/config/agents/assistant/triggers.yaml",
+    # NOTE (#403): deliberately NOT triggers.yaml — that file joined this
+    # classifier under its own kind, and the guard now denies it with the
+    # trigger-file reason (see test_resident_trigger_file_is_denied_with_its_own_reason).
+    "/config/agents/assistant/delegates.yaml",
     "/config/policies/x.yaml",
     "/config/workspace/scratch.md",
     # hooks.yaml OUTSIDE /config/agents/ is not a policy-file self-edit.
@@ -243,7 +246,7 @@ class TestNoopReturnsEmptyDict:
     async def test_allowed_write(self):
         out = await _hook()(
             {"tool_name": "Write",
-             "tool_input": {"file_path": "/config/agents/assistant/triggers.yaml"}},
+             "tool_input": {"file_path": "/config/agents/assistant/delegates.yaml"}},
             None, {},
         )
         assert out == {}, f"expected empty dict, got {out!r}"
@@ -346,7 +349,7 @@ async def test_shipped_configurator_stack_allows_resident_write():
                         "cwd": f"/data/engagements/{ENG_ID}",
                         "tool_input": {
                             "file_path":
-                                "/config/agents/assistant/triggers.yaml"}}})
+                                "/config/agents/assistant/delegates.yaml"}}})
         assert await resp.json() == {}
 
 
@@ -789,8 +792,10 @@ class TestGuardIsCodeMandatoryInCasa:
             yaml_mod.safe_load(shipped.read_text(encoding="utf-8"))
             ["pre_tool_use"])
         opts = self._build(str(shipped))
-        # + 1 = agent_home_settings_guard matcher; no second managed guard.
-        assert len(opts.hooks["PreToolUse"]) == n_declared + 1
+        # + 2 = agent_home_settings_guard and trigger_file_write_guard (#403),
+        # both code-mandatory and neither declared in the shipped yaml; NO
+        # second managed guard, which is what this test is about.
+        assert len(opts.hooks["PreToolUse"]) == n_declared + 2
         assert await _stack_denies_managed(opts)
 
 
@@ -1063,3 +1068,38 @@ async def test_bash_env_shape_inside_args_not_confused():
         "command": "grep 'MODE=1' /config/plugins/store/x/plugin.json"}},
         None, {})
     assert out == {}
+
+
+# ---------------------------------------------------------------------------
+# #403 — a resident's triggers.yaml shares this classifier under its own kind
+# ---------------------------------------------------------------------------
+
+
+async def test_resident_trigger_file_is_denied_with_its_own_reason():
+    """It is NOT managed component state — it is the operator's file — but it
+    is a file no agent may write, because the resident's reminder tools write
+    it from inside Casa. It joins the classifier so the Bash half (redirect
+    targets, destination-aware cp/rsync, git --output, wrapper unwrapping,
+    symlink resolution) is not written twice and cannot drift; the KIND stays
+    distinct so each guard says why in its own words."""
+    out = await _hook()(
+        {"tool_name": "Write",
+         "tool_input": {"file_path": "/config/agents/assistant/triggers.yaml"}},
+        None, {},
+    )
+    assert _decision(out) == "deny"
+    assert "config_trigger_upsert" in _reason(out)
+    assert "managed component state" not in _reason(out)
+
+
+async def test_resident_trigger_file_bash_redirect_is_denied():
+    """The reason the classifier is shared rather than copied: this needed the
+    redirect-target resolution the managed rules already own."""
+    out = await _hook()(
+        {"tool_name": "Bash",
+         "tool_input": {"command":
+                        "echo x > /config/agents/assistant/triggers.yaml"}},
+        None, {},
+    )
+    assert _decision(out) == "deny"
+    assert "config_trigger_upsert" in _reason(out)

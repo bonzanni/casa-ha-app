@@ -7,11 +7,21 @@ User wants to change schedule, prompt, or channel for an existing trigger.
 1. **Which trigger, on which agent?**
 2. **What specifically?**
 
-## Update the YAML
+## Update the trigger — `config_trigger_upsert`, never a hand edit
 
-Edit agents/<role>/triggers.yaml. Find the entry by name, change the field(s).
+**You cannot Edit or Write `agents/<role>/triggers.yaml`. The hook denies it**
+— the resident's reminder tools write the same file from inside Casa, and a
+hand edit silently discards whatever landed since you read it.
 
-Per-trigger prompt in prompts/<trigger_name>.md - edit that too.
+`config_trigger_upsert` REPLACES the entry of the same name, in place, so pass
+the trigger's full shape — every field it should end up with, not just the ones
+that changed. Read the file first to see what it currently has; reads are fine.
+
+    config_trigger_upsert(role="<role>", name="<trigger_name>",
+                          type="cron", schedule="0 7 * * 1-5",
+                          channel="telegram", prompt="<imperative>")
+
+Per-trigger prompt in prompts/<trigger_name>.md — that one IS an ordinary edit.
 
 ## Reload — MANDATORY before emit_completion
 
