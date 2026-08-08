@@ -1576,6 +1576,60 @@ async def test_credential_migration_rewrites_and_cycles_the_service(
     assert reg._records["keep1"].status != "error"
 
 
+async def test_stale_url_with_matching_token_rewrites_and_cycles(
+    monkeypatch, tmp_path,
+):
+    """v0.164.0: a workspace whose .mcp.json carries the record's CURRENT
+    token but a stale server URL (e.g. the retired public-8099 endpoint) is
+    rewritten to the served URL and its service cycled — the token check
+    alone would skip it, leaving an engagement whose every tool call hits a
+    route that no longer exists. Red case demonstrated: dropping the
+    workspace_mcp_url comparison from replay's rewrite predicate fails this
+    test."""
+    from casa_core import replay_undergoing_engagements
+    from drivers import s6_rc
+    from drivers.workspace import (
+        workspace_mcp_token, workspace_mcp_url, write_workspace_mcp_json,
+    )
+    from engagement_registry import EngagementRegistry
+
+    monkeypatch.setattr(s6_rc, "sweep_orphan_service_dirs", lambda **kw: [])
+    monkeypatch.setattr(s6_rc, "sweep_orphan_compiled_dbs", lambda: None)
+    monkeypatch.setattr(s6_rc, "service_pair_complete", lambda **kw: True)
+    monkeypatch.setattr(s6_rc, "run_script_is_stale", lambda **kw: False)
+    monkeypatch.setattr(s6_rc, "_compile_and_update_locked", AsyncMock())
+    started: list[str] = []
+    async def fake_start(*, engagement_id): started.append(engagement_id)
+    monkeypatch.setattr(s6_rc, "start_service", fake_start)
+    down = AsyncMock(return_value=True)
+    monkeypatch.setattr(s6_rc, "ensure_service_down", down)
+
+    ws_root = tmp_path / "eng"
+    (ws_root / "keep1").mkdir(parents=True)
+    reg = EngagementRegistry(tombstone_path=str(tmp_path / "tomb.json"), bus=None)
+    rec = _brief_rec("keep1", _BRIEF)
+    rec.origin = {}
+    rec.auth_token = "tok-same"
+    reg._records["keep1"] = rec
+    # The token already matches the record; ONLY the URL is stale.
+    write_workspace_mcp_json(
+        str(ws_root / "keep1"), engagement_id="keep1",
+        engagement_auth_token="tok-same",
+        casa_framework_mcp_url="http://127.0.0.1:8099/mcp/casa-framework")
+    driver = _boot_driver()
+    driver._spawn_background_tasks = lambda rec: None
+
+    await replay_undergoing_engagements(
+        registry=reg, driver=driver, engagements_root=str(ws_root))
+
+    assert (workspace_mcp_url(str(ws_root / "keep1"))
+            == "http://127.0.0.1:8100/mcp/casa-framework")
+    assert workspace_mcp_token(str(ws_root / "keep1")) == "tok-same"
+    down.assert_awaited_once()           # cycled so the CLI reloads it
+    assert started == ["keep1"]
+    assert reg._records["keep1"].status != "error"
+
+
 async def test_unchanged_credential_neither_rewrites_nor_cycles(
     monkeypatch, tmp_path,
 ):

@@ -187,6 +187,42 @@ class TestBootWebhookPurge:
         assert not any(k.startswith("webhook-") for k in reg.all_entries())
         assert reg._data["telegram-999"]["sdk_session_id"] == "c"
 
+    async def test_boot_wires_the_purge_and_persists_it(self, tmp_path):
+        """The purge is only worth anything if boot actually runs it and the
+        result reaches DISK — an in-memory purge resurrects on the next read
+        of sessions.json. Pins both halves: casa_core's boot sequence names
+        purge_webhook_sessions + save, and the purge+save pair leaves the
+        reopened file free of webhook rows. Red case demonstrated: deleting
+        the purge call from casa_core.main (or its save) fails this test."""
+        import inspect
+        import json as _json
+
+        import casa_core
+        from session_registry import SessionRegistry
+
+        # (a) Wiring: the boot path invokes the purge and saves on change.
+        src = inspect.getsource(casa_core.main)
+        assert "purge_webhook_sessions()" in src
+        purge_at = src.index("purge_webhook_sessions()")
+        assert "await session_registry.save()" in src[purge_at:], (
+            "boot purge is not followed by a durable save")
+
+        # (b) Durability: purge + save leaves the reopened file clean.
+        path = tmp_path / "sessions.json"
+        path.write_text(_json.dumps({
+            "webhook-stray": {"agent": "assistant", "sdk_session_id": "a",
+                              "last_active": "2026-07-14T00:00:00+00:00"},
+            "telegram-999": {"agent": "assistant", "sdk_session_id": "c",
+                             "last_active": "2026-07-14T00:00:00+00:00"},
+        }))
+        reg = SessionRegistry(str(path))
+        assert reg.purge_webhook_sessions() == 1
+        await reg.save()
+        reopened = SessionRegistry(str(path))
+        assert not any(k.startswith("webhook-")
+                       for k in reopened.all_entries())
+        assert reopened.get("telegram-999")["sdk_session_id"] == "c"
+
 
 class TestVoicePoolRoleKeyed:
     def test_two_roles_one_scope_distinct_sessions(self):

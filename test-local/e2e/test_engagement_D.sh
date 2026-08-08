@@ -85,7 +85,7 @@ async def main():
     drv = ClaudeCodeDriver(
         engagements_root="/data/engagements",
         send_to_topic=lambda *a, **kw: _noop(),
-        casa_framework_mcp_url="http://127.0.0.1:8080/mcp/casa-framework",
+        casa_framework_mcp_url="http://127.0.0.1:8100/mcp/casa-framework",
     )
 
     # Minimal ExecutorDefinition fixture for the engagement_D e2e (label is incidental, no on-disk executor matches)
@@ -146,7 +146,7 @@ async def main():
     drv = ClaudeCodeDriver(
         engagements_root="/data/engagements",
         send_to_topic=lambda *a, **kw: _noop(),
-        casa_framework_mcp_url="http://127.0.0.1:8080/mcp/casa-framework",
+        casa_framework_mcp_url="http://127.0.0.1:8100/mcp/casa-framework",
     )
     defn = ExecutorDefinition(
         type="test-fixture-driver", description="hello test driver harness xx",
@@ -193,7 +193,7 @@ async def main():
     drv = ClaudeCodeDriver(
         engagements_root="/data/engagements",
         send_to_topic=lambda *a, **kw: _noop(),
-        casa_framework_mcp_url="http://127.0.0.1:8080/mcp/casa-framework",
+        casa_framework_mcp_url="http://127.0.0.1:8100/mcp/casa-framework",
     )
     defn = ExecutorDefinition(
         type="test-fixture-driver", description="hello test driver harness xx",
@@ -250,7 +250,7 @@ async def main():
     drv = ClaudeCodeDriver(
         engagements_root="/data/engagements",
         send_to_topic=lambda *a, **kw: _noop(),
-        casa_framework_mcp_url="http://127.0.0.1:8080/mcp/casa-framework",
+        casa_framework_mcp_url="http://127.0.0.1:8100/mcp/casa-framework",
     )
     defn = ExecutorDefinition(
         type="test-fixture-driver", description="hello test driver harness xx",
@@ -305,7 +305,7 @@ async def main():
     drv = ClaudeCodeDriver(
         engagements_root="/data/engagements",
         send_to_topic=lambda *a, **kw: _noop(),
-        casa_framework_mcp_url="http://127.0.0.1:8080/mcp/casa-framework",
+        casa_framework_mcp_url="http://127.0.0.1:8100/mcp/casa-framework",
     )
     defn = ExecutorDefinition(
         type="test-fixture-driver", description="hello test driver harness xx",
@@ -360,7 +360,8 @@ sys.path.insert(0, "/opt/casa")
 
 async def main():
     # This harness needs the real Casa MCP server reachable. We use the
-    # in-container loopback at http://127.0.0.1:8080/mcp/casa-framework.
+    # in-container loopback at http://127.0.0.1:8100/mcp/casa-framework
+    # (svc-casa-mcp, the only server for these routes).
     # casa_core initializes it during container boot, so the endpoint is up.
     from engagement_registry import EngagementRegistry
     from drivers.claude_code_driver import ClaudeCodeDriver
@@ -375,7 +376,7 @@ async def main():
     drv = ClaudeCodeDriver(
         engagements_root="/data/engagements",
         send_to_topic=lambda *a, **kw: _noop(),
-        casa_framework_mcp_url="http://127.0.0.1:8080/mcp/casa-framework",
+        casa_framework_mcp_url="http://127.0.0.1:8100/mcp/casa-framework",
     )
     defn = ExecutorDefinition(
         type="test-fixture-driver", description="hello test driver harness xx",
@@ -430,7 +431,7 @@ async def main():
     # POST directly to /hooks/resolve to verify the endpoint is alive and
     # returns block for our registered policy.
     req = urllib.request.Request(
-        "http://127.0.0.1:8080/hooks/resolve",
+        "http://127.0.0.1:8100/hooks/resolve",
         data=json.dumps({"policy": "always_block_write",
                          "payload": {"tool_name": "Write"}}).encode(),
         headers={"Content-Type": "application/json"},
@@ -442,7 +443,7 @@ async def main():
 
     # Also verify unknown policy → block
     req2 = urllib.request.Request(
-        "http://127.0.0.1:8080/hooks/resolve",
+        "http://127.0.0.1:8100/hooks/resolve",
         data=json.dumps({"policy": "nonexistent", "payload": {}}).encode(),
         headers={"Content-Type": "application/json"},
         method="POST",
@@ -471,7 +472,7 @@ async def main():
     drv = ClaudeCodeDriver(
         engagements_root="/data/engagements",
         send_to_topic=lambda *a, **kw: _noop(),
-        casa_framework_mcp_url="http://127.0.0.1:8080/mcp/casa-framework",
+        casa_framework_mcp_url="http://127.0.0.1:8100/mcp/casa-framework",
     )
     defn = ExecutorDefinition(
         type="test-fixture-driver", description="hello test driver harness xx",
