@@ -19,9 +19,9 @@ most important thing here, and it is the opposite of what the architecture sugge
 in this application reads Home Assistant's entity registry or refuses an action because of
 the entity or domain it names. Action arguments are forwarded unchanged for ordinary tools —
 the one exception is the live-context tool, whose upstream arguments the facade replaces
-outright (a requested domain never leaves the facade) and whose response it domain-filters
-only when the upstream answers in the legacy mapping shape — the current curated
-success/result shape passes through unfiltered.
+outright (a requested domain never leaves the facade). Its response passes through
+unfiltered; the facade only logs the observed response shape so an upstream contract
+change stays visible.
 
 Two different limits apply, and they answer different questions. *Which agents can talk to
 Home Assistant at all* is Casa configuration: an agent reaches these tools only if its
@@ -32,9 +32,8 @@ operator-controlled, and outside this repository. If you need a connected agent 
 able to touch something, that is where to do it; adding a per-entity check here would be
 adding the first one.
 
-**A facade wraps the underlying tool surface**, curating what is offered and doing some
-filtering of what comes *back*. Read filtering and write authorization are different things,
-and only the first is happening. The curation is dynamic, not an allowlist: the facade
+**A facade wraps the underlying tool surface**, curating what is offered. It does not
+filter what comes *back*, and it does not authorize writes. The curation is dynamic, not an allowlist: the facade
 mirrors every upstream tool that carries a valid object schema, skipping malformed ones
 individually and substituting only the live-context tool's schema — there is no manual
 mapping to add a tool to.

@@ -61,8 +61,8 @@ registry; behavioural guarantees belong in the ordinary suite. See
 that the unit suite does not exercise.
 
 **Adding an option is never one edit.** The manifest, the schema, the translations, and
-whatever reads it. Removing one additionally needs its key on the boot script's deprecated
-list, or a stale stored value lingers. See `architecture/configuration.md`.
+whatever reads it. Removing one leaves the stored value behind (a boot warning from the
+host, ignored by Casa) until it is cleaned by hand. See `architecture/configuration.md`.
 
 **Put a constraint where it will actually run.** A check inside a tool applies to every
 caller. A check in an agent's declared tool list applies only to agents arriving through that

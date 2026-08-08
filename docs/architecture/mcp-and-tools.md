@@ -146,9 +146,9 @@ What it does not cover: a caller with shell access reads the file directly — t
 **INV-MCP-006**: Hook resolution binds an engagement only via the per-engagement credential — a known id with a missing or mismatched token is refused, an unauthenticated request selects no executor hook parameters and reaches no identity-consuming hook policy, and an authenticated identity contradicting the payload's working-directory claim is refused.
 
 The same verification function as INV-MCP-004, on the hook route. The shim sends the
-credential pair from its own workspace `.mcp.json` as headers; the bridge and the public
-fallback rebuild the forwarded body from those headers alone, so a body-borne identity
-claim cannot bypass them. The resolver threads the authenticated identity to the policy
+credential pair from its own workspace `.mcp.json` as headers; the bridge rebuilds the
+forwarded body from those headers alone, so a body-borne identity claim cannot bypass
+it. The resolver threads the authenticated identity to the policy
 callback in-process; the permission relay and the buttons reminder act only on that
 identity, which is what stops a forged working directory from posting a permission
 keyboard into another engagement's topic or borrowing another executor's hook parameters.
