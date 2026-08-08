@@ -1225,19 +1225,24 @@ class TelegramChannel(Channel):
         """The configured operator's Telegram user id, or ``None`` when no
         operator identity exists (#374).
 
-        Derived from ``telegram_chat_id`` under exactly the
-        ``_user_id_is_operator`` rules (the single home of the operator
-        rule): empty (accept-all) ⇒ ``None``; a group id (negative) or any
-        non-positive/non-numeric value can never be a user id ⇒ ``None``.
-        Callers binding an approval surface treat ``None`` fail-closed —
-        NOBODY is the operator.
+        Derived from ``telegram_chat_id`` and then verified through
+        ``_user_id_is_operator`` — the single home of the operator rule —
+        so the two can never disagree: a configuration whose canonical
+        integer form the exact string match would reject (``"007"``) names
+        NOBODY here too, rather than an id the identity system classifies
+        as non-operator. Empty (accept-all), a group id (negative), and any
+        non-positive/non-numeric value ⇒ ``None``. Callers binding an
+        approval surface treat ``None`` fail-closed — NOBODY is the
+        operator.
         """
         configured = str(self.chat_id or "").strip()
         try:
             user_id = int(configured)
         except ValueError:
             return None
-        return user_id if user_id > 0 else None
+        if user_id <= 0 or not self._user_id_is_operator(user_id):
+            return None
+        return user_id
 
     def _origin_clearance_for_user_id(self, user_id) -> str:
         """The per-sender read clearance stamped on a telegram turn (#336)."""
