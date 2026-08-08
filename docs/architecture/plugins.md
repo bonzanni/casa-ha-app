@@ -107,9 +107,15 @@ canonical arguments — so an approval authorises one action with one argument s
 capability.
 
 What it does not cover: unprotected plugin tools, and the executor path entirely. And
-"proceeds by consuming" applies to direct resident calls and ephemerally delegated
-specialists — a call whose provenance is an interactive *engagement* is denied outright,
-before any grant lookup: protected tools are not available inside engagements at all.
+"proceeds by consuming" applies to direct resident calls, ephemerally delegated
+specialists, and — since #400 — interactive specialist *engagements*: a protected call whose
+provenance is an engagement routes through the same DM authorization challenge, but its grant
+additionally binds the engagement id, so an approval minted inside one engagement can never
+consume a matching call in another. Identity for the engagement path comes from the live
+engagement record (its own operator DM), and on approval the challenge resumes that
+engagement rather than a resident continuation. A non-authorizable engagement record (not an
+active specialist with a topic and a reachable operator) still denies, fail-closed, before any
+grant lookup.
 
 Who may approve is a separate guarantee, INV-PLUG-007: read this invariant as "one
 approval authorises one action" and that one as "the approver is the configured operator".

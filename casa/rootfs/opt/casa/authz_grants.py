@@ -116,6 +116,13 @@ class GrantKey:
     artifact_id: str
     tool_name: str
     args_hash: str
+    # #400: the engagement this grant was minted inside, or "" for the
+    # direct/delegated DM path (which has no engagement). Binding it into the
+    # key means a grant approved inside engagement E1 can NEVER be consumed by
+    # a DIFFERENT engagement E2 whose (operator, chat, role, artifact, tool,
+    # args) happen to match — the approval is call-AND-engagement-bound. The
+    # "" default preserves the DM/direct path's key identity byte-for-byte.
+    engagement_id: str = ""
 
 
 @dataclass
@@ -613,6 +620,7 @@ class ChallengeCoordinator:
         target_role: str, tool_name: str, canonical_json: str,
         enforcement_role: str, channel: Any,
         summary: "str | None" = None, display_name: "str | None" = None,
+        engagement_id: str = "",
     ) -> ChallengeHandle:
         existing = self._entries.get(key)
         if existing is not None:
@@ -644,7 +652,7 @@ class ChallengeCoordinator:
                 target_role=target_role, enforcement_role=enforcement_role,
                 tool_name=tool_name, canonical_json=canonical_json,
                 rid=req.request_id, message_id=message_id, req=req,
-                display_name=display_name,
+                display_name=display_name, engagement_id=engagement_id,
             )
 
         return self.register_challenge(
@@ -688,12 +696,31 @@ class ChallengeCoordinator:
         self, *, channel: Any, chat_id: int, operator_id: int,
         target_role: str, enforcement_role: str, tool_name: str,
         canonical_json: str, rid: str, message_id: int, req: Any,
-        display_name: "str | None" = None,
+        display_name: "str | None" = None, engagement_id: str = "",
     ) -> Callable[[dict], Any]:
         short = short_tool_name(tool_name)
         # Same render-time guard as the challenge headline (W2): the approved
         # settlement names the agent; deny/expired are name-free by decision.
         display = _resolve_display_name(display_name, enforcement_role)
+
+        # #400: an engagement-origin challenge resumes the SPECIALIST ENGAGEMENT
+        # (the finish hook re-delivers a system turn into rec.id/topic via the
+        # channel's engagement-resume seam) instead of dispatching a synthetic
+        # button turn to a resident bus role. The engagement id is bound into the
+        # GrantKey too, so the retried call consumes only THIS engagement's grant.
+        async def _dispatch_continuation(text: str) -> bool:
+            if engagement_id:
+                return await channel._dispatch_engagement_continuation(
+                    engagement_id=engagement_id, text=text,
+                )
+            return await channel._dispatch_button_continuation(
+                chat_id=chat_id, user_id=operator_id,
+                target_role=target_role, request_id=rid, text=text,
+            )
+
+        _target_desc = (
+            f"engagement {engagement_id[:8]}" if engagement_id else target_role
+        )
 
         async def _finish(outcome: dict) -> None:
             o = outcome.get("outcome") if isinstance(outcome, dict) else None
@@ -721,34 +748,28 @@ class ChallengeCoordinator:
                     f"✅ Approved — {display} ({enforcement_role}) may run "
                     f"{short} once with exactly these arguments",
                 )
-                ok = await channel._dispatch_button_continuation(
-                    chat_id=chat_id, user_id=operator_id,
-                    target_role=target_role, request_id=rid,
-                    text=(
-                        "[authorization approved]: have "
-                        f"{enforcement_role} call {tool_name} with EXACTLY "
-                        f"these arguments:\n{canonical_json}"
-                    ),
+                ok = await _dispatch_continuation(
+                    "[authorization approved]: have "
+                    f"{enforcement_role} call {tool_name} with EXACTLY "
+                    f"these arguments:\n{canonical_json}"
                 )
                 if not ok:
                     await channel.edit_dm_message(
                         chat_id, message_id,
-                        f"⚠️ Approved, but delivery to {target_role} "
+                        f"⚠️ Approved, but delivery to {_target_desc} "
                         "failed — say 'retry' in chat",
                     )
             else:
                 await channel.edit_dm_message(
                     chat_id, message_id, f"❌ Denied — {short} will not run",
                 )
-                ok = await channel._dispatch_button_continuation(
-                    chat_id=chat_id, user_id=operator_id,
-                    target_role=target_role, request_id=rid,
-                    text=f"[authorization denied]: do not retry {tool_name}",
+                ok = await _dispatch_continuation(
+                    f"[authorization denied]: do not retry {tool_name}"
                 )
                 if not ok:
                     await channel.edit_dm_message(
                         chat_id, message_id,
-                        f"⚠️ Denied, but delivery to {target_role} "
+                        f"⚠️ Denied, but delivery to {_target_desc} "
                         "failed — say 'retry' in chat",
                     )
 
@@ -866,9 +887,15 @@ class AuthzDeps:
 
 
 # Deny reasons — one source of truth (tests assert on these exact strings).
-_DENY_ENGAGEMENT = (
-    "protected tools are not available inside engagements yet "
-    "(operator ruling 2026-07-14)"
+# #400: the blanket "not available inside engagements" deny is GONE — an
+# operator-gated plugin tool on an interactive specialist engagement now routes
+# through the DM authorization challenge (engagement-bound grant). This deny
+# remains for engagement turns that CANNOT be authorized: a non-specialist /
+# non-active / topic-less / operator-less engagement record. Same
+# instruction-not-description rule as _DENY_POSTED — control flow only.
+_DENY_ENGAGEMENT_UNAVAILABLE = (
+    "not executed: this engagement cannot authorize a protected action "
+    "(no reachable operator). Do NOT retry the call."
 )
 _DENY_UNSUPPORTED_ORIGIN = (
     "protected action requires operator confirmation over the Telegram DM "
@@ -963,11 +990,115 @@ def make_resident_authz_hook(
 
             prov = turn_provenance()
 
-            # 1. Engagement deny FIRST — no challenge, and NO closure-role
-            # assertion on this path (an in_casa specialist engagement inherits
-            # the outer execution_role and must deny cleanly, never assert).
+            tool_input = (input_data or {}).get("tool_input") or {}
+
+            # Shared authorization tail (#368/#336/#221 discipline unchanged):
+            # operator check ⇒ canonicalize ⇒ single-use engagement-aware grant
+            # consume ⇒ else post/reuse ONE challenge and deny. ``engagement_id``
+            # is "" for the direct/delegated DM path and the engagement id for
+            # the #400 specialist-engagement path — it is folded into the
+            # GrantKey (so an approval binds to THIS engagement) AND threaded to
+            # the coordinator (so the approval finish hook resumes THIS
+            # engagement instead of dispatching a resident continuation).
+            async def _authorize(
+                *, deps: "AuthzDeps", operator_id: int, chat_id: int,
+                engagement_id: str, target_role: "str | None",
+            ) -> "dict[str, Any]":
+                # #368: only the CONFIGURED operator may satisfy a challenge —
+                # deny OUTRIGHT for any other sender, BEFORE the grant lookup and
+                # with NO challenge (the requester must never receive their own
+                # approval button). Accept-all mode (empty telegram_chat_id) ⇒ NO
+                # sender is the operator (#336). Fail-closed when the channel
+                # cannot answer the question.
+                is_op = getattr(deps.channel, "_user_id_is_operator", None)
+                if not callable(is_op) or not is_op(operator_id):
+                    return _deny(_DENY_NOT_OPERATOR)
+
+                # Canonicalize — the args_hash for the grant key AND the
+                # challenge body. Unserializable ⇒ deny with NO challenge (an
+                # unrenderable call can never match a grant minted from a valid
+                # hash).
+                try:
+                    canonical_json = canonical_args_json(tool_input)
+                except ValueError:
+                    return _deny(_DENY_UNRENDERABLE)
+                args_hash = hashlib.sha256(
+                    canonical_json.encode("utf-8")).hexdigest()
+
+                key = GrantKey(
+                    operator_id=operator_id, chat_id=chat_id,
+                    enforcement_role=role,
+                    artifact_id=protected[tool_name]["artifact_id"],
+                    tool_name=tool_name, args_hash=args_hash,
+                    engagement_id=engagement_id,
+                )
+
+                # Single-use consume (provenance already gated above).
+                if deps.grants.consume(key):
+                    return {}  # allow — operator freshly approved THIS call.
+
+                # No grant — post (or reuse) a confirmation challenge and deny.
+                # get_or_create renders + size-validates BEFORE any coordinator
+                # insert (too-large ⇒ refused).
+                handle = deps.challenges.get_or_create(
+                    key, chat_id=chat_id, operator_id=operator_id,
+                    target_role=target_role, tool_name=tool_name,
+                    canonical_json=canonical_json, enforcement_role=role,
+                    channel=deps.channel,
+                    summary=protected[tool_name].get("summary"),
+                    display_name=deps.display_name,
+                    engagement_id=engagement_id,
+                )
+                if handle.refused == "args_too_large":
+                    return _deny(_DENY_UNRENDERABLE)
+                if handle.created is False:
+                    return _deny(_DENY_PENDING)  # identical challenge already up.
+
+                # settled_post awaits the coordinator-owned setup driver
+                # (shielded); deny latency ≈ one Telegram post RTT.
+                outcome = await handle.settled_post()
+                if outcome == "delivery_failed":
+                    return _deny(_DENY_DELIVERY_FAILED)
+                if outcome == "inactive":
+                    return _deny(_DENY_INACTIVE)
+                return _deny(_DENY_POSTED)
+
+            # 1. ENGAGEMENT path (#400) FIRST — an interactive specialist
+            # engagement's protected call routes through the DM authorization
+            # challenge, bound to THIS engagement. NO closure-role assertion:
+            # an in_casa specialist inherits the outer execution_role, so the
+            # rec.kind gate + engagement-bound key contain it (never assert).
+            # Fail-closed unless the record is an ACTIVE SPECIALIST with a topic
+            # and a reachable operator DM (read from the record's own origin —
+            # the operator who started the engagement, not the caller-supplied
+            # turn origin, which for an engagement is not a DM).
             if prov.execution == "engagement":
-                return _deny(_DENY_ENGAGEMENT)
+                import tools as tools_mod
+                rec = tools_mod.engagement_var.get(None)
+                # A non-empty id is REQUIRED: it becomes the GrantKey's
+                # engagement_id AND the finish hook's routing discriminator
+                # (empty ⇒ the DM/bus-role path), so an id-less record must never
+                # reach the engagement-bound path — fail closed.
+                if (rec is None
+                        or not getattr(rec, "id", "")
+                        or getattr(rec, "kind", None) != "specialist"
+                        or getattr(rec, "status", None) != "active"
+                        or strict_positive_id(
+                            getattr(rec, "topic_id", None)) is None):
+                    return _deny(_DENY_ENGAGEMENT_UNAVAILABLE)
+                eng_origin = getattr(rec, "origin", None) or {}
+                operator_id = strict_positive_id(eng_origin.get("user_id"))
+                chat_id = strict_positive_id(eng_origin.get("chat_id"))
+                if operator_id is None or chat_id is None:
+                    return _deny(_DENY_ENGAGEMENT_UNAVAILABLE)
+                deps = deps_factory()
+                if deps is None:
+                    return _deny(_DENY_ENGAGEMENT_UNAVAILABLE)
+                return await _authorize(
+                    deps=deps, operator_id=operator_id, chat_id=chat_id,
+                    engagement_id=rec.id,
+                    target_role=getattr(rec, "role_or_type", None),
+                )
 
             # 2. Transport/execution gate — no challenge. Provenance is consulted
             # BEFORE any grant lookup (a copied chat_id/user_id on a webhook turn
@@ -978,8 +1109,8 @@ def make_resident_authz_hook(
 
             origin = agent_mod.origin_var.get(None) or {}
 
-            # 3. Explicit role-mismatch deny (defense in depth) — AFTER the
-            # engagement/origin denials; an explicit deny, never an assert.
+            # 3. Explicit role-mismatch deny (defense in depth) — an explicit
+            # deny, never an assert.
             if role != origin.get("execution_role"):
                 return _deny(_DENY_ROLE_MISMATCH)
 
@@ -994,66 +1125,13 @@ def make_resident_authz_hook(
                 # The transport gate already guarantees these; stay fail-closed.
                 return _deny(_DENY_UNSUPPORTED_ORIGIN)
 
-            # 4b. #368: only the CONFIGURED operator may satisfy an
-            # authorization challenge — deny OUTRIGHT for any other sender,
-            # BEFORE the grant lookup and with NO challenge (the requester
-            # must never receive their own approval button). With
-            # ``telegram_chat_id`` empty (accept-all mode) NO sender is the
-            # operator (#336), so protected tools are always denied there.
-            # Fail-closed when the channel cannot answer the question.
-            is_op = getattr(deps.channel, "_user_id_is_operator", None)
-            if not callable(is_op) or not is_op(operator_id):
-                return _deny(_DENY_NOT_OPERATOR)
-
-            tool_input = (input_data or {}).get("tool_input") or {}
-
-            # 5. Canonicalize — the args_hash for the grant key AND the challenge
-            # body. Unserializable ⇒ deny with NO challenge (an unrenderable
-            # call can never match a grant, which was minted from a valid hash).
-            try:
-                canonical_json = canonical_args_json(tool_input)
-            except ValueError:
-                return _deny(_DENY_UNRENDERABLE)
-            args_hash = hashlib.sha256(
-                canonical_json.encode("utf-8")).hexdigest()
-
-            key = GrantKey(
-                operator_id=operator_id, chat_id=chat_id,
-                enforcement_role=role,
-                artifact_id=protected[tool_name]["artifact_id"],
-                tool_name=tool_name, args_hash=args_hash,
+            # target_role is the ORIGINATING resident (for a delegated specialist
+            # this is origin.role, i.e. Ellen — the continuation routes back to
+            # her; B1 ruling).
+            return await _authorize(
+                deps=deps, operator_id=operator_id, chat_id=chat_id,
+                engagement_id="", target_role=origin.get("role"),
             )
-
-            # 6. Single-use consume (provenance already gated above).
-            if deps.grants.consume(key):
-                return {}  # allow — the operator freshly approved THIS call.
-
-            # 7. No grant — post (or reuse) a confirmation challenge and deny.
-            # target_role is the ORIGINATING resident (for a delegated
-            # specialist this is origin.role, i.e. Ellen — the continuation
-            # routes back to her; B1 ruling). get_or_create renders + size-
-            # validates BEFORE any coordinator insert (too-large ⇒ refused).
-            handle = deps.challenges.get_or_create(
-                key, chat_id=chat_id, operator_id=operator_id,
-                target_role=origin.get("role"), tool_name=tool_name,
-                canonical_json=canonical_json, enforcement_role=role,
-                channel=deps.channel,
-                summary=protected[tool_name].get("summary"),
-                display_name=deps.display_name,
-            )
-            if handle.refused == "args_too_large":
-                return _deny(_DENY_UNRENDERABLE)
-            if handle.created is False:
-                return _deny(_DENY_PENDING)  # identical challenge already up.
-
-            # settled_post awaits the coordinator-owned setup driver (shielded);
-            # deny latency ≈ one Telegram post RTT (accepted judgment call).
-            outcome = await handle.settled_post()
-            if outcome == "delivery_failed":
-                return _deny(_DENY_DELIVERY_FAILED)
-            if outcome == "inactive":
-                return _deny(_DENY_INACTIVE)
-            return _deny(_DENY_POSTED)
         except asyncio.CancelledError:
             raise
         except Exception:  # noqa: BLE001 — fail closed, never let it escape
