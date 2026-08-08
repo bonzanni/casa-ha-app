@@ -581,6 +581,7 @@ assert body == {}, f"benign bash should return empty (allow); got {body}"
 status, body = resolve("nope_nope", {"tool_name": "Bash"})
 assert status == 200, (status, body)
 assert body["hookSpecificOutput"]["permissionDecision"] == "deny", body
+assert "unknown" in body["hookSpecificOutput"]["permissionDecisionReason"].lower(), body
 
 # 4. #366: an UNKNOWN engagement credential pair must not 500 — the request
 # proceeds unauthenticated (default policies still apply; identity-consuming
