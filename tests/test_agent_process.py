@@ -1023,19 +1023,30 @@ class TestCorrelationId:
             context={"chat_id": "42", "cid": "abcd1234"},
         )
 
+        # Baseline BEFORE the dispatch. `caplog.records` accumulates from the
+        # start of the test, so a plain snapshot also folds in CONSTRUCTION
+        # records — `Agent.__init__` logs `agent_capabilities` at INFO, with no
+        # cid bound because building an agent is not part of any turn.
+        #
+        # Whether that record is captured depends on the `agent` logger's level
+        # when `_make_agent` ran, which a test that executed EARLIER ON THE SAME
+        # xdist worker can leave at INFO. So the failure is invisible until file
+        # scheduling changes — `--dist loadfile` re-assigns files whenever the
+        # test set does — and then it is deterministic, not flaky: v0.163.0
+        # added test files and this went red on CI twice in a row while passing
+        # locally every time.
+        #
+        # Bounding the window at BOTH ends is what makes the assertion mean what
+        # it says. The tail matters for the same reason and was fixed first: the
+        # `finally` below cancels the agent loop, and on a loaded runner that
+        # logs before the assertion runs.
+        before_dispatch = len(caplog.records)
         with patch("sdk_client_pool._default_make_client", FakeClient), \
              patch_retry_sleep():
             loop = asyncio.create_task(bus.run_agent_loop("assistant"))
             try:
                 result = await bus.request(msg, timeout=5)
-                # Snapshot INSIDE the dispatch window. `caplog.records` keeps
-                # growing until the test ends, so reading it after the
-                # `finally` below folds in teardown records — emitted with no
-                # cid bound, because cancelling the agent loop is not part of
-                # any turn. On a fast machine teardown logs nothing before the
-                # assertion; on a loaded runner it does, and the test failed
-                # for a record it was never meant to judge.
-                during_dispatch = list(caplog.records)
+                during_dispatch = caplog.records[before_dispatch:]
             finally:
                 loop.cancel()
                 with pytest.raises(asyncio.CancelledError):
@@ -1075,6 +1086,7 @@ class TestCorrelationId:
         bus.register("assistant", agent.handle_message)
 
         caplog.set_level(logging.INFO)
+        before_dispatch = len(caplog.records)
 
         def _mk(cid: str, chat_id: str) -> BusMessage:
             return BusMessage(
@@ -1102,8 +1114,12 @@ class TestCorrelationId:
 
         # Every agent/retry/bus record must carry one of the two cids;
         # neither may cross-contaminate (dispatcher scopes cid per task).
+        # Sliced from the pre-dispatch baseline for the same reason as the
+        # sibling above — this one already discards cid="-" records, so
+        # construction cannot fail it, but reading the whole log to judge one
+        # window is the shape that went wrong and it should not survive here.
         relevant = [
-            r for r in caplog.records
+            r for r in caplog.records[before_dispatch:]
             if r.name in {"agent", "retry", "bus"}
             and getattr(r, "cid", "-") != "-"
         ]
