@@ -1,5 +1,7 @@
 #!/usr/bin/env bash
-# Plan 4a D-block: claude_code driver lifecycle (D-1..D-8, D-11..D-12).
+# Plan 4a D-block: claude_code driver lifecycle (D-1..D-6, D-8, D-11..D-12).
+# D-7's hook probe is superseded by D-12 (same assertions, current response
+# shape, against svc-casa-mcp:8100).
 # Tier-3 hardening: timing-sensitive + restart-survival assertions.
 # Requires CASA_USE_MOCK_CLAUDE=1 (mock CLI overlay).
 set -euo pipefail
@@ -414,50 +416,6 @@ asyncio.run(main())
 PY
 )"
 pass "D-6 mcp: emit_completion via MCP round-trip → registry completed"
-
-run_harness "D-7 hook-block" "$(cat <<'PY'
-import asyncio, pathlib, sys, json, urllib.request
-sys.path.insert(0, "/opt/casa")
-
-async def main():
-    # Register a policy that always blocks Write.
-    from hooks import HOOK_POLICIES
-    HOOK_POLICIES["always_block_write"] = lambda p: (
-        {"decision": "block", "reason": "always_block_write policy"}
-        if (p.get("tool_name") == "Write" or p.get("tool") == "Write")
-        else {"decision": "allow"}
-    )
-
-    # POST directly to /hooks/resolve to verify the endpoint is alive and
-    # returns block for our registered policy.
-    req = urllib.request.Request(
-        "http://127.0.0.1:8100/hooks/resolve",
-        data=json.dumps({"policy": "always_block_write",
-                         "payload": {"tool_name": "Write"}}).encode(),
-        headers={"Content-Type": "application/json"},
-        method="POST",
-    )
-    with urllib.request.urlopen(req, timeout=5) as resp:
-        body = json.loads(resp.read())
-    assert body["decision"] == "block", f"expected block, got {body}"
-
-    # Also verify unknown policy → block
-    req2 = urllib.request.Request(
-        "http://127.0.0.1:8100/hooks/resolve",
-        data=json.dumps({"policy": "nonexistent", "payload": {}}).encode(),
-        headers={"Content-Type": "application/json"},
-        method="POST",
-    )
-    with urllib.request.urlopen(req2, timeout=5) as resp:
-        body2 = json.loads(resp.read())
-    assert body2["decision"] == "block"
-    assert "unknown" in body2["reason"].lower()
-    print("OK")
-
-asyncio.run(main())
-PY
-)"
-pass "D-7 hook-block: PreToolUse policy denies Write via /hooks/resolve"
 
 run_harness "D-8 restart-survival" "$(cat <<'PY'
 import asyncio, pathlib, sys, subprocess, time
