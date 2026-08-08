@@ -178,6 +178,29 @@ def _make_internal_tools_call_handler(
                         or name in _TERMINAL_BINDING_TOOLS):
                     engagement = rec
 
+        # v0.166.0 bridge grant-gate: dispatch only a tool the AUTHENTICATED
+        # engagement is actually granted, and fail CLOSED when no active
+        # engagement is bound. The executor's own (root) shell can reach this
+        # socket directly with the workspace token, bypassing the CLI-side
+        # allowlist that used to be the "before dispatch" enforcement — so the
+        # check must live here. This deliberately inverts the old INV-MCP-001.
+        # Terminal-binding tools stay exempt: an emit_completion retry may
+        # legitimately arrive unbound (INV-MCP-004's terminal path).
+        if name not in _TERMINAL_BINDING_TOOLS:
+            from tools import engagement_casa_grant_names
+            granted = engagement_casa_grant_names(engagement)
+            # None = a server-level casa-framework grant → any casa tool allowed.
+            if granted is not None and name not in granted:
+                logger.warning(
+                    "internal /tools/call: tool %r not granted to engagement "
+                    "%s; rejecting", name,
+                    (str(eng_id)[:8] if eng_id else "<unbound>"),
+                )
+                return web.json_response(
+                    {"error": {"code": -32004,
+                               "message": f"tool_not_granted: {name}"}}
+                )
+
         # Lazy import so monkeypatching `tools.engagement_var` in tests works.
         from tools import engagement_var
 

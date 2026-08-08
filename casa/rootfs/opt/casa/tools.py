@@ -1012,6 +1012,49 @@ def _resolution_from_recorded(plugin_artifacts) -> "plugin_registry.ResolutionRe
     return ResolutionResult(registry_valid=True, plugins=plugins, issues=issues)
 
 
+# The casa-framework tools every bridge-backed engagement of a given kind is
+# granted at runtime, over and above whatever its definition lists (#458
+# follow-up / v0.166.0). Interactive specialists in particular are created with
+# an EMPTY tools_allowed and receive these only via the options builder — so
+# these are the single source the bridge grant-gate must also honor, or a
+# specialist's own query_engager is rejected. Keep the extra_casa_tools call
+# sites below referencing these constants so the gate can never drift from what
+# is actually granted.
+SPECIALIST_CASA_GRANTS: tuple[str, ...] = (
+    "mcp__casa-framework__query_engager",
+    "mcp__casa-framework__emit_completion",
+)
+# `react` is deliberately NOT a launch/resume-mandatory grant: an executor gets
+# it only from its OWN definition (plugin-developer lists it), so the tools it
+# is offered and the tools the bridge grant-gate admits stay consistent.
+
+# The two casa-framework tools EVERY bridge-backed engagement receives at
+# launch, both kinds, independent of its definition (query_engager to read the
+# conversation, emit_completion to end it). They are the same for specialists
+# and executors — `react` is NOT here, because it is granted only by an
+# executor definition that lists it (plus the resume builder), so gate-granting
+# it universally would over-grant e.g. the configurator (Sol review r1).
+MANDATORY_BRIDGE_CASA_GRANTS: tuple[str, ...] = SPECIALIST_CASA_GRANTS
+
+
+# Bridge grant-gate helper (imported by internal_handlers). The casa-framework
+# tools an authenticated engagement may invoke over the internal socket = the
+# grant its record PINS (persisted at creation from the definition/config plus
+# the launch-mandatory grants — the source of truth), unioned with
+# MANDATORY_BRIDGE_CASA_GRANTS so a record written before those were persisted
+# (an in-flight upgrade) still admits the two universal tools. Returns a set of
+# BARE tool names, or None to mean "server-level grant — any casa tool".
+def engagement_casa_grant_names(engagement) -> "set[str] | None":
+    if engagement is None:
+        return set()  # fail closed: no bound engagement grants nothing
+    allowed = set(getattr(engagement, "tools_allowed", ()) or ())
+    allowed |= set(MANDATORY_BRIDGE_CASA_GRANTS)
+    if "mcp__casa-framework" in allowed:      # server-level grant → all
+        return None
+    prefix = "mcp__casa-framework__"
+    return {t[len(prefix):] for t in allowed if t.startswith(prefix)}
+
+
 def _build_specialist_options(
     cfg,
     *,
@@ -1359,14 +1402,12 @@ def build_engagement_resume_options(engagement, session_id: str) -> ClaudeAgentO
                 defn,
                 executor_type=role,
                 plugin_paths=plugin_paths,
-                extra_casa_tools=(
-                    "mcp__casa-framework__query_engager",
-                    "mcp__casa-framework__emit_completion",
-                    # R5 (v0.89.0): a resumed engaged executor keeps `react`.
-                    # Scoped to executors (the specialist branch below does NOT
-                    # grant it) — matches the plugin-developer definition grant.
-                    "mcp__casa-framework__react",
-                ),
+                # Only the launch-mandatory grants here (query/emit). `react`
+                # comes from the executor's OWN definition (plugin-developer
+                # lists it); adding it unconditionally would offer a resumed
+                # configurator a tool the bridge grant-gate then rejects, since
+                # its record does not carry react (Sol/Terra re-review r2).
+                extra_casa_tools=SPECIALIST_CASA_GRANTS,
             )
     else:
         cfg = _specialist_registry.get(role) if _specialist_registry is not None else None
@@ -1381,18 +1422,12 @@ def build_engagement_resume_options(engagement, session_id: str) -> ClaudeAgentO
                 opts = _build_specialist_options(
                     cfg,
                     resolution=_resolution_from_recorded(recorded),
-                    extra_casa_tools=(
-                        "mcp__casa-framework__query_engager",
-                        "mcp__casa-framework__emit_completion",
-                    ),
+                    extra_casa_tools=SPECIALIST_CASA_GRANTS,
                 )
             else:
                 opts = _build_specialist_options(
                     cfg,
-                    extra_casa_tools=(
-                        "mcp__casa-framework__query_engager",
-                        "mcp__casa-framework__emit_completion",
-                    ),
+                    extra_casa_tools=SPECIALIST_CASA_GRANTS,
                 )
     if opts is None:
         raise RuntimeError(
@@ -4035,6 +4070,15 @@ async def delegate_to_agent(args: dict) -> dict:
                     kind="specialist", role_or_type=agent_name, driver="in_casa",
                     task=task_text, origin=dict(origin), topic_id=topic_id,
                     plugin_artifacts=_spec_arts,
+                    # v0.166.0: pin the specialist's OWN casa-framework grant so
+                    # the bridge gate admits exactly what _build_specialist_options
+                    # launches with — its declared tools (a specialist config may
+                    # grant more than query/completion) plus the launch-mandatory
+                    # grants. Without this the record is empty and every framework
+                    # tool beyond the two mandatory ones is wrongly rejected.
+                    tools_allowed=tuple(
+                        t for t in (cfg.tools.allowed or ()) if t != "Skill"
+                    ) + SPECIALIST_CASA_GRANTS,
                 )
             except asyncio.CancelledError:
                 # create() already compensated the record; close the topic in
@@ -4071,10 +4115,7 @@ async def delegate_to_agent(args: dict) -> dict:
                 _build_specialist_options,
                 cfg,
                 resolution=_spec_res,
-                extra_casa_tools=(
-                    "mcp__casa-framework__query_engager",
-                    "mcp__casa-framework__emit_completion",
-                ),
+                extra_casa_tools=SPECIALIST_CASA_GRANTS,
             )
 
             prompt = (
@@ -6077,7 +6118,13 @@ async def engage_executor(args: dict) -> dict:
                     task=task_text,
                     origin={**origin, **_origin_extra},
                     topic_id=topic_id,
-                    tools_allowed=tuple(defn.tools_allowed or ()),
+                    # v0.166.0: include the launch-mandatory casa grants so the
+                    # bridge gate admits query_engager/emit_completion even for an
+                    # executor whose definition omits them (e.g. configurator).
+                    # `react` is intentionally NOT added here — only a definition
+                    # that lists it, or a resume, grants it.
+                    tools_allowed=tuple(dict.fromkeys(
+                        (*(defn.tools_allowed or ()), *SPECIALIST_CASA_GRANTS))),
                     permission_mode=getattr(
                         defn, "permission_mode", "acceptEdits"),
                     plugin_artifacts=plugin_artifacts,  # §3.8 recorded binding
@@ -6205,10 +6252,7 @@ async def engage_executor(args: dict) -> dict:
             options = await asyncio.to_thread(
                 _build_executor_options, defn, executor_type=executor_type,
                 resolution=plugin_resolution,
-                extra_casa_tools=(
-                    "mcp__casa-framework__query_engager",
-                    "mcp__casa-framework__emit_completion",
-                ),
+                extra_casa_tools=SPECIALIST_CASA_GRANTS,
             )
             options.system_prompt = prompt
 

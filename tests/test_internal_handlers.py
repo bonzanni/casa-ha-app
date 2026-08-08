@@ -21,6 +21,12 @@ class _FakeRecord:
         self.status = status
         # #335: per-engagement secret; the body must present it to bind.
         self.auth_token = f"tok-{eng_id}"
+        # v0.166.0: the bridge grant-gate dispatches only granted tools. These
+        # plumbing tests use arbitrary tool names, so grant at the server level
+        # (any casa tool) — the grant policy itself is pinned in
+        # test_bridge_tools_allowed_gate.py.
+        self.kind = "executor"
+        self.tools_allowed = ("mcp__casa-framework",)
 
 
 class _FakeRegistry:
@@ -76,11 +82,14 @@ def _make_app(*, dispatch: dict, registry: _FakeRegistry,
 
 async def test_tools_call_known_tool_returns_result() -> None:
     reg = _FakeRegistry()
+    rec = _FakeRecord(eng_id="abc-123", status="active")
+    reg.add(rec)
     app = _make_app(dispatch={"ok_tool": _ok_tool}, registry=reg)
     async with TestClient(TestServer(app)) as client:
         resp = await client.post(
             "/internal/tools/call",
-            json={"name": "ok_tool", "arguments": {"x": 1}, "engagement_id": None},
+            json={"name": "ok_tool", "arguments": {"x": 1},
+                  "engagement_id": "abc-123", "engagement_token": rec.auth_token},
         )
         assert resp.status == 200
         body = await resp.json()
@@ -149,9 +158,12 @@ async def test_tools_call_engagement_id_binds_contextvar() -> None:
         assert text == {"eng": "abc-123"}
 
 
-async def test_tools_call_inactive_engagement_binds_none() -> None:
-    """Defense-in-depth: only UNDERGOING (status=='active') engagements get
-    bound — finalized/cancelled records become None."""
+async def test_tools_call_inactive_engagement_is_rejected_fail_closed() -> None:
+    """Defense-in-depth: only UNDERGOING (status=='active') engagements bind.
+    A finalized/cancelled record does not bind, and v0.166.0's grant-gate then
+    fails closed for a non-terminal tool — the tool never runs. (Before the
+    gate this dispatched with engagement=None; the binding rule is unchanged,
+    only the consequence of being unbound.)"""
     reg = _FakeRegistry()
     rec = _FakeRecord(eng_id="fin-1", status="completed")
     reg.add(rec)
@@ -163,17 +175,19 @@ async def test_tools_call_inactive_engagement_binds_none() -> None:
                   "engagement_token": rec.auth_token},
         )
         body = await resp.json()
-        text = json.loads(body["content"][0]["text"])
-        assert text == {"eng": None}
+        assert "tool_not_granted" in body["error"]["message"]
 
 
 async def test_tools_call_handler_exception_returns_error_object() -> None:
     reg = _FakeRegistry()
+    rec = _FakeRecord(eng_id="abc-123", status="active")
+    reg.add(rec)
     app = _make_app(dispatch={"raises": _raising_tool}, registry=reg)
     async with TestClient(TestServer(app)) as client:
         resp = await client.post(
             "/internal/tools/call",
-            json={"name": "raises", "arguments": {}, "engagement_id": None},
+            json={"name": "raises", "arguments": {},
+                  "engagement_id": "abc-123", "engagement_token": rec.auth_token},
         )
         body = await resp.json()
         assert body["error"]["code"] == -32001  # tool-level error, distinct from -32000

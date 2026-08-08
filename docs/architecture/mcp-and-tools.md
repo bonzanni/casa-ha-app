@@ -98,28 +98,42 @@ binding: change it in response to an incident, not to a scan.
 
 ## Contracts & invariants
 
-**INV-MCP-001**: The internal tool dispatch path resolves a call by name against the full tool map and does not consult any per-agent allowlist.
+**INV-MCP-001**: The internal tool dispatch path enforces the authenticated engagement's own grant — a tool the engagement is not granted is refused before it runs, and an unbound call fails closed (only the terminal-binding subset is exempt).
 
-Stated as an invariant because its absence is load-bearing. Enforcement of what an agent may
-call happens before dispatch, not at it.
+Stated as an invariant because its enforcement is load-bearing, and because it was once the
+opposite. Until v0.166.0 dispatch consulted no allowlist; enforcement was assumed to happen
+"before dispatch", in the CLI's own tool gating, contained by INV-MCP-002. That assumption
+does not hold for an executor with broad shell: its own (root) process can read the workspace
+engagement token and POST this socket directly, bypassing the CLI entirely. So the grant
+check moved to dispatch, where it binds the process, not just the model. The granted set is
+the engagement record's `tools_allowed` unioned with the kind-mandatory casa-framework grants
+(`query_engager`/`emit_completion`, plus `react` for engaged executors) — the same tools the
+options builder hands the session, so an interactive specialist's empty record still admits
+its own `query_engager`.
 
-What it does not cover: tool-local checks still apply, and a terminal-binding subset is
-treated specially.
+What it does not cover: tool-local checks still apply on top; a terminal-binding subset
+(`emit_completion`) dispatches even unbound, for completion retries; and it binds the
+*engagement identity*, not the OS process — a root executor that steals a more-privileged
+*live* sibling's token still authenticates as that sibling (the residual that needs
+per-engagement process isolation, tracked separately).
 
 **INV-MCP-002**: The internal endpoint is reachable only from inside the container, over a Unix socket with restricted permissions.
 
-This is the boundary that actually contains the property above. If reasoning about who can
-call a tool, reason about who can reach that socket.
+This bounds who *outside* the container can reach the socket (nothing). It does NOT bound
+callers *inside* the container: engagement subprocesses run as root and reach the socket
+directly, which is exactly why INV-MCP-001 enforces the per-engagement grant at dispatch
+rather than trusting socket reachability.
 
 What it does not cover: the `svc-casa-mcp` bridge on loopback port 8100, which forwards
 into this socket for workspace subprocesses. Its listener is loopback-bound and neither
 nginx listener proxies to it, so it sits inside the same container boundary rather than
 punching through it (see the mental model).
 
-**INV-MCP-003**: The two surfaces expose different tool sets — role-filtered on the SDK side, the full static set over HTTP.
+**INV-MCP-003**: The two surfaces expose different tool sets — role-filtered on the SDK side, the full static set advertised over HTTP but grant-filtered at dispatch.
 
 What it does not cover: being advertised is not being permitted. The HTTP advertisement
-describes what the bridge can route, not what any particular agent may invoke.
+describes what the bridge can route; INV-MCP-001's dispatch check decides what a particular
+engagement may actually invoke.
 
 **INV-MCP-004**: An engagement-id claim binds an engagement record only together with that record's per-engagement auth token; a known id with a missing or mismatched token is rejected without invoking the tool.
 

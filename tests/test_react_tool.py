@@ -76,6 +76,9 @@ async def wired(tmp_path):
         kind="executor", role_or_type="plugin-developer", driver="in_casa",
         task="t", origin={"role": "assistant", "channel": "telegram"},
         topic_id=TOPIC,
+        # v0.166.0: react is a bridge tool, so the engagement must grant it for
+        # the gate to dispatch — as the real plugin-developer definition does.
+        tools_allowed=("mcp__casa-framework__react",),
     )
 
     bot = _ReactBot()
@@ -116,6 +119,10 @@ async def wired(tmp_path):
                           "engagement_token": rec.auth_token},
                 )
                 body = await resp.json()
+                # A grant-gate/auth rejection has no content block — hand the
+                # raw body back so the caller can assert on the error.
+                if "content" not in body:
+                    return body
                 return json.loads(body["content"][0]["text"])
 
     yield _Fx()
@@ -164,8 +171,10 @@ async def test_react_no_inbound_yields_no_current_inbound(wired):
 @pytest.mark.asyncio
 async def test_react_terminated_engagement_no_reaction(wired):
     """A STALE target present in the map, but the engagement is terminated:
-    the internal handler binds no active record, so react rejects — NO reaction
-    can ever fire on a finished engagement."""
+    the internal handler binds no active record, so v0.166.0's grant-gate
+    rejects the call before react runs — NO reaction can ever fire on a
+    finished engagement. (The react tool's own no_current_inbound guard remains
+    as defense in depth; the bridge now stops the call one step earlier.)"""
     await wired.ch.handle_update(_mk_update(message_id=101))
     await _drain(wired.ch)
     # stale target is present
@@ -174,7 +183,7 @@ async def test_react_terminated_engagement_no_reaction(wired):
     await wired.reg.mark_cancelled(wired.rec.id)
 
     payload = await wired.react(wired.rec.id, "👍")
-    assert payload["status"] == "no_current_inbound"
+    assert "tool_not_granted" in payload["error"]["message"]
     assert wired.bot.reactions == []               # non-live rejection = guarantee
 
 
@@ -224,9 +233,14 @@ def test_react_never_touches_ask_answer_seam():
         assert forbidden not in src, f"react must not reference {forbidden!r}"
 
 
-def test_react_granted_in_definition_and_resume_builder():
-    """Grant added to BOTH the plugin-developer definition allowlist AND the
-    engaged-executor resume-options builder (scoped to executors)."""
+def test_react_granted_by_definition_not_by_a_blanket_resume_grant():
+    """react is a per-definition grant, not a launch/resume-mandatory one.
+
+    v0.166.0: the bridge grant-gate admits react only when the engagement's
+    record carries it, and the record is pinned from the definition. So react
+    must come from the plugin-developer DEFINITION — the resume builder must NOT
+    add it unconditionally, or a resumed configurator (whose definition lacks
+    react) would be offered a tool the gate rejects."""
     import yaml
     defn = yaml.safe_load(pathlib.Path(
         "casa/rootfs/opt/casa/defaults/agents/executors/"
@@ -234,9 +248,14 @@ def test_react_granted_in_definition_and_resume_builder():
     ).read_text(encoding="utf-8"))
     assert "mcp__casa-framework__react" in defn["tools"]["allowed"]
 
+    # The mandatory grant sets never carry react.
+    assert "mcp__casa-framework__react" not in tools.SPECIALIST_CASA_GRANTS
+    assert "mcp__casa-framework__react" not in tools.MANDATORY_BRIDGE_CASA_GRANTS
+    # The resume builder adds only the mandatory grants, so react is not handed
+    # to an executor whose definition omits it.
     src = inspect.getsource(tools.build_engagement_resume_options)
-    # granted in the executor branch, not the resident
-    assert "mcp__casa-framework__react" in src
+    assert "SPECIALIST_CASA_GRANTS" in src
+    assert "EXECUTOR_CASA_GRANTS" not in src
 
 
 def test_react_registered_in_casa_tools():
