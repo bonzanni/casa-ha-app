@@ -1,5 +1,36 @@
 # Changelog
 
+## [0.164.0] - 2026-08-08
+
+### Removed
+
+- **Casa no longer carries code for upgrading from much older versions of
+  itself.** Pre-1.0, with development installs expected to start fresh, the
+  accumulated migration and compatibility machinery (~2,000 lines) is gone:
+  the old port-8099 fallback for engagement workspaces provisioned before
+  v0.14.0, the one-shot conversion of the pre-durable-job delegation file,
+  the v1 session-key conversion, two boot-time config migration blocks, the
+  plugin-setup store's version upgrade-on-read, and assorted single-line
+  tolerances for state shapes no current Casa writes. Less code on the boot
+  path means fewer places for it to go wrong.
+- The boot-time purge of stored webhook sessions — a security behavior, not
+  a migration — is retained as its own explicit step.
+
+### Changed
+
+- Boot now refreshes an engagement workspace's connection file when the
+  server address in it has drifted, not only when the credential has —
+  a workspace can no longer keep talking to an address Casa stopped serving.
+- A plugin-setup store carrying an unsupported version now resets cleanly
+  and rebuilds from live state, the same way a corrupt store does.
+
+### Upgrade notes
+
+- One-time cleanup on an existing install:
+  `rm -f /data/delegations.json /data/callback-episodes.json` (both retired;
+  a leftover file is inert but pointless). If `/data` predates v0.150, wipe
+  it or expect the plugin-setup store to reset itself on first boot.
+
 ## [0.163.0] - 2026-08-08
 
 ### Fixed
